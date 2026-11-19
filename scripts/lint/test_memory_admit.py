@@ -4606,6 +4606,79 @@ class ProgressKeepAsideTests(unittest.TestCase):
                 assert isinstance(room, admission_records.MemoryRoom)
                 self.assertEqual(room.kept, kept)
 
+    def test_test_steps_use_the_peak_after_decay_until_compilation_resumes(self) -> None:
+        row = self.reservation("merge-gate", need=46 * GIB // 10)
+        use = 3 * GIB // 10
+        peak = 4 * GIB // 10
+        low_need = math.ceil(peak * 1.2)
+        scope = Path("/fixture/builds.slice/test.scope")
+        reading = admission_records.MeasuredMemory(use, anonymous=admission_records.AnonymousRunUse(use),
+            anonymous_source=admission_records.ScopeSource(scope, frozenset({100})),
+            peak_history=admission_records.PeakDecayed(peak, row["need"], 1, 181, False))
+        base = replace(self.inputs((row,), (reading,)), now=182)
+        (step,) = base.running
+        compilers = admission_records.CompilerServiceMemory(0, pid=7, jobs=(
+            admission_records.CompilerJob(scope, admission_records.AnonymousRunUse(0)),))
+        compiler_step = admission_records.RunningStep("", "sccache.service", "compile", "", 0, compilers, pid=7)
+        near_peak = replace(reading, peak_history=admission_records.PeakSoFar(row["need"], 1.0, 182.0))
+        no_progress = gate.progress_memory(row, reading, gate.AttributedStepUse(reading.anonymous, True),
+            progress.NoCounter(), progress.NoMatchingProfile(), admission_policy_fixture())
+
+        for name, current, expected in (
+            ("09:07 merge gate", base, low_need),
+            ("compiler job in scope", replace(base, running=(step, compiler_step)), row["need"]),
+            ("new near-peak sample", replace(base, running=(replace(step, measured=near_peak),)), row["need"]),
+            ("build step", replace(base, reservations=({**row, "step": "build"},),
+                                   running=(replace(step, step="build"),)), row["need"]),
+            ("no progress or profile", replace(base, running=(replace(step, measured=no_progress),)), low_need),
+        ):
+            with self.subTest(name=name):
+                (before,) = gate.run_memories(base)
+                (after,) = gate.run_memories(current)
+                self.assertEqual((before.need, after.need), (low_need, expected))
+
+    def test_service_tracks_each_decay_and_detects_a_compiler_in_the_scope(self) -> None:
+        hold = 180
+        margin = 1.5
+        first_use, second_use = 3 * GIB // 10, 4 * GIB // 10
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _ = write_config_fixture(root / "build_admission.conf",
+                f"peak_hold_seconds.merge-gate={hold}\ntest_phase_margin={margin}\n")
+            with AdmissionFixture(root=root) as fixture:
+                request = fixture.request(step="merge-gate", need=46 * GIB // 10)
+                sidecar = fixture.scope(request.owner, current=first_use, anonymous=first_use)
+                grant = only_admitted(fixture.server.handle_request(replace(request, sidecar=str(sidecar))))
+                fixture.scoped_peak(grant, grant.need)
+                wave = Path(grant.wave_path)
+                _ = wave.write_text(f"{grant.need} {int(fixture.clock.now())}\n")
+                fixture.clock.advance(hold + 1)
+
+                def need() -> int:
+                    _ = fixture.run_pass()
+                    inputs = fixture.server.last_inputs
+                    assert isinstance(inputs, admission_records.QueueInputs)
+                    (run,) = gate.run_memories(inputs)
+                    return run.need
+
+                self.assertEqual(need(), math.ceil(first_use * margin))
+                scope = Path(sidecar.read_text())
+                write_scope(scope, members=(request.owner.pid,), current=second_use, anonymous=second_use)
+                self.assertEqual(need(), math.ceil(second_use * margin))
+                write_scope(scope, members=(request.owner.pid,), current=first_use, anonymous=first_use)
+                self.assertEqual(need(), math.ceil(second_use * margin))
+
+                stat = fixture.proc.path / str(request.owner.pid) / "stat"
+                original = stat.read_text()
+                _ = stat.write_text(original.replace("(verify)", "(rustc)"))
+                self.assertEqual(need(), grant.need)
+                _ = stat.write_text(original)
+
+                _ = wave.write_text(f"{grant.need} {int(fixture.clock.now())}\n")
+                self.assertEqual(need(), grant.need)
+                fixture.clock.advance(hold + 1)
+                self.assertEqual(need(), math.ceil(first_use * margin))
+
     def test_matched_test_progress_replaces_baseline_but_the_growing_peak_keeps_its_frozen_margin(self) -> None:
         row = self.reservation("nextest", need=20 * GIB)
         baseline = admission_records.TestPhaseNeed(8 * GIB, 5, 8, 8, "same_width", margin=1.25)

@@ -18,7 +18,7 @@ import subprocess
 import sys
 import uuid
 from collections import deque
-from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Collection, Generator, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -540,6 +540,7 @@ HeadAfterEnd = HeadRelease | HeadStillHeld | EstimateExpired | TokenWaitersOnly 
 class ProcessIdentity:
     parent: int
     start: str
+    is_compiler: bool = field(default=False, compare=False, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -870,6 +871,9 @@ def observed_test_phase(row: Reservation) -> ObservedTestPhase | UnobservedTestP
     return UnobservedTestPhase()
 
 
+COMPILER_PROGRAMS = frozenset({b"rustc", b"rustdoc", b"clippy-driver", b"cc1", b"cc1plus", b"clang", b"clang++"})
+
+
 def process_table(proc: Path = PROC) -> dict[int, ProcessIdentity]:
     # The service reads this table on each pass. Plain strings and bytes cost half the CPU of Path objects.
     processes: dict[int, ProcessIdentity] = {}
@@ -879,9 +883,11 @@ def process_table(proc: Path = PROC) -> dict[int, ProcessIdentity]:
             continue
         try:
             with open(f"{root}/{name}/stat", "rb", buffering=0) as handle:
-                fields = handle.read().rsplit(b") ", 1)[1].split()
+                name_field, stat = handle.read().rsplit(b") ", 1)
+                fields = stat.split()
             if fields[0] not in (b"Z", b"X"):
-                processes[int(name)] = ProcessIdentity(int(fields[1]), fields[19].decode())
+                processes[int(name)] = ProcessIdentity(int(fields[1]), fields[19].decode(),
+                    is_compiler=name_field.partition(b" (")[2] in COMPILER_PROGRAMS)
         except (OSError, ValueError, IndexError):
             continue
     return processes
@@ -1812,8 +1818,23 @@ def test_phase_charge(phase: TestPhaseStarted) -> int:
     return math.ceil(max(phase.peak_so_far, phase.need.bytes) * phase.need.margin)
 
 
-def reservation_need(row: Reservation, reading: StepMemory) -> int:
-    """Select the full step need unless captured evidence proves a test phase."""
+DECAYING_TEST_STEPS = frozenset({"merge-gate", "targeted-test", "nextest", "test"})
+
+
+def reservation_need(row: Reservation, reading: StepMemory, *, compiling_scopes: Collection[Path] = ()) -> int:
+    """Select the need from the accepted need and current memory evidence."""
+    if row["step"] in DECAYING_TEST_STEPS and isinstance(reading, MeasuredMemory):
+        history = reading.peak_history
+        source = reading.anonymous_source
+        if isinstance(source, ScopeSource) and source.directory in compiling_scopes:
+            return row["need"]
+        if isinstance(history, PeakSoFar) and history.resumed_after_decay:
+            return row["need"]
+        if isinstance(history, PeakDecayed):
+            if history.compiler_in_scope or isinstance(reading.anonymous, RunUseUnavailable):
+                return row["need"]
+            if history.bytes > 0 and isinstance(source, ScopeSource):
+                return min(row["need"], math.ceil(history.bytes * history.margin))
     if isinstance(reading, ProgressAdjustedMemory):
         return reading.remaining_need
     if row["step"] == "nextest" and isinstance(reading, MeasuredMemory) and isinstance(reading.peak_history, TestPhaseStarted):
@@ -1837,10 +1858,12 @@ def compiler_job_uses(running: Iterable[RunningStep]) -> dict[Path, AnonymousRun
     return uses
 
 
-def attributed_step_uses(inputs: QueueInputs) -> tuple[tuple[Reservation, RunningStep, AttributedStepUse], ...]:
+def attributed_step_uses(inputs: QueueInputs, *,
+                         compiler_uses: Mapping[Path, AnonymousRunUse | RunUseUnavailable] | None = None
+                         ) -> tuple[tuple[Reservation, RunningStep, AttributedStepUse], ...]:
     """Assign each scope, process and compiler job to one step before any grouping."""
     attributed: list[tuple[Reservation, RunningStep, AttributedStepUse]] = []
-    compiled = compiler_job_uses(inputs.running)
+    compiled = compiler_job_uses(inputs.running) if compiler_uses is None else compiler_uses
     active = tuple(zip(inputs.reservations, (step for step in inputs.running if running_has_reservation(step)), strict=True))
     scope_holders: dict[Path, tuple[str, int, MeasuredMemory]] = {}
     process_holders: dict[int, tuple[int, str, int]] = {}
@@ -1900,10 +1923,11 @@ def attributed_step_uses(inputs: QueueInputs) -> tuple[tuple[Reservation, Runnin
 def run_memories(inputs: QueueInputs) -> tuple[RunMemory, ...]:
     """Group attributed steps and ephemeral handoffs inside the pure pass."""
     groups: dict[str, RunMemory] = {}
-    for row, step, attributed in attributed_step_uses(inputs):
+    compiled = compiler_job_uses(inputs.running)
+    for row, step, attributed in attributed_step_uses(inputs, compiler_uses=compiled):
         run = reservation_run(row, step)
         owner = reservation_owner(row, step)
-        need = reservation_need(row, step.measured)
+        need = reservation_need(row, step.measured, compiling_scopes=compiled)
         use = attributed.use
         previous = groups.get(owner)
         if previous is None:
@@ -1937,9 +1961,9 @@ def reservation_profile_key(row: Reservation, host: str) -> str:
 def progress_memory(row: Reservation, reading: MeasuredMemory, attributed: AttributedStepUse,
                     counter: progress.ProgressCounter | progress.NoCounter,
                     profile: progress.ProgressProfile | progress.NoMatchingProfile,
-                    policy: AdmissionPolicy) -> ProgressAdjustedMemory:
+                    policy: AdmissionPolicy, *, compiling_scopes: Collection[Path] = ()) -> ProgressAdjustedMemory:
     """Use a profile only with a current attributed swap-backed reading."""
-    full_need = reservation_need(row, reading)
+    full_need = reservation_need(row, reading, compiling_scopes=compiling_scopes)
     window = (progress.window_peak(profile, counter, policy.progress_lookahead_percent)
               if isinstance(attributed.use, AnonymousRunUse) else
               progress.NoMatchingProfile("swap-backed use unavailable"))
@@ -1954,11 +1978,13 @@ def progress_memory(row: Reservation, reading: MeasuredMemory, attributed: Attri
             else:
                 window = progress.NoMatchingProfile("test phase reset or unmatched phase")
                 need = full_need
-    return ProgressAdjustedMemory(reading.bytes, anonymous=reading.anonymous,
+    adjusted = ProgressAdjustedMemory(reading.bytes, anonymous=reading.anonymous,
         anonymous_source=reading.anonymous_source, promise=reading.promise,
         swap_bytes=reading.swap_bytes, observed_peak=reading.observed_peak,
         unknown_peak_promise=reading.unknown_peak_promise, peak_history=reading.peak_history,
         counter=counter, window=window, remaining_need=need)
+    selected = reservation_need(row, adjusted, compiling_scopes=compiling_scopes)
+    return adjusted if selected == need else replace(adjusted, remaining_need=selected)
 
 
 def progress_text(reading: StepMemory) -> str:
@@ -2353,6 +2379,7 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
     totals = result.policy.totals
     explained: list[ExplainedRunningStep] = []
     reservations = iter(inputs.reservations)
+    compiled = compiler_job_uses(inputs.running)
     for step in inputs.running:
         reading = step.measured
         admitted_at: float | AdmissionTimeNotRecorded = AdmissionTimeNotRecorded()
@@ -2361,7 +2388,7 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
         if running_has_reservation(step):
             row = next(reservations)
             admitted_at = step_estimator.epoch(row["admitted_at"])
-            need = reservation_need(row, reading)
+            need = reservation_need(row, reading, compiling_scopes=compiled)
             owner = reservation_owner(row, step)
         measured = reading.bytes if isinstance(reading, (MeasuredMemory, CompilerServiceMemory, UnownedSliceMemory)) else 0
         charge = max(need, measured)

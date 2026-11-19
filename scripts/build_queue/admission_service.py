@@ -605,12 +605,11 @@ def raw_reservation_memory(record: ReservationRecord, row: records.Reservation,
 
 
 def reservation_charge(evidence: ReservationEvidence, row: records.Reservation,
-                       now: float, policy: records.AdmissionPolicy) -> records.StepMemory:
+                       now: float, policy: records.AdmissionPolicy, *,
+                       previously_decayed: bool = False) -> records.StepMemory:
     """Apply the current reservation and policy to unchanged physical evidence."""
     memory = gate.step_promise(row, evidence.memory)
     phase = gate.test_phase_history(row, memory, evidence.phase)
-    if isinstance(memory, records.MeasuredMemory) and isinstance(phase, records.TestPhaseStarted):
-        return replace(memory, peak_history=phase)
     try:
         if isinstance(evidence.peak.text, UnreadableSample):
             raise ValueError("unreadable peak")
@@ -618,6 +617,8 @@ def reservation_charge(evidence: ReservationEvidence, row: records.Reservation,
         if peak < 0:
             raise ValueError("negative peak")
     except ValueError:
+        if isinstance(memory, records.MeasuredMemory) and isinstance(phase, records.TestPhaseStarted) and not previously_decayed:
+            return replace(memory, peak_history=phase)
         return (replace(memory, unknown_peak_promise=row["need"], peak_history=records.PeakFileUnreadable(row["need"]))
                 if isinstance(memory, records.MeasuredMemory) else memory)
     last_near_peak = now
@@ -640,10 +641,13 @@ def reservation_charge(evidence: ReservationEvidence, row: records.Reservation,
     history: records.PeakHistory = (records.PeakSoFar(peak, peak_at, peak_time, old_sampler)
                                 if peak > 0 else records.NoPeakRecorded())
     hold = policy.peak_hold.seconds_for(row.get("step", ""))
-    if not gate.release_build(row) and now - last_near_peak >= hold:
+    if peak > 0 and not gate.release_build(row) and now - last_near_peak >= hold:
         history = records.PeakDecayed(0, peak, last_near_peak, last_near_peak + hold, old_sampler)
         peak = 0
     if isinstance(memory, records.MeasuredMemory):
+        if isinstance(phase, records.TestPhaseStarted) and not previously_decayed and not (
+                isinstance(history, records.PeakDecayed) and isinstance(memory.anonymous_source, records.ScopeSource)):
+            return replace(memory, peak_history=phase)
         return replace(memory, observed_peak=peak, peak_history=history)
     if isinstance(memory, records.PromisedMemory):
         return records.PromisedMemory(max(memory.bytes, peak))
@@ -1423,6 +1427,7 @@ class AdmissionServer:
         self.last_usable_configuration: records.MemoryConfig | NoPass = NoPass()
         self.caller_versions: dict[str, str] = {}
         self.slots: dict[str, records.RunSlot] = {}
+        self.decayed_test_peaks: dict[str, records.PeakDecayed] = {}
         self.progress_history: progress.ProfileHistory = progress.ProfileHistory(state_dir / "progress_profiles")
         self.progress_captures: progress.CaptureReader = progress.CaptureReader(capture_root)
         try:
@@ -1936,12 +1941,16 @@ class AdmissionServer:
             elif isinstance(record.run, wire.RunIdentity) and not self._run_alive(record.run):
                 row["run_origin"] = records.CallerRun(NoLiveBuildRun())
             captured = evidence.reservations.get(episode)
-            memory = (reservation_charge(captured, row, now, config.policy) if captured is not None
+            prior_decay = self.decayed_test_peaks.get(record.reservation_id)
+            memory = (reservation_charge(captured, row, now, config.policy, previously_decayed=prior_decay is not None)
+                      if captured is not None
                       else records.PromisedMemory(record.need))
             if isinstance(memory, records.GoneMemory):
                 with retry_cleanup(Path(record.path)):
                     self._end(episode, record.ending if not isinstance(record.ending, NotEnding) else OwnerExited())
                 continue
+            if row["step"] in gate.DECAYING_TEST_STEPS and isinstance(memory, records.MeasuredMemory):
+                memory = self._capture_test_decay(record.reservation_id, memory, evidence, config.test_phase_margin)
             if record.episode.startswith("uid:") and isinstance(memory, records.MeasuredMemory):
                 if isinstance(memory.anonymous, records.AnonymousRunUse):
                     self._sample_runner(record, memory.anonymous.bytes, now)
@@ -1994,6 +2003,27 @@ class AdmissionServer:
             self.next_progress_sweep = self.clock.monotonic() + config.running_pass_seconds
         return self._progress_inputs(self._inputs_with_current_slots(inputs), dict(evidence.processes),
                                      config.policy, profile_rank, profile_share)
+
+    def _capture_test_decay(self, reservation: str, memory: records.MeasuredMemory, evidence: SystemEvidence,
+                            margin: float) -> records.MeasuredMemory:
+        """Keep the largest anonymous memory sample within the current decay."""
+        history = memory.peak_history
+        previous = self.decayed_test_peaks.get(reservation)
+        if isinstance(history, records.PeakSoFar) and previous is not None:
+            return replace(memory, peak_history=replace(history, resumed_after_decay=True))
+        source = memory.anonymous_source
+        if not isinstance(history, records.PeakDecayed) or not isinstance(source, records.ScopeSource):
+            return memory
+        peak = (previous.bytes if previous is not None and previous.decayed_at == history.decayed_at
+                and previous.last_near_peak_at == history.last_near_peak_at
+                and previous.peak_bytes == history.peak_bytes else 0)
+        if isinstance(memory.anonymous, records.AnonymousRunUse) and evidence.read_at >= history.decayed_at:
+            peak = max(peak, memory.anonymous.bytes)
+        compiler_in_scope = any(pid in evidence.processes and evidence.processes[pid].is_compiler for pid in source.members)
+        history = replace(history, bytes=peak, margin=margin, compiler_in_scope=compiler_in_scope)
+        if peak > 0:
+            self.decayed_test_peaks[reservation] = history
+        return replace(memory, peak_history=history)
 
     def _unowned_memory(self, evidence: SystemEvidence, rows: list[records.Reservation]
                         ) -> tuple[records.UnownedSliceMemory, ...]:
@@ -2078,7 +2108,8 @@ class AdmissionServer:
     def _progress_inputs(self, inputs: records.QueueInputs, processes: dict[int, gate.ProcessIdentity],
                          policy: records.AdmissionPolicy, profile_rank: int, profile_share: int) -> records.QueueInputs:
         """Capture counters and profile samples on the service loop thread."""
-        attributed = iter(gate.attributed_step_uses(inputs))
+        compiled = gate.compiler_job_uses(inputs.running)
+        attributed = iter(gate.attributed_step_uses(inputs, compiler_uses=compiled))
         running: list[records.RunningStep] = []
         cutoff = inputs.now - step_estimator.HISTORY_DAYS * 86400
         for step in inputs.running:
@@ -2103,7 +2134,7 @@ class AdmissionServer:
                 counter = self.progress_captures.counter({pid: processes[pid].start for pid in pids}, self.boot_id)
             key = gate.reservation_profile_key(row, self.host)
             profile = self.progress_history.matching(key, cutoff, rank=profile_rank, share_percent=profile_share)
-            adjusted = gate.progress_memory(row, memory, use, counter, profile, policy)
+            adjusted = gate.progress_memory(row, memory, use, counter, profile, policy, compiling_scopes=compiled)
             running.append(replace(step, measured=adjusted))
             if use.owns_source and isinstance(use.use, records.AnonymousRunUse) and "reservation_id" in row:
                 source = memory.anonymous_source
@@ -2786,6 +2817,7 @@ class AdmissionServer:
                     if isinstance(record.finalization, dict) else self.clock.now())
         if record.episode.startswith("uid:"):
             self._sample_runner(record, 0, ended_at)
+        _ = self.decayed_test_peaks.pop(record.reservation_id, None)
         self.progress_history.finish(record.reservation_id, ended_at, ended_at - step_estimator.HISTORY_DAYS * 86400)
         if record.sidecar:
             self.progress_captures.remove(Path(record.sidecar))

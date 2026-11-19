@@ -433,6 +433,8 @@ class NoPromise:
 
 MemoryPromise = RampPromise | LifetimePromise | NoPromise
 
+TEST_PHASE_MARGIN_FALLBACK = 1.2
+
 
 @dataclass(frozen=True)
 class PeakSoFar:
@@ -441,16 +443,19 @@ class PeakSoFar:
     peak_at: float | PeakTimeUnknown = PeakTimeUnknown()
     last_near_peak_at: float | PeakTimeUnknown = PeakTimeUnknown()
     old_sampler: bool = False
+    resumed_after_decay: bool = field(default=False, kw_only=True)
 
 
 @dataclass(frozen=True)
 class PeakDecayed:
-    """The reduced memory charge retains the original peak and decay times."""
+    """The record holds the peak after decay, the original peak, and the decay times."""
     bytes: int
     peak_bytes: int
     last_near_peak_at: float
     decayed_at: float
     old_sampler: bool
+    margin: float = field(default=TEST_PHASE_MARGIN_FALLBACK, kw_only=True)
+    compiler_in_scope: bool = field(default=False, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1371,9 +1376,6 @@ def warn_configuration_diagnostics(diagnostics: tuple[ConfigurationDiagnostic, .
         if diagnostic not in _warned_configuration_diagnostics:
             _warned_configuration_diagnostics.add(diagnostic)
             print(diagnostic.diagnostic, file=sys.stderr)
-
-TEST_PHASE_MARGIN_FALLBACK = 1.2
-
 
 @dataclass(frozen=True)
 class MemoryConfig:
