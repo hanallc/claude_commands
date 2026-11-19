@@ -134,7 +134,7 @@ class TreeWatchTests(TreeWatchFixture):
                     source.chmod(0o755)
                 else:
                     _ = source.write_text(source.read_text() + "// staged input\n")
-                    _ = subprocess.run(["git", "add", "sample/src/lib.rs"], cwd=self.root,
+                    _ = subprocess.run(["git", "add", "sample/src/lib.rs"], env=self.environment, cwd=self.root,
                                        check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
                 self.assert_fires(process, fired, before)
 
@@ -147,7 +147,7 @@ class TreeWatchTests(TreeWatchFixture):
 
     def test_parent_exit_stops_watcher_without_firing(self) -> None:
         parent = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
-                                  stdin=subprocess.PIPE)
+                                  env=self.environment, stdin=subprocess.PIPE)
         try:
             watcher, fired, _ = self.start_watcher(parent.pid, real_process=True)
             parent.terminate()

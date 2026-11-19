@@ -15,6 +15,7 @@ import unittest
 from typing import cast
 from unittest import mock
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.direct.verify_hold_wait_test_support import (
     VerifyHoldWaitFixture,
     grant_call,
@@ -154,7 +155,7 @@ class PlacementWaitModeTests(unittest.TestCase):
                 "PLACEMENT_EPISODE=two; wait_for_placement",
                 "PLACEMENT_WAIT_MEMORY=1; PLACEMENT_EPISODE=three; wait_for_placement",
             ))
-            result = subprocess.run(["bash", "-c", script], env={**os.environ, "CALLS": str(calls)},
+            result = subprocess.run(["bash", "-c", script], env={**verify_test_environment(), "CALLS": str(calls)},
                                     capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(calls.read_text().splitlines(), [

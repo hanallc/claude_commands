@@ -1,6 +1,7 @@
 """Private workspace seeds and real process trees for verify cancellation tests."""
 from __future__ import annotations
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.build_queue.admission_test_support import (
     AdmissionFixture, caller_admission, caller_provider_controls, private_provider_evidence,
 )
@@ -298,6 +299,7 @@ with (patch.object(detached_runs, "deliver", return_value="private fixture"),
         self.assertEqual(list((self.root / "verify-steps").glob("*.json")), [], "cancel kept its active step")
         pid = int((self.control / "descendant.pid").read_text())
         state = subprocess.run(["ps", "-p", str(pid), "-o", "stat="],
+                               env=verify_test_environment(),
                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
         self.assertTrue(not state or state.startswith("Z"), f"cargo descendant {pid} survived: {state}")
 

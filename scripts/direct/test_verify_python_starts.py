@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -14,9 +15,10 @@ from typing import override
 import unittest
 from unittest import mock
 
+from scripts.lib.git_test_support import commit_repository
 from scripts.lib.shell_test_support import shell_function
 from scripts.lib.helper_tree_test_support import verify_test_environment
-from scripts.direct.tree_watch_test_support import TreeWatchFixture
+from scripts.direct.tree_watch_test_support import TreeWatchFixture, write_workspace
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
 from scripts.direct.verify_lint_scope_test_support import VERIFY, CARGO_STUB, TAPLO_STUB
@@ -124,7 +126,6 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
                 self.assertEqual(routing.local_runs(), [])
                 self.assertFalse(variables.keys() & routing.environment.keys())
         self.assertFalse(hook.with_suffix(".sh.ran").exists())
-        self.assertFalse((caller / "index").exists())
 
     def test_lint_code_key_tracks_inputs_and_clears_unreadable_keys_with_both_hash_tools(self) -> None:
         home = self.root / "key-home"
@@ -181,7 +182,7 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         self.addCleanup(unreadable.chmod, 0o600)
         self.assertTrue(unreadable.is_file(), "regression input must pass the shell's -f check")
         read = subprocess.run(
-            ["cat", "--", str(unreadable)], capture_output=True,
+            ["cat", "--", str(unreadable)], env=self.environment, capture_output=True,
             timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertNotEqual(read.returncode, 0, "regression input must fail a real read")
@@ -195,6 +196,41 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
 
 
 class VerifyOutputRootsTests(unittest.TestCase):
+    def test_workspace_setup_stages_in_the_fixture_index(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        caller = root / "caller"
+        environment = verify_test_environment()
+        with mock.patch.dict(os.environ, environment, clear=True):
+            _ = write_workspace(caller)
+        _ = (caller / "sentinel.txt").write_text("caller index entry\n")
+        _ = commit_repository(caller, "caller index", "sentinel.txt", env=environment)
+        index = caller / ".git/index"
+        before = index.read_bytes()
+        fixture = root / "fixture"
+        with mock.patch.dict(os.environ, {"GIT_INDEX_FILE": str(index)}):
+            _ = write_workspace(fixture)
+        self.assertTrue(index.read_bytes() == before, "git add changed the caller's index")
+        staged = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "sample/src/lib.rs"],
+            cwd=fixture, env=environment, capture_output=True, text=True,
+            timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(staged.returncode, 0, staged.stderr)
+
+    def test_paired_keys_do_not_read_the_caller_bash_env(self) -> None:
+        caller = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        hook = caller / "startup.sh"
+        _ = hook.write_text(': > "${BASH_SOURCE[0]}.ran"\n')
+        environment = {**verify_test_environment(), "BASH_ENV": str(hook)}
+        with mock.patch.dict(os.environ, environment, clear=True), ExitStack() as fixture_context:
+            _ = fixture_context.callback(PairedTreeKeyTests.doClassCleanups)
+            PairedTreeKeyTests.setUpClass()
+            paired = PairedTreeKeyTests()
+            _ = fixture_context.callback(paired.doCleanups)
+            paired.setUp()
+            paired.assert_pair("test", "sample")
+        self.assertFalse(hook.with_suffix(".sh.ran").exists())
+
     def test_metadata_reuse_keeps_the_export_after_a_config_change(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary).resolve()

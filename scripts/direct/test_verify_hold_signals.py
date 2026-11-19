@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.process_group import send_process_group
 from scripts.direct.verify_token_wait_test_support import VERIFY
@@ -76,7 +77,7 @@ printf '%s\n' "${RUN_LOG_PIDS[*]}" >&3
 read -r command
 '''
             with subprocess.Popen(["bash", "-c", harness, "test", str(log)],
-                                  stdin=subprocess.PIPE, stdout=write_fd,
+                                  env=verify_test_environment(), stdin=subprocess.PIPE, stdout=write_fd,
                                   stderr=subprocess.PIPE, start_new_session=True, text=True) as process:
                 try:
                     assert process.stderr is not None

@@ -286,7 +286,7 @@ esac
         """
         found: list[int] = []
         result = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "pgid=", "-o", "stat="],
-                                capture_output=True, text=True, check=True)
+                                env=verify_test_environment(), capture_output=True, text=True, check=True)
         for line in result.stdout.splitlines():
             parts = line.split()
             if len(parts) != 3 or parts[2].startswith("Z"):

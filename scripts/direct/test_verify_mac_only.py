@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.direct import verify_mac_offload_test_support
 from scripts.direct.verify_mac_offload_test_support import (
     CARGO_STUB, VERIFY, VerifyMacOffloadFixture, install_fixed_cargo,
@@ -39,7 +40,7 @@ class VerifyMacOnlyTests(VerifyMacOffloadFixture):
         repository.mkdir(exist_ok=True)
         git = shutil.which("git")
         assert git is not None
-        _ = subprocess.run([git, "init", "-q", str(repository)], check=True)
+        _ = subprocess.run([git, "init", "-q", str(repository)], env=verify_test_environment(), check=True)
         _ = (repository / ".gitignore").write_text("target/\n")
         output = self.root / "parser-results"
         output.mkdir(exist_ok=True)
