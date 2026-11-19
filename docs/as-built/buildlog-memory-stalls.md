@@ -95,8 +95,9 @@ The index maps each former step and call field name in `index.FORMER_FIELDS` to 
 Each minute on natedev, `buildlog sample` checks the queue for a stalled head.
 The watch reads `queue.json` and the tail of `queue_times.jsonl`.
 It measures quiet time from the latest start that added a positive memory promise.
-A `landing_pass` event restarts the quiet clock for the passed head.
-The event matches that head by PID, process start time, and original queue arrival.
+The service records a `landing_pass` event when it admits a landing test ahead of the head.
+The event restarts the quiet clock for the passed head.
+It matches that head by PID, process start time, and original queue arrival.
 The pass does not change the head's memory wait.
 A larger `landing_merge_max_passes` allows more quiet clock resets.
 A larger pass limit needs a new alert check.

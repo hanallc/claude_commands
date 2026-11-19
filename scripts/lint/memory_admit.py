@@ -24,7 +24,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from typing import BinaryIO, Literal, Protocol, TypedDict, cast, overload
+from typing import BinaryIO, Literal, Protocol, TypedDict, cast
 from itertools import chain
 
 from scripts.build_queue import admission_records as records, placement, progress_profile as progress, snapshot_codec as codec, step_estimator
@@ -1397,23 +1397,16 @@ def waiter_label(row: Waiter) -> str:
         return f"caller pid {row['pid']}"
 
 
-@overload
-def waiter_order(row: Waiter) -> tuple[int, float, int]: ...
-
-
-@overload
-def waiter_order(row: list[tuple[Path, Waiter]], *, landing_from: int,
-                 landing_to: int) -> list[tuple[Path, Waiter]]: ...
-
-
-def waiter_order(row: Waiter | list[tuple[Path, Waiter]], *, landing_from: int = 0, landing_to: int = 0
-                 ) -> tuple[int, float, int] | list[tuple[Path, Waiter]]:
-    if isinstance(row, list):
-        row.insert(landing_to, row.pop(landing_from))
-        return row
+def waiter_order(row: Waiter) -> tuple[int, float, int]:
+    """Return the normal queue sort key."""
     order = records.waiter_priority(row)
     rank = order.position if isinstance(order, PriorityUnit) else sys.maxsize
     return rank, row.get("order_since", row["since"]), row["pid"]
+
+
+def move_waiter(rows: list[tuple[Path, Waiter]], source: int, destination: int) -> None:
+    """Move one waiter within the queue."""
+    rows.insert(destination, rows.pop(source))
 
 
 @dataclass(frozen=True)
@@ -2708,8 +2701,11 @@ def queue_staff_chain(members: staff.StaffSnapshot, session: str) -> Iterator[st
         member = members.parent_of(member)
 
 
+NATEMERGE_STAFF_ID = staff.StaffId("506b6872-03cb-4a1a-9465-fbd9cf88975e")
+
+
 def is_natemerge(member: staff.StaffRow) -> bool:
-    return member.name == "natemerge"
+    return member.id == NATEMERGE_STAFF_ID
 
 
 def landing_wait_report(directory: Path, since: float) -> str:
@@ -2737,6 +2733,7 @@ def landing_wait_report(directory: Path, since: float) -> str:
     for group, waits in (("Landing tests", landing), ("Landing tests before (by session)", before), ("Unit steps", unit)):
         stats = f"{median(waits):.1f}\t{max(waits):.1f}" if waits else "-\t-"
         lines.append(f"{group}\t{len(waits)}\t{stats}")
+    lines.append("The report excludes older sessions for unmarked landing tests.")
     return "\n".join(lines)
 
 

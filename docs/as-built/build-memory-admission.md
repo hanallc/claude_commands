@@ -1925,17 +1925,23 @@ Each later finalization attempt uses the same guard, so other admissions continu
 
 #### Landing merge test priority
 
-For a local `merge-gate` request, `admission_service.landing_test()` checks the owner's process ancestry in `/proc`.
-An ancestor must match a live record in `land_runs.lands_dir()` by PID and process start time.
-The service also checks that the request session's staff chain reaches `natemerge`.
+For a local `merge-gate` request, the service reads the PID from the socket credentials.
+The peer must be the request owner or one of its descendants.
+An ancestor of the peer must match a live land record by PID and process start time.
+The service also checks that the request session's staff chain reaches the fixed staff ID of `natemerge`.
 A unit trial without a matching land record keeps its normal place.
+The service checks the land record and process again before it changes the order.
 
-The first eligible test from each land moves to the front of the natedev memory queue.
+The first eligible test from each land can move ahead in the natedev memory queue.
+It must fit within the normal memory limits.
+A promoted test cannot start through `StartsAlone`.
+The service saves the land's PID and start time when it admits this test.
 A later request from the same land keeps its normal place.
-The service saves the land's PID and start time with its first-place claim.
-It counts a pass once for each waiter that the test passes.
 A landing test waits behind any waiter that reached the pass limit.
-The memory check uses the same rules after the order changes.
+Admission counts one pass for each waiter that the landing test moved ahead of.
+The count uses the waiter's PID, process start time, and original queue arrival.
+The count stays with that wait through a reconnect.
+The service removes the count when the owner exits.
 
 Each landing order reads two keys from `config/build_admission.conf`.
 
@@ -1946,8 +1952,9 @@ Run `scripts/lib/py -m scripts.lint.memory_admit landing-waits --since <time>` f
 Use Unix seconds or an ISO 8601 time with a UTC offset.
 The report counts steps that arrived at or after that time and have a complete memory wait.
 It prints count, median, and maximum in seconds for verified landing tests and unit steps.
-For an unmarked `merge-gate`, the report uses the recorded session's staff chain.
+For an unmarked `merge-gate`, the report uses the staff chain of a matching current session.
 Inferred landing tests appear in the row `Landing tests before (by session)`.
+The report excludes older sessions because the staff record retains only current sessions.
 
 ### Mac disk floor
 
