@@ -1366,21 +1366,23 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 #### Work Order
 
-**Goal:** the user (Questions page Q510, 22:40 EST, 2026-11-18, via the sdlc showrunner): "answer: Tools add the time: sdlc changes the two tools, and the rule for agents becomes: write no present time." Name: toolclock.
+**Goal:** the user (Questions page Q510, 22:40 EST, 2026-11-18, via the sdlc showrunner): "answer: Tools add the time: sdlc changes the two tools, and the rule for agents becomes: write no present time." Name: toolclock. morty gave the producer-file text and two conditions (via the sdlc showrunner).
 
 **Spec:**
 1. `the_list.py update` records the clock time of each update. Reuse the existing time in the record (`updated` and the log entry time); add no second field.
 2. The List page shows that time beside the latest status as `HH:MM <zone label>` in the user zone from `user_zone.py`. Give the full date when the update is not from today.
-3. `send.py` adds one header line beside "Shown sender", for example `Sent: 22:41 EST`, in the user zone. Do this part only after unit-board's workermsg is on main (it also changes send.py). Merge main first.
-4. SendMessage between Claude sessions gets no change. The rule covers it.
-5. Change the old rule ("run date first, then write the time") to: "Write no present time. Write only future times, such as an ETA. The tools add the present time." Change each repo place that teaches the old rule: the `zone.py` notice text, and the showrunner, unit and message command files. Change no file in `commands/producer/` or `docs/producer/`; morty owns them, and the showrunner gets morty's go for that text.
-6. Add rows to the existing tests (`test_the_list.py`, `test_list_page.py`, the send.py header test); add no new module.
+3. `--source` gets its time from the tool. Producers now write `<who: words>, HH:MM EST` by hand. The tool shows the source with `, HH:MM <zone label>` from the log entry time. A `--source` that ends in a clock time is refused, with text that says the tool adds the time.
+4. `send.py` adds one header line beside "Shown sender", for example `Sent: 22:41 EST`, in the user zone. Do this part only after unit-board's workermsg is on main (it also changes send.py). Merge main first.
+5. SendMessage between Claude sessions gets no change. The rule covers it.
+6. Change the old rule ("read the clock, then write the time") to: "Write no present time. Write only future times, such as an ETA. The tools add the present time." Places: the `zone.py` notice text, `commands/showrunner/produce.md` (Throughout, Time), and `commands/unit/announce.md`.
+7. `commands/producer/produce.md`, "Messages and reports", morty's text: replace "Include the time zone with each time. Send documents as review links." with "Write no present time; the tools add it. Write each past or future time, such as a start or an ETA, with its time zone. Send documents as review links." Where produce.md tells producers to use `--source`, say that they write no time there. morty's condition: this text ships in the same commit set as the tool change, not before.
+8. Add rows to the existing tests (`test_the_list.py`, `test_list_page.py`, `test_zone.py`, the send.py header test); add no new module.
 
-**Files:** `scripts/production/the_list.py`, `scripts/review_links/list_page.py`, `scripts/message/send.py`, `scripts/lib/zone.py`, their existing tests, and the command files that state the old rule.
+**Files:** `scripts/production/the_list.py`, `scripts/review_links/list_page.py`, `scripts/message/send.py`, `scripts/lib/zone.py`, their existing tests, `commands/showrunner/produce.md`, `commands/unit/announce.md`, `commands/producer/produce.md`.
 
 **Workers:** 1 writer.
 
-**Order:** after phase 82 (both change `the_list.py update`). The send.py part waits for unit-board's workermsg on main.
+**Order:** stacked on phase 82 (both change `the_list.py update`); it does not wait for phase 82 to merge. The send.py part waits for unit-board's workermsg on main.
 
 **Acceptance gate:**
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
