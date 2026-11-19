@@ -200,9 +200,10 @@ class VerifyDocFixture(unittest.TestCase):
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
         })
         private = private_slot_config(self.root, repository=self.repo.name)
-        probe_line, _ = conf.editable_line(private.settings, "locks.probe_wait_seconds")
         slot_settings = private.settings.read_text().splitlines(keepends=True)
-        slot_settings[probe_line] = "locks.probe_wait_seconds=0.25\n"
+        for key, value in (("locks.probe_wait_seconds", "0.25"), ("locks.probe_retry_seconds", "1")):
+            line, _ = conf.editable_line(private.settings, key)
+            slot_settings[line] = f"{key}={value}\n"
         _ = private.settings.write_text("".join(slot_settings))
         _ = write_config_fixture(Path(private.environment["COPIES_CONFIG"]), "git_timeout_seconds=600\n")
         configuration = Path(self.environment["CONF_DIR"])
