@@ -3390,8 +3390,6 @@ user_clock() {
 
 cache_record() {
     local kind=$1 repeat=$2 host=${3:-} key verb=passed other=fail
-    # A lost token gives no verdict about the tree.
-    (( EXIT_STATUS != 125 )) || return 1
     if [[ -n "${VERIFY_SLOT_EXECUTED_TREE:-}" ]]; then
         local snapshot
         snapshot=$(verify_helper "$STEP_COPIES_SCRIPT" snapshot-tree --repo "$COPIES_STEP_SOURCE") || return 1
@@ -3450,16 +3448,17 @@ record_mac_pass() {
     RUN_LOG=""
 }
 
-# A failed lint is the tree's own answer unless the run never reached a
-# verdict: a usage or tooling error (2), the sandbox (3), a kill, or a step
-# placement that failed before its step started. A fix pass that still changes
-# the tree at the limit can leave more fixes for the next call.
-# An incomplete fix pass can also leave fixes for the next call.
+# With an argument, classify one check by its status.
+# Without an argument, also check whether the run completed its judgment.
 lint_failure_is_the_tree() {
+    local status=${1:-$EXIT_STATUS}
+    # Usage errors, sandbox failures, lost tokens, and signals give no verdict.
+    (( status != 2 && status != 3 && status != 125 && status < 128 )) || return 1
+    [[ "$status" != "${TREE_CHANGED_STATUS:-}" ]] || return 1
+    (( $# == 0 )) || return 0
     [[ "$CMD" == lint ]] || return 1
     (( CLIPPY_FIX_LIMIT_REACHED == 0 && PLACEMENT_FAILED == 0 )) || return 1
     (( LINT_FIX_INCOMPLETE == 0 )) || return 1
-    (( EXIT_STATUS != 2 && EXIT_STATUS != 3 && EXIT_STATUS < 128 )) || return 1
     (( ${RUN_LAST_ATTEMPT_KILLED:-0} == 0 ))
 }
 
@@ -4551,13 +4550,14 @@ run_lint_held_sequence() {
 
 run_lint_checks() {
     # Run all checks even when an earlier check reports findings.
-    lint_status=0
+    local status
+    local -a failed_statuses=()
     if lint_config_enabled mend; then
         echo 'style-lint: mend start'
         if invoke_mend --workspace --fail-on-warn "${FEATURE_FLAGS[@]}"; then
             echo 'style-lint: mend passed'
         else
-            lint_status=1
+            failed_statuses+=("$?")
         fi
     else
         lint_config_skip_notice mend 'cargo mend --all-targets --workspace --fail-on-warn'
@@ -4567,31 +4567,34 @@ run_lint_checks() {
         if fmt_cargo --all --check; then
             echo 'style-lint: rustfmt passed'
         else
-            lint_status=1
+            failed_statuses+=("$?")
         fi
     else
         lint_config_skip_notice fmt 'cargo +nightly fmt --all --check'
     fi
     load_metadata
-    local taplo_status=0
-    workspace_taplo --check || taplo_status=$?
-    case "$taplo_status" in
-        0) ;;
-        2|3) lint_status=$taplo_status ;;
-        *) lint_status=1 ;;
-    esac
+    workspace_taplo --check || failed_statuses+=("$?")
     if lint_config_enabled clippy; then
         echo 'style-lint: clippy start'
         if [[ "${1:-}" != after-fix ]]; then start_tree_watch; fi
         if invoke_clippy --workspace --all-targets --all-features; then
             echo 'style-lint: clippy passed'
-        elif (( lint_status == 0 )); then
-            lint_status=1
+        else
+            failed_statuses+=("$?")
         fi
         if [[ "${1:-}" != after-fix ]]; then finish_tree_watch; fi
     else
         lint_config_skip_notice clippy 'cargo clippy --workspace --all-targets --all-features'
     fi
+    lint_status=0
+    # Keep the first status that gives no verdict.
+    for status in ${failed_statuses[@]+"${failed_statuses[@]}"}; do
+        if ! lint_failure_is_the_tree "$status"; then
+            lint_status=$status
+            return 0
+        fi
+        lint_status=1
+    done
 }
 
 run_lint_sequence() {

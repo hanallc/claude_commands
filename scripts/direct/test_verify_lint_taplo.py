@@ -110,7 +110,8 @@ class VerifyLintScopeTests(support.VerifyLintScopeFixture):
     ) -> subprocess.CompletedProcess[str]:
         """Run the production sequence with the fixture tools and a controlled copy return."""
         functions = shell_functions(
-            support.VERIFY, "workspace_taplo", "run_lint_held_sequence", "run_lint_checks", "run_lint_sequence",
+            support.VERIFY, "workspace_taplo", "lint_failure_is_the_tree",
+            "run_lint_held_sequence", "run_lint_checks", "run_lint_sequence",
         )
         script = "set -euo pipefail\n" + functions + r'''
 run() { "$@"; }

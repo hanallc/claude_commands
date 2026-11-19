@@ -50,9 +50,9 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
         self.addCleanup(self.stop_verify, process)
         return process
 
-    def finish_lint(self, process: subprocess.Popen[str]) -> str:
+    def finish_lint(self, process: subprocess.Popen[str], *, status: int = 0) -> str:
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertEqual(process.returncode, status, output + errors)
         return output + errors
 
     def release_memory(self) -> None:
@@ -97,20 +97,26 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
         local = [row["args"] for row in self.cargo_events()]
         self.assertFalse(any(arguments[:1] == ["clippy"] for arguments in local), local)
 
-    def queue_mac_lint_repair(self) -> subprocess.Popen[str]:
+    def repair_lint_on_mac(self, *, status: int = 0) -> str:
         self.write_executable(self.runner, RUNNER_STUB.replace(
             "if verb_answer.exists():",
             'if verb_answer.exists() and (attempt == 1 or verb_answer.name != "runner-answer-mend-check"):',
         ))
         self.set_verb_answer("mend-check", "failed", 1)
         self.set_verb_answer("mend-fix", "passed", 0, "applied")
-        return self.queued_lint()
+        output = self.finish_lint(self.queued_lint(), status=status)
+        self.assertEqual(self.mac_verbs(), ["mend-check", "mend-fix", "mend-check", "clippy"])
+        return output
+
+    def assert_mac_repair_tooling_failure(self, status: int) -> str:
+        output = self.repair_lint_on_mac(status=status)
+        self.assertTrue((self.board / "verify_cache").is_dir())
+        self.assertEqual(self.saved_results(), [])
+        return output
 
     def test_mac_fix_pass_repairs_the_copy_without_natedev(self) -> None:
-        process = self.queue_mac_lint_repair()
-        output = self.finish_lint(process)
+        output = self.repair_lint_on_mac()
         self.assertIn("the returned worktree passed lint after formatting", output)
-        self.assertEqual(self.mac_verbs(), ["mend-check", "mend-fix", "mend-check", "clippy"])
         fix_words = self.runner_events()[1]["args"]
         self.assertIn("--workspace", fix_words)
         self.assertNotIn("--fail-on-warn", fix_words)
@@ -126,14 +132,12 @@ if "--check" in sys.argv and (Path(os.environ["TEST_RUNNER_STATE"]) / "runner-ev
     status = 101''',
         ))
         self.set_verb_answer("clippy", "failed", 1)
-        process = self.queue_mac_lint_repair()
-        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        output = self.assert_mac_repair_tooling_failure(2)
+        self.assertIn("taplo panicked", output)
 
-        self.assertEqual(process.returncode, 2, output + errors)
-        self.assertIn("taplo panicked", output + errors)
-        self.assertEqual(self.mac_verbs(), ["mend-check", "mend-fix", "mend-check", "clippy"])
-        self.assertTrue((self.board / "verify_cache").is_dir())
-        self.assertEqual(self.saved_results(), [])
+    def test_final_mac_clippy_sandbox_failure_does_not_cache_a_lint_failure(self) -> None:
+        self.set_verb_answer("clippy", "failed", 3)
+        _ = self.assert_mac_repair_tooling_failure(3)
 
     def test_refused_mac_fix_repairs_on_natedev(self) -> None:
         self.set_verb_answer("mend-check", "failed", 1)

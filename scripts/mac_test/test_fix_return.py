@@ -310,7 +310,9 @@ workspace_taplo() { [[ "$*" == --check ]]; }
 invoke_clippy() { [[ "$LINT_MAC_FIX" == 0 ]]; }
 load_metadata() { :; }
 """
-        script += shell_functions(VERIFY, "run_mac_lint_fix", "run_lint_checks", "set_verdict_keys", "cache_record")
+        script += shell_functions(
+            VERIFY, "run_mac_lint_fix", "run_lint_checks", "lint_failure_is_the_tree", "set_verdict_keys", "cache_record",
+        )
         script += r"""
 : > "$RUN_LOG"
 run_mac_lint_fix
