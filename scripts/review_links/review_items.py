@@ -190,21 +190,40 @@ def decode_change_delivery(value: object) -> delivery_state.DeliverySlots:
     return slots
 
 
-def read_change_delivery(path: Path, *, sources: list[Path] | None = None) -> delivery_state.DeliverySlots:
-    """Read change exchanges with their request type."""
+def _read_change_delivery_fields(path: Path, sources: list[Path] | None) -> object:
     if sources is not None:
         sources.append(path)
     try:
         content = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
+        return None
     try:
-        value = cast(object, json.loads(content))
+        return cast(object, json.loads(content))
     except ValueError:
         if sources is not None:
             raise
-        return delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
-    return decode_change_delivery(value)
+        return None
+
+
+def read_change_delivery(path: Path, *, sources: list[Path] | None = None) -> delivery_state.DeliverySlots:
+    """Read change exchanges with their request type."""
+    return decode_change_delivery(_read_change_delivery_fields(path, sources))
+
+
+def validation_recipients(fields: object) -> tuple[staff.StaffId, ...]:
+    """Read the recipients saved with the validation ID."""
+    saved = cast(dict[str, object], fields).get('validation') if isinstance(fields, dict) else None
+    return delivery_state.decode_recipients(cast(dict[str, object], saved).get('recipients')) if isinstance(
+        saved, dict) else ()
+
+
+def handoff_time(fields: object) -> datetime | None:
+    """Read the saved handoff time."""
+    saved = cast(dict[str, object], fields).get('handed_at') if isinstance(fields, dict) else None
+    try:
+        return moment(saved) if isinstance(saved, str) else None
+    except ValueError:
+        return None
 
 
 @dataclass(frozen=True)
@@ -213,6 +232,7 @@ class ChangeSource:
     row: dict[str, str]
     assignment: change_routing.ChangeAssignment
     slots: delivery_state.DeliverySlots
+    handed_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -371,7 +391,9 @@ def name(identity: staff.StaffId, members: staff.StaffSnapshot) -> str:
 def change_state(row: dict[str, str], slots: delivery_state.DeliverySlots) -> ReviewState:
     if row.get('Verdict'):
         return ReviewState.DONE
-    return ReviewState.OPEN if slots.waits_for_user(False) else ReviewState.VALIDATING
+    if slots.validation_requested:
+        return ReviewState.VALIDATING
+    return ReviewState.OPEN if slots.waits_for_user(False) else ReviewState.WAITING
 
 
 def question_state(record: update_registration.QuestionRecord) -> ReviewState:
@@ -393,44 +415,73 @@ def change_delivery(root: Path, path: Path, row: str) -> delivery_state.Delivery
         return delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
 
 
+def validation_log_label(words: str, validator: str) -> str:
+    """Use plain labels for the active validation and its exchange."""
+    match words.partition(':')[0].casefold():
+        case 'validate':
+            return f'Asked {validator or "the showrunner"} to validate'
+        case 'question':
+            return 'Asked a question about validation'
+        case 'answer':
+            return 'Answered the question'
+        case _:
+            return words
+
+
 def change_item(path: Path, row: dict[str, str], assignment: change_routing.ChangeAssignment,
                 members: staff.StaffSnapshot, queue: str, current: Path,
-                slots: delivery_state.DeliverySlots) -> ReviewItem:
+                slots: delivery_state.DeliverySlots, *, handed_at: datetime | None = None,
+                validator: staff.StaffId | None = None) -> ReviewItem:
     """Project a change once for the page, counts and queue."""
     prefix = path.stem.removeprefix(change_review.PREFIX)
     routed = assignment.owner
     owner = next((member for member in members.rows if member.name == routed.tab), None)
-    identity = owner.id if owner is not None else staff.StaffId(routed.tab)
-    source = staff.StaffId(row.get('Producer', '') or identity)
+    routed_id = owner.id if owner is not None else staff.StaffId(routed.tab)
     state = change_state(row, slots)
+    identity = (validator or staff.StaffId('')) if state == ReviewState.VALIDATING else routed_id
+    source = staff.StaffId(row.get('Producer', '') or routed_id)
     entry = change_review.row_entries([row])[0]
     filed = entry.since.replace(tzinfo=user_zone()) if entry.since is not None else moment('1970-01-01')
     logs = [ReviewLog(filed, name(source, members), 'Filed for your check')]
     saved_log = review_events.decode(row.get('Review log', ''))
     words = {entry.words.casefold() for entry in saved_log}
+    validating = state == ReviewState.VALIDATING
+    validator_name = name(identity, members) if validating else ''
+    validation_at = next((index for index in range(len(saved_log)-1, -1, -1)
+                          if saved_log[index].words.partition(':')[0] == 'validate'), None)
+    if slots.validation_requested and validation_at is None:
+        logs.append(ReviewLog(filed, 'nate', validation_log_label('validate', validator_name)))
     request = slots.question
+    exchange: set[str] = set()
     if isinstance(request, (delivery_state.OpenQuestion, delivery_state.AnsweredQuestion)) and not isinstance(
             request, (OpenFeedback, CompletedFeedback)):
         event = 'Question: ' + request.text
+        exchange.add(event.casefold())
         if event.casefold() not in words:
-            logs.append(ReviewLog(filed, 'nate', event))
+            logs.append(ReviewLog(filed, 'nate', validation_log_label(event, validator_name) if validating else event))
     if isinstance(request, delivery_state.AnsweredQuestion):
         answer = 'Answer: ' + request.answer
+        validation_answer = validating and not isinstance(request, CompletedFeedback)
+        if validation_answer:
+            exchange.add(answer.casefold())
         if answer.casefold() not in words:
-            logs.append(ReviewLog(filed, name(identity, members), answer))
-    if slots.validation_requested and not any(entry.words.startswith('validate') for entry in saved_log):
-        logs.append(ReviewLog(filed, 'nate', 'Asked the showrunner to check'))
+            logs.append(ReviewLog(filed, name(identity, members),
+                                  validation_log_label(answer, validator_name) if validation_answer else answer))
     if row.get('Verdict') and row['Verdict'].casefold() not in words and not any(
             entry.words.startswith('feedback sent:') for entry in saved_log):
         logs.append(ReviewLog(filed, 'nate', row['Verdict']))
-    logs.extend(saved_log)
+    for index, event in enumerate(saved_log):
+        during_validation = index >= validation_at if validation_at is not None else event.words.casefold() in exchange
+        logs.append(replace(event, words=validation_log_label(event.words, validator_name))
+                    if validating and during_validation else event)
     shown = change_review.display_id(row, routed.tab)
     after = entry.after if '/' in entry.after else prefix+'/'+entry.after if entry.after else ''
     local = path.absolute() == current.absolute()
     return ReviewItem(prefix+'/'+row['#'], shown, ReviewType.CHANGE, identity, source,
         row['Change'], state, ReviewTimes(filed, logs[-1].time), tuple(logs),
-        ('works', 'not works', 'validate', 'feedback', 'question') if state == ReviewState.OPEN else (),
-        ChangeSource(path, row, assignment, slots), entry.urgency, after, queue,
+        ('works', 'not works', 'validate', 'feedback', 'question') if state == ReviewState.OPEN
+        else ('question',) if state == ReviewState.VALIDATING and identity else (),
+        ChangeSource(path, row, assignment, slots, handed_at), entry.urgency, after, queue,
         row['#'] if local else prefix+'/'+row['#'], change_review.prerequisite_key(entry.after, path, current),
         entry.value, change_review.describe(row | {'#':shown},record=members),
         review_events.waiting_why(slots.waiting_why))
@@ -506,8 +557,10 @@ def change_items(root: Path, members: staff.StaffSnapshot, *, document: Path | N
                     continue
                 if not row.get('Verdict') and states == (ReviewState.DONE,):
                     continue
-                slots = read_change_delivery(delivery_path, sources=sources)
-                if change_state(row, slots) not in states:
+                fields = _read_change_delivery_fields(delivery_path, sources)
+                slots = decode_change_delivery(fields)
+                state = change_state(row, slots)
+                if state not in states:
                     continue
                 assignment = routing.owner_and_production(path, row)
                 tab = assignment.owner.tab
@@ -518,7 +571,11 @@ def change_items(root: Path, members: staff.StaffSnapshot, *, document: Path | N
                     queue = change_queue_name(doc, members, current) if doc is not None else change_review.queue(path)
                     queues[queue_source] = queue, current
                 queue, current = queues[queue_source]
-                found.append(change_item(path, row, assignment, members, queue, current, slots))
+                recipients = validation_recipients(fields) if state == ReviewState.VALIDATING else ()
+                validator = recipients[0] if recipients else None
+                found.append(change_item(path, row, assignment, members, queue, current, slots,
+                                         handed_at=handoff_time(fields) if state == ReviewState.VALIDATING else None,
+                                         validator=validator))
     return found
 
 
