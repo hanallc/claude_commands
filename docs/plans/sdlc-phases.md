@@ -1170,7 +1170,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Result:** `merge_checkpoint.py --production P` names the merge destination; P's checkout, branch, tests, push, promotion and lock apply. A unit whose staff parent is another production is accepted only when its worktree uses P's main checkout; the parent keeps its log and ledger. produce.md groups merge notices by destination production. On main 62aca78ee (hash c5980b520).
 
-### Phase 75 — Review page follow-ups  · status: todo
+### Phase 75 — Review page follow-ups  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -1192,6 +1192,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Acceptance gate:**
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
+
+**Result:** A reload during a snapshot publication retry keeps the browser save marker until the snapshot confirms the verdict. A reload after a Show change restores the saved browser state, and the jump applies only to a new link. A link restored by Back during a save applies after the save ends and after every row animation finishes, without clearing the other card. A Done card shows no Later button, no Your words box and no empty Proof heading. Merged with reviewfade and reviewask. On main 558420376 (hash 299999db9).
 
 ### Phase 76 — Detached run hardening  · status: done
 **Depends on:** phase 70
