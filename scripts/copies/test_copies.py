@@ -33,7 +33,7 @@ from scripts.accounts import accounts
 from scripts.lib import build_folders, copy_record, nix_env, scratch, session_folder
 from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.lint import folder_audit, sweep, tmp_sweep
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, write_config_fixture
 from textwrap import dedent
 from scripts.mac_test import floor_claims, offload
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
@@ -133,18 +133,72 @@ class StandingTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(tempfile, "tempdir", str(temporary)))
         slot_configuration = private_slot_config(self.base, repository="origin", maximum=2, default_maximum=2)
         configuration = Path(slot_configuration.environment["CONF_DIR"])
-        _ = write_config_fixture(configuration / "build_folders.conf",
-            "patterns.target={purpose}\npatterns.legacy-stable={purpose}\n"
-            + "patterns.editable={repository}-{owner}/{purpose}\n")
-        _ = write_config_fixture(configuration / "build_steps.conf", "names.integrate=integrate\n")
         home = self.base / "home"
         home.mkdir()
+        _ = write_config_fixture(slot_configuration.settings, """\
+locks.probe_wait_seconds=0.25
+locks.probe_retry_seconds=1
+names.repository_key_length=8
+names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_
+names.suffix_length=8
+patterns.editable={repository}-{owner}/{purpose}
+patterns.legacy-stable={purpose}
+patterns.legacy-unique={purpose}{suffix}
+patterns.scratch={purpose}-{suffix}
+patterns.standing={repository}/{owner}-gate{suffix}
+patterns.target={purpose}
+patterns.tool={purpose}{suffix}
+prefixes.admit-sock=admit-sock-
+prefixes.copies-index=copies-index-
+roots.system=/tmp
+roots.temporary=${TMPDIR}/builds
+""" + f"roots.scratch={self.base / 'scratch'}\nroots.scratch.{host_name()}={self.base / 'scratch'}\n")
+        _ = write_config_fixture(configuration / "scratch.conf", f"""\
+default_life_seconds=86400
+record_lock_attempts=3
+repo_depth=3
+repo_skip=target node_modules .git
+suffix_length=6
+visible_root={home / 'rust/repro'}
+""")
+        _ = write_config_fixture(configuration / "nix_env.conf", """\
+command_timeout_seconds=600
+trusted_home_folders=rust worktrees
+trusted_home_prefix=.claude
+""")
+        _ = write_config_fixture(configuration / "lint.conf", f"""\
+folder_state_dir={home / '.local/state/folder-sweep'}
+sweep_max_tree_depth=3
+""")
+        _ = write_config_fixture(configuration / "build_steps.conf", "names.integrate=integrate\n")
+        _ = (configuration / "build_admission.conf").write_text("""\
+# whole: 1..
+cloud_gate_slots=16
+# whole: 1..
+gpu_test_slots=2
+# whole: 0..100
+agent_swap_share_percent=20
+# whole: 0..50
+peak_history_share_percent=10
+# whole: 1..
+peak_hold_seconds.merge-gate=180
+# whole: 1..
+peak_hold_seconds.targeted-test=180
+# range: 5e-324..1.6742321987285425e299
+program_first_peak_gib.targeted-test=4
+# range: 0..
+progress_profile_sweep_seconds=0.05
+# whole: 1..86400
+remote_start_hold_seconds=1200
+# range: 5e-324..
+source_check_seconds=1
+""" + ADMISSION_CONFIG_FIXTURE.read_text())
         self.configuration = self.base / "copies.conf"
         self.settings = {"root": str(self.base / "configured-gates"),
                          "owner.verify": "verify",
                          "remote_registry": str(self.base / "remote-mirrors"),
                          "wait_seconds": "0.01", "git_timeout_seconds": "10",
-                         "guard_timeout_seconds": "10"}
+                         "guard_timeout_seconds": "10", "guard_choice_limit": "32"}
         self.write_config(self.settings)
         # A run inside a build slot carries that slot's Cargo cache; the test's gates lease their own.
         environment = {key: value for key, value in os.environ.items()
@@ -152,6 +206,7 @@ class StandingTests(unittest.TestCase):
         environment.update({
             **slot_configuration.environment,
             "HOME": str(home),
+            "USER_ZONE": "UTC",
             "GIT_TERMINAL_PROMPT": "0", "GIT_AUTHOR_NAME": "Gate Tests",
             "GIT_AUTHOR_EMAIL": "gate-tests@example.invalid", "GIT_COMMITTER_NAME": "Gate Tests",
             "GIT_COMMITTER_EMAIL": "gate-tests@example.invalid",
@@ -176,9 +231,11 @@ class StandingTests(unittest.TestCase):
     @contextmanager
     def queue_service(self) -> Generator[AdmissionFixture]:
         original = dict(os.environ)
-        _ = write_config_fixture(Path(original["CONF_DIR"]) / "build_admission.conf",
-            "running_pass_seconds=5\nwaiting_pass_seconds=1\nwait_reply_seconds=60\n")
-        with AdmissionFixture() as fixture:
+        service_root = self.base / "admission-service"
+        service_root.mkdir()
+        configuration = Path(original["CONF_DIR"]) / "build_admission.conf"
+        _ = (service_root / "build_admission.conf").write_text(configuration.read_text())
+        with AdmissionFixture(root=service_root) as fixture:
             fixture.clock.epoch = time.time()
             with mock.patch.dict(os.environ, {**original, "ADMISSION_SOCKET": str(fixture.socket_path)}), fixture.serving():
                 yield fixture
