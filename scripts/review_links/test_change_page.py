@@ -2937,6 +2937,18 @@ class ChangePageTests(unittest.TestCase):
         self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
         self.assertEqual(next(row["Verdict"] for row in change_review.review_rows(self.review_list) if row["#"] == "C1"), "works")
 
+    def test_answer_preserves_the_time_of_the_change_handoff(self) -> None:
+        status = change_page.DeliveryStatus(self.root)
+        path = status.path(self.page, 'C1')
+        handed_at = '2026-11-16T12:49:08-05:00'
+        with patch.object(time, 'time', return_value=datetime.fromisoformat(handed_at).timestamp()):
+            request = status.ask(self.page, 'C1', 'Which groups?')
+        assert isinstance(request, change_page.QuestionDelivery)
+        self.assertEqual(cast(dict[str, object], json.loads(path.read_text())).get('handed_at'), handed_at)
+
+        self.assertTrue(status.answer_question(self.page, 'C1', request.question_id, 'The numbered groups.'))
+        self.assertEqual(cast(dict[str, object], json.loads(path.read_text())).get('handed_at'), handed_at)
+
     def test_an_open_question_leaves_waiting_rows_counts_and_next_after_a_fresh_prepare(self) -> None:
         path, forms, body = self.browser()
         del body

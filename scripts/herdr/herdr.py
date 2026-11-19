@@ -1714,6 +1714,12 @@ class Herdr:
     def pane_row(self, pane: str) -> PaneIdentity | NoPane:
         return next((row for row in self.panes() if row["pane_id"] == pane), NoPane(pane))
 
+    def pane_session_report(self, pane: str, *, deadline: float) -> ReportedAgentSession | NoReportedAgentSession:
+        rows = [row for row in self.listed("pane", deadline=deadline) if row.get("pane_id") == pane]
+        if len(rows) != 1:
+            raise HerdrFailure(f"{self.session}:{pane}: expected one pane report, found {len(rows)}")
+        return checked_pane_session(rows[0])
+
     def panes(self) -> list[PaneIdentity]:
         panes: list[PaneIdentity] = []
         for pane in self.listed("pane"):
@@ -3228,6 +3234,25 @@ def pane_session(row: Mapping[str, object]) -> str:
     return session if isinstance(session, str) else ""
 
 
+def checked_pane_session(row: Mapping[str, object]) -> ReportedAgentSession | NoReportedAgentSession:
+    """Read the pane report and reject malformed session metadata."""
+    report = row.get("agent_session")
+    if report is None:
+        session = row.get("session_id")
+    else:
+        fields = json_object(report, "herdr pane session report")
+        kind, session = fields.get("kind"), fields.get("value")
+        if kind == "pending" and session is None:
+            return NoReportedAgentSession()
+        if kind == "id" and isinstance(session, str) and session:
+            return ReportedAgentSession(session)
+        if "kind" in fields or "value" not in fields:
+            raise HerdrFailure("herdr pane session report is unreadable")
+    if session is None or session == "":
+        return NoReportedAgentSession()
+    return ReportedAgentSession(json_text(session, "herdr pane session report"))
+
+
 class CodexTerminalInputUnavailable(HerdrFailure):
     """A foreground child can hold the pane terminal."""
 
@@ -3289,6 +3314,13 @@ class UnprovedForegroundOwner:
 
 
 @dataclass(frozen=True)
+class ClaudeForegroundWithoutArgv(UnprovedForegroundOwner):
+    """One foreground Claude PID has no readable arguments."""
+
+    pid: int
+
+
+@dataclass(frozen=True)
 class NoForegroundAgent:
     pass
 
@@ -3313,6 +3345,13 @@ class ObservedEmpty:
 class UnknownPaneOwner:
     place: HerdrPlace
     reason: str
+
+
+@dataclass(frozen=True)
+class ClaudePaneWithoutArgv(UnknownPaneOwner):
+    """The pane reports one foreground Claude PID without arguments."""
+
+    pid: int
 
 
 type CheckedPane[Owner] = ProvedMatch[Owner] | ProvedOtherOwner | ObservedEmpty | UnknownPaneOwner
@@ -3401,6 +3440,7 @@ def _prove_foreground_owner(info: dict[str, object], *, for_input: bool
     foreground = _foreground_processes(info)
     claude: list[tuple[dict[str, object], list[str]]] = []
     codex: list[tuple[dict[str, object], list[str]]] = []
+    claude_without_argv: list[dict[str, object]] = []
     missing_argv: set[str] = set()
     for process in foreground:
         arguments = _foreground_arguments(process)
@@ -3409,7 +3449,10 @@ def _prove_foreground_owner(info: dict[str, object], *, for_input: bool
         elif is_claude_process(arguments):
             claude.append((process, arguments))
         elif not arguments:
-            missing_argv.add(_foreground_program(process))
+            program = _foreground_program(process)
+            if program == "claude":
+                claude_without_argv.append(process)
+            missing_argv.add(program)
     if codex or missing_argv.intersection({"codex", "node", "nodejs"}):
         try:
             if not codex:
@@ -3450,8 +3493,16 @@ def _prove_foreground_owner(info: dict[str, object], *, for_input: bool
         except (HerdrFailure, OSError, ValueError) as error:
             return UnprovedForegroundOwner("claude", str(error))
         return UnprovedForegroundOwner("claude", f"expected one foreground claude process, found {len(claude)}")
-    if "claude" in missing_argv:
-        return UnprovedForegroundOwner("claude", "agent argv is unavailable")
+    if claude_without_argv:
+        reason = "agent argv is unavailable"
+        if len(claude_without_argv) == 1:
+            try:
+                pid = _foreground_pid(claude_without_argv[0])
+            except HerdrFailure:
+                return UnprovedForegroundOwner("claude", reason)
+            if sum(process.get("pid") == pid for process in foreground) == 1:
+                return ClaudeForegroundWithoutArgv("claude", reason, pid)
+        return UnprovedForegroundOwner("claude", reason)
     return NoForegroundAgent()
 
 
@@ -3459,6 +3510,8 @@ def pane_foreground(place: HerdrPlace, info: dict[str, object]) -> ForegroundPan
     """Read the foreground evidence before comparing it with a requested owner."""
     try:
         owner = foreground_pane_owner(info)
+        if isinstance(owner, ClaudeForegroundWithoutArgv):
+            return ClaudePaneWithoutArgv(place, owner.reason, owner.pid)
         if isinstance(owner, UnprovedForegroundOwner):
             return UnknownPaneOwner(place, owner.reason)
         if not isinstance(owner, NoForegroundAgent):

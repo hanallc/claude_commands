@@ -2215,7 +2215,6 @@ def _cleared_validation(delivery: Path) -> str:
     fields = cast(dict[str, object], json.loads(delivery.read_text()))
     # A null slot prevents older fields from restoring the completed validation.
     fields["validation"] = None
-    _ = fields.pop("handed_at", None)
     return json.dumps(fields)+"\n"
 
 

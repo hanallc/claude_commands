@@ -21,12 +21,12 @@ from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_client, admission_protocol as wire, admission_records as records, admission_service as service, placement
 from scripts.build_queue.test_placement import (
     PlacementFixture, ManualEvidenceWorker, placement_request, publish_candidate, assignment_for, adopt_assignment,
-    consume_permission, coordinator_holder, local_candidate,
+    consume_permission, coordinator_holder, hana_policy_request, local_candidate,
 )
 from scripts.build_queue.admission_test_support import only_admitted
 from scripts.aws_target import hana_box, hana_execution, hana_placement, hana_placement_adapter, hana_protocol, hana_result, ledger, test_hana_execution
 from scripts.aws_target.control_test_support import TestClock
-from scripts.aws_target.ledger_test_support import install_hana_spending_settings
+from scripts.aws_target.ledger_test_support import install_cost_settings, install_hana_spending_settings, text_setting
 from scripts.aws_target.test_hana_box import FakeProvider, IDENTITY, record_lifecycle_image
 from scripts.aws_target.controller_lock import control_lock
 from scripts.build_targets import target_config
@@ -67,6 +67,88 @@ class HanaQueueTests(unittest.TestCase):
         super().setUpClass()
         # Load the target helpers before a test replaces the configuration reader.
         _ = import_module('scripts.build_targets.build_targets')
+
+    def test_consume_reads_the_claim_immediately_after_warm_or_cold_adoption(self) -> None:
+        for warm, lower_memory in ((False, False), (True, False), (True, True)):
+            with self.subTest(warm=warm, lower_memory=lower_memory), PlacementFixture() as fixture:
+                self.check_immediate_consume(fixture, warm=warm, lower_memory=lower_memory)
+
+    def check_immediate_consume(self, fixture: PlacementFixture, *, warm: bool, lower_memory: bool) -> None:
+        request, transport = hana_policy_request(fixture)
+        install_hana_spending_settings(transport.settings)
+        destination = request.constraints.candidates[0].destination
+        scope = destination.scope
+        assert isinstance(scope, claim_state.RepositoryScope)
+        for name, value in (('host', transport.host), ('execution_transport', 'hana-control'),
+                            ('repository_identity', scope.key), ('kinds', 'check,lint')):
+            text_setting(transport.settings, name, value)
+        with transport.settings.open('a') as settings_file:
+            _ = settings_file.write('# whole: 1..\nmax_steps=1\n# whole: 1..5\npreview_max_age_s=2\n')
+        request = replace(request, prerequisite=placement.TokenNotRequired(),
+            profile=replace(request.profile, peak=records.ExpectedPeak(2 * 1024 ** 3, 'fallback', 0)))
+        directory = fixture.root / 'hana-state'
+        clock = TestClock(int(fixture.clock.now()))
+        provider = FakeProvider(directory, clock)
+        settings = fixture.root / 'aws_target.conf'
+        install_cost_settings(settings)
+        controller = hana_box.HanaController(directory, settings, transport.settings, provider, clock=clock)
+        book = ledger.CostLedger(directory)
+        book.record_inventory(ledger.ResourceInventory(clock.now, (), 'private inventory', True))
+        book.observe(ledger.InstanceObservation(clock.now, 'terminated', 'private account inventory'))
+        controller.register(IDENTITY)
+        _ = record_lifecycle_image(directory, transport.settings)
+        _ = controller.tick()
+
+        def tick(seconds: tuple[int, ...]) -> None:
+            for advance in seconds:
+                clock.advance(advance)
+                fixture.clock.advance(advance)
+                _ = controller.tick()
+
+        if warm:
+            self.assertIsInstance(controller.request('warm-up'), hana_box.ClaimCommitted)
+            tick((1, 1, 1, 1))
+            self.assertTrue(controller.release('warm-up'))
+
+        # Keep the first worker reading in the cache until after launch permission.
+        fixture.configure(waiting_pass_seconds=60)
+        published = threading.Event()
+        probe = cast(Callable[[service.HostEvidenceWorker, placement.HostEvidenceKey, object], bool],
+            getattr(service.HostEvidenceWorker, '_probe'))
+
+        def notify(worker: service.HostEvidenceWorker, key: placement.HostEvidenceKey, subscription: object) -> bool:
+            running = probe(worker, key, subscription)
+            if isinstance(worker.evidence(key), placement.FreshHostEvidence):
+                published.set()
+            return running
+
+        with (mock.patch.object(hana_placement_adapter, 'controller_for', return_value=controller),
+                mock.patch.object(eligibility, 'repository_identity',
+                    return_value=eligibility.KnownRepository(scope.name, scope.key)),
+                mock.patch.dict(os.environ, {'BUILD_TARGETS_STATE_DIR': str(fixture.root / 'targets')}),
+                mock.patch.object(service.HostEvidenceWorker, '_probe', notify)):
+            fixture.server.host_probe = fixture.read_host_evidence
+            _ = fixture.run_pass()
+            _ = fixture.connect(request).replies()
+            self.assertTrue(published.wait(TEST_HANG_GUARD_SECS))
+            assignment = assignment_for(fixture, request)
+            holder = coordinator_holder(assignment)
+            self.assertIsInstance(hana_placement.claim_assigned(assignment, holder, controller), hana_placement.HanaClaimPending)
+            tick((1, 1) if warm else (1, 1, 1, 1))
+            adopted = hana_placement.claim_assigned(assignment, holder, controller)
+            assert isinstance(adopted, hana_placement.HanaClaimAdopted), adopted
+            reference = adopted.reserved.claim.reference
+            if lower_memory:
+                settings_text = transport.settings.read_text()
+                self.assertIn('step_memory_gib=24', settings_text)
+                _ = transport.settings.write_text(settings_text.replace('step_memory_gib=24', 'step_memory_gib=1'))
+            reply, = fixture.connect(consume_permission('consume', assignment, reference)).replies()
+            if lower_memory:
+                assert isinstance(reply, wire.DispatchStatus), reply
+                self.assertEqual(reply.reason, 'Hana admission refused: memory')
+                self.assertIsInstance(reply.permission, placement.PermissionAvailable)
+            else:
+                self.assertEqual(reply, wire.FirstAuthorization(assignment, reference))
 
     def test_refusal_keeps_the_same_episode_off_hana(self) -> None:
         for cause, claim_adopted in ((placement.HANA_IMAGE_STALE, True), (hana_box.HANA_CLAIM_BUSY, False)):
@@ -145,8 +227,11 @@ class HanaQueueTests(unittest.TestCase):
                 _ = publish_candidate(fixture, request)
                 assignment = assignment_for(fixture, request)
                 claim = adopt_assignment(fixture, request, assignment)
-                self.assertIsInstance(fixture.connect(consume_permission('consume', assignment, claim)).replies()[-1],
-                                      wire.FirstAuthorization)
+                adopted = placement.AdoptedProviderClaim(claim, coordinator_holder(assignment),
+                    assignment.session, assignment.destination.host, 'host-generation-a')
+                with mock.patch.object(hana_placement_adapter, 'read_assigned_adoption', return_value=adopted):
+                    self.assertIsInstance(fixture.connect(consume_permission('consume', assignment, claim)).replies()[-1],
+                                          wire.FirstAuthorization)
                 if next_target == 'mac':
                     mac = request.constraints.candidates[1]
                     _ = publish_candidate(fixture, replace(request, constraints=replace(request.constraints, candidates=(mac,))))
@@ -265,7 +350,8 @@ class HanaQueueTests(unittest.TestCase):
             holder = coordinator_holder(assignment)
             adopted = placement.AdoptedProviderClaim(reference, holder, assignment.session, destination.host, 'host-generation-a')
             _ = publish_candidate(fixture, request, claims=(adopted,))
-            authorized, = fixture.connect(consume_permission('consume', assignment, reference)).replies()
+            with mock.patch.object(hana_placement_adapter, 'read_assigned_adoption', return_value=adopted):
+                authorized, = fixture.connect(consume_permission('consume', assignment, reference)).replies()
             self.assertEqual(authorized, wire.FirstAuthorization(assignment, reference))
 
             paths = claim_state.state_paths(target.name)
@@ -841,7 +927,20 @@ class HanaGpuQueueTests(unittest.TestCase):
                     fixture.provider_evidence[key] = evidence
                     fixture.server.publish_host_evidence(evidence)
 
-                def consume(message: wire.ConsumePermission) -> wire.FirstAuthorization:
+                evidence_expired = False
+
+                def consume(message: wire.ConsumePermission) -> wire.FirstAuthorization | wire.DispatchStatus:
+                    nonlocal evidence_expired
+                    if not evidence_expired:
+                        evidence_expired = True
+                        stale = placement.StaleHostEvidence(key, fixture.clock.now(), 'provider evidence expired')
+                        fixture.provider_evidence[key] = stale
+                        fixture.server.publish_host_evidence(stale)
+                        refused = fixture.connect(message).replies()[-1]
+                        assert isinstance(refused, wire.DispatchStatus)
+                        self.assertIsInstance(refused.permission, placement.PermissionAvailable)
+                        self.assertEqual(refused.reason, 'adoption evidence is unavailable or stale')
+                        return refused
                     refresh_evidence()
                     answer = fixture.connect(message).replies()[-1]
                     self.assertIsInstance(answer, wire.FirstAuthorization)
