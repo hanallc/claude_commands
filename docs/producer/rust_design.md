@@ -33,7 +33,8 @@ Correctness comes first. Then apply “Simple, Fast, Beautiful” in that order.
 
 ## Types
 
-- “Make invalid states unrepresentable.” Put fields that are valid only together in the same enum variant. Enforce value limits with a private field and one checked constructor. Give a state its own type when only that state permits an operation. (make-invalid-states-unrepresentable.md)
+- “Make invalid states unrepresentable.” Put fields that are valid only together in the same enum variant. Enforce value limits with a private field and one checked constructor. Give a state its own type when only that state permits an operation; see the next point. (make-invalid-states-unrepresentable.md)
+- Use the typestate pattern when an operation is valid only in some states of a value and the code knows the state at compile time. Give each state its own type. Make each transition a method that consumes the value and returns the type of the next state. A call in the wrong state then does not compile. Use an enum when the state comes from data at run time. (typestate-for-compile-time-states.md)
 - Use enums for owned Boolean state in fields, arguments, return values, and local accumulators. Keep `bool` for a required wire field that always carries one value. Apply the rule to the typed result of parsing. (enums-over-bool-for-owned-booleans.md)
 - Use an enum with named states when `None` carries a domain meaning, such as `Inherit`. “Keep `Option` when `None` means "absent" and nothing more.” (enums-over-option-when-none-has-meaning.md)
 - Introduce an enum when code branches on the same condition in multiple places or an `if`/`else` chain exceeds two arms. Use `match` to enforce exhaustiveness. (if-else-chains-signal-missing-types.md)
