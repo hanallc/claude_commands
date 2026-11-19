@@ -190,7 +190,7 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         ready = review_items.ReviewItem("change/sdlc/C1830", "sdlc/C1830", review_items.ReviewType.CHANGE,
             OWNER.id, OWNER.id, "Check the linked change", review_items.ReviewState.OPEN,
             review_items.ReviewTimes(NOW, NOW), (), (), source)
-        reviews = [ready, replace(ready, key="change/hana/P10", id="hana/P10", state=review_items.ReviewState.DONE),
+        reviews = [ready, replace(ready, key="change/sdlc/C1829", id="sdlc/C1829", state=review_items.ReviewState.WAITING),
                    replace(ready, key="change/sdlc/C1831", id="sdlc/C1831", state=review_items.ReviewState.WAITING),
                    replace(ready, key="change/sdlc/C1832", id="sdlc/C1832",
                            times=review_items.ReviewTimes(NOW, NOW, datetime.now(UTC) + timedelta(days=1)))]
@@ -207,11 +207,9 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         reviews.append(replace(ready, key="change/builds/C17", id="builds/C17", title="Check a build",
                                owner=OTHER.id, source_unit=OTHER.id))
 
-        def read_reviews(*_args: object, **kwargs: object) -> list[review_items.ReviewItem]:
-            owners = cast(dict[staff.StaffId, str] | None, kwargs.get("owner_options"))
-            if owners is not None:
-                owners.update({OWNER.id: OWNER.name, OTHER.id: OTHER.name})
-            return reviews
+        def read_reviews(_root: Path, *, show: str = "all", **_kwargs: object) -> list[review_items.ReviewItem]:
+            states = review_items.selected_states(show)
+            return [review for review in reviews if review.state in states]
 
         with patch.object(review_items, "read", side_effect=read_reviews), patch.object(list_page, "counts_strip", return_value=""):
             reviews.append(missing)
@@ -406,9 +404,9 @@ async function inspect(frame){
     if(stage===0) history.back();else location.href=listUrl;
    }else if(stage===keys.length){
     check(visible.length===keys.length && visible.every(row=>keys.includes(row.dataset.key)),'the summary shows only linked cards');
-    const done=visible.find(row=>row.dataset.state==='Done');
-    if(done?.querySelector('.list-toggle').getAttribute('aria-expanded')!=='true') done?.querySelector('.list-toggle').click();
-    check(done?.querySelector('.list-toggle').getAttribute('aria-expanded')==='true','the Done card can open in the linked view');
+    const waiting=visible.find(row=>row.dataset.key===keys[1]);
+    if(waiting?.querySelector('.list-toggle').getAttribute('aria-expanded')!=='true') waiting?.querySelector('.list-toggle').click();
+    check(waiting?.querySelector('.list-toggle').getAttribute('aria-expanded')==='true','the Waiting card can open in the linked view');
     if(proof){await finish();return;}
     const group=doc.querySelector('[data-clear-linked-reviews]');
     check(group && !group.hidden,'the linked group has one visible filter chip');
@@ -4303,7 +4301,6 @@ window.fetch=async(_url,options)=>{
         fragment = urlencode({"item": f"{MORTY.id}/{item.id}"})
         setup = """<script>
 const fragment='#FRAGMENT',reads=[];
-if(LINK_ON_LOAD) history.replaceState(null,'',fragment);
 const seenEntries=[],NativeIntersectionObserver=window.IntersectionObserver;
 window.IntersectionObserver=class extends NativeIntersectionObserver{
  constructor(callback,options){
@@ -4315,8 +4312,14 @@ window.IntersectionObserver=class extends NativeIntersectionObserver{
   },options);
  }
 };
-let receivedRead;
+let receivedRead,receivedFirstAnswer;
 const postedRead=new Promise(resolve=>{receivedRead=resolve;});
+const firstAnswerSeen=new Promise(resolve=>{receivedFirstAnswer=resolve;});
+const unobserveAnswer=IntersectionObserver.prototype.unobserve;
+IntersectionObserver.prototype.unobserve=function(answer){
+ unobserveAnswer.call(this,answer);
+ if(answer.matches('[data-question="Q1"] > p:last-child')) receivedFirstAnswer();
+};
 window.fetch=async(_url,options)=>{
  if(options?.method!=='POST') return new Response('',{status:503});
  reads.push(new URLSearchParams(options.body));
@@ -4348,11 +4351,19 @@ window.fetch=async(_url,options)=>{
    scrollTo({top:scrollY+answer.getBoundingClientRect().top-16,behavior:'instant'});
    await paint();
   };
+  const requireEvent=(event,message)=>{
+   let timer;
+   const deadline=new Promise((_,reject)=>{
+    timer=setTimeout(()=>reject(new Error(message+' '+JSON.stringify({count:reads.length,seenEntries}))),20000);
+   });
+   return Promise.race([event,deadline]).finally(()=>clearTimeout(timer));
+  };
   check(!row.hidden && !detail.hidden,'The item link opens the row');
   document.body.style.paddingBottom='100vh';
   await paint();
   await showAnswer(first);
   check((await sample(first)).intersectionRect.height>0,'The first answer enters the viewport');
+  await requireEvent(firstAnswerSeen,'The List did not record the first visible answer within 20 seconds.');
   check(!(await sample(second)).isIntersecting && second.getBoundingClientRect().top>innerHeight,
    'The second answer starts below the viewport');
   check(!reads.length && panel.querySelectorAll('.question-unread').length===2,
@@ -4360,7 +4371,7 @@ window.fetch=async(_url,options)=>{
   await showAnswer(second);
   check((await sample(second)).intersectionRect.height>0 && first.getBoundingClientRect().bottom<0,
    'The second answer enters the viewport after the first leaves it');
-  await Promise.race([postedRead,new Promise(resolve=>setTimeout(resolve,2000))]);
+  await requireEvent(postedRead,'The List did not send the signed read within 20 seconds.');
   check(reads.length===1 && reads[0].get('action')==='read' &&
    reads[0].get('request')===panel.dataset.openReadRequest && reads[0].get('token')===panel.dataset.openReadToken,
    'The last answer to enter the viewport sends one signed read. '+JSON.stringify({count:reads.length,seenEntries}));
@@ -4371,12 +4382,13 @@ window.fetch=async(_url,options)=>{
         for link_on_load in (True, False):
             with self.subTest(link_on_load=link_on_load):
                 enabled = str(link_on_load).lower()
-                self.browser_answer_visibility(markup, setup.replace('LINK_ON_LOAD', enabled),
-                                               probe.replace('LINK_ON_LOAD', enabled), viewport_height=1120)
+                self.browser_answer_visibility(markup, setup, probe.replace('LINK_ON_LOAD', enabled),
+                                               viewport_height=1120,
+                                               console_fragment="#" + fragment if link_on_load else "")
 
     def browser_answer_visibility(self, markup: str, setup: str, probe: str, *,
                                   viewport_height: int | None = None, reload_markup: str = "",
-                                  reload_console: bool = False) -> None:
+                                  reload_console: bool = False, console_fragment: str = "") -> None:
         page = markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>').encode()
         reloaded = reload_markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>').encode()
         loaded = threading.Event()
@@ -4384,11 +4396,14 @@ window.fetch=async(_url,options)=>{
         frame_path = "/page"
         frame_url = frame_path
         console_shell = b""
-        if reload_console:
+        if reload_console or console_fragment:
             frame_path = list_page.PAGE_PATH
             listing = console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage(frame_path))
             console_shell = console.render((listing,), console.UnavailablePage())
-            frame_url = "/console/?" + urlencode({"page": "list", "at.list": frame_path + "#show=working"})
+            place = frame_path + (console_fragment or "#show=working")
+            frame_url = "/console/?" + urlencode({"page": "list", "at.list": place})
+            if console_fragment:
+                console_shell = console_shell.replace(b"</body>", b'<img hidden src="/complete"></body>')
         host_page = (f'<!doctype html><style>iframe{{border:0;width:100%;height:{height}}}'
                      + 'iframe[hidden]{display:block;visibility:hidden}</style>'
                      + f'<iframe src="{html.escape(frame_url)}"></iframe><img hidden src="/complete">').encode()
@@ -4436,9 +4451,10 @@ window.fetch=async(_url,options)=>{
                 profile = self.root / "answer-profile"
                 profile.mkdir(exist_ok=True)
                 window_height = max(900, (viewport_height or 0) + 32)
+                destination = frame_url if console_fragment else "/"
                 browser = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
                     '--window-size', f'1280,{window_height}', '--screenshot', str(self.root / 'answer.png'),
-                    f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=45)
+                    f'http://127.0.0.1:{server.server_port}{destination}'], capture_output=True, text=True, timeout=45)
                 self.assertEqual(browser.returncode, 0, browser.stderr)
                 self.assertEqual(results, [[]])
             finally:
