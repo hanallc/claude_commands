@@ -126,6 +126,8 @@ __PAGE_FRAME_STYLE__
 .tip .sum { font-weight: 700; }
 .tip .long { grid-column: 1 / -1; padding-left: 0; text-align: left; white-space: normal; opacity: 0.7; }
 #tip > .tip { min-width: min(15rem, calc(100vw - 16px)); max-width: min(24rem, calc(100vw - 16px)); }
+.tip:has(dd.call) { grid-template-columns: fit-content(44%) minmax(0, 1fr); }
+.tip:has(dd.call) :is(dt, dd) { white-space: normal; overflow-wrap: anywhere; }
 /* shared:step-tip:end */
 .tip .program-memory {
   --program-live: color-mix(in srgb, var(--accent) 72%, var(--bg));
@@ -166,7 +168,6 @@ __PAGE_FRAME_STYLE__
 details { border-radius: 6px; }
 summary { list-style: none; cursor: pointer; display: flex; gap: 8px; align-items: center; padding: 5px 0; border-radius: 6px; }
 summary::-webkit-details-marker { display: none; }
-summary:hover { background: var(--free); }
 summary .chev { flex: none; width: 14px; color: var(--ink-3); transition: transform 0.15s ease; font-size: 0.75rem; }
 details[open] > summary .chev { transform: rotate(90deg); }
 summary .name { font-weight: 600; }
@@ -875,8 +876,13 @@ function stepTooltip(key, data, roomBytes) {
   const waiting = key.startsWith('wait:');
   const duration = tipDuration(key, row, data);
   const state = waiting ? 'waiting' : row.between_steps ? 'between steps' : 'running';
-  if (row.kind === 'mac-unavailable' || (!waiting && !recorded(row.used) && (row.used || row.program_memory)))
-    return [stepTitle(row, 'unavailable')];
+  const verify = row.verify;
+  const stepFields = verify ? [field('Step', verify.total > 1
+    ? `${verify.step} (${verify.position} of ${verify.total})` : verify.step)] : [];
+  const callFields = verify ? [field('Call', verify.call, 'call', true)] : [];
+  const unavailable = row.kind === 'mac-unavailable' || (!waiting && !recorded(row.used) && (row.used || row.program_memory))
+    || (waiting && !['cloud', 'repository-slot'].includes(row.kind) && row.head_room?.unavailable);
+  if (unavailable) return [stepTitle(row, 'unavailable'), ...stepFields, ...callFields];
   const rows = [stepTitle(row, [state, duration].filter(Boolean).join(' '))];
   rows.push(...detailRows('Work', row.about, row.about_parts));
   if (row.changes) rows.push(field('Changes', row.changes));
@@ -887,14 +893,13 @@ function stepTooltip(key, data, roomBytes) {
       const parts = [...(part.who_parts || [{kind:'text',text:part.who}]), ...(suffix ? [{kind:'text',text:' · '+suffix}] : [])];
       return {...field(partsText(parts), ramAmount(part.gib * GIB)), labelParts:parts};
     }))];
-  rows.push(...ownerFields(row));
+  rows.push(...ownerFields(row), ...stepFields);
   if (row.priority_entries?.length) rows.push(staffField('Priority', row.priority_entries.map(entry => entry.unit)));
   if (waiting) {
     if (row.place) rows.push(field('Place in line', row.place));
     rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' :
       row.kind === 'repository-slot' ? 'build slot' : row.why || 'its turn'), ...routeFields(row));
     if (!['cloud', 'repository-slot'].includes(row.kind)) {
-      if (row.head_room?.unavailable) return [stepTitle(row, 'unavailable')];
       const cap = queueCapMemory(data);
       const terms = row.head_room?.rows;
       const head = terms?.at(-1);
@@ -939,6 +944,7 @@ function stepTooltip(key, data, roomBytes) {
     }
     rows.push(...progressRows(row));
   }
+  rows.push(...callFields);
   return rows.filter((row, index) => row.kind === 'title' || row.kind === 'long' || row.value || rows[index+1]?.kind === 'long');
 }
 function stepRow(key, data) {
@@ -1537,13 +1543,13 @@ function renderWalk(d) {
   const tableRows = [];
   const actionSpacer = '<td class="action-spacer" colspan="2"></td>';
   const columns = (place, duration, running = false) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th>` +
-    `<th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>` +
+    `<th scope="col" class="verify">Verify</th><th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>` +
     (running ? '<th scope="col" class="slot">Slot</th><th scope="col" class="tokens">Tokens</th>' : actionSpacer) +
     '<th scope="col" class="row-action"></th>';
-  const cells = (place, name, duration, pid, machine, vcpus, tip, className = "", done = "—", slot = "—", tokens = "—", actionable = true) => {
+  const cells = (place, name, duration, pid, machine, vcpus, tip, verify = "", className = "", done = "—", slot = "—", tokens = "—", actionable = true) => {
     const add = actionable ? rowAdd(name) : "";
     tableRows.push(`<tr class="${className}" data-tip="${tip}" tabindex="0"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
-      `<td class="duration">${esc(duration || "—")}</td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
+      `<td class="duration">${esc(duration || "—")}</td><td class="verify">${esc(verify)}</td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
       (Array.isArray(machine)
         // A waiting step lists the machines that can take it, each in its machine color.
         ? `<td class="machine" data-machine="${esc(machine.join(" or "))}"><span class="wait-target">${machine.map(target => `<span class="machine" data-machine="${esc(target)}">${esc(target)}</span>`).join(" or ") || "—"}</span></td>`
@@ -1556,18 +1562,18 @@ function renderWalk(d) {
   $("walk-title").textContent = `Running, in start order (${runningCount})`;
   const rows = [];
   if (d.ram.build_tools_bytes > 0) {
-    cells("", "Build tools", "", null, "", null, "tools", "tools", "—", "—", "—", false);
+    cells("", "Build tools", "", null, "", null, "tools", "", "tools", "—", "—", "—", false);
     rows.push(`<div class="wrow tools" data-tip="tools">${rowLabel("Build tools")}` + rowMemory("tools") + `</div>`);
   }
   rows.push(...ordered.map(r => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
     cells(stageText(r),
-      stepDisplayName(r), idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", r.pid, r.machine, r.vcpus, `row:${r.key}`, "", doneText(r), r.slot, r.tokens, r.kind !== "mac-unavailable");
+      stepDisplayName(r), idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", r.pid, r.machine, r.vcpus, `row:${r.key}`, r.verify?.verb, "", doneText(r), r.slot, r.tokens, r.kind !== "mac-unavailable");
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${r.key}" data-run="${r.key}">${stepLabel(r)}` +
       (r.kind === "cloud" ? cloudStatus(r, `row:${r.key}`) : rowMemory(`row:${r.key}`)) + `</div>`;
   }));
   // The table row only holds the place of the chart room row beside it; its value shows in the chart.
-  const columnClasses = ["place", "done", "step", "duration", "pid", "machine", "vcpus", "slot", "tokens", "row-action"];
+  const columnClasses = ["place", "done", "step", "duration", "verify", "pid", "machine", "vcpus", "slot", "tokens", "row-action"];
   tableRows.push(`<tr class="room" data-tip="room">${columnClasses.map(column => `<td class="${column}"></td>`).join("")}</tr>`);
   rows.push(`<div class="wrow room">${rowLabel("Free")}` + rowMemory("room") + `</div>`);
   const waitingCount = d.waiters.length;
@@ -1583,7 +1589,7 @@ function renderWalk(d) {
   d.waiters.forEach((w, i) => {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
     const tip = `wait:${w.key}`;
-    cells(place, stepDisplayName(w), ago(w.since, d.read_at), w.pid, w.machine ? [w.machine] : w.targets || [], null, tip, `wait${i === 0 ? " wait-first" : ""}`);
+    cells(place, stepDisplayName(w), ago(w.since, d.read_at), w.pid, w.machine ? [w.machine] : w.targets || [], null, tip, w.verify?.verb, `wait${i === 0 ? " wait-first" : ""}`);
     const note = w.why === "the build in the same Cargo folder" ? w.reason : "";
     rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${stepLabel(w, true, note)}` +
       (w.kind === "cloud" ? cloudStatus(w, tip) : rowMemory(tip)) +

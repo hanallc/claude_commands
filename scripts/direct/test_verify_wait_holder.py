@@ -485,8 +485,8 @@ class RecordedHoldWaitFixture(VerifyHoldWaitFixture):
 
     @classmethod
     @override
-    def setUpClass(cls) -> None:
-        super().setUpClass()
+    def setUpClass(cls, *, fixture_parent: Path | None = None) -> None:
+        super().setUpClass(fixture_parent=fixture_parent)
         seed = cls()
         fixture = seed.fixture
         fixture.root = fixture.fixture_root

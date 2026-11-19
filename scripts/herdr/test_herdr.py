@@ -8,7 +8,7 @@ from importlib import import_module
 import io
 import ctypes
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
-from collections.abc import Callable, Generator, Iterable
+from collections.abc import Callable, Generator, Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 import os
 import select
@@ -692,7 +692,7 @@ class NativePaneSessionTests(StaffTestCase):
             self.assertIsInstance(herdr.foreground_pane_owner(info, for_input=True), herdr.ProvedCodexForeground)
             self.assertEqual(read.call_args_list, [call(457), call(457)])
 
-    def test_known_codex_with_unreadable_live_node_descendant_is_unknown(self) -> None:
+    def test_foreground_evidence_when_argv_is_unavailable(self) -> None:
         node = {"pid": 457, "name": "node"}
         codex = {"pid": 456, "argv": ["codex"]}
         with (patch.object(herdr, "_PLATFORM", "linux"),
@@ -701,6 +701,26 @@ class NativePaneSessionTests(StaffTestCase):
                 with self.subTest(processes=processes):
                     owner = herdr.foreground_pane_owner({"foreground_processes": processes})
                     self.assertIsInstance(owner, herdr.UnprovedForegroundOwner)
+
+        place = herdr.HerdrPlace("fixture", "w1:p1")
+        reason = "agent argv is unavailable"
+        claude = {"pid": 458, "name": "claude"}
+        shell = {"pid": 459, "name": "sh", "argv": ["sh"]}
+        for processes, foreground, pane in (
+                ([claude], herdr.ClaudeForegroundWithoutArgv("claude", reason, 458),
+                 herdr.ClaudePaneWithoutArgv(place, reason, 458)),
+                ([shell, claude], herdr.ClaudeForegroundWithoutArgv("claude", reason, 458),
+                 herdr.ClaudePaneWithoutArgv(place, reason, 458)),
+                ([claude, {"pid": 460, "name": "claude"}], herdr.UnprovedForegroundOwner("claude", reason),
+                 herdr.UnknownPaneOwner(place, reason)),
+                ([claude, {**shell, "pid": 458}], herdr.UnprovedForegroundOwner("claude", reason),
+                 herdr.UnknownPaneOwner(place, reason)),
+                ([{"pid": True, "name": "claude"}], herdr.UnprovedForegroundOwner("claude", reason),
+                 herdr.UnknownPaneOwner(place, reason))):
+            with self.subTest(processes=processes):
+                info: dict[str, object] = {"foreground_processes": processes}
+                self.assertEqual(herdr.foreground_pane_owner(info), foreground)
+                self.assertEqual(herdr.pane_foreground(place, info), pane)
 
     def test_foreground_input_reads_each_ancestor_and_descendant_once(self) -> None:
         codex, ancestor, child = 456, 457, 458
@@ -2300,6 +2320,36 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertTrue(any(at >= 10 for at in failures))
         self.assertIsInstance(herdr.submitted_prompt(self.transcript, "resume the saved work", self.launched_at),
                               herdr.PromptSubmitted)
+
+        with self.subTest(transcript="malformed Codex line"):
+            from scripts.agents.stop_resume import CodexProducerPromptCursor
+
+            self.typed.clear()
+            self.turn_delay = 0
+            self.path = self.transcript.config_dir / "sessions" / f"rollout-{self.transcript.session_id}.jsonl"
+            self.path.parent.mkdir()
+            cursor = CodexProducerPromptCursor(self.transcript, self.launched_at)
+
+            def type_with_malformed_record(pane: str, text: str) -> None:
+                self.type_prompt(pane, text)
+                _ = self.path.write_text('{"type":broken}\n')
+                self.screen = "────────\n❯ \n────────"
+
+            opening = herdr.OpeningPrompt("resume the saved work", self.transcript, cursor=cursor)
+            with patch.object(self.client, "_prompt", side_effect=type_with_malformed_record):
+                outcome = self.client.submit_opening_prompt("destination:p1", opening, self.launched_at, 16_000)
+            self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+            self.assertEqual(len(self.typed), 1)
+            self.assertEqual(self.enters, [])
+            self.assertIsInstance(cursor.readability, herdr.TranscriptUnreadable)
+            retry = herdr.OpeningPrompt(opening.text, self.transcript, cursor=cursor, resend_once=True)
+            with patch.object(self.client, "_prompt", side_effect=type_with_malformed_record):
+                outcome = self.client.submit_opening_prompt("destination:p1", retry, self.launched_at, 16_000)
+            self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+            self.assertEqual(len(self.typed), 2)
+            self.assertEqual(self.enters, [])
+            self.write_turn(opening.text)
+            self.assertIsInstance(cursor.submitted_prompt(script_prompt(opening.text)), herdr.PromptSubmitted)
 
     def test_unreadable_accepted_turn_is_found_after_reads_recover_without_retyping(self) -> None:
         self.turn_delay = 8
@@ -4362,14 +4412,19 @@ class HerdrTests(unittest.TestCase):
     def darwin_sockets(self, text: str) -> None:
         self.configure(["-n", "-P", "-a", "-U", "-u", str(os.getuid()), "-F", "pfn"], text)
 
-    def darwin_process_table(self, text: str) -> None:
+    def darwin_process_table(self, text: str, *, terminals: Mapping[int, str] | None = None) -> None:
         executables: list[str] = []
+        terminals_and_executables: list[str] = []
         commands: list[str] = []
         for line in text.splitlines():
             pid, parent, uid, command = line.split(maxsplit=3)
             executables.append(f"{pid} {parent} {uid} {command.split()[0]}")
+            terminal = "??" if terminals is None else terminals.get(int(pid), "??")
+            terminals_and_executables.append(f"{pid} {parent} {uid} {terminal} {command.split()[0]}")
             commands.append(f"{pid} {command}")
         self.configure(["-U", str(os.getuid()), "-o", "pid=,ppid=,uid=,comm="], "\n".join(executables))
+        self.configure(["-U", str(os.getuid()), "-o", "pid=,ppid=,uid=,tdev=,comm="],
+                       "\n".join(terminals_and_executables))
         self.configure(["-U", str(os.getuid()), "-o", "pid=,command="], "\n".join(commands))
 
     def darwin_startup_table(self, text: str, *, started: str = "Tue Nov  3 08:00:00 2026") -> None:
@@ -4984,7 +5039,9 @@ class HerdrTests(unittest.TestCase):
         self.darwin_process_table(
             f"70 1 {uid} herdr server\n71 70 {uid} zsh\n72 71 {uid} claude\n" +
             f"73 71 {uid + 1} claude\n74 71 {uid} claude HERDR_PANE_ID=forged\n" +
-            f"75 71 {uid} codex\n76 71 {uid} claude\n77 1 {uid} unrelated 'outside-herdr\n")
+            f"75 71 {uid} codex\n76 71 {uid} claude\n77 1 {uid} unrelated 'outside-herdr\n" +
+            f"78 1 {uid} holder\n79 1 {uid} holder\n",
+            terminals={71: "16/0", 72: "16/0", 78: "16/0", 79: "unreadable"})
         self.darwin_sockets(f"p70\nf3\nn{self.root}/config/herdr/sessions/writing/herdr.sock\n")
         self.configure(["--session", "writing", "pane", "list"], json.dumps({"result": {"panes": [{'pane_id': 'w1:p1', 'workspace_id': 'w1'}, {'pane_id': 'w1:p2', 'workspace_id': 'w1'}]}}))
         self.darwin_environment(71, "zsh", "HERDR_PANE_ID=w1:p1 CODEX_THREAD_ID=unit")
@@ -5003,6 +5060,13 @@ class HerdrTests(unittest.TestCase):
             herdr.HerdrProcess(76, herdr.HerdrPlace("writing", "w1:p2"), {}, "claude",
                                herdr.UnreadableCwd("process 76 cwd: stderr: gone"))])
         self.assertEqual([command for command in self.commands() if "cwd" in command], [cwd_command])
+        ancestry = next(row.ancestry for row in rows if row.pid == 72)
+        self.assertEqual(ancestry.relative_to_shell(72, 71), herdr.PaneShellAncestry.DESCENDANT)
+        self.assertEqual(ancestry.relative_to_shell(77, 71), herdr.PaneShellAncestry.OUTSIDE)
+        self.assertEqual(ancestry.relative_to_shell(73, 71), herdr.PaneShellAncestry.UNKNOWN)
+        self.assertTrue(ancestry.is_detached_from_shell(77, 71))
+        self.assertFalse(ancestry.is_detached_from_shell(78, 71))
+        self.assertFalse(ancestry.is_detached_from_shell(79, 71))
         self.configure(cwd_command, "p72\nfcwd\nn/second folder\np71\nfcwd\nn/first folder\np76\nfcwd\nn/third folder\n")
         self.assertEqual({row.pid: row.working_directory for row in herdr.herdr_processes()},
                          {71: "/first folder", 72: "/second folder", 76: "/third folder"})

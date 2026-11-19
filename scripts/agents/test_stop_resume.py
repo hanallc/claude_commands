@@ -463,15 +463,23 @@ class StopResumeTests(unittest.TestCase):
                             _ = stop_resume.producer_adoption_launch(world.identity, world.pane, client)
 
     def test_producer_admission_refuses_an_incomplete_registry_before_reserving_a_pane(self) -> None:
-        with producer_first_fixture("claude") as world:
-            path = runtime_sessions.sessions_dir() / "unfinished.json"
-            _ = path.write_text("{")
-            result = stop_resume.resume("dwight")
-            self.assertIsInstance(result, stop_resume.ResumeFailed)
-            assert isinstance(result, stop_resume.ResumeFailed)
-            self.assertIn(f"session registry unreadable: {path}", result.reason)
-            self.assertEqual(world.case.client.opened, [])
-            self.assertEqual(world.arguments, [])
+        for missing in ("session registry", "creation record"):
+            with self.subTest(missing=missing), producer_first_fixture("claude") as world:
+                if missing == "session registry":
+                    path = runtime_sessions.sessions_dir() / "unfinished.json"
+                    _ = path.write_text("{")
+                    reason = f"session registry unreadable: {path}"
+                else:
+                    machine = remote.this_machine()
+                    registry = world.case.root / "configuration/models.conf"
+                    _ = write_registry(registry, {"producer_creations": {"dwight": f"{machine}:{'1' * 32}"}}, update=True)
+                    reason = f"the creation record is on {machine}"
+                result = stop_resume.resume("dwight")
+                self.assertIsInstance(result, stop_resume.ResumeFailed)
+                assert isinstance(result, stop_resume.ResumeFailed)
+                self.assertIn(reason, result.reason)
+                self.assertEqual(world.case.client.opened, [])
+                self.assertEqual(world.arguments, [])
 
     def test_configured_producer_first_start_and_live_resume_keep_one_native_conversation(self) -> None:
         for shown in (None, "old-producer-title"):
@@ -2970,6 +2978,30 @@ class StopResumeTests(unittest.TestCase):
             result = stop_resume.resume(str(row.id))
         self.assertEqual(result, stop_resume.ResumeFailed(row.current_session, "pane list denied"))
         self.start.assert_not_called()
+
+    def test_stopped_unit_resumes_in_its_pane_with_a_detached_holder(self) -> None:
+        from scripts.production.fake_unit_host import process
+
+        parent = fixture_member("showrunner", name="unit-owner")
+        row = fixture_member("unit", name="alpha", parent=parent.id, runtime_id=self.entry["session_id"],
+                             worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+        place = herdr.HerdrPlace("agents", self.entry["pane_id"])
+        shell, supervisor = 998042, 998043
+        process(os.environ, supervisor, 1, ["python3", "supervise"],
+                {"HERDR_PANE_ID": place.pane}, cwd=self.root)
+        detached = herdr.HerdrProcess(supervisor, place, {"CLAUDE_CODE_SESSION_ID": row.current_session},
+                                     "python3", str(self.root),
+                                     herdr.ProcessAncestry({supervisor: 1}, {shell: 34816, supervisor: 0}))
+        shell_process = herdr.HerdrProcess(shell, place, {"CLAUDE_CODE_SESSION_ID": row.current_session},
+                                          "zsh", str(self.root))
+        with (patch.object(herdr, "live_sessions", return_value=[{"name": place.session}]),
+              patch.object(herdr, "herdr_processes", return_value=[shell_process, detached])):
+            result = stop_resume.resume(str(row.id), to="claude4")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        assert isinstance(result, stop_resume.ClaudeUp)
+        self.assertEqual((result.pane_id, result.session_id, result.account), (place.pane, row.current_session, "claude4"))
+        self.assertEqual(self.start.call_args.args[:3], ("pane", "run", place.pane))
+
 
     def test_recovery_fixture_rejects_an_unrecorded_resume_identity(self) -> None:
         with self.assertRaises(AssertionError):

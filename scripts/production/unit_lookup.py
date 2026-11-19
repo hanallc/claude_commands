@@ -630,6 +630,13 @@ def _unproved_pane(place: HerdrPlace, processes: list[herdr.HerdrProcess], claud
                           session_staff.UnprovedPaneIdentity(frozenset(candidates)))
 
 
+@dataclass(frozen=True)
+class _RegisteredClaudeWithoutArgv(ObservedProcess):
+    """The foreground PID lacks argv and agrees with the pane and registry."""
+
+    conversation: str
+
+
 def _herdr_labeled(registry: dict[HerdrPlace, dict[int, list[SessionRecord]]], evidence: ClaudeRegistryEvidence,
                    processes: list[herdr.HerdrProcess]) -> Iterable[PaneObservation]:
     """Join each pane's proved owner to its current conversation."""
@@ -672,6 +679,8 @@ def _herdr_labeled(registry: dict[HerdrPlace, dict[int, list[SessionRecord]]], e
                                      "unit pane process info")
             owner = herdr.pane_foreground(place, info)
             if isinstance(owner, herdr.ObservedEmpty):
+                holders = [process for process in holders
+                           if not process.ancestry.is_detached_from_shell(process.pid, owner.shell_pid)]
                 if problem or claudes or any(process.pid != owner.shell_pid for process in holders):
                     yield _unproved_pane(place, holders, claudes, problem or "no foreground agent", pane)
                 elif holders and (identity := holders[0].marks.get("CLAUDE_CODE_SESSION_ID")):
@@ -685,7 +694,16 @@ def _herdr_labeled(registry: dict[HerdrPlace, dict[int, list[SessionRecord]]], e
                     yield LabeledSession("", ClaudeNotRunning(), place, empty=owner)
                 continue
             if isinstance(owner, herdr.UnknownPaneOwner):
-                raise herdr_types.HerdrFailure(owner.reason)
+                label = _unproved_pane(place, holders, claudes, problem or owner.reason, pane, registry_problem=problem)
+                if isinstance(owner, herdr.ClaudePaneWithoutArgv) and not problem and place in panes:
+                    registered = claudes.get(owner.pid, ())
+                    if len(registered) == 1:
+                        conversation = registered[0]["sessionId"]
+                        report = herdr.checked_pane_session(pane)
+                        if isinstance(report, herdr.NoReportedAgentSession) or report.session_id == conversation:
+                            label = replace(label, process=_RegisteredClaudeWithoutArgv(owner.pid, "claude", conversation))
+                yield label
+                continue
             native = herdr.read_foreground_pane_owner(owner, pane)
             identity = LiveSession(native.current_identity)
             if isinstance(owner, herdr.ProvedClaudeForeground):
@@ -807,6 +825,14 @@ def observed_session_labels(*, record: staff.StaffSnapshot | None = None,
         raise OSError(str(error)) from error
 
 
+@dataclass(frozen=True)
+class ClaudeArgvUnavailable(UnknownUnit):
+    """The exact conversation's pane reports a Claude PID without argv."""
+
+    pid: int
+    place: HerdrPlace
+
+
 def checked_conversation(identity: str, *, record: staff.StaffSnapshot | None = None,
                          registry: sessions.RegistryRead | None = None, probe_address: bool = True) -> UnitOwner:
     """Check the exact conversation with fresh pane evidence."""
@@ -820,7 +846,19 @@ def checked_conversation(identity: str, *, record: staff.StaffSnapshot | None = 
                 observed = observed_session_labels(record=record, registry=registry, probe_address=probe_address)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return UnknownUnit(str(error))
-    return observed.checked_conversation(identity)
+    checked = observed.checked_conversation(identity)
+    if (not isinstance(checked, UnknownUnit) or identity in observed.registry_owners
+            or observed.unreadable_pane_lists or observed.registry_failures):
+        return checked
+    candidates = [pane for pane in observed.labels
+                  if pane.identity == LiveSession(identity)
+                  or isinstance(pane.identity, session_staff.UnprovedPaneIdentity) and identity in pane.identity.candidates]
+    if len(candidates) == 1:
+        pane = candidates[0]
+        if (isinstance(pane.process, _RegisteredClaudeWithoutArgv) and pane.process.conversation == identity
+                and isinstance(pane.claude, ClaudeUnknown)):
+            return ClaudeArgvUnavailable(pane.claude.reason, pane.process.pid, pane.place)
+    return checked
 
 
 def every_labeled_session(*, record: staff.StaffSnapshot | None = None,

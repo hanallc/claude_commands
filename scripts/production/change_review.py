@@ -1536,18 +1536,24 @@ _held_review_locks: ContextVar[frozenset[Path]] = ContextVar("held_review_locks"
 
 
 @contextmanager
-def _list_lock(path: Path) -> Generator[None]:
+def _list_lock(path: Path, *, wait: bool = True) -> Generator[file_lock.LockResult]:
     folder = path.parent.resolve()
     held = _held_review_locks.get()
     if folder in held:
-        yield
+        yield file_lock.LockResult.ACQUIRED
         return
     descriptor = os.open(folder, os.O_RDONLY)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            if wait:
+                raise
+            yield file_lock.LockResult.BUSY
+            return
         token = _held_review_locks.set(held | {folder})
         try:
-            yield
+            yield file_lock.LockResult.ACQUIRED
         finally:
             _held_review_locks.reset(token)
     finally:
@@ -1555,16 +1561,19 @@ def _list_lock(path: Path) -> Generator[None]:
 
 
 @contextmanager
-def review_delivery_lock(root: Path) -> Generator[None]:
+def review_delivery_lock(root: Path, *, wait: bool = True) -> Generator[file_lock.LockResult]:
     lock = root.resolve() / ".review-link-delivery.lock"
     held = _held_review_locks.get()
     if lock in held:
-        yield
+        yield file_lock.LockResult.ACQUIRED
         return
-    with file_lock.exclusive(lock):
+    with file_lock.exclusive(lock, wait=wait) as result:
+        if result is file_lock.LockResult.BUSY:
+            yield result
+            return
         token = _held_review_locks.set(held | {lock})
         try:
-            yield
+            yield result
         finally:
             _held_review_locks.reset(token)
 
@@ -1574,6 +1583,17 @@ def checked_review_write(path: Path, root: Path, check: Callable[[], Result]) ->
     """Check a Review card while holding its list and delivery locks."""
     with review_delivery_lock(root), _list_lock(path):
         yield check()
+
+
+@contextmanager
+def try_review_write(path: Path, root: Path) -> Generator[file_lock.LockResult]:
+    """Try the Review delivery lock, then the change list lock."""
+    with review_delivery_lock(root, wait=False) as result:
+        if result is file_lock.LockResult.BUSY:
+            yield result
+            return
+        with _list_lock(path, wait=False) as result:
+            yield result
 
 
 @contextmanager
@@ -2165,7 +2185,7 @@ class VerdictRefused:
 def _require_verdict_exchange(slots: delivery_state.DeliverySlots, verdict: str, validation_id: str) -> None:
     """Apply the same exchange checks to a single verdict and a batch verdict."""
     try:
-        if isinstance(slots.question, delivery_state.OpenQuestion):
+        if isinstance(slots.question, delivery_state.OpenQuestion) and not slots.validation_requested:
             _ = delivery_state.question_exchange_for_reply(slots.question, '', verdict)
         if validation_id or slots.validation_requested:
             delivery_state.require_exchange_id(
@@ -2211,10 +2231,12 @@ def clear_change_later(path: Path, row: str) -> Generator[None, None, None]:
             raise
 
 
-def _cleared_validation(delivery: Path) -> str:
+def _cleared_validation(delivery: Path, slots: delivery_state.DeliverySlots) -> str:
     fields = cast(dict[str, object], json.loads(delivery.read_text()))
     # A null slot prevents older fields from restoring the completed validation.
     fields["validation"] = None
+    if isinstance(slots.question, delivery_state.OpenQuestion):
+        fields["question"] = None
     return json.dumps(fields)+"\n"
 
 
@@ -2242,7 +2264,7 @@ def save_verdict(path: Path, row: str, verdict: str, production: Path, *, valida
         except ChangeReviewError as error:
             return VerdictRefused([], str(error))
         if slots.validation_requested and not lands(verdict) and any(item["#"] == local_row for item in pending(path)):
-            cleared = _cleared_validation(delivery)
+            cleared = _cleared_validation(delivery, slots)
             event = _validation_fault_event(production, verdict)
             _edit(path, production, event.time.date(), lambda lines: _append_review_log(path, lines, local_row, event),
                   lambda _: f"review {local_row}", report_warning=warnings.append)
@@ -2828,7 +2850,7 @@ def _batch_item(value: object, index: int, day: date, review_root: Path,
             if slots.validation_requested and not lands(verdict):
                 _, first, end = _table(path, lines, SECTION)
                 if any(line.startswith(f"| {target.row} |") for line in lines[first:end]):
-                    cleared_validations[target] = _cleared_validation(delivery)
+                    cleared_validations[target] = _cleared_validation(delivery, slots)
                     _append_review_log(path, lines, target.row, _validation_fault_event(doc, verdict))
                     return lambda: _validation_fault_output(shown)
             result = change_verdict.write(lines)

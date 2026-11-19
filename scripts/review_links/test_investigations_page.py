@@ -17,7 +17,7 @@ from urllib.parse import urlencode
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.production import investigation, staff
-from scripts.review_links import console, investigations_page
+from scripts.review_links import console, investigations_page, page_frame
 
 RUNNER = staff.StaffRow(staff.StaffId("a0882376-677b-4da5-adbb-f11db9146021"), "showrunner", "Alpha", staff.StaffRoot(),
                         current_session=staff.StaffId("a0882376-677b-4da5-adbb-f11db9146021"))
@@ -100,6 +100,7 @@ class InvestigationsPageTests(unittest.TestCase):
         self.assertLess(body.index('data-page-status '), body.index('<div data-investigations'))
         self.assertEqual(body.count("<article "), 3)
         self.assertEqual(body.count(">Mark read</button>"), 1)
+        self.assertEqual(body.count(page_frame.BUTTON_STATES), 1)
         for part in ('Find the cause &lt;now&gt;', '<h3>Answer</h3>', '<ol>', 'Waiting for an answer',
                      '<dt>source:</dt><dd>Alpha · Builder</dd>', '<dt>date:</dt><dd>2026-11-16</dd>',
                      '<dt>time:</dt><dd>08:05</dd>', f'<dt>source:</dt><dd>{ORPHAN}</dd>'):
