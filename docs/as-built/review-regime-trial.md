@@ -42,8 +42,9 @@ The reader ignores unknown keys in old rows, including former simplify fields.
 `review_regime.Row` holds the unit, plan, phase, checkpoint, regime, times, holds, merge defects, findings, review minutes, and optional notes.
 The regime is `before`, `trial`, or `after`.
 `add` requires times with UTC offsets and refuses a merge time before the start time.
-`add` resolves `--checkpoint` to a full commit hash in the current repository.
-It keeps an existing row for the same unit, plan, phase and checkpoint. An older row with no checkpoint matches only when its start time is also the same.
+`add` requires `--checkpoint` and resolves it to a full commit hash in the current repository.
+It keeps an existing row only when the unit, plan, phase and checkpoint match.
+Reports and the watch still count eligible older rows that have no checkpoint.
 
 `report [--since <ISO date>]` excludes rows with an `excluded` reason.
 It reports means for findings, holds, defects, and review times.
