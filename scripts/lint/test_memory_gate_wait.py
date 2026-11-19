@@ -18,7 +18,7 @@ from scripts.lib.shell_test_support import shell_functions
 class MemoryGateWaitTests(unittest.TestCase):
     def test_step_command_inherits_the_grant_holder_marker_only_during_execution(self) -> None:
         invoke = Path(__file__).with_name("invoke.sh")
-        shell = shell_functions(invoke, "buildlog_exec") + r'''
+        shell = shell_functions(invoke, "close_checkout_handoffs", "buildlog_exec") + r'''
 BUILDLOG_MEM_RESERVATION=4242-start-1
 BUILDLOG_MEM_MAX_PATH="$1/admission/4242-start-1.max"
 BUILDLOG_PEAK=""

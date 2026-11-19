@@ -201,17 +201,21 @@ def wait_for_checkout_scope(owners: select.poll, watch: int, sidecar: Path, unit
         owners.unregister(watch)
 
 
+def wait_for_checkout_channel(owners: select.poll, channel: int, deadline: float, timeout_reason: str) -> None:
+    ready = poll_checkout_until(owners, deadline)
+    if not ready or time.monotonic() >= deadline:
+        raise TimeoutError(timeout_reason)
+    if any(descriptor != channel for descriptor, _ in ready):
+        raise ValueError("a scope owner exited before launch")
+
+
 def wait_for_checkout_confirmation(owners: select.poll, reply: int, deadline: float) -> None:
     expected = b"bound\n"
     confirmation = b""
     owners.register(reply, select.POLLIN)
     try:
         while len(confirmation) < len(expected) and b"\n" not in confirmation:
-            ready = poll_checkout_until(owners, deadline)
-            if not ready or time.monotonic() >= deadline:
-                raise TimeoutError("the copy owner did not confirm the checkout scope")
-            if any(descriptor != reply for descriptor, _ in ready):
-                raise ValueError("a scope owner exited before launch")
+            wait_for_checkout_channel(owners, reply, deadline, "the copy owner did not confirm the checkout scope")
             chunk = os.read(reply, len(expected) - len(confirmation))
             if not chunk:
                 break
@@ -228,7 +232,15 @@ def bind_source_copy_scope(checkout: SourceCopyLeaseChannel, request: bytes,
     reader, writer = socket.socketpair()
     with reader, writer:
         with socket.socket(fileno=os.dup(checkout.request_fd)) as channel:
-            _ = socket.send_fds(channel, [request], [writer.fileno()])
+            descriptor = channel.fileno()
+            owners.register(descriptor, select.POLLOUT)
+            try:
+                wait_for_checkout_channel(
+                    owners, descriptor, deadline, "the source copy channel did not accept the checkout scope")
+                # Keep the shared socket flags and keep this send within the deadline.
+                _ = socket.send_fds(channel, [request], [writer.fileno()], flags=socket.MSG_DONTWAIT)
+            finally:
+                owners.unregister(descriptor)
         writer.close()
         wait_for_checkout_confirmation(owners, reader.fileno(), deadline)
 

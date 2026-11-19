@@ -552,17 +552,6 @@ if [[ "${COPIES_RUN_LOCK_FD:-}" =~ ^[0-9]+$ ]]; then
     unset COPIES_RUN_LOCK_FD
 fi
 
-close_checkout_handoffs() {
-    if [[ -n "${BUILDLOG_PREPARED_COPY_LOCK_FD:-}" ]]; then
-        exec {BUILDLOG_PREPARED_COPY_LOCK_FD}>&-
-        unset BUILDLOG_PREPARED_COPY_LOCK_FD
-    fi
-    if [[ "${COPIES_RUN_BIND_FD:-}" =~ ^[0-9]+$ ]]; then
-        exec {COPIES_RUN_BIND_FD}>&-
-        unset COPIES_RUN_BIND_FD
-    fi
-}
-
 # Move the caller's checkout lock before Verify starts its helpers.
 if [[ -n "${BUILDLOG_PREPARED_COPY_LOCK_FD:-}" ]]; then
     if [[ ! "$BUILDLOG_PREPARED_COPY_LOCK_FD" =~ ^[0-9]+$ ]]; then
@@ -949,7 +938,6 @@ run_step() {
                     # The sweep runs after Cargo releases the placement.
                     [[ -z "${BUILDLOG_MEM_RESERVATION:-}" ]] || return 0
                     eval "$unscoped_buildlog"
-                    close_checkout_handoffs
                     sweep_without_placement "$@"
                 )
             fi
@@ -1132,13 +1120,13 @@ read_metadata() {
     if [[ -n "${GATE_METADATA:-}" ]]; then
         printf '%s\n' "$GATE_METADATA"
     else
-        cargo metadata --no-deps --format-version 1
+        run_without_checkout_handoffs cargo metadata --no-deps --format-version 1
     fi
 }
 
 set_gate_metadata() {
     export BUILDLOG_OUTPUT_ROOTS=""
-    GATE_METADATA="$(cargo metadata --no-deps --format-version 1)" || { GATE_METADATA=""; return 1; }
+    GATE_METADATA="$(run_without_checkout_handoffs cargo metadata --no-deps --format-version 1)" || { GATE_METADATA=""; return 1; }
     BUILDLOG_OUTPUT_ROOTS="$(verify_helper --stdin "$VERIFY_START_DIR/../buildlog/step_context.py" output-roots \
         <<< "$GATE_METADATA" 2>/dev/null)" || BUILDLOG_OUTPUT_ROOTS=""
 }
@@ -2868,7 +2856,6 @@ run_checkout_step() (
     local launch=$1 status=0 checkout_status=0 publish_status=0
     shift
     if [[ -z "${VERIFY_SLOT_SOURCE:-}" ]] || ! buildlog_step_compiles "$@"; then
-        if [[ "$launch" == buildlog_exec_without_checkout ]]; then close_checkout_handoffs; fi
         "$launch" "$@"
         return $?
     fi
@@ -2883,13 +2870,7 @@ run_checkout_step() (
         step_close_checkout || true
         return 2
     fi
-    if [[ "$launch" == buildlog_exec_without_checkout ]]; then
-        (exec {DOC_COPY_LEASE_FD}>&- {DOC_COPY_REPLY_FD}<&-
-         close_checkout_handoffs
-         "$launch" "${command[@]}") || status=$?
-    else
-        "$launch" "${command[@]}" || status=$?
-    fi
+    "$launch" "${command[@]}" || status=$?
     if (( status != 125 )); then
         (printf 'publish\n' >&"$DOC_COPY_LEASE_FD") || publish_status=$?
     fi

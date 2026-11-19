@@ -13,7 +13,7 @@ import sys
 from typing import override
 import unittest
 
-from scripts.lib.shell_test_support import shell_function
+from scripts.lib.shell_test_support import shell_function, shell_functions
 from scripts.direct.tree_watch_test_support import TreeWatchFixture
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
@@ -161,6 +161,8 @@ class VerifyOutputRootsTests(unittest.TestCase):
             harness = workspace / "metadata.sh"
             _ = harness.write_text(
                 'set -euo pipefail\n'
+                + shell_functions(VERIFY.parent.parent / "lint/invoke.sh",
+                                  "close_checkout_handoffs", "run_without_checkout_handoffs")
                 + shell_function(VERIFY.read_text(), "verify_helper") + "\n"
                 + shell_function(VERIFY.read_text(), "set_gate_metadata") + "\n"
                 + shell_function(VERIFY.read_text(), "load_metadata") + "\n"

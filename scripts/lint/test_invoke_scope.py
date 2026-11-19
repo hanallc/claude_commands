@@ -503,9 +503,22 @@ exec 0<&-
 : > "$SWEEP_TEST_JOURNAL.closed"
 exit 1
 """
-SWEEP_STAND_IN = ('invoke_sweep() { printf "started\\n" >&"$SWEEP_TEST_FD"; read -r _ < "$SWEEP_TEST_RELEASE"; '
-                  'printf "lint sweep: the floor took 1.0 GiB from /t/target\\n"; '
-                  'printf "finished\\n" >&"$SWEEP_TEST_FD"; }')
+TEST_CHECKOUT_HANDOFF = """\
+: > "$TMPDIR/source-channel"
+exec {COPIES_RUN_BIND_FD}<"$TMPDIR/source-channel"
+export COPIES_RUN_BIND_FD TEST_SOURCE_FD="$COPIES_RUN_BIND_FD"
+"""
+SWEEP_STAND_IN = """\
+invoke_sweep() {
+    if [[ -n ${COPIES_RUN_BIND_FD:-} || /dev/fd/$TEST_SOURCE_FD -ef "$TMPDIR/source-channel" ]]; then
+        printf 'inherited checkout channel\\n' >&"$SWEEP_TEST_FD"
+    fi
+    printf 'started\\n' >&"$SWEEP_TEST_FD"
+    read -r _ < "$SWEEP_TEST_RELEASE"
+    printf 'lint sweep: the floor took 1.0 GiB from /t/target\\n'
+    printf 'finished\\n' >&"$SWEEP_TEST_FD"
+}
+"""
 
 
 class SweepStartupTests(unittest.TestCase):
@@ -524,8 +537,9 @@ class SweepStartupTests(unittest.TestCase):
             environment = config_environment(configuration)
             _ = write_config_fixture(configuration / "build_folders.conf", "patterns.legacy-stable={purpose}\n")
             reader, writer = os.pipe()
+            shell = f'source "$1"\n{TEST_CHECKOUT_HANDOFF}{SWEEP_STAND_IN}\nsweep_after_step taplo fmt'
             process = subprocess.Popen(
-                ["bash", "-c", f'source "$1"; {SWEEP_STAND_IN}; sweep_after_step test-step', "sweep-test", str(INVOKE)],
+                ["bash", "-c", shell, "sweep-test", str(INVOKE)],
                 cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 pass_fds=(writer,),
                 env={**os.environ, **environment, "HOME": directory, "TMPDIR": directory,
@@ -590,6 +604,30 @@ class SweepStartupTests(unittest.TestCase):
 
 
 class BuildAdmissionTests(unittest.TestCase):
+    def test_formatter_probe_and_unscoped_tool_close_the_source_copy_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cargo = root / "cargo"
+            _ = cargo.write_text('''#!/usr/bin/env bash
+if [[ -n ${COPIES_RUN_BIND_FD:-} || /dev/fd/$TEST_SOURCE_FD -ef "$TMPDIR/source-channel" ]]; then
+    printf '%s\\n' "$*" >> "$TMPDIR/inherited"
+fi
+printf '%s\\n' "$*" >> "$TMPDIR/cargo-argv"
+printf 'rustfmt fixture\\n'
+''')
+            cargo.chmod(0o755)
+            result = self.run_invoke(root, TEST_CHECKOUT_HANDOFF + '''
+run() { BUILDLOG_PEAK="" buildlog_exec "$@"; }
+fmt_cargo --all
+VERIFY_LINT_RUSTFMT_VERSION_FILE="$TMPDIR/version" fmt_cargo --all
+[[ /dev/fd/$COPIES_RUN_BIND_FD -ef "$TMPDIR/source-channel" ]]
+''', [], environment={"PATH": str(root) + os.pathsep + os.environ["PATH"]})
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual((root / "cargo-argv").read_text().splitlines(),
+                             ["+nightly fmt --version", "+nightly fmt --all"] * 2)
+            inherited = root / "inherited"
+            self.assertFalse(inherited.is_file(), inherited.read_text() if inherited.is_file() else "")
+
     def clippy_capture(self, root: Path, command: str, config_text: str) -> subprocess.CompletedProcess[str]:
         cargo = root / "cargo"
         _ = cargo.write_text('''#!/bin/sh

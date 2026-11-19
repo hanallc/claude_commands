@@ -14,6 +14,23 @@
 
 [[ -n "${LINT_INVOKE_SOURCED:-}" ]] && return 0
 
+# Only the scope supervisor receives checkout handoffs.
+close_checkout_handoffs() {
+    local handoff descriptor
+    for handoff in COPIES_RUN_LOCK_FD COPIES_RUN_BIND_FD BUILDLOG_PREPARED_COPY_LOCK_FD DOC_COPY_LEASE_FD DOC_COPY_REPLY_FD; do
+        descriptor=${!handoff:-}
+        if [[ "$descriptor" =~ ^[0-9]+$ ]]; then
+            eval "exec $descriptor>&-"
+        fi
+        unset "$handoff"
+    done
+}
+
+run_without_checkout_handoffs() (
+    close_checkout_handoffs
+    "$@"
+)
+
 BUILD_FOLDERS_SCRIPT="$(cd -- "${BASH_SOURCE[0]%/*}/../lib" && pwd)/build_folders.py"
 if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then
     # Later session commands use this inherited TMPDIR after this command exits.
@@ -162,7 +179,8 @@ buildlog_step_compiles() {
     return 0
 }
 
-buildlog_exec() {
+buildlog_exec() (
+    close_checkout_handoffs
     local BUILDLOG_RESERVED_STEP="${BUILDLOG_RESERVED_STEP:-}"
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" ]]; then
         printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
@@ -181,7 +199,7 @@ buildlog_exec() {
         return $status
     fi
     "$@"
-}
+)
 
 buildlog_write_step() {
     BUILDLOG_TARGET_FOLDER="${BUILDLOG_TARGET_FOLDER:-}" BUILDLOG_TEST_PHASE_FILE="${BUILDLOG_TEST_PHASE_FILE:-}" \
@@ -391,7 +409,7 @@ cargo_seed_needed() {
 
 cargo_seed_before_step() {
     local script="${BUILD_FOLDERS_SCRIPT%/*}/cargo_seed.py"
-    "${script%/*}/py" "$script" "$@"
+    run_without_checkout_handoffs "${script%/*}/py" "$script" "$@"
 }
 
 run_step_attempt() {
@@ -620,13 +638,7 @@ sweep_after_step() {
     # rest, so the sweep never stops on a broken pipe in a removal.
     (
         trap '' HUP
-        local checkout_fd
-        for checkout_fd in "${DOC_COPY_LEASE_FD:-}" "${DOC_COPY_REPLY_FD:-}" "${BUILDLOG_PREPARED_COPY_LOCK_FD:-}"; do
-            if [[ "$checkout_fd" =~ ^[0-9]+$ ]]; then
-                eval "exec $checkout_fd>&-"
-            fi
-        done
-        unset BUILDLOG_PREPARED_COPY_LOCK_FD
+        close_checkout_handoffs
         TOKEN_HELD=0
         run() { run_once "$@"; }
         if command -v systemd-cat >/dev/null 2>&1; then
@@ -641,7 +653,7 @@ sweep_after_step() {
 # Mac cargo gate's names its own cause instead of a missing nextest.
 require_nextest() {
     local error
-    if ! error=$(cargo nextest --version 2>&1 >/dev/null); then
+    if ! error=$(run_without_checkout_handoffs cargo nextest --version 2>&1 >/dev/null); then
         echo "cargo nextest is required${error:+: ${error%%$'\n'*}}" >&2
         exit 2
     fi
@@ -839,13 +851,13 @@ fmt_cargo() {
     local version_file="${VERIFY_LINT_RUSTFMT_VERSION_FILE:-}"
     if [[ -n "$version_file" ]]; then
         if [[ ! -f "$version_file" ]]; then
-            cargo +nightly fmt --version > "$version_file" 2>/dev/null || : > "$version_file"
+            run_without_checkout_handoffs cargo +nightly fmt --version > "$version_file" 2>/dev/null || : > "$version_file"
         fi
         if [[ ! -s "$version_file" ]]; then
             echo "cargo +nightly fmt is required" >&2
             exit 2
         fi
-    elif ! cargo +nightly fmt --version >/dev/null 2>&1; then
+    elif ! run_without_checkout_handoffs cargo +nightly fmt --version >/dev/null 2>&1; then
         echo "cargo +nightly fmt is required" >&2
         exit 2
     fi

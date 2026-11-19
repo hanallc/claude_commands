@@ -466,6 +466,47 @@ with patch.object(verify_scoped_step.subprocess, "Popen", start_after_publicatio
         self.assertFalse(self.events.exists())
         self.assertFalse(self.pass_records())
 
+    def test_doc_times_out_when_the_source_copy_channel_is_full(self) -> None:
+        full = self.root / "source-copy-channel-full"
+        self.instrument_scope_supervisor(f'''
+from pathlib import Path
+import socket
+import time
+from types import SimpleNamespace
+
+bind = verify_scoped_step.bind_source_copy_scope
+elapsed = 0.0
+clock = SimpleNamespace(monotonic=lambda: time.monotonic() + elapsed)
+
+def bind_full_channel(checkout, request, owners, deadline):
+    global elapsed
+    sender, receiver = socket.socketpair(type=socket.SOCK_DGRAM)
+    with sender, receiver:
+        while True:
+            try:
+                sender.send(b"pending", socket.MSG_DONTWAIT)
+            except BlockingIOError:
+                break
+        full_channel = verify_scoped_step.SourceCopyLeaseChannel(checkout.lease_owner, sender.fileno())
+        elapsed = max(0.0, deadline - time.monotonic() - 1)
+        Path({str(full)!r}).touch()
+        bind(full_channel, request, owners, deadline)
+''', 'patch.object(verify_scoped_step, "bind_source_copy_scope", bind_full_channel), '
+            + 'patch.object(verify_scoped_step, "time", clock)')
+        process, log, _ = self.start_doc(command=self.copies_verify_command("doc"))
+        wait_until(lambda: full.is_file() or process.poll() is not None, self.root, processes=(process,))
+        self.assertTrue(full.is_file(), log.read_text())
+        try:
+            status = process.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            self.fail("The supervisor did not release the launch lock after the source copy channel filled.")
+        output = log.read_text()
+        self.assertEqual(status, 125, output)
+        self.assertIn("the source copy channel did not accept the checkout scope", output)
+        self.assertIn("keeping the reservation", output)
+        self.assertFalse(self.events.exists())
+        self.assertFalse(self.pass_records())
+
     def test_doc_refuses_checkout_confirmation_after_the_deadline(self) -> None:
         self.instrument_scope_supervisor('''
 import time

@@ -270,8 +270,10 @@ The copy owner writes the confirmation line in one pipe write.
 The supervisor reads to the end of the line.
 For a prepared checkout, the supervisor writes the scope while it holds the inherited slot lock.
 Verify moves the descriptor named by the caller to an unused descriptor before it starts its helpers.
-The background sweep closes the checkout lock and the private copy pipes before it starts its scope.
-`VERIFY_SCOPE_PUBLICATION_SECONDS` sets the deadline for publication and confirmation in `config/direct.conf`.
+Tool launches that bind no checkout close the checkout handoffs.
+`VERIFY_SCOPE_PUBLICATION_SECONDS` sets the deadline in `config/direct.conf`.
+The deadline covers scope publication, the source copy request, and lease confirmation.
+The supervisor waits for channel capacity and checks for owner exit before it sends the request.
 The supervisor divides long waits into intervals that fit the kernel's poll limit.
 The supervisor checks the deadline after its last check that the owners are alive.
 If the deadline expires, Verify refuses to launch Cargo and keeps the reservation.

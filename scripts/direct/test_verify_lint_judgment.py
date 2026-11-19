@@ -129,7 +129,10 @@ class VerifyLintJudgmentTests(VerifyLintJudgmentFixture):
             "start_tree_watch", "finish_tree_watch", "run_lint_judgment", "run_lint_held_sequence", "run_lint_sequence",
             "lint_copy_begin", "lint_rewrite", "lint_copy_return", "lint_copy_drop", "lint_fix_tree_key",
         )
-        functions += shell_functions(SCRIPTS / "lint/invoke.sh", "fmt_cargo", "invoke_clippy", "invoke_clippy_fix", "invoke_mend")
+        functions += shell_functions(
+            SCRIPTS / "lint/invoke.sh", "close_checkout_handoffs", "run_without_checkout_handoffs",
+            "fmt_cargo", "invoke_clippy", "invoke_clippy_fix", "invoke_mend",
+        )
         changed_members = VERIFY.read_text(encoding="utf-8").split("CHANGED_MEMBERS_PY='", 1)[1].split("\n'\n", 1)[0]
         script = "set -eo pipefail\n" + functions
         script += "\nCHANGED_MEMBERS_PY=" + shlex.quote(changed_members) + "\n"
