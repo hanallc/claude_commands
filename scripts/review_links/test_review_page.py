@@ -865,6 +865,53 @@ class ReviewPageTests(unittest.TestCase):
                     cache.synchronize()
                 self.assertIn(keys[path], cache.get().records)
 
+    def test_snapshot_worker_rebuilds_when_git_history_adds_a_proposals_folder(self) -> None:
+        current, _ = self.decisions()
+        doc = self.fixture.production
+        former = doc.parent / 'former-proposals'
+        former.mkdir()
+        issue = former / 'P2.md'
+        _ = issue.write_text(Path(current.removeprefix('proposal/')).read_text().replace('P1', 'P2'))
+        key = 'proposal/'+str(issue)
+
+        def git(*arguments: str) -> str:
+            return subprocess.run(['git', '-C', str(doc.parent), '-c', 'user.name=Fixture',
+                                   '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false', *arguments],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        _ = git('init', '-b', 'main')
+        _ = git('add', doc.name)
+        _ = git('commit', '-m', 'Set the current proposals folder.')
+        _ = git('switch', '--detach')
+        old_folder = Path(current.removeprefix('proposal/')).parent
+        _ = doc.write_text(doc.read_text().replace(f'**Proposals:** {old_folder}', f'**Proposals:** {former}'))
+        _ = git('commit', '-am', 'Set a former proposals folder.')
+        commit = git('rev-parse', 'HEAD')
+        _ = git('switch', 'main')
+
+        cache = review_page.ReviewSnapshotCache(self.root, interval=0.02)
+        self.addCleanup(cache.close)
+        before = cache.get()
+        self.assertNotIn(key, before.records)
+        self.assertIn(doc.parent / '.git/refs/heads', before.source_stamps)
+        doc_stamp = review_page.source_stamp(doc)
+        published = threading.Event()
+        build_snapshot = review_page.build_snapshot
+
+        def observe(root: Path) -> review_page.ReviewSnapshot:
+            fresh = build_snapshot(root)
+            if key in fresh.records:
+                published.set()
+            return fresh
+
+        with patch.object(review_page, 'build_snapshot', side_effect=observe):
+            _ = git('update-ref', 'refs/heads/former-proposals', commit)
+            self.assertTrue(published.wait(TEST_HANG_GUARD_SECS))
+            cache.synchronize()
+        self.assertEqual(review_page.source_stamp(doc), doc_stamp)
+        self.assertIn(current, cache.get().records)
+        self.assertIn(key, cache.get().records)
+
     def test_snapshot_worker_keeps_the_last_snapshot_after_an_unexpected_error(self) -> None:
         cache = review_page.ReviewSnapshotCache(self.root, interval=0.02)
         self.addCleanup(cache.close)

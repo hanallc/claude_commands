@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 from scripts.lib import conf
 from scripts.lib.user_zone import CONF as USER_ZONE_CONF, user_zone
 from scripts.production import change_review, change_routing, proposal_issue, staff, update_registration
-from scripts.production.record_store import state_root
+from scripts.production.record_store import FileStamp, state_root
 from scripts.lib import urgency
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_items, review_link
 from scripts.review_links import new_item_dialog, review_submissions
@@ -140,7 +140,7 @@ class ReviewSnapshot:
     refresh_seconds: float
     assets: dict[str,str]
     zone: ZoneInfo
-    source_stamps: dict[Path, tuple[int, int]]
+    source_stamps: dict[Path, FileStamp]
     later: Mapping[str, int]
     names: staff_names.StaffNames
     page: bytes = b''
@@ -372,18 +372,20 @@ class ReviewSnapshotCache:
     root: Path
     interval: float = 0.5
     start_worker: bool = True
+    initialize_on_start: bool = False
     _snapshot: ReviewSnapshot | SnapshotUnavailable = field(default_factory=SnapshotUnavailable,init=False)
     _condition: threading.Condition = field(default_factory=threading.Condition,init=False)
     _save_lock: threading.Lock = field(default_factory=threading.Lock,init=False)
     _wake: threading.Event = field(default_factory=threading.Event,init=False)
     _stop: threading.Event = field(default_factory=threading.Event,init=False)
     _busy: bool = field(default=False,init=False)
-    _initialize: bool = field(default=False,init=False)
+    _initialization_requested: bool = field(default=False,init=False)
     _generation: int = field(default=0,init=False)
     _thread: threading.Thread = field(init=False)
 
     def __post_init__(self) -> None:
-        if (self.root/change_page.CONSOLE_FOLDER/change_browser.MANIFEST).exists():
+        if not self.initialize_on_start and (self.root/change_page.CONSOLE_FOLDER/change_browser.MANIFEST).exists():
+            self._initialization_requested = True
             try:
                 self._snapshot = build_snapshot(self.root)
             except Exception as error:
@@ -393,13 +395,19 @@ class ReviewSnapshotCache:
             self.start()
 
     def start(self) -> None:
+        if self.initialize_on_start:
+            self._initialization_requested = True
+            self._wake.set()
         self._thread.start()
+
+    def _after_snapshot_update(self, _snapshot: ReviewSnapshot, /) -> None:
+        """Run background work after the worker publishes a snapshot."""
 
     def get(self) -> ReviewSnapshot:
         with self._condition:
             if isinstance(self._snapshot, SnapshotUnavailable) and self._thread.is_alive():
                 if not self._busy:
-                    self._initialize = True
+                    self._initialization_requested = True
                     self._wake.set()
                 _ = self._condition.wait_for(
                     lambda: not isinstance(self._snapshot, SnapshotUnavailable) or
@@ -411,6 +419,7 @@ class ReviewSnapshotCache:
 
     def invalidate(self) -> None:
         with self._condition:
+            self._initialization_requested = True
             self._generation += 1
             self._wake.set()
 
@@ -479,7 +488,7 @@ class ReviewSnapshotCache:
             return PublishedSubmission(saved, item.key, fresh.version)
 
     def publish_item(self, current: ReviewSnapshot, key: str, item: ReviewItem | ReviewRecordNotPublished,
-                     members: staff.StaffSnapshot, *, stamps: Mapping[Path, tuple[int, int]] | None = None,
+                     members: staff.StaffSnapshot, *, stamps: Mapping[Path, FileStamp] | None = None,
                      replaced_key: str = '') -> ReviewSnapshot:
         """Insert, replace or remove one retained record."""
         started = time.perf_counter()
@@ -556,25 +565,24 @@ class ReviewSnapshotCache:
                 unchanged = (isinstance(snapshot, ReviewSnapshot) and time.monotonic()-checked<30
                              and all(source_stamp(path)==stamp for path, stamp in snapshot.source_stamps.items()))
                 with self._condition:
-                    if (isinstance(snapshot, SnapshotUnavailable) and not self._initialize
-                            and not (self.root/change_page.CONSOLE_FOLDER/change_browser.MANIFEST).exists()):
-                        self._wake.clear()
+                    if isinstance(snapshot, SnapshotUnavailable) and not self._initialization_requested:
                         continue
                     if unchanged and not self._wake.is_set():
                         continue
-                    self._initialize = False
                     self._wake.clear()
                     self._busy = True
                 if not (self.root/change_page.CONSOLE_FOLDER/change_browser.MANIFEST).exists():
                     _ = change_page.console_folder(self.root)
                 fresh = build_snapshot(self.root)
                 with self._save_lock, self._condition:
-                    if self._snapshot is snapshot and self._generation == generation:
-                        self._snapshot = fresh
-                    else:
+                    if self._snapshot is not snapshot or self._generation != generation:
                         self._wake.set()
+                        continue
+                    self._snapshot = fresh
+                    self._condition.notify_all()
                 checked = time.monotonic()
                 last_failure = None
+                self._after_snapshot_update(fresh)
             except Exception as error:
                 failure = ' '.join(str(error).splitlines())
                 if failure != last_failure:

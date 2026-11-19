@@ -271,6 +271,12 @@ Usage errors, the stderr-only refusals above, an unreadable `--file` and an empt
 `send.py` uses the checked relay for every Claude socket delivery on both hosts while postmaster is off.
 `_postmaster_recipient` returns `RecipientNotInRegistry` for all recipients.
 The direct relay receives the original timeout and logs `unresolved`.
+When Herdr reports one foreground Claude PID with unavailable argv, the relay can use the registry for the exact conversation.
+This route requires one registry record with the same live PID, process start, and a socket path.
+The conversation ID must be a canonical UUID.
+A pane report that names a different conversation or is unreadable prevents this route.
+The relay checks the pane report during planning and again before it writes.
+The relay checks the current registry, connected peer PID, and process start before it writes.
 
 The relay runs `command claude -p` with Sonnet, auto mode, and only the `SendMessage` tool.
 It disables MCP, slash commands, and settings sources and removes inherited `CLAUDE_*` variables.
