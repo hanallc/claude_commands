@@ -2919,6 +2919,16 @@ Work:
 3. Correct `docs/as-built/copies.md:123`.
 4. A test proves that `copies.py` and `copy_record` read no `root` key.
 
+### Phase 44ci — The merge runner merges the batch file the line lists  · status: todo
+**From builds, 2026-11-18 19:3x (Hana top priority):** the item "builds setupwait" listed aws hana-setup-wait 3365c26b1, but the merge took f622b9bf0 and reported its conflicts.
+Cause: `land_queue.py next` prints only the label. natemerge's runner (`queue-runner-40/land.sh`) builds the batch path from the label (`$B/$item.txt`). The item stored `setupwait2.txt`, so the runner read the old `setupwait.txt`.
+Copy `/session/queue/nextbatch`, branch `builds-queue-44ci` from main 83ef96903.
+
+Work:
+1. `land_queue.py next` prints the label and then the stored batch path on the same line. An item with commits and no batch prints the label alone.
+2. A test adds an item whose label differs from its batch file name, and checks that `next` prints the stored path.
+3. Send natemerge the one-line runner change: use the printed path, never a path built from the label.
+
 ### Phase 44cg — A memory wait fixture gives the same result under load  · status: todo
 **From builds, 2026-11-18 18:3x:** queue's next item after 44cf.
 
