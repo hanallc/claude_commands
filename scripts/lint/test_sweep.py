@@ -38,7 +38,7 @@ from scripts.message.session_send_test_support import forbid_real_sender
 from scripts.lib import build_folders, conf, copy_record
 from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
-from scripts.lib.process_start import Gone, ProcessStart, Started
+from scripts.lib.process_start import Gone, ProcessStart, Started, process_start
 from scripts.mac_test import floor_claims
 from scripts.lint.test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -6027,16 +6027,24 @@ raise SystemExit(int(os.environ[variable]))
 
     def test_floor_pass_checks_the_original_process_start_before_sending(self) -> None:
         read_uses = sweep.process_uses
-        for after_scan in (Gone(), Started("456")):
-            with self.subTest(after_scan=type(after_scan).__name__):
+        cases = (
+            (b"test process", Gone()),
+            (b"test process", Started("456")),
+            (b"test \xff process", Started("123")),
+        )
+        for name, after_scan in cases:
+            with self.subTest(name=name, after_scan=type(after_scan).__name__):
                 base = self.base()
                 tree, payload = cargo_target(base, "busy", DEMO, time.time())
                 proc = base / "proc"
                 fake_process(proc, 46, exe=str(payload))
-                _ = (proc / "46" / "stat").write_text("46 (test process) S " + "0 " * 18 + "123 0\n")
+                _ = (proc / "46" / "stat").write_bytes(b"46 (" + name + b") S " + b"0 " * 18 + b"123 0\n")
 
-                def read_start(pid: int) -> ProcessStart:
+                def read_start(pid: int, *, proc_root: Path | None = None) -> ProcessStart:
                     self.assertEqual(pid, 46)
+                    if proc_root is not None:
+                        self.assertEqual(proc_root, proc)
+                        return process_start(pid, proc_root=proc)
                     self.assertTrue(cast(mock.Mock, sweep.scan_floor_roots).called)
                     return after_scan
 
@@ -6048,12 +6056,19 @@ raise SystemExit(int(os.environ[variable]))
                 with (mock.patch.object(sweep, "process_uses", side_effect=fixture_uses),
                       mock.patch.object(sweep, "process_start", side_effect=read_start) as starts,
                       mock.patch.object(sweep, "holder_sessions", return_value={46: "hana-unit"}),
-                      mock.patch.object(sweep, "send_holder_message") as tell,
+                      mock.patch.object(sweep, "send_holder_message",
+                                        return_value=sweep.FloorChannelOutcome.DELIVERED) as tell,
                       mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT) as summary):
                     self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB], recorded=True)[0], 0)
-                self.assertEqual(starts.call_args_list, [mock.call(46)])
-                tell.assert_not_called()
-                self.assertIn("the message to session hana-unit failed", cast(str, summary.call_args.args[0]))
+                self.assertEqual(starts.call_args_list, [mock.call(46, proc_root=proc), mock.call(46)])
+                message = cast(str, summary.call_args.args[0])
+                if after_scan == Started("123"):
+                    tell.assert_called_once()
+                    self.assertEqual(tell.call_args.args[0], "hana-unit")
+                    self.assertIn("session hana-unit was told", message)
+                else:
+                    tell.assert_not_called()
+                    self.assertIn("the message to session hana-unit failed", message)
 
     def test_free_space_rise_uses_rising_wording(self) -> None:
         now = time.time()
