@@ -1,4 +1,7 @@
 {
+  "aws_target": {
+    "accounting_zone": 8
+  },
   "build_admission": {
     "head_stall_alert_minutes": 2
   },

@@ -1162,7 +1162,17 @@ def complete_day_adjustment(complete_days: Sequence[CompleteDayAmount], interval
 
 
 def read_charge(path: Path) -> ChargeRead:
-    return charge_from_record(mapping(cast(object, json.loads(path.read_text()))))
+    row = mapping(cast(object, json.loads(path.read_text())))
+    reading = ChargeRead(text(row, 'day'), instant(row, 'at'), instant(row, 'period_start'),
+                         instant(row, 'period_end'), conf.decimal(text(row, 'actual_usd')),
+                         money(text(row, 'estimated_usd')), money(text(row, 'query_usd')),
+                         tuple(UsageTypeCost(text(item, 'usage_type'), conf.decimal(text(item, 'usd')),
+                                             conf.decimal(str(item.get('quantity', '0'))), str(item.get('unit', '')))
+                               for item in rows(row, 'usage_types')) if 'usage_types' in row else (),
+                         row.get('provisional', True) is True, row.get('excludes_credits') is True)
+    if reading.period_end <= reading.period_start or reading.period_end > reading.at:
+        raise LedgerUnavailable('invalid charge reconciliation')
+    return reading
 
 
 def unique_charge_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -1174,7 +1184,9 @@ def unique_charge_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return fields
 
 
-def charge_from_record(row: dict[str, object]) -> ChargeRead:
+def read_strict_charge(path: Path) -> ChargeRead:
+    record = cast(object, json.loads(path.read_text(), object_pairs_hook=unique_charge_fields))
+    row = mapping(record)
     reading = ChargeRead(text(row, 'day'), instant(row, 'at'), instant(row, 'period_start'),
                          instant(row, 'period_end'), conf.decimal(text(row, 'actual_usd')),
                          money(text(row, 'estimated_usd')), money(text(row, 'query_usd')),
@@ -1771,8 +1783,7 @@ class CostLedger:
         utc = ZoneInfo('UTC')
         for path in self.bill_paths():
             try:
-                record = cast(object, json.loads(path.read_text(), object_pairs_hook=unique_charge_fields))
-                reading = charge_from_record(mapping(record))
+                reading = read_strict_charge(path)
                 day = date.fromisoformat(reading.day)
                 start, end = period_bounds(day, utc)
             except (OSError, ValueError, ArithmeticError):
