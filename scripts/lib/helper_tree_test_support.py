@@ -19,6 +19,17 @@ COPY_HELPERS = (
     "scripts/build_hold", "scripts/build_queue", "scripts/build_targets", "scripts/test_times", "scripts/aws_target",
 )
 VERIFY_HELPERS = (*COPY_HELPERS, "scripts/whoami", "scripts/notify")
+VERIFY_TEST_ENVIRONMENT = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "TZ", "TMPDIR", "TERM",
+    # Keep the test runner's Python process settings in fixture subprocesses.
+    "PYTHON_CPU_COUNT", "PYTHONDONTWRITEBYTECODE",
+})
+
+
+def verify_test_environment() -> dict[str, str]:
+    """Read the caller settings that Verify fixtures can inherit."""
+    return {name: value for name, value in os.environ.items()
+            if name in VERIFY_TEST_ENVIRONMENT or name.startswith("LC_")}
 
 
 class CopyTime(NamedTuple):

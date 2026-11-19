@@ -15,6 +15,7 @@ import unittest
 from unittest import mock
 
 from scripts.lib.shell_test_support import shell_function
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.direct.tree_watch_test_support import TreeWatchFixture
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
@@ -30,12 +31,16 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
             super().setUpClass()
 
     def test_lint_trace_has_one_start_per_key_pair_and_no_unnamed_helper(self) -> None:
-        _ = self.enable_cache()
-        trace = self.root / "python-starts.tsv"
-        self.environment["VERIFY_PY_TRACE"] = str(trace)
-        self.environment["TEST_CLIPPY_STATUSES"] = "[101, 0]"
-        result = self.verify("lint", "sample")
-        self.assert_fix_and_judgment_calls()
+        self.assert_lint_start_count(self)
+        self.assert_ssh_helper_calls()
+
+    def assert_lint_start_count(self, fixture: VerifyLintCacheFixture) -> None:
+        _ = fixture.enable_cache()
+        trace = fixture.root / "python-starts.tsv"
+        fixture.environment["VERIFY_PY_TRACE"] = str(trace)
+        fixture.environment["TEST_CLIPPY_STATUSES"] = "[101, 0]"
+        result = fixture.verify("lint", "sample")
+        fixture.assert_fix_and_judgment_calls()
         rows = [line.split("\t") for line in trace.read_text().splitlines()]
         self.assertTrue(rows, result.stdout + result.stderr)
         for row in rows:
@@ -57,6 +62,8 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         # The per-run helper reads the dev features; no Python process of its own starts.
         in_helper = Counter(line.split("\t")[0] for line in Path(str(trace) + ".calls").read_text().splitlines())
         self.assertEqual((counts["dev_features.py"], in_helper["dev_features.py"]), (0, 1), rows)
+
+    def assert_ssh_helper_calls(self) -> None:
         for target, mode in (("unknown", "passed"), ("linux", "disk")):
             with self.subTest(target=target, mode=mode):
                 routing = VerifySshTargetsFixture()
@@ -81,6 +88,43 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
                         self.assertEqual(entries[program], 0, (target, program, entries, calls))
                 finally:
                     routing.doCleanups()
+
+    def test_caller_settings_leave_lint_starts_and_ssh_verification_unchanged(self) -> None:
+        caller = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        hook = caller / "startup.sh"
+        _ = hook.write_text(': > "${BASH_SOURCE[0]}.ran"\n')
+        variables = {
+            "COPIES_RUN_PID": str(os.getpid()),
+            "BUILDLOG_FIRST_STEP_REQUEST": str(caller / "request.json"),
+            "BUILDLOG_FIRST_STEP_ASSIGNMENT": str(caller / "assignment.json"),
+            "BUILDLOG_FIRST_STEP_PID": str(os.getpid()),
+            "BUILDLOG_FIRST_STEP_EPISODE": "caller-episode",
+            "BUILDLOG_FIRST_STEP_ROUTE": "caller-route",
+            "BUILDLOG_FIRST_STEP_SINCE": "123",
+            "VERIFY_HELPER_STARTED": "1",
+            "BASH_ENV": str(hook),
+            "GIT_INDEX_FILE": str(caller / "index"),
+        }
+        with mock.patch.dict(os.environ, variables):
+            with self.subTest(fixture="lint"):
+                lint = VerifyLintCacheFixture()
+                self.addCleanup(lint.doCleanups)
+                lint.setUp()
+                self.assert_lint_start_count(lint)
+                self.assertFalse(variables.keys() & lint.environment.keys())
+
+            with self.subTest(fixture="nested SSH"):
+                routing = VerifySshTargetsFixture()
+                self.addCleanup(routing.doCleanups)
+                routing.setUp()
+                routing.configure("linux,natedev")
+                result = routing.verify("test", "sample", "--target", "linux")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual([event["target"] for event in routing.ssh_events()], ["linux"])
+                self.assertEqual(routing.local_runs(), [])
+                self.assertFalse(variables.keys() & routing.environment.keys())
+        self.assertFalse(hook.with_suffix(".sh.ran").exists())
+        self.assertFalse((caller / "index").exists())
 
     def test_lint_code_key_tracks_inputs_and_clears_unreadable_keys_with_both_hash_tools(self) -> None:
         home = self.root / "key-home"
@@ -171,8 +215,7 @@ class VerifyOutputRootsTests(unittest.TestCase):
                 + 'set_gate_metadata || true\n'
                 + 'printf "failed:%s:%s\\n" "$GATE_METADATA" "$BUILDLOG_OUTPUT_ROOTS"\n')
             _ = (workspace / "metadata.json").write_text(metadata)
-            environment = {name: value for name, value in os.environ.items()
-                           if not name.startswith(("CARGO_", "BUILDLOG_"))}
+            environment = verify_test_environment()
             environment.update({"PY": sys.executable, "VERIFY_START_DIR": str(VERIFY.parent),
                                 "VERIFY_METADATA_SCRIPT": str(VERIFY.with_name("verify_metadata.py"))})
             result = subprocess.run(["bash", str(harness)], cwd=workspace, env=environment,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
 
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_provider_evidence
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
@@ -1188,24 +1188,8 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             ],
         }
         self.environment = {
+            **verify_test_environment(),
             **config_environment(self.root),
-            **{
-                name: value
-                for name, value in os.environ.items()
-                if name
-                not in {
-                    "CODEX_THREAD_ID",
-                    "CODEX_SESSION_ID",
-                    "BUILDLOG_MAC",
-                    "BUILDLOG_MAC_REASON",
-                    "BUILDLOG_LOCAL_REASON",
-                    "BUILDLOG_MAC_S",
-                    "BASH_ENV",
-                    "ENV",
-                }
-                # Fixture calls must not update the outer run or use its folders.
-                and not name.startswith(("BASH_FUNC_", "UNIT_"))
-            },
             "HOME": str(self.home),
             "PATH": stub_build_tool_path(self.bin_directory),
             "RUSTUP_HOME": str(self.root / "rustup"),
@@ -1266,7 +1250,6 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             _ = shutil.copy2(Path(private["CONF_DIR"]) / "build_folders.conf", configuration / "build_folders.conf")
         self.environment.update({key: value for key, value in private.items() if key not in ("HOME", "CONF_DIR")})
         seed_interpreter_cache(self.root / "cache")
-        _ = self.environment.pop("CLAUDE_PYTHON", None)
 
     def write_executable(self, path: Path, source: str) -> None:
         # Private tools may start as links; replacing one must never edit its target.
@@ -1285,7 +1268,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
 
         path = self.runner_state / f"direct-{target}-{verb}.assignment"
         settings = self.root / ("linux.conf" if target == "peer" else "mac settings.conf")
-        with mock.patch.dict(os.environ, self.environment):
+        with mock.patch.dict(os.environ, self.environment, clear=True):
             args = offload.parser().parse_args(["run", "--repo-root", str(self.root),
                 "--package", "sample", "--settings", str(settings), "--target", target,
                 "--verb", verb, "--kind", kind, "--call-id", f"fixture-{os.getpid()}-{target}-{verb}",

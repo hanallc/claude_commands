@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
 
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
@@ -10,7 +10,6 @@ from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lint.memory_test_support import config_environment, write_pressure_reading
 
 import json
-import os
 import subprocess
 import shutil
 import tempfile
@@ -174,11 +173,7 @@ esac
         pressure = self.root / "memory-pressure"
         write_pressure_reading(pressure)
         self.environment = {
-            **{
-                name: value for name, value in os.environ.items()
-                if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID", "CODEX_SESSION_ID"}
-                and not name.startswith("UNIT_DETACHED_")
-            },
+            **verify_test_environment(),
             "PATH": tool_path,
             "HOME": str(self.root),
             "RUSTUP_HOME": str(self.root / "rustup"),
@@ -315,7 +310,6 @@ class SeededExampleWorkspaceFixture(ExampleWorkspaceFixture):
         # The fixture supplies the entire toolchain and 64 GiB of free memory.
         # Host Nix discovery and Python version probing are separate contracts.
         cls.fixture_environment.update({"IN_NIX_SHELL": "pure"})
-        _ = cls.fixture_environment.pop("CLAUDE_PYTHON", None)
         seed_interpreter_cache(builder.root / "cache")
         _ = shutil.copytree(builder.root, cls.fixture_seed, symlinks=True)
         shutil.rmtree(builder.root)
