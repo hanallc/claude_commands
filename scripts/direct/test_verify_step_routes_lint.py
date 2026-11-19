@@ -1,7 +1,9 @@
 """Real verify step routing: lint."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import subprocess
 import unittest
 from typing import cast
 from unittest import mock
@@ -9,6 +11,8 @@ from unittest import mock
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture
+from scripts.lib.shell_test_support import shell_functions
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyStepRoutesTests(VerifyStepRoutesFixture):
@@ -65,6 +69,29 @@ lint_config_enabled() {
         local = [event["args"] for event in self.fixture.cargo_events()]
         self.assertTrue(any(args[:1] == ["mend"] and "--fix" in args for args in local), local)
         self.assert_removed()
+
+    def test_refused_internal_mac_pin_accepts_an_unset_caller_pin(self) -> None:
+        verify = Path(__file__).with_name("verify.sh")
+        script = shell_functions(verify, "placement_once") + r'''
+set -eu
+unset PINNED_TARGET
+HOLD_WAIT_DIR=$PWD DOC_REPO_TOP=$PWD
+BUILDLOG_MEM_ADMIT_SCRIPT=admission-client
+PKG=sample CMD=lint PLACEMENT_SOURCE_KEY=source PLACEMENT_SESSION=session
+PLACEMENT_EPISODE=lint-episode PLACEMENT_SINCE=123
+PLACEMENT_ASSIGNMENT_FILE=$PWD/assignment PLACEMENT_GRANT_FILE=$PWD/grant
+PLACEMENT_COMMAND=(cargo clippy)
+STEP_FORCE_MAC=1 LINT_MAC_FIX=1 LINT_LEFT_QUEUE_STATUS=79
+verify_helper() { printf 'refused\tThe fixture refused lint\n'; }
+placement_failed() { :; }
+status=0
+placement_once || status=$?
+[[ "$status" == "$LINT_LEFT_QUEUE_STATUS" ]]
+[[ "$LAST_TARGET_OUTCOME" == declined && "$LAST_TARGET_REASON" == 'The fixture refused lint' ]]
+'''
+        result = subprocess.run(["bash", "--noprofile", "--norc", "-c", script], cwd=self.fixture.root,
+                                env={"PATH": os.environ["PATH"]}, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_new_hold_during_formatting_keeps_noncompiling_work_protected(self) -> None:
         (Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "other").unlink()

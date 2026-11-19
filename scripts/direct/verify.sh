@@ -1279,7 +1279,7 @@ take_features() {
         usage
         exit 2
     fi
-    if [[ "$CMD" != test || "$PINNED_TARGET" != hana-gpu ]]; then
+    if [[ "$CMD" != test || "${PINNED_TARGET:-}" != hana-gpu ]]; then
         features="$(merge_dev_features "$features")"
     fi
     if [[ -n "$features" ]]; then
@@ -2891,7 +2891,7 @@ placement_once() {
         IFS=$'\t' read -r STEP_ASSIGNED_SETTINGS STEP_ASSIGNED_PLATFORM PLACEMENT_SESSION <<< "$metadata"
         return 0
     fi
-    [[ -z "$PINNED_TARGET" ]] || placement_args+=(--pinned-refusals)
+    [[ -z "${PINNED_TARGET:-}" ]] || placement_args+=(--pinned-refusals)
     # A builtin wait lets the parent handle TERM during a service outage.
     PLACEMENT_CLIENT_ACTIVE=1
     [[ $- != *m* ]] || monitor=1
@@ -2911,7 +2911,7 @@ placement_once() {
                 printf '%s\n' "${line#left }"
                 buildlog_memory_event left ;;
             refused$'\t'*)
-                if [[ -n "$PINNED_TARGET" ]]; then
+                if [[ -n "${PINNED_TARGET:-}" ]]; then
                     pinned_target_refuse "${line#*$'\t'}"
                 fi
                 if [[ "${LINT_MAC_FIX:-0}" == 1 ]]; then
