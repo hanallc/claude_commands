@@ -26,6 +26,26 @@ from scripts.lib import conf
 FIXTURE_GUEST_DIGEST = hana_render.GuestDigest('a' * 64)
 
 
+@contextmanager
+def fake_aws_calls(response: Callable[..., dict[str, object]]) -> Generator[None]:
+    """Keep the argument builder when the fixture supplies parsed replies."""
+    original_call = aws_cli.AwsCli.call
+
+    def call(api: aws_cli.AwsCli, operation: str, *arguments: str, service: str = 'ec2',
+             timeout_s: float | None = None) -> dict[str, object]:
+        def execute(arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float, check: bool,
+                    env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            _ = capture_output, text, timeout, check, env
+            reply = response(arguments[6], *arguments[7:-2], service=arguments[5], timeout_s=timeout_s)
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+        fixture_api = aws_cli.AwsCli(api.profile, api.region, api.timeout_s, execute)
+        return original_call(fixture_api, operation, *arguments, service=service, timeout_s=timeout_s)
+
+    with mock.patch.object(aws_cli.AwsCli, 'call', new=call):
+        yield
+
+
 @final
 class RootReplacementAws:
     def __init__(self, directory: Path, digest: hana_render.GuestDigest) -> None:
@@ -254,7 +274,10 @@ class HanaSetupTests(CostFixture):
         _ = hana_image.save(self.state, hana_image.RegisteredImage('nixos-hana-fixture', 'ami-fixture-reviewed',
             '000000000000', 'vpc-fixture', 'subnet-fixture', aws.digest))
 
-        def checks(_timeout: int, _interval: int) -> Generator[float]:
+        def checks(_timeout: int, _interval: int, *, check_at_deadline: bool = False) -> Generator[float]:
+            if check_at_deadline:
+                yield self.clock()
+                return
             for _ in range(12):
                 self.clock.advance(1)
                 yield self.clock()
@@ -262,7 +285,7 @@ class HanaSetupTests(CostFixture):
         api = aws_cli.AwsCli('fixture-admin', IDENTITY.region, 1, mock.Mock(side_effect=AssertionError))
         provider = mock.Mock()
         provider.api = api
-        with (mock.patch.object(api, 'call', side_effect=aws.call),
+        with (fake_aws_calls(aws.call),
               mock.patch.object(api, 'in_region', return_value=api),
               mock.patch.object(deploy, 'read_deployment_settings', return_value=self.base_settings()),
               mock.patch.object(subject, '_authorize'), mock.patch.object(subject, '_check_credentials'),
@@ -627,7 +650,7 @@ class HanaSetupTests(CostFixture):
 
     def test_root_replacement_preflight_refuses_without_a_mutation(self) -> None:
         for case, message in (
-                ('busy', 'must be stopped'), ('claim', 'lifecycle is busy'), ('registration', 'no verified image'),
+                ('busy', 'must be stopped'), ('claim', 'lifecycle is still busy'), ('registration', 'no verified image'),
                 ('boot', 'incompatible'), ('digest', 'did not confirm the registered Hana guest digest'),
                 ('volume', 'retained Hana data attachment'), ('identity', 'registration differs')):
             with self.subTest(case=case), self.root_replacement() as (subject, aws, output):
@@ -651,7 +674,10 @@ class HanaSetupTests(CostFixture):
                 _ = lifecycle.write_text(json.dumps(row))
                 with self.assertRaisesRegex(ValueError, message):
                     _ = subject.hana_setup(approve_resources=True)
-                self.assertEqual(output.getvalue(), '')
+                if case == 'claim':
+                    self.assertIn('waiting up to', output.getvalue())
+                else:
+                    self.assertEqual(output.getvalue(), '')
                 self.assertFalse(hana_replacement_record.held(self.state))
                 self.assertTrue(all(call.startswith('describe-') for call in aws.calls))
 
@@ -802,7 +828,7 @@ class HanaSetupTests(CostFixture):
         subject.pause = pause
         with mock.patch.object(deploy, 'read_deployment_settings', return_value=self.base_settings()), \
                 mock.patch.object(subject, '_authorize'), mock.patch.object(subject, '_validate_inputs') as validate, \
-                mock.patch.object(aws_cli.AwsCli, 'call', side_effect=api_call), \
+                fake_aws_calls(api_call), \
                 mock.patch.object(time, 'monotonic', self.clock), mock.patch('sys.stdout', new_callable=StringIO) as output:
             prepared = subject.prepare_hana()
             saved = remote.read_record(saved_path)
@@ -917,6 +943,29 @@ class HanaSetupTests(CostFixture):
         attachment = calls.index('attach-volume')
         probe = calls.index('export-credentials')
         self.assertEqual(calls[attachment + 1:probe], ['wait', 'describe-instances', 'describe-instances'])
+
+    def test_existing_data_attachment_only_waits_for_the_volume(self) -> None:
+        subject = self.subject(FakeAws(self.clock))
+        saved: dict[str, object] = {'instance': IDENTITY.instance, 'zone': 'us-east-2b', 'data_volume': 'vol-fixture'}
+        calls: list[tuple[str, tuple[str, ...]]] = []
+
+        def reply(operation: str, *arguments: str, service: str, timeout_s: float | None) -> dict[str, object]:
+            self.assertEqual(service, 'ec2')
+            calls.append((operation, arguments))
+            if operation == 'describe-volumes':
+                return {'Volumes': [{'VolumeId': 'vol-fixture', 'AvailabilityZone': 'us-east-2b',
+                                    'Attachments': [{'InstanceId': IDENTITY.instance, 'Device': '/dev/sdf',
+                                                     'State': 'attached'}]}]}
+            self.assertEqual(timeout_s, 30)
+            return {}
+
+        api = aws_cli.AwsCli('fixture-admin', IDENTITY.region, 10)
+        with fake_aws_calls(reply):
+            subject._attach_hana_data(api, self.state / 'hana/setup.json', saved, 1, 30, 1)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(calls, [
+            ('describe-volumes', ('--volume-ids', 'vol-fixture')),
+            ('wait', ('volume-in-use', '--volume-ids', 'vol-fixture')),
+        ])
 
     def test_setup_attaches_when_the_instance_stops_during_volume_creation(self) -> None:
         fake = FakeAws(self.clock, state='pending')
@@ -1111,7 +1160,8 @@ class HanaSetupTests(CostFixture):
             _ = hana_image.artifact_digest(result, execute, 1)
 
     def image_aws(self, existing: bool, *, registration_failure: bool = False,
-                  snapshot_states: tuple[str, ...] = ()) -> tuple[list[tuple[str, tuple[str, ...]]], object]:
+                  snapshot_states: tuple[str, ...] = ()
+                  ) -> tuple[list[tuple[str, tuple[str, ...]]], Callable[..., dict[str, object]]]:
         calls: list[tuple[str, tuple[str, ...]]] = []
         def api_call(operation: str, *arguments: str, service: str = 'ec2', timeout_s: float | None = None) -> dict[str, object]:
             _ = service, timeout_s
@@ -1188,8 +1238,7 @@ class HanaSetupTests(CostFixture):
                 mock.patch.object(subject, '_authorize', side_effect=authorize), mock.patch.object(subject, '_guard'), \
                 mock.patch.object(hana_image, 'artifact_digest', side_effect=read_digest), \
                 mock.patch.object(subject.admin, 'executor', side_effect=admin), \
-                mock.patch.object(aws_cli.AwsCli, 'call', side_effect=api_call), \
-                mock.patch('sys.stdout', new_callable=StringIO):
+                fake_aws_calls(api_call), mock.patch('sys.stdout', new_callable=StringIO):
             self.assertTrue(subject.hana_image(result, approve_resources=True))
         self.assertFalse((subject.output / 'hana/image.raw').exists())
         return calls, local, uploads

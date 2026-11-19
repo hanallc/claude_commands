@@ -242,8 +242,10 @@ class HanaSourceTests(unittest.TestCase):
         digest = hashlib.sha256(invalid_archive.getvalue()).hexdigest()
         self.objects.objects[digest] = invalid_archive.getvalue()
         invalid = replace(manifest, bundle_sha256=digest, bundle_url=self.objects.signed_get(digest))
-        with self.guest(), self.assertRaisesRegex(hana_protocol.SourceRefused, 'GitSourceRefused'), self.materialize(invalid):
+        with (self.guest(), self.assertRaisesRegex(hana_protocol.SourceRefused, 'GitSourceRefused') as refused,
+              self.materialize(invalid)):
             self.fail('invalid bundle was admitted')
+        self.assertIsInstance(refused.exception.__cause__, subprocess.CalledProcessError)
 
     def test_full_pool_uses_existing_admission_and_never_creates_an_overflow_slot(self) -> None:
         manifest = self.prepare()
@@ -401,8 +403,9 @@ class HanaSourceTests(unittest.TestCase):
         _ = copies.git(nested, 'init', '--quiet')
         _ = (nested / 'file').write_text('nested source\n')
         _ = commit_repository(nested, 'nested source')
-        with self.assertRaisesRegex(copies.PreparationError, 'NestedRepository: nested'):
+        with self.assertRaisesRegex(hana_protocol.SourceRefused, 'NestedRepository: nested') as refused:
             _ = self.prepare()
+        self.assertIsInstance(refused.exception.__cause__, copies.PreparationError)
         self.assertEqual(self.objects.uploads, [])
 
     def test_executable_mode_change_during_capture_refuses(self) -> None:
@@ -430,7 +433,7 @@ class HanaSourceTests(unittest.TestCase):
                 _ = (path / 'tracked').write_text('changed during capture\n')
             return tree
         with mock.patch.object(copies, 'staged_tree', side_effect=change_during_capture):
-            with self.assertRaisesRegex(copies.PreparationError, 'SourceChanged'):
+            with self.assertRaisesRegex(copies.SourceChangedDuringCapture, 'SourceChanged'):
                 _ = self.prepare()
         self.assertEqual(index.read_bytes(), before)
         self.assertEqual(self.objects.uploads, [])

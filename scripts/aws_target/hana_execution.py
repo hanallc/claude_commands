@@ -20,6 +20,9 @@ if TYPE_CHECKING:
     from scripts.build_queue import admission_protocol as wire
     from scripts.buildlog.sync import TransferBytes
 
+_MISSING_BASIS_PREFIX = 'MissingBasis: '
+
+
 @dataclass(frozen=True)
 class ExecutionPreparationRefused:
     reason: str
@@ -266,10 +269,11 @@ class NoMissingBasis:
 def missing_basis(observation: hana_protocol.HanaCommandObservation, request: hana_protocol.HanaExecutionRequest) -> hana_source.MissingBasis | NoMissingBasis:
     """Decode the guest diagnostic without accepting a different repository or basis."""
     evidence = observation.evidence
-    if not isinstance(evidence, execution_identity.ExecutionEvidenceUnavailable) or not evidence.reason.startswith('MissingBasis: '):
+    if (not isinstance(evidence, execution_identity.ExecutionEvidenceUnavailable)
+            or not evidence.reason.startswith(_MISSING_BASIS_PREFIX)):
         return NoMissingBasis()
     try:
-        diagnostic = hana_result.object_fields(cast(object, json.loads(evidence.reason.removeprefix('MissingBasis: '))))
+        diagnostic = hana_result.object_fields(cast(object, json.loads(evidence.reason.removeprefix(_MISSING_BASIS_PREFIX))))
         commits = diagnostic.get('commits')
         if diagnostic.get('repository') != request.manifest.repository or not isinstance(commits, list) or not commits:
             return NoMissingBasis()
@@ -645,7 +649,7 @@ def settle_execution(directory: Path, request: hana_protocol.HanaExecutionReques
                     evidence = execution_identity.ExecutionNotStarted()
                 elif guest_ended and isinstance(evidence, execution_identity.ExecutionEvidenceUnavailable):
                     cause = ' '.join(evidence.reason.splitlines())
-                    if cause == hana_protocol.COMMAND_RESULT_PENDING:
+                    if cause == hana_protocol.COMMAND_RESULT_PENDING or cause.startswith(_MISSING_BASIS_PREFIX):
                         cause = ' '.join(reason.splitlines())
                     outcome = {'kind': 'guest-ended', 'reason': cause}
                 else:

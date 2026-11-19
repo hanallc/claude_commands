@@ -195,6 +195,8 @@ def target_state(target: LocalTarget | SshTarget) -> TargetState:
                 return StateUnreadable(snapshot.reason)
             if isinstance(snapshot, hana_placement.HanaUnprovisioned):
                 return Unreachable('Hana is unprovisioned')
+            if isinstance(snapshot, hana_placement.HanaResourcesHeld):
+                return Unreachable('Hana is busy or recovering')
             if not controller.image_is_current(snapshot.deployment):
                 return Unreachable(hana_box.HANA_IMAGE_STALE)
             if snapshot.claims or snapshot.state not in (hana_box.Lifecycle.READY, hana_box.Lifecycle.IDLE_STOPPED):
@@ -751,6 +753,8 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
             return ExcludedTarget(target, 'unprovisioned')
         if isinstance(snapshot, hana_placement.HanaLifecycleUnavailable):
             return ExcludedTarget(target, 'state unreadable')
+        if isinstance(snapshot, hana_placement.HanaResourcesHeld):
+            return ExcludedTarget(target, 'busy')
         from scripts.aws_target import hana_box
         if not controller.image_is_current(snapshot.deployment):
             return ExcludedTarget(target, hana_box.HANA_IMAGE_STALE)

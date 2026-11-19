@@ -36,7 +36,7 @@ from scripts.message import codex_daemon
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.lib.agent_scope import agents_slice
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import session_folder
+from scripts.lib import operation_deadline, session_folder
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff, fake_unit_host
 from scripts.production.cli_fixture import process_boundary, process_boundary_for_case
@@ -5467,13 +5467,19 @@ class HerdrTests(unittest.TestCase):
                     self.assertEqual(self.herdr.agents(deadline=deadline), [])
                     self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), expected)
             program.reset_mock()
-            with self.assertRaisesRegex(herdr_types.HerdrFailure, "deadline passed"):
+            with self.assertRaisesRegex(herdr.HerdrLaunchRefused, "deadline passed"):
                 _ = self.herdr.read("pane-1", 40, joined=True, ansi=False, deadline=99.0)
             program.assert_not_called()
             _ = self.herdr.read("pane-1", 40, joined=False, ansi=False)
             self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), 10.0)
             self.assertEqual(self.herdr.agents(), [])
             self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), 10.0)
+
+    def test_run_program_refuses_launch_after_the_operation_deadline(self) -> None:
+        with (operation_deadline.within(0.0), patch.object(subprocess, "run") as launch,
+              self.assertRaisesRegex(herdr.HerdrLaunchRefused, "deadline passed")):
+            _ = herdr.run_program(["fixture", "agent", "prompt"])
+        launch.assert_not_called()
 
     def test_moved_pane_resolves_single_and_batched_process_places_from_retained_shell(self) -> None:
         server = self.process(10, 1, ["herdr", "server"], {})

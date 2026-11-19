@@ -280,6 +280,13 @@ class SpotEndTests(CostFixture):
         self.assertEqual(spot_end.end_boxes(self.api(fake), TAG), 1)
         self.assertEqual((fake.live_requests(), fake.live_boxes()), ([], []))
 
+    def test_end_boxes_finds_an_untagged_request_from_the_box(self) -> None:
+        fake = FakeEc2()
+        box = fake.launch(tagged=True)
+        fake.requests[fake.boxes[box].request].tags.clear()
+        self.assertEqual(spot_end.end_boxes(self.api(fake), TAG), 1)
+        self.assertEqual((fake.live_requests(), fake.live_boxes()), ([], []))
+
     def test_a_failed_cancel_terminates_nothing(self) -> None:
         fake = FakeEc2(fail='cancel-spot-instance-requests')
         _ = fake.launch(tagged=True)
@@ -304,7 +311,9 @@ class SpotEndTests(CostFixture):
 
     def change(self, fake: FakeEc2, keep: str = '') -> None:
         subject = self.subject(fake)
-        subject._hana_stack_change(self.api(fake), self.hana_settings(), self.root / 'template.json',  # pyright: ignore[reportPrivateUsage]
+        template = self.root / 'template.json'
+        _ = template.write_text('{"Resources":{}}')
+        subject._hana_stack_change(self.api(fake), self.hana_settings(), template,  # pyright: ignore[reportPrivateUsage]
                                    {'DeploymentId': TAG[1]}, keep=keep)
 
     def test_a_failed_create_leaves_no_request_box_disk_bucket_or_stack(self) -> None:

@@ -332,8 +332,8 @@ class AttemptEvidence:
 
 
 MacOffloadResult = (
-    PassedOnMac | FailedOnMac | PassedOnTarget | FailedOnTarget | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun | BusyMacDecline
-    | HanaCommandAdmissionRefused
+    PassedOnMac | FailedOnMac | PassedOnTarget | FailedOnTarget | NoTestMatchedOnMac | LostMacRun | DeclinedMacRun
+    | BusyMacDecline | HanaCommandAdmissionRefused
 )
 
 
@@ -1283,8 +1283,8 @@ def write_result(
         if isinstance(result, DeclinedMacRun) and result.reason == "disk":
             reason = "disk"
             description = f"disk: {result.detail}" if result.detail else reason
-        elif isinstance(result, DeclinedMacRun) and result.reason == "source_changed":
-            reason = "source_changed"
+        elif isinstance(result, DeclinedMacRun) and result.reason in ("source_changed", "runner"):
+            reason = result.reason
         if not decline_already_shown(result.reason, last_decline):
             print(f"mac_test: not running on the {label} ({description})")
     fetched = result.fetch if isinstance(result, (PassedOnMac, FailedOnMac, NoTestMatchedOnMac)) else FetchNotRun()
@@ -2852,32 +2852,30 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
             evidence.execution = refusal.evidence
         return refusal
 
-    def close_prelaunch(reason: str | execution_identity.HanaCommandAdmissionRefused) -> MacOffloadResult:
+    def close_prelaunch(reason: str, *, retain_until_released: bool = False) -> MacOffloadResult:
         staging.close()
-        reference = placement.ProviderClaimReference(assignment.destination.provider, assignment.destination.target,
-            assignment.destination.scope, execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
-            assignment.episode, assignment.attempt)
-        detail = reason if isinstance(reason, str) else reason.reason
-        refusal = execution_identity.HanaCommandAdmissionRefused(detail) if detail == placement.HANA_IMAGE_STALE else reason
-        closed = execution.settle_unpublished_claim(lifecycle.directory, reference,
-                                                     release_claim=release, reason=refusal)
-        if isinstance(closed, execution.HanaSettled):
+        reference = placement.assigned_claim_reference(assignment)
+        refusal = execution_identity.HanaCommandAdmissionRefused(' '.join(reason.splitlines()))
+        closed = execution.settle_unpublished_claim(lifecycle.directory, reference, release_claim=release, reason=refusal)
+        if isinstance(closed, execution.HanaAdmissionRefusalSettled):
             controller.hana_settlement = closed
             controller.pending = SettledDispatchOperations()
+            evidence.provider = reference
             evidence.execution = closed.evidence
             evidence.cleanup = 'confirmed'
             evidence.unresolved_count = 0
-            if isinstance(closed, execution.HanaAdmissionRefusalSettled):
-                evidence.provider = reference
-                return HanaCommandAdmissionRefused(closed.outcome.reason, elapsed_seconds(started))
+            return HanaCommandAdmissionRefused(closed.outcome.reason, elapsed_seconds(started))
+        if retain_until_released:
+            pending = execution.read_claim_admission_refusal(lifecycle.directory, reference, require_release=False)
+            if pending is not None:
+                controller.pending = PendingHanaOperation(pending.outcome)
+                evidence.execution = pending.evidence
+                return HanaCommandAdmissionRefused(pending.outcome.reason, elapsed_seconds(started))
         else:
             confirmed = remember_refusal(reference)
             if confirmed is not None:
                 return HanaCommandAdmissionRefused(confirmed.outcome.reason, elapsed_seconds(started))
-            if execution.execution_command_settled(lifecycle.directory, reference.claim_id):
-                controller.pending = PendingHanaOperation(placement.PrelaunchRefused(detail))
-                evidence.execution = execution_identity.ExecutionNotStarted()
-        return DeclinedMacRun('state', elapsed_seconds(started), detail)
+        return DeclinedMacRun('state', elapsed_seconds(started), refusal.reason)
 
     claim = hana.claim_assigned(assignment, holder, lifecycle, worktree=str(request.repo_root))
     while isinstance(claim, hana.HanaClaimPending) and time.time() < claim.deadline:
@@ -2887,7 +2885,12 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
         claim = hana.claim_assigned(assignment, holder, lifecycle, worktree=str(request.repo_root))
     if isinstance(claim, (hana.HanaClaimPending, hana.HanaClaimRetained)):
         evidence.provider = claim.reference
-        return close_prelaunch('The Hana startup wait ended before command dispatch')
+        return close_prelaunch('The Hana startup wait ended before command dispatch', retain_until_released=True)
+    if isinstance(claim, hana.HanaClaimResourcesHeld):
+        controller.pending = SettledDispatchOperations()
+        controller.hana_settlement = execution.HanaAdmissionRefusalSettled(
+            execution_identity.HanaCommandAdmissionRefused(box.HANA_CLAIM_BUSY), execution_identity.ExecutionNotStarted())
+        return HanaCommandAdmissionRefused(box.HANA_CLAIM_BUSY, elapsed_seconds(started))
     if isinstance(claim, hana.HanaClaimRefused):
         return close_prelaunch(claim.reason)
     evidence.provider = claim.reserved.claim.reference
@@ -2907,22 +2910,16 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
             hana_result.LogicalStepLink(request.call_id, assignment.episode),
             current_source_key=lambda: hana_source_key(request), environment=dict(request.environment),
             staging=staging, features=tuple(dict.fromkeys(features)))
-    except (OSError, ValueError, RuntimeError, SyntaxError, TypeError, KeyError, subprocess.SubprocessError, copies.CopyError) as error:
-        reason = ' '.join(str(error).splitlines())
-        return close_prelaunch(execution_identity.HanaCommandAdmissionRefused(
-            f'The Hana payload could not be prepared: {reason}'))
-    if isinstance(prepared, execution_identity.HanaCommandAdmissionRefused):
-        return close_prelaunch(prepared)
-    if isinstance(prepared, execution.ExecutionPreparationRefused):
-        staging.close()
-        closed = execution.settle_unpublished_claim(lifecycle.directory, claim.reserved.claim.reference,
-                                                     release_claim=release, reason=prepared.reason)
-        if isinstance(closed, execution.HanaSettled):
-            controller.hana_settlement = closed
-            controller.pending = SettledDispatchOperations()
-            evidence.cleanup = 'confirmed'
-            evidence.unresolved_count = 0
-        return DeclinedMacRun('source_changed', elapsed_seconds(started), prepared.reason)
+    except copies.SourceChangedDuringCapture as error:
+        return close_prelaunch(str(error))
+    except (OSError, ValueError, RuntimeError, SyntaxError, TypeError, KeyError, subprocess.SubprocessError,
+            copies.CopyError) as error:
+        label = ('The Hana source capture failed'
+                 if isinstance(error, subprocess.SubprocessError) or isinstance(error.__cause__, subprocess.SubprocessError)
+                 else 'The Hana payload could not be prepared')
+        return close_prelaunch(f'{label}: {error}')
+    if isinstance(prepared, (execution_identity.HanaCommandAdmissionRefused, execution.ExecutionPreparationRefused)):
+        return close_prelaunch(prepared.reason)
     prepared, upload_source = prepared
 
     admission_refusal: execution_identity.HanaCommandAdmissionRefused | hana_protocol.NoCommandAdmissionRefusal = (
@@ -2931,11 +2928,14 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
     def permission() -> box.CommandPermission | box.ClaimRefused:
         nonlocal admission_refusal
         snapshot = lifecycle.inspect()
-        if not isinstance(snapshot, hana.HanaLifecycleEvidence) or not isinstance(snapshot.permit, box.DeliveredPermit):
-            return box.ClaimRefused('The Hana acknowledged permit is unavailable')
-        result = lifecycle.permission(prepared.key.claim_id, prepared.key.generation.boot_id, snapshot.permit.generation)
-        if isinstance(result, box.ClaimRefused) and result.reason == placement.HANA_IMAGE_STALE:
-            admission_refusal = execution_identity.HanaCommandAdmissionRefused(result.reason)
+        if isinstance(snapshot, box.HanaResourcesHeld):
+            result = box.ClaimRefused(box.HANA_CLAIM_BUSY)
+        elif not isinstance(snapshot, hana.HanaLifecycleEvidence) or not isinstance(snapshot.permit, box.DeliveredPermit):
+            result = box.ClaimRefused('The Hana acknowledged permit is unavailable')
+        else:
+            result = lifecycle.permission(prepared.key.claim_id, prepared.key.generation.boot_id, snapshot.permit.generation)
+        if isinstance(result, box.ClaimRefused):
+            admission_refusal = execution_identity.HanaCommandAdmissionRefused(' '.join(result.reason.splitlines()))
         return result
 
     cancelled = False
@@ -2959,8 +2959,7 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
         short_window_reason = 'HanaResultDownloadWindowExpired: The Hana boot control deadline is unavailable'
     if (time.monotonic() + 2 * control_timeout + settlement_seconds >= deadline
             and not execution.execution_path(lifecycle.directory, prepared.key.claim_id).exists()):
-        _ = close_prelaunch(short_window_reason)
-        return LostMacRun(elapsed_seconds(started), short_window_reason)
+        return close_prelaunch(short_window_reason)
     unpublished_refusal = False
     try:
         try:
@@ -2972,10 +2971,15 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
         if isinstance(state, execution_identity.HanaCommandAdmissionRefused):
             if not execution.execution_path(lifecycle.directory, prepared.key.claim_id).exists():
                 unpublished_refusal = True
-                return close_prelaunch(state)
+                return close_prelaunch(state.reason)
             admission_refusal = state
         else:
             evidence.execution = state.evidence
+        if (isinstance(state, execution.DispatchSent)
+                and isinstance(admission_refusal, hana_protocol.NoCommandAdmissionRefusal)
+                and not execution.dispatch_publication_attempted(lifecycle.directory, prepared)):
+            admission_refusal = execution_identity.HanaCommandAdmissionRefused(
+                'The Hana command was not authorized for publication')
         if isinstance(state, execution.DispatchSettled):
             accepted = execution.replay_accepted_result(lifecycle.directory, prepared, transport.host,
                                                         lambda: hana_source_key(request))
@@ -3024,10 +3028,14 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
                             if not execution.publish_source_update(lifecycle.directory, prepared, complete, objects,
                                                                   upload_source=upload):
                                 raise hana_protocol.SourceRefused('The Hana source update was not published')
-                    except (OSError, ValueError, RuntimeError, TypeError, KeyError, subprocess.SubprocessError, copies.CopyError) as error:
+                    except (OSError, ValueError, RuntimeError, TypeError, KeyError, subprocess.SubprocessError,
+                            copies.CopyError) as error:
+                        label = ('The Hana source update publication is unresolved'
+                                 if isinstance(error, subprocess.SubprocessError)
+                                 or isinstance(error.__cause__, subprocess.SubprocessError)
+                                 else 'The Hana full-payload repair failed')
                         cause = ' '.join(str(error).splitlines())
-                        admission_refusal = execution_identity.HanaCommandAdmissionRefused(
-                            f'The Hana full-payload repair failed: {cause}')
+                        admission_refusal = execution_identity.HanaCommandAdmissionRefused(f'{label}: {cause}')
                         break
                     time.sleep(control_poll)
                     continue
@@ -3455,16 +3463,18 @@ def report_placement_result(controller: ProcessController, request: OffloadReque
             reason = result.reason if isinstance(result, (DeclinedMacRun, BusyMacDecline)) else "cleanup completed"
             _ = admission_client.claim_failure(wire.ClaimFailure(uuid.uuid4().hex, assigned, reason, provider))
         return
+    if not isinstance(controller.hana_settlement, NoHanaSettlement):
+        settled = controller.hana_settlement
+        reference = (placement.assigned_claim_reference(assigned) if isinstance(provider, placement.NoProviderClaim)
+                     else provider)
+        _ = admission_client.report_execution(wire.ExecutionReport(uuid.uuid4().hex, assigned, reference,
+            settled.evidence, settled.outcome, placement.DispatchPathSettled()))
+        return
     if isinstance(provider, placement.NoProviderClaim):
         reason = result.reason if isinstance(result, (DeclinedMacRun, BusyMacDecline)) else "claim unavailable"
         refusal_settings = result.refusal_settings if isinstance(result, DeclinedMacRun) else admission_records.NoRefusalSettings()
         _ = admission_client.claim_failure(wire.ClaimFailure(uuid.uuid4().hex, assigned, reason,
             refusal_settings=refusal_settings))
-        return
-    if not isinstance(controller.hana_settlement, NoHanaSettlement):
-        settled = controller.hana_settlement
-        _ = admission_client.report_execution(wire.ExecutionReport(uuid.uuid4().hex, assigned, provider,
-            settled.evidence, settled.outcome, placement.DispatchPathSettled()))
         return
     if isinstance(controller.pending, PendingHanaOperation):
         _ = admission_client.report_execution(wire.ExecutionReport(uuid.uuid4().hex, assigned, provider,

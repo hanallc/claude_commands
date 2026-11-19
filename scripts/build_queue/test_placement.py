@@ -398,6 +398,16 @@ class CargoFolderTests(unittest.TestCase):
             assigned, = fixture.connect(older_line).replies()
             assert isinstance(assigned, wire.Assignment)
             self.assertEqual(assigned.assignment.destination, remote.constraints.candidates[0].destination)
+            self.assertEqual(set(fixture.caller_reservations()), set())
+
+            claim = adopt_assignment(fixture, older, assigned.assignment)
+            authorized, = fixture.connect(consume_permission("remote-authorized", assigned.assignment, claim)).replies()
+            self.assertIsInstance(authorized, wire.FirstAuthorization)
+            execution = execution_identity.ProcessExecution(assigned.assignment.destination.host, "host-generation-a", 700001, "start")
+            _ = fixture.connect(wire.ExecutionReport("remote-started", assigned.assignment, claim,
+                execution_identity.ObservedExecution(execution), placement.AttemptRunning())).replies()
+            fixture.allow_next_start()
+            _ = fixture.run_pass()
             self.assertEqual(set(fixture.caller_reservations()), {later.episode})
 
     def test_a_symlink_and_its_target_share_the_local_folder(self) -> None:
@@ -485,7 +495,7 @@ class CargoFolderTests(unittest.TestCase):
                 assert isinstance(reply, wire.Assignment)
                 self.assertEqual(reply.assignment.destination, remote.constraints.candidates[0].destination)
                 self.assertEqual(set(fixture.caller_reservations()), {local.episode})
-                self.assertEqual(fixture.queue_pids(), [older.owner.pid])
+                self.assertEqual(fixture.queue_pids(), [older.owner.pid, mixed.owner.pid])
 
     def test_relative_folder_is_refused_and_an_older_request_still_runs(self) -> None:
         with PlacementFixture() as fixture:
@@ -765,6 +775,217 @@ class PlacementTests(unittest.TestCase):
                 "token-reconfirmed", request.episode, request.owner, placement.TokenHeld())).replies()
             self.assertIsInstance(fixture.connect(request).replies()[-1], wire.LocalPlacementGranted)
             self.assertEqual(set(fixture.server.reservations), {request.episode})
+
+    def test_a_head_keeps_its_local_place_while_a_mac_start_is_pending(self) -> None:
+        hold_seconds = 600
+        for ending in ("busy before authorization", "busy after authorization", "busy with stale local evidence",
+                       "busy after estimate expiry", "confirmed", "time limit", "time limit with slot", "caller death"):
+            with self.subTest(ending=ending), PlacementFixture() as fixture:
+                refresh_seconds = 5 if ending == "busy after estimate expiry" else hold_seconds + 60
+                fixture.configure(estimate_refresh_seconds=refresh_seconds, remote_start_hold_seconds=hold_seconds)
+                head = placement_request(fixture, since=fixture.clock.now() - 60)
+                slot_key = ""
+                if ending == "time limit with slot":
+                    run = fixture.run_owner()
+                    slot_key = fixture.finish_step(fixture.request(run=run, need=16 * GIB)).reservation
+                    head = replace(head, run=run)
+                    fixture.free(11 * GIB)
+                if ending == "busy after estimate expiry":
+                    assert isinstance(head.profile, records.StepProfile)
+                    head = replace(head, profile=replace(head.profile,
+                        estimated_at=fixture.clock.now() - refresh_seconds + 1))
+                head = replace(head, constraints=replace(head.constraints,
+                    candidates=(*head.constraints.candidates, local_candidate(fixture))))
+                local_only = replace(head, constraints=replace(head.constraints, candidates=(local_candidate(fixture),)))
+                stale_local = ending in ("busy with stale local evidence", "busy after estimate expiry")
+                if stale_local:
+                    fixture.server.background_local_evidence = True
+                    _ = publish_candidate(fixture, local_only)
+                _ = publish_candidate(fixture, head)
+                remote = assignment_for(fixture, head)
+                self.assertEqual(remote.destination.provider, "mac")
+                if slot_key:
+                    self.assertIsInstance(fixture.server.slots[slot_key], records.ContinuationSlot)
+
+                later = replace(local_cargo_request(fixture), route=LOCAL_CALLER)
+                if stale_local:
+                    fixture.clock.advance(records.read_memory_config().waiting_pass_seconds + 1)
+                    _ = publish_candidate(fixture, later)
+                    key = fixture.server.host_evidence_key(local_only, local_only.constraints.candidates[0].destination)
+                    self.assertIsInstance(fixture.server.host_evidence(key), placement.StaleHostEvidence)
+
+                reply, = fixture.connect(later).replies()
+                self.assertIsInstance(reply, wire.PlacementWait)
+                self.assertEqual(fixture.caller_reservations(), {})
+                self.assertEqual(fixture.queue_pids(), [head.owner.pid, later.owner.pid])
+
+                claim = adopt_assignment(fixture, head, remote)
+                if ending in ("busy after authorization", "busy after estimate expiry", "confirmed",
+                               "time limit", "time limit with slot"):
+                    authorized, = fixture.connect(consume_permission("mac-authorized", remote, claim)).replies()
+                    self.assertIsInstance(authorized, wire.FirstAuthorization)
+                    if ending == "busy after estimate expiry":
+                        fixture.clock.advance(1)
+                    _ = fixture.run_pass()
+                    self.assertEqual(fixture.caller_reservations(), {})
+
+                if ending.startswith("busy"):
+                    if not stale_local:
+                        _ = publish_candidate(fixture, local_only)
+                    _ = publish_candidate(fixture, head, placement.TemporaryExclusion("busy"))
+                    before_authorization = ending in ("busy before authorization", "busy with stale local evidence")
+                    refusal = (wire.ClaimFailure("mac-busy", remote, "busy") if before_authorization
+                        else wire.ExecutionReport("mac-busy", remote, claim, execution_identity.ExecutionNotStarted(),
+                            placement.PrelaunchRefused("busy"), placement.DispatchPathSettled()))
+                    refused, = fixture.connect(refusal).replies()
+                    assert isinstance(refused, wire.DispatchStatus)
+                    self.assertEqual(refused.state, placement.ClosedAssignment("busy"))
+
+                    if stale_local:
+                        _ = publish_candidate(fixture, later)
+                        waiting, = fixture.connect(later).replies()
+                        self.assertIsInstance(waiting, wire.PlacementWait)
+                        self.assertEqual(fixture.caller_reservations(), {})
+                        self.assertEqual(fixture.queue_pids(), [head.owner.pid, later.owner.pid])
+                        _ = publish_candidate(fixture, local_only)
+                    if ending == "busy after estimate expiry":
+                        waiting, = fixture.connect(head).replies()
+                        assert isinstance(waiting, wire.PlacementWait) and isinstance(waiting.wait, wire.Wait)
+                        reason = waiting.wait.reason
+                        cause = reason.cause if isinstance(reason, records.HeadAdmissionStatus) else reason
+                        self.assertIsInstance(cause, records.EstimateExpired)
+                        self.assertEqual((waiting.position, waiting.since), (1, head.since))
+                        self.assertEqual(fixture.queue_pids(), [head.owner.pid, later.owner.pid])
+                        self.assertEqual(fixture.caller_reservations(), {})
+                        assert isinstance(head.profile, records.StepProfile)
+                        assert isinstance(head.run, wire.RunIdentity)
+                        estimate = replace(fixture.request(owner=wire.Owner(head.owner.pid, head.owner.start_time),
+                            episode=head.episode, since=head.since, run=head.run), profile=head.profile)
+                        fresh = replace(estimate, profile=replace(head.profile, estimated_at=fixture.clock.now()))
+                        path = fixture.root / "assignment.json"
+                        args = ["place-step", "--once", "--pid", str(head.owner.pid), "--episode", head.episode,
+                                "--since", str(head.since), "--run", f"{head.run.pid}:{head.run.start_time}",
+                                "--assignment-file", str(path), "--", *head.constraints.command]
+                        with (fixture.serving(), mock.patch.object(client, "CLOCK", fixture.clock),
+                              mock.patch.object(client, "step_request", side_effect=(estimate, fresh)) as estimate_step,
+                              mock.patch("scripts.build_targets.build_targets.fixed_placement_constraints",
+                                         return_value=head.constraints),
+                              redirect_stderr(io.StringIO()) as errors, redirect_stdout(io.StringIO())):
+                            self.assertEqual(client.main(args), 0, errors.getvalue())
+                        self.assertEqual(estimate_step.call_count, 2)
+                        local = client.read_assignment(path)
+                    else:
+                        local, = fixture.connect(head).replies()
+                    assert isinstance(local, wire.LocalPlacementGranted)
+                    self.assertEqual(local.assignment.since, head.since)
+                    self.assertEqual(set(fixture.caller_reservations()), {head.episode})
+                    continue
+
+                if ending == "confirmed":
+                    execution = execution_identity.ProcessExecution(remote.destination.host, "host-generation-a", 700001, "start")
+                    key = fixture.server.host_evidence_key(head, remote.destination)
+                    evidence = fixture.provider_evidence[key]
+                    assert isinstance(evidence, placement.FreshHostEvidence)
+                    confirmed = replace(evidence, executions=((claim, execution_identity.ObservedExecution(execution)),))
+                    fixture.provider_evidence[key] = confirmed
+                    fixture.server.publish_host_evidence(confirmed)
+                elif ending in ("time limit", "time limit with slot"):
+                    fixture.clock.advance(hold_seconds - 1)
+                    if ending == "time limit":
+                        fixture.restart()
+                    _ = fixture.run_pass()
+                    self.assertEqual(fixture.caller_reservations(), {})
+                    if slot_key:
+                        self.assertIsInstance(fixture.server.slots[slot_key], records.ContinuationSlot)
+                    fixture.clock.advance(1)
+                else:
+                    fixture.end_owner(wire.Owner(head.owner.pid, head.owner.start_time))
+                _ = fixture.run_pass()
+                if slot_key:
+                    self.assertNotIn(slot_key, fixture.server.slots)
+                self.assertEqual(set(fixture.caller_reservations()), {later.episode})
+                self.assertNotIn(head.owner.pid, fixture.queue_pids())
+
+    def test_ending_a_remote_start_releases_only_the_heads_claim(self) -> None:
+        hold_seconds = 600
+        deadline_cases = ("deadline with a newer slot", "deadline with no initial claim")
+        for ending in (*deadline_cases, "lost local eligibility", "missing assignment"):
+            with self.subTest(ending=ending), PlacementFixture() as fixture:
+                fixture.configure(remote_start_hold_seconds=hold_seconds)
+                run = fixture.run_owner()
+                head = replace(placement_request(fixture, since=fixture.clock.now() - 60), run=run)
+                head = replace(head, constraints=replace(head.constraints,
+                    candidates=(*head.constraints.candidates, local_candidate(fixture))))
+                later = (only_admitted(fixture.server.handle_request(fixture.request(run=run)))
+                         if ending in deadline_cases else None)
+                slot_key = ("" if ending == "deadline with no initial claim"
+                            else fixture.finish_step(fixture.request(run=run)).reservation)
+                _ = publish_candidate(fixture, head)
+                remote = assignment_for(fixture, head)
+                self.assertEqual(remote.destination.provider, "mac")
+                self.assertIn(head.episode, fixture.server.waiters)
+                claimed = fixture.server.slots.get(slot_key)
+                if slot_key:
+                    self.assertIsInstance(claimed, records.ContinuationSlot)
+                else:
+                    self.assertEqual(fixture.server.slots, {})
+
+                if later is not None:
+                    fixture.clock.advance(hold_seconds - 1)
+                    fixture.release(later)
+                    later_slot = fixture.server.slots[later.reservation]
+                    if slot_key:
+                        self.assertIsInstance(later_slot, records.BetweenStepsSlot)
+                        self.assertIs(fixture.server.slots[slot_key], claimed)
+                    else:
+                        later_slot = gate.between_steps(later_slot)
+                        _ = fixture.run_pass()
+                    fixture.clock.advance(1)
+                    _ = fixture.run_pass()
+                    self.assertEqual(fixture.server.slots.get(later.reservation), later_slot)
+                elif ending == "lost local eligibility":
+                    retry = replace(head, local=wire.LocalAdmissionUnavailable("no local estimate"))
+                    reply, = fixture.connect(retry).replies()
+                    self.assertIsInstance(reply, wire.Assignment)
+                else:
+                    key = execution_identity.attempt_key(remote.episode, remote.attempt)
+                    del fixture.server.assignments[key]
+                    _ = fixture.run_pass()
+
+                self.assertNotIn(head.episode, fixture.server.waiters)
+                if slot_key:
+                    self.assertNotIn(slot_key, fixture.server.slots)
+
+    def test_a_pending_mac_start_keeps_its_place_without_overriding_a_local_hold(self) -> None:
+        with PlacementFixture() as fixture:
+            head = placement_request(fixture, since=fixture.clock.now() - 60)
+            local = replace(head, constraints=replace(head.constraints, candidates=(local_candidate(fixture),)))
+            _ = publish_candidate(fixture, local, placement.TemporaryExclusion("blocked"))
+            _ = publish_candidate(fixture, head)
+            head = replace(head, constraints=replace(head.constraints,
+                candidates=(*head.constraints.candidates, local_candidate(fixture))))
+            _ = assignment_for(fixture, head)
+
+            later = replace(local_cargo_request(fixture), route=LOCAL_CALLER)
+            granted, = fixture.connect(later).replies()
+            self.assertIsInstance(granted, wire.LocalPlacementGranted)
+            self.assertEqual(set(fixture.caller_reservations()), {later.episode})
+
+            _ = publish_candidate(fixture, local)
+            _ = fixture.run_pass()
+            self.assertEqual(fixture.queue_pids(), [head.owner.pid])
+
+    def test_a_pending_mac_only_start_does_not_hold_natedev(self) -> None:
+        with PlacementFixture() as fixture:
+            head = placement_request(fixture, since=fixture.clock.now() - 60)
+            _ = publish_candidate(fixture, head)
+            _ = assignment_for(fixture, head)
+
+            later = replace(local_cargo_request(fixture), route=LOCAL_CALLER)
+            granted, = fixture.connect(later).replies()
+            self.assertIsInstance(granted, wire.LocalPlacementGranted)
+            self.assertEqual(set(fixture.caller_reservations()), {later.episode})
+            self.assertNotIn(head.owner.pid, fixture.queue_pids())
 
     def test_remote_refusal_gets_one_local_reservation_for_the_replacement(self) -> None:
         cases = ((offload.DeclinedMacRun("disk", 0), True, False),
@@ -1631,7 +1852,8 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             _ = settings.write_text(good.replace("enabled=on", "enabled=broken"))
             warnings = io.StringIO()
 
-            def preview(spending: hana_spend.HanaSpending, now: int, expires: int) -> hana_spend.StartAffordable:
+            def preview(spending: hana_spend.HanaSpending[hana_spend.StartPermitSettings],
+                        now: int, expires: int) -> hana_spend.StartAffordable:
                 self.assertTrue(spending.settings.enabled)
                 self.assertEqual(expires - now, spending.settings.permit_max_seconds)
                 return hana_spend.StartAffordable(expires)
@@ -1795,7 +2017,8 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             good = settings.read_text()
             self.commit_settings(settings)
 
-            def preview(spending: hana_spend.HanaSpending, _now: int, expires: int) -> hana_spend.StartAffordable:
+            def preview(spending: hana_spend.HanaSpending[hana_spend.StartPermitSettings],
+                        _now: int, expires: int) -> hana_spend.StartAffordable:
                 self.assertEqual(spending.settings.daily_budget_usd, Decimal(6))
                 return hana_spend.StartAffordable(expires)
 

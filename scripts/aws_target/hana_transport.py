@@ -197,7 +197,10 @@ class SourceSender:
                 staging: ExitStack, features: tuple[str, ...] = ()) -> tuple[hana_protocol.SourceManifest, Callable[[], None]]:
         """Stage the exact source archive until the sender validates the command."""
         check_inputs(source, self.configuration)
-        commit = copies.capture_source(source)
+        try:
+            commit = copies.capture_source(source)
+        except copies.NestedRepository as error:
+            raise hana_protocol.SourceRefused(os.fsencode(str(error)).decode('utf-8', 'backslashreplace')) from error
         check_inputs(source, self.configuration)
         # Use the common Git directory so linked worktrees share acknowledgement history.
         common = copies.git(source, 'rev-parse', '--path-format=absolute', '--git-common-dir').decode().strip()
@@ -256,11 +259,9 @@ class SourceSender:
                 with bundle.open('wb') as output:
                     _ = output.write(header.encode())
                     output.flush()
-                    result = subprocess.run(['git', '-C', str(temporary), 'pack-objects', '--stdout'],
+                    _ = subprocess.run(['git', '-C', str(temporary), 'pack-objects', '--stdout'],
                         input=new_objects.encode(), stdout=output, stderr=subprocess.PIPE, timeout=self.limits.git_timeout_s,
-                        pass_fds=(build_folders.build_folder_lock_fd(temporary),))
-                if result.returncode:
-                    raise hana_protocol.SourceRefused('SourceBundleRefused: Git could not pack the snapshot delta')
+                        pass_fds=(build_folders.build_folder_lock_fd(temporary),), check=True)
             else:
                 _ = hana_source.git(temporary, self.limits, 'bundle', 'create', str(bundle), 'refs/heads/hana-source')
             payload = temporary / 'payload.tar'

@@ -15,7 +15,6 @@ from scripts.build_queue import snapshot_codec as codec
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_targets import target_config
-from scripts.build_targets.execution_transport import HanaControlTransport
 
 if TYPE_CHECKING:
     from scripts.build_queue import admission_records as records
@@ -456,6 +455,7 @@ def placement_configuration_digest(target_name: str, settings: placement.Provide
                                    transport_for: Callable[[target_config.SshTarget], ExecutionTransport],
                                    read_bytes: Callable[[Path], bytes]) -> str:
     """Hash the configuration for placement or an adapter refusal."""
+    from scripts.build_targets.execution_transport import HanaControlTransport
     from scripts.lib import conf
 
     paths = {conf.path("build_targets"), conf.path("build_admission"), conf.path("mac_test")}

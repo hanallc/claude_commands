@@ -18,6 +18,7 @@ from pathlib import Path
 from scripts.build_queue import execution_identity
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import placement
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
@@ -25,7 +26,7 @@ from scripts.build_targets import target_config
 from scripts.build_targets.target_config import LocalRequired, StepRoute
 from scripts.buildlog import parse
 from scripts.lib import conf
-from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
+from scripts.lib.proc_text import read_proc_text
 from scripts.production.staff import StaffId
 from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as NoCallRecord,
                                    TestPhaseChargeUse as TestPhaseChargeUse)
@@ -68,6 +69,23 @@ class NoRefusalSettings:
 
 
 @dataclass(frozen=True)
+class RemoteStartHoldUnrecorded:
+    """The assignment has no recorded hold for a remote start."""
+
+
+@dataclass(frozen=True)
+class RemoteStartHold:
+    """Keep the local place until this deadline while a remote start is pending."""
+
+    deadline: float
+
+
+@dataclass(frozen=True)
+class RemoteStartHoldEnded:
+    """The remote assignment no longer keeps a place on natedev."""
+
+
+@dataclass(frozen=True)
 class SavedPlacementAssignment:
     """The saved assignment holds its settings generation and dispatch state."""
     assignment: placement.PlacementAssignment
@@ -80,6 +98,7 @@ class SavedPlacementAssignment:
     assigned_settings_generation: placement.AssignedSettingsGeneration | placement.UnknownAssignedSettingsGeneration = (
         placement.UnknownAssignedSettingsGeneration())
     refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
+    remote_start_hold: RemoteStartHold | RemoteStartHoldUnrecorded | RemoteStartHoldEnded = RemoteStartHoldUnrecorded()
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125
@@ -1236,6 +1255,8 @@ class QueueInputs:
     slots: tuple[RunSlot, ...] = field(default=(), kw_only=True)
     cargo_folders: dict[str, placement.CargoFolder] = field(default_factory=dict, kw_only=True)
     occupied_cargo_folders: frozenset[placement.CargoFolder] = field(default=frozenset(), kw_only=True)
+    pending_remote_starts: frozenset[str] = field(default=frozenset(), kw_only=True)
+    local_waits: dict[str, placement.EvidenceNeeded] = field(default_factory=dict, kw_only=True)
 
     def __post_init__(self) -> None:
         orders = {waiter_owner(row): (waiter_priority(row) if isinstance(row.get("order"), (PriorityUnit, NormalOrder))
@@ -1495,7 +1516,7 @@ test_threads = parse.test_threads
 
 def process_start_time(pid: int) -> str | None:
     try:
-        stat = (Path("/proc") / str(pid) / "stat").read_text()
+        stat = read_proc_text(Path("/proc") / str(pid) / "stat")
         fields = stat.rsplit(") ", 1)[1].split()
         return fields[19] if fields[0] not in ("Z", "X") else None
     except (OSError, IndexError):

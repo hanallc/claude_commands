@@ -1,4 +1,4 @@
-"""Test the environment reader that the scope walk uses on each service pass."""
+"""Test process text reads for the scope walk."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -6,7 +6,7 @@ import tempfile
 from typing import override
 import unittest
 
-from scripts.build_queue.scope_activity import SCOPE_KEYS, environment_values
+from scripts.build_queue.scope_activity import SCOPE_KEYS, ScopeActivityReader, environment_values
 
 
 class EnvironmentValuesTests(unittest.TestCase):
@@ -37,6 +37,17 @@ class EnvironmentValuesTests(unittest.TestCase):
 
     def test_an_unreadable_environment_has_no_values(self) -> None:
         self.assertEqual(environment_values(self.environ, SCOPE_KEYS), {})
+
+
+class ScopeCommandTests(unittest.TestCase):
+    def test_invalid_utf8_keeps_the_command_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            proc = Path(temporary)
+            directory = proc / "123"
+            directory.mkdir()
+            _ = (directory / "cmdline").write_bytes(b"verify\0bad\xffname\0check\0")
+
+            self.assertEqual(ScopeActivityReader({}, proc).command(123), ("verify", "bad\ufffdname", "check"))
 
 
 if __name__ == "__main__":

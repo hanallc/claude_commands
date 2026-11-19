@@ -11,7 +11,7 @@ import base64
 from configparser import ConfigParser
 from io import StringIO
 from collections.abc import Callable, Generator, Iterable, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal, ROUND_CEILING
@@ -33,25 +33,26 @@ from typing import ClassVar, cast, final
 from uuid import uuid4
 
 
-from scripts.aws_target import admin_secrets, box, hana_box, hana_image, hana_replacement, hana_replacement_record, hana_spend, ledger, plan_identity, plan_run, remote, retained, spot_end, teardown
+from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, hana_command_lock
+from scripts.aws_target import admin_secrets, aws_test_identity, box, hana_box, hana_image, hana_replacement, hana_replacement_record, hana_spend, ledger, plan_identity, plan_run, remote, retained, spot_end, teardown
 from scripts.aws_target.aws_cli import aws_error_code
-from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock, execute_command, fetch_account_charges, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
+from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, execute_command, fetch_account_charges, fetch_spot_prices, spot_quota, largest_gate_vcpus as largest_gate_vcpus, snapshot as read_price_snapshot
 from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.aws_target.config import BudgetNotificationAddress, DeploymentSettings, money, read_budget_notification_address, deployment_record, gate_deployment, gate_regions, read_deployment_settings, read_settings
-from scripts.aws_target.terminal_table import aligned_table
-from scripts.lib import conf, file_lock, user_zone
+from scripts.lib import conf
 from scripts.build_targets import target_config
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
+from scripts.lib.file_lock import LockResult
 
 TEMPLATE = Path(__file__).resolve().parents[2] / 'docs/plans/builds-aws/cloudformation.json'
 HANA_TEMPLATE = TEMPLATE.with_name('hana-cloudformation.json')
-CLOSED_QUOTA_REQUEST_STATUSES = frozenset(('APPROVED', 'DENIED', 'CASE_CLOSED', 'NOT_APPROVED', 'INVALID_REQUEST'))
+QUOTA_PLAN_AUTH_FAILURES = frozenset(('InvalidClientTokenId', 'UnrecognizedClientException',
+                                      'AuthFailure', 'SignatureDoesNotMatch'))
 PROBE_DENIED_CODES = frozenset(('AccessDenied', 'AccessDeniedException', 'UnauthorizedOperation',
                                'Client.UnauthorizedOperation', 'Forbidden', '401', '403'))
 HANA_SETUP_VERSION = 2
 HANA_DATA_DEVICE = '/dev/sdf'
 HANA_DOWN_FIRST = 'Run deploy.py down --workload hana --approve-destroy first.'
-HANA_BUSY = 'The Hana lifecycle is busy. Run hana-setup again when the box is idle.'
 HANA_SPOT_REFUSALS = frozenset(('InsufficientInstanceCapacity', 'SpotMaxPriceTooLow', 'Unsupported',
                                'MaxSpotInstanceCountExceeded'))
 HANA_CREATE_REFUSALS = frozenset((
@@ -185,6 +186,40 @@ def step(command: str, text: str, settings: Path, *, hint: str = '') -> Generato
 
 class DeploymentRefused(ValueError):
     """Current evidence does not permit a resource request."""
+
+
+class HanaControlRefused(DeploymentRefused):
+    """Another command holds exclusive control of Hana."""
+
+    def __init__(self, command: str) -> None:
+        super().__init__(f'{command}: Another command is using the Hana resources. '
+                         + 'Run the same command again when that command ends.')
+
+
+class HanaSetupTimingRefused(DeploymentRefused):
+    """The settings do not give Hana enough time to stop."""
+
+
+@dataclass(frozen=True)
+class HanaSetupTiming:
+    idle_wait_s: int
+    heartbeat_s: int
+    stop_wait_s: int
+    stop_poll_s: int
+
+    @classmethod
+    def read(cls, workload: conf.ConfigRead) -> HanaSetupTiming:
+        idle_wait = workload.whole('setup_idle_wait_timeout_s')
+        heartbeat = workload.whole('setup_idle_heartbeat_s')
+        warm_idle = workload.whole('idle_stop_seconds')
+        stop_wait = workload.whole('stop_wait_timeout_s')
+        stop_poll = workload.whole('stop_poll_seconds')
+        if min(idle_wait, heartbeat, warm_idle, stop_wait, stop_poll) <= 0:
+            raise HanaSetupTimingRefused('Hana setup requires positive idle and stop intervals.')
+        if idle_wait <= warm_idle + stop_wait:
+            raise HanaSetupTimingRefused(
+                'setup_idle_wait_timeout_s must exceed idle_stop_seconds plus stop_wait_timeout_s.')
+        return cls(idle_wait, heartbeat, stop_wait, stop_poll)
 
 
 class HanaCreateRolledBack(AwsUnavailable):
@@ -367,11 +402,51 @@ def quota_timestamp(value: object) -> float:
     return moment.timestamp()
 
 
-def quota_date(value: object) -> str:
-    """Format AWS timestamps in the user's zone."""
-    if value is None:
-        return '-'
-    return datetime.fromtimestamp(quota_timestamp(value), UTC).astimezone(user_zone.user_zone()).strftime('%Y-%m-%d %H:%M:%S %Z')
+def _quota_request_age(created: float, now: float) -> str:
+    """Show the age in the largest whole unit."""
+    if not math.isfinite(created):
+        return 'age unknown'
+    elapsed = max(0, int(now - created))
+    for unit, seconds in (('d', 86400), ('h', 3600), ('m', 60)):
+        if elapsed >= seconds:
+            return f'{elapsed // seconds}{unit} old'
+    return f'{elapsed}s old'
+
+
+class _KnownQuotaRequestStatus(StrEnum):
+    PENDING = 'PENDING'
+    CASE_OPENED = 'CASE_OPENED'
+    IN_PROGRESS = 'IN_PROGRESS'
+    APPROVED = 'APPROVED'
+    DENIED = 'DENIED'
+    CASE_CLOSED = 'CASE_CLOSED'
+    NOT_APPROVED = 'NOT_APPROVED'
+    INVALID_REQUEST = 'INVALID_REQUEST'
+
+
+CLOSED_QUOTA_REQUEST_STATUSES: frozenset[str] = frozenset((
+    _KnownQuotaRequestStatus.APPROVED, _KnownQuotaRequestStatus.DENIED, _KnownQuotaRequestStatus.CASE_CLOSED,
+    _KnownQuotaRequestStatus.NOT_APPROVED, _KnownQuotaRequestStatus.INVALID_REQUEST,
+))
+
+
+@dataclass(frozen=True)
+class _UnknownQuotaRequestStatus:
+    value: str
+
+
+def _quota_request_status(value: str) -> _KnownQuotaRequestStatus | _UnknownQuotaRequestStatus:
+    try:
+        return _KnownQuotaRequestStatus(value)
+    except ValueError:
+        return _UnknownQuotaRequestStatus(value)
+
+
+@dataclass(frozen=True)
+class _QuotaRequest:
+    created_at: float
+    requested_vcpus: Decimal
+    status: _KnownQuotaRequestStatus | _UnknownQuotaRequestStatus
 
 
 def request_spot_quota(api: AwsCli, code: str, desired: int, label: str) -> bool:
@@ -491,6 +566,28 @@ def _print_hana_placement(workload: conf.ConfigRead) -> None:
         raise ValueError('enabled must be on or off')
     state = 'enabled' if enabled == 'on' else 'disabled'
     print(f'Hana placement is {state}. This command does not change it.')
+
+
+def _hana_lifecycle_idle(registration: dict[str, object]) -> bool:
+    operation = registration.get('operation', {})
+    observing = (isinstance(operation, dict)
+                 and cast(dict[str, object], operation).get('action') == hana_box.Action.OBSERVE)
+    return (registration.get('state') == hana_box.Lifecycle.IDLE_STOPPED and registration.get('claims') == []
+            and registration.get('start', {}) is None and (operation is None or observing))
+
+
+def _hana_wait_status(registration: dict[str, object], lock_busy: bool) -> str:
+    state = registration.get('state')
+    holder = 'unknown'
+    claims = registration.get('claims')
+    if claims == []:
+        holder = 'none'
+    elif isinstance(claims, list) and claims:
+        claim = cast(list[object], claims)[0]
+        if isinstance(claim, dict):
+            holder = 'local process' if isinstance(cast(dict[str, object], claim).get('owner'), dict) else 'unrecorded'
+    status = f'state {state if state in tuple(hana_box.Lifecycle) else "unavailable"}, claim holder {holder}'
+    return status + (', controller lock busy' if lock_busy else '')
 
 
 def deployment_parameters(path: Path, settings: DeploymentSettings,
@@ -689,7 +786,7 @@ class Deployment:
     def prepare_hana(self) -> PreparedDeployment:
         """Save local preparation without accessing AWS or changing placement."""
         admin_secrets.refuse_plain_admin(self.settings_path)
-        with control_lock(self.directory):
+        with self._require_hana_control('prepare --workload hana'):
             self._refuse_hana_replacement()
             settings, parameters, template = self._hana_inputs()
             decision = self._guard()
@@ -714,19 +811,17 @@ class Deployment:
         if not approve_resources and isinstance(self.mode, plan_run.ApprovedSetup):
             self._print_hana_setup(workload, limits)
             return False
-        stop_timeout = workload.whole('stop_wait_timeout_s')
-        stop_interval = workload.whole('stop_poll_seconds')
-        if min(stop_timeout, stop_interval) <= 0:
-            raise DeploymentRefused('Hana setup requires positive values for stop_wait_timeout_s and stop_poll_seconds.')
         if isinstance(self.mode, plan_run.PlanRun):
-            return self._hana_root_replacement(workload, limits)
+            return self._plan_hana_replacement(workload, limits)
+        timing = HanaSetupTiming.read(workload)
         self._authorize(True)
-        if self._hana_root_replacement(workload, limits):
-            return True
-        self._print_hana_setup(workload, limits)
-        child = self._hana_output()
-        with self._hana_setup_lock():
+        stop_timeout, stop_interval = timing.stop_wait_s, timing.stop_poll_s
+        with self._hana_setup_lock(timing):
+            if self._hana_root_replacement(workload, limits):
+                return True
             self._refuse_hana_replacement()
+            self._print_hana_setup(workload, limits)
+            child = self._hana_output()
             path = self.directory / 'hana' / 'setup.json'
             saved = remote.read_record(path) if path.exists() else {}
             ownership = _hana_setup_ownership(saved)
@@ -917,25 +1012,83 @@ class Deployment:
                 spending.reconcile(int(self.clock()), 'stopped', generation=ledger.instant(saved, 'generation'))
                 del saved['stop_pending']
                 _save_hana_setup(path, saved)
-        provider = self._hana_provider()
-        identity = hana_box.DeploymentIdentity(parameters['DeploymentId'], instance, request, settings.region)
-        hana_box.HanaController(self.directory, self.settings_path, conf.path('hana_aws'), provider,
-            clock=self.clock).register(identity)
-        print('Hana setup complete. The box is stopped.')
-        _print_hana_placement(workload)
-        return self._probe_hana_scaler(provider, identity)
+            provider = self._hana_provider()
+            identity = hana_box.DeploymentIdentity(parameters['DeploymentId'], instance, request, settings.region)
+            hana_box.HanaController(self.directory, self.settings_path, conf.path('hana_aws'), provider,
+                clock=self.clock).register(identity)
+            print('Hana setup complete. The box is stopped.')
+            _print_hana_placement(workload)
+            return self._probe_hana_scaler(provider, identity)
 
     @contextmanager
-    def _hana_setup_lock(self, *, wait: bool = True) -> Generator[None]:
-        path = self.directory / 'controller.lock'
-        if wait:
-            self.directory.mkdir(parents=True, exist_ok=True)
-        elif not path.is_file():
-            raise DeploymentRefused('The Hana controller lock is missing. Review the saved deployment.')
-        with file_lock.exclusive(path, wait=wait) as result:
-            if result is file_lock.LockResult.BUSY:
-                raise DeploymentRefused(HANA_BUSY)
+    def _require_account_stack(self, command: str) -> Generator[None]:
+        with account_stack_lock(self.directory) as access:
+            if access is LockResult.BUSY:
+                raise DeploymentRefused(f'{command}: Another command is using the AWS account stack. '
+                                        + 'Run the same command again when that command ends.')
             yield
+
+    @contextmanager
+    def _require_hana_control(self, command: str) -> Generator[None]:
+        with hana_command_lock(self.directory) as access:
+            if access is not HanaCommandAccess.ACQUIRED:
+                raise HanaControlRefused(command)
+            yield
+
+    @contextmanager
+    def _hana_setup_lock(self, timing: HanaSetupTiming) -> Generator[None]:
+        lifecycle = self.directory / 'hana' / 'lifecycle.json'
+        status = 'state unavailable, claim holder unknown'
+        waiting = False
+
+        def is_idle() -> bool:
+            nonlocal status
+            if hana_replacement_record.held(self.directory):
+                return True
+            try:
+                registration = remote.read_record(lifecycle)
+            except FileNotFoundError:
+                return True
+            status = _hana_wait_status(registration, False)
+            return _hana_lifecycle_idle(registration)
+
+        timeout = timing.idle_wait_s
+        for started in self._hana_check_times(timeout, timing.heartbeat_s, check_at_deadline=True):
+            with hana_command_lock(self.directory, ready=is_idle, wait_for_controller=False) as access:
+                if access is HanaCommandAccess.ACQUIRED:
+                    if waiting:
+                        print('hana-setup: Hana is idle-stopped. Setup holds the box.', flush=True)
+                    yield
+                    return
+                if access is HanaCommandAccess.RESOURCES_HELD:
+                    raise HanaControlRefused('hana-setup')
+                if access is HanaCommandAccess.CONTROLLER_BUSY:
+                    try:
+                        registration = remote.read_record(lifecycle)
+                    except FileNotFoundError:
+                        registration = {}
+                    status = _hana_wait_status(registration, True)
+            if not waiting:
+                print(f'hana-setup: waiting up to {timeout} s for Hana to become idle ({status}).', flush=True)
+                waiting = True
+            else:
+                elapsed = int(time.monotonic() - started)
+                print(f'hana-setup: still waiting for Hana ({status}, {elapsed} s of {timeout} s).', flush=True)
+        raise DeploymentRefused(f'The Hana lifecycle is still busy after {timeout} s ({status}). '
+                                + 'Run hana-setup again when the box is idle.')
+
+    def _plan_hana_replacement(self, workload: conf.ConfigRead, limits: hana_spend.PermitSettings) -> bool:
+        with hana_command_lock(self.directory, wait_for_controller=False, existing_controller=True) as access:
+            if access is HanaCommandAccess.RESOURCES_HELD:
+                raise HanaControlRefused('hana-setup --plan')
+            if access is HanaCommandAccess.CONTROLLER_BUSY:
+                raise DeploymentRefused('The Hana controller holds the lock. '
+                                        + 'Run the same command again when the controller releases it.')
+            if access is HanaCommandAccess.CONTROLLER_MISSING:
+                if not (self.directory / 'hana' / 'setup.json').is_file():
+                    raise plan_run.PlanRefused('Hana has no saved setup. Run deploy.py prepare --workload hana.')
+                raise DeploymentRefused('The Hana controller lock is missing. Review the saved deployment.')
+            return self._hana_root_replacement(workload, limits)
 
     def _refuse_hana_replacement(self) -> None:
         if hana_replacement_record.held(self.directory):
@@ -959,79 +1112,75 @@ class Deployment:
                 raise plan_run.PlanRefused('Hana has no saved setup. Run deploy.py prepare --workload hana.')
             return False
         try:
-            with ExitStack() as hold:
-                with self._hana_setup_lock(wait=isinstance(plan, plan_run.ApprovedSetup)):
-                    attempt = hana_replacement_record.read(self.directory)
-                    saved = remote.read_record(path)
-                    has_instance = bool(saved.get('instance'))
-                    pending = _hana_setup_pending(saved)
-                    if not has_instance or (pending and isinstance(plan, plan_run.ApprovedSetup)):
-                        if isinstance(plan, plan_run.PlanRun):
-                            raise plan_run.unsupported('Hana setup has pending instance or volume work')
-                        if isinstance(attempt, hana_replacement_record.NoReplacement):
-                            return False
-                        raise DeploymentRefused('The saved Hana setup changed during replacement.')
-                    if isinstance(plan, plan_run.PlanRun):
+            attempt = hana_replacement_record.read(self.directory)
+            saved = remote.read_record(path)
+            has_instance = bool(saved.get('instance'))
+            pending = _hana_setup_pending(saved)
+            if not has_instance or (pending and isinstance(plan, plan_run.ApprovedSetup)):
+                if isinstance(plan, plan_run.PlanRun):
+                    raise plan_run.unsupported('Hana setup has pending instance or volume work')
+                if isinstance(attempt, hana_replacement_record.NoReplacement):
+                    return False
+                raise DeploymentRefused('The saved Hana setup changed during replacement.')
+            if isinstance(plan, plan_run.PlanRun):
+                self._print_hana_image_status(saved, workload)
+            registered = self._require_current_hana_registration(workload)
+            if pending:
+                raise plan_run.unsupported('Hana setup has pending instance or volume work')
+            if isinstance(attempt, hana_replacement_record.ReplacementAttempt) and (
+                    attempt.image != registered.image or attempt.guest_digest != registered.digest.value):
+                raise DeploymentRefused('The Hana replacement inputs differ. Restore the approved registration.')
+            ownership = _hana_setup_ownership(saved)
+            box = hana_replacement.BoxIdentity.read(saved)
+            identity = hana_box.DeploymentIdentity(box.deployment, box.instance, box.spot_request, box.region)
+            account = read_deployment_settings(self.settings_path)
+            stack = workload.text('stack_name')
+            if stack == account.stack_name or saved.get('stack') != stack or box.region != limits.region:
+                raise DeploymentRefused('The Hana stack or region differs. Review the saved deployment.')
+            timeout = workload.whole('aws_timeout_s')
+            settings = replace(account, stack_name=stack, region=box.region, timeout_s=timeout)
+            api = self._api(settings)
+            if isinstance(plan, plan_run.PlanRun):
+                self._check_credentials()
+                plan.confirm_account(limits.region, timeout)
+            if isinstance(attempt, hana_replacement_record.NoReplacement):
+                self._require_idle_hana_lifecycle(path, identity)
+            root = hana_replacement.RootReplacement(self.directory, api, box)
+            preflight = root.preflight(registered, saved, limits.root_gib, attempt)
+            if isinstance(attempt, hana_replacement_record.NoReplacement):
+                if preflight.current:
+                    if isinstance(plan, plan_run.ApprovedSetup):
+                        if saved.get('image') != registered.image or saved.get('guest_digest') != registered.digest.value:
+                            _save_hana_setup_image(path, saved, registered)
                         self._print_hana_image_status(saved, workload)
-                    registered = self._require_current_hana_registration(workload)
-                    if pending:
-                        raise plan_run.unsupported('Hana setup has pending instance or volume work')
-                    if isinstance(attempt, hana_replacement_record.ReplacementAttempt) and (
-                            attempt.image != registered.image or attempt.guest_digest != registered.digest.value):
-                        raise DeploymentRefused('The Hana replacement inputs differ. Restore the approved registration.')
-                    ownership = _hana_setup_ownership(saved)
-                    box = hana_replacement.BoxIdentity.read(saved)
-                    identity = hana_box.DeploymentIdentity(box.deployment, box.instance, box.spot_request, box.region)
-                    account = read_deployment_settings(self.settings_path)
-                    stack = workload.text('stack_name')
-                    if stack == account.stack_name or saved.get('stack') != stack or box.region != limits.region:
-                        raise DeploymentRefused('The Hana stack or region differs. Review the saved deployment.')
-                    timeout = workload.whole('aws_timeout_s')
-                    settings = replace(account, stack_name=stack, region=box.region, timeout_s=timeout)
-                    api = self._api(settings)
-                    if isinstance(attempt, hana_replacement_record.NoReplacement):
-                        self._require_idle_hana_lifecycle(path, identity)
-                    if isinstance(plan, plan_run.PlanRun):
-                        self._check_credentials()
-                        plan.confirm_account(limits.region, timeout)
-                    else:
-                        _ = hold.enter_context(hana_replacement.resource_hold(self.directory))
-                    root = hana_replacement.RootReplacement(self.directory, api, box)
-                    preflight = root.preflight(registered, saved, limits.root_gib, attempt)
-                    if isinstance(attempt, hana_replacement_record.NoReplacement):
-                        if preflight.current:
-                            if isinstance(plan, plan_run.ApprovedSetup):
-                                if saved.get('image') != registered.image or saved.get('guest_digest') != registered.digest.value:
-                                    _save_hana_setup_image(path, saved, registered)
-                                self._print_hana_image_status(saved, workload)
-                            return True
-                        view = self._hana_policy_stack(api, settings, saved, ownership)
-                        policy = hana_replacement.scaler_policy(
-                            self._hana_scaler_policy(), identity.instance, registered.image, preflight.image.snapshot)
-                        if isinstance(plan, plan_run.PlanRun):
-                            self._preview_hana_policy(api, view, policy, self._hana_provider(), identity)
-                        else:
-                            _ = self._install_hana_policy(api, view, policy)
-                            attempt = hana_replacement.new_attempt(self.directory, registered, preflight)
-                    if isinstance(plan, plan_run.PlanRun):
-                        hana_replacement.print_plan(attempt)
-                        return True
-
-                def publish(proof: hana_replacement_record.ReplacementAttempt, stopped: bool) -> None:
-                    current = remote.read_record(path)
-                    if hana_replacement.BoxIdentity.read(current) != box:
-                        raise DeploymentRefused('The Hana setup changed during replacement. ' + hana_replacement.RESUME)
-                    _save_hana_setup_image(path, current, registered)
-                    hana_box.record_replacement_stop(path.with_name('lifecycle.json'), proof.generation,
-                                                     int(self.clock()), stopped=stopped)
-
-                assert isinstance(attempt, hana_replacement_record.ReplacementAttempt)
-                spending = hana_spend.HanaSpending(ledger.CostLedger(self.directory), self.settings_path, limits)
-                run_timeout = min(workload.whole('stop_wait_timeout_s'), limits.permit_max_seconds)
-                checks = self._hana_check_times(run_timeout, workload.whole('stop_poll_seconds'))
-                root = hana_replacement.RootReplacement(self.directory, self._hana_provider().api.in_region(box.region), box)
-                root.apply(attempt, spending, self.clock, run_timeout, checks, publish)
+                    return True
+                view = self._hana_policy_stack(api, settings, saved, ownership)
+                policy = hana_replacement.scaler_policy(
+                    self._hana_scaler_policy(), identity.instance, registered.image, preflight.image.snapshot)
+                if isinstance(plan, plan_run.PlanRun):
+                    self._preview_hana_policy(api, view, policy, self._hana_provider(), identity)
+                else:
+                    _ = self._install_hana_policy(api, view, policy)
+                    attempt = hana_replacement.new_attempt(self.directory, registered, preflight)
+            if isinstance(plan, plan_run.PlanRun):
+                hana_replacement.print_plan(attempt)
                 return True
+
+            def publish(proof: hana_replacement_record.ReplacementAttempt, stopped: bool) -> None:
+                current = remote.read_record(path)
+                if hana_replacement.BoxIdentity.read(current) != box:
+                    raise DeploymentRefused('The Hana setup changed during replacement. ' + hana_replacement.RESUME)
+                _save_hana_setup_image(path, current, registered)
+                hana_box.record_replacement_stop(path.with_name('lifecycle.json'), proof.generation,
+                                                 int(self.clock()), stopped=stopped)
+
+            assert isinstance(attempt, hana_replacement_record.ReplacementAttempt)
+            spending = hana_spend.HanaSpending(ledger.CostLedger(self.directory), self.settings_path, limits)
+            run_timeout = min(workload.whole('stop_wait_timeout_s'), limits.permit_max_seconds)
+            checks = self._hana_check_times(run_timeout, workload.whole('stop_poll_seconds'))
+            root = hana_replacement.RootReplacement(self.directory, self._hana_provider().api.in_region(box.region), box)
+            root.apply(attempt, spending, self.clock, run_timeout, checks, publish)
+            return True
         except (hana_image.ImageRefused, hana_replacement.ReplacementRefused, plan_run.PlanRefused,
                 plan_identity.PlanIdentityRefused, DeploymentRefused):
             raise
@@ -1273,8 +1422,8 @@ class Deployment:
                 + '3. Run deploy.py hana-setup --approve-resources')
         raise DeploymentRefused(f'AWS lists no Spot prices for Hana instance types in the eligible subnets of {api.region}.')
 
-    def _reserve_hana_setup(self, spending: hana_spend.HanaSpending, saved: dict[str, object],
-                            generation: int) -> ledger.HanaComputeExposure:
+    def _reserve_hana_setup(self, spending: hana_spend.HanaSpending[hana_spend.PermitSettings],
+                            saved: dict[str, object], generation: int) -> ledger.HanaComputeExposure:
         now = int(self.clock())
         for row in spending.book.read_snapshot().hana_compute:
             if row.generation == generation and isinstance(row.state, ledger.HanaExposureOpen):
@@ -1291,8 +1440,8 @@ class Deployment:
         return reservation.exposure
 
     def _launch_hana_instance(self, api: AwsCli, path: Path, saved: dict[str, object],
-                              candidates: tuple[HanaSpotCandidate, ...], spending: hana_spend.HanaSpending,
-                              deadline: int) -> None:
+                              candidates: tuple[HanaSpotCandidate, ...],
+                              spending: hana_spend.HanaSpending[hana_spend.PermitSettings], deadline: int) -> None:
         if 'pending_launch' in saved:
             pending = PendingHanaLaunch.decode(saved['pending_launch'])
             first = next((candidate for candidate in candidates if pending.matches(candidate)), None)
@@ -1345,7 +1494,7 @@ class Deployment:
         raise DeploymentRefused('No Hana Spot candidate launched. The stack is ready for another setup run.\n'
                                 + '\n'.join(failures))
 
-    def _hana_check_times(self, timeout: int, interval: int) -> Generator[float]:
+    def _hana_check_times(self, timeout: int, interval: int, *, check_at_deadline: bool = False) -> Generator[float]:
         started = time.monotonic()
         deadline = started + timeout
         while time.monotonic() < deadline:
@@ -1353,6 +1502,8 @@ class Deployment:
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 self.pause(min(interval, remaining))
+        if check_at_deadline:
+            yield started
 
     def _attach_hana_data(self, api: AwsCli, path: Path, saved: dict[str, object],
                           size: int, timeout: int, interval: int) -> None:
@@ -1414,7 +1565,8 @@ class Deployment:
                 return row.at
         raise DeploymentRefused('The saved Hana setup has no reservation time.')
 
-    def _clear_hana_setup(self, spending: hana_spend.HanaSpending, path: Path, saved: dict[str, object]) -> None:
+    def _clear_hana_setup(self, spending: hana_spend.HanaSpending[hana_spend.PermitSettings],
+                          path: Path, saved: dict[str, object]) -> None:
         generation = ledger.instant(saved, 'generation')
         now = int(self.clock())
         spending.reconcile(now, 'terminated', generation=generation)
@@ -1439,15 +1591,15 @@ class Deployment:
                            timeout_s=workload.whole('aws_timeout_s'))
         zone = workload.text('availability_zone')
         upload_timeout = workload.whole('image_upload_timeout_s')
-        digest = hana_image.artifact_digest(built.store, self.execute, upload_timeout)
-        description = 'Hana guest digest ' + digest.value
         wait_interval = max(workload.whole('image_wait_interval_s'),
                             (upload_timeout + hana_image.COLDSNAP_MAX_WAIT_ATTEMPTS - 1)
                             // hana_image.COLDSNAP_MAX_WAIT_ATTEMPTS)
         wait_attempts = upload_timeout // wait_interval
-        api = self._api(settings)
-        with control_lock(self.directory):
+        with self._require_hana_control('hana-image'):
             self._refuse_hana_replacement()
+            digest = hana_image.artifact_digest(built.store, self.execute, upload_timeout)
+            description = 'Hana guest digest ' + digest.value
+            api = self._api(settings)
             _ = self._guard()
             subnets = [row for row in gate_subnets(api, settings.vpc_id) if row['zone'] == zone]
             if not subnets:
@@ -1715,7 +1867,7 @@ class Deployment:
             return True
         self._check_credentials()
         path = self.directory / 'hana' / 'setup.json'
-        with control_lock(self.directory):
+        with self._require_hana_control('hana-down'):
             self._refuse_hana_replacement()
             if not path.exists():
                 print('down --workload hana: no Hana deployment is saved')
@@ -1955,7 +2107,7 @@ class Deployment:
 
     def prepare(self) -> PreparedDeployment:
         admin_secrets.refuse_plain_admin(self.settings_path)
-        with control_lock(self.directory):
+        with self._require_hana_control('prepare'):
             settings = read_deployment_settings(self.settings_path)
             now = int(self.clock())
             notification = read_budget_notification_address(self.settings_path)
@@ -2202,7 +2354,7 @@ class Deployment:
 
     def apply(self, *, approve_resources: bool = False) -> dict[str, str]:
         self._authorize(approve_resources)
-        with control_lock(self.directory):
+        with self._require_account_stack('apply'), self._require_hana_control('apply'):
             settings, parameters = self._load(read_budget_notification_address(self.settings_path))
             stack = self._stack(settings)
             previous_path = self.directory / 'deployment.json'
@@ -2318,8 +2470,8 @@ class Deployment:
             return True
         self._check_credentials()
         settings = read_deployment_settings(self.settings_path)
-        api = self._api(settings)
-        with control_lock(self.directory / 'gate-up'):
+        with self._require_account_stack('remove-images'):
+            api = self._api(settings)
             deployment = gate_deployment(self.directory / 'gate-deployment.json', settings.region)
             home = ledger.rows(deployment, 'regions')[0]
             stack_id = ledger.text(deployment_record(self.directory), 'stack_id')
@@ -2570,63 +2722,67 @@ class Deployment:
         return success
 
     def quota_status(self) -> bool:
-        """Report applied quotas and request history without changing AWS or local state."""
+        """Read regional Spot quotas with the plan identity."""
         from scripts.aws_target import gpu_size_trial
+        plan = plan_run.PlanRun(plan_identity.plan_credentials, self.execute, self.pause)
+        _ = plan.credential
         settings = read_deployment_settings(self.settings_path)
-        api = self._api(settings)
+        api = plan.api(settings.region, settings.timeout_s)
         needed = gpu_size_trial.required_vcpus(gpu_size_trial.settings())
-        regional: dict[str, list[tuple[str, str]]] = {}
-        for regions, code, _desired, label in quota_targets(settings.region):
+        now = self.clock()
+        regional: dict[str, list[tuple[str, str, int]]] = {}
+        for regions, code, desired, label in quota_targets(settings.region):
             for region in dict.fromkeys(regions):
-                regional.setdefault(region, []).append((code, 'Standard Spot' if label == 'Spot' else label))
-        _ = self.admin.get()
+                regional.setdefault(region, []).append((code, 'Standard Spot' if label == 'Spot' else label, desired))
         success = True
         ready: list[str] = []
         opened: list[str] = []
         unknown: list[str] = []
         unknown_quota: list[str] = []
+        lines: list[str] = []
         for region, quotas in regional.items():
-            print(region, flush=True)
             target = api.in_region(region)
-            for code, name in quotas:
+            lines.append(region)
+            for code, name, desired in quotas:
                 applied: Decimal | None = None
                 try:
                     applied = spot_quota(target, code)
-                    print(f'  {name}: {applied.normalize():f} vCPUs applied', flush=True)
+                    lines.append(f'  {name}: {applied.normalize():f} vCPUs applied, {desired} vCPUs needed')
                     if code == 'L-3819A6DF' and applied >= needed:
                         ready.append(region)
                     history = target.call('list-requested-service-quota-change-history-by-quota',
                         '--service-code', 'ec2', '--quota-code', code, service='service-quotas')
-                    requests = sorted(ledger.rows(history, 'RequestedQuotas'),
-                        key=lambda row: quota_timestamp(row.get('LastUpdated') or row.get('Created')), reverse=True)
-                    rows: list[list[str]] = []
-                    for request in requests:
-                        asked = f'{conf.decimal(str(request["DesiredValue"])).normalize():f}'
-                        status = ledger.text(request, 'Status')
-                        case = str(request.get('CaseId') or '-')
-                        date = quota_date(request.get('LastUpdated') or request.get('Created'))
-                        rows.append([asked, status, case, date])
-                        if status not in CLOSED_QUOTA_REQUEST_STATUSES:
-                            opened.append(f'{region} {name} {asked} vCPUs ({status})')
-                    if rows:
-                        for line in aligned_table(('Asked vCPUs', 'Status', 'Case ID', 'Updated'), rows,
-                                                  right=frozenset((0,))):
-                            print('    ' + line)
+                    requests: list[_QuotaRequest] = []
+                    for request in ledger.rows(history, 'RequestedQuotas'):
+                        created_value = request.get('Created')
+                        created = quota_timestamp(request.get('LastUpdated') if created_value is None else created_value)
+                        asked = conf.decimal(str(request['DesiredValue'])).normalize()
+                        status = _quota_request_status(ledger.text(request, 'Status'))
+                        requests.append(_QuotaRequest(created, asked, status))
+                    requests.sort(key=lambda request: request.created_at, reverse=True)
+                    if requests:
+                        newest = requests[0]
+                        age = _quota_request_age(newest.created_at, now)
+                        lines.append(f'    Newest request: {newest.status.value} for {newest.requested_vcpus:f} vCPUs ({age}).')
                     else:
-                        print('    No requests.')
-                except (admin_secrets.SecretsRefused, DeploymentRefused):
-                    raise
-                except (KeyError, OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
-                    match = re.search(r'An error occurred \(([A-Za-z][A-Za-z0-9]*)\) when calling ', str(error))
-                    reason = match[1] if match else type(error).__name__
+                        lines.append('    No requests.')
+                    for item in requests:
+                        if item.status.value not in CLOSED_QUOTA_REQUEST_STATUSES:
+                            opened.append(f'{region} {name} {item.requested_vcpus:f} vCPUs ({item.status.value})')
+                except (KeyError, OSError, OverflowError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
+                    code_text = aws_error_code(error) if isinstance(error, AwsUnavailable) else ''
+                    if code_text in QUOTA_PLAN_AUTH_FAILURES:
+                        raise plan_identity.PlanIdentityRefused(
+                            'AWS rejected the plan key. Run deploy.py plan-identity --check.') from None
+                    reason = code_text or type(error).__name__
                     if applied is None:
-                        print(f'  {name}: applied quota unknown')
+                        lines.append(f'  {name}: applied quota unknown, {desired} vCPUs needed')
                         if code == 'L-3819A6DF':
                             unknown_quota.append(region)
-                    print('    Quota status failed: ' + reason)
+                    lines.append('    Quota status failed: ' + reason)
                     unknown.append(region + ' ' + name)
                     success = False
-            print()
+            lines.append('')
         fits = ', '.join(ready)
         if unknown_quota:
             fits += (', ' if fits else '') + 'unknown for ' + ', '.join(unknown_quota)
@@ -2634,8 +2790,9 @@ class Deployment:
             fits = 'no region has enough applied quota'
         requests_text = 'unknown' if unknown else ', '.join(opened) or 'none'
         incomplete = '; request history unavailable: ' + ', '.join(unknown) if unknown else ''
-        print(f'Summary: GPU trial needs {needed} vCPUs; quota fits: {fits}; '
-              + 'open requests: ' + requests_text + incomplete, flush=True)
+        lines.append(f'Summary: GPU trial needs {needed} vCPUs; quota fits: {fits}; '
+                     + 'open requests: ' + requests_text + incomplete)
+        print('\n'.join(lines), flush=True)
         return success
 
     def gpu_size_trial(self, folder: Path, *, approve_resources: bool = False) -> bool:
@@ -2654,11 +2811,7 @@ class Deployment:
         """Preview the approved gate update in configured region order."""
         if not isinstance(self.mode, plan_run.PlanRun):
             raise DeploymentRefused('The gate plan requires the plan identity.')
-        directory = self.directory / 'gate-up'
-        directory.mkdir(parents=True, exist_ok=True)
-        with file_lock.exclusive(directory / 'controller.lock', wait=False) as lock:
-            if lock is file_lock.LockResult.BUSY:
-                raise DeploymentRefused('The gate controller lock gate-up/controller.lock is busy.')
+        with self._require_account_stack('up --workload merge-gates --plan'):
             self._gate_plan_locked(self.mode)
 
     def _gate_plan_locked(self, plan: plan_run.PlanRun) -> None:
@@ -2838,7 +2991,7 @@ class Deployment:
         """Add the gate resources and preserve every Rust parameter."""
         from scripts.aws_target import aws_trial, cloud_gate, gpu_size_trial
         self._authorize(approve_resources)
-        with control_lock(self.directory / 'gate-up'):
+        with self._require_account_stack('up --workload merge-gates'):
             settings = read_deployment_settings(self.settings_path)
             regions = gate_regions(settings.region)
             api = self._api(settings)
@@ -3111,7 +3264,8 @@ class Deployment:
             return True
         self._check_credentials()
         settings = read_deployment_settings(self.settings_path)
-        with step('down', 'removing local and cloud resources', self.settings_path):
+        with (self._require_account_stack('down'), self._require_hana_control('down'),
+              step('down', 'removing local and cloud resources', self.settings_path)):
             return teardown.TargetRemoval(self.settings_path, self.directory, self.output, self.admin,
                 self._api(settings), self.execute, tailnet=box.tailnet_request, clock=self.clock).run()
 
@@ -3259,6 +3413,7 @@ class DeploymentArguments(argparse.Namespace):
         self.approve_resources: bool = False
         self.approve_destroy: bool = False
         self.plan: bool = False
+        self.check: bool = False
         self.trial_action: str | None = None
         self.trial_folder: Path = Path()
         self.image: Path | None = None
@@ -3295,8 +3450,9 @@ def main() -> int:
         settings_path = conf.path('aws_target')
         with step('aws-trial', 'running the trial', settings_path):
             return aws_trial.main(sys.argv[2:], settings_path, target_config.ssh_target_state_directory('aws'))
-    parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'hana-image', 'apply', 'plan-identity'))
+    parser = argparse.ArgumentParser(description=__doc__, epilog=aws_test_identity.CONSOLE_SETUP)
+    _ = parser.add_argument('command', choices=('gpu-size-trial', 'secrets', 'up', 'down', 'remove-images', 'prices', 'quota-request', 'quota-status', 'prepare', 'hana-setup', 'hana-image', 'apply', 'plan-identity', 'test-identity'),
+                            help='Use quota-status to read Spot quotas with the plan key. Use quota-request to request increases with the admin key.')
     _ = parser.add_argument('trial_action', nargs='?', choices=('run',))
     _ = parser.add_argument('--trial-folder', type=Path)
     _ = parser.add_argument('--image', type=Path)
@@ -3307,7 +3463,16 @@ def main() -> int:
     _ = parser.add_argument('--approve-resources', action='store_true')
     _ = parser.add_argument('--approve-destroy', action='store_true')
     _ = parser.add_argument('--plan', action='store_true', help='Check setup with the AWS plan identity.')
+    _ = parser.add_argument('--check', action='store_true', help='Verify the saved plan or test identity without a prompt.')
     args = parser.parse_args(namespace=DeploymentArguments())
+    if args.command == 'test-identity':
+        if args.plan:
+            parser.error('Use test-identity without --plan.')
+        return aws_test_identity.command(args.settings, check=args.check)
+    if args.check:
+        if args.command != 'plan-identity' or args.plan:
+            parser.error('Use --check with plan-identity or test-identity.')
+        return plan_identity.command_check(args.settings)
     if args.plan:
         return run_setup_plan(args)
     deploy = Deployment(args.settings, args.directory, args.output)
@@ -3320,6 +3485,12 @@ def main() -> int:
             else:
                 plan_identity.command_down(args.settings, approve_destroy=args.approve_destroy)
             return 0
+        if args.command == 'quota-status':
+            try:
+                return 0 if deploy.quota_status() else 1
+            except plan_identity.PlanIdentityRefused as error:
+                print('quota-status: ' + plan_run.safe_reason(error), file=sys.stderr)
+                return 1
         os.environ['AWS_SHARED_CREDENTIALS_FILE'] = str(admin_secrets.credentials_file())
         if args.command == 'gpu-size-trial':
             if args.trial_action != 'run' or args.trial_folder == Path():
@@ -3340,14 +3511,16 @@ def main() -> int:
             deploy.prices()
         elif args.command == 'quota-request':
             return 0 if deploy.quota_request() else 1
-        elif args.command == 'quota-status':
-            return 0 if deploy.quota_status() else 1
         elif args.command == 'hana-image':
             if args.image is None:
                 raise DeploymentRefused('Use hana-image --image RESULT [--approve-resources]')
             return 0 if deploy.hana_image(args.image, approve_resources=args.approve_resources) else 1
         elif args.command == 'hana-setup':
-            return 0 if deploy.hana_setup(approve_resources=args.approve_resources) else 1
+            try:
+                return 0 if deploy.hana_setup(approve_resources=args.approve_resources) else 1
+            except KeyboardInterrupt:
+                print('hana-setup: interrupted', file=sys.stderr)
+                return 130
         elif args.command == 'prepare':
             prepared = deploy.prepare_hana() if args.workload == 'hana' else deploy.prepare()
             print(json.dumps({'at': prepared.at, 'fingerprint': prepared.fingerprint, 'output': str(args.output)}))

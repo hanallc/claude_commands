@@ -2,11 +2,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import StrEnum
-import fcntl
-import os
 import subprocess
 from pathlib import Path
 from typing import final
@@ -48,20 +45,6 @@ class BoxIdentity:
     def read(cls, setup: dict[str, object]) -> BoxIdentity:
         return cls(*(ledger.text(setup, key) for key in
                      ('deployment', 'region', 'instance', 'spot_request', 'data_volume')))
-
-
-@contextmanager
-def resource_hold(directory: Path) -> Generator[None]:
-    """Allow one command to replace the root."""
-    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise ReplacementRefused(hana_replacement_record.HELD) from None
-        yield
-    finally:
-        os.close(fd)
 
 
 def _only(reply: dict[str, object], key: str) -> dict[str, object]:
@@ -207,8 +190,8 @@ class RootReplacement:
         reason = ledger.text(ledger.mapping(request['Status']), 'Code')
         return reason.startswith('instance-stopped-') and reason != 'instance-stopped-by-user'
 
-    def _reserve(self, attempt: ReplacementAttempt, spending: hana_spend.HanaSpending, now: int,
-                 timeout: int) -> ReplacementAttempt:
+    def _reserve(self, attempt: ReplacementAttempt, spending: hana_spend.HanaSpending[hana_spend.PermitSettings],
+                 now: int, timeout: int) -> ReplacementAttempt:
         def before_commit(exposure: ledger.HanaComputeExposure) -> None:
             hana_replacement_record.save(self.directory, replace(attempt, generation=exposure.generation))
 
@@ -273,8 +256,9 @@ class RootReplacement:
         except (AwsUnavailable, OSError, ValueError, subprocess.SubprocessError):
             return state
 
-    def apply(self, attempt: ReplacementAttempt, spending: hana_spend.HanaSpending, clock: Callable[[], float],
-              timeout: int, checks: Generator[float], publish: Callable[[ReplacementAttempt, bool], None]) -> None:
+    def apply(self, attempt: ReplacementAttempt, spending: hana_spend.HanaSpending[hana_spend.PermitSettings],
+              clock: Callable[[], float], timeout: int, checks: Generator[float],
+              publish: Callable[[ReplacementAttempt, bool], None]) -> None:
         """Read the instance and task before choosing the next operation."""
         started = False
         reserved = False

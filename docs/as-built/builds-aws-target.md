@@ -53,22 +53,28 @@ Enter the administrator passphrase when the command asks for it.
 The command creates the `aws-build-plan` IAM user and one managed policy.
 It checks the user with STS, reads EC2 availability zones, and simulates seven denied actions.
 After these checks pass, it saves one access key in `~/.config/aws-build/plan.gpg` with mode `0600`.
-The rename that publishes `plan.gpg` commits setup.
-If setup fails before the rename, it revokes any new key it finds.
+If STS still rejects a new key after retries, setup revokes the unpublished key.
+Run `deploy.py plan-identity --approve-resources` again after one minute.
+If setup fails before it publishes `plan.gpg`, it revokes any new key it finds.
 During setup, `plan.gpg` must be absent before the command revokes a key.
-If directory sync or cleanup fails after the rename, the command warns and reports that the identity is ready.
-Setup keeps the verified file and IAM key after the rename.
+If directory sync or cleanup fails after setup publishes a verified key, the command warns and reports that the identity is ready.
 If IAM lists no key after a failed creation, a key can appear later.
 Run the same approved command again to revoke the late key and create a new key.
 If `plan.gpg` is absent, the command revokes all keys that IAM lists for the plan user before it creates one key.
-The command keeps the local key when it matches the sole key that IAM lists.
-Setup refuses if the local key differs from the sole key that IAM lists.
+Setup keeps the local key when it matches the sole key that IAM lists.
+Setup refuses if IAM lists no key, a different key, or more than one key.
+If STS rejects a saved key, setup preserves the local file and the IAM key.
 Setup also refuses if it cannot read or decrypt `plan.gpg`.
 This refusal preserves the local file and the IAM keys.
 Setup uses GPG without a passphrase prompt for these checks.
-If `plan.gpg` is damaged, delete the file and run the command again.
 The command compares the default policy with the current configuration and sets a new default version when they differ.
-Omit `--approve-resources` to print the plan without contacting AWS.
+Run `deploy.py plan-identity` without flags to print the plan without contacting AWS.
+Run `deploy.py plan-identity --check` to verify the saved plan key with STS without a prompt.
+Setup and the check use the region in the AWS target configuration.
+If AWS does not answer the check, run the check again.
+If AWS rejects the saved key, run the approved removal command below.
+Use the same command if `plan.gpg` is damaged or has invalid fields.
+Then run `deploy.py plan-identity --approve-resources` to create a new key.
 
 The policy allows setup reads, IAM simulation for users in the account, and S3 object listings in account buckets.
 The policy allows reads of applied service quotas and quota request history.
@@ -84,12 +90,42 @@ It denies EC2 instance attribute and Spot request reads because those calls can 
 
 Sessions use `plan_credentials()` to decrypt the key without a prompt.
 If the agent is cold, run `github-warmup` in a terminal on natedev.
-The approved removal command can revoke the key while `plan.gpg` exists.
-Run this command in the same terminal to remove the key, user, and policy.
+The approved removal command removes the IAM resources before it removes `plan.gpg`.
+It removes `plan.gpg` even if it cannot decode the file.
+It refuses if the decoded key belongs to a different AWS account.
 
 ```sh
 deploy.py down --workload plan-identity --approve-destroy
 ```
+
+## AWS test identity
+
+1. Sign in to the AWS console for the management account.
+2. Switch to `OrganizationAccountAccessRole` in the test account.
+3. Create the IAM user `aws-build-test` with the path `/aws-build/` and the `AdministratorAccess` policy in the test account.
+4. Create an access key for that user.
+5. Run `deploy.py test-identity` in a terminal on natedev.
+
+Enter the access key ID and the secret access key at the hidden prompts.
+The command checks the key format before it calls AWS.
+It uses STS with the saved plan key to identify the build account.
+It uses the region in the AWS target configuration for this STS call.
+It refuses a build account key or a test key whose account it cannot confirm.
+It stores the key in `~/.config/aws-build/test.gpg` with mode `0600`.
+The local AWS state folder holds the account ID in `test-identity.json`.
+The command saves the account record before it publishes the encrypted key.
+If setup stops after it saves the record, run the command again with a key from the same account.
+Run `github-warmup` in a terminal on natedev if the GPG agent is cold.
+If GPG cannot identify the encryption recipient, restore `~/.config/gh/token.gpg` with one GPG recipient.
+
+Run `deploy.py test-identity` again with a key from the same account to replace the key.
+The command refuses a key from a different account.
+Run `deploy.py test-identity --check` to verify the saved key and account without a prompt.
+If AWS does not answer, run the same command again.
+If you interrupt the check, run the check again.
+If the test key is locked, run `github-warmup`.
+If the private test key is unreadable, run `deploy.py test-identity` with a key from the recorded test account.
+`test_credentials()` checks the saved test key against the recorded account with one STS call.
 
 ## Run a setup plan
 
@@ -99,10 +135,12 @@ Run this command in a terminal on natedev.
 deploy.py hana-setup --plan
 ```
 
+The plan reports whether the deployed Hana image is current or stale.
 The plan checks root replacement for an existing Hana box with a registered image.
 It accepts stack-owned and direct-owned boxes.
 It refuses first-time setup and pending instance or data volume work.
-It reports whether the deployed guest digest matches the current guest files.
+The plan refuses immediately if the controller lock is busy or another command holds Hana.
+A new replacement requires an idle lifecycle.
 
 For a pending replacement, the plan checks the instance, original data attachment, and registered image.
 For a new replacement, the plan also checks that the instance is stopped.
@@ -124,8 +162,11 @@ deploy.py up --workload merge-gates --plan
 ```
 
 The plan checks the home StackId, account, region, deployment parameters, and installed scaler credentials.
-It holds the same controller lock as approved gate setup and image removal.
-If the controller lock is busy, the plan refuses before it contacts AWS.
+The gate plan, approved gate setup, and image removal take the account stack lock at `gate-up/controller.lock`.
+This lock protects the account stack, regional gate stacks, and `gate-deployment.json`.
+Account apply and teardown take the account stack lock before the Hana resource hold.
+A command refuses before it contacts AWS if another command holds the account stack lock.
+The gate commands leave Hana build claims and permit renewal available.
 It builds the same template and parameter values as approved gate setup.
 The plan previews updates in the home region and in each configured gate region.
 It removes each change set and confirms removal before it checks scaler permissions.
@@ -434,7 +475,21 @@ Setup writes a fixed probe object under `control/<deployment>/setup-probe.json` 
 It reports each operation as `hana-setup probe: <operation>: pass` or `hana-setup probe: <operation>: fail`.
 When AWS supplies an error code, the failure line includes it in parentheses.
 For a policy-only change, setup probes before and after the update.
-Setup requires an idle-stopped lifecycle with no claims or pending start for this change.
+Approved setup waits for an idle-stopped lifecycle with no claim or pending start.
+It makes no AWS write calls while it waits.
+The default setup wait is 1,500 seconds.
+This allows time for work to finish, the 600-second warm idle interval, and the 600-second stop wait.
+Set `setup_idle_wait_timeout_s` above the sum of `idle_stop_seconds` and `stop_wait_timeout_s`.
+The `setup_idle_heartbeat_s` setting reports the lifecycle state every 15 seconds.
+Setup checks the lifecycle again at the wait limit.
+If the box is still busy, setup reports the lifecycle state and the claim holder kind.
+Setup takes exclusive control of the box under the controller lock.
+The setup plan, Hana image registration, and Hana teardown use the same hold.
+Account prepare, Hana prepare, account apply, and account teardown also use the hold.
+The controller skips its tick while a command holds Hana resources.
+A competing command refuses before it calls AWS.
+Build claims and queue evidence report the box as busy during the hold.
+The kernel releases the hold when the command closes it or the process exits.
 It checks the saved stack outputs and confirms the instance is stopped and the disk is attached.
 Setup verifies the live and effective change set parameters against the approved stack parameters.
 The second run starts after CloudFormation confirms the update.
@@ -1146,9 +1201,8 @@ It uses `spot_quota_request_vcpus` from `cloud_gate.conf`.
 The default request is 136 vCPUs for four 32-vCPU gates and one 8-vCPU Hana box.
 The same command requests G and VT Spot quota (`L-3819A6DF`) in each gate region from `regions`.
 A region in `spot_candidate_regions` only has no gate stack and gets no quota request.
-`deploy.py quota-status` reads the same gate regions.
-It uses `gpu_spot_quota_request_vcpus=32` for one GPU box up to 8xlarge.
-All three new keys are in `cloud_gate.conf`.
+The GPU quota request uses `gpu_spot_quota_request_vcpus=32` for one GPU box up to 8xlarge.
+These settings are in `cloud_gate.conf`.
 Both quota codes use one helper for regional requests.
 The command uses the encrypted administrator key through the admin executor.
 It skips regions with sufficient quota and prints existing open requests instead of creating duplicates.
@@ -1157,12 +1211,18 @@ A failed call prints only the AWS error code or Python error class and does not 
 Any regional failure makes the command exit with status 1.
 The external administrator IAM policy also needs `servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota` and `servicequotas:RequestServiceQuotaIncrease`.
 Both quota codes use these same three IAM actions.
-`python3 scripts/aws_target/deploy.py quota-status` reads both quotas and their request history through the same administrator executor.
+`deploy.py quota-status` reads both quotas and their request history with the read-only plan identity.
+If the key is missing, the command names the plan identity setup command.
+If the key is locked, the command tells you to run `github-warmup` in a terminal on natedev.
+If AWS rejects the plan key during any call, the command stops and names `deploy.py plan-identity --check`.
 It shares the quota codes and region lists with `quota-request`.
 Each region starts one terminal block with its name as the heading.
-Each quota shows its applied vCPUs once, above an aligned request table.
-The table shows asked vCPUs, status, case ID, and update time, with the newest requests first.
-Dates use the user's zone and the last update time, with the creation time as a fallback.
+Each quota shows its applied vCPUs and the vCPUs needed from `cloud_gate.conf`.
+The newest request shows its status, requested vCPUs, and age.
+The command uses creation time to select the newest request and calculate its age.
+If a request has no creation time, the command uses its last update time.
+A request that has neither date shows `age unknown`.
+The report keeps unknown status text and counts the request as open.
 A quota with no requests prints `No requests.`
 The final summary lists regions whose applied GPU quota fits the trial and requests that remain open.
 The summary uses the trial's shared vCPU calculation over `gpu_size_trial_spot_max_usd_per_hour`.
@@ -1170,12 +1230,12 @@ It does not use the requested quota as proof of an applied quota.
 When every applied quota is too small, the summary says `no region has enough applied quota`.
 An unread applied GPU quota adds `unknown for <regions>` after the regions that fit.
 An unread request history makes the summary say `open requests: unknown` and name the unavailable region and quota.
-The report omits account IDs, ARNs, and request IDs.
-Regional failures print the AWS error code or Python error class and allow the remaining regions to continue.
+The report omits account IDs, case IDs, request IDs, and ARNs.
+Other regional failures print the AWS error code or Python error class and permit the remaining quota reads.
 Any regional failure makes the command exit with status 1.
 The command uses only `GetServiceQuota` and `ListRequestedServiceQuotaChangeHistoryByQuota`, including every history page.
 It makes no quota request, paid API call, or local state write.
-The administrator IAM action list in the runbook already includes both read actions.
+The plan identity policy grants both read actions in `ReadSetupInputs`.
 `down` searches configured regions and regions in the saved manifest and stack records.
 It terminates boxes before it deletes their regional stacks.
 Then it deletes copied images and their snapshots.
@@ -1384,8 +1444,12 @@ Both capture paths refuse new Git links with `NestedRepository`.
 The sender refuses unexpected ignored inputs, credential paths, Git links, and disallowed environment variables.
 It sends no ignored files, HOME, or target output.
 
+When source preparation fails before the command starts, offload reports the cause as a typed admission refusal.
+The queue records `DoNotRetry` and the build runs locally.
+If the runner cannot release the claim, the queue worker releases it after the runner exits and the lifecycle operation ends.
+
 A frozen `SourceManifest` carries the payload digest, signed URL, and runtime ABI.
-It also carries the repository, commit, basis commits, command, features, environment, and toolchain digest.
+It also carries the repository key, private commit, basis commits, command, features, environment, and toolchain digest.
 Its JSON fits the receiver's 65536-byte control limit.
 Each repository retains a bounded list of guest-acknowledged commits.
 Each snapshot commit has no parent, so bundles exclude the caller's Git history and deleted credential blobs.
@@ -1491,12 +1555,14 @@ One exact lifecycle claim excludes all other Hana worktrees.
 Boot generations include the deployment, demand-start token, and verified boot identity.
 Permit renewals retain that generation.
 
-F1 receives `HanaClaimPending`, `HanaClaimAdopted`, `HanaClaimRefused`, or `HanaClaimRetained` from `claim_assigned()`.
+F1 receives `HanaClaimPending`, `HanaClaimAdopted`, `HanaClaimRefused`, `HanaClaimRetained`, or `HanaClaimResourcesHeld` from `claim_assigned()`.
+`HanaClaimResourcesHeld` means a resource command holds Hana and prevents a new claim.
 Only an adopted claim can request the queue's first launch authorization.
 `release_assigned()` requires F1's durable command settlement before lifecycle and target claim release.
 An exact guest observation can settle an accepted execution that ended without a compiler result.
 The observation must confirm termination and lease release, and the sender must have issued no source update.
-The sender uses the guest cause when it is available and keeps a specific sender rejection if the guest reports a pending result.
+The sender uses the guest cause when it is available.
+If the guest requests a source basis or reports a pending result, the sender uses its own cause.
 For other confirmed departures, the sender attempts to release the claim without another fence observation.
 The sender requires a fence acknowledgement after a result transfer loss or when it resumes an unsettled fence.
 The sender uses the refusal code to report `HanaCommandAdmissionRefused`.
