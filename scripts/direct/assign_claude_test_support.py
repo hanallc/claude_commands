@@ -11,16 +11,19 @@ from scripts.production.staff_test_support import isolated_staff_file
 from scripts.lib.test_models_registry import registry_text, write_registry
 
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from functools import cached_property
 from importlib import import_module
 import json
+import multiprocessing
 import os
 import runpy
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from textwrap import indent
 from types import ModuleType
@@ -460,13 +463,39 @@ class AssignClaudeLauncherFixture(LauncherFixture):
             _ = runpy.run_path(str(entry), run_name="__main__")
             return 0
 
-        with (patch.object(direct_package, "__path__", list(cast(Sequence[str], getattr(direct_package, "__path__")))),
-              patch.object(assign, "SCRIPTS", direct),
-              patch.object(assign, "PYTHON", str(direct.parent / "lib/py")),
-              patch.object(assign_claude, "SCRIPTS", direct),
-              patch.object(assign_claude, "PYTHON", str(direct.parent / "lib/py")),
-              direct_launcher_helpers()):
-            return invoke_cli(module, child_main, arguments, environment, self.working_dir)
+        context = multiprocessing.get_context("fork")
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as output:
+            def run_warm() -> None:
+                os.setsid()
+                with (patch.object(direct_package, "__path__", list(cast(Sequence[str], getattr(direct_package, "__path__")))),
+                      patch.object(assign, "SCRIPTS", direct),
+                      patch.object(assign, "PYTHON", str(direct.parent / "lib/py")),
+                      patch.object(assign_claude, "SCRIPTS", direct),
+                      patch.object(assign_claude, "PYTHON", str(direct.parent / "lib/py")),
+                      direct_launcher_helpers()):
+                    result = invoke_cli(module, child_main, arguments, environment, self.working_dir)
+                json.dump((result.returncode, result.stdout, result.stderr), output)
+                output.flush()
+
+            child = context.Process(target=run_warm)
+            child.start()
+            try:
+                child.join(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+                if child.exitcode is None:
+                    raise subprocess.TimeoutExpired(command, test_hang_guard.TEST_HANG_GUARD_SECS)
+                if child.exitcode != 0:
+                    raise subprocess.CalledProcessError(child.exitcode, command)
+                _ = output.seek(0)
+                status, stdout, stderr = cast(tuple[int, str, str], json.load(output))
+                return subprocess.CompletedProcess(command, status, stdout, stderr)
+            finally:
+                if child.is_alive():
+                    assert child.pid is not None
+                    with suppress(ProcessLookupError):
+                        os.killpg(child.pid, signal.SIGKILL)
+                    child.kill()
+                    child.join()
+                child.close()
 
     def launch_records(self, session: Path, kind: str) -> list[dict[str, object]]:
         path = self.history_dir / "runs" / f"{session.name}.jsonl"

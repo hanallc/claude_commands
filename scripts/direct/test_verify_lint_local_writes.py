@@ -20,14 +20,19 @@ class VerifyLintLocalWritesTests(VerifyStepRoutesFixture):
         self.fixture.environment["TEST_REQUIRE_CLIPPY_FIX"] = "1" if tool == "clippy" else "0"
         self.fixture.environment["TEST_REQUIRE_MEND_FIX"] = "1" if tool == "mend" else "0"
         (Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "other").unlink(missing_ok=True)
-        invoke = self.fixture.verify_script.parent.parent / "lint/invoke.sh"
-        function = "invoke_mend() {" if tool == "mend" else "invoke_clippy_fix() {"
+        script = self.fixture.verify_script
+        commands = (("if lint_rewrite invoke_mend --workspace --fix ", "invoke_mend --workspace --fix ")
+                    if tool == "mend" else ("lint_rewrite invoke_clippy_fix --workspace ",))
         hold = 'printf held > "$BUILD_HOLD_DIR/other"'
-        if tool == "mend":
-            hold = f'if [[ " $* " == *" --fix "* ]]; then {hold}; fi'
-        original = invoke.read_text()
-        self.assertIn(function, original)
-        _ = invoke.write_text(original.replace(function, f"{function}\n    {hold}", 1))
+        original = script.read_text()
+        updated = original
+        for command in commands:
+            line, = (line for line in original.splitlines() if line.lstrip().startswith(command))
+            indentation = line[:len(line) - len(line.lstrip())]
+            replacement = f"{indentation}{hold}\n{line}"
+            if replacement not in updated:
+                updated = updated.replace(line, replacement, 1)
+        _ = script.write_text(updated)
         cargo = self.fixture.bin_directory / "cargo"
         source = cargo.read_text().replace('arguments = sys.argv[1:]', '''arguments = sys.argv[1:]
 repair = Path(os.environ["PACKAGE_ROOT"]) / "local-repair"

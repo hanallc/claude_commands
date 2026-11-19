@@ -315,6 +315,7 @@ class OffloadCommandFixture(unittest.TestCase):
             (self.bin_directory / name).symlink_to(stub)
         self.config = {
             "mirror_root": "~/" + FIXTURE_MIRROR_ROOT,
+            "mirror_busy_backoff_s": "120",
             "offload": "on",
             "host": "mac",
             "connect_timeout_s": "6",
@@ -643,13 +644,16 @@ raise SystemExit(offload.main())
         )
 
     def claim_stub_runner(self) -> Path:
-        checkout = self.private_tools() / "claim-runner"
-        runner_directory = checkout / "scripts/mac_test"
-        stub = runner_directory / "mac_test.py"
+        tools = self.private_tools()
+        checkout = tools / "claim-runner"
         if not checkout.exists():
-            copy_runtime(checkout)
-            self.write_executable(stub, CLAIM_STUB)
-        return runner_directory / "offload.py"
+            tools.mkdir(exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="claim-runner-", dir=tools) as directory:
+                staging = Path(directory) / "checkout"
+                copy_runtime(staging)
+                self.write_executable(staging / "scripts/mac_test/mac_test.py", CLAIM_STUB)
+                _ = staging.rename(checkout)
+        return checkout / "scripts/mac_test/offload.py"
 
     def state_command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
