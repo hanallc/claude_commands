@@ -1627,6 +1627,7 @@ process.stdout.write(JSON.stringify({
             (admission_records.PressureUnavailable("cannot read /private/proc/pressure/memory"), "/private/proc/pressure/memory", False),
             (admission_records.StartSpacingWait(200_010), "another step just started; the queue waits a few seconds between starts", False),
             (placement.CargoFolderWait(), placement.CARGO_FOLDER_WAIT_REASON, False),
+            (admission_records.LandingWait(), admission_records.LANDING_WAIT_TEXT, False),
             (admission_records.BehindHead("first", 1, "head-session"), "behind", False),
             (admission_records.BehindHead("compiler", 2, "second-session"), "behind #2 · second · nextest · compiler", True),
         )
@@ -2583,7 +2584,7 @@ process.stdout.write(JSON.stringify({
         for row in (local_run, cloud_run, local_wait, cloud_wait):
             self.assertEqual(row["name"], "devtools integrate")
             self.assertEqual(row["title"]["step"], "integrate")
-            self.assertEqual(row.get("about"), "Tests a checkpoint during landing.")
+            self.assertEqual(row.get("about"), "Tests a checkpoint while natemerge merges it.")
             self.assertEqual(row.get("changes"), "the landing branch")
 
         page = self.gate_job_page("merge-gate", ("python3", "merge_gate.py", "--tests-only"),

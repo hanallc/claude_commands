@@ -888,6 +888,13 @@ function fitLabels() {}
                     "name": "fixture", "need": 1, "since": 100, "why": memory_feed.wait_why(reason)}]})
                 self.assertIn("Waits for  "+expected, str(hover))
 
+    def test_landing_wait_hover_shows_the_full_reason(self) -> None:
+        reason = admission_records.LandingWait()
+        data = {"read_at": 200, "waiters": [{"name": "claude_commands test all", "need": 1,
+            "since": 100, "why": memory_feed.wait_why(reason), "reason": admission_records.LANDING_WAIT_TEXT}]}
+        hover = cast(list[str], self.page_expression("tipText('wait:fixture-wait-0', data)", data))
+        self.assertEqual(hover[1].count(admission_records.LANDING_WAIT_TEXT), 1)
+
     def test_a_mac_only_wait_hover_names_what_holds_the_mac_below_can_run_on(self) -> None:
         reason = "held by research for Mac CI restore"
         for because in ("Mac is held", reason, ""):
