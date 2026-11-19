@@ -190,6 +190,7 @@ from scripts.lib import file_lock
 from scripts.lib.file_lock import PROC_LOCKS as PROC_LOCKS
 from scripts.lib import build_folders, conf
 from scripts.lib.cargo_target_config import (
+    NoCargoManifest,
     cargo_build_folder,
     cargo_folder_settings,
     cargo_home_folder,
@@ -255,6 +256,7 @@ DEP_INFO_SUFFIX = ".d"
 # A dep-info file's first line starts with the output it describes.
 # target/debug, target/<triple>/debug, target/<custom>/<triple>/debug.
 FLOOR_KEY = "sweep_free_floor_gib"
+BUILD_FLOOR_KEY = "sweep_build_floor_gib"
 RECENT_KEY = "recent_minutes"
 FLOOR_LOCK_ALERT_KEY = "floor_lock_alert_minutes"
 FLOOR_ONLY_FLAG = "--floor-only"
@@ -1561,7 +1563,8 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
                 _ = found.setdefault(owner.target, TargetUse(pid, f"maps {path}", start))
         runner = cargo_workspace_runner(argv)
         if runner:
-            for target in workspace_targets(argv, cwd, os.path.join(base, "environ"), owners):
+            for target in workspace_targets(argv, cwd, os.path.join(base, "environ"), owners,
+                                            verify_runner=runner == "verify.sh"):
                 if target in checked:
                     _ = found.setdefault(target, TargetUse(pid, f"runs {runner} in {cwd}", start))
     return {target: found[target] for target in owners if target in found}
@@ -1605,8 +1608,9 @@ def orphan_process_idle(root: str, proc: str = PROC_DIR) -> bool:
                 if any(inside(path) for path in mapped_files((process / "maps").read_bytes())):
                     return False
                 argv = [os.fsdecode(arg) for arg in (process / "cmdline").read_bytes().split(b"\0") if arg]
-                if cargo_workspace_runner(argv) and workspace_targets(
-                        argv, cwd, str(process / "environ"), [root], require_environ=True):
+                runner = cargo_workspace_runner(argv)
+                if runner and workspace_targets(argv, cwd, str(process / "environ"), [root],
+                                                verify_runner=runner == "verify.sh", require_environ=True):
                     return False
                 for descriptor in (process / "fd").iterdir():
                     try:
@@ -1850,7 +1854,7 @@ def floor_holders(busy: Mapping[str, TargetUse | LockHeld | BuildHoldTarget | No
 
 
 def workspace_targets(argv: list[str], cwd: str, environ: str, targets: Sequence[str], *,
-                      require_environ: bool = False) -> list[str]:
+                      verify_runner: bool, require_environ: bool = False) -> list[str]:
     """Resolve Cargo's artifact and intermediate folders through one busy check."""
     try:
         with open(environ, "rb") as handle:
@@ -1865,6 +1869,8 @@ def workspace_targets(argv: list[str], cwd: str, environ: str, targets: Sequence
     try:
         chosen = {cargo_build_folder(setting, argv, cwd, cargo_home) if key == "build-dir"
                   else os.path.realpath(setting.base / setting.value) for key, setting in settings.items()}
+    except NoCargoManifest:
+        return [] if verify_runner else list(targets)
     except (OSError, ValueError):
         return list(targets)
     owners = targets if isinstance(targets, TargetOwnerIndex) else TargetOwnerIndex(targets)
@@ -3440,12 +3446,17 @@ def free_bytes(path: str) -> int:
     return stat.f_bavail * stat.f_frsize
 
 
+def floor_setting_key(keys: Collection[str], base: str, host: str) -> str:
+    override_key = f"{base}.{host}"
+    return override_key if override_key in keys else base
+
+
 def floor_bytes(values: dict[str, str], host: str) -> tuple[int | None, str | None]:
     """The free-space floor and the key it came from: (None, None) when none is
     set, (None, key) when its value is malformed."""
-    for key in (f"{FLOOR_KEY}.{host}", FLOOR_KEY):
-        if values.get(key):
-            return size_bytes(values[key], GIB), key
+    key = floor_setting_key({key for key, value in values.items() if value}, FLOOR_KEY, host)
+    if value := values.get(key):
+        return size_bytes(value, GIB), key
     return None, None
 
 
@@ -4626,9 +4637,16 @@ def output_device(path: str) -> int:
 
 
 def filesystem_floors(floor: int, targets: Sequence[str], *, lint_settings: conf.ConfigRead) -> list[FilesystemFloor]:
-    origin = lint_settings.origin("sweep_free_floor_percent", float)
-    if not isinstance(origin, conf.UsableLiveValue) or not math.isfinite(origin.value) or not 0 <= origin.value <= 100:
-        raise conf.Unusable("lint.conf: sweep_free_floor_percent must be a live number from 0 to 100")
+    settings = lint_settings.settings
+    live_keys = settings.keys() if isinstance(settings, dict) else ()
+    build_key = floor_setting_key(live_keys, BUILD_FLOOR_KEY, socket.gethostname())
+    fixed_floor = build_key in live_keys
+    key = build_key if fixed_floor else "sweep_free_floor_percent"
+    origin = lint_settings.origin(key, float)
+    upper = sys.float_info.max / GIB if fixed_floor else 100
+    if not isinstance(origin, conf.UsableLiveValue) or not 0 <= origin.value <= upper:
+        requirement = "a live non-negative number of GiB" if fixed_floor else "a live number from 0 to 100"
+        raise conf.Unusable(f"lint.conf: {key} must be {requirement}")
     home = os.path.expanduser("~")
     root_device = output_device(home)
     devices: dict[int, list[str]] = {root_device: []}
@@ -4657,6 +4675,8 @@ def filesystem_floors(floor: int, targets: Sequence[str], *, lint_settings: conf
         probe = probes[device]
         if device == root_device:
             threshold = floor
+        elif fixed_floor:
+            threshold = int(origin.value * GIB)
         else:
             usage = os.statvfs(probe)
             threshold = int(usage.f_blocks * usage.f_frsize * origin.value / 100)
