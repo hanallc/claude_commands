@@ -5362,3 +5362,24 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - impl: verify.sh, the helper and the fixtures.
 
 **Acceptance gate:** an AWS pair shows the CPU saved per module; the four modules and every verify test module pass; basedpyright clean on changed files; the full suite is green.
+
+### Phase 376 — the review launcher test halves its AWS CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `direct/test_review_launcher.py` uses half its AWS gate CPU (36.5 s median, 36.6 s wall, 18 tests on 2026-11-19).
+
+**Spec:**
+- AWS rank 14 on 2026-11-19 00:23 EST. Ranks above it have phases, or are verify.sh modules for phase 375. Slowest kept test: `test_broad_lenses_and_retry_keep_the_same_fast_fix_snapshot` 8.2 s; about 2 CPU s per test.
+1. Measure with `module_cost.py --tests 20 --commands 20` like the gate: fresh TMPDIR, bytecode on. Name the top commands and fixtures and their CPU share. Count the Git calls and say which ones each test needs.
+2. Cut the cost at its cause: repeated Git repository setup, Python starts, or polling. Share setup per class where the tests stay independent. Replace fixed waits with an event the test drives.
+3. Name any cause in the review launcher production code; fix it there when it also costs production runs.
+- Every assertion remains. Tests read no /tune-changeable value. No lazy imports, no copies, no signal handlers.
+
+**Files:** scripts/direct/test_review_launcher.py; its test support; the review launcher code only when the cost lives there.
+
+**Workers:** 1 writer. One module and its subject.
+- impl: the test module, its support and any production cause.
+
+**Acceptance gate:** an AWS pair (3 rounds) shows the median CPU at half or less, or a floor result with its cause; the module passes 20 times under load in a 2 GB scope; the full suite is green.
