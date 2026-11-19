@@ -3183,6 +3183,8 @@ Base: 44cy (the landing identity). Clone /session/queue/landhold, branch builds-
 ### Phase 44de — Follow-up findings from the session folder move  · status: todo
 **From 44dd closure pass 13, 2026-11-19 (hard landing rule, builds 17:10 EST).** Findings that are not a regression, broken function or failing test move here.
 1. F048 (minor): if `scratch end` runs before the sweep registers an interrupted stage, no task end is recorded for that stage. The sweep keeps the stage until another task end (scratch.py:3845, :1917; tmp_sweep.py:1437).
+2. F050 (pass 14): a scoped sweep that selects the source but not the destination recovers the journal and removes the interrupted stage beside the excluded destination (tmp_sweep.py:1444, scratch.py:2063, :1932).
+3. F051 (pass 14): after `git worktree repair` points a registration at the destination, the sweep keeps the old source, because it checks only that `gitdir` exists (tmp_sweep.py:1107, scratch.py:1614).
 
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
