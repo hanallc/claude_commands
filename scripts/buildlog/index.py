@@ -18,7 +18,7 @@ import os
 import re
 import sqlite3
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -35,7 +35,7 @@ from scripts.test_times.gate_record import (
     folder_scan_strings, module_read_record,
 )
 
-SCHEMA_VERSION = 42
+SCHEMA_VERSION = 43
 
 
 # These indexes support repeated queries over the current schema.
@@ -161,6 +161,7 @@ STEP_COLUMNS: list[Column] = [
     ("tests_skipped", "INTEGER", "skipped"),
     ("tests_flaky", "INTEGER", "passed on a retry"),
     ("tests_retried", "INTEGER", "tests that took more than one attempt"),
+    ("selected_tests", "TEXT", "JSON test names by nextest binary ID; NULL when no selection was saved"),
     ("mend_fixes", "INTEGER", "fixes 'mend: applied' reports; 0 when none were available"),
     ("mend_check_s", "REAL", "mend's cargo check time"),
     ("mend_s", "REAL", "mend's own analysis time"),
@@ -954,6 +955,40 @@ def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str
                 TEST_COLUMNS,
             ),
         )
+
+
+class NextestGpuClass(StrEnum):
+    GPU = "gpu"
+    NO_GPU = "no-gpu"
+    UNKNOWN = "unknown"
+
+
+def nextest_gpu_class(connection: sqlite3.Connection, step_id: str,
+                      proof: Mapping[tuple[str, str], NextestGpuClass]) -> NextestGpuClass:
+    """Classify a step with proof keyed by nextest binary ID and test name."""
+    step = cast(tuple[object, object] | None, connection.execute(
+        "SELECT selected_tests, tests_run FROM steps WHERE id = ? AND step = 'nextest'", (step_id,),
+    ).fetchone())
+    if step is None:
+        return NextestGpuClass.UNKNOWN
+    saved, ran = step
+    if isinstance(saved, str):
+        selection = parse.saved_test_selection(cast(object, json.loads(saved)))
+        if isinstance(selection, parse.NoTestSelection):
+            return NextestGpuClass.UNKNOWN
+        names = [(binary, test) for binary, tests in selection.by_binary.items() for test in tests]
+        complete = True
+    else:
+        names = cast(list[tuple[str, str]], connection.execute(
+            "SELECT binary, test FROM tests WHERE step_id = ?", (step_id,),
+        ).fetchall())
+        complete = ran == len(names)
+    classes = {proof.get(name, NextestGpuClass.UNKNOWN) for name in names}
+    if NextestGpuClass.GPU in classes:
+        return NextestGpuClass.GPU
+    if complete and classes == {NextestGpuClass.NO_GPU}:
+        return NextestGpuClass.NO_GPU
+    return NextestGpuClass.UNKNOWN
 
 
 def add_gate_run(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:

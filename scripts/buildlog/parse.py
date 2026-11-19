@@ -18,7 +18,9 @@ import shlex
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePath
-from typing import BinaryIO, TypedDict
+from typing import BinaryIO, TypedDict, cast
+
+from scripts.lib import conf
 
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
 
@@ -63,6 +65,79 @@ class TestRow(TypedDict):
     attempts: int
     duration_s: float | None
     slow: bool
+
+
+@dataclass(frozen=True)
+class SelectedTests:
+    """Every test that nextest selected, grouped by binary ID."""
+
+    by_binary: dict[str, list[str]]
+
+
+@dataclass(frozen=True)
+class NoTestSelection:
+    """The step has no saved selection."""
+
+
+NO_TEST_SELECTION = NoTestSelection()
+
+
+def saved_test_selection(value: object) -> SelectedTests | NoTestSelection:
+    """Read a complete selection from a build log field."""
+    if not isinstance(value, dict):
+        return NO_TEST_SELECTION
+    by_binary: dict[str, list[str]] = {}
+    for binary, tests in cast(dict[object, object], value).items():
+        if not isinstance(binary, str) or not isinstance(tests, list):
+            return NO_TEST_SELECTION
+        names: list[str] = []
+        for name in cast(list[object], tests):
+            if not isinstance(name, str):
+                return NO_TEST_SELECTION
+            names.append(name)
+        by_binary[binary] = names
+    return SelectedTests(by_binary)
+
+
+@dataclass(frozen=True)
+class NextestListing:
+    """The selected names and binary metadata from one nextest build."""
+
+    selection: SelectedTests
+    binaries_metadata: dict[str, object]
+
+
+def nextest_listing(document: dict[str, object]) -> NextestListing:
+    """Read the selected names and convert the suites to binary metadata."""
+    build = document["rust-build-meta"]
+    suites = document["rust-suites"]
+    if not isinstance(build, dict) or not isinstance(suites, dict):
+        raise ValueError("Invalid nextest build or suites")
+    selected: dict[str, list[str]] = {}
+    binaries: dict[str, object] = {}
+    for binary, suite in cast(dict[object, object], suites).items():
+        if not isinstance(binary, str) or not isinstance(suite, dict):
+            raise ValueError("Invalid nextest suite")
+        fields = cast(dict[str, object], suite)
+        cases = fields.get("testcases", {})
+        binary_fields = {key: value for key, value in fields.items()
+                         if key not in ("testcases", "package-name", "cwd", "status")}
+        binaries[binary] = binary_fields
+        if not isinstance(cases, dict):
+            raise ValueError("Invalid nextest test cases")
+        names: list[str] = []
+        for name, case in cast(dict[object, object], cases).items():
+            if not isinstance(name, str) or not isinstance(case, dict):
+                raise ValueError("Invalid nextest test case")
+            match = cast(dict[str, object], case).get("filter-match")
+            status = cast(dict[str, object], match).get("status") if isinstance(match, dict) else None
+            if status not in ("matches", "mismatch"):
+                raise ValueError("Invalid nextest filter match")
+            if status == "matches":
+                names.append(name)
+        if names:
+            selected[binary] = names
+    return NextestListing(SelectedTests(selected), {"rust-build-meta": build, "rust-binaries": binaries})
 
 
 class LogFacts(TypedDict):
@@ -348,8 +423,6 @@ def result_status(word: str) -> str:
 
 def nextest_slow_test_s() -> float:
     """Read the nextest recording threshold at use."""
-    from scripts.lib import conf
-
     return conf.read("test_times").number("NEXTEST_SLOW_TEST_S")
 
 

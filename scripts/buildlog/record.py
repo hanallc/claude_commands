@@ -12,6 +12,7 @@ port_lint.py writes its own call records through write_call() here.
       the original row and sources for collect() to finish after a failed
       save. BUILDLOG_TEST_PHASE_FILE names the step's sampled test-phase
       sidecar, retained with those sources; missing observations are unknown.
+      BUILDLOG_TEST_SELECTION_FILE names the selection saved before nextest ran.
       BUILDLOG_TREE_START is the tree key step_context.py printed
       before the step; the key taken here, after it, decides tree_key and
       tree_changed.
@@ -81,7 +82,7 @@ from scripts.lib.test_phase import (
     UnreadableTestPhaseRecord as UnreadableTestPhaseRecord,
 )
 
-from scripts.buildlog import cgroup_capture, store, step_context
+from scripts.buildlog import cgroup_capture, parse, store, step_context
 from scripts.buildlog.repository import (
     GIT_TIMEOUT_S as GIT_TIMEOUT_S,
     MANIFEST_IDENTITY_PREFIX,
@@ -284,6 +285,7 @@ class PendingStep:
     month_row_end: int
     test_phase_file: Path | NoTestPhaseRecord = NO_TEST_PHASE_RECORD
     test_phase: TestPhaseRecord | NoTestPhaseRecord | UnreadableTestPhaseRecord = NO_TEST_PHASE_RECORD
+    test_selection_file: Path | parse.NoTestSelection = parse.NO_TEST_SELECTION
 
 
 @dataclass(frozen=True)
@@ -809,6 +811,7 @@ def _save_pending_step(pending: PendingStep, *, replace_existing: bool = False) 
         "held_log": str(pending.held_log) if isinstance(pending.held_log, Path) else None,
         "peak_file": str(pending.peak_file) if isinstance(pending.peak_file, Path) else None,
         "test_phase_file": str(pending.test_phase_file) if isinstance(pending.test_phase_file, Path) else None,
+        "test_selection_file": str(pending.test_selection_file) if isinstance(pending.test_selection_file, Path) else None,
         "test_phase_read_error": (pending.test_phase.reason
                                   if isinstance(pending.test_phase, UnreadableTestPhaseRecord) else None),
         "month_row_end": pending.month_row_end,
@@ -828,9 +831,8 @@ def _read_pending_step(path: Path) -> PendingStep:
             or not all(isinstance(row.get(key), str) for key in ("host", "id", "started_at"))):
         raise ValueError("pending record is not a build step")
     held, peak, phase = fields.get("held_log"), fields.get("peak_file"), fields.get("test_phase_file")
-    if ((held is not None and not isinstance(held, str))
-            or (peak is not None and not isinstance(peak, str))
-            or (phase is not None and not isinstance(phase, str))):
+    selection = fields.get("test_selection_file")
+    if any(source is not None and not isinstance(source, str) for source in (held, peak, phase, selection)):
         raise ValueError("pending step has invalid source paths")
     boundary_key = "month_row_end" if "month_row_end" in fields else "month_offset"
     saved_boundary = fields.get(boundary_key)
@@ -844,7 +846,8 @@ def _read_pending_step(path: Path) -> PendingStep:
                   else _test_phase_record(row) if isinstance(phase, str) else NO_TEST_PHASE_RECORD)
     return PendingStep(row_key, row, Path(held) if isinstance(held, str) else NoHeldLog(),
                        Path(peak) if isinstance(peak, str) else NoPeakFile(), month_row_end,
-                       Path(phase) if isinstance(phase, str) else NO_TEST_PHASE_RECORD, test_phase)
+                       Path(phase) if isinstance(phase, str) else NO_TEST_PHASE_RECORD, test_phase,
+                       Path(selection) if isinstance(selection, str) else parse.NO_TEST_SELECTION)
 
 
 def _step_month_file(row: Mapping[str, object]) -> Path:
@@ -883,9 +886,10 @@ def _resume_step_line(pending: PendingStep) -> bool:
 
 
 def _delete_step_sources(held: Path | NoHeldLog, peak: Path | NoPeakFile,
-                         phase: Path | NoTestPhaseRecord = NO_TEST_PHASE_RECORD) -> None:
+                         phase: Path | NoTestPhaseRecord = NO_TEST_PHASE_RECORD,
+                         selection: Path | parse.NoTestSelection = parse.NO_TEST_SELECTION) -> None:
     sidecars = [Path(str(peak) + suffix) for suffix in (CPU_SIDECAR, IO_SIDECAR)] if isinstance(peak, Path) else []
-    for path in (held, peak, phase, *sidecars):
+    for path in (held, peak, phase, selection, *sidecars):
         if isinstance(path, Path):
             path.unlink(missing_ok=True)
             if path.parent.is_dir():
@@ -907,7 +911,7 @@ def _finish_step(path: Path, pending: PendingStep, publish: Callable[[PendingSte
             raise OSError("failed step log was not saved")
         _sync_directory((store.root() / saved_log).parent)
     added = publish(pending)
-    _delete_step_sources(pending.held_log, pending.peak_file, pending.test_phase_file)
+    _delete_step_sources(pending.held_log, pending.peak_file, pending.test_phase_file, pending.test_selection_file)
     os.utime(path, None)
     with path.open("rb") as handle:
         os.fsync(handle.fileno())
@@ -1029,7 +1033,6 @@ def _hana_step_row(key: hana_result.HanaAttemptKey, link: hana_result.LogicalSte
 def publish_hana_result(accepted: hana_result.AcceptedHanaResult, link: hana_result.LogicalStepLink,
                         context: HanaStepContext) -> PublishedStep:
     """Publish only a result accepted under the execution journal lock."""
-    from scripts.buildlog import parse
     from scripts.aws_target import hana_result
 
     result = accepted.result
@@ -1070,9 +1073,26 @@ def scope_resources(peak: str) -> cgroup_capture.StepScopeCounters:
             "io": cgroup_capture.parse_io(sidecar(IO_SIDECAR))}
 
 
+def selection_fields(source: Path | parse.NoTestSelection) -> dict[str, object]:
+    if isinstance(source, parse.NoTestSelection):
+        return {}
+    try:
+        content = source.read_text(encoding="utf-8")
+        if not content:
+            return {}
+        selection = parse.saved_test_selection(cast(object, json.loads(content)))
+        if isinstance(selection, parse.SelectedTests):
+            return {"selected_tests": selection.by_binary}
+    except FileNotFoundError:
+        return {}
+    except ValueError:
+        pass
+    store.note_error(f"invalid nextest selection {source}")
+    return {}
+
+
 def step(args: list[str]) -> None:
     import hashlib
-    from scripts.buildlog import parse
     from scripts.buildlog import treekey
 
     status_text, start_text, end_text, tty_text, held, peak = args[:6]
@@ -1080,15 +1100,19 @@ def step(args: list[str]) -> None:
     host = store.host_name()
     cwd = os.getcwd()
     phase_path = os.environ.get("BUILDLOG_TEST_PHASE_FILE", "")
+    selection_path = os.environ.get("BUILDLOG_TEST_SELECTION_FILE", "")
     identity: list[object] = [host, cwd, args]
     if phase_path:
         identity.append(str(Path(phase_path).absolute()))
+    if selection_path:
+        identity.append({"test_selection_file": str(Path(selection_path).absolute())})
     row_key = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
     pending_path = pending_steps_root() / f"{row_key}.json"
     done_path = pending_path.with_suffix(".done")
     held_log = Path(held).absolute() if held else NoHeldLog()
     peak_file = Path(peak).absolute() if peak else NoPeakFile()
     phase_file = Path(phase_path).absolute() if phase_path else NO_TEST_PHASE_RECORD
+    selection_file = Path(selection_path).absolute() if selection_path else parse.NO_TEST_SELECTION
     store.root().mkdir(parents=True, exist_ok=True)
     try:
         with (store.root() / LAUNCH_LOCK_NAME).open("a+b") as lock:
@@ -1096,7 +1120,7 @@ def step(args: list[str]) -> None:
             if pending_path.exists():
                 _ = finish_pending_step(pending_path)
                 return
-            if (held or peak or phase_path) and done_path.exists():
+            if (held or peak or phase_path or selection_path) and done_path.exists():
                 return
         try:
             start = float(start_text)
@@ -1105,7 +1129,7 @@ def step(args: list[str]) -> None:
             started_at, ended_at = store.utc_iso(start), store.utc_iso(end)
         except (ValueError, OverflowError, OSError):
             store.note_error(f"record.py step {' '.join(args)[:500]}")
-            _delete_step_sources(held_log, peak_file, phase_file)
+            _delete_step_sources(held_log, peak_file, phase_file, selection_file)
             return
         tty = tty_text == "1"
         directory = git_directory(argv, cwd)
@@ -1184,6 +1208,7 @@ def step(args: list[str]) -> None:
             "mem_stall_some_s": memory.stall_some_s if isinstance(memory.stall_some_s, float) else None,
             "mem_stall_full_s": memory.stall_full_s if isinstance(memory.stall_full_s, float) else None,
             **facts,
+            **selection_fields(selection_file),
             "log": log,
             **(test_phase_fields(phase) if not isinstance(phase, UnreadableTestPhaseRecord) else {}),
             **placement_step_fields(),
@@ -1193,11 +1218,11 @@ def step(args: list[str]) -> None:
             if pending_path.exists():
                 _ = finish_pending_step(pending_path)
                 return
-            if (held or peak or phase_path) and done_path.exists():
+            if (held or peak or phase_path or selection_path) and done_path.exists():
                 return
             month_file = store.host_file(host, start)
             month_row_end = store.read_last_whole_row_end(month_file)
-            pending = PendingStep(row_key, record, held_log, peak_file, month_row_end, phase_file, phase)
+            pending = PendingStep(row_key, record, held_log, peak_file, month_row_end, phase_file, phase, selection_file)
             _ = _finish_step(_save_pending_step(pending), pending, write_step_line)
     except Exception:  # noqa: BLE001 -- retain every source needed for a retry
         if pending_path.is_file():

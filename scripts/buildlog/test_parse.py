@@ -135,6 +135,31 @@ class CleaningTests(unittest.TestCase):
 
 
 class FixtureTests(unittest.TestCase):
+    def test_nextest_listing_preserves_binary_metadata_and_only_selected_names(self) -> None:
+        build = {"target-directory": "/work/target"}
+        binary = {"binary-id": "hana::test_target", "binary-path": "/work/target/test"}
+        skipped = {"binary-id": "hana::skipped", "binary-path": "/work/target/skipped"}
+        listing = parse.nextest_listing({
+            "rust-build-meta": build,
+            "rust-suites": {
+                "hana::test_target": {
+                    **binary, "cwd": "/work", "status": "listed", "package-name": "hana",
+                    "testcases": {
+                        "tests::fast": {"ignored": False, "filter-match": {"status": "matches"}},
+                        "tests::ignored": {"ignored": True, "filter-match": {"status": "matches"}},
+                        "tests::excluded": {"ignored": False, "filter-match": {"status": "mismatch", "reason": "expression"}},
+                    },
+                },
+                "hana::skipped": {**skipped, "status": "skipped", "package-name": "hana"},
+            },
+        })
+        self.assertEqual(listing.selection.by_binary, {"hana::test_target": ["tests::fast", "tests::ignored"]})
+        self.assertEqual(listing.binaries_metadata, {
+            "rust-build-meta": build, "rust-binaries": {"hana::test_target": binary, "hana::skipped": skipped},
+        })
+        self.assertEqual(parse.saved_test_selection(listing.selection.by_binary), listing.selection)
+        self.assertIsInstance(parse.saved_test_selection({"hana": ["valid", 7]}), parse.NoTestSelection)
+
     def test_compiled_names_keep_every_counted_line_in_log_order(self) -> None:
         text = (
             "\x1b[32m   Compiling hana v0.1.0 (/r/hana)\x1b[0m\n"

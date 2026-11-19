@@ -237,6 +237,15 @@ class RecordTests(unittest.TestCase):
             found += [cast(Record, json.loads(line)) for line in path.read_text().splitlines()]
         return found
 
+    def test_nextest_records_a_selection_even_when_a_terminal_watches(self) -> None:
+        selection = self.base / "nextest-selection.json"
+        names = {"hana::bin/hana": ["tests::fast"]}
+        _ = selection.write_text(json.dumps(names))
+        row = self.step(0, "1", "", "", NEXTEST, {"BUILDLOG_TEST_SELECTION_FILE": str(selection)})
+        self.assertEqual(row["selected_tests"], names)
+        self.assertIsNone(row["tests"])
+        self.assertFalse(selection.exists())
+
     def test_reserved_test_phase_row_keeps_the_sampler_reservation_with_or_without_charge(self) -> None:
         reservation = "sampled-reservation"
         charge: recorder.TestPhaseChargeUse = {
