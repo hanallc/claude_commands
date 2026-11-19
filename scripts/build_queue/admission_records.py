@@ -18,7 +18,7 @@ from pathlib import Path
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import placement
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
-from scripts.build_queue.snapshot_codec import public_queue_text, select_queue_name
+from scripts.build_queue.snapshot_codec import UNKNOWN_CALLER, public_caller_name, public_queue_text, select_queue_name
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
@@ -1015,7 +1015,7 @@ def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
     if isinstance(cause, EstimateExpired):
         return "head: estimate expired"
     if isinstance(cause, BehindHead):
-        return "head: behind " + cause.head_name
+        return "head: behind " + select_queue_name(cause.head_name)
     if isinstance(cause, GpuSlotWait):
         return "head: " + gpu_slot_text(cause)
     if isinstance(cause, ReadyForAdmission):
@@ -1601,8 +1601,9 @@ def queue_caller(session_id: str, staff_id: str, exported_name: str, session_fol
         session_id = session_id or member.current_session
         staff_name = member.name
     folder = public_queue_text(Path(worktree).name) if not reference else ""
-    name = select_queue_name(staff_name, exported_name, Path(session_folder).name,
-                             f"terminal · {folder}" if folder else "")
+    name = (public_caller_name(staff_name) or public_caller_name(exported_name)
+            or public_caller_name(Path(session_folder).name)
+            or (f"terminal · {folder}" if folder else UNKNOWN_CALLER))
     return QueueCaller(session_id, name, unit)
 
 

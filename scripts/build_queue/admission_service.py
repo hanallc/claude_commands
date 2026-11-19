@@ -1323,7 +1323,7 @@ def wait_line_name(waiting: WaitingAdmission) -> str:
     """Name a queued build from its recorded owner and step."""
     row = waiting.row
     identity = gate.RecordedQueueIdentities().identity(row["pid"], cast(dict[str, object], cast(object, row)))
-    name = gate.waiter_unit_name(identity, row["pid"])
+    name = gate.waiter_unit_name(identity)
     step = codec.public_queue_text(identity["step"])
     return f"{name} · {step}" if step else name
 
@@ -1495,10 +1495,11 @@ class AdmissionServer:
                        else records.NO_STAFF_LOOKUP)
             for episode, record in state.reservations.items():
                 row = record.queue_waiter
-                caller = self._stored_caller(row.get("session_id", ""), row.get("session_name", ""),
-                    row.get("folder") or record.worktree, row.get("unit", ""), members=members)
-                record = replace(record, queue_waiter={**row, "session_name": caller.name, "unit": caller.unit})
-                state.reservations[episode] = record
+                if not row.get("ci_runner"):
+                    caller = self._stored_caller(row.get("session_id", ""), row.get("session_name", ""),
+                        row.get("folder") or record.worktree, row.get("unit", ""), members=members)
+                    record = replace(record, queue_waiter={**row, "session_name": caller.name, "unit": caller.unit})
+                    state.reservations[episode] = record
                 self.writes.register(record)
             for key, place in state.places.items():
                 identity = place.queue_identity
@@ -4123,8 +4124,8 @@ done
     @staticmethod
     def _stored_caller(session: str, name: str, folder: str, unit: str, *,
                        members: records.QueueStaff) -> records.QueueCaller:
-        caller = records.queue_caller(session, "", name, "", folder, members=members, unit=unit)
-        return replace(caller, name=name.strip() or caller.name)
+        caller = records.queue_caller(session, "", "", "", folder, members=members, unit=unit)
+        return replace(caller, name=codec.resolve_queue_caller(stored_caller=name, staff_caller=caller.name))
 
     def _named_identity(self, identity: wire.Identity, *, members: records.QueueStaff, folder: str = "") -> wire.Identity:
         caller = self._stored_caller(identity.session_id, identity.name, identity.folder or folder, identity.unit,
@@ -4239,9 +4240,10 @@ done
             if any(waiting.request.owner == request.owner and episode != key
                    for episode, waiting in self.waiters.items()):
                 return self._mutation_reply(key, wire.Refused("owner already has an admission episode"))
-            folder = request.cwd if isinstance(request, wire.AdmitRequest) else request.profile.worktree
-            members = records.queue_staff() if request.identity.session_id else records.NO_STAFF_LOOKUP
-            request = replace(request, identity=self._named_identity(request.identity, members=members, folder=folder))
+            if not isinstance(request, ServiceEstimatedAdmission):
+                folder = request.cwd if isinstance(request, wire.AdmitRequest) else request.profile.worktree
+                members = records.queue_staff() if request.identity.session_id else records.NO_STAFF_LOOKUP
+                request = replace(request, identity=self._named_identity(request.identity, members=members, folder=folder))
             self._pending_replies[key] = []
             place_key = _place_key(request.owner, request.since)
             row = self._row(request, self.places.get(place_key, records.NoWaiter()))

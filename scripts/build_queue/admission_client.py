@@ -900,7 +900,7 @@ def wait_reasons(result: records.AdmissionWaitSnapshot) -> tuple[str, ...]:
     if isinstance(cause, records.MemoryPressure) and cause.condition == "some":
         return ("some memory pressure",)
     if isinstance(cause, records.BehindHead):
-        return (f"behind {cause.head_name}",)
+        return (f"behind {snapshot_codec.select_queue_name(cause.head_name)}",)
     if isinstance(cause, records.ReadyForAdmission):
         return ("admission refresh",)
     return (records.reason_phrase(cause, ()),)
@@ -909,7 +909,7 @@ def wait_reasons(result: records.AdmissionWaitSnapshot) -> tuple[str, ...]:
 def blocking_waiter_text(place: str, name: str, step: str, unit: str, need_gib: float, *,
                          fallback_name: str = "") -> str:
     """Name the step that holds the row and give its position."""
-    name = snapshot_codec.select_queue_name(name, fallback_name)
+    name = snapshot_codec.select_queue_name(snapshot_codec.public_caller_name(name), fallback_name)
     step = snapshot_codec.public_queue_text(step)
     unit = snapshot_codec.public_queue_text(unit)
     label = " · ".join(part for part in (name, step) if part)
@@ -1101,7 +1101,7 @@ class WaitOutput:
             if isinstance(snapshot.head_reason, records.HeadAdmissionStatus) else
             records.pressure_text(snapshot.decision.pressure)
             if isinstance(snapshot.decision.pressure, records.MemoryPressure) else "reason: " + "; ".join(reasons))
-        head = (" ".join(word for word in ("head", snapshot.head_label, f"needs {snapshot.head_need / records.GIB:.1f} GiB") if word)
+        head = (f"head {snapshot_codec.select_queue_name(snapshot.head_label)} needs {snapshot.head_need / records.GIB:.1f} GiB"
                 if not behind and snapshot.head_need and reply.position != 1 else "")
         parts = (place, f"{subject} needs {snapshot.peak.bytes / records.GIB:.1f} GiB",
                  f"{snapshot.available / records.GIB:.1f} GiB free", reason, head,

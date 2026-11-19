@@ -1658,7 +1658,7 @@ def reservation_stem(directory: Path, pid: int, start_time: str, admitted_ns: in
     return directory / f"{pid}-{start_time}-{admitted_ns}"
 
 
-def waiter_unit_name(identity: WaiterIdentity, _pid: int) -> str:
+def waiter_unit_name(identity: WaiterIdentity) -> str:
     return codec.select_queue_name(identity.get("unit"), identity["session_name"], Path(identity["folder"]).name)
 
 
@@ -1717,7 +1717,7 @@ def queue_order_reason(decision: AdmissionDecision, identities: QueueIdentities)
         return ReadyForAdmission()
     waiter = hold.waiter
     identity = identities.identity(waiter["pid"], cast(dict[str, object], cast(object, waiter)))
-    name = waiter_unit_name(identity, waiter["pid"])
+    name = waiter_unit_name(identity)
     return BehindHead(name, waiter["since"], identity["session_id"])
 
 

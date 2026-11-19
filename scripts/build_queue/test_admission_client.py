@@ -164,6 +164,28 @@ class ClientTests(unittest.TestCase):
                 self.assertNotIn(request.episode, fixture.server.placement_requests)
                 fixture.release(occupied)
 
+    def test_older_wait_lines_normalize_the_head_name_and_label(self) -> None:
+        blocker: records.Waiter = {"pid": 7, "start_time": "7", "need": 2 * GIB, "since": 1,
+                                  "session_name": "—", "step": "  ", "unit": "—"}
+        for label in ("", " \t", "—", "$CALLER", "  other   caller  "):
+            name = "other caller" if label == "  other   caller  " else "unregistered session"
+            for order in (records.NoOrderHold(), records.HeldBehindHead(blocker)):
+                with self.subTest(label=label, order=order):
+                    decision = replace(WAIT.snapshot.decision, order_hold=order)
+                    snapshot = replace(WAIT.snapshot, decision=decision,
+                                       head_reason=records.BehindHead(label, 1, ""))
+                    waiting = replace(WAIT, position=2, text="behind #1", snapshot=snapshot)
+                    with redirect_stderr(io.StringIO()) as output:
+                        client.WaitOutput()(waiting)
+                    expected = (f"reason: behind #1 · head {name} needs 2.0 GiB"
+                                if isinstance(order, records.HeldBehindHead) else f"reason: behind {name}")
+                    self.assertIn(expected, output.getvalue().split("; "))
+            with self.subTest(head_label=label):
+                snapshot = replace(WAIT.snapshot, head_need=2 * GIB, head_label=label)
+                with redirect_stderr(io.StringIO()) as output:
+                    client.WaitOutput()(replace(WAIT, position=2, snapshot=snapshot))
+                self.assertIn(f"head {name} needs 2.0 GiB", output.getvalue().split("; "))
+
     def test_wait_lines_name_the_head_and_identify_the_current_build(self) -> None:
         for position, label, expected, reason in (
             (2, "hana CI · hana-linux-2 · test", "head hana CI · hana-linux-2 · test needs 12.3 GiB", ""),

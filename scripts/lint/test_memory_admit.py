@@ -4344,7 +4344,7 @@ class QueueApiTests(MemoryQueueFixture):
             identity = admission_records.waiter_identity("merge-gate", "tree")
             self.assertEqual(identity.get("unit"), "queue-unit")
             self.assertEqual(identity["session_id"], "showrunner")
-            self.assertEqual(gate.waiter_unit_name(identity, 123), "queue-unit")
+            self.assertEqual(gate.waiter_unit_name(identity), "queue-unit")
 
     def test_waiter_identity_keeps_the_bare_step_and_caller_identity(self) -> None:
         with patch.dict(os.environ, {"CODEX_THREAD_ID": "worker-id", "CLAUDE_CODE_SESSION_ID": "parent-id",

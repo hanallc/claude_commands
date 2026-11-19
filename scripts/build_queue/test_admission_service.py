@@ -4595,6 +4595,29 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual([(step.session_name, step.unit) for step in reply.reading.view.waiting],
                              [("research", "research"), ("research", "")])
 
+    def test_an_unknown_request_caller_recovers_when_staff_data_is_available(self) -> None:
+        member = staff.StaffRow(staff.StaffId("director"), "unit", "known director", staff.StaffRoot(),
+                                current_session=staff.StaffId("director-session"))
+        members = staff.StaffSnapshot((member,))
+        for supplied in ("—", " \t", "$CALLER", "unregistered session", "recorded caller"):
+            with self.subTest(supplied=supplied), AdmissionFixture() as fixture:
+                request = fixture.request(need=GIB)
+                with mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())), \
+                        mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": member.current_session,
+                                                  "CLAUDE_SESSION_NAME": "", "CLAUDE_SESSION_FOLDER": "", "BUILDLOG_UNIT": ""}):
+                    identity = client.step_identity(request.identity.step, request.cwd)
+                self.assertEqual(identity.name, "unregistered session")
+                request = replace(request, identity=replace(identity, name=supplied))
+                with mock.patch.object(staff, "local_snapshot", return_value=members):
+                    _ = only_admitted(fixture.connect(request).replies())
+                reply, = fixture.connect(wire.ViewRequest()).replies()
+                assert isinstance(reply, wire.ViewReply)
+                row, = [step for step in reply.reading.view.running if step.pid == request.owner.pid]
+                expected = supplied if supplied == "recorded caller" else member.name
+                self.assertEqual((row.session_name, row.unit), (expected, member.name))
+                saved = fixture.server.reservations[request.episode]
+                self.assertEqual(saved.queue_waiter.get("session_name"), expected)
+
     def test_service_names_an_empty_admission(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request(need=GIB)

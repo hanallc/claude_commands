@@ -933,11 +933,12 @@ BRP launches use `launch`; launch permission creates no reservation.
 
 Transport failures never permit a start and never select another admitter.
 The client reconnects with its first request identity. It reports unavailable transport periodically and waits.
-The client, service, and Builds page use `queue_caller` to resolve a caller name.
-It checks the staff name, the exported name, and the session folder name in that order.
+The client checks the staff name, the exported name, and the session folder name in that order.
 It uses `terminal · <folder>` for a direct command with a known folder.
-It uses `unregistered session` when no other name is available.
-The service fills empty names on requests and restores.
+The service, snapshot decoder, and Builds page use `resolve_queue_caller`.
+The resolver uses the first usable name from the record, the reservation, and the staff snapshot.
+It returns `unregistered session` when no candidate is usable.
+A later read can replace this fallback with a usable name.
 A staff unit uses its own name for priority. A worker uses its parent unit.
 A showrunner keeps its caller name and has an empty unit.
 A valid wait resets checker-failure time. Checker failures after a wait retry until `BUILDLOG_MEM_CHECK_RETRY_S`.
@@ -2028,8 +2029,8 @@ The slot keeps the caller name from the reservation, including when a continuati
 The snapshot decoder restores a missing caller name from the matching reservation.
 If the reservation has no usable name, the decoder looks up the fixed staff ID in the supplied staff snapshot.
 If the decoder finds no usable name, it supplies the label `unregistered session`.
-The feed and wait lines use the first usable name in each list of candidates.
-The feed keeps the caller separate from the step name.
+The feed uses separate rules for caller names, step labels, and CI labels.
+Wait lines prefer the unit and normalize the names in older replies.
 The Builds page uses the names and hover titles from the feed.
 A continuation within the slot bypasses order, spacing, and pressure.
 A larger continuation holds the slot and requests only its extra memory before new runs.

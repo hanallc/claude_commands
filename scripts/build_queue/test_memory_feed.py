@@ -2713,7 +2713,39 @@ process.stdout.write(JSON.stringify({
                     self.assertEqual(row.get("showrunner"), "hana")
                     self.assertEqual(row["unit"], owner.unit)
 
-    def caller_selection_page(self) -> memory_feed.MemoryPage:
+    def test_decoded_work_rows_keep_caller_names_separate_from_display_labels(self) -> None:
+        for stored, reservation, caller, held in (
+            ("recorded caller", "reservation caller", "recorded caller", "recorded caller"),
+            ("", "reservation caller", "staff member", "reservation caller"),
+            (" \t", "reservation caller", "staff member", "reservation caller"),
+            ("—", "reservation caller", "staff member", "reservation caller"),
+            ("$CALLER", "reservation caller", "staff member", "reservation caller"),
+            ("unregistered session", "reservation caller", "staff member", "reservation caller"),
+            ("unregistered session", "unregistered session", "staff member", "staff member"),
+        ):
+            with self.subTest(stored=stored, reservation=reservation):
+                page = self.caller_selection_page(stored_caller=stored, reservation_caller=reservation)
+                running, waiting = page["walk"], page["waiters"]
+                self.assertEqual([row["pid"] for row in running], [700001, 50, 301, 302, 304])
+                self.assertEqual([row["pid"] for row in waiting], [200, 700002, 303])
+                self.assertEqual(len({row.get("key") for row in (*running, *waiting)}), 8)
+                self.assertEqual(page["reserved"], 11.0)
+                self.assertEqual((running[1]["name"], running[1].get("ci_label")),
+                                 ("CI nextest", "hana CI · hana-linux-2"))
+                self.assertEqual((running[2].get("caller"), running[2].get("owner_text")), (held, held))
+                for row in (running[0], *waiting):
+                    with self.subTest(pid=row["pid"]):
+                        self.assertEqual((row.get("caller"), row.get("owner_text")), (caller, caller))
+                        self.assertEqual((row["unit"], row.get("showrunner")), ("fixture unit", "fixture showrunner"))
+                self.assertEqual(waiting[0]["name"], "fixture unit")
+                self.assertEqual(waiting[0]["title"]["step"], "fixture unit")
+                self.assertEqual(waiting[2]["name"], "fixture unit")
+                for cloud_row in (running[0], waiting[1]):
+                    self.assertEqual(cloud_row["name"], "fixture unit nextest")
+                    self.assertEqual(cloud_row["title"], {"unit": "fixture unit", "step": "nextest"})
+
+    def caller_selection_page(self, *, stored_caller: str | None = None,
+                              reservation_caller: str = "") -> memory_feed.MemoryPage:
         """Decode work rows with both usable and unusable names."""
         initial = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
         inputs = initial.explanation.decided_from
@@ -2729,7 +2761,19 @@ process.stdout.write(JSON.stringify({
                             identity=replace(facts, staff_id=admission_records.NoEndedStepStaff()))
         ci = replace(inputs.running[0], ci_runner="hana-linux-2", session_name="—")
         local = replace(initial.view.waiting[0], session_name="recorded local", step="merge-gate")
-        reading = gate.queue_read_from(replace(inputs, running=(ci,),
+        members = staff.StaffSnapshot((worker,))
+        reservations = inputs.reservations
+        if stored_caller is not None:
+            runner = staff.StaffRow(staff.StaffId("runner"), "showrunner", "fixture showrunner", staff.StaffRoot(),
+                                    current_session=staff.StaffId("runner-session"))
+            director = staff.StaffRow(staff.StaffId("director"), "unit", "fixture unit", staff.ReportsTo(runner.id),
+                                      current_session=staff.StaffId("director-session"))
+            worker = replace(worker, name="staff member", parent=staff.ReportsTo(director.id))
+            members = staff.StaffSnapshot((runner, director, worker))
+            local = replace(local, session_id=worker.current_session, session_name=stored_caller)
+            retained = replace(retained, reservation="step", identity=replace(facts, caller_name=stored_caller))
+            reservations = tuple({**row, "session_name": reservation_caller} for row in inputs.reservations)
+        reading = gate.queue_read_from(replace(inputs, running=(ci,), reservations=reservations,
             slots=(retained, admission_records.ContinuationSlot(continued, "next"))), admission_policy_fixture())
         cloud = cloud_reading(replace(reading, view=replace(reading.view, waiting=(local,))))
         cloud = replace(cloud, cloud=tuple(replace(row, identity=replace(
@@ -2737,6 +2781,10 @@ process.stdout.write(JSON.stringify({
         slot = wire.RepositorySlotRow(wire.Owner(303, "303"),
             wire.Identity("slot-session", "recorded slot", "merge-gate", "/private/widget"),
             now - 30, "natedev", wire.RepositorySlotWaiting("widget", (1,), 1, "slots.natedev.widget.max"))
+        if stored_caller is not None:
+            cloud = replace(cloud, cloud=tuple(replace(row, identity=replace(
+                row.identity, session_id=worker.current_session, name=stored_caller, step="nextest")) for row in cloud.cloud))
+            slot = replace(slot, identity=replace(slot.identity, session_id=worker.id, name=stored_caller))
         message = wire.encode_reply(wire.ViewReply(replace(cloud, repository_slots=(slot,))))
         mac = queue_view.MacBuild(304, "/private/hana", now - 45, "cargo nextest run --jobs=8", "hana",
                                    queue_view.MacTesting(305), admission_records.GIB)
@@ -2750,7 +2798,7 @@ process.stdout.write(JSON.stringify({
         labels = {session: unknown for session in (local.session_id, *(row.identity.session_id for row in cloud.cloud))}
         with (mock.patch.object(admission_client, "view", side_effect=view),
               mock.patch.object(unit_labels, "unit_labels_for", return_value=labels),
-              mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((worker,))),
+              mock.patch.object(staff, "snapshot", return_value=members),
               mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(now, (mac,))),
               mock.patch.object(memory_feed, "mac_build_units", return_value={mac.pid: unknown})):
             return memory_feed.reading()
@@ -2806,7 +2854,7 @@ process.stdout.write(JSON.stringify({
         for members, tty, name, unit, showrunner, caller in (
             ((), 34816, "hana build", "", "", "terminal · hana_catalyst"),
             ((), 0, "hana build", "", "", "terminal · hana_catalyst"),
-            ((runner, director), 34816, "startup build", "startup", "hana", ""),
+            ((runner, director), 34816, "startup build", "startup", "hana", "startup"),
         ):
             with self.subTest(tty=tty, unit=unit):
                 fields = ["S", "1", str(pid), str(pid), str(tty), *(["0"] * 14), str(pid)]

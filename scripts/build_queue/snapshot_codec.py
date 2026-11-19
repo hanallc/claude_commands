@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 # Literal unions use typing.Union on Python 3.13.
 LITERAL_UNION_ORIGIN = get_origin(Literal[0] | Literal[1])
+UNKNOWN_CALLER = "unregistered session"
 
 
 class SnapshotReadPolicy(Enum):
@@ -134,8 +135,20 @@ def public_queue_text(value: object) -> str:
 
 
 def select_queue_name(*candidates: object) -> str:
-    """Use the first public name, or the label for an unknown caller."""
-    return next((name for value in candidates if (name := public_queue_text(value))), "unregistered session")
+    """Use the first public label."""
+    return next((name for value in candidates if (name := public_queue_text(value))), UNKNOWN_CALLER)
+
+
+def public_caller_name(value: object) -> str:
+    """Return a usable caller name."""
+    name = public_queue_text(value)
+    return "" if name == UNKNOWN_CALLER else name
+
+
+def resolve_queue_caller(*, stored_caller: object, reservation_caller: object = "", staff_caller: object = "") -> str:
+    """Select the recorded caller, the reservation caller, or the staff member."""
+    candidates = (stored_caller, reservation_caller, staff_caller)
+    return next((name for value in candidates if (name := public_caller_name(value))), UNKNOWN_CALLER)
 
 
 def recover_slot_callers(record: dict[str, object]) -> dict[str, object]:
@@ -153,7 +166,7 @@ def recover_slot_callers(record: dict[str, object]) -> dict[str, object]:
             key = reservation.get("reservation_id")
             identity = reservation.get("queue_waiter", reservation)
             if isinstance(key, str) and isinstance(identity, dict):
-                name = public_queue_text(cast(dict[str, object], identity).get("session_name"))
+                name = public_caller_name(cast(dict[str, object], identity).get("session_name"))
                 if name:
                     callers[key] = name
 
@@ -171,7 +184,7 @@ def recover_slot_callers(record: dict[str, object]) -> dict[str, object]:
         facts = cast(dict[str, object], identity)
         if facts.get("kind") != "EndedStepFacts":
             return slot
-        stored = public_queue_text(facts.get("caller_name"))
+        stored = public_caller_name(facts.get("caller_name"))
         key = slot.get("reservation")
         name = callers.get(key, "") if isinstance(key, str) else ""
         staff_id = facts.get("staff_id")
@@ -179,7 +192,8 @@ def recover_slot_callers(record: dict[str, object]) -> dict[str, object]:
                   if not (stored or name) and members is not None and isinstance(staff_id, str) else None)
         if members is None and not (stored or name):
             return slot
-        caller = select_queue_name(stored, name, member.name if member is not None else "")
+        caller = resolve_queue_caller(stored_caller=stored, reservation_caller=name,
+                                      staff_caller=member.name if member is not None else "")
         return slot if caller == facts.get("caller_name") else {**slot, "identity": {**facts, "caller_name": caller}}
 
     return {**record, "slots": [recover(slot) for slot in cast(list[object], slots)]}
