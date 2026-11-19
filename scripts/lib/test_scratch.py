@@ -1275,6 +1275,86 @@ for descriptor in descriptors:
         self.assertIsInstance(scratch.remove_folder(path), scratch.KeptFolder)
         self.assertTrue(scratch.removal_mark(path).is_file())
 
+    @unittest.skipUnless(sys.platform == "linux", "requires procfs")
+    def test_retry_keeps_a_checkout_that_git_can_still_reach(self) -> None:
+        for access in ("cwd", "directory descriptor"):
+            with self.subTest(access=access):
+                path = self.checkout_with_removal_intent("current", access.replace(" ", "-"))
+                program = (
+                    'if [ "$1" = "directory descriptor" ]; then exec 3<"$2"; fi\n'
+                    'printf "ready\\n"\n'
+                    'read -r command || exit 1\n'
+                    'if [ "$1" = "directory descriptor" ]; then cd /proc/self/fd/3 || exit 1; fi\n'
+                    'exec git update-ref refs/heads/held-cwd HEAD\n'
+                )
+                with subprocess.Popen(["bash", "-c", program, "writer", access, str(path)],
+                                      cwd=path if access == "cwd" else self.base,
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                      text=True) as writer:
+                    try:
+                        assert writer.stdout is not None
+                        self.assertEqual(writer.stdout.readline(), "ready\n")
+                        recover = scratch.recovery_state
+
+                        def write_after_snapshot(folder: Path, pending: copy_record.Registered,
+                                                 scope: scratch.BusyMarkScope, *, scratch_settings: conf.ConfigRead,
+                                                 locations: scratch.RemovalLocations,
+                                                 packed_refs: tuple[Path, ...]) -> scratch.RemovalRetry | scratch.KeptFolder:
+                            state = recover(folder, pending, scope, scratch_settings=scratch_settings,
+                                            locations=locations, packed_refs=packed_refs)
+                            _, error = writer.communicate("write\n", timeout=10)
+                            self.assertEqual(writer.returncode, 0, error)
+                            return state
+
+                        with mock.patch.object(scratch, "recovery_state", side_effect=write_after_snapshot):
+                            result = scratch.remove_folder(path)
+                        self.assertIsInstance(result, scratch.KeptFolder)
+                        _, error = writer.communicate("write\n", timeout=10)
+                        self.assertEqual(writer.returncode, 0, error)
+                        self.git(path, "rev-parse", "--verify", "refs/heads/held-cwd")
+                    finally:
+                        if writer.returncode is None:
+                            writer.kill()
+                            _ = writer.communicate(timeout=10)
+
+    def test_retry_resumes_when_a_crash_left_both_tombstones(self) -> None:
+        source, _ = self.copy_with_published_head("crash-source")
+        path = self.base / "interrupted-worktree"
+        self.git(source, "worktree", "add", "-q", "-b", "side", str(path))
+        admin = git_files.at(path).git_dir
+        self.stop_removal_after_intent(path, "current")
+        program = """import os
+import sys
+from pathlib import Path
+from unittest.mock import patch
+from scripts.lib import scratch
+
+with patch.object(scratch, "recovery_state", side_effect=lambda *args, **kwargs: os._exit(73)):
+    scratch.remove_folder(Path(sys.argv[1]))
+"""
+        done = subprocess.run([sys.executable, "-B", "-c", program, str(path)],
+                              capture_output=True, text=True, timeout=20)
+        self.assertEqual(done.returncode, 73, done.stderr)
+        self.assertFalse(path.exists())
+        self.assertFalse(admin.exists())
+        checkout_tombstone, = path.parent.glob(f"{scratch.TOMBSTONE_PREFIX}*")
+        admin_tombstone, = admin.parent.parent.glob(f"{scratch.TOMBSTONE_PREFIX}*")
+        self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
+        self.assertFalse(checkout_tombstone.exists())
+        self.assertFalse(admin_tombstone.exists())
+        self.assertFalse(scratch.removal_mark(path).exists())
+
+    def test_fresh_removal_keeps_separate_git_storage(self) -> None:
+        _, remote = self.copy_with_published_head("separate-source")
+        path = self.base / "checkout"
+        separate = self.base / "separate-git"
+        self.git(self.base, "clone", "-q", "-b", "main", "--separate-git-dir", str(separate), str(remote), str(path))
+        original_head = (separate / "HEAD").read_bytes()
+        self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
+        self.assertFalse(path.exists())
+        self.assertEqual((separate / "HEAD").read_bytes(), original_head)
+        self.git(self.base, "--git-dir", str(separate), "rev-parse", "--verify", "HEAD")
+
     def test_fresh_removal_does_not_read_head_when_it_records_intent(self) -> None:
         path, _ = self.copy_with_published_head("fresh-intent")
         self.git(path, "update-ref", "refs/remotes/origin/main", "HEAD")

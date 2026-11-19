@@ -111,7 +111,7 @@ UNTIL_FORMAT = "%Y-%m-%dT%H%MZ"
 ROW_NAME = re.compile(r"[A-Za-z0-9_-]+-C[0-9]+")
 WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 BUSY_REASON = "busy: a lease or .claude-busy lock is held"
-RECORD_LOCKS: ContextVar[frozenset[tuple[int, int]]] = ContextVar("scratch_record_locks", default=frozenset())
+RECORD_LOCKS: ContextVar[dict[tuple[int, int], int]] = ContextVar("scratch_record_locks", default={})
 REMOVAL_VERSION = 2
 TOMBSTONE_PREFIX = ".scratch-tombstone-"
 
@@ -392,7 +392,7 @@ def directory_record_lock(path: Path, *, wait: bool,
             if reentered:
                 yield True
                 return
-            token = RECORD_LOCKS.set(RECORD_LOCKS.get() | {identity})
+            token = RECORD_LOCKS.set({**RECORD_LOCKS.get(), identity: descriptor})
             try:
                 yield True
             finally:
@@ -933,6 +933,8 @@ def checked_removal(path: Path) -> copy_record.Registered | copy_record.NotRegis
         return record
     if record.fields.get("copy_path") != str(path.resolve()):
         return copy_record.UnreadableRecord(f"repair removal record {removal_mark(path)}: copy path differs")
+    if "removal_moves" in record.fields:
+        return record
     try:
         directory = path.stat()
     except FileNotFoundError:
@@ -1458,9 +1460,8 @@ def removal_metadata(root: Path, root_git: GitDirectoryState, descendants: tuple
         if isinstance(git, GitDirectory):
             has_git = True
             checkout = git.checkout
-            if not checkout.git_dir.is_relative_to(root):
-                if checkout.git_dir.parent != checkout.common_dir / "worktrees":
-                    raise OSError(f"{checkout.git_dir}: external Git storage is not a linked worktree")
+            if (not checkout.git_dir.is_relative_to(root)
+                    and checkout.git_dir.parent == checkout.common_dir / "worktrees"):
                 admin.add(checkout.git_dir)
             if not checkout.common_dir.is_relative_to(root):
                 packed.add(checkout.common_dir / "packed-refs")
@@ -1555,6 +1556,180 @@ def restore_removal_folders(moved: RemovalLocations) -> None:
         _ = rollback.pop_all()
 
 
+def check_tombstone_holders(tombstones: Collection[Path], scope: BusyMarkScope) -> None:
+    """Keep a checkout if a process can still use it through a directory or file."""
+    roots = {str(path.resolve()) for path in tombstones}
+    prefixes = tuple(root + os.sep for root in roots)
+
+    def check(target: str, owner: str) -> None:
+        path = target.removesuffix(" (deleted)")
+        if path in roots or path.startswith(prefixes):
+            raise OSError(f"{owner} still uses {path}")
+
+    owned_descriptors = {str(fd) for fd in (*scope.held.values(), *RECORD_LOCKS.get().values())}
+    own_pid = str(os.getpid())
+    if sys.platform == "darwin":
+        try:
+            report = subprocess.run(["lsof", "-nP", "-Fpfn"], capture_output=True, text=True, timeout=10, check=False)
+        except subprocess.TimeoutExpired as error:
+            raise OSError("cannot check tombstone holders with lsof") from error
+        if not report.stdout or report.returncode not in (0, 1):
+            raise OSError("cannot check tombstone holders with lsof")
+        pid = descriptor = ""
+        for line in report.stdout.splitlines():
+            if line.startswith("p"):
+                pid = line[1:]
+                descriptor = ""
+            elif line.startswith("f"):
+                descriptor = line[1:]
+            elif line.startswith("n") and (pid != own_pid or descriptor not in owned_descriptors):
+                check(line[1:], f"pid {pid}")
+        return
+
+    def inspect_link(link: str, owner: str) -> None:
+        try:
+            target = os.readlink(link)
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            return
+        check(target, owner)
+
+    with os.scandir("/proc") as processes:
+        for process in processes:
+            if not process.name.isdigit():
+                continue
+            owner = f"pid {process.name}"
+            for name in ("cwd", "root"):
+                inspect_link(os.path.join(process.path, name), owner)
+            try:
+                descriptors = os.scandir(os.path.join(process.path, "fd"))
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+            with descriptors:
+                for descriptor in descriptors:
+                    if process.name != own_pid or descriptor.name not in owned_descriptors:
+                        inspect_link(descriptor.path, owner)
+
+
+@dataclass(frozen=True)
+class RemovalMoves:
+    """The original identities and private names that this intent may move."""
+
+    locations: RemovalLocations
+    identities: dict[Path, tuple[int, int]]
+    packed_refs: tuple[Path, ...]
+
+    def journal(self) -> dict[str, object]:
+        return {
+            "folders": {str(original): [str(tombstone), *self.identities[original]]
+                        for original, tombstone in self.locations.items()},
+            "packed_refs": [str(path) for path in self.packed_refs],
+        }
+
+
+def removal_identity(path: Path) -> tuple[int, int]:
+    directory = path.lstat()
+    if not stat.S_ISDIR(directory.st_mode):
+        raise OSError(f"{path}: expected a removal folder")
+    return directory.st_dev, directory.st_ino
+
+
+def plan_removal_moves(path: Path, metadata: RemovalMetadata) -> RemovalMoves:
+    label = TOMBSTONE_PREFIX + secrets.token_hex(12)
+    locations = {path: path.with_name(label)}
+    for index, admin in enumerate(metadata.admin_folders):
+        locations[admin] = admin.parent.parent / f"{label}-{index}"
+    return RemovalMoves(locations, {folder: removal_identity(folder) for folder in locations}, metadata.shared_packed_refs)
+
+
+def read_removal_moves(path: Path, pending: copy_record.Registered) -> RemovalMoves:
+    """Read only moves that belong to this source and its recorded worktree metadata."""
+    invalid = f"{path}: invalid removal move record"
+    raw = pending.fields.get("removal_moves")
+    snapshot = pending.fields.get("removal_snapshot")
+    if not isinstance(raw, dict) or not isinstance(snapshot, dict):
+        raise OSError(invalid)
+    fields = cast(dict[str, object], raw)
+    saved = cast(dict[str, object], snapshot)
+    entries, packed = fields.get("folders"), fields.get("packed_refs")
+    if not isinstance(entries, dict) or not isinstance(packed, list):
+        raise OSError(invalid)
+    locations: RemovalLocations = {}
+    identities: dict[Path, tuple[int, int]] = {}
+    for original, value in cast(dict[str, object], entries).items():
+        if not isinstance(value, list):
+            raise OSError(invalid)
+        entry = cast(list[object], value)
+        if len(entry) != 3:
+            raise OSError(invalid)
+        name, device, inode = entry
+        if not isinstance(name, str) or not isinstance(device, int) or not isinstance(inode, int):
+            raise OSError(invalid)
+        source, tombstone = Path(original), Path(name)
+        if not source.is_absolute() or ".." in source.parts or not tombstone.name.startswith(TOMBSTONE_PREFIX):
+            raise OSError(invalid)
+        if source == path:
+            if tombstone.parent != path.parent or (device, inode) != (pending.fields.get("copy_device"),
+                                                                       pending.fields.get("copy_inode")):
+                raise OSError(invalid)
+        elif (source.parent.name != "worktrees" or tombstone.parent != source.parent.parent
+              or str(source / "gitdir") not in saved or source.is_relative_to(path)):
+            raise OSError(invalid)
+        locations[source] = tombstone
+        identities[source] = device, inode
+    if path not in locations or len(set(locations.values())) != len(locations):
+        raise OSError(invalid)
+    packed_refs: list[Path] = []
+    for name in cast(list[object], packed):
+        if not isinstance(name, str) or not Path(name).is_absolute() or Path(name).name != "packed-refs":
+            raise OSError(invalid)
+        packed_refs.append(Path(name))
+    return RemovalMoves(locations, identities, tuple(packed_refs))
+
+
+def move_removal_folders(plan: RemovalMoves, moved: RemovalLocations) -> None:
+    """Complete the moves that the saved intent authorized."""
+    for original, tombstone in plan.locations.items():
+        if os.path.lexists(tombstone):
+            if os.path.lexists(original) or removal_identity(tombstone) != plan.identities[original]:
+                raise OSError(f"{original}: cannot resume removal at {tombstone}")
+        else:
+            if removal_identity(original) != plan.identities[original]:
+                raise OSError(f"{original}: source identity changed during removal")
+            rename_removal_folder(original, tombstone)
+        moved[original] = tombstone
+        if removal_identity(tombstone) != plan.identities[original]:
+            raise OSError(f"{original}: tombstone identity changed during removal")
+
+
+def finish_tombstone_removal(path: Path, pending: copy_record.Registered, scope: BusyMarkScope,
+                             plan: RemovalMoves, *, scratch_settings: conf.ConfigRead,
+                             source_deletion: SourceDeletion) -> RemovalRetry | KeptFolder:
+    moved: RemovalLocations = {}
+    verified = False
+    try:
+        move_removal_folders(plan, moved)
+        try:
+            check_tombstone_holders(plan.locations.values(), scope)
+        except OSError as error:
+            return KeptFolder(path, str(error))
+        state = recovery_state(path, pending, scope, scratch_settings=scratch_settings,
+                               locations=plan.locations, packed_refs=plan.packed_refs)
+        verified = state is RemovalRetry.UNCHANGED
+        if verified:
+            for tombstone in reversed(tuple(plan.locations.values())):
+                delete_removal_source(tombstone, source_deletion)
+        return state
+    finally:
+        if not verified:
+            try:
+                restore_removal_folders(moved)
+            except OSError as error:
+                names = ", ".join(str(tombstone) for tombstone in moved.values())
+                raise ScratchError(f"{path}: cannot restore removal folders at {names}: {error}") from error
+            if not any(os.path.lexists(tombstone) for tombstone in plan.locations.values()):
+                atomic_record(removal_mark(path), {key: value for key, value in pending.fields.items() if key != "removal_moves"})
+
+
 def retry_removal(path: Path, pending: copy_record.Registered, scope: BusyMarkScope,
                   metadata: RemovalMetadata, *, scratch_settings: conf.ConfigRead,
                   source_deletion: SourceDeletion, dry_run: bool) -> RemovalRetry | KeptFolder:
@@ -1572,35 +1747,44 @@ def retry_removal(path: Path, pending: copy_record.Registered, scope: BusyMarkSc
     for admin in metadata.admin_folders:
         if str(admin / "gitdir") not in saved:
             return KeptFolder(path, f"{admin}: linked worktree metadata changed after removal intent")
-    label = TOMBSTONE_PREFIX + secrets.token_hex(12)
-    locations = {path: path.with_name(label), **{admin: admin.parent.parent / f"{label}-{index}"
-                 for index, admin in enumerate(metadata.admin_folders)}}
-    mark = removal_mark(path)
-    atomic_record(mark, {**pending.fields, "removal_tombstones": [str(folder) for folder in locations.values()]})
-    moved: RemovalLocations = {}
-    verified = False
+    plan = plan_removal_moves(path, metadata)
+    if plan.identities[path] != (pending.fields.get("copy_device"), pending.fields.get("copy_inode")):
+        return KeptFolder(path, f"{path}: source identity changed during removal")
+    atomic_record(removal_mark(path), {**pending.fields, "removal_moves": plan.journal()})
+    return finish_tombstone_removal(path, pending, scope, plan, scratch_settings=scratch_settings,
+                                    source_deletion=source_deletion)
+
+
+def resume_tombstone_removal(path: Path, pending: copy_record.Registered, scope: BusyMarkScope, *,
+                             scratch_settings: conf.ConfigRead, source_deletion: SourceDeletion,
+                             dry_run: bool) -> RemovedCopy | KeptFolder:
+    """Resume an interrupted move while holding the source directory's record lock."""
     try:
-        for original, tombstone in locations.items():
-            rename_removal_folder(original, tombstone)
-            moved[original] = tombstone
-        directory = locations[path].lstat()
-        if (directory.st_dev, directory.st_ino) != (pending.fields.get("copy_device"), pending.fields.get("copy_inode")):
-            return KeptFolder(path, f"{path}: source identity changed during removal")
-        state = recovery_state(path, pending, scope, scratch_settings=scratch_settings,
-                               locations=locations, packed_refs=metadata.shared_packed_refs)
-        verified = state is RemovalRetry.UNCHANGED
-        if verified:
-            for tombstone in locations.values():
-                delete_removal_source(tombstone, source_deletion)
-        return state
-    finally:
-        if not verified:
-            try:
-                restore_removal_folders(moved)
-            except OSError as error:
-                names = ", ".join(str(tombstone) for tombstone in moved.values())
-                raise ScratchError(f"{path}: cannot restore removal folders at {names}: {error}") from error
-            atomic_record(mark, pending.fields)
+        plan = read_removal_moves(path, pending)
+        tombstone = plan.locations[path]
+        original_present, tombstone_present = os.path.lexists(path), os.path.lexists(tombstone)
+        if original_present and tombstone_present:
+            return KeptFolder(path, f"{path}: cannot restore the source at {tombstone}: the name is in use")
+        if not original_present and not tombstone_present:
+            if any(os.path.lexists(folder) for folder in (*plan.locations, *plan.locations.values())):
+                return KeptFolder(path, f"{path}: incomplete tombstone removal")
+        else:
+            if dry_run:
+                return KeptFolder(path, f"{path}: interrupted removal needs to resume")
+            anchor = tombstone if tombstone_present else path
+            with directory_record_lock(anchor, wait=False, scratch_settings=scratch_settings) as locked:
+                current = checked_removal(path)
+                if not locked or current != pending:
+                    return KeptFolder(path, BUSY_REASON)
+                state = finish_tombstone_removal(path, pending, scope, plan, scratch_settings=scratch_settings,
+                                                 source_deletion=source_deletion)
+                if isinstance(state, KeptFolder):
+                    return state
+        if not dry_run:
+            finish_removal(path, cargo_cleaned=True)
+        return RemovedCopy()
+    except OSError as error:
+        return KeptFolder(path, str(error))
 
 
 @dataclass(frozen=True)
@@ -1745,6 +1929,13 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                         return KeptFolder(path, f"task changed to {record.task}")
                 elif copy_record.copy_folder(path) == path.resolve() or not present:
                     return KeptFolder(path, "the copy has no task record")
+            if isinstance(pending, copy_record.Registered) and "removal_moves" in pending.fields:
+                if isinstance(request, SelectedCopyRemoval):
+                    request.validate()
+                held = _held_removal_lock(path)
+                return resume_tombstone_removal(path, pending, held.marks if held is not None else scope,
+                                                scratch_settings=scratch_settings, source_deletion=source_deletion,
+                                                dry_run=dry_run)
             if not present:
                 if isinstance(request, SelectedCopyRemoval):
                     request.validate()
