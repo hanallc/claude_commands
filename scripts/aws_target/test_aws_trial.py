@@ -32,6 +32,7 @@ from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.aws_target.aws_target import AwsCli
 from scripts.production import merge_gate
 from scripts.lint.memory_test_support import config_environment
+from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lib.process_group import send_process_group
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -354,10 +355,10 @@ class PairedTrialTests(CostFixture):
         super().setUp()
         _ = self.settings.write_text(self.settings.read_text().replace('region=us-east-1', 'region=us-east-2'))
         _ = self.enterContext(mock.patch.object(trial, 'account_settings_path', return_value=self.settings))
-        git_config = self.root / 'gitconfig'
-        # Detached Git maintenance can write after fixture cleanup starts.
-        _ = git_config.write_text('[maintenance]\n\tauto = false\n')
-        os.environ['GIT_CONFIG_GLOBAL'] = str(git_config)
+        for name in tuple(os.environ):
+            if name in ('GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS') or name.startswith(('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')):
+                del os.environ[name]
+        os.environ['GIT_CONFIG_GLOBAL'] = str(write_fixture_git_config(self.root))
         shipped = Path(__file__).resolve().parents[2]
         self.repo = self.root / 'repo'
         self.repo.mkdir()
