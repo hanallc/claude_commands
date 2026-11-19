@@ -109,19 +109,23 @@ The wait line and the Builds page show this reason.
 
 The admission service checks for a local merge test each pass.
 The default interval is one second while steps wait (`waiting_pass_seconds`).
-The service sends `RouteAgain` after `claude_commands_reroute_seconds` with the landing rule as the sole blocker.
-The default is 60 seconds.
-The gate calls the same cloud route and keeps its local queue place during the check.
-The service defers the local grant while the check is open.
-After `claude_commands_reroute_seconds`, later waiters can pass the gate while its check stays open.
-If AWS declines, the gate resumes admission on the same connection at its first arrival.
-When the service grants an AWS slot, it releases the gate's local place.
-If AWS later falls back to natedev, the gate requests a new episode with its first arrival.
 An `integrate` job does not enter this hold.
 
 `merge_gate.py --tests-only --module` requests shared admission and can wait behind a local `integrate` job.
 When the shared landing check verifies natemerge's land, the named modules use the whole machine without admission.
 A named-module run writes no gate record or pass ledger entry.
+
+### Route checks for Python test gates on natedev
+
+A Python test gate that waits on natedev for any reason gets `RouteAgain` after `natedev_reroute_seconds`.
+The default is 60 seconds.
+The gate asks the other places again and keeps its local queue place during the check.
+The service defers the local grant while the check is open.
+If the check stays open for `natedev_reroute_seconds`, later local waiters can pass the gate.
+If AWS declines, the gate resumes admission on the same connection at its first arrival.
+When the service grants an AWS slot, it releases the gate's local place.
+If AWS later falls back to natedev, the gate requests a new episode with its first arrival.
+Cargo steps check placement again each admission pass while they wait.
 
 ### Placement status
 

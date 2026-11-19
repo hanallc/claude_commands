@@ -157,7 +157,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
 
         interval = 60
         self.configure_gate(f"# one of: on, off\n{memory_admit.MERGE_TEST_WAIT_KEY}=on\n"
-            + f"# range: 5e-324..\n{memory_admit.MERGE_TEST_REROUTE_KEY}={interval}\n")
+            + f"# range: 5e-324..\n{memory_admit.NATEDEV_REROUTE_KEY}={interval}\n")
         fixture = self.admission
         local_result = merge_gate.GateRun((), 1, 0, selection_certified=True)
         jobs = (merge_gate.GateJobResult("hooks", "test_first.py", 1, 2, "AWS test failed"),) if cli else ()

@@ -1318,7 +1318,7 @@ class WaitingAdmission:
     last_sent: float = float("-inf")
     continuation_claim: records.ContinuationSlot | NoContinuationClaim = NoContinuationClaim()
     landing: LandingTest | OrdinaryTest = OrdinaryTest()
-    merge_route_retry_at: float = float("inf")
+    route_retry_at: float = float("inf")
     cloud_route_check: CloudRouteCheck | NoCloudRouteCheck = NoCloudRouteCheck()
 
     @property
@@ -2565,12 +2565,28 @@ class AdmissionServer:
             self._admit([waiting], config, self.configuration.peak_history_share_percent,
                         cargo_folder=cargo_folder, landing=landing)
         self.persist()
+        next_route_retry = float("inf")
+        observed_at = self.clock.monotonic()
+        route_interval = self.configuration.natedev_reroute_seconds
+        for waiting in self.waiters.values():
+            request = waiting.request
+            if (isinstance(waiting.cloud_route_check, CloudRouteCheck)
+                    or not isinstance(request, wire.AdmitRequest) or not isinstance(request.place, wire.LocalPlace)
+                    or not isinstance(request.profile, records.ProgramProfile) or not request.profile.receive_route_notices
+                    or not isinstance(waiting.connection, Connection) or waiting.connection.finished):
+                continue
+            if waiting.route_retry_at == float("inf"):
+                waiting.route_retry_at = observed_at + route_interval
+            if observed_at >= waiting.route_retry_at:
+                waiting.cloud_route_check = CloudRouteCheck(observed_at + route_interval)
+                waiting.route_retry_at = float("inf")
+                self._deliver(waiting, wire.RouteAgain())
+            else:
+                next_route_retry = min(next_route_retry, waiting.route_retry_at)
         waiting_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
             row.get("step", ""), row.get("folder", ""), row["since"], row["need"], decision.reason, row.get("unit", ""))
             for (_, row), decision in zip(inputs.ordered, result.rows, strict=True))
         positions = {row.owner: position for position, row in enumerate(result.rows, 1)}
-        next_merge_route_retry = float("inf")
-        observed_at = self.clock.monotonic()
         for position, decision in enumerate(result.rows, 1):
             episode = by_owner[decision.owner]
             if episode in self.waiters:
@@ -2579,21 +2595,6 @@ class AdmissionServer:
                     continue
                 reason = decision.reason
                 cause = reason.cause if isinstance(reason, records.HeadAdmissionStatus) else reason
-                profile = waiting.request.profile
-                if (decision.landing_only and isinstance(profile, records.ProgramProfile) and profile.receive_route_notices
-                        and isinstance(waiting.connection, Connection)):
-                    if waiting.merge_route_retry_at == float("inf"):
-                        waiting.merge_route_retry_at = observed_at + self.configuration.merge_test_reroute_seconds
-                    if observed_at >= waiting.merge_route_retry_at:
-                        waiting.cloud_route_check = CloudRouteCheck(
-                            observed_at + self.configuration.merge_test_reroute_seconds)
-                        waiting.merge_route_retry_at = float("inf")
-                        self._deliver(waiting, wire.RouteAgain())
-                        continue
-                    else:
-                        next_merge_route_retry = min(next_merge_route_retry, waiting.merge_route_retry_at)
-                else:
-                    waiting.merge_route_retry_at = float("inf")
                 order = decision.decision.order_hold
                 text = (f"behind #{positions[records.waiter_owner(order.waiter)]}"
                         if isinstance(cause, records.BehindHead) and isinstance(order, records.HeldBehindHead)
@@ -2608,7 +2609,6 @@ class AdmissionServer:
             waiting = self.waiters[episode]
             if isinstance(waiting.cloud_route_check, CloudRouteCheck):
                 continue
-            waiting.merge_route_retry_at = float("inf")
             decision = records.AdmissionDecision("hold", waiting.row["need"], 0, 0, 0, free_passes=False)
             reply = wire.Wait(reason, position, "", reason_phrase(reason, ()),
                 self._wait_snapshot(waiting, decision, inputs, config, reason, records.NoHolder(), head_label, head_need))
@@ -2620,7 +2620,7 @@ class AdmissionServer:
         route_deadline = min((waiting.cloud_route_check.deadline for waiting in self.waiters.values()
                               if isinstance(waiting.cloud_route_check, CloudRouteCheck)
                               and waiting.cloud_route_check.deadline > self.last_pass_started), default=float("inf"))
-        self.next_pass = min(self.clock.monotonic() + interval, next_merge_route_retry, route_deadline)
+        self.next_pass = min(self.clock.monotonic() + interval, next_route_retry, route_deadline)
         if starts or cloud_started:
             self.next_pass = self.clock.monotonic()
         try:

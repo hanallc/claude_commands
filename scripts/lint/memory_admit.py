@@ -503,7 +503,6 @@ class PassRow:
     blocker: BlockingIndex | NoSingleBlocker | BlockerNotRequested
     admission: ProposedAdmission | NotAdmitted
     holder: records.WaitHolder = field(default_factory=records.NoHolder)
-    landing_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -595,7 +594,7 @@ class UsableAdmissionConfiguration:
     progress_profile_sweep_seconds: float
     remote_start_hold_seconds: int
     hold_for_merge_test: bool = False
-    merge_test_reroute_seconds: float = 60.0
+    natedev_reroute_seconds: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -604,7 +603,7 @@ class UnusableAdmissionConfiguration:
 
 
 MERGE_TEST_WAIT_KEY = "claude_commands_natedev_waits_for_landing"
-MERGE_TEST_REROUTE_KEY = "claude_commands_reroute_seconds"
+NATEDEV_REROUTE_KEY = "natedev_reroute_seconds"
 
 
 def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdmissionConfiguration:
@@ -619,13 +618,13 @@ def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdm
             progress_profile_sweep_seconds = settings.number("progress_profile_sweep_seconds")
             remote_start_hold_seconds = settings.whole("remote_start_hold_seconds")
             hold_for_merge_test = settings.value(MERGE_TEST_WAIT_KEY, conf.on_off, default=False)
-            merge_test_reroute_seconds = settings.value(MERGE_TEST_REROUTE_KEY, float, default=60.0)
+            natedev_reroute_seconds = settings.value(NATEDEV_REROUTE_KEY, float, default=60.0)
         config = records.read_memory_config(report=False)
         return UsableAdmissionConfiguration(replace(config,
             diagnostics=(*config.diagnostics, *records.configuration_diagnostics(messages))),
             cloud_gate_slots, cloud_gate_stale_pushes, progress_profile_rank, peak_history_share_percent,
             progress_profile_sweep_seconds, remote_start_hold_seconds, hold_for_merge_test,
-            merge_test_reroute_seconds)
+            natedev_reroute_seconds)
     except conf.Unusable as error:
         return UnusableAdmissionConfiguration(str(error))
 
@@ -1426,7 +1425,6 @@ class WaiterAdmission:
     decision: AdmissionDecision
     state: QueuedWaiter | TokenWaitingWaiter
     cargo_folder: placement.CargoFolderFree | placement.CargoFolderWait = placement.CargoFolderFree()
-    landing_only: bool = False
 
 
 
@@ -2190,9 +2188,8 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
             order_hold = HeldBehindHead(earlier)
         if keeps_order and folder is not None and isinstance(earlier, NoWaiter):
             first_for_folder[folder] = records.stored_waiter(row)
-        can_start = (ready and not folder_busy and isinstance(gpu_wait, GpuSlotFree)
-                     and isinstance(order_hold, NoOrderHold))
-        admitted = can_start and not landing_wait and owner not in inputs.cloud_route_waiters
+        admitted = (ready and not folder_busy and isinstance(gpu_wait, GpuSlotFree)
+                    and isinstance(order_hold, NoOrderHold) and not landing_wait and owner not in inputs.cloud_route_waiters)
         decision = AdmissionDecision("admit" if admitted else "hold",
             extra + kept + safety, kept, safety, used,
             NO_PRESSURE_HOLD if within else inputs.pressure,
@@ -2200,7 +2197,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
             room_passes, order_hold, 0.0 if reused else spacing,
             reused_slot=reused, room=RoomCheck(extra, checked_room, room_passes, basis=basis), gpu=gpu_wait)
         cargo_folder = placement.CargoFolderWait() if folder_busy else placement.CargoFolderFree()
-        decisions.append(WaiterAdmission(row, decision, state, cargo_folder, landing_only=landing_wait and can_start))
+        decisions.append(WaiterAdmission(row, decision, state, cargo_folder))
         if admitted:
             remaining += held + released - need
             gpu_used += gpu_step
@@ -2318,7 +2315,7 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy, *, 
                                 for ended in range(len(inputs.running)))
             blocker = blocking_index(owner, endings)
         rows.append(PassRow(owner, decision, reason, blocker, proposal,
-                            admission_wait_holder(decision, reason, inputs, resolved.room), landing_only=entry.landing_only))
+                            admission_wait_holder(decision, reason, inputs, resolved.room)))
     return PassResult(tuple(rows), resolved)
 
 def released_resident_bytes(running: tuple[RunningStep, ...], ended: frozenset[int]) -> int:
