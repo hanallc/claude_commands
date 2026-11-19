@@ -22,10 +22,11 @@ import sys
 import tempfile
 import threading
 import time
+from types import FunctionType, SimpleNamespace
 import unittest
 import uuid
 from unittest import mock
-from typing import ClassVar, cast, override
+from typing import ClassVar, Protocol, cast, override
 
 from scripts.lint import memory_admit as gate
 
@@ -287,12 +288,23 @@ class TestProcesses:
             _ = child.wait(timeout=2)
 
 
+class PressureReader(Protocol):
+    def __call__(self, host: records.HostMemory, *, policy: records.AdmissionPolicy) -> records.Pressure: ...
+
+
 class PrivateReadings:
     """Count each real gate reader, against only the fixture's fake files."""
     def __init__(self, root: Path) -> None:
         self.root: Path = root
         self.host_path: Path = root / "meminfo"
         self.counts: Counter[str] = Counter()
+        # Give the production reader a fixture path before the admission thread starts.
+        self.read_pressure: PressureReader = cast(PressureReader, FunctionType(
+            gate.read_pressure.__code__, {
+                **vars(gate),
+                "os": SimpleNamespace(environ={"BUILDLOG_MEMORY_PRESSURE": str(root / "pressure")}),
+            },
+        ))
 
     def host(self) -> records.HostMemory | records.ReadingUnavailable:
         self.counts["host"] += 1
@@ -303,7 +315,7 @@ class PrivateReadings:
 
     def pressure(self, host: records.HostMemory, policy: records.AdmissionPolicy) -> records.Pressure:
         self.counts["pressure"] += 1
-        return gate.read_pressure(host, policy=policy)
+        return self.read_pressure(host, policy=policy)
 
     def compilers(self) -> list[records.StepMemory]:
         self.counts["compilers"] += 1
@@ -391,6 +403,14 @@ class AdmissionFixture(ExitStack):
         self.enter_context(mock.patch.dict(os.environ, environment))
         if not (self.root / "build_admission.conf").exists():
             write_memory_config(self.root / "build_admission.conf")
+        check_memory_reading = gate.check_memory_reading
+
+        def check_fixture_reading(path: Path) -> None:
+            if path == Path("/proc/pressure/memory"):
+                raise gate.LiveMemoryReading(f"live memory reading {path} in a test")
+            check_memory_reading(path)
+
+        _ = self.enter_context(mock.patch.object(gate, "check_memory_reading", new=check_fixture_reading))
         self.readings: PrivateReadings = PrivateReadings(self.root)
         self.turn_gate: threading.Lock = threading.Lock()
         self.loop_access: threading.RLock = threading.RLock()

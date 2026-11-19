@@ -25,6 +25,7 @@ from unittest import mock
 
 from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service, first_step, placement
+from scripts.build_queue import admission_records as records
 from scripts.buildlog import repository, treekey
 from scripts.build_queue.admission_test_support import AdmissionFixture, private_caller_provider
 from scripts.build_targets import target_config
@@ -42,6 +43,7 @@ from scripts.lib import build_folders, build_slots, conf
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
+from scripts.lint import memory_admit
 from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture, write_pressure_reading
 from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
@@ -179,6 +181,20 @@ class SlotOrderTests(unittest.TestCase):
         return slots.read_slots(self.slot_root, self.root / "cargo", conf.read("build_folders"),
             self.queue.server.host, None, self.queue.clock.now(), build_folders.build_folder_state,
             owners=lambda owner: owner)
+
+    def test_private_pressure_stays_bound_without_its_environment_variable(self) -> None:
+        self.queue.hold_starts()
+        with self.queue.loop_turn(), mock.patch.dict(os.environ):
+            _ = os.environ.pop("BUILDLOG_MEMORY_PRESSURE")
+            reply, = self.queue.server.handle_request(self.queue.request())
+            self.assertIsInstance(reply, wire.Wait)
+            assert isinstance(reply, wire.Wait)
+            self.assertIsInstance(reply.reason, records.HeadAdmissionStatus)
+            assert isinstance(reply.reason, records.HeadAdmissionStatus)
+            self.assertIsInstance(reply.reason.cause, records.MemoryPressure)
+            _ = os.environ.pop("BUILDLOG_LIVE_MEMORY_TRIPWIRE")
+            with self.assertRaises(memory_admit.LiveMemoryReading):
+                memory_admit.check_memory_reading(Path("/proc/pressure/memory"))
 
     def test_scratch_queue_command_waits_before_it_creates_a_slot(self) -> None:
         self.queue.hold_starts()
@@ -917,6 +933,9 @@ placement_once
                         self.addCleanup(os.close, cargo_exit)
                         launcher_exit = os.pidfd_open(pid)
                         self.addCleanup(os.close, launcher_exit)
+                        reservation, = self.queue.caller_reservations().values()
+                        reservation_owner_exit = os.pidfd_open(reservation.owner.pid)
+                        self.addCleanup(os.close, reservation_owner_exit)
                         self.assertEqual(build_folders.build_folder_state(checkout), "held")
                         if stop == "launcher SIGKILL":
                             self.assertIn(b"copies.py", (Path("/proc") / str(pid) / "cmdline").read_bytes())
@@ -942,6 +961,8 @@ placement_once
                     self.assertEqual(process.returncode, expected, output + errors)
                     self.assertTrue(select.select([cargo_exit], [], [], TEST_HANG_GUARD_SECS)[0])
                     self.assertEqual(build_folders.build_folder_state(checkout), "free")
+                    self.assertTrue(select.select([reservation_owner_exit], [], [], TEST_HANG_GUARD_SECS)[0],
+                                    "the reservation owner did not exit")
                     with self.queue.loop_turn():
                         _ = self.queue.server.run_pass()
                         self.assertFalse(self.queue.caller_reservations())
