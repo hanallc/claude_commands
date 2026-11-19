@@ -693,6 +693,15 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
     # Capture every scope before the loop applies current reservation ownership.
     unowned = gate.unowned_slice_memory([], processes, proc.path,
         activity_reader=activity, ci_memory_slice=plan.config.ci_memory_slice)
+    has_caller = plan.runs or any(isinstance(row.activity, ScopeProcesses) and row.activity.session_id for row in unowned)
+    staff_members = records.queue_staff() if has_caller else None
+
+    def scope_caller(evidence: ScopeProcesses, unit: str = "") -> records.QueueCaller:
+        return records.queue_caller(evidence.session_id, "", evidence.session_name, "", evidence.folder,
+                                    members=staff_members, unit=unit)
+
+    unowned = tuple(replace(row, activity=replace(evidence, session_name=scope_caller(evidence).name))
+                    if isinstance(evidence := row.activity, ScopeProcesses) else row for row in unowned)
     members: dict[str, frozenset[int]] = {}
     workers: dict[str, frozenset[int]] = {}
     for reading in unowned:
@@ -726,10 +735,11 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
         measured = gate.tree_memory(run.pid, run.start_time, processes, proc.path)
         if isinstance(measured, records.GoneMemory):
             continue
+        caller = scope_caller(evidence, place.unit)
         memory = records.UnownedSliceMemory(measured.bytes, swap_bytes=measured.swap_bytes,
-                                         pid=run.pid, activity=replace(evidence, run=live_run))
-        between.append(records.RunningStep(evidence.session_id, evidence.session_name, "between steps",
-            evidence.folder, 0, memory, live_run, live_run.started_at, pid=run.pid, unit=place.unit))
+            pid=run.pid, activity=replace(evidence, run=live_run, session_name=caller.name))
+        between.append(records.RunningStep(caller.session_id, caller.name, "between steps",
+            evidence.folder, 0, memory, live_run, live_run.started_at, pid=run.pid, unit=caller.unit))
     host = readings.host()
     # Retain all pressure values so a pending policy can use the same reading.
     pressure_policy = replace(plan.config.policy,
@@ -1305,15 +1315,15 @@ class StateIntents:
 
 @dataclass(frozen=True)
 class ServiceEstimatedAdmission(wire.AdmitRequest):
-    """Retain service estimation for this connection without changing saved records."""
+    """Keep the runner separate from the unit used for priority."""
+    runner: str = field(kw_only=True)
 
 
 def wait_line_name(waiting: WaitingAdmission) -> str:
     """Name a queued build from its recorded owner and step."""
     row = waiting.row
     identity = gate.RecordedQueueIdentities().identity(row["pid"], cast(dict[str, object], cast(object, row)))
-    name = (f"hana CI · {identity.get('unit', '')}" if isinstance(waiting.request, ServiceEstimatedAdmission)
-            else gate.waiter_unit_name(identity, row["pid"]))
+    name = gate.waiter_unit_name(identity, row["pid"])
     return f"{name} · {identity['step']}" if identity["step"] else name
 
 
@@ -1480,8 +1490,19 @@ class AdmissionServer:
         if path.exists():
             self._persisted = path.read_text()
             state = parse_service_state(self._persisted, warn_missing_folders=True)
-            for record in state.reservations.values():
+            for episode, record in state.reservations.items():
+                row = record.queue_waiter
+                caller = self._stored_caller(row.get("session_id", ""), row.get("session_name", ""),
+                    row.get("folder") or record.worktree, row.get("unit", ""))
+                record = replace(record, queue_waiter={**row, "session_name": caller.name, "unit": caller.unit})
+                state.reservations[episode] = record
                 self.writes.register(record)
+            for key, place in state.places.items():
+                identity = place.queue_identity
+                caller = self._stored_caller(identity["session_id"], identity["session_name"],
+                                             identity["folder"], identity.get("unit", ""))
+                state.places[key] = replace(place, queue_identity={
+                    **identity, "session_name": caller.name, "unit": caller.unit})
             self.reservations, self.places = state.reservations, state.places
             self.ledger = ReplayLedger(state.ledger)
             self.spacing, self.priority = state.spacing, state.priority
@@ -1489,7 +1510,8 @@ class AdmissionServer:
             self.run_places = state.run_places
             self.lifecycle_outbox = state.lifecycle_outbox
             self.caller_versions = state.caller_versions
-            self.placement_requests = state.placement_requests
+            self.placement_requests = {key: self._named_placement(request)
+                                       for key, request in state.placement_requests.items()}
             self.assignments = state.assignments
             self.current_assignments = state.current_assignments
         self.persist()
@@ -1827,6 +1849,8 @@ class AdmissionServer:
         }
         if isinstance(identity.job, StepJob):
             row["job"] = identity.job
+        if isinstance(request, ServiceEstimatedAdmission):
+            row["ci_runner"] = request.runner
         if isinstance(place, WaiterPlace) and not isinstance(place.priority_since, OrderNotStarted):
             row["priority_since"] = place.priority_since
         if isinstance(place, WaiterPlace) and not isinstance(place.token_left_at, TokenNotLeft):
@@ -2490,7 +2514,8 @@ class AdmissionServer:
         if ci_holds:
             held_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
                 row.get("step", ""), row.get("folder", ""), row["since"], row["need"], reason,
-                row.get("unit", ""), route=records.waiter_route(row), job=row.get("job", GATE_JOB_NOT_RECORDED))
+                row.get("unit", ""), route=records.waiter_route(row), job=row.get("job", GATE_JOB_NOT_RECORDED),
+                ci_runner=row.get("ci_runner", ""))
                 for episode, reason in ci_holds.items() for row in (self.waiters[episode].row,))
             reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, *held_steps)),
                 ordered=[*reading.ordered, *((self.state_dir / records.waiter_owner(self.waiters[episode].row),
@@ -3165,10 +3190,6 @@ done
 
     def _placement_admission(self, request: wire.PlacementRequest) -> wire.AdmitRequest | wire.LaunchRequest:
         identity = request.identity
-        if not identity.step:
-            session = request.constraints.session
-            identity = wire.Identity(session.session_id if isinstance(session, OwningSession) else "",
-                "", request.profile.step, request.profile.worktree)
         owner = wire.Owner(request.owner.pid, request.owner.start_time)
         local = request.local
         if isinstance(local, wire.LocalAdmissionUnavailable):
@@ -4089,10 +4110,29 @@ done
             build_history_generation=lambda: records.BuildHistoryGeneration(self.build_history_generation),
             location=step_estimator.RepositoryLocation(request.repository, request.worktree))
         label = config.ci_label.format(runner=request.runner, job=request.job)
-        identity = wire.Identity("", label, estimate.profile.step, request.worktree, request.runner)
+        identity = wire.Identity("", label, estimate.profile.step, request.worktree)
         return ServiceEstimatedAdmission(request.episode, request.owner, request.argv, request.cwd, request.since,
             request.sidecar, identity, records.NoCallRecord(), request.test_width, estimate.profile,
-            isinstance(estimate.cache, records.FreshTest), route=request.route, code_version=request.code_version)
+            isinstance(estimate.cache, records.FreshTest), route=request.route, code_version=request.code_version,
+            runner=request.runner)
+
+    @staticmethod
+    def _stored_caller(session: str, name: str, folder: str, unit: str) -> records.QueueCaller:
+        caller = records.queue_caller(session, "", name, "", folder,
+                                      members=records.queue_staff() if session else None, unit=unit)
+        return replace(caller, name=name.strip() or caller.name)
+
+    def _named_identity(self, identity: wire.Identity, *, folder: str = "") -> wire.Identity:
+        caller = self._stored_caller(identity.session_id, identity.name, identity.folder or folder, identity.unit)
+        return replace(identity, name=caller.name, unit=caller.unit)
+
+    def _named_placement(self, request: wire.PlacementRequest) -> wire.PlacementRequest:
+        identity = request.identity
+        session = request.constraints.session
+        identity = replace(identity, session_id=identity.session_id or (
+            session.session_id if isinstance(session, OwningSession) else ""),
+            step=identity.step or request.profile.step, folder=identity.folder or request.profile.worktree)
+        return replace(request, identity=self._named_identity(identity))
 
     def handle_request(self, request: wire.Request, connection: Connection | NoConnection = NO_CONNECTION
                        ) -> list[wire.Reply]:
@@ -4126,9 +4166,11 @@ done
                 status_wire.KnownPlacementStatus(saved.assignment, self._assignment_state(saved), saved.provider))
             return [status_wire.PlacementStatusReply(status)]
         if isinstance(request, wire.RepositorySlotRequest):
-            return self._repository_slot(request, connection)
+            return self._repository_slot(replace(request, identity=self._named_identity(request.identity)), connection)
         if isinstance(connection, Connection):
             self._record_caller_version(request, connection, persist_change=not isinstance(request, wire.ConsumePermission))
+        if isinstance(request, wire.PlacementRequest):
+            request = self._named_placement(request)
         if isinstance(request, (wire.PlacementRequest, wire.ConsumePermission, wire.ClaimFailure, wire.ExecutionReport,
                                 wire.PrerequisiteReport, wire.CancelPlacement)):
             replies = self._handle_placement(request, connection)
@@ -4188,6 +4230,8 @@ done
             if any(waiting.request.owner == request.owner and episode != key
                    for episode, waiting in self.waiters.items()):
                 return self._mutation_reply(key, wire.Refused("owner already has an admission episode"))
+            folder = request.cwd if isinstance(request, wire.AdmitRequest) else request.profile.worktree
+            request = replace(request, identity=self._named_identity(request.identity, folder=folder))
             self._pending_replies[key] = []
             place_key = _place_key(request.owner, request.since)
             row = self._row(request, self.places.get(place_key, records.NoWaiter()))
@@ -4409,7 +4453,7 @@ done
         self.listener_started_at = self.clock.monotonic()
         _notify("READY=1")
         if os.environ.pop(ADMISSION_SOURCE_RELOAD, ""):
-            version = admission_code.admission_code_version(self.source_root)
+            version = admission_code.admission_code_version(self.source_root, watched=self.sources)
             print(f"memory admission: reload ready, source hash {version or 'unavailable'}",
                   file=sys.stderr, flush=True)
 

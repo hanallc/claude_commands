@@ -1193,11 +1193,16 @@ def row_progress(steps: Sequence[admission_records.RunningStep], token_stage: st
     return {"kind": "NoProgress", "reason": reason}
 
 
+def step_runner(step: admission_records.RunningStep | admission_records.WaitingStep,
+                runners: frozenset[str]) -> str:
+    return step.ci_runner or (step.unit if not step.session_id and step.unit in runners else "")
+
+
 def feed_step_labels(step: admission_records.RunningStep | admission_records.WaitingStep,
                      labels: Mapping[str, unit_labels.UnitLabels], runners: frozenset[str]) -> unit_labels.UnitLabels:
     """Use the CI runner record instead of an absent staff owner."""
-    if step.unit in runners:
-        return unit_labels.UnitLabels("hana CI", "hana CI", step.unit)
+    if runner := step_runner(step, runners):
+        return unit_labels.UnitLabels("hana CI", "hana CI", runner)
     return step_labels(step, labels)
 
 
@@ -1241,33 +1246,20 @@ def local_step_name(step: admission_records.RunningStep | admission_records.Wait
     return LocalStepName(title, name, step_name_parts(step, names, owner.labels, labels, ci=bool(ci_label)))
 
 
-def has_controlling_terminal(pid: int, start: str) -> bool:
-    """Use the terminal of the recorded process lifetime."""
-    try:
-        fields = read_proc_text(PROC / str(pid) / "stat").rsplit(") ", 1)[1].split()
-        return fields[19] == start and fields[0] not in ("Z", "X") and int(fields[4]) != 0
-    except (OSError, ValueError, IndexError):
-        return False
-
-
 def step_page_owner(step: admission_records.RunningStep | admission_records.WaitingStep,
                     labels: Mapping[str, unit_labels.UnitLabels], runners: frozenset[str],
-                    members: FeedStaff, local_host: str,
-                    process_starts: Mapping[int, str]) -> StepPageOwner:
+                    members: FeedStaff, local_host: str) -> StepPageOwner:
     """Use staff ownership or display the recorded caller and folder."""
     identity = feed_step_labels(step, labels, runners)
     machine = admission_records.execution_host(step, local_host) if isinstance(step, admission_records.RunningStep) else local_host
     folder = Path(step.folder)
-    if step.unit not in runners:
+    if not step_runner(step, runners):
         current = members.labels_for(step.session_id, machine, folder) or labels.get(step.session_id)
         if current is not None:
             return StepPageOwner(current, unit=staff_unit(current, missing="—"))
-    caller = public_owner_name(step.session_name, step.session_id) or public_owner_name(folder.name)
-    if (machine == local_host and not step.session_id and not step.session_name
-            and isinstance(step.pid, int) and (start := process_starts.get(step.pid))
-            and has_controlling_terminal(step.pid, start)):
-        caller = f"terminal · {caller}" if caller else "terminal"
-    return StepPageOwner(replace(identity, showrunner="", unit=""), caller)
+    caller = admission_records.queue_caller(step.session_id, "", public_owner_name(step.session_name, step.session_id),
+                                          "", public_owner_name(folder.name), members=members.members)
+    return StepPageOwner(replace(identity, showrunner="", unit=""), caller.name)
 
 
 def mac_build_units(builds: Sequence[queue_view.MacBuild],
@@ -2279,7 +2271,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     process_starts.update((row["pid"], row["start_time"]) for _, row in parsed.ordered)
 
     def page_owner(step: admission_records.RunningStep | admission_records.WaitingStep) -> StepPageOwner:
-        return step_page_owner(step, labels, ci_runners, members, machine, process_starts)
+        return step_page_owner(step, labels, ci_runners, members, machine)
 
     def local_job(step: admission_records.RunningStep | admission_records.WaitingStep) -> StepJobReading:
         if isinstance(step.job, StepJob):
@@ -2290,7 +2282,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     leftovers: list[LeftoverScope] = []
     for step, memory, activity in queue_view.leftover_processes(parsed.view.running):
         identity = labels.get(activity.session_id)
-        owner = public_queue_text(identity.session if identity is not None else activity.session_name) or "unlabelled session"
+        owner = admission_records.queue_caller(activity.session_id, "",
+            public_owner_name(identity.session if identity is not None else activity.session_name, activity.session_id),
+            "", public_owner_name(Path(activity.folder).name), members=members.members).name
         scope_members: list[LeftoverProcess] = [
             {"pid": member.pid, "program": leftover_program(member.pid, member.program)} for member in activity.members]
         if not scope_members:
@@ -2321,7 +2315,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     walk: list[RunRow] = []
     for hold in captured.runs:
         step = by_owner.get(hold.memory.owner)
-        ci_label = step.session_name if step is not None and step.unit in ci_runners else ""
+        ci_label = step.session_name if step is not None and step_runner(step, ci_runners) else ""
         job = local_job(step) if step is not None and not ci_label else NotGateStep()
         if step is None:
             slot = held_slots.get(hold.memory.owner)
@@ -2496,7 +2490,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 reason = f"behind {cause.head_name}"
         else:
             reason = reason_phrase(waiter.reason, waiting)
-        ci_label = waiter.session_name if waiter.unit in ci_runners else ""
+        ci_label = waiter.session_name if step_runner(waiter, ci_runners) else ""
         job = NotGateStep() if ci_label else local_job(waiter)
         shown_waiter = replace(waiter, step=job_step(job, waiter.step), unit=identity.unit)
         named = local_step_name(shown_waiter, owner, names, labels, ci_label)

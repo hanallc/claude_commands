@@ -5039,6 +5039,67 @@ class ProcessMemoryTests(unittest.TestCase):
                 self.assertIsInstance(result.rows[0].blocker, gate.NoSingleBlocker)
 
 
+class ValidateCIAdmissionTests(SeededExampleWorkspaceFixture):
+    def test_validate_ci_passes_the_showrunner_session_to_nextest(self) -> None:
+        from scripts.build_queue.admission_test_support import caller_admission
+        from scripts.production import staff
+
+        _ = self.package("fixture")
+        git = self.root / "stubs/git"
+        git_commands = (
+            '    *" diff "*|*" ls-files "*|*" ls-tree "*|*" read-tree "*|*" add -A "*) : ;;',
+            '    *" write-tree "*) printf "fixed-tree\\n" ;;',
+            '    *"rev-parse --git-path "*) printf "%s/%s\\n" "$PACKAGE_ROOT" "$3" ;;',
+        )
+        _ = git.write_text(git.read_text().replace(
+            '    *" ls-tree "*) : ;;', "\n".join(git_commands)))
+        session = staff.StaffId("b6374931-fe3a-4f6d-96b7-ad20415a8346")
+        runner = staff.StaffRow(session, "showrunner", "spacetime", staff.StaffRoot(), current_session=session)
+        _ = Path(self.environment["STAFF_FILE"]).write_text(json.dumps({"schema": 2, "rows": [runner.to_json()]}))
+        cargo = self.root / "stubs/cargo"
+        _ = cargo.write_text("""#!/bin/sh
+if [ "$1" = metadata ]; then
+    printf '%s\n' "$TEST_METADATA"
+else
+    printf '%s\n' "$*" >> "$CARGO_CALLS"
+fi
+""")
+        taplo = self.root / "stubs/taplo"
+        _ = taplo.write_text("#!/bin/sh\nexit 0\n")
+        taplo.chmod(0o755)
+        lint_config = self.root / ".claude/scripts/lint/lint_config.sh"
+        _ = lint_config.write_text('lint_config_enabled() { [ "$1" != mend ]; }\n'
+                                    + 'lint_config_skip_notice() { :; }\n')
+        self.environment.update({
+            "TEST_METADATA": json.dumps(workspace_metadata(self.root)), "VALIDATE_QUICK": "0",
+            "BUILDLOG_OFF": "0", "BUILDLOG_UNIT": "", "BUILDLOG_OWNER_STAFF_ID": "",
+            "CLAUDE_CODE_SESSION_ID": session, "CLAUDE_SESSION_NAME": "", "CLAUDE_SESSION_FOLDER": "spacetime",
+            "CARGO_TARGET_DIR": str(self.root / "target"),
+            "LINT_SKIP_SWEEP": "1", "BUILDLOG_SYNC": "1",
+        })
+        fixture = caller_admission(self, self.root, self.environment)
+        observed: dict[str, tuple[str, str, str]] = {}
+
+        def capture(reply: wire.Reply) -> wire.Reply:
+            grant = reply.grant if isinstance(reply, wire.LocalPlacementGranted) else reply
+            if isinstance(grant, wire.Admitted):
+                reservation, = (record for record in fixture.server.reservations.values()
+                                 if record.reservation_id == grant.reservation)
+                if reservation.step == "nextest":
+                    row = reservation.queue_waiter
+                    observed[grant.reservation] = (row.get("session_id", ""), row.get("session_name", ""), row.get("unit", ""))
+            return reply
+
+        fixture.server.reply_filter = capture
+        validate = Path(__file__).resolve().parents[1] / "validate_and_push/validate_ci.sh"
+        result = subprocess.run(["bash", str(validate)], cwd=self.root, env=self.environment, capture_output=True,
+                                text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        nextest, = [line.split() for line in self.calls.read_text().splitlines() if line.startswith("nextest run ")]
+        self.assertEqual(nextest[-3:], ["--workspace", "--all-features", "--tests"])
+        self.assertEqual(list(observed.values()), [(session, "spacetime", "")])
+
+
 class DetachedVerifyAdmissionTests(SeededExampleWorkspaceFixture):
     def test_detached_verify_cargo_and_lint_steps_ask_the_private_queue(self) -> None:
         _ = self.package("sample")

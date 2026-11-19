@@ -26,6 +26,7 @@ from scripts.build_targets.target_config import LocalRequired, StepRoute
 from scripts.buildlog import parse
 from scripts.lib import conf
 from scripts.lib.proc_text import read_proc_text
+from scripts.production import staff
 from scripts.production.staff import StaffId
 from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as NoCallRecord,
                                    TestPhaseChargeUse as TestPhaseChargeUse)
@@ -639,6 +640,7 @@ class Waiter(TypedDict):
     session_id: NotRequired[str]
     session_name: NotRequired[str]
     unit: NotRequired[str]
+    ci_runner: NotRequired[str]
     step: NotRequired[str]
     folder: NotRequired[str]
     token_left_at: NotRequired[float]
@@ -1043,6 +1045,7 @@ class WaitingStep:
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
     job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
+    ci_runner: str = field(default="", kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1064,6 +1067,7 @@ class RunningStep:
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
     job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
+    ci_runner: str = field(default="", kw_only=True)
 
 
 def execution_host(step: RunningStep, local_host: str) -> str:
@@ -1560,31 +1564,46 @@ class FreshTest:
 BUILDLOG_UNIT = "BUILDLOG_UNIT"
 
 
-def waiter_identity(step: str, worktree: str) -> WaiterIdentity:
-    from scripts.production import staff
+@dataclass(frozen=True)
+class QueueCaller:
+    session_id: str
+    name: str
+    unit: str
 
+
+def queue_staff() -> staff.StaffSnapshot | None:
+    try:
+        return staff.local_snapshot()
+    except staff.StaffUnreadable:
+        return None
+
+
+def queue_caller(session_id: str, staff_id: str, exported_name: str, session_folder: str,
+                 worktree: str, *, members: staff.StaffSnapshot | None = None, unit: str = "") -> QueueCaller:
+    """Resolve the caller name and its unit for queue priority."""
+    reference = session_id or staff_id
+    member = members.by_member_reference(reference) if members is not None and reference else None
+    if member is not None and members is not None:
+        owner = members.parent_of(member) if member.kind == "worker" else member
+        unit = owner.name if owner is not None and owner.kind == "unit" else ""
+        session_id = session_id or member.current_session
+        exported_name = member.name
+    name = exported_name.strip() or Path(session_folder).name.strip()
+    if not name and not reference and (folder := Path(worktree).name.strip()):
+        name = f"terminal · {folder}"
+    return QueueCaller(session_id, name or "unregistered session", unit)
+
+
+def waiter_identity(step: str, worktree: str) -> WaiterIdentity:
     session = staff.caller_identity()
-    reference = os.environ.get("BUILDLOG_OWNER_STAFF_ID", "") if not session else ""
-    name = os.environ.get("CLAUDE_SESSION_NAME", "").strip()
-    unit = os.environ.get(BUILDLOG_UNIT, "")
-    if session or reference:
-        try:
-            members = staff.local_snapshot()
-        except staff.StaffUnreadable:
-            members = staff.StaffSnapshot(())
-        member = members.by_current_session(session) if session else members.by_id(staff.StaffId(reference))
-        if member is not None:
-            session = member.current_session
-            name = member.name
-            owner = members.owner_of(member.id)
-            if owner is not None:
-                unit = unit or owner.name
-    name = name or Path(os.environ.get("CLAUDE_SESSION_FOLDER", "")).name
-    identity: WaiterIdentity = {"session_id": session,
-        "session_name": name or ("unregistered session" if session else "local caller"),
+    reference = os.environ.get("BUILDLOG_OWNER_STAFF_ID", "")
+    caller = queue_caller(session, reference, os.environ.get("CLAUDE_SESSION_NAME", ""),
+        os.environ.get("CLAUDE_SESSION_FOLDER", ""), worktree or os.getcwd(),
+        members=queue_staff() if session or reference else None, unit=os.environ.get(BUILDLOG_UNIT, ""))
+    identity: WaiterIdentity = {"session_id": caller.session_id, "session_name": caller.name,
         "step": step, "folder": os.getcwd() if worktree else ""}
-    if unit:
-        identity["unit"] = unit
+    if caller.unit:
+        identity["unit"] = caller.unit
     return identity
 
 

@@ -1,6 +1,7 @@
 """Hash the admission sources without importing admission code."""
 from __future__ import annotations
 
+from collections.abc import Iterable
 import hashlib
 from pathlib import Path
 import sys
@@ -22,10 +23,11 @@ ADMISSION_CODE_PATHS = (
 )
 
 
-def admission_code_version(scripts: Path | None = None) -> str:
+def admission_code_version(scripts: Path | None = None, *, watched: Iterable[Path] | None = None) -> str:
     root = scripts if scripts is not None else Path(__file__).resolve().parents[1]
     digest = hashlib.sha256()
-    for relative in ADMISSION_CODE_PATHS:
+    paths = ADMISSION_CODE_PATHS if watched is None else tuple(sorted(str(path.relative_to(root)) for path in watched))
+    for relative in paths:
         try:
             content = (root / relative).read_bytes()
         except OSError:

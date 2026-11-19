@@ -933,10 +933,13 @@ BRP launches use `launch`; launch permission creates no reservation.
 
 Transport failures never permit a start and never select another admitter.
 The client reconnects with its first request identity. It reports unavailable transport periodically and waits.
-The client reads the caller name from the local staff record.
-It uses the worker's parent as the unit and respects an explicit unit override.
-For other callers, it uses the exported name or the session folder name.
-When both are absent, it uses `unregistered session` for a session and `local caller` for a direct command.
+The client, service, and Builds page use `queue_caller` to resolve a caller name.
+It checks the staff name, the exported name, and the session folder name in that order.
+It uses `terminal · <folder>` for a direct command with a known folder.
+It uses `unregistered session` when no other name is available.
+The service fills empty names on requests and restores.
+A staff unit uses its own name for priority. A worker uses its parent unit.
+A showrunner keeps its caller name and has an empty unit.
 A valid wait resets checker-failure time. Checker failures after a wait retry until `BUILDLOG_MEM_CHECK_RETRY_S`.
 A first checker failure or explicit refusal stops at once. A launch deadline applies during transport and checker retries.
 A zero launch limit refuses its first hold and accepts an immediate grant.
@@ -1002,7 +1005,7 @@ Source changes stop the service after the settle interval. A missing source also
 Under systemd, the service then runs the new code in the same process with `execv`, and keeps the inherited socket.
 It sends `RELOADING=1` before `execv` and `READY=1` when the new listener is ready, so the systemd restart delay does not apply.
 The service logs the changed source paths before `execv`.
-The replacement logs the admission source hash after it sends `READY=1`.
+The replacement sends `READY=1`, then logs a hash of the files it watches.
 A failed start of the new code exits, and `Restart=always` starts the service again.
 A service started without `LISTEN_FDS` stops on a source change and does not run `execv`.
 `down-alert` waits `silence_seconds` and claims `build-admission`.

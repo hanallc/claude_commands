@@ -2667,7 +2667,7 @@ process.stdout.write(JSON.stringify({
         stat = process / "stat"
         for members, tty, name, unit, showrunner, caller in (
             ((), 34816, "hana build", "", "", "terminal · hana_catalyst"),
-            ((), 0, "hana build", "", "", "hana_catalyst"),
+            ((), 0, "hana build", "", "", "terminal · hana_catalyst"),
             ((runner, director), 34816, "startup build", "startup", "hana", ""),
         ):
             with self.subTest(tty=tty, unit=unit):

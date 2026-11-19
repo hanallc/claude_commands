@@ -830,6 +830,12 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(launch.identity.unit, unit)
                     self.assertEqual(records.waiter_identity("nextest", "tree").get("unit", ""), unit)
 
+    def test_direct_step_identity_includes_the_terminal_worktree(self) -> None:
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "",
+                "CLAUDE_SESSION_NAME": "", "CLAUDE_SESSION_FOLDER": "", "BUILDLOG_OWNER_STAFF_ID": ""}):
+            identity = client.step_identity("nextest", "/work/queue-fixture")
+        self.assertEqual(identity.name, "terminal · queue-fixture")
+
     def test_step_identity_names_each_caller_kind(self) -> None:
         with AdmissionFixture() as fixture, isolated_staff_file(fixture.root / "staff.json", {}):
             runner = fixture_member("showrunner", name="spacetime")
@@ -838,13 +844,13 @@ class ClientTests(unittest.TestCase):
             environment = {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "", "CLAUDE_SESSION_NAME": "",
                            "CLAUDE_SESSION_FOLDER": "", "BUILDLOG_UNIT": "", "BUILDLOG_OWNER_STAFF_ID": ""}
             for session, reference, folder, name, owner_unit in (
-                (runner.current_session, "", "", "spacetime", "spacetime"),
+                (runner.current_session, "", "", "spacetime", ""),
                 (unit.current_session, "", "", "navigation", "navigation"),
                 (worker.current_session, "", "", "impl", "navigation"),
                 ("", worker.id, "", "impl", "navigation"),
                 ("unlisted", worker.id, "research", "research", ""),
                 ("unlisted", "", "", "unregistered session", ""),
-                ("", "", "", "local caller", ""),
+                ("", "", "", f"terminal · {Path.cwd().name}", ""),
             ):
                 with self.subTest(session=session, reference=reference, folder=folder), mock.patch.dict(os.environ, {
                     **environment, "CLAUDE_CODE_SESSION_ID": session,

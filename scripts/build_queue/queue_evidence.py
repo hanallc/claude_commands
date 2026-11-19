@@ -17,7 +17,7 @@ def step_labels(step: admission_records.WaitingStep | admission_records.RunningS
     unit = gate.queue_unit(step.unit, step.session_id, labels)
     if identity is not None:
         return replace(identity, unit=unit) if step.unit else identity
-    fallback = " ".join(step.session_name.split()) or step.folder.rstrip("/").rpartition("/")[2] or "unknown"
+    fallback = admission_records.queue_caller(step.session_id, "", step.session_name, "", step.folder).name
     return unit_labels.UnitLabels(fallback, unit_labels.OWNER_NOT_RECORDED,
                                  unit or unit_labels.OWNER_NOT_RECORDED)
 
