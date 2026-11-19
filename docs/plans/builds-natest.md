@@ -171,3 +171,25 @@
   1. Each of 4a–4e has a measured answer with its evidence path.
   2. The plan names one form for natedev, the Mac and AWS, and each gap with its fix.
   3. bob reviews the plan before any code phase opens.
+
+### Phase 390 — the Mac lint result survives trailing output  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** a Mac-only lint run through verify.sh and offload.py reports the real lint status, not `mac=lost`, when the lint output ends with no newline or cleanup prints after it (builds ask; run 20261119T092359-117945-51e8 lost its result).
+- **Spec:**
+  1. Triage: /tmp/claude/unit/c48c71f4-70c9-4f7b-b4bb-ce60eed7f1f4/phases/triage_maclint/triage_report.md (result path, evidence, proposed rows).
+  2. Failing first, in `scripts/mac_test/test_offload_cleanup.py`: (a) a stub lint exits 0 after output with no final newline; expect `ReportedMacStatus(0)`. (b) cleanup prints a diagnostic after the lint marker; expect the lint status and the cleanup outcome to reach the reader.
+  3. Fix at the cause in `scripts/mac_test/offload.py`: the remote wrapper saves the lint status and prints one framed result after command output drains and cleanup ends. The reader takes only the framed result. A missing frame stays a refusal (`mac=lost`).
+  4. Command output never sets the status; only the frame from the trusted wrapper does.
+  5. `scripts/direct/test_verify_mac_only.py` covers success, failure and incomplete result.
+  6. Tests read no /tune value; pin each config value the fixture reads. No signal handlers.
+- **Files:** `scripts/mac_test/offload.py`; `scripts/mac_test/test_offload_cleanup.py`; `scripts/direct/test_verify_mac_only.py`.
+- **Workers:** 1 writer. One protocol and its tests.
+  - impl: all files.
+- **Constraints from prior phases:** user test hold (13:20 11-19): write code and tests, run no test until natemerge ends the hold. Mac runs only through verify.sh and the build queue.
+- **Acceptance gate:**
+  1. Both new rows fail on the base and pass on the fix.
+  2. 20 repeated runs of the two test modules pass, TMPDIR=/tmp, 2 GB scope.
+  3. basedpyright zero errors and warnings on changed files.
+  4. Full natedev gate passes (reds that also occur on base do not count).
