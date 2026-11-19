@@ -2970,6 +2970,13 @@ Work:
 3. Check if the step memory records and estimates have the same undercount. Fix it in this phase if the cause is the same; otherwise route it.
 4. The test replays the case: two compiling holders under sccache, with low cgroup memory and high compiler job memory.
 
+### Phase 44co — A Mac offload step never waits in the natedev memory line  · status: todo
+**From builds, 2026-11-18 23:45 EST (head-stall):** the queue head was copy_watch.py pid 3682121 (Mac offload runner), need 13.9 GiB, for 50+ min. It is a child of holder pid 4094003 (`verify.sh test hana`, inspectors-combined), which already holds a 13.9 GiB promise for its local nextest compile. One run holds one grant and asks for a second. A Mac step does not need natedev memory.
+Lead: `offload.py` `submit_direct_placement` sends `local.profile` from `admission_client.step_request`, the natedev step profile, with a Mac-pinned placement.
+1. Find the cause with a failing test first: why a Mac-pinned placement request carries a natedev need and stands at the head of the natedev line.
+2. Fix it at its cause. A Mac-pinned request waits for its Mac slot only. It never holds or blocks the natedev memory line, and the page shows it as a Mac wait.
+3. The test replays the case: a verify call holds a local nextest grant, and its Mac offload child asks for placement.
+
 ### Phase 44cg — A memory wait fixture gives the same result under load  · status: todo
 **From builds, 2026-11-18 18:3x:** queue's next item after 44cf.
 
