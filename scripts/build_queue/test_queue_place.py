@@ -24,7 +24,7 @@ from typing import Unpack, cast
 from unittest import mock
 
 from scripts.build_queue import queue_place as queue, admission_client as client, admission_service as service, admission_protocol as wire
-from scripts.build_queue.admission_test_support import AdmissionFixture
+from scripts.build_queue.admission_test_support import AdmissionFixture, Exchange, FakeClock, ScriptedTransport
 from scripts.build_queue.queue_fixture import write_process
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
@@ -731,7 +731,8 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                 if not stopped.wait(15):
                     raise AssertionError("the sampler barrier exceeded its test deadline")
 
-            def release_after_descendant_exit(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> None:
+            def release_after_descendant_exit(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming,
+                                              *, deadline: float) -> None:
                 if fork_during_scope_read:
                     self.assertTrue(raced_scope_read, "cleanup did not read the scope before release")
                     scope_pids = {int(pid) for procs in Path(scope_name).rglob("cgroup.procs")
@@ -740,7 +741,7 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                 if descendant_descriptor >= 0:
                     self.assertTrue(select.select([descendant_descriptor], [], [], 0)[0],
                                     "the reservation ended while its detached descendant still ran")
-                _ = release(path, status, configuration)
+                _ = release(path, status, configuration, deadline=deadline)
 
             def fork_and_exit() -> None:
                 nonlocal descendant, descendant_descriptor
@@ -856,13 +857,14 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
         with QueuePlaceFixture() as fixture, mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}):
             release = client.release
 
-            def release_after_reaping(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> None:
+            def release_after_reaping(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming,
+                                     *, deadline: float) -> None:
                 self.assertEqual(len(fixture.children), 1)
                 child = fixture.children[0]
                 self.assertIsNotNone(child.returncode)
                 with self.assertRaises(ChildProcessError):
                     _ = os.waitpid(child.pid, os.WNOHANG)
-                _ = release(path, status, configuration)
+                _ = release(path, status, configuration, deadline=deadline)
 
             with mock.patch.object(client, "release", side_effect=release_after_reaping) as released:
                 with queue.queue_place("rust-analyzer", fixture.root) as place:
@@ -877,9 +879,10 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
     def test_running_program_is_stopped_before_its_place_is_released(self) -> None:
         with QueuePlaceFixture() as fixture:
             release = client.release
-            def release_after_stop(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> None:
+            def release_after_stop(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming,
+                                   *, deadline: float) -> None:
                 self.assertIsNotNone(child.poll(), "reservation released while its program still ran")
-                _ = release(path, status, configuration)
+                _ = release(path, status, configuration, deadline=deadline)
             with mock.patch.object(client, "release", side_effect=release_after_stop) as released:
                 with queue.queue_place("rust-analyzer", fixture.root) as place:
                     child = fixture.start_blocked(place)
@@ -907,6 +910,27 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                 self.assertTrue(record.is_file())
                 _ = fixture.reservation()
             self.assertFalse(record.exists())
+
+    def test_release_deadline_keeps_the_sidecar_and_reservation(self) -> None:
+        with QueuePlaceFixture() as fixture, ExitStack() as holder:
+            place = holder.enter_context(queue.queue_place("rust-analyzer", fixture.root))
+            path, row = fixture.reservation()
+            self.assertEqual(Path(row["sidecar"]), place.sidecar)
+            clock = FakeClock()
+            clock.advance(10)
+            transport = ScriptedTransport(clock, Exchange(TimeoutError()))
+            with mock.patch.object(client, "CLOCK", clock), \
+                 mock.patch.object(client, "_connect", side_effect=transport.socket), \
+                 self.assertRaisesRegex(queue.CleanupUnresolved, "UNRESOLVED: the service did not confirm release"):
+                holder.close()
+            self.assertAlmostEqual(clock.monotonic(), 10.2)
+            request, = transport.requests
+            assert isinstance(request, wire.ReleaseRequest)
+            self.assertEqual(request.reservation, row.get("reservation_id"))
+            self.assertTrue(place.sidecar.is_file())
+            remaining_path, remaining = fixture.reservation()
+            self.assertEqual(remaining_path, path)
+            self.assertEqual(remaining.get("reservation_id"), request.reservation)
 
     def test_term_resistant_program_is_killed_before_release(self) -> None:
         with QueuePlaceFixture() as fixture:
@@ -938,10 +962,11 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                 if current == 3 * GIB:
                     sampled.set()
 
-            def release_after_descendant_exit(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> None:
+            def release_after_descendant_exit(path: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming,
+                                              *, deadline: float) -> None:
                 self.assertTrue(select.select([descriptor], [], [], 0)[0],
                                 "reservation released while its descendant still ran")
-                _ = release(path, status, configuration)
+                _ = release(path, status, configuration, deadline=deadline)
 
             try:
                 with mock.patch.object(client, "release", side_effect=release_after_descendant_exit) as released, \

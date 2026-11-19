@@ -544,9 +544,17 @@ def request_place(request: QueueRequest | RefreshedLaunch, output: admission_cli
     return admission_client.service_admit(request, output)
 
 
-def release_place(reservation: str, status: int, timing: wire.CleanupTiming) -> wire.Ok | wire.Refused:
-    """End a reservation with its holder's status. This is the one place that releases."""
-    return admission_client.release(reservation, status, timing)
+def release_place(reservation: str, status: int, timing: wire.CleanupTiming, *,
+                  stop_seconds: float | None = None) -> wire.Ok | wire.Refused:
+    """End a reservation with its holder's status."""
+    release = admission_client.release
+    if stop_seconds is None:
+        return release(reservation, status, timing)
+    deadline = admission_client.CLOCK.monotonic() + stop_seconds
+    try:
+        return release(reservation, status, timing, deadline=deadline)
+    except admission_client.ReleaseDeadlineExceeded as error:
+        raise CleanupUnresolved(str(error)) from error
 
 
 @dataclass
@@ -558,7 +566,8 @@ class HeldReservation:
 
 @contextmanager
 def held_reservation(request: QueueRequest, *,
-                     before_check: Callable[[], None] = no_hold_wait) -> Generator[HeldReservation]:
+                     before_check: Callable[[], None] = no_hold_wait,
+                     stop_seconds: float | None = None) -> Generator[HeldReservation]:
     """Wait for admission, then release the grant with the holder's status."""
     # service_admit sets the service estimate timing on the output.
     output = admission_client.WaitOutput()
@@ -573,7 +582,7 @@ def held_reservation(request: QueueRequest, *,
         yield held
     finally:
         if not held.keep:
-            _ = release_place(reply.reservation, held.status, reply.cleanup_timing)
+            _ = release_place(reply.reservation, held.status, reply.cleanup_timing, stop_seconds=stop_seconds)
 
 
 @contextmanager
@@ -626,7 +635,8 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
             owner, episode, since = wire.Owner(pid, start), uuid.uuid4().hex, time.time()
             def refresh() -> wire.AdmitRequest:
                 return admission_client.step_request(list(arguments) or [name], str(repo), owner, since, str(sidecar), episode, profile)
-            grant = reservation.enter_context(held_reservation(RefreshedRequest(refresh), before_check=before_check))
+            grant = reservation.enter_context(held_reservation(RefreshedRequest(refresh), before_check=before_check,
+                                                                stop_seconds=config.program_stop_seconds))
         sample_path = (Path(grant.grant.max_path).with_suffix("") if isinstance(grant, HeldReservation)
                        else temporary / "program")
         place = QueuePlace(sample_path, sidecar, configuration=config, purpose=purpose, arguments=arguments)
