@@ -49,6 +49,16 @@ FILTER = "package(hana) & (test(a) | test(b))"
 WORKING_TREE_SOURCE = offload.RepositoryWorkingTree()
 
 
+def write_mac_target_registry(directory: Path, settings_name: str) -> None:
+    _ = (directory / "build_targets.conf").write_text(
+        "targets=mac\n"
+        + "kind.mac=ssh\n"
+        + "platform.mac=macos\n"
+        + f"settings.mac={settings_name}\n",
+        encoding="utf-8",
+    )
+
+
 def assigned_adapter_main() -> int:
     """Run the adapter after placement, with the current provider state."""
     arguments = offload.parser().parse_args(namespace=offload.CliArguments())
@@ -352,7 +362,7 @@ class OffloadCommandFixture(unittest.TestCase):
             self.addCleanup(os.close, descriptor)
         self.sync_config()
         self.sync_fixture()
-        _ = write_config_fixture(self.root / "build_targets.conf", "platform.mac=macos\n")
+        write_mac_target_registry(self.root, self.config_path.name)
         _ = write_config_fixture(self.root / "config/copies.conf", "owner.verify=verify\n")
         self.environment = {
             **os.environ, **interpreter_cache_environment(self.root / "cache"),

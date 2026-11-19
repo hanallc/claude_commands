@@ -14,6 +14,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import tempfile
 from typing import cast, final
 from unittest import mock
 from scripts.lib import build_folders
@@ -152,6 +153,26 @@ sys.stdin.read(1)
                     self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
                     self.assertFalse(recovery.path.exists())
                 self.assertEqual(list(directory.glob("*.json")), [])
+
+    def test_recovery_drops_a_non_fifo_token_without_writing(self) -> None:
+        pool = self.root / "token-pool"
+        self.write(pool, "original pool")
+        recovery = merge_gate.GateRecovery(self.state / "dead-gate.json", str(self.checkout),
+                                           0, "ended-owner")
+        environment = {**self.environment, "BUILDLOG_JOBSERVER_FIFO": str(pool)}
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                tempfile.TemporaryDirectory(prefix="merge-gate-", dir="/dev/shm") as folder:
+            path = Path(folder)
+            self.write(path / "module-output", "unfinished")
+            recovery.folders.append(folder)
+            with pool.open("rb") as stream:
+                recovery.tokens.append(recovery.token(stream.fileno(), b"Q"))
+            recovery.save()
+            recovery.recover()
+            self.assertEqual(recovery.tokens, [])
+            self.assertFalse(recovery.path.exists())
+            self.assertFalse(path.exists())
+            self.assertEqual(pool.read_text(), "original pool")
 
     def test_module_timeout_removes_fixture_and_nested_gate_folders(self) -> None:
         parent = self.root / "nested-temporary"

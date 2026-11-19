@@ -194,15 +194,15 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
 
     @classmethod
     @override
-    def setUpClass(cls) -> None:
+    def setUpClass(cls, *, fixture_parent: Path | None = None) -> None:
         # Copy files before starting the admission server for each test.
         builder = VerifyMacOffloadFixture()
         cls.addClassCleanup(builder.doCleanups)
-        builder.root = Path(builder.enterContext(tempfile.TemporaryDirectory(prefix="verify-hold-tools-")))
+        builder.root = Path(builder.enterContext(tempfile.TemporaryDirectory(prefix="verify-hold-tools-", dir=fixture_parent)))
         builder.build_fixture()
         _ = copy_helpers(builder.home, "scripts/astra", "scripts/accounts")
         cls.fixture_root = builder.root
-        seed_directory = cls.enterClassContext(tempfile.TemporaryDirectory(prefix="verify-hold-seed-"))
+        seed_directory = cls.enterClassContext(tempfile.TemporaryDirectory(prefix="verify-hold-seed-", dir=fixture_parent))
         cls.fixture_seed = Path(seed_directory) / "seed"
         # These tests select a known interpreter, including recorder observers.
         # Version discovery is the lib/py suite's boundary. Preserve every
@@ -258,12 +258,11 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
 
     @override
     def stop_verify(self, process: subprocess.Popen[str] | ManagedProcess[str]) -> None:
-        # Completed calls are drained here; the unchanged final marker scan
-        # still observes and reaps detached children before restoring the seed.
-        if process.poll() is None:
+        # A descendant can keep the pipes open. Stop the owned processes first.
+        if process.poll() is None or any(
+            stream is not None and not stream.closed for stream in (process.stdout, process.stderr)
+        ):
             super().stop_verify(process)
-        else:
-            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
 
 class VerifyHoldWaitFixture(unittest.TestCase):
@@ -280,9 +279,9 @@ class VerifyHoldWaitFixture(unittest.TestCase):
 
     @classmethod
     @override
-    def setUpClass(cls) -> None:
+    def setUpClass(cls, *, fixture_parent: Path | None = None) -> None:
         cls.addClassCleanup(VerifyHoldTools.doClassCleanups)
-        VerifyHoldTools.setUpClass()
+        VerifyHoldTools.setUpClass(fixture_parent=fixture_parent)
 
     @override
     def setUp(self) -> None:
@@ -372,10 +371,7 @@ exit "$status"
             _ = admission.occupy_host()
             admission.free(0)
         _ = Path(self.fixture.environment["LINT_CONFIG_READER"]).write_text(
-            'lint_config_enabled() {\n'
-            + '    [[ "$1" == clippy ]] || return 1\n'
-            + '    exec {trace_fd}>&2; BASH_XTRACEFD=$trace_fd; set -x\n'
-            + '}\n'
+            'lint_config_enabled() { [[ "$1" == clippy ]]; }\n'
             + 'lint_config_skip_notice() { :; }\n')
         self.fixture.environment.update({
             "UNIT_RUN_DIR": str(self.fixture.board), "BUILDLOG_SYNC": "1",

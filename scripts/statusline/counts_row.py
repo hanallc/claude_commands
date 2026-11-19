@@ -1,9 +1,7 @@
-"""Write session review counts and read the global action count.
+"""Write session review counts.
 
 Usage: counts_row.py <notifier instance dir>
        counts_row.py --unit <staff id>
-       counts_row.py --for-you
-       counts_row.py --for-you-console
 
 assignment.py updates review counts when a source changes or a deadline passes.
 The review cache is `<showrunner state>/counts/<staff id>`.
@@ -12,8 +10,6 @@ Its second line contains the next deadline, or an empty value.
 The remaining lines contain watched paths and optional unit details.
 The final unit detail uses `source=unit:<staff id>`.
 The cache time records when the read began.
-The console host reads its action stores through the shared reader.
-The Mac reads the count from the console host.
 """
 from __future__ import annotations
 try:
@@ -21,61 +17,18 @@ try:
 except FileNotFoundError:
     pass
 
-import json
 import os
-import subprocess
 import sys
 import time
-from http.client import HTTPConnection, HTTPException
-from ipaddress import IPv4Address
 from pathlib import Path
-from typing import cast
 from zoneinfo import ZoneInfo
 
 from scripts.lib import conf
 from scripts.hooks import showrunner_footer  # noqa: E402
 from scripts.production import staff
-from scripts.review_links import for_you, review_items, review_later
+from scripts.review_links import review_items, review_later
 from scripts.production.update_registration import QuestionStaff
 from scripts.lib.user_zone import user_zone
-
-
-def global_action_count() -> str:
-    """Return a complete action count or an explicit unavailable result."""
-    try:
-        count = for_you.read().open_count
-    except (OSError, ValueError):
-        return "unavailable"
-    return str(count.value) if isinstance(count, for_you.KnownOpenCount) else "unavailable"
-
-
-def console_action_count() -> str:
-    """Read the global count from the console host."""
-    try:
-        host = os.environ.get("REVIEW_LINKS_HOST")
-        if not host:
-            peer = conf.read_or_repository("console").text("for_you.host")
-            address = subprocess.check_output(
-                ["tailscale", "ip", "-4", peer], text=True, stderr=subprocess.DEVNULL, timeout=2)
-            host = str(IPv4Address(address.strip()))
-        port = conf.read_or_repository("review_links").whole("server_port")
-        connection = HTTPConnection(host, port, timeout=2)
-        try:
-            connection.request("GET", "/console/for-you.json?view=count")
-            response = connection.getresponse()
-            if response.status != 200:
-                return "unavailable"
-            payload = cast(object, json.loads(response.read()))
-        finally:
-            connection.close()
-    except (HTTPException, OSError, ValueError, subprocess.SubprocessError):
-        return "unavailable"
-    if isinstance(payload, dict):
-        fields = cast(dict[str, object], payload)
-        count = fields.get("count")
-        if fields.get("available") is True and type(count) is int and count >= 0:
-            return str(count)
-    return "unavailable"
 
 
 def cache_path(name: str) -> Path:
@@ -224,12 +177,6 @@ def write_cache(cache: Path, line: str, due: str, sources: list[Path], began: in
 
 
 def main(argv: list[str]) -> int:
-    if argv == ["--for-you"]:
-        print(global_action_count())
-        return 0
-    if argv == ["--for-you-console"]:
-        print(console_action_count())
-        return 0
     if len(argv) == 2 and argv[0] == "--unit":
         _ = write_unit(argv[1])
         return 0

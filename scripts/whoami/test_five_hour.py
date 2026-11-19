@@ -34,9 +34,7 @@ from scripts.notify.user_action import NoActionRequired
 
 NOW = datetime(2026, 10, 15, 18, 20, tzinfo=timezone.utc)
 RESETS = NOW.replace(hour=21)
-CONFIG = cast(Config, cast(object, {
-    "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "hana", "always": ["natedev"],
-}))
+CONFIG = Config(threshold_percent=2, stall_minutes=5, faults_to="hana", always=["natedev"])
 SHOWRUNNERS = [Showrunner(session="hana", socket="/hana.sock", name="hana", zone="America/Los_Angeles", doc="")]
 NATE_ID = fixture_runtime_id("producer::natedev")
 RUNNER_ID = fixture_runtime_id("showrunner::hana")
