@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from time import monotonic as wall_monotonic
 import unittest
 from threading import current_thread, main_thread
 from types import ModuleType
@@ -188,6 +189,13 @@ class FixtureProcessExit:
         return self.output, ""
 
 
+@dataclass(frozen=True)
+class ListeningPeer:
+    """A fixture listener that can serve another case before its deadline."""
+    process: subprocess.Popen[bytes]
+    deadline: float
+
+
 def stop_child(child: subprocess.Popen[bytes]) -> None:
     if child.stdin is not None:
         child.stdin.close()
@@ -206,13 +214,19 @@ def setUpModule() -> None:
 
 class StallWatchTests(unittest.TestCase):
     listener_root: ClassVar[Path]
-    listeners: ClassVar[list[subprocess.Popen[bytes]]]
+    listeners: ClassVar[list[ListeningPeer]]
 
     @classmethod
     @override
     def setUpClass(cls) -> None:
         cls.listener_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="sw-peers-", dir="/tmp")))
         cls.listeners = []
+        cls.addClassCleanup(cls.close_listeners)
+
+    @classmethod
+    def close_listeners(cls) -> None:
+        for listener in cls.listeners:
+            stop_child(listener.process)
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -294,7 +308,7 @@ record = {name: args[args.index('--' + name) + 1] for name in ('to', 'from', 'ke
 with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
     log.write(json.dumps(record) + '\\n')
 """)
-        inherited = ("PATH", "TMPDIR", "LANG", "LC_ALL", "USER_ZONE", "PYTHONPATH",
+        inherited = ("PATH", "TMPDIR", "LANG", "LC_ALL", "USER_ZONE", "CLAUDE_PYTHON", "PYTHONPATH",
                      "PYTHONPYCACHEPREFIX", "PYTHONDONTWRITEBYTECODE", "CONF_READ_LOG",
                      "BUILDLOG_DIR", "BUILDLOG_LIVE_MEMORY_TRIPWIRE")
         self.environment = {
@@ -477,13 +491,17 @@ always=natedev
         check = f"CHECK=zsh /scripts/production/production_check.sh {owner.id}\n"
         _ = (directory / "conf").write_text(f"TARGET=session:{owner.id}\nPROMPT_FILE={prompt}\n{check}")
 
-    def unit(self, name: str) -> tuple[int, Path]:
-        socket_path = self.root / f"{unit_session(name)}.sock"
-        peer_path = self.listener_root / str(self.unit_count)
-        if self.unit_count == len(self.listeners):
-            listener = """import os, select, socket, sys, time
+    def unit_listener(self, slot: int, peer_path: Path) -> ListeningPeer:
+        reuse_slot = slot < len(self.listeners)
+        if reuse_slot:
+            previous = self.listeners[slot]
+            if wall_monotonic() < previous.deadline and previous.process.poll() is None:
+                return previous
+            stop_child(previous.process)
+            peer_path.unlink(missing_ok=True)
+        source = """import os, select, socket, sys, time
 path = sys.argv[1]
-deadline = time.monotonic() + float(sys.argv[2])
+deadline = float(sys.argv[2])
 with socket.socket(socket.AF_UNIX) as sock:
     sock.bind(path)
     try:
@@ -498,15 +516,24 @@ with socket.socket(socket.AF_UNIX) as sock:
     finally:
         os.unlink(path)
 """
-            child = subprocess.Popen([sys.executable, "-c", listener, str(peer_path), str(TEST_HANG_GUARD_SECS)],
-                                     env=self.environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.DEVNULL)
-            type(self).addClassCleanup(stop_child, child)
-            self.listeners.append(child)
-            assert child.stdout is not None
-            with child.stdout:
-                self.assertEqual(child.stdout.readline(), b"listening\n")
-        pid = self.listeners[self.unit_count].pid
+        deadline = wall_monotonic() + TEST_HANG_GUARD_SECS
+        child = subprocess.Popen([sys.executable, "-c", source, str(peer_path), str(deadline)],
+                                 env=self.environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL)
+        listener = ListeningPeer(child, deadline)
+        if reuse_slot:
+            self.listeners[slot] = listener
+        else:
+            self.listeners.append(listener)
+        assert child.stdout is not None
+        with child.stdout:
+            self.assertEqual(child.stdout.readline(), b"listening\n")
+        return listener
+
+    def unit(self, name: str) -> tuple[int, Path]:
+        socket_path = self.root / f"{unit_session(name)}.sock"
+        peer_path = self.listener_root / str(self.unit_count)
+        pid = self.unit_listener(self.unit_count, peer_path).process.pid
         self.unit_count += 1
         socket_path.symlink_to(peer_path)
         pane_pid = 10_000 + len(self.panes)
@@ -573,11 +600,12 @@ with socket.socket(socket.AF_UNIX) as sock:
                 *([{"event_type": "run_finished"}] if state == "run-finished" else []),
             ]
         records.update(self.run_records)
+        histories = {runs / f"{name}.jsonl": events for name, events in records.items()}
         for history in runs.iterdir():
-            if history.stem not in records:
+            if history not in histories:
                 history.unlink()
-        for name, events in sorted(records.items()):
-            history = runs / f"{name}.jsonl"
+        for history, events in sorted(histories.items()):
+            name = history.stem
             contents = "".join(json.dumps(event) + "\n" for event in events).encode()
             if not history.exists() or history.read_bytes() != contents:
                 _ = history.write_bytes(contents)
@@ -806,6 +834,19 @@ runpy.run_path(str(script), run_name='__main__')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("inspected showrunner/unit-one:", result.stdout)
         self.assertEqual(self.sent(), [])
+
+    def test_staff_run_selection_uses_history_filenames(self) -> None:
+        director = unit_session("unit-one")
+        for alternate, selected in (("active-run", "unit-one"), ("unit-one-active", "unit-one")):
+            with self.subTest(alternate=alternate):
+                self.run_records = {alternate: [{
+                    "event_type": "run_started", "run_started_at": 2.0, "working_dir": str(self.root),
+                    "main_agent": {"session_id": director},
+                }]}
+                self.write_run_records()
+                owner = staff.local_snapshot().by_current_session(director)
+                assert owner is not None
+                self.assertEqual(owner.run, staff.OpenRun(self.root / "held" / selected))
 
     def test_damaged_held_history_preserves_only_its_units_state(self) -> None:
         _ = self.unit("unit-two")
