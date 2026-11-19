@@ -10,6 +10,7 @@ from collections.abc import Callable
 import unittest
 import io
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -470,9 +471,10 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             assert_cap()
             kinds.append(kind)
             return started(suite, path, argv, repo, environment, log, kind=kind)
-        def finish(reservation: str, status: int, configuration: admission_records.MemoryConfig | wire.CleanupTiming) -> wire.Ok | wire.Refused:
+        def finish(reservation: str, status: int, configuration: admission_records.MemoryConfig | wire.CleanupTiming,
+                   *, deadline: float = math.inf) -> wire.Ok | wire.Refused:
             assert_cap()
-            return release(reservation, status, configuration)
+            return release(reservation, status, configuration, deadline=deadline)
         with mock.patch.object(merge_gate, "start_gate_job", side_effect=start), \
              mock.patch.object(client, "release", side_effect=finish):
             result = self.run_gate("--tests-only")

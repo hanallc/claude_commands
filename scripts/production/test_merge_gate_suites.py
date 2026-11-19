@@ -135,6 +135,8 @@ class MergeGateSuitesTests(GateSuitesFixture):
                                          "Traceback (most recent call last):\nAssertionError: fixture failure")
         signals: list[tuple[int, int]] = []
         def send(pid: int, signum: int) -> None:
+            if (pid, signal.SIGKILL) in signals:
+                raise ProcessLookupError(pid)
             signals.append((pid, signum))
         with mock.patch.object(time, "monotonic", return_value=11), \
                 mock.patch.object(process_group, "send_process_group", side_effect=send):

@@ -83,7 +83,7 @@ sys.stdin.read(1)
             descriptor = os.open(self.environment["BUILDLOG_JOBSERVER_FIFO"], os.O_RDWR | os.O_NONBLOCK)
             try:
                 with mock.patch.dict(os.environ, self.environment, clear=True):
-                    recovery.tokens.append(recovery.token(descriptor, os.read(descriptor, 1)))
+                    recovery.tokens.append(recovery.token(descriptor, os.read(descriptor, 1), "held"))
                     recovery.save()
                     recovery.recover()
             finally:
@@ -124,7 +124,7 @@ sys.stdin.read(1)
                     recovery.rollback_source = self.checkpoint
                     descriptor = os.open(self.environment["BUILDLOG_JOBSERVER_FIFO"], os.O_RDWR | os.O_NONBLOCK)
                     try:
-                        recovery.tokens.append(recovery.token(descriptor, os.read(descriptor, 1)))
+                        recovery.tokens.append(recovery.token(descriptor, os.read(descriptor, 1), "held"))
                         recovery.save()
                     finally:
                         os.close(descriptor)
@@ -162,7 +162,7 @@ sys.stdin.read(1)
             self.write(path / "module-output", "unfinished")
             recovery.folders.append(folder)
             with pool.open("rb") as stream:
-                recovery.tokens.append(recovery.token(stream.fileno(), b"Q"))
+                recovery.tokens.append(recovery.token(stream.fileno(), b"Q", "held"))
             recovery.save()
             recovery.recover()
             self.assertEqual(recovery.tokens, [])
@@ -236,9 +236,9 @@ merge_gate.run_suites(Path.cwd(), full=True)
                 sent.append(pid)
             send_process_group(pid, number)
 
-        def reap_after_all_terms(job: merge_gate.RunningGateJob, *, block: bool = False) -> None:
+        def reap_after_all_terms(job: merge_gate.RunningGateJob) -> None:
             self.assertEqual(sent, [item.process.pid for item in jobs])
-            reap(job, block=block)
+            reap(job)
 
         with mock.patch("scripts.production.merge_gate.process_group.send_process_group", side_effect=send_record), \
                 mock.patch.object(merge_gate, "reap_gate_job", side_effect=reap_after_all_terms):

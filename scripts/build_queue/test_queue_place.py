@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 import functools
 import io
 import json
+import math
 import os
 from pathlib import Path
 import select
@@ -1149,7 +1150,9 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
             self.assertFalse(fixture.admission.server.waiters)
 
     def test_release_leaves_cancellation_signals_unblocked(self) -> None:
-        def release(_reservation: str, _status: int, _timing: wire.CleanupTiming) -> wire.Ok:
+        def release(_reservation: str, _status: int, _timing: records.MemoryConfig | wire.CleanupTiming,
+                    *, deadline: float = math.inf) -> wire.Ok:
+            self.assertEqual(deadline, math.inf)
             mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
             self.assertFalse(mask.intersection({signal.SIGTERM, signal.SIGHUP, signal.SIGINT}))
             return wire.Ok()

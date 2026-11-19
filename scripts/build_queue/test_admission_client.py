@@ -7,6 +7,7 @@ from dataclasses import replace
 import errno
 import io
 import json
+import math
 import os
 import re
 import shlex
@@ -1075,9 +1076,10 @@ class ClientTests(unittest.TestCase):
             _ = self.use_transport(fixture, Exchange(reply_bytes(GRANTED)), Exchange(reply_bytes(wire.Ok())))
             released: list[str] = []
             release = client.release
-            def observe_release(reservation: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> wire.Ok | wire.Refused:
+            def observe_release(reservation: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming,
+                                *, deadline: float = math.inf) -> wire.Ok | wire.Refused:
                 released.append(reservation)
-                return release(reservation, status, configuration)
+                return release(reservation, status, configuration, deadline=deadline)
             with mock.patch.object(client, "step_request", return_value=original), \
                  mock.patch.object(records, "process_start_time", return_value=original.owner.start_time), \
                  mock.patch.object(client, "write_shell_grant", side_effect=OSError("grant disk failed")), \

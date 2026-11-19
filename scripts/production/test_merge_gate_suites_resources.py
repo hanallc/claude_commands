@@ -568,9 +568,9 @@ class MergeGateResourcesTests(GateSuitesFixture):
             sampled.update(roots)
             return dict.fromkeys(roots, 1.0)
 
-        def kill_module(job: merge_gate.RunningGateJob) -> None:
+        def kill_module(job: merge_gate.RunningGateJob, *, deadline: float | None = None) -> None:
             killed.append(job.process.pid)
-            kill(job)
+            kill(job, deadline=deadline)
 
         with mock.patch.dict(os.environ, self.environment), \
                 mock.patch.object(queue_place, "in_builds_slice", return_value=False), \
