@@ -17,14 +17,14 @@ import subprocess
 import tempfile
 import time
 from typing import cast
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
 from scripts.build_hold import build_hold, hold_enforcer
 from scripts.build_hold.owning_session import OwningSession
-from scripts.lib import conf
+from scripts.lib import conf, user_zone
+from scripts.lib.process_start import Started, Unreadable, process_start
 from scripts.production.gate_rename_deploy import rename_step_names as rename
 from scripts.production.gate_rename_deploy.rename_step_names import Direction
-from scripts.lib.process_start import Started, Unreadable, process_start
 
 HOLDER = "gate-rename-deploy"
 HERE = Path(__file__).resolve().parent
@@ -76,7 +76,7 @@ class DeploymentSettings:
     @classmethod
     def read(cls, settings: conf.ConfigRead) -> DeploymentSettings:
         return cls(settings.number("stop_wait_seconds"), settings.number("heartbeat_seconds"),
-                   settings.whole("drain_hold_eta_hours"), ZoneInfo(settings.text("time_zone")),
+                   settings.whole("drain_hold_eta_hours"), user_zone.user_zone(),
                    settings.whole("error_output_characters"))
 
 
@@ -512,7 +512,7 @@ def main() -> int:
         if cast(bool, args.discover):
             require_installed_code(tree, Direction.REVERSE if reverse else Direction.FORWARD)
             with tempfile.TemporaryFile(mode="w+t") as details, redirect_stdout(details):
-                wait_roots = tuple(wait) if wait is not None else rename.default_wait_roots(configuration)
+                wait_roots = tuple(wait) if wait is not None else rename.default_wait_roots()
                 cloud_roots = tuple(cloud) if cloud is not None else rename.discover_cloud_roots((tree,))
             say(json.dumps({"wait": [str(path) for path in wait_roots], "cloud": [str(path) for path in cloud_roots]}))
             return 0
@@ -528,12 +528,12 @@ def main() -> int:
                 return 2
             journal = state_folder / "deploy_gate_rename.state.json"
             state = load(journal, reverse)
-            roots = rename.configured_roots(configuration, state.direction)
+            roots = rename.configured_roots(state.direction)
             discovery = tuple(word for flag, folders in (("--wait-root", wait), ("--cloud-root", cloud))
                               for folder in folders or () for word in (flag, str(folder)))
             paths = DeploymentPaths(tree, home, journal, roots, settings, discovery)
             return deploy(paths, state)
-    except (DeploymentFailed, rename.Refused, OSError, ValueError, SyntaxError, ZoneInfoNotFoundError) as error:
+    except (DeploymentFailed, rename.Refused, OSError, ValueError, SyntaxError) as error:
         say(f"Refused: {error}")
         return error.status if isinstance(error, DeploymentFailed) else 2
 

@@ -46,7 +46,8 @@ class LandRunTests(unittest.TestCase):
                 elif old_exists and not new_exists:
                     with self.assertRaises(land_runs.GateStateMoveRequired) as refused:
                         _ = land_runs.state_dir()
-                    self.assertIn("/tmp/claude/scratch/natest-probe/p89/move_gate_state.py", str(refused.exception))
+                    self.assertIn("bash ~/.claude/scripts/production/gate_rename_deploy/deploy_gate_rename.sh",
+                                  str(refused.exception))
                     self.assertIn("/build:hold drain natedev", str(refused.exception))
                     self.assertFalse(new.exists())
                 else:

@@ -58,7 +58,7 @@ def default_state_dir() -> Path:
     if os.path.lexists(old) and not os.path.lexists(directory):
         raise GateStateMoveRequired(
             "Gate state move required: set /build:hold drain natedev, then run "
-            + "/tmp/claude/scratch/natest-probe/p89/move_gate_state.py")
+            + "bash ~/.claude/scripts/production/gate_rename_deploy/deploy_gate_rename.sh")
     return directory
 
 

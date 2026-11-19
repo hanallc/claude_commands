@@ -31,10 +31,12 @@ import tempfile
 import time
 from typing import cast
 
-from scripts.build_queue import progress_profile
+from scripts.build_queue import memory_files, progress_profile
+from scripts.build_targets import target_config
 from scripts.buildlog import store
-from scripts.lib import conf
+from scripts.lib import build_folders, conf, session_folder
 from scripts.lib.process_start import Started, Unreadable, process_start
+from scripts.mac_test import mac_queue_run
 from scripts.production.gate_rename_deploy import move_gate_state
 
 
@@ -75,10 +77,10 @@ class RecordRoots:
     direction: Direction = Direction.FORWARD
 
 
-def configured_roots(settings: conf.ConfigRead, direction: Direction) -> RecordRoots:
-    return RecordRoots(Path(settings.text("buildlog_folder")).expanduser().resolve(),
-        Path(settings.text("aws_state_folder")).expanduser().resolve(),
-        Path(settings.text("review_page_folder")).expanduser().resolve(), (), direction=direction)
+def configured_roots(direction: Direction) -> RecordRoots:
+    return RecordRoots(store.root().expanduser().resolve(),
+        target_config.ssh_target_state_directory("aws").resolve(),
+        memory_files.configured_output_folder(conf.read("memory_feed")).resolve(), (), direction=direction)
 
 
 @dataclass(frozen=True)
@@ -510,12 +512,14 @@ def require_expired_uploaded_attempts(roots: RecordRoots) -> None:
                 raise Refused(f"an old uploaded attempt can still read cloud objects; let it finish or expire: {request.parent}")
 
 
-def default_wait_roots(settings: conf.ConfigRead) -> tuple[Path, ...]:
+def default_wait_roots() -> tuple[Path, ...]:
     """Find the tool folders that hold placement assignments."""
-    folders = (*settings.words("assignment_search_folders"),
-               os.environ.get("TMPDIR", settings.text("temporary_folder")))
-    parents = tuple(dict.fromkeys(Path(folder).expanduser().resolve() for folder in folders))
-    found = {Path(settings.text("mac_receipts_folder")).expanduser()}
+    settings = conf.read_or_repository("build_folders")
+    folders = (session_folder.configured_root(), Path(settings.text("roots.system")),
+               Path(settings.text("roots.gate")), Path(settings.text("roots.scratch")),
+               build_folders.inherited_temporary_parent())
+    parents = tuple(dict.fromkeys(folder.expanduser().resolve() for folder in folders))
+    found = {Path.home() / mac_queue_run.RECEIPTS}
     tool = re.compile(r"(?:verify|copy-watch)(?:-\d+)?\Z|verify-hold\..+")
     skipped = {".git", "node_modules", "__pycache__", "target", "typecheck-venv"}
     for parent in parents:
@@ -565,11 +569,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         direction = Direction.REVERSE if cast(bool, args.reverse) else Direction.FORWARD
-        settings = conf.read("gate_rename_deploy")
-        defaults = configured_roots(settings, direction)
+        defaults = configured_roots(direction)
         requested = cast(list[Path] | None, args.wait_root)
         wait_roots = (tuple(path.expanduser().resolve() for path in requested) if requested is not None
-                      else default_wait_roots(settings))
+                      else default_wait_roots())
         requested_cloud = cast(list[Path] | None, args.cloud_root)
         checkouts = cast(list[Path] | None, args.checkout)
         cloud_roots = (tuple(path.expanduser().resolve() for path in requested_cloud) if requested_cloud is not None else
