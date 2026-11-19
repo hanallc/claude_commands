@@ -124,6 +124,64 @@ class SessionMoveTests(unittest.TestCase):
             self.assertFalse(source.exists())
             self.assertEqual((target / source.name / "draft.md").read_bytes(), b"scratch content\n")
 
+    def test_unreadable_project_keeps_later_projects_in_the_scan(self) -> None:
+        unreadable = self.leaf("unreadable").parent
+        unreadable = unreadable.rename(unreadable.with_name("-unreadable"))
+        movable = self.leaf("movable")
+        target = self.index(movable.name, "demo") / self.claude / self.project / movable.name
+        iterdir = Path.iterdir
+
+        def discover(path: Path) -> Generator[Path]:
+            if path == unreadable:
+                raise PermissionError(errno.EACCES, "cannot list project")
+            yield from iterdir(path)
+
+        with mock.patch.object(Path, "iterdir", autospec=True, side_effect=discover):
+            dry_status, dry_output, dry_errors = self.invoke("--dry-run")
+            real_status, real_output, real_errors = self.invoke()
+
+        self.assertEqual(real_status, 1, real_errors)
+        self.assertEqual(dry_status, real_status)
+        self.assertEqual(dry_errors, real_errors)
+        self.assertIn(f"kept {unreadable}: [Errno {errno.EACCES}] cannot list project", real_errors)
+        self.assertEqual(dry_output.replace("would move", "moved"), real_output)
+        self.assertEqual(real_output.splitlines()[-1],
+                         "session_move: moved 1 folders (0.00 GiB), kept 0 live, refused 1 other")
+        self.assertTrue((unreadable / "unreadable" / "draft.md").is_file())
+        self.assertFalse(movable.exists())
+        self.assertEqual((target / "draft.md").read_bytes(), b"scratch content\n")
+
+    def test_source_removal_permissions_refuse_before_printing_or_writing(self) -> None:
+        nested_source = self.leaf("a-readonly-tree")
+        nested = nested_source / "nested"
+        nested.mkdir()
+        _ = (nested_source / "draft.md").rename(nested / "draft.md")
+        shared = self.leaf("b-readonly-parent", shared=True)
+        movable = self.leaf("c-movable")
+        target = self.index(movable.name, "demo") / self.claude / self.project / movable.name
+        for folder in (nested, shared.parent):
+            self.addCleanup(folder.chmod, stat.S_IMODE(folder.stat().st_mode))
+            folder.chmod(0o555)
+
+        with mock.patch.object(session_move, "transcript_cwd", return_value=str(self.base / "unindexed")):
+            dry_status, dry_output, dry_errors = self.invoke("--dry-run")
+            real_status, real_output, real_errors = self.invoke()
+
+        for source, parent in ((nested_source, nested), (shared, shared.parent)):
+            self.assertNotIn(f" {source} -> ", dry_output)
+            self.assertIn(f"kept {source}: {parent}: directory needs write and search permission", real_errors)
+            self.assertFalse((self.root / session_folder.INDEX / source.name).is_symlink())
+        self.assertEqual(real_status, 1, real_errors)
+        self.assertEqual(dry_status, real_status)
+        self.assertEqual(dry_errors, real_errors)
+        self.assertEqual(dry_output.replace("would move", "moved"), real_output)
+        self.assertEqual(real_output.splitlines()[-1],
+                         "session_move: moved 1 folders (0.00 GiB), kept 0 live, refused 2 other")
+        self.assertFalse((self.root / "unindexed").exists())
+        self.assertEqual((nested / "draft.md").read_bytes(), b"scratch content\n")
+        self.assertEqual((shared / "draft.md").read_bytes(), b"scratch content\n")
+        self.assertEqual((target / "draft.md").read_bytes(), b"scratch content\n")
+
     def test_publish_error_keeps_the_pending_copy_and_stops(self) -> None:
         source = self.leaf("a-copy")
         waiting = self.leaf("b-waiting")
@@ -159,10 +217,12 @@ class SessionMoveTests(unittest.TestCase):
         scan = session_move.read_manifest
         refused_info = refused.stat()
 
-        def read(fd: int, identities: session_move.EntryIdentities | None = None) -> session_move.TreeManifest:
+        def read(fd: int, identities: session_move.EntryIdentities | None = None, *,
+                 removal: session_move.SourceRemoval | session_move.ReadManifestOnly =
+                 session_move.ReadManifestOnly.NO_REMOVAL_CHECK) -> session_move.TreeManifest:
             if os.path.samestat(os.fstat(fd), refused_info):
                 raise PermissionError("cannot read scratchpad")
-            return scan(fd, identities)
+            return scan(fd, identities, removal=removal)
 
         with mock.patch.object(session_move, "read_manifest", side_effect=read):
             dry_status, dry_output, dry_errors = self.invoke("--dry-run")
@@ -667,9 +727,11 @@ with (mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapsho
         registry = session_records.RegistryRead((), ())
         resumed = self.live_registry(source.name)
 
-        def resume_during_scan(fd: int, identities: session_move.EntryIdentities | None = None) -> session_move.TreeManifest:
+        def resume_during_scan(fd: int, identities: session_move.EntryIdentities | None = None, *,
+                               removal: session_move.SourceRemoval | session_move.ReadManifestOnly =
+                               session_move.ReadManifestOnly.NO_REMOVAL_CHECK) -> session_move.TreeManifest:
             nonlocal registry
-            manifest = scan(fd, identities)
+            manifest = scan(fd, identities, removal=removal)
             if target.exists() and os.path.samestat(source_info, os.fstat(fd)):
                 registry = resumed
             return manifest
@@ -801,9 +863,11 @@ with (mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapsho
         scan = session_move.read_manifest
 
         def remove_destination_during_source_scan(
-            fd: int, identities: session_move.EntryIdentities | None = None,
+            fd: int, identities: session_move.EntryIdentities | None = None, *,
+            removal: session_move.SourceRemoval | session_move.ReadManifestOnly =
+            session_move.ReadManifestOnly.NO_REMOVAL_CHECK,
         ) -> session_move.TreeManifest:
-            manifest = scan(fd, identities)
+            manifest = scan(fd, identities, removal=removal)
             if os.path.samestat(original, os.fstat(fd)) and destination.exists():
                 destination.unlink()
             return manifest

@@ -227,16 +227,14 @@ class ScratchpadLeaf:
     relative: Path
 
 
-def children(folder: Path) -> list[Path]:
-    try:
-        return sorted(folder.iterdir())
-    except FileNotFoundError:
-        return []
-
-
 def claude_tree(path: Path) -> bool:
-    return (CLAUDE_TREE.fullmatch(path.name) is not None and is_directory(path)
-            and path.lstat().st_uid == os.getuid())
+    if CLAUDE_TREE.fullmatch(path.name) is None:
+        return False
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
 
 
 @dataclass(frozen=True)
@@ -246,23 +244,49 @@ class UnrecognizedEntry:
     blocks_cutover: bool
 
 
-def scratchpad_leaves(roots: MoveRoots) -> Iterator[ScratchpadLeaf | UnrecognizedEntry]:
-    legacy = (entry for entry in children(roots.former_temp) if claude_tree(entry))
-    former = (entry for session in children(roots.former_sessions) if is_directory(session)
-              for entry in children(session) if claude_tree(entry))
-    for tree in (*former, *legacy):
-        for project in children(tree):
-            if not project.name.startswith("-"):
-                yield UnrecognizedEntry(project, "outside a Claude project", False)
-                continue
-            if not is_directory(project):
-                yield UnrecognizedEntry(project, "Claude project is not a directory", True)
-                continue
-            for leaf in children(project):
-                if session_folder.SESSION_ID.fullmatch(leaf.name) and is_directory(leaf):
-                    yield ScratchpadLeaf(leaf, Path(tree.name) / project.name / leaf.name)
-                else:
-                    yield UnrecognizedEntry(leaf, "not a Claude session directory", True)
+type SourceDiscovery = ScratchpadLeaf | UnrecognizedEntry
+
+
+def discover_children(folder: Path, visit: Callable[[Path], Iterator[SourceDiscovery]]) -> Iterator[SourceDiscovery]:
+    try:
+        entries = sorted(folder.iterdir())
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        yield UnrecognizedEntry(folder, str(error), True)
+        return
+    for entry in entries:
+        try:
+            yield from visit(entry)
+        except OSError as error:
+            yield UnrecognizedEntry(entry, str(error), True)
+
+
+def scratchpad_leaves(roots: MoveRoots) -> Iterator[SourceDiscovery]:
+    def visit_leaf(leaf: Path) -> Iterator[SourceDiscovery]:
+        if session_folder.SESSION_ID.fullmatch(leaf.name) and is_directory(leaf):
+            yield ScratchpadLeaf(leaf, Path(*leaf.parts[-3:]))
+        else:
+            yield UnrecognizedEntry(leaf, "not a Claude session directory", True)
+
+    def visit_project(project: Path) -> Iterator[SourceDiscovery]:
+        if not project.name.startswith("-"):
+            yield UnrecognizedEntry(project, "outside a Claude project", False)
+        elif not is_directory(project):
+            yield UnrecognizedEntry(project, "Claude project is not a directory", True)
+        else:
+            yield from discover_children(project, visit_leaf)
+
+    def visit_tree(tree: Path) -> Iterator[SourceDiscovery]:
+        if claude_tree(tree):
+            yield from discover_children(tree, visit_project)
+
+    def visit_former_session(session: Path) -> Iterator[SourceDiscovery]:
+        if is_directory(session):
+            yield from discover_children(session, visit_tree)
+
+    yield from discover_children(roots.former_sessions, visit_former_session)
+    yield from discover_children(roots.former_temp, visit_tree)
 
 
 @dataclass(frozen=True)
@@ -328,20 +352,26 @@ def open_directory(path: Path) -> Generator[int]:
 
 
 @contextmanager
-def destination_parent(root_fd: int, root: Path, target: Path, *, create: bool) -> Generator[int]:
+def destination_parent(root_fd: int, root: Path, target: Path, *, create: bool,
+                       check_write: bool = False) -> Generator[int]:
     fd = root_fd
+    path = root
     mount = mount_identity(fd)
+    missing = False
     with ExitStack() as stack:
         try:
             for name in target.parent.relative_to(root).parts:
                 if name == "..":
                     raise MoveRefused(f"{target}: destination is outside the session root")
                 fd = stack.enter_context(child_directory(fd, name, create=create, mount=mount))
+                path /= name
         except FileNotFoundError:
             if create:
                 raise
-            fd = -1
-        yield fd
+            missing = True
+        if check_write:
+            require_writable_directory(fd, path)
+        yield -1 if missing else fd
 
 
 def stat_at(parent: int, name: str) -> os.stat_result | None:
@@ -360,8 +390,12 @@ def unlink_at(parent: int, name: str) -> None:
         pass
 
 
+def temporary_record_name(name: str) -> str:
+    return f".{name}.session-move"
+
+
 def write_record_at(parent: int, name: str, value: object) -> None:
-    temporary = f".{name}.session-move"
+    temporary = temporary_record_name(name)
     unlink_at(parent, temporary)
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=parent)
     with os.fdopen(fd, "w", encoding="utf-8") as output:
@@ -501,6 +535,28 @@ def check_source_mounts(root: Path, mounts: Sequence[measure.Mount]) -> None:
 EntryIdentities = dict[Path, os.stat_result]
 
 
+@dataclass(frozen=True)
+class SourceRemoval:
+    """Check removal permissions while scanning the source."""
+
+    parent: int
+    path: Path
+
+
+class ReadManifestOnly(Enum):
+    NO_REMOVAL_CHECK = "read manifest only"
+
+
+def require_writable_directory(fd: int, path: Path) -> None:
+    if not os.access(".", os.W_OK | os.X_OK, dir_fd=fd, effective_ids=os.access in os.supports_effective_ids):
+        raise MoveRefused(f"{path}: directory needs write and search permission")
+
+
+def require_removable(parent: os.stat_result, entry: os.stat_result, path: Path) -> None:
+    if parent.st_mode & stat.S_ISVTX and os.geteuid() not in (0, parent.st_uid, entry.st_uid):
+        raise MoveRefused(f"{path}: sticky directory prevents removal")
+
+
 def preserved_metadata(parent: int, name: str, expected: os.stat_result) -> PreservedMetadata:
     attributes: tuple[tuple[str, str], ...] = ()
     if sys.platform == "linux":
@@ -531,13 +587,23 @@ def read_entry(parent: int, path: Path, info: os.stat_result, kind: HashedEntry,
     return TreeEntry(kind, size, preserved_metadata(parent, name, info), sha256)
 
 
-def read_manifest(fd: int, identities: EntryIdentities | None = None) -> TreeManifest:
+def read_manifest(fd: int, identities: EntryIdentities | None = None, *,
+                  removal: SourceRemoval | ReadManifestOnly = ReadManifestOnly.NO_REMOVAL_CHECK) -> TreeManifest:
     mount = mount_identity(fd)
     root = os.fstat(fd)
+    checked_parents: dict[Path, os.stat_result] = {}
+    if isinstance(removal, SourceRemoval):
+        require_writable_directory(removal.parent, removal.path.parent)
+        require_removable(os.fstat(removal.parent), root, removal.path)
     manifest = {TREE_ROOT: read_entry(fd, TREE_ROOT, root, HashedEntry.DIRECTORY, mount)}
     if identities is not None:
         identities[TREE_ROOT] = root
     for path, parent, info, kind in tree_entries(fd, mount):
+        if isinstance(removal, SourceRemoval):
+            if path.parent not in checked_parents:
+                require_writable_directory(parent, removal.path / path.parent)
+                checked_parents[path.parent] = os.fstat(parent)
+            require_removable(checked_parents[path.parent], info, removal.path / path)
         if identities is not None:
             identities[path] = info
         manifest[path] = read_entry(parent, path, info, kind, mount)
@@ -1043,7 +1109,7 @@ def finish_copy(job: MoveJournal, verified: VerifiedCopy, source: int, target: i
         with child_directory(source, move.source.name, mount=source_mount) as original:
             if not job.source.matches(os.fstat(original)):
                 raise MoveRefused("source changed before deletion")
-            remaining = read_manifest(original, source_identities)
+            remaining = read_manifest(original, source_identities, removal=SourceRemoval(source, move.source))
 
     with child_directory(target, move.target.name, mount=mount_identity(target)) as published:
         if not verified.folder.matches(os.fstat(published)):
@@ -1070,10 +1136,31 @@ def finish_copy(job: MoveJournal, verified: VerifiedCopy, source: int, target: i
         return sum(entry.size_bytes for entry in expected.values())
 
 
-def check_destination(root_fd: int, root: Path, target: Path, destinations: set[Path]) -> None:
-    with destination_parent(root_fd, root, target, create=False) as parent:
+def check_destination(root_fd: int, root: Path, move: PlannedCopy, name: SessionDestination,
+                      destinations: set[Path]) -> None:
+    target = move.target
+    with destination_parent(root_fd, root, target, create=False, check_write=True) as parent:
         if target in destinations or stat_at(parent, target.name) is not None:
             raise MoveRefused(f"destination conflict at {target}")
+    with destination_parent(root_fd, root, root / JOURNAL / MOVE_RECORD, create=False, check_write=True) as journal:
+        check_record_writes(journal, root / JOURNAL, MOVE_RECORD)
+    if name.rule is not NamingRule.INDEX:
+        with destination_parent(root_fd, root, root / session_folder.INDEX / name.session_id,
+                                create=False, check_write=True):
+            pass
+        with destination_parent(root_fd, root, name.folder / session_folder.RECORD,
+                                create=False, check_write=True) as folder:
+            check_record_writes(folder, name.folder, session_folder.RECORD)
+
+
+def check_record_writes(parent: int, folder: Path, record: str) -> None:
+    for name in (record, temporary_record_name(record)):
+        info = stat_at(parent, name)
+        if info is not None:
+            path = folder / name
+            if stat.S_ISDIR(info.st_mode):
+                raise MoveRefused(f"{path}: a directory prevents the record write")
+            require_removable(os.fstat(parent), info, path)
 
 
 def show_copy(move: PlannedCopy, size: int) -> None:
@@ -1107,8 +1194,8 @@ def validate_copy(leaf: ScratchpadLeaf, roots: MoveRoots, root_fd: int, names: D
         with child_directory(source, move.source.name, mount=mount_identity(source)) as original:
             identity = FolderIdentity.of(os.fstat(original))
             check_source_mounts(move.source, mounts)
-            manifest = read_manifest(original)
-    check_destination(root_fd, roots.sessions, move.target, destinations)
+            manifest = read_manifest(original, removal=SourceRemoval(source, move.source))
+    check_destination(root_fd, roots.sessions, move, name, destinations)
     return ValidatedCopy(move, name, identity, manifest)
 
 
@@ -1147,21 +1234,34 @@ def move_candidates(roots: MoveRoots, root_fd: int, names: DestinationNames, hol
         pending = read_journal(journal, roots)
         if isinstance(pending, MoveJournal):
             sources.add(pending.move.source)
-        source_chains = {source: directory_chain(source) for source in sources} if holds else {}
-        source_ancestors = {source: directory_ancestors(source, chain, mounts)
-                            for source, chain in source_chains.items()}
+        source_identities: dict[Path, FolderIdentity] = {}
+        source_ancestors: dict[Path, set[FolderIdentity]] = {}
+        if holds:
+            for source in sorted(sources):
+                try:
+                    chain = directory_chain(source)
+                    source_ancestors[source] = directory_ancestors(source, chain, mounts)
+                except (MoveRefused, OSError) as error:
+                    kept(source, error)
+                    summary.refused_other += 1
+                    blocked.add(source)
+                else:
+                    if source in chain:
+                        source_identities[source] = chain[source]
         scratch_chain = directory_chain(roots.scratch) if holds else {}
+        reported_hold = False
         for hold in holds:
             chain = directory_chain(hold.path)
             ancestors = directory_ancestors(hold.path, chain, mounts)
             held_folder = chain.get(hold.path)
-            overlaps = {source for source, source_chain in source_chains.items()
-                        if source_chain.get(source) in ancestors or held_folder in source_ancestors[source]}
+            overlaps = {source for source, source_parents in source_ancestors.items()
+                        if source_identities.get(source) in ancestors or held_folder in source_parents}
             if overlaps or scratch_chain.get(roots.scratch) in ancestors:
                 kept(hold.path, f"open scratch hold, owner {hold.owner}")
                 blocked.update(overlaps)
                 summary.refused_other += 1
-        if summary.refused_other:
+                reported_hold = True
+        if reported_hold:
             print("session_move: an unreleased hold keeps its folder behind. Ask the owner to release it.",
                   file=sys.stderr, flush=True)
         if isinstance(pending, MoveJournal):

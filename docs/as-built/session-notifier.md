@@ -319,6 +319,10 @@ If that check finds a live source, the next run can reuse its index entry.
 Both modes continue with other candidates and return status 0 if they only skip live entries before copying.
 Both modes check the source, its parent, the destination, and the session index before they print each move.
 The source check reads file contents, symbolic link targets, and metadata.
+It checks write and search permission on the parent of each source entry, including the source folder.
+It also checks whether sticky directory permissions prevent removal.
+The destination check includes write and search permission where the move must create entries.
+If discovery cannot read a project or an entry, both modes report the refusal and continue with the next entry.
 Both modes keep entries that fail these checks and continue in the same order.
 A destination conflict found during these checks counts as a refusal.
 The command returns status 1 if it records a refusal.
