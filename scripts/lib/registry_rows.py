@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable, Iterator
 from typing import NamedTuple
 
 
@@ -18,20 +19,22 @@ class RowChange(NamedTuple):
     replacement: str  # An empty string deletes the row.
 
 
-def records(text: str) -> list[RegistryRow]:
-    found: list[RegistryRow] = []
+def _indexed_records(lines: Iterable[str]) -> Iterator[tuple[int, RegistryRow]]:
     section = ""
-    for line in text.splitlines():
+    for index, line in enumerate(lines):
         content = line.partition("#")[0].strip()
         if not content:
             continue
         if content.startswith("[") and content.endswith("]"):
             section = content[1:-1]
-            found.append(RegistryRow(section, "", "", line))
+            yield index, RegistryRow(section, "", "", line)
         else:
             key, separator, value = content.partition("=")
-            found.append(RegistryRow(section, key.strip(), value.strip() if separator else "", line))
-    return found
+            yield index, RegistryRow(section, key.strip(), value.strip() if separator else "", line)
+
+
+def records(text: str) -> list[RegistryRow]:
+    return [row for _, row in _indexed_records(text.splitlines())]
 
 
 def parse_registry(text: str) -> dict[str, dict[str, str]]:
@@ -93,45 +96,43 @@ def additive_line(change: RowChange, current: dict[tuple[str, str], RegistryRow]
 
 
 def replay(text: str, edits: list[RowChange], additive_catalog: bool) -> str:
-    current = rows(text)
+    source = text.splitlines()
+    current: dict[tuple[str, str], RegistryRow] = {}
+    addresses: dict[int, tuple[str, str]] = {}
+    insert_after = {"": -1}
+    for index, row in _indexed_records(source):
+        if row.key and "=" in row.line.partition("#")[0]:
+            address = row.section, row.key
+            current[address] = row
+            addresses[index] = address
+        elif not row.key and row.line.lstrip().startswith("["):
+            insert_after[row.section] = index
     replacements = {(change.section, change.key):
                     additive_line(change, current) if additive_catalog and change.section in (
                         "codex.agents", "codex.families") else change.replacement
                     for change in edits}
-    lines: list[str] = []
-    section = ""
-    insert_at = 0
 
-    def insert_new_rows() -> None:
-        new_rows: list[str] = []
-        for address in list(replacements):
-            if address[0] == section:
-                line = replacements.pop(address)
-                if line:
-                    new_rows.append(line)
-        lines[insert_at:insert_at] = new_rows
+    for index, address in addresses.items():
+        source[index] = replacements.get(address, source[index])
+        if source[index]:
+            insert_after[address[0]] = index
 
-    for line in text.splitlines():
-        content = line.partition("#")[0].strip()
-        if content.startswith("[") and content.endswith("]"):
-            insert_new_rows()
-            section = content[1:-1]
-            insert_at = len(lines) + 1
-        elif "=" in content:
-            key = content.split("=", 1)[0].strip()
-            line = replacements.pop((section, key), line)
-            if not line:
-                continue
-            if key:
-                insert_at = len(lines) + 1
-        lines.append(line)
-    insert_new_rows()
+    new_rows: dict[int, list[str]] = {}
+    new_sections: dict[str, list[str]] = {}
     for address, line in replacements.items():
-        new_section = address[0]
-        if not line:
+        if address in current or not line:
             continue
-        if section != new_section:
-            lines.extend(["", f"[{new_section}]"])
-            section = new_section
-        lines.append(line)
+        section = address[0]
+        if section in insert_after:
+            new_rows.setdefault(insert_after[section], []).append(line)
+        else:
+            new_sections.setdefault(section, []).append(line)
+
+    lines = new_rows.get(-1, []).copy()
+    for index, line in enumerate(source):
+        if line or index not in addresses:
+            lines.append(line)
+        lines.extend(new_rows.get(index, ()))
+    for section, section_rows in new_sections.items():
+        lines.extend(["", f"[{section}]", *section_rows])
     return "\n".join(lines) + "\n"

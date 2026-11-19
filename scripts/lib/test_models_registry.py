@@ -408,7 +408,7 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
 
 
 class RegistryRowReplayTests(unittest.TestCase):
-    def test_new_rows_follow_the_last_key_or_empty_section_header(self) -> None:
+    def test_replay_places_new_rows_and_edits_existing_rows_in_place(self) -> None:
         edit = registry_rows.RowChange("producers", "bob", "bob=claude:fable:high")
         for case, keys, tail in (
             ("before another section",
@@ -422,6 +422,19 @@ class RegistryRowReplayTests(unittest.TestCase):
                 prefix = f"[producers]\n{keys}"
                 self.assertEqual(registry_rows.replay(prefix + tail, [edit], False),
                                  f"{prefix}{edit.replacement}\n{tail}")
+
+        prefix = "[producers]\nmorty=claude:fable:high\n\n[assignments]\nproduction=claude\n\n[producers]\n"
+        last_key = "dwight=claude:fable:high\n"
+        suffix = "\n# Directors\n[production.claude]\n"
+        for case, change, expected in (
+            ("new row in a repeated section", edit, f"{last_key}{edit.replacement}\n"),
+            ("replace a key in the second block",
+             registry_rows.RowChange("producers", "dwight", "dwight=claude:opus:high"), "dwight=claude:opus:high\n"),
+            ("delete a key in the second block", registry_rows.RowChange("producers", "dwight", ""), ""),
+        ):
+            with self.subTest(case=case):
+                self.assertEqual(registry_rows.replay(prefix + last_key + suffix, [change], False),
+                                 prefix + expected + suffix)
 
 
 class LaunchSettingsTests(unittest.TestCase):
