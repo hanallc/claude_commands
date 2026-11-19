@@ -86,8 +86,7 @@ BODY_READY_SCRIPT = r"""async function readyReviewCard(row){
 def browser_markup(root: Path, *, show: str = 'open') -> str:
     """Adapt the existing fake refresh responses to the snapshot protocol."""
     snapshot = review_page.build_snapshot(root)
-    bodies = {item.key:snapshot.body(item.key).decode() for item in snapshot.records.values()
-              if item.state != review_items.ReviewState.VALIDATING}
+    bodies = {key:snapshot.body(key).decode() for key in snapshot.records}
     bridge = r"""
 const fixtureFetch=fetch,fixtureBodies=FIXTURE_BODIES;
 let fixtureVersion=0,fixtureIndexResponse;
@@ -1832,11 +1831,11 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
         self.assertEqual(answer,'marked read')
         self.assertEqual(investigation.load(ready.owner,ready.id).state,investigation.InvestigationState.READ)
 
-    def test_review_show_row_has_validating_between_open_and_done(self) -> None:
+    def test_review_show_row_has_open_validating_and_all(self) -> None:
         markup = review_page.render(self.root).decode()
         self.assertEqual(re.findall(r'data-show-chip="([^"]+)"', markup), ['open', 'Validating', 'all'])
 
-    def test_validating_change_is_read_only_in_validating_and_all(self) -> None:
+    def test_validating_change_has_a_card_and_uses_only_a_saved_handoff_time(self) -> None:
         key = 'page-owner/C1'
         until = datetime.now(user_zone()) + timedelta(days=1)
         review_later.save(key, until)
@@ -1852,18 +1851,167 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
         self.assertEqual(entry['hiddenUntil'], 0)
         self.assertEqual(entry['ownerName'], 'page-owner')
         self.assertEqual(entry.get('handoff', ('', ''))[1], 'Nov 17 03:00 EST')
-        with self.assertRaises(LookupError):
-            _ = snapshot.body(key)
+        card = snapshot.body(key).decode()
+        for text in ('How to check', 'Proof', 'Log · newest first', 'Your words', 'Sends to page-owner',
+                     'Ask a question', 'data-validating-age datetime="2026-11-17T03:00:00-05:00"'):
+            self.assertIn(text, card)
+        self.assertNotIn('data-later-toggle', card)
+        path = self.status.path(self.fixture.page, 'C1')
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        _ = fields.pop('handed_at')
+        _ = path.write_text(json.dumps(fields))
+        snapshot = review_page.build_snapshot(self.root)
+        self.assertNotIn('handoff', next(item for item in snapshot.entries if item['key'] == key))
+        card = snapshot.body(key).decode()
+        self.assertIn('class="review-handoff">With ', card)
+        self.assertNotIn('Validating for', card)
         self.assertFalse(any(value.startswith(key+'/') for value in
                              review_page.waiting_items(console.NewsRequest(self.root))))
+
+    def test_validating_question_keeps_the_handoff_and_returns_the_answer(self) -> None:
+        key = 'page-owner/C1'
+        check, _ = review_page.submit(self.root, self.body(key, 'validate', 'Check the queued step.'), self.status)
+        assert isinstance(check, change_page.MessageDelivery)
+        change_page.deliver(check, self.status)
+        path = self.status.path(check.page, check.row)
+        handed_at = change_page.read_handed_at(path)
+        validation = self.status.slots(check.page, check.row).validation
+        self.fixture.messages.clear()
+        destination = self.fixture.temporary/'destination.md'
+        _ = destination.write_text(self.fixture.production.read_text())
+        runner = fixture_member('showrunner', name='destination', doc=staff.LiveDoc(local_machine(), destination))
+        _ = staff.move(self.fixture.unit.id, staff.ReportsTo(runner.id))
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        self.addCleanup(cache.close)
+        question = 'What is holding up validation?'
+        current = cache.get()
+        self.assertEqual(next(entry['ownerName'] for entry in current.entries if entry['key'] == key), 'page-owner')
+        self.assertIn('Sends to page-owner', current.body(key).decode())
+        fields = self.card_body(current, key, 'question', question)
+        sent = cache.save(fields, self.status)
+        self.assertEqual(sent.answer, 'question saved')
+        with patch.object(change_page, 'send_message', side_effect=RuntimeError('The recipient is offline.')):
+            change_page.deliver(sent.delivery, self.status)
+        self.assertEqual(self.fixture.messages, [])
+        reopened_status = change_page.DeliveryStatus(self.root)
+        unsent = reopened_status.slots(check.page, check.row).question
+        assert isinstance(unsent, change_page.OpenQuestion)
+        self.assertIsInstance(unsent.delivery, change_page.DeliveryIntent)
+        self.assertEqual(cache.save(self.card_body(cache.get(), key, 'question', question), self.status).answer,
+                         'question saved')
+        capture = self.fixture.capture_message
+
+        def reject_alert(recipient: str, sender: str, message: str) -> None:
+            if 'delivery needs attention' in message:
+                raise RuntimeError('The alert recipient is offline.')
+            capture(recipient, sender, message)
+
+        with patch.object(change_page, 'send_message', new=reject_alert):
+            change_page.recover_pending(reopened_status)
+            change_page.recover_pending(reopened_status)
+        self.assertEqual(len(self.fixture.messages), 1)
+        target, _, message = self.fixture.messages[0]
+        self.assertEqual(target, 'page-owner')
+        self.assertIn('Question: '+question, message)
+        self.assertIn('Production: page-owner', message)
+        self.assertIn('answer-question --item page-owner/C1', message)
+        slots = self.status.slots(check.page, check.row)
+        self.assertEqual(slots.validation, validation)
+        self.assertEqual(change_page.read_handed_at(path), handed_at)
+        assert isinstance(slots.question, change_page.OpenQuestion)
+        pending, _ = cache.publish_record(cache.get(), key)
+        self.assertEqual(pending.records[key].state, review_items.ReviewState.VALIDATING)
+        pending_card = pending.body(key).decode()
+        self.assertIn('Question for page-owner', pending_card)
+        self.assertIn(question, pending_card)
+        self.assertNotIn('Answer from page-owner', pending_card)
+        self.assertEqual([event.words for event in pending.records[key].log][-2:],
+                         ['Asked page-owner to validate', 'Asked a question about validation'])
+        retry = cache.save(self.card_body(pending, key, 'question', question), self.status)
+        self.assertIsInstance(retry.delivery, change_page.NoMessageDelivery)
+        with self.assertRaisesRegex(question_record.AnswerRefused, 'already has an open question'):
+            _ = cache.save(self.card_body(pending, key, 'question', 'Send an update?'), self.status)
+        self.assertEqual(len(self.fixture.messages), 1)
+        words = 'The macOS release build is still running.'
+        self.assertTrue(change_page.answer_item(key, words, slots.question.question_id, self.status))
+        self.assertFalse(change_page.answer_item(key, words, slots.question.question_id, self.status))
+        answered, _ = cache.publish_record(cache.get(), key)
+        self.assertEqual(answered.records[key].state, review_items.ReviewState.VALIDATING)
+        self.assertEqual(self.status.slots(check.page, check.row).validation, validation)
+        self.assertEqual(change_page.read_handed_at(path), handed_at)
+        for snapshot in (answered, review_page.build_snapshot(self.root)):
+            with self.subTest(version=snapshot.version):
+                self.assertEqual(snapshot.records[key].state, review_items.ReviewState.VALIDATING)
+                card = snapshot.body(key).decode()
+                for text in ('Question for page-owner', 'Answer from page-owner', question, words):
+                    self.assertIn(text, card)
+                    self.assertEqual(card.count(text), 1)
+                self.assertEqual([event.words for event in snapshot.records[key].log][-3:],
+                                 ['Asked page-owner to validate', 'Asked a question about validation',
+                                  'Answered the question'])
+        result = change_review.save_verdict(check.page.review_list, check.row, 'works', self.fixture.production,
+                                            validation_id=check.attempt)
+        self.assertIsInstance(result, change_review.VerdictSaved)
+        closed, item = cache.publish_record(cache.get(), key)
+        assert isinstance(item, review_items.ReviewItem)
+        self.assertEqual(item.state, review_items.ReviewState.DONE)
+        self.assertNotIn(key, closed.records)
+        self.assertNotIn(key, {entry["key"] for entry in closed.entries})
+
+        _ = staff.move(self.fixture.unit.id, staff.ReportsTo(check.recipients[0]))
+        fault_key = 'page-owner/C2'
+        check, _ = review_page.submit(self.root, self.body(fault_key, 'validate'), self.status)
+        assert isinstance(check, change_page.MessageDelivery)
+        change_page.deliver(check, self.status)
+        current, _ = cache.publish_record(cache.get(), fault_key)
+        pending = cache.save(self.card_body(current, fault_key, 'question', question), self.status)
+        change_page.deliver(pending.delivery, self.status)
+        result = change_review.save_verdict(check.page.review_list, check.row, 'not works: the gate failed',
+                                            self.fixture.production, validation_id=check.attempt)
+        self.assertIsInstance(result, change_review.VerdictSaved)
+        reopened, _ = cache.publish_record(cache.get(), fault_key)
+        self.assertEqual(reopened.records[fault_key].state, review_items.ReviewState.OPEN)
+        self.assertIsInstance(self.status.slots(check.page, check.row).question, change_page.NoQuestion)
+
+    def test_validation_uses_the_saved_validator_after_an_owner_change(self) -> None:
+        key = 'page-owner/C1'
+        validator = staff.snapshot().by_doc(local_machine(), self.fixture.production)
+        assert validator is not None
+        record = self.status.path(self.fixture.page, 'C1')
+        fields: change_page.StoredDeliverySlots = {'validation': {
+            'attempt': 'a1b2', 'state': 'sent', 'feedback': 'Check the queued step.', 'recipients': [validator.id]}}
+        _ = record.write_text(json.dumps(fields))
+        destination = self.fixture.temporary/'destination.md'
+        _ = destination.write_text(self.fixture.production.read_text())
+        runner = fixture_member('showrunner', name='destination', doc=staff.LiveDoc(local_machine(), destination))
+        _ = staff.move(self.fixture.unit.id, staff.ReportsTo(runner.id))
+
+        snapshot = review_page.build_snapshot(self.root)
+        self.assertEqual(snapshot.records[key].owner, validator.id)
+        self.assertIn('Sends to page-owner', snapshot.body(key).decode())
+        body = self.card_body(snapshot, key, 'question', 'Which check is still running?')
+        question, _ = review_page.submit(self.root, body, self.status, snapshot=snapshot)
+        assert isinstance(question, change_page.MessageDelivery)
+        self.assertEqual(question.recipients, (validator.id,))
+        change_page.deliver(question, self.status)
+        self.assertEqual([recipient for recipient, _, _ in self.fixture.messages], ['page-owner'])
+        self.assertEqual(self.status.validators(self.fixture.page, 'C1'), (validator.id,))
+        self.assertEqual(self.status.slots(self.fixture.page, 'C1').validation,
+                         change_page.ValidationRequested('a1b2', 'Check the queued step.'))
 
     def test_change_feedback_returns_after_a_showrunner_note(self) -> None:
         key = 'page-owner/C1'
         delivery, _ = review_page.submit(self.root, self.body(key, 'feedback', 'Adjust the spacing.\n'), self.status)
         assert isinstance(delivery, change_page.MessageDelivery)
         pending = next(item for item in review_items.read(self.root) if item.key == key)
-        with self.subTest(state='active hand-off'):
-            self.assertEqual(pending.state, review_items.ReviewState.VALIDATING)
+        with self.subTest(state='waiting for feedback'):
+            self.assertEqual(pending.state, review_items.ReviewState.WAITING)
+            self.assertEqual(pending.actions, ())
+            snapshot = review_page.build_snapshot(self.root)
+            card = snapshot.body(key).decode()
+            self.assertIn('Adjust the spacing.', card)
+            self.assertNotIn('Ask a question', card)
+            self.assertNotIn('value="question"', card)
         request = self.status.slots(delivery.page, delivery.row).question
         assert isinstance(request, change_page.OpenFeedback)
         change_page.deliver(delivery, self.status)
@@ -2107,16 +2255,27 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
         with patch.object(time, 'time', return_value=1794902400):
             _ = review_page.submit(self.root, self.body('page-owner/C1', 'validate'), self.status)
         review_later.save('page-owner/C1', datetime.now(user_zone()) + timedelta(days=1))
+        _ = change_review.append_rows(self.fixture.review_list,
+            pictured_changes([change_review.Visible('Check the setup.', 'Follow the setup.', 'It completes.')]),
+            datetime.now(user_zone()).date(), '', self.fixture.production,
+            producers=[self.fixture.unit.id], record=staff.snapshot())
+        waiting_change = 'page-owner/C4'
+        _ = review_page.submit(self.root, self.body(waiting_change, 'question', 'Which setup did you use?'), self.status)
         validating_keys = ['page-owner/C1']
-        waiting_keys = [f'investigation/{waiting.owner}/{waiting.id}']
+        waiting_investigation = f'investigation/{waiting.owner}/{waiting.id}'
         done_key = f'investigation/{finished.owner}/{finished.id}'
         open_keys = ['page-owner/C2', 'page-owner/C3', question, f'investigation/{ready.owner}/{ready.id}', *proposals]
-        expected = {'open':open_keys, 'Validating':validating_keys, 'doneKey':done_key, 'waitingInvestigation':waiting_keys[0],
-                    'all':open_keys+validating_keys+waiting_keys}
+        expected = {'open':open_keys, 'Validating':validating_keys, 'doneKey':done_key,
+                    'waitingInvestigation':waiting_investigation, 'waitingChange':waiting_change,
+                    'all':open_keys+validating_keys+[waiting_investigation, waiting_change]}
         pages = {show: browser_markup(self.root, show=show) for show, _ in review_page.SHOWS}
         setup = r"""<script>
 const nativeFetch=fetch,nativeTimeout=setTimeout;
-window.setInterval=()=>0;window.clearInterval=()=>{};
+let reviewClock=1794907200000;
+Date.now=()=>reviewClock;
+let updateAges;
+window.setInterval=callback=>{if(callback.name==='updateHandoffAges') updateAges=callback;return 0;};
+window.clearInterval=()=>{};
 window.refreshRequests=[];
 const showPages=PAGES;
 window.fetch=async(url,options)=>{
@@ -2152,7 +2311,7 @@ window.fetch=async(url,options)=>{
   check(noMountedState('Done'),'F064: the initial Open view mounts no Done rows');
   check(noMountedKey(EXPECTED.Validating[0]),'Open must not mount the active check.');
   check(count('open')?.textContent==='6' && count('Validating')?.textContent==='1' &&
-    !chip('Done') && count('all')?.textContent==='8',
+    !chip('Done') && count('all')?.textContent==='9',
     'F001: Open shows complete counts, including the active check in Validating');
   check(chip('Validating') && getComputedStyle(chip('Validating')).opacity==='1',
     'A nonzero Validating chip has full opacity.');
@@ -2170,11 +2329,24 @@ window.fetch=async(url,options)=>{
     document.querySelector('[data-type-chip=""] b')?.textContent==='1' &&
     document.querySelector('[data-type-chip="change"] b')?.textContent==='1',
     'Owner and Type count the active check.');
-   check(visible[0]?.dataset.parked==='false' && !visible[0]?.querySelector('button'),
-    'The active check has no Later state or buttons.');
-   const handoff=visible[0]?.querySelector('[data-label="Item"] .review-handoff');
-   check(handoff?.textContent==='With page-owner since Nov 17 03:00 EST',
-    'The mounted row shows the owner and the saved request time.');
+   const row=visible[0],toggle=row?.querySelector('.list-toggle');
+   check(row?.dataset.parked==='false' && toggle?.tagName==='BUTTON',
+    'The active check can open without a Later state.');
+   const handoff=row?.querySelector('[data-label="Item"] .review-handoff');
+   check(handoff?.textContent==='With page-owner · Validating for 1 h 20 m',
+    'The row shows the validator and elapsed time.');
+   toggle?.click();
+   const form=await readyReviewCard(row);
+   check(!row.querySelector('[data-detail]').hidden && form.textContent.includes('Sends to page-owner') &&
+    form.querySelector('[value="question"]')?.textContent==='Ask a question' &&
+    row.querySelector('[data-detail] .review-handoff')?.textContent===handoff?.textContent,
+    'Open the card with the same elapsed time and send label.');
+   reviewClock+=60000;updateAges();
+   check(handoff?.textContent==='With page-owner · Validating for 1 h 21 m' &&
+    row.querySelector('[data-detail] .review-handoff')?.textContent===handoff?.textContent,
+    'The row and card update without a server read.');
+   toggle?.click();
+   reviewClock-=60000;
    const owner=handoff?.querySelector('span');
    check(owner && getComputedStyle(owner).whiteSpace==='nowrap','The showrunner name stays together.');
    if(innerWidth>960) check(handoff &&
@@ -2196,16 +2368,22 @@ window.fetch=async(url,options)=>{
     'pressing the selected chip changes nothing');
   chip('all')?.focus();chip('all')?.click();await flush();await flush();
   const handed=document.querySelector('[data-key="page-owner/C1"]');
-  check(handed && !handed.hidden && handed.textContent.includes('With page-owner since') &&
-   !handed.querySelector('button'),'All shows the handed change without buttons.');
-  check(count('all')?.textContent==='8','All counts the handed change.');
+  check(handed && !handed.hidden && handed.textContent.includes('With page-owner · Validating for') &&
+   handed.querySelector('button.list-toggle'),'All shows the active check and can open its card.');
+  check(count('all')?.textContent==='9','All counts the active records.');
   check(noMountedKey(EXPECTED.doneKey) &&
     document.querySelector('[data-type-chip="investigation"] b').textContent==='2' &&
-    document.querySelector('[data-owner-chip=""] b').textContent==='8',
+    document.querySelector('[data-owner-chip=""] b').textContent==='9',
     'All excludes the completed investigation from the rows, Type counts and Owner counts.');
   check(document.activeElement===chip('all'),'F002: the pressed Show chip keeps focus after the load');
+  const ordinary=document.querySelector('[data-key="'+EXPECTED.waitingChange+'"]');
+  ordinary?.querySelector('button.list-toggle')?.click();
+  const ordinaryForm=await readyReviewCard(ordinary);
+  check(ordinary?.dataset.state==='Waiting' && !ordinary.hidden && !ordinaryForm.querySelector('[value="question"]') &&
+   !ordinary.querySelector('.review-handoff'), 'An ordinary question stays in Waiting without validation controls.');
+  ordinary?.querySelector('button.list-toggle')?.click();
   chip('Validating')?.focus();chip('Validating')?.click();await flush();await flush();
-  check(exactKeys('Validating'),'F020: Validating mounts the exact Waiting keys');
+  check(exactKeys('Validating'),'F020: Validating mounts the exact validation keys');
   check(count('Validating')?.textContent==='1','F001: Validating retains its complete count after the load');
   check(document.activeElement===chip('Validating'),'F002: the pressed Show chip keeps focus after the load');
   chip('all')?.focus();chip('all')?.click();await flush();await flush();
@@ -2220,7 +2398,7 @@ window.fetch=async(url,options)=>{
   check(selected('Validating') && new URLSearchParams(location.hash.slice(1)).get('show')==='Validating',
     'A State chip changes the pressed state and address.');
   check(exactKeys('Validating'),'Validating shows the active check.');
-  check(['open','Validating','all'].map(value=>count(value)?.textContent).join('|')==='6|1|8',
+  check(['open','Validating','all'].map(value=>count(value)?.textContent).join('|')==='6|1|9',
     'State counts exclude the completed investigation.');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
   check(selected('Validating') && new URL(window.refreshRequests.at(-1),location.href).searchParams.has('version'),
@@ -2239,7 +2417,7 @@ window.fetch=async(url,options)=>{
     'Open retains the two decision rows after a Show load');
   }
   chip('all')?.click();await flush();await flush();
-  check(['open','Validating','all'].map(value=>count(value)?.textContent).join('|')==='6|1|8' &&
+  check(['open','Validating','all'].map(value=>count(value)?.textContent).join('|')==='6|1|9' &&
     [...document.querySelectorAll('[data-show-chip] b')].every(number=>!number.hidden),
     'All supplies the count for every Show chip');
   const groups=[...document.querySelectorAll('.review-types')],buttons=[...document.querySelectorAll('[data-show-chip]')];
@@ -2914,16 +3092,18 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
             with self.subTest(key=key):
                 item = next(item for item in review_items.read(self.root) if item.key == key)
                 delivery, result = review_page.submit(self.root,self.body(key,'question','Check the second case.'),self.status)
-                self.assertEqual(result,'question sent')
+                expected_answer = 'question saved' if item.type == review_items.ReviewType.CHANGE else 'question sent'
+                self.assertEqual(result, expected_answer)
                 self.assertIsInstance(delivery,change_page.MessageDelivery)
                 assert isinstance(delivery,change_page.MessageDelivery)
                 self.assertIn(item.owner,delivery.recipients)
                 self.assertIn('change_page.py answer-question --item '+key,delivery.message)
                 change_page.deliver(delivery,self.status)
                 pending = next(item for item in review_items.read(self.root) if item.key == key)
-                expected_state = (review_items.ReviewState.VALIDATING if item.type == review_items.ReviewType.CHANGE
-                                  else review_items.ReviewState.WAITING)
-                self.assertEqual(pending.state, expected_state)
+                self.assertEqual(pending.state, review_items.ReviewState.WAITING)
+                if item.type == review_items.ReviewType.CHANGE:
+                    self.assertEqual(pending.actions, ())
+                    self.assertNotIn('value="question"', review_page.build_snapshot(self.root).body(key).decode())
                 args = ['answer-question','--item',key,'--text','The second case passes.']
                 request = self.status.slots(delivery.page,delivery.row).question
                 assert isinstance(request,change_page.OpenQuestion)
@@ -3100,7 +3280,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 self.assertEqual(result,'feedback sent')
                 assert isinstance(delivery,change_page.MessageDelivery)
                 self.assertIn(item.owner,delivery.recipients)
-                expected = review_items.ReviewState.VALIDATING if item.type == review_items.ReviewType.CHANGE else review_items.ReviewState.DONE
+                expected = review_items.ReviewState.WAITING if item.type == review_items.ReviewType.CHANGE else review_items.ReviewState.DONE
                 self.assertEqual(next(item.state for item in review_items.read(self.root) if item.key == key),expected)
         restarted = change_page.DeliveryStatus(self.root)
         with patch.object(atomic_file, 'write_bytes_atomic', new=write_delivery):
@@ -3278,6 +3458,43 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         verdict = self.status.slots(delivery.page, delivery.row).verdict
         assert isinstance(verdict, change_page.DeliveryIntent)
         self.assertEqual(verdict.attempt, delivery.attempt)
+
+        cases = (('C1', 'closeout'), ('C2', 'slots'), ('C3', 'receipt and slots'))
+        write_text = atomic_file.write_text_atomic
+        for row, failed_write in cases:
+            with self.subTest(write=failed_write):
+                self.fixture.messages.clear()
+                key = 'page-owner/'+row
+                check, _ = review_page.submit(self.root, self.body(key, 'validate'), self.status)
+                change_page.deliver(check, self.status)
+                self.fixture.messages.clear()
+                snapshot = review_page.build_snapshot(self.root)
+                body = self.card_body(snapshot, key, 'question', words)
+                delivery, _ = review_page.submit(self.root, body, self.status, snapshot=snapshot)
+                assert isinstance(delivery, change_page.MessageDelivery)
+                path = (self.status.closeout_path(delivery.page, row) if failed_write == 'closeout'
+                        else self.status.path(delivery.page, row))
+                pending = self.status.slots(delivery.page, row).question
+                assert isinstance(pending, change_page.OpenQuestion)
+                assert isinstance(pending.delivery, change_page.DeliveryIntent)
+                receipt = self.status.review_save_receipt(delivery.page, row, pending.delivery)
+
+                def fail_receipt(target: Path, content: str, *, new_file_mode: int | None = None) -> None:
+                    if failed_write == 'receipt and slots' and target == receipt:
+                        raise OSError('fixture acceptance receipt write failed')
+                    write_text(target, content, new_file_mode=new_file_mode)
+
+                with (patch.object(atomic_file, 'write_bytes_atomic', new=fail_result),
+                      patch.object(atomic_file, 'write_text_atomic', new=fail_receipt)):
+                    change_page.recover_pending(change_page.DeliveryStatus(self.root))
+                self.assertEqual(len(self.fixture.messages), 1)
+                self.assertEqual(self.status.slots(delivery.page, row).question, pending)
+                self.assertEqual(receipt.exists(), failed_write != 'receipt and slots')
+                change_page.recover_pending(change_page.DeliveryStatus(self.root))
+                change_page.recover_pending(change_page.DeliveryStatus(self.root))
+                self.assertEqual(len(self.fixture.messages), 1)
+                recovered = self.status.slots(delivery.page, row).question
+                self.assertEqual(recovered, replace(pending, delivery=change_page.NoDelivery()))
 
     def test_later_hides_each_type_from_the_shared_queue_and_then_returns(self) -> None:
         _ = change_review.append_rows(self.fixture.review_list,
@@ -4335,7 +4552,7 @@ window.fetch=(url,options={})=>{
    await refreshed;
    const target=row(key),item=new URLSearchParams(location.hash.slice(1)).get('item');
    if(action==='validate'){
-    if(item!==key || content.dataset.version!==snapshot.version || row(key))
+    if(item!==key || content.dataset.version!==snapshot.version || target)
      failures.push('The deferred link keeps the Validating marker when a new snapshot still shows the old Change.');
     continue;
    }
