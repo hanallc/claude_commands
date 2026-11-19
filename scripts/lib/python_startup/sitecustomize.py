@@ -24,7 +24,8 @@ STARTUP_FILES = ("scripts/lib/py", "scripts/lib/package_root.py", "scripts/lib/p
 TEST_RUNNER_FILES = (*STARTUP_FILES, "scripts/test_times/module_run.py", "scripts/lib/descendants.py",
                      "scripts/lib/conf_reads.py", "scripts/lib/build_folders.py", "scripts/lib/build_folder_lock.py",
                      "scripts/lib/boot_identity.py",
-                     "scripts/lib/conf.py", "scripts/lib/git_files.py", "config/build_folders.conf")
+                     "scripts/lib/conf.py", "scripts/lib/git_files.py", "config/build_folders.conf",
+                     "scripts/lib/test_guard.py", "config/test_guard.conf")
 DATACLASS_CODE_FILENAME = "<string>"
 # dataclasses.py has no __future__ import, so its exec compiles with no flags.
 DATACLASS_CODE_FLAGS = 0
@@ -217,15 +218,63 @@ def start_process(arguments: list[str]) -> str:
     return selected
 
 
+def kernel_guarded() -> bool:
+    """Check the mount, PID, and network walls."""
+    if sys.platform != "linux":
+        return False
+    try:
+        if not os.statvfs("/").f_flag & os.ST_RDONLY:
+            return False
+        try:
+            if not os.statvfs("/home").f_flag & os.ST_RDONLY:
+                return False
+        except FileNotFoundError:
+            pass
+        with open("/proc/1/comm", encoding="ascii") as process:
+            if process.read().strip() != "bwrap":
+                return False
+        with open("/proc/net/dev", encoding="ascii") as network:
+            interfaces = network.read().splitlines()[2:]
+        return [line.split(":", 1)[0].strip() for line in interfaces] == ["lo"]
+    except (OSError, UnicodeError):
+        return False
+
+
+def _python_module(original: Sequence[str]) -> str:
+    """Read the interpreter's module argument before its program arguments."""
+    options = iter(original[1:])
+    for option in options:
+        if option == "-m":
+            return next(options, "")
+        if option.startswith("-m"):
+            return option[2:]
+        if option in ("-W", "-X", "--check-hash-based-pycs"):
+            _ = next(options, "")
+        elif option in ("-", "--") or option.startswith("-c") or not option.startswith("-"):
+            break
+    return ""
+
+
 def _start_test_run(selected: str, arguments: list[str]) -> None:
-    # Decide before any import; module_run.py removes the gate variable later.
-    if os.environ.get("MERGE_GATE_PARENT_PID"):
-        return
     original = sys.orig_argv
-    unittest_module = ("-munittest" in original
-                       or any(original[index:index + 2] == ["-m", "unittest"] for index in range(len(original))))
     target = arguments[0] if arguments else ""
-    if not (unittest_module or target == "unittest" or os.path.basename(target) == "module_run.py"):
+    module = _python_module(original) if target == "-m" else target
+    test_module = (module.partition(".")[0] in ("unittest", "pytest")
+                   or module.startswith("scripts.") and module.rsplit(".", 1)[-1].startswith("test_"))
+    filename = os.path.basename(target)
+    guard = os.path.join(selected, "scripts/lib/test_guard.py")
+    test_file = filename.startswith("test_") and filename.endswith(".py") and os.path.abspath(target) != guard
+    if not (test_module or filename == "module_run.py" or test_file):
+        return
+    if not kernel_guarded():
+        if not os.path.isfile(guard):
+            raise SystemExit(f"test guard: launcher not found: {guard}")
+        # The launcher calls enter() before it restarts Python.
+        try:
+            os.execv(sys.executable, [sys.executable, "-I", guard, "--", sys.executable, *original[1:]])
+        except OSError as error:
+            raise SystemExit(f"test guard: cannot start the launcher: {error}") from error
+    if os.environ.get("MERGE_GATE_PARENT_PID"):
         return
     # Partial fixture checkouts can contain only the startup files.
     if not os.path.isfile(os.path.join(selected, "scripts/lib/testing_folders.py")):

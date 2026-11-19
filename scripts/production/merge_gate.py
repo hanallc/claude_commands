@@ -81,7 +81,7 @@ from scripts.buildlog import store  # noqa: E402
 from scripts.buildlog.store import host_name  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
-from scripts.lib import scratch  # noqa: E402
+from scripts.lib import scratch, test_guard  # noqa: E402
 from scripts.test_times import gate_record
 from scripts.build_queue import admission_records  # noqa: E402
 from scripts.build_queue import progress_profile
@@ -1091,10 +1091,11 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     started_at = time.time()
     try:
         with cancellation.defer_cleanup_signals():
-            process = subprocess.Popen([str(python_shim(repo)), "-c", SUITE_BOOTSTRAP, *argv],
-                                       cwd=repo, env={**environment, "MERGE_GATE_PARENT_PID": str(os.getpid())},
+            host_environment = environment if test_guard.guarded() else test_guard.host_environment(environment)
+            process = subprocess.Popen([sys.executable, "-I", "-c", SUITE_BOOTSTRAP, *argv],
+                                       cwd=repo, env={**host_environment, "MERGE_GATE_PARENT_PID": str(os.getpid())},
                                        stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, text=True,
-                                       start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get())
+                                       start_new_session=True)
             recovery = ACTIVE_GATE_RECOVERY.get()
             if isinstance(recovery, GateRecovery):
                 recovery.add_group(process.pid)
@@ -1723,10 +1724,25 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                                        else test_module_environment(root, environment))
                     if request.kind is GateJobKind.TYPE_CHECK:
                         _ = job_environment.pop("BUILDLOG_LIVE_MEMORY_TRIPWIRE", None)
-                    argv = ([os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright"), "--pythonpath", str(types_python),
-                             *type_dirs]
-                            if request.kind is GateJobKind.TYPE_CHECK else
-                            [*scope_prefix, python, str(runner), str(path.parent), path.name])
+                    read_only: list[Path] = []
+                    if request.kind is GateJobKind.TYPE_CHECK:
+                        checker = os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright")
+                        checker_path = shutil.which(checker, path=job_environment.get("PATH", os.defpath))
+                        if checker_path is not None:
+                            checker = str(Path(checker_path).resolve())
+                            if Path(checker).is_relative_to(Path.home() / ".local/share/uv/tools/basedpyright"):
+                                read_only.append(Path(checker).parent.parent)
+                        read_only.append(typecheck_venv_path().resolve())
+                        candidate = [checker, "--pythonpath", str(types_python), *type_dirs]
+                    else:
+                        candidate = [python, str(runner), str(path.parent), path.name]
+                    try:
+                        with test_guard.gate_inputs(repo, job_environment, read_only=read_only):
+                            argv = test_guard.command(candidate, root)
+                    except test_guard.TestGuardUnavailable as error:
+                        raise GateRefused(str(error)) from error
+                    if request.kind is GateJobKind.TEST_MODULE:
+                        argv = [*scope_prefix, *argv]
                     with cancellation.defer_cleanup_signals():
                         if request.kind is GateJobKind.TYPE_CHECK:
                             job = start_gate_job(suite, path, argv, repo, job_environment, log, kind=request.kind)

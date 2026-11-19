@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, TypedDict, cast, override
 import unittest
 
 
-from scripts.lib import build_folders
+from scripts.lib import build_folders, test_guard
 from scripts.test_times.line_collector import (
     REPOSITORY, SHARED_TEST, SHARED_THREAD, ChildLaunch, ChildReport, ExecutedLine, LineCollector, read_child_reports,
 )
@@ -310,6 +310,14 @@ def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print("usage: coverage_overlap.py scripts/<folder> <file> [<file> ...]", file=sys.stderr)
         return 2
+    if not test_guard.guarded():
+        try:
+            if os.environ.get("COVERAGE_OUT"):
+                raise test_guard.TestGuardUnavailable("coverage output requires a path inside an active test guard")
+            test_guard.enter([sys.executable, *sys.orig_argv[1:]])
+        except test_guard.TestGuardUnavailable as error:
+            print(f"test guard: {error}", file=sys.stderr)
+            return 2
     folder = Path(argv[0]).resolve()
     modules = {path.resolve() for _, path in discover_test_modules(REPOSITORY)}
     paths = list(dict.fromkeys(folder / name for name in argv[1:]))

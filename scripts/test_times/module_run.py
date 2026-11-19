@@ -33,6 +33,8 @@ from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypedDict, cast, 
 import unittest
 import unittest.case as unittest_case
 
+from scripts.lib import test_guard
+
 if TYPE_CHECKING:
     from scripts.test_times.gate_record import TestStatus, TestTime
 
@@ -681,6 +683,16 @@ def run_with_descendant_cleanup(cleanup_run_roots: Callable[[], None]) -> None:
     sys.exit(exit_code)
 
 
-if __name__ == "__main__":
+def run_entrypoint() -> None:
+    """Enter the guard before allocating folders or loading tests."""
+    if not test_guard.guarded():
+        try:
+            test_guard.enter([sys.executable, *sys.orig_argv[1:]])
+        except test_guard.TestGuardUnavailable as error:
+            sys.exit(f"test guard: {error}")
     with private_run_roots() as cleanup_run_roots:
         run_with_descendant_cleanup(cleanup_run_roots)
+
+
+if __name__ == "__main__":
+    run_entrypoint()

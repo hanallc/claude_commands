@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
+import io
 from dataclasses import dataclass
 import json
 import os
@@ -15,12 +16,15 @@ import tempfile
 import textwrap
 from typing import TYPE_CHECKING, cast
 import unittest
+from unittest import mock
 
 
+from scripts.lib import test_guard
 from scripts.lib.checkout_test_support import copy_test_runner
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository
+from scripts.test_times import coverage_overlap
 from scripts.test_times.coverage_overlap import TestCoverage, select_candidates
 
 if TYPE_CHECKING:
@@ -195,6 +199,21 @@ def run_child() -> subprocess.CompletedProcess[str]:
 
 
 class CoverageOverlapTests(unittest.TestCase):
+    def test_guard_refusal_prevents_discovery(self) -> None:
+        arguments = ["scripts/lib", "test_py_root.py"]
+        original = [sys.executable, str(TOOL), *arguments]
+        with (mock.patch.object(sys, "orig_argv", original),
+              mock.patch.dict(os.environ, {"COVERAGE_OUT": ""}),
+              mock.patch.object(test_guard, "guarded", return_value=False),
+              mock.patch.object(test_guard, "enter",
+                                side_effect=test_guard.TestGuardUnavailable("Bubblewrap is unavailable")) as enter,
+              mock.patch.object(coverage_overlap, "discover_test_modules") as discover,
+              redirect_stderr(io.StringIO()) as error):
+            self.assertEqual(coverage_overlap.main(arguments), 2)
+        enter.assert_called_once_with(original)
+        discover.assert_not_called()
+        self.assertIn("Bubblewrap is unavailable", error.getvalue())
+
     @contextmanager
     def fixture_command(self, sources: dict[str, str]) -> Generator[tuple[subprocess.CompletedProcess[str], Path]]:
         with tempfile.TemporaryDirectory() as directory:

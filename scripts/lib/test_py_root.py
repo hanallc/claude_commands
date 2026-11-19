@@ -5,10 +5,13 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import tarfile
 import unittest
+from unittest import mock
 
+from scripts.lib.python_startup import sitecustomize
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -82,6 +85,30 @@ assert status == 0 and record['exit_code'] == 0, record
 
 
 class PythonRootTests(unittest.TestCase):
+    def test_startup_refuses_a_test_even_with_an_inherited_gate_pid(self) -> None:
+        root = str(Path(__file__).resolve().parents[2])
+        guard = str(Path(root) / "scripts/lib/test_guard.py")
+        for original, arguments in (
+            ([sys.executable, "-m", "unittest"], ["-m"]),
+            ([sys.executable, "scripts/lib/test_py_root.py"], ["scripts/lib/test_py_root.py"]),
+        ):
+            with (self.subTest(arguments=arguments),
+                  mock.patch.object(sys, "orig_argv", original),
+                  mock.patch.dict(os.environ, {"MERGE_GATE_PARENT_PID": "1"}),
+                  mock.patch.object(sitecustomize, "kernel_guarded", return_value=False),
+                  mock.patch.object(os, "execv", side_effect=FileNotFoundError("launcher refused")) as launch):
+                with self.assertRaisesRegex(SystemExit, "cannot start the launcher"):
+                    sitecustomize._start_test_run(root, arguments)  # pyright: ignore[reportPrivateUsage]
+                launch.assert_called_once_with(
+                    sys.executable, [sys.executable, "-I", guard, "--", *original],
+                )
+
+    def test_startup_does_not_treat_program_arguments_as_interpreter_options(self) -> None:
+        with (mock.patch.object(sys, "orig_argv", [sys.executable, "command.py", "-m", "unittest"]),
+              mock.patch.object(sitecustomize, "kernel_guarded") as guarded):
+            sitecustomize._start_test_run("/fixture", ["command.py", "-m", "unittest"])  # pyright: ignore[reportPrivateUsage]
+        guarded.assert_not_called()
+
     def checkout(self, root: Path, value: str) -> Path:
         library = root / "scripts/lib"
         library.mkdir(parents=True)

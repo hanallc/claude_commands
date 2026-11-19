@@ -18,12 +18,15 @@ import tempfile
 import textwrap
 from typing import ClassVar, cast, override
 import unittest
+from unittest import mock
 
 
+from scripts.lib import test_guard
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message.process_test_support import OwnedTestProcesses
+from scripts.test_times import module_run
 from scripts.test_times.gate_record import ModuleTimes
 from scripts.test_times.module_run import FixtureMeasure, TestMeasure
 
@@ -305,6 +308,20 @@ def run_fixture(root: Path, name: str, source: str) -> FixtureRun:
     timed_sender_folders = [path.name for path in temporary.glob("sender-guard-*")]
     times = UnwrittenFixtureTimes() if output.read_text() == "stale output\n" else read_times(output)
     return FixtureRun(timed, standard, times, standard_sender_folders, timed_sender_folders)
+
+
+class GuardedRunnerTests(unittest.TestCase):
+    def test_refusal_happens_before_runner_setup(self) -> None:
+        arguments = [sys.executable, str(RUNNER), "scripts/lib", "test_py_root.py"]
+        with (mock.patch.object(sys, "orig_argv", arguments),
+              mock.patch.object(test_guard, "guarded", return_value=False),
+              mock.patch.object(test_guard, "enter",
+                                side_effect=test_guard.TestGuardUnavailable("Bubblewrap is unavailable")) as enter,
+              mock.patch.object(module_run, "private_run_roots") as prepare):
+            with self.assertRaisesRegex(SystemExit, "Bubblewrap is unavailable"):
+                module_run.run_entrypoint()
+        enter.assert_called_once_with(arguments)
+        prepare.assert_not_called()
 
 
 class ModuleRunnerTests(unittest.TestCase):
