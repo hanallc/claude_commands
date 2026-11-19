@@ -3364,11 +3364,18 @@ def read_relay(observed: RelayTransportResponse, text: str, *,
     sends = [part for event in events if event.get("type") == "assistant"
              for value in as_list(as_dict(event.get("message")).get("content"))
              if (part := as_dict(value)).get("type") == "tool_use" and part.get("name") == "SendMessage"]
-    if len(sends) != 1:
+    if not sends:
         said = next((as_str(event.get("result")) for event in reversed(events) if event.get("type") == "result"), "")
-        reason = f"{len(sends)} SendMessage calls" if sends else f"the relay made no SendMessage call: {one_line(said) or 'no output'}"
-        return _unaccepted_relay(forward, reason, queue_if_unsent=not sends)
-    call = sends[0]
+        return _unaccepted_relay(forward, f"the relay made no SendMessage call: {one_line(said) or 'no output'}",
+                                 queue_if_unsent=True)
+    if len(sends) == 1:
+        call = sends[0]
+    else:
+        forwarded_calls = [call for call in sends if isinstance(forward, RelayRequestForwarded)
+                           and call.get("id") == forward.tool_use_id]
+        if len(forwarded_calls) != 1:
+            return _unaccepted_relay(forward, f"{len(sends)} SendMessage calls")
+        call = forwarded_calls[0]
     inputs = as_dict(call.get("input"))
     if inputs.get("to") != observed.target or inputs.get("message") != text:
         return _unaccepted_relay(forward, "SendMessage used a different target or payload")
@@ -3389,7 +3396,10 @@ def read_relay(observed: RelayTransportResponse, text: str, *,
                                  queue_if_unsent=rejected)
     if forward != RelayRequestForwarded(tool_id, text):
         return _unaccepted_relay(forward, "SendMessage has no matching completed proxy forward")
-    return CheckedRelayAcceptance(tool_id, f"mode {mode}; verbatim; {describe(answer)}")
+    detail = f"mode {mode}; verbatim; {describe(answer)}"
+    if len(sends) > 1:
+        detail += f"; forwarded 1 of {len(sends)} SendMessage calls"
+    return CheckedRelayAcceptance(tool_id, detail)
 
 
 def _unaccepted_relay(forward: RelayForward, reason: str, *, queue_if_unsent: bool = False) -> Result:
