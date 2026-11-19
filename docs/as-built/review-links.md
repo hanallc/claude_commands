@@ -379,9 +379,12 @@ The table columns are Id, Type, Owner, Item, State and Age.
 One row can open its card in place.
 `record_table.py` supplies the table styles, filters, sorting and open-row controls for Review and The List.
 When a Review action removes a card, the shared table keeps a copy of the row and its open details in place.
-The copy fades and collapses in 200 ms, and the rows below slide up during that time.
+The copy fades and collapses while the rows below slide up.
+`card_fade_out_ms` in `config/review_links.conf` sets the duration. Its initial value is 450 ms.
 A save can change the card's sort values. The copy keeps its previous values until the fade ends.
 If the request fails, the row slides back into view and the current card stays selected.
+`card_fade_in_ms` sets the duration of the return. Its initial value is 600 ms.
+Review and The List read both settings when they render.
 If the fade is still in progress, the return starts at the copy's current height and opacity.
 The animation updates when the user opens or closes a card during the transition.
 A successful save adds no notice above the table.
@@ -1760,13 +1763,14 @@ The page, the footer and `/next` use these same folder readers.
 
 
 Legacy Changes and Questions forms and the Images page share one motion helper.
-A different Changes or Questions card fades out for 180ms, then fades in for 270ms with a 4px upward move.
+The page reads `card_fade_out_ms` and `card_fade_in_ms` when it renders.
+A different Changes or Questions card uses both durations, with a 4 px upward move during the fade in.
 A new switch completes the active switch first.
 The first load and an update that keeps the same card do not fade.
 A new card above the viewport scrolls into view smoothly.
-Image links scroll smoothly to their image, then reveal it over 270ms with a 4px upward move.
+Image links scroll smoothly to their image, then reveal it with a fade in and a 4 px upward move.
 Other image cards stay visible.
-An image fades before removal, and the cards below close the gap over 270ms.
+An image fades out before removal. The cards below close the gap over the fade in duration.
 Reduced motion disables fades and uses instant scrolling.
 
 Question items and change rows show a Lucide copy button inside the top right of each code block.

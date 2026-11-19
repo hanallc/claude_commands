@@ -3968,7 +3968,8 @@ class ReviewLinksConfigTests(unittest.TestCase):
         settings = conf.read(path)
         values = settings.values()
         self.assertEqual(settings.text("unrouted_alert_recipient"), values["unrouted_alert_recipient"])
-        for key in ("delivery_tries", "server_port", "snapshot_allocation_tries"):
+        for key in ("delivery_tries", "server_port", "snapshot_allocation_tries",
+                    "card_fade_out_ms", "card_fade_in_ms"):
             with self.subTest(key=key):
                 self.assertEqual(settings.whole(key), int(values[key]))
         for key in ("page_refresh_seconds", "delivery_pause_seconds", "unrouted_alert_retry_seconds",

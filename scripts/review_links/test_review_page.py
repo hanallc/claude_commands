@@ -2811,6 +2811,15 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 self.assertIn('value="later">Save',form)
                 self.assertNotIn('value="skip"',form)
 
+    def test_review_render_reads_card_motion_settings(self) -> None:
+        before = review_page.build_snapshot(self.root)
+        settings = self.fixture.temporary / "config/review_links.conf"
+        _ = write_config_fixture(settings, "card_fade_out_ms=365\ncard_fade_in_ms=725\n")
+        after = review_page.build_snapshot(self.root)
+        self.assertNotEqual(after.version, before.version)
+        self.assertIn(b'data-card-fade-out-ms="365" data-card-fade-in-ms="725"', after.render())
+        self.assertIn(b'"cardFadeOutMs": 365, "cardFadeInMs": 725', after.index_response())
+
     def test_later_presets_read_their_settings(self) -> None:
         for minutes, label in ((1,'In 1 minute'),(90,'In 90 minutes'),(60,'In 1 hour'),(120,'In 2 hours')):
             with self.subTest(minutes=minutes):
@@ -3810,14 +3819,18 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
    const clip=motion()?.querySelector('.record-motion-clip'),exit=clip?.getAnimations()[0];
    if(!exit) throw new Error('The shared exit animation is missing.');
    check(motion().querySelector('[data-detail]:not([hidden])'),'The motion copy includes the open card.');
-   check(exit.effect.getTiming().duration===200,'The motion lasts 200 ms.');
+   check(exit.effect.getTiming().duration===Number(document.querySelector('[data-review]').dataset.cardFadeOutMs),
+    'The card uses the configured fade time.');
    exit.pause();exit.currentTime=0;
    const initialOpacity=Number(getComputedStyle(clip).opacity);
    check(Math.abs(top(next)-start)<2,'The next card starts in its original position.');
-   exit.currentTime=100;
+   exit.currentTime=exit.effect.getTiming().duration/2;
    const opacity=Number(getComputedStyle(clip).opacity);
    check(opacity>0 && opacity<initialOpacity,'The motion copy fades before it disappears.');
    check(top(next)<start && top(next)>first,'The next card moves up during the fade.');
+   const submitter=form.querySelector('button[value="'+action+'"]');
+   form.dispatchEvent(new SubmitEvent('submit',{cancelable:true,submitter}));
+   check(posts.length===1,'A second submit during the fade sends no POST.');
    exit.finish();await exit.finished;
    check(!motion() && Math.abs(top(next)-first)<2,'The next card fills the gap when the copy leaves.');
   }
@@ -3825,7 +3838,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         cases = [(action, False) for action in ('works', 'not works', 'validate', 'question', 'feedback', 'later')]
-        for action, reduced in [*cases, ('question', True)]:
+        for action, reduced in [*cases, ('later', True)]:
             with self.subTest(action=action, reduced_motion=reduced):
                 markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
                 markup = markup.replace('REDUCED', json.dumps(reduced)).replace('ACTION', json.dumps(action))
@@ -3855,7 +3868,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  check(clip && near(top(clip),before),'The tall copy starts at the original position.');
  check(next.isConnected && near(top(next),following),'The visible next card keeps its position.');
  const exit=clip.getAnimations()[0];
- exit.currentTime=100;dispatchEvent(new Event('scroll'));await frame();
+ halfway(exit);dispatchEvent(new Event('scroll'));await frame();
  check(near(top(clip),before),'The shrinking copy keeps its place after a redraw.');
  check(next.isConnected && top(next)<following,'The next card stays mounted while it moves up.');
  exit.finish();await exit.finished;await frame();
@@ -3867,15 +3880,17 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
         self.check_card_motion(browser_markup(self.root), r"""
  const [first,second,next]=rows(),firstPanel=panelId(first),secondPanel=panelId(second);
  const firstForm=await openCard(first);send(firstForm);
- const firstClip=copy(firstPanel);firstClip.getAnimations()[0].currentTime=100;
+ const firstClip=copy(firstPanel);halfway(firstClip.getAnimations()[0]);
  const secondForm=await openCard(second);send(secondForm);
- const secondClip=copy(secondPanel);secondClip.getAnimations()[0].currentTime=100;
+ const secondClip=copy(secondPanel);halfway(secondClip.getAnimations()[0]);
  const height=firstClip.getBoundingClientRect().height,opacity=Number(getComputedStyle(firstClip).opacity);
  const following=top(next);
  posts.get(first.dataset.key)({ok:false,json:async()=>({reason:'Try again.'})});
  await frame();
  const restored=copy(firstPanel);
  check(restored && restored!==firstClip,'The refused card reverses its fade.');
+ check(restored?.getAnimations()[0]?.effect.getTiming().duration===
+   Number(document.querySelector('[data-review]').dataset.cardFadeInMs),'The return uses the configured duration.');
  check(restored && top(restored)<top(secondClip),'The first card returns above the departing second card.');
  check(restored && near(restored.getBoundingClientRect().height,height) &&
    near(Number(getComputedStyle(restored).opacity),opacity,0.01),'The reverse starts at the current height and opacity.');
@@ -3890,7 +3905,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  check([first,row,next].every(node=>node.dataset.state==='Open'),'Three open cards are sorted by State.');
  send(await openCard(row));
  const clip=copy(panel),exit=clip.getAnimations()[0];
- exit.currentTime=100;
+ halfway(exit);
  const position=top(clip),following=top(next);
  check(top(first)<position && position<following,'The departing card starts between its neighbors.');
  posts.get(row.dataset.key)({ok:true,json:async()=>({answer:'works',state:'Done',later:0})});
@@ -3920,6 +3935,7 @@ Element.prototype.animate=function(...args){
  const frame=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
  const rows=()=>[...document.querySelectorAll('[data-list-item]')];
  const top=node=>node.getBoundingClientRect().top;
+ const halfway=animation=>{animation.currentTime=animation.effect.getTiming().duration/2;};
  const near=(a,b,tolerance=2)=>Math.abs(a-b)<tolerance;
  const panelId=row=>row.querySelector('.list-toggle').getAttribute('aria-controls');
  const copy=panel=>document.querySelector('.record-motion-clip [aria-controls="'+CSS.escape(panel)+'"]')?.closest('.record-motion-clip');
@@ -4069,9 +4085,9 @@ window.fetch=(url,options={})=>{
     snapshot={index,version:'handoff-publication-pending',facts:pageRefreshFacts()};
    }
    finishSave();await saved;
+   await refreshed;
    const target=row(key),item=new URLSearchParams(location.hash.slice(1)).get('item');
    if(action==='validate'){
-    await refreshed;
     if(item!==key || content.dataset.version!==snapshot.version || row(key))
      failures.push('The deferred link keeps the Validating marker when a new snapshot still shows the old Change.');
     continue;
@@ -4141,7 +4157,7 @@ window.fetch=(url,options={})=>{
    ?.closest('.record-motion-clip');
   const exit=clip?.getAnimations()[0];
   if(!exit) throw new Error('The Question must fade during the save.');
-  exit.pause();exit.currentTime=100;
+  exit.pause();exit.currentTime=exit.effect.getTiming().duration/2;
   const back=afterHash('Back');history.back();await back;
   if(item()!==change) failures.push('Back restores the pending Change link.');
   if(REFUSE_QUESTION){
@@ -4152,7 +4168,7 @@ window.fetch=(url,options={})=>{
    Element.prototype.animate=function(keyframes,options){
     const motion=animate.call(this,keyframes,options);
     if(this.classList.contains('record-motion-clip') && keyframes.at(-1).opacity===1){
-     motion.pause();motion.currentTime=100;returning={clip:this,motion};
+     motion.pause();motion.currentTime=motion.effect.getTiming().duration/2;returning={clip:this,motion};
     }
     return motion;
    };
@@ -4315,11 +4331,12 @@ window.fetch=(url,options={})=>{
      CSS.escape(row.querySelector('.list-toggle').getAttribute('aria-controls'))+'"]')?.closest('.record-motion-clip');
     const exit=clip?.getAnimations()[0];
     if(!exit) throw new Error('The Change must fade during the save.');
-    exit.pause();exit.currentTime=100;
+    const midpoint=exit.effect.getTiming().duration/2;
+    exit.pause();exit.currentTime=midpoint;
     await follow({show:'Done',owner});
     finishVerdict();
     await saved;
-    check(clip.isConnected && exit.currentTime===100 && !change(key),
+    check(clip.isConnected && exit.currentTime===midpoint && !change(key),
      'The link waits for the fade after the save.');
     if(clip.isConnected){
      exit.finish();await exit.finished;

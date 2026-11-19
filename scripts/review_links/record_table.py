@@ -490,10 +490,11 @@ function animateRow(table,item,showRow,previousItem=item){
  copyTable.append(columns.cloneNode(true),copy);clip.append(copyTable);cell.append(clip);
  item.after(spacer);
  if(showRow) item.classList.add('record-motion-source');
+ const duration=Number(showRow ? content.dataset.cardFadeInMs : content.dataset.cardFadeOutMs);
  const animation=clip.animate([
   {height:(heightBefore ?? (showRow ? 0 : height))+'px',opacity:opacityBefore},
   {height:(showRow ? height : 0)+'px',opacity:Number(showRow)},
- ],{duration:200,easing:'ease-in-out',fill:'both'});
+ ],{duration,easing:'ease-in-out',fill:'both'});
  const finished=animation.finished.then(()=>{
   if(rowMotion.get(item)?.animation!==animation) return;
   stopMotion(item);
@@ -848,6 +849,7 @@ return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,saveDepar
  showActionResult,
  actionNotice(item){return actionNotices.get(item.dataset.key)?.message ?? '';},
  applyAction(){apply(false,{animate:true});},
+ rowFading(key){return [...rowMotion.keys()].some(item=>item.dataset.key===key);},
  async rowSettled(item){while(rowMotion.has(item)) await rowMotion.get(item).finished;},
  get hasActiveRowAnimations(){return rowMotion.size>0;},
  settled(){return Promise.all([...rowMotion.values()].map(motion=>motion.finished));},
