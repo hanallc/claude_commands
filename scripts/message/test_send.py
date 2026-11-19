@@ -691,7 +691,7 @@ send._bound_relay(message, 2, [], {}, attempt)
                 launch.assert_called_once_with("/fixture/claude", ["/fixture/claude", "-p"], os.environ)
                 self.assertFalse((root / ".4242.tmp").exists())
 
-    def test_relay_delivers_captured_sender_display_and_checks_that_payload_verbatim(self) -> None:
+    def test_relay_uses_the_completed_write_when_the_tool_stream_differs(self) -> None:
         original = "Message from sender-address: Preview\n\nbody"
         displayed = ("Message from sender-address: Preview\nSender native id: unavailable"
                      "\nShown sender: sdlc · roles · worker test\nSent: 01:12 EST\n\nbody")
@@ -701,26 +701,31 @@ send._bound_relay(message, 2, [], {}, attempt)
             _ = write_registry(home / ".claude/config/models.conf")
             _ = (home / ".claude.json").write_text(json.dumps({
                 "oauthAccount": {"emailAddress": "fixture@example.invalid"}}))
-            for delivered, outcome in ((displayed, "sent"), (original, "failed")):
+            for label, code, events, note in (
+                ("matches", 0, stream(INIT, call(displayed), answer(OK)), "queued there (msg_id m1)"),
+                ("omits sender", 0, stream(INIT, call(original), answer(OK)), "different target or payload"),
+                ("timeout", None, stream(INIT, call(displayed)), "one matching result"),
+            ):
                 with (
-                    self.subTest(outcome=outcome),
+                    self.subTest(label=label),
                     mock.patch.dict(os.environ, {"HOME": str(home), "PATH": os.environ["PATH"], "USER_ZONE": "America/New_York"}, clear=True),
                     mock.patch.object(send, "now", return_value=datetime(2026, 11, 19, 6, 12, tzinfo=timezone.utc)),
                     scratch_accounts_config() as config,
                     mock.patch.object(send, "_bound_relay", side_effect=run_bound_fixture),
                     mock.patch.object(send, "claude_binary", return_value="claude"),
                     mock.patch.object(send, "STATE", home / "message-state"),
-                    mock.patch.object(send, "run", return_value=(0, stream(INIT, call(delivered), answer(OK)), "")) as launch,
+                    mock.patch.object(send, "run", return_value=(code, events, "")) as launch,
                 ):
                     _ = write_send_config(config / "send.conf", "")
                     result = send.relay(fixture_bound_message("uds:/recipient", "sender-address", "Preview", original,
                                                              "sdlc · roles · worker test"), 10)
-                self.assertEqual(result.outcome, outcome)
-                self.assertIn("; verbatim;" if outcome == "sent" else "different target or payload", result.detail)
-                command = cast(list[str], launch.call_args.args[0])
-                self.assertEqual(command[command.index("-n") + 1], "relay/sender-address")
-                self.assertEqual(command[4], "sender-address")
-                self.assertIn(displayed, cast(str, launch.call_args.args[1]))
+                    self.assertEqual(result.outcome, "sent")
+                    self.assertIn("; verbatim;", result.detail)
+                    self.assertIn(note, result.detail)
+                    command = cast(list[str], launch.call_args.args[0])
+                    self.assertEqual(command[command.index("-n") + 1], "relay/sender-address")
+                    self.assertEqual(command[4], "sender-address")
+                    self.assertIn(displayed, cast(str, launch.call_args.args[1]))
 
     def test_relay_names_a_plain_sender_in_the_payload(self) -> None:
         message = send.Message("uds:/recipient", "shutdown", "Stop", "Stop now.\nKeep the record.", None)
@@ -7238,10 +7243,15 @@ class ReadRelayTests(ShutdownTestCase):
         result = self.read_relay(stream(INIT, call("hello"), answer(OK)))
         self.assertEqual(result, send.CheckedRelayAcceptance("t1", "mode auto; verbatim; queued there (msg_id m1)"))
 
-    def test_reworded_call_is_unconfirmed(self) -> None:
-        result = self.read_relay(stream(INIT, call("hi"), answer(OK)))
-        self.assertIsInstance(result, send.UncertainRelayDelivery)
-        self.assertIn("different target or payload", result.detail)
+    def test_wrong_tool_target_or_payload_is_a_note_after_a_matching_forward(self) -> None:
+        for label, events in (
+            ("payload", stream(INIT, call("hi"), answer(OK))),
+            ("target", stream(INIT, call("hello", target="session:other"), answer(OK))),
+        ):
+            with self.subTest(field=label):
+                result = self.read_relay(events)
+                self.assertEqual(result, send.CheckedRelayAcceptance(
+                    "t1", "mode auto; verbatim; SendMessage used a different target or payload"))
 
     def test_error_result_is_not_delivered(self) -> None:
         no_write = send.RelayRequestNotForwarded()
@@ -7251,12 +7261,11 @@ class ReadRelayTests(ShutdownTestCase):
         result = self.read_relay(stream(INIT, call("hello"), refused), no_write)
         self.assertEqual(result, send.Result("queued", "No agent named bogus is reachable. Use ListAgents."))
 
-    def test_multiple_calls_cannot_confirm_delivery(self) -> None:
-        events = stream(INIT, call("hello"), answer("matched two sessions", error=True),
+    def test_two_tool_calls_with_one_matching_forward_confirm_delivery(self) -> None:
+        events = stream(INIT, call("hi"), answer("matched two sessions", error=True),
                         call("hello", "t2"), answer(OK, "t2"))
-        result = self.read_relay(events)
-        self.assertIsInstance(result, send.UncertainRelayDelivery)
-        self.assertIn("2 SendMessage calls", result.detail)
+        result = self.read_relay(events, send.RelayRequestForwarded("t2", "hello"))
+        self.assertEqual(result, send.CheckedRelayAcceptance("t2", "mode auto; verbatim; 2 SendMessage calls"))
 
     def test_no_call_and_wrong_mode(self) -> None:
         events = stream({"type": "system", "subtype": "init", "permissionMode": "default"},
@@ -7264,24 +7273,35 @@ class ReadRelayTests(ShutdownTestCase):
         result = self.read_relay(events, send.RelayRequestNotForwarded())
         self.assertEqual(result, send.Result("queued", "the relay made no SendMessage call: I cannot do that"))
 
-    def test_unrelated_or_incomplete_evidence_cannot_confirm_delivery(self) -> None:
-        for label, events, forward in (
-            ("wrong target", stream(INIT, call("hello", target="session:other"), answer(OK)),
-             self.FORWARDED),
-            ("missing result", stream(INIT, call("hello")), self.FORWARDED),
-            ("wrong result", stream(INIT, call("hello"), answer(OK, "t2")), self.FORWARDED),
-            ("implicit result", stream(INIT, call("hello"), answer("queued there")), self.FORWARDED),
-            ("missing forward", stream(INIT, call("hello"), answer(OK)), send.RelayRequestNotForwarded()),
-            ("wrong forward", stream(INIT, call("hello"), answer(OK)), send.RelayRequestForwarded("t2", "hello")),
-            ("wrong forwarded payload", stream(INIT, call("hello"), answer(OK)), send.RelayRequestForwarded("t1", "hi")),
-            ("interrupted forward", stream(INIT, call("hello"), answer(OK)), send.RelayRequestInterrupted("write interrupted")),
+    def test_a_completed_matching_forward_confirms_delivery_with_an_incomplete_tool_stream(self) -> None:
+        for label, events, forward, tool_id, note in (
+            ("missing call", stream(INIT), self.FORWARDED, "t1", "the relay made no SendMessage call"),
+            ("missing result", stream(INIT, call("hello")), self.FORWARDED, "t1", "one matching result"),
+            ("wrong result", stream(INIT, call("hello"), answer(OK, "t2")), self.FORWARDED, "t1", "one matching result"),
+            ("implicit result", stream(INIT, call("hello"), answer("queued there")), self.FORWARDED, "t1",
+             "did not confirm success"),
+            ("wrong tool ID", stream(INIT, call("hello"), answer(OK)), send.RelayRequestForwarded("t2", "hello"),
+             "t2", "different tool ID"),
         ):
             with self.subTest(label=label):
                 result = self.read_relay(events, forward)
-                self.assertIsInstance(result, send.Result)
-                assert isinstance(result, send.Result)
-                self.assertEqual(result.outcome, "failed")
-                self.assertEqual(isinstance(result, send.UncertainRelayDelivery), label != "missing forward")
+                self.assertIsInstance(result, send.CheckedRelayAcceptance)
+                assert isinstance(result, send.CheckedRelayAcceptance)
+                self.assertEqual(result.tool_use_id, tool_id)
+                self.assertIn(note, result.detail)
+
+    def test_a_successful_tool_result_does_not_override_the_proxy_state(self) -> None:
+        events = stream(INIT, call("hello"), answer(OK))
+        self.assertEqual(self.read_relay(events, send.RelayRequestNotForwarded()),
+                         send.Result("failed", "SendMessage has no matching completed proxy forward"))
+        refused = send.RefusedRelayRequest("failed", "the proxy refused the request")
+        self.assertIs(self.read_relay(events, refused), refused)
+        interrupted = self.read_relay(events, send.RelayRequestInterrupted("write interrupted"))
+        self.assertIsInstance(interrupted, send.UncertainRelayDelivery)
+        self.assertEqual(interrupted, send.Result("failed", "write interrupted; delivery unconfirmed"))
+        wrong_payload = self.read_relay(events, send.RelayRequestForwarded("t1", "hi"))
+        self.assertNotIsInstance(wrong_payload, send.UncertainRelayDelivery)
+        self.assertEqual(wrong_payload, send.Result("failed", "the proxy forwarded a different payload"))
 
 
 class AccountDaemonRoutingTests(unittest.TestCase):

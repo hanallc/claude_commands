@@ -281,7 +281,8 @@ The relay checks the current registry, connected peer PID, and process start bef
 The relay runs `command claude -p` with Sonnet, auto mode, and only the `SendMessage` tool.
 It disables MCP, slash commands, and settings sources and removes inherited `CLAUDE_*` variables.
 The proxy checks the request and writes it to the recipient's verified socket.
-The relay confirms delivery from the matching tool result and the completed proxy write.
+The relay reports `SENT` when the proxy completes the approved write to the verified recipient.
+Disagreements in the tool stream appear as notes on the `SENT` line.
 It saves the tool stream in `STATE/relay/<to>.jsonl`.
 `--timeout` defaults to 40 s for every transport.
 If `~/.config/claude/oauth-token.gpg` exists, the relay decrypts it for authentication.
@@ -410,7 +411,7 @@ The key file replacement syncs its content and directory before the next step st
 | `reserved` | The sender saves this stage before publication work. A failure before publication or the owner's death permits recovery. |
 | `publishing` | The sender saves this stage before `os.replace()` exposes the entry. Exceptions and owner death retain the claim and receipt evidence. |
 | `relaying` | The sender saves this stage before relay fallback from a proved outbox miss. A live owner keeps a retry pending. |
-| `relay-unconfirmed` | The relay started or completed a recipient write without confirmed acceptance. This stage prevents another send with the same key. |
+| `relay-unconfirmed` | The proxy started a write but could not confirm completion. This stage prevents another send with the same key. |
 | `resolved` | The sender saves a definite postmaster outcome before receipt cleanup. Confirmed delivery completes the claim. A proved miss permits fallback. |
 
 A failed stage write stops the send before its next step.
