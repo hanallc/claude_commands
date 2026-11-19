@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 import fcntl
 import hashlib
 import io
@@ -174,7 +175,22 @@ raise SystemExit(1 if record['to'] in fail else 0)
 """
 SENDER_CODE = compile(SENDER, "fixture/send.py", "exec")
 
+
+@dataclass(frozen=True)
+class FixtureProcessExit:
+    """The output of a fixture command that completes at launch."""
+    args: list[str]
+    returncode: int = 0
+    output: str = ""
+
+    def communicate(self, *, timeout: float) -> tuple[str, str]:
+        del timeout
+        return self.output, ""
+
+
 def stop_child(child: subprocess.Popen[bytes]) -> None:
+    if child.stdin is not None:
+        child.stdin.close()
     child.terminate()
     try:
         _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
@@ -278,8 +294,14 @@ record = {name: args[args.index('--' + name) + 1] for name in ('to', 'from', 'ke
 with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
     log.write(json.dumps(record) + '\\n')
 """)
+        inherited = ("PATH", "TMPDIR", "LANG", "LC_ALL", "USER_ZONE", "PYTHONPATH",
+                     "PYTHONPYCACHEPREFIX", "PYTHONDONTWRITEBYTECODE", "CONF_READ_LOG",
+                     "BUILDLOG_DIR", "BUILDLOG_LIVE_MEMORY_TRIPWIRE")
         self.environment = {
-            **os.environ,
+            **{name: os.environ[name] for name in inherited if name in os.environ},
+            **{name: value for name, value in self.environment.items() if not name.startswith("GIT_")},
+            "CONF_DIR": str(self.root),
+            "CODEX_HOME": str(self.root / "codex"),
             "HOME": str(self.root),
             "PATH": f"{self.bin}:{os.environ.get('PATH', '')}",
             "SHOWRUNNERS_CONFIG": str(self.config),
@@ -298,6 +320,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             "STALL_TEST_PS_FILE": str(self.ps_file),
             "STALL_TEST_SEND_LOG": str(self.send_log),
             "XDG_STATE_HOME": str(self.root / "state"),
+            "XDG_CACHE_HOME": str(self.root / "cache"),
             "RCA_SEND": str(self.bin / "rca-send.py"),
             "STALL_TEST_RCA_LOG": str(self.rca_log),
             "STALL_TEST_FAIL_FILE": str(self.fail_file),
@@ -458,17 +481,26 @@ always=natedev
         socket_path = self.root / f"{unit_session(name)}.sock"
         peer_path = self.listener_root / str(self.unit_count)
         if self.unit_count == len(self.listeners):
-            listener = """import socket, sys
-sock = socket.socket(socket.AF_UNIX)
-sock.bind(sys.argv[1])
-sock.listen(128)
-print('listening', flush=True)
-while True:
-    connection, _ = sock.accept()
-    connection.close()
+            listener = """import os, select, socket, sys, time
+path = sys.argv[1]
+deadline = time.monotonic() + float(sys.argv[2])
+with socket.socket(socket.AF_UNIX) as sock:
+    sock.bind(path)
+    try:
+        sock.listen(128)
+        print('listening', flush=True)
+        while (remaining := deadline - time.monotonic()) > 0:
+            readable, _, _ = select.select([sock, sys.stdin], [], [], remaining)
+            if sock not in readable or sys.stdin in readable:
+                break
+            connection, _ = sock.accept()
+            connection.close()
+    finally:
+        os.unlink(path)
 """
-            child = subprocess.Popen([sys.executable, "-c", listener, str(peer_path)],
-                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            child = subprocess.Popen([sys.executable, "-c", listener, str(peer_path), str(TEST_HANG_GUARD_SECS)],
+                                     env=self.environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL)
             type(self).addClassCleanup(stop_child, child)
             self.listeners.append(child)
             assert child.stdout is not None
@@ -522,36 +554,45 @@ while True:
     def tick(self, at: float, *, real_ps: bool = False, subprocess_cli: bool = False) -> subprocess.CompletedProcess[str]:
         _ = self.ps_file.write_text("\n".join(self.process_rows) + "\n")
         self.write_panes()
-        # Staff sessions identify the directors in these temporary run records.
+        self.write_run_records()
+        return self.run_tick(at, real_ps=real_ps, subprocess_cli=subprocess_cli)
+
+    def write_run_records(self) -> None:
+        """Publish the staff and history evidence for this pass."""
         runs = self.root / "history/runs"
         runs.mkdir(parents=True, exist_ok=True)
-        for record in runs.iterdir():
-            record.unlink()
+        records: dict[str, list[dict[str, object]]] = {}
         for name in self.panes:
             state = self.states.get(name, "") or "running"
             if state == "standing-by":
                 continue
-            events = [{"event_type": "run_started", "run_started_at": 1.0,
-                       "working_dir": str(Path(f"/tmp/no-worktree-of-{name}").resolve()),
-                       "main_agent": {"session_id": unit_session(name)}},
-                      *([{"event_type": "run_finished"}] if state == "run-finished" else [])]
-            _ = (runs / f"{name}.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
-        for run_id, events in self.run_records.items():
-            _ = (runs / f"{run_id}.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
-        membership = staff.local_snapshot()
-        for history in sorted(runs.iterdir()):
-            folder = self.root / "held" / history.stem
-            if history.stem in self.unheld_runs:
+            records[name] = [
+                {"event_type": "run_started", "run_started_at": 1.0,
+                 "working_dir": str(Path(f"/tmp/no-worktree-of-{name}").resolve()),
+                 "main_agent": {"session_id": unit_session(name)}},
+                *([{"event_type": "run_finished"}] if state == "run-finished" else []),
+            ]
+        records.update(self.run_records)
+        for history in runs.iterdir():
+            if history.stem not in records:
+                history.unlink()
+        for name, events in sorted(records.items()):
+            history = runs / f"{name}.jsonl"
+            contents = "".join(json.dumps(event) + "\n" for event in events).encode()
+            if not history.exists() or history.read_bytes() != contents:
+                _ = history.write_bytes(contents)
+            if name in self.unheld_runs:
                 continue
+            folder = self.root / "held" / name
             folder.mkdir(parents=True, exist_ok=True)
-            events = self.run_records.get(history.stem, [])
             first = events[0] if events else {}
             main_agent = first.get("main_agent", {})
-            session = self.director_overrides.get(history.stem, unit_session(history.stem))
-            if history.stem not in self.director_overrides and isinstance(main_agent, dict):
+            session = self.director_overrides.get(name, unit_session(name))
+            if name not in self.director_overrides and isinstance(main_agent, dict):
                 candidate = cast(dict[str, object], main_agent).get("session_id")
                 if isinstance(candidate, str):
                     session = candidate
+            membership = staff.local_snapshot()
             owner = membership.by_current_session(session)
             run_state: dict[str, object] = {"history_file": str(history)}
             if owner is not None and isinstance(owner.parent, staff.ReportsTo):
@@ -560,29 +601,33 @@ while True:
                 run_state[unit_runs.OWNER_FIELD] = owner.id
             _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps(run_state))
             if owner is not None:
-                history_events = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
-                if any(event.get("event_type") == "run_finished" for event in history_events):
+                if any(event.get("event_type") == "run_finished" for event in events):
                     if isinstance(owner.run, staff.OpenRun):
                         _ = staff.clear_run(owner.id, folder)
                 elif owner.run != staff.OpenRun(folder):
                     _ = staff.set_run(owner.id, staff.OpenRun(folder))
 
+    def run_tick(self, at: float, *, real_ps: bool, subprocess_cli: bool) -> subprocess.CompletedProcess[str]:
         environment = {**self.environment, "STALL_WATCH_NOW_EPOCH": str(at)}
         if subprocess_cli:
+            checkout = SCRIPT.resolve().parents[2]
             wrapper = """import os, runpy, sys
 from pathlib import Path
 from scripts.lib import conf_reads, unit_runs
 unit_runs.RUN_ROOT = Path(sys.argv[1])
 unit_runs.FORMER_RUN_ROOT = Path(sys.argv[2])
-script = Path(sys.argv[3])
-defaults = script.parents[2] / 'config/stall_watch.conf'
+script = Path(sys.argv[3]).resolve()
+defaults = (script.parents[2] / 'config/stall_watch.conf').resolve()
 read_text = conf_reads.read_text
-conf_reads.read_text = lambda path: read_text(os.environ['STALL_TEST_WATCH_DEFAULTS'] if path == defaults else path)
+conf_reads.read_text = lambda path: read_text(
+    os.environ['STALL_TEST_WATCH_DEFAULTS'] if Path(path).resolve() == defaults else path
+)
 runpy.run_path(str(script), run_name='__main__')
 """
-            return subprocess.run([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", wrapper, str(self.root / "held"),
+            return subprocess.run([str(checkout / "scripts/lib/py"), "-c", wrapper, str(self.root / "held"),
                                    str(self.root / "former-held"), str(SCRIPT)], env=environment,
-                                  capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                                  cwd=checkout, capture_output=True, text=True,
+                                  check=False, timeout=TEST_HANG_GUARD_SECS)
         # Keep herdr.run_program, its sanitized environment, and every parser.
         # Only the recording fake's interpreter startup is removed.
         real_run = subprocess.run
@@ -594,11 +639,10 @@ runpy.run_path(str(script), run_name='__main__')
             exec(SESSION_LOOKUP_CODE, {})
             return 0
 
-        def start(command: list[str], *arguments: object, **options: object) -> subprocess.Popen[str]:
+        def start(command: list[str], *arguments: object, **options: object) -> subprocess.Popen[str] | FixtureProcessExit:
             if not real_ps and command == ["ps", "-eo", "pid=,ppid=,args="]:
                 output = self.ps_file.read_text()
-                return cast("subprocess.Popen[str]", mock.Mock(
-                    args=command, returncode=0, communicate=mock.Mock(return_value=(output, ""))))
+                return FixtureProcessExit(command, output=output)
             if command[:2] == [sys.executable, str(self.bin / "send.py")] and "STALL_TEST_SEND_BARRIER" not in environment:
                 with mock.patch.object(sys, "argv", command[1:]):
                     try:
@@ -607,8 +651,7 @@ runpy.run_path(str(script), run_name='__main__')
                         status = result.code if isinstance(result.code, int) else int(result.code is not None)
                     else:
                         status = 0
-                return cast("subprocess.Popen[str]", mock.Mock(
-                    args=command, returncode=status, communicate=mock.Mock(return_value=("", ""))))
+                return FixtureProcessExit(command, status)
             return real_start(command, *arguments, **options)
 
         def run(command: list[str], *, capture_output: bool, text: bool, check: bool,
