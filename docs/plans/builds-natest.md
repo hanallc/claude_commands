@@ -5404,3 +5404,25 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - impl: the test module, its support and any production cause.
 
 **Acceptance gate:** an AWS pair (3 rounds) shows the median CPU at half or less, or a floor result with its cause; the module passes 20 times under load in a 2 GB scope; the full suite is green.
+
+### Phase 378 — the scratch retry tests pass under gate load  · status: todo
+**Depends on:** Phase 360
+
+#### Work Order
+
+**Goal:** `lib/test_scratch.py` passes every gate run under load, its isolated retry included, with every assertion kept.
+
+**Spec:**
+- Builds approved this on 2026-11-19 and put it first among natest phases: a base flake that also fails its isolated retry can stop every merge on the line.
+- Evidence: the phase 374 gate (base 3605d0b14) failed `test_retry_keeps_a_symbolic_ref_added_or_changed_after_the_intent`; its isolated retry failed `test_retry_keeps_an_emptied_tracked_busy_mark`. The phase 370 gate failed the module on its first pass and passed the retry. These are the phase 359 and 360 retry tests. Phase 362 is parked and does not land.
+1. Reproduce under gate load on /tmp (20 loaded runs in a 2 GiB scope, four CPU burners). Find the race in each failing test: a test timing, a fixture order, or a production defect.
+2. Make the smallest fix at the cause. A production defect is fixed in scripts/lib/scratch.py.
+3. 40 loaded runs pass.
+- Every assertion remains. Tests read no /tune-changeable value. No lazy imports, no copies, no signal handlers. Never use the /session mount for test runs.
+
+**Files:** scripts/lib/test_scratch.py; its test support; scripts/lib/scratch.py only when the defect lives there.
+
+**Workers:** 1 writer. One module and its subject.
+- impl: the test module, its support and any scratch.py cause.
+
+**Acceptance gate:** 40 loaded runs pass; basedpyright clean on changed files; the full suite is green.
