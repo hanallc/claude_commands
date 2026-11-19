@@ -3032,3 +3032,21 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 **Files:** `scripts/aws_target/cloud_gate.py`, `config/cloud_gate.conf`, `scripts/aws_target/test_cloud_gate.py`.
 
 **Acceptance gate:** a poll with no new object makes one list call; gate.log downloads only on a new ETag; result, boot error, Spot stop and time limit paths keep their outcomes. test_cloud_gate, test_aws_trial, test_control pass; types 0.
+
+### Phase 167 — A verify.sh run outside a Cargo workspace holds no cargo target  · status: todo
+**Source:** builds (from sdlc), 2026-11-19 04:1x EST: the disk floor sweep named pid 3179104 (devtools' consolecheck `verify.sh`, a Python-only suite) as the owner of four hana targets (about 380 GiB) and skipped them.
+**Cause:** `sweep.workspace_targets` resolves the runner's `build-dir`. The global Cargo config sets `/build/paths{workspace-root}`. The run's cwd (`~/worktrees/devtools-consolecheck`) has no `Cargo.toml` at or above it, so `cargo_workspace_manifest` raises `FileNotFoundError`, and the `except (OSError, ValueError)` branch returns every target as busy.
+
+#### Work Order
+
+**Goal:** a verify.sh or cargo-nextest run with no Cargo manifest holds no workspace target.
+
+**Spec:**
+1. No `Cargo.toml` at or above the cwd and no `--manifest-path`: the runner has no workspace, so `workspace_targets` returns no target.
+2. Other unreadable workspace state (a manifest that cannot be read or parsed, an unknown template) still keeps every target busy.
+
+**Base:** main `764582979`.
+
+**Files:** `scripts/lint/sweep.py` (or `scripts/lib/cargo_target_config.py` if the manifest check belongs there), `scripts/lint/test_sweep.py` (a row in `test_a_nextest_run_uses_its_workspace_target_between_test_binaries`'s table).
+
+**Acceptance gate:** the new row passes; test_sweep, test_tmp_sweep and the cargo_target_config tests pass in both layouts; types 0.
