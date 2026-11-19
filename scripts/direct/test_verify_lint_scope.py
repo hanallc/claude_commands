@@ -25,6 +25,7 @@ from scripts.production.staff_test_support import fixture_member, isolated_staff
 
 from scripts.direct import verify_lint_scope_test_support as support
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB as CARGO_STUB
+from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
 
 
 class VerifyLintScopeTests(support.VerifyLintScopeFixture):
@@ -151,10 +152,11 @@ class VerifyBatchTests(support.VerifyLintScopeFixture):
         session.mkdir()
         self.environment["UNIT_RUN_DIR"] = str(session)
 
+    def batch_arguments(self, *flags: str, lint_scope: str = "packages") -> tuple[str, ...]:
+        return ("batch", "--packages", "sample,other", "--lint", lint_scope, *flags)
+
     def batch(self, *flags: str, lint_scope: str = "packages") -> subprocess.CompletedProcess[str]:
-        return self.invoke_verify(
-            "batch", "--packages", "sample,other", "--lint", lint_scope, *flags, cwd=self.root,
-        )
+        return self.invoke_verify(*self.batch_arguments(*flags, lint_scope=lint_scope), cwd=self.root)
 
     def batch_lines(self, result: subprocess.CompletedProcess[str]) -> list[str]:
         return [line for line in result.stdout.splitlines() if line.startswith("verify.sh batch ")]
@@ -233,6 +235,12 @@ class VerifyBatchTests(support.VerifyLintScopeFixture):
         self.assertIn("verify.sh batch lint sample,other red cached=no (tests stale)", result.stdout)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
 
+        del self.environment["TEST_EDIT_DURING"]
+        self.environment["TEST_SAMPLE_STATUS"] = "100"
+        result = self.batch()
+        self.assertIn("verify.sh batch test sample red cached=no", result.stdout)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
     def test_batch_reports_the_cache_result_of_each_package_and_lint(self) -> None:
         first = self.batch()
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
@@ -243,6 +251,42 @@ class VerifyBatchTests(support.VerifyLintScopeFixture):
         self.assertIn("verify.sh batch lint sample,other green cached=yes", second.stdout)
         self.assertNotIn(["run"], [call[:1] for call in self.calls("nextest")])
         self.assertFalse(self.clippy_ran())
+
+    def test_batch_cleanup_finishes_while_the_background_sweep_runs(self) -> None:
+        release = self.root / "sweep-release"
+        ready = self.root / "sweep-pid"
+        self.write_executable(self.root / "bin" / "systemd-cat", f"""
+import os
+from pathlib import Path
+from scripts.direct.wait_for_test_state import wait_for_file
+
+Path({str(ready)!r}).write_text(str(os.getpid()))
+wait_for_file(Path({str(release)!r}))
+""")
+        output = self.root / "batch.out"
+        with output.open("wb") as log, subprocess.Popen(
+            ["bash", str(support.VERIFY), *self.batch_arguments()], cwd=self.root,
+            env={**self.environment, "LINT_SKIP_SWEEP": "0"}, start_new_session=True,
+            stdout=log, stderr=subprocess.STDOUT,
+        ) as process:
+            try:
+                sweep = wait_for_pid(ready, processes=(process,))
+                wait_until(lambda: "verify.sh batch result green" in output.read_text() or process.poll() is not None,
+                           self.root, processes=(process,), watch_writes=True)
+                with os.fdopen(os.pidfd_open(sweep), "rb") as sweep_exit:
+                    try:
+                        status = process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self.fail("batch cleanup waited for the background sweep")
+                    self.assertEqual(status, 0, output.read_text())
+                    self.assertFalse(select.select([sweep_exit], [], [], 0)[0])
+                    _ = release.touch()
+                    self.assertTrue(select.select([sweep_exit], [], [], TEST_HANG_GUARD_SECS)[0])
+                self.assertEqual(list(Path(self.environment["TMPDIR"]).glob("verify-batch.*")), [])
+            finally:
+                _ = release.touch()
+                if process.poll() is None:
+                    _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def test_batch_refuses_a_regression_that_passed_on_the_baseline(self) -> None:
         self.fail_first(status=0)
@@ -282,8 +326,8 @@ class VerifyBatchTests(support.VerifyLintScopeFixture):
             listener.listen(1)
             listener.settimeout(TEST_HANG_GUARD_SECS)
             with subprocess.Popen(
-                ["bash", str(support.VERIFY), "batch", "--packages", "sample,other", "--lint", "packages",
-                 "--fail-first"], cwd=self.root, env=environment, start_new_session=True,
+                ["bash", str(support.VERIFY), *self.batch_arguments("--fail-first")],
+                cwd=self.root, env=environment, start_new_session=True,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             ) as process:
                 try:
@@ -301,9 +345,11 @@ class VerifyBatchTests(support.VerifyLintScopeFixture):
                         send_process_group(process.pid, signal.SIGTERM)
                         self.assertEqual(connection.recv(1), b"")
                     _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
-                    self.assertTrue(admission.callers_released(), "the batch exited before it released the grant")
-                    self.assertFalse(snapshot.parent.exists(), "the batch exited before it removed the private copy")
+                    released = admission.callers_released()
+                    snapshot_exists = snapshot.parent.exists()
                     output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    self.assertTrue(released, "the batch exited before it released the grant\n" + output + errors)
+                    self.assertFalse(snapshot_exists, "the batch exited before it removed the private copy\n" + output + errors)
                 finally:
                     if process.poll() is None:
                         send_process_group(process.pid, signal.SIGKILL)
@@ -366,8 +412,9 @@ plan = batch.BaselineProof("commit", scratch / "patch", (batch.RegressionCase("s
 
 def run_after_proof(_command, _environment):
     marker = scratch / "baseline-done"
-    with patch.object(batch, "run_baseline_tests", return_value=0):
-        assert batch.main(["--baseline", "verify", str(marker), "sample=regression", "--"]) == 0
+    with patch.object(batch, "run_baseline_tests", return_value=0), patch.object(batch.subprocess, "run") as run:
+        run.return_value.returncode = 0
+        assert batch.main(["--baseline", "verify", str(marker), str(scratch / "patch"), "sample=regression", "--"]) == 0
     return 2
 
 commands = batch.BatchCommands(Path("verify"), ())

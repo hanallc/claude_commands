@@ -32,6 +32,34 @@ class StartedLintRun(TypedDict):
 
 
 class VerifyTreeCancelTests(VerifyTreeCancelFixture):
+    def test_pid_only_term_stops_a_batch_and_releases_admission(self) -> None:
+        self.assert_batch_cancelled()
+
+    def test_pid_only_term_cleans_up_when_verify_is_stopped(self) -> None:
+        self.assert_batch_cancelled(stop_verify=True)
+
+    def assert_batch_cancelled(self, *, stop_verify: bool = False) -> None:
+        process = self.start_verify("batch", arguments=("--packages", "sample", "--lint", "packages"))
+        self.wait_for_running(self.control / "running", process)
+        self.assert_resources_held()
+        if stop_verify:
+            verify = int((self.board / "locks/cargo.d/holder_pid").read_text())
+            self.assertNotEqual(verify, process.pid)
+            os.kill(verify, signal.SIGSTOP)
+            stopped = subprocess.check_output(["ps", "-p", str(verify), "-o", "stat="],
+                                              text=True, timeout=5)
+            self.assertTrue(stopped.strip().startswith("T"), stopped)
+        process.send_signal(signal.SIGTERM)
+        try:
+            output, errors = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.fail("the batch continued after PID-only TERM")
+        self.assertEqual(process.returncode, -signal.SIGTERM, output + errors)
+        self.assertNotIn("verify.sh batch result green", output)
+        self.assert_resources_released()
+        self.assert_no_cache_verdict()
+        self.assertEqual(list((self.root / "tmp").glob("verify-batch.*")), [])
+
     def command_group(self) -> int:
         """Read the command group that the real supervisor saved in the run record."""
         return cast(StartedLintRun, json.loads((self.control / "lint-run.json").read_text()))["command_group"]

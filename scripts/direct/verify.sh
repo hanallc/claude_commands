@@ -1530,16 +1530,29 @@ if [[ "$CMD" == batch ]]; then
     if [[ "$MAC_ONLY" == 1 ]]; then batch_route+=(--mac "$MAC_REASON"); fi
     if [[ "$LOCAL_ONLY" == 1 ]]; then batch_route+=(--local "$LOCAL_REASON"); fi
     batch_scratch=""
-    # Copy and step cleanup keep fd 74 open until they release their leases.
-    trap '
+    batch_launching=0
+    batch_previous_job=${!:-}
+    finish_batch() {
+        local status=$?
+        if [[ "$batch_launching" == 1 && "${!:-}" != "$batch_previous_job" ]]; then
+            # The batch job has its own process group, as a single verify step does.
+            "$PY" "$VERIFY_START_DIR/cleanup_lease.py" cancel-group "$!" 74>&- || true
+        fi
         if [[ -n "$batch_scratch" ]]; then
+            # Foreground guards retain fd 74 through their own cleanup.
             exec 74>&-
             exec 74<>"$batch_scratch/cleanup.lock"
-            lock_file_descriptor 74 || exit 2
+            if ! "$PY" "$VERIFY_START_DIR/cleanup_lease.py" acquire 74; then
+                printf 'verify.sh: batch cleanup could not remove %s\n' "$batch_scratch" >&2
+                finish_verify_run 2
+                exit 2
+            fi
             rm -rf -- "$batch_scratch"
         fi
+        if [[ "$batch_launching" == 0 ]]; then finish_verify_run "$status"; fi
         [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
-    ' EXIT
+    }
+    trap finish_batch EXIT
     batch_scratch="$(mktemp -d "${TMPDIR:-/tmp}/verify-batch.XXXXXX")" || exit 2
     exec 74<>"$batch_scratch/cleanup.lock"
     lock_file_descriptor 74 || exit 2
@@ -1547,11 +1560,18 @@ if [[ "$CMD" == batch ]]; then
         exec 70>&- 71<&-
         unset VERIFY_HELPER_INPUT VERIFY_HELPER_OUTPUT
     fi
-    batch_status=0
+    batch_monitor=0
+    [[ $- != *m* ]] || batch_monitor=1
+    set -m
+    batch_launching=1
     "$PY" "$VERIFY_START_DIR/verify_batch.py" "$VERIFY_REPO_ROOT" \
         "$VERIFY_START_DIR/verify.sh" "$batch_scratch" 74 "${ARGS[@]}" \
-        -- ${batch_route[@]+"${batch_route[@]}"} || batch_status=$?
-    finish_verify_run "$batch_status"
+        -- ${batch_route[@]+"${batch_route[@]}"} &
+    if [[ "$batch_monitor" == 0 ]]; then set +m; fi
+    # Bash runs the EXIT trap immediately when TERM interrupts this wait.
+    batch_status=0
+    wait "$!" || batch_status=$?
+    batch_launching=0
     exit "$batch_status"
 fi
 parse_command_arguments "${ARGS[@]}"

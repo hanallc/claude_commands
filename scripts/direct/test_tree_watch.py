@@ -13,6 +13,7 @@ from typing import final
 
 from scripts.direct import tree_watch
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
+from scripts.lib.git_test_support import commit_repository
 
 from scripts.direct.tree_watch_test_support import (
     EventWatcher,
@@ -25,6 +26,28 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 @final
 class TreeWatchTests(TreeWatchFixture):
+    def test_package_keys_follow_edits_inside_a_dirty_submodule(self) -> None:
+        module = self.root / "sample" / "nested"
+        module.mkdir()
+        _ = subprocess.run(["git", "-C", str(module), "init", "-q"], check=True,
+                           capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        source = module / "input"
+        _ = source.write_text("original\n")
+        _ = commit_repository(module, "Add the submodule input")
+        _ = commit_repository(self.root, "Add a submodule", "sample/nested")
+        _ = subprocess.run(["git", "config", "diff.ignoreSubmodules", "all"], check=True,
+                           capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        inputs = tree_watch.TreeInputs(self.key_arguments(), json.dumps(self.metadata))
+        clean = inputs.keys()
+        _ = source.write_text("first edit\n")
+        first_cache, first_watch = inputs.keys()
+        _ = source.write_text("second edit\n")
+        second_cache, second_watch = inputs.keys()
+        self.assertNotEqual(first_cache, second_cache)
+        self.assertNotEqual(first_watch, second_watch)
+        _ = source.write_text("original\n")
+        self.assertEqual(inputs.keys(), clean)
+
     def test_nested_workspace_build_identity_uses_its_own_output_roots(self) -> None:
         workspace = self.nested_workspace()
         output = self.root / "build-inputs"

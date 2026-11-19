@@ -27,6 +27,7 @@ from scripts.buildlog.store import host_name
 from scripts.copies import copies
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue import admission_protocol as wire, slot_wait
+from scripts.direct.wait_for_test_state import wait_for_pid
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.test_remote_copies import expected_remote_lease_columns
@@ -203,14 +204,17 @@ class StandingTests(unittest.TestCase):
         return self.cli("run", "--repo", str(self.source),
                         "--commit", "HEAD", *options, "--", *(command or (sys.executable, "-c", "pass")))
 
-    def test_term_cleans_a_running_commands_private_snapshot(self) -> None:
-        command = "import os, sys; print(os.getcwd(), flush=True); sys.stdin.buffer.read(1)"
-        with subprocess.Popen(
+    def start_private_snapshot_command(self, command: str, *arguments: str) -> subprocess.Popen[str]:
+        return subprocess.Popen(
             [sys.executable, str(Path(copies.__file__).resolve()), "run", "--repo", str(self.source),
-             "--commit", "HEAD", "--", sys.executable, "-c", command],
+             "--commit", "HEAD", "--", sys.executable, "-c", command, *arguments],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             start_new_session=True,
-        ) as process:
+        )
+
+    def test_term_cleans_a_running_commands_private_snapshot(self) -> None:
+        command = "import os, sys; print(os.getcwd(), flush=True); sys.stdin.buffer.read(1)"
+        with self.start_private_snapshot_command(command) as process:
             assert process.stdout is not None
             try:
                 self.assertTrue(select.select([process.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
@@ -229,6 +233,38 @@ class StandingTests(unittest.TestCase):
             self.assertEqual(process.returncode, -signal.SIGTERM, output + errors)
             self.assertFalse(snapshot.exists())
             self.assertEqual(list((self.base / "temporary").iterdir()), [])
+
+    def test_private_snapshot_cleanup_finishes_while_a_background_command_runs(self) -> None:
+        release = self.base / "background-release"
+        ready = self.base / "background-pid"
+        helper = Path(copies.__file__).resolve().parents[1] / "direct" / "wait_for_test_state.py"
+        command = """
+from pathlib import Path
+import subprocess
+import sys
+
+helper, release, ready = sys.argv[1:]
+worker = subprocess.Popen([sys.executable, helper, release], close_fds=False,
+                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+Path(ready).write_text(str(worker.pid))
+"""
+        with self.start_private_snapshot_command(command, str(helper), str(release), str(ready)) as process:
+            try:
+                worker = wait_for_pid(ready, processes=(process,))
+                with os.fdopen(os.pidfd_open(worker), "rb") as worker_exit:
+                    try:
+                        output, errors = process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self.fail("private snapshot cleanup waited for the background command")
+                    self.assertEqual(process.returncode, 0, output + errors)
+                    self.assertEqual(list((self.base / "temporary").iterdir()), [])
+                    self.assertFalse(select.select([worker_exit], [], [], 0)[0])
+                    _ = release.touch()
+                    self.assertTrue(select.select([worker_exit], [], [], TEST_HANG_GUARD_SECS)[0])
+            finally:
+                _ = release.touch()
+                if process.poll() is None:
+                    _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def test_claude_and_codex_workers_use_their_unit_owner(self) -> None:
         unit = next(row for row in staff.local_snapshot().rows if row.kind == "unit")

@@ -45,6 +45,9 @@ from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.lib.build_slots import SlotQueuePosition, NewSlotQueuePosition, NEW_SLOT_QUEUE_POSITION
 from scripts.build_queue import first_step, slot_wait
+from scripts.direct.cleanup_lease import (
+    ForegroundCleanupLease, NoCleanupLease, acquire_cleanup, mark_cleanup_incomplete,
+)
 from scripts.lib.build_steps import StepJob, VerifyCommand, command_job, command_program, read_step_names, verify_command
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
@@ -2208,10 +2211,16 @@ def command_tail(command: list[str]) -> list[str]:
     return command[1:] if command[:1] == ["--"] else command
 
 
+class CopyPayload(Enum):
+    COMMAND = "command"
+    BATCH_BASELINE = "batch-baseline"
+
+
 @dataclass(frozen=True)
 class CopyRunScope:
     parent: Path
     owner_pid: int
+    payload: CopyPayload
 
 
 @dataclass(frozen=True)
@@ -2233,6 +2242,7 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
     source = Path(args.repo or "").expanduser().resolve()
     with ExitStack() as scope:
         captured = ""
+        cleanup: ForegroundCleanupLease | NoCleanupLease = NoCleanupLease.NONE
         if standing_slot:
             tree = scope.enter_context(command_tree(owner, source, policy, command, merge=merge))
             environment = dict(os.environ)
@@ -2244,18 +2254,27 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
             tree = scope.enter_context(requested_source(source, policy, merge, parent=parent))
             lease = build_folders.build_folder_lock_fd(tree.parent)
             environment = {**os.environ, "COPIES_STEP_SOURCE": str(tree), "COPIES_STEP_POOL": str(slot_source(tree)),
-                           "COPIES_STEP_REPOSITORY": str(source), "COPIES_STEP_LOCK_FD": str(lease),
+                           "COPIES_STEP_REPOSITORY": str(source),
                            "COPIES_STEP_OWNER": owner, "COPIES_RUN_PID": str(owner_pid), "UNIT_DETACHED_RUN": "1"}
             target = tree / environment.setdefault("CARGO_TARGET_DIR", str(tree / "target"))
-            locks = (*COMMAND_LOCKS.get(), lease)
+            locks = COMMAND_LOCKS.get()
+            if isinstance(invocation, CopyRunScope) and invocation.payload is CopyPayload.BATCH_BASELINE:
+                # The baseline coordinator passes the lease to its foreground guards.
+                environment["COPIES_STEP_LOCK_FD"] = str(lease)
+                locks = (*locks, lease)
+            else:
+                cleanup = ForegroundCleanupLease(lease)
             if args.publish:
                 output = tree.parent / "step-output"
                 output.mkdir()
                 _ = (output / "paths.json").write_text(json.dumps(args.publish))
                 captured = environment["COPIES_STEP_OUTPUT"] = str(output)
-        arguments = [part.replace("{tree}", str(tree)) for part in command]
-        before = publication_candidates(tree, target, arguments, args.publish)
-        result = subprocess.run(arguments, cwd=tree, pass_fds=locks, env=environment)
+        payload = [part.replace("{tree}", str(tree)) for part in command]
+        before = publication_candidates(tree, target, payload, args.publish)
+        if isinstance(cleanup, ForegroundCleanupLease):
+            result = cleanup.run(payload, cwd=tree, environment=environment, pass_fds=locks)
+        else:
+            result = subprocess.run(payload, cwd=tree, pass_fds=locks, env=environment)
         command_exit = result.returncode if result.returncode >= 0 else 128 - result.returncode
         publish_files(tree, args.publish, before, command_exit, captured=captured)
         return command_exit
@@ -2684,23 +2703,23 @@ def main(argv: list[str] | None = None, *,
 
 
 COPY_RUN_SCOPE_SH = r'''
-python=$1 copies=$2 owner=$3
-shift 3
+python=$1 copies=$2 owner=$3 batch_lease=$4
+shift 4
 parent=""
 cleanup() {
     [[ -n "$parent" ]] || return 0
     rmdir -- "$parent" 2>/dev/null && return 0
-    "$python" "$copies" --clean-run-scope "$parent" || exit 2
+    "$python" "$copies" --clean-run-scope "$parent" "$batch_lease" || exit 2
 }
 trap cleanup EXIT
 parent="$(mktemp -d "${TMPDIR:-/tmp}/copies-run.XXXXXX")" || exit 2
-"$python" "$copies" --in-run-scope "$parent" "$owner" "$@"
+"$python" "$copies" --in-run-scope "$parent" "$owner" "$batch_lease" "$@"
 exit "$?"
 '''
 
 
 def release_run_scope(parent: Path) -> int:
-    """Wait for the command's lease before removing its private copy."""
+    """Remove the private copy after its foreground command ends."""
     try:
         if (not re.fullmatch(r"copies-run\.[A-Za-z0-9]{6}", parent.name)
                 or parent.parent.resolve() != build_folders.inherited_temporary_parent().resolve()
@@ -2709,10 +2728,11 @@ def release_run_scope(parent: Path) -> int:
         lease = parent / (PRIVATE_SOURCE_TOOL + ".lock")
         try:
             with os.fdopen(os.open(lease, os.O_RDONLY | os.O_NOFOLLOW), "rb") as lock:
-                fcntl.flock(lock, fcntl.LOCK_EX)
+                if not acquire_cleanup(lock.fileno()):
+                    raise ValueError(f"the command still uses {parent}")
         except FileNotFoundError:
             pass
-        build_folders.sweep_temporary_build_folders(parent)
+        build_folders.sweep_temporary_build_folders(parent, wait=False)
         parent.rmdir()
     except (OSError, ValueError) as error:
         print(f"copies: release private copy: {error}", file=sys.stderr)
@@ -2725,17 +2745,25 @@ def run_copy_in_scope(argv: list[str]) -> int:
     environment = dict(os.environ)
     cleanup_lease = environment.pop("COPIES_RUN_SCOPE_LOCK_FD", "")
     result = subprocess.run(["bash", "-c", COPY_RUN_SCOPE_SH, "copies-run",
-                             sys.executable, str(Path(__file__).resolve()), str(os.getpid()), *argv],
+                             sys.executable, str(Path(__file__).resolve()), str(os.getpid()), cleanup_lease, *argv],
                             pass_fds=(int(cleanup_lease),) if cleanup_lease else (), env=environment, check=False)
     return result.returncode if result.returncode >= 0 else 128 - result.returncode
 
 
 def copy_cli(argv: list[str]) -> int:
     if argv[:1] == ["--in-run-scope"]:
-        _, parent, owner, *command = argv
-        return main(command, invocation=CopyRunScope(Path(parent), int(owner)))
+        _, parent, owner, batch_lease, *command = argv
+        payload = CopyPayload.COMMAND
+        if batch_lease:
+            os.close(int(batch_lease))
+            payload = CopyPayload.BATCH_BASELINE
+        return main(command, invocation=CopyRunScope(Path(parent), int(owner), payload))
     if argv[:1] == ["--clean-run-scope"]:
-        return release_run_scope(Path(argv[1]))
+        _, parent, batch_lease = argv
+        status = release_run_scope(Path(parent))
+        if status and batch_lease:
+            mark_cleanup_incomplete(int(batch_lease))
+        return status
     return main(argv, invocation=CopyCommandLine(argv))
 
 

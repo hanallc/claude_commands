@@ -30,6 +30,9 @@ import subprocess
 import time
 
 GIT_TIMEOUT_S = 10
+WORKTREE_STATUS_ARGS = (
+    "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames", "--ignore-submodules=none",
+)
 
 
 def git(directory: str, *args: str) -> subprocess.Popen[bytes]:
@@ -69,12 +72,22 @@ def content(path: bytes) -> bytes:
     if os.path.isfile(path):
         with open(path, "rb") as handle:
             return hashlib.file_digest(handle, "sha256").digest()
-    if os.path.isdir(path) and os.path.lexists(os.path.join(path, b".git")):
-        submodule_key = _tree_key(os.fsdecode(path), submodule=True)
-        if submodule_key is None:
-            raise OSError(f"no tree key for {os.fsdecode(path)}")
-        return b"gitlink " + submodule_key.encode("ascii")
-    return b"absent"
+    return gitlink_content(path) or b"absent"
+
+
+def gitlink_content(path: bytes) -> bytes:
+    """Return the checked-out commit and content key for a Git worktree."""
+    if not os.path.isdir(path) or not os.path.lexists(os.path.join(path, b".git")):
+        return b""
+    submodule_key = _tree_key(os.fsdecode(path), submodule=True)
+    if submodule_key is None:
+        raise OSError(f"no tree key for {os.fsdecode(path)}")
+    return b"gitlink " + submodule_key.encode("ascii")
+
+
+def changed_paths(status: bytes) -> list[bytes]:
+    """List changed paths once when Git reports both staged and untracked entries."""
+    return sorted({entry[3:] for entry in status.split(b"\0") if len(entry) > 3})
 
 
 def committed_tree_key(tree_id: bytes) -> str:
@@ -93,8 +106,7 @@ def _tree_key(directory: str, *, submodule: bool) -> str | None:
             git(directory, "rev-parse", "--show-toplevel", *revision),
             # Staged, unstaged, deleted and untracked alike, every untracked file
             # by name; porcelain names paths from the top in any folder.
-            git(directory, "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames",
-                "--ignore-submodules=none"),
+            git(directory, *WORKTREE_STATUS_ARGS),
         ]
     except OSError:
         return None
@@ -112,9 +124,8 @@ def _tree_key(directory: str, *, submodule: bool) -> str | None:
     if not status:
         return committed_tree_key(tree)
     key = hashlib.sha256(tree + b"\n")
-    # Each entry is "XY PATH"; a path both staged and untracked (git rm --cached) comes twice.
     try:
-        for path in sorted({entry[3:] for entry in status.split(b"\0") if len(entry) > 3}):
+        for path in changed_paths(status):
             key.update(path + b"\0" + content(os.path.join(top, path)))
     except OSError:
         return None

@@ -215,14 +215,16 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         _ = path.write_text("#!/bin/sh\n" + code)
         path.chmod(0o755)
 
-    def start_verify(self, command: str, **extra: str) -> subprocess.Popen[str]:
-        return self._start_verify(command, False, extra)
+    def start_verify(self, command: str, *, arguments: tuple[str, ...] = ("sample",),
+                     **extra: str) -> subprocess.Popen[str]:
+        return self._start_verify(command, False, extra, arguments)
 
     def start_supervised_verify(self, command: str, **extra: str) -> subprocess.Popen[str]:
-        return self._start_verify(command, True, extra)
+        return self._start_verify(command, True, extra, ("sample",))
 
-    def _start_verify(self, command: str, supervised: bool, extra: dict[str, str]) -> subprocess.Popen[str]:
-        arguments = ["bash", str(VERIFY), command, "sample"]
+    def _start_verify(self, command: str, supervised: bool, extra: dict[str, str],
+                      command_arguments: tuple[str, ...]) -> subprocess.Popen[str]:
+        arguments = ["bash", str(VERIFY), command, *command_arguments]
         if supervised:
             record_path = self.control / "lint-run.json"
             record: RunRecord = {

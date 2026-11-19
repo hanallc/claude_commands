@@ -25,6 +25,7 @@ import sys
 import time
 from typing import NotRequired, TypedDict, cast
 
+from scripts.buildlog import treekey
 from scripts.lib.cargo_output import CargoOutputRoots, read_cargo_output_roots
 from scripts.lib.git_blob import git_blob_id
 
@@ -87,17 +88,8 @@ def lint_tool_versions() -> bytes:
     return bytes(versions)
 
 
-def content(path: bytes) -> bytes:
-    if os.path.islink(path):
-        return b"link " + os.readlink(path)
-    if os.path.isfile(path):
-        with open(path, "rb") as handle:
-            return hashlib.sha256(handle.read()).digest()
-    return b"absent"
-
-
 def blob(path: bytes) -> bytes:
-    """Git's entry for a present file; empty when absent."""
+    """Identify a file or a checked-out Git worktree."""
     if os.path.islink(path):
         data, mode = os.readlink(path), b"120000"
     elif os.path.isfile(path):
@@ -105,7 +97,7 @@ def blob(path: bytes) -> bytes:
             data = handle.read()
         mode = b"100755" if os.access(path, os.X_OK) else b"100644"
     else:
-        return b""
+        return treekey.gitlink_content(path)
     return mode + b" blob " + git_blob_id(data).encode()
 
 
@@ -184,8 +176,8 @@ class TreeInputs:
     def keys(self, *, cache: bool = True, watch: bool = True, lint_versions: bool = True) -> tuple[str, str]:
         self.tree_content_key = ""
         # status never refreshes the index; diff does, even with no-optional-locks.
-        status = run("git", "--no-optional-locks", "-C", self.top, "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames")
-        changed = sorted({entry[3:] for entry in status.split(b"\0") if len(entry) > 3 and not entry[3:].startswith(self.own)})
+        status = run("git", "--no-optional-locks", "-C", self.top, *treekey.WORKTREE_STATUS_ARGS)
+        changed = [path for path in treekey.changed_paths(status) if not path.startswith(self.own)]
         entries: dict[bytes, bytes] = {}
         if self.package or watch:
             try:
@@ -221,7 +213,7 @@ class TreeInputs:
         else:
             key = hashlib.sha256(self.top + b"\0" + run("git", "--no-optional-locks", "-C", self.top, "rev-parse", "HEAD^{tree}"))
             for path in changed:
-                key.update(path + b"\0" + content(os.path.join(self.top, path)))
+                key.update(path + b"\0" + treekey.content(os.path.join(self.top, path)))
         key.update(run("rustc", "-vV"))
         if lint_versions and self.words[:1] == ["lint"]:
             try:
@@ -232,7 +224,7 @@ class TreeInputs:
             key.update(versions)
         tree_content = key.copy()
         for name in self.files:
-            key.update(content(os.fsencode(name)))
+            key.update(treekey.content(os.fsencode(name)))
         build_key = key.copy()
         words = iter(self.words)
         for word in words:

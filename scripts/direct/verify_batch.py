@@ -18,6 +18,7 @@ from typing import final
 
 from scripts.buildlog import treekey
 from scripts.direct import recorder_state
+from scripts.direct.cleanup_lease import ForegroundCleanupLease, NoCleanupLease
 
 
 class LintScope(Enum):
@@ -60,25 +61,33 @@ class BatchStepResult:
 class BatchCommands:
     """Run one command at a time in the caller's process group."""
 
-    def __init__(self, verify: Path, route: Sequence[str], *, cleanup_leases: tuple[int, ...] = ()) -> None:
+    def __init__(self, verify: Path, route: Sequence[str],
+                 *, cleanup: ForegroundCleanupLease | NoCleanupLease = NoCleanupLease.NONE) -> None:
         self.verify = verify
         self.route = route
-        self.cleanup_leases = cleanup_leases
+        self.cleanup = cleanup
         self.environment = {**os.environ, "UNIT_DETACHED_RUN": "1"}
         _ = self.environment.pop("UNIT_DETACHED_RECORD", None)
 
-    def run(self, command: Sequence[str], changes: dict[str, str]) -> int:
+    def run(self, command: Sequence[str], changes: dict[str, str], *, pass_fds: tuple[int, ...] = ()) -> int:
         result = subprocess.run(command, env={**self.environment, **changes}, stdin=subprocess.DEVNULL,
-                                pass_fds=self.cleanup_leases, check=False)
+                                pass_fds=pass_fds, check=False)
         return result.returncode if result.returncode >= 0 else 128 - result.returncode
 
     def verify_step(self, step: str, args: Sequence[str], cache_hit: Path,
                     *, format_packages: str = "") -> BatchStepResult:
         cache_hit.unlink(missing_ok=True)
-        status = self.run(["bash", str(self.verify), *args, *self.route], {
+        command = ["bash", str(self.verify), *args, *self.route]
+        changes = {
             "VERIFY_BATCH_STEP": step, "VERIFY_BATCH_CACHE_HIT": str(cache_hit),
             "VERIFY_BATCH_LINT_PACKAGES": format_packages,
-        })
+        }
+        if isinstance(self.cleanup, ForegroundCleanupLease):
+            child = self.cleanup.run(command, cwd=Path.cwd(), environment={**self.environment, **changes},
+                                     stdin=subprocess.DEVNULL)
+            status = child.returncode if child.returncode >= 0 else 128 - child.returncode
+        else:
+            status = self.run(command, changes)
         return BatchStepResult(status, cache_hit.is_file())
 
 
@@ -143,19 +152,21 @@ def run_baseline_tests(commands: BatchCommands, cases: Sequence[RegressionCase],
 
 def run_baseline_copy(commands: BatchCommands, repo: Path, plan: BaselineProof, scratch: Path) -> bool:
     done = scratch / "baseline-done"
-    apply_patch = 'git apply --index -- "$1" || exit 2; shift; exec "$@"'
     cases = [f"{case.package}={case.test}" for case in plan.cases]
     script = Path(__file__).resolve()
     copies = script.parents[1] / "copies" / "copies.py"
     # The baseline gets the copy's target directory.
     command = ["env", "-u", "CARGO_TARGET_DIR", "-u", "CARGO_BUILD_BUILD_DIR",
                sys.executable, str(copies), "run", "--repo", str(repo), "--commit", plan.revision,
-               "--", "bash", "-c", apply_patch, "regression-patch", str(plan.patch),
-               sys.executable, str(script), "--baseline", str(commands.verify), str(done), *cases,
+               "--", sys.executable, str(script), "--baseline",
+               str(commands.verify), str(done), str(plan.patch), *cases,
                "--", *commands.route]
-    cleanup = commands.cleanup_leases
-    environment = {"COPIES_RUN_SCOPE_LOCK_FD": str(cleanup[0])} if cleanup else {}
-    status = commands.run(command, environment)
+    cleanup = commands.cleanup
+    if isinstance(cleanup, ForegroundCleanupLease):
+        status = commands.run(command, {"COPIES_RUN_SCOPE_LOCK_FD": str(cleanup.descriptor)},
+                              pass_fds=(cleanup.descriptor,))
+    else:
+        status = commands.run(command, {})
     baseline_status = done.read_text() if done.is_file() else ""
     if baseline_status != str(status):
         scope = ",".join(dict.fromkeys(case.package for case in plan.cases))
@@ -200,10 +211,13 @@ def main(argv: list[str]) -> int:
     split = len(argv) - 1 - argv[::-1].index("--")
     args, route = argv[:split], argv[split + 1:]
     if args[0] == "--baseline":
-        _, verify, marker, *cases = args
+        _, verify, marker, patch, *cases = args
         done = Path(marker)
-        lease = os.environ.get("COPIES_STEP_LOCK_FD")
-        commands = BatchCommands(Path(verify), route, cleanup_leases=(int(lease),) if lease else ())
+        lease = os.environ.pop("COPIES_STEP_LOCK_FD", "")
+        cleanup = ForegroundCleanupLease(int(lease)) if lease else NoCleanupLease.NONE
+        if subprocess.run(["git", "apply", "--index", "--", patch], check=False).returncode != 0:
+            return 2
+        commands = BatchCommands(Path(verify), route, cleanup=cleanup)
         result = run_baseline_tests(commands, [RegressionCase(*case.split("=", 1)) for case in cases],
                                     done.with_name("baseline-cache-hit"))
         _ = done.write_text(str(result))
@@ -219,7 +233,7 @@ def main(argv: list[str]) -> int:
         if len(set(packages)) != len(packages) or not all(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]*", p) for p in packages):
             raise ValueError("--packages needs distinct package names separated by commas")
         baseline = baseline_proof(packages, options.fail_first)
-        commands = BatchCommands(Path(verify), route, cleanup_leases=(int(lease),))
+        commands = BatchCommands(Path(verify), route, cleanup=ForegroundCleanupLease(int(lease)))
         return run_batch(commands, Path(repo), packages, LintScope(options.lint), baseline, Path(scratch))
     except (OSError, ValueError) as error:
         print(f"verify.sh batch: {error}", file=sys.stderr)
