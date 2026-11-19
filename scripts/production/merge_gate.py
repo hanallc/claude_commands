@@ -67,7 +67,7 @@ from typing import Literal, Protocol, TextIO, cast
 from scripts.lib import process_group
 from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
-from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, waiting_rows
+from scripts.lib import build_folders, conf, land_main, main_push_lock, session_folder, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import read_step_names
 from scripts.production import affected_modules, change_review, land_runs  # noqa: E402
@@ -116,8 +116,7 @@ SLOW_MODULE_FACTOR = 3.0
 SLOW_MODULE_FLOOR_S = 60.0
 MODULE_HISTORY_RUNS = 5
 MEMORY_SAMPLE_SECONDS = 0.25
-# Restore dispositions and the mask in every child, including types. The runner
-# defers cancellation until the child is registered for cleanup.
+# Restore dispositions and unblock cancellation before the child runs.
 SUITE_BOOTSTRAP = """import ctypes, os, signal, sys
 if sys.platform == "linux":
     libc = ctypes.CDLL(None, use_errno=True)
@@ -342,18 +341,23 @@ class WaitingForCPU:
 class SharedCPUSlot:
     descriptor: int
     token: bytes
+    record: HeldGateToken | None = None
     returned: bool = False
+    returning: bool = False
 
     def release(self) -> None:
-        if not self.returned:
-            with cancellation.defer_cleanup_signals():
-                if os.write(self.descriptor, self.token) != 1:
-                    raise GateRefused("could not return the shared CPU slot")
-                self.returned = True
-                recovery = ACTIVE_GATE_RECOVERY.get()
-                if isinstance(recovery, GateRecovery):
-                    recovery.tokens.remove(recovery.token(self.descriptor, self.token))
-                    recovery.save()
+        if self.returned:
+            return
+        if self.returning:
+            raise GateRefused("UNRESOLVED: shared CPU slot return was interrupted")
+        self.returning = True
+        recovery = ACTIVE_GATE_RECOVERY.get()
+        if self.record is not None and isinstance(recovery, GateRecovery):
+            recovery.return_token(self.record, self.descriptor)
+        else:
+            if os.write(self.descriptor, self.token) != 1:
+                raise GateRefused("could not return the shared CPU slot")
+        self.returned = True
 
 
 @dataclass
@@ -369,12 +373,11 @@ class SharedCPUPool:
         print("waits for a CPU slot", flush=True)
         try:
             with ExitStack() as cleanup:
-                with cancellation.defer_cleanup_signals():
-                    reader, writer = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
-                    _ = cleanup.callback(os.close, reader)
-                    _ = cleanup.callback(os.close, writer)
-                    previous = signal.set_wakeup_fd(writer)
-                    _ = cleanup.callback(signal.set_wakeup_fd, previous)
+                reader, writer = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+                _ = cleanup.callback(os.close, reader)
+                _ = cleanup.callback(os.close, writer)
+                previous = signal.set_wakeup_fd(writer)
+                _ = cleanup.callback(signal.set_wakeup_fd, previous)
                 while True:
                     remaining = self.deadline - time.monotonic()
                     if remaining <= 0:
@@ -385,31 +388,39 @@ class SharedCPUPool:
                         _ = os.read(reader, 4096)
                     if self.blocking in readable:
                         # Another gate can take the token after select returns.
-                        with cancellation.defer_cleanup_signals():
-                            slot = self.try_acquire()
+                        slot = self.try_acquire()
                         if isinstance(slot, SharedCPUSlot):
                             return slot
         finally:
             print(f"CPU slot wait ended after {time.monotonic() - started:.3f} s", flush=True)
 
     def try_acquire(self) -> SharedCPUSlot | WaitingForCPU:
-        with cancellation.defer_cleanup_signals():
-            # CUSE devices need not honor O_NONBLOCK in the same way as pipes.
-            if not select.select([self.descriptor], [], [], 0)[0]:
-                return WaitingForCPU()
-            try:
-                token = os.read(self.descriptor, 1)
-            except BlockingIOError:
-                return WaitingForCPU()
-            if not token:
-                raise GateRefused("shared CPU pool returned no byte")
-            slot = SharedCPUSlot(self.descriptor, token)
-            self.owned.append(slot)
-            recovery = ACTIVE_GATE_RECOVERY.get()
-            if isinstance(recovery, GateRecovery):
-                recovery.tokens.append(recovery.token(self.descriptor, token))
-                recovery.save()
-            return slot
+        # CUSE devices need not honor O_NONBLOCK in the same way as pipes.
+        if not select.select([self.descriptor], [], [], 0)[0]:
+            return WaitingForCPU()
+        recovery = ACTIVE_GATE_RECOVERY.get()
+        record = None
+        if isinstance(recovery, GateRecovery):
+            record = recovery.token(self.descriptor, b"", "acquiring")
+            recovery.tokens.append(record)
+            recovery.save()
+        try:
+            token = os.read(self.descriptor, 1)
+        except BlockingIOError:
+            if record is not None and isinstance(recovery, GateRecovery):
+                recovery.update_token(record)
+            return WaitingForCPU()
+        if not token:
+            if record is not None and isinstance(recovery, GateRecovery):
+                recovery.update_token(record)
+            raise GateRefused("shared CPU pool returned no byte")
+        if record is not None and isinstance(recovery, GateRecovery):
+            held = replace(record, value=token.hex(), operation="held")
+            recovery.update_token(record, held)
+            record = held
+        slot = SharedCPUSlot(self.descriptor, token, record)
+        self.owned.append(slot)
+        return slot
 
 
 @contextmanager
@@ -431,12 +442,11 @@ def shared_cpu_pool() -> Generator[SharedCPUPool | NoSharedCPU]:
         try:
             yield pool
         finally:
-            with cancellation.defer_cleanup_signals():
-                try:
-                    for slot in pool.owned:
-                        slot.release()
-                finally:
-                    os.close(blocking)
+            try:
+                for slot in pool.owned:
+                    slot.release()
+            finally:
+                os.close(blocking)
     finally:
         os.close(descriptor)
 
@@ -536,14 +546,13 @@ def fetch_branches(repo: Path, *branches: str) -> None:
 
 def command(arguments: Sequence[str], repo: Path) -> subprocess.CompletedProcess[str]:
     with ExitStack() as cleanup:
-        with cancellation.defer_cleanup_signals():
-            process = cleanup.enter_context(subprocess.Popen(
-                arguments, cwd=repo, stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, errors="replace", start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get()))
-            recovery = ACTIVE_GATE_RECOVERY.get()
-            if isinstance(recovery, GateRecovery):
-                recovery.add_group(process.pid)
+        process = cleanup.enter_context(subprocess.Popen(
+            arguments, cwd=repo, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, errors="replace", start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get()))
+        recovery = ACTIVE_GATE_RECOVERY.get()
+        if isinstance(recovery, GateRecovery):
+            recovery.add_group(process.pid)
         try:
             output, errors = process.communicate()
         except BaseException:
@@ -654,6 +663,7 @@ class HeldGateToken:
     device: int
     inode: int
     value: str
+    operation: Literal["acquiring", "held", "returning"] = "held"
 
 
 @dataclass
@@ -688,10 +698,31 @@ class GateRecovery:
             del self.groups[pid]
             self.save()
 
-    def token(self, descriptor: int, value: bytes) -> HeldGateToken:
+    def token(self, descriptor: int, value: bytes,
+              operation: Literal["acquiring", "held", "returning"]) -> HeldGateToken:
         status = os.fstat(descriptor)
         return HeldGateToken(os.environ.get("BUILDLOG_JOBSERVER_FIFO", "/dev/steve"),
-                             status.st_dev, status.st_ino, value.hex())
+                             status.st_dev, status.st_ino, value.hex(), operation)
+
+    def update_token(self, token: HeldGateToken, replacement: HeldGateToken | None = None) -> None:
+        position = next(index for index, entry in enumerate(self.tokens) if entry is token)
+        if replacement is None:
+            del self.tokens[position]
+        else:
+            self.tokens[position] = replacement
+        self.save()
+
+    def return_token(self, token: HeldGateToken, descriptor: int) -> None:
+        pending = replace(token, operation="returning")
+        self.update_token(token, pending)
+        try:
+            count = os.write(descriptor, bytes.fromhex(token.value))
+        except BlockingIOError:
+            self.update_token(pending, token)
+            raise
+        if count != 1:
+            raise GateRefused("UNRESOLVED: could not confirm the shared CPU slot return")
+        self.update_token(pending)
 
     def recover(self) -> None:
         """Stop recorded groups before removing their folders and undoing the merge."""
@@ -742,23 +773,24 @@ class GateRecovery:
         self.save()
         while self.tokens:
             token = self.tokens[-1]
-            with cancellation.defer_cleanup_signals():
-                try:
-                    descriptor = os.open(token.path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
-                except FileNotFoundError:
-                    descriptor = -1
-                try:
-                    if descriptor >= 0:
-                        status = os.fstat(descriptor)
-                        # The jobserver device reclaims tokens from a dead owner.
-                        if (stat.S_ISFIFO(status.st_mode)
-                                and (status.st_dev, status.st_ino) == (token.device, token.inode)):
-                            _ = os.write(descriptor, bytes.fromhex(token.value))
-                    _ = self.tokens.pop()
-                    self.save()
-                finally:
-                    if descriptor >= 0:
-                        os.close(descriptor)
+            try:
+                descriptor = os.open(token.path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
+            except FileNotFoundError:
+                descriptor = -1
+            try:
+                if descriptor >= 0:
+                    status = os.fstat(descriptor)
+                    # The jobserver device reclaims tokens from a dead owner.
+                    if (stat.S_ISFIFO(status.st_mode)
+                            and (status.st_dev, status.st_ino) == (token.device, token.inode)):
+                        if token.operation != "held":
+                            raise GateRefused(f"UNRESOLVED: interrupted CPU slot {token.operation} in {token.path}")
+                        self.return_token(token, descriptor)
+                        continue
+                self.update_token(token)
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
         for folder in self.folders:
             path = Path(folder)
             try:
@@ -786,7 +818,7 @@ class GateRecovery:
                 self.rollback = ""
                 self.save()
             print(f"Recovered gate {self.pid}: merge undone, not pushed", flush=True)
-        self.path.unlink()
+        self.path.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -830,7 +862,8 @@ def recover_gate_directory(directory: Path) -> None:
                 continue
             groups = cast(dict[str, str], data["groups"])
             tokens = [HeldGateToken(cast(str, token["path"]), cast(int, token["device"]),
-                                    cast(int, token["inode"]), cast(str, token["value"]))
+                                    cast(int, token["inode"]), cast(str, token["value"]),
+                                    cast(Literal["acquiring", "held", "returning"], token.get("operation", "held")))
                       for token in cast(list[dict[str, object]], data["tokens"])]
             recovery = GateRecovery(path, cast(str, data["repo"]), pid, start,
                                     {int(group): identity for group, identity in groups.items()},
@@ -908,10 +941,9 @@ def private_gate_recovery(repo: Path, parent: Path) -> Generator[GateRecovery]:
 @contextmanager
 def gate_temporary(recovery: GateRecovery, tool: str, parent: Path) -> Generator[Path]:
     with ExitStack() as cleanup:
-        with cancellation.defer_cleanup_signals():
-            folder = cleanup.enter_context(build_folders.tool_folder(tool, parent))
-            recovery.folders.append(str(folder))
-            recovery.save()
+        folder = cleanup.enter_context(build_folders.tool_folder(tool, parent))
+        recovery.folders.append(str(folder))
+        recovery.save()
         try:
             yield folder
         finally:
@@ -992,11 +1024,15 @@ def reap_gate_job(job: RunningGateJob, *, block: bool = False) -> None:
     """Collect the leader's status and CPU once, including children it waited for."""
     if job.process.returncode is not None:
         return
-    with cancellation.defer_cleanup_signals():
+    try:
         pid, status, usage = os.wait4(job.process.pid, 0 if block else os.WNOHANG)
-        if pid:
-            job.process.returncode = os.waitstatus_to_exitcode(status)
-            job.cpu_seconds = usage.ru_utime + usage.ru_stime
+    except ChildProcessError:
+        # Cancellation can interrupt the caller after the kernel reaps the child.
+        job.process.returncode = 1
+        return
+    if pid:
+        job.process.returncode = os.waitstatus_to_exitcode(status)
+        job.cpu_seconds = usage.ru_utime + usage.ru_stime
 
 
 def kill_job_group(job: RunningGateJob) -> None:
@@ -1092,14 +1128,13 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     started = time.monotonic()
     started_at = time.time()
     try:
-        with cancellation.defer_cleanup_signals():
-            process = subprocess.Popen([str(python_shim(repo)), "-c", SUITE_BOOTSTRAP, *argv],
-                                       cwd=repo, env={**environment, "MERGE_GATE_PARENT_PID": str(os.getpid())},
-                                       stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, text=True,
-                                       start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get())
-            recovery = ACTIVE_GATE_RECOVERY.get()
-            if isinstance(recovery, GateRecovery):
-                recovery.add_group(process.pid)
+        process = subprocess.Popen([str(python_shim(repo)), "-c", SUITE_BOOTSTRAP, *argv],
+                                   cwd=repo, env={**environment, "MERGE_GATE_PARENT_PID": str(os.getpid())},
+                                   stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, text=True,
+                                   start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get())
+        recovery = ACTIVE_GATE_RECOVERY.get()
+        if isinstance(recovery, GateRecovery):
+            recovery.add_group(process.pid)
     except BaseException:
         output.close()
         raise
@@ -1729,17 +1764,16 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                              *type_dirs]
                             if request.kind is GateJobKind.TYPE_CHECK else
                             [*scope_prefix, python, str(runner), str(path.parent), path.name])
-                    with cancellation.defer_cleanup_signals():
-                        if request.kind is GateJobKind.TYPE_CHECK:
-                            job = start_gate_job(suite, path, argv, repo, job_environment, log, kind=request.kind)
-                        else:
-                            job = start_gate_job(suite, path, argv, repo, job_environment, log)
-                        job.folder_cleanup = folder_cleanup
-                        job.cpu_slot = slot
-                        running.append(job)
-                        if not shared:
-                            print(f"Starting module: {job.suite}/{job.module}", flush=True)
-                        job_started = True
+                    if request.kind is GateJobKind.TYPE_CHECK:
+                        job = start_gate_job(suite, path, argv, repo, job_environment, log, kind=request.kind)
+                    else:
+                        job = start_gate_job(suite, path, argv, repo, job_environment, log)
+                    job.folder_cleanup = folder_cleanup
+                    job.cpu_slot = slot
+                    running.append(job)
+                    if not shared:
+                        print(f"Starting module: {job.suite}/{job.module}", flush=True)
+                    job_started = True
                     if job.kind is GateJobKind.TEST_MODULE:
                         _ = suite_started.setdefault(suite, job.started)
                     if admission is not None:
@@ -1766,12 +1800,11 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                     time.sleep(0.05)
         finally:
             # Only terminate groups created by this runner. Reap them before tmpfs cleanup.
-            with cancellation.defer_cleanup_signals():
-                stop_gate_jobs(running)
-                for job in running:
-                    job.output.close()
-                    if isinstance(job.cpu_slot, SharedCPUSlot):
-                        job.cpu_slot.release()
+            stop_gate_jobs(running)
+            for job in running:
+                job.output.close()
+                if isinstance(job.cpu_slot, SharedCPUSlot):
+                    job.cpu_slot.release()
             if shared:
                 save_measures(timings_path, timings)
                 save_measures(cpu_path, cpu_measures)

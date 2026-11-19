@@ -1,10 +1,10 @@
 """A queued program owns one reservation from before launch through finalization."""
 from __future__ import annotations
 
-from scripts.lib import atomic_file, cancellation
+from scripts.lib import atomic_file
 
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from datetime import UTC, datetime
 import functools
 import io
@@ -1107,26 +1107,14 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
             self.assertEqual(stdout.getvalue(), "")
             self.assertFalse(fixture.admission.server.waiters)
 
-    def test_cleanup_mask_is_restored_when_blocking_is_interrupted(self) -> None:
-        change_mask = signal.pthread_sigmask
-        previous = change_mask(signal.SIG_BLOCK, {signal.SIGUSR1})
-        expected = previous | {signal.SIGUSR1}
+    def test_release_leaves_cancellation_signals_unblocked(self) -> None:
+        def release(_reservation: str, _status: int, _timing: wire.CleanupTiming) -> wire.Ok:
+            mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            self.assertFalse(mask.intersection({signal.SIGTERM, signal.SIGHUP, signal.SIGINT}))
+            return wire.Ok()
 
-        def interrupted_block(how: int, numbers: Iterable[int]) -> set[int | signal.Signals]:
-            mask = set(numbers)
-            result = change_mask(how, mask)
-            if how == signal.SIG_BLOCK and signal.SIGINT in mask:
-                raise KeyboardInterrupt
-            return result
-
-        try:
-            with mock.patch.object(signal, "pthread_sigmask", side_effect=interrupted_block):
-                with self.assertRaises(KeyboardInterrupt):
-                    with cancellation.defer_cleanup_signals():
-                        self.fail("The block step must interrupt entry")
-            self.assertEqual(change_mask(signal.SIG_BLOCK, set()), expected)
-        finally:
-            _ = change_mask(signal.SIG_SETMASK, previous)
+        with mock.patch.object(client, "release", side_effect=release):
+            self.assertIsInstance(queue.release_place("fixture", 0, wire.PROTOCOL_CLEANUP_TIMING), wire.Ok)
 
     @unittest.skipUnless(hasattr(os, "fork"), "holder signal lifecycle needs fork")
     def test_holder_signals_release_and_restore_handlers(self) -> None:

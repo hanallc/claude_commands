@@ -22,7 +22,7 @@ import threading
 import time
 from typing import BinaryIO, TypedDict, Unpack
 
-from scripts.lib import build_folders, atomic_file, cancellation, conf
+from scripts.lib import build_folders, atomic_file, conf
 from scripts.buildlog import store
 from scripts.build_queue import admission_records
 from scripts.build_queue import step_estimator
@@ -202,7 +202,6 @@ def program_start(record: Path, holder: wire.Owner, argv: Sequence[str], *, scop
         raise QueuePlaceRefused("the program has no live process identity")
     atomic_file.write_text_atomic(record, wire.encode_record(ProgramStart(holder, wire.Owner(os.getpid(), start), scope)))
     if admission_records.process_start_time(holder.pid) != holder.start_time:
-        record.unlink(missing_ok=True)
         raise QueuePlaceRefused("the queue place holder exited during program publication")
     _ = signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGINT, signal.SIGHUP})
     os.execvp(argv[0], list(argv))
@@ -211,9 +210,7 @@ def program_start(record: Path, holder: wire.Owner, argv: Sequence[str], *, scop
 @contextmanager
 def queue_place_folder() -> Generator[Path]:
     """Allocate and remove the folder without installing a signal handler."""
-    with ExitStack() as cleanup:
-        with cancellation.defer_cleanup_signals():
-            path = cleanup.enter_context(build_folders.tool_folder("queue-place"))
+    with build_folders.tool_folder("queue-place") as path:
         yield path
 
 
@@ -375,27 +372,26 @@ class QueuePlace:
         wrapper = [sys.executable, str(Path(__file__).resolve())]
         command = ([*prefix, *wrapper, "--scope-start", str(self.sidecar), str(holder_pid), holder_start, str(record), *argv]
                    if prefix else [*wrapper, "--program-start", str(record), str(holder_pid), holder_start, *argv])
-        with cancellation.defer_cleanup_signals():
-            process = subprocess.Popen(command, **popen_arguments)
-            stopped = threading.Event()
-            tracking: ScopedProgram | ProgramTree = ScopedProgram()
-            if not prefix:
-                tracking = ProgramTree(process.pid)
-                if self.purpose == ProgramPurpose.RUNNER:
-                    tracking.adopter = wire.Owner(holder_pid, holder_start)
-                start = admission_records.process_start_time(process.pid)
-                if start is not None:
-                    tracking.observed[process.pid] = start
-            sampler = (UnmeasuredProbe() if self.purpose == ProgramPurpose.PROBE else
-                       threading.Thread(target=self._sample, args=(tracking, stopped), daemon=True))
-            self.program = StartedProgram(process, stopped, sampler, tracking, record)
-            if isinstance(sampler, threading.Thread):
-                cancellation.start_masked_thread(sampler)
-            while not record.exists():
-                if process.poll() is not None and not record.exists():
-                    raise QueuePlaceRefused("the program exited before it published its ownership")
-                time.sleep(self.configuration.program_sample_seconds)
-            self.on_started()
+        process = subprocess.Popen(command, **popen_arguments)
+        stopped = threading.Event()
+        tracking: ScopedProgram | ProgramTree = ScopedProgram()
+        if not prefix:
+            tracking = ProgramTree(process.pid)
+            if self.purpose == ProgramPurpose.RUNNER:
+                tracking.adopter = wire.Owner(holder_pid, holder_start)
+            start = admission_records.process_start_time(process.pid)
+            if start is not None:
+                tracking.observed[process.pid] = start
+        sampler = (UnmeasuredProbe() if self.purpose == ProgramPurpose.PROBE else
+                   threading.Thread(target=self._sample, args=(tracking, stopped), daemon=True))
+        self.program = StartedProgram(process, stopped, sampler, tracking, record)
+        if isinstance(sampler, threading.Thread):
+            sampler.start()
+        while not record.exists():
+            if process.poll() is not None and not record.exists():
+                raise QueuePlaceRefused("the program exited before it published its ownership")
+            time.sleep(self.configuration.program_sample_seconds)
+        self.on_started()
         return process
 
     def _sample(self, tracking: ScopedProgram | ProgramTree, stopped: threading.Event) -> None:
@@ -459,6 +455,7 @@ class QueuePlace:
             program.stopped.set()
             if isinstance(program.sampler, threading.Thread) and program.sampler.ident is not None:
                 program.sampler.join()
+        self.program = ProgramNotStarted()
 
 
 @dataclass(frozen=True)
@@ -492,14 +489,14 @@ def request_place(request: QueueRequest | RefreshedLaunch, output: admission_cli
 
 def release_place(reservation: str, status: int, timing: wire.CleanupTiming) -> wire.Ok | wire.Refused:
     """End a reservation with its holder's status. This is the one place that releases."""
-    with cancellation.defer_cleanup_signals():
-        return admission_client.release(reservation, status, timing)
+    return admission_client.release(reservation, status, timing)
 
 
 @dataclass
 class HeldReservation:
     grant: wire.Admitted
     status: int = 1
+    keep: bool = False
 
 
 @contextmanager
@@ -518,7 +515,8 @@ def held_reservation(request: QueueRequest, *,
     try:
         yield held
     finally:
-        _ = release_place(reply.reservation, held.status, reply.cleanup_timing)
+        if not held.keep:
+            _ = release_place(reply.reservation, held.status, reply.cleanup_timing)
 
 
 @contextmanager
@@ -583,10 +581,12 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
                             error.code if isinstance(error, SystemExit) and isinstance(error.code, int) else 1)
             raise
         finally:
-            with cancellation.defer_cleanup_signals():
-                place.finish(failed=failed)
-                if isinstance(grant, HeldReservation):
-                    grant.status = place.status
+            if isinstance(grant, HeldReservation):
+                grant.keep = True
+            place.finish(failed=failed)
+            if isinstance(grant, HeldReservation):
+                grant.status = place.status
+                grant.keep = False
 
 
 class ShellArguments(argparse.Namespace):

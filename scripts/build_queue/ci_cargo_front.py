@@ -28,7 +28,6 @@ from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import queue_place
 from scripts.build_queue import step_estimator
 from scripts.buildlog import parse
-from scripts.lib import cancellation
 from scripts.lib.descendants import adopt_descendants
 
 
@@ -179,20 +178,21 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
                 status = error.code if isinstance(error.code, int) else 1
                 raise
             finally:
-                with cancellation.defer_cleanup_signals():
+                held.keep = True
+                try:
+                    place.finish(failed=status != 0)
+                    held.keep = False
+                finally:
                     try:
-                        place.finish(failed=status != 0)
+                        cleanup.close()
                     finally:
                         try:
-                            cleanup.close()
-                        finally:
-                            try:
-                                while os.waitpid(-1, os.WNOHANG)[0]:
-                                    pass
-                            except ChildProcessError:
+                            while os.waitpid(-1, os.WNOHANG)[0]:
                                 pass
-                            finally:
-                                held.status = status
+                        except ChildProcessError:
+                            pass
+                        finally:
+                            held.status = status
         return status if status >= 0 else 128 - status
 
 

@@ -54,7 +54,7 @@ class CpuUsageTest(unittest.TestCase):
 if __name__ == "__main__":
     Path(sys.argv[2]).write_text(str(spin_cpu(float(sys.argv[1]))))
 '''
-from scripts.lib import cancellation, copy_record, scratch
+from scripts.lib import copy_record, scratch
 from scripts.message.process_test_support import OwnedTestProcesses
 
 
@@ -255,7 +255,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
 
         stopped = threading.Event()
         worker = threading.Thread(target=stopped.wait, daemon=True)
-        cancellation.start_masked_thread(worker)
+        worker.start()
         try:
             with mock.patch.object(os, "wait4", side_effect=interrupt_after_wait):
                 with self.assertRaises(KeyboardInterrupt):
