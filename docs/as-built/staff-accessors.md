@@ -107,6 +107,7 @@ Its [admission boundary](long-lived-workers.md#staff-identity-and-admission) pub
 The comparison includes the machine and path when present.
 A row lock protects one member during a worker change.
 The process that takes the lock records its PID and command in the lock file.
+The process clears its record before it releases the lock.
 A joined child leaves that record intact.
 The busy-row error includes the PID and command when it can read the record.
 `staff.child_environment` removes inherited row-lock proofs and the staff ID before an agent starts.

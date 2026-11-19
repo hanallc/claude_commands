@@ -15,7 +15,7 @@ import shlex
 import sys
 import time
 from collections.abc import Mapping, Callable, Generator, Sequence
-from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -876,14 +876,19 @@ def row_operation(reference: str) -> Generator[None]:
         yield
 
 
-def _write_slot_holder(lock: IO[str]) -> None:
+def _write_slot_holder(lock: IO[bytes]) -> None:
     holder = {"pid": os.getpid(), "command": shlex.join(sys.argv)}
-    os.ftruncate(lock.fileno(), 0)
-    _ = lock.write(json.dumps(holder) + "\n")
-    lock.flush()
+    with suppress(OSError):
+        os.ftruncate(lock.fileno(), 0)
+        _ = lock.write((json.dumps(holder) + "\n").encode("utf-8"))
 
 
-def _slot_holder_suffix(lock: IO[str]) -> str:
+def _clear_slot_holder(lock: IO[bytes]) -> None:
+    with suppress(OSError):
+        os.ftruncate(lock.fileno(), 0)
+
+
+def _slot_holder_suffix(lock: IO[bytes]) -> str:
     try:
         _ = lock.seek(0)
         holder = cast(object, json.loads(lock.readline()))
@@ -906,17 +911,18 @@ def slot_operation(key: str, name: str) -> Generator[None]:
         yield
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as lock:
+    with path.open("a+b", buffering=0) as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise StaffRefused(f"{name}: another operation holds this row{_slot_holder_suffix(lock)}") from error
-        _write_slot_holder(lock)
         previous = os.environ.get(variable)
-        os.environ[variable] = str(lock.fileno())
+        _write_slot_holder(lock)
         try:
+            os.environ[variable] = str(lock.fileno())
             yield
         finally:
+            _clear_slot_holder(lock)
             if previous is None:
                 _ = os.environ.pop(variable, None)
             else:

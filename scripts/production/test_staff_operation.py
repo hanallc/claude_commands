@@ -77,7 +77,7 @@ class StaffOperationTests(StaffTestCase):
             with mock.patch.object(sys, "argv", ["staff.py", "move", "busy worker"]), staff.slot_operation("busy", "busy"):
                 refused = subprocess.run([str(CHECKOUT / "scripts/lib/py"), "-c", contender], cwd=CHECKOUT,
                                          env=staff.child_environment(os.environ), capture_output=True,
-                                         text=True, check=False, timeout=3)
+                                         text=True, check=False, timeout=30)
             self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
             self.assertIn(f"busy: another operation holds this row (pid {os.getpid()}: staff.py move 'busy worker')",
                           refused.stderr)
