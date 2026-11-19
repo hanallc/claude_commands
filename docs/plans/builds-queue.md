@@ -2989,6 +2989,15 @@ Lead: `offload.py` `submit_direct_placement` sends `local.profile` from `admissi
 2. Make the recorded peak include the step's compiler jobs, with the same rule admission uses.
 3. **From 44cn pass 4 (F006, minor):** the head-stall compiler warning mixes two samples (`scripts/build_queue/head_stall.py:133`). Two compiler environments are unreadable at capture, and one compiler exits before the alert: the warning counts one. Make the warning read the same capture as the holder values.
 
+### Phase 44cs — A batch line with a bad merge input is refused when it is added  · status: todo
+**From builds, 2026-11-19 01:0x:** four `land_queue.py add --batch` lines lacked the `review trial:` prefix. The merge input check (`scripts/production/merge_checkpoint.py:1156`, `review_numbers`) found it only when the line reached the front, and the top item lost a merge slot.
+
+Work:
+1. Replay the case with a test: `land_queue.py add --batch` with a line that has no `review trial:` prefix. Today it is accepted.
+2. Make `add --batch` run the same input check as `merge_checkpoint.py` on each batch line, and refuse a bad line at add time with the same message.
+3. Use the one parser. Move it to a module both scripts import if needed; keep no copy of the rule.
+4. Rules that only merge time can check (for example, the merged main or the gate result) stay at merge time.
+
 ### Phase 44cg — A memory wait fixture gives the same result under load  · status: todo
 **From builds, 2026-11-18 18:3x:** queue's next item after 44cf.
 
