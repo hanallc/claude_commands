@@ -126,6 +126,7 @@ def stop_guest(folder: Path, deadline: float) -> None:
         owner = process_start(pgid)
         if not isinstance(owner, (Started, Zombie)) or owner.start != groups[pgid]:
             raise GateRefused(f'Cannot prove ownership of Mac gate group {pgid}')
+        # The leader can exit and the group ID can be reused after the start check.
         with suppress(ProcessLookupError):
             process_group.send_process_group(pgid, signal.SIGKILL)
     while live_groups(set(groups)):
@@ -384,15 +385,18 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
                     with suppress(ProcessLookupError):
                         process_group.send_process_group(process.pid, signal.SIGKILL)
                     raise
+            if process.returncode:
+                prefix = f'{CLEANUP_ERROR_PREFIX}{folder.name}:'
+                detail = next((line.removeprefix(prefix) for line in reversed(output.splitlines())
+                               if line.startswith(prefix)), '')
+                if detail:
+                    return detail
             if cancelled.poll(0):
                 return 'The Mac gate was cancelled'
             if process.returncode == MAC_BUSY_STATUS:
                 return 'The Mac is busy'
             if process.returncode:
-                prefix = f'{CLEANUP_ERROR_PREFIX}{folder.name}:'
-                detail = next((line.removeprefix(prefix) for line in reversed(output.splitlines())
-                               if line.startswith(prefix)), '')
-                return detail or f'The Mac queue call ended with status {process.returncode}'
+                return f'The Mac queue call ended with status {process.returncode}'
             results = [line.removeprefix(RESULT_PREFIX) for line in output.splitlines() if line.startswith(RESULT_PREFIX)]
             if len(results) != 1:
                 return 'The Mac returned no unique gate result'

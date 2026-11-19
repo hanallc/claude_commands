@@ -5,6 +5,7 @@ from dataclasses import replace
 import json
 import os
 import signal
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -82,6 +83,11 @@ folder = root / mac_gate.REMOTE_ROOT / 'mac-gate-fixture'
 phase = sys.argv[1]
 if phase == 'prepare':
     argv_file, source = map(Path, sys.argv[2:4])
+    if (root / 'prepare_bundle').exists():
+        request = cloud_gate.read(source / 'request.json')
+        checkout = Path((source / 'local-repo').read_text())
+        cloud_gate.create_source_bundle(checkout, source / 'source.bundle', [request['commit']])
+        raise AssertionError('the fixture bundle was not interrupted')
     folder.mkdir(parents=True)
     for name in ('request.json', 'module_seconds.json'):
         shutil.copyfile(source / name, folder / name)
@@ -99,6 +105,10 @@ elif phase == 'guest':
         raise
 else:
     (root / 'close_started').touch()
+    if phase == 'cleanup' and (root / 'close_refusal').exists():
+        source = Path(sys.argv[3])
+        print(f'{mac_gate.CLEANUP_ERROR_PREFIX}{source.name}:The Mac kept its gate folder', flush=True)
+        raise SystemExit(1)
     with patch.object(scratch, 'end', return_value=scratch.TaskCleanup()):
         mac_gate.stop_checkout(folder)
     (root / 'close_finished').touch()
@@ -121,6 +131,20 @@ else:
 print(mac_gate.route(Path(repo), mode=SuiteMode.MERGE_GATE, full=True,
                      module_time_limit_s=30, cancellation=cancellation), flush=True)
 """
+
+HELD_BUNDLE_GIT = """\
+import os, signal, sys
+from pathlib import Path
+if sys.argv[1:3] == ['bundle', 'create']:
+    marker = Path(os.environ['FAKE_QUEUE_STATE']) / 'bundle_pid'
+    marker.with_suffix('.new').write_text(str(os.getpid()))
+    marker.with_suffix('.new').rename(marker)
+    signal.alarm(60)
+    signal.pause()
+    raise AssertionError('the fixture Git process was not stopped')
+os.execv(os.environ['FIXTURE_REAL_GIT'], [os.environ['FIXTURE_REAL_GIT'], *sys.argv[1:]])
+"""
+
 
 HELD_MODULE = """\
 import os, time
@@ -329,7 +353,7 @@ class MacGateTests(unittest.TestCase):
         self.assertFalse(temporary.exists())
         self.assertFalse(root.exists())
 
-    def test_route_cancellation_runs_the_mac_close_hook(self) -> None:
+    def install_held_module(self) -> None:
         shim = self.repo / 'scripts/lib/py'
         shim.parent.mkdir()
         shim.symlink_to(sys.executable)
@@ -337,11 +361,22 @@ class MacGateTests(unittest.TestCase):
         runner.parent.mkdir()
         _ = runner.write_text(HELD_MODULE)
         _ = commit_repository(self.repo, 'gate fixture')
+
+    def test_route_cancellation_runs_the_mac_close_hook(self) -> None:
+        self.install_held_module()
         for explicit in (False, True):
             with self.subTest(explicit=explicit), tempfile.TemporaryDirectory(dir=self.root) as temporary:
                 self.cancel_route(Path(temporary), explicit=explicit)
 
-    def cancel_route(self, root: Path, *, explicit: bool) -> None:
+    def test_route_cancellation_reports_a_close_failure(self) -> None:
+        self.install_held_module()
+        self.cancel_route(self.root, explicit=True, cleanup_refused=True)
+
+    def test_route_cancellation_stops_bundle_git_and_removes_refs(self) -> None:
+        self.cancel_route(self.root, explicit=True, prepare_bundle=True)
+
+    def cancel_route(self, root: Path, *, explicit: bool, cleanup_refused: bool = False,
+                     prepare_bundle: bool = False) -> None:
         environment = {**queue_fixture(root, LOCAL_MAC_SSH),
                        'MAC_GATE_FIXTURE_ROOT': str(Path(__file__).resolve().parents[2])}
         gate_root = root / 'gate-root'
@@ -350,6 +385,16 @@ class MacGateTests(unittest.TestCase):
         callback = root / 'callback'
         _ = callback.write_text(f'#!{sys.executable}\n' + LOCAL_MAC)
         callback.chmod(0o755)
+        if cleanup_refused:
+            (root / 'close_refusal').touch()
+        if prepare_bundle:
+            git = shutil.which('git')
+            assert git is not None
+            environment['FIXTURE_REAL_GIT'] = git
+            (root / 'prepare_bundle').touch()
+            shim = root / 'git'
+            _ = shim.write_text(f'#!{sys.executable}\n' + HELD_BUNDLE_GIT)
+            shim.chmod(0o755)
         reader, writer = os.pipe()
         try:
             caller = [sys.executable, '-c', CALL_ROUTE, str(self.repo), str(callback),
@@ -359,10 +404,12 @@ class MacGateTests(unittest.TestCase):
                 caller, env=environment, stdout=output, stderr=output, pass_fds=(reader,) if explicit else (),
             ) as process:
                 try:
-                    marker = root / 'module_pid'
+                    marker = root / ('bundle_pid' if prepare_bundle else 'module_pid')
                     wait_until(lambda: marker.exists() or process.poll() is not None, root, processes=(process,))
                     self.assertTrue(marker.exists(), result.read_text())
-                    module_pid = int(marker.read_text())
+                    child_pid = int(marker.read_text())
+                    if prepare_bundle:
+                        self.assertTrue(gate.checked_git(self.repo, 'for-each-ref', 'refs/cloud-gates/'))
                     if explicit:
                         self.assertEqual(os.write(writer, b'x'), 1)
                     else:
@@ -370,10 +417,15 @@ class MacGateTests(unittest.TestCase):
                     self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0 if explicit else -signal.SIGTERM,
                                      result.read_text())
                     if explicit:
-                        self.assertIn('The Mac gate was cancelled', result.read_text())
+                        message = 'The Mac kept its gate folder' if cleanup_refused else 'The Mac gate was cancelled'
+                        self.assertIn(message, result.read_text().splitlines())
+                    if prepare_bundle:
+                        self.assertFalse(isinstance(process_start(child_pid), Started))
+                        self.assertEqual(gate.checked_git(self.repo, 'for-each-ref', 'refs/cloud-gates/'), '')
+                        return
                     wait_until((root / 'close_finished').exists, root)
                     self.assertTrue((root / 'close_started').exists())
-                    self.assertFalse(isinstance(process_start(module_pid), Started))
+                    self.assertFalse(isinstance(process_start(child_pid), Started))
                     record = cloud_gate.read(root / 'interrupted')
                     self.assertEqual(record['groups'], {})
                     self.assertEqual(record['folders'], [])

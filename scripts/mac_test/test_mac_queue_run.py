@@ -199,6 +199,42 @@ class QueueRunTests(unittest.TestCase):
             self.assertIn("caller watch did not start", result.stderr)
             self.assertFalse((root / "events").exists())
 
+    def test_a_caller_watch_failure_after_ready_stops_the_queue_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = {**queue_fixture(root), "FAKE_SSH_HOLD": "1"}
+            reader, writer = os.pipe()
+            try:
+                command = self.command(root)
+                command[3:3] = ["--caller-fd", str(reader)]
+                with subprocess.Popen(command, env=environment, start_new_session=True, pass_fds=(reader,),
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as queue:
+                    try:
+                        assert queue.stdout is not None
+                        queue_output = cast(TextIO, queue.stdout)
+                        self.assertTrue(select.select([queue_output], [], [], TEST_HANG_GUARD_SECS)[0])
+                        self.assertEqual(queue_output.readline().strip(), "Mac command started")
+                        processes = subprocess.check_output(["ps", "-axo", "pid=,ppid=,args="], text=True)
+                        watchers: list[int] = []
+                        for line in processes.splitlines():
+                            fields = line.split(maxsplit=2)
+                            if len(fields) == 3 and fields[1] == str(queue.pid) and " watch-caller " in fields[2]:
+                                watchers.append(int(fields[0]))
+                        self.assertEqual(len(watchers), 1)
+                        os.kill(watchers[0], signal.SIGKILL)
+                        output, errors = queue.communicate(timeout=10)
+                    finally:
+                        if queue.poll() is None:
+                            send_process_group(queue.pid, signal.SIGKILL)
+                            _ = queue.communicate()
+                self.assertEqual(queue.returncode, -signal.SIGTERM, output + errors)
+                self.assertIn("caller watch ended unexpectedly", errors)
+                self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
+                self.assertIn("signal_group TERM", (root / "stop").read_text())
+            finally:
+                os.close(reader)
+                os.close(writer)
+
     def test_stale_callback_does_not_stop_the_next_placement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

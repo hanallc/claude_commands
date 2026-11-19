@@ -536,27 +536,29 @@ def fetch_branches(repo: Path, *branches: str) -> None:
 
 def command(arguments: Sequence[str], repo: Path) -> subprocess.CompletedProcess[str]:
     with ExitStack() as cleanup:
-        with cancellation.defer_cleanup_signals():
-            process = cleanup.enter_context(subprocess.Popen(
-                arguments, cwd=repo, stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, errors="replace", start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get()))
-            recovery = ACTIVE_GATE_RECOVERY.get()
-            if isinstance(recovery, GateRecovery):
-                recovery.add_group(process.pid)
+        recovery = ACTIVE_GATE_RECOVERY.get()
+        process: subprocess.Popen[str] | None = None
         try:
+            with cancellation.defer_cleanup_signals():
+                process = cleanup.enter_context(subprocess.Popen(
+                    arguments, cwd=repo, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, errors="replace", start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get()))
+                if isinstance(recovery, GateRecovery):
+                    recovery.add_group(process.pid)
             output, errors = process.communicate()
+            return subprocess.CompletedProcess(arguments, cast(int, process.returncode), output, errors)
         except BaseException:
-            try:
-                process_group.send_process_group(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            _ = process.wait()
+            if process is not None:
+                try:
+                    process_group.send_process_group(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                _ = process.wait()
             raise
         finally:
-            if isinstance(recovery, GateRecovery) and process.returncode is not None:
+            if isinstance(recovery, GateRecovery) and process is not None and process.returncode is not None:
                 recovery.remove_group(process.pid)
-        return subprocess.CompletedProcess(arguments, cast(int, process.returncode), output, errors)
 
 
 def git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -1086,6 +1088,7 @@ def module_order(modules: Sequence[tuple[str, Path]], timings: dict[str, float],
 def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
                    environment: dict[str, str], log: Path, *,
                    kind: GateJobKind = GateJobKind.TEST_MODULE) -> RunningGateJob:
+    module = test_module_name(repo, suite, path)
     output = log.open("w+")
     started = time.monotonic()
     started_at = time.time()
@@ -1095,14 +1098,18 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
                                        cwd=repo, env={**environment, "MERGE_GATE_PARENT_PID": str(os.getpid())},
                                        stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, text=True,
                                        start_new_session=True, pass_fds=copies.COMMAND_LOCKS.get())
+            job = RunningGateJob(suite, path, process, started, started_at, output, log, module, kind=kind)
             recovery = ACTIVE_GATE_RECOVERY.get()
             if isinstance(recovery, GateRecovery):
-                recovery.add_group(process.pid)
+                try:
+                    recovery.add_group(process.pid)
+                except BaseException:
+                    kill_job_group(job)
+                    raise
     except BaseException:
         output.close()
         raise
-    module = test_module_name(repo, suite, path)
-    return RunningGateJob(suite, path, process, started, started_at, output, log, module, kind=kind)
+    return job
 
 
 def test_module_environment(root: Path, environment: dict[str, str]) -> dict[str, str]:

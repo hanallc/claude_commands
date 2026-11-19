@@ -28,6 +28,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from typing import TextIO, TypedDict, cast
 import uuid
@@ -167,34 +168,39 @@ def capture_command(command: list[str]) -> tuple[int, str]:
             stop_command(process)
 
 
-def stream_remote(command: list[str], remote: RemoteRun) -> int:
-    # The SSH input stays open and empty while this process lives; the Mac wrapper stops the work when it closes.
-    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8",
-                          errors="replace") as process:
-        try:
-            remote.state = RemoteState.LIVE
-            assert process.stdout is not None
-            last = ""
-            for line in cast(TextIO, process.stdout):
-                if line.startswith("mac_group=") and line.removeprefix("mac_group=").strip().isdigit():
-                    remote.group = int(line.removeprefix("mac_group="))
-                    continue
-                print(line, end="", flush=True)
-                last = line.rstrip("\n")
-            ssh_status = process.wait()
-            if last.startswith("mac_exit=") and last.removeprefix("mac_exit=").isdigit():
-                remote.state = RemoteState.EXITED
-                return int(last.removeprefix("mac_exit="))
-            print("mac queue: the Mac returned no exit status", file=sys.stderr)
-            return ssh_status or 255
-        finally:
-            stop_command(process)
+def stream_remote(command: list[str], remote: RemoteRun, ssh: contextlib.ExitStack) -> int:
+    process = ssh.enter_context(subprocess.Popen(
+        command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="replace"))
+    _ = ssh.callback(stop_command, process)
+    remote.state = RemoteState.LIVE
+    assert process.stdout is not None
+    last = ""
+    for line in cast(TextIO, process.stdout):
+        if line.startswith("mac_group=") and line.removeprefix("mac_group=").strip().isdigit():
+            remote.group = int(line.removeprefix("mac_group="))
+            continue
+        print(line, end="", flush=True)
+        last = line.rstrip("\n")
+    ssh_status = process.wait()
+    if last.startswith("mac_exit=") and last.removeprefix("mac_exit=").isdigit():
+        remote.state = RemoteState.EXITED
+        return int(last.removeprefix("mac_exit="))
+    print("mac queue: the Mac returned no exit status", file=sys.stderr)
+    return ssh_status or 255
 
 
-def run_callback(script: str, phase: str, argv_file: Path, arguments: list[str], environment: dict[str, str]) -> int:
+def run_callback(script: str, phase: str, argv_file: Path, arguments: list[str],
+                 environment: dict[str, str], *, interrupt_prepare: bool = False) -> int:
     with subprocess.Popen([script, phase, str(argv_file), *arguments], env=environment, text=True) as process:
         try:
             return process.wait()
+        except KeyboardInterrupt:
+            if interrupt_prepare and process.poll() is None:
+                # Let prepare stop its commands and remove its temporary refs.
+                process.send_signal(signal.SIGINT)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    _ = process.wait(timeout=conf.read("mac_gate").number("terminate_grace_seconds"))
+            raise
         finally:
             stop_command(process)
 
@@ -295,7 +301,7 @@ def run(args: Arguments) -> int:
     assignment_file = receipts / (episode + ".json")
     _ = assignment_file.write_text(json.dumps({"episode": episode, "pid": pid}))
     assignment_file.chmod(0o600)
-    with run_directory(episode) as directory:
+    with run_directory(episode) as directory, contextlib.ExitStack() as ssh:
         argv_file = directory / "argv.json"
         callback_environment = dict(os.environ)
         lease_descriptor = -1
@@ -320,7 +326,8 @@ def run(args: Arguments) -> int:
                                        "host": placement.host}
                     write_text_atomic(directory / "run.json", json.dumps(saved))
                     prepared = True
-                    status = run_callback(args.lifecycle_script, "prepare", argv_file, original_command, callback_environment)
+                    status = run_callback(args.lifecycle_script, "prepare", argv_file, original_command,
+                                          callback_environment, interrupt_prepare=args.owned_close)
                     if status == 0:
                         command = cast(list[str], json.loads(argv_file.read_text()))
                         close_path = argv_file.with_suffix(".json.close")
@@ -337,11 +344,13 @@ def run(args: Arguments) -> int:
                     if args.owned_close and not on_close:
                         raise ValueError("the run needs a close hook")
                     status = stream_remote(remote_command(placement, args.cwd, command, on_close,
-                                                          owned_close=args.owned_close), remote)
+                                                          owned_close=args.owned_close), remote, ssh)
         except (OSError, ValueError) as error:
             print(f"mac queue: {error}", file=sys.stderr)
             status = 2
         finally:
+            if not args.owned_close:
+                ssh.close()
             safe = remote.state != RemoteState.LIVE
             if not safe and not args.owned_close:
                 try:
@@ -362,6 +371,8 @@ def run(args: Arguments) -> int:
                 else:
                     safe = True
                     (directory / "run.json").unlink()
+            # Owned cleanup uses the close hook while SSH still holds its input open.
+            ssh.close()
             if lease_descriptor >= 0:
                 os.close(lease_descriptor)
             # A Mac placement has no local grant, so the run returns it with a cancel that names the result.
@@ -385,8 +396,11 @@ def run(args: Arguments) -> int:
     return status
 
 
-def watch_caller(caller: int, queue: int, queue_pid: int) -> int:
-    """Stop the isolated queue group when the caller descriptor becomes readable."""
+CALLER_EXITED = 3
+
+
+def watch_caller(caller: int, queue: int) -> int:
+    """Report readiness and wait for a caller or queue exit."""
     watch = select.poll()
     try:
         watch.register(queue, select.POLLIN)
@@ -397,11 +411,11 @@ def watch_caller(caller: int, queue: int, queue_pid: int) -> int:
         events = dict(watch.poll())
         if queue in events:
             return 0
+        if events.get(caller, 0) & (select.POLLIN | select.POLLHUP):
+            return CALLER_EXITED
     except OSError as error:
         print(f"mac queue: caller watch failed: {error}", file=sys.stderr)
-    with contextlib.suppress(ProcessLookupError):
-        process_group.send_process_group(queue_pid, signal.SIGTERM)
-    return 0
+    return 2
 
 
 @contextlib.contextmanager
@@ -410,10 +424,12 @@ def caller_watch(caller: int) -> Generator[None]:
     if os.getpgrp() != pid:
         raise ValueError("the Mac queue must own its process group")
     reader, writer = os.pipe()
+    closing = threading.Event()
+    failed = threading.Event()
     try:
         try:
             watcher = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "watch-caller",
-                                        str(caller), str(reader), str(pid)],
+                                        str(caller), str(reader)],
                                        pass_fds=(caller, reader), start_new_session=True,
                                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
         finally:
@@ -425,23 +441,50 @@ def caller_watch(caller: int) -> Generator[None]:
                 output = watcher.stdout.fileno()
                 readiness = select.poll()
                 readiness.register(output, select.POLLIN)
-                grace_ms = math.ceil(conf.read("mac_gate").number("terminate_grace_seconds") * 1000)
-                if not readiness.poll(grace_ms) or os.read(output, 6) != b"ready\n":
+                grace = conf.read("mac_gate").number("terminate_grace_seconds")
+                if not readiness.poll(math.ceil(grace * 1000)) or os.read(output, 6) != b"ready\n":
                     raise ValueError("the Mac queue caller watch did not start")
-                yield
+
+                def monitor() -> None:
+                    status = watcher.wait()
+                    if closing.is_set():
+                        return
+                    if status != CALLER_EXITED:
+                        print(f"mac queue: caller watch ended unexpectedly ({status})", file=sys.stderr, flush=True)
+                        failed.set()
+                    # Let the queue reap prepare and obtain the remote cleanup result.
+                    os.kill(pid, signal.SIGINT)
+
+                supervisor = threading.Thread(target=monitor, daemon=True)
+                supervisor.start()
+                try:
+                    yield
+                finally:
+                    closing.set()
+                    os.close(writer)
+                    writer = -1
+                # Detect a watcher that failed just as queue work finished.
+                try:
+                    status = watcher.wait(timeout=grace)
+                except subprocess.TimeoutExpired:
+                    status = 2
+                if status:
+                    if status != CALLER_EXITED:
+                        failed.set()
+                    raise ValueError(f"the Mac queue caller watch ended with status {status}")
             finally:
-                os.close(writer)
-                writer = -1
                 stop_command(watcher)
     finally:
         if writer >= 0:
             os.close(writer)
+        if failed.is_set():
+            process_group.send_process_group(pid, signal.SIGTERM)
 
 
 def main(argv: list[str] | None = None) -> int:
     words = sys.argv[1:] if argv is None else argv
-    if len(words) == 4 and words[0] == "watch-caller":
-        return watch_caller(int(words[1]), int(words[2]), int(words[3]))
+    if len(words) == 3 and words[0] == "watch-caller":
+        return watch_caller(int(words[1]), int(words[2]))
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--what", required=True)
     _ = parser.add_argument("--kind", choices=("shot", "install", "probe", "run"), required=True)

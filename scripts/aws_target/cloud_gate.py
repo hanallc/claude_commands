@@ -1104,8 +1104,8 @@ def create_source_bundle(repo: Path, bundle: Path, commits: Sequence[str], *, ex
         for index, commit in enumerate(dict.fromkeys(commits)):
             suffix = f'-{index}' if index else ''
             ref = f'refs/cloud-gates/{bundle.parent.name}{suffix}'
-            _ = gate.checked_git(repo, 'update-ref', ref, commit)
             refs.append(ref)
+            _ = gate.checked_git(repo, 'update-ref', ref, commit)
         prerequisite = ('^' + exclude,) if exclude else ()
         _ = gate.checked_git(repo, 'bundle', 'create', str(bundle), *refs, *prerequisite)
     finally:
