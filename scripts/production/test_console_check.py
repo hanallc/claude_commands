@@ -860,7 +860,7 @@ if (location.search === '?view=saved' && location.hash === '#saved-row' &&
                                                prepare + f"\n    _ = sys.stdout.buffer.write(page() + ({expression}))")
         self.replace_script(renderer, contents)
 
-    def test_server_and_accounts_child_block_outside_writes_and_symbolic_links(self) -> None:
+    def test_server_and_accounts_child_block_outside_writes_except_read_log_appends(self) -> None:
         _ = self.configure_accounts_child()
         base = self.legacy_console_base()
         outside = self.candidate.parent / "outside"
@@ -898,9 +898,9 @@ class _PersistentModelScans:
             self.replace_script(script, contents.replace(
                 marker, '        if self.path == "/fixture/first.html":\n'
                 + '            from scripts.production.test_console_fixtures import barrier_probes\n'
-                + '            _ = barrier_probes()\n' + marker, 1))
+                + '            _ = barrier_probes("server")\n' + marker, 1))
             self.append_to_accounts_page(tree, "from scripts.production.test_console_fixtures import barrier_probes",
-                                         "barrier_probes()")
+                                         'barrier_probes("Accounts child")')
         self.commit_console_base(base)
 
         def visit(browser: Browser, _path: str, _viewport: Viewport, _limit: float,
@@ -920,7 +920,10 @@ class _PersistentModelScans:
             outside_link = outside / f"{label}-outside-link"
             outside_link.symlink_to(target)
             (folder / "inside-link").symlink_to(outside / "open.txt")
-            with patch.dict(os.environ, {"CONSOLE_TEST_OUTSIDE_LINK": str(outside_link)}):
+            read_log = outside / f"{label}-reads"
+            _ = read_log.write_text("first existing record\nsecond existing record\n")
+            (folder / "read-log-link").symlink_to(read_log)
+            with patch.dict(os.environ, {"CONSOLE_TEST_OUTSIDE_LINK": str(outside_link), "CONF_READ_LOG": str(read_log)}):
                 return start(stack, tree, label, folder, settings, chrome)
 
         with (patch.dict(os.environ, {"CONSOLE_TEST_OUTSIDE": str(outside)}),
@@ -931,11 +934,20 @@ class _PersistentModelScans:
             self.assertIn(f"{label} console First: ok", output.getvalue(), refusal)
             self.assertIn(f"{label} console Second: ok", output.getvalue(), refusal)
             self.assertTrue((outside / f"{label}-outside-link").is_symlink())
+            read_log = outside / f"{label}-reads"
+            records = read_log.read_text().splitlines()
+            self.assertEqual(records[:2], ["first existing record", "second existing record"])
             for process in ("server", "Accounts child"):
+                self.assertEqual(records.count(f"{process} fixture read"), 1)
                 inside_link = (outside / f"{label}-outside-link").readlink().with_name("inside-link")
                 for operation, name in (("os.remove", str(outside / f"{label}-outside-link")), ("open", str(inside_link))):
                     self.assertIn(f"{label} console filesystem barrier. {process} {operation}: {name!r}", refusal)
                 self.assertIn(f"{label} console filesystem barrier. {process} open: b'inside-link' (dir_fd=", refusal)
+                for operation in ("open", "os.truncate", "os.remove", "os.rename", "os.link"):
+                    self.assertIn(f"{label} console filesystem barrier. {process} {operation}: {str(read_log)!r}", refusal)
+                read_log_link = inside_link.with_name("read-log-link")
+                self.assertIn(f"{label} console filesystem barrier. {process} open: {str(read_log_link)!r}", refusal)
+                self.assertIn(f"{label} console filesystem barrier. {process} open: {read_log.name!r} (dir_fd=", refusal)
                 for operation, name in (("open", "write.txt"), ("os.rmdir", "list"), ("os.mkdir", "write-dir"),
                                         ("os.chmod", "open.txt"), ("os.utime", "open.txt"), ("os.rename", "open.txt"),
                                         ("os.chown", "open.txt"), ("os.setxattr", "open.txt"),

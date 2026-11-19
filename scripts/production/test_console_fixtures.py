@@ -68,7 +68,7 @@ class FixtureModelCache(Protocol):
     def save(self) -> None: ...
 
 
-def barrier_probes() -> bytes:
+def barrier_probes(process: str) -> bytes:
     from scripts.accounts import accounts, role_map
 
     outside = Path(os.environ["CONSOLE_TEST_OUTSIDE"])
@@ -90,6 +90,16 @@ def barrier_probes() -> bytes:
     inside_link = workspace / "inside-link"
     directory = os.open(outside, os.O_RDONLY)
     workspace_fd = os.open(workspace, os.O_RDONLY)
+    read_log = Path(os.environ["CONF_READ_LOG"])
+    append = os.O_WRONLY | os.O_APPEND
+    if process == "server":
+        read_log_fd = os.open(read_log, append | os.O_CREAT)
+    else:
+        read_log_fd = os.open(os.fsencode(read_log.name), append, dir_fd=directory)
+    try:
+        _ = os.write(read_log_fd, f"{process} fixture read\n".encode())
+    finally:
+        os.close(read_log_fd)
     target = outside / "open.txt"
     databases = outside / "outside.db"
     readonly = databases.as_uri() + "?mode=ro"
@@ -124,6 +134,15 @@ def barrier_probes() -> bytes:
         lambda: outside_link.unlink(),
         lambda: inside_link.write_text("outside write"),
         lambda: os.open(b"inside-link", os.O_WRONLY | os.O_TRUNC, dir_fd=workspace_fd),
+        lambda: os.open(read_log, append | os.O_TRUNC),
+        lambda: os.open(read_log.name, append | os.O_TRUNC, dir_fd=directory),
+        lambda: os.open(read_log, os.O_WRONLY),
+        lambda: os.open(read_log, os.O_RDWR | os.O_APPEND),
+        lambda: os.truncate(read_log, 0),
+        lambda: read_log.unlink(),
+        lambda: read_log.rename(workspace / "moved-read-log"),
+        lambda: os.open(workspace / "read-log-link", append),
+        lambda: os.link(read_log, workspace / "hard-read-log"),
     )
     for operation in operations:
         try:

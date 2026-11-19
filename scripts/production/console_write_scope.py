@@ -27,6 +27,8 @@ def install_barrier(workspace: Path, process: str) -> None:
     """Deny writes by this Python process outside its workspace."""
     workspace = workspace.resolve()
     log = workspace / BARRIER_LOG
+    read_log_setting = os.environ.get("CONF_READ_LOG", "")
+    read_log = Path(read_log_setting).resolve() if read_log_setting else None
     record = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     open_file = os.open
     opening = local()
@@ -38,7 +40,7 @@ def install_barrier(workspace: Path, process: str) -> None:
         _ = os.write(record, (message + "\n").encode(errors="backslashreplace"))
         raise PermissionError(f"Console filesystem barrier: {message}")
 
-    def check(event: str, name: object, directory: object = -1) -> None:
+    def check(event: str, name: object, directory: object = -1, *, flags: int = 0) -> None:
         try:
             if isinstance(name, int):
                 mode = os.fstat(name).st_mode
@@ -52,10 +54,17 @@ def install_barrier(workspace: Path, process: str) -> None:
             else:
                 raise ValueError("The operation has no path.")
             target = path.resolve()
-            if event == "open" and target == Path("/dev/null"):
-                return
             location = target if path.name in ("", ".", "..") else path.parent.resolve() / path.name
-            if all(candidate.is_relative_to(workspace) and candidate != log for candidate in (location, target)):
+            if read_log in (location, target):
+                if (event == "open" and location == target == read_log and target != log
+                        and flags & os.O_ACCMODE == os.O_WRONLY
+                        and flags & os.O_APPEND and not flags & os.O_TRUNC):
+                    inode = target.lstat()
+                    if stat.S_ISREG(inode.st_mode) and inode.st_nlink == 1:
+                        return
+            elif event == "open" and target == Path("/dev/null"):
+                return
+            elif all(candidate.is_relative_to(workspace) and candidate != log for candidate in (location, target)):
                 return
         except (OSError, ValueError, RuntimeError):
             pass
@@ -66,7 +75,7 @@ def install_barrier(workspace: Path, process: str) -> None:
         if dir_fd is None or not flags & WRITE_FLAGS:
             return open_file(path, flags, mode, dir_fd=dir_fd)
         # The CPython open event omits the directory descriptor.
-        check("open", os.fspath(path), dir_fd)
+        check("open", os.fspath(path), dir_fd, flags=flags)
         opening.checked = True
         try:
             return open_file(path, flags, mode, dir_fd=dir_fd)
@@ -78,7 +87,7 @@ def install_barrier(workspace: Path, process: str) -> None:
             case "open":
                 flags = arguments[2]
                 if isinstance(flags, int) and flags & WRITE_FLAGS and not getattr(opening, "checked", False):
-                    check(event, arguments[0])
+                    check(event, arguments[0], flags=flags)
             case "os.rename" | "os.link":
                 check(event, arguments[0], arguments[2])
                 check(event, arguments[1], arguments[3])
