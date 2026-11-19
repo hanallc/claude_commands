@@ -634,6 +634,7 @@ class Message:
     stamp: SenderStamp = UnavailableSender()
     claude_attempt: ClaudeDeliveryAttempt | NoClaudeDeliveryAttempt = field(
         default=NoClaudeDeliveryAttempt(), compare=False, repr=False)
+    sent_header: str = field(default_factory=lambda: sent_line(now()), compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.shown_sender:
@@ -2580,7 +2581,8 @@ def recover_socket_queues(registry: sessions.RegistryRead, at: datetime) -> tupl
             message = Message(target.address, entry["from"], entry["summary"],
                               f"Stuck message from {entry['time']}:\n" + entry["text"], identity,
                               entry.get("shown_sender", entry["from"]),
-                              stamp=read_sender_stamp(entry.get("sender_native_id", "unavailable")))
+                              stamp=read_sender_stamp(entry.get("sender_native_id", "unavailable")),
+                              sent_header=queued_sent_line(entry["time"]))
             plan = _claude_delivery_plan(message, mailbox, registry, records)
             if not isinstance(plan, RelayAttempt):
                 reason = plan.failure.reason if isinstance(plan, ClaudeRoutingFailed) else "no live receiver"
@@ -2761,7 +2763,8 @@ def pending(to: str | CodexQueueOwner | None, *, emit: bool = False,
         entries = sorted([*unkeyed_or_legacy, *newest.values()], key=lambda entry: entry["time"])
         text = "\n\n".join(stamped_text(
             f"Queued message {index} of {len(entries)}, from {entry['from']} at {entry['time']}:"
-            + shown_sender_line(entry["from"], entry.get("shown_sender", entry["from"])),
+            + shown_sender_line(entry["from"], entry.get("shown_sender", entry["from"]))
+            + queued_sent_line(entry["time"]),
             "\n" + entry["text"].rstrip(), read_sender_stamp(entry.get("sender_native_id", "unavailable")))
             for index, entry in enumerate(entries, 1))
         if emit and text:
@@ -4820,6 +4823,24 @@ def shown_sender_line(sender: str, display: str) -> str:
     return f"\nShown sender: {display}" if display != sender else ""
 
 
+def sent_line(at: datetime) -> str:
+    try:
+        zone = user_zone()
+    except (OSError, ValueError) as error:
+        print(f"send.py: Sent line omitted: {one_line(str(error))}", file=sys.stderr)
+        return ""
+    local = at.astimezone(zone)
+    return f"\nSent: {local:%H:%M} {local.tzname() or zone.key}"
+
+
+def queued_sent_line(stored_time: str) -> str:
+    try:
+        at = datetime.fromisoformat(stored_time)
+        return sent_line(at) if at.utcoffset() is not None else ""
+    except (OverflowError, ValueError):
+        return ""
+
+
 MESSAGE_LINE_BREAK = re.compile(r"\r\n|[\n\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
 
 
@@ -4839,7 +4860,8 @@ def agent_text(message: Message, *, via_relay: bool = False) -> str:
     """Format caller text and add the sending machine's display and native stamp."""
     first, separator, rest = quote_sender_lines(message.text).partition("\n")
     sender = relay_session_name(message.sender) if via_relay else message.sender
-    return stamped_text(first + shown_sender_line(sender, message.shown_sender), separator + rest, message.stamp)
+    return stamped_text(first + shown_sender_line(sender, message.shown_sender) + message.sent_header,
+                        separator + rest, message.stamp)
 
 
 def delivered_text(message: Message, entry_id: str) -> str:
@@ -4848,7 +4870,8 @@ def delivered_text(message: Message, entry_id: str) -> str:
     shown = shown_sender_line(message.sender, message.shown_sender)
     if shown:
         shown = "\n" + MESSAGE_LINE_BREAK.sub(" ", shown.removeprefix("\n"))
-    return stamped_text(f"{name}: {summary}{shown}\nTag: {entry_id[:8]}", "\n\n" + message.text, message.stamp)
+    return stamped_text(f"{name}: {summary}{shown}{message.sent_header}\nTag: {entry_id[:8]}",
+                        "\n\n" + message.text, message.stamp)
 
 
 def send(options: Options) -> Result:
@@ -4860,7 +4883,7 @@ def send(options: Options) -> Result:
     if not isinstance(options.recipient_identity, LogicalRecipientIdentity):
         return _send(options, membership=membership)
     identity = Message(options.recipient_identity.name, options.sender or default_sender(),
-                       options.summary or "", "", options.key)
+                       options.summary or "", "", options.key, sent_header="")
     with delivery_turn(identity) as acquired:
         if not acquired:
             return Result("retry", f"key {options.key!r} has a delivery in progress; retry")
@@ -5093,7 +5116,9 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     key = user_emergency_key(sender, summary) if emergency and options.key is None else options.key
     display = (options.shown_sender.text if isinstance(options.shown_sender, ShownSender)
                else sender_shown_name(sender, stamp, observed) if options.to != USER else sender)
-    message = Message(destination, sender, summary, text, key, display, options.human, stamp)
+    started = now()
+    message = Message(destination, sender, summary, text, key, display, options.human, stamp,
+                      sent_header=sent_line(started))
     claude_route = isinstance(route, (ClaudeRecipient, QueuedStaffRecipient))
     if claude_route and fixed:
         assert isinstance(mailbox, StaffClaudeRecipient)
@@ -5127,7 +5152,6 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     stable = (StableRecipient(options.recipient_identity.name)
               if isinstance(options.recipient_identity, LogicalRecipientIdentity) else attempt_recipient)
     legacy_aliases = () if typed_recipient else (destination, stable.value)
-    started = now()
     order = new_queue_order() if options.to != USER else LEGACY_QUEUE_ORDER
     # An emergency push repeats on the phone until the user acknowledges it, it is retired, or it
     # expires: with no --repeat-minutes, a send with its key inside that lifetime is skipped.
