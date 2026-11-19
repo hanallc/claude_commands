@@ -1024,7 +1024,9 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,prepareMenu=
    }
    return;
   }
-  const list=items(),index=list.indexOf(document.activeElement);
+  const list=items();
+ if(!list.length) return;
+ const index=list.indexOf(document.activeElement);
   const next={ArrowDown:index+1,ArrowUp:index-1+list.length,Home:0,End:list.length-1}[event.key];
   if(next===undefined) return;
   event.preventDefault();list[next%list.length].focus();
