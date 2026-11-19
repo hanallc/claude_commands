@@ -2341,10 +2341,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     walk: list[RunRow] = []
     for hold in captured.runs:
         running = by_owner.get(hold.memory.owner)
-        step, reservation = running if running is not None else (None, None)
-        ci_label = recorded_ci_label(step, ci_runners) if step is not None else ""
-        job = local_job(step) if step is not None and not ci_label else NotGateStep()
-        if step is None:
+        if running is None:
+            step = None
+            ci_label = ""
+            job = NotGateStep()
             slot = held_slots.get(hold.memory.owner)
             if slot is None or isinstance(slot.identity, admission_records.HoldPredatesStepFacts):
                 # Older holds contribute to the RAM totals without a separate row.
@@ -2362,7 +2362,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             display_name = title_step
             parts: list[staff_names.NamePart] = []
         else:
-            assert reservation is not None
+            step, reservation = running
+            ci_label = recorded_ci_label(step, ci_runners)
+            job = NotGateStep() if ci_label else local_job(step)
             reservation_caller = reservation.get("queue_waiter", {}).get("session_name", reservation.get("session_name", ""))
             owner = step_page_owner(step, labels, ci_runners, members, machine, ci_label=ci_label,
                                     reservation_caller=reservation_caller)

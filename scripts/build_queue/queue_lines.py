@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from types import MappingProxyType
 
+from scripts.build_queue.snapshot_codec import public_queue_text
+
 if TYPE_CHECKING:
     from scripts.build_queue.admission_records import RunningStep, WaitingStep
     from scripts.lib.build_steps import StepNames
@@ -26,12 +28,16 @@ def field(text: str) -> str:
 
 
 def step_owner_name(step: WaitingStep | RunningStep, labels: Mapping[str, UnitLabels]) -> str:
-    """Use the recorded unit before the repository name."""
+    """Use a recorded unit, a staff unit, or the repository name."""
     identity = labels.get(step.session_id)
-    unit = step.unit or (identity.unit if identity is not None else "")
-    if identity is not None:
-        unit = unit.removeprefix(identity.showrunner + "-")
-    return unit if unit not in ("", "—", "owner not recorded") else step.project
+    showrunner = public_queue_text(identity.showrunner) if identity is not None else ""
+    for candidate in (step.unit, identity.unit if identity is not None else ""):
+        unit = public_queue_text(candidate)
+        if showrunner:
+            unit = public_queue_text(unit.removeprefix(showrunner + "-"))
+        if unit:
+            return unit
+    return public_queue_text(step.project)
 
 
 def step_text(step: WaitingStep | RunningStep, names: StepNames, *,

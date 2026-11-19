@@ -5482,6 +5482,8 @@ class ServiceTests(unittest.TestCase):
                 ("explicit unit", "saved caller", "/private/folder", "explicit unit"),
                 ("—", "saved caller", "/private/folder", "saved caller"),
                 ("$UNIT", "owner not recorded", "/private/folder", "folder"),
+                ("", "unregistered session", "/private/widget", "widget"),
+                ("unregistered session", "saved caller", "/private/widget", "saved caller"),
                 ("  ", "556caf6e-713d-47c0-a8fc-5dd5e8c26ce4", "/private/$FOLDER", "unregistered session"),
             ):
                 with self.subTest(unit=unit, caller=caller, folder=folder):

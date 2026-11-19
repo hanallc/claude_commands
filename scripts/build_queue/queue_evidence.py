@@ -6,6 +6,7 @@ from dataclasses import replace
 
 from scripts.build_queue.queue_lines import age
 from scripts.build_queue.scope_activity import NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob
+from scripts.build_queue.snapshot_codec import public_queue_text
 from scripts.build_queue import admission_records
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
@@ -15,7 +16,7 @@ def step_labels(step: admission_records.WaitingStep | admission_records.RunningS
                 labels: Mapping[str, unit_labels.UnitLabels]) -> unit_labels.UnitLabels:
     identity = labels.get(step.session_id)
     unit = gate.queue_unit(step.unit, step.session_id, labels)
-    name = identity.session.strip() if identity is not None else ""
+    name = public_queue_text(identity.session) if identity is not None else ""
     if not name:
         name = admission_records.queue_caller(step.session_id, "", step.session_name, "", step.folder).name
     if identity is not None:

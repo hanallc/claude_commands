@@ -164,6 +164,21 @@ class ClientTests(unittest.TestCase):
                 self.assertNotIn(request.episode, fixture.server.placement_requests)
                 fixture.release(occupied)
 
+    def test_wait_subject_uses_the_usable_repository_and_step_fields(self) -> None:
+        for repository, step, subject in (
+            ("—", "nextest", "nextest"),
+            ("$REPO", "nextest", "nextest"),
+            ("repository", "unregistered session", "repository"),
+            ("repository", "—", "repository"),
+            ("unregistered session", "$STEP", "build"),
+            ("repository", "step", "repository step"),
+        ):
+            with self.subTest(repository=repository, step=step):
+                snapshot = replace(WAIT.snapshot, repo=repository, step=step)
+                with redirect_stderr(io.StringIO()) as output:
+                    client.WaitOutput()(replace(WAIT, snapshot=snapshot))
+                self.assertIn(f"{subject} needs 8.0 GiB", output.getvalue().split("; "))
+
     def test_older_wait_lines_normalize_the_head_name_and_label(self) -> None:
         blocker: records.Waiter = {"pid": 7, "start_time": "7", "need": 2 * GIB, "since": 1,
                                   "session_name": "—", "step": "  ", "unit": "—"}

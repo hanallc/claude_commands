@@ -939,6 +939,7 @@ The service, snapshot decoder, and Builds page use `resolve_queue_caller`.
 The resolver uses the first usable name from the record, the reservation, and the staff snapshot.
 It returns `unregistered session` when no candidate is usable.
 A later read can replace this fallback with a usable name.
+The shared name check rejects blank text, dashes, raw IDs, text with `$`, and the fallback label.
 A staff unit uses its own name for priority. A worker uses its parent unit.
 A showrunner keeps its caller name and has an empty unit.
 A valid wait resets checker-failure time. Checker failures after a wait retry until `BUILDLOG_MEM_CHECK_RETRY_S`.
@@ -2031,6 +2032,7 @@ If the reservation has no usable name, the decoder looks up the fixed staff ID i
 If the decoder finds no usable name, it supplies the label `unregistered session`.
 The feed uses separate rules for caller names, step labels, and CI labels.
 Wait lines prefer the unit and normalize the names in older replies.
+The wait subject joins the usable repository and step names. It shows `build` when both names are unusable.
 The Builds page uses the names and hover titles from the feed.
 A continuation within the slot bypasses order, spacing, and pressure.
 A larger continuation holds the slot and requests only its extra memory before new runs.

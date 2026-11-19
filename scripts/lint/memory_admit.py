@@ -1681,7 +1681,7 @@ class QueueIdentityReader:
 
     def identity(self, pid: int, row: dict[str, object]) -> WaiterIdentity:
         session = str(row.get("session_id", ""))
-        name = str(row.get("session_name", ""))
+        name = codec.public_queue_text(row.get("session_name"))
         folder = str(row.get("folder") or row.get("worktree") or "")
         step = str(row.get("step", ""))
         owner = self.processes.get(pid)
@@ -1699,7 +1699,7 @@ class QueueIdentityReader:
                 self.environments[current] = environment_values(self.proc / str(current) / "environ", SESSION_KEYS)
             env = self.environments[current]
             session = env.get("CODEX_THREAD_ID") or env.get("CLAUDE_CODE_SESSION_ID", "")
-            name = name or env.get("CLAUDE_SESSION_NAME", "")
+            name = name or codec.public_queue_text(env.get("CLAUDE_SESSION_NAME"))
             current = self.processes[current].parent
         if not step:
             try:
@@ -1708,7 +1708,8 @@ class QueueIdentityReader:
                 step = verb
             except OSError:
                 step = "build"
-        return {"session_id": session, "session_name": name or self.names.get(session, ""), "step": step, "folder": folder}
+        return {"session_id": session, "session_name": name or codec.public_queue_text(self.names.get(session)),
+                "step": step, "folder": folder}
 
 
 def queue_order_reason(decision: AdmissionDecision, identities: QueueIdentities) -> BehindHead | ReadyForAdmission:

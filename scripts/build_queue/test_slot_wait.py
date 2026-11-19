@@ -18,6 +18,11 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, Exchang
 from scripts.lib.build_slots_test_support import SlotTestConfiguration, private_slot_config
 
 
+class QueueRowNameTests(unittest.TestCase):
+    def test_an_unknown_repository_uses_the_folder_name(self) -> None:
+        self.assertEqual(slot_wait.QueueRowName.repository("unregistered session", "/private/widget"), "widget build")
+
+
 class RepositorySlotWaitTests(unittest.TestCase):
     def pool(self, maximum: int = 1) -> tuple[AdmissionFixture, SlotTestConfiguration]:
         fixture = self.enterContext(AdmissionFixture())

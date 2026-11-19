@@ -909,7 +909,7 @@ def wait_reasons(result: records.AdmissionWaitSnapshot) -> tuple[str, ...]:
 def blocking_waiter_text(place: str, name: str, step: str, unit: str, need_gib: float, *,
                          fallback_name: str = "") -> str:
     """Name the step that holds the row and give its position."""
-    name = snapshot_codec.select_queue_name(snapshot_codec.public_caller_name(name), fallback_name)
+    name = snapshot_codec.select_queue_name(name, fallback_name)
     step = snapshot_codec.public_queue_text(step)
     unit = snapshot_codec.public_queue_text(unit)
     label = " · ".join(part for part in (name, step) if part)
@@ -1096,7 +1096,8 @@ class WaitOutput:
                   if first else f"still waiting for memory ({int(CLOCK.monotonic() - self.started) // 60} min)")
         place = ("this build is the queue head" if reply.position == 1 else
                  f"place {reply.position} in line" if reply.position > 1 else "")
-        subject = f"{snapshot.repo} {snapshot.step}".strip()
+        subject = " ".join(name for value in (snapshot.repo, snapshot.step)
+                           if (name := snapshot_codec.public_queue_text(value))) or "build"
         reason = ("reason: " + reasons[0] if behind else records.head_wait_text(snapshot.head_reason, user_zone())
             if isinstance(snapshot.head_reason, records.HeadAdmissionStatus) else
             records.pressure_text(snapshot.decision.pressure)

@@ -4339,6 +4339,24 @@ class QueueApiTests(MemoryQueueFixture):
                 self.waiter(500, NOW.timestamp() - 60, "/tmp/third", "third"))
 
 
+    def test_queue_identity_skips_unusable_names_before_the_environment_and_registry(self) -> None:
+        from scripts.message import session_records
+
+        for session, saved, exported, expected in (
+            ("", "unregistered session", "environment caller", "environment caller"),
+            ("fixture", "unregistered session", "", "registry caller"),
+            ("", "$CALLER", "—", "registry caller"),
+        ):
+            with self.subTest(session=session, saved=saved), \
+                    patch.object(session_records, "read_registry", return_value=session_records.RegistryRead((), ())), \
+                    patch.object(gate, "environment_values", return_value={
+                        "CODEX_THREAD_ID": "fixture", "CLAUDE_SESSION_NAME": exported}):
+                reader = gate.QueueIdentityReader({123: gate.ProcessIdentity(1, "start")}, self.root / "proc")
+                reader.names["fixture"] = "registry caller"
+                identity = reader.identity(123, {"start_time": "start", "session_id": session, "session_name": saved,
+                                                "step": "nextest", "folder": "/private/widget"})
+                self.assertEqual((identity["session_id"], identity["session_name"]), ("fixture", expected))
+
     def test_waiter_identity_reads_the_unit_override_without_changing_the_session(self) -> None:
         with patch.dict(os.environ, {admission_records.BUILDLOG_UNIT: "queue-unit", "CODEX_THREAD_ID": "showrunner"}):
             identity = admission_records.waiter_identity("merge-gate", "tree")

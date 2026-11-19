@@ -18,7 +18,7 @@ from pathlib import Path
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import placement
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
-from scripts.build_queue.snapshot_codec import UNKNOWN_CALLER, public_caller_name, public_queue_text, select_queue_name
+from scripts.build_queue.snapshot_codec import public_queue_text, select_queue_name
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
@@ -1601,9 +1601,8 @@ def queue_caller(session_id: str, staff_id: str, exported_name: str, session_fol
         session_id = session_id or member.current_session
         staff_name = member.name
     folder = public_queue_text(Path(worktree).name) if not reference else ""
-    name = (public_caller_name(staff_name) or public_caller_name(exported_name)
-            or public_caller_name(Path(session_folder).name)
-            or (f"terminal · {folder}" if folder else UNKNOWN_CALLER))
+    name = select_queue_name(staff_name, exported_name, Path(session_folder).name,
+                             f"terminal · {folder}" if folder else "")
     return QueueCaller(session_id, name, unit)
 
 

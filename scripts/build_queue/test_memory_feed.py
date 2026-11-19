@@ -773,6 +773,35 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(memory_feed.cargo_job((*front, *words)), job)
                 self.assertEqual(memory_feed.cargo_job(("/store/bin/cargo", *words)), job)
 
+    def test_decoded_ci_rows_use_the_configured_label_when_the_recorded_label_is_unknown(self) -> None:
+        _ = (self.root / "build_admission.conf").write_text("ci_label=Fixture CI · {runner} · {job}\n")
+        base = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
+        inputs = base.explanation.decided_from
+        runner = "hana-linux-2"
+        running = replace(inputs.running[0], ci_runner=runner, session_name="unregistered session")
+        waiting = replace(base.view.waiting[0], ci_runner=runner, session_name="unregistered session")
+        reading = gate.queue_read_from(replace(inputs, running=(running,)), admission_policy_fixture())
+        reading = replace(reading, view=replace(reading.view, waiting=(waiting,)))
+        reply = wire.parse_reply(wire.encode_reply(wire.ViewReply(reading)))
+        assert isinstance(reply, wire.ViewReply)
+        with mock.patch.object(admission_client, "view", return_value=reply.reading):
+            page = memory_feed.reading()
+        run, = page["walk"]
+        wait, = page["waiters"]
+        for row, pid in ((run, 50), (wait, 200)):
+            with self.subTest(pid=pid):
+                self.assertEqual((row["pid"], row["name"]), (pid, "CI nextest"))
+                self.assertEqual(row.get("ci_label"), "Fixture CI · hana-linux-2")
+                self.assertEqual(row["title"], {"unit": "", "step": "Fixture CI · hana-linux-2"})
+
+    def test_mac_work_uses_the_caller_after_an_unknown_owner(self) -> None:
+        build = queue_view.MacBuild(90082, "/private/hana", 0, "cargo nextest run", "hana")
+        identity = unit_labels.UnitLabels("mac caller", "unregistered session")
+        row = memory_feed.mac_work_row(build, queue_view.MacBuildReading(1, (build,)), identity,
+                                      names=read_step_names(), slot_roots={}, slot_machine="private-mac-host")
+        self.assertEqual((row.get("caller"), row.get("owner_text")), ("mac caller", "mac caller"))
+        self.assertEqual(row["name"], "hana nextest")
+
     def test_ci_runner_records_name_the_owner_in_running_and_waiting(self) -> None:
         base = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
         memory = admission_records.UnownedSliceMemory(admission_records.GIB // 8,
@@ -2927,6 +2956,21 @@ process.stdout.write(JSON.stringify({
                 page = self.cloud_owner_page(step, owner, identity=wire.Identity("old-cloud", "", step, ""))
                 self.assertEqual([row["name"] for row in page["walk"] if row.get("kind") == "cloud"], [expected])
                 self.assertEqual([row["name"] for row in page["waiters"] if row.get("kind") == "cloud"], [expected])
+
+    def test_cloud_gate_uses_the_configured_template_after_an_unknown_caller(self) -> None:
+        with isolated_staff_file(self.root / "staff.json", {}):
+            runner = fixture_member("showrunner", name="sdlc")
+            unit = fixture_member("unit", name="panes", parent=runner.id)
+            director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
+                                               unit_labels.DirectsUnit("panes"))
+            config = self.root / "build_steps.conf"
+            _ = config.write_text(config.read_text().replace("owned.targeted-test={unit} targeted",
+                                                             "owned.targeted-test=targeted for {unit}"))
+            identity = wire.Identity(unit.current_session, "unregistered session", "targeted-test", "")
+            page = self.cloud_owner_page(identity.step, director, identity=identity)
+            for table, pid in ((page["walk"], 700001), (page["waiters"], 700002)):
+                row, = [row for row in table if row.get("kind") == "cloud"]
+                self.assertEqual((row["pid"], row["name"], row.get("caller")), (pid, "targeted for panes", "panes"))
 
     def test_unusable_cloud_templates_keep_the_owner_name(self) -> None:
         director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
