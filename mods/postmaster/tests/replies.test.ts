@@ -10,7 +10,8 @@ const socket = "uds:/test-sockets/recipient.sock";
 const consumed = { kind: "consumed", reason: "postmaster reply" };
 
 function entry(sender = "Original sender", destination = "original-session"): OutboxEntry {
-  return { id: "00000000000000000000000000000001", session_id: "recipient", socket,
+  return { id: "00000000000000000000000000000001", session_id: "recipient",
+    recipient_pid: 321, recipient_start: "recipient-process", socket,
     sender, reply_to_session_id: destination, text: "question", sha256: "a".repeat(64), deadline_ms: 100000 };
 }
 
