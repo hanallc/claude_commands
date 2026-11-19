@@ -42,7 +42,6 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum, auto
-import errno
 import fcntl
 import hashlib
 import inspect
@@ -751,13 +750,10 @@ class GateRecovery:
                 try:
                     if descriptor >= 0:
                         status = os.fstat(descriptor)
-                        if (status.st_dev, status.st_ino) == (token.device, token.inode):
-                            try:
-                                _ = os.write(descriptor, bytes.fromhex(token.value))
-                            except OSError as error:
-                                if error.errno != errno.ENOSPC:
-                                    raise
-                                # The jobserver already returned the token.
+                        # The jobserver device reclaims tokens from a dead owner.
+                        if (stat.S_ISFIFO(status.st_mode)
+                                and (status.st_dev, status.st_ino) == (token.device, token.inode)):
+                            _ = os.write(descriptor, bytes.fromhex(token.value))
                     _ = self.tokens.pop()
                     self.save()
                 finally:

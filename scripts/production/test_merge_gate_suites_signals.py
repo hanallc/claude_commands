@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import unittest
 from contextlib import ExitStack, redirect_stdout
-import errno
 import io
 import json
 import os
@@ -151,29 +150,25 @@ sys.stdin.read(1)
                     self.assertFalse(recovery.path.exists())
                 self.assertEqual(list(directory.glob("*.json")), [])
 
-    def test_recovery_clears_the_record_when_the_token_pool_is_full(self) -> None:
-        self.supply_jobserver(b"Q")
+    def test_recovery_drops_a_non_fifo_token_without_writing(self) -> None:
+        pool = self.root / "token-pool"
+        self.write(pool, "original pool")
         recovery = merge_gate.GateRecovery(self.state / "dead-gate.json", str(self.checkout),
                                            0, "ended-owner")
-        with mock.patch.dict(os.environ, self.environment, clear=True), \
+        environment = {**self.environment, "BUILDLOG_JOBSERVER_FIFO": str(pool)}
+        with mock.patch.dict(os.environ, environment, clear=True), \
                 tempfile.TemporaryDirectory(prefix="merge-gate-", dir="/dev/shm") as folder:
             path = Path(folder)
             self.write(path / "module-output", "unfinished")
             recovery.folders.append(folder)
-            descriptor = os.open(self.environment["BUILDLOG_JOBSERVER_FIFO"], os.O_RDONLY | os.O_NONBLOCK)
-            try:
-                recovery.tokens.append(recovery.token(descriptor, b"Q"))
-            finally:
-                os.close(descriptor)
+            with pool.open("rb") as stream:
+                recovery.tokens.append(recovery.token(stream.fileno(), b"Q"))
             recovery.save()
-            with mock.patch.object(os, "write",
-                                   side_effect=OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))) as write:
-                recovery.recover()
-            self.assertEqual(write.call_count, 1)
+            recovery.recover()
             self.assertEqual(recovery.tokens, [])
             self.assertFalse(recovery.path.exists())
             self.assertFalse(path.exists())
-            self.assertEqual(self.jobserver_tokens(), b"Q")
+            self.assertEqual(pool.read_text(), "original pool")
 
     def test_module_timeout_removes_fixture_and_nested_gate_folders(self) -> None:
         parent = self.root / "nested-temporary"
