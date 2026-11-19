@@ -1204,7 +1204,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
                     "ENV",
                 }
                 # Fixture calls must not update the outer run or use its folders.
-                and not name.startswith(("BASH_FUNC_", "UNIT_"))
+                and not name.startswith(("BASH_FUNC_", "UNIT_", "GIT_"))
             },
             "HOME": str(self.home),
             "PATH": stub_build_tool_path(self.bin_directory),

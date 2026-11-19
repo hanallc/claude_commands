@@ -559,11 +559,12 @@ Exit 1 means the trees differ; run the five steps:
    Without a package, lint checks the workspace with mend, rustfmt, and Clippy.
    Clippy uses `--all-targets --all-features` and the workspace lint config.
    Nothing rewrites the tree: mend runs in report mode and rustfmt with `--check`.
-   `copies.standing` holds the checkout's `.claude-busy` lock through lint and
-   cleanup. Each checkout keeps its own real `target/`; a second busy checkout
-   uses its own cache. A missing or swept cache builds cold. The configured
-   gates root and pool limit come from `config/copies.conf` (see
-   `docs/as-built/gate-checkouts.md`). No `CARGO_TARGET_DIR` is set.
+   `copies.standing` holds a repository slot through lint and cleanup.
+   The machine shares the repository pool across owners.
+   Each `<repository>-slot<N>` checkout keeps its own `target/`.
+   A missing or swept cache builds cold. Lint leaves `CARGO_TARGET_DIR` unset.
+   `config/build_folders.conf` sets the slot root and the repository or machine default limit.
+   See [Standing gate checkouts](as-built/gate-checkouts.md).
    It records per-file diagnostics once per tool; disabled or incomplete checks
    grant no successful coverage. Exit 0 means clean, every tool recorded passing;
    continue the sync. Exit 1 means diagnostics recorded or a tool did not pass;
