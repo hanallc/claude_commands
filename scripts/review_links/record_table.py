@@ -422,7 +422,7 @@ function readPlace(params,followingItemLink=false){
  return saved?.top;
 }
 function followItemLink({inheritFilters=false,unappliedOnly=false,beforeJump}={}){
- if(unappliedOnly && (location.hash===placeHash || history.state?.recordTable)) return false;
+ if(unappliedOnly && location.hash===placeHash) return false;
  const params=placeParams();
  const jumpKey=params.get('jump'),key=jumpKey || params.get('item');
  if(!key) return false;
@@ -686,7 +686,7 @@ function writePlace(push=false,top){
 }
 function restorePlace(event){
  // A changed fragment sends hashchange after popstate.
- if(event.type==='popstate' && location.hash!==placeHash) return;
+ if(event?.type==='popstate' && location.hash!==placeHash) return;
  const top=place();
  apply(false,{top});
  if(Number.isFinite(top)) scrollTo({top,behavior:'instant'});
@@ -815,6 +815,7 @@ return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,saveDepar
  actionNotice(item){return actionNotices.get(item.dataset.key)?.message ?? '';},
  applyAction(){apply(false,{animate:true});},
  async rowSettled(item){while(rowMotion.has(item)) await rowMotion.get(item).finished;},
+ get hasActiveRowAnimations(){return rowMotion.size>0;},
  settled(){return Promise.all([...rowMotion.values()].map(motion=>motion.finished));},
  replace(draw=true){
   const previous=words(),previousQuery=query;
