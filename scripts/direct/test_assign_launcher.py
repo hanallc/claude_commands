@@ -444,7 +444,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
         self.fixture.agent.notice_failures = 1
         failed = self.launch_review()
         self.assertNotEqual(failed.returncode, 0)
-        self.assertEqual((self.phase / "review_status_1").read_text(), "error\n")
+        self.assertEqual((self.phase / "review_status_1").read_bytes(), saved[1])
         self.assertEqual(summary.read_bytes(), saved[0])
         self.assertEqual(self.fixture.agent.submitted, [first, second])
         self.assertEqual(self.fixture.agent.notices, notices)
@@ -493,7 +493,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
         self.assertIn(reason, (self.phase / "review_agent_1.log").read_text())
         self.assertEqual(self.fixture.agent.submitted, [])
-        self.assertEqual((self.phase / "review_status_1").read_text(), "error\n")
+        self.assertFalse((self.phase / "review_status_1").exists())
 
     def test_review_admission_failure_sends_neither_stage(self) -> None:
         launches = self.fixture.fixture.world.launches.copy()
@@ -554,7 +554,7 @@ class PaneReviewLauncherTests(unittest.TestCase):
                                       (case.phase / "impl_agent_1.log").read_text())
                         self.assertNotIn("status", read_object(state_path))
                         self.assertEqual(unit_runs.open_run(staff.runtime_id()), case.fixture.run_dir)
-                        self.assertEqual((case.phase / "impl_status_1").read_text(), "error\n")
+                        self.assertFalse((case.phase / "impl_status_1").exists())
                     else:
                         with patch("scripts.agents.detached_runs.live_runs", return_value=[object()]):
                             case.assert_start_not_delivered(worker.ExitCode.REFUSED,
@@ -743,7 +743,7 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.assertEqual(self.native.agent.submitted, [])
         self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
         self.assertEqual(self.prompt.read_bytes(), prompt)
-        self.assertEqual((self.session_dir / "phases/7/impl_status").read_text(), "error\n")
+        self.assertFalse((self.session_dir / "phases/7/impl_status").exists())
 
     def herdr_claim_launch(self, claim_status: str, role: str = "implement") -> subprocess.CompletedProcess[str]:
         self.commit_project()
@@ -784,13 +784,16 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.assertEqual((self.session_dir / "baseline-at-worker-assign").read_text(), head)
 
     def test_herdr_assignment_refuses_a_failed_phase_claim_before_the_worker_assignment(self) -> None:
+        status = self.session_dir / "phases/3/impl_status"
+        status.parent.mkdir(parents=True)
+        write_text_atomic(status, "done\n")
         result = self.herdr_claim_launch("blocked")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         log = self.session_dir / "phases/3/impl_agent.log"
         self.assertEqual(result.stderr,
                          f"ERROR: phase 3 could not claim its files before its worker opens; see {log}.\n")
         self.assertEqual((self.session_dir / "dispatch_events.txt").read_text().splitlines(), ["claim"])
-        self.assertEqual((self.session_dir / "phases/3/impl_status").read_text(), "error\n")
+        self.assertEqual(status.read_text(), "done\n")
         self.assertIn("launcher: phase 3 could not claim its files; its worker did not open",
                       (self.session_dir / "board.log").read_text())
 
@@ -838,6 +841,32 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.assertTrue(repaired["rounds"][-1]["edits_landed"])
         self.assertEqual(repaired["findings"][0]["state"], "open")
         self.assertEqual(repaired["findings"][0]["fix_attempts"], 1)
+
+    def test_failed_fix_closes_the_remapped_pass_when_an_earlier_slot_shares_its_command(self) -> None:
+        self.start_repair()
+        first = self.native.opened("fix", "fix")
+        second = self.native.opened("fix2", "fix")
+        arguments = ["--role", "fix", "--cwd", str(self.project), "--phase", "7",
+                     "--prompt", str(self.prompt), "--paths", str(self.paths),
+                     "--session-dir", str(self.session_dir), "--fix-cause", "Repair the worker"]
+        _ = progress_history.begin_dispatch(self.session_dir, slot="fix", phase="7", role="fix",
+            worker_name="fix", worker_id=first.row.id, launcher_command=["bash", str(ASSIGN), *arguments],
+            prompt=self.prompt, kind="assign", lens="", fix_cause="Earlier repair")
+        self.native.fixture.world.locations[first.pane]["agent_status"] = "working"
+        phase = self.session_dir / "phases/7"
+        status = phase / "fix_status"
+        write_text_atomic(status, "running\n")
+        original = status.read_bytes(), status.stat().st_ino
+        self.native.agent.during_prompt = fail_worker_after_prompt
+        with patch.dict(os.environ, {"UNIT_RESOLVES_ROUND": "1"}):
+            result = invoke_assignment(arguments, os.environ.copy())
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual([pane for pane, _ in self.native.agent.submitted], [second.pane])
+        self.assertEqual((status.read_bytes(), status.stat().st_ino), original)
+        self.assertEqual((phase / "fix2_status").read_text(), "error\n")
+        self.assertEqual(worker_panes.worker_pass(first.row, self.session_dir)["status"], "active")
+        self.assertEqual(worker_panes.worker_pass(second.row, self.session_dir)["status"], "error")
+        self.assertEqual(self.repair_state()["rounds"][-1]["outcome"], "abandoned")
 
     def test_a_fix_with_round_resolution_disabled_keeps_the_round_in_flight(self) -> None:
         self.start_repair()
@@ -1202,12 +1231,75 @@ class AssignLauncherTests(HookAssignmentFixture):
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(self.turn_starts, 1)
 
+    def test_busy_launch_preserves_the_completed_slot_status(self) -> None:
+        _ = self.successful()
+        status = self.session_dir / "phases/7/impl_status"
+        self.assertEqual(status.read_text(), "done\n")
+        saved = status.read_bytes(), status.stat().st_ino
+        self.write_phase_prompt("7", "Assignment core", "Implement the second change.")
+        with worker_panes.worker_lock(self.native.fixture.parent.id, staff.WorkerName.parse("impl")) as hold:
+            self.assertIsInstance(hold, worker_panes.WorkerLockHold)
+            result = self.launch()
+        self.assertEqual(result.returncode, worker.ExitCode.BUSY, result.stdout + result.stderr)
+        self.assertEqual((status.read_bytes(), status.stat().st_ino), saved)
+        self.assertEqual(self.turn_starts, 1)
+        self.assertIn("role=impl; exit 6", (self.session_dir / "board.log").read_text())
+
     def test_a_failed_worker_records_an_error_pass_and_returns_worker_failure(self) -> None:
-        self.native.agent.during_prompt = fail_worker_after_prompt
+        status = self.session_dir / "phases/7/impl_status"
+
+        def fail_owned_launch() -> None:
+            self.assertEqual(status.read_text(), "running\n")
+            fail_worker_after_prompt()
+
+        self.native.agent.during_prompt = fail_owned_launch
         result = self.launch()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual((self.session_dir / "phases/7/impl_status").read_text().strip(), "error")
+        self.assertEqual(status.read_text(), "error\n")
         ended = [event for event in self.events() if event.get("event_type") == "pass_finished"]
         self.assertEqual(len(ended), 1, self.events())
         self.assertEqual(ended[0].get("status"), "error")
         self.assertNotIn("launcher_pid", next(iter(self.assignment_records().values())))
+
+    def test_confirmed_retry_restores_running_status_for_the_same_pass(self) -> None:
+        opened = self.native.opened()
+        self.native.agent.error = "agent_prompt_stalled"
+        failed = self.launch()
+        self.assertEqual(failed.returncode, worker.ExitCode.UNCERTAIN, failed.stdout + failed.stderr)
+        status = self.session_dir / "phases/7/impl_status"
+        self.assertEqual(status.read_text(), "error\n")
+        passed = worker_panes.worker_pass(opened.row, self.session_dir)
+        self.assertEqual(passed["status"], "active")
+        self.native.agent.error = ""
+        _ = self.successful()
+        self.assertEqual(self.turn_starts, 1)
+        self.assertEqual(worker_panes.worker_pass(opened.row, self.session_dir)["instance_id"], passed["instance_id"])
+        self.assertEqual(status.read_text(), "running\n")
+        self.native.agent.complete(opened.pane)
+        self.assertEqual(self.native.finish("impl"), turn_end.TurnOutcome.DONE)
+        self.assertEqual(status.read_text(), "done\n")
+
+    def test_retry_saves_the_remapped_status_path_for_an_older_pass_without_delivery(self) -> None:
+        opened = self.native.opened("impl2")
+        arguments = ["--role", "implement", "--cwd", str(self.project), "--phase", "7",
+                     "--prompt", str(self.prompt), "--paths", str(self.paths), "--session-dir", str(self.session_dir)]
+        with patch.object(progress_history, "save_dispatch_delivery", side_effect=SystemExit(worker.ExitCode.UNCERTAIN)):
+            failed = invoke_assignment(arguments, os.environ.copy())
+        self.assertEqual(failed.returncode, worker.ExitCode.UNCERTAIN, failed.stdout + failed.stderr)
+        self.assertEqual(self.turn_starts, 0)
+        state_path = self.session_dir / unit_runs.STATE_FILE
+        state = read_object(state_path)
+        passed = assign.object_map(assign.object_map(state["pass"])["impl2"])
+        self.assertNotIn("delivery", passed)
+        status = Path(str(passed.pop("assign_status_file")))
+        self.assertEqual(status, self.session_dir / "phases/7/impl2_status")
+        write_text_atomic(state_path, json.dumps(state))
+        write_text_atomic(status, "running\n")
+        retried = invoke_assignment(arguments, os.environ.copy())
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        saved = worker_panes.worker_pass(opened.row, self.session_dir)
+        self.assertEqual(saved["instance_id"], passed["instance_id"])
+        self.assertEqual(progress_history.dispatch_delivery(saved).actions.status_file, str(status))
+        self.assertEqual(self.native.finish("impl2"), turn_end.TurnOutcome.DONE)
+        self.assertEqual(status.read_text(), "done\n")
+        self.assertFalse(status.with_name("impl_status").exists())
