@@ -2945,6 +2945,7 @@ Work:
 5. Old wire and snapshot records upgrade to the identity before the strict reader runs; pinned clients keep working.
 6. Tests replace the ones that let unnamed rows drop off the page. They cover release, continuation, restart, snapshot round trip, missing staff, Mac ownership and an empty process scope, and check the page's caller text.
 7. F015 (from 44cf pass 7 and Astra /tmp/claude/astra/20261119T025153Z-1455606/review.md): a repository slot request records the showrunner as the caller (copies.py:1115, slot_wait.py:301). The producer stores the unit (for example `startup`) as the caller and keeps the showrunner (`hana`) apart. Cover both slot-request branches with a test through the real producer and the decoded page.
+8. F024-F026 (from 44cf closure pass 9, minor; each row still shows a name): a format specification such as `{job:.0s}` in a CI template can empty a required field (snapshot_codec.py:143; the validator at admission_records.py:1425 rejects format specs and conversions in name templates); with no owner template, an unusable step name hides a usable unit (build_steps.py:54, staff_names.py:87); two Swap title branches take `unregistered session` before a usable scope or owner name (memory_feed.py:1835, queue_evidence.py:19). Exact-output tests for each.
 
 ### Phase 44cl — A verify call record splits each wait by its cause  · status: todo
 **From bob via builds, 2026-11-18 20:2x:** in 7 days, 825 h (42%) of Hana verify call time had no recorded cause. Rank: after verify 43h and 44bw, before 44bf and 44j.
