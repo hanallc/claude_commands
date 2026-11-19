@@ -196,6 +196,7 @@ from scripts.lib.cargo_target_config import (
     cargo_home_folder,
 )
 from scripts.lib.process_failure import failure_detail
+from scripts.lib.process_start import ProcessStart, Started, process_start
 from scripts.lib.user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
     from scripts.lint import tmp_sweep
@@ -1244,11 +1245,17 @@ def held_cargo_lock_files(*, lint_settings: conf.ConfigRead | UseConfiguredValue
 
 
 @dataclass(frozen=True)
+class UnobservedHolderStart:
+    """The target record does not contain a process start identity."""
+
+
+@dataclass(frozen=True)
 class TargetUse:
     """A live process using a target directory, and how."""
 
     pid: int
     how: str
+    start: ProcessStart | UnobservedHolderStart = field(default=UnobservedHolderStart(), compare=False)
 
 
 @dataclass(frozen=True)
@@ -1295,6 +1302,7 @@ class FloorHolder:
     pid: int | None
     how: str
     session: str | None
+    start: ProcessStart | UnobservedHolderStart = field(default=UnobservedHolderStart(), compare=False)
 
 
 @dataclass(frozen=True)
@@ -1310,10 +1318,11 @@ class OutsideTargets:
 class TargetOwnerIndex(Sequence[str]):
     """One pass's resolved targets and memo of the deepest owner of each path."""
 
-    def __init__(self, targets: Sequence[str]) -> None:
+    def __init__(self, targets: Sequence[str], *, identify_holders: bool = False) -> None:
         self.targets: tuple[str, ...] = tuple(targets)
         self.checked_targets: tuple[str, ...] = self.targets
         self.rechecking: bool = False
+        self.identify_holders: bool = identify_holders
         self.by_path: dict[str, TargetOwner] = {
             os.path.realpath(target): TargetOwner(target) for target in targets
         }
@@ -1394,9 +1403,12 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
         names = [name for name in os.listdir(proc) if name.isdigit()]
     except OSError:
         return found
+
     for name in names:
         if len(found) == len(checked):
             break
+        pid = int(name)
+        start = process_start(pid) if owners.identify_holders else UnobservedHolderStart()
         base = os.path.join(proc, name)
         try:
             exe = os.readlink(os.path.join(base, "exe"))
@@ -1407,7 +1419,6 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
                 argv = [arg.decode(errors="replace") for arg in handle.read().split(b"\0") if arg]
         except OSError:
             continue
-        pid = int(name)
         for path, how in ((exe, "runs"), (cwd, "works in")):
             if path.endswith(DELETED_SUFFIX) and how == "runs":
                 continue
@@ -1415,14 +1426,14 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
                 continue
             owner = owners.process_owner(path)
             if isinstance(owner, TargetOwner) and owner.target in checked:
-                _ = found.setdefault(owner.target, TargetUse(pid, f"{how} {path}"))
+                _ = found.setdefault(owner.target, TargetUse(pid, f"{how} {path}", start))
         matching_maps = not restricted or any(prefix in maps for prefix in encoded_prefixes)
         for path in mapped_files(maps) if matching_maps else ():
             if path.endswith(DELETED_SUFFIX):
                 continue
             owner = owners.process_owner(path)
             if isinstance(owner, TargetOwner) and owner.target in checked:
-                _ = found.setdefault(owner.target, TargetUse(pid, f"maps {path}"))
+                _ = found.setdefault(owner.target, TargetUse(pid, f"maps {path}", start))
         command = os.path.basename(argv[0]) if argv else ""
         verify = command == "verify.sh" or (command in ("bash", "sh", "zsh", "dash") and os.path.basename(
             next((argument for argument in argv[1:] if not argument.startswith("-")), "")) == "verify.sh")
@@ -1430,7 +1441,7 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
             runner = "verify.sh" if verify else "cargo-nextest"
             for target in workspace_targets(argv, cwd, os.path.join(base, "environ"), owners, verify_runner=verify):
                 if target in checked:
-                    _ = found.setdefault(target, TargetUse(pid, f"runs {runner} in {cwd}"))
+                    _ = found.setdefault(target, TargetUse(pid, f"runs {runner} in {cwd}", start))
     return {target: found[target] for target in owners if target in found}
 
 
@@ -1633,17 +1644,22 @@ def floor_holders(busy: Mapping[str, TargetUse | LockHeld | BuildHoldTarget | No
     """Each busy target, largest first, with the pid that holds it and that pid's session when known."""
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
-    uses: list[tuple[str, int | None, str]] = []
+    holders: list[FloorHolder] = []
     for root, use in busy.items():
         if isinstance(use, (BuildHoldTarget, NoRecordedEvidence)):
             continue
         if isinstance(use, LockHeld):
-            uses.append((root, lock_holder(use.lock, locks, lint_settings=lint_settings), f"holds the cargo lock {use.lock}"))
+            pid = lock_holder(use.lock, locks, lint_settings=lint_settings)
+            start = process_start(pid) if pid is not None else UnobservedHolderStart()
+            if isinstance(start, Started) and lock_holder(use.lock, locks, lint_settings=lint_settings) != pid:
+                start = UnobservedHolderStart()
+            how = f"holds the cargo lock {use.lock}"
         else:
-            uses.append((root, use.pid, use.how))
-    sessions = holder_sessions([pid for _, pid, _ in uses if pid is not None])
-    holders = [FloorHolder(root, sizes.get(root, 0), pid, how, sessions.get(pid) if pid is not None else None)
-               for root, pid, how in uses]
+            pid, start, how = use.pid, use.start, use.how
+        holders.append(FloorHolder(root, sizes.get(root, 0), pid, how, None, start))
+    sessions = holder_sessions([holder.pid for holder in holders if holder.pid is not None])
+    holders = [replace(holder, session=sessions.get(holder.pid)) if holder.pid is not None else holder
+               for holder in holders]
     return sorted(holders, key=lambda holder: (-holder.bytes, holder.path))
 
 
@@ -3511,18 +3527,36 @@ def floor_out_of_reach_text(now: float, removed: int, free: int, floor: int,
     return fit_alert_text(render, lint_settings=lint_settings)
 
 
-def holder_message_text(holder: FloorHolder, free: int, floor: int, *,
+def holder_message_text(holders: Sequence[FloorHolder], free: int, floor: int, removed: int, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> str:
-    """The message to the session whose process holds a target the floor needs."""
+    """Describe the targets one process holds, largest first."""
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     path_limit = int(lint_settings.words("sweep_message_path_widths")[0])
-    return "\n".join([
-        f"natedev has {gib(free)} free, and builds need {gib(floor)} free. The disk floor sweep removed all idle build output.",
-        f"{holder_text(holder, path_limit)}. This process is in your session, so the sweep cannot remove that output.",
-        "When the process ends, the next sweep removes the output. If the process is stale, stop it.",
-    ])
+    limit = lint_settings.whole("sweep_message_limit")
+    cleanup = ("The disk floor sweep removed all idle build output." if removed > 0
+               else "The disk floor sweep found no idle build output to remove.")
+    count = len(holders)
+    size = gib(sum(holder.bytes for holder in holders))
+    pid = holders[0].pid if holders else None
+    process = f"Pid {pid}" if pid is not None else "A process"
+    header = [
+        cleanup,
+        f"natedev has {gib(free)} free, and builds need {gib(floor)} free.",
+        f"{process} in your session holds {count} {'target' if count == 1 else 'targets'} ({size}).",
+    ]
+    footer = "When the process ends, the next sweep removes the output. If the process is stale, stop it."
+    remaining = limit - len("\n".join([*header, footer]))
+    lines: list[str] = []
+    for holder in sorted(holders, key=lambda item: (-item.bytes, item.path)):
+        line = f"- {holder_text(holder, path_limit)}"
+        if len(line) + 1 > remaining:
+            line = f"- {alert_path(holder.path, path_limit)} ({gib(holder.bytes)})"
+        if len(line) + 1 <= remaining:
+            lines.append(line)
+            remaining -= len(line) + 1
+    return "\n".join([*header, *lines, footer])
 
 
 def leaf_directories(measurement: AvailableDiskMeasurement) -> list[OutsideCacheDirectory]:
@@ -3745,6 +3779,28 @@ def send_holder_message(session: str, message: str, *,
     command = session_send_argv(session, lint_settings=lint_settings) + crossing_send_argv(repeat)
     return run_send(command, f"message to {session}", input=message,
                     timeout=send_budget.seconds(lint_settings.number("sweep_sender_timeout_seconds")))
+
+
+def send_floor_holder_messages(holders: Sequence[FloorHolder], free: int, floor: int, removed: int, *,
+                               lint_settings: conf.ConfigRead) -> frozenset[str]:
+    """Tell each live holder's session once and return the paths it accepted."""
+    groups: dict[tuple[str, int, str], list[FloorHolder]] = {}
+    for holder in holders:
+        if holder.session is not None and holder.pid is not None and isinstance(holder.start, Started):
+            groups.setdefault((holder.session, holder.pid, holder.start.start), []).append(holder)
+    told: set[str] = set()
+    repeat_minutes = lint_settings.number("sweep_alert_interval_seconds") / 60
+    limit = lint_settings.whole("sweep_message_limit")
+    for (session, pid, start), group in groups.items():
+        paths = sorted({holder.path for holder in group})
+        digest = hashlib.sha256(json.dumps(paths).encode()).hexdigest()
+        key = CrossingSendKey(f"floor-holder:{pid}:{start}:{digest}", repeat_minutes)
+        message = holder_message_text(group, free, floor, removed, lint_settings=lint_settings)
+        if len(message) > limit or process_start(pid) != Started(start):
+            continue
+        if send_holder_message(session, message, repeat=key, lint_settings=lint_settings).accepted:
+            told.update(paths)
+    return frozenset(told)
 
 
 def disk_floor_channels() -> FloorAlertChannels:
@@ -4545,7 +4601,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         if isinstance(policy, MacFloor):
             targets = [target for target in targets if policy.allows(target)]
         target_search = SearchedFloorTargets(targets)
-        owners = TargetOwnerIndex(targets)
+        owners = TargetOwnerIndex(targets, identify_holders=isinstance(policy, NatedevFloor) and not dry_run)
         hold_targets = (build_hold_targets(targets, known_trees, lint_settings=lint_settings)
                         if isinstance(policy, NatedevFloor) else {})
         uses: dict[str, TargetUse | LockHeld] = dict(policy.uses(targets) if isinstance(policy, MacFloor) else process_uses(owners))
@@ -4753,8 +4809,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                         holders = floor_holders(busy, busy_bytes, lint_settings=lint_settings)
                         holders.extend(FloorHolder(root, 0, None, f"{use.holder} holds natedev builds", None)
                                        for root, use in busy.items() if isinstance(use, BuildHoldTarget))
-                        told = frozenset(holder.path for holder in holders if holder.session is not None
-                                         and send_holder_message(holder.session, holder_message_text(holder, after_free, floor, lint_settings=lint_settings), lint_settings=lint_settings).accepted)
+                        told = send_floor_holder_messages(holders, after_free, floor, removed, lint_settings=lint_settings)
                         measurement = (read_disk_measurement() if not isinstance(filesystem, FilesystemFloor)
                                        or filesystem.root_device else UnavailableDiskMeasurement("missing"))
                         message = floor_out_of_reach_text(now, removed, after_free, floor, holders, told,

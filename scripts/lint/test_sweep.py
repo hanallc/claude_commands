@@ -38,6 +38,7 @@ from scripts.message.session_send_test_support import forbid_real_sender
 from scripts.lib import build_folders, conf, copy_record
 from scripts.lib.cargo_output import CargoOutputRoots
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.lib.process_start import Gone, ProcessStart, Started
 from scripts.mac_test import floor_claims
 from scripts.lint.test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -1707,7 +1708,7 @@ class FloorTests(SweepCase):
         self.assertIn(f"{protected}: holds 0.0 GiB.", protected_lines)
         self.assertIn("These target dirs are in use", in_use_lines)
         self.assertNotIn(protected, in_use_lines)
-        holder_messages = [sweep.holder_message_text(holder, 0, 10 * GIB) for holder in holders]
+        holder_messages = [sweep.holder_message_text([holder], 0, 10 * GIB, 0) for holder in holders]
         self.assertEqual(len(holder_messages), 1)
         self.assertTrue(all(protected not in text for text in holder_messages))
         self.assertTrue(protected_file.exists())
@@ -4152,7 +4153,7 @@ class FloorTests(SweepCase):
                 remote = command[host_position + 1:]
                 command = shlex.split(remote[0]) if len(remote) == 1 else remote
             recipient = command[command.index("--to") + 1]
-            self.assertIn(recipient, ("natedev", "user"))
+            self.assertIn(recipient, ("natedev", "user", *replies))
             delivery.commands.append(list(command))
             if "retire" in command:
                 delivery.retire_hosts.append(retire_host)
@@ -5911,15 +5912,74 @@ raise SystemExit(int(os.environ[variable]))
         self.assertIn("No earlier floor sweep", message)
         self.assertNotIn("fall beyond cache growth", message)
 
-    def test_holder_message_uses_the_first_configured_path_width(self) -> None:
+    def test_holder_message_uses_the_first_configured_path_width_and_reports_removal(self) -> None:
         _ = write_config_fixture(conf.path("lint"),
                                  "sweep_message_path_widths=24 16\n")
         holder = sweep.FloorHolder("/phase46/" + "a" * 70 + "/target", 2 * GIB, 46,
                                    "maps build output", "phase46")
 
-        message = sweep.holder_message_text(holder, GIB, 3 * GIB)
+        for removed, first_line in (
+            (0, "The disk floor sweep found no idle build output to remove."),
+            (GIB, "The disk floor sweep removed all idle build output."),
+        ):
+            with self.subTest(removed=removed):
+                message = sweep.holder_message_text([holder], GIB, 3 * GIB, removed)
+                self.assertEqual(message.splitlines()[0], first_line)
+                self.assertIn("/phase46/aaaaaaa…/target (2.0 GiB)", message)
 
-        self.assertIn("/phase46/aaaaaaa…/target (2.0 GiB)", message)
+    def test_holder_messages_group_targets_and_reuse_delivery_keys(self) -> None:
+        start = Started("123")
+        holders = [sweep.FloorHolder(f"/cache/target-{size}", size * GIB, 46,
+                                     "maps build output", "session-one", start)
+                   for size in range(1, 9)]
+        holders.append(sweep.FloorHolder("/other/target", GIB, 47, "runs a test", "session-two", start))
+        with (self.crossing_delivery({"session-one": [], "session-two": []}) as delivery,
+              mock.patch.object(sweep, "process_start", return_value=start)):
+            _ = write_config_fixture(conf.path("lint"), "sweep_message_limit=365\nsweep_alert_interval_seconds=150\n")
+            settings = conf.read("lint")
+            for order in (holders, list(reversed(holders))):
+                told = sweep.send_floor_holder_messages(order, GIB, 3 * GIB, 0, lint_settings=settings)
+                self.assertEqual(told, frozenset(holder.path for holder in holders))
+
+        self.assertCountEqual([attempt.recipient for attempt in delivery if attempt.accepted],
+                              ["session-one", "session-two"])
+        for recipient in ("session-one", "session-two"):
+            first, repeat = [attempt for attempt in delivery if attempt.recipient == recipient]
+            self.assertTrue(first.key)
+            self.assertEqual(first.key, repeat.key)
+            self.assertFalse(repeat.accepted)
+            self.assertEqual(first.command[first.command.index("--repeat-minutes") + 1], "2.5")
+            self.assertLessEqual(len(first.text), 365)
+        message = delivery[0].text
+        self.assertIn("holds 8 targets (36.0 GiB)", message)
+        self.assertLess(message.index("/cache/target-8"), message.index("/cache/target-7"))
+        self.assertNotIn("/cache/target-1", message)
+
+    def test_floor_pass_checks_the_original_process_start_before_sending(self) -> None:
+        read_uses = sweep.process_uses
+        for after_scan in (Gone(), Started("456")):
+            with self.subTest(after_scan=type(after_scan).__name__):
+                base = self.base()
+                _, payload = cargo_target(base, "busy", DEMO, time.time())
+                proc = base / "proc"
+                fake_process(proc, 46, exe=str(payload))
+
+                def read_start(pid: int) -> ProcessStart:
+                    self.assertEqual(pid, 46)
+                    return after_scan if cast(mock.Mock, sweep.scan_floor_roots).called else Started("123")
+
+                def fixture_uses(roots: Sequence[str]) -> dict[str, sweep.TargetUse]:
+                    return read_uses(roots, str(proc))
+
+                with (mock.patch.object(sweep, "process_uses", side_effect=fixture_uses),
+                      mock.patch.object(sweep, "process_start", side_effect=read_start) as starts,
+                      mock.patch.object(sweep, "holder_sessions", return_value={46: "hana-unit"}),
+                      mock.patch.object(sweep, "send_holder_message") as tell,
+                      mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT) as summary):
+                    self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB], recorded=True)[0], 0)
+                self.assertEqual(starts.call_args_list, [mock.call(46), mock.call(46)])
+                tell.assert_not_called()
+                self.assertIn("the message to session hana-unit failed", cast(str, summary.call_args.args[0]))
 
     def test_free_space_rise_uses_rising_wording(self) -> None:
         now = time.time()
@@ -6034,7 +6094,8 @@ raise SystemExit(int(os.environ[variable]))
                     self.assertEqual(tell.call_args.args[0], "hana-unit")
                     told = cast(str, tell.call_args.args[1])
                     self.assertIn(f"{busy_tree.parent} (", told)
-                    self.assertIn(f"pid {os.getpid()} holds the cargo lock {lock_path}. This process is in your session", told)
+                    self.assertIn(f"pid {os.getpid()} holds the cargo lock {lock_path}", told)
+                    self.assertIn(f"Pid {os.getpid()} in your session holds 1 target", told)
                     self.assertIn("If the process is stale, stop it.", told)
                     message = cast(str, send.call_args.args[0])
                     if delivered:
