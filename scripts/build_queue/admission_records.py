@@ -4,6 +4,10 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from enum import StrEnum
+import fcntl
+from hashlib import sha256
+import json
 import math
 import os
 import re
@@ -17,15 +21,16 @@ from pathlib import Path
 
 from scripts.build_queue import execution_identity
 from scripts.build_queue import progress_profile as progress
-from scripts.build_queue import placement
+from scripts.build_queue import placement, snapshot_codec
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
 from scripts.build_targets import target_config
 from scripts.build_targets.target_config import LocalRequired, StepRoute
-from scripts.buildlog import parse
+from scripts.buildlog import parse, store
 from scripts.lib import conf
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.proc_text import read_proc_text
 from scripts.production.staff import StaffId
 from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as NoCallRecord,
@@ -33,6 +38,149 @@ from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as No
 
 GIB = 1 << 30
 DIRECT_CARGO = LocalRequired("a direct cargo command runs where it starts")
+
+
+class PlacementWaitReason(StrEnum):
+    MEMORY = "memory"
+    SLOT = "slot"
+    FOLDER = "folder"
+    ROUTING = "routing"
+    HOLD = "hold"
+    REMOTE_START = "remote_start"
+    AWS_REFUSAL_RETRY = "aws_refusal_retry"
+    LOCAL_SETUP = "local_setup"
+
+
+@dataclass(frozen=True)
+class NoPlacementWait:
+    """The call has no open wait."""
+
+
+NO_PLACEMENT_WAIT = NoPlacementWait()
+
+
+@dataclass(frozen=True)
+class PlacementWaitKey:
+    call_id: str
+    episode: str
+
+
+@dataclass(frozen=True)
+class OpenPlacementWait:
+    episode: str
+    reason: str
+    started_at: float
+
+
+class PlacementWaitRow(TypedDict):
+    kind: Literal["placement_wait_s"]
+    call_id: str
+    placement_episode: str
+    reason: str
+    started_at: float
+    ended_at: float
+    placement_wait_s: float
+
+
+@dataclass(frozen=True)
+class PlacementWaitHistory:
+    rows: tuple[PlacementWaitRow, ...] = ()
+    active: OpenPlacementWait | NoPlacementWait = field(default_factory=NoPlacementWait)
+    finished: bool = False
+
+
+def _placement_wait_path(root: Path, call_id: str) -> Path:
+    return root / "placement-waits" / (sha256(call_id.encode()).hexdigest() + ".json")
+
+
+def verify_run_call_id(pid: int, start_time: str) -> str:
+    """Link the preparation command and the verify command to one call."""
+    return f"v-run-{pid}-{start_time}"
+
+
+def _read_placement_wait_history(path: Path) -> PlacementWaitHistory:
+    try:
+        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return PlacementWaitHistory()
+    return cast(PlacementWaitHistory, snapshot_codec.parse_snapshot_value(value, PlacementWaitHistory))
+
+
+def read_placement_waits(call_id: str) -> tuple[PlacementWaitRow, ...]:
+    """Read the elapsed intervals for one call in time order."""
+    return _read_placement_wait_history(_placement_wait_path(store.root(), call_id)).rows
+
+
+def placement_step_start(root: Path, key: PlacementWaitKey, request_since: float) -> float:
+    """Read the journal start without changing the waiter's queue age."""
+    try:
+        history = _read_placement_wait_history(_placement_wait_path(root, key.call_id))
+    except (OSError, ValueError, TypeError, KeyError):
+        return request_since
+    for row in history.rows:
+        if row["placement_episode"] == key.episode:
+            return row["started_at"]
+    active = history.active
+    return active.started_at if isinstance(active, OpenPlacementWait) and active.episode == key.episode else request_since
+
+
+def _update_placement_wait(key: PlacementWaitKey, reason: PlacementWaitReason | NoPlacementWait,
+                           at: float, root: Path, *, finished: bool = False, if_idle: bool = False,
+                           only: PlacementWaitReason | NoPlacementWait = NO_PLACEMENT_WAIT) -> None:
+    """Close and open intervals in one atomic change."""
+    path = _placement_wait_path(root, key.call_id)
+    if (isinstance(reason, NoPlacementWait) or isinstance(only, PlacementWaitReason)) and not path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        history = _read_placement_wait_history(path)
+        active = history.active
+        if history.finished or (if_idle and isinstance(active, OpenPlacementWait)) or (isinstance(only, PlacementWaitReason)
+                and (isinstance(active, NoPlacementWait) or active.reason != only.value)):
+            return
+        rows = history.rows
+        if isinstance(active, OpenPlacementWait):
+            if key.episode == active.episode and active.reason == reason:
+                return
+            if at < active.started_at or (isinstance(reason, NoPlacementWait) and not finished
+                    and key.episode != active.episode):
+                return
+            if at > active.started_at:
+                row: PlacementWaitRow = {"kind": "placement_wait_s", "call_id": key.call_id,
+                    "placement_episode": active.episode, "reason": active.reason,
+                    "started_at": active.started_at, "ended_at": at, "placement_wait_s": at - active.started_at}
+                rows = (*rows, row)
+        elif isinstance(reason, NoPlacementWait) and not finished:
+            return
+        if rows:
+            at = max(at, rows[-1]["ended_at"])
+        next_wait = OpenPlacementWait(key.episode, reason.value, at) if isinstance(reason, PlacementWaitReason) else reason
+        updated = PlacementWaitHistory(rows, next_wait, finished)
+        write_text_atomic(path, json.dumps(snapshot_codec.snapshot_value(updated), separators=(",", ":")) + "\n")
+    finally:
+        os.close(descriptor)
+
+
+def record_placement_wait(key: PlacementWaitKey, reason: PlacementWaitReason | NoPlacementWait,
+                          at: float, *, root: Path | None = None, if_idle: bool = False,
+                          only: PlacementWaitReason | NoPlacementWait = NO_PLACEMENT_WAIT) -> None:
+    """Record the transition for one episode."""
+    if not key.call_id:
+        return
+    try:
+        _update_placement_wait(key, reason, at, store.root() if root is None else root, only=only, if_idle=if_idle)
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        print(f"buildlog: cannot record placement wait for {key.call_id}: {error}", file=sys.stderr)
+
+
+def finish_placement_waits(call_id: str, at: float) -> None:
+    """Close the last wait at the end of the call."""
+    try:
+        _update_placement_wait(PlacementWaitKey(call_id, ""), NoPlacementWait(), at, store.root(), finished=True)
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        print(f"buildlog: cannot finish placement waits for {call_id}: {error}", file=sys.stderr)
 
 
 @dataclass(frozen=True)

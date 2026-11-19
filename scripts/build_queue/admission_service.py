@@ -2743,10 +2743,14 @@ class AdmissionServer:
                 result = self.last_result
                 candidate = result.policy.queued_head if isinstance(result, gate.PassResult) else gate.NoQueuedHead()
                 source = request.profile.peak.source
+                started = request.since
+                if isinstance(request, wire.AdmitRequest) and isinstance(request.call, records.CallRecord):
+                    key = records.PlacementWaitKey(request.call.call_id, request.episode)
+                    started = records.placement_step_start(self.state_dir.parent, key, started)
                 self.lifecycle_outbox = (*self.lifecycle_outbox, PendingAdmission(request.episode, source,
                     isinstance(candidate, gate.QueuedHead)
                         and records.waiter_owner(candidate.waiter) == records.waiter_owner(waiting.row),
-                    max(0.0, now - waiting.row["since"])))
+                    max(0.0, now - started)))
                 self.reservations[request.episode] = admission
                 for key, slot in list(self.slots.items()):
                     if isinstance(slot, records.ContinuationSlot) and slot.owner == records.waiter_owner(waiting.row):
@@ -3350,6 +3354,15 @@ done
             and isinstance(saved.state, placement.ClosedAssignment)
             and saved.state.reason in ("completed", "cancelled") for saved in self.assignments.values())
 
+    def _finish_placement_wait(self, request: wire.PlacementRequest, *,
+                               only: records.PlacementWaitReason | records.NoPlacementWait = records.NO_PLACEMENT_WAIT) -> None:
+        local = request.local
+        if (isinstance(request.purpose, placement.NormalStep) and isinstance(local, wire.LocalAdmissionContext)
+                and isinstance(local.call, records.CallRecord)):
+            key = records.PlacementWaitKey(local.call.call_id, request.episode)
+            records.record_placement_wait(key, records.NoPlacementWait(), self.clock.now(),
+                                          root=self.state_dir.parent, only=only)
+
     def _placement_admission(self, request: wire.PlacementRequest) -> wire.AdmitRequest | wire.LaunchRequest:
         identity = request.identity
         if not identity.step:
@@ -3489,12 +3502,7 @@ done
 
     def _update_remote_start_hold(self, request: wire.PlacementRequest, key: str,
                                   saved: records.SavedPlacementAssignment, remote_start_hold_seconds: int) -> bool:
-        if (saved.assignment.destination.provider == "local"
-                or not isinstance(saved.state, placement.CurrentAssignment)
-                or isinstance(saved.remote_start_hold, records.RemoteStartHoldEnded)):
-            return False
-        if not self._can_hold_local_place(request):
-            self.assignments[key] = self._end_remote_start_hold(request, saved)
+        if saved.assignment.destination.provider == "local" or not isinstance(saved.state, placement.CurrentAssignment):
             return False
         if isinstance(saved.permission, placement.PermissionConsumed):
             evidence = self.execution_evidence.get(key)
@@ -3504,8 +3512,14 @@ done
                     or isinstance(host_evidence, placement.FreshHostEvidence)
                     and any(reference == saved.provider and isinstance(execution, execution_identity.ObservedExecution)
                             for reference, execution in host_evidence.executions)):
+                self._finish_placement_wait(request, only=records.PlacementWaitReason.REMOTE_START)
                 self.assignments[key] = self._end_remote_start_hold(request, saved)
                 return False
+        if isinstance(saved.remote_start_hold, records.RemoteStartHoldEnded):
+            return False
+        if not self._can_hold_local_place(request):
+            self.assignments[key] = self._end_remote_start_hold(request, saved)
+            return False
         hold = saved.remote_start_hold
         now = self.clock.now()
         if isinstance(hold, records.RemoteStartHoldUnrecorded):
@@ -3551,6 +3565,12 @@ done
             key = self.current_assignments.get(request.episode, "")
             saved = self.assignments.get(key)
             if not self._placement_owner_live(request.owner):
+                self._finish_placement_wait(request)
+                local = request.local
+                if isinstance(local, wire.LocalAdmissionContext) and isinstance(local.call, records.CallRecord):
+                    key_setup = records.PlacementWaitKey(local.call.call_id, "setup")
+                    records.record_placement_wait(key_setup, records.NoPlacementWait(), self.clock.now(),
+                        root=self.state_dir.parent, only=records.PlacementWaitReason.LOCAL_SETUP)
                 if saved is not None:
                     if isinstance(saved.permission, placement.PermissionAvailable) and not self._start_pending(saved):
                         self._close_placement(saved, "cancelled", placement.DoNotRetry("coordinator ended"))
@@ -4002,6 +4022,8 @@ done
         if self.current_assignments.get(assignment.episode) == key:
             request = self.placement_requests.get(assignment.episode)
             if request is not None:
+                if assignment.destination.provider != "local":
+                    self._finish_placement_wait(request, only=records.PlacementWaitReason.REMOTE_START)
                 saved = self._end_remote_start_hold(request, saved)
             del self.current_assignments[assignment.episode]
         self.assignments[key] = replace(saved, state=placement.ClosedAssignment(reason), retry=retry)
@@ -4125,6 +4147,7 @@ done
                     return [wire.Ok()]
                 self.prerequisites[request.episode] = request.prerequisite
             else:
+                self._finish_placement_wait(submitted)
                 saved = self.assignments.get(self.current_assignments.get(request.episode, ""))
                 if saved is not None and (isinstance(saved.permission, placement.PermissionAvailable)
                         or saved.assignment.destination.provider == "local"):
@@ -4169,6 +4192,9 @@ done
                 return [wire.Refused("placement episode changed its owner, start, run or purpose")]
             if previous is not None:
                 request = replace(request, constraints=episode_constraints(previous.constraints, request.constraints))
+                if (isinstance(previous.local, wire.LocalAdmissionContext) and isinstance(request.local, wire.LocalAdmissionContext)
+                        and isinstance(request.local.call, records.NoCallRecord)):
+                    request = replace(request, local=replace(request.local, call=previous.local.call))
             elif (isinstance(folder := request.constraints.cargo_folder, placement.CargoFolder)
                     and any(candidate.destination.provider == "local" for candidate in request.constraints.candidates)):
                 try:
@@ -4240,6 +4266,10 @@ done
                 and request.claim.provider == assignment.destination.provider
                 and request.claim.target == assignment.destination.target and request.claim.scope == assignment.destination.scope):
             self.execution_evidence[key] = request.evidence
+            submitted = self.placement_requests.get(assignment.episode)
+            if (submitted is not None and isinstance(request.evidence, execution_identity.ObservedExecution)
+                    and self.current_assignments.get(assignment.episode) == key):
+                self._finish_placement_wait(submitted, only=records.PlacementWaitReason.REMOTE_START)
             outcome = request.outcome
             if (isinstance(outcome, (placement.AttemptCompleted, placement.AttemptDeclined, placement.AttemptCancelled))
                     or isinstance(outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))

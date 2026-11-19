@@ -520,6 +520,7 @@ if [[ "${VERIFY_QUERY_ARGS[0]:-}" == final && " ${VERIFY_QUERY_ARGS[*]} " == *" 
     export CLAUDE_PYTHON="${CLAUDE_PYTHON:-python3}"
     exec "$PY" "$VERIFY_START_DIR/final_pass.py" query "$VERIFY_START_DIR/verify.sh" "$SAVED_TREE"
 fi
+export VERIFY_SETUP_STARTED="${VERIFY_SETUP_STARTED:-${EPOCHREALTIME:-$(date +%s)}}"
 VERIFY_REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 if [[ ! -f "$VERIFY_REPO_ROOT/Cargo.toml" ]]; then
     printf 'verify.sh: %s has no Cargo.toml; verify.sh checks Cargo repositories only\n' "$VERIFY_REPO_ROOT" >&2
@@ -817,6 +818,10 @@ finish_step_token() {
 }
 
 run() {
+    if [[ "${VERIFY_SETUP_OPEN:-0}" == 1 ]]; then
+        record_verify_wait done setup
+        VERIFY_SETUP_OPEN=0
+    fi
     if [[ "${TOKEN_USED:-0}" == 1 ]]; then sync_token_state; fi
     local held_before=${TOKEN_HELD:-0} status=0
     run_step "$@" || status=$?
@@ -1550,6 +1555,10 @@ fi
 # the call record note_event writes.
 export BUILDLOG_CALLER=verify
 BUILDLOG_CALL_ID="v$(date -u +%Y%m%dT%H%M%S)-$$-$RANDOM"
+if [[ -n "${BUILDLOG_FIRST_STEP_REQUEST:-}${BUILDLOG_PREPARED_COPY:-}${BUILDLOG_FIRST_STEP_ASSIGNMENT:-}" &&
+        "${BUILDLOG_RUN:-}" =~ ^[0-9]+:[0-9]+$ ]]; then
+    BUILDLOG_CALL_ID="v-run-${BUILDLOG_RUN/:/-}"
+fi
 # Children carry this id only after its live record exists.
 export -n BUILDLOG_CALL_ID
 # The newest call wins a Mac copy (copy_watch.py); bash 3.2 has no EPOCHREALTIME.
@@ -1560,6 +1569,13 @@ HOLD_WAIT_DIR=""
 HOLD_WAITER_PID=""
 RUN_STEP_PID=""
 ROUTING_WAIT_STARTED=""
+
+record_verify_wait() {
+    [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}" ]] || return 0
+    local script="$VERIFY_START_DIR/../build_queue/admission_client.py" at="${3:-${EPOCHREALTIME:-$(date +%s)}}"
+    verify_helper "$script" placement-wait --call-id "$BUILDLOG_CALL_ID" --episode "${2:-}" \
+        --wait-reason "$1" --wait-at "${at/,/.}" >/dev/null || true
+}
 
 # Each blocked resource interval has its own recorder id. Files carry ids from
 # step subshells to the parent cleanup, which also ends interrupted waits.
@@ -2830,10 +2846,11 @@ placement_once() {
         PLACEMENT_STEP_NUMBER=$((PLACEMENT_STEP_NUMBER + 1))
         PLACEMENT_EPISODE="$BUILDLOG_CALL_ID-step-$PLACEMENT_STEP_NUMBER"
         PLACEMENT_OWNER_PID=$$
+        PLACEMENT_STEP_SINCE="${EPOCHREALTIME:-$(date +%s)}"
         if [[ "$refresh_source" == 0 ]]; then
             PLACEMENT_EPISODE="${BUILDLOG_FIRST_STEP_EPISODE:-$PLACEMENT_EPISODE}"
-            PLACEMENT_SINCE="${BUILDLOG_FIRST_STEP_SINCE:-${BUILDLOG_MEM_WAIT_SINCE:-${EPOCHREALTIME:-$(date +%s)}}}"
         fi
+        PLACEMENT_SINCE="${BUILDLOG_FIRST_STEP_SINCE:-${BUILDLOG_MEM_WAIT_SINCE:-$PLACEMENT_STEP_SINCE}}"
         local tree="" key head="" snapshot
         if [[ -n "${DOC_SOURCE_KEY:-}" ]]; then
             tree=$DOC_TREE key=$DOC_SOURCE_KEY
@@ -2858,6 +2875,7 @@ placement_once() {
     if [[ "${TOKEN_USED:-0}" == 1 ]]; then token=after-grant; fi
     export LINT_QUEUE_LEAVE_HOOK BUILDLOG_MAC_IDLE_HOOK
     local placement_args=(place-step --once --wait-events --episode "$PLACEMENT_EPISODE" --since "$PLACEMENT_SINCE"
+        --call-id "$BUILDLOG_CALL_ID" --step-since "${PLACEMENT_STEP_SINCE:-$PLACEMENT_SINCE}"
         --pid "${BUILDLOG_FIRST_STEP_PID:-${PLACEMENT_OWNER_PID:-$$}}" --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" --package "$PKG"
         --kind "$CMD" --source-key "$PLACEMENT_SOURCE_KEY" --session-id "$PLACEMENT_SESSION"
         --sidecar "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" --token "$token"
@@ -3031,11 +3049,13 @@ wait_for_step_folder() {
     fi
     rm -f -- "$VERIFY_SLOT_CAPACITY_FILE.memory-released"
     step_state waiting_hold
+    record_verify_wait folder "$PLACEMENT_EPISODE"
     "$PY" "$STEP_COPIES_SCRIPT" wait-slot --repo "$VERIFY_SLOT_SOURCE" --step "$CMD" \
         --episode "$PLACEMENT_EPISODE" --since "$PLACEMENT_SINCE" --deadline "$deadline" --pid "$$" &
     HOLD_WAITER_PID=$!
     wait "$HOLD_WAITER_PID" || status=$?
     HOLD_WAITER_PID=""
+    record_verify_wait done "$PLACEMENT_EPISODE"
     if (( status != 0 )); then
         verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" cancel-placement --episode "$PLACEMENT_EPISODE" \
             --pid "$PLACEMENT_OWNER_PID" --reason "the folder wait ended" >/dev/null || return $?
@@ -3508,11 +3528,12 @@ fi
 export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds"
 export BUILDLOG_HOLD_WAITER_FILE="$HOLD_WAIT_DIR/waiter"
 export BUILDLOG_CHECK_FAILED_FILE="$HOLD_WAIT_DIR/check-failed"
-trap 'hold_status=$?; interrupt_hold_wait; finish_hold_wait; release_wait_claim; remove_step_record; finish_verify_run "$hold_status"; exit "$hold_status"' EXIT
+trap 'hold_status=$?; interrupt_hold_wait; record_verify_wait finish; finish_hold_wait; release_wait_claim; remove_step_record; finish_verify_run "$hold_status"; exit "$hold_status"' EXIT
 hold_interrupted() {
     local signal_name=$1 code=$2
     # Ignore repeated signals while cleanup closes the hold record.
     trap '' INT TERM HUP
+    local ended_at="${EPOCHREALTIME:-$(date +%s)}"
     if [[ -n "$HOLD_WAITER_PID" ]]; then
         # A background Bash sleep inherits ignored INT. End that waiter with
         # TERM for every caller signal; keep the caller's status in the record.
@@ -3520,12 +3541,23 @@ hold_interrupted() {
         collect_child "$HOLD_WAITER_PID" "$signal_name"
     fi
     interrupt_hold_wait
+    record_verify_wait finish "" "$ended_at"
     note_event interrupted "$SECONDS" 0 "" 0 "$code"
     exit "$code"
 }
 trap 'hold_interrupted INT 130' INT
 trap 'hold_interrupted TERM 143' TERM
 trap 'hold_interrupted HUP 129' HUP
+VERIFY_SETUP_OPEN=0
+if [[ -z "${BUILDLOG_FIRST_STEP_REQUEST:-}${BUILDLOG_FIRST_STEP_ASSIGNMENT:-}" ]]; then
+    setup_started=$VERIFY_SETUP_STARTED
+    if [[ -n "${BUILDLOG_PREPARED_COPY:-}" ]]; then
+        setup_started=$VERIFY_CALL_STARTED
+    fi
+    record_verify_wait local_setup setup "$setup_started"
+    VERIFY_SETUP_OPEN=1
+fi
+unset VERIFY_SETUP_STARTED
 initialize_step_record
 if [[ "$MAC_ONLY" == 0 ]] && cache_lookup; then
     exit "${LOOKUP_STATUS}"
@@ -3591,6 +3623,7 @@ token_wait_clock() {
 # A hold check ended the wait before the token came; this call holds no token.
 token_wait_left() {
     phase_wait_finish token
+    record_verify_wait done "${PLACEMENT_EPISODE:-token}"
     [[ -z "$TOKEN_WAIT_ENTRY" ]] || rm -f "$TOKEN_WAIT_ENTRY"
     TOKEN_WAIT_ENTRY=""
     trap - INT TERM HUP
@@ -3732,6 +3765,7 @@ token_wait_note() {
 token_wait_orphaned() {
     [[ -z "$TOKEN_WAIT_ENTRY" ]] || rm -f "$TOKEN_WAIT_ENTRY"
     trap - INT TERM HUP
+    record_verify_wait finish
     echo "verify.sh: the call that started this step is gone, so the step stops waiting for the cargo token." >&2
     exit 1
 }
@@ -3811,6 +3845,7 @@ acquire_token() {
         # The line goes out before the first try when the token is not free.
         if (( noted < 0 )) && { (( TOKEN_WAITERS_AHEAD > 0 )) || [[ -d "${BOARD_DIR}/locks/cargo.d" ]]; }; then
             phase_wait_start token "cargo token"
+            record_verify_wait slot "${PLACEMENT_EPISODE:-token}"
             token_wait_note first 0
             noted=0
         fi
@@ -3841,6 +3876,7 @@ acquire_token() {
         waited=$(( (TOKEN_CLOCK_NOW - started) / 60 ))
         if (( noted < 0 )); then
             phase_wait_start token "cargo token"
+            record_verify_wait slot "${PLACEMENT_EPISODE:-token}"
             token_wait_note first 0
             noted=0
         elif (( waited >= noted + TOKEN_WAIT_NOTE_MIN )); then
@@ -3850,6 +3886,7 @@ acquire_token() {
         (( TOKEN_SUPERSEDED )) || sleep "$pause"
     done
     phase_wait_finish token
+    if (( noted >= 0 )); then record_verify_wait done "${PLACEMENT_EPISODE:-token}"; fi
     TOKEN_WAITER_PID=""
     token_acquired
     TOKEN_FIRST_WAIT_DONE=1
@@ -4147,9 +4184,12 @@ build_hold_wait_local() {
     fi
     step_state waiting_hold
     phase_wait_start hold "build hold"
+    local wait_episode="${PLACEMENT_EPISODE:-hold}"
+    if declare -F record_verify_wait >/dev/null; then record_verify_wait hold "$wait_episode"; fi
     # A step without the token (before the first take, or after a Mac trip) only waits.
     if [[ "${TOKEN_HELD:-0}" -ne 1 ]]; then
         build_hold_wait_local_only "$@" || status=$?
+        if declare -F record_verify_wait >/dev/null; then record_verify_wait done "$wait_episode"; fi
         phase_wait_finish hold
         if [[ "${status:-0}" -ne 0 ]]; then return "$status"; fi
         if [[ "$TEST_BUILD_INPUTS_READY" == 1 ]]; then refresh_test_build_inputs; fi
@@ -4157,6 +4197,7 @@ build_hold_wait_local() {
     fi
     release_token || return $?
     build_hold_wait_local_only "$@" || status=$?
+    if declare -F record_verify_wait >/dev/null; then record_verify_wait done "$wait_episode"; fi
     phase_wait_finish hold
     [[ "$status" == 0 ]] || return "$status"
     acquire_token || return $?
@@ -4261,6 +4302,7 @@ verify_cleanup() {
     fi
     stop_copy_watch || true
     if [[ "$status" != interrupted ]]; then interrupt_hold_wait; fi
+    if [[ -n "${2:-}" ]]; then record_verify_wait finish "" "$2"; fi
     finish_run "${status}" || true
     # finish_run notes only a run with a record log; every other call is noted
     # here (note_event notes a call once). Its build time is unknown.
@@ -4300,14 +4342,15 @@ verify_cleanup() {
 verify_exit() {
     EXIT_STATUS=$1
     set +e
+    local ended_at="${EPOCHREALTIME:-$(date +%s)}"
     if (( EXIT_STATUS == 0 )) && [[ "$2" != exit && "$2" != "exit "* ]]; then
         EXIT_STATUS=128
         interrupt_hold_wait
-        verify_cleanup interrupted
+        verify_cleanup interrupted "$ended_at"
     elif (( EXIT_STATUS == 0 )); then
-        verify_cleanup completed
+        verify_cleanup completed "$ended_at"
     else
-        verify_cleanup error
+        verify_cleanup error "$ended_at"
     fi
     finish_verify_run "$EXIT_STATUS"
     exit "$EXIT_STATUS"
@@ -4319,7 +4362,9 @@ verify_interrupted() {
     # Ignore later signals until cleanup removes this call's records.
     trap '' INT TERM HUP
     EXIT_STATUS=$((128 + $1))
+    local ended_at="${EPOCHREALTIME:-$(date +%s)}"
     interrupt_hold_wait
+    record_verify_wait finish "" "$ended_at"
     if [[ -n "$RUN_STEP_PID" ]]; then
         "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$RUN_STEP_PID" "$1" 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$RUN_STEP_PID" >&2; }
         release_token || true
