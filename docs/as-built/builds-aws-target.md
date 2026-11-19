@@ -868,7 +868,26 @@ Paired trials use this booked cost for completed gates.
 Open reservations retain `attempt_allowance_usd`.
 Admission includes these allowances when bills exist.
 An own-day bill corrects saved estimates that still include configured allowances.
-The bill remains the minimum cost for its reconciliation period.
+Historical reports preserve saved reconciliation floors.
+A floor without bounds applies to its UTC day unless the saved labels identify Eastern slices.
+The spending guard uses saved account bills for ended UTC days with matching file names and full-day bounds.
+The saved read time must be valid and must not exceed the decision time.
+`bill_complete_after_seconds=172800` sets the minimum delay between the end of the day and a complete bill read.
+The newest complete amount replaces the day's usage estimate if the amount rounds to at least one cent.
+For every other day, the guard takes the larger amount for each accounting slice.
+It compares the original calculation with the estimate plus any excess from a validated incomplete bill.
+The original calculation includes saved day floors and the minimum compute charge in the reservation check.
+The guard allocates a positive excess to each accounting slice in proportion to its estimate.
+If the estimate is zero, the last slice receives all the excess.
+Reports recover the bounds of saved floors for reporting.
+The guard uses the original calculation for those floors in the active accounting zone.
+The trial and account caps use the same bill rates.
+For a rejected bill, they use the larger of the original bill rate and the fallback rate.
+For a valid bill, they use the original rate.
+The guard reserves the open gate allowance once in the active day and month.
+The allowance does not reduce the reserve for inventory costs.
+The guard keeps local Cost Explorer fees because the account bill cannot identify those same reads.
+On the daily schedule, this can count one daily refresh fee twice, including its pages.
 Missing cost rows contribute zero.
 The configured allowance supplies the cost when no needed bill rows exist or the S3 share has no launch count.
 The spending limits do not change.

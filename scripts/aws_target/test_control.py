@@ -21,7 +21,7 @@ from scripts.review_links.test_page_frame import assert_status_states
 from scripts.aws_target import admin_secrets, aws_page, aws_target, deploy, ledger, run_cost, spend, spot_table
 from scripts.aws_target import config as aws_config
 from scripts.aws_target.control_test_support import TestClock
-from scripts.aws_target.ledger_test_support import CostFixture
+from scripts.aws_target.ledger_test_support import CostFixture, write_charge_fixture
 from scripts.lib import atomic_file, conf
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.notify import push_texts
@@ -393,8 +393,8 @@ gate_wait_usd_per_minute=0
                                  Decimal(1), Decimal(0), Decimal(0), (ledger.UsageTypeCost(
                                      ledger.REGION_USAGE_PREFIXES[home][-1] + '-SpotUsage:' + billed_size,
                                      Decimal('0.05'), Decimal('0.1'), 'Hrs'),))
-        with mock.patch.object(ledger.CostLedger, 'read_bills', return_value=(bill,)):
-            tables = spot_table.spot_tables(self.state, max(int(self.clock.now), midnight + 120), settings_path=self.settings)
+        write_charge_fixture(self.state, bill)
+        tables = spot_table.spot_tables(self.state, max(int(self.clock.now), midnight + 120), settings_path=self.settings)
         cells = {table.title: table.rows[0][6] for table in tables.runs[0].tables}
         self.assertEqual(cells[billed_size], '0.0500 (1 bill due)')
         self.assertEqual(cells[due_size], '1 bill due')
@@ -863,7 +863,6 @@ class HoursCheckTests(CostFixture):
     limit: Decimal = Decimal(0)
     observations: list[ledger.InstanceObservation] = []
     reservations: list[ledger.GateReservation] = []
-    bills: list[ledger.ChargeRead] = []
     notices: list[tuple[str, push_texts.RenderedPush]] = []
     notice_accepted: bool = True
 
@@ -878,17 +877,13 @@ class HoursCheckTests(CostFixture):
         self.builder = configuration.text('instance_type')
         self.observations = []
         self.limit = conf.decimal(configuration.text('billed_hours_gap_max_ratio'))
-        self.reservations, self.bills, self.notices = [], [], []
+        self.reservations, self.notices = [], []
         self.notice_accepted = True
 
         def evidence(_book: ledger.CostLedger) -> ledger.LedgerEvidence:
             return ledger.LedgerEvidence(observations=list(self.observations), gate_reservations=list(self.reservations))
 
-        def bills(_book: ledger.CostLedger) -> tuple[ledger.ChargeRead, ...]:
-            return tuple(self.bills)
-
         _ = self.enterContext(mock.patch.object(ledger.CostLedger, 'read_snapshot', evidence))
-        _ = self.enterContext(mock.patch.object(ledger.CostLedger, 'read_bills', bills))
 
     def day(self, back: int) -> datetime:
         """Midnight UTC, back days before the clock's day."""
@@ -904,7 +899,7 @@ class HoursCheckTests(CostFixture):
 
     def bill(self, day: datetime, hours: dict[tuple[str, str], Decimal]) -> None:
         start = int(day.timestamp())
-        self.bills.append(ledger.ChargeRead(day.date().isoformat(), start + 90000, start, start + 86400,
+        write_charge_fixture(self.state, ledger.ChargeRead(day.date().isoformat(), start + 90000, start, start + 86400,
             Decimal(1), Decimal(0), Decimal(0), tuple(ledger.UsageTypeCost(
                 ledger.REGION_USAGE_PREFIXES[region][-1] + '-SpotUsage:' + size, Decimal(1), quantity, 'Hrs')
                 for (size, region), quantity in hours.items())))

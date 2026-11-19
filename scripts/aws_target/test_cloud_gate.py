@@ -28,7 +28,7 @@ from urllib.parse import parse_qs, urlsplit
 from scripts.aws_target import aws_trial, cloud_gate, gate_box, ledger, s3_presign
 from scripts.aws_target.aws_target import USAGE_ONLY, AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings
-from scripts.aws_target.ledger_test_support import CostFixture, account_reply, instant, numeric_settings, text_setting
+from scripts.aws_target.ledger_test_support import CostFixture, account_reply, instant, numeric_settings, text_setting, write_charge_fixture
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue.admission_wire import CloudGroup, Owner, ReservedCloudSlot
@@ -2332,7 +2332,9 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                 self.assertTrue(all(isinstance(row.state, ledger.GateAbsent) for row in self.book.read_snapshot().gate_reservations))
 
     def test_paired_cohort_reserves_the_highest_regional_rate(self) -> None:
-        reading = ledger.ChargeRead('2026-01-14', int(self.now), int(self.now) - 90000, int(self.now) - 3600,
+        start = instant('2026-01-14T00:00:00+00:00')
+        end = start + 86400
+        reading = ledger.ChargeRead('2026-01-14', int(self.now), start, end,
             Decimal('.6'), Decimal(0), Decimal(0), (
                 ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('.1'), Decimal(1), 'Hrs'),
                 ledger.UsageTypeCost('USW2-SpotUsage:m7a.8xlarge', Decimal('.5'), Decimal(1), 'Hrs')))
@@ -2342,8 +2344,9 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                                   r'\1=us-east-2 us-west-2', path.read_text()))
         worker = cloud_gate.GateWorker(AwsCli('fixture', 'us-east-2', 1, execute=self.fake), self.book,
             self.settings, self.folder / 'reservation', clock=lambda: self.now)
+        write_charge_fixture(self.state, reading)
         with (mock.patch.object(worker, 'reconcile'), mock.patch.object(worker, 'charges'),
-              mock.patch.object(self.book, 'read_bills', return_value=(reading,)), redirect_stderr(StringIO()) as output):
+              redirect_stderr(StringIO()) as output):
             aws_trial.reserve_trial(worker, [self.request])
         reserved = self.book.read_snapshot().gate_reservations[0]
         self.assertEqual(reserved.rate.usd_per_hour, Decimal('.5'))
@@ -2354,12 +2357,14 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
     def test_paired_cohort_reserves_highest_type_rate_and_prices_actual_minimum(self) -> None:
         worker = cloud_gate.GateWorker(AwsCli('fixture', 'us-east-1', 1, execute=self.fake), self.book,
             self.settings, self.folder / 'reservation', clock=lambda: self.now)
-        reading = ledger.ChargeRead('2026-01-14', int(self.now), int(self.now) - 90000, int(self.now) - 3600,
+        start = instant('2026-01-14T00:00:00+00:00')
+        end = start + 86400
+        reading = ledger.ChargeRead('2026-01-14', int(self.now), start, end,
             Decimal('2.8'), Decimal(0), Decimal(0), (
                 ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('.8'), Decimal(1), 'Hrs'),
                 ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal('2'), Decimal(1), 'Hrs')))
-        with (mock.patch.object(cloud_gate.GateWorker, 'charges'),
-              mock.patch.object(self.book, 'read_bills', return_value=(reading,))):
+        write_charge_fixture(self.state, reading)
+        with mock.patch.object(cloud_gate.GateWorker, 'charges'):
             aws_trial.reserve_trial(worker, [self.request])
             reserved = self.book.read_snapshot().gate_reservations[0]
             self.assertEqual(reserved.usd_per_hour, Decimal('0.8'))

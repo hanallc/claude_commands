@@ -17,7 +17,7 @@ import unittest
 
 from scripts.aws_target import aws_target, config as aws_config, ledger, measurement
 from scripts.aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, MeasurementFixture, narrow, read_only_evidence
-from scripts.aws_target.ledger_test_support import account_reply, instant
+from scripts.aws_target.ledger_test_support import account_reply, charge_readings, instant
 from scripts.aws_target.control_test_support import AwsReplies
 
 from scripts.buildlog import aws_report, index, report
@@ -206,6 +206,20 @@ class MeasurementTests(MeasurementFixture):
         self.assertEqual(len(reconciliations), 1)
         self.assertEqual((reconciliations[0].period_start, reconciliations[0].period_end),
                          (MIDNIGHT - 86400, MIDNIGHT))
+
+    def test_daily_refresh_keeps_its_lookback_with_an_older_provisional_bill(self) -> None:
+        book = self.book()
+        start = MIDNIGHT - 8 * 86400
+        old, = charge_readings(start, start + 86400, Decimal(2), Decimal(0))
+        directory = self.state / 'charges'
+        directory.mkdir()
+        _ = (directory / (old.day + '.json')).write_text(json.dumps(ledger.charge_record(old)))
+
+        def fetch(query_start: int, query_end: int) -> tuple[ledger.ChargeRead, ...]:
+            self.assertEqual((query_start, query_end), (MIDNIGHT - 86400, MIDNIGHT))
+            return charge_readings(query_start, query_end, Decimal(2), Decimal(0))
+
+        _ = book.refresh_charges(self.settings, NOW, fetch)
 
     def test_query_fee_stays_in_total_after_actual_charge_reconciliation(self) -> None:
         self.costs({"cost_explorer_read_usd": "0.01"})

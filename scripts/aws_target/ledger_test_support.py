@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+import json
 import os
 import re
 from decimal import Decimal
@@ -34,6 +35,13 @@ def git_only(arguments: Sequence[str], **options: object) -> subprocess.Complete
 def instant(value: str) -> int:
     """Convert an explicit zone timestamp to an integer accounting boundary."""
     return int(datetime.fromisoformat(value).timestamp())
+
+
+def write_charge_fixture(directory: Path, reading: ledger.ChargeRead) -> None:
+    """Save a bill at the path used by the ledger."""
+    charges = directory / 'charges'
+    charges.mkdir(exist_ok=True)
+    _ = (charges / (reading.day + '.json')).write_text(json.dumps(ledger.charge_record(reading)))
 
 
 def numeric_settings(path: Path, values: dict[str, str]) -> None:
@@ -72,6 +80,7 @@ def install_cost_settings(path: Path, overrides: str = "") -> None:
         "price_refresh_seconds": "3600", "price_max_age_seconds": "7200",
         "observation_max_age_seconds": "86400", "cost_explorer_interval_seconds": "86400",
         "notification_timeout_s": "5", "notification_retry_s": "60", "cost_explorer_lookback_days": "1",
+        "bill_complete_after_seconds": "172800",
     })
     text_setting(path, "cost_explorer_tag_key", "Project")
     text_setting(path, "cost_explorer_tag_value", "fixture-build")
