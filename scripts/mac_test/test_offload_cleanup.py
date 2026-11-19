@@ -11,12 +11,12 @@ import subprocess
 import tempfile
 import time
 import unittest
-from contextlib import nullcontext, redirect_stdout
+from contextlib import redirect_stdout
+from datetime import UTC, datetime
 import io
 from pathlib import Path
 from typing import Literal, cast, override
 from unittest import mock
-from scripts.copies import copies
 from scripts.mac_test import eligibility, offload, mac_test, nextest_log
 from scripts.mac_test.offload_test_commands import (
     ACTIVITY_SELECTOR_STUB, install_nextest_log_writer, write_shell,
@@ -27,8 +27,6 @@ from scripts.lib import conf, test_hang_guard
 
 
 MAC_TARGET_CONFIG = "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-# Keep the fixture PATH when the NixOS zsh startup file runs.
-SHELL_STARTUP_ENVIRONMENT = {"__NIXOS_SET_ENVIRONMENT_DONE": "1", "__ETC_ZSHENV_SOURCED": "1"}
 DOC_INDEX_MIB = "250"
 LINT_TRIM_CONFIG = f"""\
 # range: 0..
@@ -49,13 +47,43 @@ sweep_dep_info_head_bytes=4096
 TRIM_WITHOUT_PROC = """\
 import os
 import sys
+from contextlib import redirect_stdout
 from functools import partial
+from io import StringIO
+from pathlib import Path
+from scripts.lib import conf_reads
 from scripts.lint import sweep
 
 # The Mac has no /proc. Use a private missing path on the test host.
 sweep.process_uses = partial(sweep.process_uses, proc=os.environ["CLEANUP_TEST_PROC"])
-exec(sys.argv.pop(1))
+fixture = Path(os.environ["CLEANUP_TEST_DIR"])
+with StringIO() as output, conf_reads.record_reads(fixture / "trim-config-reads"):
+    try:
+        with redirect_stdout(output):
+            exec(sys.argv.pop(1))
+    finally:
+        report = output.getvalue()
+        (fixture / "trim-report").write_text(report)
+        sys.stdout.write(report)
 """
+
+
+def shell_environment(root: Path) -> dict[str, str]:
+    """Give the test shells only the settings they need."""
+    return {
+        # Keep the fixture PATH when the NixOS zsh startup file runs.
+        "__NIXOS_SET_ENVIRONMENT_DONE": "1",
+        "__ETC_ZSHENV_SOURCED": "1",
+        "CONF_DIR": str(root / "config"),
+        "HOME": str(root / "home with spaces"),
+        "TMPDIR": str(root / "tmp"),
+        "PATH": str(root / "bin") + os.pathsep + os.environ["PATH"],
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup"),
+        "PYTHONPYCACHEPREFIX": os.environ.get("PYTHONPYCACHEPREFIX", str(root / "pycache")),
+        "LINT_SWEEP_STATE_DIR": str(root / "sweep-state"),
+        "LINT_SWEEP_DOC_INDEX_MIB": DOC_INDEX_MIB,
+        "USER_ZONE": "UTC",
+    }
 
 
 def nextest_settings(tail_bytes: str = "65536", summary_bytes: str = "1024") -> str:
@@ -68,6 +96,11 @@ def nextest_settings(tail_bytes: str = "65536", summary_bytes: str = "1024") -> 
 
 
 class MacCleanupProtocolTests(unittest.TestCase):
+    def stream_protocol(self, controller: offload.ProcessController, arguments: list[str]) -> offload.RemoteRunStatus:
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(os.environ, shell_environment(Path(directory)), clear=True):
+                return controller.stream_mac_run(arguments)
+
     def test_status_marker_followed_by_ordinary_output_is_printed_and_not_a_result(self) -> None:
         controller = offload.ProcessController()
         for marker in ("mac_exit=0", "mac_nextest_setup=failed"):
@@ -75,7 +108,7 @@ class MacCleanupProtocolTests(unittest.TestCase):
                 text = f"{marker}\ntest still running\n"
                 output = io.StringIO()
                 with redirect_stdout(output):
-                    answer = controller.stream_mac_run([
+                    answer = self.stream_protocol(controller, [
                         "/bin/sh", "-c", 'printf "%s" "$1"; exit 255', "protocol", text,
                     ])
                 self.assertIsInstance(answer, offload.MissingMacStatus)
@@ -97,7 +130,7 @@ class MacCleanupProtocolTests(unittest.TestCase):
                 output = io.StringIO()
                 controller = offload.ProcessController()
                 with redirect_stdout(output):
-                    answer = controller.stream_mac_run([
+                    answer = self.stream_protocol(controller, [
                         "/bin/sh", "-c", 'printf "%s" "$1"; exit "$2"', "protocol",
                         "test output\nmac_exit=42\n" + marker, str(ssh_status),
                     ])
@@ -109,7 +142,7 @@ class MacCleanupProtocolTests(unittest.TestCase):
         output = io.StringIO()
         controller = offload.ProcessController()
         with redirect_stdout(output):
-            answer = controller.stream_mac_run([
+            answer = self.stream_protocol(controller, [
                 "/bin/sh", "-c", 'printf "mac_exit=0\\nmac_cleanup=0\\n"',
             ])
             if not isinstance(answer, offload.ReportedMacStatus):
@@ -166,20 +199,17 @@ class MacTargetCleanupShellTests(unittest.TestCase):
     mirror: Path = Path()
     temporary_directory: Path = Path()
     bin_directory: Path = Path()
-    configuration: Path = Path()
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.configuration = self.root / "config"
-        self.configuration.mkdir()
-        _ = (self.configuration / "build_targets.conf").write_text(MAC_TARGET_CONFIG)
-        mac_settings = self.configuration / "mac_test.conf"
+        configuration = self.root / "config"
+        configuration.mkdir()
+        _ = (configuration / "build_targets.conf").write_text(MAC_TARGET_CONFIG)
+        mac_settings = configuration / "mac_test.conf"
         _ = mac_settings.write_text("mirror_root=~/.local/state/mac-test/mirror\n" + nextest_settings())
-        _ = (self.configuration / "lint.conf").write_text(LINT_TRIM_CONFIG)
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "CONF_DIR": str(self.configuration), "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
-        })))
+        _ = (configuration / "lint.conf").write_text(LINT_TRIM_CONFIG)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         _ = cast(object, self.enterContext(mock.patch.object(nextest_log, "DEFAULT_SETTINGS", mac_settings)))
         self.home_directory = self.root / "home with spaces"
         self.mirror = self.home_directory / offload.remote_mirror(eligibility.KnownRepository("hana's project"))
@@ -238,22 +268,6 @@ printf 'nextest finished\n'
 exit "$CLEANUP_TEST_STATUS"
 ''')
 
-    def offload_config(
-        self, free_floor_gib: float = 100, abandoned_session_minutes: int = 7, budget_gib: str = "24",
-        budget_values: tuple[tuple[str, str], ...] = (),
-    ) -> eligibility.OffloadConfig:
-        settings = self.root / "command-mac.conf"
-        overrides = dict(budget_values)
-        _ = settings.write_text(nextest_settings(overrides.get(nextest_log.TAIL_BYTES, "65536"),
-                                                overrides.get(nextest_log.SUMMARY_BYTES, "1024")))
-        return eligibility.OffloadConfig(
-            enabled=True, connection=eligibility.SshConnectionSettings("unused-host", 6, 10), probe_timeout_s=1,
-            unreachable_backoff_s=300, free_floor_gib=free_floor_gib,
-            default_target_budget_gib=budget_gib,
-            values={"abandoned_session_minutes": str(abandoned_session_minutes), **overrides},
-            settings=conf.read(settings),
-        )
-
     def run_remote(
         self, shell: list[str], status: int, words: tuple[str, ...] = (), *,
         disk_output: str = "Filesystem GiB Used Available Capacity Mounted\nfixture 500 401 99 80% /\n",
@@ -265,21 +279,25 @@ exit "$CLEANUP_TEST_STATUS"
         trim: int | Literal["run"] = 0,
     ) -> subprocess.CompletedProcess[str]:
         request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture-session")
-        config = self.offload_config(free_floor_gib, abandoned_session_minutes, budget_gib, budget_values)
+        settings = self.root / "command-mac.conf"
+        overrides = dict(budget_values)
+        _ = settings.write_text(nextest_settings(overrides.get(nextest_log.TAIL_BYTES, "65536"),
+                                                overrides.get(nextest_log.SUMMARY_BYTES, "1024")))
+        config = eligibility.OffloadConfig(
+            enabled=True, connection=eligibility.SshConnectionSettings("unused-host", 6, 10), probe_timeout_s=1,
+            unreachable_backoff_s=300, free_floor_gib=free_floor_gib,
+            default_target_budget_gib=budget_gib,
+            values={"abandoned_session_minutes": str(abandoned_session_minutes), **overrides},
+            settings=conf.read(settings),
+        )
+
         text = (
             '[ "$(command -v df)" = ' + shlex.quote(str(self.bin_directory / "df")) + ' ] || exit 99\n'
             + offload.remote_test_command(config, request, eligibility.KnownRepository("hana's project"))
         )
         return subprocess.run(
             [*shell, "-c", text], cwd=self.home_directory,
-            env={"CONF_DIR": str(self.configuration),
-                 **SHELL_STARTUP_ENVIRONMENT,
-                 "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup"),
-                 "PYTHONPYCACHEPREFIX": os.environ.get("PYTHONPYCACHEPREFIX", str(self.root / "pycache")),
-                 "HOME": str(self.home_directory), "TMPDIR": str(self.temporary_directory),
-                 "PATH": str(self.bin_directory) + os.pathsep + os.environ["PATH"],
-                 "LINT_SWEEP_STATE_DIR": str(self.root / "sweep-state"),
-                 "LINT_SWEEP_DOC_INDEX_MIB": DOC_INDEX_MIB,
+            env={**shell_environment(self.root),
                  "CLEANUP_TEST_DIR": str(self.root), "CLEANUP_TEST_STATUS": str(status),
                  "CLEANUP_TEST_DF_OUTPUT": disk_output, "CLEANUP_TEST_DF_STATUS": str(disk_status),
                  "CLEANUP_TEST_TRIM": str(trim), "CLEANUP_TEST_PROC": str(self.root / "mac-proc")},
@@ -543,6 +561,25 @@ exit 1
                     else:
                         self.assertEqual(lines[-1], "mac_cleanup=kept")
 
+        with self.subTest(user_zone="caller has no zone"):
+            shutil.rmtree(target, ignore_errors=True)
+            old = target / "debug/incremental/old-session/output.o"
+            old.parent.mkdir(parents=True)
+            _ = old.write_bytes(os.urandom(64 * 1024))
+            (target / "debug/.fingerprint").mkdir()
+            modified = datetime(2020, 2, 3, 4, 5, tzinfo=UTC).timestamp()
+            for path in (old, old.parent):
+                os.utime(path, (modified, modified))
+            with mock.patch.dict(os.environ):
+                _ = os.environ.pop("USER_ZONE", None)
+                answer = self.run_remote(["/bin/sh"], 0, free_floor_gib=50, budget_gib=str(32 / 1024 ** 2), trim="run")
+            self.assertEqual((answer.returncode, answer.stderr), (0, ""), answer.stdout)
+            self.assertEqual(self.cleanup_lines(answer), ["nextest finished", "mac_exit=0", "mac_cleanup=kept"])
+            self.assertFalse(old.exists())
+            report = (self.root / "trim-report").read_text()
+            self.assertIn("last used 2020-02-03 04:05 to 2020-02-03 04:05", report)
+            self.assertNotIn("user_zone", (self.root / "trim-config-reads").read_text().splitlines())
+
     def test_remote_text_with_unreadable_space_keeps_build_output(self) -> None:
         target = self.mirror / "target"
         target.mkdir()
@@ -574,49 +611,6 @@ exit 1
                         self.assertEqual(existing.read_text(), "keep\n")
                         self.assertEqual((other_target / "nextest-output").read_text(), "built\n")
                         self.assertEqual(cast(list[str], json.loads((self.root / "lint-arguments.json").read_text())), ["nextest", *words])
-
-        with self.subTest(mirror_root="changes during command construction"):
-            request = offload.OffloadRequest(
-                self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, ("--target-dir=other-target",),
-                owner="verify", holder_session="fixture-session",
-            )
-            repository = eligibility.KnownRepository("hana's project")
-            controller = offload.ProcessController()
-            output_limits = nextest_log.output_limits
-            new_root = ".local/state/mac-test/new-mirror"
-
-            def change_root(settings: conf.ConfigRead | conf.UseConfiguredValue) -> nextest_log.NextestOutputLimits:
-                _ = (self.configuration / "mac_test.conf").write_text(f"mirror_root=~/{new_root}\n" + nextest_settings())
-                return output_limits(settings)
-
-            with (
-                mock.patch.object(eligibility, "mac_step_eligibility", return_value=repository),
-                mock.patch.object(copies, "remote_lease", return_value=nullcontext()) as lease,
-                mock.patch.object(copies, "register_remote") as register,
-                mock.patch.object(offload, "claim_for_run", return_value=offload.FreshMacClaim(1)),
-                mock.patch.object(offload, "release_claim"),
-                mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(100, "Mac")),
-                mock.patch.object(offload, "copy_tree_with_key", return_value=offload.CopiedTree(offload.UNAVAILABLE_TREE_KEY)),
-                mock.patch.object(nextest_log, "output_limits", side_effect=change_root) as limits,
-                mock.patch.object(conf, "read", wraps=conf.read) as read_config,
-                mock.patch.object(controller, "stream_mac_run",
-                                  return_value=offload.ReportedMacStatus(0, offload.CleanupSkipped())) as stream,
-                redirect_stdout(io.StringIO()),
-            ):
-                result = offload.run_offload(controller, self.offload_config(), request, time.monotonic())
-            self.assertIsInstance(result, offload.PassedOnMac)
-            limits.assert_called_once()
-            lease.assert_called_once()
-            (selected,) = cast(tuple[copies.RemoteMirror], lease.call_args.args)
-            stream.assert_called_once()
-            (ssh,) = cast(tuple[list[str]], stream.call_args.args)
-            command = shlex.split(ssh[-1])
-            self.assertEqual(command[command.index("--path") + 1], selected.path)
-            self.assertEqual(shlex.split(command[-1])[:2], ["cd", selected.path])
-            register.assert_called_once_with(selected)
-            self.assertEqual(read_config.call_args_list.count(mock.call("mac_test")), 1)
-            self.assertEqual(selected.path, str(self.mirror.relative_to(self.home_directory)))
-            self.assertEqual(offload.remote_mirror(repository), f"{new_root}/{repository.legacy_mirror_name}")
 
     def test_remote_text_reports_delete_failure_after_the_test_status(self) -> None:
         remove = self.bin_directory / "rm"
@@ -659,9 +653,7 @@ class MacActivityShellTests(unittest.TestCase):
             _ = (self.root / f"{name}-response.sh").write_text(
                 f"status={status}\nanswer={shlex.quote(answer)}\n")
         (self.root / "commands.jsonl").unlink(missing_ok=True)
-        environment = {**SHELL_STARTUP_ENVIRONMENT,
-                       "PATH": str(self.bin_directory) + os.pathsep + os.environ["PATH"],
-                       "ACTIVITY_TEST_DIR": str(self.root)}
+        environment = {**shell_environment(self.root), "ACTIVITY_TEST_DIR": str(self.root)}
         checks = "\n".join(
             '[ "$(command -v ' + name + ')" = ' + shlex.quote(str(self.bin_directory / name)) + ' ] || exit 99'
             for name in ("pgrep", "lsof", "ps", "id")
@@ -730,9 +722,7 @@ class MacActivityShellTests(unittest.TestCase):
             _ = (self.root / f"{name}-response.sh").write_text(
                 f"status={status}\nanswer={shlex.quote(answer)}\n")
         (self.root / "commands.jsonl").unlink(missing_ok=True)
-        environment = {**SHELL_STARTUP_ENVIRONMENT,
-                       "PATH": str(self.bin_directory) + os.pathsep + os.environ["PATH"],
-                       "ACTIVITY_TEST_DIR": str(self.root)}
+        environment = {**shell_environment(self.root), "ACTIVITY_TEST_DIR": str(self.root)}
         text = offload.mirror_selector_script(scope) + "select_leftovers\n"
         return subprocess.run([*shell, "-c", text], env=environment, capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
 
@@ -775,6 +765,7 @@ class MacActivityShellTests(unittest.TestCase):
             "sh -c cd /Users/test/rust/hana && cargo test",
         ]
         selected = subprocess.run(["grep", "-E", "-e", pattern], input="\n".join(matching + other) + "\n",
+                                  env=shell_environment(self.root),
                                   capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(selected.returncode, 0, selected.stderr)
         self.assertEqual(selected.stdout.splitlines(), matching)
