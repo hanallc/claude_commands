@@ -891,7 +891,9 @@ A revision replacement fades the old card out and slides the new card in.
 Both transitions use the configured card durations and respect reduced motion.
 If the List request fails or times out, the next periodic refresh can update the row.
 List and Review refresh, counts, and linked record requests use `page_request_timeout_seconds`.
-If a List action is pending, the refresh starts after that action ends.
+Periodic and console visibility refreshes skip a pending List action.
+A refused List action restores the confirmed row and shows the reason.
+A refresh for a saved Review change or a new item waits until pending List actions end.
 An explicit item target joins the linked selection and opens its card.
 The shared table names each linked key that the page cannot find.
 It keeps the found cards when another linked key is missing.

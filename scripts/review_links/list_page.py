@@ -942,6 +942,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     owners: Counter[the_list.ItemOwner] = Counter()
     producers: Counter[the_list.ItemOwner] = Counter()
     rows: list[str] = []
+    parked_rows: list[str] = []
     deferred_links = False
     chip_counts: Counter[ListChip] = Counter()
     for index, entry in enumerate(items):
@@ -960,8 +961,9 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
         ):
             row_reviews = LinkedReviewRead.AFTER_RENDER
             deferred_links = True
-        rows.append(item_rows(entry, names, today, index, secret, row_reviews, parked=parked,
-                              open_question=open_question, visibility=visibility))
+        (parked_rows if parked else rows).append(
+            item_rows(entry, names, today, index, secret, row_reviews, parked=parked,
+                      open_question=open_question, visibility=visibility))
     shows = [record_table.Chip("all", "All", len(items)),
              *(record_table.Chip(chip.value, chip.value.replace("-", " ").capitalize(), chip_counts[chip])
                for chip in ListChip if chip != ListChip.ALL)]
@@ -1009,7 +1011,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + '<div class="list-table-tools"><div class="list-expansion">' + expansion + '</div>'
                + '<span data-list-count role="status" aria-live="polite"></span></div>'
                + '<div class="list-table"><table aria-label="The List">' + columns + '<thead><tr>' + headers + '</tr></thead>'
-               + ''.join(rows) + '</table>'
+               + ''.join(rows) + ''.join(parked_rows) + '</table>'
                + '<p data-empty hidden>No items in this view.</p></div>'
                + '<section data-linked-item hidden><h2 id="list-linked-heading">Linked item outside filters</h2>'
                + '<div class="list-table"><table aria-labelledby="list-linked-heading">' + columns
@@ -1131,16 +1133,16 @@ const chipFor=data=>{
 };
 let content=document.querySelector('[data-list]');
 let closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
-let saving=0,listSaveVersion=0,refreshDeferred=false;
+let saving=0,listSaveVersion=0,refreshNeeded=false;
 let createdItem='';
 function startListSave(){
  saving++;listSaveVersion++;pageRefresh.abandon();
 }
 function refreshAfterListSave(needed){
- refreshDeferred ||= needed;
+ refreshNeeded ||= needed;
  if(saving) return;
  if(savedReview) void refreshSavedReview();
- else if(refreshDeferred || createdItem) void pageRefresh.refresh(true);
+ else if(refreshNeeded || createdItem) void pageRefresh.refresh(true);
 }
 const drafts=new Map();
 const unparkMessages={
@@ -1651,9 +1653,7 @@ async function readListCounts(source){
  }
 }
 async function refresh(_supersede=false,current=()=>true){
- if(saving){refreshDeferred=true;return;}
- if(dateTimePickerOpen(content)) return;
- refreshDeferred=false;
+ if(saving || dateTimePickerOpen(content)) return;
  const signal=AbortSignal.timeout(Number(content.dataset.requestTimeoutSeconds)*1000);
  const response=await fetch(location.pathname,{cache:'no-store',signal});
  if(!response.ok) throw new Error('HTTP '+response.status);
@@ -1661,8 +1661,8 @@ async function refresh(_supersede=false,current=()=>true){
  const fresh=page.querySelector('[data-list]');
  if(!fresh) throw new Error('The page has no list.');
  await tableView.settled();
- if(saving){refreshDeferred=true;return;}
- if(dateTimePickerOpen(content) || !current()) return;
+ if(saving || dateTimePickerOpen(content) || !current()) return;
+ refreshNeeded=false;
  const top=scrollY,field=listOwnsFocus() ? document.activeElement : null;
  const focus=field?.id,start=field?.selectionStart,end=field?.selectionEnd;
  const reviewLink=field?.matches('[data-list-review-card]') ? reviewLinkPlace(field) : null;

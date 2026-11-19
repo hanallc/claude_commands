@@ -241,6 +241,7 @@ window.fetch=async (path,options={})=>{
  finishRowSave(Response.json(reply.body,{status:reply.status}));
  const row=()=>document.querySelector('[data-list-item][data-key="'+CSS.escape(created)+'"]');
  await until(document.body,()=>row() && !row().hidden && !row().querySelector('[data-detail]').hidden);
+ check(reads===1,'The New item save refreshes the List once after the row save ends.');
  check(!dialog.open,'Send closes the dialog.');
  const saved=requests.find(([,body])=>body?.words);
  check(saved?.[0]==='/console/review/new-item' && saved[1].recipient_id===owner && saved[1].page==='list',
@@ -1462,6 +1463,11 @@ document.body.append(result);
         self.assertEqual(body.count('value="read">Mark read</button>'), 5)
         self.assertEqual([entry.item.number for entry in list_page.records()],
                          [item.number for item in sorted(the_list.records(MORTY.id), key=the_list.order)])
+        parked = self.add("Check the delivery", the_list.ItemState.WAITING_FOR_NATE, number=59)
+        _ = the_list.park(MORTY.id, parked.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
+        parked_markup = list_page.render(self.root / "reviews").decode()
+        self.assertEqual(re.findall(r'<tbody data-list-item [^>]*data-number="(\d+)"', parked_markup),
+                         ["58", "105", "106", "63", "59", "41"])
         self.assertNotIn(f'data-key="{MORTY.id}/L54"', body)
         self.assertNotIn('<h3>Closing words</h3>', body)
         _ = the_list.reopen(MORTY.id, "L54", source="nate")
@@ -5754,7 +5760,7 @@ window.fetch=async(_path,options={})=>{
   }
   const result={ok:true,status:200,json:async()=>({state:'sent',unread:'false',
    ...(fields.get('action')==='remove' ? {item_state:'Closed'} : {})})};
-  if(holdPost) return await new Promise(resolve=>finishPost=()=>resolve(result));
+  if(holdPost) return await new Promise(resolve=>finishPost=(reply=result)=>resolve(reply));
   return result;
  }
  reads.push(1);if(failRefresh) throw new Error('fixture refresh failed');
@@ -5993,6 +5999,18 @@ try{
  check(!refreshed.querySelector('[value="tell"]').disabled,'a restored draft enables Tell morty');
  check(scrollY===100,'refresh keeps scroll');
  check(refreshed!==selected,'refresh replaces the row');
+ const refusedForm=refreshed.querySelector('form');
+ holdPost=true;
+ const refused=submitted(refusedForm,refusedForm.querySelector('[value="tell"]'));
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ check(reads.length===3,'The shared status event makes no List request during a row save.');
+ finishPost({ok:false,status:409,json:async()=>({reason:'The row save was refused.'})});
+ holdPost=false;finishPost=undefined;
+ await refused;
+ check(reads.length===3 && refreshed.isConnected,'A refused row save makes no List request after the event.');
+ check(refreshed.dataset.unread==='true' && refusedForm.elements.words.value==='Keep my draft' &&
+       refusedForm.querySelector('[data-send-status]').textContent==='Not saved: The row save was refused.',
+       'A refusal restores the unread state and shows the reason beside the draft.');
  bulk('expand').click();
  check(visible().length===2 && visible().every(row=>!row.querySelector('[data-detail]').hidden),
   'Expand all opens both matching rows after refresh');
