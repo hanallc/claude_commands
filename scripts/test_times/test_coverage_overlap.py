@@ -20,7 +20,7 @@ from unittest import mock
 
 
 from scripts.buildlog import treekey
-from scripts.lib import build_folders, walled_tests
+from scripts.lib import build_folders, bubble_wrapped_tests
 from scripts.lib.checkout_test_support import copy_test_runner
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -205,9 +205,9 @@ class CoverageOverlapTests(unittest.TestCase):
         original = [sys.executable, str(TOOL), *arguments]
         with (mock.patch.object(sys, "orig_argv", original),
               mock.patch.dict(os.environ, {"COVERAGE_OUT": ""}),
-              mock.patch.object(walled_tests, "guarded", return_value=False),
-              mock.patch.object(walled_tests, "enter",
-                                side_effect=walled_tests.WallsUnavailable("Bubblewrap is unavailable")) as enter,
+              mock.patch.object(bubble_wrapped_tests, "guarded", return_value=False),
+              mock.patch.object(bubble_wrapped_tests, "enter",
+                                side_effect=bubble_wrapped_tests.BubblewrapUnavailable("Bubblewrap is unavailable")) as enter,
               mock.patch.object(coverage_overlap, "discover_test_modules") as discover,
               redirect_stderr(io.StringIO()) as error):
             self.assertEqual(coverage_overlap.main(arguments), 2)
@@ -232,9 +232,9 @@ class CoverageOverlapTests(unittest.TestCase):
 
             with (mock.patch.object(sys, "orig_argv", original),
                   mock.patch.dict(os.environ, {"COVERAGE_OUT": str(output)}),
-                  mock.patch.object(walled_tests, "guarded", return_value=False),
+                  mock.patch.object(bubble_wrapped_tests, "guarded", return_value=False),
                   mock.patch.object(treekey, "tree_key", return_value="fixture-tree") as tree_key,
-                  mock.patch.object(walled_tests, "run", side_effect=run),
+                  mock.patch.object(bubble_wrapped_tests, "run", side_effect=run),
                   mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(folder))):
                 self.assertEqual(coverage_overlap.main(arguments), 1)
             tree_key.assert_called_once()

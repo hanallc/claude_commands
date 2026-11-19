@@ -22,7 +22,7 @@ from typing import cast, final, override
 from contextlib import AbstractContextManager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
-from scripts.lib import scratch, walled_tests
+from scripts.lib import scratch, bubble_wrapped_tests
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import change_review, merge_gate, staff
 from scripts.production.gate_modules import GateRefused
@@ -118,14 +118,14 @@ class ModuleScopeStopTests(unittest.TestCase):
     def test_nested_job_clears_the_caller_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
-            config = folder / "walled_tests.conf"
+            config = folder / "bubble_wrapped_tests.conf"
             _ = config.write_text("kept_environment=PATH HOME\n")
             environment = {"PATH": "/bin", "HOME": "/home/test", "GIT_DIR": "/private/git",
                            "BASH_ENV": "/private/startup.sh", "COPIES_RUN_PID": "123"}
-            with (mock.patch.object(walled_tests, "CONFIG", config),
-                  mock.patch.object(walled_tests, "guarded", return_value=True),
+            with (mock.patch.object(bubble_wrapped_tests, "CONFIG", config),
+                  mock.patch.object(bubble_wrapped_tests, "guarded", return_value=True),
                   mock.patch.dict(os.environ, environment, clear=True)):
-                command = walled_tests.command(["/bin/true"], folder)
+                command = bubble_wrapped_tests.command(["/bin/true"], folder)
         self.assertEqual(command[:2], ["/usr/bin/env", "-i"])
         self.assertEqual(command[-1], "/bin/true")
         self.assertIn("PATH=/bin", command)

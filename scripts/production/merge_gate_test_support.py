@@ -31,7 +31,7 @@ from unittest import mock
 
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
-from scripts.lib import build_folders, conf, walled_tests
+from scripts.lib import build_folders, conf, bubble_wrapped_tests
 from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lint import memory_admit, sweep
 from scripts.lint.memory_test_support import config_environment, fake_memory_readings, write_config_fixture
@@ -395,14 +395,14 @@ class MergeGateFixture(unittest.TestCase):
         cgroups = self.root / "builds.slice"
         self.write(cgroups / "cgroup.kill", "")
         self.write(cgroups / "cgroup.events", "populated 0\n")
-        settings = conf.read(walled_tests.CONFIG)
+        settings = conf.read(bubble_wrapped_tests.CONFIG)
         kept = (*settings.words("kept_environment"), "BUILDLOG_BUILDS_CGROUP", "CONF_DIR",
                 "MERGE_GATE_TEST_STATE", "MERGE_GATE_TEST_REPO")
-        configuration = self.root / "config/walled_tests.conf"
+        configuration = self.root / "config/bubble_wrapped_tests.conf"
         self.write(configuration, f"bubblewrap={settings.text('bubblewrap')}\n"
                    + f"kept_environment={' '.join(kept)}\n")
         with mock.patch.dict(self.environment, {"BUILDLOG_BUILDS_CGROUP": str(cgroups)}), \
-                mock.patch.dict(os.environ, self.environment), mock.patch.object(walled_tests, "CONFIG", configuration):
+                mock.patch.dict(os.environ, self.environment), mock.patch.object(bubble_wrapped_tests, "CONFIG", configuration):
             yield cgroups
 
     @contextlib.contextmanager

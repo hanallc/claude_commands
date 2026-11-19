@@ -27,7 +27,7 @@ TEST_RUNNER_FILES = (*STARTUP_FILES, "scripts/test_times/module_run.py", "script
                      "scripts/lib/conf_reads.py", "scripts/lib/build_folders.py", "scripts/lib/build_folder_lock.py",
                      "scripts/lib/boot_identity.py",
                      "scripts/lib/conf.py", "scripts/lib/git_files.py", "config/build_folders.conf",
-                     "scripts/lib/walled_tests.py", "config/walled_tests.conf")
+                     "scripts/lib/bubble_wrapped_tests.py", "config/bubble_wrapped_tests.conf")
 DATACLASS_CODE_FILENAME = "<string>"
 # dataclasses.py has no __future__ import, so its exec compiles with no flags.
 DATACLASS_CODE_FLAGS = 0
@@ -58,7 +58,7 @@ def _load_raw_starts() -> RawStarts:
         if not callable(classifier.is_test_start) or not callable(classifier.python_target):
             raise TypeError("invalid classifier entry points")
     except Exception as error:
-        raise SystemExit(f"walled tests: cannot load {path}: {error}") from error
+        raise SystemExit(f"Bubblewrap tests: cannot load {path}: {error}") from error
     sys.modules[name] = module
     return classifier
 
@@ -248,7 +248,7 @@ def start_process(arguments: list[str]) -> str:
 
 
 def kernel_guarded() -> bool:
-    """Check the mount, PID, and network walls."""
+    """Check the mount, PID, and network namespaces."""
     if sys.platform != "linux":
         return False
     try:
@@ -286,14 +286,14 @@ def _start_test_run(selected: str) -> None:
     if not classifier.is_test_start(target):
         return
     if not kernel_guarded():
-        guard = os.path.join(selected, "scripts/lib/walled_tests.py")
+        guard = os.path.join(selected, "scripts/lib/bubble_wrapped_tests.py")
         if not os.path.isfile(guard):
-            raise SystemExit(f"walled tests: launcher not found: {guard}")
+            raise SystemExit(f"Bubblewrap tests: launcher not found: {guard}")
         # The launcher calls enter() before it restarts Python.
         try:
             os.execv(sys.executable, [sys.executable, "-I", guard, "--", sys.executable, *original[1:]])
         except OSError as error:
-            raise SystemExit(f"walled tests: cannot start the launcher: {error}") from error
+            raise SystemExit(f"Bubblewrap tests: cannot start the launcher: {error}") from error
     if os.environ.get("MERGE_GATE_PARENT_PID"):
         return
     # Partial fixture checkouts can contain only the startup files.

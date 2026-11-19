@@ -21,7 +21,7 @@ import unittest
 from unittest import mock
 
 
-from scripts.lib import walled_tests
+from scripts.lib import bubble_wrapped_tests
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -314,9 +314,9 @@ class GuardedRunnerTests(unittest.TestCase):
     def test_refusal_happens_before_runner_setup(self) -> None:
         arguments = [sys.executable, str(RUNNER), "scripts/lib", "test_py_root.py"]
         with (mock.patch.object(sys, "orig_argv", arguments),
-              mock.patch.object(walled_tests, "guarded", return_value=False),
-              mock.patch.object(walled_tests, "enter",
-                                side_effect=walled_tests.WallsUnavailable("Bubblewrap is unavailable")) as enter,
+              mock.patch.object(bubble_wrapped_tests, "guarded", return_value=False),
+              mock.patch.object(bubble_wrapped_tests, "enter",
+                                side_effect=bubble_wrapped_tests.BubblewrapUnavailable("Bubblewrap is unavailable")) as enter,
               mock.patch.object(module_run, "private_run_roots") as prepare):
             with self.assertRaisesRegex(SystemExit, "Bubblewrap is unavailable"):
                 module_run.run_entrypoint()

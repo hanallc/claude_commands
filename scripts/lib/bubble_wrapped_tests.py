@@ -1,4 +1,4 @@
-"""Start tests inside the natedev file, PID, and network walls."""
+"""Start tests in Bubblewrap on natedev."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from scripts.lib.python_startup.sitecustomize import kernel_guarded
 
 CHECKOUT = Path(__file__).resolve().parents[2]
 SYSTEM = Path("/run/current-system/sw")
-CONFIG = CHECKOUT / "config/walled_tests.conf"
+CONFIG = CHECKOUT / "config/bubble_wrapped_tests.conf"
 HOME = "/home/test"
 MODULE_VALUES = (
     "BUILDLOG_DIR", "BUILDLOG_LIVE_MEMORY_TRIPWIRE", "HERDR_BIN", "HERDR_PANE_RECORD_DIR",
@@ -32,8 +32,8 @@ MODULE_VALUES = (
 )
 
 
-class WallsUnavailable(RuntimeError):
-    """The required test walls cannot start."""
+class BubblewrapUnavailable(RuntimeError):
+    """The test cannot start in Bubblewrap."""
 
 
 class GateInputs(NamedTuple):
@@ -57,7 +57,7 @@ def gate_inputs(checkout: Path, environment: Mapping[str, str], *,
 
 
 def guarded() -> bool:
-    """Check the walls in the current kernel namespaces."""
+    """Check the mount, PID, and network namespaces."""
     return kernel_guarded()
 
 
@@ -66,7 +66,7 @@ def host_environment(environment: Mapping[str, str]) -> dict[str, str]:
     try:
         return _kept_environment(conf.read(CONFIG), environment)
     except conf.Unusable as error:
-        raise WallsUnavailable(str(error)) from error
+        raise BubblewrapUnavailable(str(error)) from error
 
 
 def _kept_environment(settings: conf.ConfigRead, environment: Mapping[str, str]) -> dict[str, str]:
@@ -77,7 +77,7 @@ def _kept_environment(settings: conf.ConfigRead, environment: Mapping[str, str])
 def command(argv: Sequence[str], job_folder: Path, *, lease_fd: int | None = None) -> list[str]:
     """Build a guarded command. The caller owns the job folder lease."""
     if not argv:
-        raise WallsUnavailable("a guarded command requires an executable")
+        raise BubblewrapUnavailable("a guarded command requires an executable")
     try:
         settings = conf.read(CONFIG)
         inputs = _gate_inputs.get()
@@ -99,7 +99,7 @@ def command(argv: Sequence[str], job_folder: Path, *, lease_fd: int | None = Non
 
         executable = Path(settings.text("bubblewrap", recover_invalid=False))
         if executable != SYSTEM / "bin/bwrap" or not executable.is_file() or not os.access(executable, os.X_OK):
-            raise WallsUnavailable(f"Bubblewrap is unavailable at {SYSTEM / 'bin/bwrap'}")
+            raise BubblewrapUnavailable(f"Bubblewrap is unavailable at {SYSTEM / 'bin/bwrap'}")
         checkout = Path.cwd().resolve() if inputs is None else inputs.checkout.resolve()
         working = checkout
         if inputs is None:
@@ -114,7 +114,7 @@ def command(argv: Sequence[str], job_folder: Path, *, lease_fd: int | None = Non
         if (not folder.is_dir() or folder in working.parents or folder == working
                 or folder in CHECKOUT.parents or folder == CHECKOUT
                 or folder in (Path("/tmp"), Path("/dev/shm"), Path("/var/tmp"))):
-            raise WallsUnavailable(f"unsafe test job folder: {folder}")
+            raise BubblewrapUnavailable(f"unsafe test job folder: {folder}")
 
         account = Path(tempfile.mkdtemp(prefix="test-account-", dir=folder))
         uid, gid = os.getuid(), os.getgid()
@@ -160,7 +160,7 @@ def command(argv: Sequence[str], job_folder: Path, *, lease_fd: int | None = Non
         arguments.extend(("--remount-ro", "/dev", "--remount-ro", "/", "--chdir", str(working), "--", *argv))
         return arguments
     except (conf.Unusable, OSError) as error:
-        raise WallsUnavailable(str(error)) from error
+        raise BubblewrapUnavailable(str(error)) from error
 
 
 def profile_folder() -> Path | None:
@@ -199,7 +199,7 @@ def _exec(argv: Sequence[str], environment: Mapping[str, str]) -> NoReturn:
     try:
         os.execvpe(argv[0], list(argv), environment)
     except OSError as error:
-        raise WallsUnavailable(f"cannot start {argv[0]}: {error}") from error
+        raise BubblewrapUnavailable(f"cannot start {argv[0]}: {error}") from error
 
 
 def _verified_command(argv: Sequence[str], folder: Path) -> list[str]:
@@ -209,25 +209,25 @@ def _verified_command(argv: Sequence[str], folder: Path) -> list[str]:
 def run(argv: Sequence[str], folder: Path) -> int:
     """Keep the caller and its folder until the guarded command exits."""
     if not argv:
-        raise WallsUnavailable("a guarded command requires an executable")
+        raise BubblewrapUnavailable("a guarded command requires an executable")
     try:
         status = subprocess.run(_verified_command(argv, folder), env={}, check=False, restore_signals=False).returncode
     except OSError as error:
-        raise WallsUnavailable(f"cannot start {argv[0]}: {error}") from error
+        raise BubblewrapUnavailable(f"cannot start {argv[0]}: {error}") from error
     return status if status >= 0 else 128 - status
 
 
 def enter(argv: Sequence[str]) -> NoReturn:
-    """Run a command behind the test walls or refuse it."""
+    """Run a command in Bubblewrap or refuse it."""
     if not argv:
-        raise WallsUnavailable("a guarded command requires an executable")
+        raise BubblewrapUnavailable("a guarded command requires an executable")
     if guarded():
         _exec(command(argv, Path(tempfile.gettempdir())), {})
     folder = profile_folder()
     if folder is None:
         if "TEST_TIMES_OUT" in os.environ:
-            raise WallsUnavailable("test timing output requires a private profiler folder")
-        with tempfile.TemporaryDirectory(prefix="walled-tests-", dir="/tmp") as directory:
+            raise BubblewrapUnavailable("test timing output requires a private profiler folder")
+        with tempfile.TemporaryDirectory(prefix="bubble-wrapped-tests-", dir="/tmp") as directory:
             raise SystemExit(run(argv, Path(directory)))
     launch = _verified_command(argv, folder)
     # Bubblewrap passes inherited descriptors to its child.
@@ -241,7 +241,7 @@ def enter(argv: Sequence[str]) -> NoReturn:
                     if error.errno != errno.EBADF:
                         raise
     except OSError as error:
-        raise WallsUnavailable(f"cannot close inherited descriptors: {error}") from error
+        raise BubblewrapUnavailable(f"cannot close inherited descriptors: {error}") from error
     _exec(launch, {})
 
 
@@ -249,15 +249,15 @@ def main(argv: list[str]) -> NoReturn:
     try:
         if argv[:1] == ["--inside"]:
             if not guarded():
-                raise WallsUnavailable("the required test walls are absent after launch")
+                raise BubblewrapUnavailable("the test started outside Bubblewrap")
             if len(argv) < 2:
-                raise WallsUnavailable("a guarded command requires an executable")
+                raise BubblewrapUnavailable("a guarded command requires an executable")
             _exec(argv[1:], os.environ)
         if argv[:1] == ["--"]:
             enter(argv[1:])
-        raise WallsUnavailable("usage: walled_tests.py -- <command>")
-    except WallsUnavailable as error:
-        raise SystemExit(f"walled tests: {error}") from error
+        raise BubblewrapUnavailable("usage: bubble_wrapped_tests.py -- <command>")
+    except BubblewrapUnavailable as error:
+        raise SystemExit(f"Bubblewrap tests: {error}") from error
 
 
 if __name__ == "__main__":

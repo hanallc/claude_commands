@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, TypedDict, cast, override
 import unittest
 
 
-from scripts.lib import build_folders, walled_tests
+from scripts.lib import build_folders, bubble_wrapped_tests
 from scripts.lib.python_startup.sitecustomize import inherited_paths
 from scripts.test_times.line_collector import (
     REPOSITORY, SHARED_TEST, SHARED_THREAD, ChildLaunch, ChildReport, ExecutedLine, LineCollector, read_child_reports,
@@ -315,8 +315,8 @@ def run_with_output(command: list[str], output: Path) -> int:
     with build_folders.tool_folder("coverage-overlap") as folder:
         report = folder.resolve() / "coverage.json"
         environment = {**os.environ, "COVERAGE_OUT": str(report), "COVERAGE_TREE_SHA": tree}
-        with walled_tests.gate_inputs(REPOSITORY, environment, read_only=()):
-            status = walled_tests.run(command, folder)
+        with bubble_wrapped_tests.gate_inputs(REPOSITORY, environment, read_only=()):
+            status = bubble_wrapped_tests.run(command, folder)
         try:
             descriptor = os.open(report, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except FileNotFoundError:
@@ -334,14 +334,14 @@ def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print("usage: coverage_overlap.py scripts/<folder> <file> [<file> ...]", file=sys.stderr)
         return 2
-    if not walled_tests.guarded():
+    if not bubble_wrapped_tests.guarded():
         try:
             command = [sys.executable, *sys.orig_argv[1:]]
             if output := os.environ.get("COVERAGE_OUT"):
                 return run_with_output(command, Path(output))
-            walled_tests.enter(command)
-        except walled_tests.WallsUnavailable as error:
-            print(f"walled tests: {error}", file=sys.stderr)
+            bubble_wrapped_tests.enter(command)
+        except bubble_wrapped_tests.BubblewrapUnavailable as error:
+            print(f"Bubblewrap tests: {error}", file=sys.stderr)
             return 2
         except OSError as error:
             print(f"coverage overlap: cannot write output: {error}", file=sys.stderr)

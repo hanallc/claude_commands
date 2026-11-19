@@ -84,7 +84,7 @@ from scripts.buildlog import store  # noqa: E402
 from scripts.buildlog.store import host_name  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
-from scripts.lib import scratch, walled_tests  # noqa: E402
+from scripts.lib import scratch, bubble_wrapped_tests  # noqa: E402
 from scripts.lint.memory_admit import builds_slice_cgroup
 from scripts.test_times import gate_record
 from scripts.build_queue import admission_records  # noqa: E402
@@ -1211,7 +1211,7 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     started_at = time.time()
     try:
         with cancellation.defer_cleanup_signals():
-            host_environment = walled_tests.host_environment(environment)
+            host_environment = bubble_wrapped_tests.host_environment(environment)
             process = subprocess.Popen([sys.executable, "-I", "-c", SUITE_BOOTSTRAP, *argv],
                                        cwd=repo, env={**host_environment, "MERGE_GATE_PARENT_PID": str(os.getpid())},
                                        stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, text=True,
@@ -1864,11 +1864,11 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         candidate = [checker, "--pythonpath", str(types_python), *type_dirs]
                     else:
                         candidate = [python, str(runner), str(path.parent), path.name]
-                    lease_fd = None if walled_tests.guarded() else build_folders.build_folder_lock_fd(root)
+                    lease_fd = None if bubble_wrapped_tests.guarded() else build_folders.build_folder_lock_fd(root)
                     try:
-                        with walled_tests.gate_inputs(repo, job_environment, read_only=read_only):
-                            argv = walled_tests.command(candidate, root, lease_fd=lease_fd)
-                    except walled_tests.WallsUnavailable as error:
+                        with bubble_wrapped_tests.gate_inputs(repo, job_environment, read_only=read_only):
+                            argv = bubble_wrapped_tests.command(candidate, root, lease_fd=lease_fd)
+                    except bubble_wrapped_tests.BubblewrapUnavailable as error:
                         raise GateRefused(str(error)) from error
                     scope = None
                     if request.kind is GateJobKind.TEST_MODULE and scope_root is not None:

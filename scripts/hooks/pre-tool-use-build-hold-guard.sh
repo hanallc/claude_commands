@@ -35,7 +35,7 @@ needs_decision() {
     local continuation='\\\n'
     command_text="${command_text//"$continuation"/}"
     case "$command_text" in
-        *unittest*|*pytest*|*py.test*|*module_run*|*coverage_overlap*|*merge_gate*|*/gate.py*|*' gate.py'*|*'"gate.py'*|*targeted_test*|*walled_tests*)
+        *unittest*|*pytest*|*py.test*|*module_run*|*coverage_overlap*|*merge_gate*|*/gate.py*|*' gate.py'*|*'"gate.py'*|*targeted_test*|*bubble_wrapped_tests*)
             return 0
             ;;
         *python*|*/py*|*node*|*bash*|*zsh*|*dash*|*'"sh '*|*'"sh"'*|*'/sh '*|*'/sh"'*|*' sh '*)

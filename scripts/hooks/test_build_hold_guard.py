@@ -287,7 +287,7 @@ class BuildHoldGuardTest(TemporaryGuardTest):
         response = cast(dict[str, dict[str, str]], json.loads(done.stdout))
         self.assertEqual(response["hookSpecificOutput"], {
             "hookEventName": "PreToolUse", "permissionDecision": "deny",
-            "permissionDecisionReason": "Start tests through scripts/lib/py or scripts/lib/walled_tests.py.",
+            "permissionDecisionReason": "Start tests through scripts/lib/py or scripts/lib/bubble_wrapped_tests.py.",
         })
 
     def test_shell_front_denies_raw_tests_without_a_hold(self) -> None:
@@ -379,7 +379,7 @@ exit "$GUARD_STATUS"
 
     def test_test_text_without_an_interpreter_starts_no_python(self) -> None:
         edit = {"tool_name": "Edit", "tool_input": {
-            "file_path": "scripts/lib/test_walled_fixture.py", "new_string": "def test_example(): pass",
+            "file_path": "scripts/lib/test_bubble_wrapped_fixture.py", "new_string": "def test_example(): pass",
         }}
         self.assert_no_python(json.dumps(edit))
         for command in ("grep test_ notes.md", "grep proof notes.md", "python3 aggregate.py"):
