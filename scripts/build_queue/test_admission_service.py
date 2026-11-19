@@ -902,6 +902,7 @@ class LandingWaitTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             self.configure_wait(fixture, retry_seconds=2.5)
             _ = only_admitted(fixture.server.handle_request(self.gate_request(fixture, self.INTEGRATE)))
+            fixture.allow_next_start()
             request = self.reroutable_gate(fixture)
             peer = fixture.connect(request)
             first, = peer.replies()
@@ -938,6 +939,32 @@ class LandingWaitTests(unittest.TestCase):
                 _ = fixture.run_pass()
                 self.assertIn(request.episode, fixture.server.waiters)
 
+    def test_memory_and_landing_hold_together_do_not_start_the_route_timer(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.configure_wait(fixture)
+            _ = only_admitted(fixture.server.handle_request(self.gate_request(fixture, self.INTEGRATE)))
+            fixture.allow_next_start()
+            fixture.free(0)
+            request = self.reroutable_gate(fixture)
+            peer = fixture.connect(request)
+            first, = peer.replies()
+            assert isinstance(first, wire.Wait)
+            self.assertEqual(first.text, records.LANDING_WAIT_TEXT)
+            self.assertIsInstance(first.snapshot.decision.room.basis, records.DoesNotFit)
+            fixture.clock.advance(4)
+            _ = fixture.run_pass()
+            self.assertEqual(fixture.server.waiters[request.episode].merge_route_retry_at, float("inf"))
+            self.assertNotIn(request.episode, fixture.server.reservations)
+            for reply in peer.replies():
+                self.assertIsInstance(reply, wire.Wait)
+                assert isinstance(reply, wire.Wait)
+                self.assertNotEqual(reply.reason, records.LandingWait(retry_route=True))
+
+            fixture.free(60 * GIB)
+            _ = fixture.run_pass()
+            self.assertEqual(fixture.server.waiters[request.episode].merge_route_retry_at,
+                             fixture.clock.monotonic() + 2)
+
     def test_landing_test_checks_the_land_session_and_the_socket_peer_owner(self) -> None:
         merge_member = staff.StaffRow(gate.NATEMERGE_STAFF_ID, "producer", "natemerge", staff.StaffRoot(),
                                       current_session=staff.StaffId("merge-session"))
@@ -948,7 +975,7 @@ class LandingWaitTests(unittest.TestCase):
                 "MERGE_GATE_STATE_DIR": str(fixture.root / "merge-state")}):
             proc = fixture.proc.path
             land = wire.Owner(10, "10")
-            owner = wire.Owner(101, "20")
+            owner = fixture.fixture_owner(101, "20")
             write_process(proc, land.pid, start=land.start_time)
             write_process(proc, owner.pid, start=owner.start_time, parent=land.pid)
             write_process(proc, os.getpid(), start="30", parent=owner.pid)
@@ -957,14 +984,24 @@ class LandingWaitTests(unittest.TestCase):
             _ = (directory / "10.json").write_text(json.dumps({"pid": land.pid, "start": land.start_time, "commits": ["abc"]}))
             environ = proc / str(land.pid) / "environ"
             request = fixture.request(owner=owner, step="merge-gate")
+            _ = (proc / str(owner.pid) / "cmdline").write_bytes(b"python3\0merge_gate.py\0--tests-only\0")
             client_socket, service_socket = socket.socketpair()
             with client_socket, service_socket:
                 connection = service.Connection(service_socket)
                 _ = environ.write_bytes(b"CODEX_THREAD_ID=land-session\0")
                 request = replace(request, identity=replace(request.identity, session_id=""))
                 self.assertEqual(service.landing_test(request, proc, connection), service.LandingTest(land))
+                remote = replace(request, place=wire.CloudPlace("aws"))
+                grant = only_admitted(fixture.connect(remote).replies())
+                record = fixture.server.reservations[remote.episode]
+                self.assertEqual(record.gate_job, self.INTEGRATE)
+                view, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(view, wire.ViewReply) and isinstance(view.reading, wire.CloudQueueRead)
+                cloud, = view.reading.cloud
+                self.assertEqual(cloud.identity.job, self.INTEGRATE)
                 wrong_owner = replace(request, owner=replace(owner, start_time="19"))
                 self.assertEqual(service.landing_test(wrong_owner, proc, connection), service.OrdinaryTest())
+                fixture.release(grant)
                 _ = environ.write_bytes(b"CODEX_THREAD_ID=trial-session\0")
                 request = replace(request, identity=replace(request.identity, session_id="merge-session"))
                 self.assertEqual(service.landing_test(request, proc, connection), service.OrdinaryTest())

@@ -57,7 +57,10 @@ from scripts.lib.process_start import Started, Unreadable, process_start
 from scripts.buildlog import store
 from scripts.lib import test_phase
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
-from scripts.lib.build_steps import GATE_PROGRAMS, gate_job_from_process
+from scripts.lib.build_steps import (
+    GATE_PROGRAMS, CommandUnreadable, CopiesRunCommand, OtherCommand, command_job, command_program,
+    copies_run_command, live_process_arguments,
+)
 
 from scripts.build_queue.scope_activity import (
     IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob,
@@ -390,18 +393,6 @@ class ReservationRecord:
     landing_merge: bool = False
 
 
-def admitted_gate_job(request: wire.AdmitRequest, proc: Path) -> StepJob | GateJobNotRecorded:
-    """Keep the request's gate job or read the local caller's command."""
-    if isinstance(request.identity.job, StepJob):
-        return request.identity.job
-    step = request.profile.step
-    if isinstance(request.place, wire.LocalPlace) and step in GATE_PROGRAMS:
-        job = gate_job_from_process(step, proc / str(request.owner.pid), start_time=request.owner.start_time)
-        if isinstance(job, StepJob):
-            return job
-    return GATE_JOB_NOT_RECORDED
-
-
 @dataclass(frozen=True)
 class LandingTest:
     """The gate descends from a live natemerge land."""
@@ -414,11 +405,37 @@ class OrdinaryTest:
     """The request has no verified landing priority."""
 
 
+ORDINARY_TEST = OrdinaryTest()
+
+
+def admitted_gate_job(request: wire.AdmitRequest, proc: Path,
+                      landing: LandingTest | OrdinaryTest) -> StepJob | GateJobNotRecorded:
+    """Name the gate from its recorded job or live command and the verified land."""
+    job: StepJob | GateJobNotRecorded | OtherCommand = request.identity.job
+    if isinstance(job, GateJobNotRecorded):
+        expected = GATE_PROGRAMS.get(request.profile.step)
+        if expected is None:
+            return GATE_JOB_NOT_RECORDED
+        argv = live_process_arguments(proc / str(request.owner.pid), request.owner.start_time)
+        if isinstance(argv, CommandUnreadable):
+            return GATE_JOB_NOT_RECORDED
+        copied = copies_run_command(argv)
+        command = copied.arguments if isinstance(copied, CopiesRunCommand) else argv
+        if command_program(command) != expected:
+            return GATE_JOB_NOT_RECORDED
+        job = command_job(command)
+    if not isinstance(job, StepJob):
+        return GATE_JOB_NOT_RECORDED
+    if isinstance(landing, LandingTest) and job.step in ("test-all", "test-modules"):
+        return StepJob("integrate")
+    return job
+
+
 def landing_test(request: wire.AdmitRequest | wire.LaunchRequest, proc: Path,
                  connection: Connection | NoConnection) -> LandingTest | OrdinaryTest:
-    """Check the local gate's owner and find the land in its socket peer's lineage."""
-    if (not isinstance(request, wire.AdmitRequest) or not isinstance(request.place, wire.LocalPlace)
-            or request.profile.step != "merge-gate" or isinstance(connection, NoConnection)):
+    """Check the gate's owner and find the land in its socket peer's lineage."""
+    if (not isinstance(request, wire.AdmitRequest) or request.profile.step != "merge-gate"
+            or isinstance(connection, NoConnection)):
         return OrdinaryTest()
     from scripts.build_hold import build_hold
     from scripts.build_targets import build_targets
@@ -1851,7 +1868,8 @@ class AdmissionServer:
         from scripts.build_hold.build_hold import ProcessIdentity
 
         landings = {records.waiter_owner(waiting.row): waiting for waiting in self.waiters.values()
-                    if isinstance(waiting.landing, LandingTest)}
+                    if isinstance(waiting.landing, LandingTest) and isinstance(waiting.request, wire.AdmitRequest)
+                    and isinstance(waiting.request.place, wire.LocalPlace)}
         limit = landing_pass_limit() if landings else 0
         if limit:
             preceding: list[tuple[int, WaiterPlace]] = []
@@ -2001,7 +2019,8 @@ class AdmissionServer:
                 del self.places[key]
         self.persist()
 
-    def _row(self, request: wire.AdmitRequest | wire.LaunchRequest, place: WaiterPlace | records.NoWaiter) -> records.Waiter:
+    def _row(self, request: wire.AdmitRequest | wire.LaunchRequest, place: WaiterPlace | records.NoWaiter,
+             landing: LandingTest | OrdinaryTest = ORDINARY_TEST) -> records.Waiter:
         profile, identity = request.profile, request.identity
         since = request.since if isinstance(place, records.NoWaiter) else place.since
         row: records.Waiter = {
@@ -2019,7 +2038,7 @@ class AdmissionServer:
             "repository_name": profile.repo,
             "route": request.route if isinstance(request, wire.AdmitRequest) else records.DIRECT_CARGO,
         }
-        job = admitted_gate_job(request, self.proc.path) if isinstance(request, wire.AdmitRequest) else identity.job
+        job = admitted_gate_job(request, self.proc.path, landing) if isinstance(request, wire.AdmitRequest) else identity.job
         if isinstance(job, StepJob):
             row["job"] = job
         if isinstance(place, WaiterPlace) and not isinstance(place.priority_since, OrderNotStarted):
@@ -2520,7 +2539,7 @@ class AdmissionServer:
                 reason = decision.reason
                 cause = reason.cause if isinstance(reason, records.HeadAdmissionStatus) else reason
                 profile = waiting.request.profile
-                if isinstance(cause, records.LandingWait) and isinstance(profile, records.ProgramProfile) and profile.retry_merge_route:
+                if decision.landing_only and isinstance(profile, records.ProgramProfile) and profile.retry_merge_route:
                     if waiting.merge_route_retry_at == float("inf"):
                         waiting.merge_route_retry_at = observed_at + self.configuration.merge_test_reroute_seconds
                     if observed_at >= waiting.merge_route_retry_at:
@@ -4673,11 +4692,12 @@ done
                     return self._mutation_reply(key, refused)
             self._pending_replies[key] = []
             place_key = _place_key(request.owner, request.since)
-            row = self._row(request, self.places.get(place_key, records.NoWaiter()))
+            landing = landing_test(request, self.proc.path, connection)
+            row = self._row(request, self.places.get(place_key, records.NoWaiter()), landing)
             place = waiter_place(row, key)
             self._run_place(request, place)
-            landing = landing_test(request, self.proc.path, connection)
-            if isinstance(landing, LandingTest):
+            if (isinstance(landing, LandingTest) and isinstance(request, wire.AdmitRequest)
+                    and isinstance(request.place, wire.LocalPlace)):
                 self.landing_first_places = {key: award for key, award in self.landing_first_places.items()
                                             if isinstance(started := process_start(award.land.pid), Unreadable)
                                             or started == Started(award.land.start_time)}

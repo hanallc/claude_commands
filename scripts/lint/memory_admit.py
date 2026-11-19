@@ -503,6 +503,7 @@ class PassRow:
     blocker: BlockingIndex | NoSingleBlocker | BlockerNotRequested
     admission: ProposedAdmission | NotAdmitted
     holder: records.WaitHolder = field(default_factory=records.NoHolder)
+    landing_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -1425,6 +1426,7 @@ class WaiterAdmission:
     decision: AdmissionDecision
     state: QueuedWaiter | TokenWaitingWaiter
     cargo_folder: placement.CargoFolderFree | placement.CargoFolderWait = placement.CargoFolderFree()
+    landing_only: bool = False
 
 
 
@@ -2057,7 +2059,8 @@ def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_s
         if claim_policy is ContinuationClaimPolicy.KEEP_FOR_OWNER or not inputs.slots:
             break
         held_owners = {records.waiter_owner(entry.waiter) for entry in admissions
-                       if entry.decision.reused_slot and isinstance(entry.decision.order_hold, HeldBehindHead)}
+                       if entry.decision.reused_slot and isinstance(entry.decision.order_hold, HeldBehindHead)
+                       and not waits_for_landing(inputs, entry.waiter)}
         if not held_owners:
             break
         # Return the claim before checking the earlier row's room again.
@@ -2151,7 +2154,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         state = QueuedWaiter(row) if remote_start_pending else waiter_state(row)
         fresh = not estimate_expired(row, now, policy)
         landing_wait = waits_for_landing(inputs, row)
-        local_route = can_use_natedev(row) and not landing_wait
+        local_route = can_use_natedev(row)
         local = local_route and isinstance(state, QueuedWaiter)
         folder = inputs.cargo_folders.get(owner) if local_route else None
         folder_busy = (folder in inputs.occupied_cargo_folders
@@ -2183,24 +2186,25 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
             order_hold = HeldBehindHead(first_folder_wait)
         elif ready and not isinstance(earlier, NoWaiter):
             order_hold = HeldBehindHead(earlier)
-        if folder is not None and isinstance(earlier, NoWaiter):
+        if not landing_wait and folder is not None and isinstance(earlier, NoWaiter):
             first_for_folder[folder] = records.stored_waiter(row)
         can_start = (ready and not folder_busy and isinstance(gpu_wait, GpuSlotFree)
                      and isinstance(order_hold, NoOrderHold))
-        decision = AdmissionDecision("admit" if can_start else "hold",
+        admitted = can_start and not landing_wait
+        decision = AdmissionDecision("admit" if admitted else "hold",
             extra + kept + safety, kept, safety, used,
-            NO_PRESSURE_HOLD if within or landing_wait else inputs.pressure,
+            NO_PRESSURE_HOLD if within else inputs.pressure,
             used + kept,
             room_passes, order_hold, 0.0 if reused else spacing,
             reused_slot=reused, room=RoomCheck(extra, checked_room, room_passes, basis=basis), gpu=gpu_wait)
         cargo_folder = placement.CargoFolderWait() if folder_busy else placement.CargoFolderFree()
-        decisions.append(WaiterAdmission(row, decision, state, cargo_folder))
-        if can_start:
+        decisions.append(WaiterAdmission(row, decision, state, cargo_folder, landing_only=landing_wait and can_start))
+        if admitted:
             remaining += held + released - need
             gpu_used += gpu_step
             if not reused:
                 new_started = True
-        elif local or folder_busy:
+        elif not landing_wait and (local or folder_busy):
             if folder_busy and isinstance(first_folder_wait, NoWaiter):
                 first_folder_wait = records.stored_waiter(row)
             if isinstance(first_held, NoWaiter):
@@ -2310,7 +2314,7 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy, *, 
                                 for ended in range(len(inputs.running)))
             blocker = blocking_index(owner, endings)
         rows.append(PassRow(owner, decision, reason, blocker, proposal,
-                            admission_wait_holder(decision, reason, inputs, resolved.room)))
+                            admission_wait_holder(decision, reason, inputs, resolved.room), landing_only=entry.landing_only))
     return PassResult(tuple(rows), resolved)
 
 def released_resident_bytes(running: tuple[RunningStep, ...], ended: frozenset[int]) -> int:
