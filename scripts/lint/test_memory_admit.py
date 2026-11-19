@@ -4713,6 +4713,72 @@ class ProgressKeepAsideTests(unittest.TestCase):
                 fixture.clock.advance(181)
                 self.assertEqual(self.current_service_need(fixture), expected)
 
+    def test_a_live_owner_missing_from_the_process_scan_keeps_its_reservation(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request(step="merge-gate")
+            grant = only_admitted(fixture.server.handle_request(request))
+            (fixture.proc.path / str(request.owner.pid) / "stat").unlink()
+            self.assertEqual(fixture.proc.owner_start(request.owner.pid),
+                             service.LiveOwnerIdentity(request.owner.start_time))
+            _ = fixture.run_pass()
+            self.assertIn(request.episode, fixture.server.reservations)
+            self.assertEqual(self.current_service_need(fixture), grant.need)
+
+    def test_decay_peak_excludes_processes_assigned_to_a_child_reservation(self) -> None:
+        with AdmissionFixture() as fixture:
+            _ = write_config_fixture(fixture.root / "build_admission.conf",
+                "peak_hold_seconds.merge-gate=180\ntest_phase_margin=1.2\n")
+            parent = fixture.proc.spawn(used=GIB)
+            child = fixture.proc.spawn(used=2 * GIB)
+            write_process(fixture.proc.path, child.pid, 2 * GIB, parent=parent.pid, start=child.start_time)
+            gate_request = fixture.request(step="merge-gate", owner=parent)
+            grant = only_admitted(fixture.server.handle_request(gate_request))
+            fixture.clock.advance(5)
+            _ = only_admitted(fixture.server.handle_request(fixture.request(step="check", owner=child)))
+            fixture.scoped_peak(grant, grant.need)
+            _ = Path(grant.wave_path).write_text(f"{grant.need} {int(fixture.clock.now())}\n")
+            fixture.clock.advance(181)
+            _ = fixture.run_pass()
+            inputs = fixture.server.last_inputs
+            assert isinstance(inputs, admission_records.QueueInputs)
+            gate_step = next(step for step in inputs.running if step.pid == parent.pid)
+            row = next(row for row in inputs.reservations if row["pid"] == parent.pid)
+            self.assertEqual(gate.reservation_need(row, gate_step.measured), math.ceil(GIB * 1.2))
+
+    def test_reused_child_pid_cannot_supply_test_memory(self) -> None:
+        with AdmissionFixture() as fixture:
+            _ = write_config_fixture(fixture.root / "build_admission.conf", "peak_hold_seconds.merge-gate=180\n")
+            request = fixture.request(step="merge-gate", owner=fixture.proc.spawn(used=GIB))
+            child = request.owner.pid + 1_000_000
+            write_process(fixture.proc.path, child, GIB, parent=request.owner.pid, start="10")
+            grant = only_admitted(fixture.server.handle_request(request))
+            fixture.scoped_peak(grant, grant.need)
+            _ = Path(grant.wave_path).write_text(f"{grant.need} {int(fixture.clock.now())}\n")
+            fixture.clock.advance(181)
+            scanned = fixture.proc.processes()
+            write_process(fixture.proc.path, child, 2 * GIB, parent=request.owner.pid, start="11")
+            with patch.object(fixture.proc, "processes", return_value=scanned):
+                self.assertEqual(self.current_service_need(fixture), grant.need)
+                inputs = fixture.server.last_inputs
+                assert isinstance(inputs, admission_records.QueueInputs)
+                step = next(step for step in inputs.running if step.pid == request.owner.pid)
+                assert isinstance(step.measured, admission_records.MeasuredMemory)
+                self.assertEqual(step.measured.bytes, GIB)
+
+    def test_zero_is_a_complete_peak_after_decay(self) -> None:
+        with AdmissionFixture() as fixture:
+            _ = write_config_fixture(fixture.root / "build_admission.conf", "peak_hold_seconds.merge-gate=180\n")
+            request = fixture.request(step="merge-gate", owner=fixture.proc.spawn(used=0))
+            grant = only_admitted(fixture.server.handle_request(request))
+            fixture.scoped_peak(grant, grant.need)
+            _ = Path(grant.wave_path).write_text(f"{grant.need} {int(fixture.clock.now())}\n")
+            fixture.clock.advance(181)
+            self.assertEqual(self.current_service_need(fixture), 0)
+
+    def test_step_attribution_requires_compiler_uses(self) -> None:
+        compiler_uses = inspect.signature(gate.attributed_step_uses).parameters["compiler_uses"]
+        self.assertIs(cast(object, compiler_uses.default), inspect.Parameter.empty)
+
     @staticmethod
     def current_service_need(fixture: AdmissionFixture) -> int:
         result = fixture.run_pass()
@@ -4806,7 +4872,7 @@ class ProgressKeepAsideTests(unittest.TestCase):
         base = self.inputs((row,), (reading,))
         inputs = replace(base, running=(*base.running, admission_records.RunningStep(
             "", "sccache.service", "compile", "builds.slice", 0, compilers, pid=7)))
-        (_, _, use), = gate.attributed_step_uses(inputs)
+        (_, _, use), = gate.attributed_step_uses(inputs, compiler_uses=gate.compiler_job_uses(inputs.running))
         self.assertEqual(use, gate.AttributedStepUse(admission_records.AnonymousRunUse(6 * GIB + GIB // 10), True))
         room = gate.inputs_room(inputs, admission_policy_fixture())
         assert isinstance(room, admission_records.MemoryRoom)
@@ -4847,7 +4913,7 @@ class ProgressKeepAsideTests(unittest.TestCase):
             anonymous=admission_records.AnonymousRunUse(3 * GIB), anonymous_source=source)
         readings = (shared, shared)
         inputs = self.inputs(rows, readings)
-        attributed = tuple(item[2] for item in gate.attributed_step_uses(inputs))
+        attributed = tuple(item[2] for item in gate.attributed_step_uses(inputs, compiler_uses=gate.compiler_job_uses(inputs.running)))
         self.assertEqual(attributed, (gate.AttributedStepUse(admission_records.AnonymousRunUse(0), False),
                                      gate.AttributedStepUse(admission_records.AnonymousRunUse(3 * GIB), True)))
         adjusted = tuple(gate.progress_memory(row, reading, use,

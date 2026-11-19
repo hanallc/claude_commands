@@ -953,7 +953,7 @@ def scope_members(directory: Path, *, require_complete: bool = False) -> set[int
     return members
 
 
-def process_memory(source: set[int] | PopulatedStepScope, proc: Path = PROC) -> MeasuredMemory:
+def process_memory(source: set[int] | Mapping[int, str] | PopulatedStepScope, proc: Path = PROC) -> MeasuredMemory:
     """Read swap-backed use from the scope or processes; retain resident bytes and swap."""
     if isinstance(source, PopulatedStepScope):
         reading = slice_working_set(source.directory)
@@ -975,6 +975,10 @@ def process_memory(source: set[int] | PopulatedStepScope, proc: Path = PROC) -> 
             use = (AnonymousRunUse(0) if error.errno in (errno.ENOENT, errno.ESRCH) else
                    RunUseUnavailable(f"{path}: {error.strerror or error}"))
             process_uses.append(ProcessAnonymousUse(child, use))
+            continue
+        if isinstance(source, Mapping) and records.process_start_time(child, proc) != source[child]:
+            memory_read_incomplete = True
+            process_uses.append(ProcessAnonymousUse(child, RunUseUnavailable(f"{path}: process identity changed")))
             continue
         rss_present = False
         swap_backed_seen: set[str] = set()
@@ -1033,7 +1037,7 @@ def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
                 proc: Path = PROC) -> MeasuredMemory | GoneMemory:
     """Read resident bytes and swap separately from one process table reading."""
     members = process_tree({pid: start}, processes)
-    return process_memory(members, proc) if members else GoneMemory()
+    return process_memory({member: processes[member].start for member in members}, proc) if members else GoneMemory()
 
 
 @dataclass(frozen=True)
@@ -1877,7 +1881,8 @@ def test_need_override(row: Reservation, reading: StepMemory, compiling_scopes: 
     if isinstance(history, PeakDecayed):
         if reading.test_compilers != "none" or isinstance(reading.anonymous, RunUseUnavailable):
             return records.TestNeedOverride(accepted, "compiler evidence unavailable")
-        if history.bytes > 0 and isinstance(source, (ScopeSource, ProcessSource)):
+        # Older records used zero to mark a missing sample.
+        if (history.sampled or history.bytes > 0) and isinstance(source, (ScopeSource, ProcessSource)):
             return records.TestNeedOverride(min(accepted, math.ceil(history.bytes * history.margin)), "peak after decay")
     return records.NoTestNeedOverride()
 
@@ -1911,11 +1916,10 @@ def compiler_job_uses(running: Iterable[RunningStep]) -> dict[Path, AnonymousRun
 
 
 def attributed_step_uses(inputs: QueueInputs, *,
-                         compiler_uses: Mapping[Path, AnonymousRunUse | RunUseUnavailable] | None = None
+                         compiler_uses: Mapping[Path, AnonymousRunUse | RunUseUnavailable]
                          ) -> tuple[tuple[Reservation, RunningStep, AttributedStepUse], ...]:
     """Assign each scope, process and compiler job to one step before any grouping."""
     attributed: list[tuple[Reservation, RunningStep, AttributedStepUse]] = []
-    compiled = compiler_job_uses(inputs.running) if compiler_uses is None else compiler_uses
     active = tuple(zip(inputs.reservations, (step for step in inputs.running if running_has_reservation(step)), strict=True))
     scope_holders: dict[Path, tuple[str, int, MeasuredMemory]] = {}
     process_holders: dict[int, tuple[int, str, int]] = {}
@@ -1960,8 +1964,8 @@ def attributed_step_uses(inputs: QueueInputs, *,
                                                for child in children.get(source.directory, ()))
                     use = (AnonymousRunUse(max(0, use.bytes - nested.bytes))
                            if isinstance(nested, AnonymousRunUse) else nested)
-                if owns_source and source.directory in compiled:
-                    use = sum_swap_backed_use((use, compiled[source.directory]))
+                if owns_source and source.directory in compiler_uses:
+                    use = sum_swap_backed_use((use, compiler_uses[source.directory]))
             elif isinstance(source, ProcessSource):
                 assigned = tuple(item for item in source.processes
                                  if item.pid in unclaimed and process_holders[item.pid][2] == index)

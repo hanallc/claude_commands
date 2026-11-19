@@ -274,14 +274,8 @@ class SystemProc:
         return gate.process_table(self.path)
 
     def owner_start(self, pid: int) -> LiveOwnerIdentity | OwnerProcessGone:
-        try:
-            stat = read_proc_text(self.path / str(pid) / "stat")
-            fields = stat.rsplit(") ", 1)[1].split()
-            if fields[0] not in ("Z", "X"):
-                return LiveOwnerIdentity(fields[19])
-        except (OSError, IndexError):
-            pass
-        return OwnerProcessGone()
+        start = records.process_start_time(pid, self.path)
+        return OwnerProcessGone() if start is None else LiveOwnerIdentity(start)
 
     def pidfd(self, pid: int) -> int:
         return os.pidfd_open(pid)
@@ -598,9 +592,7 @@ def raw_reservation_memory(record: ReservationRecord, row: records.Reservation,
         try:
             return gate.process_memory(lifetime, proc)
         except FileNotFoundError:
-            identity = processes.get(row["pid"])
-            if identity is None or identity.start != row["start_time"]:
-                return records.GoneMemory()
+            pass
     return gate.tree_memory(row["pid"], row["start_time"], processes, proc)
 
 
@@ -715,6 +707,8 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
         lifetime = proc.lifetime(row, live)
         lifetimes[record.episode] = lifetime
         memory = reservation_reader(record, row, lifetime, processes, proc.path)
+        if isinstance(memory, records.GoneMemory) and live:
+            memory = records.PromisedMemory(row["need"])
         if isinstance(memory, records.MeasuredMemory):
             memory = replace(memory, promise=records.NoPromise(), observed_peak=0,
                              unknown_peak_promise=0, peak_history=records.NoPeakRecorded())
@@ -1971,7 +1965,6 @@ class AdmissionServer:
                 continue
             if row["step"] in gate.DECAYING_TEST_STEPS and isinstance(memory, records.MeasuredMemory):
                 memory = replace(memory, test_compilers=test_compilers(memory, evidence))
-                memory = self._capture_test_decay(record.reservation_id, memory, evidence, config.test_phase_margin)
             if record.episode.startswith("uid:") and isinstance(memory, records.MeasuredMemory):
                 if isinstance(memory.anonymous, records.AnonymousRunUse):
                     self._sample_runner(record, memory.anonymous.bytes, now)
@@ -2022,24 +2015,24 @@ class AdmissionServer:
             self.progress_history.prune(now - step_estimator.HISTORY_DAYS * 86400, sweep_seconds,
                 rank=profile_rank, share_percent=profile_share)
             self.next_progress_sweep = self.clock.monotonic() + config.running_pass_seconds
-        return self._progress_inputs(self._inputs_with_current_slots(inputs), dict(evidence.processes),
-                                     config.policy, profile_rank, profile_share)
+        return self._progress_inputs(self._inputs_with_current_slots(inputs), evidence, config,
+                                     profile_rank, profile_share)
 
-    def _capture_test_decay(self, reservation: str, memory: records.MeasuredMemory, evidence: SystemEvidence,
-                            margin: float) -> records.MeasuredMemory:
-        """Keep the largest anonymous memory sample within the current decay."""
+    def _capture_test_decay(self, reservation: str, memory: records.MeasuredMemory, use: gate.AttributedStepUse,
+                            read_at: float, margin: float) -> records.MeasuredMemory:
+        """Keep the largest attributed anonymous memory sample within the current decay."""
         history = memory.peak_history
-        if not isinstance(history, records.PeakDecayed) or memory.test_compilers == "incomplete":
+        if (not isinstance(history, records.PeakDecayed) or memory.test_compilers == "incomplete"
+                or not use.owns_source or not isinstance(use.use, records.AnonymousRunUse)
+                or read_at < history.decayed_at):
             return memory
         previous = self.decayed_test_peaks.get(reservation)
-        peak = (previous.bytes if previous is not None and previous.decayed_at == history.decayed_at
-                and previous.last_near_peak_at == history.last_near_peak_at
-                and previous.peak_bytes == history.peak_bytes else 0)
-        if isinstance(memory.anonymous, records.AnonymousRunUse) and evidence.read_at >= history.decayed_at:
-            peak = max(peak, memory.anonymous.bytes)
-        history = replace(history, bytes=peak, margin=margin)
-        if peak > 0:
-            self.decayed_test_peaks[reservation] = history
+        peak = use.use.bytes
+        if (previous is not None and previous.decayed_at == history.decayed_at
+                and previous.last_near_peak_at == history.last_near_peak_at and previous.peak_bytes == history.peak_bytes):
+            peak = max(peak, previous.bytes)
+        history = replace(history, bytes=peak, margin=margin, sampled=True)
+        self.decayed_test_peaks[reservation] = history
         return replace(memory, peak_history=history)
 
     def _unowned_memory(self, evidence: SystemEvidence, rows: list[records.Reservation]
@@ -2122,9 +2115,10 @@ class AdmissionServer:
             except (OSError, ValueError):
                 pass
 
-    def _progress_inputs(self, inputs: records.QueueInputs, processes: dict[int, gate.ProcessIdentity],
-                         policy: records.AdmissionPolicy, profile_rank: int, profile_share: int) -> records.QueueInputs:
+    def _progress_inputs(self, inputs: records.QueueInputs, evidence: SystemEvidence,
+                         config: records.MemoryConfig, profile_rank: int, profile_share: int) -> records.QueueInputs:
         """Capture counters and profile samples on the service loop thread."""
+        processes = dict(evidence.processes)
         compiled = gate.compiler_job_uses(inputs.running)
         attributed = iter(gate.attributed_step_uses(inputs, compiler_uses=compiled))
         running: list[records.RunningStep] = []
@@ -2151,7 +2145,10 @@ class AdmissionServer:
                 counter = self.progress_captures.counter({pid: processes[pid].start for pid in pids}, self.boot_id)
             key = gate.reservation_profile_key(row, self.host)
             profile = self.progress_history.matching(key, cutoff, rank=profile_rank, share_percent=profile_share)
-            adjusted = gate.progress_memory(row, memory, use, counter, profile, policy, compiling_scopes=compiled)
+            if row["step"] in gate.DECAYING_TEST_STEPS and "reservation_id" in row:
+                memory = self._capture_test_decay(row["reservation_id"], memory, use,
+                                                  evidence.read_at, config.test_phase_margin)
+            adjusted = gate.progress_memory(row, memory, use, counter, profile, config.policy, compiling_scopes=compiled)
             running.append(replace(step, measured=adjusted))
             if use.owns_source and isinstance(use.use, records.AnonymousRunUse) and "reservation_id" in row:
                 source = memory.anonymous_source

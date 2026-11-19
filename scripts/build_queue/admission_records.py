@@ -455,6 +455,7 @@ class PeakDecayed:
     decayed_at: float
     old_sampler: bool
     margin: float = field(default=TEST_PHASE_MARGIN_FALLBACK, kw_only=True)
+    sampled: bool = field(default=False, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1534,9 +1535,10 @@ def read_memory_config(*, report: bool = True) -> MemoryConfig:
 test_threads = parse.test_threads
 
 
-def process_start_time(pid: int) -> str | None:
+def process_start_time(pid: int, proc: str | Path = "/proc") -> str | None:
+    root = Path(proc) if isinstance(proc, str) else proc
     try:
-        stat = read_proc_text(Path("/proc") / str(pid) / "stat")
+        stat = read_proc_text(root / str(pid) / "stat")
         fields = stat.rsplit(") ", 1)[1].split()
         return fields[19] if fields[0] not in ("Z", "X") else None
     except (OSError, IndexError):
