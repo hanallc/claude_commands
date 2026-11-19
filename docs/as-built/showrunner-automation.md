@@ -556,8 +556,11 @@ The List hides an item with unanswered questions while each send is pending or s
 If any unanswered question needs a resend, the item appears with its resend control.
 The `the_list.py list` command still shows the item.
 The producer uses `the_list.py answer` to save an answer and mark the item unread.
-ETA accepts an offset ISO time, two such times separated by `/`, or `Not asked`, `Pending`, `Paused`, or `Delivered`.
-ETA also accepts a text description when a time or status cannot express the estimate.
+Add and update accept `Mon D`, `Mon D HH:MM ZONE`, `No time yet`, `Waiting for nate`, `Paused`, and `Delivered` as an ETA.
+The command selects the date nearest to today in the user's time zone.
+A date alone uses local midnight.
+Put the reason in `--latest-status`.
+The store still reads ISO times, ranges, text descriptions, `Not asked`, and `Pending` from existing records.
 The `eta_kind` field marks text descriptions as `text` and other estimates as `time or status`.
 The store validates text descriptions as one nonempty line and never parses them as times or ranges.
 Next check accepts a time or a text condition.
@@ -584,7 +587,7 @@ Morty can use every command.
 Other producers can list only their own items, including with `--all`.
 If the directory or a record is unreadable, the producer's list reports an incomplete result and exits nonzero.
 The command shows any readable items in scope and omits details of the read error.
-They can update only `--latest-status`, `--next-step`, `--eta`, `--state`, and `--next-check` on those items.
+They can use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence` on those items.
 Only morty can close an item.
 Their updates use the caller's staff name as the log source.
 
@@ -603,7 +606,8 @@ The CLI exits nonzero if a notice fails. The saved assignment stays in place.
 An unchanged producer or an assignment to morty sends no notice.
 
 Add and update accept `--unit`, `--state`, `--next-check`, `--eta`, and `--requested-by nate|dwight`.
-They also accept `--next-step`, `--latest-status`, `--evidence`, and `--done-when`.
+They also accept `--next-step`, `--latest-status`, `--evidence`, `--add-evidence`, and `--done-when`.
+`--evidence` replaces the evidence text. `--add-evidence` appends one line.
 `--blocked-by L<n>:<condition> ...` records dependencies; `--related-to L<n> ...` records related items.
 Either option with no values clears its field.
 References use numbers in the same producer folder.
