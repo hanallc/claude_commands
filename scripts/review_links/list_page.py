@@ -1699,10 +1699,20 @@ function reviewLinkPlace(link){
  return {key:row.dataset.key,selector,position:[...row.querySelectorAll(selector)].indexOf(link)};
 }
 function restoreReviewLink({key,selector,position}){
- const row=content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]:not([hidden])');
- const link=row?.querySelectorAll(selector)[position];
- const target=link?.getClientRects().length ? link : row?.querySelector('.list-toggle');
- (target || content.querySelector('#list-search')).focus({preventScroll:true});
+ const findRow=()=>content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]:not([hidden])');
+ const visibleLink=row=>{
+  const link=row?.querySelectorAll(selector)[position];
+  return link?.getClientRects().length ? link : null;
+ };
+ const row=findRow(),link=visibleLink(row);
+ const target=link || row?.querySelector('.list-toggle') || content.querySelector('#list-search');
+ target.focus({preventScroll:true});
+ if(!link && row?.hasAttribute('data-list-review-version') && listCounts){
+  void listCounts.then(()=>{
+   if(!activeReview && listOwnsFocus() && document.activeElement===target)
+    visibleLink(findRow())?.focus({preventScroll:true});
+  });
+ }
 }
 function closeReviewCard(){
  const card=activeReview;

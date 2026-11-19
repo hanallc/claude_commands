@@ -203,7 +203,7 @@ class ReviewRepairsTests(unittest.TestCase):
                         with self.assertRaisesRegex(question_record.AnswerRefused, 'already with the showrunner'):
                             _, _ = review_page.submit(case.root, case.body(key, 'feedback', 'SECOND_REQUEST'), case.status)
                         expected_text, excluded_text = 'FIRST_REQUEST', 'SECOND_REQUEST'
-                        expected_state = review_items.ReviewState.VALIDATING
+                        expected_state = review_items.ReviewState.WAITING
                     else:
                         _, _ = review_page.submit(case.root, case.body(key, 'feedback', 'SECOND_REQUEST'), case.status)
                         expected_text, excluded_text = 'SECOND_REQUEST', 'FIRST_REQUEST'
@@ -662,8 +662,9 @@ window.fetch=async(url,options={})=>{
   check(row('C1') && !row('C1').hidden && row('C1').dataset.state==='Validating',
    'Validating shows the saved check.');
   await show('all');
-  check(!row('C1').hidden && !row('C1').querySelector('button') &&
-   row('C1').textContent.includes('With page-owner since'),'All shows the active check without buttons.');
+  check(!row('C1').hidden && row('C1').querySelector('button.list-toggle') &&
+   row('C1').textContent.includes('With page-owner · Validating for'),
+   'All shows the elapsed time and a button to open the active check.');
   await show('open');
   await nativeFetch('/problem');await refresh();check(!row('C1').hidden,'a problem returns to Open');
   row('C2').querySelector('.list-toggle').click();await readyReviewCard(row('C2'));

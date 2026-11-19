@@ -406,10 +406,11 @@ async function inspect(){
   await changed(doc.body,()=>row()!==oldRow,'the List refreshes on return');
   check(!listFrame.hidden && !dialog.open && !dialog.querySelector('iframe'),'Returning to List shows no old card.');
   savedReviewPlace=reviewPlace();
- await changed(doc.body,()=>link('sdlc/C1'),'the refreshed List loads the linked card');
+  await changed(doc.body,()=>link('sdlc/C1'),'the refreshed List loads the linked card');
   readyLink=link('sdlc/C1');
   const draft=await readCard(readyLink);
   draft.querySelector('[name=feedback]').value='Keep this draft when I switch tabs.';
+  const beforeVisibilityRefresh=row();
   for(const visibility of ['hidden','visible']){
    Object.defineProperty(doc,'visibilityState',{configurable:true,value:visibility});
    doc.dispatchEvent(new win.Event('visibilitychange'));
@@ -419,13 +420,32 @@ async function inspect(){
     'A browser tab switch keeps the open card and its draft.');
   }
   delete doc.visibilityState;
+  await changed(doc.body,()=>row()!==beforeVisibilityRefresh && link('sdlc/C1'),
+   'the visible List refreshes the row and reloads the link');
   document.querySelector('.nav-entry[data-page="review"]').click();
   await animationFrames(window);
   check(listFrame.hidden && dialog.open,'Changing console pages keeps a card that has a draft.');
+  const beforeReturn=row(),fetchBeforeReturn=win.fetch.bind(win);
+  let releaseCounts,countsStarted;
+  const heldCounts=new Promise(resolve=>{releaseCounts=resolve;});
+  const readingCounts=new Promise(resolve=>{countsStarted=resolve;});
+  win.fetch=async(url,options)=>{
+   if(String(url).includes('?counts=')){countsStarted();await heldCounts;}
+   return fetchBeforeReturn(url,options);
+  };
   document.querySelector('.nav-entry[data-page="list"]').click();
+  await changed(doc.body,()=>row()!==beforeReturn,'the List replaces the row before loading the links');
+  await readingCounts;
   check(draft.querySelector('[name=feedback]').value==='Keep this draft when I switch tabs.',
    'The draft is still available on the List.');
   close.click();
+  check(!dialog.open && !link('sdlc/C1') && doc.activeElement===row().querySelector('.list-toggle'),
+   'Close focuses the row while the List loads its links.');
+  releaseCounts();
+  await changed(doc.body,()=>link('sdlc/C1'),'the pending link appears');
+  await animationFrames(win);
+  check(doc.activeElement===link('sdlc/C1'),'The loaded link receives focus.');
+  win.fetch=fetchBeforeReturn;
   readyLink=link('sdlc/C1');
  }
  const fetchList=win.fetch.bind(win);

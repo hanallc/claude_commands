@@ -358,8 +358,8 @@ The command prints one plain error line for a refused update.
 `proposal_issue.record_review` and `efficiency_reviews.record` require `waiting_why` when setting the Waiting mark.
 `candidates.py outcome E<n> deferred --waiting-why "<reason>"` stores the reason beside the ledger.
 The states are **Open**, **Validating**, **Waiting** and **Done**.
-Changes use Validating while the showrunner has the request.
-Questions, investigations, proposals and efficiencies use Waiting while they await a response or action.
+Changes use Validating while the showrunner checks the change.
+Records use Waiting while they await an answer or action.
 Later hides an item without changing its state.
 Validating changes remain visible in Validating and All.
 The count readers and `/next` use this shared reader.
@@ -416,7 +416,7 @@ Exactly one Show chip stays selected. Pressing that chip changes nothing.
 Each type count uses the selected owner, Show and words.
 Each Show count uses the selected type, owner and words.
 One typed `ReviewIndexEntry` record defines the index for counts, filters and column sorting.
-The shell carries the complete index, including states outside the selected view.
+The shell carries the active index, including states outside the selected view.
 Each changed version supplies a complete replacement index.
 The index contains the key, ID, type, owner, source owner, owner name, title, state, filed time and update time.
 It also supplies the source name, urgency label and Later time for each summary.
@@ -430,22 +430,36 @@ If the versions differ, the browser refreshes the index before it displays the b
 The browser uses the index for every count and filter.
 The Show chips replace the right count text.
 Open and Validating select their states.
+All includes the active records.
 The Review table excludes Done records.
-Ask showrunner to check, Ask question and Send feedback move a change to Validating after the save.
+**Ask showrunner to check** moves a change to Validating.
+**Ask question** and **Send feedback** move an open change to Waiting.
 The change leaves Open and its counts when the request starts.
 A failed save restores the row and its counts.
-Validating and All show the change with **With <showrunner> since <time>** and no buttons.
+A Validating change opens from its row in Validating and All.
+The row and card show **With <validator> · Validating for <duration>**.
+The validation record stores the validator’s staff ID.
+The page resolves the name from that ID.
+At deploy, the conversion adds the validator’s staff ID to each open validation that needs it.
+The conversion uses the saved message destination or the current showrunner when the log has no destination.
+The browser updates the duration from the saved handoff time.
+When the record has no handoff time, the page shows **With <validator>**.
+The card shows the item, steps to check it, proof and the log.
+**Ask a question** sends **Your words** to the validator named above the button.
+The card shows **Question for <validator>** and **Answer from <validator>** when the answer arrives.
+The active validation log shows **Asked <validator> to validate**, **Asked a question about validation**, and **Answered the question**.
+The question and answer sections show the full text.
+The question and answer preserve the active validation and its handoff time.
 The Validating and All chips count the change.
 The Validating chip is dim at zero.
-The name comes from current staff data.
-The time comes from the saved request and uses the user zone.
-Older requests without a saved time use the delivery file time.
 The next changed snapshot replaces the index.
 An unchanged version retains the index and checks expired Later times.
-The fresh index supplies each item's state and revision, including items outside the rendered Show.
+The fresh index supplies the state and revision of each active item.
 The browser removes a saved marker when the index moves beyond its submitted revision and saved state.
-A showrunner answer, feedback action or fault returns a Validating change to Open.
+A fault returns the change to Open.
+A reply to a question or feedback sent from Open also returns the change to Open.
 A works result moves the change to Done without a notice.
+Review removes the completed change.
 Stable chip IDs retain keyboard focus after a Show load or refresh.
 The row window keeps the focused row mounted during scroll.
 A refresh restores focus to the same control by row key.
@@ -585,15 +599,15 @@ It finishes the item for questions, investigations, proposals and efficiencies.
 It transfers a change to the showrunner until the showrunner records what they did.
 The change log shows the feedback once and includes the showrunner's reply.
 Ask question sends the words to the owner.
-It moves a change to Validating and other types to Waiting.
-The owner's answer returns every type to Open.
+A question from Open moves the item to Waiting.
+The owner’s answer returns that item to Open.
 The answer stays in the item log.
 Owners use `change_page.py answer-question --item <Review key> --question <id> --text "<answer>"` for all five types.
 Each new request supplies a question ID to identify the pending exchange.
 The existing question ID rule refuses a reply to a superseded exchange.
 `update_registration.py reply` and `investigation.py answer` apply this rule before they save a native answer.
 A native answer without the current question ID cannot replace a newer Review question.
-`change_review.py verdict` also refuses a verdict during an open question or feedback request.
+`change_review.py verdict` refuses a verdict while a change is Waiting for an answer.
 These commands retain the existing refusal text and exit 1.
 Each showrunner check uses its delivery attempt as the validation ID.
 Initial and recovered messages include `change_review.py verdict --validation <id>` with the complete answer command.
@@ -825,7 +839,7 @@ The List loads the card document only when the dialog opens.
 The existing Review body route supplies the summary, body, styles, and controls.
 The Review table uses the same card renderer and action code.
 The dialog reads a Done card on demand and shows it without actions.
-A Validating card shows its details and has no actions.
+A Validating card lets the user ask the validator a question.
 If the record disappears, the dialog shows a message.
 Escape, Close, and a click outside the card close the dialog.
 Focus returns to the List link.
@@ -834,7 +848,7 @@ On a desktop, the List centers the dialog.
 Switching browser tabs keeps the dialog and its draft.
 Changing console pages closes an idle dialog when it has no draft.
 The dialog preserves the List and Review addresses and filters.
-The verdict, feedback, and Later controls use the Review save path.
+The dialog uses the Review save path for its actions.
 During a save, the dialog stays open and disables its buttons.
 A failed save keeps the draft and shows the reason.
 Review and the dialog use the same recovery code to load the current revision and keep the draft.
@@ -1533,7 +1547,8 @@ The all-list page sends to the row's current staff showrunner.
 Older selected-row pages use the same staff route.
 The saved verdict selects recipients when a new message attempt begins.
 An exact `works` verdict goes only to the showrunner.
-Send feedback and Ask question on either change page send the words to the showrunner and move the change to Validating.
+**Send feedback** and **Ask question** on an open change send the words to the showrunner.
+The change moves to Waiting.
 When one staff unit owns the change, every other verdict also goes to that unit.
 The Producer cell identifies that unit through its fixed staff id.
 An empty Producer cell belongs to the list's staff showrunner.
@@ -1588,8 +1603,13 @@ The `Production:` line names the showrunner in live and recovered messages.
 It never delivers a verdict without a saved verdict in the review list.
 Legacy failed records decode as nothing to deliver; they produce no send or page controls.
 A legacy failed validation keeps validation ownership without a message attempt.
-After a send finishes or an alert finishes, the server clears that attempt.
-A validation keeps its ownership slot with state `sent`.
+The server retains the attempt if both the Change question and its alert fail.
+It records acceptance of the question or its alert before it clears the attempt.
+Recovery clears an accepted attempt without sending again.
+Recovery retries a started Change question without an acceptance record.
+A stop between acceptance and the receipt write can cause a second send.
+Review confirms that the question was saved before it sends the message.
+A validation keeps its ownership slot and recipient IDs with state `sent`.
 An open question keeps its question ID and text; an answered question keeps its answer.
 The server deletes the record when every slot is empty.
 One stable `fcntl.flock` protects attempt creation and conditional completion.

@@ -1368,9 +1368,12 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_review_index_omits_an_unknown_handoff_time(self) -> None:
         case = self.review_fixture(changes=2)
         saved = '2026-11-16T12:49:08-05:00'
+        validator = staff.snapshot().by_doc(local_machine(), case.fixture.production)
+        assert validator is not None
         for row, time_fields in (('C1', {}), ('C2', {'handed_at': saved})):
             path = change_routing.delivery_path(case.root, case.fixture.review_list, row)
-            _ = path.write_text(json.dumps({'validation': {'attempt': row, 'state': 'sent'}, **time_fields}))
+            validation = {'attempt': row, 'state': 'sent', 'recipients': [validator.id]}
+            _ = path.write_text(json.dumps({'validation': validation, **time_fields}))
             os.utime(path, (1795123200, 1795123200))
         snapshot = review_page.build_snapshot(case.root)
         with patch.object(review_page.ReviewSnapshotCache, 'get', return_value=snapshot):
@@ -1874,7 +1877,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         case = self.review_fixture(changes=1)
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         key = 'page-owner/C1'
-        _ = cache.save(case.card_body(cache.get(), key, 'question', 'What changed?'), case.status)
+        _ = cache.save(case.card_body(cache.get(), key, 'validate', 'Check the change.'), case.status)
         listing = case.fixture.review_list
         claim = change_routing.delivery_path(case.root, listing, 'C1')
         before = (listing.read_bytes(), claim.read_bytes(), dict(case.status.request_attempts))
@@ -1892,21 +1895,25 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(cache.get().records[key].state, review_items.ReviewState.VALIDATING)
         self.assertEqual(list(case.root.glob('.review-link-scratch-*')), [])
 
-    def test_review_body_can_serve_a_read_only_validating_card(self) -> None:
+    def test_review_body_serves_the_validating_question_in_both_card_views(self) -> None:
         case = self.review_fixture(changes=1)
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         self.addCleanup(cache.close)
         key = 'page-owner/C1'
-        _ = cache.save(case.card_body(cache.get(), key, 'question', 'What changed?'), case.status)
+        _ = cache.save(case.card_body(cache.get(), key, 'validate', 'Check the change.'), case.status)
         with patch.object(self.server, 'review_cache', cache):
             table = self.request(review_page.PAGE_PATH + '?' + urlencode({'body': key}))
             card = self.request(review_page.card_url(key))
             missing = self.request(review_page.card_url('missing/key'))
-        self.assertEqual(table.status, 404)
+        self.assertEqual(table.status, 200)
         self.assertEqual(card.status, 200)
         self.assertIn(b'<template data-card-body><div class="list-panel review-panel change">', card.body)
-        self.assertIn(b'<h3>How to check</h3>', card.body)
-        self.assertNotIn(b'<form method="post"', card.body)
+        for body in (table.body, card.body):
+            self.assertIn(b'<h3>How to check</h3>', body)
+            self.assertIn(b'Sends to page-owner', body)
+            self.assertIn(b'value="question">Ask a question</button>', body)
+            self.assertNotIn(b'value="works"', body)
+            self.assertNotIn(b'data-later-toggle', body.split(b'</template>', 1)[0])
         self.assertEqual(missing.status, 404)
         self.assertIn(b'role="status"', missing.body)
 
@@ -2004,7 +2011,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         key = 'page-owner/C1'
         _ = review_page.submit(case.root, case.body(key, 'question', 'What did you see?'), case.status)
         before = review_page.build_snapshot(case.root)
-        self.assertEqual(before.records[key].state, review_items.ReviewState.VALIDATING)
+        self.assertEqual(before.records[key].state, review_items.ReviewState.WAITING)
         path = change_routing.delivery_path(case.root, case.fixture.review_list, 'C1')
         read_text = Path.read_text
 
