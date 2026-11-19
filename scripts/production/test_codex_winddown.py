@@ -596,7 +596,7 @@ class MessageTests(unittest.TestCase):
         doc = self.root / "show-production.md"
         _ = doc.write_text("# Show\n", encoding="utf-8")
         _ = (self.root / "showrunners.json").write_text(json.dumps({
-            "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "hana",
+            "threshold_percent": 2, "stall_minutes": 5, "faults_to": "hana",
             "always": [],
         }), encoding="utf-8")
         # A second showrunner whose production has no units.
