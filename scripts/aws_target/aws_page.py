@@ -7,17 +7,18 @@ except FileNotFoundError:
 
 import argparse
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Sequence, Set
 import json
 import os
 import sys
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from enum import Enum, StrEnum
 from html import escape
 from pathlib import Path
 from statistics import median
-from typing import Literal, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 from scripts.aws_target import config as aws_config, console_help, ledger, spend as aws_spend, spot_table
 from scripts.lib import conf
@@ -89,9 +90,107 @@ class SpendData(TypedDict):
     forecast: str
 
 
+class NormalLaunchRefusal(StrEnum):
+    PRICE = 'SpotMaxPriceTooLow'
+    SPOT_QUOTA = 'MaxSpotInstanceCountExceeded'
+    VCPU_QUOTA = 'VcpuLimitExceeded'
+    INSTANCE_CAPACITY = 'InsufficientInstanceCapacity'
+    SPOT_CAPACITY = 'InsufficientSpotCapacity'
+
+
+class OtherLaunchRefusal(StrEnum):
+    UNKNOWN = 'unknown code'
+    BLOCKED = 'Blocked'
+    AUTH_FAILURE = 'AuthFailure'
+    INVALID_CLIENT_TOKEN = 'InvalidClientTokenId'
+    UNRECOGNIZED_CLIENT = 'UnrecognizedClientException'
+    BAD_SIGNATURE = 'SignatureDoesNotMatch'
+    EXPIRED_TOKEN = 'ExpiredToken'
+    EXPIRED_TOKEN_EXCEPTION = 'ExpiredTokenException'
+    UNAUTHORIZED_OPERATION = 'UnauthorizedOperation'
+    ACCESS_DENIED = 'AccessDenied'
+    ACCESS_DENIED_EXCEPTION = 'AccessDeniedException'
+    UNSUPPORTED = 'Unsupported'
+    INVALID_INSTANCE_TYPE = 'InvalidInstanceType'
+    INSTANCE_TYPE_NOT_FOUND = 'InvalidInstanceType.NotFound'
+    REQUEST_LIMIT = 'RequestLimitExceeded'
+    REQUEST_TIMEOUT = 'RequestTimeout'
+    SERVICE_UNAVAILABLE = 'ServiceUnavailable'
+    INTERNAL_ERROR = 'InternalError'
+    INTERNAL_FAILURE = 'InternalFailure'
+    SERVER_INTERNAL = 'ServerInternal'
+    UNAVAILABLE = 'Unavailable'
+
+
+LAUNCH_REFUSAL_REASONS = {
+    OtherLaunchRefusal.BLOCKED: 'The account is blocked.',
+    OtherLaunchRefusal.AUTH_FAILURE: 'AWS could not authenticate the launch credentials.',
+    OtherLaunchRefusal.INVALID_CLIENT_TOKEN: 'AWS rejected the launch credentials.',
+    OtherLaunchRefusal.UNRECOGNIZED_CLIENT: 'AWS rejected the launch credentials.',
+    OtherLaunchRefusal.BAD_SIGNATURE: 'AWS rejected the request signature.',
+    OtherLaunchRefusal.EXPIRED_TOKEN: 'The launch credentials expired.',
+    OtherLaunchRefusal.EXPIRED_TOKEN_EXCEPTION: 'The launch credentials expired.',
+}
+
+
+class LaunchRowEvidence(Enum):
+    LAUNCHED = 'launched'
+    NO_ATTEMPT = 'no attempt'
+
+
+def classify_launch_row(
+    row: dict[str, object], requested_attempts: Set[str],
+) -> LaunchRowEvidence | NormalLaunchRefusal | OtherLaunchRefusal:
+    """A fallback counts only when its ID identifies an attempt without a launch request."""
+    result = row.get('result')
+    match result:
+        case 'launched':
+            return LaunchRowEvidence.LAUNCHED
+        case 'refused' | 'fallback':
+            if result == 'fallback':
+                attempt = row.get('attempt')
+                if not isinstance(attempt, str) or not attempt or attempt in requested_attempts:
+                    return LaunchRowEvidence.NO_ATTEMPT
+            code = row.get('error_code')
+            if code in NormalLaunchRefusal:
+                return NormalLaunchRefusal(code)
+            if code in OtherLaunchRefusal:
+                return OtherLaunchRefusal(code)
+            # A fallback can contain a local reason, such as the end of a capacity search.
+            return OtherLaunchRefusal.UNKNOWN if result == 'refused' else LaunchRowEvidence.NO_ATTEMPT
+        case 'finished':
+            return LaunchRowEvidence.NO_ATTEMPT
+        case _:
+            return LaunchRowEvidence.NO_ATTEMPT
+
+
+class NoLaunchEvidence(TypedDict):
+    kind: Literal['no-evidence']
+
+
+class LaunchesWorking(TypedDict):
+    kind: Literal['working']
+    last_good_at: float
+    latest_attempt_at: float
+
+
+class LaunchesRefused(TypedDict):
+    kind: Literal['refused']
+    code: OtherLaunchRefusal
+    reason: str
+    first_at: float
+    latest_attempt_at: float
+    count: int
+    last_good_at: NotRequired[float]
+
+
+type LaunchState = NoLaunchEvidence | LaunchesWorking | LaunchesRefused
+
+
 class PageData(TypedDict):
     read_at: int
     render_seconds: float
+    launch_state: LaunchState
     spend: SpendData
     # Every region a table shows, for the region filter.
     regions: list[str]
@@ -205,14 +304,52 @@ def spend_data(spend: aws_spend.Spend | aws_config.MeasurementUnavailable, now: 
     return {'unavailable': '', 'tiles': tiles, 'forecast': forecast}
 
 
+def launch_state(records: Sequence[dict[str, object]]) -> LaunchState:
+    """Count each refused gate attempt once since the last good launch."""
+    requested_attempts = {attempt for row in records if row.get('result') in ('launched', 'refused')
+                          and isinstance(attempt := row.get('attempt'), str) and attempt}
+    counted_refusals: set[str] = set()
+    state: LaunchState = {'kind': 'no-evidence'}
+    for row in sorted(records, key=lambda row: float(str(row['time']))):
+        evidence = classify_launch_row(row, requested_attempts)
+        at = float(str(row['time']))
+        if evidence is LaunchRowEvidence.LAUNCHED:
+            state = {'kind': 'working', 'last_good_at': at, 'latest_attempt_at': at}
+            counted_refusals.clear()
+        elif isinstance(evidence, NormalLaunchRefusal):
+            if state['kind'] != 'no-evidence':
+                state['latest_attempt_at'] = at
+        elif isinstance(evidence, OtherLaunchRefusal):
+            attempt = row.get('attempt')
+            count = state['count'] if state['kind'] == 'refused' else 0
+            if not isinstance(attempt, str) or attempt not in counted_refusals:
+                count += 1
+                if isinstance(attempt, str) and attempt:
+                    counted_refusals.add(attempt)
+            refused: LaunchesRefused = {
+                'kind': 'refused', 'code': evidence, 'latest_attempt_at': at,
+                'reason': LAUNCH_REFUSAL_REASONS.get(evidence, 'The launch could not proceed.'),
+                'first_at': state['first_at'] if state['kind'] == 'refused' else at,
+                'count': count,
+            }
+            if state['kind'] == 'working':
+                refused['last_good_at'] = state['last_good_at']
+            elif state['kind'] == 'refused' and 'last_good_at' in state:
+                refused['last_good_at'] = state['last_good_at']
+            state = refused
+    return state
+
+
 def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
-              placement_readings: Sequence[ledger.SpotPlacementReading] = ()) -> PageData:
+              placement_readings: Sequence[ledger.SpotPlacementReading] = (), *,
+              launch_records: Sequence[dict[str, object]] = ()) -> PageData:
     # The billed hours table can add a region that is no longer a candidate.
     placement = placement_score_table(tuple(read.region for read in tables.regions), placement_readings, now)
     regions = dict.fromkeys((*(row[0] for row in placement.rows), *tables.hours.headers[1:]))
     return {
         'read_at': now,
         'render_seconds': 0.0,
+        'launch_state': launch_state(launch_records),
         'spend': spend,
         'regions': sorted(regions, key=region_filter_key),
         'snapshot': [{'region': region, 'text': text} for region, text in tables.snapshot_rows],
@@ -262,7 +399,8 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     except (OSError, ValueError, KeyError) as error:
         print(f'aws_page: Spot placement scores unavailable: {type(error).__name__}', file=sys.stderr)
         placement = ()
-    data = page_data(spot_table.spot_tables(directory, now, settings_path=settings_path), spend, now, placement)
+    data = page_data(spot_table.spot_tables(directory, now, settings_path=settings_path), spend, now, placement,
+                     launch_records=ledger.CostLedger(directory).launches())
     source = console_theme.with_theme(Path(__file__).with_name(PAGE_NAME).read_text(encoding='utf-8'))
     # A '</' in a cell must not end the script element.
     data['render_seconds'] = time.perf_counter() - started

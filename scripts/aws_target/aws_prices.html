@@ -20,6 +20,11 @@
 __PAGE_FRAME_STYLE__
 body { container-type: inline-size; }
 h2 .unit { font-size: 0.82rem; font-weight: 400; color: var(--ink-3); }
+#launch-state { padding: 10px 18px; }
+#launch-state p { margin: 0; color: var(--ink-2); font-size: 0.9rem; }
+#launch-state strong { color: var(--ink); }
+#launch-state[data-kind="refused"] { border-inline-start: 3px solid var(--error); }
+#launch-state[data-kind="refused"] strong { color: var(--error); }
 .card-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; }
 .answer { font-size: 1.05rem; font-weight: 600; margin: 12px 0 0; }
 table { border-collapse: collapse; font-size: 0.86rem; margin-top: 6px; min-width: 100%; }
@@ -101,6 +106,9 @@ td.dearest, tbody tr:hover td.dearest { background: var(--dearest); color: var(-
 <body>
 <main>
 __PAGE_TITLE__
+<section class="card" id="launch-state" aria-label="AWS launch state">
+  <p role="status"></p>
+</section>
 <section class="card" id="spend">
   <h2>Spend <span class="unit">(USD)</span></h2>
   <div class="tiles" id="spend-tiles"></div>
@@ -309,6 +317,30 @@ function fill(section, table, note) {
   else if (table.rows.length) section.appendChild(element("p", shown.size ? NOTHING_SHOWN : NO_REGION, "note"));
   return section;
 }
+
+const launchTime = new Intl.DateTimeFormat("en-US", {month: "numeric", day: "numeric", year: "2-digit",
+  hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZoneName: "short"});
+
+function drawLaunchState() {
+  const section = document.getElementById("launch-state");
+  const state = data.launch_state;
+  section.dataset.kind = state.kind;
+  const last = state.last_good_at === undefined ? "" : launchTime.format(state.last_good_at * 1000);
+  const label = state.kind === "refused" ? `AWS refuses launches (${state.code}).`
+    : state.kind === "working" ? "AWS launches work." : "AWS launch state is unknown.";
+  let details = last ? `Last good launch: ${last}.` : "No good launch recorded.";
+  if (state.kind === "refused") {
+    const count = `${state.count} ${state.count === 1 ? "refusal" : "refusals"}`;
+    const since = last ? `since the last good launch (${last}).` : "recorded. No good launch recorded.";
+    details = `${state.reason} First refusal: ${launchTime.format(state.first_at * 1000)}. ${count} ${since}`;
+  }
+  if (state.latest_attempt_at !== undefined) {
+    const latest = `Latest attempt: ${launchTime.format(state.latest_attempt_at * 1000)}.`;
+    details = state.kind === "working" && state.latest_attempt_at === state.last_good_at ? latest : `${details} ${latest}`;
+  }
+  section.querySelector("p").replaceChildren(element("strong", label), " ", details);
+}
+drawLaunchState();
 
 function drawSpend() {
   const tiles = data.spend.tiles.map(tile => {
@@ -577,7 +609,7 @@ async function loadAws(supersede=false,current=()=>true){
  const page=new DOMParser().parseFromString(await response.text(),'text/html');
  const next=JSON.parse(page.querySelector('#aws-prices-data').textContent);
  if(!current()) return;data=next;
- drawSpend();draw();
+ drawLaunchState();drawSpend();draw();
  return {readAt:data.read_at,renderSeconds:data.render_seconds};
 }
 createPageRefresh(loadAws,()=>0,()=>'',{readAt:data.read_at,renderSeconds:data.render_seconds});

@@ -1,5 +1,6 @@
 """Check the published AWS table and quota case instructions."""
 
+from collections.abc import Mapping
 from dataclasses import replace
 from html import unescape
 import json
@@ -7,12 +8,14 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
-from typing import cast
+from typing import cast, override
 import unittest
 from unittest import mock
 
 from scripts.aws_target import aws_page, console_help, ledger, ledger_test_support
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 class AwsPageQuotaHelpTests(ledger_test_support.CostFixture):
@@ -40,19 +43,155 @@ class AwsPageQuotaHelpTests(ledger_test_support.CostFixture):
                              + '\n<p>Choose the test account.</p>\n<p>Unlock the test manager.</p>')
 
 
+class PageCostFixture(ledger_test_support.CostFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.costs({'spend_pace_days': '3', 'run_cost_days': '5', 'billed_hours_gap_max_ratio': '0.2'})
+        _ = write_config_fixture(self.root / 'cloud_gate.conf', """
+spot_candidate_regions=us-east-1
+instance_types=m7a.8xlarge
+price_compare_instance_types=c7a.8xlarge
+gpu_instance_types=g6.2xlarge
+hana_gpu_instance_types=g6.2xlarge
+gate_wait_usd_per_minute=0
+unmeasured_region_extra_seconds={}
+# whole: 1..
+lifetime_minutes=30
+""")
+
+
+class AwsPageLaunchStateTests(PageCostFixture):
+    now: int = ledger_test_support.instant('2026-01-15T12:00:00Z')
+
+    def published_launch_state(self, *events: Mapping[str, object],
+                               default_attempt_ids: bool = True) -> dict[str, object]:
+        rows = ({'instance_type': 'm7a.8xlarge', 'region': 'us-east-1', 'mode': 'merge-gate',
+                 **({'attempt': f'fixture-{index}'} if default_attempt_ids else {}),
+                 **event} for index, event in enumerate(events))
+        _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        page = aws_page.publish(self.state, self.now, self.root / 'page', settings_path=self.settings)
+        source = page.read_text()
+        self.assertNotIn('private diagnostic', source)
+        payload = source.split('<script id="aws-prices-data" type="application/json">', 1)[1].split('</script>', 1)[0]
+        return ledger.mapping(ledger.mapping(cast(object, json.loads(payload)))['launch_state'])
+
+    def test_account_refusals_count_from_the_last_good_launch(self) -> None:
+        normal_codes = ('SpotMaxPriceTooLow', 'VcpuLimitExceeded', 'MaxSpotInstanceCountExceeded',
+                        'InsufficientSpotCapacity', 'InsufficientInstanceCapacity')
+        state = self.published_launch_state(
+            {'time': self.now - 600, 'result': 'refused', 'error_code': 'Blocked'},
+            {'time': self.now - 500, 'result': 'launched'},
+            {'time': self.now - 240.25, 'result': 'refused', 'error_code': 'ExpiredToken'},
+            {'time': self.now - 180, 'result': 'refused', 'error_code': 'Blocked', 'reason': 'private diagnostic'},
+            *({'time': self.now - 120 + index, 'result': 'refused', 'error_code': code}
+              for index, code in enumerate(normal_codes)),
+            {'time': self.now - 10, 'result': 'finished'},
+        )
+        self.assertEqual(state, {'kind': 'refused', 'code': 'Blocked', 'reason': 'The account is blocked.',
+                                 'first_at': self.now - 240.25, 'count': 2, 'last_good_at': self.now - 500,
+                                 'latest_attempt_at': self.now - 116})
+
+    def test_a_good_launch_clears_the_refusal_run(self) -> None:
+        state = self.published_launch_state(
+            {'time': self.now - 180, 'result': 'refused', 'error_code': 'InvalidClientTokenId'},
+            {'time': self.now - 120, 'result': 'launched'},
+            {'time': self.now - 60, 'result': 'refused', 'error_code': 'InsufficientSpotCapacity'},
+        )
+        self.assertEqual(state, {'kind': 'working', 'last_good_at': self.now - 120,
+                                 'latest_attempt_at': self.now - 60})
+
+    def test_other_refusals_replace_the_working_state_without_publishing_diagnostics(self) -> None:
+        for code, shown in (({}, 'unknown code'), ({'error_code': 'fixture-private-id'}, 'unknown code'),
+                            ({'error_code': 'UnauthorizedOperation'}, 'UnauthorizedOperation')):
+            with self.subTest(code=code):
+                state = self.published_launch_state(
+                    {'time': self.now - 120, 'result': 'launched'},
+                    {'time': self.now - 60, 'result': 'refused', 'reason': 'private diagnostic', **code})
+                self.assertEqual((state['kind'], state['code']), ('refused', shown))
+                self.assertEqual(state['reason'], 'The launch could not proceed.')
+                self.assertNotIn('fixture-private-id', json.dumps(state))
+
+    def test_prelaunch_credential_fallback_counts_and_local_fallback_does_not(self) -> None:
+        state = self.published_launch_state(
+            {'time': self.now - 120, 'result': 'launched'},
+            {'time': self.now - 90, 'result': 'fallback', 'error_code': 'ExpiredToken', 'reason': 'private diagnostic'},
+            {'time': self.now - 60, 'result': 'fallback', 'error_code': 'Spot'},
+        )
+        self.assertEqual((state['kind'], state['code'], state['count']), ('refused', 'ExpiredToken', 1))
+
+    def test_fallback_after_launch_does_not_report_a_refusal(self) -> None:
+        launched_at = self.now - 120
+        state = self.published_launch_state(
+            {'attempt': 'gate-a', 'time': launched_at, 'result': 'launched'},
+            {'attempt': 'gate-a', 'time': self.now - 60, 'result': 'fallback', 'error_code': 'AccessDenied',
+             'reason': 'GetObject failed: private diagnostic'},
+        )
+        self.assertEqual(state, {'kind': 'working', 'last_good_at': launched_at, 'latest_attempt_at': launched_at})
+
+    def test_fallback_after_refusal_counts_only_the_gate_attempt(self) -> None:
+        refused_at = self.now - 90
+        refusal = {'attempt': 'gate-b', 'time': refused_at, 'result': 'refused',
+                   'error_code': 'ServiceUnavailable'}
+        fallback = {**refusal, 'time': self.now - 60, 'result': 'fallback'}
+        for worker_rows in ((refusal,), (refusal, {**refusal, 'time': refused_at + 1})):
+            with self.subTest(worker_rows=len(worker_rows)):
+                state = self.published_launch_state(*worker_rows, fallback)
+                self.assertEqual((state['kind'], state['code'], state['count']), ('refused', 'ServiceUnavailable', 1))
+                self.assertEqual(state['latest_attempt_at'], worker_rows[-1]['time'])
+
+    def test_fallback_without_attempt_id_keeps_the_good_launch(self) -> None:
+        launched_at = self.now - 120
+        for identity in ({}, {'attempt': ''}):
+            with self.subTest(identity=identity):
+                state = self.published_launch_state(
+                    {'time': launched_at, 'result': 'launched', **identity},
+                    {'time': self.now - 60, 'result': 'fallback', 'error_code': 'AccessDenied', **identity},
+                    default_attempt_ids=False,
+                )
+                self.assertEqual(state, {'kind': 'working', 'last_good_at': launched_at,
+                                         'latest_attempt_at': launched_at})
+
+    def test_fallback_without_attempt_id_does_not_count_the_refusal_twice(self) -> None:
+        refused_at = self.now - 120
+        for identity in ({}, {'attempt': ''}):
+            with self.subTest(identity=identity):
+                refusal = {'time': refused_at, 'result': 'refused', 'error_code': 'ServiceUnavailable', **identity}
+                state = self.published_launch_state(
+                    refusal,
+                    {**refusal, 'time': self.now - 60, 'result': 'fallback'},
+                    default_attempt_ids=False,
+                )
+                self.assertEqual((state['kind'], state['count'], state['latest_attempt_at']),
+                                 ('refused', 1, refused_at))
+
+    def test_state_without_a_good_launch(self) -> None:
+        self.assertEqual(self.published_launch_state(), {'kind': 'no-evidence'})
+        state = self.published_launch_state(
+            {'time': self.now - 60, 'result': 'refused', 'error_code': 'AuthFailure'})
+        self.assertEqual(state, {'kind': 'refused', 'code': 'AuthFailure',
+                                 'reason': 'AWS could not authenticate the launch credentials.',
+                                 'first_at': self.now - 60, 'count': 1, 'latest_attempt_at': self.now - 60})
+
+    def test_publisher_settings_have_fixed_fixture_values(self) -> None:
+        settings = conf.read(self.settings)
+        self.assertEqual((settings.whole('spend_pace_days'), settings.whole('run_cost_days'),
+                          settings.number('billed_hours_gap_max_ratio')), (3, 5, 0.2))
+        self.assertEqual(conf.read('cloud_gate').words('spot_candidate_regions'), ('us-east-1',))
+
+
 @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for the AWS table checks")
-class AwsCombinedTableTests(ledger_test_support.CostFixture):
-    def fixture_page(self) -> Path:
+class AwsCombinedTableTests(PageCostFixture):
+    def fixture_page(self, *, blocked: bool = False) -> Path:
         now = ledger_test_support.instant('2026-01-15T12:00:00Z')
         regions = ('us-east-1', 'us-east-2', 'eu-west-1')
         standard = ('c7a.4xlarge', 'm7a.8xlarge')
         gpu = 'g6.2xlarge'
         config = self.root / 'cloud_gate.conf'
-        _ = config.write_bytes((Path(__file__).resolve().parents[2] / 'config/cloud_gate.conf').read_bytes())
         for key, value in (
             ('spot_candidate_regions', ' '.join(reversed(regions))), ('instance_types', standard[0]),
             ('price_compare_instance_types', standard[1]), ('gpu_instance_types', gpu),
-            ('hana_gpu_instance_types', gpu), ('gate_wait_usd_per_minute', '0'),
+            ('hana_gpu_instance_types', gpu),
         ):
             ledger_test_support.text_setting(config, key, value)
         prices = [
@@ -74,6 +213,9 @@ class AwsCombinedTableTests(ledger_test_support.CostFixture):
                 run = {'attempt': f'{mode}-{index}', 'instance_type': size, 'mode': mode, 'region': regions[0]}
                 events.extend(({**run, 'time': now - 60 - seconds, 'result': 'launched'},
                                {**run, 'time': now - 60, 'result': 'finished', 'gate_s': seconds - 60}))
+        if blocked:
+            events.append({'attempt': 'blocked-fixture', 'instance_type': standard[0], 'mode': 'merge-gate',
+                           'region': regions[0], 'time': now - 30, 'result': 'refused', 'error_code': 'Blocked'})
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(event) + '\n' for event in events))
         placement_regions = (regions[0], 'us-west-1')
         request = ledger.SpotPlacementRequest(ledger.SpotPlacementScope.REGION,
@@ -82,8 +224,8 @@ class AwsCombinedTableTests(ledger_test_support.CostFixture):
             (ledger.SpotPlacementScore(ledger.SpotPlacementRegion(regions[0]), 9),)),), now)
         return aws_page.publish(self.state, now, self.root / 'page', settings_path=self.settings)
 
-    def run_browser_checks(self, query: str, checks: str) -> None:
-        page = self.fixture_page()
+    def run_browser_checks(self, query: str, checks: str, *, blocked: bool = False) -> None:
+        page = self.fixture_page(blocked=blocked)
         probe = """<script>
 (async () => {
   const result = document.createElement("p");
@@ -108,6 +250,34 @@ class AwsCombinedTableTests(ledger_test_support.CostFixture):
         marker = re.search(r'<p id="table-checks">(.*?)</p>', result.stdout)
         assert marker is not None, 'The browser must finish the table checks.'
         self.assertEqual(unescape(marker[1]), 'passed')
+
+    def test_launch_state_sits_above_spend_and_updates_after_a_good_launch(self) -> None:
+        self.run_browser_checks('', """
+    const block = document.getElementById("launch-state");
+    const message = () => block.querySelector("[role='status']").textContent;
+    check(block.nextElementSibling.id === "spend", "Launch state sits above spend");
+    check(block.dataset.kind === "refused", "Refusal style");
+    check(message().includes("AWS refuses launches (Blocked). The account is blocked."),
+          "Refusal includes the code and plain reason");
+    const {first_at, last_good_at, latest_attempt_at} = data.launch_state;
+    check(message().includes(`First refusal: ${launchTime.format(first_at * 1000)}.`)
+          && message().includes(`1 refusal since the last good launch (${launchTime.format(last_good_at * 1000)}).`),
+          "Refusal times and count");
+    check(Number.isFinite(latest_attempt_at)
+          && message().includes(`Latest attempt: ${launchTime.format(latest_attempt_at * 1000)}.`),
+          "Latest attempt appears in the refused state");
+    document.querySelector("#regions .all:last-child").click();
+    check(block.dataset.kind === "refused", "Region filters leave launch state intact");
+    const next = JSON.stringify({...data, launch_state: {kind: "working", last_good_at: first_at + 1,
+      latest_attempt_at: first_at + 61}});
+    window.fetch = async () => ({ok: true, text: async () =>
+      `<script type="application/json" id="aws-prices-data">${next}</scr` + "ipt>"});
+    await loadAws();
+    check(block.dataset.kind === "working", "Refresh clears refusal style");
+    check(message().includes(`AWS launches work. Last good launch: ${launchTime.format((first_at + 1) * 1000)}.`)
+          && message().includes(`Latest attempt: ${launchTime.format((first_at + 61) * 1000)}.`),
+          "Refresh shows the last good launch and latest attempt");
+""", blocked=True)
 
     def test_default_table_marks_and_shared_filters(self) -> None:
         self.run_browser_checks('?prices=cost', """
