@@ -1421,7 +1421,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Result:** `the_list.py add` and `update` accept `--eta` only as `Mon D`, `Mon D HH:MM ZONE`, `No time yet`, `Waiting for nate`, `Paused` or `Delivered`. Old records read as before. A producer may set `--evidence` and `--add-evidence` on its own items. On main 31f454605 (hash fb52e3dc7).
 
-### Phase 85 — send.py prints FAILED only when delivery failed  · status: todo
+### Phase 85 — send.py prints FAILED only when delivery failed  · status: done
 **Depends on:** phase 84 (fb52e3dc7)
 
 #### Work Order
@@ -1443,6 +1443,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Acceptance gate:**
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
+
+**Result:** `send.py` picks the SendMessage call by the proxy forward's tool ID. The SENT line notes the other calls. A refusal, a missing result, a timeout or a socket error after the write stay not SENT. On main 1a3e942f1 (hash 75e6bfa6b).
 
 ### Phase 86 — A merge run survives an account move, and a changed batch after a stopped run is refused  · status: todo
 **Depends on:** none (branch from main 815070e57)
