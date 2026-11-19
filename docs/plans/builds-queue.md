@@ -3009,6 +3009,22 @@ Work:
 5. Stack on 44cn (both edit `builds_text`), or merge main after 44cn merges.
 6. As-built note: `head_stall_alert_minutes` goes back from 600 to 30. builds runs the /tune after the merge (builds set 600 on 11-19 to mute the pushes).
 
+### Phase 44cu — The Builds page shows each step that waits for a Mac slot  · status: todo
+**From 44co (2026-11-19, repair round 4, Astra review design/phase44co/astra_review_r4.md):** 44co split. 44co keeps the natedev line fix. The Mac wait list and its page part move here. Four rounds on 44co (branch builds-queue-44co, 913366eca) failed because "who waits for a Mac slot" was rebuilt in the snapshot path from placement replies, claim failures and probe evidence.
+
+Design (Astra):
+1. `AdmissionServer` is the one writer of the Mac wait state, in its event loop. The state is keyed by episode: `NoMacWait | WaitingForMac(destination, since, cause)`.
+2. One transition function records busy probe results, scheduler contention and accepted busy claim failures. Assignment, a terminal refusal, cancellation and owner exit clear the wait.
+3. Busy attempt history stays in the assignment records. History never makes a wait active.
+4. The socket view and the saved snapshot publish from the same captured state after each change.
+5. Queries keep main behavior: no read-only query change in this phase.
+
+Carried findings: F006 (a busy refusal reached the socket reply but not the snapshot; the next pass reassigned on fresh evidence, main retry rule placement.py:525) and F010 (a past busy attempt showed as a current wait after a final `off` refusal).
+
+Work:
+1. Replay F006 and F010 with tests, plus the 44co cases: a configured-order request with only a busy Mac, a pinned `off` refusal (absent), two copies that compete for one slot (the older is listed while its owner lives).
+2. Build the state and the `mac_waits` snapshot field. report builds the page part (macwaits) on this branch, and both merge as one item.
+
 ### Phase 44cg — A memory wait fixture gives the same result under load  · status: todo
 **From builds, 2026-11-18 18:3x:** queue's next item after 44cf.
 
