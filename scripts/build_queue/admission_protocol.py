@@ -63,6 +63,7 @@ from scripts.build_queue.admission_wire import (
     CloudSlotWait as CloudSlotWait,
     Wait as Wait,
     RouteAgain as RouteAgain,
+    RouteGranted as RouteGranted,
     AcquisitionTiming as AcquisitionTiming,
     CleanupTiming as CleanupTiming,
     Admitted as Admitted,

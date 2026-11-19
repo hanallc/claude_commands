@@ -12,7 +12,9 @@ import io
 import json
 import os
 from pathlib import Path
+import runpy
 import subprocess
+import sys
 import tempfile
 import threading
 from dataclasses import replace
@@ -144,15 +146,17 @@ class SharedGateAdmissionTests(ServiceGateFixture):
     def test_unit_named_modules_wait_while_a_local_merge_test_runs(self) -> None:
         self.check_named_module_admission(integrate_running=True)
 
-    def check_merge_route_retry(self, *, accepts: bool) -> None:
-        from scripts.aws_target import cloud_gate
+    def check_merge_route_retry(self, *, accepts: bool, cli: bool = False) -> None:
+        from scripts.aws_target import cloud_gate, gate_box
 
-        interval = 2.5
+        interval = 60
         self.configure_gate(f"# one of: on, off\n{memory_admit.MERGE_TEST_WAIT_KEY}=on\n"
             + f"# range: 5e-324..\n{memory_admit.MERGE_TEST_REROUTE_KEY}={interval}\n")
         fixture = self.admission
         local_result = merge_gate.GateRun((), 1, 0, selection_certified=True)
-        remote_result = merge_gate.GateRun((), 2, 0, selection_certified=True)
+        jobs = (merge_gate.GateJobResult("hooks", "test_first.py", 1, 2, "AWS test failed"),) if cli else ()
+        remote_result = gate_box.decode_run(gate_box.encode_run(
+            merge_gate.GateRun(jobs, 2, 0, selection_certified=True)))
         start = admission_records.process_start_time(os.getpid())
         assert start is not None
         owner = wire.Owner(os.getpid(), start)
@@ -193,7 +197,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             self.assertEqual(attempts, 2)
             with fixture.loop_turn():
                 entry, = entries
-                self.assertTrue(fixture.server.waiters[entry.episode].checking_cloud_route)
+                self.assertIsInstance(fixture.server.waiters[entry.episode].cloud_route_check, service.CloudRouteCheck)
                 fixture.release(integrate)
                 fixture.allow_next_start()
                 _ = fixture.run_pass()
@@ -202,11 +206,14 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             if accepts:
                 with cloud_gate.cloud_reservation(repo, self.state / "aws.cgroup", merge_gate.SuiteMode.MERGE_GATE) as aws:
                     with fixture.loop_turn():
-                        record, = fixture.server.reservations.values()
+                        record, = (record for record in fixture.server.reservations.values()
+                                   if isinstance(record.place, wire.CloudPlace))
                         self.assertEqual(record.owner, owner)
-                        self.assertIsInstance(record.place, wire.CloudPlace)
-                        self.assertEqual(fixture.queue_pids(), [owner.pid, competitor.owner.pid])
-                    aws.status = 0
+                        self.assertNotIn(entry.episode, fixture.server.waiters)
+                        self.assertNotIn(entry.episode, {place.episode for place in fixture.server.places.values()})
+                        self.assertNotIn(owner.pid, fixture.queue_pids())
+                        self.assertIn(competitor.episode, fixture.server.reservations)
+                    aws.status = int(not remote_result.passed)
                 return remote_result
             return "AWS is still busy"
 
@@ -224,8 +231,16 @@ class SharedGateAdmissionTests(ServiceGateFixture):
               mock.patch.object(client.WaitOutput, "__call__", new=observe),
               mock.patch.object(cloud_gate, "route", side_effect=route),
               mock.patch.object(merge_gate, "run_suites", side_effect=local)):
-            run = merge_gate.run_gate_suites(self.checkout)
-        self.assertEqual(run, remote_result if accepts else local_result)
+            if cli:
+                script = str(Path(merge_gate.__file__))
+                argv = [script, "--tests-only", "--repo", str(self.checkout)]
+                with mock.patch.object(sys, "argv", argv), self.assertRaises(SystemExit) as exit_code:
+                    _ = runpy.run_path(script, run_name="__main__")
+                self.assertEqual(exit_code.exception.code, 1)
+                self.assertEqual(self.module_events(), [])
+            else:
+                run = merge_gate.run_gate_suites(self.checkout)
+                self.assertEqual(run, remote_result if accepts else local_result)
         self.assertEqual(attempts, 2)
         with fixture.loop_turn():
             entry, = entries
@@ -236,8 +251,11 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             _ = fixture.run_pass()
             self.assertIn(competitor.episode, fixture.server.reservations)
 
-    def test_the_gate_releases_its_local_place_when_aws_returns_a_result(self) -> None:
+    def test_the_aws_grant_releases_the_local_place_before_a_result(self) -> None:
         self.check_merge_route_retry(accepts=True)
+
+    def test_the_cli_keeps_the_completed_aws_result(self) -> None:
+        self.check_merge_route_retry(accepts=True, cli=True)
 
     def test_the_older_gate_starts_first_when_integrate_ends_during_the_aws_check(self) -> None:
         self.check_merge_route_retry(accepts=False)

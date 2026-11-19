@@ -343,6 +343,11 @@ class RouteAgain:
 
 
 @dataclass(frozen=True)
+class RouteGranted:
+    """The AWS grant ended this local wait."""
+
+
+@dataclass(frozen=True)
 class AcquisitionTiming:
     """Bound acquisition without reading the client account's configuration."""
     silence_seconds: float
@@ -638,7 +643,8 @@ Request = (RepositorySlotRequest | ServiceEstimateRequest | AdmitRequest | Launc
            | BuildHistoryRequest | ExplainRequest | MineRequest | PrioritySetRequest | PriorityClearRequest | TokenWaitRequest
            | PlacementRequest | PlacementStatusRequest | ClaimFailure | ConsumePermission | ExecutionReport | PrerequisiteReport | CancelPlacement)
 
-Reply = (RepositorySlotWaiting | RepositorySlotReady | RepositorySlotExpired | Wait | RouteAgain | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
+Reply = (RepositorySlotWaiting | RepositorySlotReady | RepositorySlotExpired | Wait | RouteAgain | RouteGranted
+         | RunnerAdmitted | Admitted | LaunchAdmitted | Refused | Ok | BuildHistoryReply
          | PlacementWait | Assignment | LocalPlacementGranted | FirstAuthorization | DispatchStatus | PlacementStatusReply)
 
 _GROUPED_CLOUD_ADMIT = "cloud_group_admit"
@@ -656,7 +662,8 @@ _REQUESTS: dict[str, type] = {
 REPLY_TYPES: dict[str, type] = {
     "repository_slot_waiting": RepositorySlotWaiting, "repository_slot_ready": RepositorySlotReady,
     "repository_slot_expired": RepositorySlotExpired,
-    "wait": Wait, "route_again": RouteAgain, "runner_admitted": RunnerAdmitted, "admitted": Admitted, "launch_admitted": LaunchAdmitted,
+    "wait": Wait, "route_again": RouteAgain, "route_granted": RouteGranted, "runner_admitted": RunnerAdmitted,
+    "admitted": Admitted, "launch_admitted": LaunchAdmitted,
     "build_history": BuildHistoryReply, "refused": Refused, "ok": Ok,
     "placement_wait": PlacementWait, "assignment": Assignment,
     "first_authorization": FirstAuthorization, "dispatch_status": DispatchStatus,

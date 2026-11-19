@@ -28,6 +28,11 @@ try:
 except FileNotFoundError:
     pass
 
+if __name__ == "__main__":
+    from scripts.production.merge_gate import main as gate_main
+
+    raise SystemExit(gate_main())
+
 import argparse
 from collections import deque
 from collections.abc import Callable, Generator, Sequence
@@ -2666,7 +2671,3 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (copies.CopyError, GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)
         return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

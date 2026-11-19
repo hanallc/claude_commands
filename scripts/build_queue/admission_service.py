@@ -1297,6 +1297,18 @@ class NoContinuationClaim:
     """This waiter has not claimed a continuation slot."""
 
 
+@dataclass(frozen=True)
+class NoCloudRouteCheck:
+    """The local queue applies its usual admission rules."""
+
+
+@dataclass(frozen=True)
+class CloudRouteCheck:
+    """The service defers local admission until this monotonic deadline."""
+
+    deadline: float
+
+
 @dataclass
 class WaitingAdmission:
     request: wire.AdmitRequest | wire.LaunchRequest
@@ -1307,7 +1319,7 @@ class WaitingAdmission:
     continuation_claim: records.ContinuationSlot | NoContinuationClaim = NoContinuationClaim()
     landing: LandingTest | OrdinaryTest = OrdinaryTest()
     merge_route_retry_at: float = float("inf")
-    checking_cloud_route: bool = False
+    cloud_route_check: CloudRouteCheck | NoCloudRouteCheck = NoCloudRouteCheck()
 
     @property
     def cloud(self) -> bool:
@@ -1318,10 +1330,11 @@ def checks_queued_gate_route(request: wire.AdmitRequest | wire.LaunchRequest, co
                             waiting: WaitingAdmission) -> bool:
     """Allow the waiting gate's own process to ask for one AWS place."""
     local = waiting.request
-    return (waiting.checking_cloud_route and isinstance(local, wire.AdmitRequest)
+    return (isinstance(waiting.cloud_route_check, CloudRouteCheck) and isinstance(local, wire.AdmitRequest)
             and isinstance(local.place, wire.LocalPlace) and isinstance(request, wire.AdmitRequest)
             and isinstance(request.place, wire.CloudPlace) and request.place.target == "aws"
             and not isinstance(request.place.group, status_wire.CloudGroup)
+            and request.owner == local.owner
             and request.profile.step == local.profile.step and request.profile.worktree == local.profile.worktree
             and isinstance(connection, Connection) and isinstance(waiting.connection, Connection)
             and connection.credentials == waiting.connection.credentials)
@@ -2131,7 +2144,6 @@ class AdmissionServer:
         memories: list[tuple[records.Reservation, records.StepMemory]] = []
         for episode, record in list(self.reservations.items()):
             if isinstance(record.place, wire.CloudPlace):
-                _ = self._end_if_finished(episode, record)
                 continue
             if isinstance(record.finalization, dict) or not isinstance(record.ending, NotEnding):
                 with retry_cleanup(Path(record.path)):
@@ -2193,7 +2205,8 @@ class AdmissionServer:
             if records.waiter_owner(row) in local_owners], memories, readings, now, priority, unowned)
         inputs = replace(inputs, pending_remote_starts=pending_remote_starts & local_owners, local_waits=local_waits,
                          cloud_route_waiters=frozenset(records.waiter_owner(waiting.row)
-                             for waiting in self.waiters.values() if waiting.checking_cloud_route))
+                             for waiting in self.waiters.values()
+                             if isinstance(waiting.cloud_route_check, CloudRouteCheck)))
         represented = {(step.run.pid, step.run.start_time) for step in inputs.running
                        if isinstance(step.run, LiveBuildRun)}
         between = tuple(step for step in evidence.between
@@ -2498,6 +2511,8 @@ class AdmissionServer:
         self._settle_attempt_reports(evidence_keys)
         remote_start_hold_seconds = self.configuration.remote_start_hold_seconds
         self._prepare_placements(evidence_keys, remote_start_hold_seconds)
+        self._expire_cloud_route_checks()
+        cloud_started = self._cloud_pass(self.clock.now(), self.configuration)
         inputs = self._inputs(config, self.configuration.progress_profile_rank, self.configuration.peak_history_share_percent,
                               self.configuration.progress_profile_sweep_seconds)
         ci_holds = self._ci_hold_reasons()
@@ -2513,7 +2528,6 @@ class AdmissionServer:
             del self.slots[reservation]
         self._check_reading_alert(inputs, result, config)
         self.last_inputs, self.last_result, self.last_policy = inputs, result, policy
-        cloud_started = self._cloud_pass(inputs, self.configuration)
         by_owner = {records.waiter_owner(waiting.row): episode for episode, waiting in self.waiters.items()
                     if not waiting.cloud}
         head = result.policy.queued_head
@@ -2556,7 +2570,7 @@ class AdmissionServer:
             episode = by_owner[decision.owner]
             if episode in self.waiters:
                 waiting = self.waiters[episode]
-                if waiting.checking_cloud_route:
+                if isinstance(waiting.cloud_route_check, CloudRouteCheck):
                     continue
                 reason = decision.reason
                 cause = reason.cause if isinstance(reason, records.HeadAdmissionStatus) else reason
@@ -2566,7 +2580,8 @@ class AdmissionServer:
                     if waiting.merge_route_retry_at == float("inf"):
                         waiting.merge_route_retry_at = observed_at + self.configuration.merge_test_reroute_seconds
                     if observed_at >= waiting.merge_route_retry_at:
-                        waiting.checking_cloud_route = True
+                        waiting.cloud_route_check = CloudRouteCheck(
+                            observed_at + self.configuration.merge_test_reroute_seconds)
                         waiting.merge_route_retry_at = float("inf")
                         self._deliver(waiting, wire.RouteAgain())
                         continue
@@ -2586,6 +2601,8 @@ class AdmissionServer:
                     waiting.last_reply, waiting.last_sent = reply, inputs.now
         for position, (episode, reason) in enumerate(ci_holds.items(), len(result.rows) + 1):
             waiting = self.waiters[episode]
+            if isinstance(waiting.cloud_route_check, CloudRouteCheck):
+                continue
             waiting.merge_route_retry_at = float("inf")
             decision = records.AdmissionDecision("hold", waiting.row["need"], 0, 0, 0, free_passes=False)
             reply = wire.Wait(reason, position, "", reason_phrase(reason, ()),
@@ -2595,7 +2612,9 @@ class AdmissionServer:
                 waiting.last_reply, waiting.last_sent = reply, inputs.now
         interval = (config.waiting_pass_seconds if self.waiters or self.repository_slot_waiters or any(self._placement_waiting(request)
                     for request in self.placement_requests.values()) else config.running_pass_seconds)
-        self.next_pass = min(self.clock.monotonic() + interval, next_merge_route_retry)
+        route_deadline = min((waiting.cloud_route_check.deadline for waiting in self.waiters.values()
+                              if isinstance(waiting.cloud_route_check, CloudRouteCheck)), default=float("inf"))
+        self.next_pass = min(self.clock.monotonic() + interval, next_merge_route_retry, route_deadline)
         if starts or cloud_started:
             self.next_pass = self.clock.monotonic()
         try:
@@ -2682,7 +2701,24 @@ class AdmissionServer:
                 self._deliver(waiting, reply)
         return groups
 
-    def _cloud_pass(self, inputs: records.QueueInputs, configuration: gate.UsableAdmissionConfiguration) -> bool:
+    def _expire_cloud_route_checks(self) -> None:
+        now = self.clock.monotonic()
+        for local in tuple(self.waiters.values()):
+            if not isinstance(local.cloud_route_check, CloudRouteCheck) or now < local.cloud_route_check.deadline:
+                continue
+            for cloud in self._cloud_waiters():
+                if checks_queued_gate_route(cloud.request, cloud.connection, local):
+                    episode = cloud.request.episode
+                    reply = wire.Refused("AWS route check expired")
+                    self.ledger[episode] = ReplayEntry(reply, self.clock.now())
+                    self._drop_waiter(episode)
+                    self._deliver(cloud, reply)
+            local.cloud_route_check = NoCloudRouteCheck()
+
+    def _cloud_pass(self, now: float, configuration: gate.UsableAdmissionConfiguration) -> bool:
+        for episode, record in list(self.reservations.items()):
+            if isinstance(record.place, wire.CloudPlace):
+                _ = self._end_if_finished(episode, record)
         waiting_cloud = self._cloud_waiters()
         if not waiting_cloud and not self.pending_cloud_groups:
             return False
@@ -2717,9 +2753,9 @@ class AdmissionServer:
                 replace(waiting.request.profile.peak, bytes=0), (), 0,
                 waiting.request.profile.repo, waiting.request.profile.step, config.policy, config.diagnostics)
             reply = wire.Wait(reason, position, "", reason.text, snapshot)
-            if waiting.last_reply != reply or inputs.now - waiting.last_sent >= config.wait_reply_seconds:
+            if waiting.last_reply != reply or now - waiting.last_sent >= config.wait_reply_seconds:
                 self._deliver(waiting, reply)
-                waiting.last_reply, waiting.last_sent = reply, inputs.now
+                waiting.last_reply, waiting.last_sent = reply, now
         return started
 
     def _cloud_reading(self, reading: records.QueueRead, configuration: gate.UsableAdmissionConfiguration
@@ -2764,7 +2800,8 @@ class AdmissionServer:
             request = waiting.request
             assert isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace)
             sidecar = Path(request.sidecar)
-            rows.append(wire.CloudRow(request.owner, request.identity, request.place, waiting.row["since"], 0.0,
+            identity = replace(request.identity, job=waiting.row.get("job", GATE_JOB_NOT_RECORDED))
+            rows.append(wire.CloudRow(request.owner, identity, request.place, waiting.row["since"], 0.0,
                 cloud_progress.read(sidecar) if request.sidecar else cloud_progress.NoCloudProgress(),
                 progress.read_counter(sidecar) if request.sidecar else progress.NoCounter(), wire.CloudSlotWait(used, slots)))
         return wire.CloudQueueRead(reading.view, reading.explanation, reading.ordered, reading.diagnostics,
@@ -3008,6 +3045,7 @@ class AdmissionServer:
         now = self.clock.now()
         prepared = [self._prepare_admission(waiting, now, config, share_percent, cargo_folder) for waiting in waiters]
         replies: list[wire.Admitted | wire.LaunchAdmitted] = []
+        routed: list[WaitingAdmission] = []
         for waiting, admission in zip(waiters, prepared, strict=True):
             request = waiting.request
             if isinstance(admission, wire.LaunchAdmitted):
@@ -3018,11 +3056,19 @@ class AdmissionServer:
                 candidate = result.policy.queued_head if isinstance(result, gate.PassResult) else gate.NoQueuedHead()
                 source = request.profile.peak.source
                 self.lifecycle_outbox = (*self.lifecycle_outbox, PendingAdmission(request.episode, source,
-                    isinstance(candidate, gate.QueuedHead)
+                    not waiting.cloud and isinstance(candidate, gate.QueuedHead)
                         and records.waiter_owner(candidate.waiter) == records.waiter_owner(waiting.row),
                     max(0.0, now - waiting.row["since"])))
                 self.reservations[request.episode] = admission
-                if not waiting.cloud:
+                if waiting.cloud:
+                    local = next((local for local in self.waiters.values()
+                                  if checks_queued_gate_route(request, waiting.connection, local)), None)
+                    if local is not None:
+                        episode = local.request.episode
+                        self._leave_waiter(episode, local)
+                        self.ledger[episode] = ReplayEntry(wire.RouteGranted(), now)
+                        routed.append(local)
+                else:
                     for key, slot in list(self.slots.items()):
                         if isinstance(slot, records.ContinuationSlot) and slot.owner == records.waiter_owner(waiting.row):
                             del self.slots[key]
@@ -3044,6 +3090,8 @@ class AdmissionServer:
             self._record_landing_admission(landing, now)
         # Save every grant before sending any reply for the group.
         self.persist()
+        for local in routed:
+            self._deliver(local, wire.RouteGranted())
         for waiting, reply in zip(waiters, replies, strict=True):
             del self.waiters[waiting.request.episode]
             self._deliver(waiting, reply)
@@ -4965,15 +5013,18 @@ done
         changed = False
         for episode, waiting in list(self.waiters.items()):
             if waiting.connection is connection:
-                self._record_left(episode, gate.queue_life_identity(waiting.row), "cancelled",
-                                  isinstance(waiting.landing, LandingTest))
-                if not waiting.cloud:
-                    _ = self.places.pop(_place_key(waiting.request.owner, waiting.row["since"]), None)
-                self._drop_waiter(episode, return_claim=True)
+                self._leave_waiter(episode, waiting)
                 changed = True
         if changed:
             self.persist()
         return changed
+
+    def _leave_waiter(self, episode: str, waiting: WaitingAdmission) -> None:
+        self._record_left(episode, gate.queue_life_identity(waiting.row), "cancelled",
+                          isinstance(waiting.landing, LandingTest))
+        if not waiting.cloud:
+            _ = self.places.pop(_place_key(waiting.request.owner, waiting.row["since"]), None)
+        self._drop_waiter(episode, return_claim=True)
 
     def _refuse_connection(self, connection: Connection, reason: str) -> None:
         self._drop_deferred_requests(connection)

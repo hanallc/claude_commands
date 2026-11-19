@@ -114,7 +114,10 @@ The default is 60 seconds.
 The gate calls the same cloud route and keeps its local queue place during the check.
 If the hold ends during the check, the service preserves the gate's order and defers its local grant.
 If AWS declines, the gate resumes admission on the same connection.
-When AWS returns a result, the gate closes the connection and releases its local place.
+The service ends the check after `claude_commands_reroute_seconds` if AWS has not granted a slot.
+The gate keeps its place when the check expires.
+When the service grants an AWS slot, it releases the gate's local place.
+If AWS later falls back to natedev, the gate requests a new local place.
 An `integrate` job does not enter this hold.
 
 `merge_gate.py --tests-only --module` requests shared admission and can wait behind a local `integrate` job.

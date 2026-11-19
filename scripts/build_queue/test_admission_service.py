@@ -883,7 +883,7 @@ class LandingWaitTests(unittest.TestCase):
     def configure_wait(self, fixture: AdmissionFixture, *, enabled: bool = True, retry_seconds: float = 2) -> None:
         value = "on" if enabled else "off"
         _ = write_config_fixture(fixture.root / "build_admission.conf",
-            f"# one of: on, off\n{gate.MERGE_TEST_WAIT_KEY}={value}\nwaiting_pass_seconds=1\n"
+            f"# one of: on, off\n{gate.MERGE_TEST_WAIT_KEY}={value}\nwaiting_pass_seconds=1\ncloud_gate_slots=1\n"
             + f"# range: 5e-324..\n{gate.MERGE_TEST_REROUTE_KEY}={retry_seconds}\n")
 
     def gate_request(self, fixture: AdmissionFixture, job: StepJob | GateJobNotRecorded = ALL_TESTS,
@@ -919,7 +919,7 @@ class LandingWaitTests(unittest.TestCase):
             _ = fixture.run_pass()
             self.assertEqual(peer.replies(), [wire.RouteAgain()])
             waiter = fixture.server.waiters[request.episode]
-            self.assertTrue(waiter.checking_cloud_route)
+            self.assertEqual(waiter.cloud_route_check, service.CloudRouteCheck(fixture.clock.monotonic() + 2.5))
             self.assertEqual(fixture.server.places, places)
             self.assertNotIn(request.episode, fixture.server.reservations)
             self.assertIn(request.owner.pid, fixture.queue_pids())
@@ -927,8 +927,51 @@ class LandingWaitTests(unittest.TestCase):
             peer.socket.sendall(wire.encode_request(request).encode())
             resumed, = peer.replies()
             self.assertIsInstance(resumed, wire.Wait)
-            self.assertFalse(fixture.server.waiters[request.episode].checking_cloud_route)
+            self.assertEqual(fixture.server.waiters[request.episode].cloud_route_check, service.NoCloudRouteCheck())
             self.assertEqual(fixture.server.places, places)
+
+    def test_a_silent_route_check_expires_and_the_local_queue_moves(self) -> None:
+        with AdmissionFixture() as fixture:
+            interval = 2.5
+            self.configure_wait(fixture, retry_seconds=interval)
+            blocker = replace(self.gate_request(fixture), place=wire.CloudPlace("aws"))
+            aws_slot = only_admitted(fixture.server.handle_request(blocker))
+            integrate = only_admitted(fixture.server.handle_request(self.gate_request(fixture, self.INTEGRATE)))
+            fixture.allow_next_start()
+            request = self.reroutable_gate(fixture)
+            peer = fixture.connect(request)
+            first, = peer.replies()
+            assert isinstance(first, wire.Wait)
+            later = replace(self.gate_request(fixture), since=request.since + 0.1)
+            self.assertIsInstance(fixture.server.handle_request(later)[0], wire.Wait)
+            fixture.clock.advance(interval)
+            _ = fixture.run_pass()
+            self.assertEqual(peer.replies(), [wire.RouteAgain()])
+            deadline = fixture.clock.monotonic() + interval
+            cloud = replace(request, episode="pending-aws-route", place=wire.CloudPlace("aws"))
+            aws_peer = fixture.connect(cloud)
+            waiting, = aws_peer.replies()
+            assert isinstance(waiting, wire.Wait) and isinstance(waiting.reason, wire.CloudSlotWait)
+            fixture.release(integrate)
+
+            fixture.clock.advance(interval - 0.5)
+            _ = fixture.run_pass()
+            self.assertEqual(fixture.server.next_pass, deadline)
+            self.assertEqual(fixture.queue_pids(), [request.owner.pid, later.owner.pid])
+            self.assertEqual(peer.replies(), [])
+
+            fixture.clock.advance(0.5)
+            fixture.release(aws_slot)
+            _ = fixture.run_pass()
+            grant = only_admitted(peer.replies())
+            self.assertEqual(aws_peer.replies(), [wire.Refused("AWS route check expired")])
+            self.assertNotIn(cloud.episode, fixture.server.reservations)
+            self.assertEqual(fixture.server.reservations[request.episode].queue_waiter["since"], request.since)
+            self.assertIn(later.episode, fixture.server.waiters)
+            fixture.release(grant)
+            fixture.allow_next_start()
+            _ = fixture.run_pass()
+            self.assertIn(later.episode, fixture.server.reservations)
 
     def test_memory_wait_and_integrate_wait_do_not_retry_the_route(self) -> None:
         for job in (self.ALL_TESTS, self.INTEGRATE):
@@ -970,7 +1013,7 @@ class LandingWaitTests(unittest.TestCase):
             self.assertEqual(fixture.server.waiters[request.episode].merge_route_retry_at,
                              fixture.clock.monotonic() + 2)
 
-    def test_landing_test_checks_the_land_session_and_the_socket_peer_owner(self) -> None:
+    def test_aws_wait_and_reservation_show_integrate_for_the_verified_land(self) -> None:
         merge_member = staff.StaffRow(gate.NATEMERGE_STAFF_ID, "producer", "natemerge", staff.StaffRoot(),
                                       current_session=staff.StaffId("merge-session"))
         worker = staff.StaffRow(staff.StaffId("land-worker"), "worker", "land", staff.ReportsTo(merge_member.id),
@@ -996,8 +1039,21 @@ class LandingWaitTests(unittest.TestCase):
                 _ = environ.write_bytes(b"CODEX_THREAD_ID=land-session\0")
                 request = replace(request, identity=replace(request.identity, session_id=""))
                 self.assertEqual(service.landing_test(request, proc, connection), service.LandingTest(land))
+                fixture.configure(cloud_gate_slots=1)
+                blocker = replace(self.gate_request(fixture), place=wire.CloudPlace("aws"))
+                blocked_slot = only_admitted(fixture.server.handle_request(blocker))
                 remote = replace(request, place=wire.CloudPlace("aws"))
-                grant = only_admitted(fixture.connect(remote).replies())
+                peer = fixture.connect(remote)
+                waiting, = peer.replies()
+                assert isinstance(waiting, wire.Wait)
+                self.assertIsInstance(waiting.reason, wire.CloudSlotWait)
+                view, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(view, wire.ViewReply) and isinstance(view.reading, wire.CloudQueueRead)
+                queued, = (cloud for cloud in view.reading.cloud if cloud.owner == owner)
+                self.assertEqual(queued.identity.job, self.INTEGRATE)
+                fixture.release(blocked_slot)
+                _ = fixture.run_pass()
+                grant = only_admitted(peer.replies())
                 record = fixture.server.reservations[remote.episode]
                 self.assertEqual(record.gate_job, self.INTEGRATE)
                 view, = fixture.server.handle_request(wire.ViewRequest())

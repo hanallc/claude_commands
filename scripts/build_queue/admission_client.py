@@ -422,7 +422,7 @@ NO_ROUTE_CHECK = NoRouteCheck()
 
 
 class CloudRouteTaken(Exception):
-    """The caller has an AWS result and can release the local place."""
+    """The caller has an AWS result and needs no local grant."""
 
 
 @dataclass(frozen=True)
@@ -703,24 +703,22 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                                 _ = release(reply.reservation, 1, reply.cleanup_timing)
                             raise
                         return reply
-                    if isinstance(reply, wire.RouteAgain):
+                    if isinstance(reply, (wire.RouteAgain, wire.RouteGranted)):
                         if not (isinstance(request, wire.AdmitRequest) and isinstance(attempt, AdmissionHoldCheck)
                                 and not isinstance(attempt.route_again, NoRouteCheck)):
-                            raise CheckerFailure("unexpected route notice")
-                        try:
-                            if attempt.admits():
-                                attempt.route_again()
-                        except CloudRouteTaken:
-                            # EOF confirms that the service released the local place.
-                            with suppress(OSError):
-                                connection.settimeout(configuration.silence_seconds)
-                                connection.shutdown(socket.SHUT_WR)
-                                _ = connection.recv(1)
-                            raise
-                        # Resume the same wait after the AWS check declines.
+                            raise CheckerFailure("unexpected route reply")
+                        if isinstance(reply, wire.RouteGranted):
+                            # AWS later fell back. Request a new local place.
+                            last_valid = CLOCK.monotonic()
+                            first = request = replace(request, episode=uuid.uuid4().hex, since=CLOCK.now())
+                            break
+                        if attempt.admits():
+                            attempt.route_again()
+                        # Resume the wait if AWS did not take the place.
                         last_valid = CLOCK.monotonic()
                         connection.settimeout(configuration.silence_seconds)
-                        connection.sendall(wire.encode_request(request).encode())
+                        with suppress(BrokenPipeError, ConnectionResetError):
+                            connection.sendall(wire.encode_request(request).encode())
                         continue
                     if not isinstance(reply, wire.Wait):
                         raise CheckerFailure("invalid admission answer")
