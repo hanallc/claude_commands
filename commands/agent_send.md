@@ -55,20 +55,20 @@ Whichever source, apply /message's first-line and context rules.
 In **respond mode**, append after a blank line:
 
 ```
-Respond: reply to this message with SendMessage — set `to` to the `from` attribute of the wrapper this message arrived in. Make the first line of your reply a self-contained sentence. Reply as soon as you have an answer; if you need your user's input first, reply once now saying so, and again after you have it.
+Respond: reply to this message with send.py (/message) — set `--to` to the `from` attribute of the wrapper this message arrived in. Make the first line of your reply a self-contained sentence. Reply as soon as you have an answer; if you need your user's input first, reply once now saying so, and again after you have it.
 ```
 </ComposeMessage>
 
 <Send>
-One `SendMessage` call:
+One `send.py` call (/message):
 
-- `to`: the resolved name (with ` [ref]` only when needed)
-- `summary`: `send to <name>` — or `send to <name>, reply requested` in respond mode
-- `message`: the composed text
+- `--to`: the resolved name
+- `--summary`: `send to <name>` — or `send to <name>, reply requested` in respond mode
+- `--text`: the composed text
 
-A `Remote Control` row is on another machine: send with `send.py --machine <other machine> --to <name> --from "<your session name>" --text "<message>"` (/message) and report its outcome line.
+A `Remote Control` row is on another machine: add `--machine <other machine>`.
 
-Do not set `notify_when_idle`. If the send errors asking for disambiguation, retry once with the ` [ref]` from the listing; if it still fails, report the error verbatim.
+If the send fails, report its outcome line verbatim.
 </Send>
 
 <Report>

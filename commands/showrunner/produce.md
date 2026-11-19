@@ -491,7 +491,7 @@ once and passes 150K again within 12-20 minutes.)
 ---
 
 <Direct>
-Turns come from unit directors' messages and the user. Read held messages when an adhoc review ends.
+Turns come from unit directors' messages and the user. Read held messages when an adhoc review ends. Handle each message:
 
 | Arrival | Action |
 | --- | --- |
