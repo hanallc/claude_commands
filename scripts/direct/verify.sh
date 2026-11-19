@@ -1199,7 +1199,15 @@ workspace_taplo() (
     fi
     local status=0
     run taplo fmt "$@" -- "${files[@]}" || status=$?
-    if [[ "$status" != 0 && "${1:-}" == --check ]]; then
+    if (( status != 0 )) && [[ "${1:-}" == --check ]]; then
+        if (( status == 101 )); then
+            if [[ "$(uname)" == Darwin ]]; then
+                echo "verify.sh: taplo panicked; the macOS sandbox does this. Re-run the same command with the sandbox disabled." >&2
+                return 3
+            fi
+            echo "verify.sh: taplo panicked; this is a tooling failure." >&2
+            return 2
+        fi
         echo 'verify.sh: TOML check failed; files can be invalid or not properly formatted.' >&2
     fi
     return "$status"
@@ -4565,15 +4573,19 @@ run_lint_checks() {
         lint_config_skip_notice fmt 'cargo +nightly fmt --all --check'
     fi
     load_metadata
-    if ! workspace_taplo --check; then
-        lint_status=1
-    fi
+    local taplo_status=0
+    workspace_taplo --check || taplo_status=$?
+    case "$taplo_status" in
+        0) ;;
+        2|3) lint_status=$taplo_status ;;
+        *) lint_status=1 ;;
+    esac
     if lint_config_enabled clippy; then
         echo 'style-lint: clippy start'
         if [[ "${1:-}" != after-fix ]]; then start_tree_watch; fi
         if invoke_clippy --workspace --all-targets --all-features; then
             echo 'style-lint: clippy passed'
-        else
+        elif (( lint_status == 0 )); then
             lint_status=1
         fi
         if [[ "${1:-}" != after-fix ]]; then finish_tree_watch; fi
@@ -4682,20 +4694,7 @@ run_lint_sequence() {
     fi
     # Taplo checks the repository with its top-level config, as CI does.
     load_metadata
-    if workspace_taplo --check; then
-        :
-    else
-        taplo_status=$?
-        if (( taplo_status == 101 )); then
-            if [[ "$(uname)" == Darwin ]]; then
-                echo "verify.sh: taplo panicked; the macOS sandbox does this. Re-run the same command with the sandbox disabled." >&2
-                exit 3
-            fi
-            echo "verify.sh: taplo panicked; this is a tooling failure." >&2
-            exit 2
-        fi
-        exit "$taplo_status"
-    fi
+    workspace_taplo --check || exit "$?"
     run_lint_judgment
 }
 

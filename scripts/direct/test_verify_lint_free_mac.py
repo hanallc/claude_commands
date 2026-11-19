@@ -10,6 +10,7 @@ from scripts.build_queue.admission_test_support import caller_admission, caller_
 from scripts.build_queue import admission_protocol as wire, placement
 from scripts.direct.verify_hold_wait_test_support import VerifyHoldTools
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, TAPLO_STUB
+from scripts.direct.verify_mac_offload_test_support import RUNNER_STUB
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -96,20 +97,43 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
         local = [row["args"] for row in self.cargo_events()]
         self.assertFalse(any(arguments[:1] == ["clippy"] for arguments in local), local)
 
-    def test_mac_fix_pass_repairs_the_copy_without_natedev(self) -> None:
+    def queue_mac_lint_repair(self) -> subprocess.Popen[str]:
+        self.write_executable(self.runner, RUNNER_STUB.replace(
+            "if verb_answer.exists():",
+            'if verb_answer.exists() and (attempt == 1 or verb_answer.name != "runner-answer-mend-check"):',
+        ))
         self.set_verb_answer("mend-check", "failed", 1)
         self.set_verb_answer("mend-fix", "passed", 0, "applied")
-        process = self.queued_lint()
+        return self.queued_lint()
+
+    def test_mac_fix_pass_repairs_the_copy_without_natedev(self) -> None:
+        process = self.queue_mac_lint_repair()
         output = self.finish_lint(process)
-        self.assertIn("the Mac fix pass passed; the worktree has its files", output)
-        # mend-fix runs clippy on the fixed copy, so no held clippy follows it.
-        self.assertEqual(self.mac_verbs(), ["mend-check", "mend-fix"])
+        self.assertIn("the returned worktree passed lint after formatting", output)
+        self.assertEqual(self.mac_verbs(), ["mend-check", "mend-fix", "mend-check", "clippy"])
         fix_words = self.runner_events()[1]["args"]
         self.assertIn("--workspace", fix_words)
         self.assertNotIn("--fail-on-warn", fix_words)
         self.assertEqual(self.local_mend(), [])
         local = [row["args"] for row in self.cargo_events()]
         self.assertFalse(any(arguments[:1] == ["clippy"] for arguments in local), local)
+
+    def test_final_taplo_panic_does_not_cache_a_lint_failure(self) -> None:
+        self.write_executable(self.bin_directory / "taplo", TAPLO_STUB.replace(
+            'status = int(os.environ["TEST_TAPLO_STATUS"])',
+            '''status = int(os.environ["TEST_TAPLO_STATUS"])
+if "--check" in sys.argv and (Path(os.environ["TEST_RUNNER_STATE"]) / "runner-events.jsonl").exists():
+    status = 101''',
+        ))
+        self.set_verb_answer("clippy", "failed", 1)
+        process = self.queue_mac_lint_repair()
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+        self.assertEqual(process.returncode, 2, output + errors)
+        self.assertIn("taplo panicked", output + errors)
+        self.assertEqual(self.mac_verbs(), ["mend-check", "mend-fix", "mend-check", "clippy"])
+        self.assertTrue((self.board / "verify_cache").is_dir())
+        self.assertEqual(self.saved_results(), [])
 
     def test_refused_mac_fix_repairs_on_natedev(self) -> None:
         self.set_verb_answer("mend-check", "failed", 1)
