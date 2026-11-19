@@ -680,6 +680,8 @@ Each tree supplies its own page settings.
 The selector preserves the recovery rules for each call to `conf.read`.
 The checker reports preparation time and total comparison time.
 Each server binds to loopback. Headless Chrome or Chromium opens the pages.
+A supervisor kills each server or browser process group when its dedicated pipe closes, including when SIGKILL ends the checker.
+The checker also kills each group during normal cleanup.
 The server and its Accounts child use a Python audit hook to deny writes outside the run workspace.
 The hook blocks SQLite connections and records each denial before it raises an exception.
 A recorded denial holds promotion even if both scans record it or the page catches the exception.

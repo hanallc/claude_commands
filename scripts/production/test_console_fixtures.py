@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Protocol, cast
 import json
 import os
+import socket
 import sqlite3
 import sys
 from unittest.mock import patch
@@ -19,6 +20,18 @@ from scripts.statusline import rebuild_row
 
 def first_page() -> str:
     return "/fixture/first.html"
+
+
+def wait_for_checker_exit() -> None:
+    with socket.create_connection(("127.0.0.1", int(os.environ["CONSOLE_TEST_CLEANUP_PORT"])), timeout=45) as ready:
+        ready.sendall(f"{os.getpid()}\n".encode())
+        _ = ready.recv(1)
+
+
+def startup_cleanup_page() -> str:
+    if os.environ["CONSOLE_TEST_CLEANUP_STAGE"] == "startup":
+        wait_for_checker_exit()
+    return first_page()
 
 
 def page_with_live_setup() -> str:

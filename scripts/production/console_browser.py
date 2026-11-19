@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
@@ -13,6 +13,7 @@ import os
 import select
 import signal
 import subprocess
+import sys
 import time
 
 from scripts.lib import cancellation, process_group
@@ -139,10 +140,19 @@ class PageResult:
 @contextmanager
 def managed_process(command: Sequence[str], *, cwd: Path, env: Mapping[str, str],
                     stderr: BinaryIO) -> Generator[subprocess.Popen[bytes]]:
-    """Kill the whole group when the check releases its process."""
-    with cancellation.defer_cleanup_signals():
-        child = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                 stderr=stderr, start_new_session=True)
+    """Keep the process group alive only while the checker owns it."""
+    supervisor = Path(__file__).with_name("console_supervisor.py").resolve()
+    with cancellation.defer_cleanup_signals(), ExitStack() as descriptors:
+        checker_read, checker_write = os.pipe()
+        _ = descriptors.callback(os.close, checker_write)
+        try:
+            child = subprocess.Popen(
+                [sys.executable, "-I", "-S", str(supervisor), str(checker_read), *command],
+                cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
+                pass_fds=(checker_read,), start_new_session=True,
+            )
+        finally:
+            os.close(checker_read)
         try:
             # Restore the caller's signal mask while it uses the process.
             previous = signal.pthread_sigmask(signal.SIG_UNBLOCK, cancellation.CANCELLATION_SIGNALS)

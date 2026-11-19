@@ -5,7 +5,7 @@ from base64 import urlsafe_b64decode
 from collections.abc import Callable, Generator, Mapping, Sequence
 import compileall
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout, suppress
 from dataclasses import replace
 from html import unescape
 from http.client import HTTPConnection
@@ -16,6 +16,7 @@ import json
 import os
 import py_compile
 import re
+import signal
 import socket
 import sqlite3
 import shutil
@@ -312,6 +313,95 @@ if (location.search === '?view=saved' && location.hash === '#saved-row' &&
         for child in (server, browser):
             with self.subTest(command=child.args), self.assertRaises(ProcessLookupError):
                 os.kill(child.pid, 0)
+
+    @unittest.skipUnless(browser_available(), "Headless Chrome is unavailable.")
+    def test_checker_sigkill_stops_server_accounts_and_chrome_groups(self) -> None:
+        self.page_function("page.first.url", "python:scripts.production.test_console_fixtures:startup_cleanup_page",
+                           self.candidate)
+        _ = self.configure_accounts_child()
+        self.append_to_accounts_page(self.candidate,
+            "from scripts.production.test_console_fixtures import wait_for_checker_exit\n    wait_for_checker_exit()", "b''")
+        # Chrome needs short paths for its Unix sockets.
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="console-kill-", dir="/tmp"))).resolve()
+
+        def processes() -> list[list[str]]:
+            result = subprocess.run(["ps", "-axww", "-o", "pid=,ppid=,pgid=,stat=,command="],
+                                    capture_output=True, text=True, check=True, timeout=5)
+            rows = [line.split(maxsplit=4) for line in result.stdout.splitlines()]
+            return [row for row in rows if len(row) == 5 and row[0].isdigit() and row[2].isdigit()
+                    and not row[3].startswith("Z")]
+
+        command = [sys.executable, "-c", """
+import signal
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+with patch.object(signal, "signal", side_effect=AssertionError("The checker installed a signal handler.")):
+    from scripts.production import console_check
+    from scripts.production.console_browser import Browser
+    from scripts.production.test_console_fixtures import wait_for_checker_exit
+
+    event = Browser.event
+    def report_busy(browser, message):
+        if (message.get("method") == "Runtime.consoleAPICalled"
+                and "Fixture Chrome is busy" in repr(message)):
+            wait_for_checker_exit()
+        event(browser, message)
+
+    with patch.object(Browser, "event", report_busy):
+        refusal = console_check.run_check(Path(sys.argv[1]))
+    sys.exit(refusal or 0)
+""", str(self.candidate)]
+        for stage in ("startup", "accounts", "chrome"):
+            with self.subTest(stage=stage), socket.socket() as listener, tempfile.TemporaryFile() as log:
+                if stage == "chrome":
+                    self.write_page("first", "<script>console.log('Fixture Chrome is busy'); for (;;) {}</script>")
+                listener.bind(("127.0.0.1", 0))
+                listener.listen()
+                listener.settimeout(45)
+                _, port = cast(tuple[str, int], listener.getsockname())
+                environment = {**os.environ, "TMPDIR": str(scratch.resolve()), "CONSOLE_TEST_CLEANUP_STAGE": stage,
+                               "CONSOLE_TEST_CLEANUP_PORT": str(port)}
+                groups: set[str] = set()
+                with subprocess.Popen(command, cwd=REPOSITORY, env=environment, stdout=log, stderr=log) as checker:
+                    try:
+                        connection = listener.accept()[0]
+                        with connection, connection.makefile("rb") as ready:
+                            connection.settimeout(5)
+                            active = int(ready.readline())
+                            rows = processes()
+                            groups = {pid for pid, parent, group, _, _ in rows
+                                      if parent == str(checker.pid) and pid == group}
+                            self.assertEqual(len(groups), 1 if stage == "startup" else 2)
+                            server, = (row for row in rows if row[2] in groups and row[1] == row[2]
+                                       and "console_server.py" in row[4])
+                            if stage == "startup":
+                                self.assertEqual(int(server[0]), active)
+                            else:
+                                browser, = (row for row in rows if row[2] in groups - {server[2]}
+                                            and row[1] == row[2] and "--headless" in row[4])
+                                self.assertTrue(any(row[2] == browser[2] and "--type=" in row[4] for row in rows))
+                                if stage == "accounts":
+                                    self.assertTrue(any(row[0] == str(active) and row[1] == server[0]
+                                                        and row[2] == server[2] for row in rows), rows)
+                                else:
+                                    self.assertEqual(checker.pid, active)
+                            checker.kill()
+                            deadline = time.monotonic() + 5
+                            self.assertEqual(checker.wait(timeout=5), -signal.SIGKILL)
+                            while remaining := [row for row in processes() if row[2] in groups]:
+                                self.assertLess(time.monotonic(), deadline, remaining)
+                                time.sleep(0.05)
+                    except TimeoutError as error:
+                        _ = log.seek(0)
+                        self.fail(f"{error}\n{log.read().decode(errors='replace')}")
+                    finally:
+                        if checker.poll() is None:
+                            checker.kill()
+                        for group in groups:
+                            with suppress(ProcessLookupError):
+                                os.killpg(int(group), signal.SIGKILL)
 
     def page_function(self, key: str, reference: str, tree: Path) -> None:
         settings = tree / "config/console.conf"

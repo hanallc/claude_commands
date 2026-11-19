@@ -1,9 +1,8 @@
 """Check the candidate console before promotion."""
 from __future__ import annotations
 
-from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass, replace
 from enum import Enum, auto
 from http.client import HTTPConnection, HTTPException
@@ -13,14 +12,13 @@ from urllib.parse import unquote, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 import shutil
 import os
-import signal
 import subprocess
 import sys
 import tempfile
 from threading import Barrier, BrokenBarrierError
 import time
 
-from scripts.lib import cancellation, conf
+from scripts.lib import conf
 from scripts.production.console_browser import (
     Browser, FailedPageStatus, FaultKind, PageFault, PageResult, Pipe, Viewport, VisitCompletion, json_object, managed_process,
     message_object,
@@ -88,20 +86,6 @@ def case_visits(directory: Path) -> list[PageVisit]:
         except (OSError, ValueError) as error:
             raise ValueError(f"{path.name}: {error}") from error
     return visits
-
-
-@contextmanager
-def check_signals() -> Generator[None]:
-    """Convert a termination signal to an exception so the processes close."""
-    def interrupt(number: int, _frame: object) -> None:
-        raise KeyboardInterrupt(signal.Signals(number).name)
-
-    previous = {number: signal.signal(number, interrupt) for number in cancellation.CANCELLATION_SIGNALS}
-    try:
-        yield
-    finally:
-        for number, handler in previous.items():
-            _ = signal.signal(number, handler)
 
 
 def browser_command() -> list[str]:
@@ -401,7 +385,7 @@ def run_check(candidate: Path, *, base: Path | Baseline = Baseline.ALL_FAULTS_AR
         chrome = browser_command()
         limit = conf.read(candidate / "config/merge_gate.conf").number("console_render_seconds")
         cases = case_visits(candidate / CONSOLE_CASES)
-        with check_signals(), tempfile.TemporaryDirectory(prefix="console-check-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="console-check-") as temporary:
             workspace = Path(temporary)
             settings = workspace / "installed.json"
             InstalledSettings.read().save(settings)
