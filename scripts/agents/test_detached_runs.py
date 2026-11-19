@@ -371,6 +371,7 @@ class DetachedRunsTests(unittest.TestCase):
         record = cast(dict[str, object], json.loads(records[0].read_text(encoding="utf-8")))
         self.assertEqual((record["status"], record["pid"], record["worker"], record["staff_id"]),
                          ("running", 4321, WORKER, self.worker_id))
+        self.assertTrue(records[0].stem.endswith(f"@{self.worker_id}"))
         self.assertNotIn("thread_id", record)
         self.assertEqual(record["command"], ["bash", "verify.sh", "check"])
         self.assertNotIn("port", record)
