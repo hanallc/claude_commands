@@ -3022,3 +3022,21 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 **Files:** `scripts/aws_target/gate_box.py`, `scripts/aws_target/cloud_gate.py`, `config/cloud_gate.conf`, their tests.
 
 **Acceptance gate:** a timed-out PUT that succeeds on retry gives a cloud result; a box failure retries once on a new box, then falls back; the error text names the stage. test_cloud_gate, test_gate_box, test_aws_trial pass; types 0.
+
+### Phase 166 — The cloud gate worker polls AWS less  · status: todo
+**Source:** builds, 2026-11-19 03:0x EST: "what polls, how often, and whether it can poll less".
+**Cause:** each cloud gate worker starts four aws CLI processes every 2 s (`result_poll_s`): get-object for gate.log, boot-error.json and result.json, then describe-instances. A 60-s sample showed 29 get-object and 10 describe-instances calls for one worker. Each call is a new Python process.
+
+#### Work Order
+
+**Goal:** one aws CLI call per poll in the usual case, with the same results.
+
+**Spec:**
+1. One `s3api list-objects-v2` on `artifacts/<attempt>/` per poll. Download an object only when it is listed and its ETag changed.
+2. The instance state check runs at most once per new key `instance_check_s=30`.
+
+**Base:** the Phase 165 row `75b8c2eb9` (same file).
+
+**Files:** `scripts/aws_target/cloud_gate.py`, `config/cloud_gate.conf`, `scripts/aws_target/test_cloud_gate.py`.
+
+**Acceptance gate:** a poll with no new object makes one list call; gate.log downloads only on a new ETag; result, boot error, Spot stop and time limit paths keep their outcomes. test_cloud_gate, test_aws_trial, test_control pass; types 0.
