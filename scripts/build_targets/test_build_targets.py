@@ -284,6 +284,29 @@ class StatusTests(IsolatedBuildTargetTest):
         _ = self.enterContext(mock.patch.object(targets, "utc_now", return_value=NOW))
         _ = self.enterContext(mock.patch.object(roster, "unit_labels_for", return_value={}))
 
+    def test_hana_status_and_eligibility_report_a_resource_hold_as_busy(self) -> None:
+        from scripts.aws_target import hana_box, hana_placement
+        from scripts.aws_target.controller_lock import HanaCommandAccess, hana_command_lock
+
+        target = target_config.SshTarget('hana-aws', 'linux', self.root / 'hana.conf')
+        _ = target.settings.write_text('execution_transport=hana-control\nhost=fixture-hana\n')
+        controller = hana_box.HanaController(self.root / 'aws', self.root / 'account.conf', target.settings,
+            hana_box.ProviderNotInstalled())
+        controller.register(hana_box.DeploymentIdentity('deployment', 'instance', 'spot', 'us-east-2'))
+        policy = hana_placement.EnabledHanaRoute('fixture/hana', ('check',), 1, 30)
+        with (mock.patch.object(hana_placement, 'controller_for', return_value=controller),
+                mock.patch.object(hana_placement, 'fixed_policy', return_value=policy),
+                mock.patch.object(controller, 'image_is_current', return_value=True),
+                ThreadPoolExecutor(max_workers=1) as worker):
+            with hana_command_lock(controller.directory) as access:
+                self.assertIs(access, HanaCommandAccess.ACQUIRED)
+                status = worker.submit(build_targets.target_state, target)
+                self.assertEqual(status.result(timeout=5), targets.Unreachable('Hana is busy or recovering'))
+                eligible = worker.submit(build_targets.ssh_target_eligibility, target, self.root, 'hana',
+                    'check', target_config.ANY_ELIGIBLE_TARGET)
+                self.assertEqual(eligible.result(timeout=5), target_config.ExcludedTarget(target, 'busy'))
+            self.assertEqual(build_targets.target_state(target), targets.Free())
+
     def capture_status(self, probe: bool = False) -> tuple[int, str, str]:
         output = io.StringIO()
         errors = io.StringIO()
