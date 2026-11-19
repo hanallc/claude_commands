@@ -400,7 +400,10 @@ def inspect(pid):
     global verify_pid
     arguments = original(pid)
     proc = Path(f"/proc/{{pid}}")
-    names = set(map(os.path.basename, arguments[:4]))
+    programs = arguments
+    if arguments[1:3] == ["--noprofile", "--norc"] and os.path.basename(arguments[0]) == "bash":
+        programs = [arguments[0], *arguments[3:]]
+    names = set(map(os.path.basename, programs[:4]))
     with suppress(FileNotFoundError, ProcessLookupError):
         environment = dict(row.split(b"=", 1) for row in (proc / "environ").read_bytes().split(b"\\0") if b"=" in row)
         descriptors = {{}}
@@ -710,6 +713,33 @@ def split_reply(descriptor, size):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(self.cargo_calls()), 1)
         self.assertEqual(len(self.pass_records()), 1)
+
+    def test_incomplete_checkout_token_expires_with_the_pipe_open(self) -> None:
+        config = Path(self.environment["CONF_DIR"]) / "direct.conf"
+        _ = write_config_fixture(config, "VERIFY_SCOPE_PUBLICATION_SECONDS=0.1\n")
+        release = self.root / "supervisor-release"
+        release.touch()
+        owner = scope_bindings.CheckoutProcess.live(os.getpid())
+        binding = scope_bindings.CheckoutBindingChannel(owner, "copies-scope-test-token-pipe")
+        with subprocess.Popen(
+            [sys.executable, str(VERIFY.with_name("verify_scoped_step.py")), str(owner.pid), str(owner.pid),
+             str(release), str(self.root / "peak"), "", "--checkout-binding", binding.encode().decode().strip(),
+             "false"],
+            cwd=self.repo, env=self.environment, stdin=subprocess.PIPE,
+        ) as process:
+            assert process.stdin is not None
+            with process.stdin as pipe:
+                _ = pipe.write(b"1234")
+                pipe.flush()
+                try:
+                    status = process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    _ = process.wait()
+                    self.fail("The supervisor waited past the deadline for a partial token.")
+                self.assertEqual(status, 125)
+        self.assertIn("the copy owner did not send a checkout binding token", release.read_text())
+        self.assertFalse(self.events.exists())
 
     def test_doc_scope_start_error_writes_release_state_before_status_125(self) -> None:
         recorded_failure = self.root / "recorded-scope-failure"
@@ -1176,6 +1206,63 @@ for descriptor in (8, 74):
     def prepared_registration_targets(self) -> set[str]:
         return {os.readlink(f"/proc/self/fd/{fd}")
                 for fd in self.environment["BUILDLOG_SCOPE_REGISTRATION"].split(":")}
+
+    def assert_checkout_handoff_ignores_startup_hook(self, *, reexec: bool) -> None:
+        hook = self.root / "checkout-startup"
+        log_path = self.root / "startup-log"
+        _ = hook.write_text(r'''
+case "${1:-} ${2:-} ${3:-}" in
+    *"/nix_env.py "*|*"/verify_scoped_step.py "*)
+        printf '%s\n' "${1:-} ${2:-}" >> "$TEST_CHECKOUT_STARTUP_LOG" ;;
+esac
+''')
+        self.environment.update(BASH_ENV=str(hook), ENV=str(hook), TEST_CHECKOUT_STARTUP_LOG=str(log_path))
+        self.environment["IN_NIX_SHELL"] = "impure"
+        if reexec:
+            del self.environment["IN_NIX_SHELL"]
+            self.executable(self.root / "bin/direnv", '#!/bin/sh\nprintf \'%s\\n\' \'{"IN_NIX_SHELL":"impure"}\'\n')
+        with self.prepared_doc_slot() as checkout:
+            if reexec:
+                _ = (checkout / ".envrc").write_text("# Use the fixture direnv.\n")
+            descriptor = build_folders.build_folder_lock_fd(checkout)
+            process, log, _ = self.start_doc(pass_fds=(descriptor,))
+            self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), 0, log.read_text())
+        self.assertFalse(log_path.exists(), "A checkout handoff ran the shell startup hook.")
+        self.assertEqual(len(self.cargo_calls()), 1)
+
+    def test_checkout_nix_handoff_ignores_shell_startup_hooks(self) -> None:
+        self.assert_checkout_handoff_ignores_startup_hook(reexec=True)
+
+    def test_checkout_supervisor_handoff_ignores_shell_startup_hooks(self) -> None:
+        self.assert_checkout_handoff_ignores_startup_hook(reexec=False)
+
+    def test_checkout_token_stays_out_of_the_environment_and_trace(self) -> None:
+        hook = self.root / "trace-checkout"
+        _ = hook.write_text('if [[ "${0##*/}" == verify.sh ]]; then set -ax; fi\n')
+        self.environment.update(BASH_ENV=str(hook), IN_NIX_SHELL="impure")
+        self.install_scope_interpreter('''
+if {"source_token", "checkout_token", "DOC_COPY_TOKEN"}.intersection(os.environ):
+    raise SystemExit("The supervisor inherited a token variable.")
+os.execv(sys.executable, [sys.executable, *arguments])
+''')
+        issued: list[scope_bindings.CheckoutBindToken] = []
+        issue = scope_bindings.CheckoutBindTokens.issue
+
+        def record_token(tokens: scope_bindings.CheckoutBindTokens) -> scope_bindings.CheckoutBindToken:
+            token = issue(tokens)
+            issued.append(token)
+            return token
+
+        with (mock.patch.object(scope_bindings.CheckoutBindTokens, "issue", record_token),
+              self.prepared_doc_slot() as checkout):
+            descriptor = build_folders.build_folder_lock_fd(checkout)
+            process, log, _ = self.start_doc(pass_fds=(descriptor,))
+            status = process.wait(TEST_HANG_GUARD_SECS)
+        self.assertTrue(issued)
+        output = log.read_bytes()
+        self.assertFalse(any(token.value in output for token in issued), "The shell trace includes a checkout token.")
+        self.assertEqual(status, 0, output.decode(errors="replace"))
+        self.assertEqual(len(self.cargo_calls()), 1)
 
     def test_direnv_cannot_bind_or_receive_a_prepared_checkout_lease(self) -> None:
         observed = self.root / "direnv-copy-reply"

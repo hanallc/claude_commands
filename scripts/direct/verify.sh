@@ -591,6 +591,12 @@ fi
 VERIFY_INVOKE_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$VERIFY_INVOKE_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_INVOKE_DIR=.
 source "$VERIFY_INVOKE_DIR/../lint/invoke.sh" --prepare-temp || exit 2
+exec_checkout_handoff() {
+    unset BASH_ENV ENV || exit 125
+    exec "$BASH" --noprofile --norc "$@"
+    exit 125
+}
+
 # Load the environment once through the shared helper, before tool setup or records.
 if [[ -n "${VERIFY_NIX_ENV_REEXEC:-}" || "$CHECKOUT_BINDINGS_REEXEC" == 1 ]]; then
     if [[ -n "${IN_NIX_SHELL:-}" ]]; then
@@ -612,6 +618,7 @@ elif [[ -z "${IN_NIX_SHELL:-}" ]]; then
         for scope_fd in "$SOURCE_SCOPE_FD" "$PREPARED_SCOPE_FD" "$SOURCE_SCOPE_REPLY" "$PREPARED_SCOPE_REPLY"; do
             [[ -z "$scope_fd" ]] || fdflags -s -cloexec "$scope_fd" || exit 125
         done
+        exec_checkout_handoff "$PY" -S "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/nix_env.py" exec "$@"
     else
         set -- "$VERIFY_NIX_SCRIPT_DIR/${BASH_SOURCE[0]##*/}" "$@"
     fi
@@ -2914,6 +2921,12 @@ step_uses_build_scope() {
        ( -n "${BUILDLOG_PREPARED_COPY:-}" && "$BUILDLOG_PREPARED_COPY" == "${VERIFY_REPO_ROOT:-}" ) ]]
 }
 
+read_private_checkout_token() {
+    local -
+    set +ax
+    IFS= read -r DOC_COPY_TOKEN <&"$DOC_COPY_REPLY_FD"
+}
+
 run_checkout_step() (
     local launch=$1 status=0 checkout_status=0 publish_status=0
     shift
@@ -2922,11 +2935,12 @@ run_checkout_step() (
         return $?
     fi
     local DOC_COPY_OWNER_PID="" DOC_COPY_LEASE_FD="" DOC_COPY_REPLY_FD="" MAC_SOURCE_ROOT=""
-    local command=() argument_count DOC_COPY_BINDING DOC_COPY_TOKEN
+    local command=() argument_count DOC_COPY_BINDING
+    local +x DOC_COPY_TOKEN
     step_checkout "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$VERIFY_SLOT_SOURCE" --tree "$VERIFY_SLOT_TREE" \
         --step "$CMD" --capacity-file "$VERIFY_SLOT_CAPACITY_FILE" --bind-scope -- "$@" || return $?
     if ! IFS= read -r DOC_COPY_BINDING <&"$DOC_COPY_REPLY_FD" ||
-       ! IFS= read -r DOC_COPY_TOKEN <&"$DOC_COPY_REPLY_FD" ||
+       ! read_private_checkout_token ||
        ! IFS= read -r argument_count <&"$DOC_COPY_REPLY_FD" ||
        [[ ! "$argument_count" =~ ^[1-9][0-9]*$ ]] ||
        ! mapfile -d '' -n "$argument_count" command <&"$DOC_COPY_REPLY_FD" ||
@@ -2998,8 +3012,11 @@ run_placed_scope() {
         printf 'cannot create the scope output file\n' > "$PLACEMENT_SCOPE_STATE"
         return 125
     fi
+    local -
+    set +ax
     local -a registration_start=() bind_tokens=()
-    local source_token checkout_token=${DOC_COPY_TOKEN:-} started rest
+    local +x source_token checkout_token
+    local started rest
     if [[ -n "$SOURCE_SCOPE_FD$checkout_fd" ]]; then
         read -r started rest < /proc/uptime || return 125
         registration_start=(--checkout-registration-start "$started")
@@ -3012,11 +3029,14 @@ run_placed_scope() {
         bind_tokens+=("$source_token")
     fi
     if [[ -n "$checkout_binding" ]]; then
-        if [[ -n "$checkout_fd" ]] && ! request_checkout_token "$checkout_fd" "$checkout_reply" "$checkout_timeout" "$started" checkout_token; then
+        if [[ -z "$checkout_fd" ]]; then
+            bind_tokens+=("$DOC_COPY_TOKEN")
+        elif request_checkout_token "$checkout_fd" "$checkout_reply" "$checkout_timeout" "$started" checkout_token; then
+            bind_tokens+=("$checkout_token")
+        else
             printf 'the prepared checkout did not issue a binding token\n' > "$PLACEMENT_SCOPE_STATE"
             return 125
         fi
-        bind_tokens+=("$checkout_token")
     fi
     local -a launch=("$PY" "$VERIFY_START_DIR/verify_scoped_step.py" "$$" "$leader" "$PLACEMENT_SCOPE_STATE"
                      "$peak" "$BUILDLOG_SCOPE_SH" ${registration_start[@]+"${registration_start[@]}"}
@@ -3024,12 +3044,13 @@ run_placed_scope() {
     if (( ${#bindings[@]} )); then
         # This pipe carries the tokens into the supervisor.
         coproc SCOPE_START {
-            exec "${launch[@]}" > "$output" 2>&1
+            exec_checkout_handoff "${launch[@]}" > "$output" 2>&1
         }
         supervisor=$!
         local start_fd=${SCOPE_START[1]}
         printf '%s\n' "${bind_tokens[@]}" >&"$start_fd" || true
         exec {start_fd}>&-
+        unset source_token checkout_token bind_tokens
     else
         (exec "${launch[@]}") > "$output" 2>&1 &
         supervisor=$!

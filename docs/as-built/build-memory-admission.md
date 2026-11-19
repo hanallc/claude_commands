@@ -271,9 +271,12 @@ Each registration issues a random token that the owner accepts once.
 The copy owner gives the registration descriptors to the command the user selects, including a shell wrapper.
 Verify marks the registration sockets close-on-exec with the Bash `fdflags` builtin.
 Verify carries the sockets through its Nix re-exec. The Nix helper closes them when it starts direnv.
+The Nix and supervisor handoffs start the Python shim with shell startup hooks disabled.
 Cargo, the sweep, and Verify helpers receive no registration descriptors.
 Verify reads the token from the owner. Verify passes the token to the supervisor through a private pipe.
+Verify keeps the token in unexported local variables and disables shell tracing while it handles the token.
 The supervisor closes the pipe before it starts the scope command.
+The same deadline covers token receipt, the bind request, and the confirmation.
 The supervisor checks the owner's PID and start time before it requests the lease.
 The owner checks the peer UID with `SO_PEERCRED` and requires the token in the first message.
 The owner refuses a used or unknown token before it writes a lease.

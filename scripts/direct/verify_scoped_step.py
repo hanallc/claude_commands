@@ -168,21 +168,28 @@ def wait_for_checkout_channel(owners: select.poll, channel: int, deadline: float
         raise ValueError("a scope owner exited before launch")
 
 
-def wait_for_checkout_confirmation(owners: select.poll, reply: int, deadline: float) -> None:
-    expected = b"bound\n"
-    confirmation = b""
+def read_checkout_line(owners: select.poll, reply: int, deadline: float, limit: int, timeout_reason: str) -> bytes:
+    line = b""
     owners.register(reply, select.POLLIN)
     try:
-        while len(confirmation) < len(expected) and b"\n" not in confirmation:
-            wait_for_checkout_channel(owners, reply, deadline, "the copy owner did not confirm the checkout scope")
-            chunk = os.read(reply, len(expected) - len(confirmation))
+        while len(line) < limit and b"\n" not in line:
+            wait_for_checkout_channel(owners, reply, deadline, timeout_reason)
+            chunk = os.read(reply, limit - len(line))
             if not chunk:
                 break
-            confirmation += chunk
-        if confirmation != expected:
-            raise ValueError("the copy owner did not bind the checkout scope")
+            line += chunk
     finally:
         owners.unregister(reply)
+    return line
+
+
+def wait_for_checkout_confirmation(owners: select.poll, reply: int, deadline: float) -> None:
+    expected = b"bound\n"
+    confirmation = read_checkout_line(
+        owners, reply, deadline, len(expected), "the copy owner did not confirm the checkout scope",
+    )
+    if confirmation != expected:
+        raise ValueError("the copy owner did not bind the checkout scope")
 
 
 def send_checkout_scope(channel: socket.socket, request: bytes, owners: select.poll, deadline: float) -> None:
@@ -204,6 +211,15 @@ class AuthorizedCheckoutBinding:
     token: CheckoutBindToken
 
 
+def read_checkout_token(owners: select.poll, pipe: int, deadline: float) -> CheckoutBindToken:
+    line = read_checkout_line(
+        owners, pipe, deadline, CHECKOUT_TOKEN_BYTES + 1, "the copy owner did not send a checkout binding token",
+    )
+    if not line.endswith(b"\n"):
+        raise ValueError("incomplete checkout binding token")
+    return CheckoutBindToken.parse(line[:-1])
+
+
 def bind_checkout_scope(checkout: AuthorizedCheckoutBinding, scope: Path, owners: select.poll, deadline: float) -> None:
     with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as channel:
         channel.setblocking(False)
@@ -215,7 +231,7 @@ def bind_checkout_scope(checkout: AuthorizedCheckoutBinding, scope: Path, owners
 
 
 def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
-                    scope_shell: str, command: list[str], leases: tuple[AuthorizedCheckoutBinding, ...],
+                    scope_shell: str, command: list[str], endpoints: tuple[CheckoutBindingChannel, ...],
                     registration_started: float | None) -> int:
     # The supervisor and the scope survive the exit of the step shell.
     supervisor = os.getpid()
@@ -242,20 +258,26 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
                 raise ValueError("a scope owner exited before launch")
             watch = None
             deadline = 0.0
-            if leases:
+            leases: tuple[AuthorizedCheckoutBinding, ...] = ()
+            lease_owner_fds: tuple[int, ...] = ()
+            if endpoints:
                 seconds = checkout_scope_publication_seconds()
                 if registration_started is not None:
                     seconds -= time.clock_gettime(time.CLOCK_BOOTTIME) - registration_started
                 if seconds <= 0:
                     raise TimeoutError("the checkout scope publication timed out")
                 deadline = time.monotonic() + seconds
-            if any(not lease.endpoint.owner.live_now() for lease in leases):
-                raise ValueError("a checkout owner exited before launch")
-            lease_owners = {lease.endpoint.owner.pid for lease in leases} - {caller, leader, supervisor}
-            lease_owner_fds = tuple(open_pidfd(owner, cleanup) for owner in lease_owners)
-            if leases:
+                if any(not endpoint.owner.live_now() for endpoint in endpoints):
+                    raise ValueError("a checkout owner exited before launch")
+                lease_owners = {endpoint.owner.pid for endpoint in endpoints} - {caller, leader, supervisor}
+                lease_owner_fds = tuple(open_pidfd(owner, cleanup) for owner in lease_owners)
                 for descriptor in lease_owner_fds:
                     owners.register(descriptor, select.POLLIN)
+                with sys.stdin.buffer as pipe:
+                    leases = tuple(AuthorizedCheckoutBinding(endpoint, read_checkout_token(owners, pipe.fileno(), deadline))
+                                   for endpoint in endpoints)
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("the checkout scope publication timed out")
                 watch = inotify.open_watch()
                 _ = cleanup.callback(os.close, watch)
                 _ = inotify.add_watch(watch, sidecar.parent, inotify.IN_CLOSE_WRITE | inotify.IN_MOVED_TO
@@ -341,14 +363,8 @@ def main(argv: list[str]) -> int:
         while command[:1] == ["--checkout-binding"]:
             endpoints.append(CheckoutBindingChannel.parse(command[1]))
             del command[:2]
-        leases: list[AuthorizedCheckoutBinding] = []
-        if endpoints:
-            with sys.stdin.buffer as pipe:
-                for endpoint in endpoints:
-                    token = CheckoutBindToken.parse(pipe.readline(CHECKOUT_TOKEN_BYTES + 1).removesuffix(b"\n"))
-                    leases.append(AuthorizedCheckoutBinding(endpoint, token))
         return run_scoped_step(
-            int(caller), int(leader), Path(release_state), peak, scope_shell, command, tuple(leases), registration_started,
+            int(caller), int(leader), Path(release_state), peak, scope_shell, command, tuple(endpoints), registration_started,
         )
     except (OSError, ValueError) as error:
         print(f"verify.sh: cannot finish the local build scope ({error})", file=sys.stderr)
