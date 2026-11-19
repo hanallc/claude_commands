@@ -3180,6 +3180,10 @@ Risk: an integrate job that hangs holds all natedev claude_commands tests until 
 
 Base: 44cy (the landing identity). Clone /session/queue/landhold, branch builds-queue-44dg. Commits through cf396e6dc.
 
+### Phase 44de — Follow-up findings from the session folder move  · status: todo
+**From 44dd closure pass 13, 2026-11-19 (hard landing rule, builds 17:10 EST).** Findings that are not a regression, broken function or failing test move here.
+1. F048 (minor): if `scratch end` runs before the sweep registers an interrupted stage, no task end is recorded for that stage. The sweep keeps the stage until another task end (scratch.py:3845, :1917; tmp_sweep.py:1437).
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
