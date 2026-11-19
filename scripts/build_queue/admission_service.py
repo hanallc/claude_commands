@@ -1892,7 +1892,8 @@ class AdmissionServer:
                         rows = list(inputs.ordered)
                         gate.move_waiter(rows, index, destination)
                         promoted = replace(inputs, ordered=rows)
-                        trial = gate.admission_pass(promoted, inputs.now, policy, resolved_order=True)
+                        trial = gate.admission_pass(promoted, inputs.now, policy, resolved_order=True,
+                                                    claim_policy=gate.ContinuationClaimPolicy.KEEP_FOR_OWNER)
                         decision = trial.rows[destination]
                         if (isinstance(decision.admission, gate.ProposedAdmission)
                                 and isinstance(decision.decision.room.basis, (records.Fits, records.WithinSlot))):

@@ -12,9 +12,10 @@ from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
-from scripts.build_queue import admission_protocol as wire, admission_service as service, head_stall, step_estimator
+from scripts.build_queue import admission_protocol as wire, admission_records as records
+from scripts.build_queue import admission_service as service, head_stall, step_estimator
 from scripts.build_queue.admission_records import GIB
-from scripts.build_queue.admission_test_support import AdmissionFixture
+from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
 from scripts.build_queue.queue_fixture import write_process
 from scripts.lint import memory_admit as gate
 from scripts.production import staff
@@ -112,6 +113,43 @@ class LandingMergeOrderTests(unittest.TestCase):
         self.assertEqual(self.fixture.server.landing_pass_counts, {})
         events = step_estimator.anonymous_history_rows(self.fixture.state_dir / "queue_times.jsonl")
         self.assertFalse(any(event["kind"] == "landing_pass" for event in events))
+
+    def test_promotion_keeps_the_head_continuation_claim(self) -> None:
+        self.fixture.free(60 * GIB)
+        run = self.fixture.run_owner()
+        first = only_admitted(self.fixture.server.handle_request(self.fixture.request(run=run, need=4 * GIB)))
+        self.fixture.free(0)
+        unit = replace(self.request(100), run=run)
+        self.assertIsInstance(self.fixture.server.handle_request(unit)[0], wire.Wait)
+        self.fixture.release(first)
+        claim = self.fixture.server.slots[first.reservation]
+        assert isinstance(claim, records.ContinuationSlot)
+        self.assertEqual((claim.owner, claim.slot.bytes), ("100-100", 4 * GIB))
+        self.land_record(10)
+        landing = self.submit(101, step="merge-gate", parent=10, need=4 * GIB)
+        self.fixture.allow_next_start()
+        self.fixture.free(9 * GIB)
+
+        result = self.fixture.run_pass()
+
+        inputs, policy = self.fixture.server.last_inputs, self.fixture.server.last_policy
+        assert isinstance(inputs, records.QueueInputs)
+        assert isinstance(policy, records.AdmissionPolicy)
+        room = gate.inputs_room(inputs, policy)
+        assert isinstance(room, records.MemoryRoom)
+        self.assertEqual(room.signed_room, 2 * GIB)
+        self.assertNotIn(landing.episode, self.fixture.caller_reservations())
+        self.assertEqual(self.fixture.queue_pids(), [100, 101])
+        self.assertEqual(self.fixture.server.slots[first.reservation], claim)
+        self.assertEqual(result.policy.returned_claims, frozenset())
+        self.assertEqual(self.fixture.server.landing_pass_counts, {})
+
+        self.fixture.free(11 * GIB)
+        result = self.fixture.run_pass()
+        self.assertIn(landing.episode, self.fixture.caller_reservations())
+        self.assertEqual(self.fixture.queue_pids(), [101, 100])
+        self.assertEqual(self.fixture.server.slots[first.reservation], claim)
+        self.assertEqual(result.policy.returned_claims, frozenset())
 
     def test_reconnect_preserves_the_pass_limit_for_the_same_arrival(self) -> None:
         unit = self.request(100)
@@ -254,15 +292,20 @@ class LandingMergeOrderTests(unittest.TestCase):
         paths = head_stall.StallPaths(self.fixture.state_dir, self.fixture.root / "head-stall.json")
         now = self.fixture.clock.now()
         self.assertIsInstance(head_stall.current_stall(paths, now, 1800, 120), head_stall.HeadStall)
+        times = self.fixture.state_dir / "queue_times.jsonl"
+        last_positive_start = head_stall.last_admission(times)
         self.land_record(10)
-        _ = self.submit(101, step="merge-gate", parent=10)
+        _ = self.submit(101, step="merge-gate", parent=10, need=0)
         self.assertIsInstance(head_stall.current_stall(paths, now, 1800, 120), head_stall.HeadStall)
         self.fixture.free(60 * GIB)
         _ = self.fixture.run_pass()
         self.fixture.free(0)
         self.fixture.end_fixture_owner(101)
         _ = self.fixture.run_pass()
-        events = step_estimator.anonymous_history_rows(self.fixture.state_dir / "queue_times.jsonl")
+        self.assertEqual(head_stall.last_admission(times), last_positive_start)
+        events = tuple(step_estimator.anonymous_history_rows(times))
+        self.assertEqual([event.get("need") for event in events
+                          if event["kind"] == "admitted" and event.get("pid") == 101], [0])
         self.assertEqual([(event.get("pid"), event.get("passed_at")) for event in events
                           if event["kind"] == "landing_pass"], [(100, now)])
         self.assertEqual(self.fixture.queue_pids(), [100])

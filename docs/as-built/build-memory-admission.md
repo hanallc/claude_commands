@@ -1933,7 +1933,8 @@ A unit trial without a matching land record keeps its normal place.
 The service checks the land record and process again before it changes the order.
 
 The first eligible test from each land can move ahead in the natedev memory queue.
-It must fit within the normal memory limits.
+It must fit within the normal memory limits with all current claims in place.
+Promotion cannot return another waiter's continuation claim.
 A promoted test cannot start through `StartsAlone`.
 The service saves the land's PID and start time when it admits this test.
 A later request from the same land keeps its normal place.

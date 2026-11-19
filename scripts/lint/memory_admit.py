@@ -22,6 +22,7 @@ from collections import deque
 from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
+from enum import Enum
 from pathlib import Path
 
 from typing import BinaryIO, Literal, Protocol, TypedDict, cast
@@ -2023,8 +2024,17 @@ def inputs_room(inputs: QueueInputs, policy: AdmissionPolicy) -> MemoryRoom | Re
     return memory_room(inputs.host, run_memories(inputs), policy, ci_use=ci_use)
 
 
+class ContinuationClaimPolicy(Enum):
+    """Control whether the pass can release a claim for an earlier waiter."""
+
+    RELEASE_FOR_EARLIER_WAITER = "release_for_earlier_waiter"
+    KEEP_FOR_OWNER = "keep_for_owner"
+
+
 def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_start: NextStartAt, *,
-                resolved_order: bool = False) -> HeadPolicy:
+                resolved_order: bool = False,
+                claim_policy: ContinuationClaimPolicy = ContinuationClaimPolicy.RELEASE_FOR_EARLIER_WAITER
+                ) -> HeadPolicy:
     ordered = ranked_queue_waiters(inputs, resolved_order=resolved_order)
     candidate = first_queued_waiter((row for _, row in ordered), inputs.pending_remote_starts)
     queued_head: QueuedHead | NoQueuedHead = QueuedHead(candidate.waiter) if isinstance(candidate, QueuedWaiter) else NoQueuedHead()
@@ -2033,8 +2043,9 @@ def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_s
     while True:
         room = inputs_room(inputs, policy)
         kept, used = (room.kept, room.used) if isinstance(room, MemoryRoom) else (0, 0)
-        admissions = admission_walk(inputs, ordered, room, now, policy, kept, used, safety, next_start)
-        if not inputs.slots:
+        admissions = admission_walk(inputs, ordered, room, now, policy, kept, used, safety, next_start,
+                                    claim_policy=claim_policy)
+        if claim_policy is ContinuationClaimPolicy.KEEP_FOR_OWNER or not inputs.slots:
             break
         held_owners = {records.waiter_owner(entry.waiter) for entry in admissions
                        if entry.decision.reused_slot and isinstance(entry.decision.order_hold, HeldBehindHead)}
@@ -2079,7 +2090,7 @@ def can_use_natedev(row: Waiter) -> bool:
 def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]],
                    room: MemoryRoom | ReadingUnavailable,
                    now: float, policy: AdmissionPolicy, kept: int, used: int, safety: int,
-                   next_start: NextStartAt) -> list[WaiterAdmission]:
+                   next_start: NextStartAt, *, claim_policy: ContinuationClaimPolicy) -> list[WaiterAdmission]:
     """Admit local steps in order and name the first local step that waits."""
     if isinstance(room, MemoryRoom):
         remaining, readable = room.signed_room, True
@@ -2101,9 +2112,14 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     gpu_used = sum(gpu_test_reservation(row, gpu) for row in inputs.reservations)
     first_for_folder: dict[placement.CargoFolder, Waiter] = {}
     folder_slot_bytes: dict[placement.CargoFolder, int] = {}
+    folder_claim_counts: dict[placement.CargoFolder, int] = {}
     for owner, claim in claims.items():
         folder = inputs.cargo_folders.get(owner)
-        if folder is not None:
+        if folder is None:
+            continue
+        if claim_policy is ContinuationClaimPolicy.KEEP_FOR_OWNER:
+            folder_claim_counts[folder] = folder_claim_counts.get(folder, 0) + 1
+        else:
             folder_slot_bytes[folder] = folder_slot_bytes.get(folder, 0) + claim.slot.bytes
     first_folder_wait: Waiter | NoWaiter = NoWaiter()
     first_held: Waiter | NoWaiter = NoWaiter()
@@ -2122,11 +2138,13 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         local_route = can_use_natedev(row)
         local = local_route and isinstance(state, QueuedWaiter)
         folder = inputs.cargo_folders.get(owner) if local_route else None
-        folder_busy = folder in inputs.occupied_cargo_folders
+        folder_busy = (folder in inputs.occupied_cargo_folders
+                       or (folder is not None and folder_claim_counts.get(folder, 0) > int(reused)))
         earlier = first_for_folder.get(folder, NoWaiter()) if folder is not None else NoWaiter()
-        # A grant returns the other continuation claims for this folder.
+        # The normal grant returns the other continuation claims for this folder.
         released = (folder_slot_bytes.get(folder, 0) - held
-                    if folder is not None and not folder_busy and isinstance(earlier, NoWaiter) else 0)
+                    if claim_policy is ContinuationClaimPolicy.RELEASE_FOR_EARLIER_WAITER
+                    and folder is not None and not folder_busy and isinstance(earlier, NoWaiter) else 0)
         checked_room = remaining + released
         alone = head_owner == owner and head_can_start_alone
         fits = extra <= checked_room
@@ -2210,9 +2228,11 @@ def admission_wait_holder(decision: AdmissionDecision, reason: WaitReason,
     return wait_holder_identity(session_id, session_name, unit)
 
 
-def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy, *, resolved_order: bool = False) -> PassResult:
+def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy, *, resolved_order: bool = False,
+                   claim_policy: ContinuationClaimPolicy = ContinuationClaimPolicy.RELEASE_FOR_EARLIER_WAITER
+                   ) -> PassResult:
     next_start = start_spacing_after(now, policy)
-    resolved = head_policy(inputs, now, policy, next_start, resolved_order=resolved_order)
+    resolved = head_policy(inputs, now, policy, next_start, resolved_order=resolved_order, claim_policy=claim_policy)
     candidate = resolved.queued_head
     head_owner = records.waiter_owner(candidate.waiter) if isinstance(candidate, QueuedHead) else ""
     available = inputs.host.available if isinstance(inputs.host, HostMemory) else 0
@@ -2264,7 +2284,7 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy, *, 
         if owner in inputs.blockers_for and decision.state == "hold" and isinstance(entry.state, QueuedWaiter):
             if not endings:
                 endings = tuple(admission_pass(inputs_after_steps_end(inputs, frozenset((ended,)), policy),
-                                    now, policy, resolved_order=resolved_order)
+                                    now, policy, resolved_order=resolved_order, claim_policy=claim_policy)
                                 for ended in range(len(inputs.running)))
             blocker = blocking_index(owner, endings)
         rows.append(PassRow(owner, decision, reason, blocker, proposal,
