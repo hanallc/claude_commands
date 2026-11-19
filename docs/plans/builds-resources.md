@@ -3004,24 +3004,16 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 - Accepted (review): the window between the final check and `rmtree` (no consumer reaches `.doc-prune` by its doc path); the Mac without `/proc` (the same as the first scan); a crash leftover with a cwd user stays hidden while the root is busy (the next doc run rebuilds `doc`).
 - Row 447ebc0cd on main d5d81400c. Tests in both layouts, 0 failures: 8 suites; types 0. The merge with natest 370 (dad3666a1) is clean; test_sweep and test_tmp_sweep pass on it.
 
-### Phase 165 — One failed result upload no longer sends a merge gate to natedev  · status: todo
-**Source:** builds, 2026-11-19 02:3x EST: the sdlc pageowner2 land ran its whole suite on natedev (end near 10:10).
-**Cause:** cloud attempt `f163adffc25f4d2eae15ef0c0b46eef9` ran 867 of 867 modules green. Then the guest's one 30-s S3 PUT of its result timed out (`curl: (28)`). `gate_box.boot_trap` labels any guest exit "Tool preparation failed", and `cloud_gate.run_cloud` retries only Spot interruptions, so the gate fell back to natedev. The same timeout is in 5 gate logs since 11-13.
+### Phase 165 — One failed result upload no longer sends a merge gate to natedev  · status: done
+**Source:** builds, 2026-11-19 02:3x EST: the sdlc pageowner2 merge gate ran its whole suite on natedev after attempt `f163adff` ran 867 of 867 modules green and one 30-s result PUT timed out.
 
-#### Work Order
-
-**Goal:** a box that fails once gets a new cloud attempt before natedev runs the suite.
-
-**Spec:**
-1. The guest's curl transfers retry a transient failure (a presigned PUT is idempotent).
-2. The box error names the stage that failed.
-3. A box failure gets a new cloud attempt on the next variant, up to a new key `box_failure_retries=1`, then the local fallback.
-
-**Base:** main `d5d81400c` (independent of the 161-163 chain).
-
-**Files:** `scripts/aws_target/gate_box.py`, `scripts/aws_target/cloud_gate.py`, `config/cloud_gate.conf`, their tests.
-
-**Acceptance gate:** a timed-out PUT that succeeds on retry gives a cloud result; a box failure retries once on a new box, then falls back; the error text names the stage. test_cloud_gate, test_gate_box, test_aws_trial pass; types 0.
+#### As-built
+- `gate_box.BOX_CURL_RETRY` (2 retries, `--retry-all-errors`, 1-s delay) is the one retry setting. Merge-gate and targeted-test guest transfers, the user_data download and the trap's boot-error PUT use it. The paired guest keeps single-try transfers.
+- `boot_trap` uploads its final log first (single try), then reads the last `stage=` line from boot.log: "Tool preparation failed" for tool preparation, else "The box failed at stage <stage>". user_data prints `stage=tool preparation`; the guest writes `stage=result upload` before publish.
+- `cloud_gate.RetryableCloudFailure` (`interrupted`, `box-failed`) marks a retryable outcome. The worker returns `box-failed` on boot-error.json (after the final gate.log) or on `LogUploadFailed` from `validate_result`.
+- `run_cloud` counts box failures apart from Spot interruptions and takes the shared next-variant path up to `box_failure_retries=1` (config/cloud_gate.conf, after `spot_interruption_retries`). Then the local fallback names the box failure.
+- Accepted (review): a deadline during an upload retry; a deterministic box failure costs one more launch; the boot shell retries paired downloads. The signed URL in result.json `log_error` and the boot.log traceback is on main; aws repairs it.
+- Row 75b8c2eb9 on main d5d81400c. Tests in both layouts, 0 failures: 6 suites; types 0.
 
 ### Phase 166 — The cloud gate worker polls AWS less  · status: todo
 **Source:** builds, 2026-11-19 03:0x EST: "what polls, how often, and whether it can poll less".
