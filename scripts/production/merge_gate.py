@@ -729,6 +729,13 @@ class GateRecovery:
         self.groups.clear()
         self.scopes.clear()
         self.save()
+        # Remove folders first: a held child lease means a job still runs and keeps its CPU slot.
+        for folder in self.folders:
+            path = Path(folder)
+            if not build_folders.remove_free_build_folder(path):
+                raise GateRefused(f"gate recovery kept held folder {path}")
+        self.folders.clear()
+        self.save()
         while self.tokens:
             token = self.tokens[-1]
             with cancellation.defer_cleanup_signals():
@@ -746,12 +753,6 @@ class GateRecovery:
                 finally:
                     if descriptor >= 0:
                         os.close(descriptor)
-        for folder in self.folders:
-            path = Path(folder)
-            if not build_folders.remove_free_build_folder(path):
-                raise GateRefused(f"gate recovery kept held folder {path}")
-        self.folders.clear()
-        self.save()
         if self.rollback:
             repo = Path(self.repo)
             with gate_operation_lock(repo) as descriptor, ExitStack() as cleanup:
