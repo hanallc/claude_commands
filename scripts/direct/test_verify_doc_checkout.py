@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import json
 import os
 import select
@@ -19,7 +19,7 @@ import unittest
 from unittest import mock
 
 from scripts.agents.remote import local_machine
-from scripts.build_queue import admission_protocol as wire, admission_records, admission_service as service, execution_identity, memory_feed
+from scripts.build_queue import admission_protocol as wire, admission_records, admission_service as service, execution_identity, memory_feed, placement
 from scripts.buildlog import treekey
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.direct.verify_doc_test_support import CARGO_STUB, VERIFY, VerifyDocFixture
@@ -248,68 +248,162 @@ with {patches}:
     def test_doc_scope_stop_failure_retains_checkout_and_reservation_after_sidecar_sweep(self) -> None:
         self.assert_doc_retains_checkout_until_scope_empties(interrupt=False, sweep_scope_sidecar=True)
 
+    def copies_verify_command(self, *arguments: str) -> tuple[str, ...]:
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        caller = fixture_member("showrunner", name="verify-copy")
+        self.environment["CLAUDE_CODE_SESSION_ID"] = caller.current_session
+        copies = VERIFY.parents[1] / "copies/copies.py"
+        return (sys.executable, str(copies), "run", "--repo", str(self.repo), "--commit", "HEAD", "--",
+                "bash", str(VERIFY), *arguments)
+
     def test_copies_run_binds_the_doc_checkout_before_cargo(self) -> None:
-        with isolated_staff_file(self.root / "staff.json", self.environment):
-            caller = fixture_member("showrunner", name="doc-copy")
-            self.environment["CLAUDE_CODE_SESSION_ID"] = caller.current_session
-            copies = VERIFY.parents[1] / "copies/copies.py"
-            self.assert_doc_retains_checkout_until_scope_empties(interrupt=False, command=(
-                sys.executable, str(copies), "run", "--repo", str(self.repo), "--commit", "HEAD", "--", *DOC_COMMAND,
-            ))
+        self.assert_doc_retains_checkout_until_scope_empties(
+            interrupt=False, command=self.copies_verify_command("doc"))
 
     def test_in_place_lint_keeps_the_source_copy_after_the_owner_dies(self) -> None:
-        admission = self.use_real_scope()
         _ = write_config_fixture(self.config, "mend=on\nfmt=off\nclippy=off\nsweep=off\n")
-        started = self.root / "repair-pid"
-        release = self.root / "end-repair"
+        self.assert_copies_run_keeps_folder_after_owner_exit("lint")
+
+    def test_doc_keeps_the_outer_target_after_the_owner_dies(self) -> None:
+        _ = self.environment.pop("CARGO_TARGET_DIR")
+        self.assert_copies_run_keeps_folder_after_owner_exit("doc")
+
+    def assert_copies_run_keeps_folder_after_owner_exit(self, command: str) -> None:
+        admission = self.use_real_scope()
+        started = self.root / "cargo-started.json"
+        release = self.root / "end-cargo"
         self.executable(self.root / "bin/cargo", CARGO_STUB.replace(
-            'elif arguments[:1] == ["doc"]:', f'''
-elif arguments[:1] == ["mend"] and "--fix" in arguments:
+            '    print(os.environ["TEST_METADATA"])', '''
+    metadata = json.loads(os.environ["TEST_METADATA"])
+    metadata["target_directory"] = os.environ["CARGO_TARGET_DIR"]
+    print(json.dumps(metadata))
+''').replace('elif arguments[:1] == ["doc"]:', f'''
+elif arguments[:1] == ["doc"] or arguments[:1] == ["mend"] and "--fix" in arguments:
     sys.path.insert(0, {str(VERIFY.parents[2])!r})
     from scripts.direct.wait_for_test_state import wait_for_file
 
     ready = Path({str(started)!r})
     pending = ready.with_suffix(".new")
-    pending.write_text(str(os.getpid()))
+    pending.write_text(json.dumps({{"pid": os.getpid(), "source": os.environ["COPIES_STEP_SOURCE"],
+                                  "target": os.environ["CARGO_TARGET_DIR"], "cwd": str(Path.cwd())}}))
     pending.replace(ready)
     wait_for_file(Path({str(release)!r}))
     raise SystemExit(0)
 elif arguments[:1] == ["doc"]:
 '''))
-        with isolated_staff_file(self.root / "staff.json", self.environment):
-            caller = fixture_member("showrunner", name="lint-copy")
-            self.environment["CLAUDE_CODE_SESSION_ID"] = caller.current_session
-            copies = VERIFY.parents[1] / "copies/copies.py"
-            process, log, marker = self.start_doc(command=(
-                sys.executable, str(copies), "run", "--repo", str(self.repo), "--commit", "HEAD", "--",
-                "bash", str(VERIFY), "lint",
-            ))
-            wait_until(lambda: started.is_file() or process.poll() is not None, self.root, processes=(process,))
-            self.assertTrue(started.is_file(), log.read_text())
-            cargo_pid = int(started.read_text())
-            checkout = (Path("/proc") / str(cargo_pid) / "cwd").resolve(strict=True)
-            source_folder = checkout.parent
-            sidecar, = (self.root / "tmp").glob("buildlog.*.peak.cgroup")
-            scope = Path(sidecar.read_text().strip())
-            kill_file = scope / "cgroup.kill"
+        process, log, marker = self.start_doc(command=self.copies_verify_command(command))
+        wait_until(lambda: started.is_file() or process.poll() is not None, self.root, processes=(process,))
+        self.assertTrue(started.is_file(), log.read_text())
+        cargo = cast(dict[str, int | str], json.loads(started.read_text()))
+        cargo_pid = int(cargo["pid"])
+        source = Path(str(cargo["source"]))
+        source_folder = source.parent
+        if command == "doc":
+            self.assertTrue(Path(str(cargo["target"])).is_relative_to(source_folder))
+            self.assertNotEqual(Path(str(cargo["cwd"])), source)
+        else:
+            self.assertEqual(Path(str(cargo["cwd"])), source)
+        sidecar, = (self.root / "tmp").glob("buildlog.*.peak.cgroup")
+        scope = Path(sidecar.read_text().strip())
+        kill_file = scope / "cgroup.kill"
+        self.assertIn(cargo_pid, scope_members(scope))
+        _ = admission.run_pass()
+        kill_file.chmod(0)
+        try:
+            process.kill()
+            self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), -signal.SIGKILL)
             self.assertIn(cargo_pid, scope_members(scope))
+            self.assertEqual(build_folders.build_folder_state(source_folder, wait=False), "held")
+            record = source_folder.with_name(source_folder.name + ".lease.json")
+            lease = cast(dict[str, object], json.loads(record.read_text()))
+            self.assertEqual(lease.get("scope"), str(scope))
+        finally:
+            release.touch()
+            if kill_file.exists():
+                kill_file.chmod(0o200)
+            self.assertEqual(wait_for_marker_exit(marker, TEST_HANG_GUARD_SECS), set())
             _ = admission.run_pass()
-            kill_file.chmod(0)
+        self.assertEqual(build_folders.build_folder_state(source_folder, wait=False), "free")
+
+    def test_fmt_does_not_inherit_the_source_copy_lock(self) -> None:
+        _ = self.use_real_scope()
+        _ = write_config_fixture(self.config, "mend=off\nfmt=on\nclippy=off\nsweep=off\n")
+        observed = self.root / "fmt-locks.json"
+        self.executable(self.root / "bin/cargo", CARGO_STUB.replace(
+            'elif arguments[:1] == ["doc"]:', f'''
+elif arguments[:2] == ["+nightly", "fmt"]:
+    if "--version" in arguments:
+        print("rustfmt fixture")
+        raise SystemExit(0)
+    source = Path(os.environ["COPIES_STEP_SOURCE"]).parent
+    lock = source.with_name(source.name + ".lock").stat()
+    inherited = []
+    for entry in Path("/proc/self/fd").iterdir():
+        try:
+            descriptor = entry.stat()
+        except FileNotFoundError:
+            continue
+        if (descriptor.st_dev, descriptor.st_ino) == (lock.st_dev, lock.st_ino):
+            inherited.append(entry.name)
+    lease = json.loads(source.with_name(source.name + ".lease.json").read_text())
+    Path({str(observed)!r}).write_text(json.dumps({{"inherited": inherited,
+        "scope": os.environ.get("BUILDLOG_STEP_SCOPE"), "lease_scope": lease.get("scope")}}))
+elif arguments[:1] == ["doc"]:
+'''))
+        self.executable(self.root / "bin/taplo", "#!/bin/sh\nexit 0\n")
+        process, log, _ = self.start_doc(command=self.copies_verify_command("lint"))
+        self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), 0, log.read_text())
+        fmt = cast(dict[str, object], json.loads(observed.read_text()))
+        self.assertEqual(fmt["inherited"], [])
+        self.assertIsInstance(fmt["scope"], str)
+        self.assertEqual(fmt["scope"], fmt["lease_scope"])
+
+    def test_slot_doc_leaves_the_folder_claim_to_the_slot(self) -> None:
+        self.assert_doc_folder_claim(use_slot_handoff=True)
+
+    def test_fixed_folder_doc_sends_its_folder_to_admission(self) -> None:
+        self.assert_doc_folder_claim(use_slot_handoff=False)
+
+    def assert_doc_folder_claim(self, *, use_slot_handoff: bool) -> None:
+        admission = caller_admission(self, self.root, self.environment)
+        directory = self.root / "configured-build"
+        self.environment["CARGO_BUILD_BUILD_DIR"] = str(directory)
+        metadata = cast(dict[str, object], json.loads(self.environment["TEST_METADATA"]))
+        metadata["build_directory"] = str(directory)
+        self.environment["TEST_METADATA"] = json.dumps(metadata)
+        started = self.root / "cargo-build-directory"
+        release = self.root / "end-doc"
+        self.executable(self.root / "bin/cargo", CARGO_STUB.replace(
+            'elif arguments[:1] == ["doc"]:', f'''
+elif arguments[:1] == ["doc"]:
+    sys.path.insert(0, {str(VERIFY.parents[2])!r})
+    from scripts.direct.wait_for_test_state import wait_for_file
+
+    ready = Path({str(started)!r})
+    pending = ready.with_suffix(".new")
+    pending.write_text(json.dumps({{"build": os.environ["CARGO_BUILD_BUILD_DIR"], "checkout": str(Path.cwd())}}))
+    pending.replace(ready)
+    wait_for_file(Path({str(release)!r}))
+'''))
+        with nullcontext() if use_slot_handoff else self.prepared_doc_slot():
+            pass_fds = () if use_slot_handoff else (build_folders.build_folder_lock_fd(self.repo),)
+            process, log, _ = self.start_doc(pass_fds=pass_fds)
             try:
-                process.kill()
-                self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), -signal.SIGKILL)
-                self.assertIn(cargo_pid, scope_members(scope))
-                self.assertEqual(build_folders.build_folder_state(source_folder, wait=False), "held")
-                record = source_folder.with_name(source_folder.name + ".lease.json")
-                lease = cast(dict[str, object], json.loads(record.read_text()))
-                self.assertEqual(lease.get("scope"), str(scope))
+                wait_until(lambda: started.is_file() or process.poll() is not None, self.root, processes=(process,))
+                self.assertTrue(started.is_file(), log.read_text())
+                with admission.loop_turn():
+                    reservation, = admission.caller_reservations().values()
+                launch = cast(dict[str, str], json.loads(started.read_text()))
+                launched_build_folder = Path(launch["build"])
+                if use_slot_handoff:
+                    self.assertEqual(reservation.cargo_folder, placement.NoCargoFolder())
+                    self.assertEqual(launched_build_folder, self.root / "cargo" / Path(launch["checkout"]).name)
+                else:
+                    self.assertEqual(reservation.cargo_folder, placement.CargoFolder(launched_build_folder))
+                    self.assertEqual(launched_build_folder, directory)
             finally:
                 release.touch()
-                if kill_file.exists():
-                    kill_file.chmod(0o200)
-                self.assertEqual(wait_for_marker_exit(marker, TEST_HANG_GUARD_SECS), set())
-                _ = admission.run_pass()
-            self.assertEqual(build_folders.build_folder_state(source_folder, wait=False), "free")
+            self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), 0, log.read_text())
 
     def test_doc_uses_the_build_directory_of_the_slot_it_holds(self) -> None:
         build_directory = self.root / "cargo-build-directory"

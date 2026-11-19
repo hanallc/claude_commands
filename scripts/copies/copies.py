@@ -8,7 +8,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -23,10 +23,12 @@ import re
 import select
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
+from threading import Thread
 import time
 from typing import TYPE_CHECKING, NoReturn, TextIO, cast, override
 from urllib.parse import unquote, urlsplit
@@ -2225,6 +2227,51 @@ def command_tail(command: list[str]) -> list[str]:
     return command[1:] if command[:1] == ["--"] else command
 
 
+def bind_copy_scope(folder: Path, descriptor: int, request: str, kind: build_folders.CheckoutLeaseKind) -> None:
+    scope = Path(request.removesuffix("\n"))
+    if not scope.is_absolute():
+        raise ValueError("the checkout scope path must be absolute")
+    build_folders.write_checkout_lease(folder, build_folders.CheckoutScopeBinding(scope, os.getpid(), kind),
+                                       descriptor)
+
+
+def serve_source_scope_bindings(connection: socket.socket, folder: Path, descriptor: int) -> None:
+    """Bind each scope while the source copy owner holds the lock."""
+    while True:
+        try:
+            request, replies, flags = socket.recv_fds(connection, 4096, 1)[:3]
+        except OSError:
+            return
+        if not request and not replies:
+            return
+        if len(replies) != 1 or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
+            for reply in replies:
+                os.close(reply)
+            continue
+        reply, = replies
+        with os.fdopen(reply, "wb", buffering=0) as confirmation:
+            try:
+                bind_copy_scope(folder, descriptor, os.fsdecode(request), build_folders.CheckoutLeaseKind.SOURCE_COPY)
+                _ = confirmation.write(b"bound\n")
+            except (OSError, ValueError) as error:
+                print(f"copies: cannot confirm the source copy scope: {error}", file=sys.stderr)
+
+
+@contextmanager
+def source_scope_channel(folder: Path, descriptor: int) -> Generator[int]:
+    """Give Verify a request channel instead of using its copy of the lock."""
+    owner, child = socket.socketpair(type=socket.SOCK_DGRAM)
+    with owner, child:
+        worker = Thread(target=serve_source_scope_bindings, args=(owner, folder, descriptor))
+        worker.start()
+        try:
+            yield child.fileno()
+        finally:
+            with suppress(OSError):
+                owner.shutdown(socket.SHUT_RDWR)
+            worker.join()
+
+
 def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy) -> int:
     """Give commands a private source snapshot and retain the merge gate's slot."""
     owner = caller_owner()
@@ -2245,6 +2292,10 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
             source_lock = build_folders.build_folder_lock_fd(tree.parent)
             environment["COPIES_RUN_LOCK_FD"] = str(source_lock)
             locks = (*COMMAND_LOCKS.get(), source_lock)
+            if sys.platform == "linux":
+                channel = scope.enter_context(source_scope_channel(tree.parent, source_lock))
+                environment["COPIES_RUN_BIND_FD"] = str(channel)
+                locks = (*locks, channel)
             if args.publish:
                 output = tree.parent / "step-output"
                 output.mkdir()
@@ -2442,12 +2493,8 @@ def run_slot_step(source: Path, args: CopyArguments) -> int:
                 _ = sys.stdout.buffer.flush()
                 request = sys.stdin.readline()
                 if request and request != "publish\n":
-                    scope = Path(request.removesuffix("\n"))
-                    if not scope.is_absolute():
-                        raise CopyError("the checkout scope path must be absolute")
-                    build_folders.write_checkout_lease(
-                        checkout, build_folders.CheckoutScopeBinding(scope, os.getpid()),
-                        build_folders.build_folder_lock_fd(checkout))
+                    bind_copy_scope(checkout, build_folders.build_folder_lock_fd(checkout), request,
+                                    build_folders.CheckoutLeaseKind.READY_SLOT)
                     _ = os.write(sys.stdout.fileno(), b"bound\n")
                     request = sys.stdin.readline()
                 if request == "publish\n":

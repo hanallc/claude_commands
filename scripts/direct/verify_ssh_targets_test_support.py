@@ -371,6 +371,26 @@ source() {
 
         _ = self.enterContext(mock.patch.object(self.admission.server, "handle_request", side_effect=observe))
 
+        previous_filter = self.admission.server.reply_filter
+
+        def observe_reply(reply: wire.Reply) -> wire.Reply:
+            reply = previous_filter(reply)
+            if isinstance(reply, wire.PlacementWait):
+                with (self.runner_state / "placement-waits.jsonl").open("a") as output:
+                    _ = output.write(wire.encode_reply(reply).rstrip("\n") + "\n")
+            return reply
+
+        _ = self.enterContext(mock.patch.object(self.admission.server, "reply_filter", side_effect=observe_reply))
+
+    def placement_resource_waits(self) -> list[wire.PlacementResourceWait]:
+        """Read resource waits sent on the socket."""
+        path = self.runner_state / "placement-waits.jsonl"
+        if not path.is_file():
+            return []
+        return [reply.wait for line in path.read_text().splitlines()
+                if isinstance(reply := wire.parse_reply(line), wire.PlacementWait)
+                and isinstance(reply.wait, wire.PlacementResourceWait)]
+
     @contextmanager
     def spare_after_linux_refusal(self) -> Generator[None]:
         """Make the spare available after the first provider refuses the step."""

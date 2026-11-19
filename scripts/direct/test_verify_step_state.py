@@ -131,7 +131,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
     ) -> subprocess.CompletedProcess[str]:
         functions = shell_functions(
             VERIFY, "verify_helper", "initialize_step_record", "publish_step_state", "step_state", "step_writes_tree",
-            "run", "run_step", "route_compiling_step", "place_compiling_step",
+            "run", "run_step", "step_uses_build_scope", "route_compiling_step", "place_compiling_step",
             "take_local_placement", "apply_placement_outcome", "settle_placed_scope",
             "build_hold_wait_local",
             "run_lint_sequence", "run_lint_held_sequence", "run_lint_judgment",
@@ -154,6 +154,7 @@ FEATURE_FLAGS=()
 VERIFY_METADATA_SCRIPT=$TEST_REAL_DIRECT/verify_metadata.py
 FIX_RETURN_SCRIPT=$TEST_REAL_DIRECT/../mac_test/fix_return.py
 source "$LINT_CONFIG_READER"
+verify_uses_build_scope() { return 1; }
 run_once() { "$@"; }
 BUILDLOG_RUN_START="$("$PY" "$STEP_RECORD_SCRIPT" start "$$")"
 initialize_step_record

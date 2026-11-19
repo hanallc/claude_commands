@@ -248,10 +248,12 @@ The first routed probe sends `TokenRequired(TokenReadinessUnchecked)` to let a f
 A repeat request for that episode sends `TokenNotRequired`.
 A request with `--local` starts with `TokenNotRequired`.
 A local grant starts the step without a unit board token.
-The placement request includes the resolved Cargo build folder even when the caller pins a target.
-Verify refuses placement when Cargo cannot resolve the folder.
-The queue checks that folder together with memory before a local grant.
-Verify sets `CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR` to the paths it resolved for the local grant.
+A step with a fixed Cargo build folder includes the resolved folder in its placement request.
+This rule also applies when the caller pins a target.
+The queue checks the fixed folder and memory before a local grant.
+Verify sets `CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR` for a fixed-folder step.
+A step that acquires a checkout slot sends no folder claim.
+The checkout owner supplies the Cargo build folder and protects it with the slot lease.
 On Linux, a local placement grant names the build scope through its sidecar.
 The scope publishes that path before Cargo starts.
 The supervisor stops a published scope through the kernel's `cgroup.kill` file.
@@ -1118,10 +1120,11 @@ Durable `Waiter` rows keep their join and token clocks. `RankedWaiter.order` hol
 
 ### Local execution after placement
 
-A compiling step waits for placement. The queue checks memory and the Cargo build folder for a local start.
+A compiling step waits for placement. The queue checks memory and any fixed Cargo build folder for a local start.
 Verify checks for a local hold again before it starts Cargo.
 If a hold starts after the grant, verify returns the grant and requests placement again.
 Formatting runs locally without a memory request or a board token.
+A formatter on a managed copy binds the copy lease to its scope before it starts.
 
 The admission service still accepts the legacy `token-wait` command and records the gap for those clients.
 The board still manages tokens for its own callers.

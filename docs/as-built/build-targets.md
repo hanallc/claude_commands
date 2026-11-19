@@ -3,7 +3,7 @@
 ## What it is
 
 Each build target has its own platform, capacity, hold, and admission rules.
-The queue checks natedev memory and the Cargo build folder before it grants local placement.
+The queue checks natedev memory and any fixed Cargo build folder before it grants local placement.
 SSH targets use their configured runner and claims.
 The Mac admits one job per repository, so different repositories can run together.
 `verify.sh` selects targets through `step_routing_rule` and the configured target order.
@@ -464,7 +464,7 @@ the log does not record that connection. Journal retention also limits the evide
 - A remote pass or failure ends its step. CI checks platform differences.
 - The routing rule permits remote read-only steps. Tree-writing steps always remain on natedev.
 - Unpinned `build` can run on any eligible target. The configured order selects the target. Unpinned `final` remains on natedev.
-- The queue checks memory and Cargo build folder use before local placement.
+- A fixed-folder step includes its Cargo build folder in the placement request. A slot lease protects a slot step's build folder.
 - A job never runs on a held target and never falls back to one. When every eligible target is held or full it waits and says what it is waiting on.
 - Code that picks a target counts `StateUnreadable` and `Held(end=AwaitingBlockRemoval)` as not free, and every reader of `TargetState` handles all five cases.
 - A release removes the last holder file at once. Every waiting call can then enter the memory gate, which orders builds and checks memory. Old release records still read.
@@ -700,10 +700,12 @@ Remote launch signals use `find_mac_runner_pid` and the rules in [Mac step offlo
 
 ## Local placement and wait holders
 
-Verify resolves the build folder on the caller host using the step's Cargo metadata.
-The placement request uses this folder for the local candidate.
+Verify resolves a fixed build folder using the step's Cargo metadata.
+The placement request gives that folder to the queue for a local candidate.
+A step that acquires a checkout slot sends no folder claim.
 Verify starts local Cargo after placement and the last hold check.
-Formatting uses the local invocation path and requests no memory.
+The slot lease protects the slot's build folder until its scope empties.
+Formatting requests no memory. On a managed copy, its scope holds the copy lease.
 
 ### Recorded wait holders
 

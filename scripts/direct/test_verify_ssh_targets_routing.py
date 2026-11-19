@@ -427,11 +427,7 @@ runpy.run_path(str(Path(os.environ["TEST_SOURCE_REPO"]) / "scripts/direct/local_
         result = self.verify(kind, "sample", "--target", "linux", extra={
             "TEST_BUSY_CLAIM": str(paths.run), "VERIFY_LOCAL_RELEASE_WAIT_SCRIPT": str(waiter)})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        replies = [wire.parse_reply(json.dumps(reply))
-                   for line in (self.runner_state / "queue-events.jsonl").read_text().splitlines()
-                   for reply in cast(list[dict[str, object]], cast(dict[str, object], json.loads(line))["replies"])]
-        waits = [reply.wait for reply in replies if isinstance(reply, wire.PlacementWait)
-                 and isinstance(reply.wait, wire.PlacementResourceWait)]
+        waits = self.placement_resource_waits()
         self.assertTrue(waits)
         self.assertTrue(all(wait.resource == "linux" and wait.reason == "busy" for wait in waits))
         self.assertIn("busy: private fixture work since ", result.stderr)

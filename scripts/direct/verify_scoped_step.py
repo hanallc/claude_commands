@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import select
+import socket
 import subprocess
 import sys
 import time
@@ -30,25 +31,47 @@ POLL_MAX_MILLISECONDS = (1 << 31) - 1
 
 
 @dataclass(frozen=True)
-class InheritedCheckoutLease:
+class InheritedSlotLease:
     path: Path
     lease_owner: int
     lock_fd: int
-    kind: build_folders.CheckoutLeaseKind
 
 
 @dataclass(frozen=True)
-class PrivateStepCheckout:
+class CheckoutOwnerChannel:
     lease_owner: int
     request_fd: int
     reply_fd: int
 
 
-OwnedCheckout = InheritedCheckoutLease | PrivateStepCheckout
+@dataclass(frozen=True)
+class SourceCopyLeaseChannel:
+    lease_owner: int
+    request_fd: int
 
 
-class NoOwnedCheckout(Enum):
-    NOT_REQUIRED = auto()
+CheckoutScopeLease = InheritedSlotLease | CheckoutOwnerChannel | SourceCopyLeaseChannel
+
+
+def checkout_scope_leases() -> tuple[CheckoutScopeLease, ...]:
+    """Collect each copy lease that the command can use."""
+    leases: list[CheckoutScopeLease] = []
+    source_channel = os.environ.pop("COPIES_RUN_BIND_FD", "")
+    if os.environ.get("COPIES_RUN_PID") and os.environ.get("COPIES_STEP_SOURCE"):
+        if not source_channel:
+            raise ValueError("the source copy has no scope binding channel")
+        leases.append(SourceCopyLeaseChannel(int(os.environ["COPIES_RUN_PID"]), int(source_channel)))
+
+    owner_pid = os.environ.pop("VERIFY_CHECKOUT_OWNER", "")
+    lock_fd = os.environ.pop("BUILDLOG_PREPARED_COPY_LOCK_FD", "")
+    request_fd = os.environ.pop("DOC_COPY_LEASE_FD", "")
+    reply_fd = os.environ.pop("DOC_COPY_REPLY_FD", "")
+    if owner_pid:
+        if request_fd:
+            leases.append(CheckoutOwnerChannel(int(owner_pid), int(request_fd), int(reply_fd)))
+        else:
+            leases.append(InheritedSlotLease(Path(os.environ["BUILDLOG_PREPARED_COPY"]), int(owner_pid), int(lock_fd)))
+    return tuple(leases)
 
 
 # The scope shell publishes its path before this check. A dead owner permits no start.
@@ -199,17 +222,29 @@ def wait_for_checkout_confirmation(owners: select.poll, reply: int, deadline: fl
         owners.unregister(reply)
 
 
-def bind_checkout_scope(checkout: OwnedCheckout, scope: Path, owners: select.poll, deadline: float) -> None:
+def bind_source_copy_scope(checkout: SourceCopyLeaseChannel, request: bytes,
+                           owners: select.poll, deadline: float) -> None:
+    # Each scope gets its own reply, even when commands share a source copy.
+    reader, writer = socket.socketpair()
+    with reader, writer:
+        with socket.socket(fileno=os.dup(checkout.request_fd)) as channel:
+            _ = socket.send_fds(channel, [request], [writer.fileno()])
+        writer.close()
+        wait_for_checkout_confirmation(owners, reader.fileno(), deadline)
+
+
+def bind_checkout_scope(checkout: CheckoutScopeLease, scope: Path, owners: select.poll, deadline: float) -> None:
     owner_start = process_start_time(checkout.lease_owner)
     if owner_start is None:
         raise ValueError("the checkout lease owner exited before scope publication")
-    if isinstance(checkout, PrivateStepCheckout):
-        # The copy owner publishes while it holds the checkout lock.
+    if isinstance(checkout, SourceCopyLeaseChannel):
+        bind_source_copy_scope(checkout, os.fsencode(scope) + b"\n", owners, deadline)
+    elif isinstance(checkout, CheckoutOwnerChannel):
         _ = os.write(checkout.request_fd, os.fsencode(scope) + b"\n")
         wait_for_checkout_confirmation(owners, checkout.reply_fd, deadline)
     else:
         build_folders.write_checkout_lease(
-            checkout.path, build_folders.CheckoutScopeBinding(scope, checkout.lease_owner, checkout.kind),
+            checkout.path, build_folders.CheckoutScopeBinding(scope, checkout.lease_owner),
             checkout.lock_fd)
     if process_start_time(checkout.lease_owner) != owner_start:
         raise ValueError("the checkout lease owner exited during scope publication")
@@ -240,23 +275,14 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
             owners.register(open_pidfd(leader, cleanup), select.POLLIN)
             if owners.poll(0):
                 raise ValueError("a scope owner exited before launch")
-            owner_pid = os.environ.pop("VERIFY_CHECKOUT_OWNER", "")
-            lock_fd = os.environ.pop("BUILDLOG_PREPARED_COPY_LOCK_FD", "")
-            source_copy = os.environ.pop("VERIFY_SOURCE_COPY_FOLDER", "")
-            request_fd = os.environ.pop("DOC_COPY_LEASE_FD", "")
-            reply_fd = os.environ.pop("DOC_COPY_REPLY_FD", "")
-            checkout: OwnedCheckout | NoOwnedCheckout = NoOwnedCheckout.NOT_REQUIRED
-            if owner_pid:
-                if request_fd:
-                    checkout = PrivateStepCheckout(int(owner_pid), int(request_fd), int(reply_fd))
-                else:
-                    kind = (build_folders.CheckoutLeaseKind.SOURCE_COPY if source_copy
-                            else build_folders.CheckoutLeaseKind.READY_SLOT)
-                    checkout = InheritedCheckoutLease(Path(source_copy) if source_copy else Path.cwd(),
-                                                       int(owner_pid), int(lock_fd), kind)
+            leases = checkout_scope_leases()
             watch = None
             deadline = 0.0
-            if isinstance(checkout, OwnedCheckout):
+            lease_owners = {lease.lease_owner for lease in leases} - {caller, leader, supervisor}
+            lease_owner_fds = tuple(open_pidfd(owner, cleanup) for owner in lease_owners)
+            if leases:
+                for descriptor in lease_owner_fds:
+                    owners.register(descriptor, select.POLLIN)
                 seconds = conf.read_or_repository("direct").number("VERIFY_SCOPE_PUBLICATION_SECONDS")
                 deadline = time.monotonic() + seconds
                 watch = inotify.open_watch()
@@ -270,16 +296,17 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
                  "/bin/sh", "-c", 'exec 3>&1; ' + scope_shell, peak, "/bin/sh", "-c", CHECK_SCOPE_OWNER,
                  "verify-scope-owner", str(sidecar), unit, str(caller), caller_start, str(leader), leader_start,
                  str(supervisor), supervisor_start,
-                 "bind-checkout" if isinstance(checkout, OwnedCheckout) else "no-checkout",
+                 "bind-checkout" if leases else "no-checkout",
                  *command],
-                stdin=subprocess.PIPE if isinstance(checkout, OwnedCheckout) else None,
+                stdin=subprocess.PIPE if leases else None,
                 stderr=subprocess.DEVNULL, process_group=0,
             )
             try:
                 owners.register(open_pidfd(process.pid, cleanup), select.POLLIN)
-                if isinstance(checkout, OwnedCheckout) and watch is not None:
+                if leases and watch is not None:
                     scope = wait_for_checkout_scope(owners, watch, sidecar, unit, deadline)
-                    bind_checkout_scope(checkout, scope, owners, deadline)
+                    for lease in leases:
+                        bind_checkout_scope(lease, scope, owners, deadline)
                     if owners.poll(0):
                         raise ValueError("a scope owner exited before launch")
                     assert process.stdin is not None
@@ -287,6 +314,9 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
                         if time.monotonic() >= deadline:
                             raise TimeoutError("the checkout scope publication timed out")
                         _ = os.write(permission.fileno(), b"launch\n")
+                    # The scope lease protects the checkout after its owner exits.
+                    for descriptor in lease_owner_fds:
+                        owners.unregister(descriptor)
                 _ = owners.poll()
             except ProcessLookupError:
                 pass

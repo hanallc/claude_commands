@@ -546,21 +546,20 @@ elif [[ -z "${IN_NIX_SHELL:-}" ]]; then
 fi
 unset VERIFY_NIX_ENV_REEXEC
 
-# In-place lint can compile in the source copy. Keep its lock for scope binding.
+# The source copy owner binds the scope through its request channel.
 if [[ "${COPIES_RUN_LOCK_FD:-}" =~ ^[0-9]+$ ]]; then
-    if [[ "${VERIFY_QUERY_ARGS[0]:-}" == lint && "$VERIFY_REPO_ROOT" == "${COPIES_STEP_SOURCE:-}" &&
-          -z "${BUILDLOG_PREPARED_COPY_LOCK_FD:-}" ]]; then
-        BUILDLOG_PREPARED_COPY_LOCK_FD=$COPIES_RUN_LOCK_FD
-    else
-        exec {COPIES_RUN_LOCK_FD}>&-
-    fi
+    exec {COPIES_RUN_LOCK_FD}>&-
     unset COPIES_RUN_LOCK_FD
 fi
 
-close_inherited_checkout_lock() {
+close_checkout_handoffs() {
     if [[ -n "${BUILDLOG_PREPARED_COPY_LOCK_FD:-}" ]]; then
         exec {BUILDLOG_PREPARED_COPY_LOCK_FD}>&-
         unset BUILDLOG_PREPARED_COPY_LOCK_FD
+    fi
+    if [[ "${COPIES_RUN_BIND_FD:-}" =~ ^[0-9]+$ ]]; then
+        exec {COPIES_RUN_BIND_FD}>&-
+        unset COPIES_RUN_BIND_FD
     fi
 }
 
@@ -614,7 +613,7 @@ verify_helper() {
         [[ -f "$script" ]] || return 0
         VERIFY_HELPER_LOCK="$(mktemp 2>/dev/null)" || return 0
         coproc VERIFY_CALLS {
-            close_inherited_checkout_lock
+            close_checkout_handoffs
             exec "$VERIFY_START_DIR/../lib/py" "$script" "$VERIFY_HELPER_LOCK"
         } 2>/dev/null
         VERIFY_HELPER_PID=${VERIFY_CALLS_PID:-}
@@ -925,7 +924,7 @@ run_step() {
         started="$(date '+%Y-%m-%d %H:%M:%S %z')"
         monitor=0
         [[ $- != *m* ]] || monitor=1
-        if [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]] && verify_uses_build_scope; then
+        if step_uses_build_scope "$@"; then
             if ! PLACEMENT_SCOPE_STATE=$(mktemp "$HOLD_WAIT_DIR/scope-release.XXXXXX"); then
                 PLACEMENT_SCOPE_UNRESOLVED=1 PLACEMENT_OUTCOME=unresolved
                 printf '%s\n' 'verify.sh: cannot create the scope release state. Keeping the reservation.' >&2
@@ -938,20 +937,21 @@ run_step() {
             if [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]]; then
                 export CARGO_TARGET_DIR="$PLACEMENT_CARGO_TARGET"
                 export CARGO_BUILD_BUILD_DIR="$PLACEMENT_CARGO_FOLDER"
-                if [[ -n "${PLACEMENT_SCOPE_STATE:-}" ]]; then
-                    local step_leader=$BASHPID unscoped_buildlog
-                    unscoped_buildlog=$(declare -f buildlog_exec buildlog_finish_memory)
-                    eval "$(declare -f sweep_after_step | sed '1s/sweep_after_step/sweep_without_placement/')"
-                    launch_placed_scope() { run_placed_scope "$step_leader" "$@"; }
-                    buildlog_exec() { run_checkout_step launch_placed_scope "$@"; }
-                    buildlog_finish_memory() { finish_placed_scope "$@"; }
-                    sweep_after_step() (
-                        # The sweep runs after Cargo releases the placement.
-                        [[ -z "${BUILDLOG_MEM_RESERVATION:-}" ]] || return 0
-                        eval "$unscoped_buildlog"
-                        sweep_without_placement "$@"
-                    )
-                fi
+            fi
+            if [[ -n "${PLACEMENT_SCOPE_STATE:-}" ]]; then
+                local step_leader=$BASHPID unscoped_buildlog
+                unscoped_buildlog=$(declare -f buildlog_exec buildlog_finish_memory)
+                eval "$(declare -f sweep_after_step | sed '1s/sweep_after_step/sweep_without_placement/')"
+                launch_placed_scope() { run_placed_scope "$step_leader" "$@"; }
+                buildlog_exec() { run_checkout_step launch_placed_scope "$@"; }
+                buildlog_finish_memory() { finish_placed_scope "$@"; }
+                sweep_after_step() (
+                    # The sweep runs after Cargo releases the placement.
+                    [[ -z "${BUILDLOG_MEM_RESERVATION:-}" ]] || return 0
+                    eval "$unscoped_buildlog"
+                    close_checkout_handoffs
+                    sweep_without_placement "$@"
+                )
             fi
             if (
                 if (( LINT_REPAIR_REUSED_GRANT )) || [[ "${LINT_MEND_WAIT:-0}" == 1 ]]; then
@@ -2595,10 +2595,14 @@ route_compiling_step() {
     if [[ -n "${BUILDLOG_RESERVED_STEP:-}" ]]; then buildlog_check_nested_step || return $?; fi
     STEP_RAN_ON_MAC=0 MAC_PASSED=0
     if [[ "${LINT_REPAIR_PENDING_GRANT:-0}" == 1 ]]; then
-        local reason
+        local reason roots
         take_local_placement
         LINT_REPAIR_PENDING_GRANT=0
-        if reason=$(verify_helper "$VERIFY_START_DIR/../lint/lint_repair_grant.py" \
+        if [[ -z "${LINT_REPAIR_GRANT_FOLDER:-}" ]]; then
+            reason="the judgment grant did not claim a fixed build folder"
+        elif ! roots=$(local_cargo_build_folder "$@") || [[ "${roots#*$'\n'}" != "$LINT_REPAIR_GRANT_FOLDER" ]]; then
+            reason="the repair uses a different build folder"
+        elif reason=$(verify_helper "$VERIFY_START_DIR/../lint/lint_repair_grant.py" \
                 "$PLACEMENT_ASSIGNMENT_FILE" "$PLACEMENT_GRANT_FILE" "$PLACEMENT_EPISODE" "$$" "${LINT_COPY_TREE:-}" "$@"); then
             # Keep the sidecar that the grant uses to find its build scope.
             local grant_peak=$BUILDLOG_PEAK
@@ -2852,10 +2856,19 @@ verify_uses_build_scope() {
     [[ -r /proc/self/cgroup || "${OSTYPE:-}" == linux* ]]
 }
 
+step_uses_build_scope() {
+    verify_uses_build_scope || return 1
+    [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]] && return 0
+    [[ "${1:-}" == cargo ]] || return 1
+    [[ ( -n "${COPIES_RUN_PID:-}" && -n "${COPIES_STEP_SOURCE:-}" ) ||
+       ( -n "${BUILDLOG_PREPARED_COPY:-}" && "$BUILDLOG_PREPARED_COPY" == "${VERIFY_REPO_ROOT:-}" ) ]]
+}
+
 run_checkout_step() (
     local launch=$1 status=0 checkout_status=0 publish_status=0
     shift
     if [[ -z "${VERIFY_SLOT_SOURCE:-}" ]] || ! buildlog_step_compiles "$@"; then
+        if [[ "$launch" == buildlog_exec_without_checkout ]]; then close_checkout_handoffs; fi
         "$launch" "$@"
         return $?
     fi
@@ -2871,7 +2884,9 @@ run_checkout_step() (
         return 2
     fi
     if [[ "$launch" == buildlog_exec_without_checkout ]]; then
-        (exec {DOC_COPY_LEASE_FD}>&- {DOC_COPY_REPLY_FD}<&-; "$launch" "${command[@]}") || status=$?
+        (exec {DOC_COPY_LEASE_FD}>&- {DOC_COPY_REPLY_FD}<&-
+         close_checkout_handoffs
+         "$launch" "${command[@]}") || status=$?
     else
         "$launch" "${command[@]}" || status=$?
     fi
@@ -2889,25 +2904,20 @@ run_checkout_step() (
 run_placed_scope() {
     local leader=$1 BUILDLOG_RESERVED_STEP
     shift
-    printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
-        "${BUILDLOG_MEM_RESERVATION%%-*}" "${BUILDLOG_MEM_MAX_PATH%/*}"
-    export BUILDLOG_RESERVED_STEP
+    if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" ]]; then
+        printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
+            "${BUILDLOG_MEM_RESERVATION%%-*}" "${BUILDLOG_MEM_MAX_PATH%/*}"
+        export BUILDLOG_RESERVED_STEP
+    fi
     local output="$PLACEMENT_SCOPE_STATE.output" supervisor reader status=0
-    local checkout_owner="" inherited_checkout=0 source_copy=""
-    # Keep the checkout lease while the supervisor binds the scope.
+    local checkout_owner="" peak=${BUILDLOG_PEAK:-$PLACEMENT_SCOPE_STATE.peak}
     if [[ -n "${DOC_COPY_LEASE_FD:-}" ]]; then
         checkout_owner=$DOC_COPY_OWNER_PID
-    elif [[ "$CMD" == doc && -n "${DOC_REPO_TOP:-}" && "${BUILDLOG_PREPARED_COPY:-}" == "$DOC_REPO_TOP" ]]; then
+    elif [[ -n "${BUILDLOG_PREPARED_COPY:-}" &&
+            "$BUILDLOG_PREPARED_COPY" == "${DOC_REPO_TOP:-${VERIFY_REPO_ROOT:-}}" ]]; then
+        local checkout_fd=${BUILDLOG_PREPARED_COPY_LOCK_FD:-}
         checkout_owner=${BUILDLOG_RUN:-}
         checkout_owner=${checkout_owner%%:*}
-        inherited_checkout=1
-    elif [[ "$CMD" == lint && -n "${COPIES_STEP_SOURCE:-}" && "$VERIFY_REPO_ROOT" == "$COPIES_STEP_SOURCE" ]]; then
-        source_copy=${COPIES_STEP_SOURCE%/*}
-        checkout_owner=${COPIES_RUN_PID:-}
-        inherited_checkout=1
-    fi
-    if (( inherited_checkout )); then
-        local checkout_fd=${BUILDLOG_PREPARED_COPY_LOCK_FD:-}
         if [[ ! "$checkout_fd" =~ ^[0-9]+$ || ! -e "/dev/fd/$checkout_fd" || ! "$checkout_owner" =~ ^[1-9][0-9]*$ ]]; then
             printf 'the prepared checkout has no inherited lease\n' > "$PLACEMENT_SCOPE_STATE"
             return 125
@@ -2925,12 +2935,15 @@ run_placed_scope() {
                 {DOC_COPY_REPLY_FD}<"/dev/fd/$DOC_COPY_REPLY_FD" || exit 125
             export DOC_COPY_LEASE_FD DOC_COPY_REPLY_FD
         fi
-        export VERIFY_CHECKOUT_OWNER="$checkout_owner" VERIFY_SOURCE_COPY_FOLDER="$source_copy"
+        export VERIFY_CHECKOUT_OWNER="$checkout_owner"
         exec "$PY" "$VERIFY_START_DIR/verify_scoped_step.py" "$$" "$leader" "$PLACEMENT_SCOPE_STATE" \
-            "$BUILDLOG_PEAK" "$BUILDLOG_SCOPE_SH" "$@"
+            "$peak" "$BUILDLOG_SCOPE_SH" "$@"
     ) > "$output" 2>&1 &
     supervisor=$!
-    tail -n +1 --follow --pid="$supervisor" --sleep-interval=0.1 "$output" &
+    (
+        close_checkout_handoffs
+        exec tail -n +1 --follow --pid="$supervisor" --sleep-interval=0.1 "$output"
+    ) &
     reader=$!
     wait "$supervisor" || status=$?
     wait "$reader" || true
@@ -2949,7 +2962,7 @@ finish_placed_scope() {
     fi
     close_scope_launch || return 0
     buildlog_release_memory "$status"
-    rm -f "$BUILDLOG_PEAK.cgroup" || true
+    rm -f "${BUILDLOG_PEAK:-$PLACEMENT_SCOPE_STATE.peak}.cgroup" || true
 }
 
 # Serialize release with the supervisor, even if the step shell died.
@@ -3037,7 +3050,9 @@ placement_once() {
         --kind "$CMD" --source-key "$PLACEMENT_SOURCE_KEY" --session-id "$PLACEMENT_SESSION"
         --sidecar "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" --token "$prerequisite"
         --assignment-file "$PLACEMENT_ASSIGNMENT_FILE" --shell-state "$PLACEMENT_GRANT_FILE")
-    [[ -z "${PLACEMENT_CARGO_FOLDER:-}" ]] || placement_args+=(--cargo-folder "$PLACEMENT_CARGO_FOLDER")
+    if [[ -z "${VERIFY_SLOT_SOURCE:-}" && -n "${PLACEMENT_CARGO_FOLDER:-}" ]]; then
+        placement_args+=(--cargo-folder "$PLACEMENT_CARGO_FOLDER")
+    fi
     if [[ -n "${BUILDLOG_RUN:-}" && -z "${VERIFY_SLOT_SOURCE:-}" ]]; then
         placement_args+=(--run "$BUILDLOG_RUN")
     fi
@@ -3247,6 +3262,8 @@ route_test() {
             fi
             if [[ "${LINT_MEMORY_JUDGMENT:-0}" == 1 ]]; then
                 LINT_REPAIR_PENDING_GRANT=1
+                LINT_REPAIR_GRANT_FOLDER=""
+                if [[ -z "${VERIFY_SLOT_SOURCE:-}" ]]; then LINT_REPAIR_GRANT_FOLDER=$PLACEMENT_CARGO_FOLDER; fi
                 return "$LINT_LEFT_QUEUE_STATUS"
             fi
             if [[ "$CMD" == doc && -n "${VERIFY_SLOT_SOURCE:-}" ]] && [[ "$(doc_tree)" != "$DOC_TREE" ]]; then
@@ -3920,7 +3937,7 @@ trap 'verify_interrupted 15' TERM
 trap 'verify_interrupted 1' HUP
 if [[ -n "${COPIES_RUN_PID:-}" ]]; then
     (
-        close_inherited_checkout_lock
+        close_checkout_handoffs
         exec "$PY" "$STEP_COPIES_SCRIPT" watch-owner --pid "$COPIES_RUN_PID" --verify-pid "$$"
     ) &
     COPY_RUN_WATCH_PID=$!
@@ -4176,7 +4193,8 @@ run_lint_sequence() {
         MEND_LOG="$(mktemp)"
         # run_step() records diagnostics through its tee.
         # Keep this call in the parent so cleanup can stop the step.
-        local LINT_MEND_WAIT=1 LINT_MEMORY_JUDGMENT=0 LINT_MEMORY_WAIT_FILE="" LINT_REPAIR_PENDING_GRANT=0
+        local LINT_MEND_WAIT=1 LINT_MEMORY_JUDGMENT=0 LINT_MEMORY_WAIT_FILE=""
+        local LINT_REPAIR_PENDING_GRANT=0 LINT_REPAIR_GRANT_FOLDER=""
         lint_copy_begin
         while true; do
             if lint_rewrite invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}"; then
