@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import redirect_stdout, suppress
+from collections.abc import Generator
+from contextlib import contextmanager, redirect_stdout, suppress
 from dataclasses import dataclass
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -14,6 +16,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from typing import cast
 
 if __package__ in ('', None):
@@ -21,10 +24,10 @@ if __package__ in ('', None):
 
 from scripts.aws_target import cloud_gate, gate_box, ledger
 from scripts.buildlog import store
-from scripts.lib import process_group
+from scripts.copies import copies
+from scripts.lib import conf, copy_record, process_group, scratch
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.process_start import Started, process_start
-from scripts.lint import folder_audit
+from scripts.lib.process_start import Gone, Started, Unreadable, process_start
 from scripts.mac_test.mac_queue_run import MAC_BUSY_STATUS
 from scripts.production import merge_gate as gate
 from scripts.production.affected_modules import GraphError
@@ -67,75 +70,214 @@ def attempt_name(folder: Path) -> str:
     return attempt
 
 
+def running_owner(pid: int, start: str) -> bool:
+    owner = process_start(pid)
+    if isinstance(owner, Unreadable):
+        raise GateRefused(f'Cannot read the Mac gate owner {pid}: {owner.reason}')
+    return isinstance(owner, Started) and owner.start == start
+
+
+def live_groups(groups: set[int]) -> set[int]:
+    if not groups:
+        return set()
+    output = subprocess.check_output(['ps', '-axo', 'pgid=,stat='], text=True, timeout=5)
+    rows = (line.split() for line in output.splitlines())
+    return {int(group) for group, state in rows if int(group) in groups and not state.startswith('Z')}
+
+
+def stop_guest(folder: Path) -> None:
+    """Stop the guest and the process groups it recorded."""
+    journal = folder / 'run.json'
+    if not journal.exists():
+        return
+    grace = conf.read('mac_gate').number('terminate_grace_seconds')
+    record = cloud_gate.read(journal)
+    pid, start = ledger.instant(record, 'pid'), ledger.text(record, 'start')
+    if pid <= 1 or pid == os.getpid():
+        raise GateRefused('Invalid Mac gate owner')
+    if running_owner(pid, start):
+        with suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGTERM)
+        until = time.monotonic() + grace
+        while running_owner(pid, start):
+            if time.monotonic() >= until:
+                raise GateRefused('The Mac gate guest did not exit')
+            time.sleep(0.05)
+
+    groups: set[int] = set()
+    for group, stamp in ledger.mapping(cloud_gate.read(journal)['groups']).items():
+        pgid = int(group)
+        identity = process_start(pgid)
+        if isinstance(identity, Unreadable):
+            raise GateRefused(f'Cannot read the Mac gate group {pgid}: {identity.reason}')
+        if isinstance(identity, Gone) or identity.start == stamp:
+            groups.add(process_group.check_process_group(pgid))
+    for signum in (signal.SIGTERM, signal.SIGKILL):
+        for pgid in live_groups(groups):
+            with suppress(ProcessLookupError):
+                process_group.send_process_group(pgid, signum)
+        until = time.monotonic() + grace
+        while live_groups(groups):
+            if time.monotonic() >= until:
+                break
+            time.sleep(0.05)
+        else:
+            return
+    raise GateRefused('The Mac gate job groups did not exit')
+
+
+def checkout_task(folder: Path) -> str:
+    return 'gate:' + attempt_name(folder)
+
+
+def read_checkout(folder: Path) -> Path:
+    row = cloud_gate.read(folder / 'checkout.json')
+    path = Path(ledger.text(row, 'path'))
+    if not path.is_absolute():
+        raise GateRefused('The Mac checkout path is not absolute')
+    return path
+
+
 def stop_checkout(folder: Path) -> None:
-    """Stop processes that use this attempt's checkout before removing it."""
     root = (Path.home() / REMOTE_ROOT).resolve()
     if folder.resolve() != root / attempt_name(folder):
         raise GateRefused('The folder is outside the Mac gate state directory')
-    repo = folder.resolve() / 'repo'
-    if repo.is_symlink():
-        raise GateRefused('The Mac gate checkout is a symbolic link')
-    if repo.is_dir():
-        def users() -> set[int]:
-            uses = folder_audit.process_uses([repo])
-            if isinstance(uses, folder_audit.ProcessUsesUnavailable):
-                raise GateRefused('Cannot check for test processes on the Mac')
-            return {pid for path, pid, _ in uses.paths if pid > 1 and pid != os.getpid()
-                    and Path(path).is_relative_to(repo)}
+    try:
+        lock = (folder / 'cleanup.lock').open('a')
+    except FileNotFoundError:
+        return
+    with lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if not folder.exists():
+            return
+        stop_guest(folder)
+        paths: set[Path] = {read_checkout(folder)} if (folder / 'checkout.json').exists() else set()
+        ended = scratch.end(checkout_task(folder))
+        if ended.kept:
+            raise GateRefused(f'The Mac kept {ended.kept[0].path}: {ended.kept[0].reason}')
+        for path in paths.union(ended):
+            copies.unregister_remote('localhost', str(path))
+        shutil.rmtree(folder)
 
-        processes = {pid: process_start(pid) for pid in users()}
-        if processes:
-            for pid in users() & processes.keys():
-                identity = processes[pid]
-                if isinstance(identity, Started) and process_start(pid) == identity:
-                    with suppress(ProcessLookupError):
-                        os.kill(pid, signal.SIGKILL)
-            if users():
-                raise GateRefused('Test processes still use the Mac checkout')
-    shutil.rmtree(folder, ignore_errors=False)
+
+def clone_checkout(folder: Path, owner: str, repository: str, session: str) -> Path:
+    """Create and register a task-owned clone with the installed copies command."""
+    scripts = Path.home() / '.claude/scripts'
+    with (folder / 'cleanup.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Leave the lock with copies if the SSH command ends during clone setup.
+        output = subprocess.check_output([
+            str(scripts / 'lib/py'), str(scripts / 'copies/copies.py'), 'clone', str(scripts.parent),
+            '--task', checkout_task(folder), '--name', 'mac-gate', '--owner', owner,
+            '--repository', repository, '--session', session,
+        ], text=True, pass_fds=(lock.fileno(),))
+        path = Path(output.strip().splitlines()[-1]) if output.strip() else Path()
+        if not path.is_absolute():
+            raise GateRefused('Copies did not return a Mac checkout')
+        cloud_gate.save(folder / 'checkout.json', {'path': str(path)})
+
+        def mark_disposable(record: copy_record.Registered | copy_record.NotRegistered |
+                            copy_record.UnreadableRecord) -> dict[str, object]:
+            if not isinstance(record, copy_record.Registered) or record.task != checkout_task(folder):
+                raise GateRefused('The Mac checkout belongs to another task')
+            return {**record.fields, 'throwaway': True}
+
+        _ = scratch.update_record(path, mark_disposable)
+        return path
 
 
 def lifecycle(phase: str, argv_file: Path, folder: Path, full: str) -> int:
-    # The saved queue arguments supply the same remote path after a local timeout.
     remote = f'{REMOTE_ROOT}/{attempt_name(folder)}'
     root = '"$HOME"/' + shlex.quote(remote)
-    repo = root + '/repo'
-    runner = repo + '/scripts/lib/py ' + repo + '/scripts/mac_test/mac_gate.py'
+    runner = f'PYTHONPATH="$HOME/.claude" "$HOME/.claude/scripts/lib/py" {root}/mac_gate.py'
     host = os.environ['MAC_QUEUE_HOST']
     ssh = ['ssh', '-n', '-o', 'BatchMode=yes', host]
-    cleanup = (f'if [ -f {repo}/scripts/mac_test/mac_gate.py ]; then {runner} stop {root}; '
+    checkout_file = argv_file.with_suffix('.json.checkout')
+    cleanup = (f'if [ -f {root}/mac_gate.py ]; then {runner} stop {root}; '
                f'else rm -rf -- {root}; fi')
     if phase == 'cleanup':
-        result = subprocess.run([*ssh, cleanup + ' && printf "mac_gate_cleaned\\n"'],
+        result = subprocess.run([*ssh, cleanup + ' && printf "mac_gate_cleaned\n"'],
                                 capture_output=True, text=True, check=False)
-        return int(result.returncode != 0 or result.stdout.strip() != 'mac_gate_cleaned')
+        if result.returncode or result.stdout.strip() != 'mac_gate_cleaned':
+            if result.stderr:
+                print(result.stderr, file=sys.stderr, end='')
+            return 1
+        if checkout_file.exists():
+            copies.unregister_remote(host, checkout_file.read_text())
+        return 0
 
     request = cloud_gate.read(folder / 'request.json')
+    local_repo = Path((folder / 'local-repo').read_text())
+    owner = copies.source_owner(local_repo)
+    repository = copies.repository_name(local_repo)
+    session = os.environ.get('CODEX_THREAD_ID') or os.environ.get('CLAUDE_CODE_SESSION_ID') or attempt_name(folder)
     files = [folder / 'request.json', folder / 'module_seconds.json']
-    if request['source_key']:
-        files.append(folder / 'source.bundle')
-    _ = argv_file.with_suffix('.json.close').write_text(cleanup)
     parent = root.rsplit('/', 1)[0]
-    _ = subprocess.run([*ssh, f'umask 077 && mkdir -p -- {parent} && mkdir -- {root}'], check=True)
+    created = subprocess.check_output(
+        [*ssh, f'umask 077 && mkdir -p -- {parent} && mkdir -- {root} && printf "created\n"'], text=True)
+    if created.strip() != 'created':
+        raise GateRefused('Could not create the Mac gate state folder')
+    _ = subprocess.run(['scp', '-q', '-o', 'BatchMode=yes', str(Path(__file__).resolve()),
+                        f'{host}:{remote}/mac_gate.py.new'], check=True)
+    _ = argv_file.with_suffix('.json.close').write_text(cleanup)
+    clone = f'mv -- {root}/mac_gate.py.new {root}/mac_gate.py && {runner} clone {root} '
+    response = subprocess.check_output([*ssh, clone + shlex.join([owner, repository, session])], text=True)
+    checkout = response.strip().removeprefix('mac_gate_checkout=')
+    if not response.startswith('mac_gate_checkout=') or not Path(checkout).is_absolute() or '\n' in checkout:
+        raise GateRefused('The Mac did not confirm the gate checkout')
+    write_text_atomic(checkout_file, checkout)
+    mirror = copies.RemoteMirror(owner, copies.SelectedRepository(repository), host, checkout, session)
+    _ = argv_file.with_suffix('.json.lease').write_text(str(copies.remote_lease_path(mirror)))
+    copies.register_remote(mirror)
+    commit = ledger.text(request, 'commit')
+    probe = shlex.join(['git', '-C', checkout, 'cat-file', '-e', commit + '^{commit}'])
+    if subprocess.check_output([*ssh, probe + ' 2>/dev/null && printf "present\n"'], text=True).strip() != 'present':
+        if not request['source_key']:
+            raise GateRefused('The Mac checkout does not have the requested commit')
+        files.append(folder / 'source.bundle')
     _ = subprocess.run(['scp', '-q', '-o', 'BatchMode=yes', *map(str, files), f'{host}:{remote}/'], check=True)
-
-    commit, origin, base = (shlex.quote(ledger.text(request, key)) for key in ('commit', 'origin', 'origin_main'))
-    git = f'git -C {repo}'
-    commands = [
-        f'git clone -q --no-checkout "$HOME/.claude" {repo}',
-        f'{git} remote set-url origin {origin}',
-        f'GIT_TERMINAL_PROMPT=0 {git} fetch -q origin +refs/heads/main:refs/remotes/origin/main',
-        f'{git} update-ref refs/remotes/origin/main {base}',
-    ]
-    if request['source_key']:
-        commands.append(f'{git} fetch -q {root}/source.bundle {commit}')
-    commands.extend((f'{git} checkout -q --detach {commit}', f'{runner} guest {root} {full}'))
-    _ = argv_file.write_text(json.dumps(['/bin/zsh', '-c', ' && '.join(commands)]))
+    _ = argv_file.write_text(json.dumps(['/bin/zsh', '-c', f'exec {runner} stage {root} {full}']))
     return 0
 
 
+def stage_checkout(folder: Path, full: str) -> None:
+    """Set the tested commit and base in the task-owned checkout."""
+    request = cloud_gate.read(folder / 'request.json')
+    commit, base = (ledger.text(request, key) for key in ('commit', 'origin_main'))
+    repo = read_checkout(folder)
+    with record_guest(folder, repo):
+        _ = gate.checked_git(repo, 'cat-file', '-e', base + '^{commit}')
+        if gate.git(repo, 'cat-file', '-e', commit + '^{commit}').returncode:
+            _ = gate.checked_git(repo, 'fetch', '-q', str(folder / 'source.bundle'), commit)
+        _ = gate.checked_git(repo, 'remote', 'set-url', 'origin', ledger.text(request, 'origin'))
+        _ = gate.checked_git(repo, 'update-ref', 'refs/remotes/origin/main', base)
+        _ = gate.checked_git(repo, 'checkout', '-q', '--detach', commit)
+        shim = str(repo / 'scripts/lib/py')
+        os.execv(shim, [shim, str(repo / 'scripts/mac_test/mac_gate.py'), 'guest', str(folder), full])
+
+
+@contextmanager
+def record_guest(folder: Path, repo: Path) -> Generator[None]:
+    pid = os.getpid()
+    owner = process_start(pid)
+    if not isinstance(owner, Started):
+        raise GateRefused('The Mac gate guest has no readable process start')
+    recovery = gate.GateRecovery(folder / 'run.json', str(repo.resolve()), pid, owner.start)
+    recovery.save()
+    recovery_token = gate.ACTIVE_GATE_RECOVERY.set(recovery)
+    try:
+        yield
+    finally:
+        gate.ACTIVE_GATE_RECOVERY.reset(recovery_token)
+
+
 def run_guest(folder: Path, *, full: bool) -> dict[str, object]:
-    repo = folder / 'repo'
+    repo = read_checkout(folder)
+    with record_guest(folder, repo):
+        return run_guest_modules(folder, repo, full=full)
+
+
+def run_guest_modules(folder: Path, repo: Path, *, full: bool) -> dict[str, object]:
     request = cloud_gate.read(folder / 'request.json')
     commit, tree = gate.checked_git(repo, 'rev-parse', 'HEAD', 'HEAD^{tree}').splitlines()
     if (commit, tree) != (request['commit'], request['tree']):
@@ -157,6 +299,7 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
         with tempfile.TemporaryDirectory(prefix='mac-gate-') as temporary:
             folder = Path(temporary)
             request = cloud_gate.prepare(repo, folder, mode, module_time_limit_s, selected=selected)
+            _ = (folder / 'local-repo').write_text(str(repo))
             if not request['modules']:
                 return 'No modules selected for the Mac'
             timings = gate.read_measures(gate.gate_state_dir() / 'module_seconds.json')
@@ -164,8 +307,14 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
             command = [*QUEUE_COMMAND, '--what', 'gate tests', '--kind', 'run', '--package', '',
                        '--worktree', str(repo), '--no-wait', '--lifecycle-script', str(Path(__file__).resolve()),
                        '--', str(folder), str(int(full))]
-            with subprocess.Popen(command, stdout=subprocess.PIPE, text=True, encoding='utf-8',
-                                  errors='replace', start_new_session=True) as process:
+            caller = os.pidfd_open(os.getpid())
+            try:
+                command[2:2] = ['--caller-fd', str(caller)]
+                process = subprocess.Popen(command, stdout=subprocess.PIPE, text=True, encoding='utf-8',
+                                           errors='replace', start_new_session=True, pass_fds=(caller,))
+            finally:
+                os.close(caller)
+            with process:
                 try:
                     output, _ = process.communicate(timeout=MAC_TIME_LIMIT_S)
                 except BaseException:
@@ -180,10 +329,12 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
             if len(results) != 1:
                 return 'The Mac returned no unique gate result'
             row = ledger.mapping(cast(object, json.loads(results[0])))
-            return MacGateResult(row, cloud_gate.validate_run_identity(row, request))
+            run = cloud_gate.decode_requested_run(row, request)
+            cloud_gate.validate_run_modules(run, request)
+            return MacGateResult(row, run)
     except subprocess.TimeoutExpired:
         return f'The Mac queue call exceeded {MAC_TIME_LIMIT_S:g} seconds'
-    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, GateRefused, GraphError) as error:
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, GateRefused, GraphError, copies.CopyError, scratch.ScratchError) as error:
         return f'The Mac gate could not finish: {error}'
 
 
@@ -252,6 +403,9 @@ class Arguments(argparse.Namespace):
     output: Path = Path()
     mac_result: Path = Path()
     natedev_record: Path = Path()
+    owner: str = ''
+    repository: str = ''
+    session: str = ''
 
 
 def main() -> int:
@@ -269,15 +423,26 @@ def main() -> int:
         _ = callback.add_argument('argv_file', type=Path)
         _ = callback.add_argument('folder', type=Path)
         _ = callback.add_argument('full', choices=('0', '1'))
-    guest = commands.add_parser('guest')
-    _ = guest.add_argument('folder', type=Path)
-    _ = guest.add_argument('full', choices=('0', '1'))
+    clone = commands.add_parser('clone')
+    _ = clone.add_argument('folder', type=Path)
+    _ = clone.add_argument('owner')
+    _ = clone.add_argument('repository')
+    _ = clone.add_argument('session')
+    for phase in ('stage', 'guest'):
+        guest = commands.add_parser(phase)
+        _ = guest.add_argument('folder', type=Path)
+        _ = guest.add_argument('full', choices=('0', '1'))
     _ = commands.add_parser('stop').add_argument('folder', type=Path)
     args = parser.parse_args(namespace=Arguments())
     try:
         if args.action in ('prepare', 'cleanup'):
             return lifecycle(args.action, args.argv_file, args.folder, args.full)
-        if args.action == 'guest':
+        if args.action == 'clone':
+            path = clone_checkout(args.folder, args.owner, args.repository, args.session)
+            print(f'mac_gate_checkout={path}', flush=True)
+        elif args.action == 'stage':
+            stage_checkout(args.folder, args.full)
+        elif args.action == 'guest':
             print(RESULT_PREFIX + json.dumps(run_guest(args.folder, full=args.full == '1')), flush=True)
         elif args.action == 'stop':
             if args.folder.exists():
@@ -290,7 +455,7 @@ def main() -> int:
             if isinstance(result, str):
                 raise GateRefused(result)
             cloud_gate.save(args.output, result.row)
-    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, GateRefused, GraphError) as error:
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, GateRefused, GraphError, copies.CopyError, scratch.ScratchError) as error:
         print(f'Mac gate: {error}', file=sys.stderr)
         return 2
     return 0

@@ -12,11 +12,12 @@ import signal
 import subprocess
 import sys
 import tempfile
-from typing import cast
+from typing import TextIO, cast
 import unittest
 
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.process_group import send_process_group
+from scripts.lib.process_start import Started, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import mac_queue_run
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -64,6 +65,7 @@ if "mac_stopped=" in args[-1]:
 print("mac_group=4567", flush=True)
 if os.environ.get("FAKE_SSH_HOLD") == "1":
     (root / "running").write_text(str(os.getpid()))
+    print("Mac command started", flush=True)
     # The real ssh sends the end of its input to the Mac wrapper, which stops the work.
     _ = sys.stdin.read()
     (root / "input_closed").write_text("closed")
@@ -180,6 +182,64 @@ class QueueRunTests(unittest.TestCase):
             self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
             self.assertFalse((root / "remote").exists())
 
+    def test_caller_term_stops_the_isolated_queue_and_ssh(self) -> None:
+        launch = """
+import os, subprocess, sys
+caller = os.pidfd_open(os.getpid())
+words = sys.argv[1:]
+words[3:3] = ['--caller-fd', str(caller)]
+child = subprocess.Popen(words, pass_fds=(caller,), start_new_session=True)
+raise SystemExit(child.wait())
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = {**self.fixture(root), "FAKE_SSH_HOLD": "1"}
+            with subprocess.Popen([sys.executable, "-c", launch, *self.command(root)],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                  env=environment) as caller:
+                running = root / "running"
+                wait_until(lambda: running.exists() and bool(running.read_text()), root, processes=(caller,))
+                ssh_pid = int(running.read_text())
+                try:
+                    caller.send_signal(signal.SIGTERM)
+                    output, errors = caller.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(caller.returncode, -signal.SIGTERM, output + errors)
+                    wait_until(lambda: not isinstance(process_start(ssh_pid), Started), root)
+                finally:
+                    if isinstance(process_start(ssh_pid), Started):
+                        os.kill(ssh_pid, signal.SIGKILL)
+
+    def test_failed_cleanup_leaves_the_record_for_the_next_run(self) -> None:
+        lifecycle = """
+import json, os, sys
+from pathlib import Path
+phase, argv_file, *command = sys.argv[1:]
+if phase == 'prepare':
+    Path(argv_file).write_text(json.dumps(command))
+else:
+    with (Path(os.environ['FAKE_QUEUE_STATE']) / 'cleanup_calls').open('a') as out:
+        print(argv_file, file=out)
+    raise SystemExit(int(os.environ.get('FAKE_CLEANUP_STATUS', '0')))
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = self.fixture(root)
+            callback = root / "lifecycle"
+            _ = callback.write_text(f"#!{sys.executable}\n" + lifecycle)
+            callback.chmod(0o755)
+            command = self.command(root, "run")
+            command[command.index("--"):command.index("--")] = ["--lifecycle-script", str(callback)]
+            result = subprocess.run(command, env={**environment, "FAKE_CLEANUP_STATUS": "19"},
+                                    capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 19, result.stdout + result.stderr)
+            (saved,) = (root / mac_queue_run.RUNS).glob("*/run.json")
+            recovered = subprocess.run(self.command(root, "run"), env=environment,
+                                       capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+            called = str(saved.with_name("argv.json"))
+            self.assertEqual((root / "cleanup_calls").read_text().splitlines(), [called, called])
+            self.assertFalse(saved.exists())
+
     def test_a_signal_ends_the_run_with_its_default_action(self) -> None:
         for waiting, signum in ((False, signal.SIGTERM), (False, signal.SIGHUP), (True, signal.SIGTERM),
                                 (False, signal.SIGINT)):
@@ -190,6 +250,12 @@ class QueueRunTests(unittest.TestCase):
                                       text=True, env=environment, start_new_session=True) as process:
                     try:
                         wait_until((root / ("waiting" if waiting else "running")).exists, root, processes=(process,))
+                        if signum == signal.SIGINT:
+                            # The queue reads the group before it forwards this line.
+                            assert process.stdout is not None
+                            queue_output = cast(TextIO, process.stdout)
+                            self.assertTrue(select.select([queue_output], [], [], TEST_HANG_GUARD_SECS)[0])
+                            self.assertEqual(queue_output.readline().strip(), "Mac command started")
                         if waiting:
                             # A signal to the group also ends the queue call that waits.
                             send_process_group(process.pid, signum)

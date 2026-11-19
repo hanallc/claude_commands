@@ -21,6 +21,8 @@ import math
 from dataclasses import dataclass
 from enum import Enum
 import os
+import select
+import signal
 from pathlib import Path
 import shlex
 import shutil
@@ -30,7 +32,8 @@ import time
 from typing import TextIO, TypedDict, cast
 import uuid
 
-from scripts.lib import conf
+from scripts.lib import conf, process_group
+from scripts.lib.atomic_file import write_text_atomic
 
 
 def admission_command() -> list[str]:
@@ -132,7 +135,7 @@ printf 'mac_stopped=%s\\n' "$group"
     return result.returncode == 0 and result.stdout.strip() == f"mac_stopped={remote.group}"
 
 
-def stop_command(process: subprocess.Popen[str]) -> None:
+def stop_command(process: subprocess.Popen[str] | subprocess.Popen[bytes]) -> None:
     if process.poll() is None:
         process.terminate()
         try:
@@ -210,7 +213,8 @@ def run_directory(episode: str) -> Generator[Path]:
         try:
             yield directory
         finally:
-            shutil.rmtree(directory, ignore_errors=True)
+            if not (directory / "run.json").exists():
+                shutil.rmtree(directory, ignore_errors=True)
     finally:
         os.close(descriptor)
 
@@ -251,6 +255,7 @@ class Arguments(argparse.Namespace):
     worktree: Path = Path()
     cwd: str = ""
     lifecycle_script: str = ""
+    caller_fd: int = -1
     no_wait: bool = False
     argv: list[str] = []
 
@@ -294,10 +299,10 @@ def run(args: Arguments) -> int:
                 clean_ended_runs(callback_environment)
                 on_close = ""
                 if args.lifecycle_script:
-                    prepared = True
                     saved: SavedRun = {"lifecycle_script": args.lifecycle_script, "arguments": original_command,
                                        "host": placement.host}
-                    _ = (directory / "run.json").write_text(json.dumps(saved))
+                    write_text_atomic(directory / "run.json", json.dumps(saved))
+                    prepared = True
                     status = run_callback(args.lifecycle_script, "prepare", argv_file, original_command, callback_environment)
                     if status == 0:
                         command = cast(list[str], json.loads(argv_file.read_text()))
@@ -332,6 +337,8 @@ def run(args: Arguments) -> int:
                 if cleanup_status:
                     print(f"mac queue: lifecycle cleanup failed ({cleanup_status})", file=sys.stderr)
                     status = status or cleanup_status
+                else:
+                    (directory / "run.json").unlink()
             if lease_descriptor >= 0:
                 os.close(lease_descriptor)
             # A Mac placement has no local grant, so the run returns it with a cancel that names the result.
@@ -355,7 +362,36 @@ def run(args: Arguments) -> int:
     return status
 
 
+def watch_caller(caller: int, queue: int, queue_pid: int) -> int:
+    """Stop the isolated queue group when its caller exits."""
+    ready, _, _ = select.select([caller, queue], [], [])
+    if queue not in ready:
+        with contextlib.suppress(ProcessLookupError):
+            process_group.send_process_group(queue_pid, signal.SIGTERM)
+    return 0
+
+
+def start_caller_watch(caller: int) -> subprocess.Popen[bytes]:
+    pid = os.getpid()
+    try:
+        if os.getpgrp() != pid:
+            raise ValueError("the Mac queue must own its process group")
+        queue = os.pidfd_open(pid)
+        try:
+            return subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "watch-caller",
+                                     str(caller), str(queue), str(pid)],
+                                    pass_fds=(caller, queue), start_new_session=True,
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        finally:
+            os.close(queue)
+    finally:
+        os.close(caller)
+
+
 def main(argv: list[str] | None = None) -> int:
+    words = sys.argv[1:] if argv is None else argv
+    if len(words) == 4 and words[0] == "watch-caller":
+        return watch_caller(int(words[1]), int(words[2]), int(words[3]))
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--what", required=True)
     _ = parser.add_argument("--kind", choices=("shot", "install", "probe", "run"), required=True)
@@ -363,12 +399,19 @@ def main(argv: list[str] | None = None) -> int:
     _ = parser.add_argument("--worktree", type=Path, default=Path.cwd())
     _ = parser.add_argument("--cwd", default="")
     _ = parser.add_argument("--lifecycle-script", default="")
+    _ = parser.add_argument("--caller-fd", type=int, help=argparse.SUPPRESS)
     _ = parser.add_argument("--no-wait", action="store_true", help="exit with status 78 when the Mac is busy")
     _ = parser.add_argument("argv", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv, namespace=Arguments())
     if not args.argv or args.argv == ["--"]:
         parser.error("an argv is required")
-    return run(args)
+    if args.caller_fd < 0:
+        return run(args)
+    watcher = start_caller_watch(args.caller_fd)
+    try:
+        return run(args)
+    finally:
+        stop_command(watcher)
 
 
 if __name__ == "__main__":
