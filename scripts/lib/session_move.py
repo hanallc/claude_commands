@@ -55,6 +55,14 @@ class CopyWriteFailed(RuntimeError):
 
 
 @dataclass
+class CopyWriteState:
+    started: bool = False
+
+    def begin(self) -> None:
+        self.started = True
+
+
+@dataclass
 class MoveSummary:
     moved_folders: int = 0
     moved_bytes: int = 0
@@ -153,11 +161,11 @@ class DestinationNames:
             row["sessionId"]: row for row in reversed(session_records.running_records(self.registry))
         }
 
-    def destination(self, session_id: str) -> SessionDestination:
+    def destination(self, session_id: str, root_fd: int) -> SessionDestination:
         if not session_folder.SESSION_ID.fullmatch(session_id):
             raise MoveRefused(f"invalid session id {session_id!r}")
         index_path = self.root / session_folder.INDEX
-        with open_directory(index_path, missing_ok=True) as index:
+        with destination_parent(root_fd, self.root, index_path / session_id, create=False) as index:
             if stat_at(index, session_id) is not None:
                 try:
                     name = os.readlink(session_id, dir_fd=index)
@@ -184,16 +192,18 @@ class DestinationNames:
         folder = session_folder.select_folder(self.root, base, session_id)
         return SessionDestination(folder, rule, session_id, owner)
 
-    def remember(self, name: SessionDestination, root_fd: int, mount: int) -> None:
+    def remember(self, name: SessionDestination, root_fd: int, mount: int, writes: CopyWriteState) -> None:
         session_id = name.session_id
         creates_index_entry = name.rule is not NamingRule.INDEX
-        with child_directory(root_fd, session_folder.INDEX, create=creates_index_entry, mount=mount) as index:
+        with child_directory(root_fd, session_folder.INDEX, create=creates_index_entry,
+                             mount=mount, on_write=writes.begin) as index:
             if name.rule is NamingRule.INDEX or stat_at(index, session_id) is not None:
                 check_index_link(index, session_id, name.folder)
             if name.rule is NamingRule.INDEX:
                 return
             record = session_folder.FolderRecord(owner=name.owner, session_id=session_id)
-            with child_directory(root_fd, name.folder.name, create=True, mount=mount) as folder:
+            with child_directory(root_fd, name.folder.name, create=True, mount=mount, on_write=writes.begin) as folder:
+                writes.begin()
                 write_record_at(folder, session_folder.RECORD, record)
             try:
                 os.symlink(name.folder.name, session_id, dir_fd=index)
@@ -280,13 +290,19 @@ def require_mount(fd: int, mount: int, name: str) -> None:
 
 
 @contextmanager
-def child_directory(parent: int, name: str, *, create: bool = False, mount: int = -1) -> Generator[int]:
+def child_directory(parent: int, name: str, *, create: bool = False, mount: int = -1,
+                    on_write: Callable[[], None] = lambda: None) -> Generator[int]:
     if create:
         try:
             os.mkdir(name, mode=0o700, dir_fd=parent)
         except FileExistsError:
             pass
+        except OSError:
+            # The create operation can fail after it changes the folder.
+            on_write()
+            raise
         else:
+            on_write()
             os.fsync(parent)
     fd = os.open(name, DIRECTORY_OPEN, dir_fd=parent)
     try:
@@ -298,7 +314,7 @@ def child_directory(parent: int, name: str, *, create: bool = False, mount: int 
 
 
 @contextmanager
-def open_directory(path: Path, *, missing_ok: bool = False) -> Generator[int]:
+def open_directory(path: Path) -> Generator[int]:
     """Open every component without following a symlink."""
     if not path.is_absolute() or ".." in path.parts:
         raise MoveRefused(f"{path}: expected an absolute path within a configured root")
@@ -306,13 +322,8 @@ def open_directory(path: Path, *, missing_ok: bool = False) -> Generator[int]:
         root = os.open(path.anchor, DIRECTORY_OPEN)
         _ = stack.callback(os.close, root)
         fd = root
-        try:
-            for name in path.parts[1:]:
-                fd = stack.enter_context(child_directory(fd, name))
-        except FileNotFoundError:
-            if not missing_ok:
-                raise
-            fd = -1
+        for name in path.parts[1:]:
+            fd = stack.enter_context(child_directory(fd, name))
         yield fd
 
 
@@ -481,13 +492,12 @@ def tree_entries(fd: int, mount: int, relative: Path = TREE_ROOT) -> Iterator[tu
             yield path, fd, info, kind
 
 
-def tree_size(root: Path, mounts: Sequence[measure.Mount]) -> int:
+def tree_size(root: Path, mounts: Sequence[measure.Mount], fd: int) -> int:
     for mount in mounts:
         if mount.point == root or mount.point.is_relative_to(root):
             raise MoveRefused(f"{mount.point}: entry is on another mount")
-    with open_directory(root) as fd:
-        return sum(info.st_size for _, _, info, kind in tree_entries(fd, mount_identity(fd))
-                   if kind is not HashedEntry.DIRECTORY)
+    return sum(info.st_size for _, _, info, kind in tree_entries(fd, mount_identity(fd))
+               if kind is not HashedEntry.DIRECTORY)
 
 
 EntryIdentities = dict[Path, os.stat_result]
@@ -1070,19 +1080,40 @@ def kept(source: Path, reason: object) -> None:
     print(f"session_move: kept {source}: {reason}", file=sys.stderr, flush=True)
 
 
-def start_copy(move: PlannedCopy, name: SessionDestination, names: DestinationNames,
-               roots: MoveRoots, root_fd: int, session_pids: frozenset[int]) -> int:
-    mount = mount_identity(root_fd)
+@dataclass(frozen=True)
+class ValidatedCopy:
+    move: PlannedCopy
+    destination: SessionDestination
+    source_identity: FolderIdentity
+    size_bytes: int
+
+
+def validate_copy(leaf: ScratchpadLeaf, roots: MoveRoots, root_fd: int, names: DestinationNames,
+                  destinations: set[Path], mounts: Sequence[measure.Mount], uses: SourceProcessUses) -> ValidatedCopy:
+    if leaf.source.is_relative_to(roots.sessions):
+        raise MoveRefused("source is inside the destination root")
+    check_source_idle(leaf.source, names.registry, lambda: uses)
+    name = names.destination(leaf.source.name, root_fd)
+    move = PlannedCopy(leaf.source, name.folder / leaf.relative, name.rule, name.session_id)
     with source_parent(roots, move) as source:
         with child_directory(source, move.source.name, mount=mount_identity(source)) as original:
             identity = FolderIdentity.of(os.fstat(original))
-    job = MoveJournal(move, identity, CopyInProgress())
-    writes_started = name.rule is not NamingRule.INDEX
+            size = tree_size(move.source, mounts, original)
+    check_destination(root_fd, roots.sessions, move.target, destinations)
+    return ValidatedCopy(move, name, identity, size)
+
+
+def start_copy(validated: ValidatedCopy, names: DestinationNames,
+               roots: MoveRoots, root_fd: int, session_pids: frozenset[int]) -> int:
+    mount = mount_identity(root_fd)
+    move = validated.move
+    job = MoveJournal(move, validated.source_identity, CopyInProgress())
+    writes = CopyWriteState()
     try:
-        names.remember(name, root_fd, mount)
+        names.remember(validated.destination, root_fd, mount, writes)
         check_copy_idle(move.source, session_pids)
-        writes_started = True
-        with child_directory(root_fd, JOURNAL, create=True, mount=mount) as journal:
+        with child_directory(root_fd, JOURNAL, create=True, mount=mount, on_write=writes.begin) as journal:
+            writes.begin()
             job.save(journal)
             try:
                 return resume_copy(job, journal, roots, root_fd, session_pids)
@@ -1091,7 +1122,7 @@ def start_copy(move: PlannedCopy, name: SessionDestination, names: DestinationNa
     except LiveSource:
         raise
     except (MoveRefused, OSError) as error:
-        if writes_started:
+        if writes.started:
             raise CopyWriteFailed(str(error)) from error
         raise
 
@@ -1149,17 +1180,12 @@ def move_candidates(roots: MoveRoots, root_fd: int, names: DestinationNames, hol
     destinations: set[Path] = set()
     for leaf in leaves:
         try:
-            if leaf.source.is_relative_to(roots.sessions):
-                raise MoveRefused("source is inside the destination root")
-            check_source_idle(leaf.source, names.registry, lambda: uses)
-            name = names.destination(leaf.source.name)
-            move = PlannedCopy(leaf.source, name.folder / leaf.relative, name.rule, name.session_id)
-            size = tree_size(move.source, mounts)
-            check_destination(root_fd, roots.sessions, move.target, destinations)
-            show_copy(move, size)
+            validated = validate_copy(leaf, roots, root_fd, names, destinations, mounts, uses)
+            size = validated.size_bytes
+            show_copy(validated.move, size)
             if not dry_run:
-                size = start_copy(move, name, names, roots, root_fd, session_pids)
-            destinations.add(move.target)
+                size = start_copy(validated, names, roots, root_fd, session_pids)
+            destinations.add(validated.move.target)
             summary.record_move(size)
         except (MoveRefused, OSError, CopyWriteFailed) as error:
             if isinstance(error, LiveSource):

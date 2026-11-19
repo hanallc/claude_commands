@@ -1,8 +1,8 @@
 """Check the cutover with private roots and one live process."""
 from __future__ import annotations
 
-from collections.abc import Sequence
-from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import ctypes
 import io
 import json
@@ -76,6 +76,19 @@ class SessionMoveTests(unittest.TestCase):
             status = session_move.main(list(args))
         return status, output.getvalue(), errors.getvalue()
 
+    @contextmanager
+    def other_mount(self, path: Path) -> Generator[None]:
+        mounted = path.stat()
+        mount_identity = session_move.mount_identity
+
+        def identity(fd: int) -> int:
+            if os.path.samestat(os.fstat(fd), mounted):
+                return -2
+            return mount_identity(fd)
+
+        with mock.patch.object(session_move, "mount_identity", side_effect=identity):
+            yield
+
     def test_dry_run_prints_the_copy_and_changes_nothing(self) -> None:
         source = self.leaf("recorded")
         target = self.index("recorded", "demo")
@@ -145,10 +158,10 @@ class SessionMoveTests(unittest.TestCase):
             _ = self.index(source.name, "demo")
         tree_size = session_move.tree_size
 
-        def size(source: Path, mounts: Sequence[measure.Mount]) -> int:
+        def size(source: Path, mounts: Sequence[measure.Mount], fd: int) -> int:
             if source == refused:
                 raise PermissionError("cannot read scratchpad")
-            return tree_size(source, mounts)
+            return tree_size(source, mounts, fd)
 
         with mock.patch.object(session_move, "tree_size", side_effect=size):
             dry_status, dry_output, dry_errors = self.invoke("--dry-run")
@@ -164,6 +177,53 @@ class SessionMoveTests(unittest.TestCase):
         self.assertIn(str(first), real_output.splitlines()[0])
         self.assertIn(str(last), real_output.splitlines()[1])
         self.assertTrue(refused.is_dir())
+
+    def test_index_mount_refuses_each_candidate_before_printing(self) -> None:
+        first = self.leaf("a-unindexed")
+        second = self.leaf("b-indexed")
+        folder = self.index(second.name, "demo")
+        index = self.root / session_folder.INDEX
+
+        with (self.other_mount(index),
+              mock.patch.object(session_move, "transcript_cwd", return_value=str(self.base / "unindexed"))):
+            dry_status, dry_output, dry_errors = self.invoke("--dry-run")
+            real_status, real_output, real_errors = self.invoke()
+
+        self.assertEqual(real_status, 1, real_errors)
+        self.assertEqual(real_errors.count(".id: entry is on another mount"), 2)
+        self.assertEqual(real_output, "session_move: moved 0 folders (0.00 GiB), kept 0 live, refused 2 other\n")
+        self.assertEqual(dry_status, real_status)
+        self.assertEqual(dry_errors, real_errors)
+        self.assertEqual(dry_output.replace("would move", "moved"), real_output)
+        self.assertEqual(list(index.iterdir()), [index / second.name])
+        self.assertEqual(list(folder.iterdir()), [])
+        self.assertFalse((self.root / "unindexed").exists())
+        self.assertFalse((self.root / session_move.JOURNAL).exists())
+        self.assertTrue(first.is_dir())
+        self.assertTrue(second.is_dir())
+
+    def test_source_parent_mount_refuses_the_same_candidate_in_both_modes(self) -> None:
+        refused = self.leaf("a-mounted")
+        movable = self.leaf("b-movable", shared=True)
+        folder = self.index(refused.name, "demo")
+        _ = self.index(movable.name, folder.name)
+        target = folder / self.claude / self.project
+
+        with self.other_mount(refused.parent):
+            dry_status, dry_output, dry_errors = self.invoke("--dry-run")
+            real_status, real_output, real_errors = self.invoke()
+
+        self.assertEqual(real_status, 1, real_errors)
+        self.assertIn(f"kept {refused}: {self.project}: entry is on another mount", real_errors)
+        self.assertNotIn(str(refused), real_output)
+        self.assertEqual(real_output.splitlines()[-1],
+                         "session_move: moved 1 folders (0.00 GiB), kept 0 live, refused 1 other")
+        self.assertEqual(dry_status, real_status)
+        self.assertEqual(dry_errors, real_errors)
+        self.assertEqual(dry_output.replace("would move", "moved"), real_output)
+        self.assertEqual((refused / "draft.md").read_bytes(), b"scratch content\n")
+        self.assertFalse(movable.exists())
+        self.assertEqual((target / movable.name / "draft.md").read_bytes(), b"scratch content\n")
 
     def test_open_holds_report_the_owner_and_keep_the_tree_until_release(self) -> None:
         source = self.leaf("held")
