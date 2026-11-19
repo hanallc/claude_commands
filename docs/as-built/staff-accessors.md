@@ -312,6 +312,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/review_links/for_you.py` | read | snapshot names each For you action owner and finds the open run of a waiting worker's unit |
 | `scripts/review_links/images.py` | read | snapshot().by_id checks each image owner at register and names the owner on the Images page |
 | `scripts/review_links/new_item_dialog.py` | read | StaffId (type) identifies the selected recipient and the recipient in the scoped reply key. |
+| `scripts/review_links/page_frame.py` | read | StaffRow and StaffSnapshot (types) carry the page owner and the staff rows that name it in the owner control. |
 | `scripts/review_links/page_question.py` | read | StaffId (type) identifies the question recipient. |
 | `scripts/review_links/review_items.py` | read | snapshot, by_id and parent_of resolve the Review owner and source unit |
 | `scripts/review_links/review_actions.py` | read | snapshot names the owner showrunner in a proposal or efficiency Approve outcome |
@@ -326,6 +327,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/agents/member_account.py` | write | StaffRow, SessionHome, set_home; repairs the home from live process evidence |
 | `scripts/agents/pane_record.py` | read | initial_snapshot |
 | `scripts/agents/pane_restore.py` | read | row_operation |
+| `scripts/agents/producer_creation.py` | read | authority_snapshot, is_owner, slot_operation, validate_name, producer_creation_registry; the staff owner reads and updates the creation marker |
 | `scripts/agents/producer_transfer.py` | write | initial_snapshot, runtime_id, native_id, slot_operation, row_operation, transfer_producer |
 | `scripts/agents/remote_control.py` | read | initial_snapshot |
 | `scripts/agents/restart.py` | write | initial_snapshot, row_operation, set_home |

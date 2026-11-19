@@ -858,6 +858,7 @@ def render(root: Path, *, include_counts: bool = True,
     settings = conf.read("review_links")
     seconds = settings.number("page_refresh_seconds")
     request_timeout = settings.whole("page_request_timeout_seconds")
+    card_motion = page_frame.CardMotion.read(settings)
     morning = record_table.clock_minutes(settings, "later_morning")
     log_max_height = settings.whole("list_log_max_height_rem")
     counts = counts_strip(members, names) if include_counts else ''
@@ -868,6 +869,7 @@ def render(root: Path, *, include_counts: bool = True,
     content = (STYLE + page_frame.title("The List", "list")
                + f'<div data-list data-refresh-seconds="{seconds}" data-zone="{html.escape(zone.key, quote=True)}"'
                + f' data-request-timeout-seconds="{request_timeout}"'
+               + f' {card_motion.attributes()}'
                + f' data-closed-keys="{html.escape(json.dumps(closed_keys), quote=True)}"'
                + f' data-park-morning="{morning}" style="--list-log-max-height:{log_max_height}rem">'
                + '<div data-record-filters>'
@@ -976,7 +978,8 @@ content:attr(data-label) ': ';color:var(--ink-3)}
 }
 </style>'''
 
-SCRIPT = (page_frame.REFRESH_SCRIPT + record_table.SCRIPT + record_table.DATE_TIME_SCRIPT + '''(() => {
+SCRIPT = (page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + page_frame.MOTION_SCRIPT + record_table.SCRIPT
+          + record_table.DATE_TIME_SCRIPT + '''(() => {
 const chipsByQuestion=''' + json.dumps({
     str(open_question).lower(): {
         str(parked).lower(): {
@@ -1311,7 +1314,7 @@ function bindFeedbackForm(form){
   if(!waitingForm) bindDateTimePicker(form,{zone,defaultMinutes:()=>Number(content.dataset.parkMorning),summaryPrefix:'Parks until ',
    retryTime:()=>Date.parse(matching('park')?.parkingTime ?? '')});
   form.addEventListener('submit',async event=>{
-   event.preventDefault();if(form.dataset.sending) return;
+   event.preventDefault();if(cardSubmitBlocked(form,tableView.rowFading(key))) return;
    const submitter=event.submitter,action=submitter?.value || 'tell';
    const parkForDelivery=action==='park-until-delivered',parks=action==='park' || parkForDelivery;
    const focusUnpark=action==='unpark' && document.activeElement===unpark;
@@ -1334,13 +1337,14 @@ function bindFeedbackForm(form){
    if(parks) data.set('until',parkingTime);
    if(!retry){unconfirmed.add(attempt);fresh=newRequest();}
    retainDraft();
-   form.dataset.sending='true';startListSave();
+   startListSave();
    const hadFocus=asksQuestion && item.contains(document.activeElement);
    let focusChoice;
    const trackFocus=event=>{if(event.target!==document.body) focusChoice=event.target;};
    if(hadFocus) document.addEventListener('focusin',trackFocus);
-   let buttons=[...item.querySelectorAll('button')],saved=false,refused=false,nextForm;
-   buttons.forEach(button=>button.disabled=true);notice.textContent=action==='read' ? 'Saving…' : 'Sending…';
+   let saved=false,refused=false,nextForm;
+   setCardSubmitting(form,true,item);
+   notice.textContent=action==='read' ? 'Saving…' : 'Sending…';
    const clearsUnread=action==='read' || usesWords,unreadBefore=item.dataset.unread,wasVisible=!item.hidden;
    if(action==='remove'){
     item.dataset.state='Closed';
@@ -1415,8 +1419,7 @@ function bindFeedbackForm(form){
    }
    finally{
     if(saved || refused) unconfirmed.delete(attempt);
-    buttons=[...item.querySelectorAll('button')];
-    delete form.dataset.sending;buttons.forEach(button=>button.disabled=false);syncTell();
+    setCardSubmitting(form,false,item);syncTell();
     retainDraft();
     if(nextForm) bindFeedbackForm(nextForm);
     if(focusUnpark && document.hasFocus() &&
@@ -1503,6 +1506,7 @@ async function refresh(_supersede=false,current=()=>true){
 }
 const reviewDialog=document.querySelector('[data-list-review-dialog]');
 const reviewClose=reviewDialog.querySelector('button');
+const reviewMotion=createCardMotion(()=>content);
 const listHost=window.frameElement?.matches('iframe[data-console-page="list"]') ? window.frameElement : null;
 let activeReview,savedReview,refreshingReview=false;
 function fitReviewDialog(){
@@ -1537,6 +1541,7 @@ function closeReviewCard(){
  const card=activeReview;
  if(!card || card.frame.hasAttribute('data-saving')) return;
  activeReview=null;
+ reviewMotion.finish();
  reviewDialog.close();
  card.restoreHost?.();
  card.remove();
@@ -1555,7 +1560,8 @@ async function refreshSavedReview(){
   return;
  }
  savedReview=null;
- if(activeReview===card) closeReviewCard();
+ if(activeReview===card)
+  void reviewMotion.switchCard(card.frame,null,()=>{if(activeReview===card) closeReviewCard();});
 }
 if(listHost) new MutationObserver(()=>{
  if(!listHost.hidden) return;

@@ -279,7 +279,7 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
               + icon_svg("inbox") + '<span class="for-you-label">For you</span><b data-for-you-count>?</b>'
               + '<span class="for-you-state" data-for-you-state>Unavailable</span></button>')
     content = content.replace("<!-- FOR YOU BUTTON -->", button)
-    content = content.replace("<!-- FOR YOU STYLE -->", page_frame.COPY_STYLE + FOR_YOU_STYLE)
+    content = content.replace("<!-- SHARED STYLES -->", page_frame.BUTTON_STATES + page_frame.COPY_STYLE + FOR_YOU_STYLE)
     notifier = FOR_YOU_SCRIPT
     if any(page.identity == "accounts" and isinstance(page.destination, AvailablePage) for page in pages):
         icons = {level: accounts_page.quota_icon(level)
@@ -302,7 +302,6 @@ FOR_YOU_STYLE = r'''
 .collapsed .for-you-slot{width:72px}
 .for-you-button{position:relative;display:flex;align-items:center;gap:12px;min-height:48px;width:100%;padding:12px 14px;
 border:1px solid var(--notice-hover);border-radius:9px;background:var(--notice);color:var(--notice-text);font-weight:600;text-align:left;cursor:pointer}
-.for-you-button:hover{background:var(--notice-hover)}
 .for-you-button b{margin-left:auto;background:var(--notice-text);color:var(--notice);border-radius:999px;min-width:24px;line-height:24px;text-align:center;font-size:13px}
 .for-you-button[data-state=quiet]{background:var(--hover);border-color:var(--border);color:var(--muted)}
 .for-you-button[data-state=quiet] b{background:var(--border);color:var(--muted)}
@@ -482,7 +481,7 @@ DOCUMENT = """<!doctype html>
 h1{font-size:16px;letter-spacing:-.3px;margin:0;font-weight:650;white-space:nowrap;flex:1}
 button,a{-webkit-tap-highlight-color:transparent}button{font:inherit}
 .toggle{border:0;border-radius:8px;background:transparent;color:var(--muted);width:36px;height:36px;
-display:grid;place-items:center;cursor:pointer;flex:none;padding:8px}.toggle:hover{background:var(--hover);color:var(--text)}
+display:grid;place-items:center;cursor:pointer;flex:none;padding:8px}
 svg{width:20px;height:20px;flex:none}.open-icon{display:none}
 nav{padding:22px 12px;display:flex;flex-direction:column;gap:6px}
 .nav-entry{position:relative;display:flex;gap:12px;align-items:center;min-height:46px;padding:11px 14px;border-radius:9px;
@@ -534,7 +533,7 @@ background:var(--nav);border-bottom:1px solid var(--border);z-index:4}
 .rebuild-slot:has(>[hidden]){display:none}
 .rebuild-link,.collapsed .rebuild-link{width:auto;max-width:none;margin:12px}
 .collapsed .rebuild-link .entry-label{display:inline}.collapsed .rebuild-count,.collapsed .rebuild-link .tooltip{display:none!important}}
-<!-- FOR YOU STYLE -->
+<!-- SHARED STYLES -->
 </style></head><body>
 <div class="shell" id="console-shell" <!-- SHELL -->>
 <header class="mobile-header"><button class="toggle" id="mobile-nav-toggle" type="button"

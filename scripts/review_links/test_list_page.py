@@ -33,7 +33,7 @@ from scripts.message import send_result
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
 from scripts.production import change_review, change_routing, delivery_state, investigation, record_store, session_staff, showrunners, staff, the_list
 from scripts.production.update_registration import QuestionStaff
-from scripts.review_links import console, list_page, serve, staff_names
+from scripts.review_links import console, list_page, page_frame, serve, staff_names
 from scripts.review_links import change_browser, change_page, page_question, question_record
 from scripts.review_links import review_items, review_page
 from scripts.review_links.test_change_page import BrowserForms
@@ -191,7 +191,8 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         item = self.add("Check the linked reviews", number=111)
         _ = the_list.link(MORTY.id, item.id, ("sdlc/C1", "sdlc/C2"), source="morty")
         _ = self.add("An unrelated List row", number=112)
-        _ = write_config_fixture(self.root / "config/review_links.conf", "page_request_timeout_seconds=7\n")
+        _ = write_config_fixture(self.root / "config/review_links.conf",
+                                 "page_request_timeout_seconds=7\ncard_fade_out_ms=180\ncard_fade_in_ms=260\n")
         pages = (console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage(list_page.PAGE_PATH)),
                  console.ConsolePage("review", "Review", "inbox", "Review", console.AvailablePage(review_page.PAGE_PATH)))
         shell = console.render(pages, console.UnavailablePage()).decode()
@@ -382,7 +383,16 @@ async function inspect(){
  const button=outcome=>formInCard().querySelector('[value="'+outcome+'"]');
  const submit=outcome=>formInCard().requestSubmit(button(outcome));
  let reviewPosts=0;
+ const fades=[];
  if(!phone){
+  for(const realm of [win,cardWin]){
+   const animate=realm.Element.prototype.animate;
+   realm.Element.prototype.animate=function(keyframes,options){
+    if(this.matches('[data-review-card] tbody, [data-list-review-dialog] iframe'))
+     fades.push([this.tagName,options.duration]);
+    return animate.call(this,keyframes,options);
+   };
+  }
   const fetchCard=cardWin.fetch.bind(cardWin);
   let releaseFailure;
   const failure=new Promise(resolve=>{releaseFailure=resolve;});
@@ -443,6 +453,8 @@ async function inspect(){
   releaseRefresh();
  }
  await refreshed;
+ if(!phone) check(JSON.stringify(fades)===JSON.stringify([['TBODY',180],['TBODY',260],['IFRAME',180]]),
+  'The overlay uses the configured card fade durations.');
  check(row().querySelector('[data-label="State"]').textContent.includes('Reviews done'),'The saved verdict updates the List row.');
  check(doc.activeElement===link('sdlc/C1'),'The refreshed link receives focus.');
  check(location.pathname==='/proof' && listFrame.contentDocument===doc && history.length===historyLength,
@@ -1146,6 +1158,7 @@ document.body.append(result);
             "blocked_by": (the_list.ItemDependency(105, "The status page reaches main"),)}, source="morty")
         markup = list_page.render(self.root / "reviews").decode()
         body = without_role_colors(markup)
+        self.assertEqual(body.count(page_frame.BUTTON_STATES), 1)
         self.assertEqual(body.count('<tbody data-list-item'), 5)
         for label in list_page.HEADERS:
             self.assertIn(label + '<span data-sort-mark', body)
@@ -1488,7 +1501,7 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
                       + '<button name="action" value="tell" disabled>Tell morty</button></div>', words)
         self.assertIn("!words.value.trim()", list_page.SCRIPT)
         self.assertIn("words.addEventListener('input',retain)", list_page.SCRIPT)
-        self.assertIn("buttons.forEach(button=>button.disabled=false);syncTell()", list_page.SCRIPT)
+        self.assertIn("setCardSubmitting(form,false,item);syncTell()", list_page.SCRIPT)
         self.assertIn('rows="4"', words)
 
     def test_record_fields_share_the_markdown_formatter(self) -> None:
@@ -2016,6 +2029,9 @@ window.fetch=async(_path,options={})=>{
   check(row('105').dataset.unread==='true' && row('105').querySelector('.list-dot') &&
    refused.querySelector('[value="read"]'),'a refused Remove restores the unread controls');
   check(refused.querySelector('[data-send-status]').textContent==='Not saved: The fixture refuses this close.','a refused Remove shows its reason');
+  const restore=document.querySelector('[data-record-motion]')?.getAnimations({subtree:true}) ?? [];
+  for(const animation of restore) animation.finish();
+  await Promise.allSettled(restore.map(animation=>animation.finished));
   check(!refused.querySelector('[value="remove"]').disabled,'a refused Remove enables another attempt');
   refused.elements.until.value='2026-12-03';const parked=submit('105','park');
   check(row('105').hidden,'Park hides the row before the response');
@@ -2152,6 +2168,7 @@ window.fetch=async(_path,options={})=>{
  const first=requests[0];
  check(first?.get('until')==='2026-12-04T00:30:00.000Z','The first save sends the chosen instant');
  losePost();await flush();
+ await finishRowMotion();
  now=Date.parse('2026-12-05T13:00:00Z');
  toggle.click();
  check(time.value==='19:30' && !save.disabled,'The picker retains and enables the expired retry');
@@ -2485,10 +2502,12 @@ window.fetch=async(_path,options={})=>{
  check(!document.querySelector('[data-number="2"]'),'A Closed record with a parking time has no row.');
  show('parked');
  const unpark=form.querySelector('[value=unpark]');
+ await finishRowMotion();
  submit('remove');
  check(unpark.hidden,'Remove hides Unpark immediately.');
  finishPost({reason:'Fixture refuses Remove'});await flush();
  check(!unpark.hidden,'A refusal restores Unpark.');
+ await finishRowMotion();
  submit('remove');
  finishPost({item_state:'Closed',parked:'true',unread:'false'});await flush();
  check(unpark.hidden && row.dataset.parked==='true','A confirmed Remove leaves Unpark hidden.');
@@ -2541,8 +2560,10 @@ observer.observe(original.parentNode,{childList:true});
  const park=submit('park');
  check(park.id!==tell.id,'Park uses its own request ID');
  finishPost({reason:'Fixture refuses Park'});await flush();
+ await finishRowMotion();
  check(submit('park').id!==park.id,'a refused Park leaves no unconfirmed request');
  finishPost({reason:'Fixture refuses Park again'});await flush();
+ await finishRowMotion();
  form.elements.until.value='';
  const retry=submit('tell');
  check(retry.id===tell.id && retry.token===tell.token,'Tell retains its signed ID across refusals');
@@ -2557,12 +2578,15 @@ observer.observe(original.parentNode,{childList:true});
         self.browser_action_sequence('''
  form.elements.until.value='2026-12-03';
  const first=submit('park');losePost();await flush();
+ await finishRowMotion();
  form.elements.until.value='2026-12-04';
  const second=submit('park');losePost();await flush();
+ await finishRowMotion();
  check(first.id!==second.id,'each Park date gets its own request ID');
  const remove=submit('remove');
  check(remove.id!==second.id,'Remove uses its own request ID');
  finishPost({item_state:'Closed',parked:'true',unread:'false'});await flush();
+ await finishRowMotion();
  for(const [date,original] of [['2026-12-03',first],['2026-12-04',second]]){
   form.elements.until.value=date;
   const retry=submit('park');
@@ -3361,6 +3385,7 @@ observer.observe(original.parentNode,{childList:true});
  check(row.hidden,'Remove immediately hides the row in Working');
  losePost();await flush();
  check(!row.hidden && row.dataset.state==='Working','the lost response restores the Working row');
+ await finishRowMotion();
  check(submit('remove').id===remove.id,'the exact Remove retry uses the same ID');
  show('blocked');
  finishPost({reason:'Fixture refuses Remove'});await flush();
@@ -3489,7 +3514,7 @@ observer.observe(original.parentNode,{childList:true});
  submit('remove');
  const exit=animation();
  if(!exit) throw new Error('Remove must animate the exit.');
- exit.pause();exit.currentTime=100;
+ exit.pause();exit.currentTime=exit.effect.getTiming().duration/2;
  check(row.hidden && updateKey()===0 && first()==='2','Remove clears the Update key during the exit');
  finishPost({reason:'Fixture refuses Remove'});await flush();
  const restore=animation();
@@ -3578,7 +3603,7 @@ observer.observe(original.parentNode,{childList:true});
  const top=element=>element.getBoundingClientRect().top;
  const start=top(next),first=top(row);
  const motion=()=>document.querySelector('[data-record-motion]');
- const sample=(animation,time)=>{animation.pause();animation.currentTime=time;};
+ const halfway=animation=>{animation.pause();animation.currentTime=animation.effect.getTiming().duration/2;};
  submit('remove');
  check(row.hidden && requests.length===1,'Remove starts the POST and hides the record in the same turn');
  const leaving=motion();
@@ -3586,7 +3611,7 @@ observer.observe(original.parentNode,{childList:true});
  const exit=leaving?.getAnimations({subtree:true})[0];
  check(exit,'Remove starts the shared animation');
  if(!exit) throw new Error('No exit animation');
- sample(exit,100);
+ halfway(exit);
  const opacity=Number(getComputedStyle(exit.effect.target).opacity);
  check(opacity>0 && opacity<1,'the row fades before it disappears');
  check(top(next)<start && top(next)>first,'the next row moves up during the fade');
@@ -3596,13 +3621,14 @@ observer.observe(original.parentNode,{childList:true});
  const restored=motion()?.getAnimations({subtree:true})[0];
  check(!row.hidden && restored,'the refusal restores the row with an animation');
  if(!restored) throw new Error('No restore animation');
- sample(restored,100);
+ halfway(restored);
  check(top(next)<start && top(next)>first,'the next row moves down during restore');
+ form.requestSubmit(form.querySelector('[value="remove"]'));
+ check(!row.hidden && requests.length===1,'A second Remove during the fade sends no POST.');
+ restored.finish();await flush();
  submit('remove');
- const secondExit=motion()?.getAnimations({subtree:true})[0];
- check(row.hidden && secondExit && secondExit!==restored,'a second Remove reverses the restore');
- secondExit?.finish();await flush();
- check(!motion() && Math.abs(top(next)-first)<2,'the second Remove leaves the final layout intact');
+ await finishRowMotion();
+ check(!motion() && Math.abs(top(next)-first)<2,'Remove works after the fade ends.');
  finishPost({item_state:'Closed',unread:'false'});await flush();
  show('all');
  check(row.hidden && !motion(),'a filter change keeps the Closed item hidden');
@@ -3641,10 +3667,12 @@ observer.observe(original.parentNode,{childList:true});
  check(!row.hidden && restored && restored!==firstExit,'a lost Mark read response slides the row back');
  check(form.querySelector('[data-send-status]').textContent==='Save not confirmed: Fixture lost response',
   'the restored item shows the failure reason');
+ await finishRowMotion();
  check(!form.querySelector('[value="read"]').disabled,'the restored item can retry Mark read');
  check(submit('read').id===read.id,'the exact Mark read retry uses the same ID');
  finishPost({unread:'true'});await flush();
  check(!row.hidden && row.dataset.unread==='true','a newer unread update returns the row to Unread');
+ await finishRowMotion();
  form.elements.words.value='Send the update.';
  form.elements.words.dispatchEvent(new Event('input'));
  submit('tell');
@@ -4250,6 +4278,17 @@ window.fetch=async(_url,options)=>{
         setup = """<script>
 const fragment='#FRAGMENT',reads=[];
 if(LINK_ON_LOAD) history.replaceState(null,'',fragment);
+const seenEntries=[],NativeIntersectionObserver=window.IntersectionObserver;
+window.IntersectionObserver=class extends NativeIntersectionObserver{
+ constructor(callback,options){
+  super((entries,observer)=>{
+   if(options?.threshold) for(const entry of entries) seenEntries.push([
+    entry.target.parentElement.dataset.question,entry.isIntersecting,entry.intersectionRatio,document.visibilityState
+   ]);
+   callback(entries,observer);
+  },options);
+ }
+};
 let receivedRead;
 const postedRead=new Promise(resolve=>{receivedRead=resolve;});
 window.fetch=async(_url,options)=>{
@@ -4279,22 +4318,26 @@ window.fetch=async(_url,options)=>{
    observer.observe(target);
   });
   const paint=()=>new Promise(resolve=>parent.requestAnimationFrame(()=>parent.requestAnimationFrame(resolve)));
+  const showAnswer=async answer=>{
+   scrollTo({top:scrollY+answer.getBoundingClientRect().top-16,behavior:'instant'});
+   await paint();
+  };
   check(!row.hidden && !detail.hidden,'The item link opens the row');
-  first.scrollIntoView({block:'start',behavior:'instant'});
+  document.body.style.paddingBottom='100vh';
   await paint();
+  await showAnswer(first);
   check((await sample(first)).intersectionRect.height>0,'The first answer enters the viewport');
   check(!(await sample(second)).isIntersecting && second.getBoundingClientRect().top>innerHeight,
    'The second answer starts below the viewport');
   check(!reads.length && panel.querySelectorAll('.question-unread').length===2,
    'The first answer alone leaves both answers unread');
-  document.body.style.paddingBottom='100vh';
-  second.scrollIntoView({block:'start',behavior:'instant'});
+  await showAnswer(second);
   check((await sample(second)).intersectionRect.height>0 && first.getBoundingClientRect().bottom<0,
    'The second answer enters the viewport after the first leaves it');
   await Promise.race([postedRead,new Promise(resolve=>setTimeout(resolve,2000))]);
   check(reads.length===1 && reads[0].get('action')==='read' &&
    reads[0].get('request')===panel.dataset.openReadRequest && reads[0].get('token')===panel.dataset.openReadToken,
-   'The last answer to enter the viewport sends one signed read');
+   'The last answer to enter the viewport sends one signed read. '+JSON.stringify({count:reads.length,seenEntries}));
  }catch(error){failures.push(String(error));}
  await parent.fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
@@ -5370,6 +5413,8 @@ try{
   check(posts.at(-1).get('action')===action && posts.at(-1).get('id')==='L106','signed feedback '+action);
   check(posts.at(-1).get('token').length===64,'the form carries its token');
   check(form.elements.request.value!==requestIds.at(-1),'success renews the request without refresh');
+  const motions=[...document.querySelectorAll('[data-record-motion]')].flatMap(node=>node.getAnimations({subtree:true}));
+  await Promise.allSettled(motions.map(animation=>animation.finished));
   if(action==='tell'){
    check(form.elements.words.value==='New draft during send','a newer draft survives the send');
    check(!form.querySelector('[value="tell"]').disabled,'the newer draft enables Tell morty after delivery');
@@ -5392,7 +5437,9 @@ try{
    'an address restores the producer filter');
  location.hash=new URLSearchParams({show:'all',producer:'missing'});await flush();
  check(selectedFilter('producer')==='all' && visible().length===4,'An unknown producer clears the Producer filter.');
- location.hash=new URLSearchParams({show:'unread',state:'Working',owner:OWNER,q:'106'});await flush();
+ const restoredOldAddress=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+ location.hash=new URLSearchParams({show:'unread',state:'Working',owner:OWNER,q:'106'});
+ await restoredOldAddress;
  check(selectedShow()==='working' && selectedFilter('owner')==='staff:'+OWNER && unread().checked &&
   visible().map(row=>row.dataset.number).join(',')==='106','An old address restores the Show and Owner chips, switch and search.');
 

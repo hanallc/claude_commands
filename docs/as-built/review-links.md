@@ -379,12 +379,15 @@ The table columns are Id, Type, Owner, Item, State and Age.
 One row can open its card in place.
 `record_table.py` supplies the table styles, filters, sorting and open-row controls for Review and The List.
 When a Review action removes a card, the shared table keeps a copy of the row and its open details in place.
-The copy fades and collapses in 200 ms, and the rows below slide up during that time.
+The copy fades and collapses while the rows below slide up.
+`card_fade_out_ms` in `config/review_links.conf` sets the duration. Its initial value is 450 ms.
 The Review page can restore a pending card after the user scrolls one viewport.
 The redraw that restores this card waits for all row animations to end.
-When Later hides the last card for an owner, the Owner filter resets after the fade ends.
+When Later hides the last card for an owner, the Owner filter stays selected with a zero count.
 A save can change the card's sort values. The copy keeps its previous values until the fade ends.
 If the request fails, the row slides back into view and the current card stays selected.
+`card_fade_in_ms` sets the duration of the return. Its initial value is 600 ms.
+Review and The List read both settings when they render.
 If the fade is still in progress, the return starts at the copy's current height and opacity.
 The animation updates when the user opens or closes a card during the transition.
 A successful save adds no notice above the table.
@@ -396,18 +399,18 @@ The reduced motion preference disables row animations.
 The shared `record-id` class keeps each ID and its expand arrow on one line.
 Each row becomes a card at phone width.
 The Type, Show and Owner rows use native buttons with a count and a pressed state.
-The Owner row shows owners with the selected type and words in any Show state.
+The Owner row shows the selected owner and owners with the selected type and words in any Show state.
 It hides the other Owner chips.
 Each Owner count uses the selected type, Show and words across all sources.
-An owner without that type and words returns to All.
+An explicit filter change can return the Owner filter to All when no items match the type and words.
 An owner with matching rows in another Show stays selected with a zero count.
 All stays first and counts every matching row.
 An unknown owner returns to All and clears both owner and source-owner constraints.
 Owner names resolve against all known owners before the type and Show filters apply.
 The address uses the resulting selection.
 Type and Show changes restore owners when their rows match again.
-The Show row offers Open, Validating, Done and All below the Type row.
-Old Waiting links open All.
+The Show row offers Open, Validating and All below the Type row.
+Old Waiting links open All. Old Done links use the default Open filter.
 The Owner row follows the Show row.
 Exactly one Show chip stays selected. Pressing that chip changes nothing.
 Each type count uses the selected owner, Show and words.
@@ -426,7 +429,8 @@ Each body response carries its snapshot version.
 If the versions differ, the browser refreshes the index before it displays the body.
 The browser uses the index for every count and filter.
 The Show chips replace the right count text.
-Open, Validating and Done select their states.
+Open and Validating select their states.
+The Review table excludes Done records.
 Ask showrunner to check, Ask question and Send feedback move a change to Validating after the save.
 The change leaves Open and its counts when the request starts.
 A failed save restores the row and its counts.
@@ -449,6 +453,10 @@ The browser keeps each pending save by key while the form leaves the window.
 Review and The List use Show chips.
 The shared table tracks the selected Show chip.
 The address and refresh retain the selected Show view.
+Review submissions retain the Type, Show and Owner chips and the search words.
+A new item opens when it matches the current filters.
+Review shows a save confirmation when the current filters hide the new item.
+A save conflict shows its reason and preserves the current filters.
 The Type, Show and Owner chip rows wrap at phone width.
 If a refresh hides the focused Owner chip, focus moves to the selected Owner chip.
 All types that wait on the user have the state Open.
@@ -490,8 +498,8 @@ An Efficiency save checks the ledger in the production document retained for its
 An unreadable Proposal prerequisite leaves its relationship empty in both the snapshot and the save.
 The save checks the revision under the store's write lock.
 The server returns HTTP 409 if the record is missing or its revision differs from the form revision.
-A current Done card accepts Later.
 The browser refreshes the index and shows a conflict reason above the table.
+The refresh keeps the selected filters.
 The reason stays visible if the refresh removes the card.
 After a save, the server reads and publishes the saved record if it can.
 If publication fails, the server retains the current snapshot and requests a full rebuild.
@@ -517,7 +525,6 @@ The body uses the time zone from the snapshot.
 A change to the time zone changes the snapshot version.
 A proposal body includes its issue text without front matter.
 An item fragment selects its summary before any body request.
-A Done item uses the same direct body request.
 An efficiency card shows its ledger line.
 
 Questions offer Answer and Send feedback in the closing group.
@@ -813,7 +820,7 @@ A summary for zero or multiple available reviews is plain text.
 The List loads the card document only when the dialog opens.
 The existing Review body route supplies the summary, body, styles, and controls.
 The Review table uses the same card renderer and action code.
-The dialog shows every state, including Done.
+The dialog reads a Done card on demand and shows it without actions.
 A Validating card shows its details and has no actions.
 If the record disappears, the dialog shows a message.
 Escape, Close, and a click outside the card close the dialog.
@@ -831,7 +838,9 @@ The draft store uses the record key and tracks edits across form replacements.
 Recovery preserves edits made after the conflict, including cleared words.
 The recovery lock applies to the stale revision.
 After a save, Close, Escape, and a click outside work while the List refreshes.
-A completed refresh closes the dialog.
+A completed refresh fades the card out and closes the dialog.
+A revision replacement fades the old card out and slides the new card in.
+Both transitions use the configured card durations and respect reduced motion.
 If the List request fails or times out, the next periodic refresh can update the row.
 List and Review refresh requests use `page_request_timeout_seconds`.
 If a List action is pending, the refresh starts after that action ends.
@@ -1797,13 +1806,14 @@ The page, the footer and `/next` use these same folder readers.
 
 
 Legacy Changes and Questions forms and the Images page share one motion helper.
-A different Changes or Questions card fades out for 180ms, then fades in for 270ms with a 4px upward move.
+The page reads `card_fade_out_ms` and `card_fade_in_ms` when it renders.
+A different Changes or Questions card uses both durations, with a 4 px upward move during the fade in.
 A new switch completes the active switch first.
 The first load and an update that keeps the same card do not fade.
 A new card above the viewport scrolls into view smoothly.
-Image links scroll smoothly to their image, then reveal it over 270ms with a 4px upward move.
+Image links scroll smoothly to their image, then reveal it with a fade in and a 4 px upward move.
 Other image cards stay visible.
-An image fades before removal, and the cards below close the gap over 270ms.
+An image fades out before removal. The cards below close the gap over the fade in duration.
 Reduced motion disables fades and uses instant scrolling.
 
 Question items and change rows show a Lucide copy button inside the top right of each code block.

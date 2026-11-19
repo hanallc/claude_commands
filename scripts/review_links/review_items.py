@@ -34,19 +34,18 @@ from scripts.review_links import efficiency_reviews, new_item_dialog, review_eve
 from scripts.review_links.review_events import ReviewLog as ReviewLog, ReviewMark
 
 
-def source_stamp(path: Path) -> tuple[int, int]:
+def source_stamp(path: Path) -> record_store.FileStamp:
     try:
-        stat = path.stat()
+        return record_store.file_stamp(path)
     except OSError:
-        return (0, 0)
-    return (stat.st_mtime_ns, stat.st_size)
+        return record_store.MISSING_STAMP
 
 
 class ReviewSourceStamps(list[Path]):
     """Record each source and its parent before a snapshot reads them."""
     def __init__(self) -> None:
         super().__init__()
-        self.before_read: dict[Path, tuple[int, int]] = {}
+        self.before_read: dict[Path, record_store.FileStamp] = {}
         self.notices: dict[tuple[Path, str], str] = {}
         self.folder_entries: dict[Path, tuple[Path, ...]] = {}
 
@@ -147,6 +146,8 @@ def selected_states(show: str) -> tuple[ReviewState, ...]:
     """Select the states before a store loads complete records."""
     if show == 'all':
         return REVIEW_STATES
+    if show == 'active':
+        return (ReviewState.OPEN, ReviewState.VALIDATING, ReviewState.WAITING)
     if show in ('open', 'For you', 'for-you', 'for you'):
         return (ReviewState.OPEN,)
     return (ReviewState(show),)
@@ -688,6 +689,10 @@ def investigation_items(members: staff.StaffSnapshot, *, owners: tuple[staff.Sta
                 with guard_source(path, sources, skip=(FileNotFoundError, investigation.InvestigationError)):
                     if not path.is_file():
                         continue
+                    if ReviewState.DONE not in states:
+                        header = issue_store.frontmatter(path, sources=sources, keys=frozenset({'state'}))
+                        if header.get('state') == [investigation.InvestigationState.READ]:
+                            continue
                     record = investigation.read_review_record(path)
                     if record.owner != identity or investigation_type(record) not in kinds:
                         continue
@@ -919,8 +924,8 @@ def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
             with guard_source(path, sources, skip=(FileNotFoundError, ValueError)):
                 if not path.is_file():
                     continue
-                fields = (issue_store.frontmatter(path, sources=sources) if exact else
-                          record_store.read_header(path, sources=sources, strict=sources is not None))
+                fields = (issue_store.frontmatter(path, sources=sources) if exact or ReviewState.DONE not in states
+                          else record_store.read_header(path, sources=sources, strict=sources is not None))
                 issue = Issue(path, fields)
                 add_issue(issue, candidates)
     else:
@@ -1035,9 +1040,9 @@ def efficiency_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], 
                                 or EFFICIENCY_LINE.match(line) is None or identity in invalid):
                             continue
                         review = reviews.get(identity, efficiency_reviews.EfficiencyReview())
-                        item = efficiency_item(path, index, line, review, owner, members)
-                        if item.state not in states:
+                        if efficiency_state(line.partition(' — ')[2], review) not in states:
                             continue
+                        item = efficiency_item(path, index, line, review, owner, members)
                         if owner_options is not None:
                             owner_options[owner] = name(owner,members)
                         found.append(item)
@@ -1175,8 +1180,8 @@ def project(root: Path, members: staff.StaffSnapshot, kinds: tuple[ReviewType, .
             owner_options: dict[staff.StaffId, str] | None, sources: list[Path] | None,
             selection: ReviewSelection, *, assign_ids: bool = False) -> list[ReviewItem]:
     """Select the requested records and apply the shared projection."""
-    documents = tuple(dict.fromkeys(member.doc.path for member in members.rows
-                      if member.kind == 'showrunner' and isinstance(member.doc, staff.LiveDoc)))
+    documents = tuple(dict.fromkeys(doc for member in members.rows if isinstance(member.doc, staff.LiveDoc)
+                                    if (doc := record_store.local_document(member)) is not None))
     items: list[ReviewItem] = []
     if ReviewType.QUESTION in kinds:
         items.extend(question_items(members,documents,states=states,owner_options=owner_options,

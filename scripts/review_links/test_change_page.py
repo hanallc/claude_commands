@@ -615,6 +615,8 @@ class ChangePageTests(unittest.TestCase):
                     self.assertTrue(status.answer_question(self.page, row_id, question.question_id, answer))
                     selected = change_page.render(replace(self.page, rows=(row_id,)), status).decode()
                     browser = self.browser()[2]
+                    for page in (selected, browser):
+                        self.assertEqual(page.count(page_frame.BUTTON_STATES), 1)
                     section = re.search(r'<section\b[^>]*data-key="page-owner/' + row_id
                                         + r'"[^>]*>(.*?)</section>', browser, re.DOTALL)
                     assert section is not None
@@ -2077,6 +2079,7 @@ class ChangePageTests(unittest.TestCase):
         _ = self.file_other_change()
         _ = self.file_user_question()
         _, _, body = self.browser("questions")
+        self.assertEqual(body.count(page_frame.BUTTON_STATES), 1)
         self.assertIn('</h1><p class="page-status"', body)
         self.assertIn(page_frame.STYLE, body)
         self.assertLess(body.index('data-page-status '), body.index('<div data-review-content'))
@@ -3104,10 +3107,12 @@ class ChangePageTests(unittest.TestCase):
 
         for interval in (15, 5, 300):
             with self.subTest(page_refresh_seconds=interval):
-                _ = write_config_fixture(settings, f"page_refresh_seconds={interval}\n")
+                _ = write_config_fixture(settings,
+                    f"page_refresh_seconds={interval}\ncard_fade_out_ms=365\ncard_fade_in_ms=725\n")
                 path, _, content = self.browser()
                 del path
                 self.assertIn(f'data-refresh-seconds="{float(interval)}"', content)
+                self.assertIn('data-card-fade-out-ms="365" data-card-fade-in-ms="725"', content)
                 # An open page reloads, not updates, when the server's page script is newer than its own.
                 self.assertIn(f'data-script="{change_browser.SCRIPT_VERSION}"', content)
                 self.assertIn("if(fresh.dataset.script!==content.dataset.script){location.reload();return;}", content)
@@ -3541,6 +3546,8 @@ class ChangePageTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_skip_save_and_empty_states_in_the_browser(self) -> None:
+        settings = self.temporary / "config/review_links.conf"
+        _ = write_config_fixture(settings, "card_fade_out_ms=25\ncard_fade_in_ms=35\n")
         for text in ("First question", "Second question"):
             _ = self.file_user_question(text, question="Pick one.\n\nChoices:\n1. Compact\n2. Wide")
         other = self.temporary / "change-review - all.md"
