@@ -73,6 +73,8 @@ def record_revision(item: ReviewItem, assets: Mapping[str, str]) -> str:
     source = item.source
     # A Change verdict follows the current production when staff move.
     record = (source.path, source.row, source.slots, item.times.later) if isinstance(source, review_items.ChangeSource) else item
+    if isinstance(source, review_items.ChangeSource) and item.state == ReviewState.VALIDATING:
+        record = (record, item.owner)
     retained = (record, assets.get(item.key, ''), assets.get('image:'+item.key, ''),
                 assets.get('submission:'+item.key, ''))
     return hashlib.sha256(repr(retained).encode()).hexdigest()[:16]
@@ -174,8 +176,6 @@ class ReviewSnapshot:
         item = self.records.get(key)
         if item is None:
             raise LookupError('This item is not in the current snapshot.')
-        if item.state == ReviewState.VALIDATING:
-            raise LookupError('This change is with the showrunner.')
         if key in self.unavailable_cards:
             return CARD_ERROR
         try:
@@ -233,8 +233,7 @@ def submission_assets(key: str, origin: new_item_dialog.ReviewSubmission) -> str
     return body
 
 
-def card_entry(item: ReviewItem, members: staff.StaffSnapshot, names: staff_names.StaffNames, *,
-               root: Path | None = None) -> ReviewIndexEntry:
+def card_entry(item: ReviewItem, members: staff.StaffSnapshot, names: staff_names.StaffNames) -> ReviewIndexEntry:
     owner = owner_name(item, members)
     source = review_items.name(item.source_unit, members)
     entry = ReviewIndexEntry(key=item.key, id=item.id, type=item.type, owner=str(item.owner),
@@ -243,13 +242,12 @@ def card_entry(item: ReviewItem, members: staff.StaffSnapshot, names: staff_name
         hiddenUntil=item.times.later.timestamp()*1000 if isinstance(item.times.later, datetime) else 0,
         sourceName=source, urgency=item.urgency.level, ownerHtml=names.html(item.owner, owner),
         sourceHtml=names.html(item.source_unit, source))
-    if root is not None and item.state == ReviewState.VALIDATING and isinstance(item.source, review_items.ChangeSource):
-        path = change_routing.delivery_path(root, item.source.path, item.source.row['#'])
-        if (requested := change_page.handoff_time(path)) is not None:
-            requested = requested.astimezone(user_zone())
-            entry['handoff'] = (requested.isoformat(), requested.strftime('%b %d %H:%M %Z'))
-    if (item.state == ReviewState.WAITING and item.waiting_why
-            and isinstance(review_items.submission_origin(item), new_item_dialog.ReviewSubmission)):
+    if isinstance(item.source, review_items.ChangeSource) and item.source.handed_at is not None:
+        requested = item.source.handed_at.astimezone(user_zone())
+        entry['handoff'] = (requested.isoformat(), requested.strftime('%b %d %H:%M %Z'))
+    if (item.state == ReviewState.WAITING and item.waiting_why and (
+            isinstance(item.source, review_items.ChangeSource)
+            or isinstance(review_items.submission_origin(item), new_item_dialog.ReviewSubmission))):
         entry['waitingWhy'] = item.waiting_why
     validate_text(entry['title'])
     for value in entry.values():
@@ -310,11 +308,11 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
                 record_assets: dict[str, str] = {}
                 retain_asset(item, record_assets)
                 validate_body_inputs(item, record_assets)
-                summary = card_entry(item, members, names, root=root)
+                summary = card_entry(item, members, names)
             except (UnicodeError, TypeError, ValueError, OSError, RuntimeError) as error:
                 sources.skipped(path, item.id, error)
                 unavailable_cards.add(item.key)
-                summary = card_entry(replace(item, title='Card unavailable'), members, names, root=root)
+                summary = card_entry(replace(item, title='Card unavailable'), members, names)
             else:
                 assets.update(record_assets)
                 origin = review_items.submission_origin(item)
@@ -516,7 +514,7 @@ class ReviewSnapshotCache:
             if isinstance(origin, new_item_dialog.ReviewSubmission):
                 submission_keys[origin.request_id] = key
             validate_body_inputs(item, {asset: assets[asset] for asset in asset_keys if asset in assets})
-            updated_entry = card_entry(item, members, names, root=self.root)
+            updated_entry = card_entry(item, members, names)
             entries = [updated_entry if entry['key'] == previous_key else entry for entry in current.entries
                        if entry['key'] != key or key == previous_key]
             if previous_key not in current.records:
@@ -620,9 +618,12 @@ def answer_section(text: str) -> str:
     return '<section><h3>Answer</h3>'+change_browser.answer_html(text)+'</section>'
 
 
-def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, revision: str, *, soon: str = "In 1 hour") -> str:
-    if item.state == ReviewState.VALIDATING:
-        return ''
+def waiting_change(item: ReviewItem) -> bool:
+    return item.type == ReviewType.CHANGE and item.state == ReviewState.WAITING
+
+
+def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, revision: str, *,
+         soon: str = "In 1 hour", validator: str = '') -> str:
     fields = {'row': item.key, 'token': change_browser.row_token(browser, item.key), 'revision': revision}
     hidden = ''.join(f'<input type="hidden" name="{key}" value="{html.escape(value, quote=True)}">' for key, value in fields.items())
     closes: list[str] = []
@@ -630,14 +631,16 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
     labels = {'answer': 'Answer', 'works': 'Works', 'not works': 'Does not work', 'validate': 'Ask showrunner to check',
               'question': 'Ask question', 'feedback': 'Send feedback', 'read': 'Mark read',
               'approve': 'Approve', 'decline': 'Decline'}
+    if validator:
+        labels['question'] = 'Ask a question'
     for index, action in enumerate(item.actions):
-        button = f'<button name="outcome" value="{action}"'+(' class="primary"' if index == 0 else '')+'>'+labels[action]+'</button>'
+        button = f'<button name="outcome" value="{action}"'+(' class="primary"' if index == 0 and not validator else '')+'>'+labels[action]+'</button>'
         (returns if action == 'question' or (item.type == ReviewType.CHANGE and action in change_page.CHANGE_HANDOFFS)
          else closes).append(button)
     heading = (page_frame.ReturningActionHeading.SENDS_TO_SHOWRUNNER if item.type == ReviewType.CHANGE
                else page_frame.ReturningActionHeading.ITEM_RETURNS)
     later = ''
-    if item.state != ReviewState.DONE:
+    if item.state not in (ReviewState.DONE, ReviewState.VALIDATING) and not waiting_change(item):
         presets = ''.join(f'<button type="button" role="menuitem" tabindex="-1" data-later-preset="{key}">'
                           +f'<span>{html.escape(label or soon)}</span><small></small></button>' for key, label in LATER_PRESETS)
         later = ('<button type="button" aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later <span aria-hidden="true">▾</span></button>'
@@ -647,16 +650,25 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
     words = ''
     if closes or returns or later:
         field = 'words-'+html.escape(item.key, quote=True)
+        placeholder = ('Ask the validator about this item.' if validator
+                       else 'Type your words. They go with the button that you press.')
         words = (f'<label for="{field}">Your words</label><textarea id="{field}" name="feedback" rows="{words_rows}" '
-                 + 'placeholder="Type your words. They go with the button that you press."></textarea>')
-    return ('<form method="post" data-review-form>'+hidden+words
-            + page_frame.review_action_groups(''.join(closes), ''.join(returns), later, returning_heading=heading)
+                 + f'placeholder="{placeholder}"></textarea>')
+    actions = page_frame.review_action_groups(''.join(closes), ''.join(returns), later, returning_heading=heading)
+    if validator:
+        actions = ('<div class="review-actions"><div class="review-action-group"><span>Sends to '
+                   +html.escape(validator)+'</span><div>'+''.join(returns)+'</div></div></div>')
+    return ('<form method="post" data-review-form>'+hidden+words+actions
             + '<span role="status" data-send-status></span></form>')
 
 
 def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
     names = inputs.names
     source = item.source
+    owner = owner_name(item, inputs.members)
+    validator = owner if item.state == ReviewState.VALIDATING and isinstance(source, review_items.ChangeSource) else ''
+    handoff = ''
+    exchange = ''
     if isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
         question = source.record.item
         ask = question['parts']['ask'] if 'parts' in question else change_browser.question_text(question)[0]
@@ -671,12 +683,29 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
             body += '<p>No showrunner owns this question.</p>'
     elif isinstance(source, review_items.ChangeSource):
         row = source.row
-        body = section('How to check', row.get('How to check', ''))
+        check = row.get('How to check', '')
         proof = row.get('What you see', '') or row.get('Proof', '')
-        if proof.strip():
+        if validator and not proof and ' You see: ' in check:
+            check, _, proof = check.partition(' You see: ')
+        body = section('How to check', check)
+        if proof.strip() or (validator and inputs.assets.get('image:'+item.key)):
             body += section('Proof', proof)
-        if isinstance(source.slots.question, change_page.AnsweredQuestion):
-            body += answer_section(source.slots.question.answer)
+        question = source.slots.question
+        if validator:
+            duration = (' · Validating for <time data-validating-age datetime="'
+                        +source.handed_at.isoformat()+'"></time>') if source.handed_at is not None else ''
+            handoff = '<p class="review-handoff">With '+names.html(item.owner, validator)+duration+'</p>'
+            if isinstance(question, (change_page.OpenQuestion, change_page.AnsweredQuestion)) and not isinstance(
+                    question, (change_page.OpenFeedback, change_page.CompletedFeedback)):
+                escaped = html.escape(validator)
+                exchange = section('Question for '+escaped, question.text)
+                if isinstance(question, change_page.AnsweredQuestion):
+                    exchange += '<section><h3>Answer from '+escaped+'</h3>'+change_browser.answer_html(question.answer)+'</section>'
+        else:
+            if isinstance(question, change_page.OpenQuestion):
+                body += section('Feedback' if isinstance(question, change_page.OpenFeedback) else 'Question', question.text)
+            elif isinstance(question, change_page.AnsweredQuestion):
+                body += answer_section(question.answer)
         if path := inputs.assets.get('image:'+item.key):
             alt = html.escape('Screenshot: '+item.title,quote=True)
             body = ('<div class="change-text">'+body+'</div><a data-image-zoom class="change-image" href="'
@@ -696,11 +725,12 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
     logs = ''.join('<li><time datetime="'+entry.time.isoformat()+'">'
         +entry.time.astimezone(inputs.zone).strftime('%b %d %H:%M')+'</time><span>'+html.escape(entry.words)
         +' <small>— '+names.html(entry.who)+'</small></span></li>' for entry in reversed(item.log))
-    owner = owner_name(item, inputs.members)
     fallback = '<section data-title-fallback hidden><h3>Item</h3><p>'+html.escape(item.title)+'</p></section>'
     body += inputs.assets.get('submission:'+item.key, '')
-    return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+'<div data-review-body>'+body+'</div></div><section><h3>Log · newest first</h3>'
-            +'<ol class="list-log">'+logs+'</ol></section>'+form(item, inputs.browser, inputs.words_rows, record_revision(item, inputs.assets), soon=inputs.soon_label)
+    return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+handoff+'<div data-review-body>'+body+'</div></div><div><section><h3>Log · newest first</h3>'
+            +'<ol class="list-log">'+logs+'</ol></section>'+exchange+'</div>'
+            +form(item, inputs.browser, inputs.words_rows, record_revision(item, inputs.assets), soon=inputs.soon_label,
+                  validator=validator)
             +'<p class="review-source">Owner: '+names.html(item.owner, owner)+' · Source: '
             +names.html(item.source_unit, review_items.name(item.source_unit, inputs.members))+'</p></div>')
 
@@ -790,7 +820,7 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
         return current
 
     item = validate()
-    if item.state == ReviewState.VALIDATING:
+    if waiting_change(item) or (item.state == ReviewState.VALIDATING and outcome != 'question'):
         raise change_page.ChangeHandoffRefused(change_page.WITH_SHOWRUNNER)
     if outcome == 'later':
         return change_page.NoMessageDelivery(), review_actions.later(
@@ -800,13 +830,14 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
     source = item.source
     if isinstance(source, review_items.ChangeSource):
         with change_review.checked_review_write(source.path, root, validate) as current:
-            delivery = change_browser.submit_review_change(current, snapshot.browser, outcome, words, status)
+            action = change_page.VALIDATION_QUESTION if current.state == ReviewState.VALIDATING else outcome
+            delivery = change_browser.submit_review_change(current, snapshot.browser, action, words, status)
         if isinstance(delivery, change_page.MessageDelivery) and outcome not in ('validate', 'feedback'):
             label = outcome
             with review_items.after_store_write(item.key):
                 change_review.record_review_log(delivery.page.review_list, delivery.row,
                                                 label+(': '+words if words else ''), delivery.page.production)
-        return delivery, {'validate':'asked the showrunner to check', 'question':'question sent',
+        return delivery, {'validate':'asked the showrunner to check', 'question':'question saved',
                           'feedback':'feedback sent'}.get(outcome, outcome)
     if isinstance(source, review_items.QuestionSource):
         if not words.strip():
@@ -882,6 +913,9 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
             words = fields['feedback'][0]
             log = outcome + (': ' + words if words else '')
             change_review.record_review_log(delivery.page.review_list, delivery.row, log, delivery.page.production)
+    if outcome == 'question' and isinstance(delivery, change_page.MessageDelivery) and not isinstance(
+            delivery.page, (change_page.UserQuestionPage, change_page.ReviewMessagePage)):
+        return delivery, 'question saved'
     return delivery, ('feedback sent' if outcome == 'feedback' else answer or
                      {'validate':'asked the showrunner to check', 'question':'question sent'}.get(outcome,'answer'))
 
@@ -923,12 +957,9 @@ min-height:32px;padding:5px 10px;border:0;border-radius:6px;background:none;colo
 background:var(--card);color:var(--ink)}.review-actions .primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
 .review-source{grid-column:1/-1;color:var(--ink-3);font-size:12px;margin-top:16px!important}
 .list-table .list-row td:last-child{text-align:right}.list-table [data-detail]>td{text-align:left}
-[data-validating-change] .list-row{cursor:default}
-[data-validating-change] [data-detail]{display:none}
 .review-handoff{display:block;margin-top:4px;color:var(--ink-2)}
 .review-handoff>:is(span,time){white-space:nowrap}
-.review-handoff>span{display:inline-block;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;vertical-align:bottom}
-@media(min-width:961px){.review-handoff{display:flex;align-items:baseline;gap:.25em}}
+.review-handoff>.staff-name{display:inline-block;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;vertical-align:bottom}
 @media(max-width:960px){[data-review] .list-row td:last-child::before{content:'Age: '}
 .review-panel{grid-template-columns:1fr;padding:0 14px 16px}}
 @media(max-width:480px){[data-review] .record-filter-row{grid-template-columns:minmax(0,1fr)}}
@@ -973,23 +1004,34 @@ function readIndex(payload){
 function allEntries(){return [...index.values()];}
 const escapeText=value=>String(value).replace(/[&<>"']/g,letter=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[letter]));
 const colored=(name,markup)=>markup || escapeText(name);
+function reviewAge(since,full=false){
+ const minutes=Math.max(0,Math.floor((Date.now()-since)/60000));
+ if(minutes>=1440) return Math.floor(minutes/1440)+' d';
+ if(minutes>=60) return Math.floor(minutes/60)+' h'+(full && minutes%60 ? ' '+minutes%60+' m' : '');
+ return minutes+' min';
+}
+function updateHandoffAges(root=content){
+ for(const stamp of root.querySelectorAll('[data-validating-age]')){
+  const label=reviewAge(Date.parse(stamp.dateTime),true);
+  if(stamp.textContent!==label) stamp.textContent=label;
+ }
+}
 function summary(entry){
  const node=document.createElement('tbody'),panel='review-detail-'+encodeURIComponent(entry.key);
  Object.assign(node.dataset,{listItem:'',key:entry.key,number:entry.id.toLowerCase(),title:entry.title.toLowerCase(),
   owner:entry.owner,sourceOwner:entry.sourceOwner,sourceName:entry.sourceName,state:entry.state,type:entry.type,
   order:entry.order,updated:entry.updated,parked:'false'});
  const limit=Number(content.dataset.titleLimit),first=entry.title.split(/\r?\n/)[0],short=first.slice(0,limit);
- const age=Math.max(0,Math.floor(Date.now()/1000-entry.filed));
- const stamp=age>=86400 ? Math.floor(age/86400)+' d' : age>=3600 ? Math.floor(age/3600)+' h' : Math.floor(age/60)+' min';
+ const stamp=reviewAge(entry.filed*1000);
  const icon=content.querySelector('[data-type-chip="'+entry.type+'"] .review-icon').outerHTML;
  const validating=entry.state==='Validating' && entry.type==='change';
- if(validating) node.dataset.validatingChange='';
- const handoff=entry.handoff;
- const handoffLine=validating && handoff ? '<span class="review-handoff">With <span title="'+escapeText(entry.ownerName)+
-  '">'+escapeText(entry.ownerName)+'</span> since <time datetime="'+escapeText(handoff[0])+'">'+escapeText(handoff[1])+'</time></span>' : '';
+ const handoff=entry.handoff?.[0];
+ const age=handoff ? ' · Validating for <time data-validating-age datetime="'+escapeText(handoff)+'">'
+  +reviewAge(Date.parse(handoff),true)+'</time>' : '';
+ const handoffLine=validating && entry.owner ? '<span class="review-handoff">With '+colored(entry.ownerName,entry.ownerHtml)+age+'</span>' : '';
  const waitingLine=entry.state==='Waiting' && entry.waitingWhy ?
   '<span class="review-waiting-why">'+escapeText(entry.waitingWhy)+'</span>' : '';
- const cells=[validating ? '<span class="list-toggle" tabindex="-1">'+escapeText(entry.id)+'</span>' : '<button type="button" class="list-toggle" aria-expanded="false" aria-controls="'+panel+'">'
+ const cells=['<button type="button" class="list-toggle" aria-expanded="false" aria-controls="'+panel+'">'
   +'<span class="list-chevron" aria-hidden="true">›</span>'+escapeText(entry.id)+'</button>',
   icon+entry.type[0].toUpperCase()+entry.type.slice(1),colored(entry.ownerName,entry.ownerHtml)
   +(entry.sourceName!==entry.ownerName ? '<small>· '+colored(entry.sourceName,entry.sourceHtml)+'</small>' : ''),
@@ -1052,8 +1094,9 @@ const view=createRecordTable({content:()=>content,single:true,
  visible:(data,filters)=>{
   const key=data.key,entry=index.get(key),departure=saved.get(key);
   if(!entry || pendingSaves.get(key)?.departing) return false;
+  if(departure?.handed && departure.awaitingSnapshot && view.linkedItem===key) return false;
   const reopened=departure?.closes && view.linkedItem===key && view.opened.has(key);
-  return (!departure || entry.state==='Validating' && entry.type==='change' || reopened) && matches(entry,filters);
+  return (!departure || departure.handed && entry.state!=='Open' || reopened) && matches(entry,filters);
  },
  sortValues:data=>{
   const entry=index.get(data.key);
@@ -1122,8 +1165,8 @@ function updateTitleFallback(panel){
 }
 function loadBodies(){
  view.opened.forEach(key=>{
-  const row=mountedRow(key);
-  if(!row || row.hasAttribute('data-validating-change') || row.dataset.bodyLoaded) return;
+  const row=mountedRow(key),pending=saved.get(key);
+  if(!row || row.dataset.bodyLoaded || (pending?.handed && pending.awaitingSnapshot)) return;
   const install=text=>{
    const current=mountedRow(key);
    if(!current || current.dataset.bodyLoaded) return;
@@ -1132,7 +1175,7 @@ function loadBodies(){
    if(departure?.closes && departure.awaitingSnapshot)
     current.querySelector('[data-review-form]')?.remove();
    const panel=current.querySelector('.review-panel');if(panel) updateTitleFallback(panel);
-   bindForm(current);restoreFocus(key);view.drawWindow();
+   updateHandoffAges(current);bindForm(current);restoreFocus(key);view.drawWindow();
   };
   if(bodies.has(key)){install(bodies.get(key));return;}
   if(bodyRequests.has(key)) return;
@@ -1199,7 +1242,8 @@ function bindForm(row){
    remember();
    const notice=content.querySelector('[data-review-notice]');
    notice.hidden=true;notice.textContent='';
-   const pending={notice:'Saving…',saved:false,departing:true,top:scrollY};
+   const validationQuestion=row.dataset.state==='Validating' && outcome==='question';
+   const pending={notice:'Saving…',saved:false,departing:!validationQuestion,top:scrollY};
    pendingSaves.set(key,pending);pageRefresh.abandon();drawSaveState(key);
    const submission=view.startAction(row);
    try{
@@ -1214,9 +1258,15 @@ function bindForm(row){
     }
     pending.saved=true;
     drafts.delete(key);
+    if(validationQuestion){
+     words.value='';
+     view.showActionResult(row,submission,key,{kind:'success',message:'Saved: '+result.answer});
+     return;
+    }
     const handed=row.dataset.type==='change' && ['validate','question','feedback'].includes(outcome);
+    const waitState=outcome==='validate' ? 'Validating' : 'Waiting';
     const marker={updated:row.dataset.updated,previousState:row.dataset.state,
-     handed,state:result.state ?? (handed ? 'Validating' : outcome==='question' ? 'Waiting' : outcome==='later' ? row.dataset.state : 'Done'),
+     handed,state:result.state ?? (handed || outcome==='question' ? waitState : outcome==='later' ? row.dataset.state : 'Done'),
      later:result.later ?? (outcome==='later' ? Date.parse(data.get('later')) : 0),
      question:data.get('outcome')==='question',
      closes:!handed && !['question','later'].includes(outcome),awaitingSnapshot:true};
@@ -1285,9 +1335,6 @@ function bindLater(form,pick){
   summaryPrefix:'Hides until ',prepareMenu});
 }
 function bind(){view.replace(false);}
-content.addEventListener('click',event=>{
- if(event.target.closest('[data-validating-change] .list-row')) event.stopPropagation();
-},true);
 function revealConflict(){
  const key=conflictKey;conflictKey='';
  const entry=index.get(key);
@@ -1386,6 +1433,7 @@ async function refresh(_supersede=false,current=()=>true){
 }
 bind();
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
+setInterval(updateHandoffAges,5000);
 document.querySelector('[data-review-new]').addEventListener('click',event=>{
  window.reviewNewItem.open({trigger:event.currentTarget});
 });

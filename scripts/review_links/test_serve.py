@@ -390,9 +390,12 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_review_index_omits_an_unknown_handoff_time(self) -> None:
         case = self.review_fixture(changes=2)
         saved = '2026-11-16T12:49:08-05:00'
+        validator = staff.snapshot().by_doc(local_machine(), case.fixture.production)
+        assert validator is not None
         for row, time_fields in (('C1', {}), ('C2', {'handed_at': saved})):
             path = change_routing.delivery_path(case.root, case.fixture.review_list, row)
-            _ = path.write_text(json.dumps({'validation': {'attempt': row, 'state': 'sent'}, **time_fields}))
+            validation = {'attempt': row, 'state': 'sent', 'recipients': [validator.id]}
+            _ = path.write_text(json.dumps({'validation': validation, **time_fields}))
             os.utime(path, (1795123200, 1795123200))
         snapshot = review_page.build_snapshot(case.root)
         with patch.object(review_page.ReviewSnapshotCache, 'get', return_value=snapshot):
@@ -909,7 +912,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(status, 400, body)
         self.assertIn(change_page.WITH_SHOWRUNNER.encode(), body)
         self.assertEqual((listing.read_bytes(), claim.read_bytes(), case.status.request_attempts), before)
-        self.assertEqual(cache.get().records[key].state, review_items.ReviewState.VALIDATING)
+        self.assertEqual(cache.get().records[key].state, review_items.ReviewState.WAITING)
         self.assertEqual(list(case.root.glob('.review-link-scratch-*')), [])
 
     def test_review_recovery_isolates_unreadable_lists_and_releases_locks_before_cleanup(self) -> None:
@@ -1006,7 +1009,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         key = 'page-owner/C1'
         _ = review_page.submit(case.root, case.body(key, 'question', 'What did you see?'), case.status)
         before = review_page.build_snapshot(case.root)
-        self.assertEqual(before.records[key].state, review_items.ReviewState.VALIDATING)
+        self.assertEqual(before.records[key].state, review_items.ReviewState.WAITING)
         path = change_routing.delivery_path(case.root, case.fixture.review_list, 'C1')
         read_text = Path.read_text
 
