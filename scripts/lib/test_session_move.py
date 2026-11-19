@@ -36,7 +36,7 @@ class SessionMoveTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.base = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp"))).resolve()
         self.root = self.base / "session"
         self.former = self.base / "former-temp" / "claude" / "session"
         self.scratch_root = self.base / "scratch"
@@ -50,6 +50,8 @@ class SessionMoveTests(unittest.TestCase):
             session_folder.FORMER_ROOT_ENV: str(self.former),
             copy_record.ROOT_ENV: str(self.scratch_root),
             scratch.HOLDS_ENV: str(self.holds),
+            "TMPDIR": str(self.base),
+            "PYTHONDONTWRITEBYTECODE": "1",
         })))
         _ = self.enterContext(mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())))
         _ = self.enterContext(mock.patch.object(session_records, "read_registry",
@@ -59,6 +61,7 @@ class SessionMoveTests(unittest.TestCase):
     def index(self, session: str, folder: str) -> Path:
         destination = self.root / folder
         destination.mkdir(exist_ok=True)
+        session_folder.write_record(destination, {"owner": session, "session_id": session})
         session_folder.link(self.root, session, destination)
         return destination
 
@@ -86,7 +89,7 @@ class SessionMoveTests(unittest.TestCase):
         self.assertEqual(output.splitlines()[-1],
                          "session_move: would move 1 folders (0.00 GiB), kept 0 live, refused 0 other")
         self.assertTrue(source.is_dir())
-        self.assertEqual(list(target.iterdir()), [])
+        self.assertEqual(list(target.iterdir()), [target / session_folder.RECORD])
         self.assertFalse((self.root / session_folder.LOCK).exists())
         self.assertFalse(self.holds.with_name(self.holds.name + ".lock").exists())
 
@@ -207,7 +210,7 @@ class SessionMoveTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIn("copy check failed", errors)
         self.assertEqual((source / "draft.md").read_bytes(), b"scratch content\n")
-        self.assertEqual(list(target.iterdir()), [])
+        self.assertEqual(list(target.iterdir()), [target / session_folder.RECORD])
         self.assertEqual(list((self.root / ".session-move").iterdir()), [])
 
     def test_merge_preserves_the_existing_leaf_and_refuses_a_conflict(self) -> None:
@@ -239,7 +242,7 @@ class SessionMoveTests(unittest.TestCase):
             with self.subTest(condition=condition):
                 session = condition.replace(" ", "-")
                 source = self.leaf(session)
-                target = self.index(session, "demo") / self.claude / self.project / session
+                target = self.index(session, session) / self.claude / self.project / session
                 command = ("import sys; "
                            + ("held = open(sys.argv[1], 'rb'); " if condition == "open file" else "")
                            + "print('ready', flush=True); sys.stdin.read()")
@@ -431,7 +434,7 @@ with (mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapsho
         source = self.leaf("idle")
         target = self.index("idle", "demo") / self.claude / self.project / "idle"
         movable = self.leaf("movable")
-        moved = self.index(movable.name, "demo") / self.claude / self.project / movable.name
+        moved = self.index(movable.name, "movable") / self.claude / self.project / movable.name
 
         with mock.patch.object(session_records, "read_registry", return_value=self.live_registry("idle")):
             status, output, errors = self.invoke()
@@ -493,7 +496,7 @@ with (mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapsho
         source = self.leaf("resuming")
         target = self.index("resuming", "demo") / self.claude / self.project / source.name
         movable = self.leaf("waiting")
-        moved = self.index(movable.name, "demo") / self.claude / self.project / movable.name
+        moved = self.index(movable.name, "waiting") / self.claude / self.project / movable.name
         journal = self.root / session_move.JOURNAL / session_move.MOVE_RECORD
         source_info = source.stat()
         scan = session_move.read_manifest
@@ -553,7 +556,7 @@ with (mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapsho
 
         with self.subTest("parent replaced by symlink"):
             source = self.leaf("swap")
-            target = self.index("swap", "demo") / self.claude / self.project / "swap"
+            target = self.index("swap", "swap") / self.claude / self.project / "swap"
             outside = self.base / "outside-swap"
             outside.mkdir()
             old_parent = target.parent.with_name("-saved")
@@ -610,6 +613,29 @@ with (mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapsho
         self.assertEqual(session_folder.read_record(base), record)
         self.assertFalse(source.exists())
         self.assertTrue((selected / self.claude / self.project / source.name / "draft.md").exists())
+
+    def test_stopped_sessions_with_one_working_name_get_separate_destinations(self) -> None:
+        sources = (self.leaf("first"), self.leaf("second"))
+        transcript_folder = self.base / "claude-home" / "projects" / self.project
+        transcript_folder.mkdir(parents=True)
+        for source in sources:
+            transcript = transcript_folder / f"{source.name}.jsonl"
+            _ = transcript.write_text(json.dumps({"cwd": str(self.base / "demo")}) + "\n", encoding="utf-8")
+        folders = (self.root / "demo", self.root / "demo-2")
+
+        with mock.patch.object(session_move, "process_uses", return_value=()):
+            status, preview, errors = self.invoke("--dry-run")
+            self.assertEqual(status, 0, errors)
+            for source, folder in zip(sources, folders, strict=True):
+                self.assertIn(f"{source} -> {folder / self.claude / self.project / source.name}", preview)
+            status, _, errors = self.invoke()
+
+        self.assertEqual(status, 0, errors)
+        for source, folder in zip(sources, folders, strict=True):
+            self.assertEqual(session_folder.folder_for(self.root, source.name), folder)
+            self.assertFalse(source.exists())
+            self.assertEqual((folder / self.claude / self.project / source.name / "draft.md").read_bytes(),
+                             b"scratch content\n")
 
     def test_reports_malformed_project_and_session_entries(self) -> None:
         source = self.leaf("candidate")
@@ -712,15 +738,14 @@ with (mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapsho
         for field in cases:
             with self.subTest(field=field):
                 source = self.leaf(field)
-                _ = self.index(field, "demo")
+                _ = self.index(field, field)
                 file = source / "draft.md"
                 if field == "xattr":
                     os.setxattr(file, "user.session-move", b"before")
 
                 def change_before_deletion(parent: int, name: str, fd: int, mount: int,
-                                           proof: session_move.CopyDeletion | None = None,
-                                           relative: Path = session_move.TREE_ROOT) -> None:
-                    if proof is not None and relative == session_move.TREE_ROOT:
+                                           proof: session_move.CopyDeletion | None = None) -> None:
+                    if proof is not None:
                         info = file.stat()
                         if field == "mode":
                             file.chmod(stat.S_IMODE(info.st_mode) ^ stat.S_IXUSR)
@@ -728,7 +753,7 @@ with (mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapsho
                             os.utime(file, ns=(info.st_atime_ns, info.st_mtime_ns + 1))
                         else:
                             os.setxattr(file, "user.session-move", b"after")
-                    remove(parent, name, fd, mount, proof, relative)
+                    remove(parent, name, fd, mount, proof)
 
                 with mock.patch.object(session_move, "remove_tree", side_effect=change_before_deletion):
                     status, _, errors = self.invoke()

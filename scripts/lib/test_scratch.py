@@ -28,18 +28,22 @@ from unittest import mock
 from scripts.accounts import accounts
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
+from scripts.disks import measure
 from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.lib import build_folders, cargo_output, copy_record, git_files, process_group, scratch, session_folder, time_limit
-from scripts.lint import sweep
+from scripts.lint import folder_audit, sweep, tmp_sweep
 
 from scripts.lib import conf
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.message import sessions
 from scripts.production import staff
-from scripts.production.staff_test_support import (
-    StaffTestCase, fixture_runtime_id, fixture_member, fixture_worker, isolated_staff_file,
-    source_environment, isolated_source_readers,
-)
+
+# The staff fixture creates an account folder when it loads.
+with mock.patch.object(tempfile, "tempdir", "/tmp"):
+    from scripts.production.staff_test_support import (
+        StaffTestCase, fixture_runtime_id, fixture_member, fixture_worker, isolated_staff_file,
+        source_environment, isolated_source_readers,
+    )
 
 MAKER_ID = fixture_runtime_id("scratch-Claude-session")
 
@@ -48,8 +52,14 @@ ROW = "row:cargo-liner-C54"
 
 
 def setUpModule() -> None:
-    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
-    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, config_environment(root))))
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory(dir="/tmp"))).resolve()
+    _ = unittest.enterModuleContext(mock.patch.object(tempfile, "tempdir", str(root)))
+    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, {
+        **config_environment(root / "config"),
+        "TMPDIR": str(root), "BUILDLOG_DIR": str(root / "buildlog"),
+        "SESSION_TEMP_ROOT": str(root / "session"), "SESSION_PREVIOUS_ROOT": "",
+        "SESSION_FORMER_ROOT": str(root / "former"), "PYTHONDONTWRITEBYTECODE": "1",
+    })))
 
 
 class ScratchTests(unittest.TestCase):
@@ -172,6 +182,74 @@ class ScratchTests(unittest.TestCase):
         self.assertFalse(checkout.exists())
         self.assertFalse(scratch.cargo_removal_mark(checkout).exists())
         self.assertFalse(scratch.removal_mark(checkout).exists())
+
+    def external_cargo_output(self, checkout: Path, *, workspace: Path | None = None,
+                              build: Path | None = None) -> cargo_output.CargoOutputRoots:
+        workspace = checkout if workspace is None else workspace
+        target = self.base / "external-target"
+        target.mkdir()
+        build = self.base / "external-build" if build is None else build
+        build.mkdir(parents=True)
+        _ = (build / "output").write_text("build result")
+        roots = cargo_output.CargoOutputRoots(workspace, target, build)
+        mapping: dict[str, object] = {
+            "workspace_root": str(workspace), "target_directory": str(target),
+            "build_directory": str(build), "other_checkouts": (),
+        }
+        scratch.atomic_record(scratch.cargo_removal_mark(checkout), [mapping])
+        self.enterContext(mock.patch.dict(os.environ, {
+            "LINT_SWEEP_STATE_DIR": str(self.base / "cargo-state"),
+            tmp_sweep.TEST_SWEEP_ENV: "1",
+        }))
+        sweep.save_cargo_output_roots(sweep.CargoOutputIndex((roots,)))
+        return roots
+
+    def test_cli_end_removes_external_cargo_output_on_the_first_attempt(self) -> None:
+        task = "gate:cli-cargo"
+        checkout = scratch.new(task, "checkout")
+        outputs = self.external_cargo_output(checkout)
+        result = subprocess.run([sys.executable, "-B", scratch.__file__, "end", "--task", task],
+                                cwd=self.base, capture_output=True, text=True, timeout=30, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"removed {checkout}", result.stdout)
+        self.assertFalse(checkout.exists())
+        self.assertFalse(outputs.build_directory.exists())
+        self.assertFalse(scratch.cargo_removal_mark(checkout).exists())
+
+    def test_cli_end_keeps_a_nonempty_cargo_mirror_parent(self) -> None:
+        task = "gate:mirror-parent"
+        checkout = scratch.new(task, "checkout")
+        workspace = checkout / "workspace"
+        workspace.mkdir()
+        build = (self.base / "mirror").joinpath(*workspace.parts[1:])
+        _ = self.external_cargo_output(checkout, workspace=workspace, build=build)
+        sibling = build.parent / "other-output"
+        _ = sibling.write_text("keep this build")
+        result = subprocess.run([sys.executable, "-B", scratch.__file__, "end", "--task", task],
+                                cwd=self.base, capture_output=True, text=True, timeout=30, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(checkout.exists())
+        self.assertFalse(build.exists())
+        self.assertEqual(sibling.read_text(), "keep this build")
+
+    def test_task_end_ignores_its_own_hold_and_respects_another_tasks_hold(self) -> None:
+        task = "gate:held-cargo"
+        checkout = self.base / "checkout"
+        checkout.mkdir()
+        outputs = self.external_cargo_output(checkout)
+        _ = scratch.hold(checkout, task, "Keep the checkout for this task.")
+        _ = scratch.hold(outputs.target_directory, "gate:target-owner", "Keep the target for this task.")
+        with mock.patch.object(folder_audit, "process_uses", return_value=tmp_sweep.ProcessUsesKnown([])):
+            blocked = scratch.end(task)
+            self.assertEqual(blocked, [])
+            self.assertIn(scratch.HELD_FOLDER_REASON, blocked.kept[0].reason)
+            self.assertTrue(checkout.is_dir())
+            self.assertTrue((outputs.build_directory / "output").is_file())
+            self.assertTrue(scratch.release(outputs.target_directory))
+            self.assertEqual(scratch.end(task), [checkout])
+        self.assertFalse(checkout.exists())
+        self.assertFalse(outputs.build_directory.exists())
+        self.assertNotIn(str(checkout), scratch.holds())
 
     def test_removal_intent_rechecks_current_and_legacy_sources_before_retry(self) -> None:
         for version in ("current", "legacy"):
@@ -3062,6 +3140,281 @@ print(scratch.target('gate:proof', 'tree', False))
         self.assertIsInstance(record, copy_record.Registered)
         assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.task, ROW)
+
+    def test_cross_disk_adopt_keeps_a_held_source(self) -> None:
+        shared_memory = Path("/dev/shm")
+        if not shared_memory.is_dir() or shared_memory.stat().st_dev == self.base.stat().st_dev:
+            self.skipTest("requires a private fixture on a second filesystem")
+        source = Path(self.enterContext(tempfile.TemporaryDirectory(dir=shared_memory)))
+        note = source / "note"
+        _ = note.write_text("held source")
+        _ = scratch.hold(source, "gate:source", "Keep the source.")
+        with self.assertRaisesRegex(scratch.RemovalRefused, scratch.HELD_FOLDER_REASON):
+            _ = scratch.adopt(source, ROW, "cross-disk", visible=True)
+        self.assertEqual(note.read_text(), "held source")
+        self.assertFalse((self.base / "repro" / "cargo-liner-C54-cross-disk").exists())
+
+    def test_changed_cross_disk_adoption_keeps_the_source_and_defers_the_stage(self) -> None:
+        source = self.base / "loose"
+        source.mkdir()
+        note = source / "note"
+        _ = note.write_text("original data")
+        destination = self.base / "repro" / "cargo-liner-C54-retry"
+        copy = shutil.copytree
+        settings = conf.read("scratch")
+
+        def copy_and_change(src: Path, dst: Path, *, symlinks: bool, dirs_exist_ok: bool) -> Path:
+            self.assertFalse(destination.exists())
+            result = copy(src, dst, symlinks=symlinks, dirs_exist_ok=dirs_exist_ok)
+            _ = note.write_text("changed bytes")
+            os.utime(note, ns=(note.stat().st_atime_ns, (dst / note.name).stat().st_mtime_ns))
+            return result
+
+        with (mock.patch.object(scratch, "rename_adoption", return_value=False),
+              mock.patch.object(scratch, "require_quiescent")):
+            with mock.patch.object(shutil, "copytree", side_effect=copy_and_change):
+                with self.assertRaisesRegex(scratch.RemovalRefused, "source changed during the copy"):
+                    _ = scratch.adopt(source, ROW, "retry", visible=True)
+            self.assertEqual(note.read_text(), "changed bytes")
+            self.assertFalse(destination.exists())
+            with mock.patch.object(scratch.CoordinatedRemoval, "delete_at") as delete_tree:
+                report = scratch.recover_sweep_operations((self.base,), dry_run=False, scratch_settings=settings)
+            self.assertEqual(report.blocked, ())
+            delete_tree.assert_not_called()
+            self.assertEqual(len(scratch.folder_leftovers(settings)), 1)
+            self.assertEqual(scratch.adopt(source, ROW, "retry", visible=True), destination)
+        self.assertFalse(source.exists())
+        self.assertEqual((destination / "note").read_text(), "changed bytes")
+
+    def test_cross_disk_adoption_syncs_before_publish_and_keeps_the_source_on_interruption(self) -> None:
+        source = self.base / "loose"
+        nested = source / "nested"
+        nested.mkdir(parents=True)
+        _ = (nested / "note").write_text("durable data")
+        destination = self.base / "repro" / "cargo-liner-C54-sync"
+        settings = conf.read("scratch")
+        journal = scratch.operation_journal(source, settings)
+        rename = scratch.CoordinatedRemoval.rename_new
+        synced: list[scratch.DirectoryId] = []
+        publish_at: list[int] = []
+
+        def record_sync(fd: int) -> None:
+            info = os.fstat(fd)
+            synced.append((info.st_dev, info.st_ino))
+
+        def record_rename(removal: scratch.CoordinatedRemoval, old: scratch.AnchoredRemoval,
+                          new: scratch.AnchoredRemoval) -> None:
+            if new.name == destination.name:
+                step = journal.read().step
+                assert isinstance(step, scratch.PublishAdoption)
+                stage = step.paths.stage
+                for path in (stage / "nested" / "note", stage / "nested", stage):
+                    info = path.stat()
+                    self.assertIn((info.st_dev, info.st_ino), synced)
+                publish_at.append(len(synced))
+            elif old.name == source.name:
+                self.assertIn(scratch.directory_id(destination.parent.stat()), synced[publish_at[0]:])
+                raise KeyboardInterrupt
+            rename(removal, old, new)
+
+        with (mock.patch.object(scratch, "rename_adoption", return_value=False),
+              mock.patch.object(scratch, "require_quiescent"),
+              mock.patch.object(os, "fsync", side_effect=record_sync),
+              mock.patch.object(scratch.CoordinatedRemoval, "rename_new", autospec=True, side_effect=record_rename)):
+            with self.assertRaises(KeyboardInterrupt):
+                _ = scratch.adopt(source, ROW, "sync", visible=True)
+
+        self.assertEqual((destination / "nested" / "note").read_text(), "durable data")
+        self.assertEqual((nested / "note").read_text(), "durable data")
+        self.assertTrue(journal.path.is_file())
+        with (mock.patch.object(scratch, "require_quiescent"),
+              mock.patch.object(scratch.CoordinatedRemoval, "delete_at") as delete_tree):
+            report = scratch.recover_sweep_operations((self.base,), dry_run=False, scratch_settings=settings)
+        self.assertEqual(report.blocked, ())
+        delete_tree.assert_not_called()
+        self.assertFalse(journal.path.exists())
+        self.assertFalse(source.exists())
+        leftover, = scratch.folder_leftovers(settings)
+        self.assertEqual((leftover.path / "nested" / "note").read_text(), "durable data")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires procfs")
+    def test_cross_disk_adoption_refuses_an_open_source_file(self) -> None:
+        source = self.base / "loose"
+        source.mkdir()
+        note = source / "note"
+        _ = note.write_text("before")
+        destination = self.base / "repro" / "cargo-liner-C54-open"
+        with (note.open("a") as writer, mock.patch.object(scratch, "rename_adoption", return_value=False),
+              mock.patch.object(shutil, "copytree") as copy):
+            with self.assertRaisesRegex(scratch.RemovalRefused, f"process {os.getpid()} "):
+                _ = scratch.adopt(source, ROW, "open", visible=True)
+            _ = writer.write(" and after")
+        copy.assert_not_called()
+        self.assertEqual(note.read_text(), "before and after")
+        self.assertFalse(destination.exists())
+        self.assertFalse(scratch.operation_journal(source, conf.read("scratch")).path.exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux mount information")
+    def test_adoption_refuses_a_descriptor_through_another_bind_mount(self) -> None:
+        source = self.base / "loose"
+        source.mkdir()
+        note = source / "note"
+        _ = note.write_text("original data")
+        alias = self.base / "second-mount"
+        device = source.stat().st_dev
+        number = f"{os.major(device)}:{os.minor(device)}"
+        table = self.base / "mountinfo"
+        lines = [
+            f"1 0 {number} / / rw - ext4 fixture rw",
+            f"2 1 {number} {self.base} {alias} rw - ext4 fixture rw",
+        ]
+        _ = table.write_text("\n".join(lines) + "\n")
+        proc = self.base / "proc"
+        descriptor = proc / "42" / "fd" / "5"
+        descriptor.parent.mkdir(parents=True)
+        descriptor.symlink_to(alias / source.name / note.name)
+
+        with (mock.patch.object(measure, "read_mounts", return_value=measure.read_mounts(table)),
+              mock.patch.object(tmp_sweep, "PROC_DIR", str(proc)),
+              mock.patch.object(scratch, "rename_adoption", return_value=False),
+              mock.patch.object(shutil, "copytree") as copy):
+            with self.assertRaisesRegex(scratch.RemovalRefused, "process 42 "):
+                _ = scratch.adopt(source, ROW, "bind-view", visible=True)
+        copy.assert_not_called()
+        self.assertEqual(note.read_text(), "original data")
+        self.assertFalse(scratch.operation_journal(source, conf.read("scratch")).path.exists())
+
+    def test_adopt_refuses_a_pending_delete_and_leaves_its_paths_unchanged(self) -> None:
+        source = self.base / "loose"
+        hidden = source.with_name(".scratch-operation-delete")
+        hidden.mkdir()
+        _ = (hidden / "note").write_text("original data")
+        settings = conf.read("scratch")
+        journal = scratch.operation_journal(source, settings)
+        operation = scratch.FolderOperation(source, scratch.directory_id(hidden.stat()), scratch.DeleteRemoval(
+            scratch.HiddenRemoval(hidden, scratch.NoWorktreeRegistration())))
+        journal.save(operation)
+        destination = self.base / "repro" / "cargo-liner-C54-pending"
+        with mock.patch.object(scratch.CoordinatedRemoval, "delete_at") as delete_tree:
+            with self.assertRaisesRegex(scratch.FolderRecoveryRequired, "a folder operation needs recovery"):
+                _ = scratch.adopt(source, ROW, "pending", visible=True)
+        delete_tree.assert_not_called()
+        self.assertEqual(journal.read(), operation)
+        self.assertFalse(source.exists())
+        self.assertFalse(destination.exists())
+        self.assertEqual((hidden / "note").read_text(), "original data")
+
+    def test_sweep_recovery_reverses_a_pending_removal_without_deletion(self) -> None:
+        source = self.base / "loose"
+        hidden = source.with_name(".scratch-operation-delete")
+        hidden.mkdir()
+        _ = (hidden / "note").write_text("remaining data")
+        settings = conf.read("scratch")
+        journal = scratch.operation_journal(source, settings)
+        operation = scratch.FolderOperation(source, scratch.directory_id(hidden.stat()), scratch.DeleteRemoval(
+            scratch.HiddenRemoval(hidden, scratch.NoWorktreeRegistration())))
+        journal.save(operation)
+
+        with (scratch.coordinate_removals(scratch_settings=settings) as removal,
+              mock.patch.object(scratch.CoordinatedRemoval, "delete") as delete,
+              mock.patch.object(scratch.CoordinatedRemoval, "delete_at") as delete_tree):
+            recovered = scratch.recover_folder_operation(removal, operation, settings)
+
+        delete.assert_not_called()
+        delete_tree.assert_not_called()
+        self.assertIs(recovered, scratch.RecoveredFolderRename.COMPLETE)
+        self.assertEqual(journal.read(), operation)
+        report = scratch.recover_sweep_operations((self.base,), dry_run=False, scratch_settings=settings)
+        self.assertEqual(report.blocked, ())
+        self.assertEqual(report.registrations, ())
+        self.assertEqual((source / "note").read_text(), "remaining data")
+        self.assertFalse(hidden.exists())
+        self.assertFalse(journal.path.exists())
+
+    def test_operation_journal_refuses_a_step_without_its_required_field(self) -> None:
+        source = self.base / "source"
+        journal = scratch.operation_journal(source, conf.read("scratch"))
+        journal.path.parent.mkdir()
+        hidden = str(source.with_name(".scratch-moved-hidden"))
+        common: dict[str, object] = {"source": str(source), "source_id": [1, 2]}
+        publish: dict[str, object] = {
+            **common, "step": "publish-copy", "hidden": hidden, "stage": str(self.base / ".scratch-moved-stage"),
+            "destination": str(self.base / "destination"), "task": ROW, "made": 1.0,
+        }
+        delete: dict[str, object] = {**common, "step": "delete", "registration": None}
+        for record, missing in ((publish, "stage_id"), (delete, "hidden")):
+            with self.subTest(missing=missing):
+                scratch.atomic_record(journal.path, record)
+                with self.assertRaisesRegex(scratch.RemovalRefused, f"cannot read folder operation: '{missing}'"):
+                    _ = journal.read()
+                self.assertTrue(journal.path.is_file())
+
+    def test_git_registration_failure_keeps_removal_intent_across_retries(self) -> None:
+        repository = self.base / "repository"
+        repository.mkdir()
+        checkout = self.base / "checkout"
+        self.git(repository, "init", "-q")
+        self.git(repository, "commit", "-q", "--allow-empty", "-m", "fixture")
+        self.git(repository, "remote", "add", "origin", str(repository))
+        self.git(repository, "worktree", "add", "-q", "--detach", str(checkout))
+        registration = git_files.at(checkout).git_dir
+        journal = scratch.operation_journal(checkout, conf.read("scratch"))
+        intent = scratch.removal_mark(checkout)
+        error = OSError("Git registration cleanup failed")
+
+        settings = conf.read("scratch")
+        with (mock.patch.object(scratch, "require_quiescent"),
+              mock.patch.object(scratch.CoordinatedRemoval, "remove_worktree_registration", side_effect=error)):
+            with self.assertRaisesRegex(OSError, str(error)):
+                scratch.remove_marked(checkout, source_deletion=scratch.SourceDeletion.RUN)
+            for _ in range(2):
+                with self.assertRaises(scratch.FolderRecoveryRequired):
+                    scratch.remove_marked(checkout, source_deletion=scratch.SourceDeletion.RUN)
+                report = scratch.recover_sweep_operations((self.base,), dry_run=False, scratch_settings=settings)
+                blocked = scratch.remove_orphaned_registrations(report.registrations, settings)
+                self.assertEqual([item.reason for item in blocked], [str(error)])
+                self.assertFalse(checkout.exists())
+                self.assertTrue(registration.is_dir())
+                self.assertTrue(intent.is_file())
+                self.assertIsInstance(journal.read().step, scratch.DeleteRemoval)
+
+        report = scratch.recover_sweep_operations((self.base,), dry_run=False, scratch_settings=settings)
+        self.assertEqual(scratch.remove_orphaned_registrations(report.registrations, settings), ())
+        scratch.remove_marked(checkout, source_deletion=scratch.SourceDeletion.RUN)
+        self.assertFalse(registration.exists())
+        self.assertFalse(intent.exists())
+        self.assertFalse(journal.path.exists())
+
+    def test_same_disk_adopt_preserves_hard_links(self) -> None:
+        source = self.base / "loose"
+        source.mkdir()
+        first = source / "first"
+        _ = first.write_text("shared contents")
+        os.link(first, source / "second")
+        original = first.stat()
+
+        adopted = scratch.adopt(source, ROW, "hard-links", visible=True)
+
+        self.assertFalse(source.exists())
+        self.assertTrue(os.path.samestat(original, (adopted / "first").stat()))
+        self.assertTrue(os.path.samestat(original, (adopted / "second").stat()))
+
+    def test_new_and_renew_succeed_with_the_tasks_session_hold(self) -> None:
+        session = self.base / "session" / "maker"
+        (session / session_folder.RUN).mkdir(parents=True)
+        task = "gate:renew-session"
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(scratch.main(["new", "--task", task, "--name", "renewed"]), 0)
+        path = Path(output.getvalue().strip())
+        self.assertEqual(path, session / "renewed")
+        self.assertEqual(scratch.holds()[str(path)]["task"], task)
+        now = 1234.0
+        with mock.patch.object(time, "time", return_value=now):
+            self.assertEqual(scratch.main(["renew", str(path)]), 0)
+        record = scratch.task_of(path)
+        assert isinstance(record, copy_record.Registered)
+        self.assertEqual(record.fields["renewed"], now)
+        self.assertEqual((path / copy_record.RECORD).stat().st_mtime, now)
 
     def test_renew_moves_the_records_time(self) -> None:
         path = scratch.new(RUN)

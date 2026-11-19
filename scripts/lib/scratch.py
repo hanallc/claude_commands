@@ -43,7 +43,7 @@ as `<showrunner>-C<n>-<word>`, where cargo-port lists it. Each holds copy_record
 times. The hourly tmp sweep (scripts/lint/tmp_sweep.py) keeps a folder in ROOT while its task is
 open, and removes it when its until: time passes, or after 7 idle days whatever its task, since an
 ender can fail. A row's folder waits for its verdict, and VISIBLE_ROOT is never swept. A git
-worktree goes through `git worktree remove`, so its source repo keeps no stale entry.
+worktree removal also removes its registration in the source repository.
 Removal writes versioned deletion intent to `.scratch-removing-<folder>.json` beside the source.
 The intent preserves the task and source evidence across interruptions.
 A retry compares ref file metadata with the intent and checks other file timestamps.
@@ -71,8 +71,17 @@ try:
 except FileNotFoundError:
     pass
 
+if __name__ == "__main__":
+    import sys as _sys
+    from scripts.lib import scratch as _scratch
+
+    _sys.exit(_scratch.main(_sys.argv[1:]))
+
 import argparse
+import ctypes
+import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -81,30 +90,34 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 import time
-from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Mapping
-from contextlib import ExitStack, contextmanager, nullcontext
+from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
+from functools import cached_property
 from importlib import import_module
-from pathlib import Path
+from pathlib import Path, PurePath
 from threading import get_ident
-from typing import Literal, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
 from urllib.parse import unquote_to_bytes
 
 from scripts.lib import cargo_output, conf, copy_record, git_files, session_folder, time_limit  # noqa: E402
+from scripts.lib.atomic_file import sync_folder
 from scripts.lib.conf import UseConfiguredValue
 
 from scripts.lib.build_folders import (  # noqa: E402
     BuildFolderSpec, FolderRemovalLease, HeldFolderRemovalLease, RefusedRemovalLease, build_folder_path, collector_lease,
-    folder_removal_lease, inherited_temporary_parent, open_busy_mark, require_no_removal_mark,
+    folder_removal_lease, held_build_folder_descriptors, inherited_temporary_parent, open_busy_mark, require_no_removal_mark,
     BUSY as BUSY, REMOVAL_RECORD_PREFIX as REMOVAL_RECORD_PREFIX, REMOVAL_RECORD_SUFFIX as REMOVAL_RECORD_SUFFIX,
     removal_mark as removal_mark,
 )
 from scripts.lib.user_zone import user_zone  # noqa: E402
+
+if TYPE_CHECKING:
+    from scripts.disks import measure
 
 VISIBLE_ROOT_ENV = "SCRATCH_VISIBLE_ROOT"
 HOLDS_ENV = "SCRATCH_HOLDS"
@@ -113,6 +126,7 @@ ROW_NAME = re.compile(r"[A-Za-z0-9_-]+-C[0-9]+")
 WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 BUSY_REASON = "busy: a lease or .claude-busy lock is held"
 RECORD_LOCKS: ContextVar[frozenset[tuple[int, int]]] = ContextVar("scratch_record_locks", default=frozenset())
+RECORD_LOCK_FDS: ContextVar[frozenset[int]] = ContextVar("scratch_record_lock_fds", default=frozenset())
 REMOVAL_VERSION = 1
 
 
@@ -185,21 +199,29 @@ def mark_cargo_cache(target: Path) -> None:
     (target / USE_STAMP).touch()
 
 
-def atomic_record(path: Path, fields: object) -> None:
+def atomic_record(path: Path, fields: object, *, sync: bool = False) -> None:
     # A killed writer may leave its stage file. Keep copy stages in Git metadata,
     # where they cannot look like unsaved user work on the next run.
     git = path.parent / ".git"
     staging = git if path.name == copy_record.RECORD and git.is_dir() and not git.is_symlink() else path.parent
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=staging,
-                                     prefix=f".{path.name}.", delete=False) as output:
-        temporary = Path(output.name)
+    write_scratch_text(path, staging, json.dumps(fields) + "\n")
+    if sync:
+        sync_folder(path.parent)
+
+
+def write_scratch_text(path: Path, staging: Path, text: str) -> None:
+    with coordinate_removals(wait_for_hold_lock=False) as removal:
+        temporary = staging / f".{path.name}.{secrets.token_hex(8)}"
+        removal.check_paths((path, temporary))
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            _ = output.write(json.dumps(fields) + "\n")
-            output.flush()
-            os.fsync(output.fileno())
-            os.replace(temporary, path)
+            with os.fdopen(fd, "w", encoding="utf-8") as output:
+                _ = output.write(text)
+                output.flush()
+                os.fsync(output.fileno())
+            removal.replace(temporary, path)
         finally:
-            temporary.unlink(missing_ok=True)
+            delete_entry(temporary, RemovalKind.FILE, missing_ok=True)
 
 
 def exclude_copy_metadata(path: Path, *, additional: tuple[str, ...] = ()) -> None:
@@ -214,15 +236,8 @@ def exclude_copy_metadata(path: Path, *, additional: tuple[str, ...] = ()) -> No
         text = ""
     patterns = [f"/{name}" for name in (copy_record.RECORD, BUSY, *additional) if f"/{name}" not in text.splitlines()]
     if patterns:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=exclude.parent, delete=False) as output:
-            temporary = Path(output.name)
-            try:
-                _ = output.write(text + ("\n" if text and not text.endswith("\n") else "") + "\n".join(patterns) + "\n")
-                output.flush()
-                os.fsync(output.fileno())
-                os.replace(temporary, exclude)
-            finally:
-                temporary.unlink(missing_ok=True)
+        separator = "\n" if text and not text.endswith("\n") else ""
+        write_scratch_text(exclude, exclude.parent, text + separator + "\n".join(patterns) + "\n")
 
 
 def register_copy(path: Path, *, task: str, owner_unit: str, source_path: str, source_commit: str,
@@ -387,14 +402,13 @@ def directory_record_lock(path: Path, *, wait: bool,
                 if attempt == attempts - 1:
                     raise ScratchError(f"{path}: copy kept changing while its record lock was acquired; retry")
                 continue
-            if reentered:
-                yield True
-                return
-            token = RECORD_LOCKS.set(RECORD_LOCKS.get() | {identity})
+            record_token = RECORD_LOCKS.set(RECORD_LOCKS.get() | {identity})
+            fd_token = RECORD_LOCK_FDS.set(RECORD_LOCK_FDS.get() | {descriptor})
             try:
                 yield True
             finally:
-                RECORD_LOCKS.reset(token)
+                RECORD_LOCK_FDS.reset(fd_token)
+                RECORD_LOCKS.reset(record_token)
             return
         finally:
             os.close(descriptor)
@@ -512,10 +526,12 @@ def hand_over(path: Path, owner: str, task: str, *, run_dir: str = "", land_targ
           copy_lock(path, scratch_settings=scratch_settings),
           copy_record_lock(path, scratch_settings=scratch_settings)):
         current = task_of(path, scratch_settings=scratch_settings)
-        updated = update_record(path, transferred, scratch_settings=scratch_settings)
         held = found.get(str(path.resolve()))
-        if held is not None and isinstance(current, copy_record.Registered) and (
-                held["task"] == current.task or updated.fields.get("test_hana_clone") is True):
+        transfer_hold = held is not None and isinstance(current, copy_record.Registered) and (
+            held["task"] == current.task or current.fields.get("test_hana_clone") is True)
+        _ = update_record(path, transferred, ending_task=held["task"] if transfer_hold and held is not None else None,
+                          scratch_settings=scratch_settings)
+        if transfer_hold and held is not None:
             held.update(task=task, ended=0.0)
             write_holds(found, scratch_settings=scratch_settings)
 
@@ -539,7 +555,7 @@ def fields_for_task(fields: dict[str, object], task: str, *, run_dir: str = "", 
 
 
 def update_record(path: Path, change: Callable[[copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord], dict[str, object]],
-                  *, removal: bool = False,
+                  *, removal: bool = False, ending_task: str | None = None,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> copy_record.Registered:
     """The only record-write path: read, change and publish under the directory lock."""
@@ -557,22 +573,30 @@ def update_record(path: Path, change: Callable[[copy_record.Registered | copy_re
         if not isinstance(task, str):
             raise ScratchError(f"{path}: record needs a task")
         _ = checked_task(task, False)
-        if copy_record.copy_folder(path) == path.resolve() or "owner_unit" in fields:
+        registered_copy = copy_record.copy_folder(path) == path.resolve() or "owner_unit" in fields
+        if registered_copy:
             directory = path.stat()
             identity = record.fields.get("copy_id") if isinstance(record, copy_record.Registered) else ""
             fields.update(copy_id=identity if isinstance(identity, str) and identity else secrets.token_hex(16),
                           copy_device=directory.st_dev, copy_inode=directory.st_ino)
             if removal:
                 fields["copy_path"] = str(path.resolve())
-            else:
-                exclude_copy_metadata(path)
         destination = removal_mark(path) if removal else path / copy_record.RECORD
-        atomic_record(destination, fields)
+        owner = record.task if isinstance(record, copy_record.Registered) else task
+        with coordinate_removals(scratch_settings=scratch_settings, wait_for_hold_lock=False,
+                                 ending_task=ending_task if ending_task is not None else owner):
+            if registered_copy and not removal:
+                exclude_copy_metadata(path)
+            atomic_record(destination, fields)
         return copy_record.Registered(task, fields)
 
 
 class ScratchError(Exception):
     pass
+
+
+class ScratchHoldsUnreadable(ScratchError):
+    """The hold file cannot confirm which folders are protected."""
 
 
 @dataclass(frozen=True)
@@ -588,6 +612,548 @@ class Hold(TypedDict):
     reason: str
     made: float
     ended: float
+
+
+@dataclass(frozen=True)
+class FilesystemLocation:
+    device: str
+    path: PurePath
+
+    @classmethod
+    def at(cls, path: Path, mounts: Sequence[measure.Mount]) -> FilesystemLocation:
+        mount = next((mount for mount in mounts if path.is_relative_to(mount.point)), None)
+        if mount is None:
+            raise ScratchHoldsUnreadable(f"cannot identify the mount for {path}")
+        return cls(mount.device, mount.root / path.relative_to(mount.point))
+
+    def overlaps(self, other: FilesystemLocation) -> bool:
+        return self.device == other.device and (
+            self.path.is_relative_to(other.path) or other.path.is_relative_to(self.path))
+
+
+def visible_mounts(mounts: Sequence[measure.Mount]) -> tuple[measure.Mount, ...]:
+    """Select the deepest mount first. The last mount at a point is visible."""
+    return tuple(sorted(reversed(mounts), key=lambda mount: len(mount.point.parts), reverse=True))
+
+
+@dataclass(frozen=True)
+class MountAliases:
+    source: Path
+    paths: tuple[Path, ...]
+
+    @classmethod
+    def of(cls, source: Path, mounts: Sequence[measure.Mount]) -> MountAliases:
+        if sys.platform != "linux":
+            return cls(source, (source,))
+        location = FilesystemLocation.at(source, mounts)
+        aliases = dict.fromkeys((source,))
+        for mount in mounts:
+            if mount.device != location.device:
+                continue
+            if location.path.is_relative_to(mount.root):
+                candidate = Path(mount.point / location.path.relative_to(mount.root))
+                expected = location
+            elif mount.root.is_relative_to(location.path):
+                candidate = Path(mount.point)
+                expected = FilesystemLocation(location.device, mount.root)
+            else:
+                continue
+            if FilesystemLocation.at(candidate, mounts) == expected:
+                aliases[candidate] = None
+        return cls(source, tuple(aliases))
+
+    def contains(self, path: Path) -> bool:
+        return any(path.is_relative_to(alias) for alias in self.paths)
+
+
+@dataclass(frozen=True)
+class HeldScratchFolders:
+    """Keep each held folder, its contents, and any folder that contains it."""
+
+    held: frozenset[tuple[int, int]]
+    containers: frozenset[tuple[int, int]]
+    locations: tuple[FilesystemLocation, ...]
+    mounts: tuple[measure.Mount, ...]
+
+    @staticmethod
+    def identity(path: Path, *, follow_symlinks: bool = True) -> Collection[tuple[int, int]]:
+        try:
+            info = path.stat(follow_symlinks=follow_symlinks)
+        except (FileNotFoundError, NotADirectoryError):
+            return ()
+        except OSError as error:
+            raise ScratchHoldsUnreadable(f"cannot check scratch holds at {path}: {error}") from error
+        return ((info.st_dev, info.st_ino),)
+
+    @classmethod
+    def from_holds(cls, holds: Mapping[str, Hold], *, ending_task: str | None = None,
+                   mounts: Sequence[measure.Mount] | None = None) -> HeldScratchFolders:
+        held: set[tuple[int, int]] = set()
+        parents: set[Path] = set()
+        paths: list[Path] = []
+        for name, record in holds.items():
+            if record["task"] == ending_task:
+                continue
+            path = Path(name)
+            identities = cls.identity(path, follow_symlinks=False)
+            if identities:
+                held.update(identities)
+                parents.update(path.parents)
+                paths.append(path)
+        visible: tuple[measure.Mount, ...] = ()
+        if paths and sys.platform == "linux":
+            from scripts.disks import measure
+
+            entries = measure.read_mounts() if mounts is None else mounts
+            if not entries:
+                raise ScratchHoldsUnreadable("cannot read the mount table for scratch holds")
+            visible = visible_mounts(entries)
+        locations = tuple(FilesystemLocation.at(path, visible) for path in paths) if visible else ()
+        return cls(frozenset(held), frozenset(key for path in parents for key in cls.identity(path)), locations, visible)
+
+    def protects_location(self, path: Path) -> bool:
+        if not self.locations:
+            return False
+        location = FilesystemLocation.at(path, self.mounts)
+        return any(held.overlaps(location) for held in self.locations)
+
+    def protects(self, path: Path) -> bool:
+        if not self.held:
+            return False
+        identities = self.identity(path, follow_symlinks=False)
+        return (self.protects_location(path) or not self.held.isdisjoint(identities) or not self.containers.isdisjoint(identities)
+                or any(not self.held.isdisjoint(self.identity(parent)) for parent in path.parents))
+
+
+HELD_FOLDER_REASON = "a scratch hold keeps this folder"
+
+
+class RemovalRefused(OSError):
+    """A scratch hold can prevent removal."""
+
+
+class MountRemovalRefused(RemovalRefused):
+    """A mount point prevents tree removal."""
+
+
+def mount_identity(fd: int) -> int:
+    """Identify a mount even when a bind mount has the same device."""
+    if sys.platform == "linux":
+        for line in Path(f"/proc/self/fdinfo/{fd}").read_text().splitlines():
+            key, _, value = line.partition(":")
+            if key == "mnt_id":
+                return int(value)
+        raise MountRemovalRefused("cannot read the directory mount identity")
+    return os.fstat(fd).st_dev
+
+
+class RemovalKind(Enum):
+    FILE = "file"
+    EMPTY_DIRECTORY = "empty directory"
+    TREE = "tree"
+
+
+@dataclass(frozen=True)
+class AnchoredRemoval:
+    """Name an entry relative to its open parent directory."""
+
+    parent: int
+    name: str
+
+    def __post_init__(self) -> None:
+        if self.name in ("", ".", "..") or "/" in self.name:
+            raise ValueError(f"{self.name!r}: expected one directory entry name")
+
+
+def resolved_removal_paths(paths: Iterable[Path]) -> tuple[Path, ...]:
+    """Include each path and its resolved target."""
+    return tuple(dict.fromkeys(candidate for path in paths
+                               for candidate in (path.absolute(), path.resolve())))
+
+
+_TREE_ROOT = Path()
+
+
+class TreeRemovalProof(Protocol):
+    """Verify a source entry against its published copy before deletion."""
+
+    def check(self, source: int, path: Path, info: os.stat_result, mount: int) -> None: ...
+    def check_parent_metadata(self, fd: int, path: Path) -> None: ...
+
+
+@dataclass(frozen=True)
+class CoordinatedRemoval:
+    """Check and remove entries while the scratch hold lock is held."""
+
+    holds: Mapping[str, Hold]
+    folders: HeldScratchFolders
+    ending_task: str | None
+
+    @cached_property
+    def mount_views(self) -> tuple[measure.Mount, ...]:
+        if self.folders.mounts or sys.platform != "linux":
+            return self.folders.mounts
+        from scripts.disks import measure
+
+        return visible_mounts(measure.read_mounts())
+
+    def aliases(self, path: Path) -> MountAliases:
+        return MountAliases.of(path, self.mount_views)
+
+    def check_paths(self, paths: Iterable[Path]) -> None:
+        """Check all paths under the caller's hold lock."""
+        if self.folders.held:
+            self.check_held_paths(resolved_removal_paths(paths))
+
+    def check_held_paths(self, paths: tuple[Path, ...]) -> None:
+        if any(self.folders.protects(path) for path in paths):
+            raise RemovalRefused(HELD_FOLDER_REASON)
+
+    def check(self, entry: Path | AnchoredRemoval) -> None:
+        if isinstance(entry, Path):
+            self.check_paths((entry,))
+        elif self.protects_anchored(entry):
+            raise RemovalRefused(HELD_FOLDER_REASON)
+
+    @staticmethod
+    def check_tree(path: Path, *, mounts: Sequence[measure.Mount] | None = None) -> None:
+        """Refuse a tree with a mount point before removing any entry."""
+        if not path.is_symlink() and path.is_dir():
+            CoordinatedRemoval.check_mounts(resolved_removal_paths((path,)), mounts=mounts)
+
+    @staticmethod
+    def check_mounts(paths: tuple[Path, ...], *, mounts: Sequence[measure.Mount] | None = None) -> None:
+        if not paths:
+            return
+        if sys.platform == "linux":
+            from scripts.disks import measure
+
+            entries = measure.read_mounts() if mounts is None else mounts
+            if not entries:
+                raise MountRemovalRefused(f"{paths[0]}: cannot read the mount table")
+            for mount in entries:
+                if any(mount.point.is_relative_to(path) for path in paths):
+                    raise MountRemovalRefused(f"tree contains a mount point at {mount.point}")
+            return
+
+        def unreadable(error: OSError) -> None:
+            raise MountRemovalRefused(f"cannot check mount points: {error}") from error
+
+        for path in paths:
+            if os.path.ismount(path):
+                raise MountRemovalRefused(f"tree contains a mount point at {path}")
+            if path.is_symlink() or not path.is_dir():
+                continue
+            for folder, children, _ in os.walk(path, onerror=unreadable):
+                for name in children:
+                    candidate = Path(folder) / name
+                    if os.path.ismount(candidate):
+                        raise MountRemovalRefused(f"tree contains a mount point at {candidate}")
+
+    def check_worktree_prune(self, git_dirs: Iterable[Path], *, records: Iterable[Path] = ()) -> None:
+        """Check all paths that a prune can change."""
+        sources = tuple(git_dirs)
+        self.check_prune_paths((*records, *sources, *(source / "worktrees" for source in sources)))
+
+    def check_prune_paths(self, paths: Iterable[Path]) -> None:
+        checked = resolved_removal_paths(paths)
+        self.check_held_paths(checked)
+        self.check_mounts(checked)
+
+    @contextmanager
+    def open_worktree_registrations(self, common: Path) -> Generator[tuple[Path, int | None]]:
+        given = common / "worktrees"
+        worktrees = given.resolve()
+        self.check_prune_paths((common, given, worktrees))
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        with ExitStack() as opened:
+            try:
+                parent = os.open(worktrees.parent, flags)
+                _ = opened.callback(os.close, parent)
+                fd = os.open(worktrees.name, flags, dir_fd=parent)
+            except FileNotFoundError:
+                yield worktrees, None
+                return
+            _ = opened.callback(os.close, fd)
+            if mount_identity(fd) != mount_identity(parent):
+                raise MountRemovalRefused(f"tree contains a mount point at {worktrees}")
+            self.check(AnchoredRemoval(parent, worktrees.name))
+            yield worktrees, fd
+
+    def remove_worktree_registration(self, registration: WorktreeRegistration) -> bool:
+        """Resume removal of the recorded Git registration."""
+        metadata = registration.path
+        with self.open_worktree_registrations(registration.common) as (worktrees, fd):
+            if metadata.parent != worktrees:
+                raise RemovalRefused(f"{metadata}: worktree registration parent changed")
+            if fd is None:
+                return True
+            try:
+                info = os.stat(metadata.name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return True
+            if directory_id(info) != registration.identity:
+                raise RemovalRefused(f"{metadata}: worktree registration changed")
+            self.delete_at(AnchoredRemoval(fd, metadata.name), expected=info, repair_permissions=True, sync=True)
+        return True
+
+    def prune_worktrees(self, common: Path) -> None:
+        """Ask Git which registrations to prune. Delete them through the coordinator."""
+        command = ["git", "--git-dir", str(common), "worktree", "prune", "--dry-run"]
+        with self.open_worktree_registrations(common) as (worktrees, fd):
+            if fd is None:
+                _ = subprocess.run(command, capture_output=True, check=True, timeout=60)
+                return
+            listed = {name: os.stat(name, dir_fd=fd, follow_symlinks=False) for name in os.listdir(fd)}
+            if any("\n" in name for name in listed):
+                raise RemovalRefused(f"{worktrees}: Git cannot report these names without ambiguity")
+            report = subprocess.run(command, capture_output=True, check=True, timeout=60,
+                                    env={**os.environ, "LC_ALL": "C"})
+            if not os.path.samestat(os.fstat(fd), (common / "worktrees").stat()):
+                raise RemovalRefused(f"{worktrees}: directory changed during prune")
+            selected: list[str] = []
+            for line in os.fsdecode(report.stdout + report.stderr).split("\n"):
+                if not line:
+                    continue
+                matches = [name for name in listed if line.startswith(f"Removing worktrees/{name}: ")]
+                if len(matches) != 1:
+                    raise RemovalRefused(f"{worktrees}: cannot identify the registration from Git")
+                selected.append(matches[0])
+            for name in dict.fromkeys(selected):
+                self.delete_at(AnchoredRemoval(fd, name), expected=listed[name], repair_permissions=True)
+
+    def protects_anchored(self, entry: AnchoredRemoval) -> bool:
+        if not self.folders.held:
+            return False
+        try:
+            info = os.stat(entry.name, dir_fd=entry.parent, follow_symlinks=False)
+        except FileNotFoundError:
+            info = None
+        if self.folders.locations:
+            parent = Path(os.readlink(f"/proc/self/fd/{entry.parent}"))
+            if not parent.is_absolute() or not os.path.samestat(parent.stat(), os.fstat(entry.parent)):
+                raise ScratchHoldsUnreadable(f"cannot identify the directory for {entry.name}")
+            if self.folders.protects_location(parent / entry.name):
+                return True
+        if info is not None:
+            identity = (info.st_dev, info.st_ino)
+            if identity in self.folders.held or identity in self.folders.containers:
+                return True
+        with ExitStack() as parents:
+            current = entry.parent
+            while True:
+                info = os.fstat(current)
+                if (info.st_dev, info.st_ino) in self.folders.held:
+                    return True
+                parent = os.open("..", os.O_RDONLY | os.O_DIRECTORY, dir_fd=current)
+                _ = parents.callback(os.close, parent)
+                if os.path.samestat(info, os.fstat(parent)):
+                    return False
+                current = parent
+
+    def delete(self, entry: Path | AnchoredRemoval, kind: RemovalKind, *, repair_permissions: bool = True,
+               record_last: bool = False) -> None:
+        self.check(entry)
+        path, parent = (entry, None) if isinstance(entry, Path) else (entry.name, entry.parent)
+        if kind is RemovalKind.EMPTY_DIRECTORY:
+            os.rmdir(path, dir_fd=parent)
+        elif kind is RemovalKind.FILE:
+            os.unlink(path, dir_fd=parent)
+        elif kind is RemovalKind.TREE:
+            if isinstance(entry, AnchoredRemoval):
+                self.delete_at(entry, repair_permissions=repair_permissions, record_last=record_last)
+                return
+            directory = os.open(entry.parent.resolve(), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                self.check_tree(entry)
+                self.delete_at(AnchoredRemoval(directory, entry.name),
+                               repair_permissions=repair_permissions, record_last=record_last)
+            finally:
+                os.close(directory)
+
+    def delete_at(self, entry: AnchoredRemoval, *, repair_permissions: bool, record_last: bool = False,
+                  expected: os.stat_result | None = None, proof: TreeRemovalProof | None = None,
+                  sync: bool = False) -> None:
+        self.check(entry)
+        info = os.stat(entry.name, dir_fd=entry.parent, follow_symlinks=False)
+        if expected is not None and not os.path.samestat(info, expected):
+            raise RemovalRefused(f"{entry.name}: entry changed before deletion")
+        if stat.S_ISDIR(info.st_mode):
+            self.delete_directory(entry, mount_identity(entry.parent), info, repair_permissions,
+                                  record_last=record_last, proof=proof, sync=sync)
+        else:
+            if proof is not None:
+                raise RemovalRefused(f"{entry.name}: directory changed before deletion")
+            self.delete(entry, RemovalKind.FILE)
+
+    def delete_directory(self, entry: AnchoredRemoval, mount: int, expected: os.stat_result,
+                         repair_permissions: bool, *, record_last: bool = False,
+                         proof: TreeRemovalProof | None = None, sync: bool = False,
+                         relative: Path = _TREE_ROOT) -> None:
+        """Open each directory without following links. Check its mount before descent."""
+        parent, name = entry.parent, entry.name
+        display = relative if relative.parts else Path(name)
+        flags = os.O_DIRECTORY | os.O_NOFOLLOW
+        if proof is not None and sys.platform == "linux":
+            flags |= os.O_NOATIME
+        with ExitStack() as opened:
+            try:
+                fd = os.open(name, flags | os.O_RDONLY, dir_fd=parent)
+            except PermissionError:
+                if not repair_permissions or sys.platform != "linux":
+                    raise
+                pinned = os.open(name, flags | os.O_PATH, dir_fd=parent)
+                _ = opened.callback(os.close, pinned)
+                if mount_identity(pinned) != mount:
+                    raise MountRemovalRefused(f"tree contains a mount point at {display}") from None
+                if not os.path.samestat(os.fstat(pinned), expected):
+                    raise RemovalRefused(f"{display}: directory changed before deletion") from None
+                os.chmod(f"/proc/self/fd/{pinned}", 0o700)
+                fd = os.open(".", os.O_DIRECTORY | os.O_RDONLY, dir_fd=pinned)
+            _ = opened.callback(os.close, fd)
+            if mount_identity(fd) != mount:
+                raise MountRemovalRefused(f"tree contains a mount point at {display}")
+            if not os.path.samestat(os.fstat(fd), expected):
+                raise RemovalRefused(f"{display}: directory changed before deletion")
+            proof_parent = parent if relative.parts else fd
+            if proof is not None:
+                proof.check(proof_parent, relative, os.fstat(fd), mount)
+            if repair_permissions and not os.access(".", os.W_OK | os.X_OK, dir_fd=fd):
+                os.fchmod(fd, 0o700)
+            children = os.listdir(fd)
+            if record_last or proof is not None:
+                children.sort(key=lambda child: (record_last and child == copy_record.RECORD, child))
+            for child in children:
+                path = relative / child
+                try:
+                    info = os.stat(child, dir_fd=fd, follow_symlinks=False)
+                    if stat.S_ISDIR(info.st_mode):
+                        self.delete_directory(AnchoredRemoval(fd, child), mount, info, repair_permissions,
+                                              proof=proof, sync=sync, relative=path)
+                    else:
+                        if proof is not None:
+                            proof.check(fd, path, info, mount)
+                            proof.check_parent_metadata(fd, relative)
+                        os.unlink(child, dir_fd=fd)
+                except FileNotFoundError:
+                    if proof is not None:
+                        raise
+            if proof is not None:
+                proof.check(proof_parent, relative, os.fstat(fd), mount)
+                if relative.parts:
+                    proof.check_parent_metadata(parent, relative.parent)
+            if not os.path.samestat(os.fstat(fd), os.stat(name, dir_fd=parent, follow_symlinks=False)):
+                raise RemovalRefused(f"{display}: directory changed during removal")
+            os.rmdir(name, dir_fd=parent)
+            if sync:
+                os.fsync(parent)
+
+    def replace(self, source: Path | AnchoredRemoval, target: Path | AnchoredRemoval) -> None:
+        """Check both entries before replacing a file."""
+        self.check(source)
+        self.check(target)
+        if isinstance(source, Path) and isinstance(target, Path):
+            os.replace(source, target)
+            return
+        source_path, source_parent = (source, None) if isinstance(source, Path) else (source.name, source.parent)
+        target_path, target_parent = (target, None) if isinstance(target, Path) else (target.name, target.parent)
+        os.replace(source_path, target_path, src_dir_fd=source_parent, dst_dir_fd=target_parent)
+
+    def rename_new(self, source: AnchoredRemoval, target: AnchoredRemoval) -> None:
+        """Rename an entry under the hold lock and refuse an existing destination."""
+        self.check(source)
+        self.check(target)
+        library = ctypes.CDLL(None, use_errno=True)
+        try:
+            if sys.platform == "darwin":
+                rename = cast(Callable[[int, bytes, int, bytes, int], int], library.renameatx_np)
+                flag = 4  # RENAME_EXCL
+            elif sys.platform == "linux":
+                rename = cast(Callable[[int, bytes, int, bytes, int], int], library.renameat2)
+                flag = 1  # RENAME_NOREPLACE
+            else:
+                raise RemovalRefused("this platform does not support an exclusive rename")
+        except AttributeError as error:
+            raise RemovalRefused("this platform does not support an exclusive rename") from error
+        if rename(source.parent, os.fsencode(source.name), target.parent, os.fsencode(target.name), flag) != 0:
+            number = ctypes.get_errno()
+            raise OSError(number, os.strerror(number), source.name, None, target.name)
+
+
+_ACTIVE_REMOVAL: ContextVar[CoordinatedRemoval | None] = ContextVar("scratch_coordinated_removal", default=None)
+
+
+@dataclass(frozen=True)
+class _LockedHoldFile:
+    path: Path
+    records: dict[str, Hold]
+    settings: conf.ConfigRead
+
+
+_LOCKED_HOLD_FILE: ContextVar[_LockedHoldFile | None] = ContextVar("scratch_locked_hold_file", default=None)
+
+
+@contextmanager
+def coordinate_removals(*, dry_run: bool = False, wait_for_hold_lock: bool = True, ending_task: str | None = None,
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> Generator[CoordinatedRemoval]:
+    """Use the scratch hold lock from the first hold check through deletion."""
+    active = _ACTIVE_REMOVAL.get()
+    if active is not None and (ending_task is None or ending_task == active.ending_task):
+        yield active
+        return
+    with ExitStack() as locks:
+        locked = _LOCKED_HOLD_FILE.get()
+        if isinstance(scratch_settings, UseConfiguredValue) and locked is not None:
+            ledger = locked.path
+        else:
+            if isinstance(scratch_settings, UseConfiguredValue):
+                scratch_settings = conf.read("scratch")
+            ledger = holds_file(scratch_settings=scratch_settings).absolute()
+        sweep = cast(_SweepRemoval, cast(object, import_module("scripts.lint.tmp_sweep")))
+        sweep.refuse_live_test_roots((ledger,))
+        if locked is not None and locked.path == ledger:
+            holds = locked.records
+        else:
+            holds = (read_holds(scratch_settings=scratch_settings) if dry_run else locks.enter_context(
+                locked_holds(scratch_settings=scratch_settings, wait=wait_for_hold_lock)))
+        removal = CoordinatedRemoval(holds, HeldScratchFolders.from_holds(holds, ending_task=ending_task), ending_task)
+        if dry_run:
+            yield removal
+            return
+        token = _ACTIVE_REMOVAL.set(removal)
+        try:
+            yield removal
+        finally:
+            _ACTIVE_REMOVAL.reset(token)
+
+
+def delete_entry(entry: Path | AnchoredRemoval, kind: RemovalKind, *, missing_ok: bool = False,
+    scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> None:
+    """Delete an entry through the shared hold check."""
+    if isinstance(entry, Path):
+        sweep = cast(_SweepRemoval, cast(object, import_module("scripts.lint.tmp_sweep")))
+        sweep.refuse_live_test_roots((entry,))
+        if missing_ok and not os.path.lexists(entry):
+            return
+    try:
+        with coordinate_removals(scratch_settings=scratch_settings) as removal:
+            if isinstance(entry, Path) and kind is RemovalKind.TREE:
+                if isinstance(scratch_settings, UseConfiguredValue):
+                    locked = _LOCKED_HOLD_FILE.get()
+                    scratch_settings = conf.read("scratch") if locked is None else locked.settings
+                require_no_folder_operations((entry,), scratch_settings=scratch_settings)
+                require_no_folder_leftovers((entry,), removal, scratch_settings)
+            removal.delete(entry, kind)
+    except FileNotFoundError:
+        if not missing_ok:
+            raise
+
+
+def replace_entry(source: AnchoredRemoval, target: AnchoredRemoval) -> None:
+    with coordinate_removals(wait_for_hold_lock=False) as removal:
+        removal.replace(source, target)
 
 
 def visible_root(*, scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Path:
@@ -714,6 +1280,7 @@ def target(task: str, word: str, visible: bool, *,
         raise ScratchError(f"{word!r}: a name is letters, digits, - and _")
     if visible:
         path = visible_root(scratch_settings=scratch_settings) / "-".join(part for part in (match["name"], word) if part)
+        require_no_folder_operations((path,), scratch_settings=scratch_settings)
         if os.path.lexists(path):
             raise ScratchError(f"{path} exists")
         return path
@@ -792,9 +1359,11 @@ def new(task: str = "", word: str = "", visible: bool = False, now: float | None
     task = task_or_default(task, moment, scratch_settings=scratch_settings)
     while True:
         path = target(task, word, visible, scratch_settings=scratch_settings)
-        path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            path.mkdir()
+            with coordinate_removals(scratch_settings=scratch_settings):
+                require_no_folder_operations((path,), scratch_settings=scratch_settings)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.mkdir()
             break
         except FileExistsError:
             # Another call took the free name in the session folder first; take the next one.
@@ -804,7 +1373,8 @@ def new(task: str = "", word: str = "", visible: bool = False, now: float | None
         write_record(path, task, moment, throwaway=throwaway, scratch_settings=scratch_settings)
         index_in_session(path, task, scratch_settings=scratch_settings)
     except BaseException:
-        shutil.rmtree(path, ignore_errors=True)
+        with suppress(OSError, ScratchHoldsUnreadable):
+            delete_entry(path, RemovalKind.TREE, missing_ok=True, scratch_settings=scratch_settings)
         raise
     return path
 
@@ -844,7 +1414,8 @@ def new_worker(word: str = "", *,
         write_record(path, task, time.time(), throwaway=True, scratch_settings=scratch_settings)
         _ = hold(path, task, "worker assignment folder", scratch_settings=scratch_settings)
     except BaseException:
-        shutil.rmtree(path)
+        with suppress(OSError, ScratchHoldsUnreadable):
+            delete_entry(path, RemovalKind.TREE, missing_ok=True, scratch_settings=scratch_settings)
         raise
     return path
 
@@ -852,20 +1423,732 @@ def new_worker(word: str = "", *,
 def adopt(source: Path, task: str, word: str = "", visible: bool = False, now: float | None = None, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Path:
-    """Move a loose folder into a scratch root and record its task. A git worktree's link moves
-    with it unrepaired: `git worktree repair` from the new place fixes it when it must work."""
+    """Adopt a folder and retain a cross-disk source for the sweep."""
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
-    if source.is_symlink() or not source.is_dir():
+    sweep = cast(_SweepRemoval, cast(object, import_module("scripts.lint.tmp_sweep")))
+    sweep.refuse_live_test_roots((source,))
+    source = source.parent.resolve() / source.name
+    require_no_folder_operations((source,), scratch_settings=scratch_settings)
+    try:
+        original = source.lstat()
+    except FileNotFoundError as error:
+        raise ScratchError(f"{source} is no folder") from error
+    if not stat.S_ISDIR(original.st_mode):
         raise ScratchError(f"{source} is no folder")
+    source = source.resolve()
     moment = time.time() if now is None else now
     task = task_or_default(task, moment, scratch_settings=scratch_settings)
     path = target(task, word, visible, scratch_settings=scratch_settings)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _ = shutil.move(str(source), str(path))
-    write_record(path, task, moment, scratch_settings=scratch_settings)
-    index_in_session(path, task, scratch_settings=scratch_settings)
+    sweep.refuse_live_test_roots((path,))
+    path = path.parent.resolve() / path.name
+    destination = path.resolve()
+    if destination.is_relative_to(source):
+        raise ScratchError(f"{path}: destination is inside {source}")
+    with coordinate_removals(scratch_settings=scratch_settings) as removal:
+        mounts = removal.mount_views
+        if sys.platform == "linux" and FilesystemLocation.at(source, mounts).overlaps(
+                FilesystemLocation.at(destination, mounts)):
+            raise ScratchError(f"{path}: destination overlaps {source}")
+        require_no_folder_operations((source, path), scratch_settings=scratch_settings)
+        require_no_folder_leftovers((source, path), removal, scratch_settings)
+        if operation_entry(source) != directory_id(original):
+            raise RemovalRefused(f"{source}: source changed before adoption")
+        if os.path.lexists(path):
+            raise FileExistsError(f"{path} exists")
+        removal.check_paths((source, path))
+        removal.check_tree(source, mounts=mounts)
+        if not rename_adoption(removal, source, path, original, task, moment, scratch_settings):
+            copy_adoption(removal, source, path, original, task, moment, scratch_settings)
     return path
+
+
+def copy_adoption(removal: CoordinatedRemoval, source: Path, path: Path, original: os.stat_result,
+                  task: str, now: float, scratch_settings: conf.ConfigRead) -> None:
+    """Publish a durable copy before moving the source to its leftover name."""
+    nonce = secrets.token_hex(16)
+    hidden = source.with_name(f"{MOVED_FOLDER_PREFIX}{nonce}")
+    stage = path.with_name(f"{MOVED_FOLDER_PREFIX}{nonce}-stage")
+    paths = CopyAdoptionPaths(hidden, stage, AdoptionDestination(path, task, now))
+    source_id = directory_id(original)
+    journal = operation_journal(source, scratch_settings)
+    require_quiescent(removal, source)
+    journal.save(FolderOperation(source, source_id, CopyAdoption(paths, UncreatedStage())))
+    before = adoption_change_times(source)
+    make_operation_parent(stage.parent)
+    stage.mkdir(mode=0o700)
+    stage_id = directory_id(stage.lstat())
+    journal.save(FolderOperation(source, source_id, CopyAdoption(paths, CreatedStage(stage_id))))
+    _ = shutil.copytree(source, stage, symlinks=True, dirs_exist_ok=True)
+    write_record(stage, task, now, scratch_settings=scratch_settings)
+    sync_adoption_tree(stage)
+    if adoption_change_times(source) != before:
+        raise RemovalRefused(f"{source}: source changed during the copy")
+    publish = PublishAdoption(paths, stage_id)
+    journal.save(FolderOperation(source, source_id, publish))
+    rename_operation_entry(removal, stage, path, stage_id)
+    finish_copy_adoption(removal, source, source_id, publish, scratch_settings)
+    journal.clear(removal)
+
+
+def rename_adoption(removal: CoordinatedRemoval, source: Path, path: Path, original: os.stat_result,
+                    task: str, now: float, scratch_settings: conf.ConfigRead) -> bool:
+    """Rename and record an adoption. Report when the rename needs a copy."""
+    operation = FolderOperation(source, directory_id(original), RenameAdoption(AdoptionDestination(path, task, now)))
+    journal = operation_journal(source, scratch_settings)
+    journal.save(operation)
+    try:
+        make_operation_parent(path.parent)
+        rename_operation_entry(removal, source, path, operation.source_id)
+    except OSError as error:
+        if error.errno == errno.EXDEV:
+            journal.clear(removal)
+            return False
+        raise
+    complete_adoption_record(AdoptionDestination(path, task, now), scratch_settings, renamed=True)
+    journal.clear(removal)
+    return True
+
+
+def adoption_change_times(source: Path) -> dict[Path, int]:
+    """Read the source change times for the current copy."""
+    changes = {source: source.lstat().st_ctime_ns}
+    for path, entry in removal_entries(source).items():
+        changes[path] = entry.status.st_ctime_ns
+    return changes
+
+
+def make_operation_parent(path: Path) -> None:
+    """Create missing folders and sync each new directory entry."""
+    if path.is_dir():
+        return
+    make_operation_parent(path.parent)
+    path.mkdir(mode=0o700, exist_ok=True)
+    sync_folder(path.parent)
+
+
+def sync_adoption_tree(path: Path) -> None:
+    """Sync the regular files and directories before publication."""
+    def unreadable(error: OSError) -> None:
+        raise error
+
+    for _, _, files, directory in os.fwalk(path, topdown=False, follow_symlinks=False, onerror=unreadable):
+        for name in files:
+            if not stat.S_ISREG(os.stat(name, dir_fd=directory, follow_symlinks=False).st_mode):
+                continue
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        os.fsync(directory)
+
+
+type DirectoryId = tuple[int, int]
+
+
+def directory_id(info: os.stat_result) -> DirectoryId:
+    if not stat.S_ISDIR(info.st_mode):
+        raise RemovalRefused("expected a directory")
+    return info.st_dev, info.st_ino
+
+
+def operation_entry(path: Path) -> DirectoryId | None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    return info.st_dev, info.st_ino
+
+
+@dataclass(frozen=True)
+class WorktreeRegistration:
+    common: Path
+    path: Path
+    identity: DirectoryId
+
+    @classmethod
+    def of(cls, checkout: git_files.Checkout) -> WorktreeRegistration | None:
+        common, metadata = checkout.common_dir, checkout.git_dir
+        if metadata.parent != (common / "worktrees").resolve():
+            return None
+        try:
+            backlink = (metadata / "gitdir").read_text().rstrip("\r\n")
+        except FileNotFoundError:
+            return None
+        if not backlink or (metadata / backlink).resolve() != checkout.toplevel / ".git":
+            return None
+        return cls(common, metadata, directory_id(checkout.git_dir_status))
+
+
+@dataclass(frozen=True)
+class AdoptionDestination:
+    path: Path
+    task: str
+    made: float
+
+
+@dataclass(frozen=True)
+class CopyAdoptionPaths:
+    hidden: Path
+    stage: Path
+    destination: AdoptionDestination
+
+
+MOVED_FOLDER_PREFIX = ".scratch-moved-"
+
+
+@dataclass(frozen=True)
+class RenameAdoption:
+    destination: AdoptionDestination
+
+
+@dataclass(frozen=True)
+class UncreatedStage:
+    """The staging folder has no recorded inode yet."""
+
+
+@dataclass(frozen=True)
+class CreatedStage:
+    identity: DirectoryId
+
+
+@dataclass(frozen=True)
+class CopyAdoption:
+    paths: CopyAdoptionPaths
+    staging: UncreatedStage | CreatedStage
+
+
+@dataclass(frozen=True)
+class PublishAdoption:
+    paths: CopyAdoptionPaths
+    stage_id: DirectoryId
+
+
+@dataclass(frozen=True)
+class NoWorktreeRegistration:
+    """Removal has no external Git registration to clean."""
+
+
+@dataclass(frozen=True)
+class HiddenRemoval:
+    path: Path
+    registration: WorktreeRegistration | NoWorktreeRegistration
+
+
+@dataclass(frozen=True)
+class HideRemoval:
+    target: HiddenRemoval
+
+
+@dataclass(frozen=True)
+class DeleteRemoval:
+    target: HiddenRemoval
+
+
+type FolderOperationStep = RenameAdoption | CopyAdoption | PublishAdoption | HideRemoval | DeleteRemoval
+
+
+@dataclass(frozen=True)
+class FolderOperation:
+    source: Path
+    source_id: DirectoryId
+    step: FolderOperationStep
+
+    def paths(self) -> tuple[Path, ...]:
+        step = self.step
+        if isinstance(step, RenameAdoption):
+            return self.source, step.destination.path
+        if isinstance(step, (CopyAdoption, PublishAdoption)):
+            paths = step.paths
+            return self.source, paths.hidden, paths.stage, paths.destination.path
+        target = step.target
+        if isinstance(target.registration, WorktreeRegistration):
+            return self.source, target.path, target.registration.common, target.registration.path
+        return self.source, target.path
+
+
+def operation_path(value: object) -> Path:
+    if isinstance(value, str):
+        path = Path(value)
+        if path.is_absolute() and path.name and ".." not in path.parts:
+            return path
+    raise ValueError("invalid operation path")
+
+
+def operation_id(value: object) -> DirectoryId:
+    if isinstance(value, list):
+        pair = cast(list[object], value)
+        if len(pair) == 2 and isinstance(pair[0], int) and isinstance(pair[1], int):
+            return pair[0], pair[1]
+    raise ValueError("invalid directory identity")
+
+
+def save_adoption_destination(destination: AdoptionDestination) -> dict[str, object]:
+    return {"destination": str(destination.path), "task": destination.task, "made": destination.made}
+
+
+def read_adoption_destination(fields: Mapping[str, object]) -> AdoptionDestination:
+    task, made = fields["task"], fields["made"]
+    if not isinstance(task, str) or not isinstance(made, (float, int)):
+        raise ValueError("invalid task record")
+    return AdoptionDestination(operation_path(fields["destination"]), task, float(made))
+
+
+def read_hidden_path(source: Path, value: object, prefix: str) -> Path:
+    hidden = operation_path(value)
+    if hidden.parent != source.parent or hidden == source or not hidden.name.startswith(prefix):
+        raise ValueError("invalid hidden source")
+    return hidden
+
+
+def read_worktree_registration(value: object) -> WorktreeRegistration | NoWorktreeRegistration:
+    if value is None:
+        return NoWorktreeRegistration()
+    if isinstance(value, list):
+        parts = cast(list[object], value)
+        if len(parts) == 3:
+            return WorktreeRegistration(operation_path(parts[0]), operation_path(parts[1]), operation_id(parts[2]))
+    raise ValueError("invalid Git registration")
+
+
+def read_folder_step(source: Path, fields: Mapping[str, object]) -> FolderOperationStep:
+    kind = fields["step"]
+    if kind == "rename":
+        destination = read_adoption_destination(fields)
+        if destination.path == source:
+            raise ValueError("destination matches source")
+        return RenameAdoption(destination)
+    if kind in ("copy-for-adoption", "publish-copy"):
+        hidden = read_hidden_path(source, fields["hidden"], MOVED_FOLDER_PREFIX)
+        destination = read_adoption_destination(fields)
+        stage = operation_path(fields["stage"])
+        if (stage.parent != destination.path.parent or not stage.name.startswith(MOVED_FOLDER_PREFIX)
+                or len({source, hidden, destination.path, stage}) != 4):
+            raise ValueError("invalid staging folder")
+        paths = CopyAdoptionPaths(hidden, stage, destination)
+        stage_id = fields["stage_id"]
+        if kind == "copy-for-adoption":
+            staging = UncreatedStage() if stage_id is None else CreatedStage(operation_id(stage_id))
+            return CopyAdoption(paths, staging)
+        return PublishAdoption(paths, operation_id(stage_id))
+    if kind in ("hide-for-removal", "delete"):
+        hidden = read_hidden_path(source, fields["hidden"], ".scratch-operation-")
+        target = HiddenRemoval(hidden, read_worktree_registration(fields["registration"]))
+        return HideRemoval(target) if kind == "hide-for-removal" else DeleteRemoval(target)
+    raise ValueError("invalid operation step")
+
+
+@dataclass(frozen=True)
+class OperationJournal:
+    path: Path
+
+    def save(self, operation: FolderOperation) -> None:
+        make_operation_parent(self.path.parent)
+        step = operation.step
+        fields: dict[str, object] = {"source": str(operation.source), "source_id": operation.source_id}
+        if isinstance(step, RenameAdoption):
+            fields.update(save_adoption_destination(step.destination), step="rename")
+        elif isinstance(step, (CopyAdoption, PublishAdoption)):
+            paths = step.paths
+            fields.update(save_adoption_destination(paths.destination), hidden=str(paths.hidden), stage=str(paths.stage))
+            if isinstance(step, CopyAdoption):
+                fields.update(step="copy-for-adoption",
+                              stage_id=step.staging.identity if isinstance(step.staging, CreatedStage) else None)
+            else:
+                fields.update(step="publish-copy", stage_id=step.stage_id)
+        else:
+            registration = step.target.registration
+            fields.update(step="delete" if isinstance(step, DeleteRemoval) else "hide-for-removal",
+                          hidden=str(step.target.path), registration=(
+                              [str(registration.common), str(registration.path), registration.identity]
+                              if isinstance(registration, WorktreeRegistration) else None))
+        atomic_record(self.path, fields, sync=True)
+
+    def read(self) -> FolderOperation:
+        try:
+            fields = read_operation_fields(self.path)
+            source = operation_path(fields["source"])
+            if self.path.name != operation_journal_name(source):
+                raise ValueError("record name does not match its source")
+            return FolderOperation(source, operation_id(fields["source_id"]), read_folder_step(source, fields))
+        except (OSError, ValueError, KeyError) as error:
+            raise RemovalRefused(f"{self.path}: cannot read folder operation: {error}") from error
+
+    def clear(self, removal: CoordinatedRemoval) -> None:
+        removal.delete(self.path, RemovalKind.FILE)
+        sync_folder(self.path.parent)
+
+
+def read_operation_fields(path: Path) -> dict[str, object]:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, encoding="utf-8") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError("expected a regular file")
+        value = cast(object, json.load(stream))
+    if not isinstance(value, dict):
+        raise ValueError("expected an operation record")
+    return cast(dict[str, object], value)
+
+
+def operation_journal_name(source: Path) -> str:
+    return hashlib.sha256(os.fsencode(source)).hexdigest() + ".json"
+
+
+def operation_journal_root(settings: conf.ConfigRead) -> Path:
+    ledger = holds_file(scratch_settings=settings).absolute()
+    root = ledger.with_name(ledger.name + ".operations")
+    sweep = cast(_SweepRemoval, cast(object, import_module("scripts.lint.tmp_sweep")))
+    sweep.refuse_live_test_roots((root,))
+    return root
+
+
+def operation_journal(source: Path, settings: conf.ConfigRead) -> OperationJournal:
+    return OperationJournal(operation_journal_root(settings) / operation_journal_name(source))
+
+
+def rename_operation_entry(removal: CoordinatedRemoval, source: Path, destination: Path,
+                           expected: DirectoryId) -> None:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    with ExitStack() as parents:
+        old_parent = os.open(source.parent, flags)
+        _ = parents.callback(os.close, old_parent)
+        new_parent = os.open(destination.parent, flags)
+        _ = parents.callback(os.close, new_parent)
+        old = AnchoredRemoval(old_parent, source.name)
+        if directory_id(os.stat(old.name, dir_fd=old.parent, follow_symlinks=False)) != expected:
+            raise RemovalRefused(f"{source}: directory changed before rename")
+        removal.rename_new(old, AnchoredRemoval(new_parent, destination.name))
+        os.fsync(old_parent)
+        os.fsync(new_parent)
+
+
+def require_quiescent(removal: CoordinatedRemoval, path: Path, *, proc: str | None = None) -> None:
+    """Check process use and holds through the same mount aliases."""
+    aliases = removal.aliases(path)
+    removal.check_held_paths(aliases.paths)
+    lock_fds = RECORD_LOCK_FDS.get()
+    for held in _REMOVAL_LOCKS.get():
+        if held.active and held.process == os.getpid() and held.thread == get_ident():
+            lock_fds |= frozenset(held_build_folder_descriptors()) | frozenset(held.marks.held.values())
+            if isinstance(held.lease, HeldFolderRemovalLease):
+                lock_fds |= {held.lease.descriptor, held.lease.directory}
+    sweep = cast(_SweepRemoval, cast(object, import_module("scripts.lint.tmp_sweep")))
+    sweep.require_quiescent(aliases, lock_fds, proc=proc)
+
+
+def delete_recorded_tree(removal: CoordinatedRemoval, path: Path, expected: DirectoryId, *,
+                         repair_permissions: bool) -> None:
+    """Verify the recorded inode through the parent descriptor before deletion."""
+    parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        removal.check_tree(path)
+        info = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        if directory_id(info) != expected:
+            raise RemovalRefused(f"{path}: operation directory changed")
+        removal.delete_at(AnchoredRemoval(parent, path.name), expected=info, record_last=True,
+                          repair_permissions=repair_permissions, sync=True)
+    finally:
+        os.close(parent)
+
+
+def finish_copy_adoption(removal: CoordinatedRemoval, source: Path, source_id: DirectoryId,
+                         step: PublishAdoption, settings: conf.ConfigRead) -> None:
+    paths = step.paths
+    if not hidden_source_id(paths.hidden, source_id):
+        require_quiescent(removal, source)
+        removal.check_tree(source)
+        rename_operation_entry(removal, source, paths.hidden, source_id)
+    elif operation_entry(source) is not None:
+        raise RemovalRefused(f"{source}: source name reappeared during adoption")
+    else:
+        sync_folder(source.parent)
+    FolderLeftover(paths.hidden, source_id, paths.destination.task, task_ended=False).save(settings)
+    complete_adoption_record(paths.destination, settings, renamed=False)
+
+
+class RecoveredFolderRename(Enum):
+    COMPLETE = "complete"
+    GIT_REGISTRATION_REMAINS = "git registration remains"
+
+
+def recover_folder_operation(removal: CoordinatedRemoval, operation: FolderOperation,
+                             settings: conf.ConfigRead) -> RecoveredFolderRename:
+    """Recover folder names. Leave deletion to the sweep's cleanup step."""
+    sweep = cast(_SweepRemoval, cast(object, import_module("scripts.lint.tmp_sweep")))
+    sweep.refuse_live_test_roots(operation.paths())
+    source, source_id, step = operation.source, operation.source_id, operation.step
+    if isinstance(step, RenameAdoption):
+        destination = step.destination
+        if operation_entry(destination.path) == source_id:
+            if operation_entry(source) is not None:
+                raise RemovalRefused(f"{source}: source name reappeared during adoption")
+            sync_folder(destination.path.parent)
+            sync_folder(source.parent)
+            complete_adoption_record(destination, settings, renamed=True)
+        elif operation_entry(source) != source_id:
+            raise RemovalRefused(f"{source}: cannot find the original source")
+    elif isinstance(step, (HideRemoval, DeleteRemoval)):
+        removal.check_paths(operation.paths())
+        target = step.target
+        saved = hidden_source_id(target.path, source_id)
+        if isinstance(step, DeleteRemoval) and not saved and operation_entry(source) is None:
+            if isinstance(target.registration, WorktreeRegistration) and operation_entry(target.registration.path) is not None:
+                return RecoveredFolderRename.GIT_REGISTRATION_REMAINS
+        else:
+            restore_operation_source(removal, operation, target.path, saved)
+            if isinstance(step, DeleteRemoval) and isinstance(target.registration, WorktreeRegistration):
+                if not os.path.lexists(source / ".git") and operation_entry(target.registration.path) is not None:
+                    return RecoveredFolderRename.GIT_REGISTRATION_REMAINS
+    else:
+        paths = step.paths
+        removal.check_paths(operation.paths())
+        if isinstance(step, PublishAdoption) and operation_entry(paths.destination.path) == step.stage_id:
+            sync_folder(paths.destination.path.parent)
+            finish_copy_adoption(removal, source, source_id, step, settings)
+        else:
+            restore_operation_source(removal, operation, paths.hidden, hidden_source_id(paths.hidden, source_id))
+            if (staged := operation_entry(paths.stage)) is not None:
+                expected = step.stage_id if isinstance(step, PublishAdoption) else step.staging
+                if isinstance(expected, UncreatedStage):
+                    raise RemovalRefused(f"{paths.stage}: staging identity is missing")
+                if staged != (expected.identity if isinstance(expected, CreatedStage) else expected):
+                    raise RemovalRefused(f"{paths.stage}: staging identity changed")
+                FolderLeftover(paths.stage, staged, paths.destination.task, task_ended=False).save(settings)
+    return RecoveredFolderRename.COMPLETE
+
+
+def hidden_source_id(path: Path, expected: DirectoryId) -> bool:
+    saved = operation_entry(path)
+    if saved is not None and saved != expected:
+        raise RemovalRefused(f"{path}: hidden source identity changed")
+    return saved is not None
+
+
+def restore_operation_source(removal: CoordinatedRemoval, operation: FolderOperation, hidden: Path, saved: bool) -> None:
+    original = operation_entry(operation.source)
+    if saved:
+        if original is not None:
+            raise RemovalRefused(f"{operation.source}: cannot restore the original source name")
+        rename_operation_entry(removal, hidden, operation.source, operation.source_id)
+    elif original != operation.source_id:
+        raise RemovalRefused(f"{operation.source}: cannot find the original source")
+
+
+def complete_adoption_record(destination: AdoptionDestination, settings: conf.ConfigRead, *, renamed: bool) -> None:
+    with coordinate_removals(scratch_settings=settings, ending_task=destination.task) as records:
+        records.check(destination.path)
+        if renamed:
+            write_record(destination.path, destination.task, destination.made, scratch_settings=settings)
+        index_in_session(destination.path, destination.task, scratch_settings=settings)
+
+
+class FolderRecoveryRequired(RemovalRefused):
+    """An operation must recover before another command can change its paths."""
+
+
+@dataclass(frozen=True)
+class BlockedFolderOperation:
+    source: Path
+    paths: tuple[Path, ...]
+    reason: str
+
+    def protects(self, path: Path) -> bool:
+        return paths_overlap(self.paths, resolved_removal_paths((path,)))
+
+
+@dataclass(frozen=True)
+class FolderLeftover:
+    path: Path
+    identity: DirectoryId
+    task: str
+    task_ended: bool
+
+    def record(self, settings: conf.ConfigRead) -> Path:
+        return operation_journal(self.path, settings).path.with_suffix(".leftover")
+
+    def save(self, settings: conf.ConfigRead) -> None:
+        path = self.record(settings)
+        atomic_record(path, {"path": str(self.path), "identity": self.identity, "task": self.task,
+                             "task_ended": self.task_ended}, sync=True)
+
+    @classmethod
+    def read(cls, record: Path) -> FolderLeftover:
+        try:
+            fields = read_operation_fields(record)
+            path = operation_path(fields["path"])
+            task, task_ended = fields["task"], fields["task_ended"]
+            if (not path.name.startswith(MOVED_FOLDER_PREFIX) or record.stem + ".json" != operation_journal_name(path)
+                    or not isinstance(task, str) or copy_record.TASK.fullmatch(task) is None
+                    or not isinstance(task_ended, bool)):
+                raise ValueError("invalid leftover")
+            return cls(path, operation_id(fields["identity"]), task, task_ended)
+        except (OSError, ValueError, KeyError) as error:
+            raise RemovalRefused(f"{record}: cannot read leftover: {error}") from error
+
+
+def folder_leftovers(settings: conf.ConfigRead) -> tuple[FolderLeftover, ...]:
+    return tuple(FolderLeftover.read(record) for record in operation_records(settings, "*.leftover"))
+
+
+def paths_overlap(first: Iterable[Path], second: tuple[Path, ...]) -> bool:
+    return any(path.is_relative_to(base) or base.is_relative_to(path) for path in first for base in second)
+
+
+def operation_records(settings: conf.ConfigRead, pattern: str) -> list[Path]:
+    root = operation_journal_root(settings)
+    if not os.path.lexists(root):
+        return []
+    if root.is_symlink() or not root.is_dir():
+        raise RemovalRefused(f"{root}: expected an operation journal directory")
+    return sorted(root.glob(pattern))
+
+
+def require_no_folder_leftovers(paths: Iterable[Path], removal: CoordinatedRemoval,
+                                settings: conf.ConfigRead) -> None:
+    scope = resolved_removal_paths(paths)
+    for leftover in folder_leftovers(settings):
+        if paths_overlap(removal.aliases(leftover.path).paths, scope):
+            raise RemovalRefused(f"{leftover.path}: a leftover needs the sweep")
+
+
+@dataclass(frozen=True)
+class ScopedFolderOperation:
+    journal: OperationJournal
+    operation: FolderOperation
+    aliases: tuple[Path, ...]
+
+    def blocked(self, reason: str) -> BlockedFolderOperation:
+        source = self.operation.source
+        protected = (*self.aliases, self.journal.path, removal_mark(source), cargo_removal_mark(source))
+        return BlockedFolderOperation(source, protected, reason)
+
+
+class FolderOperationScope(Enum):
+    ALL = "all"
+
+
+def scoped_folder_operations(paths: Iterable[Path] | FolderOperationScope, removal: CoordinatedRemoval,
+                             records: Sequence[Path]) -> Iterator[ScopedFolderOperation]:
+    scope = () if paths is FolderOperationScope.ALL else resolved_removal_paths(paths)
+    journals = [OperationJournal(record) for record in records]
+    pending = [(journal, journal.read()) for journal in journals]
+    for journal, operation in pending:
+        aliases = tuple(alias for path in resolved_removal_paths(operation.paths())
+                        for alias in removal.aliases(path).paths)
+        if paths is FolderOperationScope.ALL or paths_overlap(aliases, scope):
+            yield ScopedFolderOperation(journal, operation, aliases)
+
+
+def require_no_folder_operations(paths: Iterable[Path], *,
+                                 scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> None:
+    """Refuse commands that overlap a pending folder operation."""
+    if isinstance(scratch_settings, UseConfiguredValue):
+        scratch_settings = conf.read("scratch")
+    records = operation_records(scratch_settings, "*.json")
+    if not records:
+        return
+    with coordinate_removals(scratch_settings=scratch_settings, dry_run=True) as removal:
+        for pending in scoped_folder_operations(paths, removal, records):
+            raise FolderRecoveryRequired(f"{pending.operation.source}: a folder operation needs recovery")
+
+
+@dataclass(frozen=True)
+class SweepFolderRecovery:
+    blocked: tuple[BlockedFolderOperation, ...]
+    registrations: tuple[ScopedFolderOperation, ...]
+
+
+def recover_sweep_operations(paths: Iterable[Path] | FolderOperationScope, *, dry_run: bool,
+                             scratch_settings: conf.ConfigRead) -> SweepFolderRecovery:
+    """Recover pending renames before the sweep judges deletion candidates."""
+    if not operation_records(scratch_settings, "*.json"):
+        return SweepFolderRecovery((), ())
+    blocked: list[BlockedFolderOperation] = []
+    registrations: list[ScopedFolderOperation] = []
+    with coordinate_removals(scratch_settings=scratch_settings, dry_run=dry_run, wait_for_hold_lock=False) as removal:
+        records = operation_records(scratch_settings, "*.json")
+        for pending in scoped_folder_operations(paths, removal, records):
+            if dry_run:
+                blocked.append(pending.blocked(f"{pending.operation.source}: a folder operation needs recovery"))
+                continue
+            try:
+                recovered = recover_folder_operation(removal, pending.operation, scratch_settings)
+                if recovered is RecoveredFolderRename.GIT_REGISTRATION_REMAINS:
+                    registrations.append(pending)
+                else:
+                    pending.journal.clear(removal)
+            except (OSError, ScratchError) as error:
+                blocked.append(pending.blocked(str(error)))
+    return SweepFolderRecovery(tuple(blocked), tuple(registrations))
+
+
+def remove_orphaned_registrations(pending: Iterable[ScopedFolderOperation],
+                                  settings: conf.ConfigRead) -> tuple[BlockedFolderOperation, ...]:
+    """Remove only Git registrations whose source no longer refers to them."""
+    blocked: list[BlockedFolderOperation] = []
+    for item in pending:
+        operation, journal = item.operation, item.journal
+        step = operation.step
+        if not isinstance(step, DeleteRemoval) or not isinstance(step.target.registration, WorktreeRegistration):
+            raise ValueError("expected a pending Git registration")
+        registration = step.target.registration
+        try:
+            with coordinate_removals(scratch_settings=settings, wait_for_hold_lock=False) as removal:
+                if not journal.path.exists():
+                    continue
+                if journal.read() != operation or operation_entry(step.target.path) is not None:
+                    raise RemovalRefused(f"{operation.source}: removal changed before Git cleanup")
+                original = operation_entry(operation.source)
+                if original is not None and (original != operation.source_id or os.path.lexists(operation.source / ".git")):
+                    raise RemovalRefused(f"{operation.source}: the source changed before Git cleanup")
+                removal.check_paths(operation.paths())
+                if not removal.remove_worktree_registration(registration):
+                    raise RemovalRefused(f"{registration.path}: Git registration cleanup is incomplete")
+                journal.clear(removal)
+        except (OSError, ScratchError) as error:
+            blocked.append(item.blocked(str(error)))
+    return tuple(blocked)
+
+
+def remove_journaled_tree(folder: Path, checkout: git_files.Checkout | None, *,
+                          cleanup: Callable[[WorktreeRegistration], bool] | None = None,
+                          scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> None:
+    """Hide a tree, check process use, and record deletion before it starts."""
+    if isinstance(scratch_settings, UseConfiguredValue):
+        locked = _LOCKED_HOLD_FILE.get()
+        scratch_settings = conf.read("scratch") if locked is None else locked.settings
+    folder = folder.parent.resolve() / folder.name
+    sweep = cast(_SweepRemoval, cast(object, import_module("scripts.lint.tmp_sweep")))
+    sweep.refuse_live_test_roots((folder,))
+    with coordinate_removals(scratch_settings=scratch_settings, wait_for_hold_lock=False) as removal:
+        require_no_folder_operations((folder,), scratch_settings=scratch_settings)
+        require_no_folder_leftovers((folder,), removal, scratch_settings)
+        try:
+            info = directory_id(folder.lstat())
+        except FileNotFoundError:
+            return
+        registration = WorktreeRegistration.of(checkout) if checkout is not None else None
+        if checkout is not None:
+            removal.check_worktree_prune((checkout.common_dir,))
+        removal.check_tree(folder)
+        require_quiescent(removal, folder)
+        hidden = folder.with_name(f".scratch-operation-{secrets.token_hex(16)}")
+        target = HiddenRemoval(hidden, registration if registration is not None else NoWorktreeRegistration())
+        operation = FolderOperation(folder, info, HideRemoval(target))
+        journal = operation_journal(folder, scratch_settings)
+        journal.save(operation)
+        rename_operation_entry(removal, folder, hidden, info)
+        require_quiescent(removal, hidden)
+        operation = FolderOperation(folder, info, DeleteRemoval(target))
+        journal.save(operation)
+        delete_recorded_tree(removal, hidden, info, repair_permissions=True)
+        if isinstance(registration, WorktreeRegistration):
+            finish = cleanup or removal.remove_worktree_registration
+            if not finish(registration) or operation_entry(registration.path) is not None:
+                raise RemovalRefused(f"{registration.path}: Git registration cleanup is incomplete")
+        journal.clear(removal)
 
 
 def removal_target(mark: Path) -> Path | None:
@@ -907,7 +2190,10 @@ def pending_removal(path: Path, *,
                 return current
             if cargo_removal_mark(path).exists():
                 return copy_record.UnreadableRecord(f"{path}: previous copy needs Cargo recovery before path reuse")
-            finish_removal(path, source_replaced=True)
+            try:
+                finish_removal(path, source_replaced=True, scratch_settings=scratch_settings)
+            except (OSError, ScratchHoldsUnreadable) as error:
+                return copy_record.UnreadableRecord(f"{path}: cannot remove the stale removal record: {error}")
     return copy_record.NotRegistered()
 
 
@@ -1202,7 +2488,8 @@ def folders(*, scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfi
             entries = sorted(base.iterdir())
         except OSError:
             continue
-        listed = {path for path in entries if path.is_dir()} | set(marked_folders(entries))
+        listed = {path for path in entries if not path.name.startswith(MOVED_FOLDER_PREFIX) and path.is_dir()}
+        listed.update(marked_folders(entries))
         candidates.update(dict.fromkeys(sorted(listed)))
     candidates.update(dict.fromkeys((*copy_paths(), *pending_copy_paths(copy_record.copies_root()))))
     candidates.update(dict.fromkeys(Path(path) for path, held in holds(scratch_settings=scratch_settings).items()
@@ -1337,10 +2624,44 @@ def save_cargo_outputs(path: Path) -> tuple[SavedCargoOutput, ...]:
     return tuple(found)
 
 
+def has_external_cargo_output(path: Path, saved: tuple[SavedCargoOutput, ...]) -> bool:
+    root = path.resolve()
+    return any(not item.roots.build_directory.is_relative_to(root) and item.roots.build_directory.exists()
+               for item in saved)
+
+
+def check_cargo_cleanup(removal: CoordinatedRemoval, path: Path, saved: tuple[SavedCargoOutput, ...],
+                        local_targets: Iterable[Path] = ()) -> None:
+    """Check every directory before Cargo cleanup can delete any output."""
+    directories = {path, *local_targets}
+    for item in saved:
+        roots = item.roots
+        directories.update((roots.workspace_root, roots.target_directory, roots.build_directory))
+    sweep = cast(_SweepRemoval, cast(object, import_module("scripts.lint.tmp_sweep")))
+    paths = tuple(sorted(directories))
+    sweep.refuse_live_test_roots(paths)
+    try:
+        removal.check_paths(paths)
+    except RemovalRefused as error:
+        raise CargoOutputKept(f"{path}: {error}") from error
+
+
+class _CargoCleanup(Protocol):
+    def clean_external_cargo_output(self, path: Path, saved: tuple[SavedCargoOutput, ...], attempt_started: float,
+                                   removal: CoordinatedRemoval) -> None: ...
+
+
 def clean_cargo_outputs(path: Path, saved: tuple[SavedCargoOutput, ...]) -> None:
-    """Run the shared guard without importing the sweep back into scratch."""
-    if not any(not item.roots.build_directory.is_relative_to(path.resolve())
-               and item.roots.build_directory.exists() for item in saved):
+    """Run the same Cargo cleanup guard with or without an existing hold lock."""
+    if not has_external_cargo_output(path, saved):
+        return
+    removal = _ACTIVE_REMOVAL.get()
+    if removal is not None:
+        audit = cast(_CargoCleanup, cast(object, import_module("scripts.lint.folder_audit")))
+        try:
+            audit.clean_external_cargo_output(path.resolve(), saved, time.time(), removal)
+        except (OSError, ValueError) as error:
+            raise CargoOutputKept(f"Cargo output kept: {error}") from error
         return
     result = subprocess.run([sys.executable, str(Path(__file__).parents[1] / "lint" / "folder_audit.py"),
                              "--clean-cargo-output", str(path.resolve())],
@@ -1378,6 +2699,11 @@ FOLDER_REMOVAL = FolderRemoval()
 
 
 @dataclass(frozen=True)
+class EmptyFolderRemoval:
+    """Remove a directory only if it is still empty at deletion."""
+
+
+@dataclass(frozen=True)
 class ExpiredFolderRemoval:
     """Recheck a copy's expired lifetime before a sweep removes its folder."""
     now: float
@@ -1402,6 +2728,8 @@ class _SweepRemoval(Protocol):
     """Use the existing sweep checks and deletion method at the module boundary."""
     def git_work(self, path: Path, *, verified_repos: tuple[Path, ...]) -> _GitWorkAssessment: ...
     def delete_tree(self, path: str) -> None: ...
+    def refuse_live_test_roots(self, roots: tuple[Path, ...]) -> None: ...
+    def require_quiescent(self, aliases: MountAliases, lock_fds: frozenset[int], *, proc: str | None = None) -> None: ...
 
 
 class _WorkspaceRescue(Protocol):
@@ -1652,33 +2980,82 @@ def check_removal_work(path: Path, request: TaskRemoval | SelectedCopyRemoval | 
     return RemovalWorkSaved() if work.name == "SAVED" else KeptFolder(path, work.value)
 
 
-def finish_removal(path: Path, *, cargo_cleaned: bool = False, source_replaced: bool = False) -> None:
-    """Finish Cargo recovery before discarding the task's deletion intent."""
+def finish_removal(path: Path, *, cargo_cleaned: bool = False, source_replaced: bool = False,
+                   ending_task: str | None = None,
+                   scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> None:
+    """Finish Git and Cargo recovery before clearing the deletion intent."""
+    if isinstance(scratch_settings, UseConfiguredValue):
+        locked = _LOCKED_HOLD_FILE.get()
+        scratch_settings = conf.read("scratch") if locked is None else locked.settings
+    require_no_folder_operations((path,), scratch_settings=scratch_settings)
     if source_replaced:
         if cargo_removal_mark(path).exists():
             raise ScratchError(f"{path}: previous copy needs Cargo recovery before path reuse")
-        removal_mark(path).unlink(missing_ok=True)
+        with coordinate_removals(scratch_settings=scratch_settings, wait_for_hold_lock=False):
+            delete_entry(removal_mark(path), RemovalKind.FILE, missing_ok=True)
         return
     if os.path.lexists(path):
         raise ScratchError(f"{path}: source still exists; removal completion refused")
-    if not cargo_cleaned:
-        saved = save_cargo_outputs(path)
-        clean_cargo_outputs(path, saved)
-    cargo_removal_mark(path).unlink(missing_ok=True)
-    removal_mark(path).unlink(missing_ok=True)
+    with coordinate_removals(scratch_settings=scratch_settings, wait_for_hold_lock=False,
+                             ending_task=ending_task) as removal:
+        if not cargo_cleaned:
+            saved = save_cargo_outputs(path)
+            check_cargo_cleanup(removal, path, saved)
+            clean_cargo_outputs(path, saved)
+        delete_entry(cargo_removal_mark(path), RemovalKind.FILE, missing_ok=True)
+        delete_entry(removal_mark(path), RemovalKind.FILE, missing_ok=True)
 
 
-def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | FolderRemoval | ExpiredFolderRemoval = FOLDER_REMOVAL, *,
+def remove_folder(path: Path,
+                  request: TaskRemoval | SelectedCopyRemoval | FolderRemoval | EmptyFolderRemoval | ExpiredFolderRemoval = FOLDER_REMOVAL, *,
                   source_deletion: SourceDeletion = SourceDeletion.STANDARD, dry_run: bool = False,
+                  ending_task: str | None = None,
                   scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> RemovedCopy | KeptFolder:
     """Own removal locks, safety checks, preparation, deletion intent, source deletion, and completion."""
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     path = path.absolute()
-    scope = BusyMarkScope()
-    lock = judgment_lock(path, scope=scope) if dry_run else removal_lock(path)
-    with lock as idle:
+    if isinstance(request, TaskRemoval):
+        ending_task = request.task
+    elif isinstance(request, SelectedCopyRemoval):
+        ending_task = request.expected.task
+    sweep = cast(_SweepRemoval, cast(object, import_module("scripts.lint.tmp_sweep")))
+    sweep.refuse_live_test_roots((path,))
+    require_no_folder_operations((path,), scratch_settings=scratch_settings)
+    with coordinate_removals(scratch_settings=scratch_settings, dry_run=True) as removal:
+        require_no_folder_leftovers((path,), removal, scratch_settings)
+    with ExitStack() as locks:
+        CoordinatedRemoval.check_tree(path)
+        if source_deletion is SourceDeletion.SWEEP:
+            try:
+                removal = locks.enter_context(coordinate_removals(dry_run=dry_run, ending_task=ending_task,
+                                                                 scratch_settings=scratch_settings))
+                require_no_folder_operations((path,), scratch_settings=scratch_settings)
+                require_no_folder_leftovers((path,), removal, scratch_settings)
+                removal.check(path)
+            except (ScratchHoldsUnreadable, RemovalRefused) as error:
+                return KeptFolder(path, str(error))
+            except OSError as error:
+                return KeptFolder(path, f"cannot check scratch holds: {error}")
+        if isinstance(request, EmptyFolderRemoval):
+            try:
+                if dry_run:
+                    if path.is_symlink() or any(path.iterdir()):
+                        return KeptFolder(path, "the path is not an empty directory")
+                else:
+                    with coordinate_removals(scratch_settings=scratch_settings, ending_task=ending_task) as removal:
+                        require_no_folder_operations((path,), scratch_settings=scratch_settings)
+                        require_no_folder_leftovers((path,), removal, scratch_settings)
+                        removal.delete(path, RemovalKind.EMPTY_DIRECTORY)
+            except FileNotFoundError:
+                pass
+            except (OSError, ScratchHoldsUnreadable) as error:
+                return KeptFolder(path, str(error))
+            return RemovedCopy()
+        scope = BusyMarkScope()
+        lock = judgment_lock(path, scope=scope) if dry_run else removal_lock(path)
+        idle = locks.enter_context(lock)
         if not idle:
             pending = pending_removal(path, scratch_settings=scratch_settings)
             if isinstance(pending, copy_record.Registered) and path.is_dir():
@@ -1697,7 +3074,8 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                             and not task_has_end_evidence(record)
                             and (copy_record.copy_folder(path) == path.resolve() or record.fields.get("test_hana_clone") is True)):
                         fields = {**record.fields, "ended": request.now, "ended_task": request.task}
-                        _ = update_record(path, lambda current: fields, scratch_settings=scratch_settings)
+                        _ = update_record(path, lambda current: fields, ending_task=request.task,
+                                          scratch_settings=scratch_settings)
             return KeptFolder(path, BUSY_REASON)
         publication = RemoteInspection.LOCAL_ONLY if dry_run else RemovalAdvertisements(path, scratch_settings)
         present = os.path.lexists(path)
@@ -1727,7 +3105,7 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                 if isinstance(request, SelectedCopyRemoval):
                     request.validate()
                 if not dry_run:
-                    finish_removal(path)
+                    finish_removal(path, ending_task=ending_task, scratch_settings=scratch_settings)
                 return RemovedCopy()
             if isinstance(request, SelectedCopyRemoval):
                 request.validate()
@@ -1759,7 +3137,8 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                         and not task_has_end_evidence(record)):
                     original_fields = record.fields
                     record = update_record(path, lambda current: {**original_fields, "ended": task_request.now,
-                                           "ended_task": task_request.task}, scratch_settings=scratch_settings)
+                                           "ended_task": task_request.task}, ending_task=task_request.task,
+                                           scratch_settings=scratch_settings)
             check = RemovalWorkCheck.STANDARD
             if (isinstance(task_request, TaskRemoval) and isinstance(record, copy_record.Registered) and copy
                     or isinstance(task_request, ExpiredFolderRemoval) and copy_record.copy_folder(path) == path.resolve()):
@@ -1789,6 +3168,16 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                 return recovery
             if dry_run:
                 return RemovedCopy()
+            # The checkout locks are held. Refuse a busy hold lock to avoid a lock cycle.
+            removal = locks.enter_context(coordinate_removals(scratch_settings=scratch_settings,
+                                                             wait_for_hold_lock=False, ending_task=ending_task))
+            require_no_folder_operations((path,), scratch_settings=scratch_settings)
+            require_no_folder_leftovers((path,), removal, scratch_settings)
+            source_is_tree = not path.is_symlink() and path.is_dir()
+            if source_deletion is not SourceDeletion.SWEEP and isinstance(git, GitDirectory) and (path / ".git").is_file():
+                removal.check_worktree_prune((git.checkout.common_dir,))
+            saved = save_cargo_outputs(path) if source_is_tree else ()
+            check_cargo_cleanup(removal, path, saved)
             if isinstance(record, copy_record.Registered):
                 trust_folder = record.fields.get("claude_trust_folder")
                 if isinstance(trust_folder, str):
@@ -1797,19 +3186,19 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                     trust = accounts.set_claude_folder_trust(Path(trust_folder), trusted=False)
                     if isinstance(trust, accounts.FolderTrustFailed):
                         raise ScratchError("cannot clear Claude trust: " + "; ".join(trust.reasons))
-            if path.is_symlink() or not path.is_dir():
+            if not source_is_tree:
                 if source_deletion is SourceDeletion.SWEEP:
                     cast(_SweepRemoval, cast(object, import_module("scripts.lint.tmp_sweep"))).delete_tree(str(path))
                 else:
-                    path.unlink()
+                    removal.delete(path, RemovalKind.FILE)
                 return RemovedCopy()
             lease = (held.lease if isinstance(task_request, TaskRemoval) and isinstance(record, copy_record.Registered)
                      and record.fields.get("test_hana_clone") is True and held is not None
                      and isinstance(held.lease, HeldFolderRemovalLease) and held.lease.folder == path else None)
             sidecars = lease.sidecar_identities() if lease is not None else {}
+            removal.check_paths(path.parent / name for name in sidecars)
             has_cargo_manifest = isinstance(pending, copy_record.Registered) and any(
                 (folder / "Cargo.toml").is_file() for folder in (path, *descendant_checkouts))
-            saved = save_cargo_outputs(path)
             clean_cargo_outputs(path, saved)
             if isinstance(pending, copy_record.Registered) and (has_cargo_manifest or saved):
                 # Cargo preparation can change the source without finding any Cargo outputs.
@@ -1839,7 +3228,7 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                               removal_repositories=repositories,
                               removal_files=sorted(removal_regular_files(root, entries)), removal_ref_files=references,
                               removal_intent_ns=time.time_ns())
-                atomic_record(removal_mark(path), fields)
+                atomic_record(removal_mark(path), fields, sync=True)
             if source_deletion is SourceDeletion.SWEEP:
                 cast(_SweepRemoval, cast(object, import_module("scripts.lint.tmp_sweep"))).delete_tree(str(path))
             elif source_deletion is SourceDeletion.RUN:
@@ -1859,19 +3248,16 @@ def remove_with_cargo_output(path: Path) -> None:
 
 def remove(path: Path) -> None:
     """Delete the source under the coordinator's locks and leave its task record until last."""
-    if path.is_symlink() or path.is_file():
-        path.unlink()
-        return
-    if (path / ".git").is_file():
-        _ = subprocess.run(["git", "-C", str(path), "worktree", "remove", "--force", "--force", str(path)],
-                           capture_output=True, check=False)
-    if os.path.lexists(path):
-        for child in sorted(path.iterdir(), key=lambda child: (child.name == copy_record.RECORD, child.name)):
-            if child.is_dir() and not child.is_symlink():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
-        path.rmdir()
+    with coordinate_removals(wait_for_hold_lock=False) as removal:
+        locked = _LOCKED_HOLD_FILE.get()
+        settings = conf.read("scratch") if locked is None else locked.settings
+        require_no_folder_operations((path,), scratch_settings=settings)
+        require_no_folder_leftovers((path,), removal, settings)
+        checkout = git_files.at(path) if not path.is_symlink() and (path / ".git").is_file() else None
+        if checkout is not None:
+            remove_journaled_tree(path, checkout)
+        else:
+            removal.delete(path, RemovalKind.TREE, repair_permissions=False, record_last=True)
 
 
 def remove_marked(path: Path, *, source_deletion: SourceDeletion = SourceDeletion.STANDARD,
@@ -1883,6 +3269,8 @@ def remove_marked(path: Path, *, source_deletion: SourceDeletion = SourceDeletio
 
 
 def clear_finished_copy_removals(base: Path, *, skip: Collection[Path] = (),
+    source_deletion: SourceDeletion = SourceDeletion.STANDARD,
+    ending_task: str | None = None,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> list[KeptFolder]:
     """Complete absent sources through the same coordinator used for task cleanup."""
@@ -1890,7 +3278,8 @@ def clear_finished_copy_removals(base: Path, *, skip: Collection[Path] = (),
     for path in sorted(pending_copy_paths(base)):
         if path not in skip and not os.path.lexists(path):
             try:
-                result = remove_folder(path, scratch_settings=scratch_settings)
+                result = remove_folder(path, source_deletion=source_deletion, ending_task=ending_task,
+                                       scratch_settings=scratch_settings)
             except (ScratchError, OSError) as error:
                 print(f"scratch: kept {path}: {error}", file=sys.stderr)
                 kept.append(KeptFolder(path, str(error)))
@@ -1908,22 +3297,44 @@ def holds_file(*, scratch_settings: conf.ConfigRead | UseConfiguredValue = UseCo
 
 
 def holds(*, scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> dict[str, Hold]:
-    """Every hold on this machine, by the held folder's real path."""
+    """Read holds for reports that can omit an unreadable hold file."""
+    try:
+        return read_holds(scratch_settings=scratch_settings)
+    except ScratchHoldsUnreadable:
+        return {}
+
+
+def read_holds(*, scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> dict[str, Hold]:
+    """Read all holds or raise an error. An absent file has no holds."""
     path = holds_file(scratch_settings=scratch_settings)
     try:
-        raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ScratchHoldsUnreadable(f"scratch hold file {path} must be a regular file")
+            with os.fdopen(descriptor, encoding="utf-8", closefd=False) as source:
+                raw = cast(object, json.load(source))
+        finally:
+            os.close(descriptor)
+    except FileNotFoundError:
+        return {}
     except (OSError, UnicodeError, ValueError):
-        return {}
+        raise ScratchHoldsUnreadable(f"cannot read scratch hold file {path}") from None
     if not isinstance(raw, dict):
-        return {}
+        raise ScratchHoldsUnreadable(f"invalid scratch hold file {path}")
     found: dict[str, Hold] = {}
-    for path, value in cast(dict[str, object], raw).items():
+    for name, value in cast(dict[str, object], raw).items():
         if isinstance(value, dict):
             fields = cast(dict[str, object], value)
             task, made, end_at = fields.get("task"), fields.get("made"), fields.get("ended", 0.0)
-            if isinstance(task, str) and isinstance(made, (int, float)) and isinstance(end_at, (int, float)):
-                found[path] = Hold(task=task, maker=str(fields.get("maker", "")), reason=str(fields.get("reason", "")),
+            maker = fields.get("maker", "")
+            if (os.path.isabs(name) and ".." not in Path(name).parts and isinstance(task, str)
+                    and isinstance(maker, str) and isinstance(made, (int, float))
+                    and isinstance(end_at, (int, float)) and end_at >= 0):
+                found[name] = Hold(task=task, maker=maker, reason=str(fields.get("reason", "")),
                                    made=float(made), ended=float(end_at))
+                continue
+        raise ScratchHoldsUnreadable(f"invalid scratch hold for {name} in {path}")
     return found
 
 
@@ -1940,13 +3351,21 @@ def write_holds(found: dict[str, Hold], *,
 @contextmanager
 def locked_holds(*,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    wait: bool = True,
 ) -> Generator[dict[str, Hold]]:
     """Keep concurrent task changes from replacing each other's folder records."""
-    path = holds_file(scratch_settings=scratch_settings)
+    if isinstance(scratch_settings, UseConfiguredValue):
+        scratch_settings = conf.read("scratch")
+    path = holds_file(scratch_settings=scratch_settings).absolute()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_name(path.name + ".lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        yield holds(scratch_settings=scratch_settings)
+        fcntl.flock(lock, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        records = read_holds(scratch_settings=scratch_settings)
+        token = _LOCKED_HOLD_FILE.set(_LockedHoldFile(path, records, scratch_settings))
+        try:
+            yield records
+        finally:
+            _LOCKED_HOLD_FILE.reset(token)
 
 
 def hold(path: Path, task: str, reason: str, now: float | None = None, *,
@@ -1960,11 +3379,17 @@ def hold(path: Path, task: str, reason: str, now: float | None = None, *,
     moment = time.time() if now is None else now
     task = task_or_default(task, moment, scratch_settings=scratch_settings)
     _ = checked_task(task, False)
-    with locked_holds(scratch_settings=scratch_settings) as found:
+    locked = _LOCKED_HOLD_FILE.get()
+    access = (nullcontext(locked.records) if locked is not None
+              and locked.path == holds_file(scratch_settings=scratch_settings).absolute()
+              else locked_holds(scratch_settings=scratch_settings))
+    with access as found:
         if path.is_symlink() or not path.is_dir():
             raise ScratchError(f"{path} is no folder")
-        found[os.path.realpath(path)] = Hold(task=task, maker=maker(), reason=reason.strip(), made=moment, ended=0.0)
-        write_holds(found, scratch_settings=scratch_settings)
+        name = os.path.realpath(path)
+        record = Hold(task=task, maker=maker(), reason=reason.strip(), made=moment, ended=0.0)
+        write_holds({**found, name: record}, scratch_settings=scratch_settings)
+        found[name] = record
     return task
 
 
@@ -2417,6 +3842,14 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
         if folder.task == task and selected(folder.path):
             _ = remove_task_folder(folder.path)
     with locked_holds(scratch_settings=scratch_settings) as found:
+        for leftover in folder_leftovers(scratch_settings):
+            if leftover.task != task or leftover.task_ended or not selected(leftover.path):
+                continue
+            try:
+                require_no_folder_operations((leftover.path,), scratch_settings=scratch_settings)
+                replace(leftover, task_ended=True).save(scratch_settings)
+            except (OSError, ScratchError) as error:
+                kept[leftover.path] = str(error)
         changed = False
         for path, record in list(found.items()):
             if record["task"] != task or not selected(Path(path)):
@@ -2429,7 +3862,8 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
                     if copy.is_relative_to(held) and selected(copy):
                         _ = remove_task_folder(copy, require_task=False)
                 try:
-                    unfinished = clear_finished_copy_removals(copies, skip=attempted.keys(), scratch_settings=scratch_settings)
+                    unfinished = clear_finished_copy_removals(copies, skip=attempted.keys(), ending_task=task,
+                                                              scratch_settings=scratch_settings)
                 except (ScratchError, OSError) as error:
                     kept[held] = str(error)
                     record["ended"] = moment
@@ -2442,13 +3876,13 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
                     kept[held] = "the container has unfinished copy removals"
                     record["ended"] = moment
                     continue
-                remove_empty_copy_pairs(copies)
+                _ = remove_empty_copy_pairs(copies, source_deletion=SourceDeletion.STANDARD,
+                                            ending_task=task, scratch_settings=scratch_settings)
                 # A container hold never takes recursive deletion through the copies root.
                 if held != copies and held.exists():
-                    try:
-                        held.rmdir()
-                    except OSError as error:
-                        kept[held] = str(error)
+                    outcome = remove_folder(held, EmptyFolderRemoval(), ending_task=task, scratch_settings=scratch_settings)
+                    if isinstance(outcome, KeptFolder):
+                        kept[held] = outcome.reason
                         record["ended"] = moment
                         continue
                 if held == copies and any(copy_paths()):
@@ -2510,14 +3944,26 @@ def remove_task_copy_locked(path: Path, task: str, now: float, *, require_task: 
     return remove_task_copy(path, task, now, require_task=require_task, scratch_settings=scratch_settings)
 
 
-def remove_empty_copy_pairs(base: Path) -> None:
-    if base.is_dir():
-        for pair in base.iterdir():
-            if pair.is_dir() and not pair.is_symlink():
-                try:
-                    pair.rmdir()
-                except OSError:
-                    pass
+def remove_empty_copy_pairs(base: Path, *, source_deletion: SourceDeletion,
+                            ending_task: str | None = None, scratch_settings: conf.ConfigRead,
+                            blocked: Sequence[BlockedFolderOperation] = ()) -> list[KeptFolder]:
+    """Send empty copy pairs to the removal coordinator."""
+    kept: list[KeptFolder] = []
+    if not base.is_dir():
+        return kept
+    for pair in base.iterdir():
+        if any(operation.protects(pair) for operation in blocked):
+            continue
+        try:
+            if pair.is_symlink() or not pair.is_dir() or any(pair.iterdir()):
+                continue
+        except OSError:
+            continue
+        result = remove_folder(pair, EmptyFolderRemoval(), source_deletion=source_deletion,
+                               ending_task=ending_task, scratch_settings=scratch_settings)
+        if isinstance(result, KeptFolder):
+            kept.append(result)
+    return kept
 
 
 def chosen_task(arguments: argparse.Namespace) -> str:
@@ -2559,12 +4005,14 @@ def main(argv: list[str]) -> int:
     arguments = parser.parse_args(argv)
     command = cast(str, arguments.command)
     try:
+        if command in ("cargo-save", "cargo-clean", "hold", "release", "renew", "hand-over"):
+            require_no_folder_operations((Path(cast(str, arguments.path)),), scratch_settings=scratch_settings)
         if command in ("cargo-save", "cargo-clean"):
             path = Path(cast(str, arguments.path)).resolve()
             saved = save_cargo_outputs(path)
             if command == "cargo-clean":
                 clean_cargo_outputs(path, saved)
-                cargo_removal_mark(path).unlink(missing_ok=True)
+                delete_entry(cargo_removal_mark(path), RemovalKind.FILE, missing_ok=True, scratch_settings=scratch_settings)
         elif command == "new":
             if cast(bool, arguments.worker):
                 if cast(bool, arguments.visible):
@@ -2607,7 +4055,3 @@ def main(argv: list[str]) -> int:
         print(f"scratch: {error}", file=sys.stderr)
         return 2
     return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
