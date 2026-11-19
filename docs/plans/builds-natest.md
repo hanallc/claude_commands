@@ -4515,8 +4515,13 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 
 - `land_runs.DEFAULT_STATE_DIR` is `~/.local/state/gate`. `land_runs.state_dir()`, `PassedTreeLedger.path` and `push_record_path` use it as the default; `GATE_PASSED_DIR` and the state-folder variable still override it.
 - The as-built doc names `~/.local/state/gate`.
-- The live folder moves once at deploy by a program outside the repository (`move_gate_state.py`). It refuses without a natedev drain hold. It waits for each process of the user that holds a file or the cwd in the old folder, lock waiters included (review F001). It skips a process whose descriptors it cannot read, with one printed line. It refuses when a record holds the old path (review F002). It removes `typecheck-venv`, then does one `os.rename`.
-- Deploy: drain hold on natedev after the merge to main, run the program, release the hold, delete the program. An old worktree's tests-only run can make a stray `merge-gate` folder; nothing reads it, and chunk 6 deletes it.
+- `scripts/production/gate_rename_deploy/move_gate_state.py` moves the live folder during deployment.
+  It requires a natedev drain hold. It waits for each process that holds a file or working directory in the old folder.
+  This includes processes that wait for a lock (review F001). It prints one line for each process with unreadable descriptors.
+  It refuses when a record contains the old path (review F002). It removes `typecheck-venv` before it calls `os.rename`.
+- Set a natedev drain hold after the merge to main. Run the move and release the hold.
+  Chunk 6 deletes the deploy folder. A tests-only run in an old worktree can create a stray `merge-gate` folder.
+  Chunk 6 also deletes that stray folder.
 - Checkpoint acb4ca780; main merged at eb427e1e1.
 
 ### Phase 319 — the gate state readers refuse until the folder move has run  · status: done
@@ -4550,7 +4555,8 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 
 #### As-built
 
-- One program outside the repository, `/tmp/claude/scratch/natest-probe/p89/rename_step_names.py`, converts the stored step names once at deploy. It is deleted after the deploy.
+- `scripts/production/gate_rename_deploy/rename_step_names.py` converts the stored step names during deployment.
+  Chunk 6 deletes the deploy folder.
 - It changes exact structured fields only: admission records, buildlog month records, pending steps, assignment wait files, AWS ledgers, cloud attempt `request.json`, `current.json`, `remote-result.json` and outcome records, and compressed results. Each file is rewritten through a temporary file and `os.replace`. It renames `merge-gate` progress profile folders to the `gate` key hash and updates the index rows in one transaction. It converts `queue.json` and deletes `memory.json` and `report.json`, which the feed writes again. Affected-test profile folders stay; the profile sweep removes them.
 - It refuses before any write without a natedev drain hold, with an admission or feed service or the buildlog service running, with a process holding an admission file, with a live hold or queue caller (review F001), or with an unfinished old AWS attempt.
 - A copy of the live records converted with 15,237 changes in 169 seconds; a second run changed nothing. The readers kept the same counts under the new names.
@@ -4563,9 +4569,16 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 
 #### As-built
 
-- One deploy command outside the repository, `/tmp/claude/scratch/natest-probe/p89/deploy_gate_rename.sh` (with `deploy_gate_rename.py`), runs the phase 316 gate folder move and the phase 321 step-name conversion. It is deleted after the deploy.
+- Run `bash ~/.claude/scripts/production/gate_rename_deploy/deploy_gate_rename.sh`.
+  The command runs the phase 318 folder move and the phase 321 step-name conversion.
+  Chunk 6 deletes the deploy folder and `config/gate_rename_deploy.conf`.
 - Order: check the new code by content, wait for old AWS attempts, set a natedev drain hold unless one is in force, wait for the kept builds, stop `buildlog.timer` and the admission socket, admission and memory feed services, require the buildlog service inactive, run `move_gate_state.py` when needed, convert, convert again and require `changed=0`, start the services, release its own hold. Each step prints its name, its done time and a heartbeat.
 - It finds the assignment and cloud folders again just before each conversion (review F003).
-- A state file lets an interrupted run continue from its step. A refusal saves a recovery point before any service starts (F002), names the caller to cancel and how, restores the services and releases the hold. A release resumes when the holder file or a matching release record exists; a hold never published needs no release (F001).
+- A state file in the Git directory keeps the direction and the next step for an interrupted run.
+  A refusal saves a recovery point before services restart (F002). It gives the command to cancel the caller.
+  It restores the services and releases its hold. It resumes release when the holder file or a matching release record exists.
+  An unpublished hold needs no release (F001).
 - A 16.6 GB copy of the live records: full run passed with a stop time of 187 seconds; a stop after each step resumed; refusal recovery, a completed rerun and an existing hold passed. The two folder searches add about 1 minute of stop time.
+- To reverse the deployment, install the old gate code. Keep the deploy folder and its configuration in the live checkout.
+  Run the same command with `--reverse`. It uses the same hold, service stops and two conversion passes.
 - Checkpoint 403ec6239.
