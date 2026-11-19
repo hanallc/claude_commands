@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import unittest
+from scripts.direct.memory_kill_test_support import install_journal
 from scripts.direct import verify_lint_scope_test_support as support
 from scripts.direct.verify_lint_scope_test_support import TAPLO_STUB as TAPLO_STUB
 
@@ -32,6 +33,27 @@ source() {
 
 
 class VerifyLintScopeTests(support.VerifyLintScopeFixture):
+    def assert_mend_failure_runs_again(self, status: int, *arguments: str) -> None:
+        cache = self.enable_cache()
+        for attempt in (1, 2):
+            with self.subTest(attempt=attempt):
+                result = self.invoke_verify("lint", *arguments, cwd=self.root)
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                self.assertEqual(len(self.calls("mend")), 1)
+                self.assertEqual(self.taplo_calls(), [])
+                self.assertEqual(list(cache.glob("*.fail")), [])
+
+    def test_mend_fix_tooling_failure_preserves_its_status(self) -> None:
+        self.environment["TEST_MEND_STATUS"] = "3"
+        self.assert_mend_failure_runs_again(3, "sample")
+        self.assertIn("--fix", self.calls("mend")[0])
+
+    def test_killed_mend_check_preserves_cargo_status_without_caching(self) -> None:
+        install_journal(self.root / "bin", "")
+        self.environment.update(TEST_MEND_STATUS="101", TEST_MEND_DIAGNOSTIC="rustc: signal: 9")
+        self.assert_mend_failure_runs_again(101, "sample", "--check")
+        self.assertIn("--fail-on-warn", self.calls("mend")[0])
+
     def crash_place_step(self) -> None:
         original = Path(self.environment["LINT_CONFIG_READER"]).resolve()
         scripts = self.root / "reader-scripts"

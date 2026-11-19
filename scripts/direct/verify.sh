@@ -1199,15 +1199,15 @@ workspace_taplo() (
     fi
     local status=0
     run taplo fmt "$@" -- "${files[@]}" || status=$?
-    if (( status != 0 )) && [[ "${1:-}" == --check ]]; then
-        if (( status == 101 )); then
-            if [[ "$(uname)" == Darwin ]]; then
-                echo "verify.sh: taplo panicked; the macOS sandbox does this. Re-run the same command with the sandbox disabled." >&2
-                return 3
-            fi
-            echo "verify.sh: taplo panicked; this is a tooling failure." >&2
-            return 2
+    if (( status == 101 )); then
+        if [[ "$(uname)" == Darwin ]]; then
+            echo "verify.sh: taplo panicked; the macOS sandbox does this. Re-run the same command with the sandbox disabled." >&2
+            return 3
         fi
+        echo "verify.sh: taplo panicked; this is a tooling failure." >&2
+        return 2
+    fi
+    if (( status != 0 )) && [[ "${1:-}" == --check ]]; then
         echo 'verify.sh: TOML check failed; files can be invalid or not properly formatted.' >&2
     fi
     return "$status"
@@ -1847,6 +1847,7 @@ if [[ "$CMD" == test ]]; then
 fi
 RUN_LOG=""
 RUN_LOG_PIDS=()
+MEND_LOG=""
 VERDICT_KEY=""
 VERDICT_TREE_KEY=""
 CLIPPY_FIX_LIMIT_REACHED=0
@@ -3455,11 +3456,15 @@ lint_failure_is_the_tree() {
     # Usage errors, sandbox failures, lost tokens, and signals give no verdict.
     (( status != 2 && status != 3 && status != 125 && status < 128 )) || return 1
     [[ "$status" != "${TREE_CHANGED_STATUS:-}" ]] || return 1
+    (( ${RUN_LAST_ATTEMPT_KILLED:-0} == 0 )) || return 1
     (( $# == 0 )) || return 0
     [[ "$CMD" == lint ]] || return 1
     (( CLIPPY_FIX_LIMIT_REACHED == 0 && PLACEMENT_FAILED == 0 )) || return 1
-    (( LINT_FIX_INCOMPLETE == 0 )) || return 1
-    (( ${RUN_LAST_ATTEMPT_KILLED:-0} == 0 ))
+    (( LINT_FIX_INCOMPLETE == 0 ))
+}
+
+lint_require_verdict() {
+    lint_failure_is_the_tree "$1" || exit "$1"
 }
 
 # Logs the finished run and records a pass or a lint failure. Runs once:
@@ -4263,6 +4268,7 @@ verify_cleanup() {
     [[ -z "$TREE_WATCH_DIR" ]] || verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$TREE_WATCH_DIR"
     TREE_WATCH_DIR=""
     lint_copy_drop
+    [[ -z "${MEND_LOG:-}" ]] || rm -f -- "$MEND_LOG"
     if [[ "$STEP_RECORD_ACTIVE" == 1 ]]; then
         publish_step_state waiting_hold || true
     fi
@@ -4437,6 +4443,7 @@ run_lint_judgment() {
         rm -f "$CLIPPY_LOG"
         unset CLIPPY_LOG
         finish_tree_watch
+        if (( clippy_status != 0 )); then lint_require_verdict "$clippy_status"; fi
         if (( clippy_repair )); then
             # Read at use so a changed policy applies to this repair round.
             clippy_fix_limit="$(_lint_config_raw clippy_fix_pass_limit)"
@@ -4447,8 +4454,9 @@ run_lint_judgment() {
             lint_copy_begin
             clippy_tree_before="$(lint_fix_tree_key)"
             for ((clippy_fix_pass=1; HOLD_LINT == 0 && clippy_fix_pass<=clippy_fix_limit; clippy_fix_pass++)); do
-                lint_rewrite invoke_clippy_fix --workspace --all-targets --all-features --keep-going || true
-                lint_rewrite fmt_cargo "${FMT_SCOPE[@]}"
+                lint_rewrite invoke_clippy_fix --workspace --all-targets --all-features --keep-going \
+                    || lint_require_verdict "$?"
+                lint_rewrite fmt_cargo "${FMT_SCOPE[@]}" || exit "$?"
                 clippy_tree_after="$(lint_fix_tree_key)"
                 if [[ -n "$clippy_tree_before" && "$clippy_tree_before" == "$clippy_tree_after" ]]; then
                     break
@@ -4478,6 +4486,10 @@ run_mac_lint_fix() {
     MAC_FIX_RESULT=""
     echo 'verify.sh: mend found findings on the Mac; running the fix pass there.'
     invoke_mend --workspace --fix "${FEATURE_FLAGS[@]}" || fix_status=$?
+    # A queue transfer returns to local repair.
+    if (( fix_status != 0 && fix_status != LINT_LEFT_QUEUE_STATUS )); then
+        lint_require_verdict "$fix_status"
+    fi
     if [[ "$MAC_FIX_RESULT" == withheld ]]; then
         # A fix that no reservation holds is withheld on natedev too.
         LINT_FIX_INCOMPLETE=1
@@ -4514,8 +4526,8 @@ run_lint_held_sequence() {
     LINT_HELD_CLIPPY_FAILED=0
     # Format locally; the Mac judges the resulting tree without fixes.
     lint_copy_begin
-    lint_rewrite fmt_cargo --all
-    workspace_taplo
+    lint_rewrite fmt_cargo --all || exit "$?"
+    workspace_taplo || exit "$?"
     lint_copy_return || exit 1
     workspace_taplo --check || exit "$?"
     lint_status=0
@@ -4530,6 +4542,7 @@ run_lint_held_sequence() {
         fi
         LINT_MEMORY_JUDGMENT=0
         if (( mend_status != 0 )); then
+            lint_require_verdict "$mend_status"
             # A Mac finding can start a fix pass and a new judgment.
             if [[ "$LAST_TARGET_OUTCOME" == failed ]] && run_mac_lint_fix; then
                 return 0
@@ -4539,7 +4552,10 @@ run_lint_held_sequence() {
     fi
     if lint_config_enabled clippy; then
         start_tree_watch
-        if ! invoke_clippy --workspace --all-targets --all-features; then
+        if invoke_clippy --workspace --all-targets --all-features; then
+            :
+        else
+            lint_require_verdict "$?"
             if (( lint_status == 0 )); then LINT_HELD_CLIPPY_FAILED=1; fi
             lint_status=1
         fi
@@ -4550,14 +4566,14 @@ run_lint_held_sequence() {
 
 run_lint_checks() {
     # Run all checks even when an earlier check reports findings.
-    local status
-    local -a failed_statuses=()
+    lint_status=0
     if lint_config_enabled mend; then
         echo 'style-lint: mend start'
         if invoke_mend --workspace --fail-on-warn "${FEATURE_FLAGS[@]}"; then
             echo 'style-lint: mend passed'
         else
-            failed_statuses+=("$?")
+            lint_require_verdict "$?"
+            lint_status=1
         fi
     else
         lint_config_skip_notice mend 'cargo mend --all-targets --workspace --fail-on-warn'
@@ -4567,34 +4583,32 @@ run_lint_checks() {
         if fmt_cargo --all --check; then
             echo 'style-lint: rustfmt passed'
         else
-            failed_statuses+=("$?")
+            lint_require_verdict "$?"
+            lint_status=1
         fi
     else
         lint_config_skip_notice fmt 'cargo +nightly fmt --all --check'
     fi
     load_metadata
-    workspace_taplo --check || failed_statuses+=("$?")
+    if workspace_taplo --check; then
+        :
+    else
+        lint_require_verdict "$?"
+        lint_status=1
+    fi
     if lint_config_enabled clippy; then
         echo 'style-lint: clippy start'
         if [[ "${1:-}" != after-fix ]]; then start_tree_watch; fi
         if invoke_clippy --workspace --all-targets --all-features; then
             echo 'style-lint: clippy passed'
         else
-            failed_statuses+=("$?")
+            lint_require_verdict "$?"
+            lint_status=1
         fi
         if [[ "${1:-}" != after-fix ]]; then finish_tree_watch; fi
     else
         lint_config_skip_notice clippy 'cargo clippy --workspace --all-targets --all-features'
     fi
-    lint_status=0
-    # Keep the first status that gives no verdict.
-    for status in ${failed_statuses[@]+"${failed_statuses[@]}"}; do
-        if ! lint_failure_is_the_tree "$status"; then
-            lint_status=$status
-            return 0
-        fi
-        lint_status=1
-    done
 }
 
 run_lint_sequence() {
@@ -4645,10 +4659,7 @@ run_lint_sequence() {
                 lint_copy_begin
                 continue
             fi
-            if (( mend_status == 137 || mend_status == 125 )); then
-                rm -f "$MEND_LOG"
-                exit "$mend_status"
-            fi
+            lint_require_verdict "$mend_status"
             if grep -qiE 'rolled back|revert' "$MEND_LOG"; then
                 echo "verify.sh: cargo mend --fix rolled its rewrites back; stop and keep the tree for inspection" >&2
             else
@@ -4686,7 +4697,7 @@ run_lint_sequence() {
         echo 'style-lint: rustfmt start'
     fi
     lint_copy_begin
-    lint_rewrite fmt_cargo "${FMT_SCOPE[@]}"
+    lint_rewrite fmt_cargo "${FMT_SCOPE[@]}" || exit "$?"
     lint_copy_return || exit 1
     if [[ -z "$PKG" ]] && lint_config_enabled fmt; then
         echo 'style-lint: rustfmt passed'
