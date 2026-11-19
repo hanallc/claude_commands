@@ -239,3 +239,27 @@
   2. One full natedev gate behind the walls; failing modules go on file_wall_only with the reason; record the gate time with and without the guard and the cold bytecode cost (compileall pass if any loss).
   3. 20 repeated runs of the changed modules pass, TMPDIR=/tmp, 2 GB scope.
   4. basedpyright zero errors and warnings on changed files.
+
+### Phase 393 — TERM stops a gate in a known time (no cleanup signal mask)  · status: todo
+
+**Depends on:** none. Ordered after the red main repair and the guard repair (builds); does not move queue 44dg.
+
+#### Work Order
+
+**Goal:** TERM always stops a merge gate and a queue place in a known time. No code blocks HUP, INT or TERM around cleanup.
+
+**Why:** pid 101053 (merge_gate.py --tests-only) blocked TERM for 37 hours; nate needed kill -KILL. SigBlk 0x4003 is the set that `scripts/lib/cancellation.py` `defer_cleanup_signals()` blocks. The gate hung inside one such section. Candidates (not proved): `queue_place.py` `finish()` loops "while members" with no end bound; an admission call in `release` has no deadline.
+
+**Spec:**
+1. Delete `defer_cleanup_signals()` and `start_masked_thread()` from `scripts/lib/cancellation.py`. Remove every call. Callers on main a2d0e6eb6: merge_gate.py (SharedCPUSlot.release, SharedCPUPool.acquire), queue_place.py (:215, :378, :393, :495, :586), ci_cargo_front.py (:182), aws_trial.py (:292, :324, :435, :444, :516, :571), cloud_gate.py (:1014, :1446), gate_box.py (:306), admission_test_support.py (:446), test_merge_gate_suites_resources.py (:258), test_cancellation.py.
+2. Each cleanup that the mask guarded is safe to run again after an interrupt at any line. Use the existing record-first pattern: write the durable record of the step before the step, and make each step a no-op when already done (a token already returned, a folder already removed, a record already gone). Recovery finishes a half-done cleanup.
+3. Each wait in these paths has a deadline from existing config (reuse `config/build_admission.conf` `program_stop_seconds` or the gate deadline; add a key only if none fits, and name it in the reply). This covers `queue_place.py` `finish()` "while members" and the admission call in `release`. A deadline that passes returns an UNRESOLVED result that keeps the lease and the recovery record, as phase 392 does.
+4. `CANCELLATION_SIGNALS` stays if detached_runs.py still needs it to reset dispositions in a child. The explicit UNBLOCK calls before exec (queue_place.py:207, merge_gate.py:131) stay only while an inherited mask can still reach them; say which.
+5. Do not add a signal handler, mask or disposition anywhere. Do not touch staff.py, style_sync.py, cli_fixture.py. List every other mask on the gate path (module_run.py :600-680 included) in the reply with file:line and whether a wait inside it has a limit. Do not change them in this phase.
+6. Tests: one test per changed path proves a hung cleanup ends on TERM in a known time. The test starts a real child process that hangs in the cleanup (a fixture wait that never ends), sends TERM, and asserts the child exits within the deadline plus a margin. Fixtures write their own config; no test reads a /tune value. Update tests that asserted the mask (test_cancellation.py, test_aws_trial.py:737, test_cloud_gate.py:2108, test_queue_place.py:1111-1123, :1607, test_merge_gate_suites_resources.py:141) to assert that no cancellation signal is blocked.
+
+**Files:** scripts/lib/cancellation.py, scripts/lib/test_cancellation.py, scripts/production/merge_gate.py, scripts/production/test_merge_gate*.py, scripts/build_queue/queue_place.py (owner queue; claimed), scripts/build_queue/test_queue_place.py, scripts/build_queue/ci_cargo_front.py, scripts/build_queue/admission_test_support.py, scripts/aws_target/aws_trial.py, cloud_gate.py, gate_box.py and their tests.
+
+**Workers:** 2 writers. impl8: lib, production and build_queue files (hub: cancellation.py). impl5: aws_target files and their tests, after impl8 removes the helpers (same branch; impl5 starts from impl8's first commit).
+
+**Acceptance gate:** basedpyright zero errors and zero warnings on each changed file; git diff --check. After the test hold lifts: each changed module 20 times under load, then the full merge gate.
