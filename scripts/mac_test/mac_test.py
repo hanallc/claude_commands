@@ -32,8 +32,9 @@ from urllib.parse import quote
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import override_guard
-from scripts.mac_test import claim_state
+from scripts.mac_test import claim_state, mac_ci
 from scripts.mac_test.claim_state import (
+    MacCiActivity as MacCiActivity,
     CiSwitch as CiSwitch,
     NoMacBlock as NoMacBlock,
     RecordedSession as RecordedSession,
@@ -122,7 +123,22 @@ class ClaimHeldByCopy:
     holders: tuple[RunRecord, ...]
 
 
-ClaimAttempt = ClaimFinished | ClaimBusy | ClaimHeldByCopy
+@dataclass(frozen=True)
+class ClaimWaitsForMacCi:
+    """The CI observation prevents a new Mac claim."""
+
+    activity: MacCiActivity
+
+
+class ClaimNeedsMacCiEvidence:
+    """A replacement needs a CI read before it can take capacity."""
+
+
+class ClaimCapacityAvailable:
+    """The Mac has capacity for one more claim."""
+
+
+ClaimAttempt = ClaimFinished | ClaimBusy | ClaimHeldByCopy | ClaimWaitsForMacCi | ClaimNeedsMacCiEvidence
 
 
 class NoRemoteJob:
@@ -677,17 +693,36 @@ def copy_gives_way(run: RunRecord) -> bool:
 
 @dataclass(frozen=True)
 class MacBuildCapacity:
-    """The host limit and its active claims, including claims kept for cleanup."""
+    """The host limit, current claims, and CI activity."""
 
     limit: int
     claims: tuple[HeldClaim, ...]
+    ci: MacCiActivity
 
     def at_limit(self) -> bool:
-        return len(self.claims) >= self.limit
+        if self.ci not in (MacCiActivity.IDLE, MacCiActivity.RUNNING):
+            return True
+        return len(self.claims) + (self.ci is MacCiActivity.RUNNING) >= self.limit
 
 
-def mac_build_capacity(configuration: conf.ConfigRead, claims: tuple[HeldClaim, ...]) -> MacBuildCapacity:
-    return MacBuildCapacity(configuration.value("max_active_builds", conf.positive_whole), claims)
+def mac_build_capacity(configuration: conf.ConfigRead, claims: tuple[HeldClaim, ...],
+                       ci: MacCiActivity) -> MacBuildCapacity:
+    return MacBuildCapacity(configuration.value("max_active_builds", conf.positive_whole), claims, ci)
+
+
+def mac_claim_capacity(claims: tuple[HeldClaim, ...], ci: MacCiActivity
+                       ) -> ClaimCapacityAvailable | ClaimNeedsMacCiEvidence | ClaimBusy | ClaimWaitsForMacCi | ClaimFinished:
+    """Report why a new claim must wait, or confirm space for it."""
+    if ci is MacCiActivity.UNCHECKED:
+        return ClaimNeedsMacCiEvidence()
+    try:
+        capacity = mac_build_capacity(conf.read("mac_test"), claims, ci)
+    except (OSError, ValueError) as error:
+        print(f"state unreadable: {error}")
+        return ClaimFinished(12)
+    if capacity.at_limit():
+        return ClaimBusy(claims[0].record) if claims else ClaimWaitsForMacCi(ci)
+    return ClaimCapacityAvailable()
 
 
 def claim_scope(worktree: str) -> ClaimScope:
@@ -745,7 +780,8 @@ def write_claim(paths: StatePaths, scope: ClaimScope, record: RunRecord) -> None
 
 def reserve_mac_placement(paths: StatePaths, assignment: placement.PlacementAssignment, *,
                           what: str, worktree: str, copy: bool, uses_claim: bool,
-                          configuration: conf.ConfigRead) -> placement.AllowedHost | placement.TemporaryExclusion:
+                          configuration: conf.ConfigRead, ci: MacCiActivity
+                          ) -> placement.AllowedHost | placement.TemporaryExclusion:
     """Reserve capacity before publishing a grant."""
     from scripts.build_queue import placement
 
@@ -763,9 +799,13 @@ def reserve_mac_placement(paths: StatePaths, assignment: placement.PlacementAssi
             replaceable = all("placement_reserved" not in claim.record and "queue_dispatch" not in claim.record and
                               (run_is_kept(claim.record) or (not copy and copy_gives_way(claim.record)))
                               for claim in overlapping)
-            return placement.AllowedHost() if uses_claim and replaceable else busy
-        if mac_build_capacity(configuration, claims).at_limit():
+            if not (uses_claim and replaceable):
+                return busy
+            claims = tuple(claim for claim in claims if not scopes_overlap(claim.scope, scope))
+        if mac_build_capacity(configuration, claims, ci).at_limit():
             return busy
+        if overlapping:
+            return placement.AllowedHost()
         identity = claim_state.ClaimIdentity(
             execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
             assignment.episode, assignment.attempt)
@@ -1570,8 +1610,10 @@ def claim_needs_settlement(paths: StatePaths, record: claim_state.RemoteClaim) -
             or offload.pending_start_path(paths.target, claim_state.claim_identity(record)).exists())
 
 
-def settle_retained_mac_claims(paths: StatePaths, settings: Path) -> None:
-    """Retry exact settlement before a Mac capacity check."""
+def settle_retained_mac_claims(paths: StatePaths, settings: Path, *,
+                              configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                              ) -> MacCiActivity:
+    """Retry exact settlement and read CI activity before a Mac capacity check."""
     with locked(paths.lock):
         claims = read_claims(paths)
     for claim in claims:
@@ -1581,6 +1623,7 @@ def settle_retained_mac_claims(paths: StatePaths, settings: Path) -> None:
                 _ = release_exact_claims(paths, record["pid"], claim_state.claim_identity(record), str(settings))
             except (OSError, ValueError):
                 continue
+    return mac_ci.read_mac_ci_activity(configuration if isinstance(configuration, conf.ConfigRead) else conf.read(settings))
 
 
 def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
@@ -1840,8 +1883,9 @@ def full_settle(
                     write_block(paths.block, block)
 
     if isinstance(block, PendingMacBlock):
+        ci = MacCiActivity.IDLE
         if paths.platform == "macos":
-            settle_retained_mac_claims(paths, config_path(paths.target if paths.registry_selected else ""))
+            ci = settle_retained_mac_claims(paths, config_path(paths.target if paths.registry_selected else ""))
         with locked(paths.lock):
             claims = live_claims(paths)
         waiting_claims = tuple(claim for claim in claims if not claim_belongs_to_block(claim.record, block))
@@ -1851,8 +1895,14 @@ def full_settle(
             block = pending_with_wait(block, WaitingOnLocalRun(waiting_claims[0].record["what"]))
             with locked(paths.lock):
                 write_block(paths.block, block)
-        elif config.ci_repo:
-            activity = ci_activity(config)
+        else:
+            activity: CiActivity
+            if ci is MacCiActivity.RUNNING:
+                activity = CI_MAC_JOB_RUNNING
+            elif ci is not MacCiActivity.IDLE:
+                activity = CiUnknown(ci.value)
+            else:
+                activity = ci_activity(config) if config.ci_repo else CI_IDLE
             if isinstance(activity, (CiJobNotStarted, CiMacJobRunning)):
                 block = pending_with_wait(block, WAITING_ON_CI_MAC_JOB
                                           if isinstance(activity, CiMacJobRunning) else WAITING_ON_CI_JOB)
@@ -1867,10 +1917,6 @@ def full_settle(
                 block = activate_block(block, now, message_needed)
                 with locked(paths.lock):
                     write_block(paths.block, block)
-        else:
-            block = activate_block(block, now, message_needed)
-            with locked(paths.lock):
-                write_block(paths.block, block)
 
     if (
         isinstance(block, ActiveMacBlock)
@@ -1984,7 +2030,8 @@ def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobCl
 
 def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                *, session: SubmittingSession, reserve_wait: bool = False,
-               assignment: placement.PlacementAssignment | UnassignedClaim = UNASSIGNED_CLAIM) -> ClaimAttempt:
+               assignment: placement.PlacementAssignment | UnassignedClaim = UNASSIGNED_CLAIM,
+               ci: MacCiActivity = MacCiActivity.UNCHECKED) -> ClaimAttempt:
     """One claim attempt under state.lock: take over, refuse, or write the claim."""
     try:
         claims = live_claims(paths)
@@ -2048,6 +2095,10 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         for claim in overlapping:
             record = claim.record
             if scopes_overlap(claim.scope, scope) and run_is_kept(record) and "queue_dispatch" not in record:
+                if paths.platform == "macos":
+                    capacity = mac_claim_capacity(tuple(other for other in claims if other != claim), ci)
+                    if not isinstance(capacity, ClaimCapacityAvailable):
+                        return capacity
                 return take_over_kept_claim(args, claim, record, session=session)
     if not isinstance(block, NoMacBlock):
         return blocked_claim(block)
@@ -2072,16 +2123,16 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         # A test copy gives way to any new step; a copy never replaces a copy.
         if not args.copy and all("placement_reserved" not in claim.record and copy_gives_way(claim.record)
                                  for claim in overlapping):
+            if paths.platform == "macos":
+                capacity = mac_claim_capacity(tuple(claim for claim in claims if claim not in overlapping), ci)
+                if not isinstance(capacity, ClaimCapacityAvailable):
+                    return capacity
             return ClaimHeldByCopy(tuple(claim.record for claim in overlapping))
         return ClaimBusy(overlapping[0].record)
     if paths.platform == "macos":
-        try:
-            capacity = mac_build_capacity(conf.read("mac_test"), claims)
-        except (OSError, ValueError) as error:
-            print(f"state unreadable: {error}")
-            return ClaimFinished(12)
-        if capacity.at_limit():
-            return ClaimBusy(claims[0].record)
+        capacity = mac_claim_capacity(claims, ci)
+        if not isinstance(capacity, ClaimCapacityAvailable):
+            return capacity
     proc_start = process_identity.process_start(args.pid)
     if not isinstance(proc_start, process_identity.Started):
         print(f"cannot claim: process {args.pid} is not running", file=sys.stderr)
@@ -2211,15 +2262,22 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
     deadline = time.monotonic() + max(args.wait, 0.0)
     yield_deadline = 0.0
     stopped: set[tuple[int, str]] = set()
+    read_ci = isinstance(assignment, UnassignedClaim)
     while True:
-        if paths.platform == "macos" and isinstance(assignment, UnassignedClaim) and not args.from_pid:
+        ci = MacCiActivity.UNCHECKED
+        if paths.platform == "macos" and read_ci and not args.from_pid:
             settings = Path(args.settings) if args.settings else config_path(paths.target if paths.registry_selected else "")
             # claim_once reports unreadable state after it reads the claims under the lock.
+            ci = MacCiActivity.UNKNOWN
             with suppress(ClaimStateUnreadable):
-                settle_retained_mac_claims(paths, settings)
+                ci = settle_retained_mac_claims(paths, settings)
         with locked(paths.lock):
             attempt = (adopt_wait_claim(args, paths, scope, session=session) if args.from_pid
-                       else claim_once(args, paths, scope, session=session, reserve_wait=not watch_claim, assignment=assignment))
+                       else claim_once(args, paths, scope, session=session, reserve_wait=not watch_claim,
+                                       assignment=assignment, ci=ci))
+        if isinstance(attempt, ClaimNeedsMacCiEvidence):
+            read_ci = True
+            continue
         if isinstance(attempt, ClaimFinished):
             if watch_claim and attempt.status in (0, 13):
                 start_claim_watcher(paths)
@@ -2241,6 +2299,9 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
             return 11
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            if isinstance(attempt, ClaimWaitsForMacCi):
+                print(f"busy: {attempt.activity.value}")
+                return 11
             busy_run = attempt.holder
             if run_is_kept(busy_run):
                 print(f"busy: leftovers of {busy_run['what']} on {busy_run['remote_host']} since "
@@ -2362,12 +2423,11 @@ def free_now(
     *, session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
     configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
 ) -> FreeNowAnswer:
-    """Whether a claim for repo_root's repository made now could start a Mac run.
+    """Read local eligibility for the next repository claim.
 
     Read from local records alone, and cheap enough for LINT_QUEUE_LEAVE_HOOK,
-    which runs it on every held memory poll: no SSH, no gh and no lock. CI is
-    not read, since a claim does not consult it; the claim itself still decides
-    under its lock. Another repository's claim leaves the answer free. A copy
+    which runs it on every held memory poll: no SSH, no gh and no lock.
+    Allocation checks CI and the host limit separately. A copy
     claim gives way to a new test, so it holds the scope only for another copy
     (`copy`). A kept claim leaves the answer free: its holder is gone, and the
     next claim takes it over and cleans its leftovers.

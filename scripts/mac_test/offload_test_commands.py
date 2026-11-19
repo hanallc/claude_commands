@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Literal
 
 from scripts.lib.checkout_test_support import fixture_shim_source, python_tool_source
+from scripts.mac_test.mac_ci_test_support import idle_ci_shell_reply
 
 
 JSON_SHELL = r'''
@@ -71,6 +72,7 @@ COMMAND_STUB = r'''
 root=$MAC_TEST_STUB_DIR
 source "$root/fixture.sh"
 command=${0##*/}
+''' + idle_ci_shell_reply('${!#}') + r'''
 if [[ $command == systemd-run ]]; then
     json_args "$@" >> "$root/systemd-run.jsonl"
     printf '\n' >> "$root/systemd-run.jsonl"

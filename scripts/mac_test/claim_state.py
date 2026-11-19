@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 import fcntl
 import json
 from pathlib import Path
@@ -335,6 +336,15 @@ class HeldClaim:
     scope: ClaimScope
     path: Path
     record: RunRecord
+
+
+class MacCiActivity(Enum):
+    """The evidence about a live CI worker on one Mac."""
+
+    IDLE = "no CI worker"
+    RUNNING = "Hana CI is running"
+    UNKNOWN = "Hana CI activity is unknown"
+    UNCHECKED = "Hana CI activity has not been read"
 
 
 class NoRun:

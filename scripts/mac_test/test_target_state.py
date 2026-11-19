@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING, Self, TypedDict, cast, override
 
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.lib import process_start as process_identity
+from scripts.mac_test import mac_ci
+from scripts.mac_test.mac_ci_test_support import idle_ci_reply
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
@@ -126,6 +128,7 @@ class IsolatedTargetState(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(mac_test, "send_message", return_value=True))
         _ = self.enterContext(mock.patch.object(threading.Thread, "start"))
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=AssertionError("Unexpected external command")))
+        _ = self.enterContext(mock.patch.object(mac_ci, "run", side_effect=idle_ci_reply))
         _ = self.enterContext(mock.patch.object(subprocess, "Popen", side_effect=self.record_command))
         _ = self.enterContext(mock.patch.object(store, "host_name", return_value="fixture-host"))
 

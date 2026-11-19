@@ -21,7 +21,8 @@ from scripts.lint.memory_test_support import config_environment, write_config_fi
 from scripts.build_targets import build_targets, target_config, targets
 from scripts.build_hold import build_hold
 from scripts.build_hold import owning_session as session_owner
-from scripts.mac_test import mac_test
+from scripts.mac_test import mac_ci, mac_test
+from scripts.mac_test.mac_ci_test_support import idle_ci_reply
 from scripts.lib import atomic_file
 from scripts.lib import process_start as process_identity
 
@@ -421,6 +422,7 @@ class TargetStateTests(IsolatedTargetTest):
         args.worktree = str(self.root)
         output = io.StringIO()
         with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("test-run-start")), \
+             mock.patch.object(mac_ci, "run", side_effect=idle_ci_reply), \
              mock.patch.object(mac_test, "start_claim_watcher") as watcher:
             with redirect_stdout(output):
                 code = mac_test.command_claim(args, mac_test.StatePaths(self.mac_state))

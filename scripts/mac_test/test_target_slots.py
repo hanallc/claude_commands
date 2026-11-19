@@ -30,7 +30,8 @@ from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 
-from scripts.mac_test import eligibility, claim_state, mac_test, offload
+from scripts.mac_test import eligibility, claim_state, mac_ci, mac_test, offload
+from scripts.mac_test.mac_ci_test_support import idle_ci_reply
 from scripts.mac_test.offload_test_support import split_mac_run_command
 from scripts.build_hold import owning_session as session_owner
 from scripts.build_targets import targets
@@ -143,6 +144,7 @@ class RepositorySlotTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(session_owner, "owning_session", return_value=NoOwningSession()))
         _ = self.enterContext(mock.patch.object(mac_test, "start_claim_watcher"))
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=self.git_reply))
+        _ = self.enterContext(mock.patch.object(mac_ci, "run", side_effect=idle_ci_reply))
         _ = self.enterContext(mock.patch.object(subprocess, "Popen", side_effect=AssertionError("Unexpected child process")))
 
     def process_start(self, pid: int) -> str | None:

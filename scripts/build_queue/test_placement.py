@@ -28,7 +28,8 @@ from scripts.build_queue import admission_client as client, queue_snapshot
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.admission_test_support import AdmissionFixture, ObservedAdmissionServer, only_admitted, GIB
 from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
-from scripts.mac_test import claim_state, eligibility, mac_test, offload
+from scripts.mac_test import claim_state, eligibility, mac_ci, mac_test, offload
+from scripts.mac_test.mac_ci_test_support import BUSY_PROCESS_LIST, IDLE_PROCESS_LIST
 from scripts.lint.memory_test_support import write_config_fixture, write_pressure_reading
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
@@ -104,7 +105,8 @@ def publish_candidate(fixture: PlacementFixture, request: wire.PlacementRequest,
                       claims: tuple[placement.AdoptedProviderClaim, ...] = ()) -> placement.FreshHostEvidence:
     destination = request.constraints.candidates[0].destination
     key = fixture.server.host_evidence_key(request, destination)
-    evidence = placement.FreshHostEvidence(key, fixture.clock.now(), "host-generation-a", eligibility, claims)
+    evidence = placement.FreshHostEvidence(key, fixture.clock.now(), "host-generation-a", eligibility, claims,
+        mac_ci=claim_state.MacCiActivity.IDLE)
     fixture.provider_evidence[key] = evidence
     fixture.server.publish_host_evidence(evidence)
     return evidence
@@ -542,7 +544,8 @@ class MacBuildLimitTests(unittest.TestCase):
         with PlacementFixture() as fixture:
             paths = mac_test.StatePaths(fixture.root / "mac-state")
             with mock.patch.dict(os.environ, {"MAC_TEST_STATE_DIR": str(paths.directory)}):
-                _ = write_config_fixture(fixture.root / "mac_test.conf", f"max_active_builds={limit}\n")
+                _ = write_config_fixture(fixture.root / "mac_test.conf",
+                    f"host=fixture-mac\nmax_active_builds={limit}\nprobe_timeout_s=7\n")
                 yield fixture, paths
 
     def request(self, fixture: PlacementFixture, repository: str, *,
@@ -573,6 +576,58 @@ class MacBuildLimitTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False, assignment=assignment), 0)
         return args
+
+    def test_mac_ci_uses_the_same_capacity_for_placement_and_standalone_claims(self) -> None:
+        idle = IDLE_PROCESS_LIST + "44 S Runner.Listener\n45 Z Runner.Worker\n46 S Runner.Worker-helper\n"
+        cases = (
+            (1, 0, BUSY_PROCESS_LIST, claim_state.MacCiActivity.RUNNING, False),
+            (1, 0, idle, claim_state.MacCiActivity.IDLE, True),
+            (2, 0, BUSY_PROCESS_LIST, claim_state.MacCiActivity.RUNNING, True),
+            (2, 0, "", claim_state.MacCiActivity.UNKNOWN, False),
+            (2, 0, idle + "malformed row\n", claim_state.MacCiActivity.UNKNOWN, False),
+            (2, 255, idle, claim_state.MacCiActivity.UNKNOWN, False),
+        )
+        for limit, status, process_list, activity, allowed in cases:
+            with self.subTest(limit=limit, status=status, activity=activity), self.mac_fixture(limit) as (fixture, paths):
+                request = self.request(fixture, "hana", kind="run")
+                destination = request.constraints.candidates[0].destination
+                key = fixture.server.host_evidence_key(request, destination)
+                fixture.server.host_requests[key] = request
+                reply = subprocess.CompletedProcess(["ssh"], status, process_list, "")
+                with mock.patch.object(mac_ci, "run", return_value=reply) as read:
+                    evidence = fixture.read_host_evidence(key)
+                    read.assert_called_once()
+                    self.assertEqual(read.call_args.args[0][-2:], ["fixture-mac", mac_ci.PROCESS_LIST_COMMAND])
+                    self.assertEqual(read.call_args.kwargs["timeout"], 7)
+                    assert isinstance(evidence, placement.FreshHostEvidence)
+                    self.assertIs(evidence.mac_ci, activity)
+                    fixture.provider_evidence[key] = evidence
+                    fixture.server.publish_host_evidence(evidence)
+
+                    args = mac_test.CliArguments()
+                    args.pid = fixture.request().owner.pid
+                    args.worktree = str(fixture.root / "cargo-liner")
+                    args.what = "check cargo-liner"
+                    with (mock.patch.object(mac_test, "target_claim_scope", return_value=RepositoryScope("cargo-liner")),
+                          redirect_stdout(io.StringIO())):
+                        self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False), 0 if allowed else 11)
+                        if allowed:
+                            held, = mac_test.read_claims(paths)
+                            identity = claim_state.claim_identity(held.record)
+                            args.claim_id, args.episode, args.attempt = identity.claim_id, identity.episode, identity.attempt
+                            self.assertEqual(mac_test.command_release(args, paths), 0)
+                            _ = assignment_for(fixture, request)
+                            if limit == 2:
+                                self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False), 11)
+                                second = self.request(fixture, "cargo-liner", kind="run")
+                                second_key = fixture.server.host_evidence_key(second, second.constraints.candidates[0].destination)
+                                second_evidence = replace(evidence, key=second_key)
+                                fixture.provider_evidence[second_key] = second_evidence
+                                fixture.server.publish_host_evidence(second_evidence)
+                                self.assert_mac_busy(fixture, second)
+                        else:
+                            self.assert_mac_busy(fixture, request)
+                        self.assertEqual(len(mac_test.read_claims(paths)), int(allowed))
 
     def test_mac_grant_reserves_capacity_from_a_standalone_claim(self) -> None:
         with self.mac_fixture(1) as (fixture, paths):
@@ -2692,7 +2747,8 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 entered.set()
                 if not finish.wait(5):
                     raise AssertionError("the test did not release the blocked probe")
-                return placement.FreshHostEvidence(key, fixture.clock.now(), "host-generation-a", placement.AllowedHost())
+                return placement.FreshHostEvidence(key, fixture.clock.now(), "host-generation-a",
+                    placement.AllowedHost(), mac_ci=claim_state.MacCiActivity.IDLE)
 
             fixture.server.host_probe = blocked_probe
             key = fixture.server.host_evidence_key(request, assignment.destination)
@@ -2793,7 +2849,7 @@ class MacOrderTests(unittest.TestCase):
         """Set the Mac reading that the next probe of this request returns."""
         key = fixture.server.host_evidence_key(request, request.constraints.candidates[0].destination)
         fixture.provider_evidence[key] = placement.FreshHostEvidence(
-            key, fixture.clock.now(), "host-generation-a", eligibility)
+            key, fixture.clock.now(), "host-generation-a", eligibility, mac_ci=claim_state.MacCiActivity.IDLE)
         return key
 
     @staticmethod
@@ -2874,7 +2930,7 @@ class MacOrderTests(unittest.TestCase):
                     fixture.clock.advance(4)
                     for key, eligibility in readings.items():
                         fixture.provider_evidence[key] = placement.FreshHostEvidence(
-                            key, fixture.clock.now(), "host-generation-a", eligibility)
+                            key, fixture.clock.now(), "host-generation-a", eligibility, mac_ci=claim_state.MacCiActivity.IDLE)
                     _ = worker.probe_next()
                     _ = fixture.run_pass()
                 self.assertEqual(self.assigned(fixture, *older, tile), [tile.episode])

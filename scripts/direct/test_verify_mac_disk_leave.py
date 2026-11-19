@@ -14,7 +14,7 @@ from scripts.build_queue import admission_protocol as wire, admission_records as
 from scripts.build_queue.test_placement import (
     PlacementFixture, adopt_assignment, consume_permission, placement_request, publish_candidate,
 )
-from scripts.mac_test.claim_state import RepositoryScope, WholeMacScope
+from scripts.mac_test.claim_state import MacCiActivity, RepositoryScope, WholeMacScope
 from scripts.direct.verify_mac_memory_retry_test_support import VerifyMacMemoryRetryFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
@@ -231,7 +231,8 @@ class StepRetryPermissionTests(unittest.TestCase):
                             if reasons.get(candidate.destination.target) != "disk":
                                 continue
                             key = fixture.server.host_evidence_key(request, candidate.destination)
-                            evidence = placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost())
+                            evidence = placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost(),
+                                mac_ci=MacCiActivity.IDLE)
                             fixture.provider_evidence[key] = evidence
                             fixture.server.publish_host_evidence(evidence)
                         reply, = fixture.connect(request).replies()

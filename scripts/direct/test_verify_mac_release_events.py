@@ -16,6 +16,7 @@ from unittest import mock
 from scripts.build_queue import admission_protocol as wire, placement
 from scripts.build_queue.test_placement import local_candidate, placement_request
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.mac_test.claim_state import MacCiActivity
 
 
 @final
@@ -45,7 +46,7 @@ class VerifyMacReleaseEventsTests(VerifyMacOffloadFixture):
                     destination = request.constraints.candidates[0].destination
                     admission.server.publish_host_evidence(placement.FreshHostEvidence(
                         admission.server.host_evidence_key(request, destination), admission.clock.now(), "",
-                        placement.AllowedHost()))
+                        placement.AllowedHost(), mac_ci=MacCiActivity.IDLE))
                     _ = admission.server.run_pass()
                     self.assertNotIn(request.episode, admission.server.current_assignments)
 
@@ -104,7 +105,7 @@ class VerifyMacReleaseEventsTests(VerifyMacOffloadFixture):
             key = admission.server.host_evidence_key(request, destination)
             with admission.loop_turn():
                 admission.server.publish_host_evidence(placement.FreshHostEvidence(
-                    key, admission.clock.now(), "", placement.AllowedHost()))
+                    key, admission.clock.now(), "", placement.AllowedHost(), mac_ci=MacCiActivity.IDLE))
                 assigned, = admission.server.handle_request(request)
                 self.assertIsInstance(assigned, wire.Assignment)
                 assert isinstance(assigned, wire.Assignment)
@@ -130,12 +131,12 @@ class VerifyMacReleaseEventsTests(VerifyMacOffloadFixture):
                     with admission.loop_turn():
                         admission.clock.advance(1)
                         admission.server.publish_host_evidence(placement.FreshHostEvidence(
-                            key, admission.clock.now(), "", placement.AllowedHost()))
+                            key, admission.clock.now(), "", placement.AllowedHost(), mac_ci=MacCiActivity.IDLE))
                         _ = admission.server.handle_request(wire.ExecutionReport("waiter-settle", original, claim,
                             execution_identity.ExecutionNotStarted(), placement.PrelaunchRefused("busy"), placement.DispatchPathSettled()))
                         admission.clock.advance(1)
                         admission.server.publish_host_evidence(placement.FreshHostEvidence(
-                            key, admission.clock.now(), "", placement.AllowedHost()))
+                            key, admission.clock.now(), "", placement.AllowedHost(), mac_ci=MacCiActivity.IDLE))
                         replacement, = admission.server.handle_request(request)
                         if not isinstance(replacement, wire.Assignment):
                             raise AssertionError(f"the replacement was not assigned: {replacement}")

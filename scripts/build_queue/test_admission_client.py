@@ -561,7 +561,8 @@ class ClientTests(unittest.TestCase):
                         return placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost())
                     if not finish_probe.wait(10):
                         raise AssertionError("the test did not release its private evidence reader")
-                    return placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost())
+                    return placement.FreshHostEvidence(key, fixture.clock.now(), "", placement.AllowedHost(),
+                        mac_ci=claim_state.MacCiActivity.IDLE)
 
                 fixture.server.host_probe = provider
                 assignment_file = fixture.root / "assignment.json"
@@ -644,7 +645,8 @@ class ClientTests(unittest.TestCase):
                                 remote = next(candidate.destination for candidate in submitted.constraints.candidates
                                               if candidate.destination.provider == "mac")
                                 fixture.server.publish_host_evidence(placement.FreshHostEvidence(
-                                    fixture.server.host_evidence_key(submitted, remote), fixture.clock.now(), "", allowed))
+                                    fixture.server.host_evidence_key(submitted, remote), fixture.clock.now(), "", allowed,
+                                    mac_ci=claim_state.MacCiActivity.IDLE))
                         _ = fixture.run_pass()
                         self.assertEqual(client.main(arguments), 0)
                         lines = output.getvalue().splitlines()

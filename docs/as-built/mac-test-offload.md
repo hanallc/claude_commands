@@ -21,13 +21,17 @@ The `buildlog` CLI retains coordination state, hold intervals, and detailed Mac 
 
 `max_active_builds` in `config/mac_test.conf` sets the capacity for each managed Mac target.
 The initial limit is one build across repositories.
+A live `Runner.Worker` on the Mac counts as one Hana CI build.
+The shared settlement step reads CI activity before a new claim takes the state lock.
+An unreadable CI result keeps new agent builds waiting.
 A queue grant reserves a claim under the same lock that a standalone claim uses.
 The runner adopts that claim in place.
 The remote claim keeps capacity until its attempt settles.
 A full Mac uses the existing busy route.
 A replacement grant can clean up an existing claim before it acquires capacity.
 The limit applies to queued Mac runs and standalone claims.
-Interactive Mac terminal work and Hana CI remain outside this limit.
+Interactive Mac terminal work bypasses the limit.
+Hana CI can start at any time.
 
 Converted verify steps execute only at the destination assigned by the queue.
 The queue preserves configured target order.
@@ -702,6 +706,7 @@ Cargo locks, scratch busy locks, and process checks retain their existing roles.
 | Natedev floor output | Existing build holds, mirror leases, process checks, scratch locks, and Cargo locks apply. |
 `mirror_root.py` reads the one `mirror_root` setting for offload and sweep.
 `free_now` reads local records only and starts no sweep or SSH request.
+The grant and claim paths check CI activity before they allocate capacity.
 
 `local_mirror_lease` first takes an outside lease, then the existing sibling lease.
 The outside file uses the mirror path hash and sits beside the task parent.

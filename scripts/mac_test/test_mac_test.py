@@ -35,7 +35,8 @@ from scripts.lint.memory_test_support import write_config_fixture, commit_config
 
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
-from scripts.mac_test import mac_test
+from scripts.mac_test import mac_ci, mac_test
+from scripts.mac_test.mac_ci_test_support import BUSY_PROCESS_LIST, idle_ci_reply, write_idle_ci_ssh
 from scripts.lib import conf
 from scripts.lib import test_hang_guard
 
@@ -367,6 +368,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
         self.bin_directory.mkdir()
         self.write_executable(self.bin_directory / "gh", GH_STUB)
         self.write_executable(self.bin_directory / "systemd-run", SYSTEMD_STUB)
+        write_idle_ci_ssh(self.bin_directory / "ssh")
         send_stub = self.stub_directory / "send.py"
         sessions_stub = self.stub_directory / "sessions.py"
         self.write_executable(send_stub, SEND_STUB)
@@ -518,6 +520,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
                             timeout=timeout, stdin=stdin, stdout=stdout, stderr=stderr)
 
         with (mock.patch.object(subprocess, "run", side_effect=run),
+              mock.patch.object(mac_ci, "run", side_effect=idle_ci_reply),
               mock.patch.object(mac_test, "start_hold_recorder", side_effect=record)):
             return invoke_cli(mac_test, mac_test.main, list(arguments), selected_environment, self.root)
 
@@ -3082,6 +3085,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         })))
         _ = self.enterContext(mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("owner-start")))
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=AssertionError("Unexpected external command")))
+        _ = self.enterContext(mock.patch.object(mac_ci, "run", side_effect=idle_ci_reply))
         _ = self.enterContext(mock.patch.object(subprocess, "Popen", side_effect=AssertionError("Unexpected external command")))
 
     @staticmethod
@@ -3534,6 +3538,24 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         self.assertFalse(pending.exists())
         self.assertEqual(check.call_count, len(observations))
         send.assert_called_once()
+
+    def test_pending_block_waits_for_live_and_unreadable_mac_ci(self) -> None:
+        _ = write_config_fixture(self.root / "mac_test.conf", "ci_repo=\n")
+        block = mac_test.PendingMacBlock("blocker", "rendering", self.now, self.now + timedelta(hours=1),
+            mac_test.HolderQueue("blocker"), mac_test.NoShowrunner(), "not_configured", mac_test.WaitingOnLocalRun("tests"))
+        mac_test.write_block(self.paths.block, block)
+        cases = (
+            (subprocess.CompletedProcess(["ssh"], 0, BUSY_PROCESS_LIST, ""), mac_test.WaitingOnCiMacJob),
+            (subprocess.CompletedProcess(["ssh"], 255, "", "unavailable"), mac_test.WaitingOnUnknownCi),
+        )
+        config = mac_test.read_config()
+        for reply, waiting in cases:
+            with (self.subTest(waiting=waiting), mock.patch.object(mac_test, "utc_now", return_value=self.now),
+                  mock.patch.object(mac_ci, "run", return_value=reply) as read):
+                outcome = mac_test.full_settle(self.paths, config, watcher_holds_lock=True, activation_message_needed=False)
+                read.assert_called_once()
+            assert isinstance(outcome.block, mac_test.PendingMacBlock)
+            self.assertIsInstance(outcome.block.waiting_on, waiting)
 
     def test_standalone_claim_retry_recovers_capacity_from_a_dead_queue_owner(self) -> None:
         from scripts.mac_test import claim_state, offload

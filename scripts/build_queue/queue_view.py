@@ -25,7 +25,7 @@ from scripts.build_queue.queue_evidence import step_labels as step_labels
 from scripts.build_queue.queue_lines import Line, Span
 from scripts.buildlog.parse import cargo_subcommand
 from scripts.lib import cargo_target_config, conf
-from scripts.mac_test import mac_process_environment
+from scripts.mac_test import mac_ci, mac_process_environment
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import RECORDED_STEP_NAMES, StepNames, command_script, read_step_names
 from scripts.build_queue import admission_records
@@ -397,7 +397,7 @@ def repository_name(folder):
     return ""
 
 
-''' + inspect.getsource(mac_process_environment) + r'''
+''' + inspect.getsource(mac_process_environment) + "\n\n" + inspect.getsource(mac_ci.is_runner_worker) + r'''
 
 
 def process_environment(pid):
@@ -463,7 +463,7 @@ def build_origin(pid, processes):
             words = shlex.split(processes[cursor]["command"])
         except ValueError:
             return "unknown"
-        if words and Path(words[0]).name in ("Runner.Worker", "Runner.Listener"):
+        if words and (is_runner_worker(words[0]) or Path(words[0]).name == "Runner.Listener"):
             return "ci"
         cursor = processes[cursor]["parent"]
     return "non-ci"

@@ -725,7 +725,8 @@ class OffloadSettingsTests(unittest.TestCase):
             placement.SubmittingOwner(fixture.server.host, local.owner.pid, local.owner.start_time),
             local.since, local.profile, constraints, identity=local.identity, code_version=local.code_version)
         fixture.server.publish_host_evidence(placement.FreshHostEvidence(
-            fixture.server.host_evidence_key(request, target), fixture.clock.now(), "", placement.AllowedHost()))
+            fixture.server.host_evidence_key(request, target), fixture.clock.now(), "", placement.AllowedHost(),
+            mac_ci=claim_state.MacCiActivity.IDLE))
         assigned, = fixture.server.handle_request(request)
         self.assertIsInstance(assigned, wire.Assignment)
         assignment_file = self.root / "probe.assignment"

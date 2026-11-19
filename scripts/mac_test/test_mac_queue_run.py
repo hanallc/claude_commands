@@ -25,6 +25,8 @@ from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import mac_process_environment, mac_queue_run, mac_test
+from scripts.mac_test.mac_ci import PROCESS_LIST_COMMAND
+from scripts.mac_test.mac_ci_test_support import IDLE_PROCESS_LIST
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
@@ -57,7 +59,8 @@ if args[0] == "place-step":
         execution_identity.SourceKeyKnown("fixture"), placement.SubmittingOwner("fixture", pid, start.start),
         NoOwningSession(), float(option("--since")))
     reserved = mac_test.reserve_mac_placement(claim_state.state_paths(), assignment, what="fixture",
-        worktree=option("--repo-root"), copy=False, uses_claim=False, configuration=conf.read("mac_test"))
+        worktree=option("--repo-root"), copy=False, uses_claim=False, configuration=conf.read("mac_test"),
+        ci=claim_state.MacCiActivity.IDLE)
     assert isinstance(reserved, placement.AllowedHost), reserved
     wire.write_assignment(Path(option("--assignment-file")), wire.Assignment(assignment))
     print("mac\tmac\tfake-mac\t0\t"+option("--episode")+"\tattempt")
@@ -67,7 +70,12 @@ else:
     print('{"state":"closed"}')
 '''
 
-SSH = r'''
+SSH = f'''
+import sys
+if sys.argv[-1] == {PROCESS_LIST_COMMAND!r}:
+    sys.stdout.write({IDLE_PROCESS_LIST!r})
+    raise SystemExit(0)
+''' + r'''
 import json, os, shlex, sys
 from pathlib import Path
 root = Path(os.environ["FAKE_QUEUE_STATE"])
@@ -250,10 +258,10 @@ class QueueRunTests(unittest.TestCase):
             self.assertFalse((root / "watcher-start").exists())
             with mock.patch.dict(os.environ, environment):
                 paths = mac_test.state_paths()
-                mac_test.settle_retained_mac_claims(paths, mac_test.config_path())
+                _ = mac_test.settle_retained_mac_claims(paths, mac_test.config_path())
                 self.assertEqual(len(mac_test.read_claims(paths)), 1)
                 (root / "children-ended").touch()
-                mac_test.settle_retained_mac_claims(paths, mac_test.config_path())
+                _ = mac_test.settle_retained_mac_claims(paths, mac_test.config_path())
                 self.assertEqual(mac_test.read_claims(paths), ())
 
     def test_queue_retains_capacity_while_the_remote_attempt_runs(self) -> None:
@@ -301,7 +309,7 @@ class QueueRunTests(unittest.TestCase):
             with mock.patch.dict(os.environ, environment):
                 paths = mac_test.state_paths()
                 self.assertEqual(len(mac_test.read_claims(paths)), 1)
-                mac_test.settle_retained_mac_claims(paths, mac_test.config_path())
+                _ = mac_test.settle_retained_mac_claims(paths, mac_test.config_path())
                 self.assertEqual(mac_test.read_claims(paths), ())
 
             later = subprocess.run(self.command(root), capture_output=True, text=True, env=environment,
@@ -412,7 +420,7 @@ class QueueRunTests(unittest.TestCase):
                     with mock.patch.dict(os.environ, environment):
                         paths = mac_test.state_paths()
                         self.assertEqual(len(mac_test.read_claims(paths)), 1)
-                        mac_test.settle_retained_mac_claims(paths, mac_test.config_path())
+                        _ = mac_test.settle_retained_mac_claims(paths, mac_test.config_path())
                         self.assertEqual(mac_test.read_claims(paths), ())
                 if signum != signal.SIGINT:
                     # The next run cleans the state of a run that ended without local cleanup.

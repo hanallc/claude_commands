@@ -46,6 +46,7 @@ from scripts.build_queue import cloud_progress
 from scripts.build_queue import queue_snapshot, slot_wait
 from scripts.build_targets import target_config
 from scripts.build_targets.execution_transport import ExecutionTransport, HanaGpuNextestTransport
+from scripts.mac_test.claim_state import MacCiActivity
 from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHolder, reason_phrase
 from scripts.build_queue.system_clock import SystemClock as SystemClock
 from scripts.lint import memory_admit as gate
@@ -3048,8 +3049,9 @@ class AdmissionServer:
             if isinstance(transport, hana_placement.HanaControlTransport):
                 return hana_placement.read_evidence(key, request, transport=transport, workload=configuration)
         paths = claim_state.state_paths(destination.target)
+        mac_ci = MacCiActivity.UNCHECKED
         if isinstance(target, target_config.SshTarget) and target.platform == "macos":
-            mac_test.settle_retained_mac_claims(paths, target.settings)
+            mac_ci = mac_test.settle_retained_mac_claims(paths, target.settings, configuration=configuration)
         sent = request.constraints.command_kind
         kind = recorded_step_kind(request.profile.step) if isinstance(sent, placement.CommandKindNotSent) else sent
         eligibility: placement.HostEligibility
@@ -3074,8 +3076,9 @@ class AdmissionServer:
         # or each pass makes a new attempt that the Mac refuses as busy.
         if (isinstance(eligibility, placement.AllowedHost) and isinstance(target, target_config.SshTarget)
                 and target.platform == "macos"
-                and mac_test.free_now(paths, target.settings, Path(request.constraints.repository),
-                                      session=key.session, configuration=configuration) == "busy"):
+                and (mac_test.free_now(paths, target.settings, Path(request.constraints.repository),
+                                       session=key.session, configuration=configuration) == "busy"
+                     or mac_test.mac_build_capacity(conf.read("mac_test"), (), mac_ci).at_limit())):
             eligibility = placement.TemporaryExclusion("busy")
         adopted: list[placement.AdoptedProviderClaim] = []
         cleanup: list[placement.RetainedCleanupClaim] = []
@@ -3113,7 +3116,8 @@ class AdmissionServer:
                 session, record["remote_host"], record.get("instance_generation", "")))
             executions.append((reference, self._observe_provider_execution(request, destination, reference,
                 record["remote_host"], record.get("instance_generation", ""), configuration)))
-        return placement.FreshHostEvidence(key, self.clock.now(), generation, eligibility, tuple(adopted), tuple(cleanup), tuple(executions), holder, diagnostic)
+        return placement.FreshHostEvidence(key, self.clock.now(), generation, eligibility, tuple(adopted),
+            tuple(cleanup), tuple(executions), holder, diagnostic, mac_ci=mac_ci)
 
     def _observe_provider_execution(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
                                     reference: placement.ProviderClaimReference, host: str, generation: str,
@@ -3764,12 +3768,15 @@ done
                          if isinstance(record.place, wire.LocalPlace)
                          and isinstance(record.cargo_folder, placement.CargoFolder))
 
-    @staticmethod
-    def _reserve_mac_placement(request: wire.PlacementRequest,
+    def _reserve_mac_placement(self, request: wire.PlacementRequest,
                                assignment: placement.PlacementAssignment) -> placement.HostEligibility:
         from scripts.mac_test import claim_state, mac_test
 
-        target = assignment.destination.target
+        destination = assignment.destination
+        target = destination.target
+        key = self.placement_host_keys.get((request.episode, destination))
+        evidence = self.host_evidence(key) if key is not None else None
+        ci = evidence.mac_ci if isinstance(evidence, placement.FreshHostEvidence) else MacCiActivity.UNCHECKED
         with conf.report_key_changes():
             try:
                 paths = claim_state.StatePaths(target_config.ssh_target_state_directory(target), target)
@@ -3777,7 +3784,7 @@ done
                     what=request.profile.step, worktree=request.constraints.repository,
                     copy=isinstance(request.purpose, placement.SpeculativeCopy),
                     uses_claim=request.constraints.command_kind not in placement.MAC_RUN_KINDS,
-                    configuration=_provider_configuration().read("mac_test"))
+                    configuration=_provider_configuration().read("mac_test"), ci=ci)
             except (OSError, ValueError) as error:
                 return placement.EvidenceNeeded(f"The Mac build capacity is unreadable: {error}")
 

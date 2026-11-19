@@ -27,6 +27,7 @@ from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import floor_claims
+from scripts.mac_test.mac_ci_test_support import idle_ci_shell_reply
 from scripts.production.cli_fixture import ImmutableGitSeed
 
 
@@ -75,6 +76,7 @@ run_real_copies() {
 }
 state=$MAC_RUN_STUB_STATE
 command=${0:t}
+''' + idle_ci_shell_reply('${@[-1]}') + r'''
 remote=${@[-1]}
 placed_run=0
 if [[ $command == ssh && $remote == *grace_polls=* ]]; then

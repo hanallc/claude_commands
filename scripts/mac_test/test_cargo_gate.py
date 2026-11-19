@@ -13,6 +13,7 @@ import unittest
 from typing import cast
 
 from scripts.lib.helper_tree_test_support import copy_helpers
+from scripts.mac_test.mac_ci_test_support import BUSY_PROCESS_LIST
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -62,7 +63,7 @@ else:
 
 
 class CargoGateTests(unittest.TestCase):
-    def fixture(self, root: Path) -> dict[str, str]:
+    def fixture(self, root: Path, *, process_list: str = "") -> dict[str, str]:
         real = root / "real"
         fake = root / "fake"
         real.mkdir()
@@ -82,8 +83,10 @@ class CargoGateTests(unittest.TestCase):
                               + shlex.quote(sys.executable) + ' "$@"\n')
         parser.chmod(0o755)
         ps = fake / "ps"
+        list_processes = f"printf '%s' {shlex.quote(process_list)}" if process_list else '/bin/ps "$@"'
         _ = ps.write_text('#!/bin/zsh -f\nprint -r -- \"$*\" >> \"$GATE_TEST_ROOT/ps-calls\"\nif [[ ${@[-1]} == lstart= ]]; then\n'
-                          + ' kill -0 "$2" 2>/dev/null || exit 1\n print "Mon Nov  9 12:00:00 2026"\nelse\n /bin/ps "$@"\nfi\n')
+                          + ' kill -0 "$2" 2>/dev/null || exit 1\n print "Mon Nov  9 12:00:00 2026"\n'
+                          + f'else\n {list_processes}\nfi\n')
         ps.chmod(0o755)
         _ = write_config_fixture(root / "config/mac_gate.conf",
             "placement_check_command=" + shlex.join([sys.executable, str(check)])
@@ -164,6 +167,22 @@ class CargoGateTests(unittest.TestCase):
                         self.assertEqual(ssh_arguments[ssh_arguments.index("natedev") + 1],
                             "~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/admission_client.py placement-status")
                     self.assertEqual(next((root / ".local/state/mac-gate/records").iterdir()).stat().st_mode & 0o777, 0o600)
+
+    def test_terminal_bypasses_the_limit_during_ci(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = self.fixture(root, process_list=BUSY_PROCESS_LIST)
+            _ = write_config_fixture(root / "config/mac_test.conf", "max_active_builds=1\n")
+            result = self.run_gate(environment, "build")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            rows = (root / "runs").read_text().splitlines()
+            self.assertEqual(len(rows), 1)
+            self.assertIn("user", rows[0])
+            calls = (root / "ps-calls").read_text().splitlines()
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(calls[0].endswith(" -o lstart="))
+            self.assertFalse((root / "checks").exists())
+            self.assertFalse((root / "ssh-arguments").exists())
 
     def test_agent_markers_and_failed_checks_refuse_without_starting_a_program(self) -> None:
         route = "; run it through mac_queue_run.py"
