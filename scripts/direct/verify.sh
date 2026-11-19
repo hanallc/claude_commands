@@ -1789,22 +1789,31 @@ collect_hold_wait() {
 }
 
 interrupt_hold_wait() {
-    if [[ -n "$HOLD_WAITER_PID" ]]; then
-        if [[ "${PLACEMENT_CLIENT_ACTIVE:-0}" == 1 ]]; then
-            "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$HOLD_WAITER_PID" TERM 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$HOLD_WAITER_PID" >&2; }
-            if [[ -n "${VERIFY_HELPER_PID:-}" ]]; then
-                kill -TERM "$VERIFY_HELPER_PID" 2>/dev/null || true
-                VERIFY_HELPER_PID=""
-            fi
-            exec 70>&- 71<&-
-            VERIFY_HELPER_INPUT="" VERIFY_HELPER_OUTPUT=""
-            PLACEMENT_CLIENT_ACTIVE=0
-        else
-            kill -TERM "$HOLD_WAITER_PID" 2>/dev/null || true
+    local waiter_pid=$HOLD_WAITER_PID last_job_pid=${!:-}
+    if [[ "${PLACEMENT_CLIENT_ACTIVE:-0}" == 1 ]]; then
+        # A signal can arrive after Bash starts the job and before Verify saves its PID.
+        if [[ -z "$waiter_pid" && -n ${placement_previous_job_pid+x} &&
+                "$last_job_pid" != "$placement_previous_job_pid" ]]; then
+            waiter_pid=$last_job_pid
         fi
-        # Bash can wait for log readers after the waiter exits.
-        HOLD_WAITER_PID=""
+        if [[ -n "$waiter_pid" ]]; then
+            "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" \
+                "$waiter_pid" TERM 2>/dev/null || {
+                [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$waiter_pid" >&2
+            }
+        fi
+        # Stop the helper before cleanup makes another request.
+        if [[ -n "${VERIFY_HELPER_PID:-}" ]]; then
+            kill -TERM "$VERIFY_HELPER_PID" 2>/dev/null || true
+            VERIFY_HELPER_PID=""
+        fi
+        exec 70>&- 71<&-
+        VERIFY_HELPER_INPUT="" VERIFY_HELPER_OUTPUT=""
+        PLACEMENT_CLIENT_ACTIVE=0
+    elif [[ -n "$waiter_pid" ]]; then
+        kill -TERM "$waiter_pid" 2>/dev/null || true
     fi
+    HOLD_WAITER_PID=""
     if [[ -n "${BUILDLOG_HOLD_WAITER_FILE:-}" && -f "$BUILDLOG_HOLD_WAITER_FILE" ]]; then
         verify_helper "$BUILD_TARGETS_SCRIPT" interrupt-local --call-id "$BUILDLOG_CALL_ID" >/dev/null 2>&1 || true
     fi
@@ -2889,7 +2898,8 @@ placement_once() {
         IFS=$'\t' read -r STEP_ASSIGNED_SETTINGS STEP_ASSIGNED_PLATFORM PLACEMENT_SESSION <<< "$metadata"
         return 0
     fi
-    # A builtin wait lets the parent handle TERM during a service outage.
+    # A builtin wait lets the parent handle signals during a service outage.
+    local placement_previous_job_pid=${!:-}
     PLACEMENT_CLIENT_ACTIVE=1
     [[ $- != *m* ]] || monitor=1
     set -m
@@ -2898,8 +2908,7 @@ placement_once() {
     HOLD_WAITER_PID=$!
     if [[ "$monitor" == 0 ]]; then set +m; fi
     wait "$HOLD_WAITER_PID" || status=$?
-    HOLD_WAITER_PID=""
-    PLACEMENT_CLIENT_ACTIVE=0
+    HOLD_WAITER_PID="" PLACEMENT_CLIENT_ACTIVE=0
     reply=$(< "$HOLD_WAIT_DIR/placement-reply")
     while IFS= read -r line; do
         case "$line" in
