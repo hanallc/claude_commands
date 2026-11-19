@@ -23,10 +23,11 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast
 from zoneinfo import ZoneInfo
 
+from scripts.lib import file_lock
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed
 from scripts.lib.user_zone import user_zone
 from scripts.message import send_result, session_send
-from scripts.production import delivery_state, record_store, staff
+from scripts.production import change_review, delivery_state, record_store, staff
 from scripts.review_links import change_page, page_question, question_record
 
 
@@ -69,6 +70,13 @@ class NoTimestamp(StrEnum):
 
 
 Timestamp = datetime | NoTimestamp
+
+
+class ParkUntilDelivered(StrEnum):
+    DELIVERED = "delivered"
+
+
+Parking = Timestamp | ParkUntilDelivered
 
 
 class EtaStatus(StrEnum):
@@ -140,7 +148,7 @@ class PageRequest:
     action: Literal["tell", "remove", "park", "unpark", "read", "question"]
     words: str
     form_words: str = ""
-    parked_until: Timestamp = NoTimestamp.UNSET
+    parked_until: Parking = NoTimestamp.UNSET
 
 
 class NoPageRequest(StrEnum):
@@ -173,7 +181,7 @@ class PageFeedback:
     read_update: UnreadUpdate | NoUnreadUpdate = NoUnreadUpdate.ABSENT
     action: Literal["tell", "remove", "park", "unpark"] = "tell"
     form_words: str = ""
-    parked_until: Timestamp = NoTimestamp.UNSET
+    parked_until: Parking = NoTimestamp.UNSET
 
     def key(self) -> PageRequest:
         return PageRequest(self.request, self.action, self.words, self.form_words, self.parked_until)
@@ -187,7 +195,7 @@ class PageItemNotice:
     words: str
     action: Literal["remove", "park", "unpark"]
     form_words: str = ""
-    parked_until: Timestamp = NoTimestamp.UNSET
+    parked_until: Parking = NoTimestamp.UNSET
 
 
 PAGE_SOURCE = "nate via List"
@@ -208,7 +216,7 @@ class ListItem:
     next_check: NextCheck
     eta: Eta
     unread_since: Timestamp
-    parked_until: Timestamp
+    parked_until: Parking
     blocked_by: tuple[ItemDependency, ...]
     related_to: tuple[int, ...]
     requested_by: RequestedBy
@@ -289,7 +297,7 @@ class ItemChanges(TypedDict, total=False):
 
 
 class LogFields(ItemChanges, total=False):
-    parked_until: Timestamp
+    parked_until: Parking
     closing_words: str
 
 
@@ -339,6 +347,32 @@ class Unparked:
     pass
 
 
+class ItemDelivered(StrEnum):
+    RECORDED = "delivered"
+
+
+@dataclass(frozen=True)
+class LinkedChangeDelivered:
+    key: str
+
+
+@dataclass(frozen=True)
+class UnparkedForDelivery(Unparked):
+    reason: ItemDelivered | LinkedChangeDelivered
+
+
+@dataclass(frozen=True)
+class DeliveryParkEvent:
+    """Identify a park even when another park has the same time."""
+
+    index: int
+    change: ItemChange
+
+
+class NoDeliveryPark(StrEnum):
+    ABSENT = ""
+
+
 @dataclass(frozen=True)
 class ReviewLinksChanged:
     action: Literal["Linked reviews", "Unlinked reviews"]
@@ -381,6 +415,22 @@ def time_value(text: str) -> Timestamp:
         value = value.replace(tzinfo=user_zone())
     _validate_time(value)
     return value
+
+
+def parking_value(text: str) -> Parking:
+    return ParkUntilDelivered.DELIVERED if text == ParkUntilDelivered.DELIVERED else time_value(text)
+
+
+def parking_active(value: Parking, moment: datetime) -> bool:
+    return value is ParkUntilDelivered.DELIVERED or isinstance(value, datetime) and value > moment
+
+
+def _parking_text(value: Parking) -> str:
+    return value.value if isinstance(value, ParkUntilDelivered) else _time_text(value)
+
+
+def _request_parking(value: Parking) -> Parking:
+    return value.astimezone(UTC) if isinstance(value, datetime) else value
 
 
 def _required_time(text: str) -> datetime:
@@ -528,8 +578,10 @@ def _validate(item: ListItem) -> None:
     _validate_unit(item.unit)
     _ = _item_state(item.state)
     _ = _requester(item.requested_by)
-    for moment in (item.opened, item.updated, item.unread_since, item.parked_until, item.closed):
+    for moment in (item.opened, item.updated, item.unread_since, item.closed):
         _validate_time(moment)
+    if not isinstance(item.parked_until, ParkUntilDelivered):
+        _validate_time(item.parked_until)
     _ = _read_eta(eta_text(item.eta), _eta_kind(item.eta))
     _ = next_check_value(next_check_text(item.next_check))
     if (item.state == ItemState.CLOSED) != isinstance(item.closed, datetime):
@@ -594,7 +646,7 @@ def _log_fields(fields: LogFields) -> dict[str, object]:
     if "next_check" in fields:
         values["next_check"] = next_check_text(fields["next_check"])
     if "parked_until" in fields:
-        values["parked_until"] = _time_text(fields["parked_until"])
+        values["parked_until"] = _parking_text(fields["parked_until"])
     if "blocked_by" in fields:
         values["blocked_by"] = [(dependency.number, dependency.condition) for dependency in fields["blocked_by"]]
     return values
@@ -641,7 +693,7 @@ def _read_log_fields(raw: object, number: int) -> LogFields:
                 case "next_check":
                     values[field] = next_check_value(text)
                 case "parked_until":
-                    values[field] = time_value(text)
+                    values[field] = parking_value(text)
                 case _:
                     if field == "title":
                         _line(text, field)
@@ -763,8 +815,8 @@ def _question_id(value: object) -> str:
 
 def _request_fields(request: PageRequest) -> dict[str, str]:
     fields = {"request": _request_id(request.request), "action": request.action, "words": request.words, "form_words": request.form_words}
-    if isinstance(request.parked_until, datetime):
-        fields["parked_until"] = request.parked_until.isoformat()
+    if request.parked_until is not NoTimestamp.UNSET:
+        fields["parked_until"] = _parking_text(request.parked_until)
     return fields
 
 
@@ -785,6 +837,10 @@ def _log_content(content: LogContent) -> dict[str, object]:
         return {"action": "Marked read"}
     if isinstance(content, Reopened):
         return {"action": "Reopened"}
+    if isinstance(content, UnparkedForDelivery):
+        if isinstance(content.reason, LinkedChangeDelivered):
+            return {"action": "Unparked", "delivered_change": content.reason.key}
+        return {"action": "Unparked", "delivered_item": True}
     if isinstance(content, Unparked):
         return {"action": "Unparked"}
     if isinstance(content, ReviewLinksChanged):
@@ -847,6 +903,11 @@ def _read_log_line(line: str, number: int) -> ItemChange:
                 content = MarkedRead()
             case {"action": "Reopened"} if len(fields) == 1:
                 content = Reopened()
+            case {"action": "Unparked", "delivered_change": str(key)} if len(fields) == 2:
+                _line(key, "review key")
+                content = UnparkedForDelivery(LinkedChangeDelivered(key))
+            case {"action": "Unparked", "delivered_item": True} if len(fields) == 2:
+                content = UnparkedForDelivery(ItemDelivered.RECORDED)
             case {"action": "Unparked"} if len(fields) == 1:
                 content = Unparked()
             case {"action": action, "keys": values} if len(fields) == 2 and action in ("Linked reviews", "Unlinked reviews"):
@@ -896,7 +957,7 @@ def _read_item(store: record_store.NumberedRecords, identity: str, fields: dict[
                         staff.StaffId(fields.get("producer", store.owner)),
                         fields["unit"], _item_state(fields["state"]), next_check_value(fields["next_check"]),
                         _read_eta(fields["eta"], fields["eta_kind"]),
-                        time_value(fields["unread_since"]), time_value(fields["parked_until"]),
+                        time_value(fields["unread_since"]), parking_value(fields["parked_until"]),
                         _dependencies(cast(object, json.loads(fields["blocked_by"]))),
                         _related(cast(object, json.loads(fields["related_to"]))), _requester(fields["requested_by"]),
                         time_value(fields["opened"]), time_value(fields["updated"]), time_value(fields["closed"]),
@@ -931,7 +992,7 @@ def _save(store: record_store.NumberedRecords, item: ListItem) -> None:
               "owner": item.owner, "producer": item.producer, "unit": item.unit, "state": item.state.value,
               "next_check": next_check_text(item.next_check), "eta": eta_text(item.eta),
               "eta_kind": _eta_kind(item.eta),
-              "unread_since": _time_text(item.unread_since), "parked_until": _time_text(item.parked_until),
+              "unread_since": _time_text(item.unread_since), "parked_until": _parking_text(item.parked_until),
               "blocked_by": json.dumps([(entry.number, entry.condition) for entry in item.blocked_by], ensure_ascii=False),
               "related_to": json.dumps(item.related_to), "reviews": json.dumps(item.reviews),
               "requested_by": item.requested_by.value,
@@ -998,17 +1059,16 @@ class QuestionResends:
 
 def question_visibility(keeper: staff.StaffId, item: ListItem,
                         status: change_page.DeliveryStatus) -> WaitingForAnswer | QuestionResends:
-    """Read the delivery state of each unanswered question."""
+    """Read the published state of each unanswered question."""
     unanswered = tuple(question for question in item.questions if question.answer is None)
     if not unanswered:
         return QuestionResends(())
     target = _list_question_target(keeper, item)
     resends: list[QuestionResend] = []
-    with status.locked():
-        for question in unanswered:
-            delivery = change_page.question_delivery_view(status, target.saved(question))
-            if not delivery.state.waits:
-                resends.append(QuestionResend(question, delivery))
+    for question in unanswered:
+        delivery = change_page.published_question_delivery_view(status, target.saved(question))
+        if not delivery.state.waits:
+            resends.append(QuestionResend(question, delivery))
     return QuestionResends(tuple(resends)) if resends else WaitingForAnswer()
 
 
@@ -1110,6 +1170,11 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
         if changed != item:
             entries.append(ItemChange(moment, what, source))
             changed = replace(changed, updated=moment, unread_since=moment if unread else NoTimestamp.UNSET)
+            if (isinstance(what, FieldChange) and what.action == "Updated"
+                    and what.fields.get("state") == ItemState.DELIVERED
+                    and changed.parked_until is ParkUntilDelivered.DELIVERED):
+                changed = replace(changed, parked_until=NoTimestamp.UNSET)
+                entries.append(ItemChange(moment, UnparkedForDelivery(ItemDelivered.RECORDED), source))
         if isinstance(request, PageRequest):
             if entries and isinstance(page_action, PageItemNotice):
                 pending = PageFeedback(page_action.request, page_action.words, action=page_action.action,
@@ -1259,28 +1324,81 @@ def unlink(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, sour
     return _change(keeper, identity, edit, ReviewLinksChanged("Unlinked reviews", chosen), source).item
 
 
-def park(keeper: staff.StaffId, identity: str, until: Timestamp, *, source: str,
+def park(keeper: staff.StaffId, identity: str, until: Parking, *, source: str,
          notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT) -> ListItem:
     fields: LogFields = {"parked_until": until}
     event = FieldChange("Parked", fields)
-    if isinstance(notice, PageItemNotice) and isinstance(until, datetime):
+    if isinstance(until, datetime):
         _validate_time(until)
-        notice = replace(notice, parked_until=until.astimezone(UTC))
+    if isinstance(notice, PageItemNotice) and until is not NoTimestamp.UNSET:
+        notice = replace(notice, parked_until=_request_parking(until))
         event = PageParkingChange("Parked", fields, notice.request)
 
     def edit(item: ListItem, moment: datetime) -> ListItem:
-        if isinstance(notice, PageItemNotice) and (not isinstance(until, datetime) or until <= moment):
+        if isinstance(notice, PageItemNotice) and not parking_active(until, moment):
             raise ListError("Choose a future parking date.")
         _open(item)
+        if until is ParkUntilDelivered.DELIVERED and item.state in (ItemState.DELIVERED, ItemState.DONE):
+            raise ListError("This item is already delivered.")
         return replace(item, parked_until=until)
     return _change(keeper, identity, edit, event, source, page_action=notice).item
+
+
+def delivery_park_event(item: ListItem) -> DeliveryParkEvent | NoDeliveryPark:
+    if item.parked_until is ParkUntilDelivered.DELIVERED and item.state not in (ItemState.CLOSED, ItemState.DONE):
+        for index in range(len(item.log) - 1, -1, -1):
+            change = item.log[index]
+            event = change.what
+            if isinstance(event, FieldChange) and event.action == "Parked":
+                if event.fields.get("parked_until") is ParkUntilDelivered.DELIVERED:
+                    return DeliveryParkEvent(index, change)
+                break
+    return NoDeliveryPark.ABSENT
+
+
+def unread_delivery(item: ListItem) -> bool:
+    if item.state != ItemState.DELIVERED or not isinstance(item.unread_since, datetime):
+        return False
+    for change in reversed(item.log):
+        event = change.what
+        if isinstance(event, (MarkedRead, Reopened)) or event in ("Marked read", "Reopened"):
+            break
+        if isinstance(event, UnparkedForDelivery):
+            return True
+    return False
+
+
+class DeliveryParkRelease(StrEnum):
+    RELEASED = "released"
+    KEPT = "kept"
+
+
+def unpark_for_delivered_change(keeper: staff.StaffId, identity: str, park: DeliveryParkEvent, key: str,
+                                *, review_root: Path, review_list: Path,
+                                change_ready: Callable[[], bool]) -> DeliveryParkRelease:
+    """Try the List lock before the Review locks, as List Ask does."""
+    store = _store(keeper)
+    with file_lock.exclusive(store.lock_path(), wait=False) as listing:
+        if listing is file_lock.LockResult.BUSY:
+            return DeliveryParkRelease.KEPT
+        item = load(keeper, identity)
+        if delivery_park_event(item) != park or key not in item.reviews:
+            return DeliveryParkRelease.KEPT
+        with change_review.try_review_write(review_list, review_root) as review:
+            if review is file_lock.LockResult.BUSY or not change_ready():
+                return DeliveryParkRelease.KEPT
+            moment = now()
+            event = ItemChange(moment, UnparkedForDelivery(LinkedChangeDelivered(key)), "the List")
+            _save(store, replace(item, parked_until=NoTimestamp.UNSET, state=ItemState.DELIVERED,
+                                 updated=moment, unread_since=moment, log=(*item.log, event)))
+    return DeliveryParkRelease.RELEASED
 
 
 def unpark(keeper: staff.StaffId, identity: str, *, source: str,
            notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT) -> ListEdit:
     """Clear an active parking time and save its notice in the same write."""
     def edit(item: ListItem, moment: datetime) -> ListItem:
-        if not isinstance(item.parked_until, datetime) or item.parked_until <= moment:
+        if not parking_active(item.parked_until, moment):
             return item
         _open(item)
         return replace(item, parked_until=NoTimestamp.UNSET)
@@ -1380,7 +1498,7 @@ def _read_page_activity(fields: dict[str, object], source: str, *, receipt: bool
     parking_time = fields.get("parked_until", "")
     if not isinstance(parking_time, str) or (parking_time and action != "park"):
         raise ListError("invalid List request parking time")
-    parked_until = _required_time(parking_time).astimezone(UTC) if parking_time else NoTimestamp.UNSET
+    parked_until = _request_parking(parking_value(parking_time))
     if "unpark_no_change" in fields and (not receipt or action != "unpark"):
         raise ListError("invalid Unpark receipt")
     if receipt:
@@ -1447,13 +1565,13 @@ def _previous_page_request(
             key = previous.request
         else:
             key = previous
-        if key.action == request.action == "park" and isinstance(request.parked_until, datetime):
+        if key.action == request.action == "park" and request.parked_until is not NoTimestamp.UNSET:
             target = key.parked_until
             if target is NoTimestamp.UNSET:
                 recorded = [change.fields.get("parked_until", NoTimestamp.UNSET) for entry in item.log
                             if isinstance(change := entry.what, PageParkingChange) and change.request == key.request]
-                if len(recorded) == 1 and isinstance(recorded[0], datetime):
-                    target = recorded[0].astimezone(UTC)
+                if len(recorded) == 1:
+                    target = _request_parking(recorded[0])
             if target != request.parked_until:
                 raise ListError("this request already has a different parking time")
             if key.form_words != request.form_words:
@@ -1645,7 +1763,7 @@ def table(keeper: staff.StaffId, *, include_closed: bool = False, include_parked
 def _format_table(items: Sequence[ListItem], record: staff.StaffSnapshot, *, include_parked: bool,
                   show_latest_status: bool = False) -> str:
     moment = now()
-    visible = [item for item in items if include_parked or not isinstance(item.parked_until, datetime) or item.parked_until <= moment]
+    visible = [item for item in items if include_parked or not parking_active(item.parked_until, moment)]
     visible.sort(key=order)
     columns = ("#", "Owner", "Producer", "Item", "State", "Next step", "ETA", "Update")
     if show_latest_status:
@@ -1658,7 +1776,9 @@ def _format_table(items: Sequence[ListItem], record: staff.StaffSnapshot, *, inc
             state += "; " + ("check overdue " if item.next_check < moment else "check ") + item.next_check.isoformat()
         if item.state != ItemState.CLOSED and isinstance(item.next_check, CheckCondition):
             state += "; check: " + item.next_check.text
-        if isinstance(item.parked_until, datetime) and item.parked_until > moment:
+        if item.parked_until is ParkUntilDelivered.DELIVERED:
+            state += "; parked until delivered"
+        elif isinstance(item.parked_until, datetime) and item.parked_until > moment:
             state += "; parked until " + parking_date(item.parked_until, user_zone())
         producer = record.by_id(item.producer)
         cells = (str(item.number), owner.name if owner is not None else item.owner,
@@ -1797,7 +1917,7 @@ def main(argv: list[str] | None = None) -> int:
         if name == "add":
             _ = command.add_argument("--number", type=int)
         elif name == "park":
-            _ = command.add_argument("--until", required=True)
+            _ = command.add_argument("--until", required=True, help="a date, a time with a UTC offset, or delivered")
         elif name == "close":
             _ = command.add_argument("--words", required=True)
         elif name == "list":
@@ -1903,7 +2023,7 @@ def main(argv: list[str] | None = None) -> int:
             print(item.id)
             return _notify_producer_assignment(item, keeper, keeper)
         elif name == "park":
-            _ = park(keeper, cast(str, args.id), time_value(cast(str, args.until)), source=source)
+            _ = park(keeper, cast(str, args.id), parking_value(cast(str, args.until)), source=source)
         elif name == "close":
             _ = close(keeper, cast(str, args.id), cast(str, args.words), source=source)
         elif name == "reopen":
