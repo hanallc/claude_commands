@@ -45,7 +45,7 @@ from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import cloud_progress
 from scripts.build_queue import queue_snapshot, slot_wait
 from scripts.build_targets import target_config
-from scripts.build_targets.execution_transport import ExecutionTransport
+from scripts.build_targets.execution_transport import ExecutionTransport, HanaGpuNextestTransport
 from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHolder, reason_phrase
 from scripts.build_queue.system_clock import SystemClock as SystemClock
 from scripts.lint import memory_admit as gate
@@ -2844,9 +2844,12 @@ class AdmissionServer:
             target = configuration.target(key.destination.target, key.settings)
             if isinstance(target, target_config.SshTarget):
                 settings = configuration.read(target.settings)
-                if (key.destination.provider == "ssh"
-                        and isinstance(configuration.transport(target), hana_placement.HanaControlTransport)):
-                    return settings.value("aws_timeout_s", conf.positive_whole_seconds)
+                if key.destination.provider == "ssh":
+                    transport = configuration.transport(target)
+                    if isinstance(transport, hana_placement.HanaControlTransport):
+                        return settings.value("aws_timeout_s", conf.positive_whole_seconds)
+                    if isinstance(transport, HanaGpuNextestTransport):
+                        return settings.number("api_timeout_s")
                 return settings.number("probe_timeout_s")
             file = key.settings.path if isinstance(key.settings, placement.ExplicitProviderSettings) else "mac_test"
             return configuration.read(file).number("probe_timeout_s")
@@ -3018,15 +3021,18 @@ class AdmissionServer:
         target = records.effective_target(destination.target, key.settings)
         if isinstance(target, records.UnregisteredTarget):
             return placement.HostEvidenceUnavailable(key, self.clock.now(), "target is no longer configured")
+        configuration = conf.read(target.settings if isinstance(target, target_config.SshTarget) else "mac_test",
+                                  load=conf.read_bytes)
         if isinstance(target, target_config.SshTarget):
             from scripts.aws_target import hana_placement
 
-            configuration = conf.read(target.settings, load=conf.read_bytes)
             transport = target_config.read_execution_transport(target, configuration=configuration)
+            if isinstance(transport, HanaGpuNextestTransport):
+                from scripts.aws_target.hana_placement_adapter import read_gpu_evidence
+
+                return read_gpu_evidence(transport, key, request, configuration=configuration)
             if isinstance(transport, hana_placement.HanaControlTransport):
                 return hana_placement.read_evidence(key, request, transport=transport, workload=configuration)
-        else:
-            configuration = conf.read("mac_test")
         sent = request.constraints.command_kind
         kind = recorded_step_kind(request.profile.step) if isinstance(sent, placement.CommandKindNotSent) else sent
         eligibility: placement.HostEligibility
@@ -3259,6 +3265,11 @@ done
                     if not isinstance(target, target_config.SshTarget):
                         return True
                     transport = configuration.transport(target)
+                if isinstance(transport, HanaGpuNextestTransport):
+                    from scripts.aws_target.hana_placement_adapter import gpu_claim_pending
+
+                    return gpu_claim_pending(destination.target,
+                        execution_identity.assigned_claim_id(saved.assignment.episode, saved.assignment.attempt))
                 if isinstance(transport, hana_placement.HanaControlTransport):
                     if submitted is None or not isinstance(self.last_usable_configuration, records.MemoryConfig):
                         return True
@@ -3518,7 +3529,8 @@ done
             reader.worker.remove(key)
             _ = self.host_observations.pop(key, None)
         for key in self.host_requests.keys() - self.host_readers.keys():
-            _ = self.host_requests.pop(key, None)
+            if key not in needed or not isinstance(self.host_observations.get(key), placement.FreshHostEvidence):
+                _ = self.host_requests.pop(key, None)
 
     def _prepare_placements(self, keys: PlacementEvidenceKeys, remote_start_hold_seconds: int) -> None:
         """Refresh provider evidence and prepare waiting placement rows on the loop thread."""
@@ -3955,8 +3967,12 @@ done
         else:
             evidence = self._request_host_evidence(submitted, destination)
             if not isinstance(evidence, placement.FreshHostEvidence):
+                if destination.target == 'hana-gpu':
+                    return self._placement_status(assignment, 'adoption evidence is unavailable or stale')
                 state = "stale" if isinstance(evidence, placement.StaleHostEvidence) else "unavailable"
                 return self._placement_status(assignment, f"adoption evidence is {state}: {evidence.reason}")
+            if destination.target == 'hana-gpu' and not isinstance(evidence.eligibility, placement.AllowedHost):
+                return self._placement_status(assignment, 'The Hana GPU step is no longer eligible')
             if not any(claim.reference == reference and claim.holder == request.holder
                        and claim.session == assignment.session and claim.host == destination.host
                        and claim.generation == evidence.generation for claim in evidence.claims):

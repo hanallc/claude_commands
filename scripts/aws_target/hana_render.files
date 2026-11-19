@@ -4,6 +4,7 @@ scripts/aws_target/hana_guest.py
 scripts/aws_target/hana_protocol.py
 scripts/aws_target/hana_result.py
 scripts/aws_target/hana_runner.py
+scripts/aws_target/hana_runner_entry.py
 scripts/aws_target/hana_source.py
 scripts/build_hold/override_guard.py
 scripts/build_hold/owning_session.py

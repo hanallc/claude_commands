@@ -1,0 +1,11 @@
+{
+  "build_admission": {
+    "head_stall_alert_minutes": 2
+  },
+  "cloud_gate": {
+    "hana_gpu_route_enabled": 3
+  },
+  "hana_aws": {
+    "source_allowed_ignored": 1
+  }
+}

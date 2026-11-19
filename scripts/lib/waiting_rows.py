@@ -14,10 +14,11 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
-from typing import NotRequired, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.lib import build_folders, conf, conf_reads, git_index, registry_rows
 from scripts.lib.atomic_file import write_text_atomic
@@ -275,9 +276,10 @@ def show(checkout: Path, commit: str, path: str) -> str:
 
 
 def waiting_files(checkout: Path) -> list[str]:
-    """Tracked configuration files whose live text differs from HEAD."""
-    listed = git(checkout, "diff", "--name-only", "-z", "HEAD", "--", WAITING_PATHS)
-    return [path for path in listed.split("\0") if path]
+    """Tracked configuration files with a staged or unstaged change."""
+    live = git(checkout, "diff", "--name-only", "-z", "HEAD", "--", WAITING_PATHS)
+    staged = git(checkout, "diff", "--cached", "--name-only", "-z", "HEAD", "--", WAITING_PATHS)
+    return list(dict.fromkeys(path for path in (live + staged).split("\0") if path))
 
 
 @dataclass(frozen=True)
@@ -285,6 +287,10 @@ class WaitingRows:
     """The checked index entries and file text for a move to the target."""
 
     merge_source: str
+    merge_target: str
+    index_before: str
+    index_after_give: str
+    index_after_git: str
     entries: str
     plan: MovePlan
 
@@ -336,14 +342,13 @@ def pending_files(checkout: Path, journal: LockedJournal) -> dict[str, dict[str,
             if any(isinstance(save, AcceptedSave) for save in keys.values())}
 
 
-def hold(checkout: Path, move: CheckoutMove, pending: LockedJournal, *, replace_registry: bool,
-         replay_registry: RegistryReplay) -> WaitingRows:
+def hold(checkout: Path, move: CheckoutMove, pending: LockedJournal, *,
+         replace_registry: bool, replay_registry: RegistryReplay) -> MovePlan:
     """Plan writes for paths that Git must leave in place."""
     target = move.tip
-    changed = set(git(checkout, "diff", "--name-only", "--no-renames", "-z", move.head, target, "--", WAITING_PATHS).split("\0"))
+    changed = changed_paths(checkout, move.head, target, WAITING_PATHS)
     managed = pending_files(checkout, pending)
     orders = published_orders(checkout, target)
-    entries: list[str] = []
     plan = MovePlan(source=move.head, target=target, before={}, after={})
     forced = {REGISTRY_PATH} if replace_registry else set[str]()
     touched = (changed & set(waiting_files(checkout))) | managed.keys() | forced
@@ -354,17 +359,15 @@ def hold(checkout: Path, move: CheckoutMove, pending: LockedJournal, *, replace_
                    and published_save(checkout, target, stem, key, save, order := published.get(key, 0))}
         if path not in changed and not settled and path not in forced:
             continue
-        entry = git(checkout, "ls-tree", target, "--", path)
-        incoming = show(checkout, target, path) if entry else None
+        incoming = tree_text(checkout, target, path)
         head = tree_text(checkout, move.head, path)
         local = live_text(checkout / path)
-        entries.append(entry or f"0 {'0' * len(target)}\t{path}\n")
         plan["before"][path] = local
         if path == REGISTRY_PATH and incoming is not None:
             plan["after"][path] = incoming if replace_registry else replay_registry(head or "", local or "", incoming)
         else:
             plan["after"][path] = replay_settings(path, head or "", local or "", incoming, saves, settled)
-    return WaitingRows(move.head, "".join(entries), plan)
+    return plan
 
 
 def replay_settings(path: str, head: str, local: str, target: str | None,
@@ -407,8 +410,12 @@ def replay_settings(path: str, head: str, local: str, target: str | None,
 def give(checkout: Path, rows: WaitingRows, environment: dict[str, str] | None = None) -> None:
     """Give Git the target's blobs for waiting rows and refresh the index."""
     if rows.entries:
-        _ = git(checkout, "update-index", "--index-info", input_text=rows.entries, environment=environment)
-    # Refresh can report changed paths. The merge checks them.
+        _ = git(checkout, "update-index", "-z", "--index-info", input_text=rows.entries, environment=environment)
+    refresh_index(checkout, environment)
+
+
+def refresh_index(checkout: Path, environment: dict[str, str] | None) -> None:
+    # Refresh records matching files. Git checks changes during the merge.
     _ = subprocess.run(["git", "-C", str(checkout), "update-index", "-q", "--refresh"], env=environment,
                        capture_output=True, pass_fds=build_folders.held_build_folder_descriptors(), check=False)
 
@@ -445,8 +452,6 @@ def move_target(checkout: Path, target: str, pending: LockedJournal, *, fast_for
             return CheckoutMove(head, head)
         if ancestor != head:
             raise Diverged(f"{target} is not a fast-forward of HEAD")
-    if staged := git(checkout, "diff", "--cached", "--name-only", "--no-renames", "-z", head, "--", WAITING_PATHS):
-        raise OSError(f"staged settings prevent the move: {staged.split(chr(0), 1)[0]}")
     return CheckoutMove(head, tip)
 
 
@@ -454,72 +459,253 @@ def move_marker(checkout: Path) -> Path:
     return Path(git(checkout, "rev-parse", "--path-format=absolute", "--git-path", "waiting-rows.move").strip())
 
 
+class FileVersion(TypedDict):
+    device: int
+    inode: int
+    changed_ns: int
+
+
+def file_version(path: Path) -> FileVersion | None:
+    try:
+        state = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    return FileVersion(device=state.st_dev, inode=state.st_ino, changed_ns=state.st_ctime_ns)
+
+
+class MoveWrites(TypedDict):
+    index_before: str
+    expected_index: str
+    files_before: dict[str, FileVersion | None]
+    index_after_give: NotRequired[str]
+    index_after_git: NotRequired[str]
+    files_written_by_git: NotRequired[dict[str, FileVersion | None]]
+
+
 class MovePlan(TypedDict):
     source: str
     target: str
     before: dict[str, str | None]
     after: dict[str, str | None]
-    reverse_from: NotRequired[str]
+    before_index_write: NotRequired[Literal[True]]
+    writes: NotRequired[MoveWrites]
+
+
+def changed_paths(checkout: Path, before: str, after: str, *paths: str) -> set[str]:
+    if before == after:
+        return set()
+    return set(git(checkout, "diff", "--name-only", "--no-renames", "-z",
+                   before, after, "--", *paths).split("\0")) - {""}
+
+
+def index_path(checkout: Path) -> Path:
+    return Path(git(checkout, "rev-parse", "--path-format=absolute", "--git-path", "index").strip())
+
+
+def staged_paths(checkout: Path, tree: str) -> set[str]:
+    return set(git(checkout, "diff", "--cached", "--name-only", "--no-renames", "-z",
+                   tree, "--").split("\0")) - {""}
+
+
+def worktree_edit(path: str) -> OSError:
+    return OSError(f"{path} changed after the move started. Inspect it with git diff HEAD -- {shlex.quote(path)}")
+
+
+def staged_overlap(path: str) -> OSError:
+    return OSError(f"{path}: staged edit overlaps the interrupted move. "
+                   + f"Inspect it with git diff --cached -- {shlex.quote(path)}")
 
 
 def recover_move(checkout: Path, head: str) -> None:
-    """Finish the planned writes or return the checkout to its source."""
+    """Recover only changes that the move recorded."""
     marker = move_marker(checkout)
     if (record := live_text(marker)) is None:
         return
     plan = cast(MovePlan, json.loads(record))
     if head == "HEAD":
         head = git(checkout, "rev-parse", "HEAD").strip()
-    for path, text in plan["after"].items():
-        if live_text(checkout / path) not in (plan["before"].get(path), text):
-            raise OSError(f"{path} changed after the move started")
-    if head == plan["source"]:
-        if paths := plan["after"]:
-            _ = git(checkout, "--literal-pathspecs", "reset", "-q", head, "--", *paths)
-        _ = git(checkout, "read-tree", "-m", "-u", plan.get("reverse_from", plan["target"]), head)
-        write_files(checkout, plan["before"])
-    elif head == plan["target"]:
-        write_files(checkout, plan["after"])
-    else:
+    if head == plan["source"] and plan.get("before_index_write"):
+        marker.unlink()
+        return
+    if head not in (plan["source"], plan["target"]):
         raise OSError("HEAD is outside the pending settings move")
+
+    if (writes := plan.get("writes")) is None:
+        check_move_without_receipt(checkout, plan, head)
+    elif head == plan["source"]:
+        rollback_move(checkout, plan, writes)
+    else:
+        for path, after in plan["after"].items():
+            current = live_text(checkout / path)
+            if current != after and (current != plan["before"][path]
+                                     or file_version(checkout / path) != writes["files_before"][path]):
+                raise worktree_edit(path)
+        write_files(checkout, plan["after"])
     marker.unlink()
 
 
-def tree_without(checkout: Path, tree: str, paths: Iterable[str], environment: dict[str, str]) -> str:
+def check_move_without_receipt(checkout: Path, plan: MovePlan, head: str) -> None:
+    """Keep any path that an older marker cannot account for."""
+    if head == plan["source"]:
+        paths = changed_paths(checkout, head, plan["target"]) | plan["before"].keys()
+        if staged := staged_paths(checkout, head) & paths:
+            raise staged_overlap(min(staged))
+        dirty = set(git(checkout, "diff", "--name-only", "-z", head, "--").split("\0"))
+        for path in sorted(dirty & paths):
+            if path not in plan["before"] or live_text(checkout / path) != plan["before"][path]:
+                raise worktree_edit(path)
+    else:
+        for path, after in plan["after"].items():
+            if live_text(checkout / path) != after:
+                raise worktree_edit(path)
+
+
+def index_entry(checkout: Path, tree: str, path: str) -> str:
+    return git(checkout, "--literal-pathspecs", "ls-tree", "-z", tree, "--", path)
+
+
+def merge_index_entry(checkout: Path, current: str, base: str, other: str, path: str) -> str:
+    """Keep the staged edit when Git can merge it with the move."""
+    if current in (base, other):
+        return other
+    if base == other:
+        return current
+    current_info, base_info, other_info = (entry.split("\t", 1)[0].split() for entry in (current, base, other))
+    if (len(current_info) != 3 or len(base_info) != 3 or len(other_info) != 3
+            or current_info[:2] != base_info[:2] or base_info[:2] != other_info[:2]
+            or base_info[0] not in ("100644", "100755")):
+        raise staged_overlap(path)
+    try:
+        blob = git(checkout, "merge-file", "--object-id", "--quiet",
+                   current_info[2], base_info[2], other_info[2]).strip()
+    except OSError:
+        raise staged_overlap(path) from None
+    return f"{base_info[0]} blob {blob}\t{path}\0"
+
+
+def index_changes(tree: str, entries: Mapping[str, str]) -> str:
+    return "".join(entry or f"0 {'0' * len(tree)}\t{path}\0" for path, entry in entries.items())
+
+
+def write_index_tree(checkout: Path, tree: str, entries: Mapping[str, str],
+                     environment: dict[str, str]) -> str:
     _ = git(checkout, "read-tree", tree, environment=environment)
-    _ = git(checkout, "update-index", "--force-remove", "--", *paths, environment=environment)
+    _ = git(checkout, "update-index", "-z", "--index-info",
+            input_text=index_changes(tree, entries), environment=environment)
     return git(checkout, "write-tree", environment=environment).strip()
+
+
+def rollback_move(checkout: Path, plan: MovePlan, writes: MoveWrites) -> None:
+    """Reverse the recorded index changes and any files that Git wrote."""
+    with tempfile.TemporaryDirectory(prefix="waiting-rows-rollback-") as directory:
+        index = Path(directory) / "index"
+        trial = {**os.environ, "GIT_INDEX_FILE": str(index)}
+        before = writes["index_before"]
+        gave = writes.get("index_after_give", before)
+        written = writes.get("index_after_git", gave)
+        git_index.private_copy(index_path(checkout), index)
+        current = git(checkout, "write-tree", environment=trial).strip()
+        if "index_after_git" not in writes:
+            possible = changed_paths(checkout, written, writes["expected_index"]) & writes["files_before"].keys()
+            if uncertain := changed_paths(checkout, written, current) & possible:
+                path = min(uncertain)
+                raise OSError(f"{path}: the move did not record the index write. "
+                              + f"Inspect it with git diff --cached -- {shlex.quote(path)}")
+        entries: dict[str, str] = {}
+        for path in sorted(changed_paths(checkout, before, written)):
+            original = index_entry(checkout, before, path)
+            staged = index_entry(checkout, current, path)
+            if staged != original:
+                entries[path] = merge_index_entry(checkout, staged, index_entry(checkout, written, path), original, path)
+
+        files = writes.get("files_written_by_git", {})
+        for path, version in writes["files_before"].items():
+            current_version = file_version(checkout / path)
+            if path in files:
+                if current_version != files[path]:
+                    raise worktree_edit(path)
+            elif current_version != version and (path not in plan["before"]
+                                                 or live_text(checkout / path) != plan["before"][path]):
+                raise worktree_edit(path)
+
+        restored_index = write_index_tree(checkout, current, entries, trial) if entries else current
+        if files:
+            restored = {path: index_entry(checkout, gave, path) for path in files}
+            worktree_before = write_index_tree(checkout, written, restored, trial)
+            _ = git(checkout, "read-tree", written, environment=trial)
+            refresh_index(checkout, trial)
+            _ = git(checkout, "read-tree", "-m", "-u", written, worktree_before, environment=trial)
+        if restored_index != current:
+            _ = git(checkout, "read-tree", "-i", "-m", current, restored_index)
+
+
+def tree_without(checkout: Path, tree: str, paths: Iterable[str], environment: dict[str, str]) -> str:
+    return write_index_tree(checkout, tree, dict.fromkeys(paths, ""), environment)
 
 
 def check_move(checkout: Path, move: CheckoutMove, pending: LockedJournal, *,
                replace_registry: bool = False, registry_move: bool = False,
                replay_registry: RegistryReplay = registry_rows.replay_pending) -> WaitingRows:
     """Check the move on a private index before Git changes the checkout."""
-    rows = hold(checkout, move, pending, replace_registry=replace_registry, replay_registry=replay_registry)
-    index = Path(git(checkout, "rev-parse", "--path-format=absolute", "--git-path", "index").strip())
+    index = index_path(checkout)
     folder = (build_folders.tool_folder("models-ff-index") if registry_move
               else tempfile.TemporaryDirectory(prefix="waiting-rows-index-"))
     with folder as directory:
         trial = Path(directory) / "index"
         environment = {**os.environ, "GIT_INDEX_FILE": str(trial)}
-        if paths := rows.plan["after"]:
-            rows.plan["reverse_from"] = tree_without(checkout, move.tip, paths, environment)
-        if removed := [entry.partition("\t")[2] for entry in rows.entries.splitlines() if entry.startswith("0 ")]:
-            rows = replace(rows, merge_source=tree_without(checkout, move.head, removed, environment))
         git_index.private_copy(index, trial)
+        index_before = git(checkout, "write-tree", environment=environment).strip()
+        staged = changed_paths(checkout, move.head, index_before, WAITING_PATHS)
+        plan = hold(checkout, move, pending, replace_registry=replace_registry, replay_registry=replay_registry)
+        target_entries = {path: index_entry(checkout, move.tip, path) for path in plan["after"]}
+        merged_entries: dict[str, str] = {}
+        for path in sorted(staged & target_entries.keys()):
+            try:
+                merged_entries[path] = merge_index_entry(checkout, index_entry(checkout, index_before, path),
+                                                         index_entry(checkout, move.head, path), target_entries[path], path)
+            except OSError:
+                raise OSError(f"staged settings prevent the move: {path}. "
+                              + f"Inspect it with git diff --cached -- {shlex.quote(path)}") from None
+        target = write_index_tree(checkout, move.tip, merged_entries, environment) if merged_entries else move.tip
+        target_entries.update(merged_entries)
+        removed = [path for path, entry in target_entries.items() if not entry]
+        source = tree_without(checkout, move.head, removed, environment) if removed else move.head
+        entries = index_changes(target, target_entries)
+        git_index.private_copy(index, trial)
+        rows = WaitingRows(source, target, index_before, index_before, index_before, entries, plan)
         give(checkout, rows, environment)
-        _ = git(checkout, "read-tree", "--dry-run", "-m", "-u", rows.merge_source, move.tip, environment=environment)
-    return rows
+        gave = git(checkout, "write-tree", environment=environment).strip()
+        _ = git(checkout, "read-tree", "--dry-run", "-m", "-u", source, target, environment=environment)
+        _ = git(checkout, "read-tree", "-i", "-m", source, target, environment=environment)
+        written = git(checkout, "write-tree", environment=environment).strip()
+    return replace(rows, index_after_give=gave, index_after_git=written)
 
 
 def apply_move(checkout: Path, rows: WaitingRows, pending: LockedJournal) -> None:
     """Move HEAD and restore settings while the caller holds the journal lock."""
     plan = rows.plan
     source, target = plan["source"], plan["target"]
-    write_text_atomic(move_marker(checkout), json.dumps(plan) + "\n", new_file_mode=0o600)
+    marker = move_marker(checkout)
+    paths = changed_paths(checkout, source, target) | plan["before"].keys()
+    before = {path: file_version(checkout / path) for path in paths}
+    writes = MoveWrites(index_before=rows.index_before, expected_index=rows.index_after_git, files_before=before)
+    write_text_atomic(marker, json.dumps({**plan, "before_index_write": True}) + "\n", new_file_mode=0o600)
+    if changed := staged_paths(checkout, rows.index_before):
+        raise staged_overlap(min(changed))
+    plan["writes"] = writes
     try:
+        write_text_atomic(marker, json.dumps(plan) + "\n")
         give(checkout, rows)
-        _ = git(checkout, "read-tree", "-m", "-u", rows.merge_source, target)
+        writes["index_after_give"] = rows.index_after_give
+        write_text_atomic(marker, json.dumps(plan) + "\n")
+        _ = git(checkout, "read-tree", "-m", "-u", rows.merge_source, rows.merge_target)
+        writes["index_after_git"] = rows.index_after_git
+        written_paths = changed_paths(checkout, rows.index_after_give, rows.index_after_git)
+        writes["files_written_by_git"] = {
+            path: version for path in (written_paths & before.keys()) - plan["before"].keys()
+            if (version := file_version(checkout / path)) != before[path]
+        }
+        write_text_atomic(marker, json.dumps(plan) + "\n")
         _ = git(checkout, "update-ref", "-m", f"waiting_rows: move to {target}", "HEAD", target, source)
     finally:
         pending.restore(checkout, "HEAD")

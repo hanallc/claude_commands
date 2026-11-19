@@ -188,12 +188,16 @@ class HanaRenderTests(unittest.TestCase):
                 + '"scripts.aws_target.aws_cli", "scripts.aws_target.hana_provider", "scripts.aws_target.hana_box"))',
                 str(image_runtime)], cwd=output, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(imported.returncode, 0, imported.stdout + imported.stderr)
+            entry = checkout / hana_render.RUNNER_ENTRY
+            with entry.open('a') as script:
+                _ = script.write('\n# Entry point from the fixture checkout.\n')
             runtime = checkout / 'run'
             for file in hana_render.runtime_files(checkout, configuration_path):
                 destination = runtime / file.path
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 _ = destination.write_bytes(file.content)
                 destination.chmod(file.mode)
+            self.assertEqual((runtime / 'runner.py').read_bytes(), entry.read_bytes())
             with self.subTest('Render and read an override'):
                 self.assertEqual((runtime / 'config/build_targets.conf').read_text(), 'loopback.shell_timeout_s=11\n')
                 compiler = checkout / 'compiler-version'
@@ -276,8 +280,9 @@ class HanaRenderTests(unittest.TestCase):
             _ = configuration_path.write_text(original.replace('enabled=on', 'enabled=off'))
             self.assertNotEqual(hana_render.guest_digest(configuration_path, checkout=image_inputs), digest)
             self.assertEqual({str(path.relative_to(runtime)) for path in runtime.rglob('*') if path.is_file()},
-                             {*runtime_entries, 'runner.py', 'config/hana_aws.conf', 'config/build_targets.conf',
-                              'config/build_folders.conf', 'config/copies.conf'})
+                             ({*runtime_entries} - {str(hana_render.RUNNER_ENTRY)}) | {
+                                 'runner.py', 'config/hana_aws.conf', 'config/build_targets.conf',
+                                 'config/build_folders.conf', 'config/copies.conf'})
             imported = subprocess.run([sys.executable, '-IB', '-c',
                 'import sys; sys.path.insert(0, sys.argv[1]); '
                 + 'from scripts.aws_target import hana_runner, hana_protocol; '

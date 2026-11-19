@@ -1027,6 +1027,46 @@ placement_once
         release.touch()
         self.finish(process)
 
+    def test_pinned_gpu_dispatch_uses_the_admitted_checkout(self) -> None:
+        functions = shell_functions(CHECKOUT / "scripts/direct/verify.sh", "route_test", "try_reserved_target")
+        assignment = self.root / "assignment"
+        _ = assignment.write_text("fixture assignment\n")
+        script = functions + dedent('''\
+            set -eu
+            PLACEMENT_ASSIGNMENT_FILE=$1
+            MAC_RUNNER=$2
+            CMD=test PINNED_TARGET=hana-gpu DOC_REPO_TOP=/caller
+            VERIFY_SLOT_SOURCE=/snapshot VERIFY_SLOT_TREE=admitted
+            COPIES_STEP_REPOSITORY=/caller
+            STEP_TARGET_TABLE='' MAC_ONLY=0 MAC_PASSED=0
+            PLACEMENT_COMMAND=(cargo nextest run)
+            release_token() { :; }
+            check_routing_hold() { :; }
+            collect_routing_wait() { :; }
+            placement_once() {
+                PLACEMENT_PROVIDER=ssh STEP_ASSIGNED_PLATFORM=linux
+                STEP_ASSIGNED_TARGET=hana-gpu STEP_ASSIGNED_SETTINGS=gpu.conf
+            }
+            doc_checkout() {
+                [[ "$*" == '/snapshot admitted /caller' ]] || exit 3
+                MAC_SOURCE_ROOT=/admitted-checkout
+                printf 'open\\n'
+            }
+            verify_helper() { exit 4; }
+            require_nextest() { exit 5; }
+            try_mac_test() {
+                [[ "$1" == gpu.conf && "$STEP_REMOTE_REPO_ROOT" == /admitted-checkout ]] || exit 6
+                MAC_PASSED=1
+                printf 'dispatch\\n'
+            }
+            step_close_checkout() { printf 'close\\n'; }
+            route_test
+            ''')
+        result = subprocess.run(("bash", "-c", script, "verify", str(assignment), str(self.root / "missing-runner")),
+            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["open", "dispatch", "close"])
+
     def test_remote_grant_source_key_matches_the_prepared_slot(self) -> None:
         tools = self.verify_source()
         environment = self.verify_run_environment(tools)
