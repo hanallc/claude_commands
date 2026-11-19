@@ -1370,7 +1370,7 @@ function bindFeedbackForm(form){
    unpark.hidden=confirmed.parked==='false' || confirmed.state==='Closed';
    syncUnread(item,form,confirmed.unread,confirmed.unreadSort);
   };
-  const applySavedState=result=>{
+  const applySavedState=(result,keepDetailFocus=false)=>{
    delete item.dataset.listReviewVersion;
    if(typeof result.review_summary_html==='string'){
     const summary=item.querySelector('[data-list-review-summary]');
@@ -1417,7 +1417,12 @@ function bindFeedbackForm(form){
     item.dataset.waitingForAnswer='true';
     const detail=item.querySelector('[data-detail] td');
     if(typeof result.waiting_details_html==='string'){
+     const field=keepDetailFocus && listOwnsFocus() && detail.contains(document.activeElement)
+      ? document.activeElement : null;
+     const reviewLink=field?.matches('[data-list-review-card]') ? reviewLinkPlace(field) : null;
      detail.innerHTML=result.waiting_details_html;
+     if(reviewLink) restoreReviewLink(reviewLink);
+     else if(field?.id && field!==unpark) document.getElementById(field.id)?.focus({preventScroll:true});
      return detail.querySelector('[data-feedback-form]');
     }
     const note=detail.querySelector('[data-waiting-note]');
@@ -1459,6 +1464,7 @@ function bindFeedbackForm(form){
    event.preventDefault();if(cardSubmitBlocked(form,tableView.rowFading(key))) return;
    const submitter=event.submitter,action=submitter?.value || 'tell';
    const parkForDelivery=action==='park-until-delivered',parks=action==='park' || parkForDelivery;
+   const changesParking=parks || action==='unpark';
    const focusUnpark=action==='unpark' && document.activeElement===unpark;
    const usesWords=action==='tell' || action==='question';
    const asksQuestion=action==='question' || action.startsWith('resend-');
@@ -1472,7 +1478,7 @@ function bindFeedbackForm(form){
      parkingTime=new Date(at).toISOString();
     }
    }
-   if(!waitingForm && (parks || action==='unpark')) closeDateTimePicker(form.querySelector('[data-later-menu]'),false);
+   if(!waitingForm && changesParking) closeDateTimePicker(form.querySelector('[data-later-menu]'),false);
    const attempt=retry ?? {...fresh,action,words:words.value,until:until.value,parkingTime};
    identity(attempt);
    const data=new URLSearchParams(new FormData(form));data.set('action',parks ? 'park' : action);
@@ -1509,7 +1515,7 @@ function bindFeedbackForm(form){
     const result=await response.json();
     if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
     saved=true;
-    nextForm=applySavedState(result);
+    nextForm=applySavedState(result,changesParking);
     const unread=result.unread==='true';
     const unparked=action==='unpark' && result.unpark_outcome==='cleared';
     const message=action==='remove' ? 'Removed' : parks ? (parkForDelivery ? 'Parked until delivered' : 'Parked') :
@@ -1602,7 +1608,7 @@ function bindFeedbackForm(form){
       }
      }
     }
-    refreshAfterListSave((saved && item.dataset.waitingForAnswer!=='true') ||
+    refreshAfterListSave((saved && (changesParking || item.dataset.waitingForAnswer!=='true')) ||
       (!saved && !refused && (parks || action==='remove')));
    }
   });
@@ -1664,6 +1670,7 @@ async function refresh(_supersede=false,current=()=>true){
  refreshNeeded=false;
  const top=scrollY,field=listOwnsFocus() ? document.activeElement : null;
  const focus=field?.id,start=field?.selectionStart,end=field?.selectionEnd;
+ const direction=field?.selectionDirection;
  const reviewLink=field?.matches('[data-list-review-card]') ? reviewLinkPlace(field) : null;
  const action=field?.matches('button[name="action"]') ? field.value : '';
  const focusedRow=action || field?.matches('.list-toggle') ? field.closest('[data-list-item]')?.dataset.key : '';
@@ -1683,7 +1690,8 @@ async function refresh(_supersede=false,current=()=>true){
   if(watch) watchOpenedAnswer(item,watch.seen);
  }
  if(focus){const field=document.getElementById(focus);field?.focus({preventScroll:true});
-  if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number') field.setSelectionRange(start,end);}
+  if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number')
+   field.setSelectionRange(start,end,direction);}
  if(reviewLink) restoreReviewLink(reviewLink);
  if(focusedRow){
   const row=[...content.querySelectorAll('[data-list-item]')].find(item=>item.dataset.key===focusedRow && !item.hidden);

@@ -1098,6 +1098,7 @@ It keeps one confirmation per hidden row after overlapping Unpark requests.
 Focus moves from **Unpark** to the Parked filter and brings the filter and confirmation into view.
 If All is active when Unpark saves, the row stays expanded and its item number can receive focus.
 After Unpark, the item's saved state sets its status chip.
+After Park or Unpark saves, the List refreshes the server order even while the item waits for an answer.
 
 Morty can set this parking condition with `the_list.py park --id L<N> --until delivered --source morty`.
 When morty records Delivered, the List writer clears this parking condition in the same write.

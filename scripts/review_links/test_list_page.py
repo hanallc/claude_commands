@@ -2602,6 +2602,7 @@ window.fetch=async(_path,options={})=>{
  show('all');
  check(row.nextElementSibling?.dataset.number==='2','All restores the default order after Unpark.');
 """, reduced_motion=True)
+        self.browser_waiting_parking_refresh(unpark=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_park_preset_skips_menu_navigation(self) -> None:
@@ -2845,6 +2846,81 @@ window.fetch=async(_path,options={})=>{
  show('working');
  check(!row.hidden && !row.querySelector('[data-detail]').hidden,'Working shows the expanded unparked row');
 """, reduced_motion=True, add_item=False, window_size=(1440, 1120))
+        self.browser_waiting_parking_refresh(unpark=True)
+
+    def browser_waiting_parking_refresh(self, *, unpark: bool) -> None:
+        item = self.add("Keep a draft while waiting", the_list.ItemState.WAITING_FOR_NATE, number=3)
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        if unpark:
+            _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=2), source="nate")
+        before = list_page.render(root, include_counts=False, status=status).decode()
+        with patch.object(change_page, "send_question", return_value=question_outcome()):
+            list_page.deliver(list_page.submit(root, urlencode(
+                self.fields(item, "question", words="Which check passed?")), status))
+        waiting = list_page.render(root, include_counts=False, status=status).decode() if unpark else None
+        action = "unpark" if unpark else "park"
+        submission = list_page.submit(root, urlencode(self.fields(item, action, until="delivered")), status)
+        outcome = list_page.saved_action_state(MORTY.id, item.id, status=status)
+        response: dict[str, object] = dict(outcome)
+        if isinstance(submission, list_page.ListUnparkSubmission):
+            response["unpark_outcome"] = submission.response_outcome(outcome).value
+        saved = list_page.render(root, include_counts=False, status=status).decode()
+        with (patch.object(staff, "caller_identity", return_value=MORTY.current_session),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The check passed."]), 0)
+        answered = list_page.render(root, include_counts=False, status=status).decode()
+        fixture = json.dumps({
+            "waiting": waiting, "action": action, "response": response, "saved": saved, "answered": answered,
+        }).replace("</", "<\\/")
+        self.browser_action_sequence(r"""
+ const fixture=FIXTURE;
+ const parks=fixture.action==='park';
+ const current=()=>document.querySelector('[data-number="3"]');
+ const other=()=>document.querySelector('[data-number="2"]');
+ const numbers=()=>[...document.querySelectorAll('[data-number="2"],[data-number="3"]')]
+  .map(item=>item.dataset.number).join(',');
+ const refresh=async markup=>{
+  refreshMarkup=markup;
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+  await flush();
+ };
+ const input=current().querySelector('textarea');
+ input.value='Keep the words for this item.';
+ input.dispatchEvent(new Event('input'));
+ if(fixture.waiting) await refresh(fixture.waiting);
+ const prior=current(),beforeOrder=numbers(),otherRow=other();
+ const draft=otherRow.querySelector('textarea');
+ otherRow.querySelector('.list-toggle').click();
+ draft.value='Keep the words for the other item.';
+ draft.dispatchEvent(new Event('input'));
+ draft.focus();draft.setSelectionRange(5,14,'backward');
+ const methods=[];
+ window.fetch=new Proxy(window.fetch,{apply(fetch,receiver,args){
+  methods.push(args[1]?.method || 'GET');return Reflect.apply(fetch,receiver,args);
+ }});
+ refreshMarkup=fixture.saved;
+ submit(parks ? 'park-until-delivered' : 'unpark',prior.querySelector('form'));
+ if(!parks) prior.querySelector('.list-log-scroll').focus();
+ finishPost(fixture.response);
+ await flush();
+ check(methods.join()==='POST,GET','The save makes one List GET while the item waits.');
+ const refreshed=current(),freshDraft=other().querySelector('textarea');
+ check(refreshed!==prior && beforeOrder===(parks ? '3,2' : '2,3') &&
+  numbers()===(parks ? '2,3' : '3,2'),'The server moves the waiting row to its new group.');
+ check(!refreshed.querySelector('[data-detail]').hidden &&
+  refreshed.querySelector('[data-waiting-questions]').textContent.includes('Which check passed?'),
+  'Refresh keeps the waiting question open.');
+ check(freshDraft.value==='Keep the words for the other item.','Refresh keeps the other draft.');
+ if(parks) check(document.activeElement===freshDraft && freshDraft.selectionStart===5 &&
+  freshDraft.selectionEnd===14 && freshDraft.selectionDirection==='backward',
+  'Park keeps focus and the selection in the other draft.');
+ else check(document.activeElement===refreshed.querySelector('.list-log-scroll'),
+  'Unpark keeps focus on the log in the waiting row.');
+ await refresh(fixture.answered);
+ check(current().querySelector('textarea').value==='Keep the words for this item.',
+  'The item draft returns after the producer answers.');
+""".replace("FIXTURE", fixture), reduced_motion=True, add_item=False, markup=before, open_number=3)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_reports_expired_parking_and_keeps_the_parking_draft(self) -> None:
@@ -5199,11 +5275,12 @@ const change=async path=>{
 
     def browser_action_sequence(self, steps: str, *, reduced_motion: bool = False, add_item: bool = True,
                                 window_size: tuple[int, int] | None = None, in_frame: bool = False,
-                                bulk_expand: bool = False) -> None:
+                                bulk_expand: bool = False, markup: str | None = None, open_number: int = 1) -> None:
         if add_item:
             _ = self.add("Test List action retries", number=1)
-        with patch.object(list_page, "counts_strip", return_value=""):
-            markup = list_page.render(self.root / "reviews").decode()
+        if markup is None:
+            with patch.object(list_page, "counts_strip", return_value=""):
+                markup = list_page.render(self.root / "reviews").decode()
         markup = re.sub(r'data-refresh-seconds="[^"]+"', 'data-refresh-seconds="0"', markup, count=1)
         setup = '''<script>
 const requests=[],itemSnapshots=new Map();let finishPost,losePost,refreshMarkup,readback;
@@ -5229,7 +5306,7 @@ window.fetch=async(path,options={})=>{
         probe = '''<script>
 (async()=>{
  const failures=[],check=(ok,name)=>{if(!ok) failures.push(name);};
- const row=document.querySelector('[data-number="1"]'),form=row.querySelector('form');
+ const row=document.querySelector('[data-number="OPEN_NUMBER"]'),form=row.querySelector('form');
  const submit=(action,target=form)=>{
   const count=requests.length;
   target.requestSubmit(target.querySelector('[value="'+action+'"]'));
@@ -5258,8 +5335,8 @@ window.fetch=async(path,options={})=>{
  result.textContent=JSON.stringify(failures);parent.document.body.append(result);
 })();
 </script>'''
-        open_control = '#list-expand-all' if bulk_expand else '[data-number="1"] .list-toggle'
-        probe = probe.replace('OPEN_CONTROL', open_control)
+        open_control = '#list-expand-all' if bulk_expand else f'[data-number="{open_number}"] .list-toggle'
+        probe = probe.replace('OPEN_CONTROL', open_control).replace('OPEN_NUMBER', str(open_number))
         self.browser_actions(markup, setup, probe, reduced_motion=reduced_motion,
                              window_size=window_size, in_frame=in_frame)
 
