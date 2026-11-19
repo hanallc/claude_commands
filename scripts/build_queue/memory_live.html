@@ -118,8 +118,8 @@ __PAGE_FRAME_STYLE__
 .tip { display: grid; grid-template-columns: max-content 1fr; column-gap: 0; row-gap: 2px; margin: 0;
   width: max-content; min-width: 15rem; max-width: 24rem; padding: 10px 12px; border-radius: 8px;
   background: var(--ink); color: var(--bg); font-size: 0.85rem; line-height: 1.45; }
-.tip dt { text-align: left; white-space: nowrap; }
-.tip dd { margin: 0; padding-left: 24px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tip dt { max-width: min(13rem, 51vw); text-align: left; white-space: normal; overflow-wrap: anywhere; }
+.tip dd { min-width: 0; margin: 0; padding-left: 24px; text-align: right; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
 .tip .title { font-weight: 700; padding-bottom: 4px; }
 .tip .caption { grid-column: 1 / -1; margin-top: -4px; padding: 0 0 4px; text-align: left; white-space: normal; opacity: 0.7; }
 .tip .group { margin-top: 6px; padding-top: 6px; border-top: 1px solid color-mix(in srgb, currentColor 22%, transparent); }
@@ -135,14 +135,11 @@ __PAGE_FRAME_STYLE__
   grid-column: 1 / -1; width: min(344px, calc(100vw - 40px)); padding-left: 0;
   text-align: left; white-space: normal; font-size: .75rem;
 }
-.program-memory p { margin: 0; color: var(--program-muted); font-size: .73rem; }
 .program-memory .program-key { display: flex; flex-wrap: wrap; gap: 0 18px; margin: 4px 0 6px; font-weight: 600; }
 .program-swatch { display: inline-block; width: 18px; margin-right: 6px; vertical-align: middle; border-top: 3px solid var(--program-live); }
 .program-swatch.past { border-color: var(--program-past); }
-.program-phase + .program-phase { margin-top: 7px; padding-top: 7px; border-top: 1px solid var(--program-rule); }
 .program-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 3px; }
 .program-heading h2 { margin: 0; font-size: .85rem; }
-.program-heading span { color: var(--program-muted); }
 .program-phase svg { display: block; width: 100%; font-size: 10px; }
 .program-phase svg text { fill: var(--program-muted); dominant-baseline: middle; }
 .program-phase svg .past { fill: var(--program-past); }
@@ -157,10 +154,6 @@ __PAGE_FRAME_STYLE__
 .program-reserve { stroke: var(--program-muted); stroke-dasharray: 4 3; }
 .program-marker { stroke: var(--program-muted); opacity: .65; }
 .program-times { display: flex; justify-content: space-between; width: 69%; padding: 0 4px; color: var(--program-muted); font-size: .68rem; }
-.program-values { display: grid; grid-template-columns: 1fr auto; gap: 0 8px; margin: 4px 0 0; }
-.tip .program-values dt { white-space: normal; }
-.tip .program-values dd { padding-left: 0; }
-.program-values .program-swatch { width: 10px; }
 .seg-remote { background: var(--remote-memory); }
 .machine[data-machine="natedev"] { color: var(--machine-natedev); }
 .machine[data-machine="mac"] { color: var(--machine-mac); }
@@ -557,99 +550,109 @@ function partsText(parts) { return parts.map(part => part.text).join(''); }
 function groupRows(rows) {
   return rows.filter(row => row.value !== '').map((row, index) => ({...row, group: index === 0}));
 }
-// Each reading owns one set of shown leaf values and totals.
+function memoryTenths(bytes) {
+  return Math.sign(bytes) * Math.round(Math.abs(bytes) / GIB * 10);
+}
+function sumMemory(parts) {
+  return parts.reduce((sum, bytes) => sum + (recorded(bytes) ? bytes : 0), 0);
+}
 const shownReadings = new WeakMap();
 function shownReading(data) {
   if (shownReadings.has(data)) return shownReadings.get(data);
-  const rounded = new Map();
-  const leaf = bytes => {
-    if (!recorded(bytes)) return bytes;
-    if (!rounded.has(bytes)) rounded.set(bytes, Math.sign(bytes) * Math.round(Math.abs(bytes) / GIB * 10) * GIB / 10);
-    return rounded.get(bytes);
-  };
-  const sum = values => values.every(recorded) ? values.reduce((total, value) => total + value, 0)
-    : values.find(value => !recorded(value));
-  const source = data.ram;
-  const totals = new Set(['build_tools_bytes','other_programs_bytes','kernel_bytes','unattributed_bytes',
-    'available_bytes','total_bytes','cap_bytes','shortfall_bytes','safety_target_bytes','swap_target_bytes','build_target_bytes']);
-  const ram = Object.fromEntries(Object.entries(source).map(([key, value]) =>
-    [key, key.endsWith('_bytes') && !totals.has(key) ? leaf(value) : value]));
-  ram.programs = (source.programs || []).map(program => ({...program, bytes:leaf(program.bytes)}));
-  ram.build_tools_bytes = recorded(source.build_tools_bytes)
-    ? sum([ram.rust_analyzer_bytes,ram.sccache_bytes,ram.other_build_tools_bytes]) : source.build_tools_bytes;
-  ram.other_programs_bytes = recorded(source.other_programs_bytes)
-    ? sum([...ram.programs.map(program => program.bytes),ram.smaller_programs_bytes]) : source.other_programs_bytes;
-  ram.kernel_bytes = recorded(source.kernel_bytes)
-    ? sum([ram.compressed_swap_bytes,ram.kernel_structures_bytes,ram.kernel_counters_bytes]) : source.kernel_bytes;
-  ram.unnamed_bytes = leaf(source.unattributed_bytes - source.kernel_no_counter_bytes);
-  ram.unattributed_bytes = recorded(source.unattributed_bytes)
-    ? sum([ram.kernel_no_counter_bytes,ram.unnamed_bytes]) : source.unattributed_bytes;
-  // A reserve short by less than 0.05 GiB still shows as short: its missing amount is at least 0.1 GiB.
-  for (const key of ['safety','swap','build'])
-    if (source[key+'_missing_bytes'] > 0) ram[key+'_missing_bytes'] = Math.max(ram[key+'_missing_bytes'], GIB / 10);
-  for (const key of ['safety','swap','build'])
-    ram[key+'_target_bytes'] = sum([ram[key+'_covered_bytes'],ram[key+'_missing_bytes']]);
-  ram.shortfall_bytes = sum([ram.safety_missing_bytes,ram.swap_missing_bytes,ram.build_missing_bytes]);
-  ram.available_bytes = recorded(source.available_bytes)
-    ? sum([ram.build_covered_bytes,ram.room_bytes,ram.safety_covered_bytes,ram.swap_covered_bytes]) : source.available_bytes;
-  const builds = sum([ram.build_tools_bytes,ram.queued_builds_bytes,ram.ci_bytes]);
-  ram.cap_bytes = sum([builds,ram.build_covered_bytes,ram.room_bytes]);
-  ram.total_bytes = recorded(source.total_bytes)
-    ? sum([builds,ram.available_bytes,legendBytes(ram,'else')]) : source.total_bytes;
-  const rowMemory = row => {
-    const parts = row.parts?.length ? row.parts.map(part => ({...part,gib:leaf(part.gib*GIB)/GIB})) : null;
-    const used = parts ? sum(parts.map(part => part.gib*GIB))/GIB
-      : recorded(row.used) ? leaf(row.used*GIB)/GIB : row.used;
-    const reserved = recorded(row.reserved) ? leaf(row.reserved*GIB)/GIB : 0;
-    return {...row,used,reserved,counted:used+reserved,...(parts ? {parts} : {})};
-  };
-  const shown = {...data,ram,cap:hasCap(data) ? ram.cap_bytes/GIB : data.cap,
-    total:ram.total_bytes/GIB,taken:sum([builds,ram.build_covered_bytes])/GIB,
-    walk:(data.walk || []).map(rowMemory),waiters:(data.waiters || []).map(row => ({...row,
-      need:leaf(row.need*GIB)/GIB,...(recorded(row.free) ? {free:leaf(row.free*GIB)/GIB} : {}),
-      ...(row.head_room ? {head_room:{...row.head_room,rows:row.head_room.rows?.map(term =>
-        ({...term,gib:leaf(term.gib*GIB)/GIB}))}} : {})}))};
-  shownReadings.set(data,shown);
-  shownReadings.set(shown,shown);
+  const ram = {...data.ram};
+  const reserves = reserveReadings(ram);
+  ram.unnamed_bytes = recorded(ram.unattributed_bytes) && recorded(ram.kernel_no_counter_bytes)
+    ? ram.unattributed_bytes - ram.kernel_no_counter_bytes : null;
+  ram.builds_bytes = sumMemory([ram.build_tools_bytes, ram.queued_builds_bytes, ram.ci_bytes]);
+  ram.outside_bytes = sumMemory([ram.desktop_bytes, ram.agents_bytes, ram.other_programs_bytes,
+    ram.kernel_bytes, ram.cache_bytes, ram.unattributed_bytes]);
+  const overCapBytes = hasCap(data) ? reserves.build.raw.shortfall - ram.room_bytes : 0;
+  const shown = {...data, ram, reserves, waiters:data.waiters || [], overCapBytes};
+  shownReadings.set(data, shown);
   return shown;
 }
 function memoryRows(parts) {
-  return parts.map(([label, bytes]) => field(label, ramAmount(bytes)));
+  return parts.filter(([, bytes]) => recorded(bytes)).map(([label, bytes]) => field(label, ramAmount(bytes)));
 }
 function queueCapMemory(d) {
-  return {builds:legendBytes(d.ram,'builds'),reserved:d.ram.build_covered_bytes,free:d.ram.room_bytes};
+  return {builds:d.ram.builds_bytes,free:d.ram.room_bytes};
 }
-function reserveTargetRows(covered, target) {
-  return target > covered ? [field('Target', ramAmount(target))] : [];
+const RESERVES = [
+  ["safety", "Safety net", "s-safety", "A fixed setting.", "safety-note"],
+  ["swap", "Swap coming back", "s-swap", "RAM held for swap that comes back.", "swap-note"],
+  ["build", "Build reserved", "s-reserved", "Running builds grow into it.", "reserved-note"],
+];
+function reserveAmount(bytes) {
+  return {bytes, text:ramAmount(bytes)};
 }
-// Build reserved is a share of the room running steps may grow into, plus memory held between steps.
+function reserveReadings(ram) {
+  const reserves = Object.fromEntries(RESERVES.map(([key]) => {
+    const raw = {covered:ram[key+'_covered_bytes'], target:ram[key+'_target_bytes'],
+      shortfall:ram[key+'_missing_bytes']};
+    return [key, {raw, covered:ramAmount(raw.covered), target:ramAmount(raw.target),
+      shortfall:ramAmount(raw.shortfall), short:raw.shortfall > 0}];
+  }));
+  reserves.system = reserveAmount(sumMemory([reserves.safety.raw.covered, reserves.swap.raw.covered]));
+  reserves.shortfall = reserveAmount(ram.shortfall_bytes);
+  return reserves;
+}
+function coveredReserveRows(parts) {
+  return parts.filter(([, reserve]) => recorded(reserve.raw.covered))
+    .map(([label, reserve]) => field(label, reserve.covered));
+}
+const stepReserves = new WeakMap();
+function stepReserve(row) {
+  if (!stepReserves.has(row)) stepReserves.set(row, reserveAmount(row.reserved * GIB));
+  return stepReserves.get(row);
+}
+function reserveTargetRows(reserve) {
+  return reserve.short ? [field('Target', reserve.target)] : [];
+}
+function reserveTip(name, caption, reserve, parts) {
+  return [field(name, reserve.covered, 'title'), field('', caption, 'caption'),
+    ...groupRows([...parts, ...(reserve.short ? [field('Not covered', reserve.shortfall)] : [])])];
+}
 function buildReserveRows(d) {
-  const basis = d.build_reserve;
-  if (!basis || !recorded(basis.share_percent) || !(d.ram.build_target_bytes > 0))
-    return reserveTargetRows(d.ram.build_covered_bytes, d.ram.build_target_bytes);
-  return [field('Room to grow', ramAmount(basis.growth_bytes)), field('× Share held', `${basis.share_percent}%`),
-    ...(basis.between_steps_bytes > 0 ? [field('+ Held between steps', ramAmount(basis.between_steps_bytes))] : []),
-    ...(basis.unread_bytes > 0 ? [field('+ Steps with no memory reading', ramAmount(basis.unread_bytes))] : []),
-    field('= Target', ramAmount(d.ram.build_target_bytes))];
+  const basis = d.build_reserve, reserve = d.reserves.build;
+  if (!basis || !recorded(basis.share_percent) || !(reserve.raw.target > 0)) return reserveTargetRows(reserve);
+  return [field('Room to grow', ramAmount(basis.growth_bytes)), field('× Share held', formatPercent(basis.share_percent)),
+    ...(basis.between_steps_bytes > 0 ? [field('+ Between steps', ramAmount(basis.between_steps_bytes))] : []),
+    ...(basis.unread_bytes > 0 ? [field('+ Unread steps', ramAmount(basis.unread_bytes))] : []),
+    field('= Target', reserve.target)];
 }
-// Swap coming back is a share of the swap that came back into RAM within the window.
 function swapReserveRows(d) {
-  const swap = d.swap;
-  if (!recorded(swap?.reserve_share_percent)) return reserveTargetRows(d.ram.swap_covered_bytes, d.ram.swap_target_bytes);
+  const swap = d.swap, reserve = d.reserves.swap;
+  if (!recorded(swap?.reserve_share_percent)) return reserveTargetRows(reserve);
   if (!(swap.window_seconds > 0))
-    return [field('Share held', `${swap.reserve_share_percent}%`), ...reserveTargetRows(d.ram.swap_covered_bytes, d.ram.swap_target_bytes)];
-  return [field(`Swap-in, last ${Math.round(swap.window_seconds / 60)} min`, ramAmount(swap.swap_in_window_bytes)),
-    field('× Share held', `${swap.reserve_share_percent}%`), field('= Target', ramAmount(d.ram.swap_target_bytes))];
+    return [field('Share held', formatPercent(swap.reserve_share_percent)), ...reserveTargetRows(reserve)];
+  return [field('Lookback', durationMinutes(swap.window_seconds / 60)),
+    field('Swap-in', ramAmount(swap.swap_in_window_bytes)),
+    field('× Share held', formatPercent(swap.reserve_share_percent)), field('= Target', reserve.target)];
 }
-// One line names each reserve that free RAM does not fill.
-function reserveAlert(ram) {
-  const short = RESERVES.filter(([key]) => ram[`${key}_missing_bytes`] > 0)
-    .map(([key, name]) => `${name} holds ${f1(ram[`${key}_covered_bytes`] / GIB)} of ${f1(ram[`${key}_target_bytes`] / GIB)} GiB`);
-  return short.length ? `Free RAM is short by ${f1(ram.shortfall_bytes / GIB)} GiB. ${short.join("; ")}.` : "";
+function reserveAlert(d) {
+  const short = RESERVES.filter(([key]) => d.reserves[key].short)
+    .map(([key, name]) => {
+      const reserve = d.reserves[key];
+      return `${name} holds ${reserve.covered.split(" ")[0]} of ${reserve.target}`;
+    });
+  return short.length ? `Free RAM is short by ${d.reserves.shortfall.text}. ${short.join("; ")}.` : "";
 }
-const RESERVES = [["safety", "Safety net", "s-safety"], ["swap", "Swap coming back", "s-swap"], ["build", "Build reserved", "s-reserved"]];
-function legendTip(name, bytes, caption, parts = []) {
-  const title = field(name, ramAmount(bytes), 'title');
+function renderReserveStatus(d, macAlert) {
+  const reserveWarning = reserveAlert(d);
+  const alert = $("mac-idle-alert");
+  alert.textContent = [macAlert, reserveWarning].filter(Boolean).join("\n");
+  alert.hidden = !alert.textContent;
+  if (reserveWarning) alert.setAttribute("data-tip", "shortfall");
+  else alert.removeAttribute("data-tip");
+  for (const [key, , segment, description, note] of RESERVES) {
+    const reserve = d.reserves[key];
+    $(segment).classList.toggle("short-reserve", reserve.short);
+    if (reserve.short) $(segment).hidden = false;
+    $(note).textContent = reserveDescription(description, reserve);
+  }
+}
+function legendTip(name, bytes, caption, parts = [], text = ramAmount(bytes)) {
+  const title = field(name, text, 'title');
   return recorded(bytes) ? [title,field('',caption,'caption'),...groupRows(parts)] : [title];
 }
 let awsCosts;
@@ -697,65 +700,70 @@ const TIPS = {
     ['rust-analyzer', d.ram.rust_analyzer_bytes], ['+ sccache', d.ram.sccache_bytes], ['+ Other build tools', d.ram.other_build_tools_bytes]])),
   queued: d => legendTip('Queued builds', d.ram.queued_builds_bytes, 'RAM of builds the queue started'),
   ci: d => legendTip('hana CI', d.ram.ci_bytes, 'RAM of hana CI programs'),
-  'g-free': d => legendTip('Free RAM', d.ram.available_bytes, 'RAM that no program holds', memoryRows([
-    ['Build reserved', queueCapMemory(d).reserved], ['+ Free', queueCapMemory(d).free],
-    ['+ System reserved', d.ram.safety_covered_bytes + d.ram.swap_covered_bytes]])),
-  reserved: d => legendTip('Build reserved', queueCapMemory(d).reserved, 'Held for running builds to grow into', [
-    ...buildReserveRows(d),
-    ...(d.ram.build_missing_bytes > 0 ? [field('Missing', ramAmount(d.ram.build_missing_bytes))] : [])]),
+  'g-free': d => legendTip('Free RAM', d.ram.available_bytes, 'RAM that no program holds', [
+    ...coveredReserveRows([['Build reserved', d.reserves.build]]),
+    ...memoryRows([['+ Free', queueCapMemory(d).free]]),
+    field('+ System reserved', d.reserves.system.text)]),
+  reserved: d => reserveTip('Build reserved', 'Held for running builds to grow into', d.reserves.build, buildReserveRows(d)),
   room: d => legendTip('Free', queueCapMemory(d).free, 'Where the next step can start', [
     field('Queue cap', hasCap(d) ? ramAmount(d.cap * GIB) : 'unavailable'),
-    field('− Builds', ramAmount(queueCapMemory(d).builds)), field('− Build reserved', ramAmount(queueCapMemory(d).reserved))]),
-  system: d => legendTip('System reserved', d.ram.safety_covered_bytes + d.ram.swap_covered_bytes,
-    'RAM kept outside the queue cap', memoryRows([
-      ['Safety net', d.ram.safety_covered_bytes], ['+ Swap coming back', d.ram.swap_covered_bytes]])),
-  safety: d => legendTip('Safety net', d.ram.safety_covered_bytes, 'RAM the queue always leaves free', [
-    ...reserveTargetRows(d.ram.safety_covered_bytes, d.ram.safety_target_bytes),
-    ...(d.ram.safety_missing_bytes > 0 ? [field('Missing', ramAmount(d.ram.safety_missing_bytes))] : [])]),
-  swap: d => legendTip('Swap coming back', d.ram.swap_covered_bytes, 'RAM held for swap that comes back', [
-    ...swapReserveRows(d),
-    ...(d.ram.swap_missing_bytes > 0 ? [field('Missing', ramAmount(d.ram.swap_missing_bytes))] : [])]),
-  'g-else': d => legendTip('Everything else', legendBytes(d.ram, 'else'), 'RAM used outside builds', memoryRows([
+    field('− Builds', ramAmount(queueCapMemory(d).builds)), field('− Build reserved', d.reserves.build.covered)]),
+  system: d => legendTip('System reserved', d.reserves.system.bytes, 'RAM kept outside the queue cap',
+    coveredReserveRows([['Safety net', d.reserves.safety], ['+ Swap coming back', d.reserves.swap]]),
+    d.reserves.system.text),
+  safety: d => reserveTip('Safety net', 'RAM the queue always leaves free', d.reserves.safety, reserveTargetRows(d.reserves.safety)),
+  swap: d => reserveTip('Swap coming back', 'RAM held for swap that comes back', d.reserves.swap, swapReserveRows(d)),
+  shortfall: d => {
+    const short = RESERVES.filter(([key]) => d.reserves[key].short);
+    return legendTip('Shortfall', d.reserves.shortfall.bytes, 'Reserves without enough free RAM',
+      short.map(([key, name], index) => field((index ? '+ ' : '') + name, d.reserves[key].shortfall)),
+      d.reserves.shortfall.text);
+  },
+  'g-else': d => legendTip('Everything else', d.ram.outside_bytes, 'RAM used outside builds', memoryRows([
     ['Desktop', d.ram.desktop_bytes], ['+ Agents', d.ram.agents_bytes], ['+ Other programs', d.ram.other_programs_bytes],
     ['+ Kernel', d.ram.kernel_bytes], ['+ File and kernel cache', d.ram.cache_bytes], ['+ Not attributed', d.ram.unattributed_bytes]])),
   desktop: d => legendTip('Desktop', d.ram.desktop_bytes, 'RAM of the desktop session',
     memoryRows([['Protected', d.ram.desktop_protection_bytes]])),
   agents: d => legendTip('Agents', d.ram.agents_bytes, 'RAM of agent sessions and their tools'),
   programs: d => legendTip('Other programs', d.ram.other_programs_bytes, 'RAM of all other programs', memoryRows([
-    ...d.ram.programs.map(program => [program.name, program.bytes]),
+    ...(d.ram.programs || []).map(program => [program.name, program.bytes]),
     ...(d.ram.smaller_program_count ? [[`${d.ram.smaller_program_count} smaller programs`, d.ram.smaller_programs_bytes]] : [])])),
   kernel: d => legendTip('Kernel', d.ram.kernel_bytes, 'RAM the kernel uses for itself', memoryRows([
     ['Compressed swap (zram)', d.ram.compressed_swap_bytes], ['+ Slab, stacks, page tables', d.ram.kernel_structures_bytes],
     ['+ Other kernel counters', d.ram.kernel_counters_bytes]])),
   cache: d => legendTip('File and kernel cache', d.ram.cache_bytes, 'Estimated cache outside free RAM'),
-  unattributed: d => legendTip('Not attributed', d.ram.unattributed_bytes, 'RAM that the readings do not explain', memoryRows([
+  unattributed: d => legendTip('Not attributed', d.ram.unattributed_bytes, 'RAM without an attribution', memoryRows([
     ['Kernel, no counter', d.ram.kernel_no_counter_bytes], ['+ No program name', d.ram.unnamed_bytes]])),
-  cap: d => legendTip('Queue cap', hasCap(d) ? d.cap * GIB : null, 'What builds may use', memoryRows([
-    ['Builds', queueCapMemory(d).builds], ['+ Build reserved', queueCapMemory(d).reserved], ['+ Free', queueCapMemory(d).free]])),
+  cap: d => legendTip('Queue cap', hasCap(d) ? d.cap * GIB : null, 'What builds may use', [
+    ...memoryRows([['Builds', queueCapMemory(d).builds]]),
+    ...coveredReserveRows([['+ Build reserved', d.reserves.build]]),
+    ...memoryRows([['+ Free', queueCapMemory(d).free]])]),
   budget: d => legendTip('RAM', d.ram.total_bytes, 'Memory across this machine', memoryRows([
-    ['Builds', queueCapMemory(d).builds], ['+ Free RAM', d.ram.available_bytes], ['+ Everything else', legendBytes(d.ram, 'else')]])),
+    ['Builds', queueCapMemory(d).builds], ['+ Free RAM', d.ram.available_bytes], ['+ Everything else', d.ram.outside_bytes]])),
   waiting: () => [field('Waiting step', '', 'title'), field('Dashed outline', 'memory needed'), field('End', 'queue cap')],
   progress: () => [field('Build progress', '', 'title'), field('Blue', 'building'), field('Pink', 'testing')],
   walkhead: () => [field('Running, in start order', '', 'title'), field('Blue', 'in use now'), field('Hatching', 'reserved'),
     field('Dashed outline', 'waiting step'), field('Red line', 'queue cap')],
-  walksum: d => legendTip('Taken', hasCap(d) ? claimedGib(d) * GIB : null, 'Memory used or held by builds', [
-    ...memoryRows([['Builds', queueCapMemory(d).builds],
-      [overCapBytes(d) > 0 ? '+ Build reserved (full)' : '+ Build reserved',
-        queueCapMemory(d).reserved + overCapBytes(d)]]),
-    ...(overCapBytes(d) > 0 ? memoryRows([['Queue cap', d.cap * GIB], ['Over cap', overCapBytes(d)]]) : [])]),
+  queuehead: d => [field('Queued', d.waiters.length, 'title'),
+    ...(d.queued_priority_units?.length ? [staffField('Priority', d.queued_priority_units)] : []),
+    field('Order', 'submission order')],
+  walksum: d => legendTip('Taken', hasCap(d) ? claimedBytes(d) : null, 'Memory used or held by builds', [
+    ...memoryRows([['Builds', queueCapMemory(d).builds]]),
+    field(d.reserves.build.short ? '+ Full reserve' : '+ Build reserved',
+      d.reserves.build.short ? d.reserves.build.target : d.reserves.build.covered),
+    ...(d.overCapBytes > 0 ? memoryRows([['Queue cap', d.cap * GIB], ['Over cap', d.overCapBytes]]) : [])]),
   tokens: d => {
-    const known = d.tokens?.kind === 'TokenPool';
-    const reason = known ? d.token_counts : d.tokens?.reason || 'no token pool reading';
+    if (d.tokens?.kind !== 'TokenPool') return [field('Tokens', 'unavailable', 'title')];
     return [field('Tokens', '', 'title'), ...groupRows(tokenPoolRows(d.tokens)),
-      ...(known ? [field('Job capacity', 'one extra job per token'),
-        field('Shared by', 'natedev cargo and nextest'), field('CI pool', 'separate'),
-        field('Pause below free RAM', ramAmount(d.tokens.memory_floor_bytes)),
-        field('Pool', d.tokens.paused ? 'paused' : 'active'),
-        field('Per-build counts', d.token_counts ? 'unavailable' : 'known')] : []),
-      ...becauseRows((reason || '').replace(/\.$/, ''))];
+      field('Job capacity', 'one extra job per token'),
+      field('Shared by', 'natedev cargo and nextest'), field('CI pool', 'separate'),
+      field('Pause below', ramAmount(d.tokens.memory_floor_bytes)),
+      field('Pool', d.tokens.paused ? 'paused' : 'active'),
+      field('Per-build counts', d.token_counts ? 'unavailable' : 'known'),
+      ...detailRows('Because', d.token_counts)];
   },
-  ticks: d => [field('Scale', ramAmount(d.total * GIB), 'title'), field('', 'One scale for both charts', 'caption'),
-    field('Start', '0.0 GiB'), field('Red line', hasCap(d) ? 'queue cap' : 'unavailable')],
+  ticks: d => legendTip('Scale', d.ram.total_bytes, 'One scale for both charts',
+    [field('Start', '0.0 GiB'), field('Red line', hasCap(d) ? 'queue cap' : '')]),
   swaphead: () => [field('Swap and pressure', '', 'title'), field('Swap', 'memory on disk'), field('Stall', 'waiting for memory')],
   pill: d => [field('Memory pressure', ({ok:'none',warn:'near a limit',hold:'queue holds',neutral:'unavailable'})[level(d)], 'title')],
   'g-some': d => pressureTip('Some tasks stall', d.psi.some, d.limits.some, 'Memory waits of at least one task'),
@@ -764,14 +772,15 @@ const TIPS = {
 };
 function pressureTip(name, value, limit, caption) {
   return !recorded(value) ? [field(name, 'unavailable', 'title')] : [field(name, formatPercent(value), 'title'),
-    field('', caption, 'caption'), ...groupRows([field('Average over', '10 s'), field('Queue holds above', formatPercent(limit))])];
+    field('', caption, 'caption'), ...groupRows([field('Average over', '10 s'), field('Queue holds above', recorded(limit) ? formatPercent(limit) : '')])];
 }
 const GIB = 1024 ** 3;
 const RAM_BLOCKS = [
   ["tools", "Build tools", r => r.build_tools_bytes, "builds"], ["queued", "Queued builds", r => r.queued_builds_bytes, "builds"],
   ["ci", "hana CI", r => r.ci_bytes, "builds"],
-  ["reserved", "Build reserved", r => r.build_covered_bytes, "free"], ["room", "Free", r => r.room_bytes, "free"],
-  ["safety", "Safety net", r => r.safety_covered_bytes, "free"], ["swap", "Swap coming back", r => r.swap_covered_bytes, "free"],
+  ["reserved", "Build reserved", r => r.build_covered_bytes, "free", "build"], ["room", "Free", r => r.room_bytes, "free"],
+  ["safety", "Safety net", r => r.safety_covered_bytes, "free", "safety"],
+  ["swap", "Swap coming back", r => r.swap_covered_bytes, "free", "swap"],
   ["desktop", "Desktop", r => r.desktop_bytes, "else"], ["agents", "Agents", r => r.agents_bytes, "else"],
   ["programs", "Other programs", r => r.other_programs_bytes, "else"], ["kernel", "Kernel", r => r.kernel_bytes, "else"],
   ["cache", "File and kernel cache", r => r.cache_bytes, "else"], ["unattributed", "Not attributed", r => r.unattributed_bytes, "else"],
@@ -781,28 +790,28 @@ function shownBytes(bytes) { return recorded(bytes) ? Math.max(0, bytes) : 0; }
 function groupBytes(r, group) {
   return RAM_BLOCKS.filter(block => block[3] === group).reduce((sum, block) => sum + shownBytes(block[2](r)), 0);
 }
-function legendBytes(r, group) {
-  return RAM_BLOCKS.filter(block => block[3] === group).reduce((sum, block) => {
-    const bytes = block[2](r);
-    return sum + (recorded(bytes) ? bytes : 0);
-  }, 0);
-}
 function tokenPoolRows(pool) {
   return pool?.kind === 'TokenPool' ? [field('Total', pool.total), field('Available', pool.free)]
     : [field('Status', 'unavailable')];
 }
+function isSmallRamAmount(bytes) { return bytes !== 0 && Math.abs(bytes) < GIB / 10; }
 function ramAmount(bytes) {
   if (!recorded(bytes)) return "unavailable";
-  return `${Object.is(bytes,-0) ? "-0.0" : f1(bytes / GIB)} GiB`;
+  if (isSmallRamAmount(bytes)) return bytes < 0 ? "-<0.1 GiB" : "<0.1 GiB";
+  const tenths = memoryTenths(bytes);
+  return `${Object.is(tenths,-0) ? "-0.0" : f1(tenths / 10)} GiB`;
 }
 function statusLine(d) {
   const status = d.memory_status, room = ramAmount(d.ram.room_bytes);
+  const {build, safety, swap} = d.reserves;
+  const shortage = recorded(status.next_need_bytes) && recorded(status.check_room_bytes)
+    ? status.next_need_bytes - status.check_room_bytes : 0;
   return ({
     unavailable: "Memory reading unavailable; build capacity is unknown.",
-    gpu_slot: "A GPU test waits: another GPU test holds the GPU test slot." + (status.next_need_bytes > status.check_room_bytes
-      ? ` It also needs ${ramAmount(status.next_need_bytes)}, and free is ${ramAmount(status.check_room_bytes)}.` : ""),
+    gpu_slot: "A GPU test waits: another GPU test holds the GPU test slot." + (shortage > 0
+      ? ` It also needs ${ramAmount(shortage)} more memory.` : ""),
     pressure: `Memory pressure prevents a new start; free is ${room}.`,
-    shortfall: d.ram.build_missing_bytes > 0 && !(d.ram.safety_missing_bytes > 0) && !(d.ram.swap_missing_bytes > 0)
+    shortfall: build.short && !safety.short && !swap.short
       ? "Nothing is free: build reserved needs more than free RAM. A reserve is room a step may still grow into, not RAM in use."
       : "Nothing is free: the reserves need more than free RAM.",
     no_room: "Nothing is free: the safety net, swap coming back and build reserved use all free RAM.",
@@ -834,9 +843,9 @@ function capEnd(d) {
 function poolTip(pool, d) {
   return pool === 'builds_ci' ? [field('Builds and CI', swapAmount(d.swap.builds_ci_bytes), 'title'),
     field('', 'Swap outside the reserve target', 'caption')] : [field('Outside builds and CI', swapAmount(d.swap.outside_bytes), 'title'),
-    ...groupRows([field('Reserve share', formatPercent(d.swap.reserve_share_percent)),
-      field('Swap coming back', ramAmount(d.ram.swap_covered_bytes)),
-      ...reserveTargetRows(d.ram.swap_covered_bytes, d.ram.swap_target_bytes)])];
+    ...groupRows([field('Reserve share', recorded(d.swap.reserve_share_percent) ? formatPercent(d.swap.reserve_share_percent) : ''),
+      field('Swap coming back', d.reserves.swap.covered),
+      ...reserveTargetRows(d.reserves.swap)])];
 }
 const pctOf = (v, t) => t > 0 ? v / t * 100 : 0;
 function formatPercent(value, complete = true) {
@@ -893,37 +902,38 @@ function stepTitle(row, value) {
   const {unit, step} = row.title ?? olderStepTitle(row);
   return unit ? staffTitle(unit, value, ' · ' + step) : field(step, value, 'title');
 }
-function becauseRows(reason, parts) {
-  if (!reason) return [];
-  return reason.length <= 30 ? [{...field('Because', reason), valueParts:parts}]
-    : [field('Because', ''), {...field('', reason, 'long'), valueParts:parts}];
+function detailRows(label, value, parts) {
+  const phrase = value?.trim().replace(/[.!?]+$/, '');
+  if (!phrase) return [];
+  const valueParts = phrase === value ? parts : undefined;
+  return phrase.length <= 30 ? [{...field(label, phrase), valueParts}]
+    : [field(label, ''), {...field('', phrase, 'long'), valueParts}];
 }
 function routeFields(row) {
   return [field('Runs on', row.kind === 'cloud' ? 'AWS' : row.runs_on || ''),
-    ...(row.runs_on === 'natedev or Mac' ? [] : becauseRows(row.because || '', row.because_parts))];
+    ...(row.runs_on === 'natedev or Mac' ? [] : detailRows('Because', row.because, row.because_parts))];
 }
 function progressRows(row) {
   const progress = row.progress;
   // The Stage column shows only "waiting"; the tooltip gives the full reason.
-  if (progress?.kind === 'TokenWaitProgress') return [field('Stage', sentence(progress.stage))];
+  if (progress?.kind === 'TokenWaitProgress') return detailRows('Stage', progress.stage);
   if (!progress || progress.kind !== 'RowProgress')
-    return row.kind === 'cloud' && row.stage ? [field('Stage', sentence(row.stage))] : [];
+    return row.kind === 'cloud' && row.stage ? [field('Stage', row.stage)] : [];
   const stage = row.kind === 'cloud' ? stageText(row) : progress.phase;
   return groupRows([field(sentence(stage), `${progress.done} of ${progress.total} ${progress.unit}`),
     field('Done', formatPercent(progress.percent ?? 100 * progress.done / progress.total, progress.done === progress.total)),
     ...(progress.unit === 'modules' ? [field('Order', 'slowest first')] : [])]);
 }
-function stepTooltip(key, data) {
+function stepTooltip(key, data, roomBytes) {
   const row = stepRow(key, data);
   if (!row) return [];
   const waiting = key.startsWith('wait:');
   const duration = tipDuration(key, row, data);
   const state = waiting ? 'waiting' : row.between_steps ? 'between steps' : 'running';
-  if (row.kind === 'mac-unavailable' || (!waiting && row.used && !recorded(row.used)))
+  if (row.kind === 'mac-unavailable' || (!waiting && !recorded(row.used) && (row.used || row.program_memory)))
     return [stepTitle(row, 'unavailable')];
   const rows = [stepTitle(row, [state, duration].filter(Boolean).join(' '))];
-  // A gate job says what it does and what it changes (#109).
-  if (row.about) rows.push({...field('', row.about, 'caption'), valueParts:row.about_parts});
+  rows.push(...detailRows('Work', row.about, row.about_parts));
   if (row.changes) rows.push(field('Changes', row.changes));
   if (row.group) return [field(row.name, ramAmount(row.used * GIB), 'title'), field('Started by', 'not the queue'),
     ...groupRows((row.parts || []).map(part => {
@@ -940,31 +950,28 @@ function stepTooltip(key, data) {
       row.kind === 'repository-slot' ? 'build slot' : row.why || 'its turn'), ...routeFields(row));
     if (!['cloud', 'repository-slot'].includes(row.kind)) {
       if (row.head_room?.unavailable) return [stepTitle(row, 'unavailable')];
-      let free = row.free ?? queueCapMemory(data).free / GIB;
-      if (row.head_room?.rows?.length) {
-        const terms = row.head_room.rows, result = terms.at(-1);
-        const cap = queueCapMemory(data);
-        const earlier = terms.slice(3, -1).map(term => ({label:term.label, tenths:Math.round(term.gib * 10)}));
-        free = Math.max(0, Math.round(cap.free / GIB * 10) - earlier.reduce((sum, term) => sum + term.tenths, 0)) / 10;
+      const cap = queueCapMemory(data);
+      const terms = row.head_room?.rows;
+      const head = terms?.at(-1);
+      const free = recorded(head?.gib) ? head.gib * GIB : recorded(row.free) ? row.free * GIB : roomBytes;
+      if (terms?.length) {
+        const earlier = terms.slice(3, -1);
         rows.push(...groupRows([field('Queue cap', ramAmount(data.cap * GIB)),
-          field('− Builds', ramAmount(cap.builds)), field('− Build reserved', ramAmount(cap.reserved)),
-          ...earlier.map(term => field(term.label, `${(term.tenths / 10).toFixed(1)} GiB`)),
-          field(result.label, `${free.toFixed(1)} GiB`, 'sum')]));
+          field('− Builds', ramAmount(cap.builds)), field('− Build reserved', data.reserves.build.covered),
+          ...earlier.map(term => field(term.label, ramAmount(term.gib * GIB))),
+          field(head.label, ramAmount(free), 'sum')]));
       }
-      const freeTenths = Math.round(free * 10);
-      const needTenths = Math.round(row.need * 10);
-      const need = [field('Needs', `${(needTenths / 10).toFixed(1)} GiB`)];
-      // The queue admits one step at a time, so only the step it admits next shows its room.
+      const need = [field('Needs', ramAmount(row.need * GIB))];
+      // Only the next step shows the memory it can use.
       if (row.first_in_line) {
-        if (!row.head_room?.rows?.length) {
-          // Free matches the page's Free row. The step's own room differs when held slots get memory first,
-          // or when an earlier step gives back memory it held.
-          const pageTenths = Math.max(0, Math.round(queueCapMemory(data).free / GIB * 10));
-          need.push(field('Free', `${(pageTenths / 10).toFixed(1)} GiB`));
-          if (pageTenths > freeTenths) need.push(field('− Kept for other steps', `${((pageTenths - freeTenths) / 10).toFixed(1)} GiB`));
-          if (freeTenths > pageTenths) need.push(field('+ Given back by other steps', `${((freeTenths - pageTenths) / 10).toFixed(1)} GiB`));
+        if (!terms?.length) {
+          need.push(field('Free', ramAmount(cap.free)));
+          const difference = roomBytes - free;
+          if (difference > 0) need.push(field('− Held elsewhere', ramAmount(difference)));
+          if (difference < 0) need.push(field('+ Released', ramAmount(-difference)));
         }
-        if (needTenths > freeTenths) need.push(field('Short by', `${((needTenths - freeTenths) / 10).toFixed(1)} GiB`));
+        const shortage = row.need * GIB - free;
+        if (shortage > 0) need.push(field('Short by', ramAmount(shortage)));
       }
       rows.push(...groupRows(need));
     }
@@ -979,16 +986,15 @@ function stepTooltip(key, data) {
         ...(row.read_at ? [field('Reading age', ago(row.read_at, data.read_at))] : []), field('In queue cap', 'no')]));
     } else {
       if (!row.queued && !row.ci) rows.push(field('Started by', 'not the queue'));
-      const counted = (row.used + row.reserved) * GIB;
       const memory = (row.queued || row.ci) && row.reserved > 0
-        ? [...memoryRows([['Uses', row.used * GIB], ['+ Build reserved', row.reserved * GIB]]),
-          field('= In queue cap', ramAmount(counted), 'sum')]
+        ? [...memoryRows([['Uses', row.used * GIB]]), field('+ Build reserved', stepReserve(row).text),
+          field('= In queue cap', ramAmount((row.used + row.reserved) * GIB), 'sum')]
         : recorded(row.used) ? [field('Uses', ramAmount(row.used * GIB))] : [];
       rows.push(...groupRows(memory));
     }
     rows.push(...progressRows(row));
   }
-  return rows.filter(row => row.kind === 'title' || row.kind === 'long' || row.value || row.label === 'Because');
+  return rows.filter((row, index) => row.kind === 'title' || row.kind === 'long' || row.value || rows[index+1]?.kind === 'long');
 }
 function stepRow(key, data) {
   const kind = key.slice(0, key.indexOf(':'));
@@ -999,10 +1005,10 @@ function tipDuration(key, row, data) {
   const since = key.startsWith('wait:') ? row.since : row.started_at;
   return recorded(since) ? ago(since, data.read_at) : '';
 }
-function tooltipRows(key, data) {
-  data = shownReading(data);
+function tooltipRows(key, rawData) {
+  const data = shownReading(rawData);
   const [kind, index] = key.split(':');
-  if (kind === 'row' || kind === 'wait') return stepTooltip(key, data);
+  if (kind === 'row' || kind === 'wait') return stepTooltip(key, data, rawData.ram.room_bytes);
   if (kind === 'swap' && index !== undefined) return swapTip(data.swap_by[+index]);
   if (kind === 'swap-pool') return poolTip(index, data);
   if (kind === 'aws-cost') return awsCostTip(index);
@@ -1015,13 +1021,16 @@ function tooltipHtml(key, data) {
   return tipRowsHtml(tooltipRows(key, data));
 }
 function tipRowsHtml(rows) {
-  return '<dl class="tip">'+rows.map(row => {
+  return '<dl class="tip">'+tipCellsHtml(rows)+'</dl>';
+}
+function tipCellsHtml(rows) {
+  return rows.map(row => {
     const classes=[row.kind === 'field' ? '' : row.kind, row.group ? 'group' : ''].filter(Boolean).join(' ');
     const attr=classes ? ` class="${classes}"` : '';
     return ['caption','long'].includes(row.kind) ? `<dd${attr}>${row.valueParts ? nameParts(row.valueParts) : esc(row.value)}</dd>`
       : `<dt${attr}>${row.labelParts ? nameParts(row.labelParts) : row.labelStaffName ? staffName(row.labelStaffName) + esc(row.labelSuffix) : esc(row.label)}</dt>` +
         `<dd${attr}>${row.valueParts ? nameParts(row.valueParts) : row.valueStaffNames ? row.valueStaffNames.map(staffName).join(', ') : esc(row.value)}</dd>`;
-  }).join('')+'</dl>';
+  }).join('');
 }
 function tipText(key, data) {
   const rows=tooltipRows(key,data);
@@ -1049,10 +1058,10 @@ function renderTargets(rows) {
 }
 function recorded(value) { return typeof value === "number"; }
 function hasCap(d) { return recorded(d.cap); }
-// Build reserves that do not fit under the queue cap; the cap holds only the covered part.
-function overCapBytes(d) { return hasCap(d) && recorded(d.ram.build_missing_bytes) ? Math.max(0, d.ram.build_missing_bytes) : 0; }
-// Taken includes the full build reserve, including the uncovered part.
-function claimedGib(d) { return d.taken + overCapBytes(d) / GIB; }
+function claimedBytes(d) {
+  const reserve = d.reserves.build;
+  return d.ram.builds_bytes + (reserve.short ? reserve.raw.target : reserve.raw.covered);
+}
 function useValue(row) { return recorded(row.used) ? row.used : 0; }
 function visibleDetail(row) {
   if (row.ci) {
@@ -1121,11 +1130,14 @@ function memoryText(text) {
   return text.replace(/([0-9]+(?:\.[0-9]+)?) MiB/g, (_, amount) => `${f1(Number(amount) / 1024)} GiB`)
     .replace(/([0-9]+(?:\.[0-9]+)?) GiB/g, (_, amount) => `${f1(Number(amount))} GiB`);
 }
-function reserveDescription(description, needed, covered) {
-  return description + (needed > covered ? ` Needs ${ramAmount(needed)}; free RAM covers ${ramAmount(covered)}.` : "");
+function reserveDescription(description, reserve) {
+  return description + (reserve.short ? ` Needs ${reserve.target}; free RAM covers ${reserve.covered}.` : "");
 }
 function ago(then, now) {
-  const m = Math.max(0, Math.round((now - then) / 60));
+  return durationMinutes((now - then) / 60);
+}
+function durationMinutes(minutes) {
+  const m = Math.max(0, Math.round(minutes));
   if (m < 1) return "<1 min";
   if (m < 60) return `${m} min`;
   const h = Math.floor(m / 60);
@@ -1141,7 +1153,7 @@ function placeTipAt(tip, x, y) {
   tip.classList.toggle("scrollable", tip.scrollHeight > tip.clientHeight || tip.scrollWidth > tip.clientWidth);
 }
 const f1 = (n) => recorded(n) ? n.toFixed(1) : "unavailable";
-const memoryAmount = (n) => recorded(n) ? `${f1(n)} GiB` : "use unavailable";
+const memoryAmount = (n) => recorded(n) ? ramAmount(n * GIB) : "use unavailable";
 // Show the tooltip of the [data-tip] element under the mouse, or of a clicked one; a second click hides it.
 // content(key) gives the tooltip HTML, or "" for no tooltip.
 function hoverTips(tip, content) {
@@ -1179,19 +1191,16 @@ function hoverTips(tip, content) {
 const programMemoryMarkup = new WeakMap();
 function programSeconds(ms) { return `${Math.round(ms / 1000)} s`; }
 function programSwatch(series) { return `<span class="program-swatch ${series}" aria-hidden="true"></span>`; }
-function programValue(series, label, value) {
-  return `<dt>${programSwatch(series)}${label}</dt><dd>${value}</dd>`;
-}
 function programValues(live, past, hanaDuration = null) {
   const last = live.segments.at(-1)?.at(-1);
-  const current = last ? ramAmount(last[1]) : live.state === 'not_started' ? 'Not started' : 'No samples';
-  const currentName = last && live.state !== 'sampling' ? 'This run, last sample' : 'This run now';
+  const current = last ? ramAmount(last[1]) : live.state === 'not_started' ? 'not started' : 'no samples';
+  const currentName = last && live.state !== 'sampling' ? 'Live last sample' : 'Live sample';
   return [
-    ['live', currentName, current],
-    ...(past?.peak ? [['past', 'Past run peak', ramAmount(past.peak[1])]] : []),
+    [currentName, current],
+    ...(past?.peak ? [['Past peak', ramAmount(past.peak[1])]] : []),
     ...(past?.above_half_reserve_ms != null
-      ? [['past', 'Past run time above half the reserve', programSeconds(past.above_half_reserve_ms)]] : []),
-    ...(hanaDuration != null ? [['past', 'Past run, hana crate', programSeconds(hanaDuration)]] : []),
+      ? [['Past >½ reserve', programSeconds(past.above_half_reserve_ms)]] : []),
+    ...(hanaDuration != null ? [['Past hana crate', programSeconds(hanaDuration)]] : []),
   ];
 }
 function programPhaseChart(name, live, past, reserve, bands, axisEnd, scale, memoryMax) {
@@ -1221,7 +1230,7 @@ function programPhaseChart(name, live, past, reserve, bands, axisEnd, scale, mem
       ? Math.max(7, Math.min(peakY, reserveY - 12))
       : Math.min(base - 1, Math.max(peakY, reserveY + 12));
     peakLabel = dot(peak, peakSeries, peakSeries === 'past' ? 1 : scale, 3) +
-      `<text class="${peakSeries}" x="245" y="${labelY}">${ramAmount(peak[1])} peak</text>`;
+      `<text class="${peakSeries}" x="245" y="${labelY}">${esc(ramAmount(peak[1]))} peak</text>`;
   }
   let crateBands = '';
   if (bands.length) {
@@ -1233,7 +1242,7 @@ function programPhaseChart(name, live, past, reserve, bands, axisEnd, scale, mem
   }
   return `<svg viewBox="0 0 344 ${base + 5}" role="img" aria-label="${name} program memory by elapsed time">
     ${crateBands}${rule(base, 'axis')}
-    ${reserveY === null ? '' : rule(reserveY, 'reserve') + `<text x="245" y="${reserveY}">${ramAmount(reserve.bytes)} reserved</text>`}
+    ${reserveY === null ? '' : rule(reserveY, 'reserve') + `<text x="245" y="${reserveY}">${esc(reserve.text)} reserved</text>`}
     ${last ? `<line class="program-marker" x1="${x(last[0] * scale)}" x2="${x(last[0] * scale)}" y1="${plotTop}" y2="${base}"/>` : ''}
     ${lines(past, 'past', 1)}${lines(live, 'live', scale)}${peakLabel}${last ? dot(last, 'live', scale, 3.5) : ''}
   </svg>`;
@@ -1244,34 +1253,31 @@ function programMemoryPhase(name, live, past, reserve, bands, hanaDuration, memo
   const scaled = name === 'Compile' && pastDuration > 0 && live.duration_ms > 0 && !!last;
   const axisEnd = (scaled ? pastDuration : Math.max(live.duration_ms, pastDuration)) || 1000;
   const scale = scaled ? axisEnd / live.duration_ms : 1;
-  const caption = [
-    scaled ? `The chart scales ${programSeconds(live.duration_ms)} of this run to the ${programSeconds(axisEnd)} past-run axis.` : '',
-    reserve?.source === 'past' ? 'The line shows the past reserve.' :
-      (reserve && past?.reserve_bytes != null && reserve.bytes !== past.reserve_bytes ? 'The line shows this run’s reserve.' : ''),
-  ].filter(Boolean).join(' ');
   const values = programValues(live, past, bands.length ? hanaDuration : null);
-  return `<section class="program-phase">
-    <div class="program-heading"><h2>${name}</h2>${last ? `<span>${programSeconds(live.duration_ms)} elapsed</span>` : ''}</div>
-    ${programPhaseChart(name, live, past, reserve, bands, axisEnd, scale, memoryMax)}
+  const elapsed = last ? programSeconds(live.duration_ms) : '';
+  const rows = [field('Elapsed', elapsed),
+    field('Axis', scaled ? 'scaled to past run' : ''),
+    field('Reserve source', reserve?.source === 'past' ? 'past run' :
+      reserve && past?.reserve_bytes != null && reserve.bytes !== past.reserve_bytes ? 'this run' : ''),
+    ...values.map(([label, value]) => field(label, value))].filter(row => row.value);
+  return `<dd class="program-memory group"><section class="program-phase">
+    <div class="program-heading"><h2>${name}</h2></div>
+    ${programPhaseChart(name, live, past, reserve && reserveAmount(reserve.bytes), bands, axisEnd, scale, memoryMax)}
     <div class="program-times"><span>0 s</span><span>time</span><span>${programSeconds(axisEnd)}</span></div>
-    ${caption ? `<p>${caption}</p>` : ''}
-    <dl class="program-values">
-      ${values.map(([series, label, value]) => programValue(series, label, value)).join('')}
-    </dl>
-  </section>`;
+  </section></dd>` + tipCellsHtml(rows);
 }
 function programMemoryHtml(memory) {
   if (programMemoryMarkup.has(memory)) return programMemoryMarkup.get(memory);
   const {live, past, compile_reserve: compileReserve, test_reserve: testReserve} = memory;
   const memoryMax = Math.max(GIB, compileReserve.bytes, testReserve?.bytes ?? 0,
     live.compile.peak?.[1] ?? 0, live.test.peak?.[1] ?? 0, past?.compile.peak?.[1] ?? 0, past?.test.peak?.[1] ?? 0);
-  const html = `<dd class="program-memory group">
-    <p>Program memory excludes file cache.</p>
-    ${past ? '' : '<p>No past run yet</p>'}
+  const html = tipCellsHtml(groupRows([
+    field('Program memory', 'file cache excluded'), field('Past run', past ? '' : 'none recorded'),
+  ])) + `<dd class="program-memory">
     <div class="program-key"><span>${programSwatch('live')}This run (live)</span><span>${programSwatch('past')}Past run</span></div>
-    ${programMemoryPhase('Compile', live.compile, past?.compile, compileReserve, past?.hana_crate_bands ?? [], past?.hana_compile_ms, memoryMax)}
-    ${programMemoryPhase('Test', live.test, past?.test, testReserve, [], 0, memoryMax)}
-  </dd>`;
+  </dd>` +
+    programMemoryPhase('Compile', live.compile, past?.compile, compileReserve, past?.hana_crate_bands ?? [], past?.hana_compile_ms, memoryMax) +
+    programMemoryPhase('Test', live.test, past?.test, testReserve, [], 0, memoryMax);
   programMemoryMarkup.set(memory, html);
   return html;
 }
@@ -1347,9 +1353,7 @@ function render(d) {
   }
   renderTargets(d.targets || []);
   const shown = shownReading(d), amounts = shown.ram;
-  const alert = [d.mac_idle_alert, reserveAlert(amounts)].filter(Boolean).join("\n");
-  $("mac-idle-alert").textContent = alert;
-  $("mac-idle-alert").hidden = !alert;
+  const {build, system, swap} = shown.reserves;
   const r = d.ram;
   $("ram-missing").textContent = r.missing.length ? `Missing readings: ${r.missing.join("; ")}.` : "";
   $("ram-missing").hidden = !r.missing.length;
@@ -1359,53 +1363,46 @@ function render(d) {
   $("barwrap").hidden = !total;
   $("scale").hidden = !total;
   const parts = [];
-  for (const [key, name, amount] of RAM_BLOCKS) {
+  for (const [key, name, amount, , reserveKey] of RAM_BLOCKS) {
     const bytes = amount(r);
-    const shown = shownBytes(bytes);
-    if (total) setSeg(`s-${key}`, shown, total);
-    $(`s-${key}`).hidden = shown === 0;
-    const amountBytes = amount(amounts);
-    $(`l-${key}`).textContent = f1(shownBytes(amountBytes) / GIB);
-    $(`v-${key}`).textContent = ramAmount(amountBytes);
-    parts.push(`${name} ${ramAmount(amountBytes)}`);
+    const widthBytes = shownBytes(bytes);
+    if (total) setSeg(`s-${key}`, widthBytes, total);
+    $(`s-${key}`).hidden = widthBytes === 0;
+    const text = reserveKey ? shown.reserves[reserveKey].covered : ramAmount(bytes);
+    const label = reserveKey ? text : ramAmount(widthBytes);
+    $(`l-${key}`).textContent = label.split(" ")[0];
+    $(`v-${key}`).textContent = text;
+    parts.push(`${name} ${text}`);
   }
   $("barwrap").setAttribute("aria-label", `RAM ${ramAmount(amounts.total_bytes)}: ${parts.join(", ")}`);
-  const builds = groupBytes(r, "builds"), system = r.safety_covered_bytes + r.swap_covered_bytes;
+  const builds = groupBytes(r, "builds");
   const capMemory = queueCapMemory(shown);
-  for (const [id, bytes] of [["g-builds", capMemory.builds], ["g-free", amounts.available_bytes], ["g-else", legendBytes(amounts, "else")],
-    ["reserved", capMemory.reserved], ["room", capMemory.free],
-    ["system", amounts.safety_covered_bytes + amounts.swap_covered_bytes], ["cap-builds", capMemory.builds], ["cap-reserved", capMemory.reserved], ["cap-room", capMemory.free]]) {
+  for (const [id, bytes] of [["g-builds", capMemory.builds], ["g-free", amounts.available_bytes], ["g-else", amounts.outside_bytes],
+    ["cap-builds", capMemory.builds], ["cap-room", capMemory.free]]) {
     $(`v-${id}`).textContent = ramAmount(bytes);
   }
-  $("v-cap").textContent = !hasCap(d) ? "unavailable" : `${f1(shown.cap)} GiB`;
-  for (const [key, description] of [["build", "Running builds grow into it."],
-    ["safety", "A fixed setting."], ["swap", "RAM held for swap that comes back."]]) {
-    $(key === "build" ? "reserved-note" : `${key}-note`).textContent =
-      reserveDescription(description, amounts[`${key}_target_bytes`], amounts[`${key}_covered_bytes`]);
-  }
+  $("v-cap-reserved").textContent = build.covered;
+  $("v-system").textContent = system.text;
+  $("v-cap").textContent = ramAmount(hasCap(d) ? shown.cap * GIB : null);
   const compressed = recorded(r.compressed_swap_bytes) && r.compressed_swap_bytes > 0;
   $("kernel-note").textContent = compressed ? `Of which compressed swap: ${ramAmount(amounts.compressed_swap_bytes)}.` : "";
   $("kernel-note").hidden = !compressed;
-  $("cap-value").textContent = !hasCap(d) ? "Queue cap unavailable" : `Queue cap ${f1(shown.cap)} GiB`;
+  $("cap-value").textContent = !hasCap(d) ? "Queue cap unavailable" : `Queue cap ${ramAmount(shown.cap * GIB)}`;
   const freeShown = groupBytes(r, "free");
   const capBytes = hasCap(d) ? d.cap * GIB : 0;
-  for (const [id, from, size] of [["builds", 0, builds], ["free", builds, freeShown], ["else", builds + freeShown, groupBytes(r, "else")],
-    ["reserved", builds, r.build_covered_bytes], ["room", builds + r.build_covered_bytes, r.room_bytes],
-    ["system", builds + r.build_covered_bytes + r.room_bytes, system], ["cap", 0, capBytes]]) {
+  const roomAt = builds + build.raw.covered;
+  for (const [id, from, size, label] of [
+    ["builds", 0, builds, ramAmount(capMemory.builds)], ["free", builds, freeShown, ramAmount(amounts.available_bytes)],
+    ["else", builds + freeShown, groupBytes(r, "else"), ramAmount(amounts.outside_bytes)],
+    ["reserved", builds, build.raw.covered, build.covered], ["room", roomAt, r.room_bytes, ramAmount(capMemory.free)],
+    ["system", roomAt + r.room_bytes, system.bytes, system.text], ["cap", 0, capBytes, $("v-cap").textContent]]) {
     const brace = $(`b-${id}`);
     brace.hidden = !total || size <= 0;
     brace.style.left = `${pctOf(from, total)}%`;
     brace.style.width = `${pctOf(size, total)}%`;
-    const amount = ({builds:capMemory.builds,free:amounts.available_bytes,else:legendBytes(amounts,"else"),
-      reserved:capMemory.reserved,room:capMemory.free,system:amounts.safety_covered_bytes+amounts.swap_covered_bytes,
-      cap:shown.cap*GIB})[id];
-    $(`bv-${id}`).textContent = f1(amount / GIB);
+    $(`bv-${id}`).textContent = label.split(" ")[0];
   }
-  for (const [key, , id] of RESERVES) {
-    const short = amounts[`${key}_missing_bytes`] > 0;
-    $(id).classList.toggle("short-reserve", short);
-    if (short) $(id).hidden = false;
-  }
+  renderReserveStatus(shown, d.mac_idle_alert);
 
   const [roomValue, roomUnit] = ramAmount(capMemory.free).split(" ");
   $("room").textContent = roomValue;
@@ -1415,7 +1412,7 @@ function render(d) {
   $("room-why").hidden = !why;
   $("last-reading").textContent = d.read_error ? `Last reading: ${new Date(d.read_at * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})}` : "";
   $("last-reading").hidden = !d.read_error;
-  $("swap-reserve").textContent = `Swap coming back: ${ramAmount(amounts.swap_covered_bytes)}`;
+  $("swap-reserve").textContent = `Swap coming back: ${swap.covered}`;
   $("cap-reason").textContent = hasCap(d) ? "" : d.cap_text;
   latest = d;
   setTimeout(fitLabels, 650);
@@ -1569,16 +1566,14 @@ function rowAdd(name) {
   return `<button type="button" class="row-add" aria-label="New item for ${esc(name)}"><svg class="lucide lucide-plus" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M5 12h14"/><path d="M12 5v14"/></svg></button>`;
 }
 function buildStepEvidence(key, data, row, cells, tooltip, limits) {
-  const shown = shownReading(data);
-  const memory = queueCapMemory(shown);
-  const gib = bytes => recorded(bytes) ? shownBytes(bytes) / GIB : null;
+  const gib = bytes => recorded(bytes) ? bytes / GIB : null;
   const clip = (text, limit) => text.length <= limit ? text : [...text].slice(0, limit).join('');
   const trace = row.program_memory;
   const programRows = trace ? [
     ['Compile', programValues(trace.live.compile, trace.past?.compile,
       trace.past?.hana_crate_bands?.length ? trace.past.hana_compile_ms : null)],
     ['Test', programValues(trace.live.test, trace.past?.test)],
-  ].flatMap(([phase, values]) => groupRows(values.map(([, label, value]) => field(`${phase} · ${label}`, value)))) : [];
+  ].flatMap(([phase, values]) => groupRows(values.map(([label, value]) => field(`${phase} · ${label}`, value)))) : [];
   const clippedTip = [...tooltip.slice(0, limits.tipEntries + 1 - programRows.length), ...programRows].map((entry, index) => {
     const label = clip(entry.label, index ? limits.label : limits.title);
     const value = clip(entry.value, index ? limits.text : limits.title);
@@ -1592,9 +1587,9 @@ function buildStepEvidence(key, data, row, cells, tooltip, limits) {
     title: clip(row.name, limits.title), owner: clip(rowOwner(row, key.startsWith('wait:')), limits.title),
     cells: cells.map(cell => ({label: clip(cell.label, limits.label), value: clip(cell.value, limits.text)})),
     memory: {
-      free_for_next_gib: gib(memory.free), queue_cap_gib: hasCap(shown) ? shown.cap : null,
+      free_for_next_gib: gib(data.ram.room_bytes), queue_cap_gib: hasCap(data) ? data.cap : null,
       segments: RAM_BLOCKS.flatMap(([block, label, amount, group]) => {
-        const value = gib(amount(shown.ram));
+        const value = gib(amount(data.ram));
         const tone = block === 'tools' ? 'tools' : group === 'builds' || block === 'reserved' ? 'build'
           : block === 'room' ? 'free' : group === 'free' ? 'system' : 'other';
         return value > 0 ? [{label, gib: value, tone}] : [];
@@ -1654,7 +1649,7 @@ function renderWalk(d) {
     : `Queued, ${units.join(" followed by ")} and then in submission order`;
   const titleHtml = !units.length ? esc(title) : units.length === 1 ? `Queued, ${roleName(units[0])} first, then in submission order`
     : `Queued, ${units.map(unit=>roleName(unit)).join(' followed by ')} and then in submission order`;
-  rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}"><span>${titleHtml}</span><span> (${waitingCount})</span></span></div>`);
+  rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" data-tip="queuehead"><span>${titleHtml}</span><span> (${waitingCount})</span></span></div>`);
   let localPosition = 0;
   d.waiters.forEach((w, i) => {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
@@ -1680,10 +1675,10 @@ function renderWalk(d) {
   $("ticks").style.width = `${axisEnd / scale * 100}%`;
   $("ticks").innerHTML = lowerTicks.join("");
   $("ticks-top").innerHTML = ticks.join("");
-  const shown = shownReading(d), overCap = overCapBytes(shown);
-  $("walk-sum").textContent = !hasCap(d) ? `${f1(shown.taken)} GiB taken · cap unavailable`
-    : `${f1(claimedGib(shown))} of ${f1(shown.cap)} GiB taken${overCap > 0 ? ` · ${ramAmount(overCap)} over cap` : ""}`;
-  $("walk-sum").classList.toggle("over-cap", overCap > 0);
+  const shown = shownReading(d);
+  $("walk-sum").textContent = !hasCap(d) ? `${ramAmount(shown.ram.builds_bytes + shown.reserves.build.raw.covered)} taken · cap unavailable`
+    : `${ramAmount(claimedBytes(shown)).split(" ")[0]} of ${ramAmount(shown.cap * GIB)} taken${shown.overCapBytes > 0 ? ` · ${ramAmount(shown.overCapBytes)} over cap` : ""}`;
+  $("walk-sum").classList.toggle("over-cap", shown.overCapBytes > 0);
   $("walk-tokens").innerHTML = tokenPoolRows(d.tokens).map(row => `<dt>${esc(row.label)}</dt><dd>${esc(row.value)}</dd>`).join('');
   fitLabels();
 }
@@ -1783,10 +1778,11 @@ function fitWalkDetails() {
   measureColumn("machine");
   context.font = canvasFont(walk.querySelector(".amounts"));
   const amountGroups = latest.walk.filter(row => row.kind !== "cloud" && (row.queued || row.ci || row.kind === "mac-build"))
-    .map(row => [useValue(row), row.reserved].filter(value => value > 0));
-  amountGroups.push([latest.room], [latest.ram.build_tools_bytes / GIB], ...latest.waiters.filter(row => row.kind !== "cloud").map(row => [row.need]));
-  const amountWidth = Math.max(...amountGroups.map(values => values.reduce((sum, value) =>
-    sum + context.measureText(memoryAmount(value)).width, 0) + LABEL_GAP * Math.max(0, values.length - 1)));
+    .map(row => [useValue(row) > 0 ? memoryAmount(row.used) : "", row.reserved > 0 ? stepReserve(row).text : ""].filter(Boolean));
+  amountGroups.push([memoryAmount(latest.room)], [memoryAmount(latest.ram.build_tools_bytes / GIB)],
+    ...latest.waiters.filter(row => row.kind !== "cloud").map(row => [memoryAmount(row.need)]));
+  const amountWidth = Math.max(...amountGroups.map(labels => labels.reduce((sum, label) =>
+    sum + context.measureText(label).width, 0) + LABEL_GAP * Math.max(0, labels.length - 1)));
   // A cloud status shows before the cap on one or two lines, so it never wraps one letter to a line.
   const statusWidth = Math.max(0, ...[...walk.querySelectorAll(".cloud-status .amounts")].map(status => {
     context.font = canvasFont(status);
@@ -1921,7 +1917,7 @@ function placeMemoryBars(d) {
       const drawnUse = useWidth > 0 ? Math.max(3, useWidth) : 0;
       bars = capBox(usedAt, drawnUse, "seg-used") + capBox(reservedAt, reserveWidth, "hatch");
       if (recorded(run.used) && run.used > 0) amounts.push({kind: "used-amount", left: usedAt, value: amount.used});
-      if (run.reserved > 0) amounts.push({kind: "reserved-amount", left: reservedAt, value: amount.reserved});
+      if (run.reserved > 0) amounts.push({kind: "reserved-amount", left: reservedAt, text: stepReserve(run).text});
       usedAt += useWidth;
       reservedAt += reserveWidth;
     }

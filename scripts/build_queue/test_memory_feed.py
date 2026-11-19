@@ -252,7 +252,7 @@ class MemoryFeedTests(unittest.TestCase):
         cut = "1763270010.000000 natedev steve[1304]: steve: currently 26 tokens available out of 31\n"
         self.assertEqual(memory_feed.token_holders(complete + cut), memory_feed.TokenHolders({50: 6}))
         self.assertEqual(memory_feed.token_holders(cut + "1763270010.000001 natedev steve[1304]:   PID 60 holds 3 tokens:\n"),
-                         memory_feed.TokenHoldersUnknown("Each steve token dump in the journal window was incomplete."))
+                         memory_feed.TokenHoldersUnknown("incomplete steve token dumps"))
         self.assertEqual(memory_feed.token_holders("1763270000.0 natedev steve[1304]: steve: currently 31 tokens available out of 31\n"),
                          memory_feed.TokenHolders({}))
 
@@ -1553,8 +1553,8 @@ process.stdout.write(JSON.stringify({
 
         names = read_step_names()
         notes = memory_feed.job_notes(StepJob("test-all"), "builder", names)
-        self.assertEqual(notes.get("about_parts"), [{"kind": "text", "text": "Tests every module of "},
-            {"kind": "staff", "text": "builder"}, {"kind": "text", "text": "."}])
+        self.assertEqual(notes.get("about_parts"), [{"kind": "text", "text": "tests every module of "},
+            {"kind": "staff", "text": "builder"}])
         self.assertEqual(staff_names.parts_text(notes.get("about_parts", [])), notes.get("about"))
         routes = target_availability.MacRoutes((snapshot(MAC, MAC_BLOCK),),
             {"mac-session": unit_labels.UnitLabels("helper", "hana", "builder")}, UTC)
@@ -2684,7 +2684,7 @@ process.stdout.write(JSON.stringify({
                         self.assertEqual(row["title"]["step"], named or "devtools")
                         self.assertEqual(staff_names.parts_text(row.get("name_parts", [])), row["name"])
                         about = names.about(job, "devtools") if isinstance(job, StepJob) else ""
-                        self.assertEqual(row.get("about", ""), about)
+                        self.assertEqual(row.get("about", ""), about[:1].lower() + about[1:].rstrip("."))
                         self.assertEqual(row.get("changes", ""), names.changes(job) if isinstance(job, StepJob) else "")
 
         copied = ("python3", "/repo/scripts/copies/copies.py", "run", "--repo=/repo", "--",
@@ -2695,14 +2695,14 @@ process.stdout.write(JSON.stringify({
         for row in (local, waiting):
             self.assertIn(row["title"]["step"], approved)
             self.assertEqual(row["name"], "devtools test all")
-            self.assertEqual(row.get("about"), "Tests every module of devtools.")
+            self.assertEqual(row.get("about"), "tests every module of devtools")
 
         page = self.gate_job_page("merge-gate", (), job=StepJob("test-all"))
         local, = [row for row in page["walk"] if row.get("queued")]
         waiting, = [row for row in page["waiters"] if not row.get("kind")]
         for row in (local, waiting):
             self.assertEqual(row["name"], "devtools test all")
-            self.assertEqual(row.get("about"), "Tests every module of devtools.")
+            self.assertEqual(row.get("about"), "tests every module of devtools")
 
         source = Path("/repo/devtools")
         caller = SlotCaller("director", "sdlc", source, copied[6:], "test-all")
@@ -2735,8 +2735,8 @@ process.stdout.write(JSON.stringify({
         from scripts.aws_target.aws_trial import PAIRED_TRIAL_JOB
 
         for unit_known, name, about in (
-            (True, "devtools test named", "Tests 1 named modules of devtools."),
-            (False, "test named", "Tests 1 named modules."),
+            (True, "devtools test named", "tests 1 named modules of devtools"),
+            (False, "test named", "tests 1 named modules"),
         ):
             with self.subTest(paired_trial_unit_known=unit_known):
                 trial = self.gate_job_page(PAIRED_TRIAL_JOB.step, (), unit_known=unit_known, job=PAIRED_TRIAL_JOB)
@@ -2757,7 +2757,7 @@ process.stdout.write(JSON.stringify({
         page = self.gate_job_page("merge-gate", ("python3", "scripts/production/merge_gate.py", "--tests-only", "--full"))
         row, = [row for row in page["walk"] if row.get("kind") == "cloud"]
         self.assertEqual(row["name"], "devtools test all")
-        self.assertEqual(row.get("about"), "Tests every module of devtools.")
+        self.assertEqual(row.get("about"), "tests every module of devtools")
         self.assertEqual(row.get("changes"), "no branch")
 
     def owner_machine_page(self, owner: unit_labels.UnitLabels, *, ci: bool = False) -> memory_feed.MemoryPage:

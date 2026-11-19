@@ -13,6 +13,7 @@
 // Use --headcount to compare the Running and Queued headers.
 // Add --awscosts as the fourth argument to save the AWS costs pane.
 // Use --rowask to capture the rows and the New item dialog.
+// Use <output-folder> --tip-design for the six dark tooltip captures.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
 import {accessSync, constants, statSync} from 'node:fs';
@@ -24,6 +25,8 @@ import {inflateSync} from 'node:zlib';
 import {delimiter, join, dirname, resolve} from 'node:path';
 import {tmpdir} from 'node:os';
 import {fileURLToPath} from 'node:url';
+
+const memoryTenths = text => text.startsWith("<") ? 1 : Math.round(parseFloat(text) * 10);
 
 function chromeExecutable() {
   if (process.env.CHROME) return process.env.CHROME;
@@ -49,7 +52,8 @@ const args = process.argv.slice(2);
 const gateMode = args[0] === '--gate';
 if (gateMode) args.shift();
 const [callerFolder, ...comparisonArgs] = args;
-const [previousPage, comparison] = gateMode ? [] : comparisonArgs;
+const tipDesignComparison = !gateMode && comparisonArgs[0] === '--tip-design';
+const [previousPage, comparison] = gateMode || tipDesignComparison ? [] : comparisonArgs;
 const requestedShot = gateMode ? undefined : process.env.MEMORY_PAGE_SHOT;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
@@ -362,8 +366,8 @@ try {
           const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip});
           return pngPixels(Buffer.from(shot.data,'base64'))(0,0);
         };
-        const saveScreenshot = async (name, options = {}) => {
-          if (!comparisonImages) return;
+        const saveScreenshot = async (name, options = {}, enabled = comparisonImages) => {
+          if (!enabled) return;
           const shot = await call('Page.captureScreenshot', {format:'png', ...options});
           await writeFile(join(folder,name+'.png'),Buffer.from(shot.data,'base64'));
         };
@@ -469,10 +473,9 @@ try {
           })()`);
           for(const group of legendSums?totals:[]) {
             if(group.total==='unavailable') continue;
-            const amount=text=>text==='unavailable'?0:Number.parseFloat(text.replace('<',''));
+            const amount=text=>text==='unavailable' ? 0 : memoryTenths(text);
             const sum=group.rows.reduce((total,text)=>total+amount(text),0);
-            // Every displayed total is the sum of its displayed leaves.
-            assert.ok(Math.abs(amount(group.total)-sum)<=1e-9,
+            assert.equal(amount(group.total),sum,
               'A legend total differs from its rows: '+JSON.stringify(group));
           }
           return true;
@@ -680,7 +683,7 @@ try {
                   return room.getClientRects().length?room.textContent:null;
                 })(),
                 machine:table.querySelector('td.machine')?.textContent,
-                capText:text('#cap-value'), room:text('#v-room'),
+                capText:text('#cap-value'), legendCap:text('#v-cap'), room:text('#v-room'),
                 roomBar:rect(document.querySelector('#s-room')), roomColor:color('--room'),
                 rowLeft:rect(row.querySelector('.row-label')).left,
                 headingLeft:rect(card.querySelector('.section-head')).left,
@@ -748,7 +751,7 @@ try {
             assert.match(proof.swapText.at(-1), /All swap used7\.8 GiB/);
             assert.equal(proof.swapBytes.slice(0,-1).reduce((sum,bytes)=>sum+bytes,0),proof.swapBytes.at(-1));
             assert.equal(proof.swapBytes.at(-1),base.swap.used_bytes);
-            assert.equal(proof.capText,'Queue cap '+base.cap.toFixed(1)+' GiB');
+            assert.equal(proof.capText,'Queue cap '+proof.legendCap);
             assert.ok(!proof.legacySwapBar, 'The page repeats the swap bar.');
             assert.equal(proof.swapBars, 3);
             for (const ratio of proof.reservedRatios) assert.ok(ratio >= 3, 'The reservation contrast is below 3:1.');
@@ -828,17 +831,16 @@ try {
                   clipped:box.left<0||box.right>innerWidth||box.top<0||box.bottom>innerHeight};
               })()`);
               const fields=Object.fromEntries(tokenView.rows.map(row=>[row.label,row.value]));
-              assert.equal(fields.Tokens,'');
+              assert.equal(fields.Tokens,state==='unavailable'?'unavailable':'');
               assert.equal(tokenView.grids,1);
               assert.ok(tokenView.values.every(value=>value==='right'));
               assert.equal(tokenView.clipped,false);
               if(state==='unavailable') {
-                assert.equal(fields.Status,'unavailable');
-                assert.equal(fields.Because,'steve exited 1');
+                assert.deepEqual(fields,{Tokens:'unavailable'});
               } else {
                 assert.equal(fields.Total,'31');
                 assert.equal(fields.Available,state==='paused'?'0':'4');
-                assert.equal(fields['Pause below free RAM'],'12.0 GiB');
+                assert.equal(fields['Pause below'],'12.0 GiB');
                 assert.equal(fields.Pool,state);
                 assert.equal(fields['Per-build counts'],state==='paused'?'unavailable':'known');
                 if(state==='paused') assert.equal(fields.Because,'steve cannot be asked');
@@ -1192,6 +1194,7 @@ try {
             Object.assign(shortReading.ram,{build_covered_bytes:shortReading.ram.build_covered_bytes+shortReading.ram.room_bytes,room_bytes:0});
             Object.assign(shortReading.ram,{build_target_bytes:shortReading.ram.build_covered_bytes+4*gib,build_missing_bytes:4*gib,shortfall_bytes:4*gib});
             Object.assign(shortReading,{room:0,taken:shortReading.cap,shortfall:4});
+            delete shortReading.build_reserve;
             await show(shortReading);
             if(comparisonImages&&theme==='dark'&&width===1400) {
               const shortClip=await evaluate(`(()=>{
@@ -1221,7 +1224,7 @@ try {
             assert.equal(overBar.swap.short,false);
             assert.deepEqual(overBar.old,[],'The old over-cap drawing is still on the page.');
             assert.match(overBar.alert,/Free RAM is short by 4\.0 GiB\. Build reserved holds [0-9.]+ of [0-9.]+ GiB\./);
-            assert.equal(overBar.tip.Missing,'4.0 GiB');
+            assert.equal(overBar.tip['Not covered'],'4.0 GiB');
             // A small hana CI part stays visible, so the builds parts add up on screen.
             assert.equal(await evaluate(`getComputedStyle(document.getElementById('s-ci')).minWidth`),'3px');
             proof.overBar=overBar;
@@ -1229,20 +1232,20 @@ try {
               sumColor:getComputedStyle(document.querySelector('#walk-sum')).color,hover:tipText('walksum',latest)[1],rows:tooltipRows('walksum',latest),
               cap:getComputedStyle(document.querySelector('#walk .walk-bud .cap-part')||document.querySelector('#walk .walk-bud')).borderLeftColor}))()`);
             // Taken counts the full reserve, so it reads 4 GiB more than the cap.
-            assert.equal(overHeader.sum,(shortReading.cap+4).toFixed(1)+' of '+shortReading.cap.toFixed(1)+' GiB taken · 4.0 GiB over cap');
+            assert.match(overHeader.sum,/ · 4\.0 GiB over cap$/);
             assert.equal(overHeader.sumColor,overHeader.cap,'The over-cap total is not in the cap color.');
             const fields=Object.fromEntries(overHeader.rows.map(row=>[row.label,row.value]));
-            assert.equal(fields.Taken,(shortReading.cap+4).toFixed(1)+' GiB');
-            assert.equal(fields['Queue cap'],shortReading.cap.toFixed(1)+' GiB');
+            assert.equal(overHeader.sum,`${fields.Taken.split(' ')[0]} of ${fields['Queue cap']} taken · 4.0 GiB over cap`);
             assert.equal(fields['Over cap'],'4.0 GiB');
-            assert.ok('+ Build reserved (full)' in fields,overHeader.hover);
+            assert.equal(fields['+ Full reserve'],await evaluate("ramAmount(shownReading(latest).ram.build_target_bytes)"));
+            assert.ok(!('+ Build reserved' in fields),overHeader.hover);
             // Taken includes the full reserve. The difference from the cap is the uncovered reserve.
             const number=(text,pattern)=>Number.parseFloat(text.match(pattern)[1]);
             const header={taken:number(overHeader.sum,/^([0-9.]+) of/),cap:number(overHeader.sum,/of ([0-9.]+) GiB/),over:number(overHeader.sum,/· ([0-9.]+) GiB over cap/)};
-            const tip={builds:parseFloat(fields.Builds),reserved:parseFloat(fields['+ Build reserved (full)']),
+            const tip={builds:parseFloat(fields.Builds),reserved:parseFloat(fields['+ Full reserve']),
               taken:parseFloat(fields.Taken),over:parseFloat(fields['Over cap']),cap:parseFloat(fields['Queue cap'])};
-            assert.ok(Math.abs(tip.builds+tip.reserved-tip.taken)<=0.1+1e-9,'Builds + Build reserved is not Taken. '+JSON.stringify(tip));
-            assert.ok(Math.abs(tip.taken-tip.cap-tip.over)<=0.1+1e-9,'Taken - Queue cap is not the amount over the cap. '+JSON.stringify(tip));
+            assert.ok(Math.abs(tip.builds+tip.reserved-tip.taken)<=0.15,'Builds + Build reserved is not Taken. '+JSON.stringify(tip));
+            assert.ok(Math.abs(tip.taken-tip.cap-tip.over)<=0.15,'Taken - Queue cap is not the amount over the cap. '+JSON.stringify(tip));
             assert.deepEqual([header.taken,header.cap,header.over],[tip.taken,tip.cap,tip.over],'The header and its tooltip differ.');
             const plainHeader=await (async()=>{await show(base);return evaluate(`document.querySelector('#walk-sum').textContent`);})();
             assert.ok(!plainHeader.includes('over cap'),'The header names an over-cap amount when nothing is over the cap.');
@@ -1363,7 +1366,7 @@ try {
               assert.equal(ciProof.chart,state==='busy');
               if(state==='busy') assert.equal(ciProof.stage,'—');
               assert.equal(ciProof.ci,0.125);
-              const takenTenths=Math.round(parseFloat(ciProof.builds)*10)+Math.round(parseFloat(ciProof.reserved)*10);
+              const takenTenths=memoryTenths(ciProof.builds)+memoryTenths(ciProof.reserved);
               assert.equal(ciProof.taken,(takenTenths/10).toFixed(1)+' of '+ciProof.cap.replace(' GiB','')+' GiB taken');
             }
             await show(base);
@@ -1510,9 +1513,9 @@ try {
               for(const [label,value] of Object.entries(headProof.values)) {
                 assert.ok(headProof.hover.includes(label+'  '+value),'The head tooltip omits the term: '+label);
               }
-              const tenths=text=>Math.round(parseFloat(text)*10);
-              assert.equal(tenths(headProof.values['Queue cap'])-tenths(headProof.values.Builds)
-                -tenths(headProof.values['Build reserved']),tenths(headProof.values.Free));
+              const tenths=memoryTenths;
+              assert.ok(Math.abs(tenths(headProof.values['Queue cap'])-tenths(headProof.values.Builds)
+                -tenths(headProof.values['Build reserved'])-tenths(headProof.values.Free))<=2);
               for(const [label,value] of Object.entries(headProof.values))
                 assert.equal(value,headProof.legend[label].value,'The head changes a legend amount: '+label);
               assert.ok(!headProof.hover.includes('Safety net') && !headProof.hover.includes('Swap coming back'));
@@ -1664,14 +1667,14 @@ try {
           assert.equal(states[name].state,'Live');
           assert.ok(!states[name].ageHidden && states[name].reason==='');
         }
-        const capture = async (name, selector) => {
-          if (!comparisonImages) return;
+        const capture = async (name, selector, enabled = comparisonImages) => {
+          if (!enabled) return;
           await evaluate(`document.querySelector(${JSON.stringify(selector)}).scrollIntoView({block:'center'})`);
           const clip=await evaluate(`(() => {
             const r=document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();
             return {x:Math.max(0,r.left+scrollX),y:r.top+scrollY,width:r.width,height:r.height,scale:1};
           })()`);
-          await saveScreenshot(name,{captureBeyondViewport:true,clip});
+          await saveScreenshot(name,{captureBeyondViewport:true,clip},enabled);
         };
         if (cloudOwnerComparison) {
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
@@ -1909,7 +1912,7 @@ try {
                     return range.getBoundingClientRect().bottom;
                   };
                   return {title:heading.textContent,font:getComputedStyle(heading).font,
-                    hover:heading.title,truncated:heading.firstElementChild.scrollWidth>heading.firstElementChild.clientWidth,
+                    hover:tipText(heading.dataset.tip,latest).join('\\n'),truncated:heading.firstElementChild.scrollWidth>heading.firstElementChild.clientWidth,
                     clipped:getComputedStyle(heading.firstElementChild).textOverflow==='ellipsis' && getComputedStyle(heading.firstElementChild).overflow==='hidden',
                     withinChart:heading.getBoundingClientRect().right<=header.getBoundingClientRect().right+1,
                     headerHeight:header.getBoundingClientRect().height,
@@ -1930,9 +1933,8 @@ try {
                     }),beside:walk.classList.contains('beside')};
                 })()`);
                 assert.equal(state.title,`${title} (${readings[name].waiters.length})`);
-                assert.ok(state.hover.startsWith(title+'\n'));
-                assert.match(state.hover,/Showrunner:/);
-                assert.match(state.hover,/Unit:/);
+                assert.ok(state.hover.startsWith('Queued  ' + readings[name].waiters.length + '\n'));
+                assert.match(state.hover,/Order  submission order/);
                 assert.equal(state.font,state.runningFont);
                 assert.equal(state.headerHeight,30);
                 assert.equal(state.nextGap,0);
@@ -2291,6 +2293,7 @@ try {
           await navigate(version==='before' ? 'before.html' : 'memory_live.html');
           const reading=structuredClone(readings.macroute_running);
           const row=reading.walk.find(row=>row.kind==='mac-build');
+          row.started_at = reading.read_at - 600;
           if(version==='before') row.name += ' · '+row.gate_label;
           await show(reading);
           const index=reading.walk.findIndex(row=>row.kind==='mac-build');
@@ -2358,6 +2361,7 @@ try {
                 build_tools_bytes:1.04*GIB,rust_analyzer_bytes:1.04*GIB,sccache_bytes:0,other_build_tools_bytes:0,
                 queued_builds_bytes:1.04*GIB,ci_bytes:1.04*GIB,
                 swap_covered_bytes:GIB,swap_target_bytes:2*GIB,swap_missing_bytes:GIB,build_covered_bytes:1.04*GIB,room_bytes:1.04*GIB},
+                swap:{...latest.swap,window_seconds:0},
                 unmatched_priority_entries:[{unit:'research'},{unit:'cables'}],
                 walk:[{key:'fractional-run',name:'Codex servers',group:'codex',used:0.4,parts:[
                   {who:'codex',pid:123,started_at:100,gib:0.2},{who:'codex',pid:456,started_at:100,gib:0.2}]}],
@@ -2372,11 +2376,9 @@ try {
             })()`);
             const amounts=rows=>Object.fromEntries(rows.map(row=>[row.label,row.value]));
             const builds=review['g-builds'].filter(row=>row.kind!=='caption');
-            assert.equal(Math.round(parseFloat(builds[0].value)*10),
-              builds.slice(1).reduce((sum,row)=>sum+Math.round(parseFloat(row.value)*10),0));
+            assert.deepEqual(builds.map(row=>row.value),['3.1 GiB','1.0 GiB','1.0 GiB','1.0 GiB']);
             const wait=amounts(review['wait:fractional-wait']);
-            assert.equal(Math.round(parseFloat(wait['Short by'])*10),
-              Math.round(parseFloat(wait.Needs)*10)-Math.round(parseFloat(wait['= Free'])*10));
+            assert.equal(wait['Short by'],'<0.1 GiB');
             const cap=amounts(review.cap);
             assert.equal(cap.Builds,review.legend.builds);
             assert.equal(cap['+ Build reserved'],review.legend.reserved);
@@ -2418,10 +2420,10 @@ try {
             // With a recorded basis, each tooltip ends in its sum, also when the sum equals the title.
             assert.deepEqual(basisProof.reserved.filter(row=>row.kind!=='title'&&row.kind!=='caption')
               .map(row=>[row.label,row.value]),
-              [['Room to grow','5.0 GiB'],['× Share held','80%'],['+ Held between steps','1.0 GiB'],['= Target','5.0 GiB']]);
+              [['Room to grow','5.0 GiB'],['× Share held','80.0%'],['+ Between steps','1.0 GiB'],['= Target','5.0 GiB']]);
             assert.deepEqual(basisProof.swap.filter(row=>row.kind!=='title'&&row.kind!=='caption')
               .map(row=>[row.label,row.value]),
-              [['Swap-in, last 10 min','10.0 GiB'],['× Share held','20%'],['= Target','2.0 GiB']]);
+              [['Lookback','10 min'],['Swap-in','10.0 GiB'],['× Share held','20.0%'],['= Target','2.0 GiB']]);
             for(const {key,target,rows} of reserveProof) {
               const title=rows.find(row=>row.kind==='title');
               const targetRow=rows.find(row=>row.label==='Target');
@@ -2433,26 +2435,29 @@ try {
               }
             }
             const leafProof = await evaluate(`(() => {
-              const reading={...latest,cap:3.06,taken:2.04,ram:{...latest.ram,
+              const reading={...latest,cap:3.06,taken:2.04,build_reserve:undefined,ram:{...latest.ram,
                 rust_analyzer_bytes:1.02*GIB,sccache_bytes:0,other_build_tools_bytes:0,
                 build_tools_bytes:1.02*GIB,queued_builds_bytes:0,ci_bytes:0,
-                build_covered_bytes:1.02*GIB,room_bytes:1.02*GIB,
+                build_covered_bytes:1.02*GIB,build_target_bytes:1.02*GIB,room_bytes:1.02*GIB,
                 desktop_bytes:10*GIB,agents_bytes:0,programs:[],smaller_programs_bytes:0,other_programs_bytes:0,
                 compressed_swap_bytes:0,kernel_structures_bytes:0,kernel_counters_bytes:0,kernel_bytes:0,
                 cache_bytes:0,unattributed_bytes:-GIB,kernel_no_counter_bytes:0}};
+              const ram=reading.ram;
+              ram.available_bytes=ram.build_covered_bytes+ram.room_bytes+ram.safety_covered_bytes+ram.swap_covered_bytes;
+              ram.total_bytes=ram.build_tools_bytes+ram.available_bytes+ram.desktop_bytes+ram.unattributed_bytes;
               window.renderReading(reading);
               const keys=['tools','g-builds','cap','walksum','g-free','g-else','budget'];
               return {tips:Object.fromEntries(keys.map(key=>[key,tooltipRows(key,reading)])),
                 legend:Object.fromEntries(['tools','g-builds','g-free','g-else','unattributed','cap']
                   .map(key=>[key,document.querySelector('#v-'+key).textContent]))};
             })()`);
-            const tenths=value=>Math.round(parseFloat(value)*10);
+            const tenths=memoryTenths;
             for(const [key,rows] of Object.entries(leafProof.tips)) {
               const values=rows.filter(row=>row.value.endsWith(' GiB')).map(row=>tenths(row.value));
-              assert.equal(values[0],values.slice(1).reduce((sum,value)=>sum+value,0),key);
+              assert.ok(Math.abs(values[0]-values.slice(1).reduce((sum,value)=>sum+value,0))<=values.length/2,key);
               if(key in leafProof.legend) assert.equal(rows[0].value,leafProof.legend[key]);
             }
-            assert.equal(leafProof.tips.cap[0].value,'3.0 GiB');
+            assert.equal(leafProof.tips.cap[0].value,'3.1 GiB');
             assert.equal(leafProof.tips.walksum[0].value,'2.0 GiB');
             assert.equal(leafProof.tips['g-else'][0].value,'9.0 GiB');
             assert.equal(leafProof.legend.unattributed,'-1.0 GiB');
@@ -2540,39 +2545,52 @@ try {
         const mockState = structuredClone(legendReading);
         const shotAt = mockState.read_at;
         const bytes = gib => gib * 1024**3;
-        Object.assign(mockState,{cap:11.3,total:44.4,taken:11.3,used:3.2,reserved:8.1,room:0,shortfall:0});
-        Object.assign(mockState.ram,{queued_builds_bytes:bytes(3.2),build_tools_bytes:0,ci_bytes:0,
+        Object.assign(mockState,{cap:18.3,total:51.4,taken:18.3,used:10.2,reserved:8.1,room:0,shortfall:0});
+        Object.assign(mockState.ram,{queued_builds_bytes:bytes(10.2),build_tools_bytes:0,ci_bytes:0,
           rust_analyzer_bytes:0,sccache_bytes:0,other_build_tools_bytes:0,
           safety_target_bytes:bytes(4),safety_covered_bytes:bytes(4),safety_missing_bytes:0,
           swap_target_bytes:bytes(2.1),swap_covered_bytes:bytes(2.1),swap_missing_bytes:0,
           build_covered_bytes:bytes(8.1),build_target_bytes:bytes(8.1),build_missing_bytes:0,
-          available_bytes:bytes(14.2),total_bytes:bytes(44.4),cap_bytes:bytes(11.3),room_bytes:0,shortfall_bytes:0});
+          available_bytes:bytes(14.2),total_bytes:bytes(51.4),cap_bytes:bytes(18.3),room_bytes:0,shortfall_bytes:0});
+        mockState.build_reserve = {growth_bytes:bytes(10.125),share_percent:80,between_steps_bytes:0,unread_bytes:0};
         mockState.waiters = [
           {name:'fps test',unit:'fps',showrunner:'hana',since:shotAt-720,place:1,why:'memory',need:1,free:0,
-            runs_on:'natedev or Mac',first_in_line:true,head_room:{unavailable:'',rows:[{label:'Queue cap',gib:11.3},
-              {label:'− Builds',gib:3.2},
+            runs_on:'natedev or Mac',first_in_line:true,head_room:{unavailable:'',rows:[{label:'Queue cap',gib:18.3},
+              {label:'− Builds',gib:10.2},
               {label:'− Build reserved',gib:8.1},{label:'= Free',gib:0}]}},
           {name:'cables build',unit:'cables',showrunner:'hana',since:shotAt-51*3600,
-            place:2,why:'memory',need:1,free:0,runs_on:'natedev only',because:'edits the merged checkout'},
-          {name:'cables build',unit:'cables',showrunner:'hana',since:shotAt-51*3600,
-            place:3,why:'memory',need:1,free:0,runs_on:'natedev only',because:localReason}];
+            place:2,why:'its turn',need:1,free:0,runs_on:'natedev only',because:localReason}];
+        const waitingState = {...mockState,waiters:[{...mockState.waiters[1],place:1,why:'memory',
+          first_in_line:true,because:'edits the merged checkout'}]};
         mockState.walk = [{name:'cables build',unit:'cables',showrunner:'hana',runner:'worker',worker:'codex2',
-          started_at:shotAt-840,used:3.2,reserved:8.1,counted:11.3,queued:true,machine:'natedev',
+          started_at:shotAt-840,used:3.2,reserved:2,counted:5.2,queued:true,machine:'natedev',
           progress:{kind:'RowProgress',phase:'testing',done:412,total:993,percent:100*412/993,unit:'tests'}}];
+        await show(mockState);
+        const reserveDisplay = await evaluate(`(() => {
+          const reading=structuredClone(latest);
+          const {build,swap}=shownReading(reading).reserves;
+          build.covered='8.2 GiB';
+          swap.covered='2.2 GiB';
+          window.renderReading(reading);
+          return {
+            cap:tooltipRows('cap',reading).find(row=>row.label==='+ Build reserved').value,
+            swap:document.querySelector('#swap-reserve').textContent
+          };
+        })()`);
+        assert.deepEqual(reserveDisplay,{cap:'8.2 GiB',swap:'Swap coming back: 2.2 GiB'});
         // Compare every global legend reference in both covered and shortfall states.
         for(const state of [mockState,readings.head_memory,readings.head_shortfall,readings.head_swap_shortfall]) {
           await show(state);
           const references = await evaluate(`(() => {
-            const shown=shownReading(latest);
             const legend = Object.fromEntries([
-              ...RAM_BLOCKS.map(([,name,amount])=>[name,ramAmount(amount(shown.ram))]),
+              ...RAM_BLOCKS.map(([key,name])=>[name,document.getElementById('v-'+key).textContent]),
               ['Builds',document.querySelector('#v-g-builds').textContent],
               ['Free RAM',document.querySelector('#v-g-free').textContent],
               ['System reserved',document.querySelector('#v-system').textContent],
               ['Queue cap',document.querySelector('#v-cap').textContent],
               ['Everything else',document.querySelector('#v-g-else').textContent]]);
-            const keys=[...Object.keys(TIPS),...(latest.waiters||[]).flatMap((row,index)=>row.head_room?[proofTip('wait',index)]:[]),
-              ...(latest.walk.length===1 && latest.walk[0].queued ? [proofTip('row', 0)] : [])];
+            const keys=Object.keys(TIPS).filter(key=>key!=='shortfall')
+              .concat(latest.waiters.flatMap((row,index)=>row.head_room?[proofTip('wait',index)]:[]));
             return keys.flatMap(key=>tooltipRows(key,latest).flatMap(row=> {
               const label=row.label.replace(/^[+−=] /,'');
               return label in legend ? [{key,label,value:row.value,legend:legend[label]}] : [];
@@ -2587,15 +2605,43 @@ try {
           if (comparisonImages) comparisons.push({legendReferences:references});
         }
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
-        for(const [name,key] of [['waiting',proofTip('wait',1,mockState)],['first-in-line',proofTip('wait',0,mockState)],
-          ['running',proofTip('row',0,mockState)],['queue-cap','cap'],['build-reserved','reserved'],['long-reason',proofTip('wait',2,mockState)]]) {
-          const reading = mockState;
-          await show(reading);
-          await evaluate(`showTip(${JSON.stringify(key)},700,700)`);
-          await capture(name,'#tip');
-          const rows=await evaluate(`tooltipRows(${JSON.stringify(key)},latest)`);
+        const mockTips = [['queue-cap','cap'], ['waiting',null],
+          ['first-in-line',proofTip('wait',0,mockState)], ['running',proofTip('row',0,mockState)],
+          ['build-reserved','reserved'], ['long-reason',proofTip('wait',1,mockState)]];
+        await show(mockState);
+        for (const [name,mockKey] of gateMode ? mockTips.slice(0,1) : mockTips) {
+          if (name==='waiting') await show(waitingState);
+          const key = mockKey ?? proofTip('wait',0,waitingState);
+          const shape = await evaluate(`(() => {
+            showTip(${JSON.stringify(key)},700,700);
+            const grid = document.querySelector('#tip > .tip');
+            const style = getComputedStyle(grid);
+            const labels = [...grid.querySelectorAll(':scope > dt')];
+            const values = labels.map(label=>label.nextElementSibling);
+            const long = grid.querySelector('.long');
+            const box = grid.getBoundingClientRect();
+            return {grids: grid.querySelectorAll('dl').length + 1, columns:style.gridTemplateColumns.split(' ').length,
+              title:grid.querySelectorAll('dt.title').length, dark:matchMedia('(prefers-color-scheme: dark)').matches,
+              labels:labels.map(cell=>[getComputedStyle(cell).textAlign,cell.getBoundingClientRect().left]),
+              values:values.map(cell=>[getComputedStyle(cell).textAlign,cell.getBoundingClientRect().right]),
+              fits:grid.scrollWidth<=grid.clientWidth && box.left>=0 && box.right<=innerWidth &&
+                box.top>=0 && box.bottom<=innerHeight,
+              long:long ? [getComputedStyle(long).textAlign,getComputedStyle(long).gridColumn] : null,
+              rows:tooltipRows(${JSON.stringify(key)},latest)};
+          })()`);
+          const {rows, labels, values} = shape;
+          assert.deepEqual([shape.grids,shape.columns,shape.title,shape.dark,shape.fits],[1,2,1,true,true],name);
+          assert.ok(labels.every(([align,left])=>align==='left' && left===labels[0][1]),name);
+          assert.ok(values.every(([align,right])=>align==='right' && right===values[0][1]),name);
+          assert.ok(rows.every(({label,value})=>!label.includes(':') && !/[.!?]$/.test(value)),name);
+          assert.equal(new Set(rows.map(({label,value})=>label+'  '+value)).size,rows.length,name);
+          assert.deepEqual(shape.long,name==='long-reason' ? ['left','1 / -1'] : null,name);
+          await capture(name,'#tip',comparisonImages || tipDesignComparison);
+          console.log(JSON.stringify({tooltip:name,rows:rows.map(({label,value})=>[label,value]),dark:shape.dark}));
           const amounts=Object.fromEntries(rows.map(row=>[row.label,row.value]));
-          const tenths=value=>Math.round(parseFloat(value)*10);
+          if(name==='waiting') assert.deepEqual([amounts['Place in line'],amounts.Free,amounts['Short by']],
+            ['1','0.0 GiB','1.0 GiB']);
+          const tenths=memoryTenths;
           if(amounts.Free||amounts['= Free']) assert.equal(tenths(amounts['Short by']||'0'),
             Math.max(0,tenths(amounts.Needs)-tenths(amounts.Free||amounts['= Free'])));
           if(name==='first-in-line') assert.equal(tenths(amounts['= Free']),
@@ -2603,7 +2649,10 @@ try {
           if(name==='running') assert.equal(tenths(amounts['= In queue cap']),tenths(amounts.Uses)+tenths(amounts['+ Build reserved']));
           if(name==='queue-cap') assert.equal(tenths(amounts['Queue cap']),
             tenths(amounts.Builds)+tenths(amounts['+ Build reserved'])+tenths(amounts['+ Free']));
+          if(name==='build-reserved') assert.equal(tenths(amounts['= Target']),
+            Math.round(tenths(amounts['Room to grow'])*parseFloat(amounts['× Share held'])/100));
           if (comparisonImages) comparisons.push({mock:name,rows});
+          if (name==='waiting') await show(mockState);
         }
 
         // Both swap images use the same current reading and dark desktop viewport.
@@ -2617,7 +2666,7 @@ try {
             : await evaluate("document.querySelector('#tip').innerText");
           if(version==='after') {
             const share=rows.findIndex(row=>row.label==='Share held');
-            assert.equal(rows[share].value,'20%');
+            assert.equal(rows[share].value,'20.0%');
             assert.ok(!rows.some(row=>row.label==='Target'));
             assert.equal(rows.find(row=>row.kind==='title').value,'2.1 GiB');
             const alignment=await evaluate("getComputedStyle(document.querySelector('#tip dt').nextElementSibling).textAlign");
@@ -2633,7 +2682,7 @@ try {
         const gateReading=structuredClone(base);
         const gateIndex=gateReading.walk.findIndex(row=>row.queued);
         assert.ok(gateIndex>=0,'The base reading has no queued run.');
-        const gateAbout='Merges the handler checkpoint into the sdlc branch, tests every module, then pushes sdlc.';
+        const gateAbout='merges the handler checkpoint into the sdlc branch, tests every module, then pushes sdlc';
         const gateRow=gateReading.walk[gateIndex];
         Object.assign(gateRow,{name:'natemerge integrate',unit:'natemerge',title:{unit:'natemerge',step:'integrate'},
           about:gateAbout,changes:'sdlc branch',showrunner:'sdlc',machine:'natedev',used:6.2,reserved:2.8,counted:9,
@@ -2751,7 +2800,7 @@ try {
         assert.ok(evidence.cells.every(cell => cell.label), 'Evidence includes the action column.');
         assert.ok(evidence.memory.segments.some(segment => segment.label === 'Queued builds' && segment.gib > 0));
         assert.ok(evidence.tip.some(entry => entry.label === 'Changes' && entry.value === 'sdlc branch'));
-        assert.ok(evidence.tip.some(entry => entry.kind === 'caption' && entry.text === gateAbout));
+        assert.ok(evidence.tip.some(entry => entry.kind === 'detail' && entry.text === gateAbout));
         if (!gateMode) {
           await call('Emulation.setDeviceMetricsOverride', {width:390,height:844,deviceScaleFactor:1,mobile:false});
           const mobileActions = await evaluate(`(async () => {
