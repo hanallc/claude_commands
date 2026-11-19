@@ -360,7 +360,7 @@ The journal stores these lifecycle states:
 | State | Meaning |
 | --- | --- |
 | Unprovisioned | No setup has registered a deployment. |
-| Idle-stopped | A deliberate idle stop permits a later demand start. |
+| Idle-stopped | A confirmed idle or interruption recovery stop permits a later demand start. |
 | Interrupted | Only EC2 can restart the interrupted Spot instance. |
 | Stopped-unknown | An unknown stop cause forbids a manual restart. |
 | Starting | A committed claim owns the unresolved demand start. |
@@ -376,8 +376,18 @@ The controller refuses claim release while a start or provider operation remains
 Idle stop and claim creation use the same lock.
 A committed claim prevents idle stop.
 A saved idle-stop intent refuses a later claim until stop confirmation.
-A confirmed interruption takes priority over a pending idle stop.
+A confirmed interruption takes priority over a pending stop.
 The controller records `INTERRUPTED` and refuses a manual restart.
+A stopped observation with an unknown cause preserves `INTERRUPTED`.
+If EC2 restarts the box without a claim, the controller saves its stop decision before it calls the provider.
+The decision records the generation and whether an interruption came before the restart.
+Another running observation keeps the stop in progress.
+If the running box enters a new generation, the controller saves a new stop decision for that generation.
+After compute exposure closes, a fresh stopped observation settles the unclaimed stop decision for the same generation.
+The controller records `IDLE_STOPPED` if that decision followed an interruption.
+A stopped observation from a different generation preserves `INTERRUPTED` if the old decision followed an interruption.
+An unclaimed stop with no prior interruption ends at `STOPPED_UNKNOWN`.
+The decision applies whether the controller or the guest stops the box.
 
 Phase C reserves compute before the next boot identity exists through `reserve_start()`.
 `check_start()` rechecks current caps before bootstrap, start, and permit publication.
@@ -738,6 +748,9 @@ The guest writes `finish` after the last run.
 It publishes the current stage before each run through the existing per-run log transfer.
 The final transfer includes `finish` and the last result rows.
 These transfers include `boot.log`, `gate.log`, and `timeline.log`.
+The gate box passes signed URLs to curl in private files. A transfer failure reports the stage, curl exit code, and HTTP status.
+The bootstrap removes each known signed URL and its query from the result records and logs it sends.
+Older paired candidates can send logs directly. The bootstrap cannot filter those uploads.
 The upload count and measured result fields remain unchanged.
 
 `cloud_gate.log_cloud_progress` reads stages for both paired trials and merge gates.

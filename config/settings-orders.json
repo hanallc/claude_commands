@@ -7,5 +7,11 @@
   },
   "hana_aws": {
     "source_allowed_ignored": 1
+  },
+  "lint": {
+    "sweep_build_floor_gib.natedev": 6
+  },
+  "merge_gate": {
+    "GATE_TIME_LIMIT_FACTOR": 5
   }
 }
