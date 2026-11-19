@@ -20,6 +20,7 @@ from typing import Never, cast, override
 from unittest import mock
 from contextlib import contextmanager, nullcontext
 
+from scripts.lib.process_supervisor import launch
 from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, scratch, unit_runs, process_group
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -1825,9 +1826,9 @@ os._exit(0)
         probe = "import os, pathlib, signal; print(str(pathlib.Path.cwd()), os.getpid(), flush=True); signal.pause()"
         for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGKILL):
             with self.subTest(signal=number):
-                process: subprocess.Popen[str] = subprocess.Popen([sys.executable, str(Path(folders.__file__)), "run", "--owner", "unit",
+                process = self.enterContext(launch([sys.executable, str(Path(folders.__file__)), "run", "--owner", "unit",
                                             "--name", "proof", "--", sys.executable, "-c", probe],
-                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
                 try:
                     assert process.stdout is not None
                     path, child_pid = cast(str, process.stdout.readline()).split()

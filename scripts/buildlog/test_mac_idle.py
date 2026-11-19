@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import launch as launch_process
+
 import io
 import json
 import os
@@ -1283,9 +1285,9 @@ buildlog_wait_for_memory cargo nextest run
 test "$BUILDLOG_MEM_OUTCOME" = LeftQueue
 '''
         with tempfile.TemporaryFile(mode="w+") as output, tempfile.TemporaryFile(mode="w+") as errors:
-            process = subprocess.Popen(["bash", "-c", command, "memory-marker-test",
+            process = self.enterContext(launch_process(["bash", "-c", command, "memory-marker-test",
                 str(mac_idle.SCRIPTS / "lint/memory_gate.sh")], env={**os.environ,
-                "TEST_RETRY_MARKER": str(marker)}, stdout=output, stderr=errors, start_new_session=True)
+                "TEST_RETRY_MARKER": str(marker)}, stdout=output, stderr=errors))
             expired = False
             try:
                 _ = process.wait(timeout=30)

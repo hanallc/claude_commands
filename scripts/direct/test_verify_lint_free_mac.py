@@ -1,11 +1,11 @@
 """Route a queued lint to the Mac before local repairs start."""
 from __future__ import annotations
 
-import subprocess
 import unittest
 from pathlib import Path
 from typing import override
 
+from scripts.lib.process_supervisor import ManagedProcess
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
 from scripts.build_queue import admission_protocol as wire, placement
 from scripts.direct.verify_hold_wait_test_support import VerifyHoldTools
@@ -32,7 +32,7 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
             "TEST_RUNNER_STATUS": "0",
         })
 
-    def queued_lint(self) -> subprocess.Popen[str]:
+    def queued_lint(self) -> ManagedProcess[str]:
         _ = self.hold_memory()
         admission = caller_admission(self, self.root, self.environment)
         controls = caller_provider_controls(self, admission)
@@ -49,7 +49,7 @@ class VerifyLintFreeMacTests(VerifyHoldTools):
         self.addCleanup(self.stop_verify, process)
         return process
 
-    def finish_lint(self, process: subprocess.Popen[str]) -> str:
+    def finish_lint(self, process: ManagedProcess[str]) -> str:
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         return output + errors

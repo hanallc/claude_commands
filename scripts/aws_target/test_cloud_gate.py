@@ -1,6 +1,8 @@
 """Exercise durable cloud gates with private files and a fake AWS transport."""
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import launch as launch_process
+
 from collections.abc import Callable, Generator, Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
@@ -2320,9 +2322,9 @@ with (mock.patch.object(aws_trial, 'AwsCli', side_effect=create_api),
                                'base': {'commit': 'base', 'tree': 'base-tree'}, 'changed': {'commit': 'commit', 'tree': 'tree'}}
                     cloud_gate.save(folder / 'request.json', request)
                     cloud_gate.save(folder / 'deployment.json', self.deployment)
-                with subprocess.Popen([sys.executable, '-c', script, str(cohort), str(self.state), str(self.settings),
+                with launch_process([sys.executable, '-c', script, str(cohort), str(self.state), str(self.settings),
                                        str(self.now), str(number)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                      text=True, start_new_session=True) as process:
+                                      text=True) as process:
                     try:
                         stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                     except subprocess.TimeoutExpired:

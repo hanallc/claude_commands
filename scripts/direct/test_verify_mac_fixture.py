@@ -1,6 +1,8 @@
 """Real verify.sh Mac fixture with disposable tools."""
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import launch as launch_process
+
 import unittest
 import json
 import os
@@ -118,7 +120,7 @@ class VerifyMacFixtureTests(VerifyMacOffloadFixture):
     def test_exceptional_verify_exit_stops_its_processes_before_the_next_case(self) -> None:
         for failure in (subprocess.TimeoutExpired("verify", 0), FixtureHang("the fixture stopped")):
             with self.subTest(failure=type(failure).__name__):
-                process = subprocess.Popen([sys.executable, "-c", """
+                process = self.enterContext(launch_process([sys.executable, "-c", """
 import subprocess
 from pathlib import Path
 import os
@@ -127,7 +129,7 @@ child = subprocess.Popen(["sleep", "300"])
 print("ready", flush=True)
 wait_for_file(Path(os.environ["TEST_RUNNER_STATE"]) / "exception-release")
 """], cwd=VERIFY.parents[2], env=self.environment, stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE, text=True, start_new_session=True)
+                    stderr=subprocess.PIPE, text=True))
                 assert process.stdout is not None
                 self.assertEqual(process.stdout.readline(), "ready\n")
                 communicate = process.communicate

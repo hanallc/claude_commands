@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import launch as launch_process
+
 from scripts.lint.memory_test_support import write_config_fixture
 
 import contextlib
@@ -1202,11 +1204,10 @@ sys.exit(status)
                         environment = {**os.environ, "BUILDLOG_SCOPE": "1" if scoped else "0",
                                        "XDG_RUNTIME_DIR": str(runtime), "PATH": str(tools) + os.pathsep + os.environ["PATH"]}
                         with (Path(self.root / "supervisor.log").open("ab") as output,
-                              subprocess.Popen([sys.executable, "-c", supervisor_source, "detached_runs.py",
+                              launch_process([sys.executable, "-c", supervisor_source, "detached_runs.py",
                                                 "supervise", str(path), str(address), str(watcher)],
                                                env=environment,
-                                               stdout=output, stderr=subprocess.STDOUT,
-                                               start_new_session=True) as supervisor,
+                                               stdout=output, stderr=subprocess.STDOUT) as supervisor,
                               contextlib.ExitStack() as connections):
                             self.update_record(path, pid=supervisor.pid)
 

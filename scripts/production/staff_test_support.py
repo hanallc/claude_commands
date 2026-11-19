@@ -12,7 +12,7 @@ import shutil
 import signal
 import socket
 import subprocess
-from subprocess import Popen as start_staff_owner
+from scripts.lib.process_supervisor import launch as start_staff_owner
 from subprocess import run as run_fixture_git
 import sys
 import tempfile
@@ -772,7 +772,6 @@ class SharedStaffOwner:
             [sys.executable, str(script)], cwd=self.root,
             env={**os.environ, "TMPDIR": str(self.root)},
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=errors, text=True,
-            start_new_session=True,
         ))
         port = cast(TextIO, process.stdout).readline().strip()
 

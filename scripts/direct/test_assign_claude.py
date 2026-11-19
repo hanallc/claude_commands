@@ -1,6 +1,8 @@
 """Test Claude launcher validation and artifact placement."""
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import launch as launch_process
+
 from collections.abc import Callable, Generator
 import json
 import os
@@ -92,8 +94,8 @@ def stop_assignment(command: list[str], environment: dict[str, str], number: int
         listener.bind(address)
         listener.listen()
         listener.settimeout(TEST_HANG_GUARD_SECS)
-        with subprocess.Popen(command[3:], env={**environment, "TEST_STOP_SOCKET": address},
-                start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as launcher:
+        with launch_process(command[3:], env={**environment, "TEST_STOP_SOCKET": address},
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as launcher:
             try:
                 with ExitStack() as connections:
                     peers: list[socket.socket] = []
@@ -120,7 +122,7 @@ def stop_assignment(command: list[str], environment: dict[str, str], number: int
                     if private_worker:
                         pid = int((Path(environment["STUB_CLAUDE_ROOT"]) / "private-worker-pid").read_text())
                         assert isinstance(process_start.process_start(pid), (process_start.Gone, process_start.Zombie))
-                return subprocess.CompletedProcess(command, launcher.returncode, output, errors), child
+                return subprocess.CompletedProcess(command, launcher.wait(), output, errors), child
             finally:
                 with suppress(ProcessLookupError):
                     process_group.send_process_group(launcher.pid, signal.SIGKILL)

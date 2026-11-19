@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import launch as launch_process
+
 import unittest
 from contextlib import ExitStack, redirect_stdout
 import io
@@ -58,9 +60,9 @@ child = subprocess.Popen([sys.executable, '-c',
 print(child.stdout.readline(), end='', flush=True)
 sys.stdin.read(1)
 """
-        leader = subprocess.Popen([sys.executable, "-c", source], env=self.environment,
+        leader = self.enterContext(launch_process([sys.executable, "-c", source], env=self.environment,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, start_new_session=True)
+            text=True))
         member = 0
         try:
             output = leader.stdout
@@ -69,7 +71,9 @@ sys.stdin.read(1)
             recovery = merge_gate.GateRecovery(self.state / "dead-gate.json", str(self.checkout),
                                                leader.pid, "ended-owner")
             recovery.add_group(leader.pid)
-            stdout, stderr = leader.communicate(input="x", timeout=TEST_HANG_GUARD_SECS)
+            assert leader.stdin is not None
+            _ = leader.stdin.write("x")
+            stdout, stderr = leader.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(leader.returncode, 0, stdout + stderr)
             folder = self.root / "abandoned-gate"
             folder.mkdir()

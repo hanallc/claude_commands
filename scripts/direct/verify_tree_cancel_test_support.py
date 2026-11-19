@@ -1,6 +1,8 @@
 """Private workspace seeds and real process trees for verify cancellation tests."""
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import ManagedProcess, launch as launch_process
+
 from scripts.build_queue.admission_test_support import (
     AdmissionFixture, caller_admission, caller_provider_controls, private_provider_evidence,
 )
@@ -195,7 +197,7 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         self.admission.server.host_probe = provider
         _ = caller_provider_controls(self, self.admission)
 
-    def release_lint_rewrites(self, process: subprocess.Popen[str]) -> None:
+    def release_lint_rewrites(self, process: ManagedProcess[str]) -> None:
         # Formatting runs before clippy fix, then runs again without rewriting.
         for stage in ("mend", "fmt", "fix"):
             self.wait_for_running(self.control / (stage + ".rewritten"), process)
@@ -215,13 +217,13 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         _ = path.write_text("#!/bin/sh\n" + code)
         path.chmod(0o755)
 
-    def start_verify(self, command: str, **extra: str) -> subprocess.Popen[str]:
+    def start_verify(self, command: str, **extra: str) -> ManagedProcess[str]:
         return self._start_verify(command, False, extra)
 
-    def start_supervised_verify(self, command: str, **extra: str) -> subprocess.Popen[str]:
+    def start_supervised_verify(self, command: str, **extra: str) -> ManagedProcess[str]:
         return self._start_verify(command, True, extra)
 
-    def _start_verify(self, command: str, supervised: bool, extra: dict[str, str]) -> subprocess.Popen[str]:
+    def _start_verify(self, command: str, supervised: bool, extra: dict[str, str]) -> ManagedProcess[str]:
         arguments = ["bash", str(VERIFY), command, "sample"]
         if supervised:
             record_path = self.control / "lint-run.json"
@@ -250,16 +252,15 @@ with (patch.object(detached_runs, "deliver", return_value="private fixture"),
     raise SystemExit(detached_runs.main(["supervise", sys.argv[1]]))
 """
             arguments = [str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", supervisor, str(record_path)]
-        process = subprocess.Popen(arguments,
+        process = self.enterContext(launch_process(arguments,
                                    cwd=self.workspace, env={**self.environment, **extra},
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                   start_new_session=True)
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
         self.started_groups.add(process.pid)
         self.addCleanup(self.finish_process, process)
         return process
 
     @override
-    def wait_for_running(self, path: Path, process: subprocess.Popen[str] | subprocess.Popen[bytes]) -> None:
+    def wait_for_running(self, path: Path, process: ManagedProcess[str] | ManagedProcess[bytes]) -> None:
         try:
             super().wait_for_running(path, process)
         except (AssertionError, TimeoutError):
@@ -268,7 +269,7 @@ with (patch.object(detached_runs, "deliver", return_value="private fixture"),
                 self.fail(f"verify exited before {path.name}: {output!r} {errors!r}")
             raise
 
-    def finish_process(self, process: subprocess.Popen[str]) -> None:
+    def finish_process(self, process: ManagedProcess[str]) -> None:
         if process.poll() is None:
             self.end_group(process.pid)
         _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
@@ -306,7 +307,7 @@ with (patch.object(detached_runs, "deliver", return_value="private fixture"),
             self.assertEqual(list((self.board / "verify_cache").glob(suffix)), [],
                              "cancelled run recorded a cache verdict")
 
-    def assert_cancelled(self, process: subprocess.Popen[str], command: str) -> re.Match[str]:
+    def assert_cancelled(self, process: ManagedProcess[str], command: str) -> re.Match[str]:
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 77, output + errors)
         matches = cancellation_lines(output + errors, command)

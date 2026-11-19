@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import ManagedProcess, launch as launch_process
+
 from scripts.lib.checkout_test_support import copy_test_runner
 
 from dataclasses import dataclass
@@ -742,10 +744,9 @@ class ParentDeath(unittest.TestCase):
             env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         processes.track(parent)
         environment["MERGE_GATE_PARENT_PID"] = str(parent.pid)
-        runner = subprocess.Popen([sys.executable, str(RUNNER), str(root), "test_parent.py"],
+        runner = self.enterContext(launch_process([sys.executable, str(RUNNER), str(root), "test_parent.py"],
             env=environment, cwd=root, stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-        processes.track(runner)
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
         output = runner.stdout
         assert output is not None
         self.assertTrue(select.select([output], [], [], TEST_HANG_GUARD_SECS)[0])
@@ -829,10 +830,9 @@ class InheritedSignal(unittest.TestCase):
         for name in ("TEST_TIMES_OUT", "PYTHONPATH"):
             _ = environment.pop(name, None)
         environment["PYTHONPATH"] = str(root)
-        process: subprocess.Popen[str] = subprocess.Popen([str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(root), "test_orphan.py"],
+        process: ManagedProcess[str] = self.enterContext(launch_process([str(RUNNER.parents[1] / "lib/py"), str(RUNNER), str(root), "test_orphan.py"],
             cwd=root, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, start_new_session=True)
-        processes.track(process)
+            stderr=subprocess.PIPE, text=True))
         output = process.stdout
         self.assertIsNotNone(output)
         if output is None:
@@ -844,7 +844,10 @@ class InheritedSignal(unittest.TestCase):
         self.addCleanup(os.close, descriptor)
         if terminate:
             send_process_group(process.pid, signal.SIGTERM)
-        stdout, stderr = process.communicate(input="x", timeout=TEST_HANG_GUARD_SECS)
+        else:
+            assert process.stdin is not None
+            _ = process.stdin.write("x")
+        stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         expected = -signal.SIGTERM if terminate else 1 if fail else 0
         self.assertEqual(process.returncode, expected, stdout + stderr)
         # POLLHUP means the process was reaped, rather than left as a zombie.

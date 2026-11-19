@@ -263,6 +263,7 @@ Linux guardians adopt orphaned descendants, including descendants in new session
 macOS guardians rescan their session for a bounded time. A detached session needs a registered guardian to take part in cleanup.
 Each registered macOS guardian reports its result through a private pipe. A launch that fails before the guardian starts reports cancellation.
 One deadline covers all cleanup steps. The guardian reports failure if it reaches the deadline.
+The AST test checks isolated launches in test files and their support files. Each exception names one call and gives its cleanup reason.
 
 **Build-hold guard tests.** `scripts/hooks/test_build_hold_guard.py` calls the real Python hook entry point in-process for command parsing and hold decisions, restoring stdin, environment and import paths for each call. `build_hold_guard_test_support.py` copies the existing hold fixture's class seed into a private case directory at the same path for each test. Real subprocess tests retain the shell front's no-Python fast paths, byte-for-byte stdin/output/status relay, lazy imports, malformed input, and shell-to-reader integration. No production hook or hold decision is replaced, and no clock or wait budget is shortened.
 

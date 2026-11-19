@@ -1,6 +1,8 @@
 """Record resource holders through private event pipes and real verify calls."""
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import ManagedProcess, launch as launch_process
+
 from scripts.build_queue import admission_client, admission_records, admission_protocol as wire, admission_service as service, placement
 
 import json
@@ -514,7 +516,7 @@ class RecordedHoldWaitFixture(VerifyHoldWaitFixture):
 
 
 class VerifyHoldHolderTests(RecordedHoldWaitFixture):
-    def start_hold_step(self) -> subprocess.Popen[str]:
+    def start_hold_step(self) -> ManagedProcess[str]:
         """Call the real hold wrapper before the real cargo launcher."""
         script = self.fixture.root / "held-step.sh"
         _ = script.write_text('set -euo pipefail\nsource "$1"\n'
@@ -529,10 +531,10 @@ STEP_RECORD_ACTIVE=0 TOKEN_HELD=0 TEST_BUILD_INPUTS_READY=0
 export BUILDLOG_CALL_ID="direct-hold-$$" BUILDLOG_CALLER=verify
 run_once cargo check
 ''')
-        process = subprocess.Popen(["bash", str(script), str(SCRIPTS / "lint/invoke.sh"),
+        process = self.enterContext(launch_process(["bash", str(script), str(SCRIPTS / "lint/invoke.sh"),
                                     str(SCRIPTS / "direct/progress_history.py")], cwd=self.fixture.root,
                                    env=self.fixture.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   text=True, start_new_session=True)
+                                   text=True))
         self.addCleanup(self.stop_process, process)
         return process
 
@@ -645,14 +647,14 @@ if "--assignment-file" in arguments:''', 1)
         _ = path.write_text(json.dumps(row))
         return row
 
-    def pause(self, process: subprocess.Popen[str], number: int) -> list[dict[str, object]]:
+    def pause(self, process: ManagedProcess[str], number: int) -> list[dict[str, object]]:
         self.fixture.wait_for_path(self.fixture.root / f"target-poll-{number}", (process,))
         return wait_rows(Path(self.fixture.environment["UNIT_RUN_DIR"]))
 
     def resume(self, number: int) -> None:
         (self.fixture.root / f"target-resume-{number}").touch()
 
-    def start_pinned_route(self) -> subprocess.Popen[str]:
+    def start_pinned_route(self) -> ManagedProcess[str]:
         """Check target waits through the real placement command."""
         return self.start("check", "sample", "--target", "mac", "--no-cache")
 

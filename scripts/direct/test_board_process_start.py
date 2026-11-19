@@ -13,6 +13,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from scripts.lib.process_supervisor import launch
 from scripts.direct.verify_token_wait_test_support import BOARD
 from scripts.direct import step_record
 from scripts.lib import process_group
@@ -87,8 +88,8 @@ class BoardProcessStartTests(unittest.TestCase):
         for matches in (False, True):
             with self.subTest(matches=matches), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
-                                         stdin=subprocess.PIPE, start_new_session=True)
+                child = self.enterContext(launch([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                                         stdin=subprocess.PIPE))
                 try:
                     start = identity.process_start(child.pid)
                     self.assertIsInstance(start, identity.Started)

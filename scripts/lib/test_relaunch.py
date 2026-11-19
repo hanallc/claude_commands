@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import ManagedProcess, launch as launch_process
+
 import json
 import os
 from pathlib import Path
@@ -110,25 +112,25 @@ class RelaunchTests(ShutdownTestCase):
         self.state = self.root / "state"
         (self.state / "relaunch").mkdir(parents=True)
 
-    def start(self, child: str) -> subprocess.Popen[str]:
-        process = subprocess.Popen(
+    def start(self, child: str) -> ManagedProcess[str]:
+        process = self.enterContext(launch_process(
             [sys.executable, str(SUPERVISOR), "run", "--", sys.executable, "-c", child],
             cwd=self.root, env={"PATH": os.defpath, "HOME": str(self.root),
                 "SHUTDOWN_STATE_DIR": str(self.state), "REMOVE_ON_RELAUNCH": "old"},
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, start_new_session=True,
-        )
+            text=True,
+        ))
         self.addCleanup(self.reap, process)
         return process
 
-    def reap(self, process: subprocess.Popen[str]) -> None:
+    def reap(self, process: ManagedProcess[str]) -> None:
         try:
             send_process_group(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
-    def wait_for_file(self, path: Path, process: subprocess.Popen[str]) -> None:
+    def wait_for_file(self, path: Path, process: ManagedProcess[str]) -> None:
         deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         while not path.exists():
             self.assertIsNone(process.poll(), "supervisor exited before its child became ready")
@@ -162,7 +164,7 @@ class RelaunchTests(ShutdownTestCase):
             "note": "restarting fixture on its target account"}), encoding="utf-8")
         return request
 
-    def assert_relaunched(self, process: subprocess.Popen[str], request: Path) -> None:
+    def assert_relaunched(self, process: ManagedProcess[str], request: Path) -> None:
         stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 11, stderr)
         observed = cast(RelaunchObservation, json.loads((self.root / "observation.json").read_text()))

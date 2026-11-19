@@ -13,6 +13,7 @@ import sys
 from typing import TextIO, cast
 import unittest
 
+from scripts.lib.process_supervisor import ManagedProcess, launch
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_targets import target_config
 from scripts.build_queue import admission_records as records
@@ -157,9 +158,8 @@ class CargoLifetimeTests(unittest.TestCase):
                     "PYTHONPATH": "job-module-path", "TMPDIR": str(job_temporary),
                     "PATH": os.pathsep.join((str(front_dir), str(devshell_dir), str(shim_dir),
                                               str(cargo_dir), os.environ["PATH"]))}
-                child = subprocess.Popen([str(wrapper), "build"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, env=environment, cwd=fixture.root)
-                self.addCleanup(self.stop_front, child)
+                child = self.enterContext(launch([str(wrapper), "build"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, env=environment, cwd=fixture.root))
                 data = self.started(child)
                 self.supply_front_memory(fixture, child)
                 with fixture.loop_turn():
@@ -205,7 +205,7 @@ class CargoLifetimeTests(unittest.TestCase):
                 except ProcessLookupError:
                     pass
 
-    def start_front(self, fixture: AdmissionFixture, *arguments: str) -> subprocess.Popen[str]:
+    def start_front(self, fixture: AdmissionFixture, *arguments: str) -> ManagedProcess[str]:
         cargo = fixture.root / "fake-cargo"
         _ = cargo.write_text(FAKE_CARGO)
         cargo.chmod(0o755)
@@ -213,27 +213,17 @@ class CargoLifetimeTests(unittest.TestCase):
             "HOME": str(fixture.root / "runner-home"), "PYTHONDONTWRITEBYTECODE": "1",
             "TMPDIR": str(fixture.root),
             "RUNNER_NAME": "hana-runner-a", "GITHUB_JOB": "compile"}
-        child = subprocess.Popen([sys.executable, "-c", DENIED_HOME_FRONT,
+        child = self.enterContext(launch([sys.executable, "-c", DENIED_HOME_FRONT,
             "--cargo", str(cargo), "--", *arguments], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, env=environment, cwd=fixture.root)
-        self.addCleanup(self.stop_front, child)
+            text=True, env=environment, cwd=fixture.root))
         return child
 
-    def stop_front(self, child: subprocess.Popen[str]) -> None:
-        if child.poll() is None:
-            child.terminate()
-        try:
-            _ = child.communicate(timeout=8)
-        except subprocess.TimeoutExpired:
-            child.kill()
-            _ = child.communicate(timeout=3)
-
-    def started(self, child: subprocess.Popen[str]) -> dict[str, object]:
+    def started(self, child: ManagedProcess[str]) -> dict[str, object]:
         stream = cast(TextIO, child.stdout)
         self.assertTrue(select.select([stream], [], [], 8)[0])
         return cast(dict[str, object], json.loads(stream.readline()))
 
-    def supply_front_memory(self, fixture: AdmissionFixture, child: subprocess.Popen[str]) -> None:
+    def supply_front_memory(self, fixture: AdmissionFixture, child: ManagedProcess[str]) -> None:
         with fixture.loop_turn():
             record, = [record for record in fixture.server.reservations.values() if record.owner.pid == child.pid]
             write_process(fixture.proc.path, child.pid, GIB, start=record.owner.start_time)

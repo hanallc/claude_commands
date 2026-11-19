@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import launch as launch_process
+
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 
 import json
@@ -77,10 +79,10 @@ buildlog_end() { printf '%s|%s|%s\\n' "$BUILDLOG_START" "$BUILDLOG_MEM_WAIT_S" "
 sweep_after_step() { :; }
 run_once cargo check
 '''
-        process = subprocess.Popen(
+        process = self.enterContext(launch_process(
             ["bash", "-c", script, "bash", str(invoke)], cwd=self.fixture.root, env=environment,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
-        )
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ))
         self.addCleanup(self.stop_process, process)
         _ = self.wait_for_call(process)
         self.assertFalse(compiled.exists())

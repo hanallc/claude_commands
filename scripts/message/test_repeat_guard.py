@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Literal, cast, override
 from unittest.mock import patch
 
+from scripts.lib.process_supervisor import launch as launch_process
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 
@@ -206,10 +207,9 @@ print(json.dumps(held))
     def test_isolated_ends_its_worker_on_interrupt_and_communication_error(self) -> None:
         for error in (KeyboardInterrupt(), OSError("fixture read failed")):
             with self.subTest(error=type(error).__name__):
-                child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
+                child = self.enterContext(launch_process([sys.executable, "-c", "import signal; signal.pause()"],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, start_new_session=True, env=self.owned.environment())
-                self.owned.track(child, group=True)
+                    text=True, env=self.owned.environment()))
                 exchange = child.communicate
                 reaped = Event()
                 interrupted = False
@@ -220,7 +220,9 @@ print(json.dumps(held))
                         interrupted = True
                         raise error
                     try:
-                        return exchange(input, timeout=timeout)
+                        if input and child.stdin is not None:
+                            _ = child.stdin.write(input)
+                        return exchange(timeout=timeout)
                     finally:
                         reaped.set()
 
@@ -765,9 +767,8 @@ os.kill(os.getpid(), signal.SIGSTOP)
         runner = "import sys; from scripts.message import send; send.run(sys.argv[1:], '', 60)"
         command = [sys.executable, "-c", runner, sys.executable, "-c", child_program, str(marker), grandchild, str(ready)]
         # Start the deadline check only after the delivery descendants exist.
-        child = subprocess.Popen(command, start_new_session=True,
-            env=self.owned.environment({**os.environ, "PYTHONPATH": str(Path(guard.__file__).parent), "SEND_REPEAT_NOTICE_JOB": "1"}))
-        self.owned.track(child, group=True)
+        child = self.enterContext(launch_process(command, env=self.owned.environment(
+            {**os.environ, "PYTHONPATH": str(Path(guard.__file__).parent), "SEND_REPEAT_NOTICE_JOB": "1"})))
         try:
             wait_for_notice_readiness(ready, child)
             started = time.monotonic()
@@ -779,6 +780,7 @@ os.kill(os.getpid(), signal.SIGSTOP)
                 status = subprocess.run(["ps", "-p", pid, "-o", "stat="], text=True, capture_output=True, check=False)
                 self.assertTrue(not status.stdout.strip() or status.stdout.strip().startswith("Z"), status.stdout)
         finally:
+            child.close()
             self.owned.finish()
 
     def test_notice_readiness_fails_fast_when_the_runner_exits(self) -> None:
@@ -857,18 +859,20 @@ sys.stdin.readline()
 assert not g.check(Path(sys.argv[2]), g.Attempt('watchdog','session:a','same','fixture',0)).held
 """
         command = [sys.executable, "-c", program, str(fifo), str(self.root), str(workers)]
-        with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, start_new_session=True,
+        with launch_process(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True,
                 env=self.owned.environment({**os.environ, "SEND_REPEAT_CONFIG": str(fifo),
                      "PYTHONPATH": str(Path(guard.__file__).parent)})) as process:
-            self.owned.track(process, group=True)
             try:
                 with LauncherHangGuard("guard import and protected call").protect():
                     if process.stdout is None or process.stdout.readline() != "ready\n":
                         raise AssertionError("guard import or protected call did not finish")
-                stdout, stderr = process.communicate("go\n", timeout=TEST_HANG_GUARD_SECS)
+                assert process.stdin is not None
+                _ = process.stdin.write("go\n")
+                stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 result = subprocess.CompletedProcess(command, process.wait(timeout=TEST_HANG_GUARD_SECS), stdout, stderr)
             finally:
+                process.close()
                 self.owned.finish()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("operation deadline exceeded", result.stderr)
@@ -907,14 +911,15 @@ assert not g.check(Path(sys.argv[2]), g.Attempt('watchdog','session:a','same','f
         path = self.home / "notice_fixture.py"
         if not path.exists():
             _ = path.write_text(NOTICE_FIXTURE)
-        child = subprocess.Popen([sys.executable, str(path), "supervise", mode, str(self.root), str(self.home / "accepted")],
+        child = self.enterContext(launch_process(
+            [sys.executable, str(path), "supervise", mode, str(self.root), str(self.home / "accepted")],
             env=self.owned.environment({**os.environ, "SEND_REPEAT_CONFIG": str(self.limits_file(self.limits))}),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-        self.owned.track(child, group=True)
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
         try:
             _, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(child.returncode, 0, errors)
         finally:
+            child.close()
             self.owned.finish()
 
     def fixture_accepts(self) -> list[dict[str, str]]:

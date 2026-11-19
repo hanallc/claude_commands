@@ -24,6 +24,8 @@ import sys
 import tempfile
 import time
 import unittest
+
+from scripts.lib.process_supervisor import launch
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
 import contextlib
 from contextlib import closing
@@ -5078,10 +5080,10 @@ class DetachedVerifyAdmissionTests(SeededExampleWorkspaceFixture):
             with self.subTest(command=command):
                 grants.clear()
                 observed_grants.clear()
-                result = subprocess.run(["bash", str(VERIFY), command, "sample", *options], cwd=self.root,
-                    env=self.environment, start_new_session=True, capture_output=True, text=True,
-                    check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                with launch(["bash", str(VERIFY), command, "sample", *options], cwd=self.root,
+                            env=self.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+                    output, errors = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+                    self.assertEqual(process.returncode, 0, output + errors)
                 self.assertEqual([grant[0] for grant in grants], [step])
                 for name, run in grants:
                     self.assertIsInstance(run, wire.RunIdentity, name)

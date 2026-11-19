@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import ManagedProcess, launch as launch_process
+
 from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
 
 from scripts.lib.checkout_test_support import fixture_shim_source
@@ -255,7 +257,7 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         super().addCleanup(recorded_cleanup)
 
     @override
-    def stop_verify(self, process: subprocess.Popen[str]) -> None:
+    def stop_verify(self, process: subprocess.Popen[str] | ManagedProcess[str]) -> None:
         # Completed calls are drained here; the unchanged final marker scan
         # still observes and reaps detached children before restoring the seed.
         if process.poll() is None:
@@ -355,15 +357,15 @@ exit "$status"
     def fixture_cleanups(self) -> None:
         self.assertTrue(self.fixture.doCleanups(), "a fixture cleanup failed:\n" + "\n".join(self.fixture.cleanup_failures))
 
-    def start(self, *arguments: str) -> subprocess.Popen[str]:
+    def start(self, *arguments: str) -> ManagedProcess[str]:
         process = self.fixture.start_verify(*arguments)
         self.addCleanup(self.stop_process, process)
         return process
 
-    def stop_process(self, process: subprocess.Popen[str]) -> None:
+    def stop_process(self, process: ManagedProcess[str]) -> None:
         self.fixture.stop_verify(process)
 
-    def start_memory_queued_lint(self) -> subprocess.Popen[str]:
+    def start_memory_queued_lint(self) -> ManagedProcess[str]:
         """Keep the real admission client waiting behind a private memory limit."""
         admission = caller_admission(self.fixture, self.fixture.root, self.fixture.environment)
         with admission.loop_turn():
@@ -388,13 +390,13 @@ exit "$status"
         with admission.loop_turn():
             return {waiting.request.owner.pid for waiting in admission.server.waiters.values()}
 
-    def wait_for_owned_exit(self, timeout: float) -> set[int]:
-        return wait_for_marker_exit(self.fixture.child_marker(), timeout)
+    def wait_for_owned_exit(self, process: ManagedProcess[str], timeout: float) -> set[int]:
+        return wait_for_marker_exit(self.fixture.child_marker(), timeout, guardian=process.session_id)
 
-    def wait_for_call(self, process: subprocess.Popen[str], announcement: str = VERIFY_WAITING) -> None:
+    def wait_for_call(self, process: ManagedProcess[str], announcement: str = VERIFY_WAITING) -> None:
         self.wait_for_waiting_diagnostic(process, announcement)
 
-    def wait_for_waiting_diagnostic(self, process: subprocess.Popen[str],
+    def wait_for_waiting_diagnostic(self, process: ManagedProcess[str],
                                     announcement: str = VERIFY_WAITING) -> None:
         # Registration precedes the first waiting announcement. Releasing before
         # that announcement can legitimately record zero waiting seconds.
@@ -425,9 +427,9 @@ exit "$status"
                         output += chunk.decode("utf-8")
                         self.wait_output[process.pid] = output
 
-    def finish(self, process: subprocess.Popen[str]) -> tuple[int, str]:
+    def finish(self, process: ManagedProcess[str]) -> tuple[int, str]:
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-        return process.returncode, self.wait_output.pop(process.pid, "") + output + self.wait_diagnostics.pop(process.pid, "") + errors
+        return process.wait(), self.wait_output.pop(process.pid, "") + output + self.wait_diagnostics.pop(process.pid, "") + errors
 
     def set_hold_routing(self, runs_on: Literal["natedev_only", "any_target"]) -> None:
         targets = "natedev" if runs_on == "natedev_only" else "natedev,mac"
@@ -525,15 +527,15 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         return row["hold_wait_s"]
 
     def start_lint_step(self, caller: str, extra: dict[str, str] | None = None,
-                        probe: Path | None = None) -> subprocess.Popen[str]:
+                        probe: Path | None = None) -> ManagedProcess[str]:
         """One compiling lint step, as `caller` runs it: no BUILDLOG_CALL_ID."""
         shell = [LINT_STEP_PROBE, "bash", str(INVOKE), str(probe)] if probe else [LINT_STEP, "bash", str(INVOKE)]
-        process = subprocess.Popen(
+        process = self.enterContext(launch_process(
             ["bash", "-c", *shell],
             cwd=self.fixture.root, env={**self.fixture.environment, "BUILDLOG_CALLER": caller,
                                         "BUILDLOG_CALL_ID": "", **(extra or {})},
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
-        )
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ))
         self.addCleanup(self.stop_process, process)
         return process
 

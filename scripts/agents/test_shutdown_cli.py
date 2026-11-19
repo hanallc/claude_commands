@@ -1,6 +1,8 @@
 """Test the agents CLI with private staff rows and temporary repositories."""
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import ManagedProcess, launch as launch_process
+
 import fcntl
 import io
 import json
@@ -890,10 +892,10 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertIn("reservation could not be released", output.getvalue())
 
 
-    def orphan_child(self, session_id: str) -> subprocess.Popen[bytes]:
-        child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
-                                 stdin=subprocess.PIPE, cwd=self.worktree, start_new_session=True,
-                                 env={**os.environ, "CLAUDE_CODE_SESSION_ID": session_id})
+    def orphan_child(self, session_id: str) -> ManagedProcess[bytes]:
+        child = self.enterContext(launch_process([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                                 stdin=subprocess.PIPE, cwd=self.worktree,
+                                 env={**os.environ, "CLAUDE_CODE_SESSION_ID": session_id}))
         def cleanup() -> None:
             if child.stdin is not None:
                 child.stdin.close()

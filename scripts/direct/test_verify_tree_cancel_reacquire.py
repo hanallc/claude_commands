@@ -1,6 +1,8 @@
 """Real verify entry point cancellation with private Cargo and Git fixtures."""
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import launch as launch_process
+
 import subprocess
 import unittest
 import sys
@@ -45,9 +47,9 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
 
         wait_until(lambda: blocked_episode() and not lock.exists(), self.root, processes=(process,))
         self.assertEqual(self.admission.server.placement_requests[episode].episode, episode)
-        holder = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()", "verify.sh"],
+        holder = self.enterContext(launch_process([sys.executable, "-c", "import sys; sys.stdin.read()", "verify.sh"],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, text=True, start_new_session=True)
+                                  stderr=subprocess.PIPE, text=True))
         self.started_groups.add(holder.pid)
         self.addCleanup(self.finish_process, holder)
         taken = subprocess.run(["bash", str(BOARD), "acquire", str(self.board), "peer", "cargo",
@@ -83,9 +85,9 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
 
     def test_tree_cancel_during_token_wait_removes_own_entry_and_keeps_peer(self) -> None:
         # Keep the peer alive before the caller publishes its token entry.
-        holder = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()", "verify.sh"],
+        holder = self.enterContext(launch_process([sys.executable, "-c", "import sys; sys.stdin.read()", "verify.sh"],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, text=True, start_new_session=True)
+                                  stderr=subprocess.PIPE, text=True))
         self.started_groups.add(holder.pid)
         self.addCleanup(self.finish_process, holder)
         taken = subprocess.run(["bash", str(BOARD), "acquire", str(self.board), "peer", "cargo",

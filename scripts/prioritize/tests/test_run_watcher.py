@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import launch as launch_process
+
 import signal
 import subprocess
 import sys
@@ -210,12 +212,11 @@ class RunWatcherTests(ScriptRepositoryTestCase):
                 str(self.fixture.owner_release),
             ]
         )
-        daemon = subprocess.Popen(
+        daemon = self.enterContext(launch_process(
             ["bash", str(self.fixture.watcher), "--daemon"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        ))
         try:
             deadline = time.monotonic() + TEST_HANG_GUARD_SECS
             log = ""
@@ -292,12 +293,11 @@ raise SystemExit(0)
             encoding="utf-8",
         )
 
-        daemon = subprocess.Popen(
+        daemon = self.enterContext(launch_process(
             ["bash", str(self.fixture.watcher), "--daemon"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        ))
         try:
             deadline = time.monotonic() + TEST_HANG_GUARD_SECS
             log = ""
@@ -562,12 +562,11 @@ raise SystemExit(0)
             encoding="utf-8",
         )
 
-        daemon = subprocess.Popen(
+        daemon = self.enterContext(launch_process(
             ["bash", str(self.fixture.watcher), "--daemon"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        ))
         try:
             deadline = time.monotonic() + TEST_HANG_GUARD_SECS
             log = ""

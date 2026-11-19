@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import launch as launch_process
+
 import json
 import os
 import shlex
@@ -167,7 +169,6 @@ class NotifierTests(unittest.TestCase):
         _ = (self.sessions_dir / "live.json").write_text(json.dumps(record))
 
     def run_cli(self, *args: str, now: int = NOW, send_rc: int = 0) -> subprocess.CompletedProcess[str]:
-        owned = OwnedTestProcesses()
         command = ["zsh", str(SCRIPT), *args]
         environment = self.owned.environment({
             **os.environ,
@@ -192,17 +193,9 @@ class NotifierTests(unittest.TestCase):
                 environment["SHOWN_ZONE"] = ""
             else:
                 environment["SHOWN_ZONE"] = zone.stdout.rstrip("\n") if zone.returncode == 0 else ""
-        child = subprocess.Popen(
-            command,
-            env=environment,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
-        )
-        owned.track(child, group=True)
-        try:
+        with launch_process(command, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as child:
             output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
             return subprocess.CompletedProcess(command, child.wait(), output, errors)
-        finally:
-            owned.finish()
 
     def successful(self, *args: str, now: int = NOW, send_rc: int = 0) -> str:
         result = self.run_cli(*args, now=now, send_rc=send_rc)
@@ -700,7 +693,7 @@ class NotifierTests(unittest.TestCase):
         )
         job.chmod(0o755)
         _ = self.successful("new", "example", "--every", "1", "--run", str(job))
-        tick = subprocess.Popen(
+        tick = self.enterContext(launch_process(
             ["zsh", str(SCRIPT), "tick"],
             env=self.owned.environment({
                 **os.environ,
@@ -709,9 +702,8 @@ class NotifierTests(unittest.TestCase):
                 "NOTIFIER_SESSIONS_DIR": str(self.sessions_dir),
                 "NOTIFIER_NOW_EPOCH": str(MINUTE + 60),
             }),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
-        )
-        self.owned.track(tick, group=True)
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ))
         try:
             _, stderr = tick.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(tick.returncode, 0, stderr)

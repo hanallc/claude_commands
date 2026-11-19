@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import ManagedProcess, launch as launch_process
+
 import json
 import os
 import signal
@@ -394,16 +396,15 @@ class MacRunTests(unittest.TestCase):
 
     def start_mac_run(
         self, *, extra: dict[str, str] | None = None
-    ) -> subprocess.Popen[str]:
-        return subprocess.Popen(
+    ) -> ManagedProcess[str]:
+        return self.enterContext(launch_process(
             ["zsh", str(SCRIPT), str(self.repository), SHA, "0"],
             cwd=self.root,
             env={**self.environment, **(extra or {})},
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
-        )
+        ))
 
     def events(self) -> list[CommandEvent]:
         path = self.stub_state / "events"
@@ -441,7 +442,7 @@ class MacRunTests(unittest.TestCase):
     def assert_claim_released(self) -> None:
         self.assertFalse((self.state_directory / "run.json").exists())
 
-    def wait_for_path(self, path: Path, process: subprocess.Popen[str]) -> None:
+    def wait_for_path(self, path: Path, process: ManagedProcess[str] | subprocess.Popen[str]) -> None:
         wait_until(lambda: path.exists() or process.poll() is not None, path.parent, processes=(process,))
         if process.poll() is not None:
             output, errors = process.communicate()

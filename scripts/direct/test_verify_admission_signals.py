@@ -11,6 +11,7 @@ from scripts.build_queue import admission_protocol as wire
 from scripts.direct.verify_doc_test_support import VERIFY, VerifyDocFixture
 from scripts.direct.verify_mac_offload_test_support import processes_carrying, reap
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.process_supervisor import launch as launch_process
 
 
 CONNECT_OBSERVER = '''import os, runpy, sys
@@ -66,16 +67,15 @@ class VerifyAdmissionSignalsTests(VerifyDocFixture):
                     admission.server.reply_filter = observed_wait
                     _ = Path(environment["BUILDLOG_MEMINFO"]).write_text(
                         "MemTotal: 67108864 kB\nMemAvailable: 0 kB\n")
-                process = subprocess.Popen(["bash", str(VERIFY), "doc"], cwd=self.repo,
-                                           env=environment, stdout=subprocess.PIPE,
-                                           stderr=subprocess.PIPE, text=True, start_new_session=True)
-                self.addCleanup(process.wait, timeout=5)
                 self.addCleanup(reap, marker)
+                process = self.enterContext(launch_process(["bash", str(VERIFY), "doc"], cwd=self.repo,
+                                           env=environment, stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE, text=True))
                 wait_until(ready.exists, self.root, processes=(process,))
                 process.terminate()
                 output, errors = process.communicate(timeout=5)
                 self.assertEqual(process.returncode, 143, output + errors)
-                self.assertEqual(processes_carrying(marker), set())
+                self.assertEqual(processes_carrying(marker) - {process.session_id}, set())
                 self.assertEqual(list((self.root / "slots").glob("*")), [])
                 with admission.loop_turn():
                     self.assertFalse(any(request.owner.pid == process.pid

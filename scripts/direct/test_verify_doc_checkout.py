@@ -2,6 +2,8 @@
 """Exercise doc verification against real Git trees and fake Cargo."""
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import ManagedProcess, launch as launch_process
+
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -36,16 +38,15 @@ DOC_COMMAND = ("bash", str(VERIFY), "doc")
 
 
 class VerifyDocCheckoutTests(VerifyDocFixture):
-    def start_doc(self, *, command: tuple[str, ...] = DOC_COMMAND) -> tuple[subprocess.Popen[bytes], Path, str]:
+    def start_doc(self, *, command: tuple[str, ...] = DOC_COMMAND) -> tuple[ManagedProcess[bytes], Path, str]:
         log = self.root / "verify.log"
         marker = f"TEST_DOC_CHECKOUT={self.root}"
-        with log.open("wb") as output:
-            process = subprocess.Popen(
-                command, cwd=self.repo, stdout=output, stderr=output,
-                env={**self.environment, "TEST_DOC_CHECKOUT": str(self.root)}, start_new_session=True,
-            )
-        self.addCleanup(process.wait, timeout=TEST_HANG_GUARD_SECS)
         self.addCleanup(reap, marker)
+        with log.open("wb") as output:
+            process = self.enterContext(launch_process(
+                command, cwd=self.repo, stdout=output, stderr=output,
+                env={**self.environment, "TEST_DOC_CHECKOUT": str(self.root)},
+            ))
         return process, log, marker
 
     @contextmanager
@@ -252,7 +253,8 @@ with subprocess.Popen(command, stdout=subprocess.PIPE, text=True) as copy:
                     expected = 143 if stop == signal.SIGTERM else -signal.SIGKILL
                     self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), expected, log.read_text())
                     if stop == signal.SIGTERM:
-                        self.assertEqual(processes_carrying(marker), set())
+                        self.assertEqual(processes_carrying(marker) - {process.session_id}, set())
+                        process.close()
                     else:
                         self.assertTrue(select.select([exited], [], [], 30)[0],
                                         "the folder waiter survived verify")

@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 import unittest
 from unittest import mock
 
+from scripts.lib.process_supervisor import ManagedProcess, launch
 from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service, first_step, placement
 from scripts.buildlog import repository, treekey
@@ -74,7 +75,7 @@ class SlotOrderTests(unittest.TestCase):
     slot_root: Path = Path()
     owner: str = ""
     queue: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
-    processes: list[subprocess.Popen[str]] = []
+    processes: list[ManagedProcess[str]] = []
     requests: list[wire.Request] = []
     request_times: list[tuple[wire.Request, float]] = []
     replies: list[wire.Reply] = []
@@ -128,16 +129,9 @@ class SlotOrderTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(self.queue.server, "handle_request", side_effect=observe_request))
         _ = self.enterContext(mock.patch.object(self.queue.server, "reply_filter", side_effect=observe_reply))
         _ = self.enterContext(self.queue.serving())
-        self.addCleanup(self.stop_processes)
-
-    def stop_processes(self) -> None:
-        for process in self.processes:
-            if process.poll() is None:
-                process.kill()
-            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def start(self, command: tuple[str, ...], *options: str, since_age: float = 0,
-              separate_command: bool = True) -> subprocess.Popen[str]:
+              separate_command: bool = True) -> ManagedProcess[str]:
         launcher = [sys.executable, "-m", "scripts.copies.copies"]
         if since_age:
             program = ("import sys,time; from types import SimpleNamespace; from unittest.mock import patch; "
@@ -146,13 +140,13 @@ class SlotOrderTests(unittest.TestCase):
                 + "with patch.object(first_step, 'time', clock): raise SystemExit(copies.main(sys.argv[1:]))\n")
             launcher = [sys.executable, "-c", program]
         separator = ["--"] if separate_command else []
-        process = subprocess.Popen([*launcher, "run", "--repo", str(self.source),
+        process = self.enterContext(launch([*launcher, "run", "--repo", str(self.source),
             "--commit", "HEAD", *options, *separator, *command], cwd=CHECKOUT, env=dict(os.environ),
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
         self.processes.append(process)
         return process
 
-    def next_step(self, process: subprocess.Popen[str]) -> StartedStep:
+    def next_step(self, process: ManagedProcess[str]) -> StartedStep:
         assert process.stdout is not None
         self.assertTrue(select.select([process.stdout], [], [], TEST_HANG_GUARD_SECS)[0],
             "the command did not reach its admitted step")
@@ -162,12 +156,12 @@ class SlotOrderTests(unittest.TestCase):
             self.fail("the command exited before its admitted step: " + output + errors)
         return cast(StartedStep, json.loads(line))
 
-    def finish_step(self, process: subprocess.Popen[str]) -> None:
+    def finish_step(self, process: ManagedProcess[str]) -> None:
         assert process.stdin is not None
         _ = process.stdin.write("x")
         process.stdin.flush()
 
-    def finish(self, process: subprocess.Popen[str]) -> None:
+    def finish(self, process: ManagedProcess[str]) -> None:
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
 
@@ -763,7 +757,7 @@ placement_once
         verify = str(CHECKOUT / "scripts/direct/verify.sh")
         boards: dict[int, Path] = {}
 
-        def start_verify(variant: str = "") -> subprocess.Popen[str]:
+        def start_verify(variant: str = "") -> ManagedProcess[str]:
             caller = len(self.processes)
             board = boards[caller] = self.root / f"board-{caller}"
             local = ("test", "sample", "--local", "fixture", "--no-cache")
@@ -791,7 +785,7 @@ placement_once
             listener.listen(maximum + 1)
             listener.settimeout(60)
 
-            def next_running_step() -> tuple[Path, tuple[socket.socket, subprocess.Popen[str]]]:
+            def next_running_step() -> tuple[Path, tuple[socket.socket, ManagedProcess[str]]]:
                 connection = steps.enter_context(listener.accept()[0])
                 connection.settimeout(60)
                 with connection.makefile("r") as response:
@@ -862,7 +856,7 @@ placement_once
                     self.assertFalse((boards[number] / "locks/cargo.d").exists())
             print("Capacity: two waiters hold no memory, token or folder.", flush=True)
 
-            def finish_caller(process: subprocess.Popen[str]) -> None:
+            def finish_caller(process: ManagedProcess[str]) -> None:
                 output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(process.returncode, 0, output + errors)
                 if process is token_caller:

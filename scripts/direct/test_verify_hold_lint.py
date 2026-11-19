@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import launch as launch_process
+
 import subprocess
 import unittest
 from pathlib import Path
@@ -90,10 +92,10 @@ date() { if [[ "${1:-}" == +%s ]]; then cat "$TEST_WIDTH_CLOCK"; else command da
 sweep_after_step() { :; }
 run_nextest --package sample
 '''
-        process = subprocess.Popen(
+        process = self.enterContext(launch_process(
             ["bash", "-c", script, "bash", str(invoke)], cwd=self.fixture.root, env=environment,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
-        )
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ))
         self.addCleanup(self.stop_process, process)
         _ = self.wait_for_call(process)
         self.assertEqual(self.fixture.local_runs(), [])

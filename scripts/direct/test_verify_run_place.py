@@ -18,6 +18,7 @@ from scripts.build_queue import admission_protocol as wire, admission_service as
 from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.process_group import send_process_group
+from scripts.lib.process_supervisor import ManagedProcess, launch
 
 VERIFY = Path(__file__).with_name("verify.sh")
 
@@ -73,7 +74,7 @@ fi
         return script
 
     def start(self, script: Path, name: str, *words: str,
-              **changes: str) -> subprocess.Popen[str]:
+              **changes: str) -> ManagedProcess[str]:
         repository = script.parents[2] / "repository"
         repository.mkdir()
         _ = (repository / "Cargo.toml").write_text("[workspace]\n")
@@ -83,18 +84,18 @@ fi
                        "UNIT_DETACHED_RUN": "", **changes}
         _ = environment.pop("PYTHONPATH", None)
         _ = environment.pop("BUILDLOG_RUN", None)
-        process = subprocess.Popen(["bash", str(script), name, *words], cwd=repository, env=environment,
-                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   text=True, start_new_session=True)
+        process = self.enterContext(launch(["bash", str(script), name, *words], cwd=repository, env=environment,
+                                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                           text=True))
         self.addCleanup(self.stop, process)
         return process
 
-    def stop(self, process: subprocess.Popen[str]) -> None:
+    def stop(self, process: ManagedProcess[str]) -> None:
         if process.poll() is None:
             send_process_group(process.pid, signal.SIGKILL)
         _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
-    def probe(self, process: subprocess.Popen[str]) -> RunProbe:
+    def probe(self, process: ManagedProcess[str]) -> RunProbe:
         assert process.stdout is not None
         self.assertTrue(select.select([process.stdout], [], [], TEST_HANG_GUARD_SECS)[0],
                         "verify startup did not reach the probe")
@@ -102,7 +103,7 @@ fi
         self.assertTrue(line, "verify startup exited before the probe")
         return cast(RunProbe, json.loads(line))
 
-    def proceed(self, process: subprocess.Popen[str]) -> None:
+    def proceed(self, process: ManagedProcess[str]) -> None:
         assert process.stdin is not None
         _ = process.stdin.write("continue\n")
         process.stdin.flush()

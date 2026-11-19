@@ -1,6 +1,8 @@
 """Exercise placement return and SSH routing with executable stand-ins."""
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import launch as launch_process
+
 import json
 import os
 from pathlib import Path
@@ -171,8 +173,8 @@ class QueueRunTests(unittest.TestCase):
             with self.subTest(waiting=waiting, signum=signum), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 environment = {**self.fixture(root), "FAKE_QUEUE_WAIT": "1" if waiting else "0", "FAKE_SSH_HOLD": "1"}
-                with subprocess.Popen(self.command(root), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                      text=True, env=environment, start_new_session=True) as process:
+                with launch_process(self.command(root), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                      text=True, env=environment) as process:
                     try:
                         wait_until((root / ("waiting" if waiting else "running")).exists, root, processes=(process,))
                         if waiting:
@@ -223,8 +225,8 @@ class QueueRunTests(unittest.TestCase):
                             + f" || print ended > {root}/order; kill -TERM $(<{root}/app)")
                 wrapper = mac_queue_run.remote_wrapper(work, on_close, 20).replace("/bin/zsh", zsh)
                 # Its own session stands in for the SSH session on the Mac.
-                with subprocess.Popen([zsh, "-c", wrapper], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                      text=True, start_new_session=True) as process:
+                with launch_process([zsh, "-c", wrapper], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      text=True) as process:
                     try:
                         assert process.stdout is not None and process.stdin is not None
                         self.assertEqual(process.stdout.readline(), f"mac_group={process.pid}\n")

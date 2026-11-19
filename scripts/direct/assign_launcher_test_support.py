@@ -14,7 +14,8 @@ from typing import Callable, TextIO, cast, override
 from unittest.mock import patch
 
 from scripts.direct import assign, phase_table
-from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
+from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.lib.process_supervisor import launch
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
@@ -225,10 +226,10 @@ class AssignLauncherFixture(unittest.TestCase):
         command = [str(director), "-c", "import subprocess, sys; raise SystemExit(subprocess.call(sys.argv[1:]))", *arguments]
         if isolate_ancestors:
             command = ["unshare", "--user", "--map-current-user", "--pid", "--fork", "--mount-proc", *command]
-        with subprocess.Popen(command, env=os.environ.copy(), cwd=ROOT, text=True,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as child:
-            output, errors = communicate_launcher(child)
-            return subprocess.CompletedProcess(arguments, child.returncode, output, errors)
+        with launch(command, env=os.environ.copy(), cwd=ROOT, text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
+            output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
+            return subprocess.CompletedProcess(arguments, child.wait(), output, errors)
 
     def successful(self, role: str = "implement", *options: str,
                    execution: AssignmentExecution = DEFAULT_ASSIGNMENT_EXECUTION) -> subprocess.CompletedProcess[str]:

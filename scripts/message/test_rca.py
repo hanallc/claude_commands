@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import IO, cast, override
 from unittest import mock
 
+from scripts.lib.process_supervisor import launch as launch_process
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.notify import push_texts  # noqa: E402
@@ -286,10 +287,9 @@ subprocess.run([sys.executable, '-c',
                     "OWNER_TEST_RETURN": str(returned), "OWNER_TEST_CASE_DIR": str(rca.STATE),
                     "OWNER_TEST_PIDS": str(descendants)}
                 self.owned.markers.append(descendants)
-                with REAL_POPEN([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", caller, mode], cwd=Path(__file__).resolve().parents[2],
+                with mock.patch.object(subprocess, "Popen", REAL_POPEN), launch_process([str(Path(__file__).resolve().parents[2] / "scripts/lib/py"), "-c", caller, mode], cwd=Path(__file__).resolve().parents[2],
                                 env=self.owned.environment(environment), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, start_new_session=True) as process:
-                    self.owned.track(process, group=True)
+                                text=True) as process:
                     try:
                         with receiver.accept()[0] as connection:
                             connection.settimeout(10)
@@ -298,6 +298,7 @@ subprocess.run([sys.executable, '-c',
                             connection.sendall(b"delivered")
                         out, err = process.communicate(timeout=10)
                     finally:
+                        process.close()
                         self.owned.finish()
                 self.assertEqual(process.returncode, -signal.SIGTERM, out + err)
                 self.assertEqual(json.loads(returned.read_text()), {"failure": "", "delivered": True})

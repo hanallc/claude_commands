@@ -8,7 +8,6 @@ import io
 import json
 import os
 from pathlib import Path
-import signal
 import shutil
 import socket
 import subprocess
@@ -27,6 +26,7 @@ from scripts.lib.build_slots_test_support import UseDefaultMaximum, private_slot
 from scripts.lib.descendants import adopt_descendants
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.process_group import send_process_group
+from scripts.lib.process_supervisor import ManagedProcess, launch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -74,12 +74,16 @@ class BuildSlotsTests(unittest.TestCase):
         record["last_use"] = (datetime.now(UTC) - timedelta(days=8)).isoformat()
         _ = path.with_name(path.name + ".lease.json").write_text(json.dumps(record) + "\n")
 
-    def command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+    def launch_command(self, *arguments: str) -> ManagedProcess[str]:
         checkout = Path(__file__).resolve().parents[2]
-        return subprocess.run([sys.executable, "-m", "scripts.lib.build_slots", *arguments],
-                              cwd=checkout, capture_output=True, text=True,
-                              env={**os.environ, "PYTHONPATH": str(checkout), "PYTHONSAFEPATH": "1"},
-                              timeout=TEST_HANG_GUARD_SECS)
+        return launch([sys.executable, "-m", "scripts.lib.build_slots", *arguments], cwd=checkout,
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                      env={**os.environ, "PYTHONPATH": str(checkout), "PYTHONSAFEPATH": "1"})
+
+    def command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        with self.launch_command(*arguments) as process:
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            return subprocess.CompletedProcess(process.args, process.wait(), output, errors)
 
     def run_arguments(self) -> tuple[str, ...]:
         return ("run", "--source", str(self.source), "--commit", self.base,
@@ -760,19 +764,14 @@ child = subprocess.Popen([sys.executable, '-c', 'import signal; signal.pause()']
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 print(child.pid, flush=True)
 """
-        result = self.command(*self.run_arguments(), sys.executable, "-c", probe)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        descendant = int(result.stdout.strip())
-        try:
+        with self.launch_command(*self.run_arguments(), sys.executable, "-c", probe) as process:
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(process.returncode, 0, output + errors)
+            descendant = int(output.strip())
             with self.assertRaises(ProcessLookupError):
                 os.kill(descendant, 0)
             with self.take() as reused:
                 self.assertEqual(reused.path, self.slot_root / "widget-slot1")
-        finally:
-            try:
-                os.kill(descendant, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
 
     @unittest.skipUnless(sys.platform == "linux", "the Mac path runs with Linux orphan reaping")
     def test_mac_run_stops_its_background_group_before_it_releases_the_slot(self) -> None:

@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from typing import cast
 
-from scripts.lib.process_group import send_process_group
+from scripts.lib.process_supervisor import launch
 from scripts.lib.test_hang_guard import LauncherHangGuard
 
 HEARTBEAT = Path(__file__).resolve().parent / "heartbeat.sh"
@@ -65,20 +65,13 @@ class HeartbeatWatcherTests(unittest.TestCase):
             root = Path(directory)
             with subprocess.Popen([sys.executable, "-c", "pass"]) as agent:
                 _ = agent.wait(timeout=guard.remaining())
-            watcher: subprocess.Popen[str] = subprocess.Popen(
+            with launch(
                 ["bash", str(WATCHER), str(root / "heartbeat.log"), "fixture",
                  str(agent.pid), str(root / "agent.log"), "1"],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
-            )
-            try:
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            ) as watcher:
                 output, errors = watcher.communicate(timeout=guard.remaining())
                 self.assertEqual(watcher.returncode, 0, output + errors)
-            finally:
-                try:
-                    send_process_group(watcher.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                _ = watcher.communicate(timeout=guard.remaining())
 
     def test_stop_signals_close_the_output_pipes_and_reap_the_sleep(self) -> None:
         for stop_signal in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -95,19 +88,18 @@ class HeartbeatWatcherTests(unittest.TestCase):
                 _ = sleep_probe.write_text(
                     f"#!{sys.executable}\nimport os\n"
                     + "print(os.getpid(), flush=True)\n"
-                    + f"os.read({interval_read}, 1)\n",
+                    + "os.read(3, 1)\n",
                     encoding="utf-8",
                 )
                 sleep_probe.chmod(0o755)
                 environment = dict(os.environ)
                 environment["PATH"] = str(root) + os.pathsep + environment["PATH"]
-                watcher: subprocess.Popen[str] = subprocess.Popen(
-                    ["bash", str(WATCHER), str(root / "heartbeat.log"), "fixture",
-                     str(os.getpid()), str(root / "agent.log"), "30"],
+                with launch(
+                    ["bash", "-c", 'exec 3<&0; exec bash "$@"', "heartbeat-fixture",
+                     str(WATCHER), str(root / "heartbeat.log"), "fixture", str(os.getpid()), str(root / "agent.log"), "30"],
                     env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, start_new_session=True, pass_fds=(interval_read,),
-                )
-                try:
+                    text=True, stdin=interval_read,
+                ) as watcher:
                     assert watcher.stdout is not None
                     self.assertTrue(select.select([watcher.stdout], [], [], guard.remaining())[0],
                                     "the watcher's sleep child never started")
@@ -118,14 +110,6 @@ class HeartbeatWatcherTests(unittest.TestCase):
                     with self.assertRaises(ProcessLookupError,
                                            msg="the watcher's sleep child survived shutdown"):
                         os.kill(sleep_pid, 0)
-                finally:
-                    # On a regression, kill only this disposable process group,
-                    # including a child that still owns the output pipes.
-                    try:
-                        send_process_group(watcher.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    _ = watcher.communicate(timeout=guard.remaining())
 
 
 if __name__ == "__main__":

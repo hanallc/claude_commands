@@ -205,7 +205,6 @@ SYSTEMD_STUB = r'''from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 
 root = Path(os.environ["MAC_TEST_STUB_DIR"])
@@ -214,16 +213,6 @@ with (root / "systemd-run.jsonl").open("a", encoding="utf-8") as output:
     output.write(json.dumps(arguments) + "\n")
 status_file = root / "systemd-status"
 status = int(status_file.read_text()) if status_file.exists() else 0
-if status == 0 and (root / "systemd-start").exists():
-    command = arguments[arguments.index("--") + 1:]
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    (root / "systemd-pid").write_text(str(process.pid), encoding="utf-8")
 raise SystemExit(status)
 '''
 

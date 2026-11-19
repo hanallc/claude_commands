@@ -15,7 +15,8 @@ from functools import cached_property
 from pathlib import Path
 from typing import TypedDict, cast, override
 
-from scripts.direct.recorder_fixture import LauncherFixture, communicate_launcher, configure_launcher_fixture, launcher_environment, prepare_launcher_runtime
+from scripts.lib.process_supervisor import ManagedProcess
+from scripts.direct.recorder_fixture import LauncherFixture, configure_launcher_fixture, launcher_environment, prepare_launcher_runtime
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
@@ -226,11 +227,15 @@ class ReviewLauncherFixture(LauncherFixture):
             check=False, capture_output=True, text=True, env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
-    def finish_early_launcher(self, process: subprocess.Popen[str], ready: Path,
+    def finish_early_launcher(self, process: ManagedProcess[str], ready: Path,
                               finish: Path, timeout: float = test_hang_guard.TEST_HANG_GUARD_SECS) -> tuple[str, str]:
         ready.touch()
         finish.touch()
-        return communicate_launcher(process, timeout)
+        try:
+            return process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.close()
+            raise
 
     @override
     def recorder(self, *arguments: str) -> None:

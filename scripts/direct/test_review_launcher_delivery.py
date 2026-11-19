@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import launch as launch_process
+
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -134,9 +136,8 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
                             "TEST_EARLY_READY": str(ready), "STUB_REVIEW_FINISH_FILE": str(finish)})
         command = ["bash", "-c", 'export TEST_REVIEW_LAUNCHER_PID=$$; exec "$@"', "review-under-test",
                    *self.review_command(session, "adversary", str(ready))]
-        process = subprocess.Popen(command,
-                                   env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                   start_new_session=True)
+        process = self.enterContext(launch_process(command,
+                                   env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
         try:
             wait_until(entered.exists, session, timeout=TEST_HANG_GUARD_SECS, processes=(process,))
             self.assertEqual(heartbeat_arguments.read_text().splitlines(), ["1"])
@@ -160,8 +161,8 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
                 + 'Path(os.environ["TEST_CLAUDE_CHILD_PID"]).write_text(str(os.getpid())); signal.pause()\'\n'
             )
         with (session / "cancellation-output").open("w") as output:
-            process = subprocess.Popen(self.review_command(session, "", ""), env=environment,
-                                       stdout=output, stderr=output, text=True, start_new_session=True)
+            process = self.enterContext(launch_process(self.review_command(session, "", ""), env=environment,
+                                       stdout=output, stderr=output, text=True))
             try:
                 descriptor = os.pidfd_open(wait_for_pid(child_ready, processes=(process,)))
                 try:
@@ -186,8 +187,8 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
                       "p = Path(sys.argv[1]); staged = p.with_name(p.name + '.tmp'); "
                       "staged.write_text(str(os.getpid())); os.replace(staged, p); signal.pause()")
         program = f"import subprocess, sys; child = subprocess.Popen([sys.executable, '-c', {child_code!r}, {str(child_ready)!r}]); child.wait()"
-        process = subprocess.Popen([sys.executable, "-c", program], stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, text=True, start_new_session=True)
+        process = self.enterContext(launch_process([sys.executable, "-c", program], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True))
         ready, finish = self.root / "early-ready", self.root / "early-finish"
         try:
             descriptor = os.pidfd_open(wait_for_pid(child_ready, processes=(process,)))

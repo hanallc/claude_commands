@@ -2,6 +2,8 @@
 """Tests for scratch.py: folders that belong to a task and go when it ends."""
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import launch as launch_process
+
 import errno
 import itertools
 import json
@@ -671,7 +673,7 @@ class ScratchTests(unittest.TestCase):
             server.bind(str(address))
             server.listen()
             server.settimeout(5)
-            with subprocess.Popen(command, env=env, start_new_session=True, stderr=subprocess.PIPE) as removal:
+            with launch_process(command, env=env, stderr=subprocess.PIPE) as removal:
                 try:
                     with server.accept()[0] as conn:
                         conn.settimeout(7)

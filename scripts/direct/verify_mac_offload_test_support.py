@@ -40,7 +40,7 @@ from unittest import mock
 from scripts.build_hold import build_hold
 from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
 from scripts.lib import inotify
-from scripts.lib.process_supervisor import ManagedProcess
+from scripts.lib.process_supervisor import ManagedProcess, launch as launch_process
 from scripts.production.cli_fixture import invoke_cli
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
@@ -88,9 +88,10 @@ def stub_build_tool_path(directory: Path) -> str:
     return str(directory)
 
 
-def restore_sigint() -> None:
-    # Background suite processes may inherit SIG_IGN; Bash cannot trap that.
-    _ = signal.signal(signal.SIGINT, signal.SIG_DFL)
+def with_interrupts(command: list[str]) -> list[str]:
+    if sys.platform == "linux" and signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
+        return ["env", "--default-signal=INT", *command]
+    return command
 
 
 def processes_carrying(marker: str) -> set[int]:
@@ -108,10 +109,10 @@ def processes_carrying(marker: str) -> set[int]:
     return found
 
 
-def wait_for_marker_exit(marker: str, timeout: float) -> set[int]:
+def wait_for_marker_exit(marker: str, timeout: float, *, guardian: int = 0) -> set[int]:
     """Wait for marked processes to exit. Return survivors without a signal."""
     deadline = time.monotonic() + timeout
-    while children := processes_carrying(marker):
+    while children := processes_carrying(marker) - {guardian}:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
@@ -136,7 +137,7 @@ def wait_for_marker_exit(marker: str, timeout: float) -> set[int]:
         finally:
             for descriptor in descriptors:
                 os.close(descriptor)
-    return processes_carrying(marker)
+    return processes_carrying(marker) - {guardian}
 
 
 def reap(marker: str) -> dict[int, str]:
@@ -1302,7 +1303,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         """Call the real result and retry functions with private tools and records."""
         return self.finish_verify(self.start_mac_functions(body, extra=extra))
 
-    def start_mac_functions(self, body: str, *, extra: dict[str, str] | None = None) -> subprocess.Popen[str]:
+    def start_mac_functions(self, body: str, *, extra: dict[str, str] | None = None) -> ManagedProcess[str]:
         """Start the real result and retry functions with private tools and records."""
         install_fixed_cargo(self.bin_directory / "cargo")
         direct = self.root / "direct-functions"
@@ -1379,12 +1380,11 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
 '''
         invoke = 'source "$TEST_REAL_DIRECT/../lint/invoke.sh"\n'
         _ = script.write_text(invoke + functions + setup + '\neval "$1"\n', encoding="utf-8")
-        return subprocess.Popen(["bash", str(script), body], cwd=self.root,
+        return self.enterContext(launch_process(with_interrupts(["bash", str(script), body]), cwd=self.root,
                                    env={**self.environment, "TEST_REAL_DIRECT": str(VERIFY.parent),
                                         "TEST_TOKEN_RECORD": str(self.board / "locks/cargo.d/holder_pid"),
                                         **(extra or {})},
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                   start_new_session=True, preexec_fn=restore_sigint)
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
 
     def verify(
         self, *arguments: str, extra: dict[str, str] | None = None
@@ -1414,17 +1414,15 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
 
     def start_verify(
         self, *arguments: str, extra: dict[str, str] | None = None
-    ) -> subprocess.Popen[str]:
-        return subprocess.Popen(
-            self.prepare_verify(*arguments, extra=extra),
+    ) -> ManagedProcess[str]:
+        return self.enterContext(launch_process(
+            with_interrupts(self.prepare_verify(*arguments, extra=extra)),
             cwd=self.root,
             env={**self.environment, **(extra or {})},
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
-            preexec_fn=restore_sigint,
-        )
+        ))
 
     def prepare_verify(self, *arguments: str, extra: dict[str, str] | None = None) -> list[str]:
         self.placement_policy = {**self.environment, **(extra or {})}
@@ -1583,7 +1581,7 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
             self.fail(f"processes outlived the test:\n{commands}")
 
     def start_routing(self, reason: str = "busy", *, pause_retry: bool = False,
-                      step_sleep: bool = False, once: Path | None = None) -> subprocess.Popen[str]:
+                      step_sleep: bool = False, once: Path | None = None) -> ManagedProcess[str]:
         real_sleep = shutil.which("sleep")
         assert real_sleep is not None
         process = self.start_verify("test", "sample", "--filter", "alpha", "--no-cache", extra={
@@ -1650,7 +1648,7 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
             for descriptor in descriptors:
                 os.close(descriptor)
 
-    def wait_for_memory_wait(self, process: subprocess.Popen[str]) -> None:
+    def wait_for_memory_wait(self, process: ManagedProcess[str]) -> None:
         """Wait for a held reply from this fixture's service."""
         from scripts.build_queue import admission_client
 
@@ -1707,7 +1705,7 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         saved = admission_client.read_assignment(Path(words[words.index("--assignment-file") + 1]))
         return saved.assignment.episode
 
-    def wait_for_retry_probe(self, clock: int, process: subprocess.Popen[str]) -> None:
+    def wait_for_retry_probe(self, clock: int, process: ManagedProcess[str]) -> None:
         """Advance the queue to the requested retry observation."""
         from scripts.build_queue import admission_client
 
@@ -1825,7 +1823,7 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         for event in self.runner_events()[1:]:
             self.assertNotIn("--last-decline", event["args"])
 
-    def start_copy_call(self, *words: str, copy: dict[str, str]) -> tuple[subprocess.Popen[str], int]:
+    def start_copy_call(self, *words: str, copy: dict[str, str]) -> tuple[ManagedProcess[str], int]:
         """Start a call the busy Mac sends to natedev, where its step compiles
         until cargo-release; return it with the pid of the Mac copy it starts."""
         admission = caller_admission(self, self.root, self.environment)
@@ -1876,7 +1874,7 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         self.assertEqual(len(self.runner_events()), 0)
         return process, int(started.read_text(encoding="utf-8"))
 
-    def wait_for_reaped(self, pid: int, processes: Sequence[subprocess.Popen[str]]) -> None:
+    def wait_for_reaped(self, pid: int, processes: Sequence[subprocess.Popen[str] | ManagedProcess[str]]) -> None:
         # Only the watcher collects its copy, and it reads the copy's result
         # when it does: a gone pid means the watcher has taken the result.
         # After collecting a yielded copy, the watcher publishes its next

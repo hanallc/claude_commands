@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import ManagedProcess, launch as launch_process
+
 import os
 import select
 import signal
@@ -94,14 +96,14 @@ class PoolCase(unittest.TestCase):
         _ = os.write(self.keeper, taken)
         return len(taken)
 
-    def holder(self, *command: str, extra: dict[str, str] | None = None) -> subprocess.Popen[str]:
+    def holder(self, *command: str, extra: dict[str, str] | None = None) -> ManagedProcess[str]:
         # Its own process group stands in for the step's scope.
-        child = subprocess.Popen(
+        child = self.enterContext(launch_process(
             [str(PY), str(HOLDER), "--pool", str(self.pool), "--width-file", str(self.root / "width"), "--",
              *command],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True,
-            env={**self.environment, **(extra or {})}, start_new_session=True,
-        )
+            env={**self.environment, **(extra or {})},
+        ))
         self.addCleanup(close_stream, child.stdout)
         self.addCleanup(stop, child)
         return child
@@ -115,18 +117,18 @@ def close_stream(stream: IO[str] | None) -> None:
         stream.close()
 
 
-def stop(child: subprocess.Popen[str]) -> None:
+def stop(child: ManagedProcess[str]) -> None:
     if child.poll() is None:
         child.kill()
         _ = child.wait()
 
 
-def output_of(child: subprocess.Popen[str]) -> IO[str]:
+def output_of(child: ManagedProcess[str]) -> IO[str]:
     assert child.stdout is not None
     return cast(IO[str], child.stdout)
 
 
-def read_line(child: subprocess.Popen[str]) -> str:
+def read_line(child: ManagedProcess[str]) -> str:
     return output_of(child).readline()
 
 

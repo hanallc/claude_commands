@@ -1,6 +1,8 @@
 """Check remote copy removal, admission and recovery through their entry points."""
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import ManagedProcess, launch as launch_process
+
 from collections.abc import Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stdout
@@ -596,8 +598,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
         command = [sys.executable, str(Path(copies.__file__)), "mirror-use", "--path", mirror.path,
                    "--owner", mirror.owner, "--repository", mirror.repository.name,
                    "--session", mirror.session, "--", sys.executable, "-c", program, mirror.path, str(exports)]
-        owner: subprocess.Popen[str] = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                 start_new_session=True)
+        owner: ManagedProcess[str] = self.enterContext(launch_process(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
         runner, shell, child = 0, 0, 0
         try:
             if owner.stdout is None:
@@ -765,7 +766,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
         _ = staff.set_run(owner.id, staff.OpenRun(run))
         environment = {key: value for key, value in os.environ.items()
                        if key not in {"UNIT_RUN_DIR", "UNIT_SESSION_DIR", "PLAN_DELEGATE_BOARD_DIR",
-                                      "PLAN_DELEGATE_SESSION_DIR", 
+                                      "PLAN_DELEGATE_SESSION_DIR",
                                       "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"}}
         environment.update(UNIT_RUN_DIR=str(run),
                            CLAUDE_CODE_SESSION_ID="worker-shell-session")

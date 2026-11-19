@@ -1,6 +1,7 @@
 """Exercise native hook payloads against private staff and transcripts."""
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import ManagedProcess, launch
 from scripts.lib.checkout_test_support import python_tool_source
 
 import json
@@ -56,14 +57,14 @@ class NativeHookEntryTests(unittest.TestCase):
                     "from scripts.lib.atomic_file import write_text_atomic",
                     "turn_end.handle = lambda event: write_text_atomic(Path(sys.argv[1]), json.dumps(asdict(event)))",
                     "raise SystemExit(turn_end.main(sys.argv[2:]))", ""))))
-                children: list[subprocess.Popen[bytes]] = []
+                children: list[ManagedProcess[bytes]] = []
 
                 def receive(arguments: list[str], *, start_new_session: bool, stdin: int,
-                            stdout: int, stderr: int) -> subprocess.Popen[bytes]:
-                    child = real_popen([arguments[0], str(receiver), str(receipt), *arguments[2:]],
-                        start_new_session=start_new_session, stdin=stdin, stdout=stdout, stderr=stderr)
-                    self.addCleanup(child.wait, timeout=TEST_HANG_GUARD_SECS)
-                    self.addCleanup(child.kill)
+                            stdout: int, stderr: int) -> ManagedProcess[bytes]:
+                    self.assertTrue(start_new_session)
+                    with patch.object(subprocess, "Popen", real_popen):
+                        child = self.enterContext(launch([arguments[0], str(receiver), str(receipt), *arguments[2:]],
+                            stdin=stdin, stdout=stdout, stderr=stderr))
                     children.append(child)
                     return child
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import ManagedProcess, launch as launch_process
+
 from scripts.production.change_review_test_support import registered_fixture_image
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
@@ -575,14 +577,14 @@ class MergeCheckpointFixture(unittest.TestCase):
                 _ = path.write_text(json.dumps(row))
         _ = timer.write_text(timer_text)
 
-    def launch_competing_bump_gate(self, tip: str) -> subprocess.Popen[bytes]:
+    def launch_competing_bump_gate(self, tip: str) -> ManagedProcess[bytes]:
         path = merge_checkpoint.checkpoint_step_record(self.checkout, tip, "bump-gate")
         output = self.enterContext((self.state / "competing-gate.log").open("wb"))
-        process = subprocess.Popen(
+        process = self.enterContext(launch_process(
             [sys.executable, str(SCRIPT.with_name("bump_gate.py")), "--record", str(path)],
             cwd=self.checkout, env=self.env, stdin=subprocess.DEVNULL,
-            stdout=output, stderr=subprocess.STDOUT, start_new_session=True,
-        )
+            stdout=output, stderr=subprocess.STDOUT,
+        ))
 
         def cleanup() -> None:
             if process.poll() is None:
@@ -592,7 +594,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.addCleanup(cleanup)
         return process
 
-    def wait_competing_bump_gate(self, process: subprocess.Popen[bytes]) -> None:
+    def wait_competing_bump_gate(self, process: ManagedProcess[bytes]) -> None:
         wait_until(lambda: process.poll() is not None or len(self.bump_gate_runs()) > 1,
                    self.state / "gate-runs", processes=(process,))
 

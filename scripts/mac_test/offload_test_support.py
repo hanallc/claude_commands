@@ -32,6 +32,7 @@ from scripts.buildlog import treekey
 from scripts.buildlog import sync as buildlog_sync
 from scripts.mac_test.offload_test_commands import COMMAND_STUB, write_shell
 from scripts.lib import test_hang_guard
+from scripts.lib.process_supervisor import ManagedProcess, launch
 from scripts.lib.process_group import send_process_group
 from scripts.production.cli_fixture import invoke_cli
 from scripts.build_queue.admission_test_support import caller_admission, private_provider_evidence
@@ -588,10 +589,9 @@ raise SystemExit(offload.main())
         script: Path = SCRIPT,
         extra: dict[str, str] | None = None,
         ignore_interrupt: bool = False,
-        start_new_session: bool = False,
         runner_options: tuple[str, ...] = (),
         call_id: str = "call-signal",
-    ) -> subprocess.Popen[str]:
+    ) -> ManagedProcess[str]:
         self.result_path.unlink(missing_ok=True)
         arguments = [
             str(SCRIPT.resolve().parents[1] / "lib/py"),
@@ -619,15 +619,14 @@ raise SystemExit(offload.main())
                 "offload-with-ignored-interrupt",
                 *arguments,
             ]
-        return subprocess.Popen(
+        return self.enterContext(launch(
             arguments,
             cwd=self.root,
             env={**self.environment, **(extra or {})},
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            start_new_session=start_new_session,
-        )
+        ))
 
     def claim_stub_runner(self) -> Path:
         checkout = self.root / "claim-runner"
@@ -783,7 +782,7 @@ raise SystemExit(offload.main())
         self.fail(f"timed out waiting for {path}")
 
     def read_until_output(
-        self, process: subprocess.Popen[str], expected: str
+        self, process: ManagedProcess[str], expected: str
     ) -> str:
         output = process.stdout
         if output is None:
@@ -823,7 +822,6 @@ raise SystemExit(offload.main())
             extra={"MAC_TEST_HELD_TAKEOVER": "1" if takeover else "0",
                    "MAC_TEST_TAKEOVER_FIRST": "0",
                    "MAC_TEST_TAKEOVER_REPLY": reply_host},
-            start_new_session=signal_group,
         )
         try:
             self.wait_for_path(self.stub_directory / "claim-started")
@@ -844,7 +842,7 @@ raise SystemExit(offload.main())
         self.assertFalse((self.state_directory / "unreachable_until").exists())
         return output
 
-    def wait_for_ignored_signals(self, process: subprocess.Popen[str]) -> None:
+    def wait_for_ignored_signals(self, process: ManagedProcess[str]) -> None:
         expected = sum(1 << (number - 1) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP))
         deadline = time.monotonic() + test_hang_guard.TEST_HANG_GUARD_SECS
         while time.monotonic() < deadline:

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import ManagedProcess, launch as launch_process
+
 import argparse
 from datetime import datetime, timezone
 from dataclasses import replace
@@ -390,8 +392,8 @@ class CopyWatchProcessTests(unittest.TestCase):
         self.result = Path()
         self.runner = Path()
         self.environment: dict[str, str] = {}
-        self.step: subprocess.Popen[bytes] | None = None
-        self.watcher: subprocess.Popen[str] | None = None
+        self.step: ManagedProcess[bytes] | None = None
+        self.watcher: ManagedProcess[str] | None = None
 
     @override
     def setUp(self) -> None:
@@ -451,18 +453,17 @@ class CopyWatchProcessTests(unittest.TestCase):
                     process.kill()
                 _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
 
-    def start_step(self) -> subprocess.Popen[bytes]:
+    def start_step(self) -> ManagedProcess[bytes]:
         log = self.root / "step.log"
-        self.step = subprocess.Popen([sys.executable, str(self.root / "step.py"), str(self.root), str(log)],
-                                     env=self.environment, start_new_session=True)
+        self.step = self.enterContext(launch_process([sys.executable, str(self.root / "step.py"), str(self.root), str(log)],
+                                     env=self.environment))
         _ = self.info.write_text(f"pgid={self.step.pid}\nlog={log}\n")
         return self.step
 
     def start_watcher(self, modes: str, *, filter_run: bool = False, call_started: str = "1000.5") -> None:
         arguments = self.watcher_arguments(filter_run=filter_run, call_started=call_started)
-        self.watcher = subprocess.Popen(arguments, env={**self.environment, "TEST_COPY_MODES": modes},
-                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                        start_new_session=True)
+        self.watcher = self.enterContext(launch_process(arguments, env={**self.environment, "TEST_COPY_MODES": modes},
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True))
 
     def watcher_arguments(self, *, filter_run: bool = False, call_started: str = "1000.5") -> list[str]:
         arguments = [
@@ -750,7 +751,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         # The watcher and its runner inherit this parent's output pipe.
         # EOF proves both processes closed the pipe. Cleanup owns only this new process group.
         # The delayed wrapper starts the watcher after its parent exits.
-        parent: subprocess.Popen[str] = subprocess.Popen([
+        parent: ManagedProcess[str] = self.enterContext(launch_process([
             sys.executable, "-c",
             "import os, signal\n"
             + 'signal.alarm(int(os.environ["TEST_HANG_GUARD_SECS"]))\n'
@@ -769,7 +770,7 @@ class CopyWatchProcessTests(unittest.TestCase):
             + ("" if before_start else "signal.pause()\n"),
             *self.watcher_arguments(),
         ], env={**self.environment, "TEST_COPY_MODES": "hold"},
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True))
         try:
             assert parent.stdout is not None
             watcher_pid = int(cast(str, parent.stdout.readline()))

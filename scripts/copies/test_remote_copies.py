@@ -35,6 +35,7 @@ from scripts.lint import tmp_sweep
 from scripts.production.cli_fixture import ImmutableGitSeed
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker
+from scripts.lib.process_supervisor import ManagedProcess, launch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -561,23 +562,19 @@ class RemoteCopiesTests(unittest.TestCase):
                 self.assertIn("copies.py mirror-use", copies.remote_use_command(mirror, "true"))
 
     @contextmanager
-    def open_file_process(self, path: Path, mode: str = "r") -> Generator[subprocess.Popen[str]]:
+    def open_file_process(self, path: Path, mode: str = "r") -> Generator[ManagedProcess[str]]:
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text("held\n")
-        child = subprocess.Popen([
+        with launch([
             sys.executable, "-c",
             "import signal,sys; held=open(sys.argv[1],sys.argv[2]); print('ready',flush=True); signal.pause()",
             str(path), mode,
-        ], cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-        try:
+        ], cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as child:
             if child.stdout is None:
                 self.fail("The child has no readiness stream")
             self.assertTrue(select.select([child.stdout], [], [], 10)[0])
             self.assertEqual(child.stdout.readline(), "ready\n")
             yield child
-        finally:
-            child.kill()
-            _ = child.communicate(timeout=10)
 
     def test_open_file_below_mirror_keeps_the_mirror_busy(self) -> None:
         for mode in ("r", "w", "r+"):

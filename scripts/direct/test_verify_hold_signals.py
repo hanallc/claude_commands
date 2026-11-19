@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import launch as launch_process
+
 import json
 import fcntl
 import subprocess
@@ -34,7 +36,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
                          "the coordinator waits at admission before any step starts")
         started = time.monotonic()
         send_process_group(process.pid, signum)
-        survivors = self.wait_for_owned_exit(5)
+        survivors = self.wait_for_owned_exit(process, 5)
         code = process.poll()
         remaining = self.memory_queue_pids()
         output = ""
@@ -75,9 +77,9 @@ printf '%8192s' x
 printf '%s\n' "${RUN_LOG_PIDS[*]}" >&3
 read -r command
 '''
-            with subprocess.Popen(["bash", "-c", harness, "test", str(log)],
+            with launch_process(["bash", "-c", harness, "test", str(log)],
                                   stdin=subprocess.PIPE, stdout=write_fd,
-                                  stderr=subprocess.PIPE, start_new_session=True, text=True) as process:
+                                  stderr=subprocess.PIPE, text=True) as process:
                 try:
                     assert process.stderr is not None
                     reader_pids = cast(str, process.stderr.readline())

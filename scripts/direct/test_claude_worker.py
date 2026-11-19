@@ -1,6 +1,8 @@
 """Background Claude publishes its observed identity before the opening work."""
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import launch as launch_process
+
 from functools import cached_property
 from contextlib import suppress
 from dataclasses import dataclass
@@ -299,8 +301,7 @@ class NativeClaudeWorkerTests(StaffTestCase):
                     "CODEX_HOME": str(backend.codex_home), "FIXTURE_STOPPED": str(stopped),
                     "UNIT_RUN_DIR": str(parent), "PLAN_DELEGATE_BOARD_DIR": str(parent),
                     "PYTHONPATH": os.pathsep.join((str(CHECKOUT / "scripts/lib/python_startup"), str(modules)))}
-                with subprocess.Popen(command, cwd=self.fixture.work, text=True, env=environment,
-                        start_new_session=True,
+                with launch_process(command, cwd=self.fixture.work, text=True, env=environment,
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE) as launcher:
                     try:
                         with gate.accept()[0] as delivery:

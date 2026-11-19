@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from threading import Thread
 from unittest.mock import patch
 
+from scripts.lib.process_supervisor import ManagedProcess
 from scripts.message import repeat_guard
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
@@ -78,7 +79,7 @@ def install_notice_test_config(home: Path) -> Path:
     return config
 
 
-def wait_for_notice_readiness(path: Path, runner: subprocess.Popen[bytes]) -> None:
+def wait_for_notice_readiness(path: Path, runner: subprocess.Popen[bytes] | ManagedProcess[bytes]) -> None:
     """Fail when the runner exits before its descendants report readiness."""
     exited, notification = socket.socketpair()
 

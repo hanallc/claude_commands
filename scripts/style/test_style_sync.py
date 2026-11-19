@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import launch as launch_process
+
 import errno
 import fcntl
 import io
@@ -1131,7 +1133,7 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
             self.assertEqual(connection.execute("SELECT passed FROM lint_runs").fetchall(), [(0,), (0,), (0,)])
 
     def running_group(self) -> int:
-        group = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        group = self.enterContext(launch_process(["sleep", "60"]))
         self.addCleanup(group.wait)
         self.addCleanup(group.kill)
         return group.pid
