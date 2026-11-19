@@ -161,6 +161,7 @@ HOLDS_FILE = "holds a file open in it"
 WRITES_FILE = "holds a file open for writing in it"
 # The kept reason when the Cargo output guard keeps a folder's external output.
 CARGO_OUTPUT_KEPT = "its Cargo output is kept"
+SCRATCH_HELD = "a scratch hold keeps this folder"
 # The folder names tempfile makers give by default: Rust's tempfile crate ".tmp" and 6 letters or
 # digits, mktemp "tmp." and 8 to 10, Python's tempfile "tmp" and 8 lower-case letters, digits or "_".
 # Test runs leave them behind in the temp folders (3,058 Rust ones in natedev /tmp since 2026-09-06;
@@ -389,6 +390,22 @@ def under_test() -> bool:
             or any(os.environ.get(name) for name in (TEST_SWEEP_ENV, RUN_FOLDER_ENV, "PYTEST_CURRENT_TEST")))
 
 
+def protected_root_configs(home: Path) -> tuple[Path, ...]:
+    return (Path(__file__).absolute().parents[2] / "config" / "build_folders.conf",
+            home / ".claude" / "config" / "build_folders.conf")
+
+
+type FileIdentity = tuple[int, int]
+
+
+def file_identity(path: Path) -> FileIdentity | None:
+    try:
+        info = path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    return info.st_dev, info.st_ino
+
+
 def refuse_live_test_roots(roots: Sequence[str | Path]) -> None:
     """Refuse live roots before a test can list them."""
     if not roots or not under_test():
@@ -403,14 +420,13 @@ def refuse_live_test_roots(roots: Sequence[str | Path]) -> None:
     mounts = {Path(name) for name in ("/tmp", "/private/tmp", "/build", "/dev/shm")}
     live = {Path("/tmp/claude"), Path("/private/tmp/claude"), Path("/session"), home / "session",
             Path(f"/tmp/claude-{os.getuid()}"), Path(f"/private/tmp/claude-{os.getuid()}"),
-            Path(f"/var/tmp/dataclass-code-{os.getuid()}"), home / nextest_log.DIRECTORY}
-    settings = (Path(__file__).absolute().parents[2] / "config" / "build_folders.conf",
-                home / ".claude" / "config" / "build_folders.conf")
+            Path(f"/var/tmp/dataclass-code-{os.getuid()}"), home / nextest_log.DIRECTORY,
+            home / Path(DEFAULT_STATE_DIR).relative_to("~")}
     temporary = os.environ.get("TMPDIR") or "/tmp"
     test_folder = os.environ.get(RUN_FOLDER_ENV)
     if test_folder and absolute(temporary).is_relative_to(absolute(test_folder)):
         temporary = "/tmp"
-    for file in settings:
+    for file in protected_root_configs(home):
         if file.is_file():
             live.update(absolute(value.replace("${TMPDIR}", temporary))
                         for key, value in conf.read(file).values().items() if key.startswith("roots.") and value)
@@ -426,8 +442,16 @@ def refuse_live_test_roots(roots: Sequence[str | Path]) -> None:
             raise ValueError(f"tmp sweep: test cannot use live root {path}")
     real_mounts = {root.resolve() for root in mounts}
     real_live = {root.resolve() for root in live} - real_mounts
-    for path in paths:
-        if blocked(path.resolve(), real_mounts, real_live):
+    resolved = tuple(path.resolve() for path in paths)
+    for path, real in zip(paths, resolved, strict=True):
+        if blocked(real, real_mounts, real_live):
+            raise ValueError(f"tmp sweep: test cannot use live root {path}")
+
+    # A bind mount keeps its own path but has the same file identity.
+    live_ids = {key for root in real_live if (key := file_identity(root)) is not None}
+    mount_ids = {key for root in real_mounts if (key := file_identity(root)) is not None}
+    for path, real in zip(paths, resolved, strict=True):
+        if file_identity(real) in mount_ids or any(file_identity(parent) in live_ids for parent in (real, *real.parents)):
             raise ValueError(f"tmp sweep: test cannot use live root {path}")
 
 
@@ -728,6 +752,7 @@ def delete_tree(path: str) -> None:
     """Delete a file, a link or a folder. A folder goes through shutil.rmtree, then once more after
     making each folder writable: a copy of a read-only tree (a nix store path, a Go module cache)
     keeps its modes, and rmtree cannot empty such a folder."""
+    refuse_live_test_roots((path,))
     if os.path.islink(path) or not os.path.isdir(path):
         os.unlink(path)
         return
@@ -1127,6 +1152,16 @@ class ClosedPhaseEntry(RemovableEntry):
     """The phase is closed under a director or session worktree guard."""
 
 
+def held_folder_identities(holds: dict[str, scratch.Hold]) -> set[FileIdentity]:
+    """Find the held folders and their parents, including through bind mounts."""
+    paths: set[Path] = set()
+    for name in holds:
+        path = Path(name)
+        if path.is_dir():
+            paths.update((path, *path.parents))
+    return {key for path in paths if (key := file_identity(path)) is not None}
+
+
 def judge_entries(roots: Roots, now: float, proc: str, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
@@ -1188,14 +1223,19 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
     judged = roots.all() + inner + temp_parents(roots, temp_live) + tuple(phase_parents)
     pairs = tuple(pair.path for root in roots.copies for pair in listing(root) if pair.is_dir(follow_symlinks=False))
     uses = entry_uses(paths.paths, judged + pairs)
+    held = (held_folder_identities(scratch.holds(scratch_settings=scratch_settings))
+            if roots.former_sessions else set[FileIdentity]())
     for root in judged:
         for entry in roots.entries(root, scratch_settings=scratch_settings):
             reason = owner_reason(entry, root, roots, temp_live,
                                   record=pane_use.record if isinstance(pane_use, PaneRunUse) else pane_use,
                                   scratch_settings=scratch_settings)
-            if reason is None and root in roots.former_sessions and isinstance(pane_use, PaneRunUse):
+            if reason is None and root in roots.former_sessions:
                 try:
-                    if session_folder.holds_run(Path(entry.path), now, pane_use.record):
+                    folder = Path(entry.path)
+                    if entry.is_dir(follow_symlinks=False) and file_identity(folder) in held:
+                        reason = SCRATCH_HELD
+                    elif isinstance(pane_use, PaneRunUse) and session_folder.holds_run(folder, now, pane_use.record):
                         reason = RunKeepReason.OPEN_RUN.value
                 except (OSError, ValueError):
                     reason = UNREADABLE
@@ -1256,9 +1296,8 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
 def remove_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> bool:
-    if isinstance(scratch_settings, UseConfiguredValue):
-        scratch_settings = conf.read("scratch")
     if isinstance(entry, FormerSessionEntry) and not dry_run:
+        refuse_live_test_roots((entry.path, entry.root))
         from scripts.production import staff
 
         folder = Path(entry.path)
@@ -1279,7 +1318,11 @@ def remove_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
                         folder, time.time(), staff.local_snapshot()):
                     result.keep(entry.path, RunKeepReason.OPEN_RUN.value)
                     return False
-                return remove_idle_entry(entry, result, False, scratch_settings=scratch_settings)
+                with scratch.locked_holds(scratch_settings=scratch_settings) as holds:
+                    if file_identity(folder) in held_folder_identities(holds):
+                        result.keep(entry.path, SCRATCH_HELD)
+                        return False
+                    return remove_idle_entry(entry, result, False, scratch_settings=scratch_settings)
         except (OSError, ValueError):
             result.keep(entry.path, UNREADABLE)
             return False
@@ -1289,6 +1332,7 @@ def remove_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
 def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> bool:
+    refuse_live_test_roots((entry.path,))
     if isinstance(entry, ClosedPhaseEntry):
         parent = Path(entry.path).parent
         if parent.is_symlink() or not parent.is_dir() or os.path.realpath(parent) != entry.root:
@@ -1758,6 +1802,8 @@ def run(dry_run: bool, now: float | None = None, roots: Roots | None = None, pro
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> int:
     """Sweep once, print each deletion and a summary, and log the run unless it is a dry run."""
+    if not dry_run:
+        refuse_live_test_roots((state_dir(),))
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     moment = time.time() if now is None else now
@@ -1801,7 +1847,7 @@ def run_if_due(dry_run: bool, now: float | None = None, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> SweepAssessment:
-    """Assess only a due sweep. Move the stamp before the attempt."""
+    """Assess only a due sweep. Check its roots before moving the stamp."""
     moment = time.time() if now is None else now
     stamp = state_dir() / STAMP_NAME
     try:
@@ -1809,11 +1855,14 @@ def run_if_due(dry_run: bool, now: float | None = None, *,
             return SkippedSweepAssessment()
     except FileNotFoundError:
         pass
+    roots = default_roots()
+    refuse_live_test_roots(roots.all() + roots.dataclass_code + (stamp,))
     if not dry_run:
         stamp.parent.mkdir(parents=True, exist_ok=True)
         stamp.touch()
         os.utime(stamp, (moment, moment))
-    return CompletedSweepAssessment(run(dry_run, moment, lint_settings=lint_settings, scratch_settings=scratch_settings))
+    return CompletedSweepAssessment(run(dry_run, moment, roots, PROC_DIR,
+                                        lint_settings=lint_settings, scratch_settings=scratch_settings))
 
 
 def main(argv: list[str]) -> int:

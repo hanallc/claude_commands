@@ -14,7 +14,7 @@ import json
 import os
 import re
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib import import_module
@@ -170,7 +170,9 @@ def root_lock(root: Path) -> Generator[None]:
 
 
 def folder_for(root: Path, session_id: str) -> Path | None:
-    """The folder the index names for this session, when it still exists."""
+    """Return the indexed folder only when its record names this session."""
+    if not SESSION_ID.fullmatch(session_id):
+        return None
     try:
         name = os.readlink(root / INDEX / session_id)
     except OSError:
@@ -178,7 +180,8 @@ def folder_for(root: Path, session_id: str) -> Path | None:
     if name in ("", ".", "..") or "/" in name:
         return None
     folder = root / name
-    return folder if not folder.is_symlink() and folder.is_dir() else None
+    holder = read_record(folder) if not folder.is_symlink() and folder.is_dir() else None
+    return folder if holder is not None and holder["session_id"] == session_id else None
 
 
 def link(root: Path, session_id: str, folder: Path) -> None:
@@ -209,8 +212,14 @@ def claim(folder: Path, owner: str, session_id: str) -> Path:
     elif folder.is_symlink() or not folder.is_dir():
         raise FileExistsError(f"{folder}: selected session folder changed")
     record = FolderRecord(owner=owner, session_id=session_id)
-    if read_record(folder) != record:
-        write_record(folder, record)
+    previous = read_record(folder)
+    if previous == record:
+        return folder
+    old_id = previous["session_id"] if previous is not None else ""
+    old_link = folder_for(folder.parent, old_id) if old_id != session_id else None
+    write_record(folder, record)
+    if old_link == folder:
+        (folder.parent / INDEX / old_id).unlink(missing_ok=True)
     return folder
 
 
@@ -226,23 +235,32 @@ def holds_run(folder: Path, now: float, record: staff.StaffSnapshot) -> bool:
             or bool(live_run_folders(now, (runs,))))
 
 
+def owned_folders(root: Path, owner: str, session_id: str) -> Iterator[Path]:
+    """Find this member's folders that no other live session holds."""
+    for folder in sorted(root.iterdir()):
+        if folder.name.startswith(".") or folder.is_symlink() or not folder.is_dir():
+            continue
+        holder = read_record(folder)
+        if holder is not None and holder["owner"] == owner and not held_by_another(holder, session_id):
+            yield folder
+
+
 def claim_at_start(root: Path, former_roots: tuple[Path, ...], owner: str, base: str, session_id: str) -> Path:
     """Claim the new folder or retain a former folder with an open run. Hold the current root lock."""
     from scripts.production import staff
 
     folder = select_folder(root, base, session_id)
     current = read_record(folder)
-    if current is None or current["owner"] != owner:
+    owned = (folder if current is not None and current["owner"] == owner
+             else next(owned_folders(root, owner, session_id), None))
+    if owned is not None:
+        folder = owned
+    else:
         for former in former_roots:
             if not former.is_dir() or former.samefile(root):
                 continue
             with root_lock(former):
-                for candidate in sorted(former.iterdir()):
-                    if candidate.name.startswith(".") or candidate.is_symlink() or not candidate.is_dir():
-                        continue
-                    holder = read_record(candidate)
-                    if holder is None or holder["owner"] != owner or held_by_another(holder, session_id):
-                        continue
+                for candidate in owned_folders(former, owner, session_id):
                     if not (candidate / RUN).is_dir():
                         continue
                     try:
@@ -276,9 +294,20 @@ def launch_folder(member: Member, session_id: str = "") -> Path | None:
 def adopted(root: Path) -> Path | None:
     """The folder a launcher made for this session: TMPDIR names it and FOLDER_ENV matches."""
     name, temporary = os.environ.get(FOLDER_ENV, ""), os.environ.get("TMPDIR", "")
-    if not name or not temporary or Path(temporary) != root / name or read_record(root / name) is None:
+    if not name or Path(name).name != name or not temporary or Path(temporary) != root / name:
         return None
-    return root / name
+    folder = root / name
+    return folder if not folder.is_symlink() and folder.is_dir() else None
+
+
+def adopt_launch(root: Path, folder: Path, session_id: str) -> Path | None:
+    """Claim the launcher folder if its record permits this session. Hold the root lock."""
+    holder = read_record(folder)
+    if holder is None or holder["session_id"] not in ("", session_id):
+        return None
+    claimed = claim(folder, holder["owner"], session_id)
+    link(root, session_id, claimed)
+    return claimed
 
 
 def session_folder(session_id: str, cwd: str = "", *, starting: bool = False) -> Path | None:
@@ -298,10 +327,7 @@ def session_folder(session_id: str, cwd: str = "", *, starting: bool = False) ->
         launched = adopted(former)
         if launched is not None:
             with root_lock(former):
-                holder = read_record(launched)
-                if holder is not None and holder["session_id"] in ("", session_id):
-                    folder = claim(launched, holder["owner"], session_id)
-                    link(former, session_id, folder)
+                if (folder := adopt_launch(former, launched, session_id)) is not None:
                     return folder
     if found is not None:
         return found
@@ -313,15 +339,11 @@ def session_folder(session_id: str, cwd: str = "", *, starting: bool = False) ->
         if found is not None:
             return found
         launched = adopted(root)
-        if launched is not None:
-            record = read_record(launched)
-            holder = record["owner"] if record is not None else session_id
-            folder = claim(launched, holder, session_id)
-            link(root, session_id, folder)
-        else:
-            owner = member_of(session_id) or previous_owner
-            holder = owner.id if owner is not None else session_id
-            folder = claim_at_start(root, tuple(former_roots), holder, folder_name(owner, session_id, cwd), session_id)
+        if launched is not None and (folder := adopt_launch(root, launched, session_id)) is not None:
+            return folder
+        owner = member_of(session_id) or previous_owner
+        holder = owner.id if owner is not None else session_id
+        folder = claim_at_start(root, tuple(former_roots), holder, folder_name(owner, session_id, cwd), session_id)
     return folder
 
 

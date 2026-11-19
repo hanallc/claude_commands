@@ -64,7 +64,9 @@ class ReadSessionsTests(unittest.TestCase):
                 (root / name).mkdir()
                 session_folder.write_record(root / name, {"owner": name, "session_id": name + "-id"})
             with (mock.patch.object(session_folder, "session_root", return_value=root),
+                  mock.patch.object(session_folder, "configured_roots", return_value=(root,)),
                   mock.patch.object(measure, "read_data", return_value=None),
+                  mock.patch.object(measure, "read_mounts", return_value=()),
                   mock.patch.object(scratch, "holds", return_value={}),
                   mock.patch.object(session_records, "read_registry",
                                     return_value=session_records.RegistryRead((), ())) as registry):
@@ -91,7 +93,8 @@ class ReadSessionsTests(unittest.TestCase):
         self.assertEqual([row["name"] for row in report["sessions"]], ["current", "older"])
 
     def test_no_session_root_gives_no_report(self) -> None:
-        with mock.patch.object(session_folder, "session_root", return_value=None):
+        with (mock.patch.object(session_folder, "session_root", return_value=None),
+              mock.patch.object(session_folder, "configured_roots", return_value=(Path("/unused-test-root"),))):
             self.assertIsNone(sessions.session_report())
 
 

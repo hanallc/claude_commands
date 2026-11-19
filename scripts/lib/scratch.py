@@ -1955,14 +1955,14 @@ def hold(path: Path, task: str, reason: str, now: float | None = None, *,
     """Hold an existing folder for `task`; return the task."""
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
-    if path.is_symlink() or not path.is_dir():
-        raise ScratchError(f"{path} is no folder")
     if not reason.strip():
         raise ScratchError("a hold needs --reason")
     moment = time.time() if now is None else now
     task = task_or_default(task, moment, scratch_settings=scratch_settings)
     _ = checked_task(task, False)
     with locked_holds(scratch_settings=scratch_settings) as found:
+        if path.is_symlink() or not path.is_dir():
+            raise ScratchError(f"{path} is no folder")
         found[os.path.realpath(path)] = Hold(task=task, maker=maker(), reason=reason.strip(), made=moment, ended=0.0)
         write_holds(found, scratch_settings=scratch_settings)
     return task

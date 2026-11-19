@@ -222,6 +222,9 @@ A row without a run produces no health check.
 
 - A new run uses the director's session folder, usually `~/session/<name>/run/<run id>/`.
   A director that retains a former session folder on natedev uses `/session/<name>/run/<run id>/`.
+  Startup checks all current folders that the member can reuse before it checks the former root.
+  The folder record must name the session before it can use an index link.
+  Folder reuse removes the old session's index link.
   If the session has no named folder, the run uses `/tmp/claude/unit/<run id>/`.
   `scripts/lib/unit_runs.py` reads both named roots and the legacy `unit` and `delegate` roots.
   The director's staff row stores the open run in `run`.
@@ -310,6 +313,7 @@ That rule controls turn continuation and does not permit deletion.
 
 This procedure moves scratchpads from the legacy roots.
 The natedev session root change uses the tmp sweep to remove idle former folders.
+A scratch hold on a child folder keeps the former session folder.
 
 Run `scripts/lib/py scripts/lib/session_move.py --dry-run` before the cutover.
 The output gives each source, destination, size, move type, and naming rule.

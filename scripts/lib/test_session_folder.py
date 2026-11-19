@@ -133,8 +133,40 @@ class SessionFolderTests(unittest.TestCase):
         self.assertEqual(second, first)
         assert second is not None
         self.assertEqual(session_folder.read_record(second), {"owner": "m1", "session_id": "second"})
-        self.assertEqual(session_folder.folder_for(self.root, "first"), second)
+        self.assertFalse(os.path.lexists(self.root / session_folder.INDEX / "first"))
         self.assertEqual(second.stat().st_mode & 0o777, 0o700)
+
+    def test_stale_index_cannot_give_a_live_folder_to_another_session(self) -> None:
+        self.root.mkdir()
+        self.previous.mkdir()
+        current = self.root / "verify"
+        previous = self.previous / "verify"
+        for folder in (current, previous):
+            folder.mkdir()
+            session_folder.write_record(folder, {"owner": "m2", "session_id": "live"})
+            session_folder.link(folder.parent, "resume", folder)
+        self.live = frozenset({"live"})
+        self.member = Member("m1", "verify")
+        with patch.dict(os.environ, {session_folder.FOLDER_ENV: current.name, "TMPDIR": str(current)}):
+            self.assertEqual(session_folder.session_folder("resume", starting=True), self.root / "verify-2")
+        self.assertEqual(session_folder.read_record(current), {"owner": "m2", "session_id": "live"})
+        self.assertEqual(session_folder.read_record(previous), {"owner": "m2", "session_id": "live"})
+        session_folder.link(self.root, "resume", current)
+        self.assertEqual(session_folder.launch_folder(self.member, "resume"), self.root / "verify-2")
+
+    def test_start_preserves_a_numbered_current_folder_before_the_former_folder(self) -> None:
+        self.root.mkdir()
+        member = Member("m1", "verify")
+        current = self.root / "verify-2"
+        current.mkdir()
+        session_folder.write_record(current, {"owner": member.id, "session_id": "ended"})
+        former = self.previous_folder()
+        run = former / "run" / "demo"
+        run.mkdir(parents=True)
+        (run / unit_runs.HEARTBEAT).touch()
+        with patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())):
+            self.assertEqual(session_folder.launch_folder(member, "next"), current)
+        self.assertFalse((self.root / "verify").exists())
 
     def test_a_name_gets_a_number_only_while_a_live_session_holds_it(self) -> None:
         self.root.mkdir()

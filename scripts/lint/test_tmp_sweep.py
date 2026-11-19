@@ -12,6 +12,7 @@ import json
 import os
 import pwd
 import select
+import shutil
 import signal
 import socket
 import subprocess
@@ -52,6 +53,8 @@ PROJECT = "-home-natepiano-rust-hana"
 
 def setUpModule() -> None:
     _ = unittest.enterModuleContext(fake_cargo_output_roots())
+    settings = Path(__file__).resolve().parents[2] / "config" / "build_folders.conf"
+    _ = unittest.enterModuleContext(mock.patch.object(tmp_sweep, "protected_root_configs", return_value=(settings,)))
 
 
 def write(path: Path, text: str = "x" * 4096) -> Path:
@@ -1242,6 +1245,43 @@ class TempFolderTests(TmpSweepCase):
 
 
 class LiveRootGuardTests(unittest.TestCase):
+    def test_sweep_refuses_the_session_bind_mount_before_listing(self) -> None:
+        alias = Path("/build/session")
+        identity = os.stat_result((0o40700, 765, 123, 1, os.getuid(), os.getgid(), 0, 0, 0, 0))
+        real_stat = Path.stat
+
+        def stat_path(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+            if path in (alias, Path("/session")):
+                return identity
+            return real_stat(path, follow_symlinks=follow_symlinks)
+
+        with (mock.patch.object(Path, "stat", stat_path),
+              mock.patch.object(tmp_sweep, "listing", side_effect=AssertionError("listed a root")) as listing,
+              mock.patch.object(os, "scandir", side_effect=AssertionError("listed a root")) as scandir,
+              mock.patch.object(tmp_sweep, "read_pane_runs", side_effect=AssertionError("read pane state"))):
+            for path in (alias, alias / "unused-test-root"):
+                with self.subTest(path=path):
+                    with self.assertRaisesRegex(ValueError, "test cannot use live root /build/session"):
+                        _ = tmp_sweep.sweep(False, tmp_sweep.Roots((str(path),), (), ()), time.time())
+            listing.assert_not_called()
+            scandir.assert_not_called()
+
+    def test_direct_removal_refuses_live_paths_before_the_removal_coordinator(self) -> None:
+        path = "/tmp/claude/unit/unused-test-root"
+        entry = tmp_sweep.RemovableEntry(path, "/tmp/claude/unit", 0.0, 0)
+        with (mock.patch.object(scratch, "remove_folder", side_effect=AssertionError("started removal")) as remove,
+              mock.patch.object(os, "scandir", side_effect=AssertionError("listed a root")) as scandir,
+              mock.patch.object(os, "unlink", side_effect=AssertionError("unlinked a live path")) as unlink,
+              mock.patch.object(shutil, "rmtree", side_effect=AssertionError("deleted a live path")) as rmtree):
+            with self.assertRaisesRegex(ValueError, f"test cannot use live root {path}"):
+                _ = tmp_sweep.remove_idle_entry(entry, tmp_sweep.Sweep(), False)
+            with self.assertRaisesRegex(ValueError, f"test cannot use live root {path}"):
+                tmp_sweep.delete_tree(path)
+            remove.assert_not_called()
+            scandir.assert_not_called()
+            unlink.assert_not_called()
+            rmtree.assert_not_called()
+
     def test_sweep_refuses_live_roots_before_listing(self) -> None:
         home = Path(pwd.getpwuid(os.getuid()).pw_dir)
         roots = ("/tmp/claude", "/tmp/claude/unit", "/session", "~/session", str(home / "session"),
@@ -1268,6 +1308,40 @@ class LiveRootGuardTests(unittest.TestCase):
 
 
 class OwnerTests(TmpSweepCase):
+    def test_former_session_folder_stays_while_a_descendant_has_a_scratch_hold(self) -> None:
+        previous = self.tmp.parent / "previous"
+        folder = previous / "ended"
+        payload = write(folder / "result" / "nested" / "file")
+        session_folder.write_record(folder, {"owner": "ended", "session_id": ENDED_SESSION})
+        _ = scratch.hold(payload.parent, "phase:demo/1", "The task needs this result.")
+        roots = tmp_sweep.Roots((), (), (), former_sessions=(str(previous),))
+
+        dry = tmp_sweep.sweep(True, roots, self.now, str(self.proc))
+        live = tmp_sweep.sweep(False, roots, self.now, str(self.proc))
+        self.assertEqual(dry.deleted, [])
+        self.assertEqual(live.deleted, [])
+        self.assertEqual(dry.kept, {tmp_sweep.SCRATCH_HELD: [str(folder)]})
+        self.assertEqual(live.kept, dry.kept)
+        self.assertTrue(payload.is_file())
+        self.assertTrue(scratch.release(payload.parent))
+        self.assertEqual([entry["path"] for entry in tmp_sweep.sweep(False, roots, self.now, str(self.proc)).deleted],
+                         [str(folder)])
+
+    def test_former_session_removal_rechecks_a_scratch_hold_added_after_the_scan(self) -> None:
+        previous = self.tmp.parent / "previous"
+        folder = previous / "ended"
+        payload = write(folder / "result" / "file")
+        session_folder.write_record(folder, {"owner": "ended", "session_id": ENDED_SESSION})
+        roots = tmp_sweep.Roots((), (), (), former_sessions=(str(previous),))
+        [entry] = [entry for entry in tmp_sweep.timed_entries(roots, self.now, str(self.proc))
+                   if isinstance(entry, tmp_sweep.FormerSessionEntry)]
+
+        _ = scratch.hold(payload.parent, "phase:demo/1", "The task needs this result.")
+        result = tmp_sweep.Sweep()
+        self.assertFalse(tmp_sweep.remove_entry(entry, result, False))
+        self.assertEqual(result.kept, {tmp_sweep.SCRATCH_HELD: [str(folder)]})
+        self.assertTrue(payload.is_file())
+
     def test_sweep_judges_ended_former_folders_and_keeps_live_and_open_folders(self) -> None:
         previous = self.tmp.parent / "previous"
         ended = write(previous / "ended" / "file").parent
@@ -1392,6 +1466,16 @@ class OwnerTests(TmpSweepCase):
 
 
 class LogTests(TmpSweepCase):
+    def test_refused_sweep_leaves_the_due_stamp_unchanged(self) -> None:
+        stamp = write(self.state / tmp_sweep.STAMP_NAME)
+        before = stamp.stat().st_mtime_ns
+        with (mock.patch.object(tmp_sweep, "default_roots", return_value=tmp_sweep.Roots(("/session",), (), ())),
+              mock.patch.object(tmp_sweep, "run", side_effect=ValueError("test cannot use live root /session")) as run):
+            with self.assertRaisesRegex(ValueError, "test cannot use live root /session"):
+                _ = tmp_sweep.run_if_due(False, self.now)
+            self.assertEqual(stamp.stat().st_mtime_ns, before)
+            run.assert_not_called()
+
     def test_log_retention_keeps_the_boundary_and_newer_records_in_order(self) -> None:
         # Whole seconds keep the boundary exact after the ISO timestamp round trip.
         now = float(int(self.now))
@@ -1488,15 +1572,9 @@ class LogTests(TmpSweepCase):
     def test_a_run_waits_an_hour_after_the_last(self) -> None:
         self.now = time.time() + 8 * DAY
         idle = write(self.tmp / "shots" / "1.png")
-        run = tmp_sweep.run
-
-        def fixture_run(dry_run: bool, now: float, *, lint_settings: conf.ConfigRead,
-                        scratch_settings: conf.ConfigRead) -> int:
-            return run(dry_run, now, self.roots(), str(self.proc),
-                       lint_settings=lint_settings, scratch_settings=scratch_settings)
 
         with (mock.patch.object(tmp_sweep, "default_roots", return_value=self.roots()),
-              mock.patch.object(tmp_sweep, "run", side_effect=fixture_run),
+              mock.patch.object(tmp_sweep, "PROC_DIR", str(self.proc)),
               redirect_stdout(io.StringIO())):
             self.assertEqual(tmp_sweep.run_if_due(False, self.now), tmp_sweep.CompletedSweepAssessment(0))
             self.assertFalse(idle.exists())
