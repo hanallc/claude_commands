@@ -132,12 +132,22 @@ A regional failure prints its error code and permits other regions to continue.
 Any regional failure makes the command exit with status 1.
 A requested quota does not prove an applied quota.
 
+On the AWS page, expand **How to open the quota cases in AWS** under **Quotas** for the sign-in steps.
+
 `quota-status` reports the applied quotas and their request history without creating a request or writing local state.
-It uses the same regions, quota codes, and encrypted administrator credentials as `quota-request`.
+It reads the same regions and quota codes as `quota-request`.
+It uses the saved read-only plan key.
+If the plan key is missing, run `deploy.py plan-identity --approve-resources` on natedev.
+If the plan key is locked, run `github-warmup` in a terminal on natedev.
+If AWS rejects the plan key during any call, the command stops and prints one line on stderr.
+Run `deploy.py plan-identity --check` to check a rejected plan key.
 Each region starts one block with its name as the heading.
-Each quota prints its applied vCPUs once, followed by aligned request columns.
-Requests appear newest first by update time, or creation time when no update time exists.
-Dates use the zone from `config/user_zone.conf`, with `USER_ZONE` as an override.
+Each quota shows its applied and needed vCPUs.
+The newest request shows its status, requested vCPUs, and age.
+The command selects the newest request and calculates its age from its creation time.
+If a request has no creation time, the command uses its last update time.
+If a request has neither date, the command shows `age unknown`.
+The command keeps unknown status text and counts the request as open.
 A quota with no history prints `No requests.`
 The final summary lists regions whose applied GPU quota fits the trial and requests that remain open.
 The trial and report share the vCPU calculation over the types in `gpu_size_trial_spot_max_usd_per_hour`.
@@ -150,26 +160,17 @@ Example from the test fake:
 
 ```text
 us-east-1
-  Standard Spot: 128 vCPUs applied
-    Asked vCPUs  Status       Case ID       Updated
-            129  CASE_OPENED  case-fixture  2026-01-15 13:59:00 HST
-            128  APPROVED     -             2026-01-14 13:59:00 HST
-
-us-west-2
-  Standard Spot: 128 vCPUs applied
-    No requests.
-  G and VT Spot: 4 vCPUs applied
-    Asked vCPUs  Status   Case ID  Updated
-              4  PENDING  -        2026-01-14 13:59:00 HST
-
-eu-north-1
-  G and VT Spot: 4 vCPUs applied
+  Standard Spot: 120 vCPUs applied, 128 vCPUs needed
+    Newest request: CASE_OPENED for 129 vCPUs (3h old).
+  G and VT Spot: 32 vCPUs applied, 4 vCPUs needed
     No requests.
 
-Summary: GPU trial needs 32 vCPUs; quota fits: no region has enough applied quota; open requests: us-east-1 Standard Spot 129 vCPUs (CASE_OPENED), us-west-2 G and VT Spot 4 vCPUs (PENDING)
+Summary: GPU trial needs 32 vCPUs; quota fits: us-east-1; open requests: us-east-1 Standard Spot 129 vCPUs (CASE_OPENED)
 ```
-A regional failure prints only its error code and makes the command exit with status 1 after the remaining regions.
-The report includes case IDs and omits account IDs, ARNs, and request IDs.
+
+Other regional failures print the error code or class and permit the remaining quota reads.
+Any quota failure makes the command exit with status 1.
+The report omits account IDs, case IDs, request IDs, and ARNs.
 It calls only `GetServiceQuota` and `ListRequestedServiceQuotaChangeHistoryByQuota` through the AWS CLI.
 The AWS CLI reads every page of request history.
 [AWS provides Service Quotas at no additional charge](https://aws.amazon.com/about-aws/whats-new/2023/03/service-quotas-additional-regions/).
@@ -180,7 +181,7 @@ The administrator IAM policy needs these actions:
 2. `servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota`.
 3. `servicequotas:RequestServiceQuotaIncrease`.
 
-`quota-status` needs only the first two actions, which this list already includes.
+The plan identity policy grants `quota-status` the first two actions in `ReadSetupInputs`.
 
 ## Deploy gate resources
 
@@ -202,8 +203,30 @@ AWS attaches at most 10 managed policies to one IAM user.
 When a regional stack fails, `up` prints the failed resource events of that run.
 `up` deletes a regional stack in `ROLLBACK_COMPLETE` before it deploys that stack again.
 Deployment records each completed regional stack in `gate-deployment.json`.
+`up` prints each region before network and image preparation.
+It prints each region again before the gate stack update.
+Each operation shows its position, elapsed seconds, and the existing progress heartbeat.
+Before each regional loop, `up` estimates its total duration from `gate-region-times.json` in the deployment state folder.
+The record stores the last successful duration for each region and operation.
+The record uses the operation keys `network` and `stack`.
+An unmeasured region uses the median saved duration for that operation.
+Without saved durations, the output says the total is not yet measured.
+Each successful region saves its duration before the next region starts.
+Failed operations do not replace saved durations.
+A failed operation shows `failed after N s`.
+If a timing write fails, `up` prints a warning and continues.
 The gate path uses the official NixOS image.
 Saved regional image copies remain subject to normal teardown.
+
+`up` always runs the home stack update and checks each regional stack.
+It skips regional deployment when the template, stack name, and parameters match the last successful deployment.
+The live stack ID and last update time must also match the saved values.
+The live status must be `CREATE_COMPLETE` or `UPDATE_COMPLETE`.
+The output reports the skip and measures the region's elapsed time.
+The first run without saved digests deploys every region and saves each digest after success.
+An unreadable or invalid `regional-stack-digests.json` produces one warning and deploys every region.
+CloudFormation deployment can take several minutes per changed region.
+For a home-only change, regional time goes to network and image preparation and stack status checks.
 
 ## Foundation maintenance
 
@@ -429,24 +452,61 @@ The setup command needs no active target or slot capacity.
 7. Confirm that the command reports a stopped box.
 
 `hana-image` converts the image to a raw disk and uploads it to one EBS snapshot with coldsnap.
-`image_upload_tool` names the coldsnap package, and `image_upload_timeout_s` bounds each long stage.
+Coldsnap applies the cost tag with `--tag Key=...,Value=...` during the upload.
+`image_upload_tool` names the coldsnap package.
+`image_upload_timeout_s` bounds each long stage, including the snapshot wait.
+`image_wait_interval_s` sets the minimum interval between snapshot checks.
+The command uses `max(image_wait_interval_s, ceil(image_upload_timeout_s / 255))` as the interval.
+Coldsnap uses `image_upload_timeout_s // interval` attempts within that wait bound and its 255-attempt limit.
+The defaults use a 15-second interval and 240 attempts.
+The command saves the image name and snapshot ID as a pending registration before it waits for the snapshot.
 The command registers the snapshot as an x86_64 image that requires IMDSv2.
+The registration applies the cost tag only to the image.
 It selects the public subnet of the gate VPC in `availability_zone`.
 It saves the image, owner, VPC, and subnet in the local `hana/image.json` record.
-An empty `ami_id`, `ami_owner_id`, `vpc_id`, or `subnet_id` in `config/hana_aws.conf` uses that record.
+An empty `ami_id`, `ami_owner_id`, `vpc_id`, or `subnet_id` in `config/hana_aws.conf` uses only a complete registration record.
 A rerun with the same image build finds the registered image by name and does not upload again.
+If AWS has no image with that name, a rerun waits for the saved pending snapshot and registers it.
+Without a matching pending record, the command checks snapshots owned by the account with a description equal to the image name.
+It saves one completed or pending snapshot as the pending record, then waits for it and registers it.
+It refuses multiple matching snapshots or a snapshot in state `error` and reports the count and states.
+It uploads a new snapshot only when no snapshot matches.
+A wait failure or registration failure keeps the pending record for the next run.
 
 The local plan makes no AWS call.
 Approved setup uses the existing encrypted admin session and progress display.
 It reserves compute and storage costs before requesting resources.
 Setup permission does not enable command permission.
-The separate stack creates the instance, retained data volume, launch template, security group, private control bucket, and scaler policy.
+The separate stack creates the launch template, security group, private control bucket, and scaler policy.
+Setup reads Spot prices and skips candidates with no price or a price above the ceiling.
+It tries the configured type in the registered subnet first when that price qualifies.
+It then tries eligible fallback types and subnets in order of price.
+If every launch fails, rerun approved setup to use the same stack.
+Setup creates the encrypted data volume in the zone of the successful launch.
+It saves the instance, Spot request, and data volume identities in `hana/setup.json`.
 The root disk keeps its data while the box is stopped. AWS deletes the root disk when the box is terminated.
 The Spot request is persistent and uses interruption behavior `stop`.
 Setup confirms the instance, request, and stopped state before registering the lifecycle controller.
-Repeat approved setup after a timeout to read the existing stack and confirm its stop.
-An expired reservation cannot authorize another stack request.
-Changed resource inputs require a separate replacement review.
+Repeat approved setup after a timeout to continue an eligible launch or confirm the instance stopped.
+An expired reservation cannot authorize a pending launch.
+Setup skips the Spot price check if it already has the instance ID.
+Setup can change the ceiling on the saved stack after AWS refuses all launch requests.
+Other resource changes require a separate replacement review.
+If setup finds a legacy instance in the stack, run `deploy.py down --workload hana --approve-destroy` first.
+Teardown checks for a pending launch or disk creation before it deletes anything.
+If AWS does not confirm a pending request within `intent_lookup_timeout_s`, run approved teardown again.
+Approved teardown cancels the Spot request, terminates the instance, then deletes the data volume and stack.
+
+Before a launch, setup checks current Spot prices for the eligible instance types and subnets.
+If all priced candidates exceed the ceiling, setup shows the cheapest candidate.
+Setup gives a `/tune` command when the effective ceiling key is editable.
+If the configuration rejects the command, setup reports the error and the suggested ceiling.
+
+If setup gives a `/tune` command:
+
+1. Run the displayed `/tune` command.
+2. Run `deploy.py prepare --workload hana`.
+3. Run `deploy.py hana-setup --approve-resources`.
 
 The image must include the independent Hana guard, watchdog, data mount, and root receiver.
 The Natedev owner must install the files from `hana_guest.render_files()` and `hana_receiver.render_files()`.

@@ -24,8 +24,9 @@ from scripts.agents import remote
 from scripts.message.sessions import SessionRecord
 from scripts.herdr.place import HerdrPlace
 from scripts.herdr.pane_launch import without_staff_labels
-from scripts.herdr import pane_launch
+from scripts.herdr import pane_launch, herdr_types
 if TYPE_CHECKING:
+    from scripts.herdr import herdr
     from scripts.herdr.pane_launch import PaneLaunch
 
 
@@ -52,15 +53,14 @@ class AnomalyReport:
             self.processes[pid] = result
         return result
 
-    def add(self, message: str, pid: int) -> None:
+    def add(self, message: str, pid: int, *, check_identity: bool = True) -> None:
         message = " ".join(message.splitlines())
         if not pid:
             line = "anomaly: " + message
             if line not in self.lines:
                 self.lines.append(line)
             return
-        identity = self.process(pid, "")
-        if identity.is_morty:
+        if check_identity and self.process(pid, "").is_morty:
             return
         if pid in self.reported:
             return
@@ -89,16 +89,16 @@ def report_process(pid: int, identity: str = "") -> ReportProcessIdentity:
     return report.process(pid, identity) if report is not None else ReportProcessIdentity(identity, False)
 
 
-def collect_anomaly(message: str, *, pid: int = 0) -> bool:
+def collect_anomaly(message: str, *, pid: int = 0, check_identity: bool = True) -> bool:
     report = _anomaly_report.get()
     if report is None:
         return False
-    report.add(message, pid)
+    report.add(message, pid, check_identity=check_identity)
     return True
 
 
-def report_anomaly(message: str, *, pid: int = 0) -> None:
-    if not collect_anomaly(message, pid=pid):
+def report_anomaly(message: str, *, pid: int = 0, check_identity: bool = True) -> None:
+    if not collect_anomaly(message, pid=pid, check_identity=check_identity):
         print("anomaly: " + " ".join(message.splitlines()), file=sys.stderr)
 
 
@@ -650,9 +650,13 @@ class NoSuchMember:
 
 
 def unit_match(selector: UnitMember | ObservedUnit, record: staff.StaffSnapshot,
-                reference: StoredReference | LiveSession | ByName | UnitExclusion = BY_NAME, *,
+                reference: StoredReference | LiveSession | UnprovedPaneIdentity | ByName | UnitExclusion = BY_NAME, *,
                 parent: RequiredParent | AnyParent = ANY_PARENT) -> MemberFound | NoSuchMember:
     """One id-first join; production requests also require their current parent."""
+    if isinstance(reference, UnprovedPaneIdentity):
+        if isinstance(reference.unit, UnassignedPane):
+            return NoSuchMember(selector)
+        reference = reference.unit
     if isinstance(reference, StoredReference):
         row = record.by_member_reference(reference.id)
         matches = [row] if row is not None and row.kind == "unit" else []
@@ -729,6 +733,7 @@ class LiveClaude(NamedTuple):
     session_id: str
     socket: str
     pid: int
+    activity: str = ""
 
 
 class ClaudeNotRunning(NamedTuple):
@@ -754,8 +759,45 @@ class ObservedProcess:
 
 
 @dataclass(frozen=True)
+class ProvedCodexPaneProcess(ObservedProcess):
+    """The process proves the native conversation of its pane."""
+
+
+@dataclass(frozen=True)
+class UnassignedPane:
+    """No unit is associated with the pane."""
+
+
+@dataclass(frozen=True)
+class UnprovedPaneIdentity:
+    """Candidate identities and an optional unit association without owner proof."""
+
+    candidates: frozenset[str] = frozenset()
+    unit: StoredReference | UnassignedPane = UnassignedPane()
+
+
+@dataclass(frozen=True)
 class ProcessUnobserved:
     """No process observation is available for this pane."""
+
+
+@dataclass(frozen=True)
+class ShellNotObserved:
+    """No empty shell is proved for this pane."""
+
+
+@dataclass(frozen=True)
+class ProvedProcessGeneration:
+    pid: int
+    started: str
+
+
+@dataclass(frozen=True)
+class NoProvedProcessGeneration:
+    """The observation carries no checked process start."""
+
+
+type OwnerGeneration = ProvedProcessGeneration | NoProvedProcessGeneration
 
 
 @dataclass(frozen=True)
@@ -764,7 +806,9 @@ class LabeledSession:
     claude: Claude
     place: Place
     process: ObservedProcess | ProcessUnobserved = ProcessUnobserved()
-    identity: LiveSession | NoSession = NO_SESSION
+    identity: LiveSession | StoredReference | NoSession | UnprovedPaneIdentity = NO_SESSION
+    empty: herdr.ObservedEmpty | ShellNotObserved = ShellNotObserved()
+    generation: OwnerGeneration = field(default=NoProvedProcessGeneration(), compare=False, repr=False)
 
 
 def place_text(place: Place) -> str:
@@ -788,15 +832,134 @@ def holder_text(unit: LabeledSession) -> str:
 
 
 @dataclass(frozen=True)
+class UnassignedPaneObservation:
+    place: Place
+    reason: str
+
+
+@dataclass(frozen=True)
+class UnreadablePaneList:
+    session: str
+    reason: str
+
+
+type UnitPaneObservation = LabeledSession | UnreadablePaneList
+
+
+@dataclass(frozen=True)
+class ProvedLiveUnit:
+    owner: LabeledSession | LiveClaude
+    standalone_generation: OwnerGeneration = field(default=NoProvedProcessGeneration(), compare=False, repr=False)
+
+    @property
+    def generation(self) -> OwnerGeneration:
+        return self.owner.generation if isinstance(self.owner, LabeledSession) else self.standalone_generation
+
+
+@dataclass(frozen=True)
+class NoUnitPane:
+    """No pane is associated with the unit."""
+
+
+@dataclass(frozen=True)
+class ProvedAbsentUnit:
+    """Complete evidence contains no live owner."""
+
+    pane: LabeledSession | NoUnitPane = NoUnitPane()
+
+
+@dataclass(frozen=True)
+class UnknownUnit:
+    reason: str
+
+
+type UnitOwner = ProvedLiveUnit | ProvedAbsentUnit | UnknownUnit
+
+
+def checked_unit_owner(pane: LabeledSession | None, failures: tuple[str, ...] = ()) -> UnitOwner:
+    """Use proved presence immediately. Require complete evidence for absence."""
+    if pane is not None:
+        if isinstance(pane.claude, LiveClaude):
+            identity = LiveSession(pane.claude.session_id)
+            if pane.identity == identity:
+                return ProvedLiveUnit(pane)
+            if isinstance(pane.identity, NoSession):
+                return ProvedLiveUnit(replace(pane, identity=identity))
+            return UnknownUnit("the registry identity differs from the pane evidence")
+        if isinstance(pane.identity, LiveSession) and isinstance(pane.process, ProvedCodexPaneProcess):
+            return ProvedLiveUnit(pane)
+        if isinstance(pane.claude, ClaudeUnknown):
+            return UnknownUnit(pane.claude.reason)
+        if not isinstance(pane.empty, ShellNotObserved):
+            if not isinstance(pane.identity, StoredReference):
+                pane = None
+        elif isinstance(pane.identity, UnprovedPaneIdentity):
+            return UnknownUnit("no proved pane owner")
+    if failures:
+        return UnknownUnit(failures[0])
+    return ProvedAbsentUnit(pane if pane is not None else NoUnitPane())
+
+
+@dataclass(frozen=True)
+class SessionLabelObservations:
+    labels: tuple[LabeledSession, ...]
+    unreadable_pane_lists: tuple[UnreadablePaneList, ...] = ()
+    registry_failures: tuple[str, ...] = ()
+    registry_owners: dict[str, ProvedLiveUnit | UnknownUnit] = field(default_factory=dict)
+
+    def checked_conversation(self, identity: str) -> UnitOwner:
+        """Look for the exact conversation before considering absence."""
+        failures = [problem.reason for problem in self.unreadable_pane_lists]
+        failures.extend(self.registry_failures)
+        for pane in self.labels:
+            if not isinstance(pane.empty, ShellNotObserved):
+                continue
+            if isinstance(pane.identity, LiveSession) and pane.identity.id == identity:
+                result = checked_unit_owner(pane)
+                if isinstance(result, ProvedLiveUnit):
+                    return result
+                if isinstance(result, UnknownUnit):
+                    failures.append(result.reason)
+            elif isinstance(pane.identity, UnprovedPaneIdentity):
+                result = checked_unit_owner(pane)
+                if isinstance(result, UnknownUnit):
+                    failures.append(result.reason)
+        registered = self.registry_owners.get(identity)
+        return registered if registered is not None else checked_unit_owner(None, tuple(failures))
+
+
+@dataclass(frozen=True)
 class LabeledProductions:
-    # Session labels grouped by production and unit.
+    # These labels include candidate and stopped panes.
     units: dict[str, dict[str, LabeledSession]]
     members: dict[str, tuple[str, ...]] = field(default_factory=dict, compare=False)
+    unassigned_panes: tuple[UnassignedPaneObservation, ...] = ()
+    unreadable_pane_lists: tuple[UnreadablePaneList, ...] = ()
+    registry_failures: tuple[str, ...] = ()
+    registry_owners: dict[str, dict[str, ProvedLiveUnit | UnknownUnit]] = field(default_factory=dict)
+
+    @property
+    def failures(self) -> tuple[str, ...]:
+        return (*self.registry_failures, *(item.reason for item in self.unreadable_pane_lists),
+                *(item.reason for item in self.unassigned_panes))
+
+    def checked_unit(self, production_name: str, name: str) -> UnitOwner:
+        owner = checked_unit_owner(self.units.get(production_name, {}).get(name), self.failures)
+        if isinstance(owner, ProvedLiveUnit):
+            return owner
+        registered = self.registry_owners.get(production_name, {}).get(name)
+        return registered if registered is not None else owner
 
     def status_units(self, production_name: str) -> dict[str, LabeledSession]:
-        """Return the selected process for each unit in the production."""
-        return dict(self.units.get(production_name, {}))
-
+        """Return pane details only when the enumeration is complete."""
+        failures = self.failures
+        if failures:
+            raise staff.StaffUnreadable(failures[0])
+        panes = self.units.get(production_name, {})
+        for name, owner in self.registry_owners.get(production_name, {}).items():
+            if name not in panes and isinstance(owner, UnknownUnit):
+                raise staff.StaffUnreadable(f"{name}: {owner.reason}")
+        return dict(panes)
 
 
 def production_members(record: staff.StaffSnapshot) -> dict[str, tuple[staff.StaffRow, ...]]:
@@ -806,7 +969,7 @@ def production_members(record: staff.StaffSnapshot) -> dict[str, tuple[staff.Sta
             for row in staff.active(record, "showrunner")}
 
 
-def group_labeled_sessions(marked: Iterable[LabeledSession], *,
+def group_labeled_sessions(marked: SessionLabelObservations | Iterable[LabeledSession], *,
                        record: staff.StaffSnapshot | None = None,
                        sources: MemberSources | None = None) -> LabeledProductions:
     """Join native runtime identities to their recorded parents."""
@@ -815,7 +978,7 @@ def group_labeled_sessions(marked: Iterable[LabeledSession], *,
     return _group_labeled_sessions(marked, record, production_members(record), sources.launches)
 
 
-def retained_session_labels(marked: Iterable[LabeledSession], row: staff.StaffRow, production_name: str, *,
+def retained_session_labels(marked: SessionLabelObservations | Iterable[LabeledSession], row: staff.StaffRow, production_name: str, *,
                         record: staff.StaffSnapshot, sources: MemberSources) -> LabeledProductions:
     """Keep pane evidence for a retained identity during stop and cleanup checks."""
     membership = production_members(record)
@@ -824,7 +987,7 @@ def retained_session_labels(marked: Iterable[LabeledSession], row: staff.StaffRo
     return _group_labeled_sessions(marked, record, membership, sources.launches)
 
 
-def _group_labeled_sessions(marked: Iterable[LabeledSession], record: staff.StaffSnapshot,
+def _group_labeled_sessions(marked: SessionLabelObservations | Iterable[LabeledSession], record: staff.StaffSnapshot,
                         membership: dict[str, tuple[staff.StaffRow, ...]], launches: tuple[PaneLaunch, ...]) -> LabeledProductions:
     from scripts.herdr import herdr
     from scripts.message import process_table
@@ -833,12 +996,15 @@ def _group_labeled_sessions(marked: Iterable[LabeledSession], record: staff.Staf
     parents = {row.id: production_name for production_name, rows in membership.items() for row in rows}
     found: dict[str, dict[staff.StaffId, list[LabeledSession]]] = {}
     observed: list[LabeledSession] = []
-    for unit in marked:
-        identity = report_process(process_pid(unit), unit.identity.id if isinstance(unit.identity, LiveSession) else "")
-        if identity.is_morty:
-            continue
-        if identity.native_id and not isinstance(unit.identity, LiveSession):
-            unit = replace(unit, identity=LiveSession(identity.native_id))
+    unassigned: list[UnassignedPaneObservation] = []
+    labels = marked.labels if isinstance(marked, SessionLabelObservations) else marked
+    for unit in labels:
+        if not isinstance(unit.identity, UnprovedPaneIdentity):
+            identity = report_process(process_pid(unit), unit.identity.id if isinstance(unit.identity, LiveSession) else "")
+            if identity.is_morty:
+                continue
+            if identity.native_id and isinstance(unit.identity, NoSession) and not isinstance(unit.claude, ClaudeUnknown):
+                unit = replace(unit, identity=LiveSession(identity.native_id))
         observed.append(unit)
     pane_rows: dict[Place, set[staff.StaffId]] = {}
     for unit in observed:
@@ -846,41 +1012,69 @@ def _group_labeled_sessions(marked: Iterable[LabeledSession], record: staff.Staf
         if row is not None:
             pane_rows.setdefault(unit.place, set()).add(row.id)
     for unit in observed:
-        runtime_row = record.by_current_session(unit.identity.id) if isinstance(unit.identity, LiveSession) else None
-        if runtime_row is None:
-            if isinstance(unit.identity, LiveSession):
+        if isinstance(unit.identity, LiveSession):
+            row = record.by_current_session(unit.identity.id)
+            candidates: set[staff.StaffId] = {row.id} if row is not None else set()
+        elif isinstance(unit.identity, StoredReference):
+            row = record.by_member_reference(unit.identity.id)
+            candidates = {row.id} if row is not None else set()
+        else:
+            unproved = isinstance(unit.identity, UnprovedPaneIdentity)
+            if not unproved and (pid := process_pid(unit)) and pid not in process_table.snapshot():
                 continue
-            if (pid := process_pid(unit)) and pid not in process_table.snapshot():
-                continue
-            reason = "process identity is unavailable"
             candidates = set(pane_rows.get(unit.place, ()))
+            if isinstance(unit.identity, UnprovedPaneIdentity):
+                candidates.update(row.id for identity in unit.identity.candidates
+                                  if (row := record.by_current_session(identity)) is not None)
             for launch in launches:
                 if unit.place.session == shared_session and launch["pane_id"] == unit.place.pane:
                     owner = record.by_member_reference(pane_launch.reference_id(launch))
                     if owner is not None:
                         candidates.add(owner.id)
-            if candidates:
+            if not unproved:
+                stopped = isinstance(unit.claude, ClaudeNotRunning)
+                if candidates and not stopped:
+                    report_anomaly(f"{holder_text(unit)}: cannot read its thread; staff status may be incomplete",
+                                   pid=process_pid(unit))
+                if len(candidates) != 1:
+                    continue
+                if not stopped:
+                    unit = replace(unit, claude=ClaudeUnknown("process identity is unavailable"))
+        assigned = False
+        for candidate in sorted(candidates):
+            row = record.by_id(candidate)
+            if row is None or row.kind != "unit":
+                continue
+            production_name = parents.get(row.id)
+            if production_name is None:
+                parent = record.parent_of(row)
+                if (isinstance(row.worktree, staff.RemovedWorktree)
+                        or (parent is not None and parent.kind == "showrunner"
+                            and isinstance(parent.doc, staff.WrappedDoc))):
+                    continue
+                report_anomaly(f"{row.name}: no showrunner staff parent", pid=process_pid(unit))
+                continue
+            selected = unit
+            if not isinstance(unit.empty, ShellNotObserved):
+                # A retained launch can add a candidate. The shell mark identifies the retained pane.
+                marked_shell = (isinstance(unit.identity, UnprovedPaneIdentity)
+                                and row.current_session in unit.identity.candidates
+                                and isinstance(unit.claude, ClaudeNotRunning))
+                reference = StoredReference(row.id)
+                selected = replace(unit, identity=reference if marked_shell else UnprovedPaneIdentity(unit=reference))
+            elif isinstance(unit.identity, UnprovedPaneIdentity):
+                selected = replace(unit, identity=replace(unit.identity, unit=StoredReference(row.id)))
+            found.setdefault(production_name, {}).setdefault(row.id, []).append(selected)
+            assigned = True
+        if (isinstance(unit.empty, ShellNotObserved) and isinstance(unit.identity, UnprovedPaneIdentity)
+                and isinstance(unit.claude, ClaudeUnknown)):
+            if not assigned:
+                unassigned.append(UnassignedPaneObservation(unit.place, unit.claude.reason))
+                report_anomaly(f"{place_text(unit.place)}: cannot assign the pane to a unit: {unit.claude.reason}",
+                               pid=process_pid(unit), check_identity=False)
+            elif process_pid(unit):
                 report_anomaly(f"{holder_text(unit)}: cannot read its thread; staff status may be incomplete",
-                               pid=process_pid(unit))
-            if len(candidates) != 1:
-                continue
-            runtime_row = record.by_id(next(iter(candidates)))
-            assert runtime_row is not None
-            unit = replace(unit, claude=ClaudeUnknown(reason))
-        if runtime_row.kind != "unit":
-            continue
-        row = runtime_row
-        production_name = parents.get(row.id)
-        if production_name is None:
-            parent = record.parent_of(row)
-            if (isinstance(row.worktree, staff.RemovedWorktree)
-                    or (parent is not None and parent.kind == "showrunner"
-                        and isinstance(parent.doc, staff.WrappedDoc))):
-                continue
-            report_anomaly(f"{row.name}: no showrunner staff parent",
-                           pid=process_pid(unit))
-            continue
-        found.setdefault(production_name, {}).setdefault(row.id, []).append(unit)
+                               pid=process_pid(unit), check_identity=False)
     units: dict[str, dict[str, LabeledSession]] = {}
     for production_name, production in found.items():
         units[production_name] = {}
@@ -888,12 +1082,29 @@ def _group_labeled_sessions(marked: Iterable[LabeledSession], record: staff.Staf
             row = record.by_id(identity)
             assert row is not None
             name = row.name
-            selected = next((unit for unit in places if isinstance(unit.process, ObservedProcess)
-                             and (herdr.is_claude_process([unit.process.command])
-                                  or herdr.is_codex_process([unit.process.command]))), places[0])
+            selected = next((unit for unit in places if isinstance(unit.claude, LiveClaude)
+                             or isinstance(unit.process, ProvedCodexPaneProcess)), None)
+            if selected is None:
+                selected = next((unit for unit in places if isinstance(unit.process, ObservedProcess)
+                                 and (herdr.is_claude_process([unit.process.command])
+                                      or herdr.is_codex_process([unit.process.command]))), None)
+            if selected is None:
+                # Other pane evidence can prevent a finding of absence.
+                selected = next((unit for unit in places if isinstance(unit.claude, ClaudeUnknown)
+                                 or isinstance(unit.empty, ShellNotObserved)), None)
+            if selected is None:
+                selected = next((unit for unit in places if isinstance(unit.identity, StoredReference)), places[0])
             units[production_name][name] = selected if selected.unit == name else replace(selected, unit=name)
+    unreadable = marked.unreadable_pane_lists if isinstance(marked, SessionLabelObservations) else ()
+    registry_failures = marked.registry_failures if isinstance(marked, SessionLabelObservations) else ()
+    registry_owners = (marked.registry_owners if isinstance(marked, SessionLabelObservations) else {})
+    owners_by_production = {
+        name: {row.name: registry_owners[row.current_session] for row in rows if row.current_session in registry_owners}
+        for name, rows in membership.items() if any(row.current_session in registry_owners for row in rows)
+    }
     return LabeledProductions(units, {production_name: tuple(row.name for row in rows)
-                                     for production_name, rows in membership.items()})
+                                     for production_name, rows in membership.items()}, tuple(unassigned), unreadable,
+                              registry_failures, owners_by_production)
 
 
 def session_staff_and_directors(
@@ -985,26 +1196,42 @@ def repair_marks() -> list[RepairedSessionLabels]:
     if live:
         from scripts.herdr import herdr
 
-        by_pid = {entry["pid"]: entry for entry in live}
+        places = herdr.herdr_places()
         seen: set[str] = set()
-        for process in herdr.herdr_processes():
-            session = by_pid.get(process.pid)
-            if session is None or session["sessionId"] in seen:
+        for session in live:
+            pid, identity = session["pid"], session["sessionId"]
+            place = places.get(pid)
+            if identity in seen or record.by_current_session(identity) is None:
                 continue
-            seen.add(session["sessionId"])
-            if pane_launch.matching_launch(pane_record.read(process.place.session), process.place, session["sessionId"]) is not None:
+            if place is None:
+                place = herdr.process_placement(pid)
+            if isinstance(place, herdr.UnprovedHerdrPlacement):
+                report_anomaly(f"{identity}: {place.reason}", pid=pid, check_identity=False)
+            if not isinstance(place, HerdrPlace):
                 continue
+            if pane_launch.matching_launch(pane_record.read(place.session), place, identity) is not None:
+                continue
+            client = herdr.Herdr(place.session)
+            herdr.forget_pane_evidence(place.session, place.pane)
             try:
-                entry = pane_record.running_launch(session, process.place, process.cwd)
-            except (OSError, ValueError):
+                info = herdr.json_object(client.result("pane", "process-info", "--pane", place.pane).get("process_info"),
+                                         "pane launch repair process info")
+                owner = herdr.foreground_pane_owner(info)
+                if not isinstance(owner, herdr.ProvedClaudeForeground) or owner.pid != pid:
+                    continue
+                native = herdr.read_foreground_pane_owner(owner, {})
+                if native.current_identity != identity:
+                    continue
+                entry = pane_record.running_launch(session, place, owner.cwd if isinstance(owner.cwd, str) else "")
+                if entry.get("proc_start") != native.started:
+                    continue
+            except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
                 continue
-            if record.by_current_session(entry["session_id"]) is None:
-                continue
-            pane_record.write(process.place.session, entry)
+            pane_record.write(place.session, entry)
+            seen.add(identity)
             newest[pane_launch.reference_id(entry)] = entry["written_at"]
             repaired.append(RepairedSessionLabels(
-                f"{process.place.session}:{process.place.pane}:{pane_launch.reference_id(entry)}",
-                (), ()))
+                f"{place.session}:{place.pane}:{pane_launch.reference_id(entry)}", (), ()))
     for path in sorted(pane_record.record_directory().glob("*.json")):
         with pane_record.locked(path.stem):
             entries = pane_record.read_strict(path.stem)

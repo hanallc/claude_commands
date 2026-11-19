@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_provider_evidence
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.mac_test import claim_state, eligibility
 from scripts.lib.berth_test_support import write_unconfigured_berth
-from scripts.lib.checkout_test_support import copy_runtime, python_tool_source, write_python_tool
+from scripts.lib.checkout_test_support import python_tool_source, write_python_tool
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
 from scripts.copies.copies_test_support import copies_environment
@@ -502,7 +504,7 @@ if "--assignment-file" in arguments:
 
     with open(Path(os.environ["TEST_REAL_RECORD"]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root:
         exec(package_root.read(), {"__file__": package_root.name})
-    from scripts.build_queue import admission_client, admission_protocol as wire, placement
+    from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
     from scripts.mac_test import mac_test as assigned_mac_test, claim_state
     from scripts.lib import process_start
 
@@ -546,7 +548,7 @@ if "--assignment-file" in arguments:
         output.write(assignment.attempt + "\n")
 
     fixture_outcome = placement.AttemptOutcomeUnavailable("the execution has not settled")
-    fixture_evidence = placement.ExecutionEvidenceUnavailable("the execution has not settled", time.time())
+    fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the execution has not settled", time.time())
     fixture_cleanup_confirmed = False
 
     def finish_assigned() -> None:
@@ -586,7 +588,7 @@ result = Path(arguments[arguments.index("--result") + 1])
 ''' + ASSIGNED_RUNNER_SETUP + r'''
 if "--assignment-file" in arguments:
     fixture_outcome = placement.PrelaunchRefused("runner")
-    fixture_evidence = placement.ExecutionNotStarted()
+    fixture_evidence = execution_identity.ExecutionNotStarted()
     fixture_cleanup_confirmed = True
 if "--copy" in arguments:
     # A Mac copy started by copy_watch.py. With TEST_COPY_CLAIM (mac_test.py)
@@ -636,7 +638,7 @@ if "--copy" in arguments:
         wait_for_file(root / "copy-release")
     if "--assignment-file" in arguments:
         fixture_outcome = placement.AttemptCompleted(int(os.environ.get("TEST_COPY_STATUS", "1")))
-        fixture_evidence = placement.ExecutionEvidenceUnavailable("the private command has ended", time.time())
+        fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private command has ended", time.time())
     result.write_text("mac=" + os.environ.get("TEST_COPY_MAC", "failed") + "\nreason=\nseconds="
                       + os.environ.get("TEST_COPY_SECONDS", "2.5") + "\n", encoding="utf-8")
     release_copy_claim()
@@ -665,7 +667,7 @@ def decline(reason: str, seconds: str) -> None:
     if "--assignment-file" in arguments:
         fixture_outcome = (placement.AttemptDeclined(reason) if reason in ("no_tests", "lost")
                            else placement.PrelaunchRefused(reason))
-        fixture_evidence = placement.ExecutionNotStarted()
+        fixture_evidence = execution_identity.ExecutionNotStarted()
     refusal = root / "placement-refusal.json"
     ready = refusal.with_suffix(".ready")
     ready.write_text(json.dumps({"reason": reason or "runner", "attempt": attempt,
@@ -720,10 +722,10 @@ if verb_answer.exists():
 if "--assignment-file" in arguments:
     if (mode == "passed" and runner_status == 0) or (mode == "failed" and runner_status not in (0, 75)):
         fixture_outcome = placement.AttemptCompleted(runner_status)
-        fixture_evidence = placement.ExecutionEvidenceUnavailable("the private command has ended", time.time())
+        fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private command has ended", time.time())
     elif mode == "lost":
         fixture_outcome = placement.AttemptDeclined("lost")
-        fixture_evidence = placement.ExecutionEvidenceUnavailable("the private command has ended", time.time())
+        fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private command has ended", time.time())
 if mode in ("passed", "failed", "lost"):
     print("mac_test: running on the Mac (macOS, host Mac); tree copied in 0.0 s", flush=True)
 if mode == "none":
@@ -1095,6 +1097,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
 
     def fixture_paths(self) -> None:
         self.home = self.root / "home"
+        self.verify_script = self.home / ".claude/scripts/direct/verify.sh"
         self.bin_directory = self.root / "bin"
         self.board = self.root / "board"
         self.runner_state = self.root / "runner-state"
@@ -1107,14 +1110,13 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         claude = self.home / ".claude"
         scripts = claude / "scripts"
         scripts.mkdir(parents=True)
-        (claude / "config").symlink_to(VERIFY.parent.parent.parent / "config", target_is_directory=True)
-        for source in VERIFY.parent.parent.iterdir():
-            if source.name != "buildlog":
-                (scripts / source.name).symlink_to(source, target_is_directory=source.is_dir())
+        _ = copy_helpers(self.home, *VERIFY_HELPERS)
+        _ = shutil.copytree(VERIFY.parent.parent.parent / "config", claude / "config")
         log = scripts / "buildlog"
-        log.mkdir()
-        self.write_executable(log / "record.py", RECORD_WRAPPER)
-        copy_runtime(claude, configuration=False)
+        # Keep the recorder's import interface while the command records fixture observations.
+        record_source = (VERIFY.parent.parent / "buildlog/record.py").read_text()
+        record_library = record_source.partition('\nif __name__ == "__main__":')[0]
+        self.write_executable(log / "record.py", record_library + RECORD_WRAPPER)
         self.bin_directory.mkdir()
         self.runner_state.mkdir()
         self.write_executable(self.bin_directory / "cargo", CARGO_STUB)
@@ -1361,7 +1363,7 @@ PINNED_TARGET="" STEP_FORCE_MAC=0
 PLACEMENT_STEP_NUMBER=0 PLACEMENT_EPISODE="" PLACEMENT_COMMAND=()
 PLACEMENT_ASSIGNMENT_FILE="" PLACEMENT_GRANT_FILE="" PLACEMENT_PROVIDER=""
 PLACEMENT_SINCE="" PLACEMENT_SOURCE_KEY="" PLACEMENT_SESSION=""
-LOCAL_RELEASE_WAIT_SCRIPT=${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$TEST_REAL_DIRECT/local_release_wait.py}
+LOCAL_RELEASE_WAIT_SCRIPT=${VERIFY_LOCAL_RELEASE_WAIT_SCRIPT:-$HOME/.claude/scripts/direct/local_release_wait.py}
 STEP_RECORD_ACTIVE=0 STEP_WRITES_TREE=0 STEP_RUNS_ON=any_target
 STEP_TARGET_TABLE=$(printf 'mac\teligible\t-\t%s\tmacos' "$MAC_TEST_CONFIG")
 TREE_WATCH_PID="" TREE_WATCH_DIR="" RUN_STEP_PID="" RUN_LOG=""
@@ -1494,7 +1496,7 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
             holders = Path(self.environment["BUILD_HOLD_DIR"])
             _ = build_hold.start_hold(holders, build_hold.HolderIdentity("hana", "hana"), "render checks", build_hold.NoReleaseEta(), datetime.now().astimezone())
             cycle = build_hold.read_cycle()
-            assert cycle is not None
+            assert not isinstance(cycle, build_hold.NoCycle)
             return self.root / "release" / cycle["id"] / "cycle.json"
 
     def control_routing_clock(self) -> Path:
@@ -1506,7 +1508,8 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         direct.mkdir(parents=True)
         for sibling in VERIFY.parent.parent.iterdir():
             if sibling.name != "direct":
-                (scripts / sibling.name).symlink_to(sibling, target_is_directory=sibling.is_dir())
+                selected = self.home / ".claude/scripts" / sibling.name if sibling.name == "buildlog" else sibling
+                (scripts / sibling.name).symlink_to(selected, target_is_directory=selected.is_dir())
         for helper in VERIFY.parent.iterdir():
             if helper.name != "verify.sh":
                 (direct / helper.name).symlink_to(helper, target_is_directory=helper.is_dir())
@@ -1619,6 +1622,9 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
                         return
                     for process in processes:
                         if process.poll() is not None:
+                            # A process can exit after the first condition check.
+                            if condition():
+                                return
                             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                             self.fail(f"verify exited {process.returncode} before {what}: {output + errors}")
                     remaining = deadline - time.monotonic()

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass, field
 import fcntl
 from io import StringIO
@@ -12,14 +13,65 @@ import sys
 from typing import cast, override
 from unittest import mock
 
-from scripts.aws_target import aws_target, hana_box, hana_spend, ledger
+from scripts.aws_target import aws_target, hana_box, hana_placement, hana_provider, hana_render, hana_spend, ledger
 from scripts.aws_target.control_test_support import TestClock
-from scripts.aws_target.ledger_test_support import CostFixture, git_only, text_setting
-from scripts.lib import conf
+from scripts.aws_target.ledger_test_support import CostFixture, HANA_GUEST_RUNTIME_SETTINGS, git_only, text_setting
+from scripts.lib import conf, process_start
 
 
-REPOSITORY = Path(__file__).resolve().parents[2]
 IDENTITY = hana_box.DeploymentIdentity('fixture-deployment', 'fixture-instance', 'fixture-spot-request', 'us-east-2')
+
+
+def write_lifecycle_configuration(path: Path) -> None:
+    """Give lifecycle tests fixed limits in their private configuration."""
+    _ = path.write_text("""\
+enabled=on
+host=fixture-hana
+region=us-east-2
+instance_type=m7a.2xlarge
+fallback_instance_types=c7a.4xlarge,m7i.4xlarge,m6a.4xlarge
+spot_max_usd_per_hour=0.15
+daily_budget_usd=6
+gp3_usd_per_gib_month=0.08
+# whole: 1..
+root_gib=40
+# whole: 1..
+data_gib=300
+# whole: 1..
+idle_stop_seconds=600
+# whole: 1..
+start_timeout_seconds=120
+# whole: 1..
+tick_interval_s=5
+# whole: 1..
+controller_tick_timeout_s=45
+# whole: 1..
+guard_grace_seconds=60
+# whole: 1..
+watchdog_check_seconds=1
+# whole: 1..
+permit_max_seconds=1800
+# whole: 1..
+step_cpu_limit=4
+# whole: 1..
+step_memory_gib=24
+# whole: 1..
+mount_timeout_seconds=15
+# whole: 1..
+aws_timeout_s=10
+# whole: 1..
+result_transfer_timeout_s=83
+# whole: 1..
+control_url_seconds=3600
+""" + HANA_GUEST_RUNTIME_SETTINGS)
+
+
+def record_lifecycle_image(directory: Path, workload: Path, *, identity: hana_box.DeploymentIdentity = IDENTITY) -> Path:
+    path = directory / 'hana/setup.json'
+    path.parent.mkdir(exist_ok=True, parents=True)
+    _ = path.write_text(json.dumps({'deployment': identity.deployment, 'instance': identity.instance,
+        'guest_digest': hana_render.guest_digest(workload).value}))
+    return path
 
 
 @dataclass
@@ -38,6 +90,8 @@ class FakeProvider:
     recoveries: list[hana_box.PendingOperation] = field(default_factory=list)
     published: list[hana_box.PendingOperation] = field(default_factory=list)
     during_call: Callable[[], None] = lambda: None
+    pending_bootstrap: bool = False
+    abandoned: list[str] = field(default_factory=list)
 
     def check_intent(self, operation: hana_box.PendingOperation) -> None:
         path = self.directory / 'hana/lifecycle.json'
@@ -65,6 +119,8 @@ class FakeProvider:
         self.during_call()
         if operation.action == hana_box.Action.OBSERVE:
             return hana_box.BoxObservation(identity, self.clock.now, self.state, self.boot, self.cause)
+        if operation.action == hana_box.Action.BOOTSTRAP and self.pending_bootstrap:
+            raise hana_provider.ProviderPending('The Hana bootstrap operation remains unresolved')
         if operation.action == hana_box.Action.START:
             assert isinstance(start, hana_box.DemandStart)
             self.starts.add(operation.token)
@@ -86,13 +142,15 @@ class FakeProvider:
         return hana_box.OperationAccepted(operation.token)
 
     def recover(self, identity: hana_box.DeploymentIdentity, start: hana_box.DemandStart | hana_box.NoDemandStart,
-                operation: hana_box.PendingOperation) -> hana_box.MutationRecovery:
+                operation: hana_box.PendingOperation, *, abandon_start: bool = False) -> hana_box.MutationRecovery:
         _ = start
         self.recoveries.append(operation)
         self.check_intent(operation)
         observed = hana_box.BoxObservation(identity, self.clock.now, self.state, self.boot, self.cause)
         if operation.token in self.in_flight:
             return hana_box.MutationUnresolved(operation.token, observed)
+        if abandon_start:
+            self.abandoned.append(operation.token)
         return hana_box.MutationSettled(operation.token, observed)
 
 
@@ -114,14 +172,33 @@ class HanaBoxTests(CostFixture):
         _ = self.enterContext(mock.patch.object(subprocess, 'run', side_effect=git_only))
         self.clock = TestClock()
         self.workload_path = self.root / 'hana_aws.conf'
-        _ = self.workload_path.write_text((REPOSITORY / 'config/hana_aws.conf').read_text())
-        text_setting(self.workload_path, 'enabled', 'on')
+        write_lifecycle_configuration(self.workload_path)
         self.book = ledger.CostLedger(self.state)
         self.book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'private inventory', True))
         self.book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'private account inventory'))
         self.provider = FakeProvider(self.state, self.clock)
         self.controller = hana_box.HanaController(self.state, self.settings, self.workload_path, self.provider, clock=self.clock)
         self.controller.register(IDENTITY)
+        _ = record_lifecycle_image(self.state, self.workload_path)
+
+    def test_only_a_current_image_can_start_a_hana_claim(self) -> None:
+        image = self.state / 'hana/setup.json'
+        current = image.read_text()
+        for proof in ('{}', current.replace(IDENTITY.instance, 'another-box')):
+            with self.subTest(proof=proof):
+                _ = image.write_text(proof)
+                self.assertEqual(self.controller.request('execution-one'), hana_box.ClaimRefused(hana_box.HANA_IMAGE_STALE))
+        _ = image.write_text(current)
+        for key, value in (('spot_max_usd_per_hour', '0.20'), ('execution_shell', 'ci')):
+            with self.subTest(key=key):
+                text_setting(self.workload_path, key, value)
+                self.assertTrue(self.controller.image_is_current(IDENTITY))
+        self.assertIsInstance(self.controller.request('execution-one'), hana_box.ClaimCommitted)
+        _ = self.workload_path.write_text(self.workload_path.read_text().replace(
+            'watchdog_check_seconds=1', 'watchdog_check_seconds=2'))
+        self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+        self.assertEqual(self.provider.calls, [])
+        self.assertEqual(self.controller.claim_status('execution-one'), hana_box.ClaimRefused(hana_box.HANA_IMAGE_STALE))
 
     def record(self) -> dict[str, object]:
         return ledger.mapping(cast(object, json.loads((self.state / 'hana/lifecycle.json').read_text())))
@@ -131,7 +208,9 @@ class HanaBoxTests(CostFixture):
 
     def tick(self) -> hana_box.Lifecycle:
         self.clock.advance(1)
-        return self.controller.tick()
+        result = self.controller.tick()
+        assert isinstance(result, hana_box.Lifecycle)
+        return result
 
     def ready(self) -> None:
         self.assertIsInstance(self.controller.request('execution-one'), hana_box.ClaimCommitted)
@@ -160,14 +239,14 @@ class HanaBoxTests(CostFixture):
 
         self.ready()
         self.controller.bind_execution('execution-one')
-        self.assertFalse(self.controller.release('execution-one'))
+        self.assertIsInstance(self.controller.release('execution-one'), hana_placement.HanaClaimReleaseRefused)
         reference = placement.ProviderClaimReference('ssh', 'fixture-target', RepositoryScope('hana', 'fixture-repository', 1),
             'execution-one', 'fixture-episode', 'fixture-attempt')
         settled = hana_execution.settle_unpublished_claim(self.state, reference,
             release_claim=lambda: self.controller.release('execution-one'), reason='The capture was refused')
         self.assertIsInstance(settled, hana_execution.HanaSettled)
         self.assertEqual(self.record()['claims'], [])
-        self.assertTrue(self.controller.release('execution-one'))
+        self.assertIsInstance(self.controller.release('execution-one'), hana_placement.HanaClaimReleased)
 
     def test_missing_or_corrupt_execution_journal_keeps_the_exact_claim_after_restart(self) -> None:
         from scripts.aws_target import hana_execution
@@ -175,10 +254,14 @@ class HanaBoxTests(CostFixture):
         self.ready()
         self.controller.bind_execution('execution-one')
         restarted = hana_box.HanaController(self.state, self.settings, self.workload_path, self.provider, clock=self.clock)
-        self.assertFalse(restarted.release('execution-one'))
         journal = hana_execution.execution_path(self.state, 'execution-one')
-        _ = journal.write_text('{')
-        self.assertFalse(restarted.release('execution-one'))
+        for state in ('missing', 'corrupt'):
+            with self.subTest(state=state):
+                if state == 'corrupt':
+                    _ = journal.write_text('{')
+                refusal = restarted.release('execution-one')
+                assert isinstance(refusal, hana_placement.HanaClaimReleaseRefused)
+                self.assertEqual(refusal.reason, 'The Hana command settlement is unconfirmed')
 
     def test_execution_bound_checks_lifecycle_under_the_controller_lock(self) -> None:
         def read_locked() -> hana_box.NoDeployment:
@@ -228,18 +311,87 @@ class HanaBoxTests(CostFixture):
         self.assertEqual(self.book.read_snapshot().hana_compute, [])
         self.assertEqual(self.controller.claim_status('execution-one'), hana_box.ClaimRefused('daily_limit'))
 
-    def test_start_timeout_keeps_the_unresolved_claim(self) -> None:
+    def test_expired_waiting_claim_is_refused_without_bootstrap(self) -> None:
+        committed = self.controller.request('execution-one')
+        assert isinstance(committed, hana_box.ClaimCommitted)
+        self.clock.advance(hana_box.read_settings(conf.read(self.workload_path)).start_timeout_seconds)
+        self.assertEqual(self.controller.claim_status('execution-one'), hana_box.ClaimWaiting(committed.claim))
+        self.assertEqual(self.controller.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+        self.assertEqual(self.controller.claim_status('execution-one'),
+                         hana_box.ClaimRefused('The Hana start deadline expired'))
+        self.assertEqual(self.provider.calls, [])
+        self.assertEqual(self.book.read_snapshot().hana_compute, [])
+
+    def test_start_deadline_refuses_claim_before_the_barrier_settles(self) -> None:
         _ = self.controller.request('execution-one')
         _ = self.tick()
-        timeout = hana_box.read_settings(conf.read(self.workload_path)).start_timeout_seconds
-        self.clock.advance(timeout)
-        result = self.controller.claim_status('execution-one')
-        self.assertIsInstance(result, hana_box.ClaimWaiting)
-        assert isinstance(result, hana_box.ClaimWaiting)
-        self.assertTrue(result.timed_out)
-        self.assertFalse(self.controller.release('execution-one'))
+        self.clock.advance(hana_box.read_settings(conf.read(self.workload_path)).start_timeout_seconds)
+        self.assertEqual(self.controller.claim_status('execution-one'),
+                         hana_box.ClaimRefused('The Hana start deadline expired'))
+        self.assertIsInstance(self.controller.release('execution-one'), hana_placement.HanaClaimReleaseRefused)
         self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimRefused)
         self.assertEqual(len(ledger.rows(self.record(), 'claims')), 1)
+
+    def test_pending_bootstrap_deadline_releases_claim_and_ignores_late_reply(self) -> None:
+        self.provider.pending_bootstrap = True
+        _ = self.controller.request('execution-one')
+        for _step in range(2):
+            with self.assertRaises(hana_provider.ProviderPending):
+                _ = self.tick()
+        operation = self.provider.calls[-1]
+        deadline = ledger.instant(ledger.mapping(self.record()['start']), 'deadline')
+
+        def late_reply(_identity: hana_box.DeploymentIdentity, _start: hana_box.DemandStart | hana_box.NoDemandStart,
+                       pending: hana_box.PendingOperation) -> hana_box.ProviderReply:
+            self.assertEqual(pending, operation)
+            self.clock.now = deadline
+            self.assertEqual(self.controller.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+            return hana_box.OperationAccepted(pending.token)
+
+        with mock.patch.object(self.provider, 'step', side_effect=late_reply):
+            self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+        self.assertEqual(self.provider.abandoned, [operation.token])
+        self.assertEqual(self.record()['claims'], [])
+        self.assertIsNone(self.record()['operation'])
+        self.assertIsNone(self.record()['start'])
+        self.assertEqual(self.controller.claim_status('execution-one'),
+                         hana_box.ClaimRefused('The Hana start deadline expired'))
+        exposure, = self.book.read_snapshot().hana_compute
+        self.assertEqual(exposure.state, ledger.HanaExposureClosed(deadline))
+
+    def test_bootstrap_acknowledgment_at_the_deadline_does_not_schedule_start(self) -> None:
+        _ = self.controller.request('execution-one')
+
+        def reach_deadline() -> None:
+            self.clock.now = ledger.instant(ledger.mapping(self.record()['start']), 'deadline')
+
+        self.provider.during_call = reach_deadline
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STARTING)
+        self.assertEqual(ledger.mapping(self.record()['operation'])['action'], hana_box.Action.BOOTSTRAP)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+        self.assertFalse(self.provider.starts)
+
+    def test_stopped_start_deadline_cancels_before_dispatch(self) -> None:
+        _ = self.controller.request('execution-one')
+        _ = self.tick()
+        operation = ledger.mapping(self.record()['operation'])
+        self.assertEqual(operation['action'], hana_box.Action.START)
+        self.clock.now = ledger.instant(ledger.mapping(self.record()['start']), 'deadline')
+        self.assertEqual(self.controller.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+        self.assertEqual(self.provider.abandoned, [operation['token']])
+        self.assertFalse(self.provider.starts)
+        self.assertEqual(self.record()['claims'], [])
+
+    def test_dead_start_owner_releases_the_stopped_box_before_deadline(self) -> None:
+        self.provider.pending_bootstrap = True
+        _ = self.controller.request('execution-one')
+        with self.assertRaises(hana_provider.ProviderPending):
+            _ = self.tick()
+        with mock.patch.object(process_start, 'process_start', return_value=process_start.Gone()):
+            self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+        self.assertEqual(self.controller.claim_status('execution-one'), hana_box.ClaimRefused('The Hana start owner exited'))
+        self.assertEqual(self.record()['claims'], [])
+        self.assertIsInstance(self.book.read_snapshot().hana_compute[-1].state, ledger.HanaExposureClosed)
 
     def test_start_intent_recovers_after_crash_before_response(self) -> None:
         _ = self.controller.request('execution-one')
@@ -304,8 +456,8 @@ class HanaBoxTests(CostFixture):
         self.assertEqual(self.provider.calls, calls)
         self.assertIsNone(self.record()['operation'])
         self.assertIsInstance(self.book.read_snapshot().hana_compute[-1].state, ledger.HanaExposureClosed)
-        self.assertTrue(self.controller.release('execution-one'))
-        self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimRefused)
+        self.assertEqual(self.record()['claims'], [])
+        self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimCommitted)
 
     def test_expired_start_recovers_a_running_box_and_restores_exposure_before_stopping(self) -> None:
         self.lose_mutation_response(hana_box.Action.START)
@@ -320,7 +472,7 @@ class HanaBoxTests(CostFixture):
         self.assertEqual(self.record()['state'], hana_box.Lifecycle.STOPPING.value)
         _ = self.tick()
         self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
-        self.assertTrue(self.controller.release('execution-one'))
+        self.assertEqual(self.record()['claims'], [])
         self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimCommitted)
 
     def test_expired_publication_recovers_without_extending_permission(self) -> None:
@@ -328,15 +480,44 @@ class HanaBoxTests(CostFixture):
         publications = list(self.provider.published)
         self.assertEqual(len(publications), 1)
         _ = self.tick()
-        self.assertEqual(len(self.provider.recoveries), 1)
+        self.assertEqual(self.provider.recoveries, [])
         self.assertEqual(self.provider.published, publications)
         self.assertIsNone(self.record()['delivered'])
         self.assertIsInstance(self.controller.permission('execution-one', 'fixture-boot', self.generation()), hana_box.ClaimRefused)
         self.assertEqual(self.record()['state'], hana_box.Lifecycle.STOPPING.value)
         _ = self.tick()
         self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
-        self.assertTrue(self.controller.release('execution-one'))
+        self.assertEqual(self.record()['claims'], [])
         self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimCommitted)
+
+    def test_spending_recovery_still_orders_a_stop_after_the_generation_changes(self) -> None:
+        self.ready()
+        boot = self.record()['boot']
+        claims = ledger.rows(self.record(), 'claims')
+        self.assertTrue(claims[0]['active'])
+        publications = list(self.provider.published)
+        expiry = ledger.instant(ledger.mapping(self.record()['delivered']), 'expires')
+        settings = hana_box.read_settings(conf.read(self.workload_path))
+        self.clock.now = expiry - (2 * settings.controller_tick_timeout_s + 3 * settings.tick_interval_s)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.READY)
+        self.assertEqual(ledger.mapping(self.record()['operation'])['action'], hana_box.Action.PUBLISH.value)
+        workload = hana_spend.read_settings(conf.read(self.workload_path))
+        self.costs({'daily_limit_usd': str(workload.storage_usd_per_month / 60)})
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.assertEqual(self.record()['reason'], 'daily_limit')
+        self.assertEqual(self.record()['boot'], boot)
+        self.assertEqual(ledger.rows(self.record(), 'claims'), claims)
+        generation = self.generation()
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.crash_after_closing_stop_exposure()
+        self.costs({'daily_limit_usd': '20'})
+        self.provider.state = 'running'
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.assertEqual(self.generation(), generation + 1)
+        self.assertEqual(ledger.mapping(self.record()['operation'])['action'], hana_box.Action.STOP.value)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.assertEqual(self.provider.calls[-1].action, hana_box.Action.STOP)
+        self.assertEqual(self.provider.published, publications)
 
     def test_stale_recovery_cannot_settle_a_different_mutation(self) -> None:
         self.lose_mutation_response(hana_box.Action.START)
@@ -365,6 +546,34 @@ class HanaBoxTests(CostFixture):
         self.assertFalse(any(row.action == hana_box.Action.PUBLISH for row in self.provider.calls))
         self.assertIsInstance(self.controller.permission('execution-one', 'old-boot', self.generation()), hana_box.ClaimRefused)
 
+    def test_abandonment_stops_a_late_permit_acknowledgment_and_a_ready_box(self) -> None:
+        _ = self.controller.request('execution-one')
+        for _step in range(3):
+            _ = self.tick()
+        self.assertEqual(ledger.mapping(self.record()['operation'])['action'], hana_box.Action.PUBLISH.value)
+
+        def reach_deadline() -> None:
+            self.clock.now = ledger.instant(ledger.mapping(self.record()['start']), 'deadline')
+
+        self.provider.during_call = reach_deadline
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.provider.during_call = lambda: None
+        self.assertEqual(len(self.provider.published), 1)
+        self.assertIsNone(self.record()['delivered'])
+        self.assertEqual(self.record()['claims'], [])
+        _ = self.tick()
+        self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+
+        self.ready()
+        self.clock.now = ledger.instant(ledger.mapping(self.record()['start']), 'deadline')
+        self.assertEqual(self.tick(), hana_box.Lifecycle.READY)
+        with mock.patch.object(process_start, 'process_start', return_value=process_start.Gone()):
+            self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.assertEqual(self.record()['claims'], [])
+        self.assertIsNone(self.record()['delivered'])
+        _ = self.tick()
+        self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+
     def test_stale_acknowledgment_keeps_the_publication_unresolved(self) -> None:
         _ = self.controller.request('execution-one')
         for _step in range(3):
@@ -377,7 +586,7 @@ class HanaBoxTests(CostFixture):
 
     def test_committed_incoming_claim_prevents_idle_stop(self) -> None:
         self.ready()
-        self.assertTrue(self.controller.release('execution-one'))
+        self.assertIsInstance(self.controller.release('execution-one'), hana_placement.HanaClaimReleased)
         self.clock.advance(hana_box.read_settings(conf.read(self.workload_path)).idle_stop_seconds)
         self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimCommitted)
         _ = self.tick()
@@ -387,10 +596,10 @@ class HanaBoxTests(CostFixture):
 
     def test_idle_stop_intent_refuses_a_concurrent_new_claim(self) -> None:
         self.ready()
-        self.assertTrue(self.controller.release('execution-one'))
+        self.assertIsInstance(self.controller.release('execution-one'), hana_placement.HanaClaimReleased)
         self.clock.advance(hana_box.read_settings(conf.read(self.workload_path)).idle_stop_seconds)
         self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
-        received: list[hana_box.ClaimCommitted | hana_box.ClaimRefused] = []
+        received: list[hana_box.ClaimCommitted | hana_box.ClaimRefused | hana_box.HanaResourcesHeld] = []
         self.provider.during_call = lambda: received.append(self.controller.request('execution-two'))
         _ = self.tick()
         self.assertIsInstance(received[0], hana_box.ClaimRefused)
@@ -400,19 +609,35 @@ class HanaBoxTests(CostFixture):
 
     def test_interruption_and_unknown_stop_never_authorize_manual_restart(self) -> None:
         self.ready()
+        ready = self.controller.path.read_text()
         self.provider.state, self.provider.cause = 'stopped', hana_box.StopCause.INTERRUPTION
         self.assertEqual(self.tick(), hana_box.Lifecycle.INTERRUPTED)
         self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimRefused)
         starts = len(self.provider.starts)
         _ = self.tick()
         self.assertEqual(len(self.provider.starts), starts)
+        interrupted = self.controller.path.read_text()
+        _ = self.controller.path.write_text(ready)
         self.provider.cause = hana_box.StopCause.UNKNOWN
         self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPED_UNKNOWN)
         self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimRefused)
+        unknown = self.controller.path.read_text()
+        for state, cause, record in (
+                (hana_box.Lifecycle.INTERRUPTED, hana_box.StopCause.INTERRUPTION, interrupted),
+                (hana_box.Lifecycle.STOPPED_UNKNOWN, hana_box.StopCause.UNKNOWN, unknown)):
+            with self.subTest(state=state):
+                _ = self.controller.path.write_text(record)
+                self.provider.cause = cause
+                self.assertEqual(ledger.rows(self.record(), 'claims')[0]['execution'], 'execution-one')
+                with mock.patch.object(process_start, 'process_start', return_value=process_start.Gone()):
+                    self.assertEqual(self.tick(), state)
+                self.assertEqual(self.record()['claims'], [])
+                self.assertEqual(self.record()['reason'], 'The Hana start owner exited')
+                self.assertEqual(len(self.provider.starts), starts)
 
     def test_interruption_during_idle_stop_forbids_a_manual_restart(self) -> None:
         self.ready()
-        self.assertTrue(self.controller.release('execution-one'))
+        self.assertIsInstance(self.controller.release('execution-one'), hana_placement.HanaClaimReleased)
         self.clock.advance(hana_box.read_settings(conf.read(self.workload_path)).idle_stop_seconds)
         self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
         self.assertEqual(self.record()['stop_cause'], hana_box.StopCause.IDLE.value)
@@ -425,6 +650,111 @@ class HanaBoxTests(CostFixture):
             self.assertEqual(self.tick(), hana_box.Lifecycle.INTERRUPTED)
         self.assertEqual(self.provider.starts, starts)
         self.assertEqual(self.record()['claims'], [])
+
+    def unclaimed_restart(self, cause: hana_box.StopCause, prior: hana_box.Lifecycle, *, later_stops: int = 0) -> None:
+        evidence = self.book.read_snapshot()
+
+        def save(state: ledger.LedgerEvidence) -> None:
+            nonlocal evidence
+            evidence = deepcopy(state)
+
+        _ = self.enterContext(mock.patch.object(ledger.CostLedger, '_read', side_effect=lambda: deepcopy(evidence)))
+        _ = self.enterContext(mock.patch.object(ledger.CostLedger, '_save', side_effect=save))
+        self.ready()
+        self.assertIsInstance(self.controller.release('execution-one'), hana_placement.HanaClaimReleased)
+        self.provider.state, self.provider.cause = 'stopped', cause
+        self.assertEqual(self.tick(), prior)
+        self.provider.cause = hana_box.StopCause.UNKNOWN
+        for _step in range(later_stops):
+            self.assertEqual(self.tick(), prior)
+        self.clock.advance(82 - later_stops)
+        self.provider.state, self.provider.cause = 'running', hana_box.StopCause.UNKNOWN
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.assertIsInstance(self.book.read_snapshot().hana_compute[-1].state, ledger.HanaExposureOpen)
+        self.clock.advance(6)
+
+    def test_unclaimed_restart_after_interruption_allows_a_later_demand_start(self) -> None:
+        self.unclaimed_restart(hana_box.StopCause.INTERRUPTION, hana_box.Lifecycle.INTERRUPTED, later_stops=3)
+        self.assertEqual(self.record()['stop_cause'], hana_box.StopCause.UNCLAIMED_AFTER_INTERRUPTION.value)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+        self.assertIsInstance(self.book.read_snapshot().hana_compute[-1].state, ledger.HanaExposureClosed)
+        self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimCommitted)
+        for _step in range(4):
+            _ = self.tick()
+        self.assertEqual(self.record()['state'], hana_box.Lifecycle.READY.value)
+        self.assertEqual(len(self.provider.starts), 2)
+
+    def test_unclaimed_restart_after_unknown_stop_keeps_the_hold(self) -> None:
+        self.unclaimed_restart(hana_box.StopCause.UNKNOWN, hana_box.Lifecycle.STOPPED_UNKNOWN)
+        self.assertEqual(self.record()['stop_cause'], hana_box.StopCause.UNCLAIMED.value)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPED_UNKNOWN)
+        self.assertIsInstance(self.book.read_snapshot().hana_compute[-1].state, ledger.HanaExposureClosed)
+        self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimRefused)
+        self.assertEqual(len(self.provider.starts), 1)
+
+    def assert_saved_stop_survives_a_restart(self) -> None:
+        token = ledger.text(ledger.mapping(self.record()['operation']), 'token')
+        self.assertFalse(any(call.action == hana_box.Action.STOP for call in self.provider.calls))
+        self.controller = hana_box.HanaController(self.state, self.settings, self.workload_path,
+                                                  self.provider, clock=self.clock)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.assertEqual(self.provider.calls[-1].token, token)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+        self.assertIsInstance(self.book.read_snapshot().hana_compute[-1].state, ledger.HanaExposureClosed)
+
+    def test_controller_restart_sends_the_saved_stop(self) -> None:
+        self.unclaimed_restart(hana_box.StopCause.INTERRUPTION, hana_box.Lifecycle.INTERRUPTED)
+        self.assert_saved_stop_survives_a_restart()
+
+    def test_controller_restart_settles_the_saved_stop_after_the_guest_stops(self) -> None:
+        self.unclaimed_restart(hana_box.StopCause.INTERRUPTION, hana_box.Lifecycle.INTERRUPTED)
+        self.provider.state = 'stopped'
+        self.assert_saved_stop_survives_a_restart()
+
+    def test_running_observation_in_the_same_generation_preserves_the_stop_decision(self) -> None:
+        self.unclaimed_restart(hana_box.StopCause.INTERRUPTION, hana_box.Lifecycle.INTERRUPTED)
+        generation = self.generation()
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.provider.state = 'running'
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.assertEqual(self.record()['generation'], generation)
+        self.assertEqual(self.record()['stop_cause'], hana_box.StopCause.UNCLAIMED_AFTER_INTERRUPTION.value)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+
+    def crash_after_closing_stop_exposure(self) -> None:
+        with (mock.patch.object(self.controller, '_save', side_effect=RuntimeError('The lifecycle write failed')),
+              self.assertRaisesRegex(RuntimeError, 'The lifecycle write failed')):
+            _ = self.tick()
+        self.assertIsInstance(self.book.read_snapshot().hana_compute[-1].state, ledger.HanaExposureClosed)
+        self.assertEqual(self.record()['state'], hana_box.Lifecycle.STOPPING.value)
+        self.controller = hana_box.HanaController(self.state, self.settings, self.workload_path,
+                                                  self.provider, clock=self.clock)
+
+    def test_pending_generation_cannot_settle_an_older_stop_decision(self) -> None:
+        self.unclaimed_restart(hana_box.StopCause.INTERRUPTION, hana_box.Lifecycle.INTERRUPTED)
+        generation = self.generation()
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.crash_after_closing_stop_exposure()
+        self.assertEqual(self.record()['unclaimed_stop_generation'], generation)
+        self.provider.state = 'pending'
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.assertEqual(self.record()['generation'], generation + 1)
+        self.assertEqual(self.record()['unclaimed_stop_generation'], generation)
+        self.assertIsInstance(self.book.read_snapshot().hana_compute[-1].state, ledger.HanaExposureOpen)
+        self.provider.state = 'stopped'
+        self.assertEqual(self.tick(), hana_box.Lifecycle.INTERRUPTED)
+        self.assertIsInstance(self.book.read_snapshot().hana_compute[-1].state, ledger.HanaExposureClosed)
+        self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimRefused)
+
+    def test_interruption_during_the_unclaimed_stop_keeps_priority(self) -> None:
+        self.unclaimed_restart(hana_box.StopCause.INTERRUPTION, hana_box.Lifecycle.INTERRUPTED)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.provider.cause = hana_box.StopCause.INTERRUPTION
+        self.assertEqual(self.tick(), hana_box.Lifecycle.INTERRUPTED)
+        self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimRefused)
 
     def test_automatic_restart_is_counted_without_caller_while_disabled(self) -> None:
         text_setting(self.workload_path, 'enabled', 'off')
@@ -451,7 +781,9 @@ class HanaBoxTests(CostFixture):
         self.assertEqual(intent['expected_generation'], old)
         self.assertGreater(self.generation(), old)
         self.assertEqual(ledger.rows(self.record(), 'claims')[0], claim)
+        observed_at = self.record()['observed_at']
         _ = self.tick()
+        self.assertEqual(self.record()['observed_at'], observed_at)
         self.assertEqual(ledger.rows(self.record(), 'claims')[0], claim)
 
     def test_refresh_failure_does_not_stop_lifecycle_recovery(self) -> None:
@@ -470,6 +802,18 @@ class HanaBoxTests(CostFixture):
                     lifecycle=lifecycle, refresh=refresh), 1)
         self.assertEqual(events, ['lifecycle', 'refresh'] * 4)
         self.assertEqual(self.record()['state'], hana_box.Lifecycle.READY.value)
+
+    def test_controller_tick_logs_the_provider_reason(self) -> None:
+        def lifecycle() -> None:
+            raise hana_provider.ProviderPending('The Hana bootstrap operation remains unresolved')
+
+        error = StringIO()
+        with mock.patch.object(sys, 'stderr', error):
+            self.assertEqual(aws_target.controller_tick(self.settings, self.state, self.workload_path,
+                                                        lifecycle=lifecycle, refresh=lambda: None), 1)
+        self.assertEqual(error.getvalue(),
+                         'aws_target: Hana lifecycle unavailable: ProviderPending: '
+                         + 'The Hana bootstrap operation remains unresolved\n')
 
     def test_supervisor_bounds_ticks_and_continues_after_timeout(self) -> None:
         calls: list[float] = []
@@ -524,19 +868,29 @@ class HanaBoxTests(CostFixture):
         self.provider.state, self.provider.cause = 'stopped', hana_box.StopCause.INTERRUPTION
         _ = self.tick()
         assert isinstance(old_boot, hana_box.VerifiedBoot)
-        self.provider.state = 'running'
+        self.provider.state, self.provider.cause = 'running', hana_box.StopCause.UNKNOWN
         self.provider.boot = hana_box.VerifiedBoot('automatic-boot', old_boot.start_token)
         before = sum(row.action == hana_box.Action.PUBLISH for row in self.provider.calls)
         self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
         self.assertEqual(sum(row.action == hana_box.Action.PUBLISH for row in self.provider.calls), before)
         self.assertGreater(len(self.book.read_snapshot().hana_compute), 1)
         self.assertIsInstance(self.controller.permission('execution-one', 'automatic-boot', self.generation()), hana_box.ClaimRefused)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
+        self.assertEqual(self.tick(), hana_box.Lifecycle.INTERRUPTED)
 
     def test_unprovisioned_tick_makes_no_provider_call(self) -> None:
         directory = self.root / 'empty-state'
         controller = hana_box.HanaController(directory, self.settings, self.workload_path, self.provider, clock=self.clock)
         self.assertEqual(controller.tick(), hana_box.Lifecycle.UNPROVISIONED)
         self.assertEqual(self.provider.calls, [])
+
+    def test_tick_observes_the_box_with_any_setup_margin(self) -> None:
+        for margin in ('0.25', '0', '-0.01', 'invalid'):
+            with self.subTest(margin=margin):
+                text_setting(self.workload_path, 'spot_ceiling_margin', margin)
+                self.provider.calls.clear()
+                self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+                self.assertEqual([call.action for call in self.provider.calls], [hana_box.Action.OBSERVE])
 
     def test_obsolete_provider_response_cannot_replace_a_new_operation(self) -> None:
         self.ready()

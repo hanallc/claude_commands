@@ -6,12 +6,15 @@ import html
 import json
 import re
 import time
+from collections.abc import Callable
+from enum import StrEnum
 from pathlib import Path
 
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 
 ICONS = Path(__file__).with_name("lucide")
+QUESTION_WAITING = "The {owner_role} will answer this"
 
 
 def icon_svg(name: str) -> str:
@@ -22,8 +25,8 @@ def icon_svg(name: str) -> str:
     return source[source.index("<svg"):].replace("<svg", '<svg aria-hidden="true" focusable="false"', 1)
 
 
-def title(text: str, page: str) -> str:
-    """Build the title and its shared refresh status."""
+def title(text: str, page: str, *, action: str = "", component: str = "refresh") -> str:
+    """Build the title and refresh status with an optional action beside the title."""
     settings = conf.read_or_repository("console")
     options = {"roundTripLimit": settings.number("status.round_trip_limit_seconds"),
                "renderLimit": settings.number("status.render_limit_seconds"),
@@ -33,8 +36,12 @@ def title(text: str, page: str) -> str:
                     + '>' + icon_svg(icon) + '</span>' for state, icon in (
                         ('Live', 'radio'), ('Reading', 'loader-circle'), ('Late', 'clock-alert'),
                         ('Failed', 'triangle-alert'), ('Paused', 'circle-pause')))
-    return (f'<h1 class="page-title">{html.escape(text)}</h1>'
+    heading = f'<h1 class="page-title">{html.escape(text)}</h1>'
+    if action:
+        heading = f'<div class="page-heading">{heading}{action}</div>'
+    return (heading
             + '<p class="page-status" data-page-status data-state="Reading" role="status" aria-live="off" '
+            + f'data-status-component="{html.escape(f"{page}.{component}", quote=True)}" '
             + f'data-status-options="{html.escape(json.dumps(options), quote=True)}" data-page-facts>'
             + '<span class="page-status-state">' + icons + '<span data-status-word>Reading…</span></span>'
             + '<span data-status-age hidden></span><span data-status-trip hidden></span>'
@@ -60,12 +67,23 @@ REFRESH_SCRIPT = r'''function pageRefreshFacts(page=document){
  return {readAt:Number(line.dataset.readAt),renderSeconds:Number(line.dataset.renderSeconds),
   renderMedian:line.dataset.renderMedian,renderCount:line.dataset.renderCount,failure:line.dataset.readError};
 }
+function restoreFocusAfterRefresh(){
+ const {id,selectionStart,selectionEnd,selectionDirection}=document.activeElement || {};
+ return ()=>{
+  if(!id) return;
+  const field=document.getElementById(id);
+  field?.focus({preventScroll:true});
+  if(typeof field?.setSelectionRange==='function' && typeof selectionStart==='number' && typeof selectionEnd==='number'){
+   field.setSelectionRange(selectionStart,selectionEnd,selectionDirection);
+  }
+ };
+}
 function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
  const line=document.querySelector('[data-page-status]');
  const options=line ? JSON.parse(line.dataset.statusOptions) : {};
  const hidden=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;
  const frame=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
- let last=null,failure='',reading=false;
+ let last=null,failure='',reading=false,busy='';
  let request=0,active=false,started=0,pending=null,timer,clock,delay;
  let trip=null,state='',nextAt=0;
  const duration=value=>Number(value)<10 ? Number(value).toFixed(2) : Number(value).toFixed(0);
@@ -75,14 +93,14 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
   const reason=held(),age=last ? Math.max(0,Math.floor(Date.now()/1000-last.readAt)) : 0;
   // An on-demand page can report a server answer separately from the data time.
   const unanswered=last ? Math.max(0,Math.floor(Date.now()/1000-(last.answeredAt ?? last.readAt))) : 0;
-  const next=reason ? 'Paused' : failure ? 'Failed' : last && unanswered>options.ageLimit ? 'Late' : last?.busy ? 'Paused' : reading || !last ? 'Reading' : 'Live';
+  const next=reason ? 'Paused' : failure ? 'Failed' : last && unanswered>options.ageLimit ? 'Late' : busy || last?.busy ? 'Paused' : reading || !last ? 'Reading' : 'Live';
   line.dataset.state=next;
   line.querySelectorAll('[data-status-icon]').forEach(icon=>icon.hidden=icon.dataset.statusIcon!==next);
   line.querySelector('[data-status-word]').textContent=next==='Reading' ? 'Reading…' : next;
   if(next!==state){line.querySelector('[data-status-announcement]').textContent=next;state=next;}
   const part=(key,text)=>{const node=line.querySelector('[data-status-'+key+']');node.hidden=!text;node.textContent=text;return node;};
   part('age',last ? age<60 ? age+' s ago' : Math.floor(age/60)+' min ago' : '');
-  const why=next==='Paused' ? reason || last.busy : next==='Failed' ? failure : next==='Late' ? 'The feed has stopped.' : '';
+  const why=next==='Paused' ? reason || busy || last?.busy : next==='Failed' ? failure : next==='Late' ? 'The feed has stopped.' : '';
   part('reason',why);
   const timings=last && !why;
   const round=part('trip',timings && trip!==null ? 'round trip '+duration(trip)+' s' : '');
@@ -117,6 +135,11 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
  function abandon(){
   request++;active=false;clearTimeout(delay);reading=false;pending=null;draw();
  }
+ function setStatus(text,reason=''){
+  busy=text;failure=reason;
+  if(last) last={...last,busy:text,answeredAt:Date.now()/1000};
+  draw();
+ }
  function changed(){
   if(pending && !held()){const value=pending;pending=null;void present(value.value,value.began,value.own);}
   draw();
@@ -140,7 +163,7 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
  const first=initial || (line?.dataset.readAt ? pageRefreshFacts() : null);
  if(first){const navigation=performance.getEntriesByType('navigation')[0];
   void present(first,navigation?.requestStart || started,request,true);}
- return {restart,refresh,changed,abandon};
+ return {restart,refresh,changed,abandon,setStatus};
 }
 '''
 
@@ -155,14 +178,45 @@ def code_block_html(block: re.Match[str]) -> str:
             + '</code></pre>' + COPY_BUTTON + '</div>')
 
 
+def render_code_blocks(text: str, render_text: Callable[[str], str]) -> str:
+    """Render code blocks and pass the text between them to the caller's renderer."""
+    content: list[str] = []
+    start = 0
+    for block in CODE_BLOCK.finditer(text):
+        before = text[start:block.start()]
+        if before.strip():
+            content.append(render_text(before))
+        content.append(code_block_html(block))
+        start = block.end()
+    after = text[start:]
+    if after.strip() or not content:
+        content.append(render_text(after))
+    return "".join(content)
+
+
+BUTTON_STATES = '''
+:where(button[aria-pressed=true]){--button-hover-tint:rgb(0 0 0 / 24%)}
+:where(:is(button:enabled,summary,th[aria-sort][tabindex="0"]):not([aria-disabled=true]):hover,
+label:hover>input:enabled+[data-button-face],tr[aria-expanded]:not([aria-disabled=true]):hover>:is(th,td)){
+box-shadow:inset 0 0 0 1px color-mix(in srgb,currentColor 75%,transparent),
+inset 0 0 0 100vmax var(--button-hover-tint,rgb(255 255 255 / 28%))}
+:where(:is(button:enabled,summary,th[aria-sort][tabindex="0"]):not([aria-disabled=true]):active,
+label:active>input:enabled+[data-button-face],tr[aria-expanded]:not([aria-disabled=true]):active>:is(th,td)){
+box-shadow:inset 0 0 0 2px currentColor,
+inset 0 0 0 100vmax light-dark(rgb(0 0 0 / 32%),rgb(0 0 0 / 64%))}
+'''
+
 # The title, status and content share one centered column and page background.
 # A text page keeps a 1124 px column; a page whose main has the page-wide class uses the pane width.
 # A page that measures its layout uses the desktop gutter.
-STYLE = (':root{scrollbar-gutter:stable}'
+STYLE = (BUTTON_STATES
+         + ':root{scrollbar-gutter:stable}'
          + 'body{background:var(--bg,Canvas);color:var(--ink,CanvasText)}'
          + 'main{box-sizing:border-box;margin:0 auto;padding:32px 32px 64px}'
          + 'main:has(>.page-status):not(.page-wide){max-width:1124px}'
          + '.page-title{font:700 26px/1.25 system-ui,sans-serif;letter-spacing:normal;margin:0 0 8px;color:var(--ink,CanvasText)}'
+         + '.page-heading{position:relative;margin-bottom:8px}'
+         + '.page-heading>.page-title{margin:0}'
          + '@media (max-width:560px){:root:not(.layout-measuring) main{padding:24px 16px 48px}}'
          + r'''
 .page-status{display:flex;align-items:center;flex-wrap:wrap;gap:6px 0;font:14px/1.5 system-ui,sans-serif;
@@ -181,7 +235,33 @@ color:var(--ink-2);margin:0 0 20px;min-height:21px;background:var(--bg,Canvas)}
 [data-status-icon=Reading] svg{animation:page-status-turn 1s linear infinite}
 @keyframes page-status-turn{to{transform:rotate(360deg)}}
 @media(prefers-reduced-motion:reduce){[data-status-icon=Reading] svg{animation:none}}
+.review-actions{display:flex;align-items:flex-end;gap:26px;flex-wrap:wrap}
+.review-action-group>span{display:block;font-size:11px;color:var(--ink-3);text-transform:uppercase;margin-bottom:5px}
+.review-action-group>div{display:flex;gap:8px;flex-wrap:wrap}
+.review-action-group+.review-action-group{padding-left:26px;border-left:1px solid var(--line)}
+@media(max-width:960px){.review-action-group+.review-action-group{padding-left:0;border:0}}
+@media(max-width:560px){.review-actions{flex-direction:column;align-items:flex-start;flex-wrap:nowrap}}
 ''')
+
+class ReturningActionHeading(StrEnum):
+    ITEM_RETURNS = "The item returns to you"
+    SENDS_TO_SHOWRUNNER = "Sends to showrunner"
+
+
+def review_action_groups(closing_buttons: str, returning_buttons: str, later_controls: str = "", *,
+                         returning_heading: ReturningActionHeading = ReturningActionHeading.ITEM_RETURNS) -> str:
+    """Render the Review action groups that have controls."""
+    groups = (
+        ("Closes the item", closing_buttons, "", ""),
+        (returning_heading, returning_buttons, "", ""),
+        ("Hides it until", later_controls, " review-later", ' class="later-menu"'),
+    )
+    return '<div class="review-actions">' + "".join(
+        f'<div class="review-action-group{group_class}"><span>{label}</span>'
+        + f'<div{controls_class}>{controls}</div></div>'
+        for label, controls, group_class, controls_class in groups if controls
+    ) + '</div>'
+
 
 COPY_BUTTON = '''<button type="button" data-copy-code aria-label="Copy code" title="Copy">
 <svg data-copy-icon width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -199,7 +279,7 @@ COPY_STYLE = '''
 box-sizing:border-box;width:28px;min-height:28px;height:28px;padding:4px;margin:0;border:0;border-radius:4px;
 background:transparent;color:inherit;opacity:.55;cursor:pointer;user-select:none}
 .code-block:hover [data-copy-code],.code-block [data-copy-code]:focus-visible{opacity:1}
-.code-block [data-copy-code]:hover,.code-block [data-copy-code]:focus-visible{background:#8882}
+.code-block [data-copy-code]:focus-visible{background:#8882}
 [data-copy-code] [hidden]{display:none}
 '''
 

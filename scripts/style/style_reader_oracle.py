@@ -10,7 +10,7 @@ import subprocess
 import sys
 from typing import BinaryIO, NotRequired, Protocol, TypedDict, cast
 
-from scripts.style import approved_renames, declarations, style_footprint, style_plan, style_ledger
+from scripts.style import approved_renames, declarations, style_config, style_footprint, style_plan, style_ledger
 
 
 type Json = str | int | bool | None | list[Json] | dict[str, Json]
@@ -331,6 +331,9 @@ def answer(request: Request) -> None:
 
 
 def main() -> None:
+    if sys.argv[1:] == ["--version"]:
+        print(f"cargo-style {style_config.reader_minimum_version()} protocol {style_config.reader_protocol()}")
+        return
     request = cast(Request, json.load(sys.stdin))
     answer(request)
 

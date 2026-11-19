@@ -1,6 +1,7 @@
 """Merge gate suites contracts."""
 
 from __future__ import annotations
+from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
 
 import unittest
 import fcntl
@@ -12,7 +13,6 @@ import tempfile
 from collections.abc import Generator
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -169,7 +169,7 @@ class MergeGateTypesTests(GateSuitesFixture):
         self.assertEqual([call["args"] for call in self.calls() if call["tool"] == "uv"],
                          [["venv", "--clear", str(venv)],
                           ["pip", "install", "--python", str(venv / "bin" / "python"),
-                           *merge_gate.TYPECHECK_REQUIREMENTS]])
+                           "fake-bpy-module==20260822"]])
 
     def test_tests_only_runs_types_for_each_requested_directory(self) -> None:
         result = self.run_gate("--tests-only", "--type-dirs", "scripts/production", "scripts/hooks")
@@ -252,7 +252,9 @@ class NightlyPushTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = self.root / "config"
-        _ = shutil.copytree(Path(__file__).resolve().parents[2] / "config", config)
+        _ = copy_config_fixture(Path(__file__).resolve().parents[2] / "config", config)
+        _ = write_config_fixture(config / "merge_gate.conf",
+            "nightly_result_push=on\nnightly_result_modules=8\nnightly_assign_minutes=30\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "CONF_DIR": str(config),
             "MERGE_GATE_STATE_DIR": str(self.root / "state"), "USER_ZONE": "America/New_York"})))

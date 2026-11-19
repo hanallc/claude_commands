@@ -100,7 +100,7 @@ class OffloadCommandTests(SeededCleanupFixture):
                 self.assertNotIn("mac_exit=", result.stdout)
                 self.assertNotIn("mac_cleanup=", result.stdout)
                 self.assertEqual(result.stdout.count(
-                    "Mac build output removed: ~/.local/state/mac-test/mirror/hana/target, "
+                    "Mac build output removed: ~/.local/state/mac-test/test-mirror/hana/target, "
                     + "31.2 GiB; Mac free 59 GiB under the 60 GiB floor\n"), 1)
 
     def test_cleanup_failure_reports_once_without_changing_test_result(self) -> None:

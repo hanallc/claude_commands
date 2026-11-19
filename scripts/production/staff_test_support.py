@@ -20,6 +20,7 @@ import time
 import traceback
 import unittest
 from collections.abc import Generator
+from contextvars import ContextVar
 from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from io import IOBase
 from datetime import UTC, datetime
@@ -38,9 +39,11 @@ from scripts.production import staff
 from scripts.herdr import pane_launch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.agents import pane_record, remote
+from scripts.lint.memory_test_support import write_config_fixture
 
 _LOGIN_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 _FIXTURE_ACCOUNTS = tempfile.TemporaryDirectory(prefix="staff-test-accounts-")
+_PRIVATE_STAFF_FILE: ContextVar[Path | None] = ContextVar("private_staff_file", default=None)
 
 
 @contextmanager
@@ -247,6 +250,24 @@ with patch.object(stop_resume, "stop", return_value=stop_resume.Stopped(row.curr
 '''
 
 
+def fixture_unit_saved_name(row: staff.StaffRow, name: str) -> staff.StaffRow:
+    """Seed an old unit name in the private staff file."""
+    configured = os.environ.get("STAFF_FILE") or os.environ.get("STAFF_TEST_OWNER_FILE")
+    if row.kind != "unit" or not configured:
+        raise AssertionError("A saved unit name requires a private staff fixture.")
+    path = Path(configured).resolve()
+    temporary_roots = (Path(tempfile.gettempdir()), Path("/tmp"))
+    if path != _PRIVATE_STAFF_FILE.get() and not any(path.is_relative_to(root.resolve()) for root in temporary_roots):
+        raise AssertionError("The staff fixture must be in a temporary directory.")
+    with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        document = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+        fields = next(value for value in cast(list[dict[str, object]], document["rows"]) if value["id"] == row.id)
+        fields["name"] = name
+        write_text_atomic(path, json.dumps(document, indent=2, sort_keys=True) + "\n")
+    return replace(row, name=name)
+
+
 def fixture_member(kind: staff.Kind, *, name: str,
                    parent: staff.StaffId | staff.ReportsTo | staff.StaffRoot | None = None,
                    worktree: staff.PresentWorktree | staff.RemovedWorktree | staff.WorktreeUnfilled = UNFILLED_WORKTREE,
@@ -267,6 +288,14 @@ def fixture_member(kind: staff.Kind, *, name: str,
         row = staff.ensure_worker(staff.native_id(identity), name, parent_id)
         fixture_session(identity, backend)
         return staff.by_id(row.id) or row
+    if kind == "unit" and not existing:
+        try:
+            staff.validate_unit_name_for_write(name)
+        except staff.StaffRefused:
+            # Keep legacy test inputs while the real writer refuses new rows with these names.
+            row = staff.ensure(kind, name=f"fixture-{identity}", parent=relationship,
+                               worktree=worktree, doc=doc, runtime_id=identity)
+            return fixture_unit_saved_name(row, name)
     return staff.ensure(kind, name=name, parent=relationship,
                         worktree=worktree, doc=doc, runtime_id=identity)
 
@@ -377,13 +406,14 @@ class ClaudeBackendFixture:
 def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[None]:
     """Use private staff and registry paths in this process and its fixture children."""
     environment["STAFF_FILE"] = str(path)
+    if "XDG_CONFIG_HOME" not in environment or environment["XDG_CONFIG_HOME"] == os.environ.get("XDG_CONFIG_HOME"):
+        environment["XDG_CONFIG_HOME"] = str(path.parent / "config")
     _ = environment.setdefault("CLAUDE_CONFIG_DIR", str(path.parent / "claude"))
     _ = environment.setdefault("NOTIFIER_STATE_DIR", str(path.parent / "notifier"))
     for key, folder in (
         ("SHOWRUNNER_STATE_DIR", "showrunners"),
         ("NOTIFIER_SESSIONS_DIR", "sessions"),
         ("HERDR_PANE_RECORD_DIR", "panes"),
-        ("XDG_CONFIG_HOME", "config"),
         # Session folders belong to staff members; a fixture member never makes one in the live root.
         ("SESSION_TEMP_ROOT", "session"),
     ):
@@ -392,6 +422,10 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
     _ = environment.setdefault("SHUTDOWN_STATE_DIR", os.environ.get("SHUTDOWN_STATE_DIR", str(path.parent / "shutdown")))
     environment["STAFF_CONFIG"] = os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf"))
     with ExitStack() as contexts:
+        if Path(environment["STAFF_CONFIG"]) == CHECKOUT / "config/staff.conf":
+            configuration = Path(contexts.enter_context(tempfile.TemporaryDirectory(prefix="staff-config-", dir="/tmp"))) / "staff.conf"
+            _ = write_config_fixture(configuration, "PRODUCER_WORKSPACE=producers\n")
+            environment["STAFF_CONFIG"] = str(configuration)
         _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "STAFF_FILE": str(path),
             "CLAUDE_CONFIG_DIR": environment["CLAUDE_CONFIG_DIR"],
@@ -403,7 +437,7 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
             "SESSION_TEMP_ROOT": environment["SESSION_TEMP_ROOT"],
             "SHUTDOWN_STATE_DIR": environment["SHUTDOWN_STATE_DIR"],
             "CODEX_HOME": environment.get("CODEX_HOME", os.environ.get("CODEX_HOME", "")),
-            "STAFF_CONFIG": os.environ.get("STAFF_CONFIG", str(CHECKOUT / "config/staff.conf")),
+            "STAFF_CONFIG": environment["STAFF_CONFIG"],
         })))
         for name in ("showrunners", "scripts.production.showrunners"):
             module = sys.modules.get(name)
@@ -416,6 +450,7 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
                 _ = contexts.enter_context(mock.patch.object(
                     module, "RECORD_DIR", Path(environment["HERDR_PANE_RECORD_DIR"]),
                 ))
+        _ = contexts.callback(_PRIVATE_STAFF_FILE.reset, _PRIVATE_STAFF_FILE.set(path.resolve()))
         yield
 
 

@@ -11,9 +11,10 @@ import time
 from typing import cast
 from unittest import mock
 
+from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import OwningSession
 from scripts.build_queue import placement
-from scripts.mac_test import eligibility, offload
+from scripts.mac_test import eligibility, nextest_log, offload
 from scripts.mac_test.claim_state import RepositoryScope
 from scripts.buildlog import sync as buildlog_sync
 from scripts.mac_test.offload_test_support import HANA, OffloadCommandFixture
@@ -76,24 +77,25 @@ class OffloadForwardTests(OffloadCommandFixture):
         request = offload.OffloadRequest(self.repository, "hana", "call-forward", offload.NO_RESULT_FILE, ("--workspace",), owner="verify", holder_session="fixture-session")
         config = eligibility.read_config(self.config_path)
         expected = (
-            'cd .local/state/mac-test/mirror/hana && { find "$HOME"/.local/state/mac-test/mirror/hana/target -maxdepth 5 -type d '
+            'cd .local/state/mac-test/test-mirror/hana && { find "$HOME"/.local/state/mac-test/test-mirror/hana/target -maxdepth 5 -type d '
             + r"\( -name deps -o -name build -o -name .fingerprint -o -name examples \) -prune -o "
             + f"-type d -name 's-*-working' -mmin +{config.abandoned_session_minutes} -prune "
             + "-exec sh -c 'for session do rm -rf -- \"$session\" \"${session%-working}.lock\"; done' sh {} + >/dev/null 2>&1 || :; } && "
+            + nextest_log.capture_function(nextest_log.output_limits(config.settings)) + " && "
             + 'PATH="$HOME/.claude/scripts/mac_test/cargo_gate/bin:$HOME/.cargo/bin:$PATH" '
             + "BUILDLOG_CALLER=verify-mac BUILDLOG_PINNED_TARGET='' BUILDLOG_CALL_ID=call-forward BUILDLOG_SYNC=1 "
             + 'LINT_SKIP_SWEEP=1 LINT_SWEEP_BUDGET_GIB=64 MACOSX_DEPLOYMENT_TARGET=14.0 '
-            + '~/.claude/scripts/lint/lint nextest --workspace; echo mac_exit=$?; '
-            + 'cd "$HOME"/.local/state/mac-test/mirror/hana && trim_started=$(date +%s); '
+            + 'run_nextest_logged ~/.claude/scripts/lint/lint nextest --workspace || echo mac_nextest_setup=failed; '
+            + 'cd "$HOME"/.local/state/mac-test/test-mirror/hana && trim_started=$(date +%s); '
             + 'if LINT_SWEEP_BUDGET_GIB=64 "$HOME/.claude/scripts/lib/py" -B -c '
             + shlex.quote('import sys; from scripts.lint import sweep; from scripts.lib import conf; '
                           + 'config = conf.read("lint"); '
                           + 'sys.exit(sweep.sweep_workspace(sys.argv[1], config, False, '
                           + 'config.number(sweep.RECENT_KEY)))')
-            + ' "$HOME"/.local/state/mac-test/mirror/hana/target >/dev/null 2>&1; then '
+            + ' "$HOME"/.local/state/mac-test/test-mirror/hana/target >/dev/null 2>&1; then '
             + 'trim_status=0; else trim_status=$?; fi; '
             + 'trim_elapsed=$(( $(date +%s) - trim_started )); '
-            + 'if trim_size=$(du -sk "$HOME"/.local/state/mac-test/mirror/hana/target 2>/dev/null); then '
+            + 'if trim_size=$(du -sk "$HOME"/.local/state/mac-test/test-mirror/hana/target 2>/dev/null); then '
             + 'trim_size=${trim_size%%[[:space:]]*}; '
             + 'over_budget=$(awk -v size="$trim_size" -v budget=64 '
             + "'BEGIN { print (size > budget * 1048576) ? \"yes\" : \"no\" }'); "
@@ -104,24 +106,33 @@ class OffloadForwardTests(OffloadCommandFixture):
             + "free_gib=$(printf '%s\\n' \"$free_gib\" | awk 'NR == 2 {print $4}'); "
             + 'else free_gib=; fi; if awk -v free="$free_gib" -v floor=60 '
             + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
-            + 'if size_kib=$(du -sk "$HOME"/.local/state/mac-test/mirror/hana/target 2>/dev/null); then '
+            + 'if size_kib=$(du -sk "$HOME"/.local/state/mac-test/test-mirror/hana/target 2>/dev/null); then '
             + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
-            + 'if rm -rf -- "$HOME"/.local/state/mac-test/mirror/hana/target; then '
+            + 'if rm -rf -- "$HOME"/.local/state/mac-test/test-mirror/hana/target; then '
             + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
             + 'else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi'
         )
         self.assertEqual(offload.remote_test_command(config, request, HANA), expected)
         fetch = offload.remote_test_command(config, replace(request, fetch=offload.FetchFolder("target/shots")), HANA)
-        self.assertTrue(fetch.startswith("cd .local/state/mac-test/mirror/hana && { find "))
-        self.assertIn(" || :; } && rm -rf -- target/shots && PATH=", fetch)
+        self.assertTrue(fetch.startswith("cd .local/state/mac-test/test-mirror/hana && { find "))
+        self.assertIn(" || :; } && rm -rf -- target/shots && run_nextest_logged() ", fetch)
         self.assertTrue(fetch.endswith("; echo mac_cleanup=kept"))
         self.assertNotIn("df -g", fetch)
         self.assertNotIn("rm -rf -- target/shots", expected)
 
+    def test_nextest_setup_failure_declines_without_fetching(self) -> None:
+        self.configure_fetch(run_status_line="mac_nextest_setup=failed")
+        result = self.command(runner_options=("--fetch", "target/shots"))
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        self.assert_fetch_wire("not_run", mac="declined", reason="state")
+        self.assertNotIn("Treat the failure as real", result.stdout)
+        self.assertFalse(any("fetch_kib=" in event["args"][-1] for event in self.events_for("ssh")))
+        self.assertFalse(self.claim_file.exists())
+
     def test_placed_mac_command_sends_the_assignment_placement_to_the_cargo_gate(self) -> None:
         request = offload.OffloadRequest(self.repository, "hana", "call-forward", offload.NO_RESULT_FILE, ("--workspace",), owner="verify", holder_session="fixture-session")
         destination = placement.PlacementDestination("mac", "mac", "fixture-mac", RepositoryScope("hana"))
-        assignment = placement.PlacementAssignment("episode-a", "attempt-b", destination, placement.SourceKeyKnown("source-a"),
+        assignment = placement.PlacementAssignment("episode-a", "attempt-b", destination, execution_identity.SourceKeyKnown("source-a"),
             placement.SubmittingOwner("natedev", 42, "start"), OwningSession("submitting-session"), 1.0)
         config = eligibility.read_config(self.config_path)
         with self.subTest(placement="assigned"), mock.patch.dict(os.environ, {"MAC_PLACEMENT": "environment/value"}):
@@ -211,7 +222,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assertIn("sweep.sweep_workspace", events[-1]["args"][-1])
         pull = events[-2]["args"]
         self.assertEqual(pull[:6], ["-rlp", "--stats", "--compress", "--safe-links", "-e", shlex.join(["ssh", *offload.ssh_options(eligibility.read_config(self.config_path).connection)])])
-        self.assertEqual(pull[-2], "mac:.local/state/mac-test/mirror/hana/target/shots/")
+        self.assertEqual(pull[-2], "mac:.local/state/mac-test/test-mirror/hana/target/shots/")
         self.assertTrue(pull[-1].endswith("/fetched/call-forward.partial/target/shots/"))
         rows = [cast(dict[str, object], json.loads(line))
                 for path in (self.root / "buildlog").glob("*/*.jsonl")
@@ -285,7 +296,8 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assertFalse(self.claim_file.exists())
 
     def test_fetch_after_failure_and_no_tests_preserves_the_mac_status(self) -> None:
-        for status, wire_status, reason, exit_code in ((37, "failed", "", 37), (4, "declined", "no_tests", 75)):
+        cases = ((37, "failed", "", 37), (75, "failed", "", 75), (4, "declined", "no_tests", 75))
+        for status, wire_status, reason, exit_code in cases:
             with self.subTest(status=status):
                 self.fixture["run_status_line"] = f"mac_exit={status}"
                 self.sync_fixture()

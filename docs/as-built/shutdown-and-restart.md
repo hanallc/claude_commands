@@ -63,6 +63,8 @@ Stall-watch retires the saved prompt keys on its next pass, even after launch de
 A cancellation error prints a separate warning and does not change the stop result.
 Workers keep their threads.
 Staff membership selects worker children for stop and restart.
+A retained worker pane at its shell or a closed pane still needs proof that the conversation stopped.
+An incomplete conversation read returns `StopUnproved`.
 These operations do not read a transport pin.
 
 `release_source(row, backend)` uses the current native conversation evidence.
@@ -95,7 +97,7 @@ The shared resume path reads the saved environment, arguments, and folder.
 The source account does not select the target account.
 A named Codex resume uses the configured `workers` account, with or without a staff row.
 Claude units and showrunners use their configured role account, even without a pane launch record.
-Claude producers use the configured showrunners account.
+Claude producers use the configured producers account, or the showrunners account while the producers group has no selection.
 Other Claude sessions use the configured units account.
 A configured producer without a staff row uses the producer first-start account rule.
 When the account does not change, the resume message names no move.
@@ -153,6 +155,8 @@ Pane input waits up to ten seconds for the target shell to finish its startup wo
 Launch seeding reads process information only for selected panes.
 
 The shared session registry reader skips a file that vanishes during the scan. It retries a transient unreadable file up to three times, 50 milliseconds apart. Other unreadable evidence remains visible.
+Worker stop uses the backend in the staff snapshot for both native checks when that backend is available.
+Full restart and full stop require complete Claude registry discovery before they act.
 
 `agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]` delegates to the accounts move command.
 It normalizes the account label and preserves the result and output.
@@ -222,20 +226,30 @@ Each producer uses its own tab in the `producers` workspace of the shared herdr 
 It takes the family, model, and effort from the current producer settings.
 `pane_launch` reads `--effort` as an option with a value.
 
+When the configured family matches the current session, a named resume uses that session.
+When the family changes, `stop_resume._resume_once` uses the first-start path.
+It stops the old conversation and closes its pane before it starts a fresh conversation in a new tab.
+If the old process exits before the `ended` write, a retry can use the saved binding to identify its family.
+The retry checks that the old process has stopped before it writes `ended`.
+First admission binds the new conversation to the existing producer row.
+A retry uses the saved admission record to complete the launch or bind the live conversation.
+If an interruption occurs after tab creation and before the admission write, a retry can leave an extra shell tab open.
+
 `models_registry.launch_settings("producers", name)` validates each `family:model:effort` value in `config/models.conf`.
 The configured lines are:
 
 ```ini
 [producers]
-morty=codex:astra:high
-brain=codex:astra:medium
+morty=claude:fable:high
+brain=claude:fable:high
 dwight=claude:fable:high
 ```
 
 These model names are aliases that the shared model registry resolves.
 `member_account.producer_account(kind, *, to="")` selects the account before admission.
-Admitted producers use `member_account.resume_account`.
-Both functions select the workers account for Codex and the showrunners account for Claude.
+An admitted producer's same-family resume uses `member_account.resume_account`.
+Both functions select the workers account for Codex.
+Claude uses the producers account, or the showrunners account while the producers group has no selection.
 An explicit `--to` overrides that selection.
 
 `accounts.eligible_producers(membership, family)` selects active, unpaused, local producers of the configured family.
@@ -243,7 +257,7 @@ An explicit `--to` overrides that selection.
 Invalid settings exclude that producer.
 `settings_report_scope` limits its warning to one per operation.
 A workers swap includes eligible Codex producers.
-A showrunners group move includes eligible Claude producers.
+A producers group move includes eligible Claude producers.
 Units and showrunners retain their existing group selection.
 
 A repeated move selects a stopped producer even when its recorded home already names the target.
@@ -275,13 +289,54 @@ A Claude compaction summary is one block. A Codex compaction summary is encrypte
 The reader finds transcripts through `scripts/lib/transcripts.py` and reads from the end of the file in windows that double.
 `config/catch_up.conf` sets the default block count, the characters kept from one message, the tool line length and the first read window. Times use the user's zone.
 
+### Create a producer
+
+`agents add-producer NAME` reads `producer_defaults.model` from `config/models.conf`.
+The create command validates the name and records its profile and README text before it writes them.
+The staff owner publishes the creation machine and creation ID under `[producer_creations]` with the profile.
+The staff owner compares names without case distinctions and refuses a claim when a marker or staff row exists.
+The staff owner checks the current marker before removal.
+A pending creation requires the local creation record on that machine.
+Resume on another machine names the machine that holds the record and gives the `add-producer` command.
+It creates the README from `templates/producer/README.md` when the README is absent.
+The first conversation receives a prompt to read the README and run `/producer:produce`.
+The creation record keeps the time for prompt recovery after a failed start.
+Resume accepts a matching Codex user turn even when the turn has no timestamp.
+A malformed Codex rollout line blocks automatic retries of the opening prompt.
+Check the reserved pane for the opening prompt.
+If the prompt is absent, run `agents resume NAME --resend-opening-prompt` on the creation machine.
+The command sends the prompt once when the pane is idle and its input is empty.
+The create or resume command removes the shared creation entry after prompt confirmation, staff admission, and pane publication.
+The command reports the staff id, account and tab.
+
+### Rename or retire a producer
+
+`agents rename OLD NEW` moves the registry key and retains the staff id.
+If the old name no longer belongs to the saved staff id, the retry keeps the old key.
+It updates the session label and tab title.
+The staff document path still names the original folder.
+Rename and retire refuse while the producer has a pending admission.
+
+`agents retire NAME [--to PRODUCER]` requires a handoff file and no open questions.
+Without `handoff.md`, it asks the producer for the file and returns.
+The command stops the conversation and closes its tab before it reads the open List items.
+It moves those items with log source `agents retire` and tells each item's showrunner.
+The retirement receipt keeps the profile, session id, and notices.
+The command records notice delivery after the send succeeds.
+A retry refuses if the producer has a different session id.
+The command removes the producer key after a final read confirms that no open List items remain assigned to the producer.
+The staff row keeps the profile in `retired_producer`.
+Active staff lookups omit retired producers.
+The fixed-id lookup supplies their names for closed List items.
+`agents resume NAME --retired` restores the profile, clears the mark and resumes the same conversation.
+
 ### First start
 
 `ProducerFirstStart(name, folder)` represents a configured producer before staff admission.
 It is separate from an admitted `StaffRow`.
 `PRODUCER_FOLDER_ROOT` in `config/staff.conf` defaults to `~/rust/hanadocs`.
 The first start requires `<root>/<name>/README.md`.
-Dwight uses `~/rust/hanadocs/dwight/README.md`, with role `strategist`.
+Dwight uses `~/rust/hanadocs/dwight/README.md`.
 
 The first-start path uses this order:
 
@@ -305,7 +360,7 @@ It publishes a retained binding when the live session has a proved pane.
 Two live sessions cause refusal before any staff write or launch.
 An unproved live session also causes refusal.
 The refusal names each conflicting session ID and pane on one line.
-An unreadable daemon registry also refuses admission.
+An unreadable Claude registry or daemon registry refuses producer admission.
 Recovery checks live sessions before it resumes a retained conversation.
 Recovery adopts a different proved live session and removes the pending admission record.
 Recovery resumes the retained conversation only when no other live session carries the producer name.
@@ -316,11 +371,13 @@ The shared native process reader uses Claude's session registry to prove a plain
 The process arguments need no session ID.
 
 `agents transfer NAME [--model MODEL --effort EFFORT]` gives a producer role to the conversation that runs it.
+`producer_transfer.transfer` checks for a pending admission while it holds the `producer-first-NAME` slot.
+If an admission is pending, transfer asks the user to run `agents resume NAME` first.
 `producer_transfer.transfer` holds the `producer-first-NAME` slot and the row lock for these steps:
 
 1. Refuse a caller that another staff row records. Refuse a producer on another machine.
 2. Prove the caller through `stop_resume.producer_adoption_launch`: native id, family, account home, folder, and pane.
-3. Refuse a Claude caller outside the showrunners account; the refusal names the `agents move` command.
+3. Refuse a Claude caller outside the selected producer account. Print the `agents move` command.
 4. Validate the settings through `models_registry.producer_settings`. Without options, the configured family must match the caller.
 5. Stop the old conversation through `restart.stop_row`, print its `catch_up.py` command, and close its panes.
 6. Publish `[producers].NAME` through `models_registry.store_producer`.
@@ -369,7 +426,7 @@ A repeated command prints `unchanged` when no cleanup record or selected resourc
 
 The record path is `<pane record directory>/.producer-admission-<name>`.
 The saved record also holds the folder.
-A repeated resume completes an interrupted admission without opening another conversation.
+A repeated resume uses the saved record to complete the admission.
 Later resumes use the admitted row's `current_session`.
 The pending record retains the original account.
 A conflicting `--to`, family, or folder returns failure and preserves that record.
@@ -476,6 +533,9 @@ Worker restore uses the shared run index.
 The stop helpers use the shared Codex snapshot.
 Action checks still prove the target process before a signal.
 Independent rows stop and start in parallel.
+Each row stop reads the pane list and pane processes once, inside its own `herdr.observation_snapshot()`.
+Each identity check forgets its pane's evidence before it reads that pane again.
+A pane process that exits between the pane read and the process read counts as starting or exiting; the scan prints no notice.
 Each restore line starts with the staff name, including worker restore results.
 
 Before a power-off, run `agents stop --all`.
@@ -545,12 +605,46 @@ The director counts as started and leaves the restart record.
 Restart checks each unit director and showrunner that it starts with a continuation message.
 The check uses the launched account home and native session identity.
 It reads only turns after that director's start.
-The opening prompt and the Claude resume check share a cursor positioned before launch.
+Herdr keeps one cursor for each native transcript and preserves the requested cursor's launch offsets.
+The Claude resume check uses the requested cursor when the pane reports the same ID.
+The check creates its own cursor when the pane reports a different ID.
 Herdr waits for the native session identity and uses that identity to check the opening prompt's target.
 A starting agent can lack its registry record, its process start time or its argv.
 Herdr retries the identity read and the target check until the launch deadline.
 The pause between tries starts at `PANE_POLL_SECONDS` and doubles up to `START_RETRY_MAX_SECONDS`.
 Only a failure at the deadline prints the native session error.
+Herdr checks the requested and discovered transcripts before typing, sending Enter or reporting a failure.
+If the send gate finds a different native ID, the failure check includes that ID's transcript.
+The receipt check reports a matching turn, a readable search with no match, or unknown evidence.
+An inaccessible transcript directory gives unknown evidence.
+Unknown evidence blocks a send.
+A matching turn gives the submission state `confirmed`.
+A new launch with no transport process gives `not_sent` when Herdr finds no matching turn.
+All other results without a matching turn have the state `unknown`.
+Add-unit closes a session for an opening prompt failure only when the state is `not_sent`.
+Herdr uses the last native ID reported by the pane to publish the staff relationship.
+When a transcript confirms the prompt during startup, Herdr publishes the staff relationship before it returns success.
+Staff publication uses the remaining launch time.
+The result reports a staff publication error in a separate field.
+A change in the recipient does not cancel a matching turn.
+Herdr requires one registered foreground agent and a recorded recipient for the same process.
+Herdr limits the slash-command record lock to the remaining launch time.
+Herdr prepares the slash-command record before it reads the transcript.
+After the gate accepts the send, Herdr writes the record.
+Herdr can evict an old record after the transport starts.
+If startup fails, Herdr removes the new record and keeps the older records.
+Each attempt reads the transcript for a matching turn before it checks the pane.
+The gate reads the composer first, then checks the terminal and registered foreground recipient.
+The gate checks that the agent is idle before record publication and transport.
+Typing requires an empty composer. Herdr types at most once per launch.
+An empty composer ends Enter retries for that launch.
+Add-unit, add-showrunner, and promote-showrunner reruns check the transcript before they send Enter for a matching draft.
+A rerun in the retained pane never types the prompt.
+If the composer is empty at the deadline and the transcript has no matching turn, Herdr reports "sent once, not confirmed".
+The terminal, process, or composer can still change between the last check and the terminal's receipt of input.
+The launch deadline limits the pane queries and both transport calls.
+The prompt transport uses the remaining time after its process starts.
+If Herdr declines to send a resume prompt, the anomaly tells the operator to check the retained pane and send the prompt by hand.
 For a Claude launch with an opening prompt, restart uses the greater of `START_SECONDS` and `OPENING_PROMPT_SECONDS`.
 `config/shutdown.conf` sets these limits to 20 seconds and 90 seconds.
 The operation deadline can reduce either limit.

@@ -1,14 +1,15 @@
 """Quota alerts: delivery."""
 
 from __future__ import annotations
+from scripts.lint.memory_test_support import write_config_fixture
 
 import io
+import os
+from pathlib import Path
 import json
-import shutil
 import subprocess
 import sys
 import unittest
-from pathlib import Path
 from contextlib import redirect_stdout
 from datetime import timedelta
 from typing import cast, override
@@ -85,6 +86,8 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
             self.assertEqual(REAL_TELL_USER(push), quota_alert.PushFailed("sender unavailable"))
 
     def test_user_send_uses_configured_review_limit_without_shortening_agent_relays(self) -> None:
+        settings = Path(os.environ["CONF_DIR"]) / "accounts.conf"
+        _ = write_config_fixture(settings, "quota_relay_timeout_seconds=40\n")
         config = self.root / "notify.conf"
         _ = config.write_text("REVIEW_TIMEOUT_SECONDS=90\n")
         done = subprocess.CompletedProcess(["send.py"], 0, "SENT: to the user", "")
@@ -103,11 +106,10 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
     def test_relay_reads_the_current_account_timeout(self) -> None:
         config = self.enterContext(scratch_accounts_config()) / "accounts.conf"
         for name in ("send", "postmaster", "codex_daemon"):
-            _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config" / f"{name}.conf", config.with_name(f"{name}.conf"))
-        original = config.read_text()
+            _ = write_config_fixture(config.with_name(f'{name}.conf'))
         done = subprocess.CompletedProcess([], 0, "SENT: fixture", "")
         for limit in (40, 55):
-            _ = config.write_text(original.replace("quota_relay_timeout_seconds=40", f"quota_relay_timeout_seconds={limit}"))
+            _ = write_config_fixture(config, f"quota_relay_timeout_seconds={limit}\n")
             with self.subTest(limit=limit), mock.patch.object(subprocess, "run", return_value=done) as run:
                 self.assertIsNone(REAL_RELAY("fixture", "message", None))
                 command = cast(list[str], run.call_args.args[0])

@@ -44,6 +44,8 @@ from scripts.production.staff_test_support import fixture_unit_location, recorde
 from scripts.style.ledger_test_support import style_staff_fixture, style_unit_id, ticket_owner_id, write_style_units
 from scripts.style.style_config import StyleUnitAssignment
 from scripts.message import send_budget, session_send
+from scripts.message.test_send_budget import write_configs
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.direct import test_verify_lint_scope as verify_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
@@ -192,8 +194,11 @@ class StyleSyncTests(unittest.TestCase):
         (rule_root / "rust").mkdir(parents=True)
         for tool in ("mend", "clippy", "rustfmt"):
             _ = (rule_root / "rust" / f"{tool}.md").write_text(f"---\ntier: A\nmechanism: {tool}\n---\n# {tool}\n")
+        environment = copies_environment(self.root)
+        _ = write_config_fixture(Path(environment["CONF_DIR"]) / "build_folders.conf",
+            "patterns.legacy-unique={purpose}{suffix}\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            **copies_environment(self.root),
+            **environment,
             "HOME": str(self.root / "gate-home"),
             **interpreter_cache_environment(self.root / "cache"),
             "STYLE_HISTORY_NATE_STYLE_DIR": str(rule_root),
@@ -589,7 +594,7 @@ class StyleSyncTests(unittest.TestCase):
         self.assertEqual(self.merge_for_wake(), (0, "", ""))
         self.assertEqual(self.recorded_wakes(), [
             ["--to", "session:fake-" + unit, "--from", "sample-style", "--text",
-             "From the showrunner of sample-style: ticket 3001 merged; refill.", "--timeout", "10"]
+             "ticket 3001 merged; refill.", "--timeout", "10"]
             for unit in ("names", "types")
         ])
         self.assertEqual(self.remaining_waiters(), [])
@@ -605,17 +610,12 @@ class StyleSyncTests(unittest.TestCase):
 
     def test_handoff_budget_tracks_a_raised_cleanup_grace_without_reload(self) -> None:
         config = self.root / "send-budget-config"
-        config.mkdir()
-        for name in ("send", "postmaster", "codex_daemon"):
-            source = Path(__file__).resolve().parents[2] / "config" / f"{name}.conf"
-            _ = (config / source.name).write_text(source.read_text())
-        postmaster_config = config / "postmaster.conf"
-        _ = postmaster_config.write_text(postmaster_config.read_text().replace("claim_grace_seconds=15.0", "claim_grace_seconds=2.0"))
+        write_configs(config)
+        _ = write_config_fixture(config / "postmaster.conf", "claim_grace_seconds=2.0\n")
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
             budgets: list[float] = []
             for grace in (10, 80):
-                source = Path(__file__).resolve().parents[2] / "config/send.conf"
-                _ = (config / "send.conf").write_text(source.read_text().replace("kill_grace=10", f"kill_grace={grace}"))
+                _ = write_config_fixture(config / "send.conf", f"kill_grace={grace}\n")
                 with (mock.patch.object(style_sync, "runner_value", return_value="session:fixture"),
                       mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT: fixture")) as sender):
                     self.assertEqual(style_sync.handoff_notice("style", "parent", "checkpoint"), "sent")
@@ -625,17 +625,12 @@ class StyleSyncTests(unittest.TestCase):
 
     def test_handoff_budget_tracks_raised_postmaster_wait_and_claim_grace_without_reload(self) -> None:
         config = self.root / "postmaster-budget-config"
-        config.mkdir()
-        for name in ("send", "postmaster", "codex_daemon"):
-            source = Path(__file__).resolve().parents[2] / "config" / f"{name}.conf"
-            _ = (config / source.name).write_text(source.read_text())
+        write_configs(config)
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
             budgets: list[float] = []
             for wait, grace in ((3, 2), (120, 40)):
-                source = Path(__file__).resolve().parents[2] / "config/postmaster.conf"
-                _ = (config / "postmaster.conf").write_text(source.read_text()
-                    .replace("wait_seconds=3.0", f"wait_seconds={wait}")
-                    .replace("claim_grace_seconds=15.0", f"claim_grace_seconds={grace}"))
+                _ = write_config_fixture(config / "postmaster.conf",
+                                         f"wait_seconds={wait}\nclaim_grace_seconds={grace}\n")
                 with (mock.patch.object(style_sync, "runner_value", return_value="session:fixture"),
                       mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT: fixture")) as sender):
                     self.assertEqual(style_sync.handoff_notice("style", "parent", "checkpoint"), "sent")
@@ -673,8 +668,8 @@ class StyleSyncTests(unittest.TestCase):
         self.assertEqual((second.unit, second.since), (first.unit, first.since))
         self.assertNotEqual(second.token, first.token)
         self.assertEqual([call[5] for call in self.recorded_wakes()], [
-            "From the showrunner of sample-style: ticket 3002 merged; refill.",
-            "From the showrunner of sample-style: ticket 3001 merged; refill.",
+            "ticket 3002 merged; refill.",
+            "ticket 3001 merged; refill.",
         ])
 
     def test_failed_wake_keeps_only_that_waiter_and_an_already_merged_ticket_retries_it(self) -> None:
@@ -724,7 +719,7 @@ class StyleSyncTests(unittest.TestCase):
         self.assertEqual([notice[1] for notice in notices], ["session:fake-names", "session:fake-types"])
         self.assertEqual([notice[notice.index("--key") + 1] for notice in notices],
                          ["style-sync:names", "style-sync:types"])
-        self.assertTrue(all(f"From style_sync: branch point main moved to {self.tip[:7]}; sync." in notice
+        self.assertTrue(all(f"branch point main moved to {self.tip[:7]}; sync." in notice
                             for notice in notices))
         style_sync.notify(self.repo, "another", self.tip)
         self.assertEqual(self.handoff_notices(), notices)
@@ -739,7 +734,7 @@ class StyleSyncTests(unittest.TestCase):
         self.assertEqual(self.merge_for_wake(), (0, f"style_ledger: wake {style_unit_id('names')}: no live director\n", ""))
         self.assertEqual(self.recorded_wakes(), [[
             "--to", "session:fake-types", "--from", "sample-style", "--text",
-            "From the showrunner of sample-style: ticket 3001 merged; refill.", "--timeout", "10",
+            "ticket 3001 merged; refill.", "--timeout", "10",
         ]])
         self.assertEqual(self.remaining_waiters(), [style_unit_id("names")])
 
@@ -813,7 +808,7 @@ class StyleSyncTests(unittest.TestCase):
                 arguments = call["arguments"]
                 self.assertEqual(arguments, [
                     "--to", "session:fake-style", "--from", "style_sync", "--text",
-                    f"From style_sync: branch point main moved to {self.tip[:7]}; sync.",
+                    f"branch point main moved to {self.tip[:7]}; sync.",
                     "--key", "style-sync:sample-style", "--timeout", "10",
                 ])
                 self.assertLess(int(arguments[-1]), cast(int, calls.call_args_list[-1].kwargs["timeout"]))
@@ -1547,7 +1542,7 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
         self.assertEqual(rows[checkpoint][1:3], ("sent", "parent"))
         notices = self.handoff_notices()
         self.assertEqual(len(notices), 1)
-        self.assertIn(f"From the showrunner of sample-style: hand-off {checkpoint}", notices[0])
+        self.assertIn(f"hand-off {checkpoint}", notices[0])
         self.assertIn("session:fake-parent", notices[0])
 
     def test_resume_replays_same_parent_without_touching_the_row(self) -> None:
@@ -1635,7 +1630,7 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
         notices = self.handoff_notices()
         self.assertEqual(len(notices), 1)
         self.assertIn("session:fake-parent", notices[0])
-        self.assertIn(f"From the showrunner of sample-style: hand-off {checkpoint}", notices[0])
+        self.assertIn(f"hand-off {checkpoint}", notices[0])
 
     def test_send_handoff_as_root_sends_nothing_and_leaves_the_row_pending(self) -> None:
         checkpoint = self.handoff_checkpoint()
@@ -1729,7 +1724,7 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
                 ledger.handoff_add(first)
         self.assertEqual(self.resume_handoffs()[0], 0)
         texts = [notice[notice.index("--text") + 1] for notice in self.handoff_notices()]
-        self.assertEqual(texts, [f"From the showrunner of sample-style: hand-off {checkpoint}" for checkpoint in (first, second)])
+        self.assertEqual(texts, [f"hand-off {checkpoint}" for checkpoint in (first, second)])
         self.assertEqual({row[1:3] for row in self.handoff_rows()}, {("sent", "parent")})
 
 

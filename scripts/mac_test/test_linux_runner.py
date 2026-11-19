@@ -20,6 +20,9 @@ from typing import Literal, NamedTuple, TypedDict, cast, override
 import unittest
 from unittest import mock
 
+from scripts.lib import process_stat
+from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
+
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.copies.copies_test_support import copies_environment
 from scripts.mac_test import eligibility, claim_state, linux_runner, mac_test, offload, test_target_slots
@@ -228,9 +231,7 @@ class LinuxShellTests(unittest.TestCase):
         for tool in ("nix", "df", "rm", "rustup", "cargo-nextest", "cargo-mend"):
             self.write_tool(tools / tool)
         self.write_tool(self.root / ".claude/scripts/lint/lint")
-        for folder in ("lib", "copies"):
-            (self.root / ".claude/scripts" / folder).symlink_to(
-                Path(__file__).resolve().parents[1] / folder, target_is_directory=True)
+        _ = copy_helpers(self.root, *COPY_HELPERS)
         _ = self.enterContext(mock.patch.object(linux_runner, "boot_identity", return_value="fixture-boot"))
         real_rm = shutil.which("rm")
         if real_rm is None:
@@ -1164,7 +1165,7 @@ class LinuxProcessTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(Path, "resolve", resolve_path))
 
     def use_private_processes(self) -> None:
-        fields = linux_runner.process_fields
+        fields = process_stat.process_fields
         processes = linux_runner.slot_processes
 
         def private_fields(pid: int, proc_root: Path = linux_runner.PROC_ROOT) -> list[str]:
@@ -1176,7 +1177,7 @@ class LinuxProcessTests(unittest.TestCase):
             _ = proc_root
             return processes(mirror, self.proc, require_boot_identity=require_boot_identity)
 
-        _ = self.enterContext(mock.patch.object(linux_runner, "process_fields", side_effect=private_fields))
+        _ = self.enterContext(mock.patch.object(process_stat, "process_fields", side_effect=private_fields))
         _ = self.enterContext(mock.patch.object(linux_runner, "slot_processes", side_effect=private_processes))
 
     def selector_output(self) -> subprocess.CompletedProcess[str]:
@@ -1639,7 +1640,7 @@ class LinuxProcessTests(unittest.TestCase):
 
         self.assertEqual(set(selected), {100, 101, 103})
         self.assertTrue(marker.exists())
-        fields = linux_runner.process_fields(100, proc_root=self.proc)
+        fields = process_stat.process_fields(100, proc_root=self.proc)
         self.assertEqual((fields[0], fields[2], fields[19]), ("S", "100", "123"))
 
     def test_runner_before_marker_publication_selects_only_its_exact_slot(self) -> None:
@@ -1699,7 +1700,7 @@ class LinuxProcessTests(unittest.TestCase):
             raise ValueError("fixture shell failure")
 
         values = {"shell_cache": "cache", "devshell": "ci", "shell_timeout_s": "2", "kinds": "test,check,doc"}
-        with mock.patch.object(linux_runner, "process_fields", return_value=fields), \
+        with mock.patch.object(process_stat, "process_fields", return_value=fields), \
                 mock.patch.object(linux_runner, "slot_processes", return_value=()), \
                 mock.patch.object(linux_runner, "prepare_shell", side_effect=fail_shell):
             with self.assertRaisesRegex(ValueError, "fixture shell failure"):
@@ -1709,7 +1710,7 @@ class LinuxProcessTests(unittest.TestCase):
     def test_detached_children_keep_the_marker_and_emit_uncertain_cleanup(self) -> None:
         fields = ["S", "1", "900", *(["0"] * 16), "123"]
         output = io.StringIO()
-        with mock.patch.object(linux_runner, "process_fields", return_value=fields), \
+        with mock.patch.object(process_stat, "process_fields", return_value=fields), \
                 mock.patch.object(linux_runner, "slot_processes", return_value=(101,)), redirect_stdout(output):
             with linux_runner.slot_run(self.mirror):
                 self.assertTrue((self.mirror / ".linux-run.json").exists())
@@ -1784,7 +1785,7 @@ class LinuxCopyTests(unittest.TestCase):
         _ = self.write_source("src/lib.rs", "first source\n")
         remote_home = self.root / "remote-home"
         remote_home.mkdir()
-        (remote_home / ".claude").symlink_to(Path(__file__).resolve().parents[2], target_is_directory=True)
+        _ = copy_helpers(remote_home, *COPY_HELPERS, "config")
         ssh = self.root / "ssh"
         _ = ssh.write_text('#!/bin/bash\nwhile [[ $1 == -o ]]; do shift 2; done\n'
                            + '[[ $1 == natedev ]] && exit 255\n'
@@ -2181,7 +2182,7 @@ class LinuxDispatchTests(unittest.TestCase):
         mirror.mkdir(parents=True)
         fields = ["S", "1", "100", *(["0"] * 16), "123"]
         wire = io.StringIO()
-        with mock.patch.object(linux_runner, "process_fields", return_value=fields), \
+        with mock.patch.object(process_stat, "process_fields", return_value=fields), \
                 mock.patch.object(linux_runner, "slot_processes", return_value=(101,)), redirect_stdout(wire):
             with linux_runner.slot_run(mirror):
                 print("mac_exit=0\nmac_cleanup=kept")

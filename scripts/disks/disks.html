@@ -29,6 +29,26 @@
 body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
 __PAGE_FRAME_STYLE__
 __STEP_TIP_STYLE__
+#tip > .tip[data-held-count] { max-width: min(60rem, calc(100vw - 16px)); grid-template-columns: minmax(0, auto) minmax(0, auto); }
+.tip dd.held-folder { text-align: left; opacity: 0.7; }
+@media (width >= 900px) {
+  .tip .held-folder { overflow: hidden; text-overflow: ellipsis; }
+}
+@media (width < 900px) {
+  .tip[data-held-count] :is(dt, dd) { white-space: normal; overflow-wrap: anywhere; }
+}
+:where(.page-status) { position: relative; }
+.page-status { --measure-width: 7.75rem; padding-inline-end: calc(var(--measure-width) + 8px); }
+.page-status > span[data-status-reason] { white-space: normal; overflow-wrap: anywhere; }
+#measure-now { position: absolute; inset-inline-end: 0; top: 50%; transform: translateY(-50%);
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  inline-size: var(--measure-width); padding: 1px 6px; white-space: nowrap;
+  font: inherit; line-height: 1; font-weight: 600;
+  border: 1px solid var(--line); border-radius: 4px; background: var(--card); color: var(--ink); cursor: pointer; }
+#measure-now svg { width: 16px; height: 16px; }
+#measure-now:focus-visible { color: var(--accent); }
+#measure-now:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#measure-now:disabled { color: var(--ink-3); cursor: default; }
 h2 { font-size: 1.05rem; margin: 0; }
 h2 .path { font-size: 0.86rem; font-weight: 400; color: var(--ink-3); margin-left: 6px; }
 /* A card title with a definition: the info mark shows that a hover tells what the card holds. */
@@ -37,6 +57,7 @@ h2 .about { display: inline-flex; margin-left: 6px; color: var(--ink-3); vertica
 h2 .about svg { width: 15px; height: 15px; }
 #sessions .limit { margin: 10px 0 6px; }
 .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 0 0 16px; align-items: start; }
+#cards { grid-template-columns: minmax(0, 1fr); }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 18px 14px; min-width: 0; }
 .head { display: flex; align-items: baseline; justify-content: space-between; gap: 4px 12px; flex-wrap: wrap; }
 .free { font-size: 1.05rem; font-weight: 600; }
@@ -62,7 +83,7 @@ td.path { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.8
 /* A long folder name wraps, so no name is cut. */
 .tree td:first-child { white-space: normal; overflow-wrap: anywhere; }
 td.dim, .dim { color: var(--ink-3); }
-tbody tr:hover td { background: var(--hover); }
+tbody tr:not([aria-expanded]):hover td { background: var(--hover); }
 .slots col.size { width: 80px; } .slots col.used { width: 120px; }
 .slots td:first-child, .slots td.use { white-space: normal; overflow-wrap: break-word; }
 .slots .tag { white-space: nowrap; }
@@ -70,15 +91,17 @@ tbody tr:hover td { background: var(--hover); }
 /* A repository is a band that opens and closes; its slots sit indented below it. */
 .slots tr.group th { padding: 7px 10px 7px 6px; border-top: 4px solid var(--card); background: color-mix(in srgb, var(--accent) 12%, var(--card));
   background-clip: padding-box; color: var(--ink); white-space: normal; cursor: pointer; }
-.slots tr.group:hover th { background-color: color-mix(in srgb, var(--accent) 18%, var(--card)); }
 .slots tr.group .name { font-weight: 700; }
 .slots tr.group .sum { color: var(--ink-2); font-weight: 400; margin-left: 8px; }
 .slots tr.group .folder { display: inline-flex; margin-right: 6px; color: var(--accent); vertical-align: -2px; }
 .slots tr.group .folder svg { width: 15px; height: 15px; }
 .slots tbody td:first-child { padding-left: 26px; }
 [aria-expanded]:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.sessions col.size { width: 80px; } .sessions col.share { width: 18%; } .sessions col.state { width: 96px; }
-.sessions td.held { white-space: normal; overflow-wrap: anywhere; }
+.sessions col.who { width: 200px; }
+.sessions col.size { width: 80px; } .sessions col.share { width: 14%; } .sessions col.state { width: 96px; }
+.sessions .held .line { display: flex; gap: 10px; }
+.sessions .held .names { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.sessions .held .count { flex: none; color: var(--ink-3); font-variant-numeric: tabular-nums; }
 .share i { display: block; height: 8px; min-width: 2px; border-radius: 3px; background: var(--accent); opacity: 0.7; }
 .tag { display: inline-block; padding: 0 7px; border-radius: 9px; font-size: 0.76rem; line-height: 18px; border: 1px solid var(--line); color: var(--ink-2); margin-right: 6px; }
 .tag.run { border-color: transparent; background: color-mix(in srgb, var(--room) 22%, transparent); color: var(--ink); }
@@ -105,9 +128,12 @@ tr[aria-expanded="true"] .twist svg { transform: rotate(90deg); }
   .slots td:nth-child(3) { white-space: normal; }
   .slots .wide { display: none; }
   .slots .narrow { display: block; }
+  .sessions col.who { width: 24%; }
   .sessions col.size { width: 64px; } .sessions col.share { width: 0; } .sessions col.state { width: 72px; }
+  .sessions .held .line { gap: 6px; }
   .sessions .share { display: none; }
   .sessions th { white-space: normal; }
+  .sessions :is(th, td):not(:first-child) { padding-left: 6px; }
 }
 </style>
 </head>
@@ -136,7 +162,17 @@ const INFO = icon("M12 2a10 10 0 1 0 0 20a10 10 0 1 0 0-20M12 16v-4M12 8h.01");
 // The Builds page's step tooltip code, as it is (disks_page.shared_step_tip). Its names stay inside this function.
 const stepTip = (() => {
 __STEP_TIP_SCRIPT__
-  return {field, tooltipHtml, tipRowsHtml, hoverTips};
+  const placeSharedTip = placeTipAt;
+  placeTipAt = (tip, x, y) => {
+    const list = tip.querySelector(".tip[data-held-count]");
+    if (list) fitSessionTip(tip, list);
+    placeSharedTip(tip, x, y);
+    if (list) {
+      const bottomLimit = innerHeight - tip.offsetHeight - 8;
+      tip.style.top = `${Math.max(8, Math.min(parseFloat(tip.style.top), bottomLimit))}px`;
+    }
+  };
+  return {field, staffField, staffTitle, tooltipHtml, tipRowsHtml, hoverTips, roleName, nameParts};
 })();
 
 function size(bytes) {
@@ -316,9 +352,11 @@ function slotsHtml(report, keepBytes, now, opened, step = () => null) {
   const usedBy = row => {
     if (row.used_by) {
       // The name of the Builds step in the slot, else the lease's work with the Builds names; then the showrunner.
-      const name = step(row)?.name || row.used_by.name;
-      return (name ? `<span class="tag run">${esc(name)}</span>` : "")
-        + (row.used_by.showrunner ? `<span class="dim">${esc(row.used_by.showrunner)}</span>` : "");
+      const current = step(row);
+      const name = current?.name || row.used_by.name;
+      const parts = current?.name ? current.name_parts : row.used_by.name_parts;
+      return (name ? `<span class="tag run">${parts ? stepTip.nameParts(parts) : esc(name)}</span>` : "")
+        + (row.used_by.showrunner ? `<span class="dim">${stepTip.roleName(row.used_by.showrunner)}</span>` : "");
     }
     return row.deleted_tonight ? '<span class="tag go">deleted tonight</span>' : "";
   };
@@ -347,11 +385,16 @@ function slotsHtml(report, keepBytes, now, opened, step = () => null) {
 function sessionRows(report, keepBytes, limit) {
   const folderSize = bytes => esc(measuredSize(bytes, keepBytes));
   const largest = Math.max(0, ...report.sessions.map(row => row.size || 0));
-  const held = row => row.held.length ? row.held.map(folder => esc(folder.name)
-    + (folder.ended ? ' <span class="dim">(unsaved work)</span>' : "")).join(", ") : '<span class="dim">—</span>';
+  const held = row => {
+    if (!row.held.length) return '<span class="dim">—</span>';
+    const names = row.held.map(folder => esc(folder.name)
+      + (folder.ended ? ' <span class="dim">(unsaved work)</span>' : "")).join(", ");
+    const count = row.held.length > 1 ? `<span class="count">${row.held.length} folders</span>` : "";
+    return `<div class="line"><span class="names">${names}</span>${count}</div>`;
+  };
   const state = row => row.state === "ended" ? '<span class="tag go">ended</span>'
     : `<span class="dim">${row.state === "running" ? "running" : "—"}</span>`;
-  const sessionRow = row => `<tr data-tip="session:${esc(row.name)}"><td class="path">${esc(row.name)}</td><td class="n">${folderSize(row.size)}</td>`
+  const sessionRow = row => `<tr data-tip="session:${esc(row.name)}"><td class="path">${stepTip.roleName(row.name)}</td><td class="n">${folderSize(row.size)}</td>`
     + `<td class="share">${row.size && largest ? `<i style="width:${(100 * row.size / largest).toFixed(1)}%"></i>` : ""}</td>`
     + `<td class="held">${held(row)}</td><td>${state(row)}</td></tr>`;
   const {shown, smaller} = sessionsAtLeast(report, limit);
@@ -390,6 +433,7 @@ let sessionReport = null;
 let sessionLimit = 0;
 let builds = null;
 let measuring = null;
+let measureTimer;
 
 // A walk bar: the parent's span as a band, and this row's part of it at its running offset, on one scale for the drive.
 function walk(row, scale) {
@@ -545,7 +589,7 @@ function sessionsView(card) {
     card.innerHTML = `<div class="top"></div><div class="limit">Show sessions of at least<span class="range">`
       + `<span class="end low">any</span><input type="range" min="0" max="${SLIDER_STEPS}" value="0" aria-label="Show sessions of at least">`
       + `<span class="end high"></span><output></output></span></div>`
-      + `<table class="sessions"><colgroup><col><col class="size"><col class="share"><col><col class="state"></colgroup>`
+      + `<table class="sessions"><colgroup><col class="who"><col class="size"><col class="share"><col><col class="state"></colgroup>`
       + `<thead><tr><th>Session</th><th class="n">Size</th><th class="share" aria-label="Share of the largest session"></th>`
       + `<th>Held folders</th><th>State</th></tr></thead><tbody></tbody></table>`;
     slider = card.querySelector("input");
@@ -616,9 +660,9 @@ function slotStep(slot) {
   if (!slot.used_by || !(age <= settings.builds_max_age_seconds)) return null;
   const here = row => row.key && row.slot_folder === slot.name && row.slot_machine === slotReport.machine;
   const run = builds.walk?.find(here);
-  if (run) return {tip: "row:" + run.key, name: run.name};
+  if (run) return {tip: "row:" + run.key, name: run.name, name_parts:run.name_parts};
   const wait = builds.waiters?.find(here);
-  return wait ? {tip: "wait:" + wait.key, name: wait.name} : null;
+  return wait ? {tip: "wait:" + wait.key, name: wait.name, name_parts:wait.name_parts} : null;
 }
 
 // The tooltip of each Disks row and card title. A slot that a Builds page step runs or waits in shows that step's tooltip.
@@ -641,7 +685,9 @@ function tipFor(key) {
   }
   if (kind === "session" && sessionReport) {
     const row = sessionReport.sessions.find(row => row.name === name);
-    return row ? stepTip.tipRowsHtml(sessionTip(row, keepBytes)) : "";
+    if (!row) return "";
+    const html = stepTip.tipRowsHtml(sessionTip(row, keepBytes));
+    return row.held.length ? html.replace('<dl class="tip">', `<dl class="tip" data-held-count="${row.held.length}">`) : html;
   }
   if (kind === "smaller" && sessionReport) return stepTip.tipRowsHtml(smallerTip(sessionsAtLeast(sessionReport, sessionLimit).smaller, sessionLimit, keepBytes));
   return "";
@@ -674,17 +720,43 @@ function slotTip(slot, group, keepBytes, now, unusedDays) {
   const field = stepTip.field;
   const rows = [field(slot.name, slot.used_by ? "in use" : slot.deleted_tonight ? "deleted tonight" : "free", "title"),
     field("Repository", group.repository), field("Size", measuredSize(slot.size, keepBytes)), field("Last used", lastUsedText(slot, now))];
-  if (slot.used_by) rows.push(field("Used by", slot.used_by.name || "—"), field("Showrunner", slot.used_by.showrunner || "—"));
+  if (slot.used_by) rows.push({...field("Used by", slot.used_by.name || "—"), valueParts:slot.used_by.name_parts},
+    stepTip.staffField("Showrunner", [slot.used_by.showrunner || "—"]));
   if (slot.deleted_tonight) rows.push(field("", `No run used it for ${unusedDays} days, so the nightly sweep deletes it.`, "long", true));
   return rows;
 }
 
+const SESSION_TIP_FOLDER_LIMIT = 30;
+const moreHeldFolders = count => `+${count} more folders`;
+
 function sessionTip(row, keepBytes) {
   const field = stepTip.field;
-  const rows = [field(row.name, row.state === "unknown" ? "state unknown" : row.state, "title"), field("Size", measuredSize(row.size, keepBytes))];
+  const rows = [stepTip.staffTitle(row.name, row.state === "unknown" ? "state unknown" : row.state), field("Size", measuredSize(row.size, keepBytes))];
   if (!row.held.length) return [...rows, field("Held folders", "none")];
-  return [...rows, ...row.held.flatMap((folder, index) =>
-    [field(folder.name, folder.ended ? "unsaved work" : "held", "field", index === 0), field("", "Task " + folder.task, "long")])];
+  const shown = row.held.slice(0, SESSION_TIP_FOLDER_LIMIT);
+  rows.push(...shown.map((folder, index) =>
+    field(folder.name, `${folder.ended ? "unsaved work" : "held"} · Task ${folder.task}`, "held-folder", index === 0)));
+  const omitted = row.held.length - shown.length;
+  if (omitted) rows.push(field("", moreHeldFolders(omitted), "long"));
+  return rows;
+}
+
+function fitSessionTip(tip, list) {
+  const maxHeight = innerHeight - 16;
+  if (tip.offsetHeight <= maxHeight) return;
+  const folders = [...list.querySelectorAll("dt.held-folder")];
+  let summary = list.querySelector("dd.long");
+  if (!summary) {
+    summary = document.createElement("dd");
+    summary.className = "long";
+    list.append(summary);
+  }
+  while (folders.length && tip.offsetHeight > maxHeight) {
+    const folder = folders.pop();
+    folder.nextElementSibling.remove();
+    folder.remove();
+    summary.textContent = moreHeldFolders(Number(list.dataset.heldCount) - folders.length);
+  }
 }
 
 function smallerTip(rows, limit, keepBytes) {
@@ -706,14 +778,20 @@ async function readBuilds(current) {
   }
   if (!current()) return;
   builds = next;
+  if (builds?.staff_names) globalThis.staffNames?.set(builds.staff_names);
   renderSlots();
 }
 
-async function readData() {
+async function readData(current) {
   const response = await fetch(DATA_FILE + "?" + Date.now(), {cache: "no-store"});
   if (response.status === 404 && !data) return null;
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return response.json();
+  const next=await response.json();
+  if(current()){
+    if(!data || next.measured_at!==data.measured_at || next.generation!==data.generation) show(next);
+    finishMeasure(next);
+  }
+  return next;
 }
 
 function show(next) {
@@ -721,38 +799,44 @@ function show(next) {
   if (data) render(); else { renderCards(); }
 }
 
-// Ask the server for a measure and the slots and sessions in use now. The server starts a measure only when the sizes
-// are old. The page keeps the old sizes and reads the data file again until it changes.
-async function askMeasure(current) {
-  const response=await fetch(MEASURE,{method:"POST",body:"",
+function setMeasuring(value,failure='') {
+  clearTimeout(measureTimer);
+  measuring=value;
+  document.getElementById("measure-now").disabled=Boolean(measuring);
+  pageRefresh.setStatus(measuring ? 'Measuring…' : '',failure);
+  if(measuring) measureTimer=setTimeout(()=>{
+    pageRefresh.abandon();
+    setMeasuring(null,"The measure did not finish.");
+  },settings.wait_seconds*1000);
+}
+
+function finishMeasure(next) {
+  if(measuring && measuring.target!==null && next && (next.generation ?? 0)>=measuring.target) setMeasuring(null);
+}
+
+// Ask for a measure and the current slots and sessions. Keep the old sizes until the data file changes.
+async function askMeasure(current,force=false) {
+  const response=await fetch(MEASURE,{method:"POST",body:force ? "force=1" : "",
     headers:{"Content-Type":"application/x-www-form-urlencoded"}});
   const answer=await response.json();
   if(!current()) return;
   if(!response.ok) throw new Error(answer.reason || `HTTP ${response.status}`);
   slotReport=answer.slots || null;sessionReport=answer.sessions || null;renderCards();
-  if(answer.state!=="current" && !measuring)
-    measuring={since:Date.now()/1000,before:data ? data.measured_at : null};
+  if(force) measuring.target=answer.target;
+  else if(answer.state!=="current" && !measuring)
+    setMeasuring({since:Date.now()/1000,target:answer.target});
+  finishMeasure(data);
 }
 async function loadDisks(supersede=false,current=()=>true){
- // The page reads the Builds data on its own refresh, so the page has one timer.
- let next;
- try{[next]=await Promise.all([readData(),readBuilds(current)]);}
- catch(error){
-  if(current() && measuring && Date.now()/1000-measuring.since>settings.wait_seconds) measuring=null;
-  throw error;
- }
- if(!current()) return;
- if(next && (!data || next.measured_at!==data.measured_at)){measuring=null;show(next);}
- let failure='';
- try{if(!measuring) await askMeasure(current);}
- catch(error){if(!data) throw error;failure=error.message;}
- if(!current()) return;
- if(measuring && Date.now()/1000-measuring.since>settings.wait_seconds){
-  measuring=null;failure="The measure did not finish.";
-  if(!data) throw new Error("The measure did not finish.");
- }
- if(data) return {readAt:data.measured_at,renderSeconds:data.render_seconds,answeredAt:Date.now()/1000,
-  busy:measuring ? 'Measuring…' : '',failure};
+  // The page reads the Builds data on each page refresh.
+  await Promise.all([readData(current),readBuilds(current)]);
+  if(!current()) return;
+  let failure='';
+  try{if(!measuring) await askMeasure(current);}
+  catch(error){if(!data) throw error;failure=error.message;}
+  if(!current()) return;
+  if(data) return {readAt:data.measured_at,renderSeconds:data.render_seconds,answeredAt:Date.now()/1000,
+   busy:measuring ? 'Measuring…' : '',failure};
 }
 const updateSessions = sessionsView(document.getElementById("sessions"));
 stepTip.hoverTips(document.getElementById("tip"), tipFor);
@@ -762,6 +846,18 @@ onToggle(document.getElementById("slots"), "tr[data-group]", row => {
 });
 __PAGE_REFRESH_SCRIPT__
 const pageRefresh=createPageRefresh(loadDisks,()=>settings.poll_seconds);
+document.getElementById("measure-now").addEventListener("click",async()=>{
+ if(measuring) return;
+ pageRefresh.abandon();
+ const press={since:Date.now()/1000,target:null};
+ setMeasuring(press);
+ try{
+  await askMeasure(()=>measuring===press,true);
+  if(measuring===press) await pageRefresh.refresh(true);
+ }catch(error){
+  if(measuring===press){pageRefresh.abandon();setMeasuring(null,error.message);}
+ }
+});
 void pageRefresh.refresh();
 </script>
 </body>

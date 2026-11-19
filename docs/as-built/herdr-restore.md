@@ -18,7 +18,11 @@ The saved launch selects each conversation and account.
   the flags from the nearest ancestor whose argv is Claude (`herdr.is_claude_process`). So a pane
   started by hand is covered the same as one restart or add_unit started. A session outside
   herdr (`HERDR_ENV` not 1, or no `HERDR_PANE_ID`) writes nothing.
-- A start replaces its own pane's entry and keeps every other pane's, under a file lock.
+- A start replaces its own pane's entry under a file lock.
+  The Claude hook uses the session socket to prove the foreground owner.
+  It can contact the socket without the herdr binary.
+  The hook checks that its nearest Claude ancestor has the proved foreground PID.
+  A failed check produces a diagnostic and retains both records.
 - The conversation id that counts is herdr's own `agent_session` for the pane, kept by herdr's
   hook; the id in the entry is a check on it. A pane herdr no longer has is ignored, so a stale
   entry needs no cleanup.
@@ -36,17 +40,22 @@ The [launch-name policy](shutdown-and-restart.md#launch-names) supplies current 
 - Each entry also holds `flags_read` (false when the hook found no Claude argv) and `ended`. `scripts/hooks/session-end-pane-record.py` sets `ended` at
   SessionEnd for any reason but `other`: `/exit` and logout mark it, a signal at a reboot or a
   crash does not. An end only marks the entry of the same conversation.
-- `pane_record.py seed [--session NAME]` writes the entries of the Claudes running now: the argv
-  and cwd from herdr's `pane process-info`, the environment of the process, and the
-  conversation id from `<config>/sessions/<pid>.json`. It needs no
-  `report-agent-session`: a restore takes the id from the entry and checks herdr's
-  `agent_session` only when the pane has one.
+- `pane_record.py seed [--session NAME]` writes the entry of each proved foreground owner.
+  It reads the owner's arguments and folder from `pane process-info`.
+  For Claude, it reads the environment and the conversation id in `<config>/sessions/<pid>.json`.
+  The process start time must match before and after these reads.
+  For Codex, it uses the proved owner's native conversation.
+- `session_staff.py repair` recovers a missing Claude launch only when its PID and native identity match the proved foreground owner.
+  A Claude child cannot replace its Codex parent's retained launch.
 - `scripts/agents/pane_restore.py [--session NAME] [--dry-run]` first starts or adopts the shared server.
   It resumes staff rows through `restart.start_row`.
   For a worker row, `start_row` resumes only that worker through `worker.restore` with the worker launch policy and the saved account. An idle worker prints `<name>: closed; its next assign resumes it` and stays closed.
   It resumes saved panes without staff rows through `herdr.launch_agent`.
   A pane without a saved entry or a staff row stays open.
-- Restore keeps live conversations. Unknown conversation evidence prints one anomaly line and permits a guarded launch.
+- Restore keeps live conversations.
+  The saved-pane path checks occupancy before it starts a launch.
+  The launch and close paths check ownership separately.
+  Unknown conversation evidence prints one anomaly line and permits a guarded launch.
   Saved entries remain eligible after an intentional stop or when `flags_read` is false.
   The shared launch path checks the selected terminal before it sends keys.
 - Restore reuses a retained shell when its terminal and folder match.
@@ -175,3 +184,28 @@ The write uses the repository trust key, or the folder itself outside a reposito
 A failed write prints one anomaly with the folder, account file, and error.
 The launch then returns its failure result without a process start.
 A composer with a draft waits until the deadline without changes to the draft.
+
+## Checked unit lookups
+
+Pane reports keep failed pane lists, unassigned panes, and unreadable registry evidence. A proved owner establishes presence even when other observations fail. A lookup requires complete relevant evidence to report absence.
+
+An observed empty pane requires one foreground shell with the same PID as the pane shell and the foreground process group.
+An empty pane adds no failure to a conversation search. Demotion can resume the conversation after a complete search proves absence.
+
+The unit lookup requires a recorded process start and a matching native conversation for every Claude owner.
+For a pane, the lookup also requires proof of the foreground PID.
+A failed native check or a missing recorded start leaves ownership unknown.
+Inherited marks can identify candidates for the report.
+The lookup takes the socket path from the current record for the proved PID and process start.
+It rejects a different path in the snapshot.
+It checks the connected peer PID and verifies the process start before and after the connection.
+A proved Claude owner can have no messaging address.
+The lookup combines pane and standalone proofs for each conversation before it selects an owner.
+Repeated proofs for the same PID and process start count as one owner.
+A single proved owner takes precedence over incomplete evidence.
+Proofs for different processes or process starts leave the owner unknown.
+
+Process placement can prove a Herdr pane, prove that a process is outside Herdr, or report an unknown placement. The bulk scan retains read failures. A cache miss requires a PID lookup before Codex can use its process arguments.
+
+An action clears the pane evidence in the enclosing report before report reads resume.
+Two Darwin processes that hold one Herdr listener cause a placement scan failure.

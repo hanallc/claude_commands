@@ -14,6 +14,7 @@ import unittest
 from unittest import mock
 
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.aws_target import ledger
 
@@ -60,7 +61,8 @@ def text_setting(path: Path, key: str, value: str) -> None:
 
 def install_cost_settings(path: Path, overrides: str = "") -> None:
     """Install complete settings with exact, private test prices."""
-    _ = write_config_fixture(path, "region=us-east-1\n" + overrides)
+    _ = write_config_fixture(path, "region=us-east-1\ninstance_type=m7a.4xlarge\nlimit_action=drain\n"
+        + "spot_max_usd_per_hour=0.483\nbox_minimum_seconds=60\n" + overrides)
     numeric_settings(path, {
         "daily_limit_usd": "20", "monthly_limit_usd": "400", "limit_reserve_usd": "3",
         "fallback_usd_per_hour": "1", "fixed_usd_per_month": "0",
@@ -75,6 +77,100 @@ def install_cost_settings(path: Path, overrides: str = "") -> None:
     text_setting(path, "cost_explorer_tag_value", "fixture-build")
     text_setting(path, "accounting_zone", "UTC")
     text_setting(path, "notification_recipient", "fixture-showrunner")
+
+
+HANA_GUEST_RUNTIME_SETTINGS = """\
+# whole: 1..
+control_poll_seconds=2
+execution_shell=default
+# whole: 1..
+free_floor_gib=30
+# whole: 1..
+source_max_bytes=1048576
+# whole: 1..
+source_download_timeout_s=60
+# whole: 1..
+source_git_timeout_s=60
+source_allowed_environment=RUST_BACKTRACE
+"""
+
+
+def write_hana_config(path: Path | None = None) -> Path:
+    """Write fixed setup settings to the test configuration directory."""
+    if path is None:
+        path = conf.path('hana_aws')
+    _ = path.write_text("""\
+enabled=off
+host=fixture-hana
+region=us-east-2
+availability_zone=us-east-2b
+instance_type=m7a.2xlarge
+fallback_instance_types=c7a.4xlarge,m7i.4xlarge,m6a.4xlarge
+stack_name=fixture-hana
+ami_id=fixture-image
+ami_owner_id=000000000000
+vpc_id=fixture-vpc
+subnet_id=fixture-subnet
+# range: 0.001..
+spot_max_usd_per_hour=0.25
+# range: 5e-324..
+spot_ceiling_margin=0.25
+# whole: 1..
+root_gib=40
+# whole: 1..
+data_gib=300
+daily_budget_usd=6
+gp3_usd_per_gib_month=0.08
+# whole: 1..60
+guard_grace_seconds=60
+# whole: 1..60
+watchdog_check_seconds=1
+# whole: 1..1800
+permit_max_seconds=1800
+# whole: 1..8
+step_cpu_limit=4
+# whole: 1..24
+step_memory_gib=24
+# whole: 1..60
+mount_timeout_seconds=15
+# whole: 1..
+aws_timeout_s=10
+# whole: 1..
+result_transfer_timeout_s=83
+# whole: 1..
+idle_stop_seconds=600
+# whole: 1..
+start_timeout_seconds=120
+# whole: 1..
+tick_interval_s=5
+# whole: 1..
+controller_tick_timeout_s=45
+# whole: 1..604800
+control_url_seconds=3600
+# whole: 1..
+stop_wait_timeout_s=600
+# whole: 1..
+stop_poll_seconds=10
+# whole: 1..
+setup_idle_wait_timeout_s=1500
+# whole: 1..
+setup_idle_heartbeat_s=15
+# whole: 1..
+intent_lookup_timeout_s=120
+image_upload_tool=fixture-nixos#coldsnap
+# whole: 60..
+image_upload_timeout_s=3600
+# whole: 1..60
+image_wait_interval_s=10
+""" + HANA_GUEST_RUNTIME_SETTINGS)
+    return path
+
+
+def install_hana_spending_settings(path: Path) -> None:
+    """Enable private Hana spending at the test price."""
+    _ = write_hana_config(path)
+    text_setting(path, 'enabled', 'on')
+    numeric_settings(path, {'spot_max_usd_per_hour': '0.15'})
 
 
 def account_reply(arguments: Sequence[str], amount: str = '0') -> dict[str, object]:
@@ -113,6 +209,7 @@ class CostFixture(unittest.TestCase):
         self.settings = self.root / "aws_target.conf"
         self.state = self.root / "state"
         self.state.mkdir()
+        _ = write_hana_config(self.root / 'hana_aws.conf')
         environment = config_environment(self.root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             **environment, "HOME": str(self.root),

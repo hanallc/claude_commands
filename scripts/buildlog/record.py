@@ -65,6 +65,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast
 
+from scripts.build_queue import execution_identity
 from scripts.lib.test_phase import (
     CallRecord,
     NoCallRecord,
@@ -973,7 +974,7 @@ def fallback_step_fields(assignment_path: Path) -> dict[str, object]:
     except FileNotFoundError:
         return {}
     from scripts.aws_target import hana_result
-    from scripts.build_queue import admission_protocol as wire, admission_wire, placement
+    from scripts.build_queue import admission_protocol as wire, admission_wire
 
     row = hana_result.object_fields(cast(object, json.loads(content)))
     if type(row.get('version')) is not int or row['version'] != 1:
@@ -990,7 +991,7 @@ def fallback_step_fields(assignment_path: Path) -> dict[str, object]:
     return {'step_link': json.dumps([link.call_id, link.episode], separators=(',', ':')),
             'placement_episode': assignment.episode, 'placement_attempt': assignment.attempt,
             'attempt_role': 'fallback', 'is_final_result': True,
-            **({'source_key': assignment.source_key.key} if isinstance(assignment.source_key, placement.SourceKeyKnown) else {})}
+            **({'source_key': assignment.source_key.key} if isinstance(assignment.source_key, execution_identity.SourceKeyKnown) else {})}
 
 
 def _publish_hana_step(row: dict[str, object], output: bytes) -> PublishedStep:

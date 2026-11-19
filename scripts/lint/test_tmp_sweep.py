@@ -12,12 +12,13 @@ import json
 import os
 import select
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
 from functools import cached_property
@@ -25,9 +26,10 @@ from typing import TextIO, cast, override
 from unittest import mock
 
 from scripts.lint import tmp_sweep
+from scripts.mac_test import nextest_log
 from scripts.direct import recorder_state
 from scripts.copies.copies_test_support import copies_environment
-from scripts.lib import build_folders, copy_record, scratch, test_hang_guard
+from scripts.lib import build_folders, copy_record, scratch, test_hang_guard, time_limit
 from scripts.message import sessions
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
@@ -117,10 +119,15 @@ class TmpSweepCase(unittest.TestCase):
             folder.mkdir(parents=True)
         registry = base / "sessions"
         registry.mkdir()
+        environment = copies_environment(base)
+        _ = write_config_fixture(Path(environment["CONF_DIR"]) / "build_folders.conf",
+            "patterns.legacy-stable={purpose}\nprefixes.verify-copy=verify-copy.{owner}.\n"
+            + "prefixes.verify-hold=verify-hold.{owner}.\nnames.suffix_length=8\n"
+            + "patterns.legacy-unique={purpose}{suffix}\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "NOTIFIER_SESSIONS_DIR": str(registry), "SHUTDOWN_STATE_DIR": str(base / "shutdown"),
             "BUILDLOG_DIR": str(base / "buildlog"),
-            **copies_environment(base),
+            **environment,
         })))
         self.addCleanup(self.pane_world.process_directory.cleanup)
         pane_patches = [
@@ -263,6 +270,20 @@ class TmpSweepCase(unittest.TestCase):
 
 
 class CopyTests(TmpSweepCase):
+    def test_expired_lock_removal_leaves_the_fresh_lease_without_a_folder(self) -> None:
+        folder = self.tmp / "scratch" / "report"
+        lock = write(folder.with_name(folder.name + ".lock"))
+        lease = write(folder.with_name(folder.name + ".lease.json"), "fresh lease")
+        os.utime(lock, (self.now - 10 * DAY, self.now - 10 * DAY))
+        self.recent(lease)
+
+        result = self.sweep()
+
+        self.assertEqual([entry["path"] for entry in result.deleted], [str(lock)])
+        self.assertFalse(folder.exists())
+        self.assertFalse(lock.exists())
+        self.assertEqual(lease.read_text(), "fresh lease")
+
     def test_busy_absent_copy_does_not_block_later_recovery_or_the_sweep(self) -> None:
         pair = self.tmp / "copies/pair"
         pair.mkdir(parents=True)
@@ -536,6 +557,40 @@ class CopyTests(TmpSweepCase):
         _ = self.sweep()
         self.assertFalse(path.exists())
 
+    def test_landed_dry_run_keeps_a_copy_that_needs_a_remote_check(self) -> None:
+        path = self.copy("stale-landed", task="landed:maker-unit/work", land_target="origin/main",
+                         source_path=str(self.tmp / "copies" / "show-maker" / "stale-landed"))
+        remote = self.tmp.parent / "landed-origin.git"
+        trace = self.tmp.parent / "landed.trace"
+        trace.touch()
+        environment = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+                       "GIT_ALLOW_PROTOCOL": "file"}
+        for arguments in (("init", "-q"),
+                          ("init", "--bare", "-q", str(remote)),
+                          ("-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-qm", "base"),
+                          ("remote", "add", "origin", str(remote)),
+                          ("push", "-q", "origin", "HEAD:refs/heads/work", "HEAD:refs/heads/main"),
+                          ("-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-qm", "published"),
+                          ("push", "-q", str(remote), "HEAD:refs/heads/published")):
+            _ = subprocess.run(["git", "-C", str(path), *arguments], check=True, capture_output=True, env=environment)
+        scratch.exclude_copy_metadata(path)
+        with (mock.patch.dict(os.environ, {**environment, "GIT_TRACE": str(trace)}),
+              mock.patch.object(time_limit, "capture", wraps=time_limit.capture) as query):
+            result = self.sweep(True)
+            query.assert_not_called()
+        self.assertTrue(path.is_dir())
+        self.assertNotIn(str(path), [entry["path"] for entry in result.deleted])
+        self.assertTrue(any("a remote check is needed" in reason and str(path) in paths for reason, paths in result.kept.items()))
+        self.assertNotIn("built-in: git fetch ", trace.read_text())
+        self.assertNotIn("built-in: git ls-remote ", trace.read_text())
+        with (mock.patch.dict(os.environ, {**environment, "GIT_TRACE": str(trace)}),
+              mock.patch.object(time_limit, "capture", wraps=time_limit.capture) as query):
+            result = self.sweep()
+            query.assert_called_once()
+        self.assertIn(str(path), [entry["path"] for entry in result.deleted])
+        self.assertFalse(path.exists())
+        self.assertNotIn("built-in: git fetch ", trace.read_text())
+
     def test_new_unsaved_work_between_scan_and_remove_keeps_copy(self) -> None:
         path = self.copy("edited")
         _ = subprocess.run(["git", "-C", str(path), "init", "-q"], check=True, capture_output=True)
@@ -656,6 +711,78 @@ class IdleTests(TmpSweepCase):
         self.assertTrue(idle.is_file())
         self.assertIn(f"tmp sweep: would delete {self.tmp / 'shots'} (0.0 GiB), last changed ", output)
         self.assertFalse((self.state / tmp_sweep.LOG_NAME).exists())
+
+
+class NextestLogRetentionTests(TmpSweepCase):
+    def test_mac_sweep_keeps_recent_open_and_unrelated_logs(self) -> None:
+        home = self.tmp.parent / "private home"
+        logs = home / nextest_log.DIRECTORY
+        expired = write(logs / "nextest.00000001")
+        recent = write(logs / "nextest.00000002")
+        opened = write(logs / "nextest.00000003")
+        unrelated = write(logs / "other.log")
+        linked = logs / "nextest.00000004"
+        linked.symlink_to(unrelated)
+        folder = logs / "nextest.00000005"
+        folder.mkdir()
+        old = self.now - 3 * DAY
+        for path in (expired, opened, unrelated, linked, folder):
+            os.utime(path, (old, old), follow_symlinks=False)
+        host = socket.gethostname().partition(".")[0]
+        _ = conf.path("mac_test").write_text(f"# whole: 1..\n{nextest_log.RETENTION_DAYS}.{host}=2\n")
+        scan = ("printf", "%s", f"p41\nf4\naw\nn{opened}\n")
+        with (mock.patch.dict(os.environ, {"HOME": str(home)}),
+              mock.patch.object(sys, "platform", "darwin"),
+              mock.patch.object(tmp_sweep, "LSOF", scan)):
+            status, output = self.run_once(dry_run=True)
+            self.assertEqual(status, 0, output)
+            self.assertIn(f"would delete {expired}", output)
+            self.assertTrue(expired.is_file())
+            self.assertFalse((self.state / tmp_sweep.LOG_NAME).exists())
+
+            status, output = self.run_once()
+        self.assertEqual(status, 0, output)
+        self.assertFalse(expired.exists())
+        self.assertIn(f"deleted {expired}", output)
+        for path in (recent, opened, unrelated, linked, folder):
+            self.assertTrue(path.exists(), path)
+        record, = self.log()
+        self.assertIn("expired Mac nextest log", str(record["deleted"]))
+        self.assertEqual(cast(dict[str, int], record["kept"])[tmp_sweep.IN_USE], 1)
+
+    def test_mac_sweep_keeps_a_log_locked_after_the_process_scan(self) -> None:
+        logs = self.tmp.parent / "logs"
+        expired = write(logs / "nextest.00000001")
+        old = self.now - 8 * DAY
+        os.utime(expired, (old, old))
+        _ = write_config_fixture(conf.path("mac_test"))
+        result = tmp_sweep.Sweep()
+        with ExitStack() as readers:
+            def scan(*_args: object, **_kwargs: object) -> tmp_sweep.ProcessUsesKnown:
+                reader = readers.enter_context(expired.open("rb"))
+                fcntl.flock(reader, fcntl.LOCK_SH)
+                return tmp_sweep.ProcessUsesKnown([])
+
+            with mock.patch.object(tmp_sweep, "lsof_paths", side_effect=scan):
+                tmp_sweep.remove_expired_nextest_logs(logs, self.now, False, result)
+            self.assertTrue(expired.is_file())
+            self.assertEqual(result.kept, {tmp_sweep.IN_USE: [str(expired)]})
+        with mock.patch.object(tmp_sweep, "lsof_paths", return_value=tmp_sweep.ProcessUsesKnown([])):
+            tmp_sweep.remove_expired_nextest_logs(logs, self.now, False, result)
+        self.assertFalse(expired.exists())
+
+    def test_incomplete_mac_process_scan_keeps_expired_logs(self) -> None:
+        logs = self.tmp.parent / "logs"
+        expired = write(logs / "nextest.00000001")
+        old = self.now - 8 * DAY
+        os.utime(expired, (old, old))
+        _ = write_config_fixture(conf.path("mac_test"))
+        incomplete = subprocess.CompletedProcess(tmp_sweep.LSOF, 1, "p41\nf4\nn/other\n", "")
+        result = tmp_sweep.Sweep()
+        with mock.patch.object(subprocess, "run", return_value=incomplete):
+            tmp_sweep.remove_expired_nextest_logs(logs, self.now, False, result)
+        self.assertTrue(expired.is_file())
+        self.assertEqual(result.kept, {tmp_sweep.NO_PROC: [str(expired)]})
 
 
 class OwnerEndTests(TmpSweepCase):
@@ -935,19 +1062,15 @@ class TempFolderTests(TmpSweepCase):
     def test_verify_prefix_changes_after_import(self) -> None:
         config = self.tmp / "config"
         config.mkdir()
-        source = Path(build_folders.__file__).resolve().parents[2] / "config/build_folders.conf"
-        settings = source.read_text()
         name = "changed-hold.123.abcdefgh"
         folder = self.tmp / name
         _ = write(folder / "content")
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}), os.scandir(self.tmp) as entries:
             entry = next(entry for entry in entries if entry.name == name)
-            _ = write(config / "build_folders.conf", settings)
+            _ = write_config_fixture(config / "build_folders.conf", "prefixes.verify-hold=verify-hold.{owner}.\n")
             roots = self.roots()
             self.assertFalse(roots.judged_temp(str(self.tmp), entry))
-            _ = write(config / "build_folders.conf", settings.replace(
-                "prefixes.verify-hold=verify-hold.{owner}.",
-                "prefixes.verify-hold=changed-hold.{owner}."))
+            _ = write_config_fixture(config / "build_folders.conf", "prefixes.verify-hold=changed-hold.{owner}.\n")
             self.assertFalse(roots.judged_temp(str(self.tmp), entry))
             self.assertTrue(self.roots().judged_temp(str(self.tmp), entry))
 

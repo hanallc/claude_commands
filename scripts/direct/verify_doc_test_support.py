@@ -1,6 +1,8 @@
 """Judge real Git trees with fake Cargo, without changing the caller's index."""
 from __future__ import annotations
 
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
 from scripts.build_queue import placement
 from scripts.lib.berth_test_support import write_unconfigured_berth
@@ -134,8 +136,7 @@ class VerifyDocFixture(unittest.TestCase):
         self.repo = self.root / "workspace"
         self.repo.mkdir()
         home = self.root / "home"
-        (home / ".claude").mkdir(parents=True)
-        (home / ".claude/scripts").symlink_to(SCRIPTS, target_is_directory=True)
+        _ = copy_helpers(home, *VERIFY_HELPERS)
         self.records = home / ".local/state/verify/doc_pass"
         self.events = self.root / "cargo-events.jsonl"
         self.config = self.root / "lint.conf"
@@ -271,7 +272,7 @@ Path(words[words.index("--result") + 1]).write_text("mac=" + result + "\\nsecond
     '    raise SystemExit(int(os.environ.get("TEST_DOC_STATUS", "0")))',
     '''    if "--assignment-file" in words:
         fixture_outcome = placement.AttemptCompleted(int(os.environ.get("TEST_DOC_STATUS", "0")))
-        fixture_evidence = placement.ExecutionEvidenceUnavailable("the private doc command ended", time.time())
+        fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private doc command ended", time.time())
         fixture_cleanup_confirmed = True
     raise SystemExit(int(os.environ.get("TEST_DOC_STATUS", "0")))'''))
         self.environment["VERIFY_MAC_RUNNER"] = str(runner)

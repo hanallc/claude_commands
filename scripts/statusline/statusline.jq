@@ -148,13 +148,12 @@ def usage($config; $label; $window; $fmt):
 | ((.session_id // "") as $id
    | ([$ARGS.named.counts // "" | split("\n")[]
        | select($id != "" and startswith($id + " ")) | .[($id | length) + 1:]
-       | sub("^For you: "; "") | split(", ")[]] ) as $parts
-   | ($ARGS.named.rebuild // "") as $rebuild
+       # Older caches can still use the former heading.
+       | ltrimstr("Review: ") | ltrimstr("For you: ") | split(", ")[]] ) as $parts
    | ((if ($ARGS.named.adhoc // "") == "" then [] else [$ARGS.named.adhoc] end)
       + ($parts | map(select(test("^[0-9]+ (question|change)s?$"))))
-      + (if $rebuild == "" then [] else [$rebuild] end)
       + ($parts | map(select(test("^[0-9]+ (question|change)s?$") | not))))
-   | if length == 0 then "" else "For you: " + join(", ") end
+   | if length == 0 then "" else "Review: " + join(", ") end
       # Use the plural key with underscores: counts.adhoc_items; efficiency stays singular.
       | gsub("(?<count>[0-9]+)(?: (?<word>adhoc item|question|change|efficiency|proposal|project)(?<s>s?))?";
              . as $part | "\u001b[1m\($part.count)\u001b[22m"
@@ -162,4 +161,9 @@ def usage($config; $label; $window; $fmt):
                else (. + " " + $part.word + $part.s)
                  | color($colors; "counts." + ($part.word | gsub(" "; "_")) + (if $part.word == "efficiency" then "" else "s" end))
                end)) as $counts_row
-| [$first_line, $second_line, $counts_row] | map(select(. != "")) | join("\n")
+| ($ARGS.named.for_you // "") as $actions
+| (if $actions == "unavailable" then "For you: Unavailable"
+   elif ($actions | test("^[1-9][0-9]*$")) then
+     "For you: " + "\u001b[1m" + $actions + "\u001b[22m" + (if $actions == "1" then " action" else " actions" end)
+   else "" end) as $action_row
+| [$first_line, $second_line, $action_row, $counts_row] | map(select(. != "")) | join("\n")

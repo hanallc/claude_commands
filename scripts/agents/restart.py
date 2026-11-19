@@ -27,7 +27,7 @@ from importlib import import_module
 
 from scripts.herdr import herdr
 from scripts.herdr import herdr_types
-from scripts.message import sessions, codex_daemon
+from scripts.message import sessions, codex_daemon, session_records
 from scripts.production import staff, session_staff, worker_admission
 from scripts.accounts import accounts
 from scripts.lib import conf, models_registry, nix_env, operation_deadline, unit_runs, resume_message
@@ -81,6 +81,11 @@ class SelectedRestartRows:
 class WorkerRestartScope(Enum):
     FOLLOW_OWNER = "restore the owner's workers"
     SELECTED_ROWS = "restart only selected rows"
+
+
+class LiveWorkerRecovery(Enum):
+    LEAVE_RUNNING = "leave a live worker unchanged"
+    RESTORE_BEFORE_REMOVAL = "restore the worker before removing its restart entry"
 
 
 class RestartDisposition(Enum):
@@ -367,7 +372,8 @@ def _anomaly(row: staff.StaffRow, error: object) -> None:
 
 def stop_row(row: staff.StaffRow, client: herdr.Herdr, *, deadline: float = math.inf,
              codex: herdr.CodexConversations | None = None) -> bool:
-    with operation_deadline.within(deadline):
+    # One row's stop reads each pane once; each identity check forgets its pane before it reads again.
+    with operation_deadline.within(deadline), herdr.observation_snapshot():
         try:
             record = staff.initial_snapshot()
             if record.by_id(row.id) is None:
@@ -504,7 +510,7 @@ def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot, *,
     if row.kind == "worker":
         parent = record.parent_of(row)
         if parent is None:
-            return ""
+            raise OSError("worker parent is unavailable")
         result = worker.restore(parent.id, record=record, only=frozenset({row.id}), started_panes=started_panes,
             account=target_account,
             runs=observed.runs if observed is not None else None,
@@ -540,6 +546,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
               observed: RestartObservations | None = None,
               opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt = NO_RESTART_MESSAGE,
               resume_checks: DirectorResumeChecks | NoDirectorResumeChecks = NoDirectorResumeChecks.CURRENT,
+              live_worker_recovery: LiveWorkerRecovery = LiveWorkerRecovery.LEAVE_RUNNING,
               success_report: RestartSuccessReport = RestartSuccessReport.START_ROW) -> str:
     with operation_deadline.within(deadline):
         live = (herdr.read_conversation(str(row.current_session)) if observed is None else
@@ -547,6 +554,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         if isinstance(live, herdr.LiveConversation):
             if live.pids:
                 member_account.repair_home(row, live.kind, live.pids[0])
+            if row.kind == "worker" and live_worker_recovery is LiveWorkerRecovery.RESTORE_BEFORE_REMOVAL:
+                return _restore_workers(row, record, observed=observed, target_account=target_account)
             if row.kind != "worker" and worker_scope is WorkerRestartScope.FOLLOW_OWNER:
                 _ = (_restore_workers(row, record) if observed is None else
                      _restore_workers(row, record, observed=observed))
@@ -666,13 +675,15 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
                           CodexResumeTranscript(transcript, since))
                 if isinstance(reader, CodexResumeTranscript):
                     reader.skip_existing_turns()
-                check = DirectorResumeCheck(row.name, opening.text, reader)
+                progress = DirectorResumeCheck(row.name, opening.text, reader)
+                check = progress
                 if isinstance(reader, herdr.TranscriptCursor):
                     cursor = reader
                     before_prompt = opening.before_prompt
 
                     def native_transcript(actual: herdr.SessionTranscript) -> object:
-                        cursor.bind_transcript(actual)
+                        if cursor.transcript != actual:
+                            progress.reader = herdr.TranscriptCursor(actual, cursor.since)
                         return before_prompt(actual)
 
                     opening = replace(opening, before_prompt=native_transcript)
@@ -690,7 +701,10 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
                 codex=observed.codex if observed is not None else herdr.CodexLaunchRead.CURRENT, client=client)
         if isinstance(result.outcome, herdr.ClaudeTrustNotWritten):
             raise ClaudeTrustWriteFailed(result.outcome.reason)
-        if isinstance(result.outcome, herdr.PromptNotSubmitted):
+        if not isinstance(result.outcome, herdr.PromptSubmissionNotRequired) and result.outcome.publication_error is not None:
+            raise OSError(f"staff publication failed: {result.outcome.publication_error}")
+        if (not isinstance(result.outcome, herdr.PromptSubmissionNotRequired)
+                and result.outcome.state != "confirmed"):
             if isinstance(target, herdr.ExistingPane) and not target.terminal:
                 return result.pane
             raise OSError(result.outcome.reason)
@@ -746,9 +760,15 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         return result.pane
 
 
-def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[staff.StaffRow, str]]:
+@dataclass(frozen=True)
+class RowPanesUnreadable:
+    reason: str
+
+
+def _read_row_panes(rows: list[staff.StaffRow], client: herdr.Herdr, *, strict: bool
+                    ) -> list[tuple[staff.StaffRow, str]] | RowPanesUnreadable:
     try:
-        entries = pane_record.read(client.session)
+        entries = pane_record.read_strict(client.session) if strict else pane_record.read(client.session)
         record = staff.initial_snapshot()
         record = staff.StaffSnapshot((*record.rows, *(row for row in rows if record.by_id(row.id) is None)))
         with herdr.pane_evidence_run():
@@ -761,11 +781,22 @@ def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[sta
                              key=lambda entry: entry["written_at"], default=None)
                 retained = {newest["pane_id"]: newest} if newest is not None else {}
                 found.extend((row, str(pane["pane_id"])) for pane in pane_launch.reference_panes(
-                    reference, record, client, retained, evidence=evidence))
+                    reference, record, client, retained, evidence=evidence, strict_retained_reads=strict))
         return found
-    except (OSError, ValueError, herdr_types.HerdrFailure) as error:
-        print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
+    except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+        return RowPanesUnreadable(_error_reason(error))
+
+
+def read_row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[staff.StaffRow, str]] | RowPanesUnreadable:
+    return _read_row_panes(rows, client, strict=True)
+
+
+def row_panes(rows: list[staff.StaffRow], client: herdr.Herdr) -> list[tuple[staff.StaffRow, str]]:
+    result = _read_row_panes(rows, client, strict=False)
+    if isinstance(result, RowPanesUnreadable):
+        print(f"restart: layout anomaly: {result.reason}", file=sys.stderr)
         return []
+    return result
 
 
 @dataclass(frozen=True)
@@ -776,6 +807,7 @@ class CompleteLiveRows:
 @dataclass(frozen=True)
 class PartialLiveRows:
     rows: list[staff.StaffRow]
+    registry_discovery_failed: bool = False
 
 
 def _read_live_members(rows: Iterable[staff.StaffRow], record: staff.StaffSnapshot, *,
@@ -891,46 +923,53 @@ def live_rows(record: staff.StaffSnapshot, client: herdr.Herdr, *, save_tabs: bo
     resolver = session_staff.RowResolver(record) if resolver is None else resolver
     codex = observed.codex
     rows = [row for row in record.rows if not isinstance(selection, SelectedRestartRows) or row.id in selection.ids]
-    complete = True
-    if isinstance(selection, AllRestartRows):
-        # The registry supplies candidate names; the reader proves each conversation.
-        try:
+    with ExitStack() as selection_scope:
+        if isinstance(selection, AllRestartRows):
+            try:
+                registry = session_records.read_registry()
+            except (OSError, ValueError) as error:
+                print(f"restart: session registry discovery failed: {error}", file=sys.stderr)
+                return PartialLiveRows([], registry_discovery_failed=True)
+            if registry.unreadable:
+                print(f"restart: {session_records.registry_unreadable_reason(registry.unreadable)}", file=sys.stderr)
+                return PartialLiveRows([], registry_discovery_failed=True)
+            running = session_records.enumerate_running_sessions(registry=registry)
+            if isinstance(running, session_records.RunningSessionDiscoveryFailed):
+                print(f"restart: {running.reason}", file=sys.stderr)
+                return PartialLiveRows([], registry_discovery_failed=True)
+            _ = selection_scope.enter_context(session_records.use_registry_for_liveness(registry))
             candidates = {session["sessionId"]: (session["name"] or session["sessionId"]) +
-                (f" in {folder}" if (folder := session.get("cwd")) else "") for session in sessions.running_sessions()}
-        except (OSError, ValueError) as error:
-            complete = False
-            print(f"restart: Claude registry anomaly: {error}", file=sys.stderr)
-            candidates = {}
-        for identity in herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon, codex=codex):
-            _ = candidates.setdefault(identity, identity)
-        owned = {row.current_session for row in record.rows}
-        for identity in sorted(candidates.keys() - owned):
-            if isinstance(herdr.read_conversation(identity, codex=codex), herdr.LiveConversation):
-                print(f"{' '.join(observed.pane_names.get(identity, candidates[identity]).splitlines())}: "
-                      + "restart anomaly: unassigned live session", file=sys.stderr)
-        owners = [row for row in record.rows if row.id in observed.pane_owners]
-        observations = worker_panes.observe_parents(owners, record) if owners else {}
-    else:
-        parents = {parent.id for row in rows if row.kind == "worker"
-                   and (parent := record.parent_of(row)) is not None}
-        owners = [row for row in record.rows if row.id in parents]
-        observations = worker_panes.observe_parents(
-            owners, record, selection=worker_panes.SelectedWorkerRows(selection.ids)) if owners else {}
-    workers = {state.row.id: state for states in observations.values() for state in states}
-    active_workers = [state.row for state in workers.values()
-                      if not isinstance(state, (worker_panes.ClosedWorker, worker_panes.StoppedWorker))]
-    candidates_rows = [row for row in rows if row.id not in workers]
-    if not isinstance(account, AllRestartAccounts):
-        candidates_rows.extend(active_workers)
-    reading = _read_live_members(candidates_rows, record, resolver=resolver, codex=codex, account=account)
-    complete = complete and isinstance(reading, CompleteLiveRows) and not any(
-        isinstance(state, (UncertainWorker, ProcessUnknownWorker))
-        for state in workers.values())
-    selected = reading.rows
-    if isinstance(account, AllRestartAccounts):
-        selected.extend(active_workers)
-    positions = {row.id: index for index, row in enumerate(record.rows)}
-    selected.sort(key=lambda row: positions[row.id])
+                (f" in {folder}" if (folder := session.get("cwd")) else "") for session in running.records}
+            for identity in herdr.running_codex_threads(thread_host=herdr.codex_managed_daemon, codex=codex):
+                _ = candidates.setdefault(identity, identity)
+            owned = {row.current_session for row in record.rows}
+            for identity in sorted(candidates.keys() - owned):
+                if isinstance(herdr.read_conversation(identity, codex=codex), herdr.LiveConversation):
+                    print(f"{' '.join(observed.pane_names.get(identity, candidates[identity]).splitlines())}: "
+                          + "restart anomaly: unassigned live session", file=sys.stderr)
+            owners = [row for row in record.rows if row.id in observed.pane_owners]
+            observations = worker_panes.observe_parents(owners, record) if owners else {}
+        else:
+            parents = {parent.id for row in rows if row.kind == "worker"
+                       and (parent := record.parent_of(row)) is not None}
+            owners = [row for row in record.rows if row.id in parents]
+            observations = worker_panes.observe_parents(
+                owners, record, selection=worker_panes.SelectedWorkerRows(selection.ids)) if owners else {}
+        workers = {state.row.id: state for states in observations.values() for state in states}
+        active_workers = [state.row for state in workers.values()
+                          if not isinstance(state, (worker_panes.ClosedWorker, worker_panes.StoppedWorker))]
+        candidates_rows = [row for row in rows if row.id not in workers]
+        if not isinstance(account, AllRestartAccounts):
+            candidates_rows.extend(active_workers)
+        reading = _read_live_members(candidates_rows, record, resolver=resolver, codex=codex, account=account)
+        complete = isinstance(reading, CompleteLiveRows) and not any(
+            isinstance(state, (UncertainWorker, ProcessUnknownWorker))
+            for state in workers.values())
+        selected = reading.rows
+        if isinstance(account, AllRestartAccounts):
+            selected.extend(active_workers)
+        positions = {row.id: index for index, row in enumerate(record.rows)}
+        selected.sort(key=lambda row: positions[row.id])
     if save_tabs:
         try:
             client.save_layout()
@@ -1024,11 +1063,18 @@ def stop_all(*, dry_run: bool = False, only: tuple[str, ...] = (),
     return restart(stop_all=True, dry_run=dry_run, only=only, account=account, after_stop=AfterStop.KEEP_STOPPED)
 
 
-@herdr.pane_evidence_run()
 def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, ...] = (),
             account: AllRestartAccounts | accounts.AccountSelection = ALL_RESTART_ACCOUNTS,
             after_stop: AfterStop = AfterStop.RESTART,
             why: str = DEFAULT_RESTART_CAUSE) -> int:
+    with ExitStack() as pane_evidence:
+        _ = pane_evidence.enter_context(herdr.pane_evidence_run())
+        return _restart(pane_evidence, stop_all=stop_all, dry_run=dry_run, only=only, account=account,
+                        after_stop=after_stop, why=why)
+
+
+def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: tuple[str, ...],
+             account: AllRestartAccounts | accounts.AccountSelection, after_stop: AfterStop, why: str) -> int:
     try:
         record = staff.initial_snapshot()
     except (OSError, ValueError, staff.StaffRefused) as error:
@@ -1045,6 +1091,8 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                 if (row := record.by_member_reference(reference)) is not None)) if only else AllRestartRows.CURRENT)
             reading = live_rows(record, client, save_tabs=not dry_run, resolver=resolver, account=account,
                                 observed=observed, selection=selection)
+            if isinstance(reading, PartialLiveRows) and reading.registry_discovery_failed:
+                return 1
             selected = reading.rows
         select_only = bool(only) and not stop_all
         pending_ids = ([] if after_stop == AfterStop.KEEP_STOPPED else
@@ -1054,7 +1102,10 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             path = shutdown_record.record_path()
             saved_at = time.strftime("%H:%M", time.localtime(path.stat().st_mtime)) if path.exists() else "unknown"
             print(f"restart record: {len(pending_ids)} rows saved at {saved_at}")
-            for row in live_rows(record, client, resolver=resolver, observed=observed).rows:
+            shown = live_rows(record, client, resolver=resolver, observed=observed)
+            if isinstance(shown, PartialLiveRows) and shown.registry_discovery_failed:
+                return 1
+            for row in shown.rows:
                 if str(row.id) not in pending_ids:
                     print(f"{row.name}: live, not in the restart record")
         for reference in pending_ids:
@@ -1209,6 +1260,10 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             present = isinstance(server, herdr.WindowServerCreated)
         except errors as error:
             print(f"restart: server anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
+        if stop_all:
+            # A stop read can still show a worker that has exited. Read pane evidence again for restore.
+            pane_evidence.close()
+            _ = pane_evidence.enter_context(herdr.pane_evidence_run())
     resume_checks = DirectorResumeChecks()
 
     def start_holder(holder: staff.StaffRow, focus: bool,
@@ -1235,7 +1290,9 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                 if isinstance(fresh, herdr.UnknownConversation):
                     raise OSError(fresh.reason)
                 if isinstance(fresh, herdr.LiveConversation):
-                    if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
+                    if current.kind == "worker":
+                        _ = _restore_workers(current, current_record)
+                    elif worker_scope is WorkerRestartScope.FOLLOW_OWNER:
                         _ = _restore_workers(current, current_record, observed=observed)
                     print(f"{current.name}: unchanged")
                     shutdown_record.remove_started([member for member in members_by_holder[holder.id]
@@ -1246,6 +1303,8 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
                        if current.kind in ("unit", "showrunner") else NO_RESTART_MESSAGE)
             launch_row = (start_row if success_report is RestartSuccessReport.START_ROW else
                           partial(start_row, success_report=success_report))
+            if current.kind == "worker":
+                launch_row = partial(launch_row, live_worker_recovery=LiveWorkerRecovery.RESTORE_BEFORE_REMOVAL)
             if worker_scope is WorkerRestartScope.FOLLOW_OWNER:
                 pane = launch_row(current, current_record, client, present=focus, resolver=facts, observed=observed,
                                   opening=opening, resume_checks=resume_checks)

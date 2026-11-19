@@ -577,6 +577,7 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
 '''
         completion, refresh = command.split('export CARGO_TARGET_DIR="$TEST_FIRST_FOLDER"', 2)[1:]
         environment = self.environment(HOME=str(home), BUILDLOG_RECORD=str(SCRIPT),
+            BUILD_HELPER_ROOT=str(launcher.parent.parent),
             BUILDLOG_SCOPE="0", PY=sys.executable, HOLD_WAIT_DIR=str(hold),
             TEST_FIRST_FOLDER=str(self.repo / "first"), TEST_CHANGED_FOLDER=str(self.repo / "changed"),
             TEST_METADATA=json.dumps({"workspace_root": str(self.repo),
@@ -896,25 +897,25 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         meminfo = self.base / "meminfo-fifo"
         os.mkfifo(meminfo)
         opened = threading.Event()
-        read_text = Path.read_text
+        read_bytes = Path.read_bytes
 
-        def bounded_fifo_read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        def bounded_fifo_read(path: Path) -> bytes:
             if path != meminfo:
-                return read_text(path, encoding=encoding, errors=errors)
+                return read_bytes(path)
             descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK)
             try:
                 opened.set()
                 if not select.select([descriptor], [], [], 5)[0]:
                     raise TimeoutError("the meminfo FIFO received no sample within 5 seconds")
-                value = os.read(descriptor, 4096).decode()
+                value = os.read(descriptor, 4096)
                 sample_path = self.base / "fifo-sample"
-                _ = sample_path.write_text(value)
+                _ = sample_path.write_bytes(value)
                 self.admission.readings.host_path = sample_path
                 return value
             finally:
                 os.close(descriptor)
 
-        _ = self.enterContext(mock.patch.object(Path, "read_text", autospec=True, side_effect=bounded_fifo_read))
+        _ = self.enterContext(mock.patch.object(Path, "read_bytes", autospec=True, side_effect=bounded_fifo_read))
         command = 'source "$1"; SECONDS=0; printf "ready\\n"; buildlog_wait_for_memory; printf "%s\\n" "$BUILDLOG_MEM_WAIT_S"'
         process = subprocess.Popen(
             ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh")],

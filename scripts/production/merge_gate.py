@@ -36,7 +36,7 @@ except FileNotFoundError:
 
 import argparse
 from collections import deque
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, closing, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
@@ -70,13 +70,12 @@ from scripts.copies import copies
 from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import read_step_names
-from scripts.production import affected_modules, change_review, land_runs  # noqa: E402
+from scripts.production import affected_modules, change_review, console_check, land_runs  # noqa: E402
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
 )
 from scripts.direct.local_release_wait import local_release_waiter  # noqa: E402
-from scripts.build_targets import build_targets  # noqa: E402
 from scripts.build_hold import build_hold  # noqa: E402
 from scripts.buildlog import store  # noqa: E402
 from scripts.buildlog.store import host_name  # noqa: E402
@@ -101,10 +100,9 @@ UNRECORDED_MODULE_RESERVATION_MIB = 640
 DEFAULT_MODULE_TIME_LIMIT_S = 1800
 RERUN_LIMIT = 8
 RELEASE_LOCK_WAIT_S = 60
-# basedpyright resolves bpy (Blender's interpreter only) and PIL (a PEP 723 dependency) from this
-# type-check-only venv, so the full tree reports 0/0. The stub date matches the 2026-08-23 sweep;
-# later dates report new diagnostics in bake_textures.py.
-TYPECHECK_REQUIREMENTS = ("pillow==13.0.0", "fake-bpy-module==20260822")
+# basedpyright resolves bpy with these Blender stubs.
+# Later versions report diagnostics in bake_textures.py.
+TYPECHECK_REQUIREMENTS = ("fake-bpy-module==20260822",)
 NIGHTLY_TYPE_DIRS = ("scripts",)
 NIGHTLY_TYPE_DIAGNOSTIC_LINES = 20
 # An unrecorded type job keeps its own fallback; recorded jobs all use one margin.
@@ -499,7 +497,10 @@ class BuildHoldWait:
         try:
             directory = build_hold.holder_directory()
             holds = build_hold.natedev_holds(directory)
-            held = build_targets.caller_waits_on_hold(holds, directory)
+            # Load the hold check here to avoid the GPU routing import cycle.
+            caller_waits_on_hold = cast(Callable[[build_hold.NatedevHolds, Path], bool], getattr(
+                import_module("scripts.build_targets.build_targets"), "caller_waits_on_hold"))
+            held = caller_waits_on_hold(holds, directory)
         except (OSError, ValueError) as error:
             raise GateRefused(f"natedev hold state cannot be read: {error}") from error
         if held and not self.waiting:
@@ -1860,44 +1861,52 @@ def promotion_edit_conflict(repo: Path, target: str, waiting: str = "") -> str:
     return ""
 
 
-def live_state_refusal(repo: Path, target: str) -> str:
-    """Run the target tree's live state checks before its code is installed."""
+def live_state_refusal(tree: Path, target: str) -> str:
+    """Check that the target code can read live state."""
+    settings = tree / "config" / "merge_gate.conf"
+    if not settings.exists():
+        return ""
+    config = conf.read(settings)
+    if "live_state_checks" not in config.values():
+        return ""
+    try:
+        checks = config.words("live_state_checks")
+        seconds = config.whole("live_state_check_seconds")
+    except conf.Unusable as error:
+        return f"promotion refused: live state check settings: {error}"
+    environment = {**os.environ, "PYTHONPATH": str(tree), "PYTHONDONTWRITEBYTECODE": "1"}
+    for module in checks:
+        if not (tree / Path(*module.split("."))).with_suffix(".py").exists():
+            return f"promotion refused: live_state_checks names {module}, absent from {target}"
+        try:
+            result = subprocess.run([sys.executable, "-m", module, "state-check"], cwd=tree, env=environment,
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                    timeout=seconds, check=False)
+        except (OSError, subprocess.SubprocessError) as error:
+            return f"promotion refused: {module} state-check failed to run: {error}"
+        if result.returncode:
+            detail = "; ".join(failure_detail(result, lines=1).splitlines())
+            return (f"promotion refused: {target} cannot read live state: {module}: {detail}; "
+                    "run its conversion before the land")
+    return ""
+
+
+class ConsolePromotionRefused(GateRefused):
+    """The console check found a fault that holds promotion."""
+
+
+def check_promotion(repo: Path, target: str) -> None:
+    """Check the exported target before main moves."""
     with tempfile.TemporaryDirectory(prefix="promotion-state-") as temporary:
         tree = Path(temporary)
         try:
-            archive = subprocess.run(["git", "archive", "--format=tar", target], cwd=repo, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE, check=True).stdout
-            _ = subprocess.run(["tar", "-x", "-C", str(tree)], input=archive, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, check=True)
+            console_check.export_tree(repo, target, tree)
         except (OSError, subprocess.SubprocessError) as error:
-            return f"promotion refused: live state check could not export {target}: {error}"
-        settings = tree / "config" / "merge_gate.conf"
-        if not settings.exists():
-            return ""
-        # A target tree from before these checks names none.
-        config = conf.read(settings)
-        if "live_state_checks" not in config.values():
-            return ""
-        try:
-            checks = config.words("live_state_checks")
-            seconds = config.whole("live_state_check_seconds")
-        except conf.Unusable as error:
-            return f"promotion refused: live state check settings: {error}"
-        environment = {**os.environ, "PYTHONPATH": str(tree), "PYTHONDONTWRITEBYTECODE": "1"}
-        for module in checks:
-            if not (tree / Path(*module.split("."))).with_suffix(".py").exists():
-                return f"promotion refused: live_state_checks names {module}, absent from {target}"
-            try:
-                result = subprocess.run([sys.executable, "-m", module, "state-check"], cwd=tree, env=environment,
-                                        stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                                        timeout=seconds, check=False)
-            except (OSError, subprocess.SubprocessError) as error:
-                return f"promotion refused: {module} state-check failed to run: {error}"
-            if result.returncode:
-                detail = "; ".join(failure_detail(result, lines=1).splitlines())
-                return (f"promotion refused: {target} cannot read live state: {module}: {detail}; "
-                        "run its conversion before the land")
-    return ""
+            raise GateRefused(f"promotion refused: live state check could not export {target}: {error}") from error
+        if refusal := live_state_refusal(tree, target):
+            raise GateRefused(refusal)
+        if refusal := console_check.compare_to_main(repo, "origin/main", tree):
+            raise ConsolePromotionRefused(refusal)
 
 
 # Send the same function to a Mac without repository Python modules.
@@ -1999,8 +2008,7 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
             raise GateRefused("main is not an ancestor of the merge branch")
         if conflict := promotion_edit_conflict(main_repo, target, waiting_rows.WAITING_PATHS):
             raise GateRefused(conflict)
-        if refusal := live_state_refusal(main_repo, target):
-            raise GateRefused(refusal)
+        check_promotion(main_repo, target)
         write_push_record(path, RecordedPush(origin, target, target))
         try:
             waiting_rows.move_to(main_repo, target)
@@ -2766,7 +2774,7 @@ def _sweep_nightly_slots() -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments and arguments[0] in {"nightly-assigned", "nightly-check"}:
-        nightly_parser = argparse.ArgumentParser(prog=f"merge_gate.py {arguments[0]}")
+        nightly_parser = argparse.ArgumentParser(prog=f"merge_gate.py {arguments[0]}", allow_abbrev=False)
         if arguments[0] == "nightly-assigned":
             _ = nightly_parser.add_argument("--unit", required=True)
             _ = nightly_parser.add_argument("--result", default="")
@@ -2779,7 +2787,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
             print(f"REFUSED: {error}", file=sys.stderr, flush=True)
             return 1
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     add_suite_arguments(parser)
     for name in ("merge-branch", "unit-branch", "checkpoint", "previous-checkpoint", "unit", "phase"):
         _ = parser.add_argument(f"--{name}", default="")

@@ -62,6 +62,7 @@ class AccountMoveTests(ShutdownTestCase):
         self.moves = FakeSessionMoves()
         _ = self.enterContext(patch.object(stop_resume, "move_sessions", side_effect=self.moves))
         (self.root / ".claude").mkdir()
+        (self.root / "registry").mkdir()
         _ = (self.root / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": "default@example.invalid"},
         }), encoding="utf-8")
@@ -75,26 +76,36 @@ class AccountMoveTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(accounts.account_dir("claude1"))))
         _ = self.enterContext(patch.object(inventory, "inventory", side_effect=AssertionError("accounts must use the listing")))
         _ = self.enterContext(patch.object(inventory, "listing", side_effect=self.current_listing))
-        _ = self.enterContext(patch.object(accounts, "live_group_members", side_effect=self.group_members))
+        _ = self.enterContext(patch("scripts.accounts.accounts._read_local_role_sessions",
+                                    side_effect=self.listed_role_sessions))
         at = datetime.now(timezone.utc)
         _ = self.enterContext(patch.object(refusals, "stored_reading", return_value=refusals.FreshReading(
             refusals.ReadingWindow(80, refusals.NoResetKnown(), at), refusals.NoWindow(), "")))
 
 
-    def group_members(self) -> dict[accounts.ClaudeGroup, list[accounts.LiveGroupMember]]:
-        groups: dict[accounts.ClaudeGroup, list[accounts.LiveGroupMember]] = {"units": [], "showrunners": []}
+    def listed_role_sessions(self, *_args: object, **_kwargs: object) -> accounts.LocalRoleSessions:
+        members: list[accounts.LiveGroupMember] = []
         for session in inventory.listing():
             group = accounts.session_group(session)
             if group != "ungrouped":
-                groups[group].append(accounts.LiveGroupMember(session.session_id, session.name, group, session.config_dir))
-        return groups
+                members.append(accounts.LiveGroupMember(session.session_id, session.name, group, session.config_dir))
+        return self.role_sessions(*members)
+
+    def role_sessions(self, *members: accounts.LiveGroupMember,
+                      without_account: tuple[str, ...] = ()) -> accounts.LocalRoleSessions:
+        groups: dict[accounts.ClaudeGroup, list[accounts.LiveGroupMember]] = {group: [] for group in accounts.CLAUDE_GROUPS}
+        for member in members:
+            groups[member.group].append(member)
+        running = frozenset(without_account).union(member.session_id for member in members)
+        return accounts.LocalRoleSessions({}, groups, (), (), (), False, running)
 
     def test_group_and_single_move_ignore_stale_shutdown_holds(self) -> None:
         for subject in ("units", "move-id"):
             with self.subTest(subject=subject):
                 self.moves.calls.clear()
-                member = replace(self.current_listing()[0], kind="unit")
-                with (patch.object(accounts, "live_group_members", return_value={"units": [member], "showrunners": []})):
+                listed = self.current_listing()[0]
+                member = accounts.LiveGroupMember(listed.session_id, listed.name, "units", listed.config_dir)
+                with patch("scripts.accounts.accounts._read_local_role_sessions", return_value=self.role_sessions(member)):
                     result, output, error = self.cli(subject)
                 self.assertEqual(result, 0, error)
                 self.assertEqual(error, "")
@@ -276,17 +287,19 @@ class AccountMoveTests(ShutdownTestCase):
         members = [replace(self.current_listing()[0], session_id="first", kind="showrunner"),
                    replace(self.current_listing()[0], session_id="second", kind="showrunner", login="default@example.invalid", config_dir=self.root / ".claude2"),
                    replace(self.current_listing()[0], session_id="already", kind="showrunner", login="target@example.invalid", config_dir=self.root / ".claude3")]
-        producer = accounts.LiveGroupMember("producer", "producer", "showrunners", self.root / ".claude2")
+        producer = accounts.LiveGroupMember("producer", "producer", "producers", self.root / ".claude2")
+        runners = tuple(accounts.LiveGroupMember(member.session_id, member.name, "showrunners", member.config_dir)
+                        for member in members)
         with (patch.object(inventory, "listing", return_value=members),
-              patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": [*members, producer]}),
-              patch.object(inventory, "unregistered_showrunners", return_value=[])):
+              patch("scripts.accounts.accounts._read_local_role_sessions", return_value=self.role_sessions(*runners, producer)),
+              patch.object(inventory, "showrunner_registrations", return_value=inventory.ShowrunnerRegistrations(()))):
             result = accounts.move_group("showrunners", "claude3", why="manual group move")
         self.assertIsInstance(result, accounts.GroupMoveStarted)
-        self.assertEqual(self.moves.calls, [MoveCall(identity, "claude3", "manual group move") for identity in ("first", "second", "producer")])
-        self.assertEqual(self.moves.batches, [["first", "second", "producer"]])
+        self.assertEqual(self.moves.calls, [MoveCall(identity, "claude3", "manual group move") for identity in ("first", "second")])
+        self.assertEqual(self.moves.batches, [["first", "second"]])
         self.assertEqual(accounts.group_accounts().get("showrunners"), "claude3")
         assert isinstance(result, accounts.GroupMoveStarted)
-        self.assertEqual(sum("Claude is up on" in line for line in result.stdout.splitlines()), 3)
+        self.assertEqual(sum("Claude is up on" in line for line in result.stdout.splitlines()), 2)
 
         from scripts.production import staff
         from scripts.agents import remote
@@ -310,7 +323,7 @@ class AccountMoveTests(ShutdownTestCase):
                     self.moves.failures[identity] = "live process account is unreadable"
                 family = "codex:gpt-test:high" if state == "control codex" else "claude:opus:max"
                 registry = write_registry(self.root / "producer-models.conf", {"producers": {row.name: family}})
-                live = [accounts.LiveGroupMember(identity, row.name, "showrunners", self.root / ".claude1")] if state == "interrupted" else []
+                live = [accounts.LiveGroupMember(identity, row.name, "producers", self.root / ".claude1")] if state == "interrupted" else []
                 move = self.moves.move
                 def start(session: str, target: str, *, why: str) -> stop_resume.MoveResult:
                     nonlocal row
@@ -319,25 +332,27 @@ class AccountMoveTests(ShutdownTestCase):
                         row = staff.set_home(row.id, staff.SessionHome(self.root / f".{target}"))
                         return stop_resume.ResumePending(session, target, "start confirmation failed")
                     return result
+                def producer_roles(*_args: object, **_kwargs: object) -> accounts.LocalRoleSessions:
+                    without_account = (identity,) if state == "unreadable account" else ()
+                    return self.role_sessions(*live, without_account=without_account)
+
                 with (patch.object(staff, "local_snapshot", side_effect=lambda: staff.StaffSnapshot((row,))),
                       patch.object(self.moves, "move", side_effect=start),
                       patch.object(remote, "other_machine", return_value="mac"),
-                      patch.object(sessions, "running_sessions", return_value=[sessions.SessionRecord(
-                          pid=998071, sessionId=identity, name=row.name, messagingSocketPath="", updatedAt=1,
-                          tmux="", formerNames=[])] if state == "unreadable account" else []),
                       patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)}),
-                      patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": live})):
+                      patch("scripts.accounts.accounts._read_local_role_sessions",
+                            side_effect=producer_roles)):
                     if state in ("interrupted", "early exit after home write"):
                         if state == "interrupted":
                             self.moves.failures[identity] = "resume pending"
-                        first = accounts.move_group("showrunners", "claude3", why="retry")
+                        first = accounts.move_group("producers", "claude3", why="retry")
                         self.assertIsInstance(first, accounts.GroupMoveStartFailed)
-                        self.assertEqual(accounts.group_accounts().get("showrunners"), "claude3")
+                        self.assertEqual(accounts.group_accounts().get("producers"), "claude3")
                         if state == "early exit after home write":
                             self.assertEqual(row.home, staff.SessionHome(self.root / ".claude3"))
                         self.moves.failures.clear()
                         live.clear()
-                    retry = accounts.move_group("showrunners", "claude3", why="retry")
+                    retry = accounts.move_group("producers", "claude3", why="retry")
                 if state == "unreadable account":
                     self.assertIsInstance(retry, accounts.GroupMoveStartFailed)
                     assert isinstance(retry, accounts.GroupMoveStartFailed)
@@ -371,8 +386,7 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual(error.getvalue(), "accounts: anomaly: missing: no saved session was found\n")
 
     def test_group_preview_and_empty_selection_do_not_move(self) -> None:
-        with (patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []}),
-              patch.object(inventory, "unregistered_showrunners", return_value=[])):
+        with patch("scripts.accounts.accounts._read_local_role_sessions", return_value=self.role_sessions()):
             preview = accounts.move_group("units", "claude3", dry_run=True)
             self.assertIsInstance(preview, accounts.GroupMoveDryRun)
             self.assertFalse(accounts.groups_file().exists())

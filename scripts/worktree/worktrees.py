@@ -11,13 +11,14 @@ import json
 import os
 import subprocess
 import sys
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
 
 from scripts.lib.process_failure import failure_detail
-from scripts.lib import build_folders
+from scripts.lib import build_folders, scratch
 from scripts.production import session_staff, staff
 from scripts.agents import remote
 
@@ -308,6 +309,18 @@ def cleanup(path: Path) -> CleanupReady | Kept:
     return CleanupReady(local, origin)
 
 
+def release_worktree_pair(path: Path) -> None:
+    try:
+        result = build_folders.release_removed_folder(path)
+    except (OSError, ValueError) as error:
+        print(f"Worktree pair kept for {str(path)!r}: {str(error)!r}", file=sys.stderr)
+        return
+    if result is build_folders.FolderPairRelease.PARTIAL:
+        print(f"Worktree pair partially released for {str(path)!r}", file=sys.stderr)
+    elif result not in (build_folders.FolderPairRelease.RELEASED, build_folders.FolderPairRelease.PAIR_ABSENT):
+        print(f"Worktree pair kept for {str(path)!r}: {result.value}", file=sys.stderr)
+
+
 def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended | Kept:
     path, repo = Path(record.path), Path(record.repo)
     resolver = session_staff.RowResolver(snapshot)
@@ -337,17 +350,24 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
     origin = origin_branch_state(record)
     if isinstance(origin, Kept):
         return origin
-    if isinstance(origin, CheckedOriginTip):
-        deletion = git(repo, "push", f"--force-with-lease=refs/heads/{record.branch}:{origin.sha}",
-                       "origin", "--delete", record.branch, check=False)
-        if deletion.returncode:
-            return Kept(path, "origin branch deletion failed; the worktree stays: " + failure_detail(deletion))
-    registered = path in worktree_branches(repo)
-    if local_branch_tip(repo, record.branch) != local:
-        return Kept(path, "the local branch changed after the cleanup check; the worktree stays")
-    if not build_folders.remove_build_folder(
-            path, lambda: git(repo, "worktree", "remove", str(path)) if path.exists() or registered else True):
-        return Kept(path, "the build folder lock is held; the worktree stays")
+    cargo_mark = scratch.cargo_removal_mark(path.resolve())
+    with ExitStack() as guards:
+        try:
+            _guard_cargo_cleanup(path, guards)
+        except (OSError, ValueError) as error:
+            return Kept(path, f"Cargo output kept: {error}")
+        if isinstance(origin, CheckedOriginTip):
+            deletion = git(repo, "push", f"--force-with-lease=refs/heads/{record.branch}:{origin.sha}",
+                           "origin", "--delete", record.branch, check=False)
+            if deletion.returncode:
+                return Kept(path, "origin branch deletion failed; the worktree stays: " + failure_detail(deletion))
+        registered = path in worktree_branches(repo)
+        if local_branch_tip(repo, record.branch) != local:
+            return Kept(path, "the local branch changed after the cleanup check; the worktree stays")
+        if not build_folders.remove_build_folder(
+                path, lambda: git(repo, "worktree", "remove", str(path)) if path.exists() or registered else True):
+            return Kept(path, "the build folder lock is held; the worktree stays")
+        cargo_mark.unlink(missing_ok=True)
     if isinstance(local, CheckedLocalTip):
         deletion = git(repo, "update-ref", "-d", f"refs/heads/{record.branch}", local.sha, check=False)
         if deletion.returncode:
@@ -361,6 +381,42 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
         raise Refused(1, failure_detail(config))
     record_file(path).unlink(missing_ok=True)
     return Ended(path, record.branch)
+
+
+def _guard_cargo_cleanup(path: Path, guards: ExitStack) -> None:
+    from scripts.buildlog.store import host_name
+    from scripts.lib import cargo_seed, conf
+
+    checkout = path.resolve()
+    if path.exists() and sys.platform == "linux":
+        try:
+            guards.enter_context(cargo_seed.checkout_guard(checkout, cargo_seed.CheckoutAccess.REMOVE))
+        except BlockingIOError as error:
+            raise OSError(f"Cargo seed is in progress: {checkout}") from error
+
+    settings = conf.read_or_repository("build_folders")
+    host = host_name()
+    cargo_root = cargo_seed.managed_cargo_root(settings, host).resolve()
+    directory = cargo_seed.managed_build_directory(checkout, settings, host, cargo_root)
+    if isinstance(directory, cargo_seed.UnmanagedBuildDirectory) or not directory.is_dir():
+        return
+    if sys.platform == "linux":
+        limits = cargo_seed.seed_limits(settings, host)
+        if isinstance(limits, cargo_seed.SeedLimits):
+            try:
+                guards.enter_context(cargo_seed.destination_guards((directory,), limits))
+            except BlockingIOError as error:
+                raise OSError(f"Cargo seed holds an output lock: {checkout}") from error
+    target = checkout / "target"
+    mark = scratch.cargo_removal_mark(checkout)
+    scratch.atomic_record(mark, [{
+        "workspace_root": str(checkout),
+        "target_directory": str(target),
+        "build_directory": str(directory),
+        "other_checkouts": [str(peer) for peer in scratch.cargo_checkout_peers(checkout)],
+        "shared_output_roots": [str(target.resolve())] if target.is_symlink() else [],
+    }])
+    scratch.clean_cargo_outputs(checkout, scratch.save_cargo_outputs(checkout))
 
 
 def end_landed(repo: Path, merge_branch: str) -> list[Ended | Kept]:
@@ -417,7 +473,12 @@ def main() -> int:
     check_cleanup = commands.add_parser("cleanup")
     _ = check_cleanup.add_argument("path")
     _ = check_cleanup.add_argument("--checked-tips", action="store_true")
+    release = commands.add_parser("release-pair")
+    _ = release.add_argument("path")
     arguments = parser.parse_args()
+    if cast(str, arguments.command) == "release-pair":
+        release_worktree_pair(Path(cast(str, arguments.path)).absolute())
+        return 0
     if cast(str, arguments.command) == "cleanup":
         try:
             result = cleanup(Path(cast(str, arguments.path)).expanduser().resolve())

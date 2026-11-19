@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from scripts.copies.copies_test_support import copies_environment
+from scripts.build_queue import first_step
 from scripts.lib import build_folders
 
 from scripts.production.fake_unit_host import labeled as labeled_host
@@ -49,6 +50,7 @@ from scripts.production.cli_fixture import invoke_cli, production_paths
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.production import fake_unit_host
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.message import sessions
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -98,6 +100,27 @@ raise SystemExit(codes[recipient])
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
+class LiteralScratchCommandTests(unittest.TestCase):
+    def test_only_literal_command_words_can_use_admission_before_the_slot(self) -> None:
+        literal = ('bash verify.sh check sample', 'bash "verify.sh" check "sample package"',
+                   "python3 targeted_test.py --type-dirs scripts/production")
+        shell = ('bash verify.sh check "$PKG"', 'bash verify.sh check ${PKG}',
+                 'bash verify.sh check $(printf sample)', 'bash verify.sh check `printf sample`',
+                 'bash verify.sh check sample*', 'bash verify.sh check sample?',
+                 'bash verify.sh check [ab]', 'bash verify.sh check sample > output',
+                 'bash verify.sh check sample < input', 'bash verify.sh check sample | cat',
+                 'bash verify.sh check sample && true', 'bash verify.sh check sample; true',
+                 'PKG=sample bash verify.sh check sample', 'bash verify.sh check ~',
+                 'bash verify.sh check {sample,other}', 'bash verify.sh check sample # comment',
+                 'bash verify.sh check sample\ntrue', 'bash verify.sh check "unterminated', '')
+        for command in literal:
+            with self.subTest(command=command):
+                self.assertTrue(waiting.command_words_need_no_shell_processing(command))
+        for command in shell:
+            with self.subTest(command=command):
+                self.assertFalse(waiting.command_words_need_no_shell_processing(command))
 
 
 @final
@@ -277,6 +300,7 @@ class WaitingTests(unittest.TestCase):
         if not path.exists():
             held = socket.socket(socket.AF_UNIX)
             held.bind(str(path))
+            held.listen(128)
             self.addCleanup(held.close)
         if pane not in self.host_pids:
             self.host_pids[pane] = fake_unit_host.live_pid(self)
@@ -284,9 +308,12 @@ class WaitingTests(unittest.TestCase):
         process = Path(os.environ["HERDR_PROC"]) / str(pid) / "environ"
         if not process.exists():
             fake_unit_host.place_process(os.environ, pid, pane, exec_shell=True)
-        self.write(self.root / "sessions" / f"{pane.removeprefix("w").split(":")[0]}.json", json.dumps({
-            "pid": pid, "sessionId": unit_membership("showrunner-example", (ALPHA, BETA, GAMMA)[int(pane[1:].split(":")[0]) - 1]).id, "name": name, "messagingSocketPath": str(path),
-            "updatedAt": 1, "tmux": ""}))
+        unit = (ALPHA, BETA, GAMMA)[int(pane[1:].split(":")[0]) - 1]
+        self.write(self.root / "sessions" / f"{pid}.json", json.dumps({
+            "pid": pid, "procStart": sessions.process_start(pid),
+            "sessionId": unit_membership("showrunner-example", unit).id,
+            "name": name, "messagingSocketPath": str(path), "updatedAt": 1, "tmux": "",
+        }))
 
     def write_production_doc(self) -> None:
         self.write(self.doc, "\n".join((
@@ -428,6 +455,24 @@ class WaitingTests(unittest.TestCase):
         log = self.scratch_log(result.stdout)
         self.assertIn("scratch green marker", log.read_text(encoding="utf-8"))
         self.assert_scratch_clean(before, unit_tip, merge_tip, local_refs, origin_refs)
+
+    def test_scratch_shell_expansion_keeps_admission_inside_the_command(self) -> None:
+        _ = self.commit(self.alpha, "verify.sh",
+            'test "$1" = check && test "$2" = sample || exit 9\nprintf "expanded package: %s\\n" "$2"\n')
+        self.push_scratch_branches()
+        self.env["PKG"] = "sample"
+        commands = ('bash verify.sh check "$PKG"',
+                    'bash verify.sh check "$(printf sample)"',
+                    'PKG=sample bash verify.sh check "$PKG"')
+        with mock.patch.object(first_step, "admitted_run",
+                side_effect=AssertionError("the shell command requested admission before expansion")) as admitted:
+            for command in commands:
+                with self.subTest(command=command):
+                    result = self.run_waiting("scratch-test", ALPHA, "--tests", command,
+                                              "--state-dir", str(self.state))
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("expanded package: sample", self.scratch_log(result.stdout).read_text())
+            admitted.assert_not_called()
 
     def test_scratch_red_keeps_full_log_and_cleans_worktree_without_claiming_block(self) -> None:
         unit_tip = self.commit(self.alpha, "alpha.txt", "unit work\n")

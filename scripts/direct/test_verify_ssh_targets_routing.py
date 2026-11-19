@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
+from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import OwningSession
 from scripts.direct import verify_ssh_targets_test_support as support
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
@@ -305,9 +306,63 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
                                 self.admission.server.publish_host_evidence(self.admission.server.host_probe(key))
                     _ = self.admission.run_pass()
                     with self.admission.loop_turn():
-                        self.assertTrue(all(isinstance(self.admission.server.assignments[placement.attempt_key(
+                        self.assertTrue(all(isinstance(self.admission.server.assignments[execution_identity.attempt_key(
                             attempt.assignment.episode, attempt.assignment.attempt)].state, placement.ClosedAssignment)
                             for attempt in saved), repr(saved) + result.stdout + result.stderr)
+
+    def test_prelaunch_failure_ends_pinned_and_placed_builds_after_one_attempt(self) -> None:
+        self.configure("natedev,linux")
+        _ = self.hold_memory()
+        self.write_executable(self.runner, r'''
+import os
+from pathlib import Path
+import sys
+
+assert "--assignment-file" in sys.argv
+with (Path(os.environ["TEST_RUNNER_STATE"]) / "source-captures").open("a") as attempts:
+    attempts.write("capture\n")
+Path(sys.argv[sys.argv.index("--result") + 1]).write_text(
+    "outcome=prelaunch_failed\ntarget=linux\nreason=\nseconds=0\n")
+print("The build did not run on linux. Fix the source refusal (IgnoredInput).")
+raise SystemExit(1)
+''')
+        captures = self.runner_state / "source-captures"
+        for target in (("--target", "linux"), ()):
+            with self.subTest(pinned=bool(target)):
+                captures.unlink(missing_ok=True)
+                result = self.verify("check", "sample", *target)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(captures.read_text().splitlines(), ["capture"])
+                self.assertEqual(result.stdout.count("The build did not run on linux."), 1)
+                self.assertEqual(self.local_runs(), [])
+
+    def test_pinned_hana_command_admission_refusal_prints_one_cause(self) -> None:
+        self.configure("natedev,linux")
+        self.write_executable(self.runner, r'''
+import os
+from pathlib import Path
+import sys
+
+cause = os.environ["TEST_GUEST_REFUSAL"]
+with (Path(os.environ["TEST_RUNNER_STATE"]) / "command-attempts").open("a") as attempts:
+    attempts.write("attempt\n")
+Path(sys.argv[sys.argv.index("--result") + 1]).write_text(
+    f"outcome=hana_command_admission_refused\ntarget=linux\nreason={cause}\nseconds=0\n")
+raise SystemExit(75)
+''')
+        attempts = self.runner_state / "command-attempts"
+        for cause in ("The data mount and a fresh permit are required",
+                      "Hana command admission is disabled on the guest"):
+            with self.subTest(cause=cause):
+                attempts.unlink(missing_ok=True)
+                result = self.verify("check", "sample", "--target", "linux", extra={"TEST_GUEST_REFUSAL": cause})
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 2, output)
+                self.assertEqual([line for line in output.splitlines() if "target linux refused:" in line],
+                                 [f"verify.sh: target linux refused: {cause}"])
+                self.assertEqual(output.count(cause), 1)
+                self.assertEqual(attempts.read_text().splitlines(), ["attempt"])
+                self.assertEqual(self.local_runs(), [])
 
     def test_pinned_toolchain_mismatch_records_a_repository_decline(self) -> None:
         from scripts.mac_test import eligibility, offload

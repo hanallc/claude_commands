@@ -1,5 +1,6 @@
 """Tests for the Codex wind-down: which processes count, whose they are, and the two messages."""
 from __future__ import annotations
+from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
 
 from scripts.agents import remote
 
@@ -9,7 +10,6 @@ import json
 import os
 import io
 import shlex
-import shutil
 import socket
 import subprocess
 import sys
@@ -27,6 +27,7 @@ from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import broadcast
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 from scripts.production import codex_winddown
+from scripts.production import live_units, session_staff
 from scripts.production import fake_unit_host
 from scripts.production import fake_showrunner
 from scripts.production import showrunners, staff
@@ -35,7 +36,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import herdr, worker_panes
 from scripts.message import process_table, roster
 from scripts.message.process_table import Process
-from scripts.message.sessions import SessionRecord
+from scripts.message.sessions import SessionRecord, process_start
 from scripts.production.showrunners import Showrunner
 
 SCRIPT = Path(__file__).with_name("codex_winddown.py")
@@ -83,12 +84,30 @@ class NoticeRetryTests(unittest.TestCase):
         output = io.StringIO()
         with (mock.patch.object(showrunners, "registered_showrunners", return_value=partial),
               mock.patch.object(codex_winddown, "current_counts", return_value={"healthy": 1}),
-              mock.patch.object(codex_winddown, "live_unit_ids", return_value=[healthy.id]) as units,
+              mock.patch.object(codex_winddown, "live_unit_ids",
+                                return_value=live_units.LiveUnitIds([healthy.id], {}, ())) as units,
               mock.patch.object(codex_winddown, "read_projections", return_value={}),
               redirect_stdout(output)):
             self.assertEqual(codex_winddown.main(["status"]), 1)
         units.assert_called_once_with(runner)
         self.assertIn("healthy", output.getvalue())
+
+    def test_an_unknown_unit_is_reported_without_counting_it_as_zero(self) -> None:
+        runner = Showrunner(session=self.runner.id, socket="/fixture", name="show", zone="UTC",
+                            doc=str(self.state / "doc.md"))
+        units = live_units.LiveUnitIds([], {self.unit.name: session_staff.UnknownUnit("pane read denied")},
+                                     ("registry unreadable",))
+        for report in (codex_winddown.status, lambda: codex_winddown.count(self.runner.id)):
+            with (mock.patch.object(showrunners, "registered_showrunners",
+                                    return_value=showrunners.ShowrunnerDiscovery([runner])),
+                  mock.patch.object(codex_winddown, "live_unit_ids", return_value=units),
+                  mock.patch.object(codex_winddown, "current_counts", return_value=Counter[str]()),
+                  mock.patch.object(codex_winddown, "announce_quiet"),
+                  redirect_stdout(io.StringIO()) as output):
+                self.assertEqual(report(), 0)
+            self.assertIn(f"{self.unit.name} - unknown - pane read denied", output.getvalue())
+            self.assertIn("show - unavailable - registry unreadable", output.getvalue())
+            self.assertNotIn("show - 0", output.getvalue())
 
     def test_quiet_claim_is_retried_after_a_stop_before_delivery(self) -> None:
         class Killed(BaseException):
@@ -151,7 +170,8 @@ class NoticeRetryTests(unittest.TestCase):
 
         runner = Showrunner(session=self.runner.id, socket="/fixture", name="show", zone="UTC", doc=str(self.state / "doc.md"))
         with (mock.patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery([runner])),
-              mock.patch.object(codex_winddown, "live_unit_ids", return_value=[self.unit.id]),
+              mock.patch.object(codex_winddown, "live_unit_ids",
+                                return_value=live_units.LiveUnitIds([self.unit.id], {}, ())),
               mock.patch.object(codex_winddown, "current_counts", return_value=Counter[str]()),
               mock.patch.object(codex_winddown, "refresh", side_effect=refresh),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT", "")),
@@ -196,7 +216,7 @@ class NoticeRetryTests(unittest.TestCase):
         with mock.patch.object(broadcast, "send", side_effect=Killed):
             with self.assertRaises(Killed):
                 _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 0}, 1000)
-        _ = staff.rename(self.unit.id, "renamed-unit")
+        _ = staff.rename(self.unit.id, "renamed")
         current = staff.native_id(fixture_runtime_id("winddown-after-clear"))
         _ = staff.update_current_session(self.unit.current_session, current)
         from scripts.message import sessions
@@ -589,7 +609,8 @@ class MessageTests(unittest.TestCase):
             self.addCleanup(listener.close)
             listener.bind(str(socket_dir / f"{name}.sock"))
             _ = (self.root / f"sessions/{pid}.json").write_text(json.dumps({
-                "pid": pid, "sessionId": fixture_runtime_id("showrunner::show") if name == "hana" else
+                "pid": pid, "procStart": process_start(pid),
+                "sessionId": fixture_runtime_id("showrunner::show") if name == "hana" else
                     fixture_runtime_id("unit:" + fixture_runtime_id("showrunner::show") + ":trunk"), "name": name, "updatedAt": 1,
                 "tmux": "",
                 "messagingSocketPath": str(socket_dir / f"{name}.sock"),
@@ -618,7 +639,9 @@ class MessageTests(unittest.TestCase):
             "UNIT_HISTORY_DIR": str(self.root / "history"),
             "CONF_DIR": str(self.root / "config"),
         }
-        _ = shutil.copytree(SCRIPT.parents[2] / "config", self.root / "config")
+        configuration = self.root / "config"
+        _ = copy_config_fixture(SCRIPT.parents[2] / "config", configuration)
+        _ = write_config_fixture(configuration / "accounts.conf", "codex_credit_accounts=none\n")
         self.environment.update(fake_unit_host.environment(self.root))
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
@@ -716,8 +739,7 @@ class MessageTests(unittest.TestCase):
 
     def test_start_and_triage_say_first_that_paid_credits_stay_on(self) -> None:
         accounts = self.root / "config/accounts.conf"
-        _ = accounts.write_text(accounts.read_text(encoding="utf-8").replace(
-            "\ncodex_credit_accounts=none\n", "\ncodex_credit_accounts=codex2 codex1\n"), encoding="utf-8")
+        _ = write_config_fixture(accounts, "codex_credit_accounts=codex2 codex1\n")
         line = ("Paid credits stay on for codex1, codex2. The wind-down does not stop them. "
                 + "To stop them, get the user's go and run: /tune accounts codex_credit_accounts none")
         before = accounts.read_bytes()
@@ -766,7 +788,7 @@ class MessageTests(unittest.TestCase):
         self.set_processes(f"{os.getppid()} 1 claude claude", f"40 {os.getppid()} codex codex exec task")
         with mock.patch.dict(os.environ, self.environment):
             runner = showrunners.require_complete(showrunners.registered_showrunners())[0]
-            self.assertEqual(codex_winddown.live_unit_ids(runner), [renamed.id])
+            self.assertEqual(codex_winddown.live_unit_ids(runner).proved_ids, [renamed.id])
         counted = self.run_script("count", owner.id)
         self.assertEqual(counted.returncode, 0, counted.stderr)
         self.assertIn("renamed-trunk - 1", counted.stdout)
