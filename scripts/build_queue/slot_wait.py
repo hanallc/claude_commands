@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
-from functools import cache, cached_property, lru_cache
+from functools import cache, lru_cache
 import os
 from pathlib import Path
 import re
@@ -15,22 +15,15 @@ import subprocess
 from threading import Thread
 
 from scripts.lib import conf
-from scripts.lib.build_steps import (INTERPRETER, LONG_VALUE_OPTIONS, RAW_ID, RECORDED_STEP_NAMES, RECORDED_VERBS,
+from scripts.lib.build_steps import (INTERPRETER, LONG_VALUE_OPTIONS, RECORDED_STEP_NAMES, RECORDED_VERBS,
                                      SHORT_OWNER_STEPS, VERIFY_VERBS, StepJob, StepNames, VerifyCommand, command_job,
                                      command_script, is_recorded_step, queue_identifier, script_file, verify_command)
 from scripts.build_queue import admission_wire as wire
+from scripts.build_queue.snapshot_codec import RAW_ID, public_queue_text as public_queue_text, select_queue_name
 from scripts.message.owner_role import OwnerRole
 
 
 SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh", "fish", "ash", "csh", "tcsh"})
-
-
-def public_queue_text(text: str) -> str:
-    """Return text that can appear in a queue name or owner field."""
-    text = " ".join(text.split())
-    if text in ("", "—", "owner not recorded") or "$" in text or RAW_ID.search(text):
-        return ""
-    return text
 
 
 class QueueKind(Enum):
@@ -54,8 +47,8 @@ class QueueRowName(str):
         return str.__new__(cls, kind.value)
 
     @classmethod
-    def owner_only(cls, owner: str) -> QueueRowName:
-        return str.__new__(cls, public_queue_text(owner) or "—")
+    def owner_only(cls, *candidates: object) -> QueueRowName:
+        return str.__new__(cls, select_queue_name(*candidates))
 
     @classmethod
     def repository(cls, repository: str, folder: str = "") -> QueueRowName | NoNamedStep:
@@ -144,9 +137,9 @@ class SlotCaller:
     command: tuple[str, ...]
     work: str
 
-    @cached_property
+    @property
     def step(self) -> QueueRowName | NoNamedStep:
-        """Read the command only when the slot must wait."""
+        """Read the step name for this slot request."""
         if self.command:
             return command_slot_name(self.command, RECORDED_STEP_NAMES)
         return recorded_step(self.work, RECORDED_STEP_NAMES)
@@ -227,16 +220,21 @@ printf '%s' "$VERIFY_PACKAGE"
 """
 
 
-@lru_cache(maxsize=128)
 def verify_package(step: str, arguments: tuple[str, ...]) -> str:
     """Pass literal arguments to the verify parser without starting a build."""
     try:
-        result = subprocess.run(["bash", "--noprofile", "--norc", "-c", verify_package_parser(),
-                                 "verify-package", step, *arguments], env={}, stdin=subprocess.DEVNULL,
-                                capture_output=True, text=True, timeout=2, check=False)
-    except (OSError, subprocess.TimeoutExpired, AssertionError):
+        return _parse_verify_package(step, arguments)
+    except (OSError, subprocess.SubprocessError, AssertionError):
         return ""
-    return result.stdout if result.returncode == 0 else ""
+
+
+@lru_cache(maxsize=128)
+def _parse_verify_package(step: str, arguments: tuple[str, ...]) -> str:
+    result = subprocess.run(["bash", "--noprofile", "--norc", "-c", verify_package_parser(),
+                             "verify-package", step, *arguments], env={}, stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True, timeout=2, check=False)
+    result.check_returncode()
+    return result.stdout
 
 
 def command_slot_name(command: Sequence[str], names: StepNames) -> QueueRowName | NoNamedStep:

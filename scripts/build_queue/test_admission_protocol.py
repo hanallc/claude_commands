@@ -317,11 +317,19 @@ class ProtocolTests(unittest.TestCase):
             line = json.dumps(encoded) + "\n"
             self.assertEqual(wire.parse_reply(line), reply)
             granted = admitted_reply()
-            transport = ScriptedTransport(fixture.clock, Exchange((line + wire.encode_reply(granted)).encode()))
+            exchange = Exchange(line.encode())
+            transport = ScriptedTransport(fixture.clock, exchange)
             waits: list[wire.Wait] = []
-            with mock.patch.object(client, "CLOCK", fixture.clock), mock.patch.object(
-                    socket, "socket", side_effect=transport.socket), redirect_stderr(io.StringIO()):
-                result = client.admit(request, waits.append, lambda: request)
+
+            def receive_wait(wait: wire.Wait) -> None:
+                waits.append(wait)
+                exchange.events.append(wire.encode_reply(granted).encode())
+
+            with (mock.patch.object(client, "CLOCK", fixture.clock),
+                  mock.patch.object(socket, "socket", side_effect=transport.socket),
+                  mock.patch.object(client, "DefaultSelector", side_effect=transport.selector),
+                  redirect_stderr(io.StringIO())):
+                result = client.admit(request, receive_wait, lambda: request)
             self.assertEqual(waits, [reply])
             self.assertEqual(result, granted)
             self.assertEqual(len(transport.requests), 1)
@@ -518,6 +526,30 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
                                 _ = decode_legacy(json.dumps(envelope))
                         self.assertEqual(wire.parse_request_envelope(json.dumps(envelope)), (version, shaped))
                         self.assertEqual(wire.parse_record(json.dumps(data), wire.AdmitRequest), shaped)
+
+    def test_verify_metadata_is_optional_and_older_decoders_ignore_it(self) -> None:
+        from scripts.build_queue.test_placement import placement_request
+
+        with AdmissionFixture() as fixture:
+            old = fixture.request(step="build")
+            assert isinstance(old.profile, records.StepProfile)
+            old = replace(old, profile=replace(old.profile,
+                peak=records.ExpectedPeak(10 * GIB, "shape", 14, records.ShapeRankedPeak(14, 10))))
+            facts = records.VerifyCall("build", "verify build sample --release", 1, 1)
+            request = replace(old, identity=replace(old.identity, verify=facts))
+            encoded = wire.encode_request(request)
+            self.assertEqual(wire.parse_request(encoded), request)
+            old_message = wire.encode_request(old)
+            self.assertNotIn('"verify":', old_message)
+            self.assertEqual(wire.parse_request(old_message), old)
+            placed = placement_request(fixture)
+            placed = replace(placed, identity=replace(placed.identity, verify=facts))
+            self.assertEqual(wire.parse_request(wire.encode_request(placed)), placed)
+            for version in (1, 2):
+                previous = cast(dict[str, object], json.loads(old_message))
+                current = cast(dict[str, object], json.loads(encoded))
+                previous["v"] = current["v"] = version
+                self.assertEqual(decode_legacy(json.dumps(previous)), decode_legacy(json.dumps(current)))
 
     def test_every_reply_round_trips_and_domain_payloads_use_the_shared_codec(self) -> None:
         with AdmissionFixture() as fixture:
