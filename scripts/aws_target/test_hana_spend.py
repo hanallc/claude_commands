@@ -12,13 +12,13 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.aws_target import config, hana_spend, ledger
-from scripts.aws_target.ledger_test_support import CostFixture, git_only, install_hana_spending_settings, instant
+from scripts.aws_target.ledger_test_support import CostFixture, git_only, install_hana_spending_settings, instant, text_setting
 from scripts.lib import conf
 
 
 class HanaSpendTests(CostFixture):
     book: ledger.CostLedger  # pyright: ignore[reportUninitializedInstanceVariable]
-    controller: hana_spend.HanaSpending  # pyright: ignore[reportUninitializedInstanceVariable]
+    controller: hana_spend.HanaSpending[hana_spend.PermitSettings]  # pyright: ignore[reportUninitializedInstanceVariable]
     workload: hana_spend.PermitSettings  # pyright: ignore[reportUninitializedInstanceVariable]
     start: int = instant('2026-01-15T00:00:00+00:00')
 
@@ -52,6 +52,15 @@ class HanaSpendTests(CostFixture):
         self.assertEqual(result.exposure.usd_per_hour, self.workload.spot_max_usd_per_hour)
         self.assertEqual(result.exposure.expires, self.start + self.workload.permit_max_seconds)
         self.assertEqual(state.hana_storage[0].usd_per_month, self.workload.storage_usd_per_month)
+
+    def test_fallback_types_reject_empty_items_and_duplicates(self) -> None:
+        configuration = self.root / 'hana_aws.conf'
+        for value in ('c7a.4xlarge,', ',m7i.4xlarge', 'c7a.4xlarge,c7a.4xlarge',
+                      f'c7a.4xlarge,{self.workload.instance_type}'):
+            with self.subTest(value=value):
+                text_setting(configuration, 'fallback_instance_types', value)
+                with self.assertRaisesRegex(ValueError, 'distinct types and no empty items'):
+                    _ = hana_spend.read_settings(conf.read(configuration))
 
     def test_hana_budget_refuses_start_and_saves_no_exposure(self) -> None:
         self.controller.settings = replace(self.workload, daily_budget_usd=self.workload.storage_usd_per_month / 60)

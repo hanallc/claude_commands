@@ -4,6 +4,7 @@ from __future__ import annotations
 from scripts.production.change_review_test_support import fixture_image, fixture_row_image, pictured_changes, registered_fixture_image
 
 import fcntl
+import hashlib
 import html
 import os
 import re
@@ -26,23 +27,24 @@ from io import StringIO
 from functools import cache
 from pathlib import Path
 from types import ModuleType
-from typing import Literal, cast, override
+from typing import Literal, TextIO, cast, override
 from collections.abc import Callable, Generator
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
+from uuid import uuid4
 
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib import atomic_file, conf, urgency
+from scripts.lib import atomic_file, conf, scratch, urgency
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
-from scripts.production import change_routing, change_review, footer_counts, next_item, showrunners, staff, unrouted_alert, update_registration
+from scripts.production import change_routing, change_review, footer_counts, next_item, record_store, showrunners, staff, unrouted_alert, update_registration
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.feature_log import feature_log
-from scripts.review_links import change_browser, change_page, serve, image_store, page_frame, review_link
-from scripts.review_links import question_record
+from scripts.review_links import change_browser, change_page, serve, image_store, page_frame, review_events, review_link
+from scripts.review_links import new_item_dialog, question_record, review_actions, review_items, review_submissions
 from scripts.rebuild import need
 from scripts.statusline import rebuild_row
 from scripts.agents.remote import local_machine
@@ -735,10 +737,14 @@ class ChangePageTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.set_up_review(changes=3, legacy_links=True)
+
+    def set_up_review(self, *, changes: int, legacy_links: bool = False) -> None:
         self.temporary = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="change-page-test-")))
-        cache_home = self.temporary / "cache"
-        seed_interpreter_cache(cache_home)
-        self.enterContext(patch.dict(os.environ, {"XDG_CACHE_HOME": str(cache_home), "CLAUDE_PYTHON": ""}))
+        if legacy_links:
+            cache_home = self.temporary / "cache"
+            seed_interpreter_cache(cache_home)
+            self.enterContext(patch.dict(os.environ, {"XDG_CACHE_HOME": str(cache_home), "CLAUDE_PYTHON": ""}))
         self.root = self.temporary / "snapshots"
         configuration = self.temporary / "config"
         configuration.mkdir()
@@ -748,7 +754,8 @@ class ChangePageTests(unittest.TestCase):
         _ = self.enterContext(patch.object(unrouted_alert, "send_message"))
         self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)}))
         self.repo = self.temporary / "repo"
-        _ = shutil.copytree(repository_seed(), self.repo)
+        if legacy_links:
+            _ = shutil.copytree(repository_seed(), self.repo)
         self.enterContext(patch.dict(os.environ, {
             "REVIEW_LINKS_ROOT": str(self.root), "REVIEW_LINKS_HOST": "127.0.0.1",
             "NEXT_STATE_DIR": str(self.temporary / "next"),
@@ -764,11 +771,12 @@ class ChangePageTests(unittest.TestCase):
         }))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.temporary / "notifier"))
         _ = self.enterContext(patch.object(change_review, "lists_directory", return_value=self.temporary))
-        _ = self.enterContext(patch("scripts.production.change_review.lists_directory", return_value=self.temporary))
-        _ = fixture_member("showrunner", name="demo")
-        _ = registered_fixture_image(self.root, "012345abcdef")
+        if legacy_links:
+            _ = fixture_member("showrunner", name="demo")
+        if changes:
+            _ = registered_fixture_image(self.root, "012345abcdef")
         item = change_review.Visible("Numbered moves", "Run moves list", "Each group starts at 1")
-        merged = self.git("rev-parse", "HEAD")
+        merged = self.git("rev-parse", "HEAD") if legacy_links else ""
         # A production file is configuration: neither a recipient nor a checkout
         # comes from the submitted form.
         self.production = self.temporary / "demo.md"
@@ -779,16 +787,32 @@ class ChangePageTests(unittest.TestCase):
 - **Showrunner session:** fallback-owner
 - **Change review:** `{self.review_list}`
 """, encoding="utf-8")
-        runner = fixture_member("showrunner", name="page-owner", doc=staff.LiveDoc(local_machine(), self.production))
-        self.unit = fixture_member("unit", name="builder-unit", parent=runner.id,
-                                   worktree=staff.PresentWorktree(local_machine(), Path("/unused/feature")))
-        _ = change_review.append_rows(self.review_list, pictured_changes([item, item, change_review.Visible(
-            "Internal comments clarified", "Read the diff", "The old and new comments agree with the tests")]),
-            date(2026, 11, 1), merged, self.production, producers=[self.unit.id] * 3, record=staff.snapshot())
-        for row, kind in (("C1", "See in action"), ("C2", "See in action"), ("C3", "Read only")):
-            _ = change_review.set_row_kind(self.review_list, row, kind, self.production)
-        self.page_path = urlsplit(change_page.publish(self.production, self.review_list, ["C1", "C3"])).path
-        self.page = change_page.page_at(self.root, self.page_path)
+        machine = local_machine()
+        document = staff.LiveDoc(machine, self.production)
+        worktree = staff.PresentWorktree(machine, Path("/unused/feature"))
+        if legacy_links:
+            runner = fixture_member("showrunner", name="page-owner", doc=document)
+            self.unit = fixture_member("unit", name="builder-unit", parent=runner.id, worktree=worktree)
+        else:
+            runner_id = staff.StaffId(fixture_runtime_id("showrunner::page-owner"))
+            unit_id = staff.StaffId(fixture_runtime_id(f"unit:{runner_id}:builder-unit"))
+            runner = staff.StaffRow(runner_id, "showrunner", "page-owner", staff.StaffRoot(),
+                                    doc=document, current_session=runner_id)
+            self.unit = staff.StaffRow(unit_id, "unit", "builder-unit", staff.ReportsTo(runner_id),
+                                       worktree=worktree, current_session=unit_id, unit_type=staff.UnitDetails("direct"))
+            _ = staff.record_path().write_text(staff.StaffSnapshot((runner, self.unit)).encode())
+        rows = [item, item, change_review.Visible(
+            "Internal comments clarified", "Read the diff", "The old and new comments agree with the tests")][:changes]
+        if rows:
+            # The fixture list is outside the fixture repository.
+            with patch.object(change_review, "_commit"):
+                _ = change_review.append_rows(self.review_list, pictured_changes(rows), date(2026, 11, 1), merged,
+                    self.production, producers=[self.unit.id] * changes, record=staff.snapshot())
+                for row, kind in (("C1", "See in action"), ("C2", "See in action"), ("C3", "Read only"))[:changes]:
+                    _ = change_review.set_row_kind(self.review_list, row, kind, self.production)
+        if legacy_links:
+            self.page_path = urlsplit(change_page.publish(self.production, self.review_list, ["C1", "C3"])).path
+            self.page = change_page.page_at(self.root, self.page_path)
         self.messages = []
         self.raw_messages = []
         self.delivery_done = threading.Event()
@@ -803,8 +827,11 @@ class ChangePageTests(unittest.TestCase):
         _ = self.enterContext(patch.object(change_page, "deliver", side_effect=finish_delivery))
         _ = self.enterContext(patch.object(change_page, "send_message", side_effect=self.capture_message))
         _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
+        if not legacy_links:
+            return
         # Restart tests start recovery after they create the pending records.
-        with patch.object(change_page, "recover_pending"):
+        with (patch.object(change_page, "recover_pending"),
+              patch.object(serve, "loaded_module_stamps", return_value={})):
             server = serve.ReviewLinksServer(("127.0.0.1", 0), self.root)
         self.port = server.server_port
         self.addCleanup(server.server_close)
@@ -841,8 +868,8 @@ class ChangePageTests(unittest.TestCase):
         began, release = threading.Event(), threading.Event()
         begin = status.begin
         def pause_begin(page: change_page.ReviewPage, row: str, kind: Literal["verdict", "validation"],
-                        feedback: str = "", *, recipients: tuple[staff.StaffId, ...] = ()) -> str:
-            attempt = begin(page, row, kind, feedback, recipients=recipients)
+                        feedback: str = "", *, recipients: tuple[staff.StaffId, ...] = (), user_verdict: bool = False) -> str:
+            attempt = begin(page, row, kind, feedback, recipients=recipients, user_verdict=user_verdict)
             began.set()
             if not release.wait(TEST_HANG_GUARD_SECS):
                 raise RuntimeError("test did not release the save")
@@ -1254,6 +1281,36 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(forms.counts["page-owner"], 2)
         self.assertEqual(footer_counts.changes(self.production), forms.counts["page-owner"])
         self.assert_no_delivery_controls(content)
+
+    def test_submission_message_recovery_reuses_the_claim_and_receipt(self) -> None:
+        recipient = fixture_member('producer', name='producer')
+        kind = new_item_dialog.SubmissionKind.BUG
+        request = new_item_dialog.NewItemRequest(f'r1-{uuid4().hex}-{kind}-{recipient.id}', kind,
+                                                recipient.id, 'Check the build.', new_item_dialog.NoEvidence())
+        native = review_submissions.submit(request)
+        status = change_page.DeliveryStatus(self.root)
+        first = review_actions.prepare_submission_delivery(native, request.words, status)
+        assert isinstance(first, change_page.MessageDelivery)
+        self.assertIsInstance(review_actions.prepare_submission_delivery(native, request.words, status),
+                              change_page.NoMessageDelivery)
+        self.assertIn(change_page.reply_command(native.key, native.reply_token), first.message)
+        with patch.object(change_page, 'send_with_retries', return_value=[
+            change_page.DeliveryFailure(recipient.id, 'The fixture sender is unavailable.')
+        ]), patch.object(change_page, 'send_to_staff') as alert:
+            change_page.deliver(first, status)
+        alert.assert_called_once()
+        self.assertIn('The fixture sender is unavailable.', cast(str, alert.call_args.args[2]))
+        retried = review_actions.prepare_submission_delivery(native, request.words, status)
+        assert isinstance(retried, change_page.MessageDelivery)
+        self.assertEqual(retried.attempt, first.attempt)
+        restarted = change_page.DeliveryStatus(self.root)
+        with patch.object(change_page, 'send_to_staff') as send:
+            with patch.object(restarted, 'write_slots', side_effect=OSError('Cannot write the delivery receipt.')):
+                change_page.recover_review_messages(restarted)
+            change_page.recover_review_messages(change_page.DeliveryStatus(self.root))
+            send.assert_called_once_with(recipient.id, change_page.SENDER, first.message)
+        self.assertIsInstance(review_actions.prepare_submission_delivery(native, request.words, restarted),
+                              change_page.NoMessageDelivery)
 
     def test_delivery_failure_survives_restart_until_the_same_row_succeeds(self) -> None:
         status = change_page.DeliveryStatus(self.root)
@@ -1763,20 +1820,40 @@ class ChangePageTests(unittest.TestCase):
     def file_user_question(self, text: str = "Choose the layout", *, asker: staff.StaffRow | None = None,
                            question: str = "Which layout gives each review card enough space for its controls?\n"
                            + "1. Compact <layout>\n2. Wide layout") -> str:
-        """File a canonical question without a reviewer or a real message sender."""
+        """Write a legacy Question fixture without allocating an ID."""
         document = self.production.read_text()
         if "- **Merge branch:**" not in document:
             _ = self.production.write_text(document + "- **Merge branch:** main\n- **Log:** progress.log\n")
         record = staff.snapshot()
         identities = update_registration.QuestionStaff.for_record(record)
         owner = next(row for row in record.rows if row.name == "page-owner")
-        production = read_production(owner, record)
-        items = [item.item for item in update_registration.question_records(production, identities) if item.status == "open"]
+        folder = update_registration.question_folder(self.production, identities)
+        assert isinstance(folder, update_registration.QuestionFolder)
+        asker = asker or self.unit
+        digest = hashlib.sha256(f"{owner.id}:{asker.id}:{text}".encode()).hexdigest()[:16]
+        path = folder.path / f"question-{asker.id}-{digest}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
         item = update_registration.OutstandingItem(since="2026-11-12T12:00", text=text, question=question,
-                                                   asked_by=(asker or self.unit).id)
-        update_registration.store_questions(production, [*items, item], identities)
-        filed = next(item for item in update_registration.question_records(production, identities) if item.item["text"] == text)
-        return "question/" + owner.id + "/" + filed.path.name
+                                                   asked_by=asker.id)
+        update_registration.write_question_record(update_registration.QuestionRecord(path, owner.id, asker.id, item, "open"))
+        return "question/" + owner.id + "/" + path.name
+
+    def test_f075_open_shows_a_legacy_question_when_numbering_fails(self) -> None:
+        key = self.file_user_question()
+        other_key = self.file_user_question("Read the numbered Question?")
+        folder = update_registration.question_folder(self.production, update_registration.QuestionStaff.read())
+        assert isinstance(folder, update_registration.QuestionFolder)
+        path = folder.path / key.rsplit("/", 1)[-1]
+        numbered = folder.path / other_key.rsplit("/", 1)[-1]
+        _ = numbered.write_text(numbered.read_text().replace('registration: {', 'registration: {"review_id": "Q8", ', 1))
+        before = {record: record.read_bytes() for record in (path, numbered)}
+        blocked = record_store.default_question_folder(staff.StaffId("other-owner")) / "question-undecodable.md"
+        blocked.parent.mkdir(parents=True)
+        _ = blocked.write_bytes(b"---\n\xff\n")
+        items = review_items.read(self.root, show="open", kinds=(review_items.ReviewType.QUESTION,))
+        self.assertEqual({item.key: item.id for item in items}, {key: "", other_key: "page-owner/Q8"})
+        self.assertEqual({record: record.read_bytes() for record in before}, before)
+        self.assertFalse((record_store.state_root() / "record-ids" / "question.water").exists())
 
     def test_questions_page_renders_the_reviewed_memory_bar_record_without_changing_it(self) -> None:
         key = self.file_user_question(MEMORY_BAR_ASK, question=MEMORY_BAR_RAW)
@@ -2053,6 +2130,96 @@ class ChangePageTests(unittest.TestCase):
             self.assertIn("First answer", self.messages[-1][2])
             self.assertNotIn("Second answer", self.messages[-1][2])
 
+    def test_open_question_answer_recovers_for_the_asker_when_the_saved_mark_fails(self) -> None:
+        key = self.file_user_question("Keep the saved answer")
+        status = change_page.DeliveryStatus(self.root)
+        browser = change_page.ReviewBrowser("private", kind="questions")
+        question = next(item for item in change_browser.prepare(browser, status).questions if item.key == key)
+        write_slots = status.write_slots
+
+        def write(page: change_page.ReviewPage, row: str, slots: change_page.DeliverySlots) -> None:
+            if (isinstance(page, change_page.UserQuestionPage) and page.saved["saved"]
+                    and isinstance(slots.verdict, change_page.DeliveryIntent)):
+                raise OSError("fixture saved mark failed")
+            write_slots(page, row, slots)
+
+        with patch.object(status, "write_slots", new=write):
+            delivery, answer = change_browser.submit_question(question, "answer", "Keep it", status)
+        self.assertEqual(answer, "Keep it")
+        self.assertEqual(delivery.recipients, (self.unit.id,))
+        self.assertTrue(status.review_save_receipt(delivery.page, delivery.row).exists())
+        self.assertEqual(self.messages, [])
+        change_page.recover_question_answers(change_page.DeliveryStatus(self.root))
+        change_page.recover_question_answers(change_page.DeliveryStatus(self.root))
+        self.assertEqual([recipient for recipient, _, _ in self.messages], [self.unit.name])
+        self.assertIn("Keep it", self.messages[0][2])
+        self.assertFalse(status.review_save_receipt(delivery.page, delivery.row).exists())
+
+    def test_a_failed_question_log_write_preserves_the_answer_delivery(self) -> None:
+        key = self.file_user_question("Keep the answer if its log fails")
+        status = change_page.DeliveryStatus(self.root)
+        browser = change_page.ReviewBrowser("private", kind="questions")
+        question = next(item for item in change_browser.prepare(browser, status).questions if item.key == key)
+        with patch.object(update_registration, "record_review_log", side_effect=OSError("fixture log write failed")):
+            delivery, answer = change_browser.submit_question(question, "answer", "Keep this answer", status)
+        self.assertEqual(answer, "Keep this answer")
+        self.assertIsInstance(status.slots(delivery.page, delivery.row).verdict, change_page.DeliveryIntent)
+        change_page.recover_question_answers(change_page.DeliveryStatus(self.root))
+        change_page.recover_question_answers(change_page.DeliveryStatus(self.root))
+        self.assertEqual([recipient for recipient, _, _ in self.messages], [self.unit.name])
+        self.assertIn(answer, self.messages[0][2])
+
+    def test_question_recovery_ignores_read_errors_on_other_questions(self) -> None:
+        key = self.file_user_question("Recover this answer")
+        unrelated_key = self.file_user_question("Leave this question alone")
+        status = change_page.DeliveryStatus(self.root)
+        browser = change_page.ReviewBrowser("private", kind="questions")
+        questions = {item.key: item for item in change_browser.prepare(browser, status).questions}
+        unrelated = questions[unrelated_key].record.path
+        _ = change_browser.submit_question(questions[key], "answer", "Use this answer", status)
+        open_path = Path.open
+
+        def read(path: Path, mode: Literal["r"] = "r", buffering: int = -1,
+                 encoding: str | None = None, errors: str | None = None, newline: str | None = None) -> TextIO:
+            if path == unrelated:
+                raise OSError("fixture unrelated question read failed")
+            return open_path(path, mode, buffering, encoding, errors, newline)
+
+        with patch.object(Path, "open", new=read):
+            change_page.recover_question_answers(change_page.DeliveryStatus(self.root))
+        self.assertEqual([recipient for recipient, _, _ in self.messages], [self.unit.name])
+        self.assertIn("Use this answer", self.messages[0][2])
+
+    def test_question_recovery_keeps_the_receipt_when_the_source_read_fails(self) -> None:
+        key = self.file_user_question("Read the saved answer again")
+        status = change_page.DeliveryStatus(self.root)
+        browser = change_page.ReviewBrowser("private", kind="questions")
+        question = next(item for item in change_browser.prepare(browser, status).questions if item.key == key)
+        delivery, _ = change_browser.submit_question(question, "answer", "Use the saved answer", status)
+        page = delivery.page
+        assert isinstance(page, change_page.UserQuestionPage)
+        slots = status.slots(page, delivery.row)
+        status.write_slots(replace(page, saved={**page.saved, "saved": False}), delivery.row, slots)
+        receipt = status.review_save_receipt(page, delivery.row)
+        _ = receipt.write_text(delivery.attempt + "\n")
+        open_path = Path.open
+
+        def read(path: Path, mode: Literal["r"] = "r", buffering: int = -1,
+                 encoding: str | None = None, errors: str | None = None, newline: str | None = None) -> TextIO:
+            if path == question.record.path:
+                raise OSError("fixture question read failed")
+            return open_path(path, mode, buffering, encoding, errors, newline)
+
+        with patch.object(Path, "open", new=read):
+            change_page.recover_question_answers(change_page.DeliveryStatus(self.root))
+        self.assertEqual(status.slots(page, delivery.row), slots)
+        self.assertTrue(receipt.exists())
+        self.assertEqual(self.messages, [])
+        change_page.recover_question_answers(change_page.DeliveryStatus(self.root))
+        self.assertEqual([recipient for recipient, _, _ in self.messages], [self.unit.name])
+        self.assertIn("Use the saved answer", self.messages[0][2])
+        self.assertFalse(receipt.exists())
+
     def test_followup_waits_for_the_reply_and_skip_moves_a_question_to_the_end(self) -> None:
         texts = {self.file_user_question("Choose first"): "Choose first",
                  self.file_user_question("Choose second"): "Choose second"}
@@ -2207,7 +2374,7 @@ class ChangePageTests(unittest.TestCase):
         status = change_page.DeliveryStatus(self.root)
         browser = change_browser.page_at(self.root, path)
         fields = self.browser_fields(forms, "page-owner/C4", "question", "Who checks this?")
-        with self.assertRaisesRegex(question_record.AnswerRefused, "no showrunner to answer a question"):
+        with self.assertRaisesRegex(question_record.AnswerRefused, "no showrunner to receive the request"):
             _ = change_browser.submit(browser, urlencode(fields), status)
         self.assertEqual(self.review_list.read_bytes(), before)
         self.assertFalse(status.path(self.page, "C4").exists())
@@ -2217,8 +2384,11 @@ class ChangePageTests(unittest.TestCase):
             self.assertEqual(self.http_request(path, fields).status, 400)
             self.assertEqual(self.review_list.read_bytes(), before)
             self.assertNotIn("feedback", forms.outcomes["page-owner/C4"])
-        self.assertEqual(self.http_request(path, self.browser_fields(forms, "page-owner/C4")).status, 200)
-        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        with (patch.object(scratch, "end", side_effect=conf.Unusable("scratch settings unavailable")),
+              redirect_stderr(StringIO()) as errors):
+            self.assertEqual(self.http_request(path, self.browser_fields(forms, "page-owner/C4")).status, 200)
+            self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        self.assertIn("scratch not removed: scratch settings unavailable", errors.getvalue())
         self.assertEqual(self.messages, [])
         saved = next(row for row in change_review.review_rows(self.review_list) if row["#"] == "C4")
         self.assertEqual(saved["Verdict"], "works")
@@ -2237,6 +2407,16 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn("Pass it on by hand", self.messages[0][2])
 
     def test_a_legacy_failed_verdict_shows_the_saved_answer_and_sends_nothing(self) -> None:
+        before = self.review_list.read_bytes()
+        conflict = change_review.VerdictConflict("not works", "2026-11-01")
+        with (patch.object(change_review, "record_verdict", return_value=conflict),
+              patch.object(scratch, "end", side_effect=conf.Unusable("scratch settings unavailable")),
+              redirect_stderr(StringIO()) as errors):
+            self.assertEqual(self.request(self.page_path, self.answer()).status, 400)
+        self.assertIn("scratch not removed: scratch settings unavailable", errors.getvalue())
+        self.assertEqual(self.review_list.read_bytes(), before)
+        self.assert_record_cleared()
+
         self.assertEqual(self.request(self.page_path, self.answer(outcome="not works")).status, 303)
         status = change_page.DeliveryStatus(self.root)
         _ = status.path(self.page, "C1").write_text(json.dumps({"attempt": "old", "state": "failed", "kind": "verdict"}))
@@ -2439,7 +2619,7 @@ class ChangePageTests(unittest.TestCase):
         status = change_page.DeliveryStatus(self.root)
         with patch.object(feature_log, "drop_review", side_effect=feature_log.FeatureLogError("bad proposal /private/file.json")):
             with self.assertRaises(change_page.FeatureLogFailed):
-                change_page.closeout_before_save(self.page, self.production, "C1", "not works", status)
+                _ = change_page.closeout_before_save(self.page, self.production, "C1", "not works", status)
         self.assertEqual(len(self.messages), 3)
         self.delivery_done.clear()
         saved = self.http_request(path, fields)
@@ -2702,7 +2882,7 @@ class ChangePageTests(unittest.TestCase):
 
     def test_browser_feedback_waits_for_the_showrunner_note_before_returning_to_the_count(self) -> None:
         path, forms, _ = self.browser()
-        before = self.review_list.read_bytes()
+        before = change_page.answer_row(self.page, "C1")
         self.delivery_done.clear()
         fields = self.browser_fields(forms, "page-owner/C1", "feedback", "Make <this> proof clearer")
         reply = self.http_request(path, fields)
@@ -2717,7 +2897,10 @@ class ChangePageTests(unittest.TestCase):
         saved_question = saved.get("question")
         assert saved_question is not None
         self.assertEqual(saved_question.get("kind"), "feedback")
-        self.assertEqual(self.review_list.read_bytes(), before)
+        row = change_page.answer_row(self.page, "C1")
+        log = review_events.decode(row.pop("Review log"))
+        self.assertEqual(row, before)
+        self.assertEqual([entry.words for entry in log], ["feedback: Make <this> proof clearer"])
         self.assertEqual([recipient for recipient, _, _ in self.messages], ["page-owner"])
         for line in ("C1: the user sends feedback to act on", f"Feedback id: {feedback.question_id}",
                      "Feedback: Make <this> proof clearer"):
@@ -2737,7 +2920,8 @@ class ChangePageTests(unittest.TestCase):
         self.assertIn("The showrunner will act on this", direct)
         self.assertNotIn('<form', direct)
         repeat = self.http_request(path, fields)
-        self.assertEqual(repeat.status, 200)
+        self.assertEqual(repeat.status, 400)
+        self.assertEqual(json.loads(repeat.body), {"reason": change_page.WITH_SHOWRUNNER})
         self.assertEqual(len(self.messages), 1)
         note = self.answer_question("The <proof> now has three steps.", question_id=feedback.question_id)
         self.assertEqual(note.returncode, 0, note.stderr)
@@ -2967,8 +3151,14 @@ class ChangePageTests(unittest.TestCase):
                 delivery = record.read_bytes() if record.exists() else b""
                 messages = list(self.messages)
                 self.delivery_done.clear()
-                self.assertEqual(self.http_request(path, fields).status, 200)
-                self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+                repeated = self.http_request(path, fields)
+                if outcome in ("works", "not works"):
+                    self.assertEqual(repeated.status, 200)
+                    self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+                else:
+                    self.assertEqual(repeated.status, 400)
+                    self.assertEqual(json.loads(repeated.body), {"reason": change_page.WITH_SHOWRUNNER})
+                    self.assertFalse(self.delivery_done.is_set())
                 self.assertEqual(self.review_list.read_bytes(), saved)
                 self.assertEqual(record.read_bytes() if record.exists() else b"", delivery)
                 self.assertEqual(self.messages, messages)
@@ -3013,7 +3203,9 @@ class ChangePageTests(unittest.TestCase):
                 self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
                 record = change_page.DeliveryStatus(self.root).path(self.page, "C1")
                 pending = (record.read_bytes(), record.stat().st_mtime_ns)
-                self.assertEqual(self.http_request(path, fields).status, 200)
+                refused = self.http_request(path, fields)
+                self.assertEqual(refused.status, 400)
+                self.assertEqual(json.loads(refused.body), {"reason": change_page.WITH_SHOWRUNNER})
                 self.assertEqual((record.read_bytes(), record.stat().st_mtime_ns), pending)
                 self.assertEqual(self.messages, [])
             finally:
@@ -3021,8 +3213,10 @@ class ChangePageTests(unittest.TestCase):
                 self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
         sent = (record.read_bytes(), record.stat().st_mtime_ns)
         self.delivery_done.clear()
-        self.assertEqual(self.http_request(path, fields).status, 200)
-        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        refused = self.http_request(path, fields)
+        self.assertEqual(refused.status, 400)
+        self.assertEqual(json.loads(refused.body), {"reason": change_page.WITH_SHOWRUNNER})
+        self.assertFalse(self.delivery_done.is_set())
         self.assertEqual((record.read_bytes(), record.stat().st_mtime_ns), sent)
         self.assertEqual(len(self.messages), 1)
 
@@ -3158,8 +3352,10 @@ class ChangePageTests(unittest.TestCase):
         record = change_page.DeliveryStatus(self.root).path(self.page, "C1")
         failed = (record.read_bytes(), record.stat().st_mtime_ns)
         self.delivery_done.clear()
-        self.assertEqual(self.http_request(path, fields).status, 200)
-        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        refused = self.http_request(path, fields)
+        self.assertEqual(refused.status, 400)
+        self.assertEqual(json.loads(refused.body), {"reason": change_page.WITH_SHOWRUNNER})
+        self.assertFalse(self.delivery_done.is_set())
         self.assertEqual((record.read_bytes(), record.stat().st_mtime_ns), failed)
         self.assertEqual(self.messages, [])
 
@@ -3495,36 +3691,61 @@ class ChangePageTests(unittest.TestCase):
    check(!first.querySelector('details') && first.querySelector('.change-details').textContent.startsWith('change:'),'the details are always shown');
   }
  }catch(error){failures.push(String(error)+'\n'+(error.stack || ''));}
- await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+ await realFetch('/results'+location.search,{method:'POST',body:JSON.stringify(failures)});
+ parent.postMessage('finished',location.origin);
 })();
 </script>'''
-        pages = {kind: self.browser(kind)[2].replace('</body>', '<img src="/probe-complete" alt="" hidden>' + probe + '</body>').encode()
+        cases = (("changes", "light"), ("changes", "dark"), ("questions", "light"))
+        pages = {kind: self.browser(kind)[2].replace('</body>', probe + '</body>').encode()
                  for kind in ("changes", "questions")}
-        results: list[list[str]] = []
+        urls = [f"/case?scheme={mode}&kind={kind}" for kind, mode in cases]
+        page = f"""<!doctype html><meta charset="utf-8">
+        <style>body{{margin:0}}iframe{{display:block;border:0;width:390px;height:1200px}}</style>
+        <iframe title="Review probe"></iframe><img src="/probe-complete" alt="" hidden>
+        <script>
+        const urls={json.dumps(urls)}, frame=document.querySelector('iframe');
+        let next=0;
+        const load=()=>{{if(next<urls.length)frame.src=urls[next++];}};
+        addEventListener('message', event=>{{
+          if(event.origin===location.origin && event.source===frame.contentWindow && event.data==='finished')load();
+        }});
+        load();
+        </script>""".encode()
+        results: dict[tuple[str, str], list[list[str]]] = {}
         probe_complete = threading.Event()
 
         class BrowserProbe(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
-                if self.path == "/probe-complete":
-                    # Keep Firefox alive until the asynchronous checks report their result.
+                address = urlsplit(self.path)
+                if address.path == "/probe-complete":
                     if not probe_complete.wait(20):
                         self.send_error(504, "The browser checks did not complete.")
                         return
                     self.send_response(204)
                     self.end_headers()
                     return
+                if address.path == "/":
+                    body = page
+                elif address.path == "/case":
+                    body = pages[parse_qs(address.query)["kind"][0]]
+                else:
+                    self.send_error(404)
+                    return
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.end_headers()
-                _ = self.wfile.write(pages[parse_qs(urlsplit(self.path).query)["kind"][0]])
+                _ = self.wfile.write(body)
 
             def do_POST(self) -> None:
                 payload = self.rfile.read(int(self.headers["Content-Length"]))
                 if self.path == "/measurements":
                     print("Review tab measurements:", payload.decode())
                 else:
-                    results.append(cast(list[str], json.loads(payload)))
-                    probe_complete.set()
+                    query = parse_qs(urlsplit(self.path).query)
+                    case = (query["kind"][0], query["scheme"][0])
+                    results.setdefault(case, []).append(cast(list[str], json.loads(payload)))
+                    if all(case in results for case in cases):
+                        probe_complete.set()
                 self.send_response(204)
                 self.end_headers()
 
@@ -3532,17 +3753,16 @@ class ChangePageTests(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
-                for kind, mode in (("changes", "light"), ("changes", "dark"), ("questions", "light")):
+                profile = self.temporary / "browser-profile"
+                profile.mkdir()
+                run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
+                                      "--window-size", "390,1200", "--screenshot", str(self.temporary / "browser.png"),
+                                      f"http://127.0.0.1:{server.server_port}/"], capture_output=True, text=True, timeout=45)
+                for kind, mode in cases:
                     with self.subTest(kind=kind, mode=mode):
-                        results.clear()
-                        probe_complete.clear()
-                        profile = self.temporary / f"browser-profile-{kind}-{mode}"
-                        profile.mkdir()
-                        run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
-                                              "--window-size", "390,1200", "--screenshot", str(self.temporary / f"browser-{kind}-{mode}.png"),
-                                              f"http://127.0.0.1:{server.server_port}/?scheme={mode}&kind={kind}"], capture_output=True, text=True, timeout=45)
                         self.assertEqual(run.returncode, 0, run.stderr)
-                        self.assertEqual(results, [[]], "The browser must complete every check without a failure.")
+                        self.assertEqual(results.get((kind, mode)), [[]],
+                                         "The browser must complete every check without a failure.")
             finally:
                 server.shutdown()
                 thread.join(TEST_HANG_GUARD_SECS)
@@ -3577,15 +3797,14 @@ class ChangePageTests(unittest.TestCase):
         self.feature_command("propose", "--review", "page-owner/C1", *self.note_arguments("claude", "Numbered moves"))
         proposal = feature_log.state_dir() / "proposals/page-owner/C1.json"
         before_proposal = proposal.read_bytes()
-        before = self.review_list.read_bytes()
         initial = self.request(self.page_path, {}).body
         self.assertEqual(initial.count('value="validate">Ask showrunner to check'), len(self.page.rows))
         words = "Please check this yourself"
         reply = self.request(self.page_path, self.answer(outcome="validate", feedback=words))
         self.assertEqual((reply.status, reply.location), (303, self.page_path))
-        self.assertEqual(self.review_list.read_bytes(), before)
+        self.assertFalse(change_page.answer_row(self.page, "C1").get("Verdict"))
         self.assertEqual(proposal.read_bytes(), before_proposal)
-        self.assertEqual([row["#"] for row in change_review.pending(self.review_list)], ["C1", "C2", "C3"])
+        self.assertCountEqual([row["#"] for row in change_review.pending(self.review_list)], ["C1", "C2", "C3"])
         queue = next_item.change_queue(self.production)
         self.assertEqual([entry.key for entry in urgency.queue_order(queue.entries, queue.name)], ["C2", "C3"])
         self.assertEqual([recipient for recipient, _, _ in self.messages], ["page-owner"])
@@ -3620,7 +3839,6 @@ class ChangePageTests(unittest.TestCase):
     def test_a_failed_validation_message_alerts_with_the_saved_feedback(self) -> None:
         words = "Check <this> & keep the proof"
         sent: list[str] = []
-        before = self.review_list.read_bytes()
         started, release = threading.Event(), threading.Event()
         send = self.fail_all_but_alerts(sent)
         def paused_send(recipient: str, sender: str, message: str) -> None:
@@ -3642,7 +3860,7 @@ class ChangePageTests(unittest.TestCase):
                 if started.is_set():
                     self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
         self.assertEqual(len(sent), 4)
-        self.assertEqual(self.review_list.read_bytes(), before)
+        self.assertFalse(change_page.answer_row(self.page, "C1").get("Verdict"))
         self.assertEqual([recipient for recipient, _, _ in self.messages], ["page-owner"])
         self.assertIn(words, self.messages[0][2])
         self.assertIn("Tries: 3", self.messages[0][2])
@@ -3668,10 +3886,9 @@ class ChangePageTests(unittest.TestCase):
         _ = change_review.set_row_kind(earlier, "C1", "Read only", self.production)
         path = urlsplit(change_page.publish(self.production, earlier, ["C1"])).path
         page = change_page.page_at(self.root, path)
-        before = earlier.read_bytes()
         fields = dict(self.answer(outcome="validate"), token=page.token)
         self.assertEqual(self.request(path, fields).status, 303)
-        self.assertEqual(earlier.read_bytes(), before)
+        self.assertFalse(change_page.answer_row(page, "C1").get("Verdict"))
         queue = next_item.change_queue(self.production)
         self.assertEqual(set(urgency.ended(queue.name)), {"demo/C1"})
         self.assertNotIn("demo/C1", [entry.key for entry in urgency.queue_order(queue.entries, queue.name)])
@@ -3700,8 +3917,8 @@ class ChangePageTests(unittest.TestCase):
 
     def test_not_works_and_free_text_follow_the_stored_producer_route(self) -> None:
         for row, outcome, feedback, verdict in (("C1", "not works", "", "not works"),
-                                               ("C2", "feedback", "works but café | <still tiny>",
-                                                "works but café | <still tiny>")):
+                                               ("C2", "not works", "café | <still tiny>",
+                                                "not works: café | <still tiny>")):
             with self.subTest(outcome=outcome):
                 path = urlsplit(change_page.publish(self.production, self.review_list, [row])).path
                 page = change_page.page_at(self.root, path)
@@ -3797,27 +4014,52 @@ class ChangePageTests(unittest.TestCase):
 
     def test_a_feature_log_project_saves_when_the_writer_skips_an_absent_proposal(self) -> None:
         _ = self.git("remote", "add", "origin", "https://github.com/natepiano/claude_commands.git")
+        configured = self.temporary / "configured-lists"
+        configured.mkdir()
+        _ = self.enterContext(patch.object(change_review, "lists_directory", return_value=configured))
+        published = self.command(change_page, change_page.main,
+                                 ["--production", "page-owner", "--list", str(self.review_list), "C1"])
+        self.assertEqual((published.returncode, published.stderr), (0, ""))
+        path = urlsplit(published.stdout.strip()).path
+        page = change_page.page_at(self.root, path)
+        cleanup = replace(change_review.PendingVerdictCleanup.for_row(self.root, self.review_list, "C1"),
+                          verdict="works", require_git_commit=False)
         with (patch.object(subprocess, "run", wraps=subprocess.run) as commands,
               patch.object(feature_log, "project_of", wraps=feature_log.project_of) as project,
               patch.object(feature_log, "land_review", wraps=feature_log.land_review) as land,
-              patch.object(change_review, "save_verdict", wraps=change_review.save_verdict) as save):
-            reply = self.request(self.page_path, self.answer())
-        self.assertEqual((reply.status, reply.location), (303, self.page_path))
+              patch.object(change_review, "save_verdict", wraps=change_review.save_verdict) as save,
+              patch.object(scratch, "end", side_effect=conf.Unusable("scratch settings unavailable"))):
+            reply = self.request(path, dict(self.answer(), token=page.token))
+        self.assertEqual((reply.status, reply.location), (303, path))
         invocations = [cast(list[str], call.args[0]) for call in commands.call_args_list]
         self.assertTrue(invocations)
         self.assertTrue(all(args[0] == "git" for args in invocations), invocations)
         project.assert_called_once_with(str(self.repo))
-        land.assert_called_once_with("page-owner/C1", if_proposed=True)
-        save.assert_called_once_with(self.review_list, "C1", "works", self.production)
+        land.assert_called_once_with("page-owner/C1", if_proposed=True, check_only=True)
+        save.assert_called_once_with(self.review_list, "C1", "works", self.production, cleanup=cleanup)
         saved = next(row for row in change_review.review_rows(self.review_list) if row["#"] == "C1")
         self.assertEqual(saved["Verdict"], "works")
         self.assertEqual([row["#"] for row in change_review.pending(self.review_list)], ["C2", "C3"])
-        self.assertIn("Saved: works", self.request(self.page_path, {}).body)
+        self.assertIn("Saved: works", self.request(path, {}).body)
         self.assertEqual([target for target, _, _ in self.messages], ["page-owner"])
         self.assertIn("C1 landed", self.messages[0][2])
         self.assertFalse((feature_log.state_dir() / "proposals/page-owner/C1.json").exists())
+        self.assertEqual(change_review.PendingVerdictCleanup.load(cleanup.intent, self.temporary), cleanup)
+        shutil.rmtree(self.root / path.split("/")[1])
+        before = self.review_list.read_bytes()
+        with patch.object(scratch, "end", wraps=scratch.end) as end:
+            cleanup.intent.chmod(0o644)
+            change_page.recover_pending(change_page.DeliveryStatus(self.root))
+            end.assert_not_called()
+            self.assertTrue(cleanup.intent.exists())
+            cleanup.intent.chmod(0o600)
+            change_page.recover_pending(change_page.DeliveryStatus(self.root))
+            end.assert_called_once_with("row:page-owner-C1")
+        self.assertFalse(cleanup.intent.exists())
+        self.assertEqual(self.review_list.read_bytes(), before)
+        self.assertEqual([target for target, _, _ in self.messages], ["page-owner"])
 
-    def test_works_with_feedback_lands_the_proposal_before_closing_the_row(self) -> None:
+    def test_works_with_feedback_lands_the_proposal_after_saving_the_verdict(self) -> None:
         _ = self.git("remote", "add", "origin", "https://github.com/natepiano/claude_commands.git")
         self.feature_command("propose", "--review", "page-owner/C1", *self.note_arguments("claude", "Numbered moves"))
         self.assertEqual(self.request(self.page_path, self.answer(feedback="The numbers are clear")).status, 303)
@@ -3984,11 +4226,12 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(text.count("Numbered moves"), 1)
         self.assertEqual(text.count("Internal comments clarified"), 1)
 
-    def test_feedback_works_retries_on_the_server_and_alerts_only_the_showrunner(self) -> None:
-        with self.subTest(verdict="fine through Send feedback"):
+    def test_feedback_that_starts_with_works_still_requests_action_and_retries(self) -> None:
+        with self.subTest(request="fine through Send feedback"):
             self.assertEqual(self.request(self.page_path, self.answer("C3", "feedback", "fine with the title")).status, 303)
-            self.assertEqual(next(row["Verdict"] for row in change_review.review_rows(self.review_list) if row["#"] == "C3"), "fine with the title")
-            self.assertIsInstance(change_page.DeliveryStatus(self.root).slots(self.page, "C3").question, change_page.NoQuestion)
+            self.assertFalse(change_page.answer_row(self.page, "C3").get("Verdict"))
+            self.assertIsInstance(change_page.DeliveryStatus(self.root).slots(self.page, "C3").question,
+                                  change_page.OpenFeedback)
             self.messages.clear()
         def report_delivery_failure(recipient: str, sender: str, message: str) -> None:
             self.capture_message(recipient, sender, message)
@@ -4152,8 +4395,9 @@ class ChangePageTests(unittest.TestCase):
     def test_an_interruption_after_the_verdict_preserves_a_pending_message_for_server_recovery(self) -> None:
         save = change_review.save_verdict
 
-        def interrupt_after_verdict(path: Path, row: str, verdict: str, production: Path) -> change_review.VerdictSaved | change_review.VerdictRefused:
-            result = save(path, row, verdict, production)
+        def interrupt_after_verdict(path: Path, row: str, verdict: str, production: Path, *,
+                                    cleanup: change_review.PendingVerdictCleanup) -> change_review.VerdictSaved | change_review.VerdictRefused:
+            result = save(path, row, verdict, production, cleanup=cleanup)
             if isinstance(result, change_review.VerdictSaved):
                 raise RuntimeError("interrupted after verdict")
             return result
@@ -4195,59 +4439,45 @@ class ChangePageTests(unittest.TestCase):
                               ["builder-unit", "page-owner"])
         self.assert_record_cleared()
 
-    def test_a_failed_or_interrupted_verdict_write_preserves_validation_ownership_and_feedback(self) -> None:
+    def test_a_failed_or_interrupted_owner_verdict_preserves_validation_ownership_and_feedback(self) -> None:
         status = change_page.DeliveryStatus(self.root)
         self.assertEqual(self.request(self.page_path, self.answer(outcome="validate", feedback="Keep these words")).status, 303)
         validation = status.slots(self.page, "C1").validation
+        assert isinstance(validation, change_page.ValidationRequested)
         before = self.review_list.read_bytes()
-        for failure in (change_review.VerdictRefused([], "verdict write failed"),
-                        change_review.ChangeReviewError("verdict write failed"), OSError("verdict write failed"),
+        for failure in (change_review.ChangeReviewError("verdict write failed"), OSError("verdict write failed"),
                         RuntimeError("interrupted before verdict")):
-            interruption = isinstance(failure, RuntimeError)
             with self.subTest(failure=failure):
-                def fail_verdict(path: Path, row: str, verdict: str, production: Path, *,
-                                 validation_id: str = '') -> change_review.VerdictRefused:
-                    del path, row, verdict, production, validation_id
-                    if isinstance(failure, Exception):
-                        raise failure
-                    return failure
-                with patch.object(change_review, "save_verdict", side_effect=fail_verdict):
-                    reply = self.request(self.page_path, self.answer(feedback="New answer"))
-                self.assertEqual(reply.status, 503 if interruption else 400)
+                with patch.object(change_review, "record_verdict", side_effect=failure):
+                    with self.assertRaises(type(failure)):
+                        _ = change_review.save_verdict(self.review_list, "C1", "works", self.production,
+                                                      validation_id=validation.attempt)
                 self.assertEqual(self.review_list.read_bytes(), before)
                 self.assertEqual(status.slots(self.page, "C1").validation, validation)
-                self.assertEqual(validation.feedback if isinstance(validation, change_page.ValidationRequested) else "", "Keep these words")
+                self.assertEqual(validation.feedback, "Keep these words")
                 self.assertIn("C1", [row["#"] for row in change_review.pending(self.review_list)])
-                self.assertIsInstance(status.slots(self.page, "C1").verdict,
-                                      change_page.DeliveryIntent if interruption else change_page.NoDelivery)
+                self.assertIsInstance(status.slots(self.page, "C1").verdict, change_page.NoDelivery)
                 body = self.request(self.page_path, {}).body
                 self.assertIn("The showrunner will validate this", body)
                 self.assertNotIn("Saved:", body)
                 self.assert_no_delivery_controls(body)
 
-    def test_an_interruption_after_saving_selects_the_verdict_slot_and_keeps_validation_feedback(self) -> None:
+    def test_an_interruption_after_saving_an_owner_verdict_keeps_validation_feedback(self) -> None:
         words = "Check the small text"
         with patch.object(change_page, "send_message", side_effect=RuntimeError("socket unavailable")):
             self.assertEqual(self.request(self.page_path, self.answer(outcome="validate", feedback=words)).status, 303)
+        messages = list(self.messages)
         status = change_page.DeliveryStatus(self.root)
         validation = status.slots(self.page, "C1").validation
-        save = change_review.save_verdict
-
-        def interrupt_after_save(path: Path, row: str, verdict: str, production: Path, *,
-                                 validation_id: str = '') -> change_review.VerdictSaved | change_review.VerdictRefused:
-            self.assertEqual(status.slots(self.page, "C1").validation, validation)
-            self.assertIsInstance(status.slots(self.page, "C1").verdict, change_page.DeliveryIntent)
-            result = save(path, row, verdict, production, validation_id=validation_id)
-            if isinstance(result, change_review.VerdictSaved):
-                raise RuntimeError("interrupted after verdict")
-            return result
-
-        with patch.object(change_review, "save_verdict", side_effect=interrupt_after_save):
-            self.assertEqual(self.request(self.page_path, self.answer()).status, 503)
+        assert isinstance(validation, change_page.ValidationRequested)
+        with patch.object(change_review, "_verdict_output", side_effect=RuntimeError("interrupted after verdict")):
+            with self.assertRaisesRegex(RuntimeError, "interrupted after verdict"):
+                _ = change_review.save_verdict(self.review_list, "C1", "works", self.production,
+                                              validation_id=validation.attempt)
         slots = status.slots(self.page, "C1")
         self.assertEqual(slots.validation, validation)
-        self.assertEqual(status.slots(self.page, "C1").verdict, slots.verdict)
-        self.assertIsInstance(status.slots(self.page, "C1").verdict, change_page.DeliveryIntent)
+        self.assertIsInstance(slots.verdict, change_page.NoDelivery)
+        self.assertEqual(self.messages, messages)
         body = self.request(self.page_path, {}).body
         self.assertIn("Saved: works", body)
         self.assert_no_delivery_controls(body)

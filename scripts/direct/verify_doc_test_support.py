@@ -272,7 +272,7 @@ Path(words[words.index("--result") + 1]).write_text("mac=" + result + "\\nsecond
     '    raise SystemExit(int(os.environ.get("TEST_DOC_STATUS", "0")))',
     '''    if "--assignment-file" in words:
         fixture_outcome = placement.AttemptCompleted(int(os.environ.get("TEST_DOC_STATUS", "0")))
-        fixture_evidence = placement.ExecutionEvidenceUnavailable("the private doc command ended", time.time())
+        fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private doc command ended", time.time())
         fixture_cleanup_confirmed = True
     raise SystemExit(int(os.environ.get("TEST_DOC_STATUS", "0")))'''))
         self.environment["VERIFY_MAC_RUNNER"] = str(runner)

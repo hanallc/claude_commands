@@ -4,15 +4,20 @@ from __future__ import annotations
 
 from scripts.agents import remote
 
+import hashlib
 import json
 import os
+import subprocess
 import unittest
+from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
 from scripts.production import proposal_issue, proposals_folder, staff
+from scripts.review_links import new_item_dialog
 from scripts.production.issues import Issue, frontmatter
 from scripts.production.production_doc import read_production
 from scripts.production.cli_fixture import invoke_cli
@@ -31,6 +36,59 @@ class RegistrationTests(RegistrationFixture):
         _ = (config / "production.conf").write_text("# whole: 20..\nquestion_title_max_chars=100\n")
         self.env["CONF_DIR"] = str(config)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)})))
+
+    def test_f079_new_question_keeps_the_answer_at_a_late_collision(self) -> None:
+        identities = registration.QuestionStaff.read()
+        scope = registration.question_scope(self.owner_id, identities.record)
+
+        def file(title: str, before_write: Callable[[str, Path], None]) -> registration.QuestionRecord:
+            nonce = hashlib.sha256(title.encode()).hexdigest()[:32]
+            request = f"r1-{nonce}-question-{self.owner_id}"
+            details = new_item_dialog.ReviewSubmission(request, "a" * 64, new_item_dialog.NoEvidence(), (), "a" * 43)
+            parts = registration.QuestionParts(ask=title, context="", items=[], recommend="", choices=[])
+            return registration.ask(
+                scope, title, parts, "", registration.Ranking(), identities=identities,
+                outgoing=registration.QuestionFromReview(title, "The owner answers.", details, before_write))
+
+        answered = file("First question", lambda _identity, _path: None)
+        answered.item["followups"] = [{"followup": "First question", "reply": "The peer answered."}]
+        registration.write_question_record(answered)
+        original = answered.path.read_bytes()
+        occupied: list[Path] = []
+
+        def sync_answer(_identity: str, path: Path) -> None:
+            if not occupied:
+                occupied.append(path)
+                _ = answered.path.rename(path)
+
+        saved = file("Second question", sync_answer)
+        collision, = occupied
+        self.assertEqual(collision.read_bytes(), original)
+        self.assertEqual(saved.path, collision.with_stem(collision.stem + "-2"))
+        self.assertEqual(saved.item.get("review_id"), "Q2")
+
+    def test_f072_question_numbering_scans_the_former_folder(self) -> None:
+        identities = registration.QuestionStaff.read()
+        scope = registration.question_scope(self.owner_id, identities.record)
+
+        def file(title: str, token: str) -> registration.QuestionRecord:
+            details = new_item_dialog.ReviewSubmission(token, "a" * 64, new_item_dialog.NoEvidence(), (), "a" * 43)
+            parts = registration.QuestionParts(ask=title, context="", items=[], recommend="", choices=[])
+            _ = registration.ask(scope, title, parts, "", registration.Ranking(), identities=identities,
+                                 outgoing=registration.QuestionFromReview(title, "The owner answers.", details, lambda _id, _path: None))
+            record = registration.question_records(scope, identities)
+            return next(item for item in record if item.item["text"] == title)
+
+        first = file("First question", "first-request")
+        synced = replace(first, path=first.path.with_name("question-synced.md"),
+                         item={**first.item, "text": "Synced question", "review_id": "Q2"})
+        _ = synced.path.write_text(first.path.read_text().replace('"Q1"', '"Q2"').replace("First question", "Synced question"))
+        current = self.root / "new-questions"
+        document = self.doc.read_text().replace(str(self.root / "issues"), str(current))
+        _ = self.doc.write_text(document)
+        second = file("Next question", "next-request")
+        self.assertEqual((second.path.parent, second.item.get("review_id")), (current, "Q3"))
+        self.assertIn('"Q2"', synced.path.read_text())
 
     def test_ask_checks_both_titles_before_review_and_reads_the_current_limit(self) -> None:
         config = Path(self.env["CONF_DIR"]) / "production.conf"
@@ -214,20 +272,23 @@ class RegistrationTests(RegistrationFixture):
               mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?"))):
             _ = self.run_ask(title, "Keep this layout?")
             path = self.question_record_path(title)
-            first_since = self.open_rows()[0]["since"]
+            original = self.open_rows()[0]
             answered = self.run_command("answer", "--item", title)
             self.assertEqual(answered.returncode, 0, answered.stdout + answered.stderr)
             self.assertIn("status: closed", path.read_text().splitlines())
             moment = first + timedelta(minutes=minutes)
             _ = self.run_ask(title, "Keep this layout?")
-        self.assertEqual(self.question_record_path(title), path)
-        return first_since, self.open_rows()[0]["since"]
+        reopened = self.open_rows()[0]
+        self.assertNotEqual(self.question_record_path(title), path)
+        self.assertEqual((original["review_id"], reopened["review_id"]), ("Q1", "Q2"))
+        self.assertIn("status: closed", path.read_text().splitlines())
+        return original["since"], reopened["since"]
 
     def test_reopening_a_question_in_a_later_minute_changes_since(self) -> None:
         first, reopened = self.check_question_reopening(1)
         self.assertNotEqual(reopened, first)
 
-    def test_same_minute_reopening_keeps_since_as_a_documented_limit(self) -> None:
+    def test_same_minute_reopening_gets_a_new_id_with_the_same_timestamp(self) -> None:
         first, reopened = self.check_question_reopening(0)
         self.assertEqual(reopened, first)
 
@@ -413,6 +474,56 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(listed_after_answer.returncode, 0, listed_after_answer.stdout + listed_after_answer.stderr)
         self.assertEqual(listed_after_answer.stdout.strip(), "no open questions")
 
+    def test_producer_closes_its_own_questions_without_a_production(self) -> None:
+        producer = fixture_member("producer", name="dwight")
+        environment = {**self.env, "CLAUDE_CODE_SESSION_ID": producer.current_session, "CODEX_THREAD_ID": ""}
+        showrunner = staff.snapshot().by_id(self.owner_id)
+        assert showrunner is not None
+        showrunner_environment = {**environment, "CLAUDE_CODE_SESSION_ID": showrunner.current_session}
+        folder = self.state / "showrunner" / producer.id / "questions"
+
+        def run(*arguments: str, env: dict[str, str] = environment) -> subprocess.CompletedProcess[str]:
+            return invoke_cli(registration, registration.main, list(arguments), env, self.checkout, production_state=True)
+
+        for action, title in (("answer", "Choose the layout"), ("withdraw", "Choose the colors")):
+            with self.subTest(action=action):
+                question = title + "?"
+                with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(question)):
+                    filed = run("ask", "--ask", question, "--text", title)
+                self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
+                listed = run("questions-table")
+                self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
+                self.assertIn(title, listed.stdout)
+
+                refused = run(action, "--item", title, env=showrunner_environment)
+                self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+                self.assertIn("the following arguments are required: --production", refused.stderr)
+
+                closed = run(action, "--item", title)
+                self.assertEqual(closed.returncode, 0, closed.stdout + closed.stderr)
+                self.assertIn(f"{action}: ok — dwight: {title}", closed.stdout)
+                listed_after_close = run("questions-table")
+                self.assertEqual(listed_after_close.returncode, 0, listed_after_close.stdout + listed_after_close.stderr)
+                self.assertNotIn(title, listed_after_close.stdout)
+                records = registration.question_records_for_document(producer, registration.QuestionStaff.read())
+                record, = (record for record in records if record.item["text"] == title)
+                self.assertEqual(record.path.parent, folder)
+                self.assertEqual(record.status, "closed")
+
+    def test_ask_refuses_to_replace_an_open_legacy_question_from_the_same_asker(self) -> None:
+        title = "Choose the layout"
+        legacy = self.outstanding()
+        original = {"since": "2026-10-06T08:00", "text": title,
+                    "question": "Keep this layout?", "asked_by": "alpha"}
+        _ = legacy.write_text(json.dumps([original]) + "\n")
+
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Use the new layout?")):
+            result = self.run_command("ask", "--text", title, "--ask", "Use the new layout?", "--unit", "alpha")
+
+        self.assertEqual(json.loads(legacy.read_text()), [original])
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn(f"{title}: a legacy question from this asker is already open", result.stdout)
+
     def test_question_migration_without_a_proposals_line_preserves_records_on_a_rerun(self) -> None:
         _ = self.doc.write_text("\n".join(line for line in self.doc.read_text().splitlines()
                                          if not line.startswith("- **Proposals:**")) + "\n")
@@ -467,8 +578,7 @@ class RegistrationTests(RegistrationFixture):
                     self.assertEqual(path.read_bytes(), before)
                     self.assertEqual([item.text for item in self.read_items(path)], ["Reminder", "unit question?"])
                     if action == "ask":
-                        entries = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
-                        self.assertEqual(sum(item["text"] == "new question?" for item in entries), 1)
+                        self.assertFalse(history.exists())
                     retried = self.run_command(*command)
                 self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
                 saved = self.open_rows()

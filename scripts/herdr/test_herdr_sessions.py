@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 from scripts.herdr import herdr, pane_launch
 from scripts.herdr import herdr_sessions
+from scripts.herdr.test_herdr import codex_foreground_cases
 from scripts.message import sessions, codex_daemon
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr.fake_herdr import CommandResponse
@@ -91,6 +92,7 @@ class HerdrSessionsTests(unittest.TestCase):
             "XDG_CONFIG_HOME": str(self.root / "config"),
             "XDG_STATE_HOME": str(self.root / "layout-state"),
         }))
+        _ = self.enterContext(fake_unit_host.private_process_registry())
         _ = self.enterContext(patch.object(herdr_sessions, "live_session", side_effect=self.record_is_live))
         _ = self.enterContext(patch.object(sessions, "running_session", side_effect=self.record_is_live))
         _ = self.enterContext(patch.object(runtime_sessions, "running_session", side_effect=self.record_is_live))
@@ -200,6 +202,15 @@ class HerdrSessionsTests(unittest.TestCase):
                for name in names for pane in panes},
         }))
 
+    def observe(self, pane: str, info: dict[str, object], *, session: str = "agents") -> None:
+        replies = cast(dict[str, CommandResponse], json.loads(self.responses.read_text()))
+        replies[f"--session {session} pane process-info --pane {pane}"] = {
+            "code": 0, "stdout": json.dumps({"result": {"process_info": info}})}
+        _ = self.responses.write_text(json.dumps(replies))
+
+    def observe_agent(self, pane: str, pid: int, *arguments: str) -> None:
+        self.observe(pane, {"foreground_processes": [{"pid": pid, "argv": list(arguments)}]})
+
     def process(self, pid: int, parent: int, argv: list[str], environment: dict[str, str]) -> None:
         directory = self.proc / str(pid)
         directory.mkdir()
@@ -265,24 +276,28 @@ class HerdrSessionsTests(unittest.TestCase):
         replies["--session agents pane list"] = {"code": 0, "stdout": json.dumps({"result": {"panes": [
             {"pane_id": "wM:pR", "workspace_id": "wM", "label": "fix-rounds"}]}})}
         replies["--session agents pane process-info --pane wM:pR"] = {
-            "code": 0, "stdout": json.dumps({"result": {"process_info": {"shell_pid": 11}}})}
+            "code": 0, "stdout": json.dumps({"result": {"process_info": {
+                "shell_pid": 11, "foreground_processes": [{"pid": 12, "argv": ["claude"]}]}}})}
         replies["--session agents workspace list"] = {"code": 0, "stdout": json.dumps({"result": {
             "workspaces": [{"workspace_id": "wM", "label": "sdlc"}]}})}
         _ = self.responses.write_text(json.dumps(replies))
         self.assertEqual(self.call("list"), (0, "fix-rounds\tunit sdlc/fix-rounds\tfix-rounds\n", ""))
 
-    def test_list_batches_claude_place_reads_for_all_session_records(self) -> None:
+    def test_list_reads_each_pane_once_without_a_process_placement_scan(self) -> None:
         self.respond(["agents"], tabs=("one", "two"))
         self.server(100, "agents")
         self.claude(101, 100, "first", pane="w1:p1")
         self.claude(102, 100, "newest", pane="w1:p1", updated=2)
         self.claude(103, 100, "second", pane="w1:p2")
-        with patch.object(herdr, "herdr_places", wraps=herdr.herdr_places) as places, patch.object(
-                herdr, "herdr_place_of", side_effect=AssertionError("list must use the batched place scan")):
-            self.assertEqual(self.call("list"), (0, "one\tstandalone\tnewest\ntwo\tstandalone\tsecond\n", ""))
-        self.assertEqual(places.call_count, 1)
+        self.observe_agent("w1:p1", 101, "claude")
+        self.observe_agent("w1:p2", 103, "claude")
+        with (patch.object(herdr, "herdr_places", side_effect=AssertionError("list uses pane ownership")),
+              patch.object(herdr, "herdr_place_of", side_effect=AssertionError("list uses pane ownership"))):
+            self.assertEqual(self.call("list"), (0, "one\tstandalone\tfirst\ntwo\tstandalone\tsecond\n", ""))
+        self.assertEqual([command for command in self.commands() if "process-info" in command], [
+            ["--session", "agents", "pane", "process-info", "--pane", pane] for pane in ("w1:p1", "w1:p2")])
 
-    def test_list_prints_each_tab_of_the_shared_session_with_its_role_and_newest_live_claude_name(self) -> None:
+    def test_list_prints_each_tab_of_the_shared_session_with_its_proved_role_and_claude_name(self) -> None:
         self.respond(["agents", "other"], tabs=("unit", "showrunner", "standalone", None))
         self.server(100, "agents")
         self.server(900, "other")
@@ -299,14 +314,17 @@ class HerdrSessionsTests(unittest.TestCase):
         # Another session's pane ids never name a tab of the shared session.
         self.claude(901, 900, "elsewhere", pane="w1:p4", updated=9, marks=marks)
         _ = (self.records / "malformed.json").write_text("{broken")
+        for pane, pid in (("w1:p1", 101), ("w1:p2", 201), ("w1:p3", 301)):
+            self.observe_agent(pane, pid, "claude")
         code, stdout, stderr = self.call("list")
         self.assertEqual((code, stderr), (0, ""))
-        self.assertEqual(stdout, "unit\tunit build-followups/herdr-trial\tnew-unit-name\n"
+        self.assertEqual(stdout, "unit\tunit build-followups/herdr-trial\told-unit-name\n"
                          + "showrunner\tshowrunner\tdirector\nstandalone\tstandalone\tsolo\n"
                          + "w1:p4\tstandalone\t\n")
         self.assertEqual(self.commands(), [["--session", "default", "session", "list", "--json"],
                                            ["--session", "agents", "pane", "list"],
-                                           ["--session", "other", "pane", "list"]])
+                                           *[["--session", "agents", "pane", "process-info", "--pane", f"w1:p{index}"]
+                                             for index in range(1, 5)]])
 
         owner = staff.snapshot().by_current_session(fixture_runtime_id("pane-session-201"))
         assert owner is not None
@@ -324,6 +342,55 @@ class HerdrSessionsTests(unittest.TestCase):
         self.assertEqual((code, output), (3, ""))
         self.assertIn("fixture lookup failed", errors)
 
+    def test_list_uses_the_proved_owner_for_unit_and_showrunner_roles(self) -> None:
+        self.respond(["agents"], tabs=("unit", "solo", "runner"))
+        self.server(100, "agents")
+        unit = unit_membership("build", "codex-unit")
+        child = unit_membership("build", "claude-unit")
+        self.process(456, 100, ["codex"], {"HERDR_PANE_ID": "w1:p1"})
+        self.claude(457, 456, "child", pane="w1:p1", marks={"CLAUDE_CODE_SESSION_ID": child.id})
+        self.process(556, 100, ["codex"], {"HERDR_PANE_ID": "w1:p2"})
+        self.claude(557, 556, "child-runner", pane="w1:p2")
+        self.register_showrunner(557)
+        self.claude(558, 100, "runner", pane="w1:p3", marks={"CLAUDE_CODE_SESSION_ID":
+            fixture_runtime_id("pane-session-557")})
+
+        def read_native(pid: int, kind: str, _report: str = "") -> herdr.NativeAgentProcess:
+            identity = {456: unit.current_session, 457: child.current_session,
+                        556: fixture_runtime_id("solo-codex"), 557: fixture_runtime_id("pane-session-557"),
+                        558: fixture_runtime_id("pane-session-557")}[pid]
+            return herdr.NativeAgentProcess(
+                herdr.PaneSessionReport(identity) if kind == "codex" else herdr.EnvironmentThread(identity),
+                "0", {})
+
+        with (codex_foreground_cases(self.root) as cases,
+              patch.object(herdr, "native_process", side_effect=read_native)):
+            for case in cases:
+                with self.subTest(case=case.name):
+                    foreground = herdr.json_items(case.info["foreground_processes"], "fixture processes")
+                    moved: list[dict[str, object]] = []
+                    for value in foreground:
+                        process = herdr.json_object(value, "fixture process")
+                        moved.append({**process, "pid": cast(int, process["pid"]) + 100})
+                    self.observe("w1:p1", case.info)
+                    self.observe("w1:p2", {**case.info, "foreground_processes": moved})
+                    self.observe("w1:p3", {"foreground_processes": [{"pid": 558, "argv": ["claude"]}]})
+                    rows = ("unit\tunit build/codex-unit\t\nsolo\tstandalone\t\n" if case.owner_proved
+                            else "unit\tunknown\t\nsolo\tunknown\t\n")
+                    self.assertEqual(self.call("list"), (0, rows + "runner\tshowrunner\trunner\n", ""))
+
+    def test_list_reports_an_unreadable_node_wrapper_as_unknown(self) -> None:
+        self.respond(["agents"], tabs=("wrapped",))
+        replies = cast(dict[str, CommandResponse], json.loads(self.responses.read_text()))
+        replies["--session agents pane list"] = {"code": 0, "stdout": json.dumps({"result": {"panes": [
+            {"pane_id": "w1:p1", "label": "wrapped", "session_id": fixture_runtime_id("node-wrapper")}
+        ]}})}
+        _ = self.responses.write_text(json.dumps(replies))
+        for program in ("node", "nodejs"):
+            with self.subTest(program=program):
+                self.observe("w1:p1", {"foreground_processes": [{"pid": 456, "name": program, "argv": []}]})
+                self.assertEqual(self.call("list"), (0, "wrapped\tunknown\t\n", ""))
+
     def test_unit_role_takes_precedence_over_showrunner(self) -> None:
         self.respond(["agents"], tabs=("unit",))
         self.server(100, "agents")
@@ -331,6 +398,7 @@ class HerdrSessionsTests(unittest.TestCase):
         self.claude(101, 100, "director", pane="w1:p1", marks={('' + 'SHOWRUNNER_' + 'UNIT'): "build", ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "one",
                                                               "CLAUDE_CODE_SESSION_ID": unit.id})
         self.register_showrunner(101)
+        self.observe_agent("w1:p1", 101, "claude")
         self.assertEqual(self.call("list"), (0, "unit\tunit build/one\tdirector\n", ""))
 
     def test_staff_marks_are_visible_without_a_claude_record(self) -> None:
@@ -343,16 +411,17 @@ class HerdrSessionsTests(unittest.TestCase):
         rollout = self.root / ("rollout-" + str(unit.current_session) + ".jsonl")
         _ = rollout.write_text(json.dumps({"type": "session_meta", "payload": {"id": unit.current_session}}) + "\n")
         (self.proc / "101/fd/4").symlink_to(rollout)
+        self.observe_agent("w1:p1", 101, "codex", "resume", unit.id)
         with patch.object(runtime_sessions, "process_start", return_value="fixture-codex-start"):
             self.assertEqual(self.call("list"), (0, "unit\tunit build/one\t\n", ""))
 
-    def test_an_inherited_codex_thread_id_keeps_the_shell_membership_evidence(self) -> None:
+    def test_an_inherited_codex_thread_id_does_not_make_a_shell_a_unit_owner(self) -> None:
         self.respond(["agents"], tabs=("terminal",))
         self.server(100, "agents")
         unit = unit_membership("build", "one")
         self.process(101, 100, ["zsh"], {"HERDR_PANE_ID": "w1:p1", ('' + 'SHOWRUNNER_' + 'UNIT'): "build",
                                        ('' + 'SHOWRUNNER_' + 'UNIT_ID'): "one", "CODEX_THREAD_ID": unit.id})
-        self.assertEqual(self.call("list"), (0, "terminal\tunit build/one\t\n", ""))
+        self.assertEqual(self.call("list"), (0, "terminal\tstandalone\t\n", ""))
 
     def test_list_classifies_unmarked_units_and_transferred_identity_from_one_staff_read(self) -> None:
         self.respond(["agents"], tabs=("herdr", "shutdown", "style", "former-name", "terminal"))
@@ -376,6 +445,11 @@ class HerdrSessionsTests(unittest.TestCase):
         replies["--session agents workspace list"] = {"stdout": json.dumps({"result": {"workspaces": [
             {"workspace_id": "w1", "label": "sdlc"}, {"workspace_id": "w2", "label": "natedev"}]}}), "code": 0}
         _ = self.responses.write_text(json.dumps(replies))
+        for index in range(1, 5):
+            self.observe_agent(f"w1:p{index}", 100 + index, "claude")
+        self.observe_agent("w1:p5", 105, "sleep")
+        for pane in ("w2:p1", "w1:unowned"):
+            self.observe(pane, {"foreground_processes": []})
 
         with patch.object(staff, "snapshot", wraps=staff.snapshot) as read:
             self.assertEqual(self.call("list"), (0,
@@ -388,6 +462,7 @@ class HerdrSessionsTests(unittest.TestCase):
         self.respond(["agents"], tabs=("solo",))
         self.server(100, "agents")
         self.claude(101, 100, "solo-name", pane="w1:p1", marks={('' + 'SHOWRUNNER_' + 'UNIT'): "build"})
+        self.observe_agent("w1:p1", 101, "claude")
         self.assertEqual(self.call("list"), (0, "solo\tstandalone\tsolo-name\n", ""))
 
     def test_sort_tabs_ignores_saved_order_saves_unit_groups_and_orders_split_tabs(self) -> None:
@@ -432,6 +507,7 @@ class HerdrSessionsTests(unittest.TestCase):
         replies["--session desk pane list"] = {"stdout": json.dumps({"result": {"panes": [
             {"pane_id": "w2:p1", "label": "writing"}]}}), "code": 0}
         _ = self.responses.write_text(json.dumps(replies))
+        self.observe("w2:p1", {"foreground_processes": []}, session="desk")
         self.assertEqual(self.call("list"), (0, "writing\tstandalone\t\n", ""))
 
     def test_empty_list(self) -> None:
@@ -637,8 +713,8 @@ class HerdrSessionsTests(unittest.TestCase):
         self.respond(["agents"], tabs=("target",))
         for owner, operation, arguments in (
                 (herdr, "live_sessions", ("list",)),
-                (herdr_sessions, "claude_sessions", ("list",)),
-                (herdr_sessions, "unit_roles", ("list",)),
+                (herdr.Herdr, "panes", ("list",)),
+                (herdr, "foreground_pane_conversation", ("list",)),
                 (herdr_sessions, "registered_showrunners", ("list",)),
                 (os, "execvp", ("attach", "target"))):
             with self.subTest(operation=operation), patch.object(owner, operation, side_effect=KeyboardInterrupt):
@@ -876,9 +952,15 @@ class StandaloneLaunchTests(unittest.TestCase):
         _ = prompt.write_text("first line\nsecond line\n")
         self.destination()
         transcript = directory / "projects/fixture/recorded-id.jsonl"
-        self.responses["--session agents pane process-info --pane w1:p1"] = CommandResponse(code=0, stdout=json.dumps({
-            "result": {"process_info": {"shell_pid": 100, "foreground_process_group_id": 101,
-                                        "foreground_processes": [{"pid": 101, "name": "claude", "argv": ["claude"]}]}}}))
+        fake_unit_host.process(os.environ, 101, 100, ["claude"], {}, started="fixture-start")
+        registry = runtime_sessions.sessions_dir() / "101.json"
+        self.responses["--session agents pane process-info --pane w1:p1"] = CommandResponse(
+            code=0, stdout=json.dumps({"result": {"process_info": {
+                "shell_pid": 100, "foreground_process_group_id": 101,
+                "foreground_processes": [{"pid": 101, "name": "claude", "argv": ["claude"]}]}}}),
+            write_files={str(registry): json.dumps({"pid": 101, "procStart": "fixture-start",
+                "name": "solo", "sessionId": "recorded-id", "updatedAt": 1, "messagingSocketPath": ""})},
+        )
         def native_process(pid: int, kind: str) -> herdr.NativeAgentProcess:
             self.assertEqual((pid, kind), (101, "claude"))
             return herdr.NativeAgentProcess(herdr.EnvironmentThread("recorded-id"), "fixture-start", {})

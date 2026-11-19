@@ -13,6 +13,7 @@ Send an item to morty's tracking list.
 
 2. **Park.** Copy any park words, such as `park till tuesday`, exactly as written.
    Do not parse or convert them; morty applies its own park terms.
+   Park only hides the item from the user's list until morty unparks it. It never stops, delays or reorders any work.
 
 3. **Send.** Replace `<item>` with the item from step 1.
    Replace `<park words>` with the words from step 2, or omit it when absent.
@@ -30,4 +31,4 @@ Send an item to morty's tracking list.
    Do not send the message again after a non-zero exit.
 
 When "recall" ends a prompt that requests other work, do that work too.
-`/recall` only adds the tracking.
+`/recall` only adds the tracking. It never changes the work, its owner or its timing.

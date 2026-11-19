@@ -214,10 +214,15 @@ class ReadNativePanes(Enum):
     CURRENT = "read the current native processes"
 
 
+class PaneProcessUnreadable(ValueError):
+    """The retained pane's current process could not be read."""
+
+
 def reference_panes(reference: StaffLaunchReference | NativeLaunchReference,
                     record: staff.StaffSnapshot, client: NativePaneServer,
                     entries: Mapping[str, PaneLaunch], *,
-                    evidence: NativePaneEvidence | ReadNativePanes = ReadNativePanes.CURRENT) -> list[dict[str, object]]:
+                    evidence: NativePaneEvidence | ReadNativePanes = ReadNativePanes.CURRENT,
+                    strict_retained_reads: bool = False) -> list[dict[str, object]]:
     """Select the current native pane, or its newest retained shell after the process stops."""
     owner = record.by_id(reference.id) if isinstance(reference, StaffLaunchReference) else None
     if isinstance(reference, StaffLaunchReference) and owner is None:
@@ -248,60 +253,80 @@ def reference_panes(reference: StaffLaunchReference | NativeLaunchReference,
     candidates = [pane for pane in panes
                   if str(pane["pane_id"]) in retained and str(pane["pane_id"]) not in occupied
                   and (owner is None or owner.kind != "worker" or str(pane["pane_id"]) not in unknown)]
-    if owner is not None:
-        retained_matches = [dict(pane) for pane in candidates
-                            if (_retained_shell(client, pane) if str(pane["pane_id"]) in unknown else
-                                _retained_native_owner(client, pane, owner, record))]
-    else:
-        retained_matches = [dict(pane) for pane in candidates
-                            if (_retained_shell(client, pane) if str(pane["pane_id"]) in unknown else
-                                not decoded[str(pane["pane_id"])])]
+    retained_matches: list[dict[str, object]] = []
+    for pane in candidates:
+        identity = str(pane["pane_id"])
+        try:
+            if identity in unknown:
+                matches_retained = _retained_shell(client, pane, strict=strict_retained_reads)
+            elif owner is not None:
+                matches_retained = _retained_native_owner(client, pane, owner, record)
+            else:
+                matches_retained = not decoded[identity]
+        except (herdr_types.HerdrFailure, OSError, ValueError) as error:
+            if strict_retained_reads:
+                raise PaneProcessUnreadable(f"{identity}: {error}") from error
+            continue
+        if matches_retained:
+            retained_matches.append(dict(pane))
     return sorted(retained_matches, key=lambda pane: entries[str(pane["pane_id"])]["written_at"], reverse=True)[:1]
 
 
-class NativePaneDecoder(Protocol):
-    def is_codex_process(self, arguments: Sequence[str]) -> bool: ...
-    def is_claude_process(self, arguments: Sequence[str]) -> bool: ...
-    def pane_native_process(self, info: dict[str, object], kind: str,
-                            pane: Mapping[str, object]) -> CurrentProcessEvidence: ...
+@dataclass(frozen=True)
+class ProvedPaneConversation:
+    identity: str
+    kind: Literal["claude", "codex"]
+    pid: int
+
+
+class NoForegroundConversation(Enum):
+    FOUND = "no foreground conversation"
+
+
+class NativePaneReader(Protocol):
+    def foreground_pane_conversation(
+        self, info: object, pane: Mapping[str, object],
+    ) -> ProvedPaneConversation | NoForegroundConversation: ...
+    def shared_session(self) -> str: ...
+    def Herdr(self, session: str) -> NativePaneServer: ...
+    def codex_resume_thread(self, pid: int) -> str: ...
 
 
 def native_sessions(client: NativePaneServer, pane: Mapping[str, object]) -> set[str]:
-    info = cast(dict[str, object], client.result("pane", "process-info", "--pane", str(pane["pane_id"]))["process_info"])
-    return _native_sessions(info, pane)
+    return _native_sessions(_process_info(client, pane), pane)
+
+
+def _process_info(client: NativePaneServer, pane: Mapping[str, object]) -> dict[str, object]:
+    info = client.result("pane", "process-info", "--pane", str(pane["pane_id"])).get("process_info")
+    if not isinstance(info, dict):
+        raise ValueError("expected pane process information")
+    process = cast(dict[str, object], info)
+    pids = (process.get("shell_pid"), process.get("foreground_process_group_id"))
+    if any(isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 for pid in pids):
+        raise ValueError("expected positive pane process ids")
+    return process
 
 
 def _native_sessions(info: dict[str, object], pane: Mapping[str, object]) -> set[str]:
-    decoder = cast(NativePaneDecoder, cast(object, import_module("scripts.herdr.herdr")))
-    identities: set[str] = set()
-    for process in cast(list[dict[str, object]], info.get("foreground_processes", [])):
-        arguments = cast(list[str], process.get("argv", []))
-        kind = "codex" if decoder.is_codex_process(arguments) else "claude" if decoder.is_claude_process(arguments) else ""
-        if kind:
-            identities.add(decoder.pane_native_process(info, kind, pane).current_identity)
-    return identities
+    reader = cast(NativePaneReader, cast(object, import_module("scripts.herdr.herdr")))
+    conversation = reader.foreground_pane_conversation(info, pane)
+    return {conversation.identity} if isinstance(conversation, ProvedPaneConversation) else set()
 
 
-def _retained_shell(client: NativePaneServer, pane: Mapping[str, object]) -> bool:
+def _retained_shell(client: NativePaneServer, pane: Mapping[str, object], *, strict: bool) -> bool:
     """Refresh a retained unknown pane once after its agent can exit."""
-    try:
-        info = cast(dict[str, object], client.result("pane", "process-info", "--pane", str(pane["pane_id"]))["process_info"])
-        shell = info.get("shell_pid")
-        return (isinstance(shell, int) and shell > 0 and info.get("foreground_process_group_id") == shell
-                and not _native_sessions(info, pane))
-    except (OSError, ValueError, herdr_types.HerdrFailure):
-        return False
+    info = _process_info(client, pane)
+    at_shell = info["foreground_process_group_id"] == info["shell_pid"]
+    if strict or at_shell:
+        return not _native_sessions(info, pane) and at_shell
+    return False
 
 
 def _retained_native_owner(client: NativePaneServer, pane: Mapping[str, object],
                            owner: staff.StaffRow, record: staff.StaffSnapshot) -> bool:
     """Keep readable retained panes unless another staffed owner runs there."""
-    try:
-        identities = native_sessions(client, pane)
-    except (herdr_types.HerdrFailure, OSError, ValueError):
-        return False
     return all(current is None or current.id == owner.id
-               for identity in identities
+               for identity in native_sessions(client, pane)
                for current in (record.by_member_reference(identity),))
 
 
@@ -342,48 +367,26 @@ def retained_launch(entry: PaneLaunch, record: staff.StaffSnapshot) -> PaneLaunc
     return cast(StaffPaneLaunch, cast(object, retained))
 
 
-class NativeBackendPanes(Protocol):
-    def panes(self) -> list[dict[str, object]]: ...
-    def result(self, *arguments: str) -> dict[str, object]: ...
-
-
 def native_kind(row: staff.StaffRow) -> str:
-    """Read the current backend from its native pane or Claude registry."""
-    module = import_module("scripts.herdr.herdr")
-    session = cast(Callable[[], str], module.shared_session)()
+    """Read the current backend from its proved pane owner or process registry."""
+    reader = cast(NativePaneReader, cast(object, import_module("scripts.herdr.herdr")))
     try:
-        client = cast(Callable[[str], NativeBackendPanes], module.Herdr)(session)
-        native = cast(Callable[[int, str], CurrentProcessEvidence], module.native_process)
-        codex = cast(Callable[[Sequence[str]], bool], module.is_codex_process)
-        claude = cast(Callable[[Sequence[str]], bool], module.is_claude_process)
+        client = reader.Herdr(reader.shared_session())
         for pane in client.panes():
             report = pane.get("agent_session")
             identity = pane.get("session_id", cast(dict[str, object], report).get("value") if isinstance(report, dict) else "")
             if identity != row.current_session:
                 continue
             reply = client.result("pane", "process-info", "--pane", str(pane["pane_id"]))
-            info = cast(dict[str, object], reply.get("process_info", {}))
-            for value in cast(list[dict[str, object]], info.get("foreground_processes", [])):
-                arguments = cast(list[str], value.get("argv", []))
-                family = "codex" if codex(arguments) else "claude" if claude(arguments) else ""
-                pid = value.get("pid")
-                if family and isinstance(pid, int):
-                    if family == "codex":
-                        resume_thread = cast(Callable[[int], str], module.codex_resume_thread)
-                        try:
-                            if resume_thread(pid) == row.current_session:
-                                return family
-                        except (OSError, ValueError):
-                            pass
-                    if native(pid, family).current_identity == row.current_session:
-                        return family
+            conversation = reader.foreground_pane_conversation(reply.get("process_info"), pane)
+            if isinstance(conversation, ProvedPaneConversation) and conversation.identity == row.current_session:
+                return conversation.kind
     except (OSError, ValueError, herdr_types.HerdrFailure):
         pass
     observed = sessions.session_liveness(row.current_session)
     if isinstance(observed, sessions.LiveSessionProcess):
-        resume_thread = cast(Callable[[int], str], module.codex_resume_thread)
         try:
-            if resume_thread(observed.pid) == row.current_session:
+            if reader.codex_resume_thread(observed.pid) == row.current_session:
                 return "codex"
         except (OSError, ValueError):
             pass

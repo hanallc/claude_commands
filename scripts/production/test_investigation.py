@@ -2,15 +2,17 @@
 from __future__ import annotations
 
 import io
+import fcntl
 import json
 import os
 import tempfile
 import unittest
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
-from typing import cast, override
+from typing import TextIO, cast, override
 from unittest.mock import patch
 
 from scripts.production import investigation, staff
@@ -63,6 +65,7 @@ class InvestigationTests(unittest.TestCase):
                          (question, answer, investigation.InvestigationState.ANSWER_READY))
         self.assertEqual(ready.filed, item.filed)
         self.assertTrue(ready.answered)
+        self.assert_review_checks_under_the_owner_lock(ready)
         self.assertEqual(self.command("read", "--id", "I1"), (0, "", ""))
         read = investigation.load(OWNER.id, "I1")
         self.assertTrue(read.read)
@@ -70,6 +73,52 @@ class InvestigationTests(unittest.TestCase):
         self.assertEqual(self.command("list"), (0, "", ""))
         self.assertIn(f"I1 | read | {title}", self.command("list", "--all")[1])
         self.assertEqual(investigation.records(OWNER.id, include_read=True), [read])
+
+    def test_f079_new_investigation_keeps_the_answer_at_a_late_collision(self) -> None:
+        first = investigation.file(OWNER.id, "First report", "Check the result.", waiting_why="The owner answers.")
+        _ = investigation.answer(OWNER.id, first.id, "The peer answered.")
+        original = investigation.folder(OWNER.id) / "I1.md"
+        content = original.read_bytes()
+        collision = investigation.folder(OWNER.id) / "I2.md"
+
+        def sync_answer(_identity: str, path: Path) -> None:
+            if path == collision:
+                _ = original.rename(path)
+
+        saved = investigation.file(OWNER.id, "Second report", "Check the other result.",
+                                   waiting_why="The owner answers.", before_write=sync_answer)
+        self.assertEqual(collision.read_bytes(), content)
+        self.assertEqual(investigation.load(OWNER.id, first.id).answer, "The peer answered.")
+        self.assertEqual(investigation.load(OWNER.id, saved.id), saved)
+        self.assertEqual((collision.with_stem("I2-2")).read_text().count("Second report"), 1)
+
+    def test_file_without_staff_uses_existing_store_ids(self) -> None:
+        staff_file = self.root / "staff.json"
+        staff_file.unlink()
+        first = investigation.file(OTHER.id, "First report", "Why?", waiting_why="The owner answers.")
+        second = investigation.file(OWNER.id, "Second report", "Why?", waiting_why="The owner answers.")
+        self.assertEqual((first.id, second.id), ("I1", "I2"))
+        self.assertEqual(investigation.load(OTHER.id, first.id), first)
+        self.assertEqual(investigation.load(OWNER.id, second.id), second)
+
+    def test_file_refuses_an_unreadable_staff_record(self) -> None:
+        _ = (self.root / "staff.json").write_text("invalid staff record")
+        with self.assertRaises(staff.StaffUnreadable):
+            _ = investigation.file(OWNER.id, "Check the result", "Why?", waiting_why="The owner answers.")
+        self.assertEqual(investigation.records(OWNER.id), [])
+
+    def test_legacy_record_without_kind_is_an_investigation(self) -> None:
+        directory = investigation.folder(OWNER.id)
+        directory.mkdir(parents=True)
+        fields = {
+            "id": "I1", "owner": OWNER.id, "title": "Find the cause", "state": "open",
+            "filed": "2026-11-17T16:00:00+00:00", "answered": "", "read": "", "question_length": "4",
+        }
+        header = "\n".join(f"{key}: {json.dumps(value)}" for key, value in fields.items())
+        _ = (directory / "I1.md").write_text(f"---\n{header}\n---\n\nWhy?\n\n## Answer\n\n")
+        self.assertEqual(investigation.load(OWNER.id, "I1").kind, investigation.InvestigationKind.INVESTIGATION)
+        self.assertEqual(investigation.answer(OWNER.id, "I1", "Fixed").kind,
+                         investigation.InvestigationKind.INVESTIGATION)
 
     def test_moves_refuse_invalid_states_and_preserve_exact_repeats(self) -> None:
         item = investigation.file(OWNER.id, "Find the cause", "What caused this?", waiting_why='The owner must complete the investigation.')
@@ -91,6 +140,22 @@ class InvestigationTests(unittest.TestCase):
         _ = investigation.mark_read(OWNER.id, item.id)
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), (before, timestamp))
         self.assertEqual(self.command("answer", "--id", item.id, "--text", "The cause is known.")[0], 1)
+
+    def assert_review_checks_under_the_owner_lock(self, item: investigation.Investigation) -> None:
+        """Use the answered record to check refusal under the owner lock."""
+        folder = investigation.folder(OWNER.id)
+        path = folder / f"{item.id}.md"
+        before = path.read_bytes()
+
+        def refuse() -> None:
+            lock = investigation.state_root() / "investigation-locks" / (OWNER.id + ".lock")
+            with lock.open("r") as other, self.assertRaises(BlockingIOError):
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            raise investigation.InvestigationError("The record changed.")
+
+        with self.assertRaisesRegex(investigation.InvestigationError, "The record changed"):
+            _ = investigation.mark_read(OWNER.id, item.id, check=refuse)
+        self.assertEqual(path.read_bytes(), before)
 
     def test_native_answer_refuses_a_superseded_review_exchange(self) -> None:
         for wait in ('native', 'question'):
@@ -147,7 +212,7 @@ class InvestigationTests(unittest.TestCase):
         finally:
             case.doCleanups()
 
-    def test_each_owner_numbers_records_under_a_lock(self) -> None:
+    def test_all_owners_number_records_under_one_lock(self) -> None:
         def file_one(number: int) -> str:
             return investigation.file(OWNER.id, f"Find cause {number}", "What caused this?", waiting_why='The owner must complete the investigation.').id
 
@@ -158,12 +223,12 @@ class InvestigationTests(unittest.TestCase):
         _ = investigation.mark_read(OWNER.id, "I12")
         self.assertEqual(investigation.file(OWNER.id, "Another cause", "What caused this?", waiting_why='The owner must complete the investigation.').id, "I13")
         with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
-            self.assertEqual(self.command("file", "--title", "Other cause", "--question", "Why?"), (0, "I1\n", ""))
+            self.assertEqual(self.command("file", "--title", "Other cause", "--question", "Why?"), (0, "I14\n", ""))
             self.assertEqual(len(self.command("list")[1].splitlines()), 1)
             self.assertEqual(self.command("answer", "--id", "I1", "--owner", OWNER.id, "--text", "Found it.")[0], 0)
             self.assertEqual(self.command("read", "--id", "I1", "--owner", OWNER.id)[0], 0)
         self.assertEqual(investigation.load(OWNER.id, "I1").state, investigation.InvestigationState.READ)
-        self.assertEqual(investigation.load(OTHER.id, "I1").state, investigation.InvestigationState.OPEN)
+        self.assertEqual(investigation.load(OTHER.id, "I14").state, investigation.InvestigationState.OPEN)
 
     def test_missing_callers_and_invalid_inputs_get_one_refusal_line(self) -> None:
         for args in (("file", "--title", "Two\nlines", "--question", "Why?"),
@@ -186,12 +251,14 @@ class InvestigationTests(unittest.TestCase):
     def test_reads_watch_sources_and_refuse_corrupt_records(self) -> None:
         sources: list[Path] = []
         self.assertEqual(investigation.records(OWNER.id, sources=sources), [])
-        self.assertEqual(sources, [investigation.folder(OWNER.id)])
+        folder = investigation.folder(OWNER.id)
+        watched = [folder, folder / "archive", folder.parent / "archive"]
+        self.assertEqual(sources, watched)
         item = investigation.file(OWNER.id, "Cause", "Why?", waiting_why='The owner must complete the investigation.')
         sources.clear()
         self.assertEqual(investigation.records(OWNER.id, sources=sources), [item])
         path = investigation.folder(OWNER.id) / "I1.md"
-        self.assertEqual(sources, [path.parent, path])
+        self.assertEqual(sources, [*watched, path])
         before = path.read_text()
         for text in ("bad", before.replace('state: "open"', 'state: "closed"'),
                      before.replace(OWNER.id, OTHER.id), before.replace('id: "I1"', 'id: "I2"')):
@@ -222,17 +289,37 @@ class InvestigationTests(unittest.TestCase):
                 self.assertEqual(self.command(*args)[0], 1)
                 self.assertEqual(path.read_text(), "bad")
 
+    def test_f078_records_skip_an_unreadable_renamed_record(self) -> None:
+        first = investigation.file(OWNER.id, "First", "Why?", waiting_why="The unit answers.")
+        second = investigation.file(OWNER.id, "Second", "Why?", waiting_why="The unit answers.")
+        folder = investigation.folder(OWNER.id)
+        blocked = (folder / f"{first.id}.md").rename(folder / "renamed.md")
+        _ = investigation.answer(OWNER.id, second.id, "The answer")
+        open_file = Path.open
+
+        def read_file(path: Path, *args: object, **kwargs: object) -> TextIO:
+            if path == blocked:
+                raise PermissionError("Cannot read the renamed record.")
+            return cast(Callable[..., TextIO], open_file)(path, *args, **kwargs)
+
+        sources: list[Path] = []
+        with patch.object(Path, "open", read_file), redirect_stderr(io.StringIO()):
+            records = investigation.records(OWNER.id, sources=sources)
+        self.assertEqual([item.id for item in records], [second.id])
+        self.assertIn(blocked, sources)
+
     def test_a_showrunner_owns_records_without_a_production_document(self) -> None:
         owner = replace(OWNER, kind="showrunner", parent=staff.StaffRoot(), unit_type=staff.NotUnit())
         _ = (self.root / "staff.json").write_text(json.dumps({"schema": 1, "rows": [owner.to_json()]}))
         self.assertEqual(self.command("file", "--title", "Cause", "--question", "Why?"), (0, "I1\n", ""))
 
-    def test_invalid_records_keep_their_numbers_and_valid_records_still_count(self) -> None:
+    def test_corrupt_records_keep_their_files_and_allocated_numbers(self) -> None:
         item = investigation.file(OWNER.id, "Cause", "Why?", waiting_why='The owner must complete the investigation.')
         path = investigation.folder(OWNER.id) / "I2.md"
         bad_time = (path.parent / "I1.md").read_text().replace('id: "I1"', 'id: "I2"')
         bad_time = bad_time.replace(f'filed: {json.dumps(item.filed)}', 'filed: "bad"')
-        for text in (b"bad", b"\xff", bad_time.encode()):
+        for text, identity, filename in ((b"bad", "I2", "I2-2.md"), (b"\xff", "I3", "I3.md"),
+                                         (bad_time.encode(), "I4", "I4.md")):
             with self.subTest(text=text):
                 _ = path.write_bytes(text)
                 errors = io.StringIO()
@@ -249,10 +336,17 @@ class InvestigationTests(unittest.TestCase):
                 self.assertEqual(error, errors.getvalue())
                 with self.assertRaises(investigation.InvestigationError):
                     _ = investigation.load(OWNER.id, "I2")
+                if text == b"\xff":
+                    with self.assertRaisesRegex(OSError, "I2.md"):
+                        _ = investigation.file(OWNER.id, "Next cause", "Why?", waiting_why='Await the findings.')
+                    self.assertEqual(path.read_bytes(), text)
+                    path.unlink()
                 next_item = investigation.file(OWNER.id, "Next cause", "Why?", waiting_why='The owner must complete the investigation.')
-                self.assertEqual(next_item.id, "I3")
-                self.assertEqual(path.read_bytes(), text)
-                (path.parent / "I3.md").unlink()
+                self.assertEqual(next_item.id, identity)
+                self.assertEqual(investigation.load(OWNER.id, identity), next_item)
+                if text != b"\xff":
+                    self.assertEqual(path.read_bytes(), text)
+                (path.parent / filename).unlink()
 
     def test_load_checks_required_times_and_empty_times_for_each_state(self) -> None:
         item = investigation.file(OWNER.id, "Cause", "Why?", waiting_why='The owner must complete the investigation.')

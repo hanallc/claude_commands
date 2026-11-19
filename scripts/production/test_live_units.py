@@ -19,7 +19,7 @@ from scripts.production import fake_showrunner
 from scripts.production import fake_unit_host
 from scripts.production.fake_unit_host import HostedUnit, labeled as marked
 from scripts.production import staff
-from scripts.production.staff_test_support import StaffTestCase, isolated_staff_file, unit_membership, showrunner_relationship, fixture_runtime_id
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, isolated_staff_file, unit_membership, showrunner_relationship, fixture_runtime_id
 
 SCRIPT = Path(__file__).with_name("live_units.py")
 
@@ -52,6 +52,126 @@ class RowDocumentLiveUnitsTests(StaffTestCase):
         self.assertEqual(listing.anomalies, ("anomaly: pid 123: session record is unreadable",))
         self.assertEqual(legacy, listing.units)
         self.assertEqual(errors.getvalue(), "anomaly: pid 123: session record is unreadable\n")
+
+    def test_unit_report_keeps_unproved_pane_owners_unknown_with_the_process_callback(self) -> None:
+        from scripts.agents import pane_record
+        from scripts.herdr import herdr
+        from scripts.herdr.test_herdr import codex_foreground_cases
+        from scripts.message import sessions
+        from scripts.production import live_units, staff_sources, unit_lookup
+
+        fixture = self.row_production()
+        unit = fixture.unit
+        child = fixture_member("unit", name="child", parent=fixture.runner.id)
+        place = herdr.HerdrPlace("agents", "w1:p1")
+        processes = [
+            herdr.HerdrProcess(456, place, {"CODEX_THREAD_ID": unit.current_session}, "codex", str(self.root)),
+            herdr.HerdrProcess(457, place, {"CLAUDE_CODE_SESSION_ID": child.current_session}, "claude", str(self.root)),
+        ]
+        claude = sessions.SessionRecord(pid=457, name="child-claude", sessionId=child.current_session,
+                                        procStart="1", updatedAt=1, messagingSocketPath="", tmux="", formerNames=[])
+        launch = pane_record.launch(place.pane, unit.current_session, str(self.root), {}, ["codex"], kind="codex")
+        pane: herdr.PaneIdentity = {"pane_id": place.pane, "workspace_id": "w1", "session_id": unit.current_session}
+        with (codex_foreground_cases(self.root) as cases,
+              mock.patch.object(herdr, "live_sessions", return_value=[{"name": place.session}]),
+              mock.patch.object(herdr, "shared_session", return_value=place.session),
+              mock.patch.object(herdr, "herdr_processes", return_value=processes) as scan,
+              mock.patch.object(herdr, "process_placement", return_value=place),
+              mock.patch.object(herdr, "process_environment", return_value={"CODEX_THREAD_ID": unit.current_session}),
+              mock.patch.object(herdr.Herdr, "listed", return_value=[dict(pane)]),
+              mock.patch.object(herdr.Herdr, "result") as read,
+              mock.patch.object(herdr, "native_process", return_value=herdr.NativeAgentProcess(
+                  herdr.PaneSessionReport(unit.current_session), "1", {})),
+              mock.patch.object(unit_lookup, "member_sources", return_value=unit_lookup.MemberSources((launch,))),
+              mock.patch.object(unit_lookup, "_claudes", return_value=(
+                  {place: {457: [claude]}},
+                  unit_lookup.ClaudeRegistryEvidence({}, unit_lookup.RecordsRead())))):
+            for case in cases:
+                with self.subTest(case=case.name):
+                    read.return_value = {"process_info": case.info}
+                    listing = live_units.read_units(fixture.name, check=staff_sources.CodexProcessThreads().check)
+                    units = {item.unit: item for item in listing.units}
+                    self.assertEqual(units[unit.name].status, "idle" if case.owner_proved else "unknown")
+                    self.assertEqual(unit_lookup.checked_unit(fixture.name, unit.name), units[unit.name].owner)
+                    if case.owner_proved:
+                        self.assertEqual(units["child"].status, "exited")
+                        self.assertIsNone(units["child"].session)
+                    else:
+                        self.assertTrue(listing.anomalies)
+            scan.return_value = []
+            read.return_value = {"process_info": {"foreground_processes": [
+                {"pid": 456, "name": "node", "argv": []}]}}
+            listing = live_units.read_units(fixture.name, check=staff_sources.CodexProcessThreads().check)
+            units = {item.unit: item for item in listing.units}
+            self.assertEqual(units[unit.name].status, "unknown")
+
+    def test_live_unit_ids_preserve_unknowns_beside_proved_claude_ids(self) -> None:
+        from scripts.production import live_units, showrunners, unit_lookup
+
+        fixture = self.row_production()
+        unknown = fixture_member("unit", name="unreadable", parent=fixture.runner.id)
+        reason = unit_lookup.UnknownUnit("pane read denied")
+        claude = unit_lookup.LiveClaude(fixture.unit.name, fixture.unit.current_session, "", 456)
+        listing = live_units.UnitListing([
+            live_units.LiveUnit(fixture.unit.name, None, owner=unit_lookup.ProvedLiveUnit(claude), member=fixture.unit),
+            live_units.LiveUnit(unknown.name, None, status="unknown", owner=reason, member=unknown),
+        ], (), failures=("registry unreadable",))
+        runner = showrunners.Showrunner(name=fixture.name, doc="", session="", socket="", zone="")
+        with (mock.patch.object(live_units, "read_units", return_value=listing),
+              mock.patch.object(live_units, "units_of", return_value=listing.units)):
+            ids = live_units.live_unit_ids(runner)
+        self.assertEqual(ids.proved_ids, [fixture.unit.id])
+        self.assertEqual(ids.unknown, {unknown.name: reason})
+        self.assertEqual(ids.failures, ("registry unreadable",))
+
+    def test_unassigned_pane_proof_failure_is_visible_in_the_report(self) -> None:
+        from scripts.herdr import herdr
+        from scripts.production import live_units, unit_lookup
+
+        fixture = self.row_production()
+        place = herdr.HerdrPlace("agents", "w1:p1")
+        with (mock.patch.object(herdr, "live_sessions", return_value=[{"name": place.session}]),
+              mock.patch.object(herdr, "herdr_processes", return_value=[]),
+              mock.patch.object(herdr.Herdr, "listed", return_value=[{"pane_id": place.pane}]),
+              mock.patch.object(herdr.Herdr, "result", return_value={"process_info": {
+                  "foreground_processes": [{"pid": 456, "name": "node"}]}}),
+              mock.patch.object(unit_lookup, "member_sources", return_value=unit_lookup.MemberSources(()))):
+            listing = live_units.read_units(fixture.name)
+        self.assertEqual([unit.status for unit in listing.units], ["unknown"])
+        self.assertTrue(any("herdr:agents:w1:p1" in line and "cannot assign" in line
+                            for line in listing.anomalies), listing.anomalies)
+
+    def test_report_preserves_unknown_when_no_unit_can_take_the_observation(self) -> None:
+        from scripts.herdr import herdr
+        from scripts.message import sessions
+        from scripts.production import live_units, staff_sources, unit_lookup
+        from scripts.production.staff_test_support import fixture_worker
+
+        fixture = self.row_production()
+        worker = fixture_worker("worker", fixture.unit.id)
+        running = sessions.SessionRecord(pid=456, sessionId=fixture.unit.current_session, name=fixture.unit.name,
+                                         status="idle", updatedAt=1, messagingSocketPath="", tmux="", formerNames=[])
+        for case in ("worker candidate", "pane list failure", "unplaced registry process", "placement read failure"):
+            visible_sessions = [] if case == "placement read failure" else [{"name": "agents"}]
+            visible_registry = [running] if case in ("unplaced registry process", "placement read failure") else []
+            with (self.subTest(case=case),
+                  mock.patch.object(herdr, "live_sessions", return_value=visible_sessions),
+                  mock.patch.object(herdr, "herdr_processes", return_value=[]),
+                  mock.patch.object(herdr, "_process_environment", side_effect=PermissionError("placement denied")),
+                  mock.patch.object(herdr.Herdr, "listed", return_value=[{
+                      "pane_id": "w1:p1", "session_id": worker.current_session if case == "worker candidate" else "",
+                  }]) as listed,
+                  mock.patch.object(herdr.Herdr, "result", return_value={"process_info": {
+                      "foreground_processes": [{"pid": 456, "name": "node"}]}}),
+                  mock.patch.object(unit_lookup, "member_sources", return_value=unit_lookup.MemberSources(())),
+                  mock.patch.object(sessions, "read_registry", return_value=sessions.RegistryRead(
+                      tuple(sessions.RegistryObservation(item, {}) for item in visible_registry), ())),
+                  mock.patch.object(sessions, "running_session", return_value=True)):
+                if case == "pane list failure":
+                    listed.side_effect = OSError("pane list denied")
+                listing = live_units.read_units(fixture.name, check=staff_sources.CodexProcessThreads().check)
+                self.assertEqual([unit.status for unit in listing.units], ["unknown"])
+                self.assertTrue(listing.anomalies)
 
     def test_incomplete_facts_keep_the_live_unit_and_one_named_problem(self) -> None:
         import io
@@ -156,15 +276,19 @@ class LiveUnitsTests(unittest.TestCase):
 
     def claude(self, name: str, pane: str) -> None:
         """Record a live Claude in `pane`: this test process stands in for it."""
+        from scripts.message import sessions
+
         if pane:
             fake_unit_host.place_process(self.environment, os.getpid(), pane, exec_shell=True)
         path = Path(self.enterContext(short_socket_directory())) / f"{name}.sock"
         held = socket.socket(socket.AF_UNIX)
         held.bind(str(path))
+        held.listen(128)
         self.addCleanup(held.close)
-        _ = (self.records / f"{name}.json").write_text(json.dumps({
+        _ = (self.records / f"{os.getpid()}.json").write_text(json.dumps({
             "pid": os.getpid(), "sessionId": self.pane_sessions[pane], "name": name,
-            "messagingSocketPath": str(path), "updatedAt": 1, "tmux": f"label-at-start:@1.{pane}" if pane else ""}))
+            "procStart": sessions.process_start(os.getpid()), "messagingSocketPath": str(path),
+            "updatedAt": 1, "tmux": f"label-at-start:@1.{pane}" if pane else ""}))
 
     def run_script(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *(arguments or ("--production", "show"))],
@@ -236,6 +360,7 @@ class LiveUnitsTests(unittest.TestCase):
     def test_herdr_pane_targets_match_between_live_units_and_lookup(self) -> None:
         self.members("alpha")
         self.hosts({"$1": marked("alpha-label", "w41:p1", "alpha")})
+        self.claude("alpha-claude", "w41:p1")
         listed = self.run_script()
         target = subprocess.run([str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT.with_name("unit_lookup.py")),
                                  "pane", "show", "alpha"], env=self.environment,

@@ -39,6 +39,15 @@ class LedgerTests(CostFixture):
         self.book.record_inventory(ledger.ResourceInventory(
             at, (ledger.PricedResource("retained-storage", Decimal(monthly)),), "priced fixture inventory"))
 
+    def test_quota_refusal_without_saved_time_is_expired(self) -> None:
+        pool = ledger.SpotQuotaPool('us-west-2', ledger.SpotQuotaClass.STANDARD)
+        self.book.record_gate_quota_refusal(pool, self.start)
+        document = ledger.mapping(cast(object, json.loads(self.book.path.read_text())))
+        row, = ledger.rows(document, 'gate_quota_refusals')
+        del row['at']
+        _ = self.book.path.write_text(json.dumps(document))
+        self.assertEqual(self.book.read_snapshot().gate_quota_refusals, [])
+
     def observe(self, at: int, state: ledger.InstanceState) -> None:
         self.book.observe(ledger.InstanceObservation(at, state, "fake DescribeInstances"))
 
@@ -50,7 +59,7 @@ class LedgerTests(CostFixture):
         return True
 
     def guard(self, at: int, purpose: ledger.SpendingPurpose = "admission") -> ledger.SpendingDecision:
-        return self.book.guard(self.settings, purpose, at, self.notice)
+        return self.book.guard(self.settings, purpose, at, self.notice, clock=lambda: 0.0)
 
     def estimate(self, at: int) -> ledger.CostEstimate:
         return self.book.estimate(config.read_settings(self.settings), at)
@@ -58,6 +67,27 @@ class LedgerTests(CostFixture):
     def running(self, at: int) -> None:
         self.inventory(at)
         self.observe(at, "running")
+
+    def test_spot_quota_classes_use_the_instance_families(self) -> None:
+        for instance_type, quota_class in (
+                ('g6.8xlarge', ledger.SpotQuotaClass.G_AND_VT),
+                ('vt1.3xlarge', ledger.SpotQuotaClass.G_AND_VT),
+                ('p4d.24xlarge', ledger.SpotQuotaClass.P),
+                ('m7a.8xlarge', ledger.SpotQuotaClass.STANDARD)):
+            with self.subTest(instance_type=instance_type):
+                self.assertEqual(ledger.spot_quota_class(instance_type), quota_class)
+
+    def test_spot_quota_snapshot_can_omit_the_p_limit(self) -> None:
+        path = self.state / 'spot-prices.json'
+        region = {'region': 'us-east-2', 'read_at': self.start, 'standard_vcpus': '128', 'gpu_vcpus': '32'}
+        p_limits: tuple[dict[str, str], ...] = ({}, {'p_vcpus': '96'})
+        for p_limit in p_limits:
+            with self.subTest(p_limit=p_limit):
+                _ = path.write_text(json.dumps({'regions': [{**region, **p_limit}]}))
+                quota, = ledger.read_spot_quotas(self.state)
+                self.assertEqual(quota.limit(ledger.SpotQuotaClass.STANDARD), Decimal(128))
+                self.assertEqual(quota.limit(ledger.SpotQuotaClass.G_AND_VT), Decimal(32))
+                self.assertEqual(quota.limit(ledger.SpotQuotaClass.P), Decimal(96) if p_limit else ledger.NoSpotQuota())
 
     def test_gpu_trial_budget_counts_booked_cost_and_open_maximum(self) -> None:
         self.inventory(self.start)
@@ -858,7 +888,8 @@ class LedgerTests(CostFixture):
             attempts.append(event)
             return False
 
-        self.assertIsInstance(self.book.guard(self.settings, "admission", now, refused), ledger.SpendingRefused)
+        self.assertIsInstance(self.book.guard(self.settings, "admission", now, refused, clock=lambda: 0.0),
+                              ledger.SpendingRefused)
         self.assertEqual(self.saved_events()[0]["delivery"], "pending")
         self.book = ledger.CostLedger(self.state)
         now += config.read_settings(self.settings).notification_retry_s
@@ -867,6 +898,98 @@ class LedgerTests(CostFixture):
         self.assertEqual(self.saved_events()[0]["delivery"], "delivered")
         self.assertIsInstance(self.guard(now), ledger.SpendingRefused)
         self.assertEqual(len(self.notices), 1)
+
+    def test_guard_delivers_an_old_pending_record_with_live_settings(self) -> None:
+        now = self.reach_limit()
+        original = config.read_settings(self.settings)
+        self.assertIsInstance(self.book.guard(self.settings, "admission", now, lambda _event: False),
+                              ledger.SpendingRefused)
+        saved, = self.saved_events()
+        self.assertEqual(saved["delivery"], "pending")
+        self.assertEqual(saved["recipient"], original.notification_recipient)
+        self.assertEqual(saved["timeout_s"], original.notification_timeout_s)
+        self.assertNotIn("expired", saved)
+
+        self.book = ledger.CostLedger(self.state)
+        pending, = self.book.read_snapshot().events
+        self.assertEqual(pending.delivery, ledger.DeliveryState.PENDING)
+        self.text_setting("notification_recipient", "live-fixture-recipient")
+        self.replace("notification_timeout_s", "23")
+        sends: list[tuple[str, object, str]] = []
+
+        def message(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if arguments[0] == "git":
+                return git_only(arguments, **options)
+            self.assertEqual(Path(arguments[1]).name, "send.py")
+            sends.append((arguments[arguments.index("--to") + 1], options["timeout"],
+                          arguments[arguments.index("--text") + 1]))
+            return subprocess.CompletedProcess(list(arguments), 0, "SENT: fixture recipient\n", "")
+
+        with mock.patch.object(subprocess, "run", side_effect=message):
+            self.assertIsInstance(self.book.guard(self.settings, "admission", pending.retry_after),
+                                  ledger.SpendingRefused)
+
+        (recipient, timeout, message_text), = sends
+        self.assertEqual((recipient, timeout), ("live-fixture-recipient", 23))
+        self.assertIn("daily limit for 2026-01-15", message_text)
+        delivered, = self.saved_events()
+        self.assertEqual(delivered["delivery"], "delivered")
+        self.assertEqual(delivered["recipient"], saved["recipient"])
+        self.assertEqual(delivered["timeout_s"], saved["timeout_s"])
+        self.assertNotIn("expired", delivered)
+
+    def test_guard_expires_pending_notices_at_accounting_boundaries(self) -> None:
+        self.text_setting("accounting_zone", "America/New_York")
+        midnight = instant("2026-01-31T00:00:00-05:00")
+        month_ends = instant("2026-02-01T00:00:00-05:00")
+        settings = config.read_settings(self.settings)
+        daily = ledger.LimitEvent("daily:2026-01-30", midnight - 1, "daily", Decimal(20), Decimal(20),
+                                  settings.notification_recipient, settings.notification_timeout_s,
+                                  retry_after=month_ends + 1, owner=ledger.DeliveryOwner("interrupted"))
+        monthly = replace(daily, event_id="monthly:2026-01", period="monthly")
+        with self.book.transaction() as state:
+            state.events.extend((daily, monthly))
+
+        notify = mock.Mock(return_value=True)
+        expired_daily = replace(daily, delivery=ledger.DeliveryState.EXPIRED, owner=ledger.DeliveryUnowned())
+        expired_monthly = replace(monthly, delivery=ledger.DeliveryState.EXPIRED, owner=ledger.DeliveryUnowned())
+        for at, expected in ((midnight - 0.25, [daily, monthly]), (midnight, [expired_daily, monthly]),
+                             (month_ends - 0.25, [expired_daily, monthly]),
+                             (month_ends, [expired_daily, expired_monthly])):
+            with self.subTest(at=at):
+                _ = ledger.spending_guard(self.settings, self.state, clock=lambda: at, notify=notify)
+                self.assertEqual(self.book.read_snapshot().events, expected)
+        notify.assert_not_called()
+        for saved in self.saved_events():
+            self.assertEqual(saved["delivery"], "delivered")
+            self.assertIs(saved["expired"], True)
+            self.assertEqual(saved["recipient"], settings.notification_recipient)
+            self.assertTrue(saved["recipient"])
+            for key in ("at", "timeout_s", "retry_after"):
+                self.assertIs(type(saved[key]), int)
+                self.assertGreaterEqual(cast(int, saved[key]), 0)
+
+    def test_guard_checks_expiry_again_after_saving_the_attempt(self) -> None:
+        _ = self.reach_limit()
+        midnight = instant("2026-01-16T00:00:00+00:00")
+        clock = [midnight - 0.25]
+        notify = mock.Mock(return_value=True)
+
+        def save_then_cross_midnight(path: Path, text: str) -> None:
+            write_text_atomic(path, text)
+            document = ledger.mapping(cast(object, json.loads(text)))
+            if any(event["owner"] for event in ledger.rows(document, "events")):
+                clock[0] = float(midnight)
+
+        with mock.patch.object(ledger, "write_text_atomic", side_effect=save_then_cross_midnight):
+            self.assertIsInstance(self.book.guard(self.settings, "admission", clock[0], notify,
+                                                  clock=lambda: clock[0]),
+                                  ledger.SpendingRefused)
+
+        notify.assert_not_called()
+        event, = self.book.read_snapshot().events
+        self.assertIs(event.delivery, ledger.DeliveryState.EXPIRED)
+        self.assertIsInstance(event.owner, ledger.DeliveryUnowned)
 
     def test_guard_retries_delivery_after_notifier_exception(self) -> None:
         now = self.reach_limit()
@@ -955,14 +1078,16 @@ class LedgerTests(CostFixture):
             attempts.append(event)
             return False
 
-        self.assertIsInstance(self.book.guard(self.settings, "admission", now, failed_notice), ledger.SpendingRefused)
+        self.assertIsInstance(self.book.guard(self.settings, "admission", now, failed_notice, clock=lambda: 0.0),
+                              ledger.SpendingRefused)
         event_id = self.saved_events()[0]["event_id"]
         self.book = ledger.CostLedger(self.state)
         self.replace("notification_retry_s", "120")
         for at in (now, now + 59):
             self.assertIsInstance(self.book.guard(self.settings, "start", at, failed_notice), ledger.SpendingRefused)
         self.assertEqual(len(attempts), 1)
-        self.assertIsInstance(self.book.guard(self.settings, "admission", now + 60, failed_notice), ledger.SpendingRefused)
+        self.assertIsInstance(self.book.guard(self.settings, "admission", now + 60, failed_notice, clock=lambda: 0.0),
+                              ledger.SpendingRefused)
         self.assertEqual(len(attempts), 2)
         self.assertEqual([event.event_id for event in attempts], [event_id, event_id])
         self.book = ledger.CostLedger(self.state)
@@ -1049,17 +1174,19 @@ class LedgerTests(CostFixture):
         self.assertEqual(attempts, [f"aws-limit:{event_id}", f"aws-limit:{event_id}"])
         self.assertEqual(replies, ["SENT: fixture recipient\n", "SKIPPED: inside the repeat window\n"])
 
-    def test_each_pending_notice_sets_its_retry_deadline_from_its_own_attempt(self) -> None:
+    def test_each_pending_notice_uses_its_own_attempt_time_and_settings(self) -> None:
         self.replace("monthly_limit_usd", "20")
         now = self.reach_limit()
-        retry_s = config.read_settings(self.settings).notification_retry_s
-        clock = [now]
-        attempts: list[tuple[str, int, int]] = []
+        settings = config.read_settings(self.settings)
+        clock = [now + 0.25]
+        attempts: list[ledger.LimitEvent] = []
 
         def slow_first_notice(event: ledger.LimitEvent) -> bool:
-            attempts.append((event.event_id, clock[0], event.retry_after))
+            attempts.append(event)
             if len(attempts) == 1:
-                clock[0] += retry_s + 1
+                clock[0] += settings.notification_retry_s + 1
+                self.text_setting("notification_recipient", "second-fixture-recipient")
+                self.replace("notification_timeout_s", "23")
                 return True
             return False
 
@@ -1070,15 +1197,19 @@ class LedgerTests(CostFixture):
             self.settings, self.state, clock=current_time, notify=slow_first_notice), ledger.SpendingRefused)
         self.assertEqual(len(attempts), 2)
         first, second = attempts
-        self.assertNotEqual(first[0], second[0])
+        self.assertNotEqual(first.event_id, second.event_id)
         self.assertIsInstance(ledger.spending_guard(
             self.settings, self.state, clock=current_time, notify=slow_first_notice), ledger.SpendingRefused)
-        self.assertEqual([attempt[0] for attempt in attempts].count(second[0]), 1)
-        self.assertEqual(first[2], first[1] + retry_s)
-        self.assertEqual(second[2], second[1] + retry_s)
-        saved = next(event for event in self.saved_events() if event["event_id"] == second[0])
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(first.retry_after, now + settings.notification_retry_s + 1)
+        self.assertEqual(second.retry_after, now + 2 * settings.notification_retry_s + 2)
+        self.assertEqual((first.recipient, first.timeout_s), (settings.notification_recipient, settings.notification_timeout_s))
+        self.assertEqual((second.recipient, second.timeout_s), ("second-fixture-recipient", 23))
+        saved = next(event for event in self.saved_events() if event["event_id"] == second.event_id)
         self.assertEqual(saved["delivery"], "pending")
-        self.assertEqual(saved["retry_after"], second[1] + retry_s)
+        self.assertEqual(saved["retry_after"], second.retry_after)
+        self.assertEqual(saved["recipient"], settings.notification_recipient)
+        self.assertEqual(saved["timeout_s"], settings.notification_timeout_s)
 
     def test_legacy_unknown_observations_do_not_block_later_confirmed_charging(self) -> None:
         self.running(self.start)
@@ -1154,6 +1285,39 @@ class LedgerTests(CostFixture):
         self.assertTrue(published)
         self.assertTrue(all(cast(int, row["start"]) >= current for row in published))
         self.assertEqual(len(cast(list[object], json.loads(self.book.path.read_text())["observations"])), 2)
+
+
+class SpotPlacementEvidenceTests(CostFixture):
+    def test_request_type_order_is_canonical_in_storage_and_in_older_readings(self) -> None:
+        now = 1768478400
+        types = ('c7a.8xlarge', 'm7a.8xlarge')
+        request = ledger.SpotPlacementRequest(ledger.SpotPlacementScope.REGION,
+            ledger.SpotPlacementTypeSet.GATE_32_VCPU, 8, types[::-1], ('us-east-2',))
+        path = self.state / ledger.SPOT_PLACEMENT_FILE
+        reading = ledger.SpotPlacementSample(request, now, ())
+        ledger.write_spot_placement_scores(self.state, (reading,), now)
+        saved = path.read_text()
+        self.assertIn(json.dumps(types), saved)
+        _ = path.write_text(saved.replace(json.dumps(types), json.dumps(types[::-1])))
+        self.assertEqual(ledger.read_spot_placement_scores(self.state), (reading,))
+
+    def test_scores_and_failures_round_trip_with_only_the_last_72_hours(self) -> None:
+        now = 1768478400
+        first = now - 72 * 3600
+        region = 'us-east-2'
+        request = ledger.SpotPlacementRequest(ledger.SpotPlacementScope.REGION,
+            ledger.SpotPlacementTypeSet.GATE_32_VCPU, 8, ('c7a.8xlarge', 'm7a.8xlarge'), (region,))
+        sample = ledger.SpotPlacementSample(request, first,
+            (ledger.SpotPlacementScore(ledger.SpotPlacementRegion(region), 5),))
+        zone_sample = ledger.SpotPlacementSample(replace(request, scope=ledger.SpotPlacementScope.ZONE), now,
+            (ledger.SpotPlacementScore(ledger.SpotPlacementZone(region, 'use2-az1'), 7),))
+        failed = ledger.SpotPlacementFailure(request, now, 'UnauthorizedOperation')
+        self.assertEqual(ledger.read_spot_placement_scores(self.state), ())
+        ledger.write_spot_placement_scores(self.state, (replace(sample, at=first - 1), sample, zone_sample, failed), now)
+        self.assertEqual(ledger.read_spot_placement_scores(self.state), (sample, zone_sample, failed))
+        ledger.write_spot_placement_scores(self.state, (sample, zone_sample, failed), now + 1)
+        self.assertEqual(ledger.read_spot_placement_scores(self.state), (zone_sample, failed))
+        self.assertFalse((self.state / 'spot-prices.json').exists())
 
 
 class SpotPriceEvidenceTests(CostFixture):

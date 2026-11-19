@@ -12,6 +12,7 @@ import tempfile
 from typing import BinaryIO, cast, override
 import unittest
 
+from scripts.agents.detached_runs import RunRecord
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import process_start
@@ -222,8 +223,14 @@ FIXTURE_EXECUTION=next verify_helper "$3" > "$4/next-environment"
         started = process_start.process_start(os.getpid())
         self.assertIsInstance(started, process_start.Started)
         assert isinstance(started, process_start.Started)
-        _ = record.write_text(json.dumps(dict(run_id="helper-test", command=[], status="running",
-                                             command_pid=os.getpid(), command_started=started.start)))
+        detached: RunRecord = {
+            "run_id": record.stem, "status": "running", "session_dir": str(self.root),
+            "worker": "helper-test", "staff_id": "", "label": "verify helper",
+            "command": [str(shell)], "log": str(record.with_suffix(".log")), "started_at": 1.0,
+            "pid": os.getpid(), "director_dir": "", "done_message_file": "",
+            "command_pid": os.getpid(), "command_started": started.start,
+        }
+        _ = record.write_text(json.dumps(detached))
         for mode in ("death", "shell", "TERM", "INT", "HUP", "parent-exit", "forwarded-empty", "trap", "record-exit"):
             with self.subTest(mode=mode):
                 if mode == "parent-exit" and sys.platform != "linux":

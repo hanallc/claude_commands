@@ -30,7 +30,6 @@ from scripts.whoami import account
 from scripts.herdr import herdr
 from scripts.message import session_records, sessions
 from scripts.production import showrunners
-from scripts.production import unit_lookup
 from scripts.agents import shutdown
 from scripts.herdr.fake_herdr import CommandResponse
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
@@ -510,9 +509,20 @@ class InventoryTests(ShutdownTestCase):
         _live_context: object = self.enterContext(
             patch.object(session_records, "live_session", return_value=True)
         )
-        _unit_live_context: object = self.enterContext(
-            patch.object(unit_lookup, "live_session", return_value=True)
-        )
+        started = session_records.process_start
+        running = session_records.running_session
+
+        def process_start(pid: int) -> str | None:
+            return CURRENT_PROCESS_START if pid == UNIT_PID else started(pid)
+
+        def running_session(record: sessions.SessionRecord) -> bool:
+            if record["pid"] == UNIT_PID:
+                return record.get("procStart") == CURRENT_PROCESS_START
+            return running(record)
+
+        _ = self.enterContext(patch.object(session_records, "process_start", side_effect=process_start))
+        _ = self.enterContext(patch.object(sessions, "process_start", side_effect=process_start))
+        _ = self.enterContext(patch.object(session_records, "running_session", side_effect=running_session))
         _process_environment_context = cast(
             object,
             self.enterContext(patch("scripts.agents.inventory._process_environment", return_value={})),
@@ -526,6 +536,7 @@ class InventoryTests(ShutdownTestCase):
         self.live_socket.close()
         self.live_socket = socket.socket(socket.AF_UNIX)
         self.live_socket.bind(str(socket_path))
+        self.live_socket.listen(128)
         self.addCleanup(self.live_socket.close)
         self.write_account(self.target_config, TARGET_LOGIN)
         self.write_account(self.other_config, OTHER_LOGIN)
@@ -556,6 +567,8 @@ class InventoryTests(ShutdownTestCase):
         self.make_git_checkout()
         self.make_command_stand_ins()
         self.make_sessions(socket_path)
+        self.herdr_process(self.director_pid, DIRECTOR_SHELL_PID, ["/fixture/claude"], {})
+        self.herdr_process(DESKTOP_PID, DESKTOP_SHELL_PID, ["/fixture/claude"], {})
         for config_dir in (self.target_config, self.other_config):
             (config_dir / "projects").symlink_to(self.home / ".claude/projects", target_is_directory=True)
         self.make_production_state()
@@ -619,8 +632,11 @@ class InventoryTests(ShutdownTestCase):
             responses[f"--session {session} pane list"] = {"code": 0, "stdout": json.dumps({"result": {
                 "panes": [{"pane_id": pane, "workspace_id": pane.split(":", 1)[0]} for pane in shells]}})}
             for pane, shell in shells.items():
+                _, arguments, _ = self.pane_processes[shell]
                 responses[f"--session {session} pane process-info --pane {pane}"] = {
-                    "code": 0, "stdout": json.dumps({"result": {"process_info": {"shell_pid": shell}}})}
+                    "code": 0, "stdout": json.dumps({"result": {"process_info": {
+                        "shell_pid": shell, "foreground_process_group_id": shell,
+                        "foreground_processes": [{"pid": shell, "argv": arguments}]}}})}
         _ = path.write_text(json.dumps(responses))
 
     def herdr_sessions(self, names: list[str]) -> None:
@@ -966,6 +982,13 @@ elif "comm=" in joined:
         self.assertEqual(inventory.parse_inventory(json.dumps(found)), found)
         self.assertEqual(shutdown._host_text(desktop["host"]), "herdr writing")  # pyright: ignore[reportPrivateUsage]
 
+    def test_unreadable_herdr_placement_stays_unknown_in_inventory(self) -> None:
+        with patch.object(herdr, "herdr_place_of", return_value=herdr.UnprovedHerdrPlacement("placement denied")):
+            found = inventory.inventory(TARGET_LOGIN)
+        desktop = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
+        self.assertEqual(desktop["host"], {"kind": "unknown"})
+        self.assertEqual(inventory.parse_inventory(json.dumps(found)), found)
+
     def test_herdr_inventory_records_attached_clients_and_defaults_unreadable_clients_to_detached(self) -> None:
         self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "writing", "server"], {})
         self.herdr_process(DESKTOP_PID, 71_001, ["/bin/claude"], {"HERDR_PANE_ID": "w1:p1"})
@@ -1022,10 +1045,12 @@ elif "comm=" in joined:
         rows = cast(dict[str, list[object]], json.loads(os.environ["SHUTDOWN_TEST_PARENT_ROWS"]))
         rows[str(self.director_pid)] = [supervisor_pid, "claude"]
         rows[str(supervisor_pid)] = [DIRECTOR_SHELL_PID, "python3"]
+        read_bytes = Path.read_bytes
+
         def cmdline(path: Path) -> bytes:
             if path == Path(f"/proc/{supervisor_pid}/cmdline"):
                 return b"python3\0/tmp/relaunch.py\0run\0--\0claude\0"
-            raise FileNotFoundError(path)
+            return read_bytes(path)
         for refresh in (True, False):
             with (
                 self.subTest(refresh=refresh),
@@ -1042,7 +1067,14 @@ elif "comm=" in joined:
 
 
     def test_ghostty_shell_parent_is_not_a_supervisor(self) -> None:
-        with patch.object(Path, "read_bytes", side_effect=FileNotFoundError):
+        read_bytes = Path.read_bytes
+
+        def no_supervisor_command(path: Path) -> bytes:
+            if path.name == "cmdline":
+                raise FileNotFoundError(path)
+            return read_bytes(path)
+
+        with patch.object(Path, "read_bytes", autospec=True, side_effect=no_supervisor_command):
             found = inventory.inventory(TARGET_LOGIN, only=frozenset({DIRECTOR_ID}))
         owner = next(item for item in found["sessions"] if item["session_id"] == DIRECTOR_ID)
         host = owner["host"]

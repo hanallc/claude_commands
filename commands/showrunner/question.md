@@ -21,7 +21,8 @@ Use this command for a unit's question or your own question. Do not file questio
 
 Omit `--unit` for your own question. A current unit label is also accepted. The stored `asked_by` always holds the fixed staff id.
 
-A producer files its own question without `--production` or `--unit`:
+A producer omits `--production` for `ask`, `answer`, and `withdraw`. Omit `--unit` when you ask as a producer.
+Use `answer --item "<question title>"` to record the user's answer. Use `withdraw --item "<question title>"` to close it without an answer.
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py ask --ask "<question>" --context "<why now>"

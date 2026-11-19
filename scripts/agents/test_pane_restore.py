@@ -1159,6 +1159,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
 
             with (mock.patch.object(accounts, "group_accounts", return_value=accounts.GroupAccounts(units="claude4")),
                   mock.patch.object(accounts, "claude_account_dir", return_value=backend.config),
+                  mock.patch.object(herdr, "live_sessions", return_value=[{"name": "agents"}]),
                   mock.patch.object(herdr, "Herdr", return_value=client),
                   mock.patch.object(client, "open_tab", side_effect=open_tab),
                   mock.patch.object(stop_resume, "_tab_of", return_value=stop_resume.SessionNotFound(self.owner.current_session)),

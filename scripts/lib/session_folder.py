@@ -174,21 +174,29 @@ def link(root: Path, session_id: str, folder: Path) -> None:
     os.replace(temporary, index / session_id)
 
 
-def claim(root: Path, owner: str, base: str, session_id: str) -> Path:
-    """The first name no other live session holds, made or taken over. Hold the root lock."""
+def select_folder(root: Path, base: str, session_id: str) -> Path:
+    """Return the first available folder name without changing any records."""
     number = 1
     while True:
         folder = root / (base if number == 1 else f"{base}-{number}")
         if not os.path.lexists(folder):
-            folder.mkdir(mode=0o700)
-            write_record(folder, FolderRecord(owner=owner, session_id=session_id))
             return folder
-        record = read_record(folder)
-        if folder.is_dir() and not folder.is_symlink() and not held_by_another(record, session_id):
-            if record != FolderRecord(owner=owner, session_id=session_id):
-                write_record(folder, FolderRecord(owner=owner, session_id=session_id))
+        if not folder.is_symlink() and folder.is_dir() and not held_by_another(read_record(folder), session_id):
             return folder
         number += 1
+
+
+def claim(root: Path, owner: str, base: str, session_id: str) -> Path:
+    """Create or take over the selected folder. Hold the root lock."""
+    folder = select_folder(root, base, session_id)
+    if not os.path.lexists(folder):
+        folder.mkdir(mode=0o700)
+    elif folder.is_symlink() or not folder.is_dir():
+        raise FileExistsError(f"{folder}: selected session folder changed")
+    record = FolderRecord(owner=owner, session_id=session_id)
+    if read_record(folder) != record:
+        write_record(folder, record)
+    return folder
 
 
 def launch_folder(member: Member, session_id: str = "") -> Path | None:

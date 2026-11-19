@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import override
+from unittest import mock
 
 from scripts.lib import git_files
 
@@ -114,6 +115,64 @@ class GitFilesTests(unittest.TestCase):
         self.assertEqual(git_files.head(checkout), git_files.OnBranch("trunk"))
         _ = git(self.main, "switch", "-q", "--detach")
         self.assertEqual(git_files.head(checkout), git_files.DetachedHead(git(self.main, "rev-parse", "HEAD")))
+
+    def test_internal_head_allows_absence_and_reports_inspection_errors(self) -> None:
+        checkout = git_files.at(self.main)
+        path = checkout.git_dir / "HEAD"
+        path.unlink()
+        git_files.check_internal_head(checkout)
+        path.symlink_to(self.root / "missing-head")
+        with self.assertRaises(git_files.UnreadableGitFiles) as raised:
+            git_files.check_internal_head(checkout)
+        self.assertEqual(raised.exception.path, path)
+
+        with (mock.patch.object(Path, "lstat", side_effect=PermissionError("cannot inspect fixture")),
+              self.assertRaisesRegex(git_files.UnreadableGitFiles, "cannot inspect fixture") as raised):
+            git_files.check_internal_head(checkout)
+        self.assertEqual(raised.exception.path, path)
+
+    def test_removal_entries_accept_optional_absence_and_ref_namespaces(self) -> None:
+        checkout = git_files.at(self.main)
+        (checkout.git_dir / "index").unlink(missing_ok=True)
+        prefix = checkout.common_dir / "refs/heads/nested"
+        prefix.mkdir()
+        _ = (prefix / "branch").write_text(git(self.main, "rev-parse", "HEAD") + "\n")
+        self.assertIsNone(git_files.check_internal_removal_entries((checkout,), git_files.LegacyRemovalFiles(),
+                                                                removal_root=self.main))
+
+        previous = git_files.RecordedRemovalFiles(frozenset({str(prefix.relative_to(self.main))}))
+        with self.assertRaises(git_files.UnreadableGitFiles) as raised:
+            git_files.check_internal_removal_entries((checkout,), previous, removal_root=self.main)
+        self.assertEqual(raised.exception.path, prefix)
+
+    def test_removal_scan_checks_the_metadata_identity_from_checkout_inspection(self) -> None:
+        checkout = git_files.at(self.main)
+        _ = checkout.common_dir.rename(self.root / "original-git")
+        (checkout.common_dir / "refs").mkdir(parents=True)
+        previous = git_files.RecordedRemovalFiles(frozenset())
+        with self.assertRaisesRegex(git_files.UnreadableGitFiles, "directory changed before open") as raised:
+            git_files.check_internal_removal_entries((checkout,), previous, removal_root=self.main)
+        self.assertEqual(raised.exception.path, checkout.common_dir)
+
+    def test_removal_entries_detect_nonregular_files_without_opening_them(self) -> None:
+        checkout = git_files.at(self.main)
+        previous = git_files.RecordedRemovalFiles(frozenset())
+        open_entry = os.open
+
+        def open_directory(path: Path | str, flags: int, *, dir_fd: int | None = None) -> int:
+            self.assertTrue(flags & os.O_DIRECTORY, f"opened metadata at {path}")
+            return open_entry(path, flags, dir_fd=dir_fd)
+
+        for relative in ("index", "packed-refs", "refs/heads/loose"):
+            with self.subTest(relative=relative):
+                path = checkout.git_dir / relative
+                path.unlink(missing_ok=True)
+                os.mkfifo(path)
+                with (mock.patch.object(os, "open", side_effect=open_directory),
+                      self.assertRaises(git_files.UnreadableGitFiles) as raised):
+                    git_files.check_internal_removal_entries((checkout,), previous, removal_root=self.main)
+                self.assertEqual(raised.exception.path, path)
+                path.unlink()
 
     def assert_unreadable_metadata(self, folder: Path, metadata: Path) -> None:
         program = """import errno, os, sys

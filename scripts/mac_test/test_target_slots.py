@@ -31,6 +31,7 @@ from unittest import mock
 SCRIPTS = Path(__file__).resolve().parents[1]
 
 from scripts.mac_test import eligibility, claim_state, mac_test, offload
+from scripts.mac_test.offload_test_support import split_mac_run_command
 from scripts.build_hold import owning_session as session_owner
 from scripts.build_targets import targets
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -616,7 +617,7 @@ class RepositorySlotTests(unittest.TestCase):
 
                 command = offload.remote_test_command(eligibility.read_config(settings), request, identity)
 
-                invocation = shlex.split(command.rpartition("; echo mac_exit=$?")[0])
+                invocation, _ = split_mac_run_command(command)
                 start = invocation.index("~/.claude/scripts/lint/lint") + 1
                 self.assertEqual(invocation[start:], ["nextest", *expected])
 
