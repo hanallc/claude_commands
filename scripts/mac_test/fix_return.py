@@ -52,7 +52,7 @@ import subprocess
 import sys
 from typing import Literal, TypedDict, cast
 
-from scripts.lib import berth_board
+from scripts.lib import atomic_file, berth_board
 
 
 @dataclass(frozen=True)
@@ -299,15 +299,7 @@ def write_record(path: Path, record: FixRecord) -> None:
         output.flush()
         os.fsync(output.fileno())
     os.replace(temporary, path)
-    sync_directory(path.parent)
-
-
-def sync_directory(path: Path) -> None:
-    folder = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(folder)
-    finally:
-        os.close(folder)
+    atomic_file.sync_folder(path.parent)
 
 
 def read_record(path: Path) -> FixRecord:
@@ -379,10 +371,27 @@ def commit_files(repo_root: Path, entry: StagingPath) -> CommitFiles:
     return CommitFiles(destination, folder)
 
 
+def checked_displacement(files: CommitFiles, original: PathVersion) -> PathVersion:
+    """Restore a changed displaced file if its live path is empty."""
+    try:
+        displaced = file_version(files.displaced)
+        if displaced != "absent" and displaced != original:
+            raise files.conflict()
+    except OSError:
+        try:
+            os.link(files.displaced, files.destination, follow_symlinks=False)
+        except (FileExistsError, FileNotFoundError):
+            pass
+        else:
+            atomic_file.sync_folder(files.destination.parent)
+        raise
+    return displaced
+
+
 def commit_progress(files: CommitFiles, entry: CommitPath) -> CommitProgress:
-    live = file_version(files.destination)
-    displaced = file_version(files.displaced)
     original = entry["original"]
+    displaced = checked_displacement(files, original)
+    live = file_version(files.destination)
     fixed = entry["fixed"]
     if file_version(files.staged) == fixed:
         if displaced == original and live == fixed:
@@ -402,43 +411,32 @@ def commit_path(files: CommitFiles, entry: CommitPath) -> None:
     if progress == CommitProgress.PENDING and entry["original"] != "absent":
         # Move the file before the comparison. An editor can save after the first check.
         os.replace(files.destination, files.displaced)
-        sync_directory(files.folder)
-        sync_directory(files.destination.parent)
-        try:
-            if file_version(files.displaced) != entry["original"]:
-                raise files.conflict()
-        except OSError:
-            # Restore the save if the name is still free. Keep the displaced file either way.
-            try:
-                os.link(files.displaced, files.destination, follow_symlinks=False)
-                sync_directory(files.destination.parent)
-            except OSError:
-                pass
-            raise
+        atomic_file.sync_folder(files.folder)
+        atomic_file.sync_folder(files.destination.parent)
+        if checked_displacement(files, entry["original"]) != entry["original"]:
+            raise files.conflict()
     if entry["fixed"] != "absent":
         # Publish only to an empty name. A new editor save must win.
         try:
             os.link(files.staged, files.destination)
         except FileExistsError as error:
             raise files.conflict() from error
-        sync_directory(files.destination.parent)
+        atomic_file.sync_folder(files.destination.parent)
 
 
 def clear_record(path: Path) -> None:
     path.unlink()
-    sync_directory(path.parent)
+    atomic_file.sync_folder(path.parent)
 
 
-def clean_staging(files: CommitFiles, *, committed: bool) -> None:
+def clean_staging(files: CommitFiles) -> None:
     files.staged.unlink(missing_ok=True)
     files.received.unlink(missing_ok=True)
-    if committed:
-        files.displaced.unlink(missing_ok=True)
     try:
         files.folder.rmdir()
     except FileNotFoundError:
         return
-    sync_directory(files.folder.parent)
+    atomic_file.sync_folder(files.folder.parent)
 
 
 def finish_record(repo_root: Path, path: Path) -> str:
@@ -456,22 +454,35 @@ def finish_record(repo_root: Path, path: Path) -> str:
         return f"removed {count} staged file(s) of a stopped Mac fix; the worktree is unchanged"
     if record["state"] == "staging":
         for entry in record["paths"]:
-            clean_staging(commit_files(repo_root, entry), committed=False)
+            clean_staging(commit_files(repo_root, entry))
         clear_record(path)
         return f"removed {len(record['paths'])} staged file(s) of a stopped Mac fix; the worktree is unchanged"
 
-    entries = [(commit_files(repo_root, entry), entry) for entry in record["entries"]]
+    entries: list[tuple[CommitFiles, CommitPath]] = []
+    errors: list[OSError] = []
+    for entry in record["entries"]:
+        try:
+            files = commit_files(repo_root, entry)
+            if record["state"] == "commit":
+                _ = commit_progress(files, entry)
+            entries.append((files, entry))
+        except OSError as error:
+            # Check all displacements so another conflict cannot prevent restoration.
+            errors.append(error)
+    if errors:
+        raise errors[0]
+
     if record["state"] == "commit":
-        for files, entry in entries:
-            _ = commit_progress(files, entry)
         for files, entry in entries:
             commit_path(files, entry)
         for files, entry in entries:
             if commit_progress(files, entry) != CommitProgress.COMPLETE:
                 raise files.conflict()
         write_record(path, CommitRecord(state="cleanup", entries=record["entries"]))
-    for files, _ in entries:
-        clean_staging(files, committed=True)
+    for files, entry in entries:
+        if checked_displacement(files, entry["original"]) != "absent":
+            files.displaced.unlink()
+        clean_staging(files)
     clear_record(path)
     written = sum(entry["fixed"] != "absent" for _, entry in entries)
     return f"finished a stopped Mac fix: {written} file(s) written, {len(entries) - written} removed"
@@ -613,8 +624,8 @@ def stage_and_commit(repo_root: Path, staging: Path, path: Path, paths: list[Sta
                 # A write through the published hard link must leave the received file intact.
                 stage_file(files.staged, files.received, files.staged)
             fixed = file_version(files.staged)
-            sync_directory(files.folder)
-            sync_directory(files.folder.parent)
+            atomic_file.sync_folder(files.folder)
+            atomic_file.sync_folder(files.folder.parent)
             entries.append(CommitPath(**item, original=original, fixed=fixed))
     except OSError:
         _ = finish_record(repo_root, path)

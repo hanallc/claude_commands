@@ -14,11 +14,11 @@ from pathlib import Path
 from typing import Literal, cast, override
 from unittest.mock import patch
 
-from scripts.lib import berth_board
+from scripts.lib import berth_board, test_hang_guard
+from scripts.lib.shell_test_support import shell_functions
 from scripts.lint.memory_test_support import config_environment
 from scripts.mac_test import eligibility, fix_return, offload
 from scripts.mac_test.offload_test_commands import write_shell
-from scripts.lib import test_hang_guard
 
 HOST = "fixture-host"
 REPOSITORY = eligibility.KnownRepository("claude")
@@ -162,6 +162,7 @@ class ReturnFixTests(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in self.worktree.glob(".*mac-fix-*")), [])
         calls = (self.root / "rsync-calls").read_text()
         self.assertIn("--files-from", calls)
+        self.assertEqual(calls.count("--dry-run"), 1)
 
     def test_changed_worktree_refuses_the_patch(self) -> None:
         sent = offload.read_tree_key(self.worktree)
@@ -258,45 +259,83 @@ class ReturnFixTests(unittest.TestCase):
 
         self.assertEqual((self.worktree / "a.rs").read_text(), "pub(crate) fn a() {}\n")
         self.assertEqual((self.worktree / "b.rs").read_text(), "fn b() {}\n")
-        record = self.root / "pass"
-        shell = r"""
-reply=$1
-RUN_LOG=$2
-LINT_FIX_INCOMPLETE=0
-invoke_mend() { STEP_RAN_ON_MAC=1; MAC_FIX_RESULT=$reply; }
-lint_copy_begin() { :; }
-lint_rewrite() { :; }
-lint_copy_return() { :; }
-set_verdict_keys() { printf 'pass' > "$RUN_LOG"; }
-"""
-        script = shell + verify_function("run_mac_lint_fix") + (
-            '\nrun_mac_lint_fix\nstatus=$?\nprintf "incomplete=%s\\n" "$LINT_FIX_INCOMPLETE"\nexit "$status"'
-        )
-        verdict = subprocess.run(
-            ["bash", "-c", script, "verify", fix_return.fix_word(result), str(record)],
-            capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
-        )
-        self.assertFalse(record.exists())
+        verdict = self.mac_lint_fix(result)
+        self.assertEqual(list(self.root.glob("*.pass")), [])
         self.assertEqual(verdict.returncode, 1, verdict.stdout + verdict.stderr)
         self.assertIn("incomplete=1", verdict.stdout)
         self.assertEqual(fix_return.fix_word(result), "partial")
 
-    def test_an_edit_outside_the_return_prevents_a_mac_pass(self) -> None:
-        sent = offload.read_tree_key(self.worktree)
-        _ = (self.mirror / "a.rs").write_text("pub(crate) fn a() {}\n")
-        edit = self.worktree / "d.rs"
-        stage = fix_return.stage_file
+    def mac_lint_fix(self, result: fix_return.FixResult,
+                     judgment: Literal["pass", "fail", "edit"] = "pass") -> subprocess.CompletedProcess[str]:
+        script = r"""
+reply=$1
+judgment=$2
+CACHE_DIR=$3
+RUN_LOG="$CACHE_DIR/run.log"
+TREE_WATCH_PID=""
+LINT_FIX_INCOMPLETE=0
+CMD=lint
+VERIFY_PACKAGE=""
+COMMAND_ARGS=()
+EXIT_STATUS=0
+LINT_LOADED_CODE_KEY=fixture
+lint_code_key() { echo fixture; }
+user_clock() { echo fixture; }
+tree_key() { cat a.rs; }
+start_tree_watch() { set_verdict_keys; TREE_WATCH_PID=fixture; }
+finish_tree_watch() {
+    if [[ "$judgment" == edit ]]; then printf 'edited\n' > a.rs; fi
+}
+invoke_mend() {
+    if (( LINT_MAC_FIX )); then
+        STEP_RAN_ON_MAC=1
+        MAC_FIX_RESULT=$reply
+    else
+        cat a.rs > "$CACHE_DIR/judged"
+        [[ "$1 $2" == "--workspace --fail-on-warn" && "$judgment" != fail ]]
+    fi
+}
+lint_copy_begin() { :; }
+lint_rewrite() { "$@"; }
+lint_copy_return() { :; }
+lint_config_enabled() { return 0; }
+fmt_cargo() {
+    if [[ "$2" == --check ]]; then
+        [[ "$(cat a.rs)" == formatted ]]
+    else
+        printf 'formatted\n' > a.rs
+    fi
+}
+workspace_taplo() { [[ "$*" == --check ]]; }
+invoke_clippy() { [[ "$LINT_MAC_FIX" == 0 ]]; }
+load_metadata() { :; }
+"""
+        script += shell_functions(VERIFY, "run_mac_lint_fix", "run_lint_checks", "set_verdict_keys", "cache_record")
+        script += r"""
+: > "$RUN_LOG"
+run_mac_lint_fix
+status=$?
+printf 'incomplete=%s\n' "$LINT_FIX_INCOMPLETE"
+if (( status == 0 )); then cache_record pass 0 || true; fi
+exit "$status"
+"""
+        return subprocess.run(
+            ["bash", "-c", script, "verify", fix_return.fix_word(result), judgment, str(self.root)],
+            cwd=self.worktree, capture_output=True, text=True, check=False,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+        )
 
-        def edit_while_staging(source: Path, temporary: Path, destination: Path) -> None:
-            _ = edit.write_text("fn d() { local_edit }\n")
-            stage(source, temporary, destination)
-
-        with patch.object(fix_return, "stage_file", edit_while_staging):
-            result = self.return_fix(sent)
-
-        self.assertEqual(edit.read_text(), "fn d() { local_edit }\n")
-        self.assertEqual((self.worktree / "a.rs").read_text(), "pub(crate) fn a() {}\n")
-        self.assertEqual(result, fix_return.FixRefused("the returned worktree differs from the Mac mirror"))
+    def test_mac_fix_records_only_a_passing_judgment_of_the_formatted_tree(self) -> None:
+        cases: tuple[tuple[Literal["fail", "edit", "pass"], int, bool], ...] = (
+            ("fail", 1, False), ("edit", 0, False), ("pass", 0, True),
+        )
+        for judgment, status, cached in cases:
+            with self.subTest(judgment=judgment):
+                verdict = self.mac_lint_fix(fix_return.FixApplied(("a.rs",), ()), judgment=judgment)
+                self.assertEqual(verdict.returncode, status, verdict.stdout + verdict.stderr)
+                self.assertEqual((self.root / "judged").read_text(), "formatted\n")
+                self.assertEqual((self.root / "formatted.pass").exists(), cached)
+                self.assertFalse((self.root / "edited.pass").exists())
 
     def test_an_empty_listing_still_requires_the_sent_key(self) -> None:
         sent = offload.read_tree_key(self.worktree)
@@ -323,7 +362,6 @@ from scripts.mac_test import fix_return
 worktree, staging, stop_at = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
 stage, replace, link = fix_return.stage_file, os.replace, os.link
 staged: list[Path] = []
-renamed: list[str] = []
 
 def stage_then_stop(source, temporary, destination):
     if Path(temporary).name != "received":
@@ -333,11 +371,11 @@ def stage_then_stop(source, temporary, destination):
     stage(source, temporary, destination)
 
 def rename_then_stop(source, destination):
+    if stop_at == "displaced" and Path(source) == worktree / "a.rs":
+        Path(source).write_text("editor save before displacement\n")
+        replace(source, destination)
+        os._exit(137)
     replace(source, destination)
-    if fix_return.TEMPORARY_MARK in str(source) and Path(source).parent == Path(destination).parent:
-        renamed.append(str(destination))
-        if stop_at == "renames" and len(renamed) == 1:
-            os._exit(137)
 
 def link_then_stop(source, destination, **kwargs):
     link(source, destination, **kwargs)
@@ -357,12 +395,6 @@ VERIFY_START = r'''
 VERIFY_START_DIR=$1
 verify_helper() { "$VERIFY_PYTHON" "$@"; }
 '''
-
-
-def verify_function(name: str) -> str:
-    signature = f"{name}() {{"
-    body = VERIFY.read_text().split(f"\n{signature}", 1)[1].split("\n}\n", 1)[0]
-    return signature + body + "\n}\n"
 
 
 class RollForwardTests(unittest.TestCase):
@@ -399,7 +431,7 @@ class RollForwardTests(unittest.TestCase):
 
     def next_verify_start(self, status: int = 0) -> str:
         started = subprocess.run(
-            ["bash", "-c", VERIFY_START + verify_function("finish_mac_fix") + "finish_mac_fix\n", "verify", str(VERIFY.parent)],
+            ["bash", "-c", VERIFY_START + shell_functions(VERIFY, "finish_mac_fix") + "finish_mac_fix\n", "verify", str(VERIFY.parent)],
             cwd=self.worktree / "src", capture_output=True, text=True, check=False,
             timeout=test_hang_guard.TEST_HANG_GUARD_SECS, env={**os.environ, "VERIFY_PYTHON": sys.executable},
         )
@@ -446,6 +478,43 @@ class RollForwardTests(unittest.TestCase):
         self.assertEqual(self.files()["a.rs"], "editor save after publication\n")
         self.assertIn("fixed src/b.rs\n", self.files().values())
         self.assertIn("fixed a.rs\n", self.files().values())
+
+    def test_recovery_restores_a_changed_displacement_when_the_live_path_is_empty(self) -> None:
+        self.stop_return("displaced")
+        edited = self.worktree / "a.rs"
+        self.assertFalse(edited.exists())
+        _ = edited.write_text("editor save after the stop\n")
+        self.assertIn("a.rs changed", self.next_verify_start(status=2))
+        self.assertEqual(edited.read_text(), "editor save after the stop\n")
+
+        edited.unlink()
+        self.assertIn("a.rs changed", self.next_verify_start(status=2))
+        self.assertEqual(edited.read_text(), "editor save before displacement\n")
+        self.assertEqual((self.worktree / "src/b.rs").read_text(), "old src/b.rs\n")
+        self.assertTrue(self.record().exists())
+        (displaced,) = self.worktree.glob(".*mac-fix-*/original")
+        self.assertEqual(displaced.with_name("received").read_text(), "fixed a.rs\n")
+
+    def test_cleanup_keeps_a_save_to_the_open_displaced_file(self) -> None:
+        edit = "editor save after the commit check\n"
+        changes = fix_return.MirrorChanges(("a.rs",), ())
+        write_record = fix_return.write_record
+        with (self.worktree / "a.rs").open("r+") as editor:
+            def save_at_cleanup(path: Path, record: fix_return.FixRecord) -> None:
+                write_record(path, record)
+                if record["state"] == "cleanup":
+                    _ = editor.write(edit)
+                    _ = editor.truncate()
+                    editor.flush()
+
+            with patch.object(fix_return, "write_record", save_at_cleanup):
+                result = fix_return.apply_fix(self.worktree, self.staging, changes, lambda: True, unconfigured)
+
+        self.assertIsInstance(result, fix_return.FixRefused)
+        self.assertEqual((self.worktree / "a.rs").read_text(), "fixed a.rs\n")
+        self.assertEqual(fix_return.read_record(self.record())["state"], "cleanup")
+        self.assertIn("a.rs changed", self.next_verify_start(status=2))
+        self.assertEqual([saved.read_text() for saved in self.worktree.glob(".*mac-fix-*/original")], [edit])
 
     def test_recovery_keeps_a_legacy_commit_without_file_versions(self) -> None:
         staged = self.worktree / ".a.rs.mac-fix-legacy"

@@ -2219,19 +2219,18 @@ def return_fix(
     metadata = [f"--exclude=/{name}" for name in floor_claims.MIRROR_METADATA]
     root = request.repo_root
 
-    def compare(exclude_path: Path) -> fix_return.MirrorChanges | fix_return.FixFailed:
-        listing = controller.capture([
-            "rsync", "-rlpc", "--dry-run", "--itemize-changes", "--delete", *metadata,
-            f"--exclude-from={exclude_path}", *transport, f"{config.host}:{mirror}/", f"{root}/",
-        ])
-        if not isinstance(listing, CommandOutput) or listing.status != 0:
-            return fix_return.FixFailed("the Mac mirror could not be compared with the worktree")
-        changes = fix_return.parse_itemized(listing.stdout)
-        return fix_return.without_ignored(root, changes) if isinstance(changes, fix_return.MirrorChanges) else changes
-
     try:
         with mirror_exclude_file(ignored) as exclude_path, tempfile.TemporaryDirectory(prefix="mac-fix-") as staging:
-            changes = compare(exclude_path)
+            listing = controller.capture([
+                "rsync", "-rlpc", "--dry-run", "--itemize-changes", "--delete", *metadata,
+                f"--exclude-from={exclude_path}", *transport, f"{config.host}:{mirror}/", f"{root}/",
+            ])
+            if not isinstance(listing, CommandOutput) or listing.status != 0:
+                return fix_return.FixFailed("the Mac mirror could not be compared with the worktree")
+            changes = fix_return.parse_itemized(listing.stdout)
+            if isinstance(changes, fix_return.FixFailed):
+                return changes
+            changes = fix_return.without_ignored(root, changes)
             if isinstance(changes, fix_return.FixFailed):
                 return changes
             if changes.changed:
@@ -2244,15 +2243,8 @@ def return_fix(
                     ])
                 if not isinstance(fetched, CommandOutput) or fetched.status != 0:
                     return fix_return.FixFailed("the changed files could not be fetched from the Mac")
-            result = fix_return.apply_fix(root, Path(staging), changes,
-                                          lambda: read_tree_key(root) == sent_tree_key)
-            if isinstance(result, fix_return.FixApplied):
-                remaining = compare(exclude_path)
-                if isinstance(remaining, fix_return.FixFailed):
-                    return remaining
-                if remaining.changed or remaining.removed:
-                    return fix_return.FixRefused("the returned worktree differs from the Mac mirror")
-            return result
+            return fix_return.apply_fix(root, Path(staging), changes,
+                                        lambda: read_tree_key(root) == sent_tree_key)
     except OSError as error:
         return fix_return.FixFailed(str(error))
 

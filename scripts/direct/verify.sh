@@ -4465,9 +4465,7 @@ run_lint_judgment() {
     fi
 }
 
-# The Mac runs mend --fix and then clippy on its copy in one run. offload.py
-# checks the source key before returning the fixes. The caller needs a new
-# lint judgment if the return omits fixes or detects a conflict.
+# The Mac fixes and judges its copy. Judge the live tree after local rustfmt.
 run_mac_lint_fix() {
     local STEP_FORCE_MAC=1 LINT_MAC_FIX=1 fix_status=0
     MAC_FIX_RESULT=""
@@ -4490,14 +4488,18 @@ run_mac_lint_fix() {
         echo 'verify.sh: the Mac fix pass did not finish; natedev repairs the tree.'
         return 1
     fi
-    # Format the returned files with natedev's rustfmt, then judge this tree.
+    LINT_MAC_FIX=0
     lint_copy_begin
-    lint_rewrite fmt_cargo --all
+    lint_rewrite fmt_cargo --all || exit "$?"
     lint_copy_return || exit 1
-    if [[ -n "${RUN_LOG}" ]]; then
-        set_verdict_keys
-    fi
-    echo 'verify.sh: the Mac fix pass passed; the worktree has its files.'
+    start_tree_watch
+    local judgment_watch="$TREE_WATCH_PID"
+    run_lint_checks after-fix
+    finish_tree_watch
+    # The verdict keys must cover all checks of the formatted tree.
+    if [[ -z "$judgment_watch" ]]; then VERDICT_KEY="" VERDICT_TREE_KEY=""; fi
+    (( lint_status == 0 )) || exit "$lint_status"
+    echo 'verify.sh: the returned worktree passed lint after formatting.'
 }
 
 run_lint_held_sequence() {
@@ -4521,7 +4523,7 @@ run_lint_held_sequence() {
         fi
         LINT_MEMORY_JUDGMENT=0
         if (( mend_status != 0 )); then
-            # A finding the Mac reported gets its fix pass there; clippy judges the fixed copy.
+            # A Mac finding can start a fix pass and a new judgment.
             if [[ "$LAST_TARGET_OUTCOME" == failed ]] && run_mac_lint_fix; then
                 return 0
             fi
@@ -4539,51 +4541,54 @@ run_lint_held_sequence() {
     return 0
 }
 
+run_lint_checks() {
+    # Run all checks even when an earlier check reports findings.
+    lint_status=0
+    if lint_config_enabled mend; then
+        echo 'style-lint: mend start'
+        if invoke_mend --workspace --fail-on-warn "${FEATURE_FLAGS[@]}"; then
+            echo 'style-lint: mend passed'
+        else
+            lint_status=1
+        fi
+    else
+        lint_config_skip_notice mend 'cargo mend --all-targets --workspace --fail-on-warn'
+    fi
+    if lint_config_enabled fmt; then
+        echo 'style-lint: rustfmt start'
+        if fmt_cargo --all --check; then
+            echo 'style-lint: rustfmt passed'
+        else
+            lint_status=1
+        fi
+    else
+        lint_config_skip_notice fmt 'cargo +nightly fmt --all --check'
+    fi
+    load_metadata
+    if ! workspace_taplo --check; then
+        lint_status=1
+    fi
+    if lint_config_enabled clippy; then
+        echo 'style-lint: clippy start'
+        if [[ "${1:-}" != after-fix ]]; then start_tree_watch; fi
+        if invoke_clippy --workspace --all-targets --all-features; then
+            echo 'style-lint: clippy passed'
+        else
+            lint_status=1
+        fi
+        if [[ "${1:-}" != after-fix ]]; then finish_tree_watch; fi
+    else
+        lint_config_skip_notice clippy 'cargo clippy --workspace --all-targets --all-features'
+    fi
+}
+
 run_lint_sequence() {
     if [[ "$HOLD_LINT" == 1 ]]; then
         run_lint_held_sequence
         exit "$lint_status"
     fi
     if (( CHECK_LINT )); then
-        # Judge all three tools even when an earlier one reports findings.
-        # Report mode never enters the rewrite paths of the package gate.
-        lint_status=0
-        if lint_config_enabled mend; then
-            echo 'style-lint: mend start'
-            if invoke_mend --workspace --fail-on-warn "${FEATURE_FLAGS[@]}"; then
-                echo 'style-lint: mend passed'
-            else
-                lint_status=1
-            fi
-        else
-            lint_config_skip_notice mend 'cargo mend --all-targets --workspace --fail-on-warn'
-        fi
-        if lint_config_enabled fmt; then
-            echo 'style-lint: rustfmt start'
-            if fmt_cargo --all --check; then
-                echo 'style-lint: rustfmt passed'
-            else
-                lint_status=1
-            fi
-        else
-            lint_config_skip_notice fmt 'cargo +nightly fmt --all --check'
-        fi
-        load_metadata
-        if ! workspace_taplo --check; then
-            lint_status=1
-        fi
-        if lint_config_enabled clippy; then
-            echo 'style-lint: clippy start'
-            start_tree_watch
-            if invoke_clippy --workspace --all-targets --all-features; then
-                echo 'style-lint: clippy passed'
-            else
-                lint_status=1
-            fi
-            finish_tree_watch
-        else
-            lint_config_skip_notice clippy 'cargo clippy --workspace --all-targets --all-features'
-        fi
+        run_lint_checks
         exit "$lint_status"
     fi
     # Cargo stages are gated by lint.conf; the Taplo check always runs.
