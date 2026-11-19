@@ -79,7 +79,10 @@ class HanaSourceTests(unittest.TestCase):
             _ = shutil.copyfile(self.configuration.source.with_name(name), self.runtime_checkout / 'config' / name)
         manifest = self.runtime_checkout / hana_render.RUNTIME_FILE_LIST
         manifest.parent.mkdir(parents=True)
-        _ = manifest.write_text('scripts/aws_target/fixture_runtime.py\nscripts/aws_target/hana_protocol.py\n')
+        _ = manifest.write_text('scripts/aws_target/fixture_runtime.py\nscripts/aws_target/hana_protocol.py\n'
+            + f'{hana_render.RUNNER_ENTRY}\n')
+        _ = shutil.copyfile(Path(__file__).with_name(hana_render.RUNNER_ENTRY.name),
+                            self.runtime_checkout / hana_render.RUNNER_ENTRY)
         _ = (manifest.parent / 'hana_protocol.py').write_text(f'RUNTIME_ABI = {hana_protocol.RUNTIME_ABI}\n')
         _ = (manifest.parent / 'fixture_runtime.py').write_text('version = "captured"\n')
         _ = write_config_fixture(private.settings,
