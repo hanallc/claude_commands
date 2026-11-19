@@ -930,12 +930,10 @@ class LandingWaitTests(unittest.TestCase):
             self.assertEqual(fixture.server.waiters[request.episode].cloud_route_check, service.NoCloudRouteCheck())
             self.assertEqual(fixture.server.places, places)
 
-    def test_a_silent_route_check_expires_and_the_local_queue_moves(self) -> None:
+    def test_an_open_route_check_lets_a_later_waiter_start_at_the_deadline(self) -> None:
         with AdmissionFixture() as fixture:
             interval = 2.5
             self.configure_wait(fixture, retry_seconds=interval)
-            blocker = replace(self.gate_request(fixture), place=wire.CloudPlace("aws"))
-            aws_slot = only_admitted(fixture.server.handle_request(blocker))
             integrate = only_admitted(fixture.server.handle_request(self.gate_request(fixture, self.INTEGRATE)))
             fixture.allow_next_start()
             request = self.reroutable_gate(fixture)
@@ -944,34 +942,40 @@ class LandingWaitTests(unittest.TestCase):
             assert isinstance(first, wire.Wait)
             later = replace(self.gate_request(fixture), since=request.since + 0.1)
             self.assertIsInstance(fixture.server.handle_request(later)[0], wire.Wait)
+            last = replace(self.gate_request(fixture), since=request.since + 0.2)
+            self.assertIsInstance(fixture.server.handle_request(last)[0], wire.Wait)
             fixture.clock.advance(interval)
             _ = fixture.run_pass()
             self.assertEqual(peer.replies(), [wire.RouteAgain()])
             deadline = fixture.clock.monotonic() + interval
-            cloud = replace(request, episode="pending-aws-route", place=wire.CloudPlace("aws"))
-            aws_peer = fixture.connect(cloud)
-            waiting, = aws_peer.replies()
-            assert isinstance(waiting, wire.Wait) and isinstance(waiting.reason, wire.CloudSlotWait)
             fixture.release(integrate)
 
             fixture.clock.advance(interval - 0.5)
             _ = fixture.run_pass()
             self.assertEqual(fixture.server.next_pass, deadline)
-            self.assertEqual(fixture.queue_pids(), [request.owner.pid, later.owner.pid])
+            self.assertEqual(fixture.queue_pids(), [request.owner.pid, later.owner.pid, last.owner.pid])
+            self.assertEqual(fixture.server.reservations, {})
             self.assertEqual(peer.replies(), [])
 
             fixture.clock.advance(0.5)
-            fixture.release(aws_slot)
             _ = fixture.run_pass()
-            grant = only_admitted(peer.replies())
-            self.assertEqual(aws_peer.replies(), [wire.Refused("AWS route check expired")])
-            self.assertNotIn(cloud.episode, fixture.server.reservations)
-            self.assertEqual(fixture.server.reservations[request.episode].queue_waiter["since"], request.since)
-            self.assertIn(later.episode, fixture.server.waiters)
-            fixture.release(grant)
+            self.assertEqual(peer.replies(), [])
+            self.assertNotIn(request.episode, fixture.server.reservations)
+            self.assertEqual(fixture.server.waiters[request.episode].cloud_route_check, service.CloudRouteCheck(deadline))
+            self.assertGreater(fixture.server.next_pass, deadline)
+            self.assertIn(later.episode, fixture.server.reservations)
+            self.assertIn(last.episode, fixture.server.waiters)
+
+            peer.socket.sendall(wire.encode_request(request).encode())
+            resumed, = peer.replies()
+            self.assertIsInstance(resumed, wire.Wait)
+            self.assertEqual(fixture.server.waiters[request.episode].cloud_route_check, service.NoCloudRouteCheck())
+            self.assertEqual(fixture.queue_pids(), [request.owner.pid, last.owner.pid])
             fixture.allow_next_start()
             _ = fixture.run_pass()
-            self.assertIn(later.episode, fixture.server.reservations)
+            _ = only_admitted(peer.replies())
+            self.assertEqual(fixture.server.reservations[request.episode].queue_waiter["since"], request.since)
+            self.assertIn(last.episode, fixture.server.waiters)
 
     def test_memory_wait_and_integrate_wait_do_not_retry_the_route(self) -> None:
         for job in (self.ALL_TESTS, self.INTEGRATE):

@@ -1272,6 +1272,7 @@ class QueueInputs:
     local_waits: dict[str, placement.EvidenceNeeded] = field(default_factory=dict, kw_only=True)
     landing_waiters: frozenset[str] = field(default=frozenset(), kw_only=True)
     cloud_route_waiters: frozenset[str] = field(default=frozenset(), kw_only=True)
+    cloud_route_waiters_past_deadline: frozenset[str] = field(default=frozenset(), kw_only=True)
 
     def __post_init__(self) -> None:
         orders = {waiter_owner(row): (waiter_priority(row) if isinstance(row.get("order"), (PriorityUnit, NormalOrder))

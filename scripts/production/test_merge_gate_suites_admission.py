@@ -7,6 +7,7 @@ from scripts.build_queue import admission_records
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from collections.abc import Callable
+from enum import Enum, auto
 import unittest
 import io
 import json
@@ -72,6 +73,11 @@ class ServiceGateFixture(GateSuitesFixture):
         record, = self.admission.server.reservations.values()
         return Path(record.path), service.reservation_row(record)
 
+
+class AwsReroute(Enum):
+    DECLINES = auto()
+    COMPLETES = auto()
+    FALLS_BACK = auto()
 
 
 @final
@@ -146,7 +152,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
     def test_unit_named_modules_wait_while_a_local_merge_test_runs(self) -> None:
         self.check_named_module_admission(integrate_running=True)
 
-    def check_merge_route_retry(self, *, accepts: bool, cli: bool = False) -> None:
+    def check_merge_route_retry(self, outcome: AwsReroute, *, cli: bool = False) -> None:
         from scripts.aws_target import cloud_gate, gate_box
 
         interval = 60
@@ -177,12 +183,22 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             cause = reply.reason.cause if isinstance(reply.reason, admission_records.HeadAdmissionStatus) else reply.reason
             self.assertIsInstance(cause, admission_records.LandingWait)
             assert isinstance(cause, admission_records.LandingWait)
-            if entries:
+            if entries and (outcome is not AwsReroute.FALLS_BACK or len(entries) > 1):
                 return
             with fixture.loop_turn():
-                local, = (waiting.request for waiting in fixture.server.waiters.values()
-                          if waiting.request.owner == owner)
+                local = next((waiting.request for waiting in fixture.server.waiters.values()
+                              if waiting.request.owner == owner), None)
+                if entries and (local is None or local.episode == entries[0].episode):
+                    return
                 assert isinstance(local, wire.AdmitRequest)
+                if entries:
+                    self.assertEqual(local.since, entries[0].since)
+                    self.assertEqual(fixture.queue_pids(), [owner.pid, competitor.owner.pid])
+                    entries.append(local)
+                    fixture.release(integrate)
+                    fixture.allow_next_start()
+                    _ = fixture.run_pass()
+                    return
                 entries.append(local)
                 later = replace(competitor, since=local.since + 0.1)
                 self.assertIsInstance(fixture.server.handle_request(later)[0], wire.Wait)
@@ -198,12 +214,14 @@ class SharedGateAdmissionTests(ServiceGateFixture):
             with fixture.loop_turn():
                 entry, = entries
                 self.assertIsInstance(fixture.server.waiters[entry.episode].cloud_route_check, service.CloudRouteCheck)
-                fixture.release(integrate)
-                fixture.allow_next_start()
-                _ = fixture.run_pass()
+                if outcome is not AwsReroute.FALLS_BACK:
+                    fixture.release(integrate)
+                    fixture.allow_next_start()
+                    _ = fixture.run_pass()
                 self.assertEqual(fixture.queue_pids(), [owner.pid, competitor.owner.pid])
-                self.assertEqual(fixture.server.reservations, {})
-            if accepts:
+                self.assertEqual(set(fixture.server.reservations),
+                                 {merge.episode} if outcome is AwsReroute.FALLS_BACK else set())
+            if outcome is not AwsReroute.DECLINES:
                 with cloud_gate.cloud_reservation(repo, self.state / "aws.cgroup", merge_gate.SuiteMode.MERGE_GATE) as aws:
                     with fixture.loop_turn():
                         record, = (record for record in fixture.server.reservations.values()
@@ -212,21 +230,25 @@ class SharedGateAdmissionTests(ServiceGateFixture):
                         self.assertNotIn(entry.episode, fixture.server.waiters)
                         self.assertNotIn(entry.episode, {place.episode for place in fixture.server.places.values()})
                         self.assertNotIn(owner.pid, fixture.queue_pids())
-                        self.assertIn(competitor.episode, fixture.server.reservations)
+                        if outcome is AwsReroute.FALLS_BACK:
+                            self.assertIn(competitor.episode, fixture.server.waiters)
+                        else:
+                            self.assertIn(competitor.episode, fixture.server.reservations)
                     aws.status = int(not remote_result.passed)
-                return remote_result
+                return "AWS fell back" if outcome is AwsReroute.FALLS_BACK else remote_result
             return "AWS is still busy"
 
         def local(repo: Path, *_args: object, route_again: Callable[[], None], **_options: object) -> merge_gate.GateRun:
             with merge_gate.gate_reservation(repo, self.state, merge_gate.BuildHoldWait(), route_again=route_again) as place:
                 with fixture.loop_turn():
-                    self.assertIn(entries[0].episode, fixture.server.reservations)
+                    self.assertIn(entries[-1].episode, fixture.server.reservations)
                     self.assertIn(competitor.episode, fixture.server.waiters)
                 place.status = 0
             return local_result
 
         repository = admission_records.RepositoryIdentity("fixture-repository", "claude_commands")
         with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(client.CLOCK, "now", side_effect=fixture.clock.now),
               mock.patch.object(step_estimator, "git_identity", return_value=(repository, "merge")),
               mock.patch.object(client.WaitOutput, "__call__", new=observe),
               mock.patch.object(cloud_gate, "route", side_effect=route),
@@ -240,25 +262,29 @@ class SharedGateAdmissionTests(ServiceGateFixture):
                 self.assertEqual(self.module_events(), [])
             else:
                 run = merge_gate.run_gate_suites(self.checkout)
-                self.assertEqual(run, remote_result if accepts else local_result)
+                self.assertEqual(run, remote_result if outcome is AwsReroute.COMPLETES else local_result)
         self.assertEqual(attempts, 2)
+        self.assertEqual(len(entries), 2 if outcome is AwsReroute.FALLS_BACK else 1)
         with fixture.loop_turn():
-            entry, = entries
-            self.assertNotIn(entry.episode, fixture.server.waiters)
-            self.assertNotIn(entry.episode, fixture.server.reservations)
+            for entry in entries:
+                self.assertNotIn(entry.episode, fixture.server.waiters)
+                self.assertNotIn(entry.episode, fixture.server.reservations)
             self.assertNotIn(owner.pid, fixture.queue_pids())
             fixture.allow_next_start()
             _ = fixture.run_pass()
             self.assertIn(competitor.episode, fixture.server.reservations)
 
     def test_the_aws_grant_releases_the_local_place_before_a_result(self) -> None:
-        self.check_merge_route_retry(accepts=True)
+        self.check_merge_route_retry(AwsReroute.COMPLETES)
 
     def test_the_cli_keeps_the_completed_aws_result(self) -> None:
-        self.check_merge_route_retry(accepts=True, cli=True)
+        self.check_merge_route_retry(AwsReroute.COMPLETES, cli=True)
 
     def test_the_older_gate_starts_first_when_integrate_ends_during_the_aws_check(self) -> None:
-        self.check_merge_route_retry(accepts=False)
+        self.check_merge_route_retry(AwsReroute.DECLINES)
+
+    def test_a_fallback_after_an_aws_grant_rejoins_ahead_of_a_later_held_gate(self) -> None:
+        self.check_merge_route_retry(AwsReroute.FALLS_BACK)
 
     @gate_suites("lib", "hooks")
     def test_suite_progress_counts_type_jobs_and_clears_the_counter_for_reruns(self) -> None:

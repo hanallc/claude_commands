@@ -947,7 +947,7 @@ class ClientTests(unittest.TestCase):
             self.assertEqual((first.owner, first.since, first.profile),
                              (second.owner, second.since, second.profile))
 
-    def test_a_fallback_after_aws_admission_requests_a_new_local_place(self) -> None:
+    def test_a_fallback_after_aws_admission_preserves_the_first_arrival(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request()
             transport = self.use_transport(fixture,
@@ -964,7 +964,7 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(first, refresh)
             assert isinstance(second, wire.AdmitRequest)
             self.assertNotEqual(second.episode, request.episode)
-            self.assertEqual(second.since, request.since + 3)
+            self.assertEqual(second.since, request.since)
             self.assertEqual(second.owner, request.owner)
 
     def test_program_request_uses_its_checkout_instead_of_the_launcher_directory(self) -> None:

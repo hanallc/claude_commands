@@ -708,9 +708,9 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                                 and not isinstance(attempt.route_again, NoRouteCheck)):
                             raise CheckerFailure("unexpected route reply")
                         if isinstance(reply, wire.RouteGranted):
-                            # AWS later fell back. Request a new local place.
+                            # AWS fell back. Keep the first arrival in the new episode.
                             last_valid = CLOCK.monotonic()
-                            first = request = replace(request, episode=uuid.uuid4().hex, since=CLOCK.now())
+                            first = request = replace(request, episode=uuid.uuid4().hex)
                             break
                         if attempt.admits():
                             attempt.route_again()

@@ -1304,7 +1304,7 @@ class NoCloudRouteCheck:
 
 @dataclass(frozen=True)
 class CloudRouteCheck:
-    """The service defers local admission until this monotonic deadline."""
+    """An open route check keeps its order until this monotonic deadline."""
 
     deadline: float
 
@@ -1910,6 +1910,7 @@ class AdmissionServer:
                     continue
                 owner = records.waiter_owner(row)
                 if (gate.waits_for_landing(inputs, row)
+                        or owner in inputs.cloud_route_waiters_past_deadline
                         or isinstance(gate.waiter_state(row), records.TokenWaitingWaiter)
                         and owner not in inputs.pending_remote_starts):
                     continue
@@ -2191,9 +2192,15 @@ class AdmissionServer:
             and isinstance(self.assignments[key].remote_start_hold, records.RemoteStartHold))
         local_owners: set[str] = set()
         local_waits: dict[str, placement.EvidenceNeeded] = {}
+        cloud_route_waiters: set[str] = set()
+        cloud_route_waiters_past_deadline: set[str] = set()
         for episode, waiting in self.waiters.items():
             row = waiting.row
             owner = records.waiter_owner(row)
+            if isinstance(check := waiting.cloud_route_check, CloudRouteCheck):
+                cloud_route_waiters.add(owner)
+                if check.deadline <= self.last_pass_started:
+                    cloud_route_waiters_past_deadline.add(owner)
             request = self.placement_requests.get(episode)
             eligibility = placement.AllowedHost() if request is None else self._local_placement_eligibility(request)
             if isinstance(eligibility, placement.EvidenceNeeded):
@@ -2204,9 +2211,8 @@ class AdmissionServer:
         inputs = gate.build_queue_inputs([(path, row) for path, row in ordered
             if records.waiter_owner(row) in local_owners], memories, readings, now, priority, unowned)
         inputs = replace(inputs, pending_remote_starts=pending_remote_starts & local_owners, local_waits=local_waits,
-                         cloud_route_waiters=frozenset(records.waiter_owner(waiting.row)
-                             for waiting in self.waiters.values()
-                             if isinstance(waiting.cloud_route_check, CloudRouteCheck)))
+                         cloud_route_waiters=frozenset(cloud_route_waiters),
+                         cloud_route_waiters_past_deadline=frozenset(cloud_route_waiters_past_deadline))
         represented = {(step.run.pid, step.run.start_time) for step in inputs.running
                        if isinstance(step.run, LiveBuildRun)}
         between = tuple(step for step in evidence.between
@@ -2511,7 +2517,6 @@ class AdmissionServer:
         self._settle_attempt_reports(evidence_keys)
         remote_start_hold_seconds = self.configuration.remote_start_hold_seconds
         self._prepare_placements(evidence_keys, remote_start_hold_seconds)
-        self._expire_cloud_route_checks()
         cloud_started = self._cloud_pass(self.clock.now(), self.configuration)
         inputs = self._inputs(config, self.configuration.progress_profile_rank, self.configuration.peak_history_share_percent,
                               self.configuration.progress_profile_sweep_seconds)
@@ -2613,7 +2618,8 @@ class AdmissionServer:
         interval = (config.waiting_pass_seconds if self.waiters or self.repository_slot_waiters or any(self._placement_waiting(request)
                     for request in self.placement_requests.values()) else config.running_pass_seconds)
         route_deadline = min((waiting.cloud_route_check.deadline for waiting in self.waiters.values()
-                              if isinstance(waiting.cloud_route_check, CloudRouteCheck)), default=float("inf"))
+                              if isinstance(waiting.cloud_route_check, CloudRouteCheck)
+                              and waiting.cloud_route_check.deadline > self.last_pass_started), default=float("inf"))
         self.next_pass = min(self.clock.monotonic() + interval, next_merge_route_retry, route_deadline)
         if starts or cloud_started:
             self.next_pass = self.clock.monotonic()
@@ -2700,20 +2706,6 @@ class AdmissionServer:
             for waiting, reply in refused:
                 self._deliver(waiting, reply)
         return groups
-
-    def _expire_cloud_route_checks(self) -> None:
-        now = self.clock.monotonic()
-        for local in tuple(self.waiters.values()):
-            if not isinstance(local.cloud_route_check, CloudRouteCheck) or now < local.cloud_route_check.deadline:
-                continue
-            for cloud in self._cloud_waiters():
-                if checks_queued_gate_route(cloud.request, cloud.connection, local):
-                    episode = cloud.request.episode
-                    reply = wire.Refused("AWS route check expired")
-                    self.ledger[episode] = ReplayEntry(reply, self.clock.now())
-                    self._drop_waiter(episode)
-                    self._deliver(cloud, reply)
-            local.cloud_route_check = NoCloudRouteCheck()
 
     def _cloud_pass(self, now: float, configuration: gate.UsableAdmissionConfiguration) -> bool:
         for episode, record in list(self.reservations.items()):

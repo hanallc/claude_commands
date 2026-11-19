@@ -2118,7 +2118,8 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     clear = isinstance(inputs.pressure, NoPressureHold)
     due = not isinstance(inputs.spacing, NextStartAt) or now >= inputs.spacing.at
     local_head = first_queued_waiter((row for _, row in ordered
-        if can_use_natedev(row) and not waits_for_landing(inputs, row)), inputs.pending_remote_starts)
+        if can_use_natedev(row) and not waits_for_landing(inputs, row)
+        and records.waiter_owner(row) not in inputs.cloud_route_waiters_past_deadline), inputs.pending_remote_starts)
     head_owner = records.waiter_owner(local_head.waiter) if isinstance(local_head, QueuedWaiter) else ""
     head_can_start_alone = not inputs.reservations and all(
         not slot_in_force(slot, inputs.now)
@@ -2154,6 +2155,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         state = QueuedWaiter(row) if remote_start_pending else waiter_state(row)
         fresh = not estimate_expired(row, now, policy)
         landing_wait = waits_for_landing(inputs, row)
+        keeps_order = not landing_wait and owner not in inputs.cloud_route_waiters_past_deadline
         local_route = can_use_natedev(row)
         local = local_route and isinstance(state, QueuedWaiter)
         folder = inputs.cargo_folders.get(owner) if local_route else None
@@ -2186,7 +2188,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
             order_hold = HeldBehindHead(first_folder_wait)
         elif ready and not isinstance(earlier, NoWaiter):
             order_hold = HeldBehindHead(earlier)
-        if not landing_wait and folder is not None and isinstance(earlier, NoWaiter):
+        if keeps_order and folder is not None and isinstance(earlier, NoWaiter):
             first_for_folder[folder] = records.stored_waiter(row)
         can_start = (ready and not folder_busy and isinstance(gpu_wait, GpuSlotFree)
                      and isinstance(order_hold, NoOrderHold))
@@ -2204,7 +2206,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
             gpu_used += gpu_step
             if not reused:
                 new_started = True
-        elif not landing_wait and (local or folder_busy):
+        elif keeps_order and (local or folder_busy):
             if folder_busy and isinstance(first_folder_wait, NoWaiter):
                 first_folder_wait = records.stored_waiter(row)
             if isinstance(first_held, NoWaiter):
