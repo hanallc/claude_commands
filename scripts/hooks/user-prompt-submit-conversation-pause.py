@@ -102,6 +102,16 @@ def main() -> None:
             conversation_pause.scheduled_senders,
             lambda: conversation_pause.read_scheduled_prompts(session_id),
         )
+        now = conversation_pause.now_epoch()
+        if source in (conversation_pause.PromptSource.PEER, conversation_pause.PromptSource.SCHEDULED):
+            try:
+                kept = conversation_pause.keep_native_review_prompt(session_id, prompt, now)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                print(f"review hold: {error}", file=sys.stderr)
+            else:
+                if kept:
+                    print(json.dumps({"decision": "block", "reason": "Kept for the end of the review."}), flush=True)
+                    return
         if source is conversation_pause.PromptSource.SCHEDULED:
             conversation_pause.consume_scheduled_prompt(session_id, prompt)
         # Read the staff pointer so long waits retain the current run.
@@ -122,7 +132,6 @@ def main() -> None:
         if not prompt.strip():
             activity_source = "UnknownPrompt"
         _record_activity(session_id, activity_source, prompt, record)
-        now = conversation_pause.now_epoch()
         reply = conversation_pause.message_arrived(session_id, source, prompt, now, record=record)
         emitted = False
 

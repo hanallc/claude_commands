@@ -351,6 +351,7 @@ KeyedMessage = TypedDict(
         "shown_sender": NotRequired[str],
         "sender_native_id": NotRequired[str],
         "review_batch": NotRequired[bool],
+        "urgent": NotRequired[bool],
         "socket_recovery": NotRequired[str],
         "stable_recipient": NotRequired[str],
         "claude_recipient": NotRequired[QueuedClaudeMailbox],
@@ -370,6 +371,7 @@ UnkeyedMessage = TypedDict(
         "shown_sender": NotRequired[str],
         "sender_native_id": NotRequired[str],
         "review_batch": NotRequired[bool],
+        "urgent": NotRequired[bool],
         "socket_recovery": NotRequired[str],
         "stable_recipient": NotRequired[str],
         "claude_recipient": NotRequired[QueuedClaudeMailbox],
@@ -642,6 +644,7 @@ class Message:
     review_delivery: bool = False
     sent_header: str = field(default_factory=lambda: sent_line(now()), compare=False, repr=False)
     review_batch: bool = False
+    urgent: bool = False
 
     def __post_init__(self) -> None:
         if not self.shown_sender:
@@ -1173,7 +1176,7 @@ def _queued_message(value: object) -> QueuedMessage | None:
     order = values.get("send_order")
     if "send_order" in values and (not isinstance(order, int) or isinstance(order, bool) or order < 0):
         return None
-    if "review_batch" in values and not isinstance(values["review_batch"], bool):
+    if any(field in values and not isinstance(values[field], bool) for field in ("review_batch", "urgent")):
         return None
     if "sender_native_id" in values:
         try:
@@ -1295,6 +1298,8 @@ def enqueue(message: Message, reason: str, at: datetime, *,
         entry["send_order"] = order.value
     if message.review_batch:
         entry["review_batch"] = True
+    if message.urgent:
+        entry["urgent"] = True
     with locked():
         path.parent.mkdir(parents=True, exist_ok=True)
         queues = [(path, _read_queue_rows(path))]
@@ -2623,7 +2628,7 @@ def recover_socket_queues(registry: sessions.RegistryRead, at: datetime) -> tupl
                               f"Stuck message from {entry['time']}:\n" + entry["text"], identity,
                               entry.get("shown_sender", entry["from"]),
                               stamp=read_sender_stamp(entry.get("sender_native_id", "unavailable")),
-                              sent_header=queued_sent_line(entry["time"]))
+                              sent_header=queued_sent_line(entry["time"]), urgent=entry.get("urgent", False))
             plan = _claude_delivery_plan(message, mailbox, registry, records)
             if not isinstance(plan, RelayAttempt):
                 reason = plan.failure.reason if isinstance(plan, ClaudeRoutingFailed) else "no live receiver"
@@ -2803,7 +2808,8 @@ def pending(to: str | CodexQueueOwner | None, *, emit: bool = False,
                 unkeyed_or_legacy.append(entry)
         entries = sorted([*unkeyed_or_legacy, *newest.values()], key=lambda entry: entry["time"])
         text = "\n\n".join(stamped_text(
-            f"Queued message {index} of {len(entries)}, from {entry['from']} at {entry['time']}:"
+            delivery_preview(f"Queued message {index} of {len(entries)}, from {entry['from']} at {entry['time']}:",
+                             urgent=entry.get("urgent", False))
             + shown_sender_line(entry["from"], entry.get("shown_sender", entry["from"]))
             + queued_sent_line(entry["time"]),
             "\n" + entry["text"].rstrip(), read_sender_stamp(entry.get("sender_native_id", "unavailable")),
@@ -4368,6 +4374,8 @@ def remote(message: Message, host: str, options: Options) -> Result:
         forwarded += ["--forwarded-conversation"]
     if message.to != USER:
         forwarded += ["--forwarded-shown-sender", message.shown_sender]
+        if options.urgent:
+            forwarded += ["--urgent"]
     if options.human:
         forwarded += ["--human"]
     if message.key is not None:
@@ -4908,12 +4916,19 @@ def stamped_text(first: str, rest: str, stamp: SenderStamp, *, review_batch: boo
             + (rest if review_batch else quote_sender_lines(rest)))
 
 
+def delivery_preview(text: str, *, urgent: bool) -> str:
+    if urgent and not text.startswith(review_hold.URGENT_PREFIX):
+        return f"{review_hold.URGENT_PREFIX} {text}"
+    return text
+
+
 def agent_text(message: Message, *, via_relay: bool = False) -> str:
     """Format caller text and add the sending machine's display and native stamp."""
     text = message.text if message.review_batch else quote_sender_lines(message.text)
     first, separator, rest = text.partition("\n")
     sender = relay_session_name(message.sender) if via_relay else message.sender
-    return stamped_text(first + shown_sender_line(sender, message.shown_sender) + message.sent_header,
+    preview = delivery_preview(first, urgent=message.urgent)
+    return stamped_text(preview + shown_sender_line(sender, message.shown_sender) + message.sent_header,
                         separator + rest, message.stamp, review_batch=message.review_batch)
 
 
@@ -4923,7 +4938,8 @@ def delivered_text(message: Message, entry_id: str) -> str:
     shown = shown_sender_line(message.sender, message.shown_sender)
     if shown:
         shown = "\n" + MESSAGE_LINE_BREAK.sub(" ", shown.removeprefix("\n"))
-    return stamped_text(f"{name}: {summary}{shown}{message.sent_header}\nTag: {entry_id[:8]}",
+    preview = delivery_preview(f"{name}: {summary}", urgent=message.urgent)
+    return stamped_text(f"{preview}{shown}{message.sent_header}\nTag: {entry_id[:8]}",
                         "\n\n" + message.text, message.stamp, review_batch=message.review_batch)
 
 
@@ -5176,9 +5192,15 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
     display = (options.shown_sender.text if isinstance(options.shown_sender, ShownSender)
                else sender_shown_name(sender, stamp, observed) if options.to != USER else sender)
     started = now()
-    message = Message(destination, sender, summary, text, key, display, options.human, stamp,
-                      review_delivery=options.review_delivery, sent_header=sent_line(started))
     claude_route = isinstance(route, (ClaudeRecipient, QueuedStaffRecipient))
+    claude_worker_session = ""
+    if isinstance(route, PaneWorkerRecipient):
+        worker_session = str(route.row.current_session)
+        if any(record["sessionId"] == worker_session for record in running):
+            claude_worker_session = worker_session
+    message = Message(destination, sender, summary, text, key, display, options.human, stamp,
+                      review_delivery=options.review_delivery, sent_header=sent_line(started),
+                      urgent=options.urgent and (claude_route or bool(claude_worker_session)))
     if claude_route and fixed:
         assert isinstance(mailbox, StaffClaudeRecipient)
         plan = _claude_delivery_plan(message, mailbox, registry, running)
@@ -5252,10 +5274,8 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         if isinstance(route, (ClaudeRecipient, QueuedStaffRecipient)):
             if not isinstance(recipient, (NoRelayReplyMailbox, RelayProcessRecipient)):
                 review_session = conversation_recipient(recipient).conversation
-        elif isinstance(route, PaneWorkerRecipient):
-            worker_session = str(route.row.current_session)
-            if any(record["sessionId"] == worker_session for record in running):
-                review_session = worker_session
+        elif claude_worker_session:
+            review_session = claude_worker_session
         if review_session:
             try:
                 review_route = review_access.enter_context(review_hold.route(

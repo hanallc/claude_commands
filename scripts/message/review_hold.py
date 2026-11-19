@@ -18,6 +18,9 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.user_zone import user_zone
 
 
+URGENT_PREFIX = "URGENT:"
+
+
 @dataclass(frozen=True)
 class ReviewMessage:
     sender: str
@@ -68,10 +71,17 @@ def _count_file(session: str) -> Path:
 
 def item_count(session: str) -> int:
     try:
-        value = _count_file(session).read_text(encoding="utf-8").strip()
-        return int(value) if value.isdecimal() else 0
-    except (FileNotFoundError, UnicodeError, ValueError):
+        return _read_count(_count_file(session))
+    except ValueError:
         return 0
+
+
+def _read_count(count: Path) -> int:
+    try:
+        value = count.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return 0
+    return int(value) if value.isdecimal() else 0
 
 
 def _state_file(count: Path) -> Path:
@@ -97,7 +107,7 @@ def _read_state(count: Path, path: Path) -> ReviewState:
     try:
         value = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
     except FileNotFoundError:
-        return ReviewState(_last_prompt(path, count.stat().st_mtime) if item_count(count.name)
+        return ReviewState(_last_prompt(path, count.stat().st_mtime) if _read_count(count)
                            else EndedReview.HOLD_ENDED)
     at = value["last_activity"]
     activity = EndedReview.HOLD_ENDED if at is None else float(cast(float, at))
@@ -118,6 +128,27 @@ def _write_state(path: Path, state: ReviewState) -> None:
 
 def _idle(active_at: float, at: float) -> bool:
     return at - active_at >= conf.read("send").number("review_hold_idle_minutes") * 60
+
+
+def _hold_open(count: Path, state: ReviewState, at: float) -> bool:
+    activity = state.last_activity
+    return not isinstance(activity, EndedReview) and _read_count(count) > 0 and not _idle(activity, at)
+
+
+def keep_native_message(session: str, message: ReviewMessage) -> bool:
+    if message.text.startswith(URGENT_PREFIX):
+        return False
+    count = _count_file(session)
+    path = _state_file(count)
+    # The sender can hold the lock while it delivers an ended review's list.
+    if not _hold_open(count, _read_state(count, path), message.sent):
+        return False
+    with _locked(path):
+        state = _read_state(count, path)
+        if not _hold_open(count, state, message.sent):
+            return False
+        OpenReview(path, state).keep(message)
+        return True
 
 
 def sent_line(at: datetime) -> str:
@@ -170,8 +201,11 @@ def set_count(session: str, remaining: int, at: float, emit: Callable[[str], Non
 
 def _emit_saved(path: Path, state: ReviewState, emit: Callable[[str], None]) -> None:
     if state.messages:
+        ended = EndedReview.HOLD_ENDED
+        if state.last_activity is not ended:
+            _write_state(path, ReviewState(ended, state.messages))
         emit(render(state.messages))
-        _write_state(path, ReviewState(state.last_activity))
+        _write_state(path, ReviewState(ended))
 
 
 def record_user_prompt(session: str, at: float, emit: Callable[[str], None]) -> None:
@@ -181,7 +215,7 @@ def record_user_prompt(session: str, at: float, emit: Callable[[str], None]) -> 
         state = _read_state(count, path)
         previous = state.last_activity
         if not isinstance(previous, EndedReview):
-            activity = EndedReview.HOLD_ENDED if not item_count(session) or _idle(previous, at) else max(previous, at)
+            activity = max(previous, at) if _hold_open(count, state, at) else EndedReview.HOLD_ENDED
             state = ReviewState(activity, state.messages)
             _write_state(path, state)
         write_text_atomic(path.with_suffix(".prompt"), repr(at), new_file_mode=0o600)
@@ -206,7 +240,7 @@ def route(session: str, message: ReviewMessage, *, urgent: bool) -> Generator[Op
         with _locked(path):
             state = _read_state(count, path)
             activity = state.last_activity
-            if not isinstance(activity, EndedReview) and item_count(session) and not _idle(activity, message.sent):
+            if _hold_open(count, state, message.sent):
                 if not urgent:
                     if message.key and any(item.key == message.key for item in state.messages):
                         yield AlreadyKeptForReview()

@@ -2025,11 +2025,35 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(send.send(local_options([*args, "--text", "Later."])).outcome, "kept")
         self.assertEqual(send.send(local_options([*args, "--urgent", "--text", "Now."])).outcome, "sent")
         self.assertEqual([message.text for message in self.relayed], ["Now."])
+        self.assertEqual(send.agent_text(self.relayed[0], via_relay=True).splitlines()[0], "URGENT: Now.")
         held: list[str] = []
         review_hold.set_count("recipient", 0, send.now().timestamp(), held.append)
         self.assertEqual(len(held), 1)
         self.assertIn("Later.", held[0])
         self.assertNotIn("Now.", held[0])
+
+    def test_urgent_postmaster_delivery_prefixes_an_explicit_summary(self) -> None:
+        clock = self.postmaster_clock()
+        self.session("recipient", "Recipient")
+        self.session("worker", "Postmaster")
+        self.postmaster_heartbeat(clock)
+        texts: list[str] = []
+        self.postmaster_mod(clock, texts)
+        review_hold.set_count("recipient", 2, send.now().timestamp(), self.fail)
+        result = send.send(local_options(["--to", "session:recipient", "--from", "test", "--urgent",
+                                         "--summary", "Check the phase", "--text", "The work is blocked."]))
+        self.assertEqual(result.outcome, "sent", result.detail)
+        self.assertEqual([text.splitlines()[0] for text in texts], ["URGENT: test: Check the phase"])
+        self.assertIn("The work is blocked.", texts[0])
+
+    def test_urgent_delivery_keeps_its_prefix_in_the_mailbox(self) -> None:
+        result = send.send(local_options(["--to", "session:recipient", "--from", "test", "--urgent",
+                                         "--text", "Read when you return."]))
+        self.assertEqual(result.outcome, "queued", result.detail)
+        self.session("recipient", "Recipient")
+        queued = send.pending("session:recipient")
+        self.assertTrue(queued.startswith("URGENT: Queued message 1 of 1"), queued)
+        self.assertIn("Read when you return.", queued)
 
     def test_expired_review_releases_the_list_and_stays_ended_until_a_new_review(self) -> None:
         self.session("recipient", "Recipient")

@@ -22,7 +22,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from scripts.message import send_budget, send_result, session_send
+from scripts.message import review_hold, send_budget, send_result, session_send
 from scripts.lib.script_envelope import SCRIPT_ENVELOPE_END, SCRIPT_ENVELOPE_START
 from scripts.production import staff
 
@@ -60,10 +60,12 @@ KEEP_COMMAND = (
 )
 NOTICE_TAG = re.compile(r"^<(?:task-notification|system-reminder|agent-message)(?:\s|>)")
 CROSS_SESSION_TAG = re.compile(r"^<cross-session-message\b[^>]*>")
+CROSS_SESSION_END = "</cross-session-message>"
 # Claude Code types these itself: a session it was asked to watch is idle, or a message was dropped.
 HARNESS_NOTICE = re.compile(r"^\[Cross-session [a-z]+ notice\]")
 USAGE_RESET = "Your claude.ai usage limit has reset."
 FROM_NAME = re.compile(r'\bfrom-name="([^"]*)"')
+FROM_ADDRESS = re.compile(r'\sfrom="([^"]*)"')
 CLIPPED_PROMPT_MARKER = re.compile(r"… \[\+\d+ chars\]")
 WHOLE_PASTE = re.compile(
     r'<pasted_content id="(?P<id>[^"]+)">'
@@ -415,6 +417,20 @@ def is_return_question(prompt: str) -> bool:
     opening_tag = text.partition(">")[0]
     match = FROM_NAME.search(opening_tag)
     return match is not None and message_sender_name(match.group(1)) == WATCHER
+
+
+def keep_native_review_prompt(session_id: str, prompt: str, now: int) -> bool:
+    text = prompt.strip()
+    opening = CROSS_SESSION_TAG.match(text)
+    if opening is None or not text.endswith(CROSS_SESSION_END):
+        return False
+    sender = FROM_NAME.search(opening.group())
+    address = FROM_ADDRESS.search(opening.group())
+    body = text[opening.end():-len(CROSS_SESSION_END)]
+    body = re.sub(r"^\r?\n|\r?\n\Z", "", body)
+    message = review_hold.ReviewMessage(sender.group(1) if sender else "unavailable", now, body,
+                                        address.group(1) if address else "unavailable")
+    return review_hold.keep_native_message(session_id, message)
 
 
 def prompt_source(

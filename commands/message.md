@@ -8,7 +8,7 @@ description: Read agent message rules and delivery.
 
 - **Use `send.py` for peer messages.** Run `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py`.
   A `Remote Control` row is on another machine.
-  Native `SendMessage` bypasses the review hold.
+  The review also holds native peer messages. A first line that starts with `URGENT:` delivers at once.
   Reply with `send.py` too, also when the harness says to reply with `SendMessage`.
   A `[Cross-session delivery notice]` after a native `SendMessage` means held or refused: send it again with `send.py`.
   `send.py pending` prints and clears messages in your mailbox. The mailbox follows your session ID across a rename.
