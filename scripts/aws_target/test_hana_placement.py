@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from collections.abc import Generator
-from contextlib import contextmanager, redirect_stderr
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager, redirect_stderr
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -10,13 +11,17 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import select
 import subprocess
 import sys
+import threading
 from typing import cast, override
 from unittest import mock
 
+from scripts.build_queue import execution_identity
 from scripts.aws_target import hana_box as box, hana_placement as hana, hana_placement_adapter as adapter, hana_spend, ledger, remote
 from scripts.aws_target.control_test_support import TestClock
+from scripts.aws_target.controller_lock import HanaCommandAccess, hana_command_lock
 from scripts.aws_target.ledger_test_support import CostFixture, git_only, install_hana_spending_settings, text_setting
 from scripts.aws_target.test_hana_box import FakeProvider, IDENTITY, record_lifecycle_image
 from scripts.build_targets import build_targets, target_config
@@ -48,7 +53,7 @@ class HanaPlacementTests(CostFixture):
         self.controller = box.HanaController(Path(), Path(), Path(), self.provider)
         self.assignment = placement.PlacementAssignment('', '', placement.PlacementDestination(
             'ssh', 'fixture', 'fixture-hana', claim_state.RepositoryScope('hana', KEY, 1), 1),
-            placement.SourceKeyKnown('source'), placement.SubmittingOwner('', 0, ''), OwningSession('fixture-session'), 0)
+            execution_identity.SourceKeyKnown('source'), placement.SubmittingOwner('', 0, ''), OwningSession('fixture-session'), 0)
 
     @override
     def setUp(self) -> None:
@@ -183,6 +188,89 @@ class HanaPlacementTests(CostFixture):
                 self.assertEqual(constraints.candidates[0].eligibility, placement.FixedExclusion('command'))
                 self.assertIsInstance(placement.retry_decision(constraints.candidates[0].destination, 'command', 0), placement.DoNotRetry)
 
+    def test_claim_waits_for_a_controller_tick(self) -> None:
+        entered, release = threading.Event(), threading.Event()
+        read = self.controller._read  # pyright: ignore[reportPrivateUsage]
+
+        def hold_tick() -> box.BoxRecord | box.NoDeployment:
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError('The test did not release the controller tick')
+            return read()
+
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            # After the tick releases the lock, the claim can hold it during the provider call.
+            with (mock.patch.object(self.controller, '_read', side_effect=hold_tick),
+                    mock.patch.object(self.provider, 'check_intent')):
+                tick = workers.submit(self.controller.tick)
+                try:
+                    self.assertTrue(entered.wait(5))
+                    claim = workers.submit(self.controller.request, 'fixture-after-tick')
+                    with self.assertRaises(TimeoutError):
+                        _ = claim.result(timeout=0.1)
+                finally:
+                    release.set()
+                self.assertIsInstance(claim.result(timeout=5), box.ClaimCommitted)
+                self.assertEqual(tick.result(timeout=5), box.Lifecycle.IDLE_STOPPED)
+
+    def test_setup_hold_excludes_assigned_claim_and_queue_evidence(self) -> None:
+        execution = execution_identity.assigned_claim_id(self.assignment.episode, self.assignment.attempt)
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            with hana_command_lock(self.state) as access:
+                self.assertIs(access, HanaCommandAccess.ACQUIRED)
+                claim = worker.submit(self.claim)
+                self.assertIsInstance(claim.result(timeout=5), hana.HanaClaimResourcesHeld)
+                inspect = worker.submit(self.controller.inspect)
+                self.assertIsInstance(inspect.result(timeout=5), box.HanaResourcesHeld)
+                evidence = worker.submit(self.evidence, self.request())
+                snapshot = evidence.result(timeout=5)
+                assert isinstance(snapshot, placement.FreshHostEvidence)
+                self.assertEqual(snapshot.eligibility, placement.TemporaryExclusion('busy'))
+                bound = worker.submit(self.controller.execution_bound, execution)
+                self.assertFalse(bound.result(timeout=5))
+                tick = worker.submit(self.controller.tick)
+                self.assertIsInstance(tick.result(timeout=5), box.HanaResourcesHeld)
+            self.assertIsInstance(worker.submit(self.claim).result(timeout=5), hana.HanaClaimPending)
+        self.assertEqual(self.provider.calls, [])
+
+    def test_provider_reply_settles_during_a_resource_hold(self) -> None:
+        with ExitStack() as hold:
+            def take_hold() -> None:
+                self.assertIs(hold.enter_context(hana_command_lock(self.state)), HanaCommandAccess.ACQUIRED)
+
+            self.provider.during_call = take_hold
+            self.assertEqual(self.controller.tick(), box.Lifecycle.IDLE_STOPPED)
+            snapshot = self.controller.inspect_for_settlement()
+            assert isinstance(snapshot, box.HanaLifecycleEvidence)
+            self.assertIsInstance(snapshot.operation, box.NoOperation)
+            self.assertIsInstance(self.controller.tick(), box.HanaResourcesHeld)
+            self.assertEqual(len(self.provider.calls), 1)
+
+    def test_kernel_releases_the_setup_hold_when_setup_is_killed(self) -> None:
+        child = """
+import sys
+from pathlib import Path
+from scripts.aws_target.controller_lock import HanaCommandAccess, hana_command_lock
+directory = Path(sys.argv[1])
+with hana_command_lock(directory) as access:
+    assert access is HanaCommandAccess.ACQUIRED
+    print('held', flush=True)
+    sys.stdin.read()
+"""
+        with (ThreadPoolExecutor(max_workers=1) as worker,
+                subprocess.Popen([sys.executable, '-B', '-c', child, str(self.state)], cwd=REPOSITORY,
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as process):
+            try:
+                assert process.stdout is not None
+                self.assertTrue(select.select([process.stdout], [], [], 5)[0])
+                self.assertEqual(process.stdout.readline(), 'held\n')
+                inspect = worker.submit(self.controller.inspect)
+                self.assertIsInstance(inspect.result(timeout=5), box.HanaResourcesHeld)
+            finally:
+                process.kill()
+                _ = process.communicate(timeout=5)
+        self.assertIsInstance(self.claim(), hana.HanaClaimPending)
+
     def test_claim_is_exact_and_busy_across_worktrees(self) -> None:
         first = self.claim()
         self.assertIsInstance(first, hana.HanaClaimPending)
@@ -193,7 +281,7 @@ class HanaPlacementTests(CostFixture):
 
     def test_claim_rejects_wrong_slot_source_session_and_holder(self) -> None:
         variants = [replace(self.assignment, destination=replace(self.assignment.destination, slot=2)),
-            replace(self.assignment, source_key=placement.SourceKeyUnavailable('missing')),
+            replace(self.assignment, source_key=execution_identity.SourceKeyUnavailable('missing')),
             replace(self.assignment, destination=replace(self.assignment.destination, host='other'))]
         for assignment in variants:
             self.assertIsInstance(hana.claim_assigned(assignment, self.holder, self.controller), hana.HanaClaimRefused)
@@ -225,13 +313,21 @@ class HanaPlacementTests(CostFixture):
         evidence = self.evidence(other)
         assert isinstance(evidence, placement.FreshHostEvidence)
         self.assertEqual(evidence.eligibility, placement.TemporaryExclusion('busy'))
-        with mock.patch.object(process_start, 'process_start', return_value=process_start.Gone()):
+        with (hana_command_lock(self.state) as access,
+                mock.patch.object(process_start, 'process_start', return_value=process_start.Gone())):
+            self.assertIs(access, HanaCommandAccess.ACQUIRED)
             evidence = self.evidence(other)
+            assert isinstance(evidence, placement.FreshHostEvidence)
+            self.assertEqual(evidence.eligibility, placement.TemporaryExclusion('busy'))
+            self.assertEqual(claim_state.read_claims(claim_state.state_paths('fixture')), ())
+            self.assertIsInstance(hana_execution.read_claim_execution(self.state, pending.reference),
+                                  execution_identity.ExecutionNotStarted)
+        evidence = self.evidence(other)
         assert isinstance(evidence, placement.FreshHostEvidence)
         self.assertIsInstance(evidence.eligibility, placement.AllowedHost)
         self.assertEqual(claim_state.read_claims(claim_state.state_paths('fixture')), ())
         self.assertIsInstance(hana_execution.read_claim_execution(self.state, pending.reference),
-                              placement.ExecutionNotStarted)
+                              execution_identity.ExecutionNotStarted)
 
     def test_failed_boot_never_recommits_demand_for_the_same_assignment(self) -> None:
         pending = self.claim()
@@ -249,24 +345,26 @@ class HanaPlacementTests(CostFixture):
         key = replace(template.key, claim_id=claim.claim_id, generation=adopted.generation)
         self.assertEqual((key.episode, key.attempt), (claim.episode, claim.attempt))
         source = self.assignment.source_key
-        assert isinstance(source, placement.SourceKeyKnown)
+        assert isinstance(source, execution_identity.SourceKeyKnown)
         request = replace(template, key=key, source_key=source)
         objects = fixtures.FakeExecutionObjects(request, terminated=True, lease_free=True, fail_fence=True)
         permit = self.provider.published[-1]
         _ = execution.dispatch_execution(self.state, request, adopted, objects,
+            upload_source=lambda: None,
             consume=lambda selected: wire.FirstAuthorization(selected.assignment, selected.claim),
             current_permission=lambda: self.controller.permission(claim.claim_id, key.generation.boot_id, permit.generation),
             current_source_key=lambda: source)
         reason = 'The data mount and a fresh permit are required'
-        observation = replace(objects.observe_execution(key), evidence=placement.ExecutionEvidenceUnavailable(reason, self.clock.now))
+        observation = replace(objects.observe_execution(key), evidence=execution_identity.ExecutionEvidenceUnavailable(reason, self.clock.now))
         with mock.patch.object(objects, 'observe_execution', return_value=observation):
             _ = execution.observe_execution(self.state, request, objects)
         with mock.patch.object(hana, 'release_assigned', return_value=False) as release:
             settled = execution.settle_execution(self.state, request, objects,
                 release_claim=lambda: hana.release_assigned(self.assignment, self.holder, self.controller), reason='lost',
                 fence_window=execution.FenceAcknowledgementWindow(0, 1))
-        self.assertIsInstance(settled, execution.HanaAdmissionRefusalSettled)
-        release.assert_not_called()
+        self.assertIsInstance(settled, execution.HanaSettlementPending)
+        self.assertTrue(execution.claim_dispatch_pending(self.state, claim))
+        release.assert_called_once()
         other = replace(self.request(), episode='other')
         evidence = self.evidence(other)
         assert isinstance(evidence, placement.FreshHostEvidence)
@@ -279,6 +377,7 @@ class HanaPlacementTests(CostFixture):
         assert isinstance(evidence, placement.FreshHostEvidence)
         self.assertEqual(evidence.eligibility, placement.AllowedHost())
         self.assertEqual(claim_state.read_claims(claim_state.state_paths('fixture')), ())
+        self.assertTrue(execution.claim_admission_refused(self.state, claim))
 
     def test_settled_attempt_cannot_commit_another_lifecycle_claim(self) -> None:
         from scripts.aws_target import hana_execution
@@ -384,7 +483,7 @@ class HanaPlacementTests(CostFixture):
     def test_workload_edit_after_routing_keeps_the_probe_budget_and_expires_its_preview(self) -> None:
         inspect = self.controller.inspect
 
-        def inspect_after_edit() -> box.HanaLifecycleEvidence | box.HanaUnprovisioned | box.HanaLifecycleUnavailable:
+        def inspect_after_edit() -> box.HanaInspection:
             text_setting(self.workload, 'daily_budget_usd', '0.01')
             return inspect()
 
@@ -470,7 +569,7 @@ class HanaPlacementTests(CostFixture):
             self.assertTrue(hana.release_assigned(self.assignment, self.holder, self.controller))
             self.assertTrue(hana.release_assigned(self.assignment, self.holder, self.controller))
         self.assertEqual(claim_state.read_claims(claim_state.state_paths('fixture')), ())
-        self.assertEqual(adopted.reserved.claim.reference.claim_id, placement.assigned_claim_id('fixture-episode', 'fixture-attempt'))
+        self.assertEqual(adopted.reserved.claim.reference.claim_id, execution_identity.assigned_claim_id('fixture-episode', 'fixture-attempt'))
 
     def test_generation_import_is_guest_safe(self) -> None:
         code = "import sys; from scripts.aws_target.hana_placement import HanaHostGeneration; assert 'scripts.aws_target.hana_provider' not in sys.modules"
@@ -484,7 +583,7 @@ class HanaPlacementTests(CostFixture):
         from scripts.build_hold import build_hold, hold_enforcer
         from scripts.build_queue import admission_service
         _ = self.ready()
-        key = placement.attempt_key(self.assignment.episode, self.assignment.attempt)
+        key = execution_identity.attempt_key(self.assignment.episode, self.assignment.attempt)
         saved = records.SavedPlacementAssignment(self.assignment)
         state = admission_service.ServiceState({}, {}, {}, records.ReadyToStart(),
             assignments={key: saved}, current_assignments={self.assignment.episode: key})

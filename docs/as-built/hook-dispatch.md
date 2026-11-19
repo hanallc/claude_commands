@@ -18,8 +18,7 @@ separate hooks.
 ## The tables
 
 Each row is a hook file in `scripts/hooks/`, the tool-name matcher it had in
-`settings.json`, and its timeout (600 s unless stated). The original hooks keep
-their old order; push-delivered runs last, for PushNotification only.
+`settings.json`, and its timeout (600 s unless stated). The retained hooks keep their order.
 push-alone denies a Bash call that holds `git push` with any other command
 (rca 261114-1). An ask rule such as `Bash(git push * -f *)` matches across
 the whole compound command, so the deny comes before the user gets a prompt.
@@ -29,9 +28,10 @@ the whole compound command, so the deny comes before the user gets a prompt.
 | `pre_tool_use` | heredoc-guard, tool-output-read, showrunner-move-guard, change-review-gate, checkpoint-doc-gate, push-alone (10 s) | `Bash` |
 | | scratch-guard (10 s) | `Bash\|Write\|NotebookEdit` |
 | `post_tool_use` | basedpyright, fn-length | `Edit\|MultiEdit\|Write` |
-| | context-usage (message off in `config/context_usage.conf`), banned-words | all tools |
+| | context-usage (message off in `config/context_usage.conf`) | all tools |
 | | push-delivered | `PushNotification` |
-| `stop` | compaction-marker-clear, conversation-pause, prose-banned-words, context-deferral (10 s), herdr_tab_title | — |
+| | sendmessage-miss | `SendMessage` |
+| `stop` | compaction-marker-clear, conversation-pause, context-deferral (10 s), herdr_tab_title | — |
 
 `settings.json` has one dispatcher entry per event:
 
@@ -39,8 +39,9 @@ the whole compound command, so the deny comes before the user gets a prompt.
 - PostToolUse: no matcher, timeout 2430 s.
 - Stop: no matcher, timeout 1850 s.
 
-Each outer timeout covers the largest sum of hook budgets that match one tool, plus 30 s of
-dispatcher overhead, so every hook keeps its full budget.
+Each outer timeout covers the largest sum of hook budgets that match one tool.
+It also covers 30 s of dispatcher overhead.
+The PostToolUse and Stop timeouts retain 600 s each from the retired hooks.
 
 `scripts/hooks/test_hook_dispatch.py` checks that the tables match
 `settings.json`: a dispatched hook file must no longer appear as an entry of

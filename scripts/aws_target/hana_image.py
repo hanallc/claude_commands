@@ -112,6 +112,7 @@ def artifact_digest(store: Path, execute: AwsExecutor, timeout: float) -> hana_r
 
 
 def guest_digest_is_current(digest: hana_render.GuestDigest, configuration: Path | conf.ConfigRead) -> bool:
+    """Compare the installed image files with the current render."""
     try:
         return digest == hana_render.guest_digest(configuration)
     except (OSError, ValueError):

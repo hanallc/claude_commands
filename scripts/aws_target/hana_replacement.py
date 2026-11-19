@@ -2,11 +2,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import StrEnum
-import fcntl
-import os
 import subprocess
 from pathlib import Path
 from typing import final
@@ -48,20 +45,6 @@ class BoxIdentity:
     def read(cls, setup: dict[str, object]) -> BoxIdentity:
         return cls(*(ledger.text(setup, key) for key in
                      ('deployment', 'region', 'instance', 'spot_request', 'data_volume')))
-
-
-@contextmanager
-def resource_hold(directory: Path) -> Generator[None]:
-    """Allow one command to replace the root."""
-    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise ReplacementRefused(hana_replacement_record.HELD) from None
-        yield
-    finally:
-        os.close(fd)
 
 
 def _only(reply: dict[str, object], key: str) -> dict[str, object]:

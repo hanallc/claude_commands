@@ -52,6 +52,14 @@ from scripts.feature_log import feature_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
+ROLE_COLOR_CONFIG = (
+    "role.showrunner=#a379fd\n"
+    "role.unit-director=#ffaf02\n"
+    "role.producer=#90fe42\n"
+    "role.worker=#ff0404\n"
+)
+
+
 @dataclass(frozen=True)
 class HttpReply:
     status: int
@@ -70,7 +78,9 @@ def setUpModule() -> None:
         + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n"
         + "rebuilds.url=python:scripts.review_links.change_page:rebuilds_url\n")
     _ = write_config_fixture(configuration / "scratch.conf", "record_lock_attempts=3\n")
-    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
+    _ = (configuration / "statusline.conf").write_text(ROLE_COLOR_CONFIG, encoding="utf-8")
+    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {
+        "CONF_DIR": str(configuration), "USER_ZONE": "America/New_York"})))
 
 
 class ReviewLinksServerTests(unittest.TestCase):
@@ -1538,6 +1548,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_list_serves_linked_items_with_a_producer_directory_document(self) -> None:
         case = self.review_fixture(changes=2)
+        _ = conf.path("statusline").write_text(ROLE_COLOR_CONFIG, encoding="utf-8")
         directory = self.root.parent / "brain"
         directory.mkdir()
         producer = fixture_member("producer", name="brain", doc=staff.LiveDoc(local_machine(), directory))
@@ -2065,6 +2076,43 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertEqual(code, 503)
                     self.assertEqual(json.loads(body), {"reason": f"Invalid quota clear state in {state}."})
                     self.assertEqual(state.read_bytes(), contents)
+
+    def test_quota_clear_accepts_a_submitted_reset_from_the_same_week(self) -> None:
+        from scripts.accounts import accounts
+
+        reset = datetime.now(timezone.utc) + timedelta(days=1)
+        state = accounts_page.quota_state(self.root)
+        quotas = {"claude1": accounts.WeeklyQuota(4, reset)}
+        cases = ((reset - timedelta(days=7), 400),
+                 (reset + timedelta(microseconds=526917), 200))
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(accounts, "stored_weekly_quotas", return_value=quotas)):
+            for submitted, status in cases:
+                with self.subTest(submitted=submitted):
+                    form = urlencode({"quota_account": "claude1", "quota_level": "urgent",
+                                      "quota_reset": submitted.isoformat()})
+                    self.assertEqual(self.post(accounts_page.PAGE_PATH, form)[0], status)
+                    if status == 400:
+                        self.assertFalse(state.exists())
+                    else:
+                        self.assertEqual(json.loads(state.read_text()), {
+                            "claude1": {"level": "urgent", "reset": reset.isoformat()},
+                        })
+
+    def test_warning_clear_keeps_an_urgent_record_for_the_same_week(self) -> None:
+        from scripts.accounts import accounts
+
+        reset = datetime.now(timezone.utc) + timedelta(days=1)
+        quotas = {"claude1": accounts.WeeklyQuota(9, reset)}
+        state = accounts_page.quota_state(self.root)
+        state.parent.mkdir(parents=True, exist_ok=True)
+        receipt = {"claude1": {"level": "urgent", "reset": (reset - timedelta(microseconds=526917)).isoformat()}}
+        _ = state.write_text(json.dumps(receipt), encoding="utf-8")
+        form = urlencode({"quota_account": "claude1", "quota_level": "warning", "quota_reset": reset.isoformat()})
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(accounts, "stored_weekly_quotas", return_value=quotas)):
+            self.assertEqual(self.post(accounts_page.PAGE_PATH, form)[0], 200)
+        self.assertEqual(json.loads(state.read_text()), receipt)
 
     def test_accounts_post_saves_and_clears_a_producers_next_move(self) -> None:
         from scripts.accounts import accounts, next_moves

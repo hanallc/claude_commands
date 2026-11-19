@@ -31,7 +31,7 @@ from typing import ParamSpec, TypeVar, cast, override
 import unittest
 from unittest import mock
 
-from scripts.aws_target import admin_secrets, test_deploy, test_plan_identity, test_plan_run
+from scripts.aws_target import admin_secrets, plan_identity, plan_run, test_deploy, test_plan_identity, test_test_identity
 from scripts.aws_target.aws_cli import AwsCli, AwsExecutor, execute_command
 
 SOURCE = Path(__file__).resolve().parent
@@ -58,7 +58,7 @@ SCENARIOS = {
         'test_foundation_preparation_refusal_discards_the_reservation',
         'test_empty_update_is_success_without_execution_or_compute_request',
         'test_lost_update_creation_response_discards_the_recovered_change_set',
-        'test_quota_status_prints_aligned_regional_blocks_without_writes',
+        'test_quota_status_reads_with_plan_key_and_prints_newest_request_without_ids',
         'test_prices_lists_all_region_type_zone_combinations_without_ids',
         'test_scaler_key_cleans_stale_and_unconfirmed_keys',
         'test_remove_gate_image_switches_to_the_official_image_before_deleting_the_gate_image',
@@ -107,6 +107,8 @@ SCENARIOS = {
         'test_changed_config_updates_the_policy_without_replacing_the_key',
         'test_down_deletes_the_key_before_the_user_and_policy',
     ),
+    'test_test_identity.TestIdentityTests': (
+        'test_install_check_and_replace_key_for_same_account',),
     'test_plan_run.PlanSetupTests': (
         'test_stack_owned_plan_passes_with_the_current_allow_list',),
     'test_plan_run.GatePlanTests': (
@@ -308,6 +310,7 @@ def shell_names_aws(command: str) -> bool:
 
 def run_fixtures(names: Sequence[str], collection: CommandCollection, endpoint: str, path: str) -> None:
     original_init = AwsCli.__init__
+    original_plan_init = plan_run.PlanRun.__init__
     original_admin_executor = admin_secrets.AdminSecretSession.executor
     captured_executors: list[AwsExecutor] = []
     original_init_process = subprocess.Popen.__init__
@@ -327,6 +330,10 @@ def run_fixtures(names: Sequence[str], collection: CommandCollection, endpoint: 
             execute = collection.aws_executor(execute)
             captured_executors.append(execute)
         original_init(api, profile, region, timeout_s, execute)
+
+    def plan_init(plan: plan_run.PlanRun, load_credential: Callable[[], plan_identity.PlanCredentials],
+                  executor: AwsExecutor, pause: Callable[[float], None]) -> None:
+        original_plan_init(plan, load_credential, collection.aws_executor(executor), pause)
 
     def guarded_init(process: subprocess.Popen[str] | subprocess.Popen[bytes],
                      args: ProcessWord | Sequence[ProcessWord], *positional: object, **kwargs: object) -> None:
@@ -362,13 +369,12 @@ def run_fixtures(names: Sequence[str], collection: CommandCollection, endpoint: 
             mock.patch.object(tempfile, 'tempdir', str(collection.root)),
             mock.patch.object(subprocess.Popen, '__init__', new=guarded_init),
             mock.patch.object(AwsCli, '__init__', new=init),
+            mock.patch.object(plan_run.PlanRun, '__init__', new=plan_init),
             mock.patch.object(admin_secrets.AdminSecretSession, 'executor', new=admin_executor),
             mock.patch.object(test_plan_identity.Commands, 'execute',
                               new=collection.fixture_executor(test_plan_identity.Commands.execute)),
-            mock.patch.object(test_plan_run.PlanSetupTests, 'execute',
-                              new=collection.fixture_executor(test_plan_run.PlanSetupTests.execute)),
-            mock.patch.object(test_plan_run.GatePlanTests, 'execute',
-                              new=collection.fixture_executor(test_plan_run.GatePlanTests.execute)),
+            mock.patch.object(test_test_identity.IdentityCommands, 'execute',
+                              new=collection.fixture_executor(test_test_identity.IdentityCommands.execute)),
             redirect_stdout(output), redirect_stderr(output)):
         for name in names:
             collection.fixture = name

@@ -15,6 +15,7 @@ from unittest import mock
 
 import sys
 
+from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.mac_test import claim_state, mac_test
 from scripts.lib import process_start as identity
@@ -157,7 +158,7 @@ class ClaimProcessStartTests(unittest.TestCase):
                     if cleanup and expected == 13:
                         assigned = placement.PlacementAssignment("new-episode", "new-attempt",
                             placement.PlacementDestination("mac", "mac", "mac", mac_test.WHOLE_MAC),
-                            placement.SourceKeyUnavailable("the retained cleanup has no source key"),
+                            execution_identity.SourceKeyUnavailable("the retained cleanup has no source key"),
                             placement.SubmittingOwner("natedev", 42, new_start), session, 0)
                         result_status = mac_test.command_claim(args, paths, watch_claim=False,
                             session=session, assignment=assigned)

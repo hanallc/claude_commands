@@ -28,6 +28,7 @@ from pathlib import Path
 from types import FrameType
 from typing import Literal, Protocol, TypedDict, cast, final, get_args
 
+from scripts.build_queue import execution_identity
 from scripts.build_hold import owning_session as session_owner
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import override_guard
@@ -194,6 +195,8 @@ def target_state(target: LocalTarget | SshTarget) -> TargetState:
                 return StateUnreadable(snapshot.reason)
             if isinstance(snapshot, hana_placement.HanaUnprovisioned):
                 return Unreachable('Hana is unprovisioned')
+            if isinstance(snapshot, hana_placement.HanaResourcesHeld):
+                return Unreachable('Hana is busy or recovering')
             if not controller.image_is_current(snapshot.deployment):
                 return Unreachable(hana_box.HANA_IMAGE_STALE)
             if snapshot.claims or snapshot.state not in (hana_box.Lifecycle.READY, hana_box.Lifecycle.IDLE_STOPPED):
@@ -371,7 +374,7 @@ def step_routing_rule(kind: CommandKind, routing: Routing = ANY_ELIGIBLE_TARGET,
 
 def fixed_placement_constraints(
     repo_root: Path, package: str, kind: CommandKind, command: tuple[str, ...],
-    session: SubmittingSession, source_key: str | placement.SourceIdentity, routing: Routing = ANY_ELIGIBLE_TARGET,
+    session: SubmittingSession, source_key: str | execution_identity.SourceIdentity, routing: Routing = ANY_ELIGIBLE_TARGET,
     selection: TargetSelection = ROUTED, *, writes_tree: bool = False,
     provider_settings: ProviderSettings = CONFIGURED_PROVIDER_SETTINGS,
 ) -> placement.PlacementConstraints:
@@ -397,7 +400,7 @@ def fixed_placement_constraints(
                 settings = provider_settings
             candidates.extend(fixed_remote_candidates(
                 target, settings, repository, repo_root, package, kind, command, rule, selection=selection))
-    source = placement.SourceKeyKnown(source_key) if isinstance(source_key, str) else source_key
+    source = execution_identity.SourceKeyKnown(source_key) if isinstance(source_key, str) else source_key
     return placement.PlacementConstraints(source, command, str(repo_root), package, session, tuple(candidates),
         placement.PinnedHost(selection.target) if isinstance(selection, Pinned) else placement.ConfiguredOrder(),
         command_kind=kind)
@@ -483,7 +486,7 @@ def command_constraints(args: CliArguments) -> int:
     selection = Pinned(args.target or "mac") if args.target or args.mac_only else ROUTED
     rule = step_routing_rule(cast(StepKind, args.kind), routing, selection)
     constraints = fixed_placement_constraints(Path(args.repo_root).resolve(), args.package,
-        cast(StepKind, args.kind), (), session, placement.SourceKeyUnavailable("source is not submitted yet"), routing, selection)
+        cast(StepKind, args.kind), (), session, execution_identity.SourceKeyUnavailable("source is not submitted yet"), routing, selection)
     print("any_target" if isinstance(rule, AnyTarget) else f"natedev_only {rule.reason}")
     shown: set[str] = set()
     with conf.report_key_changes():
@@ -750,6 +753,8 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
             return ExcludedTarget(target, 'unprovisioned')
         if isinstance(snapshot, hana_placement.HanaLifecycleUnavailable):
             return ExcludedTarget(target, 'state unreadable')
+        if isinstance(snapshot, hana_placement.HanaResourcesHeld):
+            return ExcludedTarget(target, 'busy')
         from scripts.aws_target import hana_box
         if not controller.image_is_current(snapshot.deployment):
             return ExcludedTarget(target, hana_box.HANA_IMAGE_STALE)
@@ -941,7 +946,7 @@ def reserve_assigned(args: CliArguments) -> int:
         if isinstance(checked, hana_placement.HanaClaimRefused):
             return 1
         # F1 commits lifecycle demand after this process-bound reservation handoff.
-        identity = claim_state.ClaimIdentity(placement.assigned_claim_id(assignment.episode, assignment.attempt),
+        identity = claim_state.ClaimIdentity(execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
             assignment.episode, assignment.attempt)
         publish_wait_reservation(args, target, identity, assignment.session)
         return 0
@@ -951,7 +956,7 @@ def reserve_assigned(args: CliArguments) -> int:
 
         try:
             with mac_test.locked(paths.lock):
-                expected = claim_state.ClaimIdentity(placement.assigned_claim_id(assignment.episode, assignment.attempt),
+                expected = claim_state.ClaimIdentity(execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
                                                      assignment.episode, assignment.attempt)
                 owner = process_start.process_start(args.pid)
                 if isinstance(owner, process_start.Unreadable):
