@@ -321,7 +321,8 @@ class ReviewPageTests(unittest.TestCase):
         archive_snapshot = archive_cache.get()
         record = archive_snapshot.records[created.key]
         self.assertEqual(record.queue_after, str(archived))
-        with (patch.object(review_items, 'proposal_store_folders', side_effect=AssertionError('The exact read scanned folders.')),
+        with (patch('scripts.production.record_store.known_folders',
+                    side_effect=AssertionError('The exact read scanned folders.')),
               patch.object(review_items, 'store_paths', side_effect=AssertionError('The exact read listed records.'))):
             self.assertEqual(review_items.read_current(self.root, record, archive_snapshot.members), record)
             retry = archive_cache.create_submission(request)
@@ -699,6 +700,40 @@ class ReviewPageTests(unittest.TestCase):
                 with self.assertRaises(PermissionError):
                     _ = review_items.read_current(self.root, moved.records[issue], staff.snapshot())
 
+    def test_snapshot_shows_and_counts_proposals_from_a_producer_document(self) -> None:
+        doc = self.fixture.temporary / 'producer.md'
+        folder = self.fixture.temporary / 'producer-proposals'
+        folder.mkdir()
+        _ = doc.write_text(f'# Producer\n- **Proposals:** {folder}\n')
+        producer = fixture_member('producer', name='producer', doc=staff.LiveDoc(local_machine(), doc))
+        path = folder / 'P1.md'
+        _ = path.write_text('---\nstatus: open\ntags: [proposal]\nstage: backlog\n'
+            +f'proposed_by: {producer.id}\nproposal_id: P1\ndate_created: 2026-11-01\n---\n'
+            +'# Reduce the build time\n')
+
+        snapshot = review_page.build_snapshot(self.root)
+        proposals = [item for item in snapshot.records.values() if item.type == review_items.ReviewType.PROPOSAL]
+        self.assertEqual(review_items.count_items(proposals, datetime.now(snapshot.zone)), 1)
+        self.assertIn('proposal/'+str(path), {entry['key'] for entry in snapshot.entries})
+        self.assertEqual(proposals[0].owner, producer.id)
+        self.assertIn(doc, snapshot.source_stamps)
+        self.assertEqual(snapshot.notices, ())
+
+    def test_snapshot_ignores_producer_documents_and_reports_missing_production(self) -> None:
+        directory = self.fixture.temporary / 'brain'
+        directory.mkdir()
+        missing_producer = self.fixture.temporary / 'current.md'
+        missing_production = self.fixture.temporary / 'production-missing.md'
+        _ = fixture_member('producer', name='brain', doc=staff.LiveDoc(local_machine(), directory))
+        _ = fixture_member('producer', name='morty', doc=staff.LiveDoc(local_machine(), missing_producer))
+        _ = fixture_member('showrunner', name='missing', doc=staff.LiveDoc(local_machine(), missing_production))
+
+        snapshot = review_page.build_snapshot(self.root)
+        self.assertIn(f'Could not load {missing_production}.', snapshot.notices)
+        for path in (directory, missing_producer):
+            self.assertNotIn(f'Could not load {path}.', snapshot.notices)
+            self.assertNotIn(path, snapshot.source_stamps)
+
     def test_change_projection_isolates_an_unreadable_production_path(self) -> None:
         doc = self.fixture.temporary / 'unreadable.md'
         listing = change_review.list_file('unreadable')
@@ -1007,6 +1042,10 @@ class ReviewPageTests(unittest.TestCase):
         self.assertRegex(revision, r'^[0-9a-f]{16}$')
         self.assertIn(f'name="revision" value="{revision}"', card)
         self.assertIn('How to check', done, 'A Done key loads its body directly.')
+        self.assertIn('data-send-status', done)
+        for hidden in ('<h3>Proof</h3>', 'data-later-toggle', 'Your words', 'name="feedback"'):
+            with self.subTest(hidden=hidden):
+                self.assertNotIn(hidden, done)
         with self.assertRaises(LookupError):
             _ = snapshot.body('missing/key')
 
@@ -1366,12 +1405,13 @@ class ReviewPageTests(unittest.TestCase):
   check(document.querySelector('[data-review]').dataset.show==='Done' &&
    form('page-owner/C4').querySelector('[data-send-status]').textContent.includes('This item is already Done.'),
    'F015: HTTP 409 refreshes the index and reveals the Done card with the reason.');
+  await open('page-owner/C6');
   conflict='/remove-conflict';
-  const removed=form('page-owner/C4');
+  const removed=form('page-owner/C6');
   removed.elements.later.value='2030-12-02T18:30';
   const removalVersion=document.querySelector('[data-review]').dataset.version;
   removed.requestSubmit(removed.querySelector('button[value=later]'));
-  await until(()=>!row('page-owner/C4') && document.querySelector('[data-review]').dataset.version!==removalVersion,
+  await until(()=>!row('page-owner/C6') && document.querySelector('[data-review]').dataset.version!==removalVersion,
    'the refreshed view without the removed row');
   const notice=document.querySelector('[data-review-notice]');
   check(notice && !notice.hidden && notice.textContent.includes('This item is no longer on the list.'),
@@ -1394,7 +1434,7 @@ class ReviewPageTests(unittest.TestCase):
                 for item in newer.records.values()]):
             accepted = review_page.build_snapshot(self.root)
         with patch.object(review_items, 'read', return_value=[
-                item for item in accepted.records.values() if item.key != 'page-owner/C4']):
+                item for item in accepted.records.values() if item.key != 'page-owner/C6']):
             deleted = review_page.build_snapshot(self.root)
         counts = {'version':0,'index':0}
         spy = """<script>window.coldErrors=[];
@@ -1484,7 +1524,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
                 server.shutdown()
                 thread.join(5)
         self.assertEqual(results,[[]])
-        self.assertEqual(set(requested_bodies),{'page-owner/C399',key,'page-owner/C2','page-owner/C4'},
+        self.assertEqual(set(requested_bodies),{'page-owner/C399',key,'page-owner/C2','page-owner/C4','page-owner/C6'},
                          'Only opened keys request a body.')
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
@@ -3301,7 +3341,7 @@ window.fetch=async(url,options={})=>{
    });
    observer.observe(recipients,{childList:true});
   });
-  review.querySelector('[data-review-new]').click();
+  document.querySelector('[data-review-new]').click();
   if(!dialog.open) throw new Error('New must open the dialog.');
   dialog.querySelector('[name="kind"][value="bug"]').click();
   (await ready).click();
@@ -3566,6 +3606,31 @@ window.fetch=async(url)=>{
         self.assertEqual(results, [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_new_button_aligns_with_the_review_title_at_desktop_width(self) -> None:
+        markup = review_page.build_snapshot(self.root).page.decode()
+        probe = r'''<script>
+(async()=>{
+ const failures=[];
+ frameElement.style.width='1280px';
+ await document.fonts.ready;
+ const group=document.querySelector('[role="group"][aria-label="Type"]');
+ const button=document.querySelector('[data-review-new]');
+ const heading=document.querySelector('h1.page-title'),label=document.createRange();
+ label.selectNodeContents(heading);
+ const bounds=button.getBoundingClientRect(),title=heading.getBoundingClientRect();
+ const table=document.querySelector('.list-table').getBoundingClientRect();
+ if(innerWidth!==1280 || bounds.width===0 || bounds.left<label.getBoundingClientRect().right ||
+    Math.abs((bounds.top+bounds.bottom)-(title.top+title.bottom))>2 || Math.abs(bounds.right-table.right)>1){
+  failures.push('The New button must align with the title at the right edge at 1280 px.');
+ }
+ if(group.contains(button)) failures.push('The Type chips must exclude the New button.');
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''
+        markup = markup.replace('</body>', probe + '</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_clears_the_review_save_notice(self) -> None:
         fixture = self.fixture
         _ = change_review.append_rows(fixture.review_list, pictured_changes([
@@ -3736,6 +3801,309 @@ Element.prototype.animate=function(...args){
         self.assertEqual(firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_reload_keeps_a_saved_verdict_and_the_selected_show(self) -> None:
+        setup = r"""<script>
+const sendProbe=fetch;
+window.setInterval=()=>0;
+window.fetch=(url,options={})=>{
+ if(options.method==='POST') return Promise.resolve(Response.json({answer:'works'}));
+ return sendProbe(url,options);
+};
+if(!sessionStorage.getItem('review-reload')) history.replaceState(null,'','#item=page-owner%2FC1');
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[],key='page-owner/C1',check=(condition,message)=>{if(!condition) failures.push(message);};
+ const content=document.querySelector('[data-review]');
+ const row=()=>content.querySelector('[data-key="'+key+'"]');
+ const fetchCard=fetch;
+ window.fetch=(url,options)=>new URL(url,location.href).search==='?version=1'
+  ? Promise.resolve(Response.json({version:content.dataset.version,facts:pageRefreshFacts()}))
+  : fetchCard(url,options);
+ try{
+  if(!sessionStorage.getItem('review-reload')){
+   if(CASE==='verdict'){
+    const form=await readyReviewCard(row());
+    const saved=new Promise(resolve=>{
+     const observer=new MutationObserver(()=>{
+      if(!form.dataset.sending){observer.disconnect();resolve();}
+     });
+     observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
+    });
+    form.requestSubmit(form.querySelector('[value="works"]'));
+    await saved;
+    history.replaceState(null,'','#item=page-owner%2FC1');
+   }else content.querySelector('[data-show-chip="open"]').click();
+   sessionStorage.setItem('review-reload','1');
+   location.reload();return;
+  }
+  if(CASE==='verdict'){
+   const deadline=performance.now()+8000;
+   while(row() && !row().dataset.bodyLoaded && performance.now()<deadline)
+    await new Promise(resolve=>requestAnimationFrame(resolve));
+   check(row()?.dataset.state==='Done' && row()?.querySelector('[data-review-body]') &&
+      !row()?.querySelector('[value="works"]'),'A reload during publication retry hides the old verdict action.');
+   const index=JSON.parse(content.querySelector('[data-review-index]').textContent);
+   index.r.find(entry=>entry[0]===key)[6]=2;
+   const facts=pageRefreshFacts(),version='confirmed';
+   window.fetch=(url,options)=>{
+    const params=new URL(url,location.href).searchParams;
+    if(params.has('index')) return Promise.resolve(Response.json({index,version,facts}));
+    if(params.has('version') && !params.has('body')) return Promise.resolve(Response.json({version,facts}));
+    return fetchCard(url,options);
+   };
+   const refreshed=new Promise(resolve=>content.addEventListener('review-refreshed',resolve,{once:true}));
+   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+   await refreshed;
+   row().querySelector('.list-toggle').click();
+   content.querySelector('[data-show-chip="Done"]').click();
+   check(row()?.dataset.state==='Done' && !row().hidden && row().querySelector('[data-detail]').hidden,
+    'The confirmed Change appears in the Done list after its linked card closes.');
+  }else{
+   check(content.dataset.show==='open' && !row(),'A reload restores Open when the address names a Done Change.');
+  }
+ }catch(error){failures.push(String(error));}
+ await sendProbe('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        for case in ('verdict', 'show'):
+            with self.subTest(case=case):
+                if case == 'show':
+                    _ = change_review.record_verdict(self.fixture.review_list, 'C1', 'works',
+                                                     datetime.now(user_zone()).date(), self.fixture.production)
+                page = browser_markup(self.root).replace('<head>', '<head>'+setup, 1)
+                page = page.replace('</body>', probe.replace('CASE', json.dumps(case))+'</body>', 1)
+                self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_back_during_a_save_keeps_the_link_for_a_change_and_question(self) -> None:
+        _ = self.question()
+        setup = r"""<script>
+const sendProbe=fetch;
+let finishSave,savedState;
+window.setInterval=()=>0;
+window.fetch=(url,options={})=>{
+ if(options.method!=='POST') return sendProbe(url,options);
+ return new Promise(resolve=>{finishSave=()=>resolve(Response.json({answer:'saved',state:savedState}));});
+};
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[];
+ const content=document.querySelector('[data-review]');
+ const row=key=>content.querySelector('[data-key="'+key+'"]');
+ const fetchCard=fetch;
+ let snapshot;
+ window.fetch=(url,options)=>{
+  const params=new URL(url,location.href).searchParams;
+  if(params.has('index') && snapshot) return Promise.resolve(Response.json(snapshot));
+  if(params.has('version') && !params.has('body'))
+   return Promise.resolve(Response.json({version:snapshot?.version ?? content.dataset.version,facts:pageRefreshFacts()}));
+  return fetchCard(url,options);
+ };
+ const afterHash=()=>new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+ const follow=async key=>{
+  const changed=afterHash();
+  location.hash=new URLSearchParams({item:key});
+  await changed;
+ };
+ try{
+  const question=content.querySelector('[data-type="question"][data-list-item]').dataset.key;
+  for(const [key,action] of [['page-owner/C1','works'],[question,'answer'],['page-owner/C3','validate']]){
+   await follow(key);
+   const form=await readyReviewCard(row(key));
+   form.elements.feedback.value='The saved words.';
+   const previous={href:location.href,state:history.state};
+   const saved=new Promise(resolve=>{
+    const observer=new MutationObserver(()=>{
+     if(!form.dataset.sending){observer.disconnect();resolve();}
+    });
+    observer.observe(form,{attributes:true,attributeFilter:['data-sending']});
+   });
+   form.requestSubmit(form.querySelector('[value="'+action+'"]'));
+   await follow('page-owner/C2');
+   const oldURL=location.href;
+   history.replaceState(previous.state,'',previous.href);
+   dispatchEvent(new PopStateEvent('popstate',{state:previous.state}));
+   dispatchEvent(new HashChangeEvent('hashchange',{oldURL,newURL:previous.href}));
+   savedState=action==='validate' ? 'Validating' : 'Done';
+   const refreshed=new Promise(resolve=>content.addEventListener('review-refreshed',resolve,{once:true}));
+   if(action==='validate'){
+    const index=JSON.parse(content.querySelector('[data-review-index]').textContent);
+    snapshot={index,version:'handoff-publication-pending',facts:pageRefreshFacts()};
+   }
+   finishSave();await saved;
+   const target=row(key),item=new URLSearchParams(location.hash.slice(1)).get('item');
+   if(action==='validate'){
+    await refreshed;
+    if(item!==key || content.dataset.version!==snapshot.version || row(key))
+     failures.push('The deferred link keeps the Validating marker when a new snapshot still shows the old Change.');
+    continue;
+   }
+   if(item!==key || target?.dataset.state!=='Done' || target.querySelector('[data-detail]').hidden)
+    failures.push('Back keeps the link and opens the Done card for '+key+'.');
+  }
+ }catch(error){failures.push(String(error));}
+ await sendProbe('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        page = browser_markup(self.root).replace('<head>', '<head>'+setup, 1)
+        page = page.replace('</body>', probe+'</body>', 1)
+        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_back_and_forward_defer_the_link_to_its_own_pending_save(self) -> None:
+        _ = self.question()
+        setup = r"""<script>
+const sendProbe=fetch,finishSave=new Map();
+history.scrollRestoration='manual';
+window.setInterval=()=>0;
+window.fetch=(url,options={})=>{
+ if(options.method!=='POST') return sendProbe(url,options);
+ const key=new URLSearchParams(options.body).get('row');
+ return new Promise(resolve=>finishSave.set(key,resolve));
+};
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[];
+ const content=document.querySelector('[data-review]');
+ const row=key=>content.querySelector('[data-key="'+key+'"]');
+ const fetchCard=fetch;
+ window.fetch=(url,options)=>new URL(url,location.href).search==='?version=1'
+  ? Promise.resolve(Response.json({version:content.dataset.version,facts:pageRefreshFacts()}))
+  : fetchCard(url,options);
+ const afterHash=step=>new Promise((resolve,reject)=>{
+  const timeout=setTimeout(()=>reject(new Error('The history entry did not change during '+step+'.')),5000);
+  addEventListener('hashchange',()=>{clearTimeout(timeout);resolve();},{once:true});
+ });
+ const item=()=>new URLSearchParams(location.hash.slice(1)).get('item');
+ async function start(key,action){
+  const changed=afterHash('link to '+key);location.hash=new URLSearchParams({item:key});await changed;
+  const form=await readyReviewCard(row(key));
+  form.elements.feedback.value='The saved words.';
+  form.requestSubmit(form.querySelector('[value="'+action+'"]'));
+  return form;
+ }
+ async function settle(key,form,response=Response.json({answer:'saved',state:'Done'})){
+  finishSave.get(key)(response);
+  while(form.dataset.sending) await new Promise(resolve=>requestAnimationFrame(resolve));
+ }
+ const afterFades=async()=>{
+  const fades=[...content.querySelectorAll('.record-motion-clip')].flatMap(node=>node.getAnimations());
+  await Promise.allSettled(fades.map(animation=>animation.finished));
+  await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ };
+ try{
+  if(document.readyState!=='complete') await new Promise(resolve=>addEventListener('load',resolve,{once:true}));
+  frameElement.style.width='1280px';frameElement.style.height='820px';
+  await new Promise(resolve=>requestAnimationFrame(resolve));
+  const change='page-owner/C1',question=content.querySelector('[data-type="question"][data-list-item]').dataset.key;
+  const changeForm=await start(change,'works'),questionForm=await start(question,'answer');
+  const panel=questionForm.closest('[data-list-item]').querySelector('.list-toggle').getAttribute('aria-controls');
+  const clip=content.querySelector('.record-motion-clip [aria-controls="'+CSS.escape(panel)+'"]')
+   ?.closest('.record-motion-clip');
+  const exit=clip?.getAnimations()[0];
+  if(!exit) throw new Error('The Question must fade during the save.');
+  exit.pause();exit.currentTime=100;
+  const back=afterHash('Back');history.back();await back;
+  if(item()!==change) failures.push('Back restores the pending Change link.');
+  if(REFUSE_QUESTION){
+   await settle(change,changeForm);
+   if(!clip.isConnected || row(change)) throw new Error('The Change link must wait for the Question fade.');
+   let returning;
+   const animate=Element.prototype.animate;
+   Element.prototype.animate=function(keyframes,options){
+    const motion=animate.call(this,keyframes,options);
+    if(this.classList.contains('record-motion-clip') && keyframes.at(-1).opacity===1){
+     motion.pause();motion.currentTime=100;returning={clip:this,motion};
+    }
+    return motion;
+   };
+   await settle(question,questionForm,Response.json({reason:'Try again.'},{status:503}));
+   Element.prototype.animate=animate;
+   if(!returning) throw new Error('The refused Question must start a return fade.');
+   if(!returning.clip.isConnected || row(change))
+    failures.push('F007: The deferred Change link waits for the Question return fade.');
+   if(returning.clip.isConnected) returning.motion.finish();
+  }else{
+   const forward=afterHash('Forward');history.forward();await forward;
+   if(item()!==question) failures.push('Forward restores the pending Question link.');
+   await settle(change,changeForm);
+   if(!questionForm.dataset.sending || item()!==question)
+    failures.push('The Change save leaves the Question link pending.');
+   await settle(question,questionForm);
+   if(!clip.isConnected || row(question))
+    failures.push('The Question link waits for the fade after the save. Fade mounted: '+clip.isConnected+'.');
+   exit.finish();
+  }
+  await afterFades();
+  const linked=REFUSE_QUESTION ? change : question,target=row(linked);
+  if(item()!==linked || target?.dataset.state!=='Done' || target.querySelector('[data-detail]').hidden)
+   failures.push('The save opens the Done card at the restored link. State: '+
+    target?.dataset.state+', expanded: '+(target?.querySelector('[data-detail]').hidden===false)+'.');
+ }catch(error){failures.push(String(error));}
+ await sendProbe('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        page = browser_markup(self.root).replace('<head>', '<head>'+setup, 1)
+        for refuse_question in (False, True):
+            with self.subTest(refuse_question=refuse_question):
+                script = probe.replace('REFUSE_QUESTION', json.dumps(refuse_question))
+                self.assertEqual(firefox_probe_results(page.replace('</body>', script+'</body>', 1).encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_console_reload_preserves_show_and_an_explicit_link_opens_the_card(self) -> None:
+        _ = change_review.record_verdict(self.fixture.review_list, 'C1', 'works',
+                                         datetime.now(user_zone()).date(), self.fixture.production)
+        review = browser_markup(self.root)
+        pages = (console.ConsolePage('review', 'Review', 'inbox', 'Review',
+                                     console.AvailablePage('/console/review.html')),)
+        shell = console.render(pages, console.UnavailablePage()).decode()
+        shell = shell.replace('</head>', '''<script>
+const sendProbe=fetch;
+window.fetch=(url,options)=>String(url)==='/results' ? sendProbe(url,options) :
+ Promise.resolve(Response.json({available:true,count:0,entries:[],new:[]}));
+</script></head>''', 1)
+        probe = r"""<script>
+(async()=>{
+ const failures=[],stage=sessionStorage.getItem('console-reload');
+ const frame=document.querySelector('iframe'),key='page-owner/C1';
+ const explicit='/console/review.html?show=open&item='+encodeURIComponent(key);
+ const row=()=>frame.contentDocument.querySelector('[data-key="'+key+'"]');
+ const show=()=>frame.contentDocument.querySelector('[data-review]')?.dataset.show;
+ const until=async (predicate,label)=>{
+  const end=performance.now()+8000;
+  while(!predicate()){
+   if(performance.now()>end) throw new Error('Timed out waiting for '+label+'.');
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ try{
+  if(!stage){
+   sessionStorage.setItem('console-reload','linked');
+   location.search=new URLSearchParams({'page':'review','at.review':explicit});return;
+  }
+  await until(()=>frame.contentWindow.history.state?.recordTable,'Review to load');
+  if(stage==='linked'){
+   if(show()!=='all' || row()?.querySelector('[data-detail]').hidden!==false)
+    failures.push('An explicit link opens the Done Change.');
+   frame.contentDocument.querySelector('[data-show-chip="open"]').click();
+   await until(()=>new URLSearchParams(location.search).get('at.review')==='/console/review.html'+
+    frame.contentWindow.location.hash,'Console to record Open');
+   sessionStorage.setItem('console-reload','reloaded');location.reload();return;
+  }
+  if(show()!=='open' || row()) failures.push('A Console reload keeps Open and hides the Done Change. Show: '+show());
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        shell = shell.replace('</body>', probe+'</body>', 1)
+        review_html, shell_html = (json.dumps(page).replace('</', '<\\/') for page in (review, shell))
+        router = f'<script>document.write(location.pathname.endsWith("review.html") ? {review_html} : {shell_html});</script>'
+        self.assertEqual(firefox_probe_results(router.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_same_tab_link_shows_the_change_that_just_closed(self) -> None:
         _ = self.question()
         setup = r"""<script>
@@ -3825,6 +4193,10 @@ window.fetch=(url,options={})=>{
    await saved;
    check(form.querySelector('[data-send-status]').textContent==='Saved: works',key+' saved.');
    check(row.hidden,'The save hides '+key+'.');
+   if(key==='page-owner/C2'){
+    const fades=[...review.querySelectorAll('.record-motion-clip')].flatMap(node=>node.getAnimations());
+    await Promise.allSettled(fades.map(animation=>animation.finished));
+   }
   }
   check(expanded(change('page-owner/C1'),'Done') && review.dataset.show==='Done' && selectedOwner()===owner,
    'F006: A link during the save opens the Done Change and keeps the matching filters.');

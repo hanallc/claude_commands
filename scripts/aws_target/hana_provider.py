@@ -49,13 +49,18 @@ class ProviderPending(RuntimeError):
     """The provider has no settled response for the saved operation."""
 
 
+class ProviderTimedOut(ProviderPending):
+    """The AWS request exceeded its time limit."""
+
+
 class AwsHanaProvider:
     def __init__(self, api: AwsCli, directory: Path, bucket: str, url_seconds: int,
-                 *, clock: Callable[[], float] = time.time):
+                 *, result_transfer_timeout_s: int, clock: Callable[[], float] = time.time):
         self.api: AwsCli = api
         self.directory: Path = directory / 'hana' / 'provider'
         self.bucket: str = bucket
         self.url_seconds: int = url_seconds
+        self.result_transfer_timeout_s: int = result_transfer_timeout_s
         self.clock: Callable[[], float] = clock
 
     @classmethod
@@ -79,12 +84,15 @@ class AwsHanaProvider:
         path = directory / 'hana' / 'setup.json'
         saved = remote.read_record(path) if path.exists() else {}
         return cls(AwsCli(account.text('credentials_profile'), workload.text('region'), timeout, scaler), directory,
-            str(saved.get('bucket', '')), seconds)
+            str(saved.get('bucket', '')), seconds, result_transfer_timeout_s=workload.whole('result_transfer_timeout_s'))
 
-    def _call(self, operation: str, *arguments: str) -> dict[str, object]:
+    def _call(self, operation: str, *arguments: str, timeout_s: float | None = None) -> dict[str, object]:
         action = PROVIDER_OPERATIONS[operation]
         try:
-            return self.api.call(operation, *arguments, service='s3api' if action.startswith('s3:') else 'ec2')
+            return self.api.call(operation, *arguments, service='s3api' if action.startswith('s3:') else 'ec2',
+                                 timeout_s=timeout_s)
+        except subprocess.TimeoutExpired:
+            raise ProviderTimedOut('Hana provider call failed: ' + action) from None
         except (OSError, ValueError, AwsUnavailable, subprocess.SubprocessError) as error:
             message = 'Hana provider call failed: ' + action
             if isinstance(error, AwsUnavailable):
@@ -94,7 +102,10 @@ class AwsHanaProvider:
             raise ProviderPending(message) from None
 
     def signing_key(self) -> s3_presign.SigningKey:
-        credentials = self.api.call('export-credentials', '--format', 'process', service='configure')
+        try:
+            credentials = self.api.call('export-credentials', '--format', 'process', service='configure')
+        except subprocess.TimeoutExpired:
+            raise ProviderTimedOut('The Hana signing credential request timed out') from None
         return s3_presign.SigningKey(ledger.text(credentials, 'AccessKeyId'), ledger.text(credentials, 'SecretAccessKey'),
                                     str(credentials.get('SessionToken', '')))
 
@@ -137,6 +148,22 @@ class AwsHanaProvider:
                 prefix + suffix, self.api.region, signing, datetime.fromtimestamp(now, UTC), self.url_seconds)
         return HanaExecutionAccess(signed('/observation.json'), signed('/result.json'), now + self.url_seconds)
 
+    def boot_control_deadline(self, key: HanaAttemptKey) -> int:
+        """Read the deadline of the URLs installed at this boot."""
+        for path in self.directory.glob('*.json'):
+            try:
+                row = remote.read_record(path)
+                if row.get('action') != box.Action.BOOTSTRAP:
+                    continue
+                descriptor = ledger.mapping(row['descriptor'])
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            expires = descriptor.get('expires')
+            if (descriptor.get('deployment') == key.generation.deployment
+                    and descriptor.get('start_token') == key.generation.start_token and type(expires) is int):
+                return expires
+        raise ProviderPending('The Hana boot control deadline is unavailable')
+
     def publish_execution(self, envelope: HanaExecutionEnvelope) -> None:
         """Publish one bounded command or an idempotent exact-attempt fence."""
         from scripts.aws_target.hana_execution import HanaCommandEnvelope, HanaFenceEnvelope, encode_envelope
@@ -149,27 +176,31 @@ class AwsHanaProvider:
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         _ = self._object(prefix + suffix, ledger.mapping(cast(object, json.loads(content))))
 
-    def _execution_bytes(self, key: HanaAttemptKey, suffix: str, maximum: int) -> bytes:
+    def _execution_bytes(self, key: HanaAttemptKey, suffix: str, maximum: int, timeout_s: float) -> bytes:
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         with tempfile.TemporaryDirectory(prefix='hana-execution-', dir=self.directory) as folder:
             path = Path(folder) / 'object.json'
             _ = self._call('get-object', '--bucket', self.bucket, '--key', self._execution_prefix(key) + suffix,
-                           '--range', f'bytes=0-{maximum}', str(path))
+                           '--range', f'bytes=0-{maximum}', str(path), timeout_s=timeout_s)
             if path.stat().st_size > maximum:
                 raise ProviderPending('The Hana execution object exceeds its protocol bound')
             return path.read_bytes()
 
-    def observe_execution(self, key: HanaAttemptKey) -> HanaCommandObservation:
+    def observe_execution(self, key: HanaAttemptKey, *, timeout_s: float | None = None) -> HanaCommandObservation:
         """Read execution evidence without repeating command publication."""
         from scripts.aws_target.hana_execution import CONTROL_MAX_BYTES, decode_observation
 
-        return decode_observation(self._execution_bytes(key, '/observation.json', CONTROL_MAX_BYTES))
+        timeout = self.api.timeout_s if timeout_s is None else min(self.api.timeout_s, timeout_s)
+        return decode_observation(self._execution_bytes(key, '/observation.json', CONTROL_MAX_BYTES, timeout))
 
     def execution_result(self, key: HanaAttemptKey) -> bytes:
         """Read the bounded result after the guest publishes its terminal observation."""
-        from scripts.aws_target.hana_result import RESULT_MAX_BYTES
+        from scripts.aws_target.hana_result import RESULT_MAX_BYTES, HanaResultDownloadTimedOut
 
-        return self._execution_bytes(key, '/result.json', RESULT_MAX_BYTES)
+        try:
+            return self._execution_bytes(key, '/result.json', RESULT_MAX_BYTES, self.result_transfer_timeout_s)
+        except ProviderTimedOut:
+            raise HanaResultDownloadTimedOut(self.result_transfer_timeout_s) from None
 
     def _prefix(self, identity: box.DeploymentIdentity, start: box.DemandStart) -> str:
         if not all(re.fullmatch(r'[A-Za-z0-9_-]+', name) for name in (identity.deployment, start.token)):
@@ -259,10 +290,13 @@ class AwsHanaProvider:
                 if saved:
                     recovered = self._recover(identity, start, operation, path, saved)
                     if isinstance(recovered, box.MutationUnresolved):
-                        if (operation.action != box.Action.BOOTSTRAP or recovered.observed.state != 'stopped'
-                                or not isinstance(start, box.DemandStart)):
+                        if operation.action == box.Action.STOP:
+                            self._dispatch(identity, start, operation, path, saved)
+                        elif (operation.action == box.Action.BOOTSTRAP and recovered.observed.state == 'stopped'
+                              and isinstance(start, box.DemandStart)):
+                            self._write_bootstrap(identity, start, path, saved)
+                        else:
                             raise ProviderPending('The Hana ' + operation.action.value + ' operation remains unresolved')
-                        self._write_bootstrap(identity, start, path, saved)
                     elif operation.action != box.Action.BOOTSTRAP:
                         return self._accepted(identity, start, operation)
                 else:

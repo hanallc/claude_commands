@@ -4115,7 +4115,7 @@ class LiveMemoryTripwireTests(MemoryQueueFixture):
         for path in (Path("/proc/meminfo"), link):
             with self.subTest(path=path):
                 self.record.unlink(missing_ok=True)
-                with patch.object(Path, "read_text", side_effect=AssertionError("must refuse before reading memory")):
+                with patch.object(Path, "read_bytes", side_effect=AssertionError("must refuse before reading memory")):
                     with self.assertRaises(gate.LiveMemoryReading) as raised:
                         _ = gate.read_meminfo(path)
                 self.assertEqual(str(raised.exception), self.refusal("/proc/meminfo"))
@@ -4140,7 +4140,7 @@ class LiveMemoryTripwireTests(MemoryQueueFixture):
                 else:
                     os.environ["BUILDLOG_LIVE_MEMORY_TRIPWIRE"] = setting
                 # Keep the default-path contract without reading host memory.
-                with patch.object(Path, "read_text", return_value="full avg10=0 total=0\n"):
+                with patch.object(Path, "read_bytes", return_value=b"full avg10=0 total=0\n"):
                     self.assertIsInstance(gate.read_pressure(policy=admission_policy_fixture()), admission_records.Pressure)
 
     def test_shell_refuses_live_meminfo_or_pressure_and_records_one_reading(self) -> None:
@@ -4819,14 +4819,14 @@ class ProcessRunUseTests(unittest.TestCase):
     def test_a_denied_status_keeps_the_run_unavailable_and_names_its_file(self) -> None:
         _ = self.reservation("holder", 100)
         denied = self.fixture.proc.path / "101/status"
-        read_text = Path.read_text
+        read_bytes = Path.read_bytes
 
-        def read_private(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        def read_private(path: Path) -> bytes:
             if path == denied:
                 raise PermissionError(13, "Permission denied", str(path))
-            return read_text(path, encoding=encoding, errors=errors)
+            return read_bytes(path)
 
-        with patch.object(Path, "read_text", read_private):
+        with patch.object(Path, "read_bytes", read_private):
             room = self.room()
         self.assertIsInstance(room.cap, admission_records.CapUnavailable)
         hold, = room.runs

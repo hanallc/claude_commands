@@ -51,6 +51,7 @@ from scripts.production.staff_test_support import fixture_member
 from scripts.herdr.fake_herdr import herdr_listener
 from scripts.direct import progress_history
 from scripts.agents.test_support import ShutdownTestCase, registry_confirmation
+from scripts.lib.script_envelope import script_prompt
 
 LAUNCH_PREPARED_AGENT = herdr.launch_prepared_agent
 STOP_SESSION = stop_resume.stop
@@ -2631,9 +2632,10 @@ class RestartTests(RestartTestCase):
                                  "message": {"role": "assistant", "content": "Resumed work"}}
                     write_text_atomic(source, source.read_text() + json.dumps(assistant) + "\n")
                     _ = opening.before_prompt(native)
-                    self.assertEqual(cursor.transcript, native)
-                    self.assertEqual(cursor.offsets, {} if native_identity_changes else {source: len(history.encode())})
-                    proof = cursor.submitted_prompt(opening.text)
+                    self.assertEqual(cursor.transcript, requested)
+                    self.assertEqual(cursor.offsets, {original: len(history.encode())})
+                    native_cursor = cursor if native == requested else herdr.TranscriptCursor(native, cursor.since)
+                    proof = native_cursor.submitted_prompt(opening.text)
                     self.assertIsInstance(proof, herdr.PromptSubmitted)
                     return herdr.AgentLaunched("w1:p0", herdr.PromptSubmitted(user_at))
 
@@ -2650,6 +2652,46 @@ class RestartTests(RestartTestCase):
                 self.assertEqual(any("prelaunch-only-history" in str(value)
                                     for parsed_call in parsed.call_args_list
                                     for value in cast(tuple[object, ...], parsed_call.args)), native_identity_changes)
+
+    def test_restart_callback_preserves_a_receipt_under_the_requested_id(self) -> None:
+        row = self.rows[0]
+        self.running.clear()
+        client = herdr.Herdr("agents")
+        checks = restart.DirectorResumeChecks()
+        discovered = str(row.current_session) + "-native"
+
+        def launched(*arguments: object, **_options: object) -> herdr.AgentLaunched:
+            opening = arguments[5]
+            assert isinstance(opening, herdr.OpeningPrompt)
+            cursor = opening.cursor
+            assert isinstance(cursor, herdr.TranscriptCursor)
+            transcript = cursor.transcript
+            path = transcript.config_dir / "projects/fixture" / f"{transcript.session_id}.jsonl"
+            at = cursor.since + timedelta(seconds=1)
+            write_text_atomic(path, json.dumps({"timestamp": at.isoformat(), "type": "user",
+                "message": {"role": "user", "content": script_prompt(opening.text)}}) + "\n")
+            pane = "w1:p9"
+            outcome = client.start_agent(row.name, pane, "claude", ["--resume", transcript.session_id], opening, 1000)
+            assert not isinstance(outcome, herdr.PromptSubmissionNotRequired)
+            self.assertEqual(outcome.state, "confirmed")
+            self.assertEqual(cursor.transcript, transcript)
+            return herdr.AgentLaunched(pane, outcome)
+
+        with (patch.object(herdr, "launch_prepared_agent", side_effect=launched),
+              patch.object(client, "start_command", return_value=subprocess.CompletedProcess([], 0, "", "")),
+              patch.object(client, "native_session", return_value=discovered),
+              patch.object(herdr, "check_target", return_value=True),
+              patch.object(client, "wait_for_prompt_input", return_value=herdr.PromptInputReady()),
+              patch.object(client, "run", return_value="────────\n❯ \n────────"),
+              patch.object(client, "_prompt") as typed,
+              patch.object(client, "_send_keys") as keys,
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(restart.start_row(row, staff.StaffSnapshot(self.rows), client,
+                                              opening=herdr.OpeningPrompt("continue the saved work"),
+                                              resume_checks=checks), "w1:p9")
+        typed.assert_not_called()
+        keys.assert_not_called()
+        self.assertEqual(checks.checks[0].reader.transcript.session_id, discovered)
 
     def test_restart_fixed_reference_uses_current_native_id_name_and_folder(self) -> None:
         class ContinuationDelivery(Enum):
