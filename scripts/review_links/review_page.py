@@ -493,9 +493,9 @@ class ReviewSnapshotCache:
             finally:
                 self.invalidate()
 
-    def publish_record(
-        self, current: ReviewSnapshot, key: str, *, members: staff.StaffSnapshot | None = None,
-    ) -> tuple[ReviewSnapshot, ReviewItem | ReviewRecordNotPublished]:
+    def publish_record(self, current: ReviewSnapshot, key: str, *,
+                       members: staff.StaffSnapshot | None = None
+                       ) -> tuple[ReviewSnapshot, ReviewItem | ReviewRecordNotPublished]:
         """Replace or remove one record while serving the previous version to readers."""
         if members is None:
             members = staff.snapshot()
