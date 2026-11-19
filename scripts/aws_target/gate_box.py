@@ -13,7 +13,7 @@ import math
 from scripts.lib.python_startup import sitecustomize as python_startup
 
 if TYPE_CHECKING:
-    from scripts.production.merge_gate import GateRun
+    from scripts.production.gate_routes import GateRun
     from scripts.test_times import gate_record
 
 
@@ -654,10 +654,12 @@ def completion_record(value: object, attempt: str, commit: str, tree: str, host:
     from scripts.test_times import gate_record
     from datetime import UTC
     from scripts.buildlog import record, store
-    from scripts.production.merge_gate import GateRun
+    from scripts.production.gate_routes import GateRun, ModuleCoverage
     import os
     if not isinstance(value, GateRun):
         raise TypeError('expected a completed gate')
+    selection = 'subset' if value.coverage is ModuleCoverage.SUBSET else (
+        'affected' if mode == 'targeted-test' else 'full')
     modules = gate_record.module_runs(execution_records(value), gate_record.slow_test_s())
     suites = [{'suite': suite, 'wall_s': max((job.seconds for job in value.jobs if job.suite == suite), default=0),
                'status': int(any(job.returncode for job in value.jobs if job.suite == suite))}
@@ -665,7 +667,7 @@ def completion_record(value: object, attempt: str, commit: str, tree: str, host:
     return {'kind': 'gate_run', 'v': record.RECORD_VERSION, 'id': 'gate-' + attempt, 'host': host,
             'started_at': datetime.fromtimestamp(started, UTC).isoformat(),
             'ended_at': datetime.fromtimestamp(ended, UTC).isoformat(), 'wall_s': value.seconds,
-            'hold_wait_s': 0, 'selection': 'affected' if mode == 'targeted-test' else 'full',
+            'hold_wait_s': 0, 'selection': selection,
             'reason': 'time limit' if value.time_limit_report else 'cloud gate',
             'vcpus': os.cpu_count() or 1, 'status': int(not value.passed), 'max_jobs': os.cpu_count() or 1,
             'peak_mib': value.peak_memory_mib, 'cap_mib': 0, 'checkout': '/var/lib/gate-trial/repo',

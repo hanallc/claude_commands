@@ -398,6 +398,16 @@ else:
         self.assertEqual(module["folder_scans"], ["scripts/fixture"])
         self.assertEqual([row["test"] for row in ledger.rows(module, "tests")], ["Fixture.test_slow"])
 
+    def test_aws_subset_does_not_record_a_full_run(self) -> None:
+        from scripts.production.gate_routes import ModuleCoverage
+
+        job = gate.GateJobResult("fixture", "test_one.py", 0, 2, "")
+        for coverage, selection in ((ModuleCoverage.COMPLETE, "full"), (ModuleCoverage.SUBSET, "subset")):
+            with self.subTest(coverage=coverage):
+                run = gate.GateRun((job,), 2, 0, coverage=coverage)
+                record = gate_box.completion_record(run, "attempt", "commit", "tree", "remote-host", 9, 15, "merge-gate")
+                self.assertEqual(record["selection"], selection)
+
     def test_result_round_trip_preserves_reruns_and_test_failures(self) -> None:
         first = gate.GateJobResult('fixture', 'test_one.py', 1, 2, 'failed', cpu_seconds=1, peak_mib=3,
                                    wall_clock=gate_record.WallClockSpan(10, 12))

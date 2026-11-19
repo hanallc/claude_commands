@@ -37,7 +37,7 @@ except FileNotFoundError:
 import argparse
 from collections import deque
 from collections.abc import Callable, Generator, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
 from contextlib import ExitStack, closing, contextmanager, nullcontext
 from contextvars import ContextVar, copy_context
 from dataclasses import asdict, dataclass, field, replace
@@ -62,8 +62,9 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from typing import Literal, Protocol, TextIO, cast
+from typing import Literal, TextIO, cast
 
 from scripts.lib import process_group
 from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
@@ -73,6 +74,12 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import read_step_names
 from scripts.production import affected_modules, change_review, land_runs  # noqa: E402
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
+from scripts.production.gate_routes import (
+    ALL_MODULES as ALL_MODULES, AllModules as AllModules, AssignedModules, CloudGateRoute,
+    GateJobKind as GateJobKind, GateJobResult as GateJobResult, GateRun as GateRun,
+    MacGateCancellation, MacGateRoute, ModuleCoverage, SelectedModules as SelectedModules,
+    SuiteMode as SuiteMode, TreeSelection as TreeSelection,
+)
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
 )
@@ -161,18 +168,6 @@ class GateArguments(argparse.Namespace):
     modules: list[str] = field(default_factory=list)
 
 
-class SuiteMode(Enum):
-    """Choose the step and whether the runner selects affected modules."""
-    MERGE_GATE = "merge-gate"
-    TARGETED_TEST = "targeted-test"
-
-
-class GateJobKind(Enum):
-    TEST_MODULE = auto()
-    TYPE_CHECK = auto()
-    RUNNER_FAILURE = auto()
-
-
 class NightlyRunState(Enum):
     NOT_STARTED = auto()
 
@@ -188,25 +183,6 @@ class WholeMachine:
     module_seconds: dict[str, float] = field(default_factory=dict[str, float])
 
 
-@dataclass(frozen=True)
-class AllModules:
-    """Run every discovered module."""
-
-
-@dataclass(frozen=True)
-class SelectedModules:
-    """Run the paths selected on natedev, including a certified empty selection."""
-    paths: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class TreeSelection:
-    """Hold selected paths and the Git tree that the selection read."""
-    paths: tuple[str, ...]
-    tree: str
-
-
-ALL_MODULES = AllModules()
 SHARED_MACHINE = SharedMachine()
 
 
@@ -217,42 +193,6 @@ class GateJobRequest:
     path: Path
     module: str
     kind: GateJobKind = GateJobKind.TEST_MODULE
-
-
-@dataclass(frozen=True)
-class GateJobResult:
-    suite: str
-    module: str
-    returncode: int
-    seconds: float
-    output: str
-    killed_for: str = ""
-    tripwire_tripped: bool = False
-    kind: GateJobKind = GateJobKind.TEST_MODULE
-    cpu_seconds: float = 0.0
-    times: gate_record.ModuleTimes | gate_record.NoModuleTimes | gate_record.TimingNotApplicable = gate_record.NoModuleTimes("job has no timing data")
-    peak_mib: float = 0.0
-    restart: Literal["", "hold"] = ""
-    memory_stopped: bool = False
-    wall_clock: gate_record.WallClockSpan | gate_record.WallClockNotRecorded = field(
-        default=gate_record.WallClockNotRecorded("job did not run"), kw_only=True)
-
-
-@dataclass(frozen=True)
-class GateRun:
-    jobs: tuple[GateJobResult, ...]
-    seconds: float
-    peak_memory_mib: float
-    tests_reused: bool = False
-    # A valid affected selection may have no test modules at all.
-    selection_certified: bool = False
-    executions: tuple[GateJobResult, ...] = ()
-    time_limit_report: str = ""
-
-    @property
-    def passed(self) -> bool:
-        return ((bool(self.jobs) or self.tests_reused or self.selection_certified)
-                and not self.time_limit_report and all(job.returncode == 0 for job in self.jobs))
 
 
 @dataclass
@@ -1442,6 +1382,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     modules = discover_test_modules(repo)
     if not modules:
         raise GateRefused("the test list is empty")
+    module_count = len(modules)
     if isinstance(selected, SelectedModules):
         paths = set(selected.paths)
         discovered = {str(path.relative_to(repo)) for _, path in modules}
@@ -1461,7 +1402,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     ledger: PassedTreeLedger | None = None
     required: FullSuite | NoFullRunRequired = NoFullRunRequired()
     reused = False
-    selection: AffectedSelection | FullSuite = FullSuite("whole machine")
+    selection: AffectedSelection | FullSuite | SelectedModules = (
+        selected if isinstance(selected, SelectedModules) else FullSuite("whole machine"))
     if shared:
         try:
             tested_tree = clean_test_tree(repo)
@@ -1471,23 +1413,24 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         if isinstance(tested_tree, UnrecordableTestTree) and tested_tree.dirty_paths:
             print(f"Dirty checkout: {len(tested_tree.dirty_paths)} paths", flush=True)
         ledger = PassedTreeLedger(repo, source, tested_tree, suites)
-        required = full_required() if mode is SuiteMode.MERGE_GATE else NoFullRunRequired()
-        reused = not full and not isinstance(required, FullSuite) and ledger.reuse()
-        selection = FullSuite("passed tree reused")
-        if not reused:
-            if isinstance(required, FullSuite):
-                selection = required
-            elif full:
-                selection = FullSuite("--full")
-            elif mode is SuiteMode.MERGE_GATE:
-                selection = FullSuite(f"{read_step_names().prose(mode.value)} runs all modules")
-            else:
-                selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
-            if mode is SuiteMode.MERGE_GATE or full:
-                report_selection(selection, len(modules))
-            if isinstance(selection, AffectedSelection):
-                selected_paths = set(selection.modules)
-                modules = [(suite, path) for suite, path in modules if path in selected_paths]
+        if isinstance(selected, AllModules):
+            required = full_required() if mode is SuiteMode.MERGE_GATE else NoFullRunRequired()
+            reused = not full and not isinstance(required, FullSuite) and ledger.reuse()
+            selection = FullSuite("passed tree reused")
+            if not reused:
+                if isinstance(required, FullSuite):
+                    selection = required
+                elif full:
+                    selection = FullSuite("--full")
+                elif mode is SuiteMode.MERGE_GATE:
+                    selection = FullSuite(f"{read_step_names().prose(mode.value)} runs all modules")
+                else:
+                    selection, ledger = select_targeted_modules(repo, tested_tree, modules, source=source)
+                if mode is SuiteMode.MERGE_GATE or full:
+                    report_selection(selection, len(modules))
+                if isinstance(selection, AffectedSelection):
+                    selected_paths = set(selection.modules)
+                    modules = [(suite, path) for suite, path in modules if path in selected_paths]
         print(f"Runner: {len(modules)} modules, memory governor {governor_gib:g} GiB", flush=True)
     else:
         print(f"Runner: {len(modules)} modules, whole machine, {max_running_jobs} CPUs", flush=True)
@@ -1547,8 +1490,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         waited = hold.waited_s()
         wall_s = time.monotonic() - began - (waited - initial_hold_seconds) if aborted else elapsed
         record_gate_run(ledger, executions, results, suite_started, suite_finished, started_at=started_at,
-                        wall_s=wall_s, hold_wait_s=waited,
-                        selection=selected if isinstance(selected, SelectedModules) else selection, reused=reused,
+                        wall_s=wall_s, hold_wait_s=waited, selection=selection, reused=reused,
                         reason=reason, status=status, max_jobs=max_running_jobs, peak_mib=admission.peak_mib,
                         cap_mib=admission.governor_mib, aborted=aborted, mode=mode)
 
@@ -1784,8 +1726,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     hold_seconds = hold.seconds if hold is not None else 0.0
     peak_mib = admission.peak_mib if admission is not None else 0.0
     elapsed = time.monotonic() - began - (hold_seconds - initial_hold_seconds)
+    coverage = ModuleCoverage.COMPLETE if len(modules) == module_count else ModuleCoverage.SUBSET
     run = GateRun(tuple(results), elapsed, peak_mib, reused,
-                  isinstance(selection, AffectedSelection) or isinstance(selected, SelectedModules), tuple(executions), time_limit_report)
+                  isinstance(selection, (AffectedSelection, SelectedModules)), tuple(executions), time_limit_report,
+                  coverage=coverage)
     record(0 if run.passed else 1, aborted=False)
     ending_load = one_minute_load()
     maximum_load = max(maximum_load, ending_load)
@@ -1824,7 +1768,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     cpu_jobs = ", ".join(f"{run_cpu[key]:.2f} s {key}" for key in most_cpu) or "(none)"
     print(f"Most CPU: {cpu_jobs}; total {sum(run_cpu.values()):.2f} s", flush=True)
     print(f"One-minute load: start={starting_load:.2f} max={maximum_load:.2f} end={ending_load:.2f}", flush=True)
-    if run.passed and not reused and ledger is not None and isinstance(selected, AllModules):
+    if run.passed and not reused and ledger is not None and not isinstance(selection, SelectedModules):
         ledger.record_pass(selection)
         if isinstance(required, FullSuite):
             (gate_state_dir() / "full-required").unlink(missing_ok=True)
@@ -2635,26 +2579,44 @@ def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
                             help="run only this module, named as the gate prints it (suite/module), with no gate record")
 
 
-class RemoteGateRoute(Protocol):
-    """Run the modules assigned to a remote host."""
-    def route(self, repo: Path, *, mode: SuiteMode, full: bool,
-              module_time_limit_s: float, selected: AllModules | TreeSelection = ALL_MODULES) -> GateRun | str: ...
-
-
-class CloudGateRoute(RemoteGateRoute, Protocol):
-    """Run AWS tests and identify the checkout tree."""
-    def working_tree(self, repo: Path) -> tuple[str, set[str]]: ...
-
-
-class MacGateRoute(RemoteGateRoute, Protocol):
-    """Read the allow list and run its assigned modules through the Mac queue."""
-    def read_modules(self, repo: Path) -> tuple[str, ...]: ...
-
-
 def combine_gate_runs(first: GateRun, second: GateRun, *, seconds: float) -> GateRun:
+    reports = "\n".join(filter(None, (first.time_limit_report, second.time_limit_report)))
     return GateRun(first.jobs + second.jobs, seconds, max(first.peak_memory_mib, second.peak_memory_mib),
-                   selection_certified=True, executions=first.executions + second.executions,
-                   time_limit_report=first.time_limit_report or second.time_limit_report)
+                   selection_certified=True,
+                   executions=(first.executions or first.jobs) + (second.executions or second.jobs),
+                   time_limit_report=reports)
+
+
+@dataclass(frozen=True)
+class MacGateMiss:
+    """Keep the reason and elapsed time when the Mac returns no result."""
+    reason: str
+    seconds: float
+
+
+@contextmanager
+def start_mac_gate(mac: MacGateRoute, repo: Path, *, mode: SuiteMode, full: bool,
+                   module_time_limit_s: float, selected: TreeSelection) -> Generator[Future[GateRun | MacGateMiss]]:
+    """Keep the Mac cancellation pipe open while the split gate owns it."""
+    outcome: Future[GateRun | MacGateMiss] = Future()
+    reader, writer = os.pipe()
+    read_end = os.fdopen(reader, "rb")
+
+    def run() -> None:
+        try:
+            with read_end:
+                began = time.monotonic()
+                result = mac.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                                   selected=selected, cancellation=MacGateCancellation(read_end.fileno()))
+                observed = MacGateMiss(result, time.monotonic() - began) if isinstance(result, str) else result
+        except BaseException as error:
+            outcome.set_exception(error)
+        else:
+            outcome.set_result(observed)
+
+    with os.fdopen(writer, "wb"):
+        threading.Thread(target=copy_context().run, args=(run,), daemon=True, name="mac-gate-route").start()
+        yield outcome
 
 
 def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
@@ -2690,14 +2652,14 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
             return GateRun((), 0.0, 0.0, selection_certified=True)
 
     def run_local_subset(paths: tuple[str, ...], types: Sequence[str]) -> GateRun:
-        return run_suites(repo, types, module_time_limit_s, source=source, full=True,
+        return run_suites(repo, types, module_time_limit_s, source=source, full=full,
                           mode=mode, selected=SelectedModules(paths))
 
-    def run_cloud(selection: AllModules | TreeSelection, *, assigned_only: bool = False) -> GateRun:
+    def run_cloud(selection: AllModules | TreeSelection) -> GateRun:
         outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s, selected=selection)
         if isinstance(outcome, str):
             print('Cloud gate uses natedev: ' + outcome, flush=True)
-            if assigned_only and isinstance(selection, TreeSelection):
+            if isinstance(selection, AssignedModules):
                 return run_local_subset(selection.paths, type_dirs)
             return run_suites(repo, type_dirs, module_time_limit_s, source=source, full=full, mode=mode)
         if not type_dirs or outcome.time_limit_report:
@@ -2726,21 +2688,19 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         if not mac_paths:
             return run_cloud(selected)
         linux_paths = tuple(path for path in assignment.paths if path not in allowed)
-        with ThreadPoolExecutor(max_workers=1) as worker:
-            mac_result = worker.submit(copy_context().run, mac.route, repo, mode=mode, full=full,
-                                       module_time_limit_s=module_time_limit_s,
-                                       selected=TreeSelection(mac_paths, assignment.tree))
+        with start_mac_gate(mac, repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                            selected=TreeSelection(mac_paths, assignment.tree)) as mac_result:
             if linux_paths:
-                linux = run_cloud(TreeSelection(linux_paths, assignment.tree), assigned_only=True)
+                linux = run_cloud(AssignedModules(linux_paths, assignment.tree))
             elif type_dirs:
                 linux = run_local_subset((), type_dirs)
             else:
                 linux = GateRun((), 0.0, 0.0, selection_certified=True)
             outcome = mac_result.result()
 
-        if isinstance(outcome, str):
-            print('Mac gate uses natedev: ' + outcome, flush=True)
-            outcome = GateRun((), 0.0, 0.0, selection_certified=True)
+        if isinstance(outcome, MacGateMiss):
+            print("Mac gate uses natedev: " + outcome.reason, flush=True)
+            outcome = GateRun((), outcome.seconds, 0.0, coverage=ModuleCoverage.SUBSET)
 
         def module_path(job: GateJobResult) -> str:
             return f"scripts/{job.suite}/{job.module}"
@@ -2751,7 +2711,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                             and not job.killed_for and not job.tripwire_tripped and module_path(job) in requested_paths)
         passed_paths = {module_path(job) for job in passed_jobs}
         mac_pass = replace(outcome, jobs=passed_jobs, time_limit_report="",
-                           executions=tuple(job for job in outcome.executions if module_path(job) in passed_paths))
+                           executions=outcome.executions or outcome.jobs)
         run = combine_gate_runs(linux, mac_pass, seconds=max(linux.seconds, mac_pass.seconds))
         missing = tuple(path for path in mac_paths if path not in passed_paths)
         if missing:
