@@ -4,7 +4,7 @@ from __future__ import annotations
 from scripts.lib.checkout_test_support import copy_startup, copy_test_runner
 
 from collections.abc import Callable, Generator, Sequence
-from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from decimal import Decimal
 from io import StringIO
@@ -540,9 +540,9 @@ class Sample(unittest.TestCase):
             self.assertEqual({number: signal.getsignal(number) for number in trial.TRIAL_SIGNALS}, handlers)
             observations.append(label)
 
-        def inspect_git(repo: Path, *arguments: str, start_new_session: bool = True) -> str:
+        def inspect_git(repo: Path, *arguments: str, recovery: Path | None = None) -> str:
             check_handlers(arguments[0])
-            return git(repo, *arguments, start_new_session=start_new_session)
+            return git(repo, *arguments, recovery=recovery)
 
         def service(_command: Sequence[str], _unit: str) -> int:
             check_handlers('service')
@@ -632,12 +632,12 @@ class Sample(unittest.TestCase):
         git = trial.checked_git
         for failure in ('list', 'delete'):
             with self.subTest(failure=failure):
-                def refuse_sweep(repo: Path, *arguments: str, start_new_session: bool = True) -> str:
+                def refuse_sweep(repo: Path, *arguments: str, recovery: Path | None = None) -> str:
                     listing = arguments[0] == 'ls-remote' and arguments[-1] == 'refs/heads/gate-trial-*'
                     deleting = arguments[0] == 'push' and '--delete' in arguments and arguments[-1] == branch
                     if (failure == 'list' and listing) or (failure == 'delete' and deleting):
                         raise subprocess.CalledProcessError(1, ['git', *arguments])
-                    return git(repo, *arguments, start_new_session=start_new_session)
+                    return git(repo, *arguments, recovery=recovery)
 
                 errors = StringIO()
                 with (mock.patch.object(trial, 'checked_git', side_effect=refuse_sweep),
@@ -677,14 +677,14 @@ class Sample(unittest.TestCase):
             with self.subTest(pushed=fail_after):
                 pushed: list[str] = []
 
-                def fail_push(repo: Path, *arguments: str, start_new_session: bool = True) -> str:
+                def fail_push(repo: Path, *arguments: str, recovery: Path | None = None) -> str:
                     if arguments[0] == 'push' and '--delete' not in arguments:
                         if len(pushed) == fail_after:
                             raise subprocess.CalledProcessError(1, ['git', *arguments])
                         reply = git(repo, *arguments)
                         pushed.append(arguments[-1])
                         return reply
-                    return git(repo, *arguments, start_new_session=start_new_session)
+                    return git(repo, *arguments, recovery=recovery)
 
                 output = StringIO()
                 with (mock.patch.object(trial, 'checked_git', side_effect=fail_push),
@@ -701,8 +701,8 @@ class Sample(unittest.TestCase):
         branches = self.remote_branches()
         accepted: list[str] = []
 
-        def fail_after_acceptance(repo: Path, *arguments: str, start_new_session: bool = True) -> str:
-            reply = git(repo, *arguments, start_new_session=start_new_session)
+        def fail_after_acceptance(repo: Path, *arguments: str, recovery: Path | None = None) -> str:
+            reply = git(repo, *arguments, recovery=recovery)
             if arguments[0] == 'push' and '--delete' not in arguments:
                 accepted.append(arguments[-1])
                 raise subprocess.CalledProcessError(1, ['git', *arguments])
@@ -722,11 +722,11 @@ class Sample(unittest.TestCase):
             with self.subTest(status=status):
                 listings: list[str] = []
 
-                def refuse_listing(repo: Path, *arguments: str, start_new_session: bool = True) -> str:
+                def refuse_listing(repo: Path, *arguments: str, recovery: Path | None = None) -> str:
                     if arguments[0] == 'ls-remote' and arguments[-1] != 'refs/heads/gate-trial-*':
                         listings.append(arguments[-1])
                         raise subprocess.CalledProcessError(1, ['git', *arguments])
-                    return git(repo, *arguments, start_new_session=start_new_session)
+                    return git(repo, *arguments, recovery=recovery)
 
                 errors = StringIO()
                 with (mock.patch.object(trial, 'checked_git', side_effect=refuse_listing),
@@ -831,8 +831,8 @@ else:
         branches = self.remote_branches()
         pushed: list[str] = []
 
-        def interrupt_push(repo: Path, *arguments: str, start_new_session: bool = True) -> str:
-            reply = git(repo, *arguments, start_new_session=start_new_session)
+        def interrupt_push(repo: Path, *arguments: str, recovery: Path | None = None) -> str:
+            reply = git(repo, *arguments, recovery=recovery)
             if arguments[0] == 'push' and '--delete' not in arguments:
                 pushed.append(arguments[-1])
                 raise KeyboardInterrupt
@@ -853,11 +853,11 @@ else:
                 branches = self.remote_branches()
                 refused: list[str] = []
 
-                def refuse_delete(repo: Path, *arguments: str, start_new_session: bool = True) -> str:
+                def refuse_delete(repo: Path, *arguments: str, recovery: Path | None = None) -> str:
                     if arguments[0] == 'push' and '--delete' in arguments and arguments[-1].endswith('-base'):
                         refused.append(arguments[-1])
                         raise subprocess.CalledProcessError(1, ['git', *arguments])
-                    return git(repo, *arguments, start_new_session=start_new_session)
+                    return git(repo, *arguments, recovery=recovery)
 
                 errors = StringIO()
                 with (mock.patch.object(trial, 'checked_git', side_effect=refuse_delete),
@@ -868,25 +868,80 @@ else:
                     'paired trial: could not delete branch ' + refused[0].removeprefix('refs/heads/')])
                 self.assertEqual(self.remote_branches(), {**branches, refused[0]: self.base})
 
-    def test_branch_cleanup_git_inherits_the_trial_group_and_uses_the_network_timeout(self) -> None:
-        _ = write_config_fixture(self.root / 'cloud_gate.conf', 'git_network_timeout_s=17\n')
-        branch = 'refs/heads/gate-trial-123-fixture-base'
-        list_communicate = mock.Mock(return_value=(f'{self.base}\t{branch}\n', ''))
-        delete_communicate = mock.Mock(return_value=('', ''))
-        listing = mock.Mock(returncode=0, stdout=None, stderr=None, communicate=list_communicate)
-        deletion = mock.Mock(returncode=0, stdout=None, stderr=None, communicate=delete_communicate)
-        with mock.patch.object(subprocess, 'Popen', side_effect=(listing, deletion)) as popen:
-            trial.delete_trial_branches(self.repo, str(self.origin), 'gate-trial', 123, 'fixture')
+    @unittest.skipUnless(sys.platform == 'linux', 'The test observes process exit with pidfds')
+    def test_branch_cleanup_stops_git_and_its_child(self) -> None:
+        for cleanup in ('timeout', 'TERM', 'recovery'):
+            with self.subTest(cleanup=cleanup):
+                self.assert_branch_cleanup_stops_git_group(cleanup)
 
-        command = ['git', '-C', str(self.repo)]
-        self.assertEqual(popen.call_args_list, [
-            mock.call([*command, 'ls-remote', '--heads', str(self.origin), 'refs/heads/gate-trial-123-fixture-*'],
-                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=False),
-            mock.call([*command, 'push', str(self.origin), '--delete', branch],
-                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=False),
-        ])
-        list_communicate.assert_called_once_with(timeout=17)
-        delete_communicate.assert_called_once_with(timeout=17)
+    def assert_branch_cleanup_stops_git_group(self, cleanup: str) -> None:
+        timeout = 10 if cleanup == 'timeout' else 60
+        _ = write_config_fixture(self.root / 'cloud_gate.conf', f'git_network_timeout_s={timeout}\n')
+        _ = write_config_fixture(self.root / 'build_admission.conf', 'program_stop_seconds=0.2\n')
+        folder = self.root / cleanup
+        folder.mkdir()
+        record = folder / trial.GIT_RECOVERY
+        git = folder / 'git'
+        with short_socket_directory() as socket_dir, socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as ready:
+            marker = str(Path(socket_dir) / 'ready')
+            ready.bind(marker)
+            _ = git.write_text(f'''#!{sys.executable}
+import os, signal, socket, subprocess, sys
+if 'ls-remote' in sys.argv:
+    print('fixture\\t' + sys.argv[-1].removesuffix('*') + 'base')
+    raise SystemExit(0)
+assert '--delete' in sys.argv
+child = subprocess.Popen([sys.executable, '-c', 'import signal; signal.pause()'])
+os.kill(child.pid, signal.SIGSTOP)
+os.waitpid(child.pid, os.WUNTRACED)
+with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as report:
+    report.sendto(f'{{os.getpid()}} {{child.pid}}'.encode(), {marker!r})
+signal.pause()
+''')
+            git.chmod(0o700)
+
+            def delete() -> int:
+                trial.delete_trial_branches(self.repo, str(self.origin), 'gate-trial', 123, folder)
+                return 0
+
+            with (ForkChildren() as children, ExitStack() as descriptors,
+                  mock.patch.dict(os.environ, {'PATH': str(folder) + os.pathsep + os.environ['PATH']})):
+                controller = children.start(delete)
+                self.assertTrue(select.select([ready], [], [], TEST_HANG_GUARD_SECS)[0])
+                git_pid, child_pid = map(int, ready.recv(128).split())
+                group = os.getpgid(git_pid)
+                try:
+                    saved = cloud_gate.read(record)
+                    self.assertEqual(ledger.instant(saved, 'group'), git_pid)
+                    self.assertEqual(group, git_pid)
+                    self.assertEqual(os.getpgid(child_pid), group)
+                    git_exit = os.pidfd_open(git_pid)
+                    _ = descriptors.callback(os.close, git_exit)
+                    child_exit = os.pidfd_open(child_pid)
+                    _ = descriptors.callback(os.close, child_exit)
+                    owner = ledger.instant(saved, 'owner')
+                    owner_exit = os.pidfd_open(owner)
+                    _ = descriptors.callback(os.close, owner_exit)
+                    if cleanup == 'recovery':
+                        os.kill(owner, signal.SIGKILL)
+                        self.assertTrue(select.select([owner_exit], [], [], TEST_HANG_GUARD_SECS)[0])
+                    if cleanup != 'timeout':
+                        os.kill(controller.pid, signal.SIGTERM)
+                    if cleanup == 'recovery':
+                        trial.recover_git(record, 0.2)
+                    reply = controller.result()
+                    self.assertEqual(reply.returncode, 0 if cleanup == 'timeout' else -signal.SIGTERM, reply.stderr)
+                    if cleanup == 'timeout':
+                        self.assertIn('could not delete branch', reply.stderr)
+                    self.assertTrue(select.select([git_exit], [], [], TEST_HANG_GUARD_SECS)[0])
+                    self.assertTrue(select.select([child_exit], [], [], TEST_HANG_GUARD_SECS)[0])
+                    self.assertTrue(select.select([owner_exit], [], [], TEST_HANG_GUARD_SECS)[0])
+                    self.assertFalse(record.exists())
+                finally:
+                    try:
+                        send_process_group(group, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
     def test_module_validation_rejects_duplicate_missing_and_traversal(self) -> None:
         for modules in (('fixture/test_sample.py',) * 2, ('fixture/missing.py',), ('../test_sample.py',), ('/fixture/test_sample.py',)):

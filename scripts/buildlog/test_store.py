@@ -8,6 +8,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
@@ -120,6 +121,20 @@ class StoreTests(unittest.TestCase):
                 _ = path.write_bytes(tail)
                 store.append_line(path, {"id": "next"})
                 self.assertEqual(path.read_bytes(), b'{"id":"next"}\n')
+
+    def test_append_lock_deadline_keeps_the_existing_bytes(self) -> None:
+        path = self.root / 'history.jsonl'
+        path.parent.mkdir(parents=True)
+        previous = b'{"id":"old"}\n{"id":"unfinished"'
+        _ = path.write_bytes(previous)
+        with path.open('rb') as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            with self.assertRaisesRegex(TimeoutError, 'the append lock deadline passed'):
+                with store.locked_append(path, deadline=time.monotonic() + 0.01):
+                    self.fail('The append acquired a held lock')
+        self.assertEqual(path.read_bytes(), previous)
+        store.append_line(path, {'id': 'next'})
+        self.assertEqual(path.read_bytes(), b'{"id":"old"}\n{"id":"next"}\n')
 
     def test_append_discards_a_failed_short_write_and_keeps_every_line_parseable(self) -> None:
         path = self.root / "natedev" / "2026-10.jsonl"
