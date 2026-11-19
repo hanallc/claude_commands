@@ -1,13 +1,16 @@
 """Check boot failure settlement and queue read invalidation through private sockets."""
 from __future__ import annotations
 
+import base64
 from dataclasses import replace
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stderr
+from contextlib import nullcontext, redirect_stderr
 from importlib import import_module
 from io import StringIO
+import json
 import os
+from pathlib import Path
 import threading
 import time
 from typing import cast, override
@@ -18,20 +21,20 @@ from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_client, admission_protocol as wire, admission_records as records, admission_service as service, placement
 from scripts.build_queue.test_placement import (
     PlacementFixture, ManualEvidenceWorker, placement_request, publish_candidate, assignment_for, adopt_assignment,
-    consume_permission, local_candidate,
+    consume_permission, coordinator_holder, local_candidate,
 )
 from scripts.build_queue.admission_test_support import only_admitted
-from scripts.aws_target import hana_box, hana_execution, hana_placement, hana_placement_adapter, ledger
+from scripts.aws_target import hana_box, hana_execution, hana_placement, hana_placement_adapter, hana_protocol, hana_result, ledger, test_hana_execution
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import install_hana_spending_settings
 from scripts.aws_target.test_hana_box import FakeProvider, IDENTITY, record_lifecycle_image
 from scripts.aws_target.controller_lock import control_lock
 from scripts.build_targets import target_config
 from scripts.buildlog import store
-from scripts.lib import conf, process_start
+from scripts.lib import atomic_file, conf, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.mac_test import claim_state, eligibility
+from scripts.mac_test import claim_state, eligibility, mac_test, offload
 
 
 def hana_target(fixture: PlacementFixture) -> target_config.SshTarget:
@@ -230,6 +233,204 @@ class HanaQueueTests(unittest.TestCase):
                     key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
                     self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment)
                     self.assertEqual(fixture.server.current_assignments[request.episode], key)
+
+    def test_dead_holder_replay_requires_exact_proof_and_reports_once(self) -> None:
+        for proof in ('legacy refusal', 'no reply', 'other boot', 'claim from other boot',
+                      'restart after release reports once', 'sender settled without a saved observation',
+                      'sender final write failed without a saved observation',
+                      'pending conflicting report', 'stale completion', 'failed release', 'interrupted journal write'):
+            with self.subTest(proof=proof):
+                self.check_dead_holder_replay(proof)
+
+    def check_dead_holder_replay(self, proof: str) -> None:
+        with PlacementFixture() as fixture, mock.patch.object(service, 'HostEvidenceWorker', ManualEvidenceWorker):
+            target = hana_target(fixture)
+            controller = hana_box.HanaController(fixture.root / 'hana-state', fixture.root / 'account.conf',
+                target.settings, hana_box.ProviderNotInstalled())
+            controller.register(IDENTITY)
+            original = placement_request(fixture)
+            scope = claim_state.RepositoryScope('hana', 'fixture-repository', 1)
+            destination = placement.PlacementDestination('ssh', target.name, 'fixture-hana', scope, 1)
+            request = replace(original, prerequisite=placement.TokenNotRequired(),
+                constraints=replace(original.constraints, command=('cargo', 'check'), command_kind='check',
+                    repository=str(fixture.root), candidates=(placement.PlacementCandidate(destination),)))
+            _ = fixture.enter_context(mock.patch.object(target_config, 'read_targets', return_value=(target,)))
+            _ = fixture.enter_context(mock.patch.object(hana_placement, 'controller_for', return_value=controller))
+            _ = cast(object, fixture.enter_context(mock.patch.dict(os.environ,
+                {'BUILD_TARGETS_STATE_DIR': str(fixture.root / 'targets')})))
+
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            reference = placement.assigned_claim_reference(assignment)
+            holder = coordinator_holder(assignment)
+            adopted = placement.AdoptedProviderClaim(reference, holder, assignment.session, destination.host, 'host-generation-a')
+            _ = publish_candidate(fixture, request, claims=(adopted,))
+            authorized, = fixture.connect(consume_permission('consume', assignment, reference)).replies()
+            self.assertEqual(authorized, wire.FirstAuthorization(assignment, reference))
+
+            paths = claim_state.state_paths(target.name)
+            path = mac_test.claim_path(paths, scope)
+            path.parent.mkdir(parents=True)
+            claim: claim_state.RemoteJobClaim = {
+                'claim_id': reference.claim_id, 'episode': reference.episode, 'attempt': reference.attempt,
+                'pid': holder.pid, 'proc_start': holder.start_time, 'what': 'Hana judgment', 'worktree': str(fixture.root),
+                'since': '2024-01-01T00:00:00+00:00', 'submitting_session': claim_state.session_id(assignment.session),
+                'repo_name': scope.name, 'repo_key': scope.key, 'slot': scope.slot, 'remote_host': destination.host,
+            }
+            controller.bind_execution(reference.claim_id)
+            execution_fixture = test_hana_execution.HanaExecutionTests()
+            template = execution_fixture.request
+            source = assignment.source_key
+            assert isinstance(source, execution_identity.SourceKeyKnown)
+            attempt = replace(template.key, episode=reference.episode, attempt=reference.attempt, claim_id=reference.claim_id)
+            dispatch = replace(template, key=attempt, source_key=source, link=replace(template.link, episode=attempt.episode))
+            claim_generation = (replace(attempt.generation, boot_id='other-boot')
+                                if proof == 'claim from other boot' else attempt.generation)
+            claim['instance_generation'] = hana_placement.generation_text(claim_generation)
+            _ = path.write_text(json.dumps(claim))
+            observed_attempt = (replace(attempt, generation=replace(attempt.generation, boot_id='other-boot'))
+                                if proof == 'other boot' else attempt)
+            reason = 'The data mount and a fresh permit are required'
+            stale_completion = proof == 'stale completion'
+            evidence = execution_identity.ExecutionEvidenceUnavailable(
+                'The command ended' if stale_completion else reason, fixture.clock.now())
+            observation = hana_protocol.HanaCommandObservation(observed_attempt, dispatch.slot, True,
+                stale_completion, True, True, fixture.clock.now(), evidence, False)
+            journal: dict[str, object] = {'version': 1, 'request': hana_protocol.request_fields(dispatch), 'phase': 'fenced',
+                'publication_attempted': True, 'command_settled': False, 'evidence': hana_protocol.encode_evidence(evidence)}
+            sender_write_failed = proof == 'sender final write failed without a saved observation'
+            sender_fenced = proof == 'sender settled without a saved observation' or sender_write_failed
+            if proof != 'no reply' and not sender_fenced:
+                journal['observation'] = cast(object, json.loads(hana_protocol.encode_observation(observation)))
+            if stale_completion:
+                result = replace(execution_fixture.command_result(), key=attempt, source_key=source.key, host=destination.host)
+                journal['accepted_result'] = base64.b64encode(hana_result.encode_result(result)).decode('ascii')
+            journal_path = hana_execution.execution_path(controller.directory, reference.claim_id)
+            original_journal = json.dumps(journal)
+            _ = journal_path.write_text(original_journal)
+
+            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+            if proof == 'pending conflicting report':
+                _ = fixture.connect(wire.ExecutionReport('pending', assignment, reference, evidence,
+                    placement.AttemptDeclined('lost'), placement.DispatchPathPending('claim retained'))).replies()
+            pending = fixture.server.assignments[key].terminal_report
+            if proof == 'pending conflicting report':
+                assert isinstance(pending, placement.TerminalAttemptReport)
+                self.assertEqual(pending.outcome, placement.AttemptDeclined('lost'))
+            write_atomic = atomic_file.write_text_atomic
+
+            def interrupted_write(path: Path, content: str, *, new_file_mode: int | None = None) -> None:
+                if path == journal_path and '"phase": "settled"' in content:
+                    raise OSError('The final journal write was interrupted')
+                write_atomic(path, content, new_file_mode=new_file_mode)
+
+            with (mock.patch.object(hana_placement_adapter, 'release_assigned',
+                                    wraps=hana_placement_adapter.release_assigned) as release,
+                    mock.patch.object(offload, 'read_tree_key', return_value=offload.KnownTreeKey('changed')) as source_read):
+                sender_reason = 'The sender fenced the command'
+                if sender_fenced:
+                    objects = test_hana_execution.FakeExecutionObjects(dispatch, accepted=True)
+                    with (mock.patch.object(atomic_file, 'write_text_atomic', side_effect=interrupted_write)
+                          if sender_write_failed else nullcontext()):
+                        settled = hana_execution.settle_execution(controller.directory, dispatch, objects,
+                            release_claim=lambda: hana_placement_adapter.release_assigned(assignment, holder, controller),
+                            reason=sender_reason, fence_window=hana_execution.FenceAcknowledgementWindow(
+                                time.monotonic() + TEST_HANG_GUARD_SECS, 1))
+                    if sender_write_failed:
+                        self.assertIsInstance(settled, hana_execution.HanaSettlementPending)
+                        self.assertIn('"phase": "fenced"', journal_path.read_text())
+                        self.assertTrue(hana_execution.execution_command_settled(controller.directory, reference.claim_id))
+                        self.assertTrue(hana_execution.claim_dispatch_pending(controller.directory, reference))
+                        self.assertEqual(fixture.server.current_assignments[assignment.episode], key)
+                        release.assert_called_once_with(assignment, holder, controller)
+                    else:
+                        assert isinstance(settled, hana_execution.HanaSettled)
+                        self.assertEqual(settled.outcome, placement.AttemptDeclined(sender_reason))
+                        self.assertFalse(hana_execution.claim_dispatch_pending(controller.directory, reference))
+                    self.assertEqual(len(objects.envelopes), 1)
+                    self.assertIsInstance(objects.envelopes[0], hana_protocol.HanaFenceEnvelope)
+                    self.assertNotIn('"observation"', journal_path.read_text())
+                    self.assertFalse(path.exists())
+                fixture.end_owner(wire.Owner(holder.pid, holder.start_time))
+                if proof == 'failed release':
+                    release.return_value = False
+                    self.probe_dead_holder(fixture, target.name)
+                    _ = fixture.run_pass()
+                    self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment)
+                    self.assertEqual(fixture.server.current_assignments[assignment.episode], key)
+                    self.assertTrue(path.exists())
+                    self.assertIn('"phase": "fenced"', journal_path.read_text())
+                    self.assertTrue(hana_execution.execution_command_settled(controller.directory, reference.claim_id))
+                    source_read.assert_not_called()
+                    release.assert_called_once_with(assignment, holder, controller)
+                    return
+                if proof == 'interrupted journal write':
+                    with mock.patch.object(atomic_file, 'write_text_atomic', side_effect=interrupted_write):
+                        self.probe_dead_holder(fixture, target.name)
+                    _ = fixture.run_pass()
+                    self.assertEqual(fixture.server.current_assignments[assignment.episode], key)
+                    self.assertFalse(path.exists())
+                    self.assertIn('"phase": "fenced"', journal_path.read_text())
+                    self.assertTrue(hana_execution.execution_command_settled(controller.directory, reference.claim_id))
+                    release.assert_called_once_with(assignment, holder, controller)
+                self.probe_dead_holder(fixture, target.name)
+                if proof == 'restart after release reports once':
+                    self.assertFalse(path.exists())
+                    self.assertFalse(hana_execution.claim_dispatch_pending(controller.directory, reference))
+                    self.assertEqual(fixture.server.current_assignments[assignment.episode], key)
+                    self.assertIsInstance(fixture.server.assignments[key].terminal_report, placement.NoTerminalReport)
+                    release.assert_called_once_with(assignment, holder, controller)
+                    fixture.restart()
+                    self.probe_dead_holder(fixture, target.name)
+                handle_report = cast(Callable[[wire.ExecutionReport], list[wire.Reply]],
+                    getattr(fixture.server, '_handle_placement'))
+                applied = fixture.enter_context(mock.patch.object(fixture.server, '_handle_placement', wraps=handle_report))
+                _ = fixture.run_pass()
+                saved = fixture.server.assignments[key]
+                if proof in ('no reply', 'other boot', 'claim from other boot'):
+                    self.assertIsInstance(saved.state, placement.CurrentAssignment)
+                    self.assertIsInstance(saved.terminal_report, placement.NoTerminalReport)
+                    self.assertEqual(fixture.server.current_assignments[assignment.episode], key)
+                    self.assertTrue(path.exists())
+                    self.assertEqual(journal_path.read_text(), original_journal)
+                    release.assert_not_called()
+                    applied.assert_not_called()
+                    return
+                self.assertNotIn(assignment.episode, fixture.server.current_assignments)
+                self.assertFalse(path.exists())
+                self.assertFalse(hana_execution.claim_dispatch_pending(controller.directory, reference))
+                report = saved.terminal_report
+                assert isinstance(report, placement.TerminalAttemptReport)
+                self.assertIsInstance(report.path, placement.DispatchPathSettled)
+                if proof == 'pending conflicting report':
+                    assert isinstance(pending, placement.TerminalAttemptReport)
+                    self.assertEqual(saved.state, placement.ClosedAssignment('lost'))
+                    self.assertEqual(report, replace(pending, path=placement.DispatchPathSettled()))
+                elif stale_completion:
+                    changed = hana_execution.SOURCE_CHANGED_BEFORE_RESULT_PUBLICATION
+                    self.assertEqual(saved.state, placement.ClosedAssignment(changed))
+                    self.assertEqual(report.outcome, placement.AttemptDeclined(changed))
+                    source_read.assert_called_once_with(fixture.root)
+                elif sender_fenced:
+                    self.assertEqual(saved.state, placement.ClosedAssignment(sender_reason))
+                    self.assertEqual(report.outcome, placement.AttemptDeclined(sender_reason))
+                    source_read.assert_not_called()
+                else:
+                    self.assertEqual(saved.state, placement.ClosedAssignment(reason))
+                    self.assertEqual(saved.retry, placement.DoNotRetry(reason))
+                    self.assertEqual(report.outcome, execution_identity.HanaCommandAdmissionRefused(reason))
+                    self.assertIsInstance(fixture.server.execution_evidence[key], execution_identity.ExecutionNotStarted)
+                _ = fixture.run_pass()
+                self.assertIs(fixture.server.assignments[key], saved)
+                applied.assert_called_once_with(wire.ExecutionReport('hana-recovery:' + reference.claim_id,
+                    assignment, reference, fixture.server.execution_evidence[key], report.outcome, placement.DispatchPathSettled()))
+                release.assert_called_once_with(assignment, holder, controller)
+
+    def probe_dead_holder(self, fixture: PlacementFixture, target: str) -> None:
+        _ = fixture.run_pass()
+        worker = fixture.server.host_targets[('ssh', target)]
+        assert isinstance(worker, ManualEvidenceWorker)
+        _ = worker.probe_next()
 
     def test_controller_lock_does_not_block_a_queue_pass_or_release_reply(self) -> None:
         with PlacementFixture() as fixture:
