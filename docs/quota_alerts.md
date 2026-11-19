@@ -27,7 +27,12 @@ The outcome is one of these: workers moved to an account, workers wait for a res
 The caller supplies `--stopped <session id> <worker>`.
 Unknown directors receive no message; a waiting follow keeps its continuation.
 
-Zero, credits forecasts, Codex-to-Codex moves and unknown-account refusals write log lines without session delivery. Phone pushes, move journal rows and the natedev prompt notice remain. Restoration is recorded only in `moves.jsonl` as `routed back` or `routing not restored`; `/quota_refresh` tells nobody. Showrunners keep no held quota-alert list. The legacy configuration `repeat_minutes` is unused; `always` supplies recipients only for Claude five-hour and Claude no-room notices, alongside running showrunners.
+Zero quota, credits forecasts, Codex-to-Codex moves and unknown-account refusals write log lines without session delivery.
+The alert pass still sends phone pushes and the natedev prompt notice and writes move journal rows.
+The alert pass records restoration only in `moves.jsonl` as `routed back` or `routing not restored`.
+`/quota_refresh` sends no notices.
+Showrunners keep no held quota-alert list.
+`always` adds recipients to the running showrunners for Claude five-hour notices, Claude no-room notices, and blocked account move notices.
 
 The Codex `5-hour limit:` notice from `five_hour.py` writes one log line per low spell, with its back-above line also logged. The Claude five-hour notice is unchanged: tell the user in one line and change nothing else. Escalation goes to the phone unless the user types in a terminal within 15 minutes.
 

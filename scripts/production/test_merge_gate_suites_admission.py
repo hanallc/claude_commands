@@ -134,7 +134,7 @@ class SharedGateAdmissionTests(ServiceGateFixture):
              mock.patch.object(os, "access", side_effect=writable), \
              mock.patch.object(merge_gate, "gate_reservation") as admission:
             with self.assertRaisesRegex(GateRefused,
-                                        f"requires writable tmpfs at {build_folders.tmpfs_temporary_parent()}"):
+                                        f"requires a writable gate folder at {build_folders.tmpfs_temporary_parent()}"):
                 _ = merge_gate.run_suites(self.checkout)
             admission.assert_not_called()
         self.assert_gate_released()
