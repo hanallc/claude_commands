@@ -3199,6 +3199,14 @@ Base: 44cy (the landing identity). Clone /session/queue/landhold, branch builds-
 5. build_folders.conf: resources edits it in item 143 track B. Whichever merges second merges the other first.
 Tests (after the hold): the config reader tests and the hana_render tests.
 
+### Phase 44dj — A new copy never borrows from a copy that borrows  · status: todo
+**From builds (sdlc/admin-console fault), 2026-11-19 18:35 EST.** Cloning a clone chain (dialogshot > shownid > filterrow > statecount > ... > rebuild) fails: "fatal: fetch-pack: invalid index-pack output" and "ignoring alternate object stores, nesting too deep". Git follows only a few nested alternates. Cause: `copies.initialize_git` (scripts/copies/copies.py:661) clones `--shared` from the source, so a copy of a copy borrows through a chain. Evidence: /session/admin-console/dialogfollow borrows /session/admin-console/dialogshot/.git/objects (read only; do not delete; expires 11-20 18:00).
+1. A new copy borrows only from object stores that do not borrow themselves (the root repository). Objects that exist only in an intermediate copy come in by fetch.
+2. One function finds the root stores; clone and worktree_objects use it.
+3. Removing an intermediate copy then breaks no later copy. Keep the 11-16 rule: check alternates before any clone removal.
+4. Existing chains: report them; repair none by hand.
+Tests (after the hold): a copy of a copy of a copy has alternates only to the root; it reads every commit, including one made only in the middle copy; removing the middle copy leaves it readable.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
