@@ -2388,8 +2388,8 @@ def step_owner(source: Path) -> str:
 def run_slot_step(source: Path, args: CopyArguments) -> int:
     """Try the slot once and pass its lease to the command tree."""
     command = command_tail(args.command)
-    if not command or not args.tree or not args.capacity_file:
-        raise CopyError("a slot step needs a tree, capacity file and command")
+    if not command or not args.capacity_file:
+        raise CopyError("a slot step needs a capacity file and a command")
     head = commit_at(source, "HEAD")
     policy = (CommittedSource(head) if git(source, "rev-parse", f"{head}^{{tree}}").decode().strip() == args.tree
               else StagedSource(args.tree))
@@ -2551,7 +2551,7 @@ def main(argv: list[str] | None = None) -> int:
     run = commands.add_parser("run", help="run a command in a private source copy")
     hold = commands.add_parser("hold", help="run a step in a slot or hold a remote source copy")
     _ = hold.add_argument("--repo", required=True)
-    _ = hold.add_argument("--tree", required=True)
+    _ = hold.add_argument("--tree", default="")
     _ = hold.add_argument("--step", default="hold")
     _ = hold.add_argument("--capacity-file", default="")
     _ = hold.add_argument("--scratch", action="store_true")
@@ -2592,6 +2592,8 @@ def main(argv: list[str] | None = None) -> int:
                     register_remote(mirror)
             return 0
         if args.action == "hold":
+            if not args.tree:
+                raise CopyError("hold requires --tree. Run verify.sh again.")
             source = Path(args.repo or "").expanduser().resolve()
             if not args.scratch:
                 return run_slot_step(source, args)
