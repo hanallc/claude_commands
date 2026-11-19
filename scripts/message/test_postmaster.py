@@ -26,7 +26,7 @@ EPOCH = 1_800_000_000.0
 
 
 def session(identity: str, name: str) -> sessions.SessionRecord:
-    return sessions.SessionRecord(pid=123, sessionId=identity, name=name,
+    return sessions.SessionRecord(pid=123, sessionId=identity, name=name, procStart="fixture-start",
         messagingSocketPath=f"/test-sockets/{identity}.sock", updatedAt=1, tmux="", formerNames=[])
 
 
@@ -96,7 +96,8 @@ class PostmasterTests(unittest.TestCase):
 
     def result(self, outcome: Literal["delivered", "failed", "expired", "withdrawn", "abandoned"], *, matching: bool = True) -> None:
         self.write(self.path("results"), postmaster.OutboxResult(id=ENTRY_ID, outcome=outcome,
-            detail="fake mod result", sha256=hashlib.sha256(TEXT.encode()).hexdigest() if matching else "0" * 64,
+            detail="fake mod result", session_id=self.recipient["sessionId"], recipient_pid=self.recipient["pid"],
+            recipient_start=self.recipient.get("procStart", ""), sha256=hashlib.sha256(TEXT.encode()).hexdigest() if matching else "0" * 64,
             claimed_ms=int(self.clock.time() * 1000), finished_ms=int(self.clock.time() * 1000)))
 
     def claim(self) -> None:
@@ -363,7 +364,9 @@ class PostmasterTests(unittest.TestCase):
                 deadline = int(self.clock.time() * 1000) + int(postmaster.wait_seconds() * 1000)
                 def mod() -> None:
                     value = cast(dict[str, object], json.loads(self.path("outbox").read_text()))
-                    self.assertEqual(set(value), {"id", "session_id", "socket", "text", "sha256", "deadline_ms", "sender", "reply_to_session_id"})
+                    self.assertEqual(set(value), {"id", "session_id", "socket", "text", "sha256", "deadline_ms", "sender", "reply_to_session_id",
+                                                  "recipient_pid", "recipient_start"})
+                    self.assertEqual((value["recipient_pid"], value["recipient_start"]), (123, "fixture-start"))
                     self.assertRegex(str(value["id"]), r"^[a-fA-F0-9]{32}$")
                     self.assertRegex(str(value["sha256"]), r"^[a-f0-9]{64}$")
                     self.assertIs(type(value["deadline_ms"]), int)
@@ -487,7 +490,20 @@ class PostmasterTests(unittest.TestCase):
                 self.assertEqual(len(delivered), 1)
                 self.no_id_files()
 
-    def test_entry_validator_matches_mod_rules_and_integer_bounds(self) -> None:
+    def test_receipt_for_another_process_does_not_confirm_delivery(self) -> None:
+        self.heartbeat()
+
+        def mod() -> None:
+            self.result("delivered")
+            value = cast(dict[str, object], json.loads(self.path("results").read_text()))
+            value["recipient_start"] = "replacement"
+            self.write(self.path("results"), value)
+
+        self.clock.after_sleep = mod
+        self.assertIsInstance(self.attempt(), postmaster.DeliveryUnconfirmed)
+        self.assertTrue(self.path("results").exists())
+
+    def test_entry_validator_requires_recipient_generation_and_integer_bounds(self) -> None:
         entry = postmaster.wire_entry(ENTRY_ID, self.recipient, "Sender", postmaster.ReplyToSession("sender"), TEXT, 0)
         self.assertTrue(postmaster.is_outbox_entry(entry))
         self.assertTrue(postmaster.is_outbox_entry({**entry, "deadline_ms": 9007199254740991}))
@@ -496,6 +512,7 @@ class PostmasterTests(unittest.TestCase):
         invalid: list[tuple[str, object]] = [
             ("deadline_ms", 9007199254740992), ("deadline_ms", True), ("deadline_ms", 1.0), ("deadline_ms", -1),
             ("id", "a" * 31), ("id", "g" * 32), ("session_id", ""), ("sender", ""),
+            ("recipient_pid", True), ("recipient_pid", 0), ("recipient_start", ""),
             ("socket", 17), ("text", 17), ("sha256", "A" * 64), ("sha256", "a" * 63), ("reply_to_session_id", 17)]
         for field, value in invalid:
             with self.subTest(field=field, value=value):
@@ -602,7 +619,8 @@ class PostmasterTests(unittest.TestCase):
                 new_id = "f" * 32
                 def mod(receipt_outcome: postmaster.ModOutcome = outcome) -> None:
                     value: postmaster.OutboxResult = {"id": new_id, "outcome": receipt_outcome, "detail": "",
-                        "sha256": hashlib.sha256(TEXT.encode()).hexdigest(),
+                        "session_id": self.recipient["sessionId"], "recipient_pid": self.recipient["pid"],
+                        "recipient_start": self.recipient.get("procStart", ""), "sha256": hashlib.sha256(TEXT.encode()).hexdigest(),
                         "claimed_ms": int(self.clock.time() * 1000), "finished_ms": int(self.clock.time() * 1000)}
                     self.write(self.directory / "results" / f"{new_id}.json", value)
                 self.clock.after_sleep = mod
@@ -622,7 +640,8 @@ class PostmasterTests(unittest.TestCase):
                     next_id = "e" * 32
                     def abandoned() -> None:
                         self.write(self.directory / "results" / f"{next_id}.json", postmaster.OutboxResult(
-                            id=next_id, outcome="abandoned", detail="", sha256=hashlib.sha256(TEXT.encode()).hexdigest(),
+                            id=next_id, outcome="abandoned", detail="", session_id=self.recipient["sessionId"],
+                            recipient_pid=self.recipient["pid"], recipient_start=self.recipient.get("procStart", ""), sha256=hashlib.sha256(TEXT.encode()).hexdigest(),
                             claimed_ms=int(self.clock.time() * 1000), finished_ms=int(self.clock.time() * 1000)))
                     self.clock.after_sleep = abandoned
                     self.assertIsInstance(postmaster.attempt(self.state, self.recipient, "Sender", next_id, TEXT, self.live),
