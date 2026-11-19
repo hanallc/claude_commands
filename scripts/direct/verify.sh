@@ -2145,11 +2145,11 @@ step_close_checkout() {
         DOC_COPY_REPLY_FD=""
     fi
     if [[ -n "$owner" ]]; then
-        if [[ "${1:-}" == stop ]]; then
-            collect_child "$owner" TERM
-        else
-            wait "$owner" || status=$?
-        fi
+        case "${1:-}" in
+            stop) collect_child "$owner" TERM ;;
+            kill) collect_child "$owner" KILL ;;
+            *) wait "$owner" || status=$? ;;
+        esac
         DOC_COPY_OWNER_PID=""
     fi
     MAC_SOURCE_ROOT=""
@@ -2921,12 +2921,6 @@ step_uses_build_scope() {
        ( -n "${BUILDLOG_PREPARED_COPY:-}" && "$BUILDLOG_PREPARED_COPY" == "${VERIFY_REPO_ROOT:-}" ) ]]
 }
 
-read_private_checkout_token() {
-    local -
-    set +ax
-    IFS= read -r DOC_COPY_TOKEN <&"$DOC_COPY_REPLY_FD"
-}
-
 run_checkout_step() (
     local launch=$1 status=0 checkout_status=0 publish_status=0
     shift
@@ -2935,23 +2929,38 @@ run_checkout_step() (
         return $?
     fi
     local DOC_COPY_OWNER_PID="" DOC_COPY_LEASE_FD="" DOC_COPY_REPLY_FD="" MAC_SOURCE_ROOT=""
-    local command=() argument_count DOC_COPY_BINDING
-    local +x DOC_COPY_TOKEN
+    local command=() argument_count empty_binding empty_token
     step_checkout "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$VERIFY_SLOT_SOURCE" --tree "$VERIFY_SLOT_TREE" \
         --step "$CMD" --capacity-file "$VERIFY_SLOT_CAPACITY_FILE" --bind-scope -- "$@" || return $?
-    if ! IFS= read -r DOC_COPY_BINDING <&"$DOC_COPY_REPLY_FD" ||
-       ! read_private_checkout_token ||
-       ! IFS= read -r argument_count <&"$DOC_COPY_REPLY_FD" ||
-       [[ ! "$argument_count" =~ ^[1-9][0-9]*$ ]] ||
-       ! mapfile -d '' -n "$argument_count" command <&"$DOC_COPY_REPLY_FD" ||
-       (( ${#command[@]} != argument_count )) || ! cd -- "$MAC_SOURCE_ROOT"; then
+    if ! cd -- "$MAC_SOURCE_ROOT"; then
         step_close_checkout || true
         return 2
     fi
-    "$launch" "${command[@]}" || status=$?
-    if (( status != 125 )); then
-        (printf 'publish\n' >&"$DOC_COPY_LEASE_FD") || publish_status=$?
+    if verify_uses_build_scope; then
+        if [[ -z "${PLACEMENT_SCOPE_STATE:-}" ]]; then
+            printf 'verify.sh: the slot checkout requires a build scope\n' >&2
+            step_close_checkout kill
+            return 125
+        fi
+        # The supervisor reads the private token and the command from the reply pipe.
+        "$launch" || status=$?
+    else
+        if ! IFS= read -r empty_binding <&"$DOC_COPY_REPLY_FD" || [[ -n "$empty_binding" ]] ||
+           ! IFS= read -r empty_token <&"$DOC_COPY_REPLY_FD" || [[ -n "$empty_token" ]] ||
+           ! IFS= read -r argument_count <&"$DOC_COPY_REPLY_FD" ||
+           [[ ! "$argument_count" =~ ^[1-9][0-9]*$ ]] ||
+           ! mapfile -d '' -n "$argument_count" command <&"$DOC_COPY_REPLY_FD" ||
+           (( ${#command[@]} != argument_count )); then
+            step_close_checkout || true
+            return 2
+        fi
+        "$launch" "${command[@]}" || status=$?
     fi
+    if (( status == 125 )); then
+        step_close_checkout kill
+        return "$status"
+    fi
+    (printf 'publish\n' >&"$DOC_COPY_LEASE_FD") || publish_status=$?
     step_close_checkout || checkout_status=$?
     if (( status == 0 )); then
         status=$checkout_status
@@ -2972,6 +2981,57 @@ request_checkout_token() {
         IFS= read -r -N 64 -t "$timeout" -u "$reply" "$result"
 }
 
+start_checkout_scope_supervisor() {
+    local -
+    set +ax
+    local -a registration_start=() bind_tokens=()
+    local +x source_token checkout_token
+    local started rest
+    if [[ -n "$SOURCE_SCOPE_FD$checkout_fd" ]]; then
+        read -r started rest < /proc/uptime || return 125
+        registration_start=(--checkout-registration-start "$started")
+    fi
+    if [[ -n "$SOURCE_SCOPE_FD" ]]; then
+        if ! request_checkout_token "$SOURCE_SCOPE_FD" "$SOURCE_SCOPE_REPLY" "$SOURCE_SCOPE_TIMEOUT" "$started" source_token; then
+            printf 'the source copy did not issue a binding token\n' > "$PLACEMENT_SCOPE_STATE"
+            return 125
+        fi
+        bind_tokens+=("$source_token")
+    fi
+    if [[ -n "$checkout_fd" ]]; then
+        if ! request_checkout_token "$checkout_fd" "$checkout_reply" "$checkout_timeout" "$started" checkout_token; then
+            printf 'the prepared checkout did not issue a binding token\n' > "$PLACEMENT_SCOPE_STATE"
+            return 125
+        fi
+        bind_tokens+=("$checkout_token")
+    fi
+    # Only the supervisor receives the slot reply and the registration tokens.
+    coproc SCOPE_START {
+        local -a slot=()
+        local reply_fd=${DOC_COPY_REPLY_FD:-}
+        if [[ -n "$reply_fd" ]]; then
+            if (( ${#bind_tokens[@]} )); then
+                # Source registration already loaded fdflags.
+                fdflags -s -cloexec "$reply_fd" || exit 125
+                DOC_COPY_REPLY_FD=""
+            else
+                exec <&"$reply_fd" || exit 125
+                reply_fd=0
+            fi
+            slot=(--checkout-slot "$reply_fd" "$DOC_COPY_OWNER_PID")
+        fi
+        close_checkout_handoffs
+        exec_checkout_handoff "${launch[@]}" ${registration_start[@]+"${registration_start[@]}"} \
+            ${bindings[@]+"${bindings[@]}"} ${slot[@]+"${slot[@]}"} "$@" > "$output" 2>&1
+    }
+    supervisor=$!
+    local start_fd=${SCOPE_START[1]}
+    if (( ${#bind_tokens[@]} )); then
+        printf '%s\n' "${bind_tokens[@]}" >&"$start_fd" || true
+    fi
+    exec {start_fd}>&-
+}
+
 run_placed_scope() {
     local leader=$1 BUILDLOG_RESERVED_STEP
     shift
@@ -2990,69 +3050,29 @@ run_placed_scope() {
         printf 'the source copy has no scope binding channel\n' > "$PLACEMENT_SCOPE_STATE"
         return 125
     fi
-    if [[ -n "${DOC_COPY_LEASE_FD:-}" ]]; then
-        checkout_binding=$DOC_COPY_BINDING
-    elif [[ -n "${BUILDLOG_PREPARED_COPY:-}" &&
+    if [[ -z "${DOC_COPY_REPLY_FD:-}" && -n "${BUILDLOG_PREPARED_COPY:-}" &&
             "$BUILDLOG_PREPARED_COPY" == "${DOC_REPO_TOP:-${VERIFY_REPO_ROOT:-}}" ]]; then
         checkout_fd=$PREPARED_SCOPE_FD
         checkout_reply=$PREPARED_SCOPE_REPLY
         checkout_timeout=$PREPARED_SCOPE_TIMEOUT
         checkout_binding=$PREPARED_SCOPE_BINDING
-    fi
-    if [[ -n "$checkout_binding" ]]; then
+        if [[ -z "$checkout_binding" ]]; then
+            printf 'the checkout has no scope binding channel\n' > "$PLACEMENT_SCOPE_STATE"
+            return 125
+        fi
         bindings+=(--checkout-binding "$checkout_binding")
-    elif [[ -n "${DOC_COPY_LEASE_FD:-}$checkout_fd" ||
-            ( -n "${BUILDLOG_PREPARED_COPY:-}" &&
-              "$BUILDLOG_PREPARED_COPY" == "${DOC_REPO_TOP:-${VERIFY_REPO_ROOT:-}}" ) ]]; then
-        printf 'the checkout has no scope binding channel\n' > "$PLACEMENT_SCOPE_STATE"
-        return 125
     fi
     # The scope writes to a file. Only the reader can write to the log pipeline.
     if ! : > "$output"; then
         printf 'cannot create the scope output file\n' > "$PLACEMENT_SCOPE_STATE"
         return 125
     fi
-    local -
-    set +ax
-    local -a registration_start=() bind_tokens=()
-    local +x source_token checkout_token
-    local started rest
-    if [[ -n "$SOURCE_SCOPE_FD$checkout_fd" ]]; then
-        read -r started rest < /proc/uptime || return 125
-        registration_start=(--checkout-registration-start "$started")
-    fi
-    if [[ -n "$SOURCE_SCOPE_FD" ]]; then
-        if ! request_checkout_token "$SOURCE_SCOPE_FD" "$SOURCE_SCOPE_REPLY" "$SOURCE_SCOPE_TIMEOUT" "$started" source_token; then
-            printf 'the source copy did not issue a binding token\n' > "$PLACEMENT_SCOPE_STATE"
-            return 125
-        fi
-        bind_tokens+=("$source_token")
-    fi
-    if [[ -n "$checkout_binding" ]]; then
-        if [[ -z "$checkout_fd" ]]; then
-            bind_tokens+=("$DOC_COPY_TOKEN")
-        elif request_checkout_token "$checkout_fd" "$checkout_reply" "$checkout_timeout" "$started" checkout_token; then
-            bind_tokens+=("$checkout_token")
-        else
-            printf 'the prepared checkout did not issue a binding token\n' > "$PLACEMENT_SCOPE_STATE"
-            return 125
-        fi
-    fi
     local -a launch=("$PY" "$VERIFY_START_DIR/verify_scoped_step.py" "$$" "$leader" "$PLACEMENT_SCOPE_STATE"
-                     "$peak" "$BUILDLOG_SCOPE_SH" ${registration_start[@]+"${registration_start[@]}"}
-                     ${bindings[@]+"${bindings[@]}"} "$@")
-    if (( ${#bindings[@]} )); then
-        # This pipe carries the tokens into the supervisor.
-        coproc SCOPE_START {
-            exec_checkout_handoff "${launch[@]}" > "$output" 2>&1
-        }
-        supervisor=$!
-        local start_fd=${SCOPE_START[1]}
-        printf '%s\n' "${bind_tokens[@]}" >&"$start_fd" || true
-        exec {start_fd}>&-
-        unset source_token checkout_token bind_tokens
+                     "$peak" "$BUILDLOG_SCOPE_SH")
+    if (( ${#bindings[@]} )) || [[ -n "${DOC_COPY_REPLY_FD:-}" ]]; then
+        start_checkout_scope_supervisor "$@" || return $?
     else
-        (exec "${launch[@]}") > "$output" 2>&1 &
+        (exec "${launch[@]}" "$@") > "$output" 2>&1 &
         supervisor=$!
     fi
     (

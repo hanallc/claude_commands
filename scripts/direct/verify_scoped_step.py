@@ -168,13 +168,15 @@ def wait_for_checkout_channel(owners: select.poll, channel: int, deadline: float
         raise ValueError("a scope owner exited before launch")
 
 
-def read_checkout_line(owners: select.poll, reply: int, deadline: float, limit: int, timeout_reason: str) -> bytes:
+def read_checkout_line(owners: select.poll, reply: int, deadline: float, limit: int, timeout_reason: str,
+                       *, read_size: int | None = None) -> bytes:
     line = b""
+    chunk_size = limit if read_size is None else read_size
     owners.register(reply, select.POLLIN)
     try:
         while len(line) < limit and b"\n" not in line:
             wait_for_checkout_channel(owners, reply, deadline, timeout_reason)
-            chunk = os.read(reply, limit - len(line))
+            chunk = os.read(reply, min(chunk_size, limit - len(line)))
             if not chunk:
                 break
             line += chunk
@@ -220,6 +222,57 @@ def read_checkout_token(owners: select.poll, pipe: int, deadline: float) -> Chec
     return CheckoutBindToken.parse(line[:-1])
 
 
+class SlotCheckout(Enum):
+    NOT_USED = auto()
+
+
+@dataclass(frozen=True)
+class SlotCheckoutReply:
+    descriptor: int
+    owner_pid: int
+
+
+def read_slot_command(owners: select.poll, reply: int, deadline: float) -> list[str]:
+    timeout_reason = "the copy owner did not send the slot command"
+    # Read the count without consuming any bytes from the first word.
+    header = read_checkout_line(owners, reply, deadline, 20, timeout_reason, read_size=1)
+    count_bytes = header[:-1]
+    if not header.endswith(b"\n") or not count_bytes.isdigit() or count_bytes.startswith(b"0"):
+        raise ValueError("invalid slot command argument count")
+    count = int(count_bytes)
+    words = bytearray()
+    remaining = count
+    limit = os.sysconf("SC_ARG_MAX")
+    owners.register(reply, select.POLLIN)
+    try:
+        while remaining > 0 and len(words) < limit:
+            wait_for_checkout_channel(owners, reply, deadline, timeout_reason)
+            chunk = os.read(reply, min(65536, limit - len(words)))
+            if not chunk:
+                break
+            words.extend(chunk)
+            remaining -= chunk.count(b"\0")
+    finally:
+        owners.unregister(reply)
+    if remaining > 0:
+        raise ValueError("incomplete slot command")
+    return [os.fsdecode(word) for word in bytes(words).split(b"\0", count)[:count]]
+
+
+def read_slot_checkout(owners: select.poll, slot: SlotCheckoutReply,
+                       deadline: float) -> tuple[AuthorizedCheckoutBinding, list[str]]:
+    with os.fdopen(slot.descriptor, "rb", buffering=0) as pipe:
+        reply = pipe.fileno()
+        line = read_checkout_line(owners, reply, deadline, 256, "the copy owner did not send a slot binding", read_size=1)
+        if not line.endswith(b"\n"):
+            raise ValueError("incomplete slot binding")
+        endpoint = CheckoutBindingChannel.parse(line[:-1].decode("ascii"))
+        if endpoint.owner.pid != slot.owner_pid or not endpoint.owner.live_now():
+            raise ValueError("the slot binding does not name its live copy owner")
+        token = read_checkout_token(owners, reply, deadline)
+        return AuthorizedCheckoutBinding(endpoint, token), read_slot_command(owners, reply, deadline)
+
+
 def bind_checkout_scope(checkout: AuthorizedCheckoutBinding, scope: Path, owners: select.poll, deadline: float) -> None:
     with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as channel:
         channel.setblocking(False)
@@ -232,7 +285,7 @@ def bind_checkout_scope(checkout: AuthorizedCheckoutBinding, scope: Path, owners
 
 def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
                     scope_shell: str, command: list[str], endpoints: tuple[CheckoutBindingChannel, ...],
-                    registration_started: float | None) -> int:
+                    registration_started: float | None, slot: SlotCheckoutReply | SlotCheckout) -> int:
     # The supervisor and the scope survive the exit of the step shell.
     supervisor = os.getpid()
     unit = f"verify-step-{supervisor}.scope"
@@ -260,7 +313,7 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
             deadline = 0.0
             leases: tuple[AuthorizedCheckoutBinding, ...] = ()
             lease_owner_fds: tuple[int, ...] = ()
-            if endpoints:
+            if endpoints or isinstance(slot, SlotCheckoutReply):
                 seconds = checkout_scope_publication_seconds()
                 if registration_started is not None:
                     seconds -= time.clock_gettime(time.CLOCK_BOOTTIME) - registration_started
@@ -269,13 +322,19 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
                 deadline = time.monotonic() + seconds
                 if any(not endpoint.owner.live_now() for endpoint in endpoints):
                     raise ValueError("a checkout owner exited before launch")
-                lease_owners = {endpoint.owner.pid for endpoint in endpoints} - {caller, leader, supervisor}
-                lease_owner_fds = tuple(open_pidfd(owner, cleanup) for owner in lease_owners)
+                lease_owners = {endpoint.owner.pid for endpoint in endpoints}
+                if isinstance(slot, SlotCheckoutReply):
+                    lease_owners.add(slot.owner_pid)
+                lease_owner_fds = tuple(open_pidfd(owner, cleanup) for owner in lease_owners - {caller, leader, supervisor})
                 for descriptor in lease_owner_fds:
                     owners.register(descriptor, select.POLLIN)
-                with sys.stdin.buffer as pipe:
-                    leases = tuple(AuthorizedCheckoutBinding(endpoint, read_checkout_token(owners, pipe.fileno(), deadline))
-                                   for endpoint in endpoints)
+                if endpoints:
+                    with sys.stdin.buffer as pipe:
+                        leases = tuple(AuthorizedCheckoutBinding(endpoint, read_checkout_token(owners, pipe.fileno(), deadline))
+                                       for endpoint in endpoints)
+                if isinstance(slot, SlotCheckoutReply):
+                    slot_lease, command = read_slot_checkout(owners, slot, deadline)
+                    leases += (slot_lease,)
                 if time.monotonic() >= deadline:
                     raise TimeoutError("the checkout scope publication timed out")
                 watch = inotify.open_watch()
@@ -363,8 +422,13 @@ def main(argv: list[str]) -> int:
         while command[:1] == ["--checkout-binding"]:
             endpoints.append(CheckoutBindingChannel.parse(command[1]))
             del command[:2]
+        slot: SlotCheckoutReply | SlotCheckout = SlotCheckout.NOT_USED
+        if command[:1] == ["--checkout-slot"]:
+            slot = SlotCheckoutReply(int(command[1]), int(command[2]))
+            del command[:3]
         return run_scoped_step(
-            int(caller), int(leader), Path(release_state), peak, scope_shell, command, tuple(endpoints), registration_started,
+            int(caller), int(leader), Path(release_state), peak, scope_shell, command, tuple(endpoints),
+            registration_started, slot,
         )
     except (OSError, ValueError) as error:
         print(f"verify.sh: cannot finish the local build scope ({error})", file=sys.stderr)

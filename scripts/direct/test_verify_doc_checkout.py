@@ -393,6 +393,7 @@ observations = []
 source_locks = set()
 source_registration = set()
 slot_pipes = set()
+slot_replies = set()
 token_pipes = set()
 verify_pid = 0
 
@@ -417,10 +418,14 @@ def inspect(pid):
             source_registration.update(descriptors[fd] for fd in environment[b"COPIES_SCOPE_REGISTRATION"].split(b":"))
         if verify_pid and "copies.py" in names and "hold" in arguments:
             slot_pipes.update(descriptors[fd] for fd in (b"0", b"1") if descriptors[fd].startswith("pipe:"))
+            if descriptors[b"1"].startswith("pipe:"):
+                slot_replies.add(descriptors[b"1"])
         if "verify_scoped_step.py" in names and descriptors.get(b"0", "").startswith("pipe:"):
-            token_pipes.add(descriptors[b"0"])
+            slot_stdin = "--checkout-slot" in arguments and arguments[arguments.index("--checkout-slot") + 1] == "0"
+            if not slot_stdin:
+                token_pipes.add(descriptors[b"0"])
         if verify_pid:
-            observations.append((pid, arguments, names, set(descriptors.values())))
+            observations.append((pid, arguments, names, descriptors))
     return arguments
 
 with patch.object(task_cpu, "command_arguments", inspect):
@@ -437,13 +442,18 @@ assert any("verify_scoped_step.py" in names for _, _, names, _ in observations)
 assert any("dev_features.py" in names for _, _, names, _ in observations), "the helper fallback did not run"
 leaks = set()
 for pid, arguments, names, descriptors in observations:
-    unexpected = descriptors & source_locks
+    inherited = set(descriptors.values())
+    unexpected = inherited & source_locks
     if pid != verify_pid:
-        unexpected |= descriptors & source_registration
+        unexpected |= inherited & source_registration
     if not ("copies.py" in names and "hold" in arguments):
-        unexpected |= descriptors & slot_pipes
+        slot_fds = inherited & slot_pipes
+        if "verify_scoped_step.py" in names and "--checkout-slot" in arguments:
+            reply_fd = os.fsencode(arguments[arguments.index("--checkout-slot") + 1])
+            slot_fds -= {{descriptors.get(reply_fd)}} & slot_replies
+        unexpected |= slot_fds
     if "verify_scoped_step.py" not in names:
-        unexpected |= descriptors & token_pipes
+        unexpected |= inherited & token_pipes
     if unexpected:
         leaks.add(tuple(map(os.path.basename, arguments[:3])))
 assert not leaks, "unbound children inherited checkout descriptors: " + repr(sorted(leaks))
@@ -740,6 +750,31 @@ def split_reply(descriptor, size):
                 self.assertEqual(status, 125)
         self.assertIn("the copy owner did not send a checkout binding token", release.read_text())
         self.assertFalse(self.events.exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "Private slot binding requires Linux")
+    def test_private_slot_token_expires_with_the_pipe_open(self) -> None:
+        config = Path(self.environment["CONF_DIR"]) / "direct.conf"
+        _ = write_config_fixture(config, "VERIFY_SCOPE_PUBLICATION_SECONDS=0.1\n")
+        self.install_scope_interpreter(f'''
+import select
+
+if "--bind-scope" in script_arguments:
+    sys.path.insert(0, {str(VERIFY.parents[2])!r})
+    from scripts.copies.scope_bindings import CheckoutBindingChannel, CheckoutProcess
+
+    endpoint = CheckoutBindingChannel(CheckoutProcess.live(os.getpid()), "copies-scope-test-slot")
+    print(os.getcwd(), flush=True)
+    os.write(1, endpoint.encode())
+    select.select([0], [], [], 3)
+    raise SystemExit(0)
+os.execv(sys.executable, [sys.executable, *arguments])
+''', scripts=("/copies.py",))
+        result = self.verify()
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 125, output)
+        self.assertIn("the copy owner did not send a checkout binding token", output)
+        self.assertFalse(self.events.exists())
+        self.assertFalse(self.pass_records())
 
     def test_doc_scope_start_error_writes_release_state_before_status_125(self) -> None:
         recorded_failure = self.root / "recorded-scope-failure"
