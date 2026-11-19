@@ -14,6 +14,7 @@ import sys
 import tempfile
 from typing import cast
 import unittest
+from unittest import mock
 
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.process_group import send_process_group
@@ -50,11 +51,9 @@ if args[0] == "place-step":
         placement.PlacementDestination("mac", "mac", "fake-mac", claim_state.RepositoryScope("hana")),
         execution_identity.SourceKeyKnown("fixture"), placement.SubmittingOwner("fixture", pid, start.start),
         NoOwningSession(), float(option("--since")))
-    reserve = getattr(mac_test, "reserve_mac_placement", None)
-    if reserve is not None:
-        reserved = reserve(claim_state.state_paths(), assignment, what="fixture", worktree=option("--repo-root"),
-            copy=False, uses_claim=False, configuration=conf.read("mac_test"))
-        assert isinstance(reserved, placement.AllowedHost), reserved
+    reserved = mac_test.reserve_mac_placement(claim_state.state_paths(), assignment, what="fixture",
+        worktree=option("--repo-root"), copy=False, uses_claim=False, configuration=conf.read("mac_test"))
+    assert isinstance(reserved, placement.AllowedHost), reserved
     wire.write_assignment(Path(option("--assignment-file")), wire.Assignment(assignment))
     print("mac\tmac\tfake-mac\t0\t"+option("--episode")+"\tattempt")
 else:
@@ -71,9 +70,12 @@ args = shlex.split(sys.argv[-1])
 if "dispatch_start_prepared=" in sys.argv[-1]:
     print(args[-1])
     raise SystemExit(0)
-if "leftovers=0" in sys.argv[-1]:
+if "leftovers=0" in sys.argv[-1] or "settlement=$(" in sys.argv[-1]:
     key, = (root / "mac-state" / "pending-starts").iterdir()
-    print(f"dispatch_start_settled={key.name}\nleftovers=0\nrc=0")
+    count = int(os.environ.get("FAKE_GROUP_REMAINS", "0")) if "select_group_processes" in sys.argv[-1] else 0
+    if "MAC_PLACEMENT" in sys.argv[-1]:
+        count += int(os.environ.get("FAKE_PLACEMENT_REMAINS", "0"))
+    print(f"dispatch_start_settled={key.name}\nleftovers={count}\nrc=0")
     raise SystemExit(0)
 if "mac_stopped=" in args[-1]:
     (root / "stop").write_text(args[-1])
@@ -140,7 +142,7 @@ class QueueRunTests(unittest.TestCase):
         _ = ssh.write_text(f"#!{sys.executable}\n" + SSH)
         ssh.chmod(0o755)
         systemd = root / "systemd-run"
-        _ = systemd.write_text("#!/bin/sh\nexit 0\n")
+        _ = systemd.write_text('#!/bin/sh\nprintf "called\\n" > "$FAKE_QUEUE_STATE/watcher-start"\nexit 1\n')
         systemd.chmod(0o755)
         environment = {**os.environ, **config_environment(root / "config"), "FAKE_QUEUE_STATE": str(root),
                        "FAKE_QUEUE_PROJECT": str(Path(__file__).resolve().parents[2]),
@@ -216,6 +218,19 @@ class QueueRunTests(unittest.TestCase):
             self.assertEqual(record["attempt"], "attempt")
             self.assertTrue(mac_test.run_is_kept(record))
             self.assertEqual(len(list((root / "mac-state/pending-starts").iterdir())), 1)
+            self.assertFalse((root / "watcher-start").exists())
+
+    def test_queue_retains_capacity_while_the_remote_attempt_runs(self) -> None:
+        for running in ("FAKE_GROUP_REMAINS", "FAKE_PLACEMENT_REMAINS"):
+            with self.subTest(running=running), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = {**self.fixture(root), running: "1"}
+                result = subprocess.run(self.command(root), capture_output=True, text=True, env=environment,
+                                        timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual([event[0] for event in self.events(root)], ["place-step"])
+                self.assertTrue((root / "mac-state/claims/hana.json").exists())
+                self.assertIn(".group", (root / "remote").read_text())
 
     def test_a_signal_ends_the_run_with_its_default_action(self) -> None:
         for waiting, signum in ((False, signal.SIGTERM), (False, signal.SIGHUP), (True, signal.SIGTERM),
@@ -249,6 +264,11 @@ class QueueRunTests(unittest.TestCase):
                     self.assertEqual(events, ["place-step"])
                     if not waiting:
                         wait_until((root / "input_closed").exists, root)
+                        with mock.patch.dict(os.environ, environment):
+                            paths = mac_test.state_paths()
+                            self.assertEqual(len(mac_test.read_claims(paths)), 1)
+                            mac_test.settle_retained_mac_claims(paths, mac_test.config_path())
+                            self.assertEqual(mac_test.read_claims(paths), ())
                     # The run's state folder stays until the next run cleans it.
                     runs = root / mac_queue_run.RUNS
                     self.assertEqual(len(list(runs.iterdir())), 1)

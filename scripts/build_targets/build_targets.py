@@ -897,6 +897,7 @@ def wait_claim_identity(paths: mac_test.StatePaths, repo_root: str, pid: int,
                      if mac_test.scopes_overlap(claim.scope, scope)
                      and claim.record["pid"] == pid and claim.record["proc_start"] == start.start
                      and claim.record["submitting_session"] == claim_state.session_id(session)
+                     and "placement_reserved" not in claim.record
                      and ("remote_host" not in claim.record or claim.record.get("cleanup_pending"))
                      and (isinstance(block, mac_test.NoMacBlock) or "remote_host" in claim.record)),
                     claim_state.NO_CLAIM_IDENTITY)
@@ -920,6 +921,7 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
     with mac_test.locked(paths.lock):
         claims = tuple(claim for claim in mac_test.read_claims(paths)
                        if mac_test.scopes_overlap(claim.scope, scope) and "remote_host" in claim.record
+                       and not claim.record.get("queue_dispatch")
                        and (mac_test.run_is_kept(claim.record)
                             or (claim.record.get("cleanup_pending") and claim.record["pid"] == args.pid
                                 and claim.record["proc_start"] == start.start)))
@@ -1012,6 +1014,7 @@ def reserve_assigned(args: CliArguments) -> int:
                     if held.scope == assignment.destination.scope and held.record["pid"] == args.pid
                     and owner == process_start.Started(held.record["proc_start"])
                     and held.record["submitting_session"] == claim_state.session_id(assignment.session)
+                    and "placement_reserved" not in held.record
                     and (claim_state.claim_identity(held.record) == expected
                          or "remote_host" in held.record and held.record.get("cleanup_pending"))]
                 if not matches:

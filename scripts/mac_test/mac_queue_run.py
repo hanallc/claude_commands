@@ -64,7 +64,6 @@ def prepare_dispatch(assignment: queue_placement.PlacementAssignment) -> ArmedMa
         stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=connection.leftover_timeout_s, check=False)
     if ready.returncode != 0 or ready.stdout.strip() != marker:
         raise OSError("The Mac start fence could not be prepared")
-    mac_test.start_claim_watcher(paths)
     return ArmedMacDispatch(assignment, paths, mac_test.arm_mac_queue_claim(paths, assignment))
 
 
@@ -77,7 +76,7 @@ def placement_arguments(episode: str, since: float, pid: int, worktree: Path, pa
         "--assignment-file", str(assignment_file), "--token", "none", "--", *argv]
 
 
-def remote_wrapper(work: str, on_close: str, grace_polls: int) -> str:
+def remote_wrapper(work: str, on_close: str, grace_polls: int, *, record_group: str = "") -> str:
     """Run the work in the SSH session's process group, and stop the work when the SSH input closes.
 
     zsh refuses job control without a terminal, so the work shares the session's group. When the
@@ -89,6 +88,7 @@ def remote_wrapper(work: str, on_close: str, grace_polls: int) -> str:
 exec 3<&0
 group=$(ps -o pgid= -p $$)
 group=${group//[[:space:]]/}
+""" + record_group + r"""
 printf 'mac_group=%s\n' "$group"
 {
     read -r _ <&3
@@ -114,9 +114,13 @@ def remote_command(dispatch: ArmedMacDispatch, cwd: str, argv: list[str], on_clo
     work += "MAC_PLACEMENT=" + shlex.quote(assignment.episode + "/" + assignment.attempt) + " " + shlex.join(argv)
     # Ten polls a second while the group ends.
     grace_polls = max(1, math.ceil(conf.read("mac_gate").number("terminate_grace_seconds") * 10))
-    wrapper = remote_wrapper(work, on_close, grace_polls)
-    wrapper = offload.fenced_start_command(claim_state.claim_identity(dispatch.claim.record),
-        dispatch.paths.target, wrapper, scope_key=dispatch.claim.path.stem)
+    identity = claim_state.claim_identity(dispatch.claim.record)
+    target, scope_key = dispatch.paths.target, dispatch.claim.path.stem
+    group_file = offload.queue_group_file(identity, target, scope_key)
+    record_group = f"""case "$group" in ''|0|1|*[!0-9]*) exit 1 ;; esac
+printf '%s\\n' "$group" > {group_file} || exit 1"""
+    wrapper = remote_wrapper(work, on_close, grace_polls, record_group=record_group)
+    wrapper = offload.fenced_start_command(identity, target, wrapper, scope_key=scope_key)
     return ["ssh", "-o", "BatchMode=yes", assignment.destination.host, "/bin/zsh -c " + shlex.quote(wrapper)]
 
 
@@ -142,8 +146,9 @@ signal_group() {{ "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/proc
 signal_group TERM
 sleep {grace}
 signal_group KILL
-groups=$(ps -axo pgid=) || exit 1
-if printf '%s\\n' "$groups" | grep -Eq "^[[:space:]]*$group[[:space:]]*$"; then exit 1; fi
+{offload.PROCESS_GROUP_SELECTOR}
+members=$(select_group_processes) || exit 1
+[ -z "$members" ] || exit 1
 printf 'mac_stopped=%s\\n' "$group"
 """
     connection = eligibility.read_connection_settings(mac_test.config_path(dispatch.paths.target))

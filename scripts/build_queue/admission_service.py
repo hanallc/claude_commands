@@ -3047,6 +3047,9 @@ class AdmissionServer:
                 return read_gpu_evidence(transport, key, request, configuration=configuration)
             if isinstance(transport, hana_placement.HanaControlTransport):
                 return hana_placement.read_evidence(key, request, transport=transport, workload=configuration)
+        paths = claim_state.state_paths(destination.target)
+        if isinstance(target, target_config.SshTarget) and target.platform == "macos":
+            mac_test.settle_retained_mac_claims(paths, target.settings)
         sent = request.constraints.command_kind
         kind = recorded_step_kind(request.profile.step) if isinstance(sent, placement.CommandKindNotSent) else sent
         eligibility: placement.HostEligibility
@@ -3067,7 +3070,6 @@ class AdmissionServer:
                     configuration=configuration)
             eligibility = (placement.TemporaryExclusion(answer.reason)
                 if isinstance(answer, target_config.ExcludedTarget) else placement.AllowedHost())
-        paths = claim_state.state_paths(destination.target)
         # Routing keeps a busy Mac eligible so a step can wait for it. Placement must wait too,
         # or each pass makes a new attempt that the Mac refuses as busy.
         if (isinstance(eligibility, placement.AllowedHost) and isinstance(target, target_config.SshTarget)
@@ -3100,7 +3102,9 @@ class AdmissionServer:
                 record["claim_id"], record["episode"], record["attempt"])
             session_id = record["submitting_session"]
             session = OwningSession(session_id) if session_id else NoOwningSession()
-            if record.get("cleanup_pending", False):
+            if (record.get("cleanup_pending")
+                    or (paths.platform == "macos" and mac_test.run_is_kept(record)
+                        and mac_test.claim_needs_settlement(paths, record))):
                 cleanup.append(placement.RetainedCleanupClaim(reference, "provider cleanup remains unresolved"))
                 executions.append((reference, execution_identity.ExecutionEvidenceUnavailable("provider cleanup remains unresolved", self.clock.now())))
                 continue

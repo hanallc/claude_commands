@@ -242,7 +242,9 @@ class PendingDispatchTests(unittest.TestCase):
                                 return real_run(["bash", "-c", arguments[-1]], cwd=root, env=environment,
                                     capture_output=True, text=True, check=False, timeout=5)
 
-                            with mock.patch.object(subprocess, "run", side_effect=release_transport):
+                            with mock.patch.object(subprocess, "run", side_effect=release_transport), \
+                                 mock.patch.object(offload, "mirror_selector_script",
+                                                   return_value="select_leftovers() { :; }\n"):
                                 self.assertEqual(mac_test.command_release(args, paths), 12)
                                 self.assertEqual(paths.run.read_bytes(), before)
                                 self.assertTrue(pending.exists())

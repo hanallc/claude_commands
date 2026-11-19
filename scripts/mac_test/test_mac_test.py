@@ -3303,6 +3303,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
 
             with mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()), \
                  mock.patch.object(mac_test, "send_message", return_value=True) as send, \
+                 mock.patch.object(offload, "mirror_selector_script", return_value="select_leftovers() { :; }\n"), \
                  mock.patch.object(subprocess, "run", side_effect=release_transport):
                 _ = self.watch_once()
                 self.assertEqual(self.read_claim(), record)
@@ -3391,6 +3392,7 @@ class ClaimWatchTests(NotificationGuardedTestCase):
                     return self.run_private_shell(arguments[-1], self.root)
 
                 with mock.patch.object(subprocess, "run", side_effect=remote), \
+                     mock.patch.object(offload, "mirror_selector_script", return_value="select_leftovers() { :; }\n"), \
                      mock.patch.object(mac_test, "start_watcher"):
                     answer = mac_test.release_exact_claims(self.paths, cast(int, record["pid"]), identity, "")
                 if new_owner:
@@ -3455,27 +3457,43 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         return cast(dict[str, object], json.loads((self.paths.claims / f"{name}.json").read_text()))
 
     def test_retained_fence_settles_while_another_repository_runs(self) -> None:
-        from scripts.mac_test import claim_state, offload
+        from scripts.mac_test import claim_state, eligibility, offload
 
         _ = write_config_fixture(self.root / "mac_test.conf", "max_active_builds=2\n")
         ended_pid = os.getpid() + 1
         _ = self.write_repository_claims(pid=ended_pid)
         identity = claim_state.ClaimIdentity("claim-hana", "episode-hana", "attempt-1")
+        prepared = self.run_private_shell(offload.prepare_start_fence_command(identity, "mac", scope_key="hana"), self.root)
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        offload.record_pending_start(self.paths.target, identity)
         pending = offload.pending_start_path(self.paths.target, identity)
-        pending.parent.mkdir()
-        _ = pending.write_text(offload.pending_start_key(identity))
-        settled = offload.LeftoverObservation(offload.LeftoversEnded(),
-            "dispatch_start_settled=" + offload.pending_start_key(identity))
+        selected: list[str] = []
 
         def process_start(pid: int) -> process_identity.Started | process_identity.Gone:
             return process_identity.Gone() if pid == ended_pid else process_identity.Started("owner-start")
 
+        def remote(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            del options
+            self.assertEqual(arguments[-2], "claim-mac")
+            return self.run_private_shell(arguments[-1], self.root)
+
+        def selector(scope: offload.MirrorScope, target: str, slot: int) -> str:
+            self.assertEqual((scope, target, slot), (eligibility.KnownRepository("hana"), self.paths.target, 1))
+            command = selected.pop(0)
+            return f"select_leftovers() {{ {command}; }}\n"
+
+        selected.extend(("printf '417\\n'", ":"))
         with mock.patch.object(process_identity, "process_start", side_effect=process_start), \
              mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacActive(1, 1)), \
-             mock.patch.object(offload, "read_leftovers", return_value=settled) as check:
+             mock.patch.object(offload, "mirror_selector_script", side_effect=selector), \
+             mock.patch.object(subprocess, "run", side_effect=remote) as check:
+            self.assertTrue(mac_test.claim_watch_pass(self.paths, mac_test.read_config()))
+            self.assertTrue((self.paths.claims / "hana.json").exists())
+            self.assertTrue(pending.exists())
+            self.assertFalse((self.root / offload.start_fence_relative(identity, "mac", scope_key="hana").with_suffix(".lock")).exists())
             self.assertTrue(mac_test.claim_watch_pass(self.paths, mac_test.read_config()))
 
-        check.assert_called_once()
+        self.assertEqual(check.call_count, 2)
         self.assertFalse((self.paths.claims / "hana.json").exists())
         self.assertFalse(pending.exists())
         self.assertTrue((self.paths.claims / "cargo-liner.json").exists())

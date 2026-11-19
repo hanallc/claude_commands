@@ -699,7 +699,8 @@ raise SystemExit(offload.main())
                 self.assertTrue(event["claimed"], event)
 
     def leftover_events(self) -> list[CommandEvent]:
-        return [event for event in self.events_for("ssh") if "select_leftovers()" in event["args"][-1]]
+        return [event for event in self.events_for("ssh") if "select_leftovers()" in event["args"][-1]
+                and not event["args"][-1].startswith("settlement=$(")]
 
     def assert_leftover_selectors(self, remote: str) -> None:
         self.assertIn(f"mirror_command_pattern={shlex.quote(HANA_COMMAND_PATTERN)}\n", remote)

@@ -17,6 +17,7 @@ import json
 import math
 import os
 from pathlib import Path
+import shlex
 import signal
 import subprocess
 import sys
@@ -655,12 +656,15 @@ def claim_owner(run: RunRecord) -> tuple[claim_state.ClaimIdentity, int, str, st
 
 
 def run_is_kept(run: RunRecord) -> TypeGuard[RemoteJobClaim]:
-    return "remote_host" in run and process_identity.process_start(run["pid"]) != process_identity.Started(run["proc_start"])
+    if "remote_host" not in run:
+        return False
+    owner = process_identity.process_start(run["pid"])
+    return not isinstance(owner, process_identity.Unreadable) and owner != process_identity.Started(run["proc_start"])
 
 
 def run_holds_work(run: RunRecord) -> bool:
     """Report running work without counting claims kept for cleanup."""
-    return run_is_live(run) and not run_is_kept(run) and not run.get("placement_reserved")
+    return run_is_live(run) and not run_is_kept(run) and "placement_reserved" not in run
 
 
 def copy_gives_way(run: RunRecord) -> bool:
@@ -756,7 +760,7 @@ def reserve_mac_placement(paths: StatePaths, assignment: placement.PlacementAssi
         overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, scope))
         if overlapping:
             # This grant permits replacement of an existing claim. Acquisition checks capacity again.
-            replaceable = all(not claim.record.get("placement_reserved") and
+            replaceable = all("placement_reserved" not in claim.record and not claim.record.get("queue_dispatch") and
                               (run_is_kept(claim.record) or (not copy and copy_gives_way(claim.record)))
                               for claim in overlapping)
             return placement.AllowedHost() if uses_claim and replaceable else busy
@@ -767,8 +771,7 @@ def reserve_mac_placement(paths: StatePaths, assignment: placement.PlacementAssi
             assignment.episode, assignment.attempt)
         record = new_claim_record(scope, identity, pid=assignment.owner.pid, proc_start=assignment.owner.start_time,
                                   what=what, worktree=worktree, session=assignment.session, copy=copy)
-        record["placement_reserved"] = True
-        write_claim(paths, scope, record)
+        write_claim(paths, scope, {**record, "placement_reserved": True})
         return placement.AllowedHost()
 
 
@@ -779,7 +782,7 @@ def clear_closed_mac_reservations(paths: StatePaths, current_attempts: set[tuple
             return False
         for claim in read_claims(paths):
             record = claim.record
-            if record.get("placement_reserved") and (record["episode"], record["attempt"]) not in current_attempts:
+            if "placement_reserved" in record and (record["episode"], record["attempt"]) not in current_attempts:
                 claim.path.unlink(missing_ok=True)
     return True
 
@@ -795,15 +798,15 @@ def arm_mac_queue_claim(paths: StatePaths, assignment: placement.PlacementAssign
         assignment.episode, assignment.attempt)
     with locked(paths.lock):
         record = read_run(path)
-        if (isinstance(record, NoRun) or "remote_host" in record or not record.get("placement_reserved")
+        if (isinstance(record, NoRun) or "placement_reserved" not in record
                 or claim_state.claim_identity(record) != identity or record["pid"] != os.getpid()
                 or not run_is_live(record)):
             raise ValueError("The Mac placement reservation is unavailable")
         if not isinstance(blocking_claim_block(paths, assignment.session), NoMacBlock):
             raise ValueError("The Mac became blocked before launch")
         offload.record_pending_start(paths.target, identity)
-        armed: RemoteJobClaim = {**record, "remote_host": assignment.destination.host}
-        _ = armed.pop("placement_reserved", None)
+        armed = claim_state.adopt_remote_claim(record, record["pid"], record["proc_start"],
+                                              assignment.destination.host, queue_dispatch=True)
         write_json(path, armed)
     return HeldClaim(scope, path, armed)
 
@@ -1550,11 +1553,8 @@ def retained_claim_activity(paths: StatePaths, scope: RepositoryScope, record: R
 
     repository = eligibility.KnownRepository(scope.name, scope.key)
     settings = eligibility.read_connection_settings(config_path(paths.target))
-    command = offload.mirror_selector_script(repository, paths.target, record.get("slot", 0) or 1) + r"""
-pids=$(select_leftovers) || exit 1
-count=$(printf '%s\n' "$pids" | awk 'NF { count++ } END { print count+0 }') || exit 1
-printf 'leftovers=%s\nrc=0\n' "$count"
-"""
+    command = (offload.mirror_selector_script(repository, paths.target, record.get("slot", 0) or 1)
+               + offload.leftover_count_script())
     result = offload.read_leftovers(settings, record["remote_host"], command, paths.target).result
     if isinstance(result, offload.LeftoversEnded):
         return MacIdle()
@@ -1563,9 +1563,28 @@ printf 'leftovers=%s\nrc=0\n' "$count"
     return ActivityCheckFailed("The retained claim's work is unconfirmed")
 
 
+def claim_needs_settlement(paths: StatePaths, record: RemoteJobClaim) -> bool:
+    from scripts.mac_test import offload
+
+    return ("queue_dispatch" in record
+            or offload.pending_start_path(paths.target, claim_state.claim_identity(record)).exists())
+
+
+def settle_retained_mac_claims(paths: StatePaths, settings: Path) -> None:
+    """Retry exact remote settlement when the admission service reads the Mac."""
+    with locked(paths.lock):
+        claims = read_claims(paths)
+    for claim in claims:
+        record = claim.record
+        if run_is_kept(record) and claim_needs_settlement(paths, record):
+            try:
+                _ = release_exact_claims(paths, record["pid"], claim_state.claim_identity(record), str(settings))
+            except (OSError, ValueError):
+                continue
+
+
 def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
     """Check local holders and settle retained remote claims."""
-    from scripts.mac_test import offload
 
     with locked(paths.lock):
         claims = tuple(claim for claim in read_claims(paths) if run_is_live(claim.record))
@@ -1580,13 +1599,15 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
     watched = False
     for claim in claims:
         record = claim.record
-        if record.get("placement_reserved"):
+        if "placement_reserved" in record:
             watched = True
+            continue
+        if "queue_dispatch" in record:
             continue
         if run_is_kept(record):
             try:
                 identity = claim_state.claim_identity(record)
-                if offload.pending_start_path(paths.target, identity).exists():
+                if claim_needs_settlement(paths, record):
                     result = release_exact_claims(paths, record["pid"], identity, "")
                     watched |= isinstance(result, ClaimReleaseRefused)
                     continue
@@ -2024,14 +2045,14 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     if isinstance(args.remote, str) or reserve_wait:
         for claim in overlapping:
             record = claim.record
-            if scopes_overlap(claim.scope, scope) and run_is_kept(record):
+            if scopes_overlap(claim.scope, scope) and run_is_kept(record) and not record.get("queue_dispatch"):
                 return take_over_kept_claim(args, claim, record, session=session)
     if not isinstance(block, NoMacBlock):
         return blocked_claim(block)
     if overlapping:
         for claim in overlapping:
             record = claim.record
-            if (record.get("placement_reserved") and scope == claim.scope
+            if ("placement_reserved" in record and scope == claim.scope
                     and not isinstance(assignment, UnassignedClaim)
                     and claim_state.claim_identity(record) == identity
                     and record["pid"] == assignment.owner.pid and record["proc_start"] == assignment.owner.start_time):
@@ -2040,13 +2061,14 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                     return ClaimFinished(1)
                 claimed = new_claim_record(scope, identity, pid=args.pid, proc_start=proc_start.start,
                                            what=args.what, worktree=args.worktree, session=session, copy=args.copy)
-                adopted: RunRecord = {**claimed, "remote_host": args.remote} if isinstance(args.remote, str) else claimed
+                adopted = (claim_state.adopt_remote_claim(claimed, args.pid, proc_start.start, args.remote)
+                           if isinstance(args.remote, str) else claimed)
                 write_json(claim.path, adopted)
                 print_claim_identity(args, adopted)
                 print("claimed")
                 return ClaimFinished(0)
         # A test copy gives way to any new step; a copy never replaces a copy.
-        if not args.copy and all(not claim.record.get("placement_reserved") and copy_gives_way(claim.record)
+        if not args.copy and all("placement_reserved" not in claim.record and copy_gives_way(claim.record)
                                  for claim in overlapping):
             return ClaimHeldByCopy(tuple(claim.record for claim in overlapping))
         return ClaimBusy(overlapping[0].record)
@@ -2066,7 +2088,8 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                                          args.attempt or uuid.uuid4().hex)
     record = new_claim_record(scope, identity, pid=args.pid, proc_start=proc_start.start, what=args.what,
                               worktree=args.worktree, session=session, copy=args.copy)
-    claimed: RunRecord = {**record, "remote_host": args.remote} if isinstance(args.remote, str) else record
+    claimed = (claim_state.adopt_remote_claim(record, args.pid, proc_start.start, args.remote)
+               if isinstance(args.remote, str) else record)
     write_claim(paths, scope, claimed)
     print_claim_identity(args, claimed)
     if isinstance(scope, RepositoryScope) and scope.slot:
@@ -2126,13 +2149,7 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
             return ClaimFinished(12)
         if not isinstance(block, NoMacBlock):
             return blocked_claim(block)
-    record: RemoteJobClaim
-    if "remote_host" in claim.record:
-        record = {**claim.record}
-    else:
-        record = {**claim.record, "remote_host": args.remote}
-    record["pid"] = args.pid
-    record["proc_start"] = start.start
+    record = claim_state.adopt_remote_claim(claim.record, args.pid, start.start, args.remote)
     write_json(claim.path, record)
     print_claim_identity(args, record)
     if isinstance(claim.scope, RepositoryScope) and claim.scope.slot:
@@ -2260,7 +2277,7 @@ def release_exact_claims(
     paths: StatePaths, pid: int, identity: claim_state.ClaimIdentity, settings: str, *,
     provider_lock_held: bool = False, remote_work: EndStoppedWork | KeepRemoteWork = KEEP_REMOTE_WORK,
 ) -> ClaimsReleased | ClaimReleaseRefused:
-    """Release the claims that pid holds under identity, after their remote start fence settles."""
+    """Release exact claims after their remote fence and work end."""
     from scripts.mac_test import eligibility, offload
 
     with nullcontext() if provider_lock_held else locked(paths.lock):
@@ -2277,17 +2294,32 @@ def release_exact_claims(
     transfers: list[transfer_bytes.TransferBytes] = []
     for path, record in owned:
         pending = offload.pending_start_path(paths.target, identity)
-        if "remote_host" in record and pending.exists():
+        if "remote_host" in record and claim_needs_settlement(paths, record):
             connection = eligibility.read_connection_settings(Path(settings) if settings else config_path(paths.target))
             fence = offload.start_fence_command(identity, paths.target, settle=True, scope_key=path.stem)
-            # Stopped work ends first, so the fence it holds is free to settle.
-            command = (offload.leftover_check_script(remote_work.repository, paths.target, record.get("slot", 0) or 1)
-                       + "\n" + fence + "\n" if isinstance(remote_work, EndStoppedWork)
-                       else fence + "\nprintf 'leftovers=0\\nrc=0\\n'\n")
+            settled = "dispatch_start_settled=" + offload.pending_start_key(identity)
+            slot = record.get("slot", 1)
+            if isinstance(remote_work, EndStoppedWork):
+                command = offload.leftover_check_script(remote_work.repository, paths.target, slot) + "\n" + fence
+            elif paths.platform == "linux":
+                command = fence + "\nprintf 'leftovers=0\\nrc=0\\n'\n"
+            else:
+                if "queue_dispatch" in record:
+                    selector = offload.queue_leftover_selector(identity, paths.target, path.stem)
+                else:
+                    scope = (RepositoryScope(record["repo_name"], record.get("repo_key", ""))
+                             if "repo_name" in record else target_claim_scope(paths, record["worktree"]))
+                    mirror = (eligibility.KnownRepository(scope.name, scope.key)
+                              if isinstance(scope, RepositoryScope) else offload.ALL_MIRRORS)
+                    selector = offload.mirror_selector_script(mirror, paths.target, slot)
+                command = ('settlement=$(\n' + fence + '\n) || exit 1\n'
+                           + "printf '%s\\n' \"$settlement\"\n"
+                           + f'[ "$settlement" = {shlex.quote(settled)} ] || exit 1\n'
+                           + selector + offload.leftover_count_script())
             observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target)
             if not isinstance(observed.result, offload.LeftoversEnded):
                 return ClaimReleaseRefused("the remote work of the claim has not ended")
-            if "dispatch_start_settled=" + offload.pending_start_key(identity) not in observed.output.splitlines():
+            if settled not in observed.output.splitlines():
                 return ClaimReleaseRefused("the remote start fence remains unconfirmed")
         with nullcontext() if provider_lock_held else locked(paths.lock):
             # The claim watcher rewrites its own fields during the settle; only a new owner refuses.

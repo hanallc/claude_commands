@@ -234,13 +234,14 @@ The runner, the claim and the block are covered in [mac-test-offload.md](mac-tes
 
 - `offload.py run --settings <path>` reads that target's settings; `--last-decline busy|blocked` silences a decline line (and the claim's holder output) that repeats the last reason. A failed probe prints `mac_test: could not reach the Mac: <reason>`.
 - A lost run keeps the Mac busy until its leftovers are gone. The runner claims with `--remote <host>`; the claim (`RemoteJobClaim`) outlives its process until the printed `mac_exit=<n>` line with a confirmed cleanup marker, or a leftover check that counted no process (`check_leftovers` → `LeftoversEnded | LeftoversRemain(count) | LeftoverCheckFailed(reason)`). A later `claim --remote` for the same repository takes a kept claim over (exit 13). Leftovers decline `busy`; a failed check declines `unreachable`.
-- The claim watcher settles a dead holder by its exact start fence when one exists.
+- The admission service checks retained Mac claims when it reads capacity.
+  The claim watcher can also check a retained Verify claim.
   A failed check retains the claim. See [Mac claim watcher](mac-test-offload.md#the-idle-claim--mac_testpy-watch-claim).
 - A `busy` decline names its holder: `BusyMacDecline(holder: MacHolder)`, `MacHolder = KnownMacJob(what) | LostRunLeftovers | UnreadableMacHolder`, written as `holder=` in the result file.
 - `remote_test_command` sets `MACOSX_DEPLOYMENT_TARGET=14.0` (module constant `MACOSX_DEPLOYMENT_TARGET`), so a test binary that reaches a Swift bridge loads on the Mac. It also sends `BUILDLOG_SENT_TREE_KEY` when `copy_tree_with_key` read the same known tree key before and after the copy, and `LINT_SKIP_SWEEP=1` so the Mac's steps start no detached sweep. After the tests it removes the mirror's `target` folder only when the Mac's free space is below `free_floor_gib` (100 GiB), and keeps it otherwise (`mac_cleanup=kept`); a run that names `--target-dir` skips the cleanup with one line.
 - `scripts/production/mac_run.sh` uses `mac_queue_run.py` to reserve a claim through placement.
   Before SSH launch, the runner binds the claim to the attempt's remote start fence.
-  The claim retains capacity until the fence settles if the local holder exits.
+  The claim holds capacity until the start fence settles and the process check finds no work for that attempt.
   The script compiles Hana or the selected example in a Mac checkout.
 
 ### The commands: `commands/build/`

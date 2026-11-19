@@ -25,6 +25,7 @@ from scripts.build_queue.queue_evidence import step_labels as step_labels
 from scripts.build_queue.queue_lines import Line, Span
 from scripts.buildlog.parse import cargo_subcommand
 from scripts.lib import cargo_target_config, conf
+from scripts.mac_test.mac_process_environment import MAC_PROCESS_ENVIRONMENT
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import RECORDED_STEP_NAMES, StepNames, command_script, read_step_names
 from scripts.build_queue import admission_records
@@ -256,10 +257,8 @@ def mac_reading_status(reading: MacBuildReading, now: float) -> str:
 def mac_build_script() -> str:
     """Read cargo tile registrations and process trees in one SSH call."""
     return "python3 - <<'MAC_READING'\n" + inspect.getsource(cargo_target_config) + r'''
-import ctypes
 import json
 import re
-import struct
 import sys
 import os
 from pathlib import Path
@@ -398,51 +397,7 @@ def repository_name(folder):
     return ""
 
 
-def process_environment(pid):
-    """Read only Cargo paths, CI labels and the queue placement from the Mac environment."""
-    if sys.platform != "darwin":
-        return {}
-    try:
-        kernel = ctypes.CDLL(None, use_errno=True)
-        kernel.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
-                                  ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
-        kernel.sysctl.restype = ctypes.c_int
-        # sysinfo uses CTL_KERN and KERN_PROCARGS2 for the same process observation.
-        mib = (ctypes.c_int * 3)(1, 49, pid)
-        size = ctypes.c_size_t()
-        if kernel.sysctl(mib, 3, None, ctypes.byref(size), None, 0) or not 4 <= size.value <= 2097152:
-            return {}
-        data = ctypes.create_string_buffer(size.value)
-        if kernel.sysctl(mib, 3, data, ctypes.byref(size), None, 0):
-            return {}
-        return cargo_environment(data.raw[:size.value])
-    except (OSError, ValueError, AttributeError):
-        return {}
-
-
-def cargo_environment(data):
-    """Keep only Cargo paths, CI labels and the queue placement from the environment."""
-    if len(data) < 4:
-        return {}
-    argc = struct.unpack_from("i", data)[0]
-    if argc < 1:
-        return {}
-    start = data.find(b"\0", 4)
-    if start < 0:
-        return {}
-    start += 1
-    while start < len(data) and data[start] == 0:
-        start += 1
-    fields = data[start:].split(b"\0")
-    selected = {}
-    for field in fields[argc:]:
-        if not field:
-            break
-        key, separator, value = field.partition(b"=")
-        if separator and key in (b"CARGO_TARGET_DIR", b"CARGO_BUILD_TARGET_DIR", b"CARGO_HOME", b"HOME",
-                                 b"RUNNER_NAME", b"GITHUB_JOB", b"MAC_PLACEMENT"):
-            selected[os.fsdecode(key)] = os.fsdecode(value)
-    return selected
+''' + MAC_PROCESS_ENVIRONMENT + r'''
 
 
 def test_output_directories(pid, folder, command, members, processes):

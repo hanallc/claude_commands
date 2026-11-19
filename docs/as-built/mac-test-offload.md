@@ -107,12 +107,17 @@ A PID alone cannot release another attempt.
 ### The idle claim — `mac_test.py watch-claim`
 
 The watcher reads claims under `state.lock`.
-It keeps a live placement reservation until the grant adopts or releases it.
-A remote dispatch keeps the same claim and records a pending start fence before launching SSH.
-A dead remote holder leaves the claim in place.
-The watcher checks its exact start fence outside the lock.
-A confirmed settlement frees that claim even when a different repository is active.
-A timeout or an unconfirmed result keeps the claim for a later check.
+The grant holds its reservation until a runner adopts it or the grant closes.
+A remote dispatch records its pending start fence before it launches SSH.
+A retained claim still holds capacity after its local owner ends.
+The admission service retries fenced claims when it reads Mac capacity.
+Verify's claim watcher can also retry a retained Verify claim.
+
+The release check closes the exact attempt's start fence outside `state.lock`.
+For Verify, it checks for processes that refer to the claimed mirror or use that mirror as their working directory.
+For a queue run, it checks the recorded SSH process group and the exact `MAC_PLACEMENT` environment value.
+It releases the claim when the fence has settled and the process check finds no matching processes.
+A timeout, a matching process, or an unconfirmed fence keeps the claim for a later check.
 
 The watcher uses the retained repository's mirror activity for older claims without a fence.
 It uses host activity for claims with a live holder and for old whole-Mac claims without a fence.

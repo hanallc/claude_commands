@@ -235,7 +235,6 @@ class ClaimOwnerRecord(TypedDict):
     idle_since: NotRequired[str]
     work_idle_since: NotRequired[str]
     copy: NotRequired[bool]
-    placement_reserved: NotRequired[bool]
     repo_key: NotRequired[str]
     repo_name: NotRequired[str]
     slot: NotRequired[int]
@@ -246,15 +245,43 @@ class ProcessBoundClaim(ClaimOwnerRecord):
     """The claim holds Mac capacity while its process lives."""
 
 
+class PlacementReservation(ClaimOwnerRecord):
+    """The grant holds capacity before its runner adopts the claim."""
+
+    placement_reserved: Literal[True]
+
+
 class RemoteJobClaim(ClaimOwnerRecord):
     """The claim holds Mac capacity until the named host confirms that its job ends."""
 
     remote_host: str
-    cleanup_pending: NotRequired[bool]
+    cleanup_pending: NotRequired[Literal[True]]
+    queue_dispatch: NotRequired[Literal[True]]
     instance_generation: NotRequired[str]
 
 
-RunRecord = ProcessBoundClaim | RemoteJobClaim
+RunRecord = PlacementReservation | ProcessBoundClaim | RemoteJobClaim
+
+
+def adopt_remote_claim(record: RunRecord, pid: int, start: str, host: str, *,
+                       queue_dispatch: bool = False) -> RemoteJobClaim:
+    """Transfer the claim to a remote runner without releasing capacity."""
+    if "remote_host" in record:
+        return {**record, "pid": pid, "proc_start": start}
+    owner = process_bound_claim(record)
+    adopted: RemoteJobClaim = {**owner, "pid": pid, "proc_start": start, "remote_host": host}
+    if queue_dispatch:
+        adopted["queue_dispatch"] = True
+    return adopted
+
+
+def process_bound_claim(record: ProcessBoundClaim | PlacementReservation) -> ProcessBoundClaim:
+    """Remove the grant state before the waiter takes ownership."""
+    if "placement_reserved" in record:
+        owner: dict[str, object] = dict(record)
+        del owner["placement_reserved"]
+        return cast(ProcessBoundClaim, cast(object, owner))
+    return record
 
 
 @dataclass(frozen=True)
@@ -397,10 +424,6 @@ def read_run(path: Path) -> RunState:
         if values["copy"] is not True:
             raise StateReadError(f"{path} has an invalid copy")
         record["copy"] = True
-    if "placement_reserved" in values:
-        if values["placement_reserved"] is not True or "remote_host" in values:
-            raise StateReadError(f"{path} has an invalid placement reservation")
-        record["placement_reserved"] = True
     if "repo_key" in values or "repo_name" in values:
         record["repo_key"] = required_string(values, "repo_key", path)
         record["repo_name"] = required_string(values, "repo_name", path)
@@ -409,9 +432,14 @@ def read_run(path: Path) -> RunState:
         if type(slot) is not int or slot < 1:
             raise StateReadError(f"{path} has an invalid slot")
         record["slot"] = slot
-    if "remote_host" not in values:
+    remote_fields = ("remote_host", "instance_generation", "cleanup_pending", "queue_dispatch")
+    if "placement_reserved" in values:
+        if values["placement_reserved"] is not True or any(field in values for field in remote_fields):
+            raise StateReadError(f"{path} has an invalid placement reservation")
+        return {**record, "placement_reserved": True}
+    if not any(field in values for field in remote_fields):
         return record
-    host = values["remote_host"]
+    host = values.get("remote_host")
     if not isinstance(host, str) or not host.strip():
         raise StateReadError(f"{path} has an invalid remote_host")
     remote: RemoteJobClaim = {**record, "remote_host": host}
@@ -424,6 +452,10 @@ def read_run(path: Path) -> RunState:
         if values["cleanup_pending"] is not True:
             raise StateReadError(f"{path} has an invalid cleanup_pending")
         remote["cleanup_pending"] = True
+    if "queue_dispatch" in values:
+        if values["queue_dispatch"] is not True or "cleanup_pending" in values or "instance_generation" in values:
+            raise StateReadError(f"{path} has an invalid queue_dispatch")
+        remote["queue_dispatch"] = True
     return remote
 
 
@@ -493,7 +525,8 @@ def read_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
             scope: ClaimScope = RepositoryScope(record["repo_name"], record.get("repo_key", ""), record.get("slot", 0))
         else:
             if path == paths.run:
-                scope = WHOLE_MAC if record.get("placement_reserved") else target_claim_scope(paths, record["worktree"])
+                scope = (WHOLE_MAC if "placement_reserved" in record or record.get("queue_dispatch")
+                         else target_claim_scope(paths, record["worktree"]))
             else:
                 scope = RepositoryScope(path.stem)
         held.append(HeldClaim(scope, path, record))

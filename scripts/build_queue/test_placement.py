@@ -37,6 +37,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.build_queue.queue_fixture import write_process
 from scripts.build_queue.test_snapshot_codec import OLDER_CLIENTS, pinned_snapshot_reader
 from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, LOCAL_CALLER, PinnedTarget
+from scripts.build_targets import build_targets
 
 
 SUBMITTING_SESSION = OwningSession("submitting-session")
@@ -588,6 +589,61 @@ class MacBuildLimitTests(unittest.TestCase):
                     "done", request.episode, request.owner, "the step ended")).replies()
                 self.assertIsInstance(reply, wire.Ok)
                 self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False), 0)
+
+    def test_verify_adopts_a_granted_mac_claim(self) -> None:
+        with self.mac_fixture(1) as (fixture, paths):
+            request = self.request(fixture, "hana")
+            assignment = assignment_for(fixture, request)
+            args = build_targets.CliArguments()
+            args.pid, args.target, args.kind = request.owner.pid, "mac", "test"
+            args.repo_root, args.package = request.constraints.repository, request.constraints.package
+            args.assignment_file = str(fixture.root / "assignment.json")
+            args.reservation_file = str(fixture.root / "reservation")
+            _ = Path(args.assignment_file).write_text(wire.encode_reply(wire.Assignment(assignment)))
+            repository = eligibility.KnownRepository("hana")
+            with mock.patch.object(eligibility, "repository_identity", return_value=repository):
+                self.assertEqual(build_targets.reserve_assigned(args), 0)
+                wait, = mac_test.read_claims(paths)
+                adopted = mac_test.CliArguments()
+                adopted.target, adopted.from_pid, adopted.pid = "mac", args.pid, fixture.request().owner.pid
+                adopted.worktree, adopted.remote = args.repo_root, assignment.destination.host
+                identity = claim_state.claim_identity(wait.record)
+                adopted.claim_id, adopted.episode, adopted.attempt = identity.claim_id, identity.episode, identity.attempt
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(mac_test.command_claim(adopted, paths, watch_claim=False, assignment=assignment), 0)
+                held, = mac_test.read_claims(paths)
+            self.assertNotIn("placement_reserved", wait.record)
+            self.assertNotIn("placement_reserved", held.record)
+            self.assertEqual(held.record.get("remote_host"), assignment.destination.host)
+            self.assertEqual(held.record["pid"], adopted.pid)
+            self.assertEqual(claim_state.claim_identity(held.record), claim_state.claim_identity(wait.record))
+
+    def test_mac_capacity_read_settles_a_retained_queue_run_without_a_watcher(self) -> None:
+        with self.mac_fixture(1) as (fixture, paths):
+            first = self.request(fixture, "hana", kind="run")
+            assignment = assignment_for(fixture, first)
+            held, = mac_test.read_claims(paths)
+            record = {key: value for key, value in held.record.items() if key != "placement_reserved"}
+            mac_test.write_json(held.path, {**record, "remote_host": assignment.destination.host, "queue_dispatch": True})
+            identity = claim_state.claim_identity(held.record)
+            offload.record_pending_start(paths.target, identity)
+            fixture.end_owner(wire.Owner(first.owner.pid, first.owner.start_time))
+            next_run = self.request(fixture, "cargo-liner", kind="run")
+            key = fixture.server.host_evidence_key(next_run, next_run.constraints.candidates[0].destination)
+            self.assert_mac_busy(fixture, next_run)
+            fixture.server.host_requests[key] = next_run
+
+            marker = "dispatch_start_settled=" + offload.pending_start_key(identity)
+            answers = (offload.LeftoverObservation(offload.LeftoversRemain(1), marker),
+                       offload.LeftoverObservation(offload.LeftoversEnded(), marker))
+            with mock.patch.object(offload, "read_leftovers", side_effect=answers) as probe:
+                _ = fixture.read_host_evidence(key)
+                self.assertTrue(held.path.exists())
+                _ = fixture.read_host_evidence(key)
+            self.assertEqual(probe.call_count, len(answers))
+            self.assertIn(marker, cast(str, probe.call_args.args[2]))
+            self.assertFalse(held.path.exists())
+            self.assertEqual(assignment_for(fixture, next_run).episode, next_run.episode)
 
     def test_mac_limit_counts_grants_before_and_after_claim(self) -> None:
         for limit in (1, 2):

@@ -485,6 +485,10 @@ def start_fence_relative(identity: claim_state.ClaimIdentity, target: str, *, sc
     return state / "dispatch-fences" / scope_key / pending_start_key(identity)
 
 
+def queue_group_file(identity: claim_state.ClaimIdentity, target: str, scope_key: str) -> str:
+    return '"$HOME"/' + shlex.quote(str(start_fence_relative(identity, target, scope_key=scope_key).with_suffix(".group")))
+
+
 def clean_start_fences_command(identity: claim_state.ClaimIdentity, target: str, *, scope_key: str = "run") -> str:
     """Remove inactive fences from older claims in this exact provider scope."""
     encoded = str(start_fence_relative(identity, target, scope_key=scope_key)).encode().hex()
@@ -1115,7 +1119,9 @@ class ProcessController:
                 if (isinstance(identity, claim_state.ClaimIdentity)
                         and marker == "dispatch_start_settled=" + pending_start_key(identity)):
                     self.pending = SettledDispatchOperations()
-                    pending_start_path(self.claim_target, identity).unlink(missing_ok=True)
+                    if (isinstance(status, (ReportedMacStatus, MacNextestSetupFailed))
+                            and not isinstance(cleanup, CleanupUnconfirmed)):
+                        pending_start_path(self.claim_target, identity).unlink(missing_ok=True)
                     if not isinstance(status, ReportedMacStatus):
                         self.attempt_evidence.execution = execution_identity.ExecutionNotStarted()
                     continue
@@ -2329,9 +2335,45 @@ leftover_pids=$(select_leftovers) || exit "$?"
 printf '%s\n' "$leftover_pids" | while IFS= read -r leftover_pid; do
     [ -n "$leftover_pid" ] && kill -9 "$leftover_pid" 2>/dev/null
 done
+''' + leftover_count_script()
+
+
+def leftover_count_script() -> str:
+    """Count the processes from the selected scope."""
+    return r'''
 leftover_pids=$(select_leftovers) || exit "$?"
 leftover_count=$(printf '%s\n' "$leftover_pids" | awk 'NF { count++ } END { print count+0 }') || exit 1
 printf 'leftovers=%s\nrc=0\n' "$leftover_count"
+'''
+
+
+PROCESS_GROUP_SELECTOR = r'''
+select_group_processes() {
+    group_processes=$(ps -axo pid=,pgid=) || return 1
+    printf '%s\n' "$group_processes" | awk -v group="$group" '$2 == group { print $1 }'
+}
+'''
+
+
+def queue_leftover_selector(identity: claim_state.ClaimIdentity, target: str, scope_key: str) -> str:
+    """Select the SSH group and processes that carry its placement identity."""
+    from scripts.mac_test.mac_process_environment import placement_pids_command
+
+    placement = placement_pids_command(identity.episode, identity.attempt)
+    return PROCESS_GROUP_SELECTOR + "group_file=" + queue_group_file(identity, target, scope_key) + r'''
+select_queue_group() {
+    if [ ! -f "$group_file" ]; then return 0; fi
+    group=$(cat "$group_file") || return 1
+    case "$group" in ''|0|1|*[!0-9]*) return 1 ;; esac
+    select_group_processes
+}
+select_leftovers() {
+    group_pids=$(select_queue_group) || return 1
+    if [ -n "$group_pids" ]; then printf '%s\n' "$group_pids"; return; fi
+''' + f'    placement_pids=$({placement}) || return 1\n' + r'''
+    if [ -z "$placement_pids" ]; then rm -f "$group_file" || return 1; fi
+    printf '%s\n' "$placement_pids"
+}
 '''
 
 
@@ -2357,7 +2399,7 @@ class LeftoverObservation:
 
 def read_leftovers(config: SshConnectionSettings, host: str, script: str,
                    target: str) -> LeftoverObservation:
-    """End and count one mirror's work without exposing the check to a second signal."""
+    """Read one bounded remote process check."""
     try:
         arguments = ["ssh", *ssh_options(config), host, script]
         result = subprocess.run(

@@ -120,6 +120,10 @@ if [[ $command != ssh ]]; then
     exit 99
 fi
 remote=${!#}
+if [[ $remote == 'settlement=$('* ]]; then
+    /bin/bash -c $'pgrep() { return 1; }\nlsof() { :; }\n'"$remote"
+    exit $?
+fi
 if [[ $remote == *dispatch_start_settled=* && $remote == *"printf 'leftovers=0"* &&
       $remote != *'select_leftovers()'* ]]; then
     /bin/bash -c "$remote"
