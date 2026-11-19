@@ -226,6 +226,31 @@ def step_name(argv: list[str]) -> str:
     return cargo_subcommand(words[1:]) or "cargo"
 
 
+NEXTEST_PASS_LEVELS = frozenset({"pass", "skip", "all"})
+
+
+def nextest_status_is_trusted(argv: Sequence[str], environment: Mapping[str, str]) -> bool:
+    """Require nextest to capture test output and report passing tests."""
+    words, _, effective = command_context(list(argv), os.getcwd(), environment)
+    status_level = effective.get("NEXTEST_STATUS_LEVEL", "pass")
+    progress = effective.get("NEXTEST_SHOW_PROGRESS", "")
+    if effective.get("NEXTEST_NO_CAPTURE", "").lower() in ("1", "true"):
+        return False
+    options = iter(words)
+    for word in options:
+        if word == "--":
+            return not any(arg in ("--nocapture", "--no-capture") for arg in options) and (
+                status_level in NEXTEST_PASS_LEVELS and progress != "only")
+        name, equals, value = word.partition("=")
+        if name in ("--no-capture", "--nocapture"):
+            return False
+        if name == "--status-level":
+            status_level = value if equals else next(options, "")
+        elif name == "--show-progress":
+            progress = value if equals else next(options, "")
+    return status_level in NEXTEST_PASS_LEVELS and progress != "only"
+
+
 def toolchain(argv: list[str]) -> str | None:
     """The `+toolchain` a cargo argv names, as rustc takes it."""
     words = command_words(argv)
@@ -446,8 +471,8 @@ def sweep_freed(lines: list[str]) -> int:
     return freed
 
 
-def log_facts(step: str, text: str) -> LogFacts:
-    lines = clean_lines(text)
+def log_facts(step: str, *output: str, trust_nextest_status: bool = True) -> LogFacts:
+    lines = [line for stream in output for line in clean_lines(stream)]
     facts = no_facts()
     finished, mend_check, mend = build_seconds(lines)
     facts["finished_s"] = finished
@@ -459,8 +484,11 @@ def log_facts(step: str, text: str) -> LogFacts:
     facts["warnings"], facts["errors"] = diagnostics(lines)
     results = test_results(lines)
     rows, summaries = results.timing_rows, results.summaries
-    if step == "nextest" and results.observed["by_binary"]:
-        facts["observed_tests"] = results.observed
+    if step == "nextest":
+        if not trust_nextest_status:
+            facts["observed_tests"] = {"by_binary": {}, "complete": False}
+        elif results.observed["by_binary"]:
+            facts["observed_tests"] = results.observed
     if summaries or step == "nextest":
         facts["tests"] = rows
         facts["tests_retried"] = sum(1 for row in rows if row["attempts"] > 1)

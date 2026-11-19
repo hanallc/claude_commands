@@ -966,12 +966,19 @@ class NextestGpuClass(StrEnum):
 def nextest_gpu_class(connection: sqlite3.Connection, step_id: str,
                       proof: Mapping[tuple[str, str], NextestGpuClass]) -> NextestGpuClass:
     """Classify a step with proof keyed by nextest binary ID and test name."""
-    step = cast(tuple[object, object] | None, connection.execute(
-        "SELECT observed_tests, tests_run FROM steps WHERE id = ? AND step = 'nextest'", (step_id,),
+    step = cast(tuple[object, object, object] | None, connection.execute(
+        "SELECT observed_tests, tests_run, argv FROM steps WHERE id = ? AND step = 'nextest'", (step_id,),
     ).fetchone())
     if step is None:
         return NextestGpuClass.UNKNOWN
-    saved, ran = step
+    saved, ran, argv_json = step
+    if isinstance(argv_json, str):
+        try:
+            argv = cast(list[str], json.loads(argv_json))
+            if not parse.nextest_status_is_trusted(argv, {}):
+                return NextestGpuClass.UNKNOWN
+        except (ValueError, AttributeError, TypeError):
+            return NextestGpuClass.UNKNOWN
     if isinstance(saved, str):
         try:
             observed = cast(parse.ObservedNextestTests, json.loads(saved))

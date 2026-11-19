@@ -59,8 +59,8 @@ import math
 import os
 import sys
 import time
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast
@@ -936,6 +936,7 @@ class HanaStepContext:
     repo_identity: str
     cwd: str
     target_dir: str
+    environment: Mapping[str, str] = field(default_factory=dict[str, str])
 
 
 def placement_step_fields() -> dict[str, object]:
@@ -1022,9 +1023,12 @@ def _hana_step_row(key: hana_result.HanaAttemptKey, link: hana_result.LogicalSte
             'call_id': link.call_id, **hana_result.linked_step_fields(key, link, 'remote', final)}
 
 
-def captured_log_facts(step: str, output: bytes, source: str) -> parse.LogFacts:
+def captured_log_facts(step: str, source: str, argv: Sequence[str], environment: Mapping[str, str],
+                       *streams: bytes) -> parse.LogFacts:
     try:
-        return parse.log_facts(step, output.decode("utf-8", "replace"))
+        trust = step != "nextest" or parse.nextest_status_is_trusted(argv, environment)
+        return parse.log_facts(step, *(stream.decode("utf-8", "replace") for stream in streams),
+                               trust_nextest_status=trust)
     except Exception:  # noqa: BLE001 -- a parser failure must preserve the step result
         store.note_error(f"parse {step} {source}")
         return parse.no_facts()
@@ -1036,18 +1040,15 @@ def publish_hana_result(accepted: hana_result.AcceptedHanaResult, link: hana_res
     from scripts.aws_target import hana_result
 
     result = accepted.result
-    output = result.stdout + result.stderr
-    parse_input = output
-    if result.stdout and result.stderr and not result.stdout.endswith(b"\n"):
-        parse_input = b"\n".join((result.stdout, result.stderr))
     row = _hana_step_row(result.key, link, context, result.host, result.started_at, result.finished_at,
                          result.status, True)
     row.update({'argv': list(result.argv), 'source_key': result.source_key, 'source_commit': result.commit,
                 'sha': result.commit[:12], 'toolchain_identity': result.toolchain,
                 'duration_s': result.execution_seconds,
                 'peak_mem_bytes': result.memory.bytes if isinstance(result.memory, hana_result.MeasuredPeak) else None,
-                **captured_log_facts(context.step, parse_input, str(row['id']))})
-    return _publish_hana_step(row, output)
+                **captured_log_facts(context.step, str(row['id']), result.argv, context.environment,
+                                     result.stdout, result.stderr)})
+    return _publish_hana_step(row, result.stdout + result.stderr)
 
 
 def publish_hana_loss(key: hana_result.HanaAttemptKey, link: hana_result.LogicalStepLink,
@@ -1131,7 +1132,7 @@ def step(args: list[str]) -> None:
         log: str | None = None
         if not tty and held and os.path.isfile(held):
             data = Path(held).read_bytes()
-            facts = captured_log_facts(name, data, held)
+            facts = captured_log_facts(name, held, argv, os.environ, data)
             if status != 0:
                 log = _log_relative_path(host, start, record_id)
         output_roots = step_context.step_output_roots(argv, cwd) if name != "sweep" else CargoOutputUnavailable("sweep step")

@@ -3,6 +3,7 @@ from __future__ import annotations
 from scripts.lint.memory_test_support import write_config_fixture
 
 from contextlib import closing
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
 import json
@@ -23,7 +24,8 @@ from scripts.buildlog.test_index import use_test_log
 
 use_test_log()
 
-from scripts.aws_target import ledger, measurement, run_cost
+from scripts.aws_target import hana_result, ledger, measurement, run_cost
+from scripts.aws_target.test_hana_result import command_result
 from scripts.aws_target.ledger_test_support import numeric_settings
 from scripts.aws_target.measurement_test_support import DAY, MIDNIGHT, NOW, MeasurementFixture, narrow, read_only_evidence
 
@@ -135,6 +137,24 @@ class AwsReportTests(MeasurementFixture):
             self.assertIn('of the $7.00 daily limit', output)
             self.assertIn('**Today (UTC 2026-01-15, estimate):', output)
             self.assertNotIn('AWS measurement unavailable', output)
+
+    def test_report_classifies_a_hana_offload_with_only_a_fast_pass(self) -> None:
+        _ = write_config_fixture(self.root / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+        _ = write_config_fixture(self.root / "buildlog.conf", "INDEX_SPILL_PAGES=65536\nINDEX_TOUCH_MINUTES=60")
+        output = (b"PASS [ 0.010s] hana::bin/hana tests::fast\n"
+                  b"Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n")
+        result = replace(command_result(), argv=("cargo", "nextest", "run"), stdout=b"", stderr=output,
+                         started_at=NOW - 30, finished_at=NOW)
+        link = hana_result.LogicalStepLink("call", result.key.episode)
+        context = record.HanaStepContext("hana", "nextest", "github.com/natepiano/hana", "/fixture/hana", "")
+        self.assertTrue(record.publish_hana_result(hana_result.AcceptedHanaResult(result), link, context).added)
+        self.write_records(self.local_step("unrelated", 0, 10, repo_identity="https://github.com/example/other",
+                                          observed_tests={"by_binary": {"hana::bin/hana": ["tests::fast"]},
+                                                          "complete": True}, tests_run=1))
+        proof = self.root / "proof.csv"
+        _ = proof.write_text("binary,test,status,failure_class\nhana::bin/hana,tests::fast,pass,\n")
+        with mock.patch.dict(os.environ, {"BUILDLOG_HANA_GPU_PROOF": str(proof)}):
+            self.assertIn("Hana nextest GPU proof: 1 no-gpu, 0 gpu, 0 unknown.", self.render())
 
     def test_instrument_counts_use_targets_while_samples_use_local_hosts(self) -> None:
         self.write_records(

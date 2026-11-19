@@ -9,7 +9,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Generator, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from importlib import import_module
 import fcntl
@@ -3092,14 +3092,23 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
         return LostMacRun(elapsed_seconds(started), detail)
     execution.record_attempt_charge(lifecycle.directory, prepared, evidence.traffic.transfers,
                                     remote_started_at, time.time())
-    context = record.HanaStepContext(request.target, request.verb, repository.key, str(request.repo_root), '')
+    context = record.HanaStepContext(request.target, request.verb, repository.key, str(request.repo_root), '',
+                                     dict(request.environment))
     if isinstance(accepted, hana_result.AcceptedHanaResult):
         if hana_source_key(request) != prepared.source_key:
             reason = 'The caller source changed before result publication'
         else:
             evidence.completion = 'confirmed'
             result = accepted.result
-            _ = record.publish_hana_result(accepted, prepared.link, context)
+            try:
+                _ = record.publish_hana_result(accepted, prepared.link, context)
+            except OffloadInterrupted:
+                raise
+            except Exception as error:  # noqa: BLE001 -- recording does not determine the command status
+                message = f"Could not record the accepted Hana result: {error}"
+                store.note_error(message)
+                with suppress(OSError):
+                    print(message, file=sys.stderr)
             _ = sys.stdout.buffer.write(result.stdout)
             _ = sys.stderr.buffer.write(result.stderr)
             return PassedOnTarget(result.execution_seconds) if result.status == 0 else FailedOnTarget(result.status, result.execution_seconds)

@@ -1,7 +1,8 @@
 """Estimate AWS benefit from durable attempts and comparable local steps."""
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
+import csv
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -11,6 +12,7 @@ from statistics import median
 from typing import TYPE_CHECKING, cast
 
 from scripts.aws_target import ledger, run_cost
+from scripts.buildlog import index
 from scripts.lib import conf
 
 if TYPE_CHECKING:
@@ -22,6 +24,48 @@ else:
     from scripts.buildlog import record
     from scripts.buildlog import store
     from scripts.mac_test import offload
+
+
+HANA_REPOSITORIES = ("github.com/natepiano/hana", "https://github.com/natepiano/hana")
+
+
+def hana_nextest_gpu_lines(connection: sqlite3.Connection, bounds: tuple[str, str],
+                           proof_path: Path) -> list[str]:
+    """Summarize Hana steps with the supplied no-adapter test evidence."""
+    classes = index.NextestGpuClass
+    proof: dict[tuple[str, str], index.NextestGpuClass] = {}
+    try:
+        with proof_path.open(encoding="utf-8", newline="") as source:
+            rows = csv.DictReader(source)
+            required = {"binary", "test", "status", "failure_class"}
+            if not required.issubset(rows.fieldnames or []):
+                raise ValueError("missing test proof columns")
+            for row in rows:
+                if row["status"] == "pass":
+                    verdict = classes.NO_GPU
+                elif row["status"] == "fail" and row["failure_class"] == "no-adapter":
+                    verdict = classes.GPU
+                else:
+                    verdict = classes.UNKNOWN
+                name = (row["binary"], row["test"])
+                if not all(name):
+                    raise ValueError("missing binary or test in GPU proof")
+                proof[name] = verdict if name not in proof or proof[name] == verdict else classes.UNKNOWN
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError, csv.Error) as error:
+        return [f"Hana nextest GPU proof unavailable: {error}.", ""]
+
+    step_ids = cast(list[tuple[str]], connection.execute(
+        "SELECT id FROM steps WHERE step = 'nextest' AND repo_identity IN (?, ?) "
+        + "AND started_at >= ? AND started_at < ? AND COALESCE(is_final_result, 1) = 1",
+        (*HANA_REPOSITORIES, *bounds),
+    ).fetchall())
+    if not step_ids:
+        return []
+    counts = Counter(index.nextest_gpu_class(connection, step_id, proof) for step_id, in step_ids)
+    return [f"Hana nextest GPU proof: {counts[classes.NO_GPU]} no-gpu, "
+            + f"{counts[classes.GPU]} gpu, {counts[classes.UNKNOWN]} unknown.", ""]
 
 
 def daily_spend_source(spend: ledger.DailySpend) -> str:

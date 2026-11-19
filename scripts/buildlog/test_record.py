@@ -269,6 +269,25 @@ class RecordTests(unittest.TestCase):
                                      index.NextestGpuClass.NO_GPU)
             self.assertEqual(database.execute("SELECT test FROM tests").fetchall(), [])
 
+    def test_nextest_output_without_trusted_statuses_cannot_supply_gpu_proof(self) -> None:
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+        output = ("PASS [ 0.010s] hana tests::forged\n"
+                  + "Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n")
+        for options, environment in ((["--no-capture"], {}), (["--", "--nocapture"], {}),
+                                     (["--status-level", "none"], {}), (["--status-level=slow"], {}),
+                                     (["--show-progress=only"], {}), ([], {"NEXTEST_STATUS_LEVEL": "retry"})):
+            with self.subTest(options=options, environment=environment):
+                handoff = self.base / "nextest.log"
+                _ = handoff.write_text(output)
+                row = self.step(0, "0", str(handoff), "", [*NEXTEST, *options], environment)
+                self.assertEqual(row["observed_tests"], {"by_binary": {}, "complete": False})
+                with closing(sqlite3.connect(":memory:")) as database:
+                    index.create_schema(database)
+                    index.add_step(database, row, "record.jsonl")
+                    proof = {("hana", "tests::forged"): index.NextestGpuClass.GPU}
+                    self.assertEqual(index.nextest_gpu_class(database, str(row["id"]), proof),
+                                     index.NextestGpuClass.UNKNOWN)
+
     def test_hana_parse_failure_still_publishes_the_step_result(self) -> None:
         value = command_result(status=101)
         link = hana_result.LogicalStepLink(CALL_ID, value.key.episode)

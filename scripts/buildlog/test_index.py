@@ -833,6 +833,7 @@ class IndexTests(unittest.TestCase):
     def test_fast_passes_get_a_gpu_class_only_with_proof(self) -> None:
         config = configure_cleanup(self, self.root)
         _ = write_config_fixture(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+        _ = write_config_fixture(config / "buildlog.conf", "INDEX_SPILL_PAGES=65536\nINDEX_TOUCH_MINUTES=60")
         passed = "PASS [ 0.010s] hana tests::fast\n"
         summary = "Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n"
         partial = "Summary [ 0.020s] 2 tests run: 2 passed, 0 skipped\n"

@@ -1,6 +1,8 @@
 """Exercise Hana offload without SSH, AWS, live holds, or a local execution grant."""
 from __future__ import annotations
 
+import errno
+
 from contextlib import ExitStack, nullcontext, redirect_stdout
 from dataclasses import replace
 from io import BytesIO, StringIO
@@ -26,7 +28,7 @@ from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_client, admission_protocol as wire, admission_service, placement
 from scripts.build_queue import test_placement as queue_fixtures
 from scripts.build_targets import target_config
-from scripts.buildlog import record, treekey
+from scripts.buildlog import record, store, treekey
 from scripts.copies import copies
 from scripts.direct import runner_result
 from scripts.lib import process_start
@@ -131,6 +133,17 @@ source_allowed_environment=RUSTFLAGS
         self.assertEqual(self.output.getvalue(), b'compiler output')
         self.assertIsInstance(self.controller.pending, offload.SettledDispatchOperations)
         self.assertEqual(self.controller.attempt_evidence.cleanup, 'confirmed')
+
+    def test_buildlog_write_failure_preserves_the_accepted_exit_status(self) -> None:
+        with (self.context(),
+              mock.patch.object(record, 'publish_hana_result', side_effect=OSError(errno.ENOSPC, 'disk full')),
+              mock.patch.object(store, 'note_error') as note):
+            outcome = self.run_claimed()
+            self.assertEqual(offload.write_result(outcome, offload.NO_RESULT_FILE, target='hana'), 0)
+            note.assert_called_once()
+            self.assertIn('disk full', str(note.call_args))
+        self.assertIsInstance(self.controller.pending, offload.SettledDispatchOperations)
+        self.assertEqual(self.controller.attempt_evidence.completion, 'confirmed')
 
     def test_accepted_result_releases_the_claim_during_account_prepare(self) -> None:
         install_hana_spending_settings(self.transport.settings)
