@@ -1097,8 +1097,24 @@ def working_tree(repo: Path) -> tuple[str, set[str]]:
         return tree.stdout.strip(), dirty
 
 
-def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
-            selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> dict[str, object]:
+def create_source_bundle(repo: Path, bundle: Path, commits: Sequence[str], *, exclude: str = '') -> None:
+    """Write one bundle for the requested tips and an optional common base."""
+    refs: list[str] = []
+    try:
+        for index, commit in enumerate(dict.fromkeys(commits)):
+            suffix = f'-{index}' if index else ''
+            ref = f'refs/cloud-gates/{bundle.parent.name}{suffix}'
+            _ = gate.checked_git(repo, 'update-ref', ref, commit)
+            refs.append(ref)
+        prerequisite = ('^' + exclude,) if exclude else ()
+        _ = gate.checked_git(repo, 'bundle', 'create', str(bundle), *refs, *prerequisite)
+    finally:
+        for ref in refs:
+            _ = gate.checked_git(repo, 'update-ref', '-d', ref)
+
+
+def prepare_request(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
+                    selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> dict[str, object]:
     head = gate.checked_git(repo, 'rev-parse', 'HEAD')
     tree, dirty = working_tree(repo)
     if isinstance(selected, gate.TreeSelection) and tree != selected.tree:
@@ -1116,21 +1132,23 @@ def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
     if urlsplit(origin).password or urlsplit(origin).query or ('://' in origin and urlsplit(origin).username):
         raise GateRefused('The origin URL must contain no credential')
     folder.mkdir(parents=True, exist_ok=True)
-    source_key = ''
-    if int(gate.checked_git(repo, 'rev-list', '--count', commit, '--not', 'refs/remotes/origin/main')):
-        ref = 'refs/cloud-gates/' + folder.name
-        _ = gate.checked_git(repo, 'update-ref', ref, commit)
-        try:
-            _ = gate.checked_git(repo, 'bundle', 'create', str(folder / 'source.bundle'), ref, '--not', 'refs/remotes/origin/main')
-        finally:
-            _ = gate.checked_git(repo, 'update-ref', '-d', ref)
-        digest = sha256((folder / 'source.bundle').read_bytes()).hexdigest()
-        source_key = 'source/' + digest + '.bundle'
     request: dict[str, object] = {'attempt': folder.name, 'commit': commit, 'head': head, 'tree': tree, 'dirty_paths': sorted(dirty), 'origin': origin,
         'origin_main': origin_main, 'clone_url': settings().text('clone_url'),
-        'mode': mode.value, 'modules': [str(p.relative_to(repo)) for _, p in modules], 'source_key': source_key,
+        'mode': mode.value, 'modules': [str(p.relative_to(repo)) for _, p in modules], 'source_key': '',
         'expires': int(time.time()) + settings().whole('lifetime_minutes') * 60,
         'module_time_limit_s': min(limit, settings().number('module_time_limit_s'))}
+    return request
+
+
+def prepare(repo: Path, folder: Path, mode: gate.SuiteMode, limit: float, *,
+            selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> dict[str, object]:
+    request = prepare_request(repo, folder, mode, limit, selected=selected)
+    commit, base = (ledger.text(request, key) for key in ('commit', 'origin_main'))
+    if int(gate.checked_git(repo, 'rev-list', '--count', commit, '--not', base)):
+        bundle = folder / 'source.bundle'
+        create_source_bundle(repo, bundle, (commit,), exclude=base)
+        digest = sha256(bundle.read_bytes()).hexdigest()
+        request['source_key'] = 'source/' + digest + '.bundle'
     save(folder / 'request.json', request)
     return request
 

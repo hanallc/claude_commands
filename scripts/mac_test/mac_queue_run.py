@@ -64,13 +64,24 @@ def placement_arguments(episode: str, since: float, pid: int, worktree: Path, pa
         "--assignment-file", str(assignment_file), "--token", "none", "--", *argv]
 
 
-def remote_wrapper(work: str, on_close: str, grace_polls: int) -> str:
+def remote_wrapper(work: str, on_close: str, grace_polls: int, *, owned_close: bool = False) -> str:
     """Run the work in the SSH session's process group, and stop the work when the SSH input closes.
 
     zsh refuses job control without a terminal, so the work shares the session's group. When the
     input closes, the watcher ends every other process of the group, then runs `on_close` (work
     such as a GUI app that started outside the group).
     """
+    if owned_close:
+        # The gate hook stops the guest. Leave the hook alive until it finishes.
+        return ("work=" + shlex.quote(work) + "\non_close=" + shlex.quote(on_close) + r"""
+exec 3<&0
+{
+    read -r _ <&3
+    exec /bin/zsh -c "$on_close"
+} </dev/null >/dev/null 2>&1 &!
+/bin/zsh -c "$work" </dev/null
+printf '\nmac_exit=%s\n' $?
+""")
     return ("work=" + shlex.quote(work) + "\non_close=" + shlex.quote(on_close)
             + f"\ngrace_polls={grace_polls}" + r"""
 exec 3<&0
@@ -95,12 +106,13 @@ printf '\nmac_exit=%s\n' $code
 """)
 
 
-def remote_command(placement: MacPlacement, cwd: str, argv: list[str], on_close: str) -> list[str]:
+def remote_command(placement: MacPlacement, cwd: str, argv: list[str], on_close: str,
+                   *, owned_close: bool = False) -> list[str]:
     work = ("cd " + shlex.quote(cwd) + " && " if cwd else "")
     work += "MAC_PLACEMENT=" + shlex.quote(placement.episode + "/" + placement.attempt) + " " + shlex.join(argv)
     # Ten polls a second while the group ends.
     grace_polls = max(1, math.ceil(conf.read("mac_gate").number("terminate_grace_seconds") * 10))
-    wrapper = remote_wrapper(work, on_close, grace_polls)
+    wrapper = remote_wrapper(work, on_close, grace_polls, owned_close=owned_close)
     return ["ssh", "-o", "BatchMode=yes", placement.host, "/bin/zsh -c " + shlex.quote(wrapper)]
 
 
@@ -237,8 +249,12 @@ def clean_ended_runs(environment: dict[str, str]) -> None:
             record = directory / "run.json"
             if record.exists():
                 saved = cast(SavedRun, json.loads(record.read_text()))
-                status = run_callback(saved["lifecycle_script"], "cleanup", directory / "argv.json",
-                                      saved["arguments"], {**environment, "MAC_QUEUE_HOST": saved["host"]})
+                try:
+                    status = run_callback(saved["lifecycle_script"], "cleanup", directory / "argv.json",
+                                          saved["arguments"], {**environment, "MAC_QUEUE_HOST": saved["host"]})
+                except OSError as error:
+                    print(f"mac queue: cleanup of an ended run failed: {error}; kept {directory}", file=sys.stderr)
+                    continue
                 if status:
                     print(f"mac queue: cleanup of an ended run failed ({status}); kept {directory}", file=sys.stderr)
                     continue
@@ -257,6 +273,7 @@ class Arguments(argparse.Namespace):
     lifecycle_script: str = ""
     caller_fd: int = -1
     no_wait: bool = False
+    owned_close: bool = False
     argv: list[str] = []
 
 
@@ -317,18 +334,21 @@ def run(args: Arguments) -> int:
                 if status == 0:
                     # A run that ends before the Mac answers reports a failure, not success.
                     status = 1
-                    status = stream_remote(remote_command(placement, args.cwd, command, on_close), remote)
+                    if args.owned_close and not on_close:
+                        raise ValueError("the run needs a close hook")
+                    status = stream_remote(remote_command(placement, args.cwd, command, on_close,
+                                                          owned_close=args.owned_close), remote)
         except (OSError, ValueError) as error:
             print(f"mac queue: {error}", file=sys.stderr)
             status = 2
         finally:
             safe = remote.state != RemoteState.LIVE
-            if not safe:
+            if not safe and not args.owned_close:
                 try:
                     safe = stop_remote(placement, remote)
                 except OSError:
                     safe = False
-            if prepared and safe:
+            if prepared and (safe or args.owned_close):
                 try:
                     cleanup_status = run_callback(args.lifecycle_script, "cleanup", argv_file, original_command, callback_environment)
                 except OSError as error:
@@ -337,7 +357,10 @@ def run(args: Arguments) -> int:
                 if cleanup_status:
                     print(f"mac queue: lifecycle cleanup failed ({cleanup_status})", file=sys.stderr)
                     status = status or cleanup_status
+                    if args.owned_close and remote.state is not RemoteState.NOT_STARTED:
+                        safe = False
                 else:
+                    safe = True
                     (directory / "run.json").unlink()
             if lease_descriptor >= 0:
                 os.close(lease_descriptor)
@@ -363,29 +386,56 @@ def run(args: Arguments) -> int:
 
 
 def watch_caller(caller: int, queue: int, queue_pid: int) -> int:
-    """Stop the isolated queue group when its caller exits."""
-    ready, _, _ = select.select([caller, queue], [], [])
-    if queue not in ready:
-        with contextlib.suppress(ProcessLookupError):
-            process_group.send_process_group(queue_pid, signal.SIGTERM)
+    """Stop the isolated queue group when the caller descriptor becomes readable."""
+    watch = select.poll()
+    try:
+        watch.register(queue, select.POLLIN)
+        watch.register(caller, select.POLLIN)
+        if watch.poll(0):
+            return 2
+        print("ready", flush=True)
+        events = dict(watch.poll())
+        if queue in events:
+            return 0
+    except OSError as error:
+        print(f"mac queue: caller watch failed: {error}", file=sys.stderr)
+    with contextlib.suppress(ProcessLookupError):
+        process_group.send_process_group(queue_pid, signal.SIGTERM)
     return 0
 
 
-def start_caller_watch(caller: int) -> subprocess.Popen[bytes]:
+@contextlib.contextmanager
+def caller_watch(caller: int) -> Generator[None]:
     pid = os.getpid()
+    if os.getpgrp() != pid:
+        raise ValueError("the Mac queue must own its process group")
+    reader, writer = os.pipe()
     try:
-        if os.getpgrp() != pid:
-            raise ValueError("the Mac queue must own its process group")
-        queue = os.pidfd_open(pid)
         try:
-            return subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "watch-caller",
-                                     str(caller), str(queue), str(pid)],
-                                    pass_fds=(caller, queue), start_new_session=True,
-                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            watcher = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "watch-caller",
+                                        str(caller), str(reader), str(pid)],
+                                       pass_fds=(caller, reader), start_new_session=True,
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
         finally:
-            os.close(queue)
+            os.close(reader)
+            os.close(caller)
+        with watcher:
+            try:
+                assert watcher.stdout is not None
+                output = watcher.stdout.fileno()
+                readiness = select.poll()
+                readiness.register(output, select.POLLIN)
+                grace_ms = math.ceil(conf.read("mac_gate").number("terminate_grace_seconds") * 1000)
+                if not readiness.poll(grace_ms) or os.read(output, 6) != b"ready\n":
+                    raise ValueError("the Mac queue caller watch did not start")
+                yield
+            finally:
+                os.close(writer)
+                writer = -1
+                stop_command(watcher)
     finally:
-        os.close(caller)
+        if writer >= 0:
+            os.close(writer)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -400,6 +450,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = parser.add_argument("--cwd", default="")
     _ = parser.add_argument("--lifecycle-script", default="")
     _ = parser.add_argument("--caller-fd", type=int, help=argparse.SUPPRESS)
+    _ = parser.add_argument("--owned-close", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--no-wait", action="store_true", help="exit with status 78 when the Mac is busy")
     _ = parser.add_argument("argv", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv, namespace=Arguments())
@@ -407,11 +458,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("an argv is required")
     if args.caller_fd < 0:
         return run(args)
-    watcher = start_caller_watch(args.caller_fd)
     try:
-        return run(args)
-    finally:
-        stop_command(watcher)
+        with caller_watch(args.caller_fd):
+            return run(args)
+    except (OSError, ValueError) as error:
+        print(f"mac queue: {error}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

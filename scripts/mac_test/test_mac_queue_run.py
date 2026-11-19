@@ -17,7 +17,6 @@ import unittest
 
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.process_group import send_process_group
-from scripts.lib.process_start import Started, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import mac_queue_run
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
@@ -108,19 +107,20 @@ def signal_handlers(root: Path, names: tuple[str, ...]) -> list[str]:
     return findings
 
 
-class QueueRunTests(unittest.TestCase):
-    def fixture(self, root: Path) -> dict[str, str]:
-        queue = root / "queue.py"
-        _ = queue.write_text(QUEUE)
-        ssh = root / "ssh"
-        _ = ssh.write_text(f"#!{sys.executable}\n" + SSH)
-        ssh.chmod(0o755)
-        environment = {**os.environ, **config_environment(root / "config"), "FAKE_QUEUE_STATE": str(root),
-                       "PATH": str(root) + os.pathsep + os.environ["PATH"], "HOME": str(root)}
-        _ = write_config_fixture(root / "config/mac_gate.conf", "admission_client_command="
-                                 + shlex.join([sys.executable, str(queue)]) + "\n")
-        return environment
+def queue_fixture(root: Path, ssh_source: str = SSH) -> dict[str, str]:
+    queue = root / "queue.py"
+    _ = queue.write_text(QUEUE)
+    ssh = root / "ssh"
+    _ = ssh.write_text(f"#!{sys.executable}\n" + ssh_source)
+    ssh.chmod(0o755)
+    environment = {**os.environ, **config_environment(root / "config"), "FAKE_QUEUE_STATE": str(root),
+                   "PATH": str(root) + os.pathsep + os.environ["PATH"], "HOME": str(root)}
+    _ = write_config_fixture(root / "config/mac_gate.conf", "admission_client_command="
+                             + shlex.join([sys.executable, str(queue)]) + "\n")
+    return environment
 
+
+class QueueRunTests(unittest.TestCase):
     def command(self, root: Path, kind: str = "shot") -> list[str]:
         return [sys.executable, "-m", "scripts.mac_test.mac_queue_run", "--what", "camera shot", "--kind", kind,
                 "--package", "hana", "--worktree", str(root), "--cwd", "/Mac scratch/checkout", "--",
@@ -138,7 +138,7 @@ class QueueRunTests(unittest.TestCase):
                     self.check_returned_placement(Path(temporary), kind, status, queue_refuses, return_fails)
 
     def check_returned_placement(self, root: Path, kind: str, status: int, queue_refuses: bool, return_fails: bool) -> None:
-        environment = {**self.fixture(root), "FAKE_MAC_STATUS": str(status),
+        environment = {**queue_fixture(root), "FAKE_MAC_STATUS": str(status),
                        "FAKE_QUEUE_REFUSE": "1" if queue_refuses else "0", "FAKE_RETURN_FAIL": "1" if return_fails else "0"}
         result = subprocess.run(self.command(root, kind), capture_output=True, text=True, env=environment,
                                 timeout=TEST_HANG_GUARD_SECS)
@@ -173,7 +173,7 @@ class QueueRunTests(unittest.TestCase):
     def test_no_wait_returns_the_busy_status_after_one_queue_call(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            environment = {**self.fixture(root), "FAKE_QUEUE_BUSY": "1"}
+            environment = {**queue_fixture(root), "FAKE_QUEUE_BUSY": "1"}
             command = self.command(root, "run")
             command.insert(command.index("--"), "--no-wait")
             result = subprocess.run(command, capture_output=True, text=True, env=environment,
@@ -182,32 +182,39 @@ class QueueRunTests(unittest.TestCase):
             self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
             self.assertFalse((root / "remote").exists())
 
-    def test_caller_term_stops_the_isolated_queue_and_ssh(self) -> None:
-        launch = """
-import os, subprocess, sys
-caller = os.pidfd_open(os.getpid())
-words = sys.argv[1:]
-words[3:3] = ['--caller-fd', str(caller)]
-child = subprocess.Popen(words, pass_fds=(caller,), start_new_session=True)
-raise SystemExit(child.wait())
-"""
+    def test_caller_watch_must_be_ready_before_placement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            environment = {**self.fixture(root), "FAKE_SSH_HOLD": "1"}
-            with subprocess.Popen([sys.executable, "-c", launch, *self.command(root)],
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                  env=environment) as caller:
-                running = root / "running"
-                wait_until(lambda: running.exists() and bool(running.read_text()), root, processes=(caller,))
-                ssh_pid = int(running.read_text())
-                try:
-                    caller.send_signal(signal.SIGTERM)
-                    output, errors = caller.communicate(timeout=TEST_HANG_GUARD_SECS)
-                    self.assertEqual(caller.returncode, -signal.SIGTERM, output + errors)
-                    wait_until(lambda: not isinstance(process_start(ssh_pid), Started), root)
-                finally:
-                    if isinstance(process_start(ssh_pid), Started):
-                        os.kill(ssh_pid, signal.SIGKILL)
+            environment = queue_fixture(root)
+            reader, writer = os.pipe()
+            os.close(writer)
+            try:
+                command = self.command(root)
+                command[3:3] = ["--caller-fd", str(reader)]
+                result = subprocess.run(command, env=environment, start_new_session=True, pass_fds=(reader,),
+                                        capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            finally:
+                os.close(reader)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("caller watch did not start", result.stderr)
+            self.assertFalse((root / "events").exists())
+
+    def test_stale_callback_does_not_stop_the_next_placement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = queue_fixture(root)
+            stale = root / mac_queue_run.RUNS / "stale"
+            stale.mkdir(parents=True)
+            (stale / "lock").touch()
+            saved = stale / "run.json"
+            _ = saved.write_text(json.dumps({"lifecycle_script": str(root / "gone"),
+                                            "arguments": [], "host": "fake-mac"}))
+            result = subprocess.run(self.command(root, "run"), env=environment, capture_output=True,
+                                    text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("cleanup of an ended run failed", result.stderr)
+            self.assertTrue(saved.exists())
+            self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
 
     def test_failed_cleanup_leaves_the_record_for_the_next_run(self) -> None:
         lifecycle = """
@@ -223,7 +230,7 @@ else:
 """
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            environment = self.fixture(root)
+            environment = queue_fixture(root)
             callback = root / "lifecycle"
             _ = callback.write_text(f"#!{sys.executable}\n" + lifecycle)
             callback.chmod(0o755)
@@ -245,7 +252,7 @@ else:
                                 (False, signal.SIGINT)):
             with self.subTest(waiting=waiting, signum=signum), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
-                environment = {**self.fixture(root), "FAKE_QUEUE_WAIT": "1" if waiting else "0", "FAKE_SSH_HOLD": "1"}
+                environment = {**queue_fixture(root), "FAKE_QUEUE_WAIT": "1" if waiting else "0", "FAKE_SSH_HOLD": "1"}
                 with subprocess.Popen(self.command(root), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                       text=True, env=environment, start_new_session=True) as process:
                     try:
