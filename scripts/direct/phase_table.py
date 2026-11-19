@@ -381,16 +381,6 @@ class RemovedPlan(NoPlan):
         self.plan_path: Path = plan_path
 
 
-def _json_object(text: str) -> dict[str, object] | None:
-    try:
-        parsed: object = json.loads(text)  # pyright: ignore[reportAny]
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(parsed, dict):
-        return None
-    return cast(dict[str, object], parsed)
-
-
 def _object_dict(value: object) -> dict[str, object] | None:
     if not isinstance(value, dict):
         return None
@@ -404,13 +394,11 @@ def _text(value: object, default: str = "") -> str:
 def _state(session_dir: Path) -> dict[str, object]:
     state_path = session_dir / plan_history.STATE_FILENAME
     try:
-        text = state_path.read_text(encoding="utf-8")
+        return recorder_state.read_state(state_path)
     except (OSError, UnicodeError) as error:
         raise NoState(f"No progress state in {session_dir}") from error
-    state = _json_object(text)
-    if state is None:
-        raise NoState(f"Invalid progress state in {session_dir}")
-    return state
+    except ValueError as error:
+        raise NoState(f"Invalid progress state in {session_dir}") from error
 
 
 def _epoch(value: object) -> float | None:
@@ -1954,7 +1942,7 @@ def main() -> int:
             return 0
         zone = ZoneInfo(zone_name) if zone_name else user_zone()
         output = show(session_dir.expanduser().resolve(), zone, json_value is True)
-    except (NoState, NoPlan, Refusal, ZoneInfoNotFoundError) as error:
+    except (NoState, NoPlan, Refusal, ZoneInfoNotFoundError, recorder_state.OldRecorderState) as error:
         print(str(error), file=sys.stderr)
         return 1
     print(output)

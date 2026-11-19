@@ -73,8 +73,7 @@ def _text(value: dict[str, object], key: str) -> str:
 def phase_work(run_directory: str | Path, phase_id: str) -> PhaseWork:
     directory = Path(run_directory).expanduser().resolve()
     try:
-        state = _object(cast(object, json.loads(
-            (directory / recorder_state.STATE_FILENAME).read_text(encoding="utf-8"))))
+        state = recorder_state.read_state(directory / recorder_state.STATE_FILENAME)
         matches = [phase for phase in recorder_state.open_phases(state) if phase.get("id") == phase_id]
         if not phase_id or len(matches) != 1:
             raise ValueError(f"phase {phase_id} does not resolve to one open phase")
@@ -167,6 +166,9 @@ def main(arguments: list[str]) -> int:
                     or destination.read_text(encoding="utf-8").partition("\n")[2] != text):
                 raise ValueError(f"brief already exists with different or incomplete content: {destination}")
         print(destination)
+    except recorder_state.OldRecorderState as error:
+        print(error, file=sys.stderr)
+        return 1
     except (OSError, UnicodeError, ValueError) as error:
         print(f"astra_work: {str(error).replace(chr(10), ' ')}", file=sys.stderr)
         return 2

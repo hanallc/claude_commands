@@ -21,7 +21,7 @@ import time
 import uuid
 from collections import defaultdict
 from collections.abc import Callable, Collection, Generator, Iterable, Mapping
-from contextlib import contextmanager, redirect_stderr
+from contextlib import contextmanager, redirect_stderr, suppress
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -402,7 +402,7 @@ def set_unit(session_dir: Path, production: str, unit: str) -> None:
     if any(not value or value in (".", "..") or "/" in value or "\\" in value
            for value in (production, unit)):
         raise ValueError("invalid production or unit identity")
-    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+    with _recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
         worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_EX)
         state = _read_state(session_dir)
         _set_owner(state, production, unit)
@@ -440,6 +440,19 @@ def _state_path(session_dir: Path) -> Path:
     return session_dir / plan_history.STATE_FILENAME
 
 
+def _refuse_old_state(session_dir: Path) -> None:
+    """Check the old-shape marker without changing other read errors."""
+    with suppress(OSError, ValueError):
+        _ = recorder_state.read_state(_state_path(session_dir))
+
+
+def _recorder_lock_path(session_dir: Path) -> Path:
+    path = session_dir / ".progress_history.lock"
+    if not path.exists():
+        _refuse_old_state(session_dir)
+    return path
+
+
 def _stored_fields(fields: dict[str, object]) -> dict[str, object]:
     """Keep plan paths relative to the recorded folder."""
     stored = dict(fields)
@@ -455,11 +468,11 @@ def _read_state(session_dir: Path, *, record: staff.StaffSnapshot | None = None,
                 resolve_staff: bool = True, pass_agents: bool = True) -> dict[str, object]:
     path = _state_path(session_dir)
     try:
-        state = _json_object(path.read_text(encoding="utf-8"))
+        state = recorder_state.read_state(path)
     except OSError as error:
         raise SystemExit(f"Unable to read progress state {path}: {error}") from error
-    if state is None:
-        raise SystemExit(f"Invalid progress state: {path}")
+    except ValueError as error:
+        raise SystemExit(f"Invalid progress state: {path}") from error
     if not resolve_staff:
         return state
     return plan_history.staff_directory(state, staff.initial_snapshot() if record is None else record,
@@ -1041,6 +1054,7 @@ def active_dispatch(worker_id: staff.StaffId, run: Path) -> ActiveDispatch | NoA
         owner = unit_runs.run_owner(state, record)
         if not isinstance(owner, staff.StaffRow) or row.parent != staff.ReportsTo(owner.id):
             return NoActiveDispatch()
+        recorder_state.require_current_shape(_state_path(run), state)
         matches = [item for item in _open_passes(state).values() if item.get("worker_id") == worker_id]
         if not matches:
             return NoActiveDispatch()
@@ -1054,6 +1068,8 @@ def active_dispatch(worker_id: staff.StaffId, run: Path) -> ActiveDispatch | NoA
         return ActiveDispatch(instance, tuple(_worker_launcher(cast(list[str], command), row.name)))
     except FileNotFoundError:
         return NoActiveDispatch()
+    except recorder_state.OldRecorderState as error:
+        return ActiveDispatchUnavailable(str(error))
     except (OSError, ValueError, worker_lifecycle.WorkerStateUnreadable) as error:
         return ActiveDispatchUnavailable(f"worker {worker_id}: {error}")
 
@@ -1176,6 +1192,7 @@ def last_dispatch(worker_id: staff.StaffId) -> RecordedDispatch | NoDispatchReco
             continue
         if owner != parent:
             continue
+        recorder_state.require_current_shape(path, state)
         if path not in reads.events:
             reads.events[path] = _run_events(state, record=membership)
         passes = [*_pass_slots(state).values(), *(
@@ -2118,7 +2135,7 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
         new_pass_instance_id=new_pass_instance_id,
     )
     session_dir.mkdir(parents=True, exist_ok=True)
-    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+    with _recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             instance_id = _start_pass(args)
@@ -2140,7 +2157,7 @@ def fail_launch_pass(session_dir: Path, instance_id: uuid.UUID) -> str | None:
 
 
 def _complete_dispatch(session_dir: Path, instance_id: str, status: str, *, slot: str | None = None) -> str | None:
-    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+    with _recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         state = _read_state(session_dir)
         for name, passed in _open_passes(state).items():
@@ -2182,7 +2199,7 @@ class DispatchDelivery:
 
 def _update_dispatch(session_dir: Path, instance_id: str, key: str, value: object, *,
                      stopped_notice: bool = False) -> None:
-    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+    with _recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = _read_state(session_dir)
         changed = False
@@ -2291,6 +2308,7 @@ def stopped_pass_receipts(run: Path, worker_id: staff.StaffId) -> Generator[Stop
     except worker_lifecycle.WorkerStateUnreadable as error:
         unit_runs.report_anomaly(" ".join(f"anomaly: stopped pass receipts: {error}".splitlines()))
         return
+    recorder_state.require_current_shape(_state_path(run), state)
     notices = _object_dict(state.get("stopped_pass_notices")) or {}
     for instance_id, value in notices.items():
         fields = _object_dict(value) or {}
@@ -2332,7 +2350,7 @@ class StopDispatchRefused(Enum):
 def stop_dispatch(run: Path, slot: str, instance_id: str, worker: staff.StaffRow,
                   director: staff.StaffId, *, run_id: str, reason: str) -> StoppedPassNotice | StopDispatchRefused:
     """Commit the stopped outcome, pass status, and notice in one state write."""
-    with (run / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+    with _recorder_lock_path(run).open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = _read_state(run)
         passed = _open_passes(state).get(slot)
@@ -2374,7 +2392,7 @@ def mark_pass_refused(session_dir: Path, worker_name: str) -> None:
     """Mark the open pass without closing it or changing its dispatch id."""
     if not _state_path(session_dir).is_file():
         return
-    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+    with _recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         record = staff.initial_snapshot()
         state = _read_state(session_dir, record=record)
@@ -2392,7 +2410,7 @@ def cancel_worker_passes(session_dir: Path, worker_id: staff.StaffId) -> int:
     """End each open pass of a stopped worker as canceled. Return the number of passes ended."""
     if not _state_path(session_dir).is_file():
         return 0
-    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+    with _recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         state = _read_state(session_dir)
         slots = [slot for slot, passed in _open_passes(state).items() if passed.get("worker_id") == worker_id]
@@ -6206,15 +6224,23 @@ def _external_wait_lock() -> Generator[None, None, None]:
 def _start_external_wait(args: argparse.Namespace) -> None:
     if os.environ.get(PROBE_ENV) == "1":
         return
-    with _external_wait_lock():
-        _record_external_wait(args)
-
-
-def _record_external_wait(args: argparse.Namespace) -> None:
     commit = _arg_string(args, "commit")
     attribution = (ProductionHandoff(_arg_string(args, "production"), commit)
                    if _arg_string(args, "command") == "start-handoff-wait" else
                    resolve_checkpoint(commit, Path(_arg_string(args, "working_dir")), _arg_string(args, "phase_id")))
+    if isinstance(attribution, ResolvedCheckpointPhase):
+        _check_external_wait_run(attribution.identity)
+    with _external_wait_lock():
+        _record_external_wait(args, attribution, commit)
+
+
+def _check_external_wait_run(fields: dict[str, object]) -> None:
+    if directory := _string(fields.get("session_dir")):
+        _refuse_old_state(Path(directory))
+
+
+def _record_external_wait(args: argparse.Namespace, attribution: ResolvedCheckpointPhase |
+                          ProductionHandoff | UnresolvedWaitAttribution, commit: str) -> None:
     now = plan_history.now_epoch()
     owner = (_arg_string(args, "owner_session") or os.environ.get("CLAUDE_CODE_SESSION_ID")
              or os.environ.get("CODEX_THREAD_ID", ""))
@@ -6241,6 +6267,8 @@ def _record_external_wait(args: argparse.Namespace) -> None:
                      wait_record_state={"state": "NotRecorded", "reason": attribution.reason},
                      wait_attribution={"state": "UnresolvedAttribution", "reason": attribution.reason,
                                        "candidates": list(attribution.candidates)})
+    if isinstance(attribution, ResolvedCheckpointPhase):
+        _check_external_wait_run(attribution.identity)
     _append_event({"history_file": str(_external_wait_file())}, event)
     print(event["wait_id"])
 
@@ -6249,14 +6277,19 @@ def _finish_external_wait(args: argparse.Namespace) -> None:
     if os.environ.get(PROBE_ENV) == "1":
         return
     path = _external_wait_file()
+    wait_id = _arg_string(args, "wait_id")
+    wait = _waits_by_id(_external_wait_events()).get(wait_id)
+    if wait is not None and wait.get("event_type") == "wait_started":
+        _check_external_wait_run(wait)
     with _external_wait_lock():
-        wait = _waits_by_id(_external_wait_events()).get(_arg_string(args, "wait_id"))
+        wait = _waits_by_id(_external_wait_events()).get(wait_id)
         if wait is None:
             raise SystemExit("External wait was not recorded")
         if wait.get("event_type") == "wait_started":
             now = plan_history.now_epoch()
             if now < _number(wait.get("wait_started_epoch")):
                 raise SystemExit("Cannot finish a wait before its start")
+            _check_external_wait_run(wait)
             _end_wait({"history_file": str(path)}, wait, now, unclosed=False)
 
 
@@ -6523,7 +6556,7 @@ def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) 
         kind = "WaitingForSupplier"
     else:
         return False
-    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+    with _recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         state = _read_state(session_dir)
         supplier = _turn_supplier(state, reason) if kind == "WaitingForSupplier" else _showrunner_supplier(state)
@@ -6571,7 +6604,7 @@ def finish_turn_wait(session_dir: Path, owner_session: str, *, source: str, prom
     """Finish only for typed input or a message from the recorded supplier."""
     if os.environ.get(PROBE_ENV) == "1" or not (session_dir / "turn_wait.json").exists():
         return
-    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+    with _recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         marker_path = session_dir / "turn_wait.json"
         try:
@@ -6899,18 +6932,19 @@ def _paused_seconds(waits: Iterable[dict[str, object]], instance_id: str,
 
 
 def _finish_phase(args: argparse.Namespace) -> InterruptedWorkerPasses:
-    # The run lock is already held. External starts use this same history lock,
-    # through the cleanup scan and publication of phase_finished.
+    session_dir = _session_dir(args)
+    state = _read_state(session_dir)
+    # The run lock is held. Keep the wait lock through the scan and finish event.
     with _external_wait_lock():
-        return _finish_phase_with_wait_lock(args)
+        return _finish_phase_with_wait_lock(args, session_dir, state)
 
 
-def _finish_phase_with_wait_lock(args: argparse.Namespace) -> InterruptedWorkerPasses:
+def _finish_phase_with_wait_lock(
+    args: argparse.Namespace, session_dir: Path, state: dict[str, object],
+) -> InterruptedWorkerPasses:
     """Close only the selected phase and its work."""
     from scripts.direct import phase_reservation
 
-    session_dir = _session_dir(args)
-    state = _read_state(session_dir)
     phase = _selected_phase(state, args)
     if phase is None:
         return InterruptedWorkerPasses()
@@ -7503,8 +7537,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
-    args = _build_parser().parse_args()
+def _run_recorder_command(args: argparse.Namespace) -> None:
     handler_value: object = getattr(args, "handler")  # pyright: ignore[reportAny]
     if not callable(handler_value):
         raise SystemExit("No command handler selected")
@@ -7521,7 +7554,7 @@ def main() -> None:
     session_dir.mkdir(parents=True, exist_ok=True)
     result: object = None
     try:
-        with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        with _recorder_lock_path(session_dir).open("a+", encoding="utf-8") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             try:
                 result = handler(args)
@@ -7531,6 +7564,13 @@ def main() -> None:
         passes: object = getattr(args, "interrupted_worker_passes", result)
         if isinstance(passes, InterruptedWorkerPasses):
             _close_interrupted_workers(passes)
+
+
+def main() -> None:
+    try:
+        _run_recorder_command(_build_parser().parse_args())
+    except recorder_state.OldRecorderState as error:
+        raise SystemExit(str(error)) from error
 
 
 if __name__ == "__main__":

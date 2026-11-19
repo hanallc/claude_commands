@@ -94,7 +94,9 @@ def text(value: object) -> str:
 
 
 def read_object(path: Path) -> dict[str, object]:
-    return worker_lifecycle.read_worker_state(path)
+    state = worker_lifecycle.read_worker_state(path)
+    recorder_state.require_current_shape(path, state)
+    return state
 
 
 
@@ -817,4 +819,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except recorder_state.OldRecorderState as error:
+        raise SystemExit(str(error)) from error

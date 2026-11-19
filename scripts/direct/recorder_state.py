@@ -9,6 +9,32 @@ STATE_FILENAME = "progress_history_state.json"
 OPEN_PHASES_KEY = "open_phases"
 
 
+class OldRecorderState(RuntimeError):
+    """The recorder state requires conversion before use."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(
+            f"Recorder state {path} has the old shape. Run the conversion: "
+            + "/tmp/claude/unit/bd19678b-c7b1-4e24-be9e-133ecfe24c7a/phases/parallelphases/deploy/run_conversion.sh"
+        )
+
+
+def require_current_shape(path: Path, state: dict[str, object]) -> None:
+    """Check the shape before interpreting the recorder state."""
+    if "phase_last_percent" in state:
+        raise OldRecorderState(path)
+
+
+def read_state(path: Path) -> dict[str, object]:
+    """Read the current shape of the recorder state."""
+    value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    if not isinstance(value, dict):
+        raise ValueError(f"Invalid progress state: {path}")
+    state = cast(dict[str, object], value)
+    require_current_shape(path, state)
+    return state
+
+
 def open_phases(state: dict[str, object]) -> list[dict[str, object]]:
     """Return the open phases in start order."""
     raw = state.get(OPEN_PHASES_KEY)
@@ -38,14 +64,12 @@ def read_open_phases(session_dir: Path) -> list[dict[str, object]]:
     """Read atomically published recorder state. A missing file has no open phases."""
     path = session_dir / STATE_FILENAME
     try:
-        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+        state = read_state(path)
     except FileNotFoundError:
         return []
-    except (OSError, ValueError) as error:
+    except (OSError, json.JSONDecodeError, UnicodeError) as error:
         raise ValueError(f"Unable to read progress state {path}: {error}") from error
-    if not isinstance(value, dict):
-        raise ValueError(f"Invalid progress state: {path}")
-    return open_phases(cast(dict[str, object], value))
+    return open_phases(state)
 
 
 def read_open_phase_ids(session_dir: Path) -> list[str]:

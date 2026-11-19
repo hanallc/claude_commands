@@ -234,12 +234,9 @@ def _write_state(session_dir: Path, state: dict[str, object]) -> None:
 
 
 def _progress_state(session_dir: Path) -> dict[str, object] | None:
-    path = session_dir / PROGRESS_STATE_FILENAME
-    if not path.exists():
-        return None
     try:
-        return _json_object(path.read_text(encoding="utf-8"))
-    except OSError:
+        return recorder_state.read_state(session_dir / PROGRESS_STATE_FILENAME)
+    except (OSError, ValueError):
         return None
 
 
@@ -296,13 +293,7 @@ def _phase_identity(
 
 
 def _history_file(session_dir: Path) -> Path | None:
-    path = session_dir / PROGRESS_STATE_FILENAME
-    if not path.exists():
-        return None
-    try:
-        progress = _json_object(path.read_text(encoding="utf-8"))
-    except OSError:
-        return None
+    progress = _progress_state(session_dir)
     if progress is None:
         return None
     value = _string(progress.get("history_file"))
@@ -1428,12 +1419,18 @@ def main() -> None:
     handler = cast(Callable[[argparse.Namespace], None], handler_value)
     session_dir = _session_dir(args)
     session_dir.mkdir(parents=True, exist_ok=True)
-    with (session_dir / ".findings.lock").open("a+", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            handler(args)
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    lock_path = session_dir / ".findings.lock"
+    try:
+        if not lock_path.exists():
+            _ = _progress_state(session_dir)
+        with lock_path.open("a+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                handler(args)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    except recorder_state.OldRecorderState as error:
+        raise SystemExit(str(error)) from error
 
 
 if __name__ == "__main__":

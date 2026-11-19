@@ -8,7 +8,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Callable, Generator, Iterable
-from contextlib import ExitStack, redirect_stderr
+from contextlib import ExitStack, redirect_stderr, suppress
 from dataclasses import dataclass, replace
 from enum import Enum, IntEnum
 from importlib import import_module
@@ -826,6 +826,8 @@ def finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: str
     diagnostics = io.StringIO()
     result: DispatchSubmission | ExitCode = ExitCode.UNCERTAIN
     try:
+        with suppress(OSError, ValueError):
+            _ = recorder_state.read_state(run / recorder_state.STATE_FILENAME)
         with redirect_stderr(diagnostics):
             record = staff.snapshot()
             row = record.by_id(identity)
@@ -854,6 +856,9 @@ def finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: str
             _ = _dispatch_failure_step(identity, "notice", lambda: _dispatch_notice(
                 parent, identity, run, instance, passed, "uncertain", detail))
             return result
+    except recorder_state.OldRecorderState as error:
+        print(str(error), file=sys.stderr)
+        return ExitCode.UNCERTAIN
     except (Exception, SystemExit) as error:
         result = ExitCode.UNCERTAIN
         detail = diagnostics.getvalue().strip()
@@ -1403,6 +1408,7 @@ def _finished_worker_results(holder: staff.StaffRow, record: staff.StaffSnapshot
             continue
         if unit_runs.run_owner(state, record) != holder:
             continue
+        recorder_state.require_current_shape(run / unit_runs.STATE_FILE, state)
         open_instances = {str(phase["id"]): str(phase.get("instance_id", ""))
                           for phase in recorder_state.open_phases(state) if isinstance(phase.get("id"), str)}
         if not open_instances:
@@ -1543,8 +1549,11 @@ def _recorded_worker_dispatches(record: staff.StaffSnapshot, *,
         run_ids[run] = state.get("run_id")
         owner = unit_runs.run_owner(state, record)
         parent_id = owner.id if isinstance(owner, staff.StaffRow) else StaffId("")
+        if parent_id not in parents:
+            continue
+        recorder_state.require_current_shape(path, state)
         history = state.get("history_file")
-        if isinstance(history, str) and history and parent_id in parents:
+        if isinstance(history, str) and history:
             histories.setdefault(Path(history).resolve(), {})[run] = {str(row.id).encode(): row
                 for row in workers if row.parent == staff.ReportsTo(parent_id)}
         entries = _pass_records(state)
@@ -1855,6 +1864,9 @@ def main(arguments: list[str] | None = None) -> int:
         elif code == ExitCode.OK:
             print("done")
         return code
+    except recorder_state.OldRecorderState as error:
+        print(str(error), file=sys.stderr)
+        return ExitCode.UNCERTAIN
     except (staff.StaffUnreadable, staff.StaffRefused, herdr_types.HerdrFailure, OSError, ValueError) as error:
         print(f"anomaly: {' '.join(str(error).splitlines())}", file=sys.stderr)
         return ExitCode.UNCERTAIN

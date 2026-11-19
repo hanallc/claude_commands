@@ -619,8 +619,14 @@ def worker_run_directories(record: staff.StaffSnapshot) -> unit_runs.LauncherRun
                                   (*(Path(directory) for directory in held), *recorded, fallback))
         runs, first, shared = parents[parent.id]
         dispatched = linked[row.id].directory if row.id in linked else None
-        selected = (_worker_run_in(row, runs, dispatched, first, record=record, read=read) if parent is not row
-                    else worker_run(row, record=record, scanned=scanned))
+        try:
+            selected = (_worker_run_in(row, runs, dispatched, first, record=record, read=read) if parent is not row
+                        else worker_run(row, record=record, scanned=scanned))
+        except recorder_state.OldRecorderState as error:
+            print(error, file=sys.stderr)
+            # Detached records prove their worker by staff id.
+            selected = first
+            shared = (*shared, *runs, *((dispatched,) if dispatched is not None else ()))
         found[row.id] = tuple(dict.fromkeys((selected, *shared)))
     return unit_runs.LauncherRunDirectories(found, scanned)
 
@@ -669,7 +675,10 @@ def _worker_run_in(member: staff.StaffRow, runs: Sequence[Path], linked: Path | 
 
 
 def _run_state(run: Path) -> dict[str, object]:
-    return worker_lifecycle.read_json_object(run / recorder_state.STATE_FILENAME)
+    path = run / recorder_state.STATE_FILENAME
+    state = worker_lifecycle.read_json_object(path)
+    recorder_state.require_current_shape(path, state)
+    return state
 
 
 def _passes(state: dict[str, object]) -> list[dict[str, object]]:
@@ -1675,6 +1684,9 @@ def main(arguments: list[str] | None = None) -> int:
             return ExitCode.REFUSED
         account = DestinationWorkerAccount(args.account) if args.account else ConfiguredWorkerAccount.CURRENT
         return _result(start_or_resume(owner.id, name, cast(WorkerRole, args.role), account=account))
+    except recorder_state.OldRecorderState as error:
+        print(error, file=sys.stderr)
+        return ExitCode.UNCERTAIN
     except (staff.StaffUnreadable, staff.StaffRefused, OSError, ValueError, herdr_types.HerdrFailure) as error:
         print(f"anomaly: {error}; correct the evidence and retry", file=sys.stderr)
         return ExitCode.UNCERTAIN

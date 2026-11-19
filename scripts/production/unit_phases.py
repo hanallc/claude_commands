@@ -1806,6 +1806,9 @@ def main(arguments: list[str], columns: int | None = None) -> int:
                         from scripts.production import style_units
                         sections.append(style_units.table(ticket_units, records, doc=doc, ledger_paths=paths))
                     output = "\n\n".join(sections)
+        except recorder_state.OldRecorderState as error:
+            print(str(error), file=sys.stderr)
+            return 1
         except (OSError, ValueError, Refusal) as error:
             print(f"unit_phases: {error}", file=sys.stderr)
             return 1

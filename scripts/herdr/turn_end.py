@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, cast
 
 from scripts.agents import shutdown_record, worker_lifecycle
-from scripts.direct import progress_history
+from scripts.direct import progress_history, recorder_state
 from scripts.herdr import herdr_types
 from scripts.lib import atomic_file, scratch, unit_runs
 from scripts.herdr import herdr, worker_panes
@@ -630,9 +630,13 @@ def _ignored(event: WorkerEvent, reason: str, worker_name: str = "unknown") -> T
 
 def handle(event: WorkerEvent) -> TurnOutcome:
     """Send the decided notice after the worker lock is released."""
-    decision = _handle_locked(event)
-    if isinstance(decision, TurnDecision):
-        return decision.send_notice() or decision.outcome
+    try:
+        decision = _handle_locked(event)
+        if isinstance(decision, TurnDecision):
+            return decision.send_notice() or decision.outcome
+    except recorder_state.OldRecorderState as error:
+        print(error, file=sys.stderr)
+        return TurnOutcome.UNCERTAIN
     return decision
 
 
