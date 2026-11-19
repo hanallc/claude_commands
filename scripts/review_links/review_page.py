@@ -966,11 +966,12 @@ function readIndex(payload){
 function allEntries(){return [...index.values()];}
 const escapeText=value=>String(value).replace(/[&<>"']/g,letter=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[letter]));
 const colored=(name,markup)=>markup || escapeText(name);
+const entrySortValues=entry=>[entry.id,entry.type,entry.ownerName,entry.title,entry.state,entry.filed];
 function summary(entry){
  const node=document.createElement('tbody'),panel='review-detail-'+encodeURIComponent(entry.key);
  Object.assign(node.dataset,{listItem:'',key:entry.key,number:entry.id.toLowerCase(),title:entry.title.toLowerCase(),
   owner:entry.owner,sourceOwner:entry.sourceOwner,sourceName:entry.sourceName,state:entry.state,type:entry.type,
-  order:entry.order,updated:entry.updated,parked:'false'});
+  order:entry.order,updated:entry.updated,parked:'false',sortValues:JSON.stringify(entrySortValues(entry))});
  const limit=Number(content.dataset.titleLimit),first=entry.title.split(/\r?\n/)[0],short=first.slice(0,limit);
  const age=Math.max(0,Math.floor(Date.now()/1000-entry.filed));
  const stamp=age>=86400 ? Math.floor(age/86400)+' d' : age>=3600 ? Math.floor(age/3600)+' h' : Math.floor(age/60)+' min';
@@ -1031,10 +1032,7 @@ const view=createRecordTable({content:()=>content,single:true,
   if(!entry || pendingSaves.get(key)?.departing) return false;
   return (!departure || entry.handoff) && matches(entry,filters);
  },
- sortValues:data=>{
-  const entry=index.get(data.key);
-  return [entry.id,entry.type,entry.ownerName,entry.title,entry.state,entry.filed];
- },
+ sortValues:data=>data.sortValues===undefined ? entrySortValues(data) : undefined,
  applied:(_items,{type,show,owner,query,sourceOwner,keys})=>{
   selectedShow=show;content.dataset.show=show;loadBodies();
   const eligibleOwners=allEntries().filter(entry=>matches(entry,{type,query,keys}));

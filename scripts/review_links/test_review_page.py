@@ -3783,6 +3783,34 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  check(!copy(panel) && top(next)<following,'The next card fills the gap when the fade ends.');
 """)
 
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_completed_card_leaves_after_remount_during_save(self) -> None:
+        change = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
+        records = [replace(change, key=f'change-{number}', id=f'C{number}') for number in range(1, 181)]
+        with patch.object(review_items, 'read', return_value=records):
+            source = browser_markup(self.root)
+        self.check_card_motion(source, r"""
+ document.querySelector('[data-sort="0"]').click();
+ const row=rows()[1],key=row.dataset.key,panel=panelId(row);
+ const current=()=>rows().find(node=>node.dataset.key===key);
+ send(await openCard(row));
+ check(posts.has(key) && !row.isConnected,'The pending save removes the original row.');
+ scrollTo({top:document.documentElement.scrollHeight,behavior:'instant'});await frame();
+ check(scrollY>innerHeight && !current() && !copy(panel),'Scrolling away clears the first copy.');
+ scrollTo({top:0,behavior:'instant'});await frame();
+ const remounted=current();
+ if(!remounted || remounted===row) throw new Error('The pending row must mount again.');
+ const form=await readyReviewCard(remounted);
+ check(form.dataset.sending==='true','The remounted form shows the pending save.');
+ posts.get(key)({ok:true,json:async()=>({answer:'works',state:'Done',later:0})});
+ await frame();
+ check(!current(),'The completed row leaves the table.');
+ const exit=copy(panel)?.getAnimations()[0];
+ if(!exit) throw new Error('The remounted row must animate when it leaves.');
+ exit.finish();await exit.finished;await frame();
+ check(!current() && !document.querySelector('[data-record-motion]'),'The animation leaves no row or spacer.');
+""")
+
     def check_card_motion(self, source: str, steps: str) -> None:
         setup = r"""<script>
 const realFetch=fetch,posts=new Map(),animate=Element.prototype.animate;
