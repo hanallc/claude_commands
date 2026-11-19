@@ -2994,26 +2994,15 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 
 **Files:** `scripts/aws_target/cloud_gate.py`, `scripts/aws_target/run_cost.py`.
 
-### Phase 164 — The doc prune never removes a doc tree a new process opened  · status: todo
-**Source:** builds, 2026-11-19 02:0x EST, from natest's phase 370 review (reproduced with a read-only probe).
-**Cause:** `_sweep_workspace` scans process uses once, then `prune_doc_index` removes an over-budget doc tree with `shutil.rmtree` (`scripts/lint/sweep.py:2513` on main `d5d81400c`). A process that opens the doc tree after the scan loses it.
+### Phase 164 — The doc prune never removes a doc tree a new process opened  · status: done
+**Source:** builds, 2026-11-19, from natest's phase 370 review.
 
-#### Work Order
-
-**Goal:** the doc prune removes a doc tree only when no process uses it at the moment of removal.
-
-**Spec:**
-1. Under the rustdoc lock, rename the doc tree to a fixed sibling name in the same output root (atomic). A process that starts after the rename cannot open the old path.
-2. Scan process uses of the renamed tree and of the output root. A use renames the tree back and keeps it, with a printed reason.
-3. With no use, remove the renamed tree. A removal that fails leaves it for the next run.
-4. A leftover renamed tree (crash, failed removal) is removed by the next sweep, under the same check.
-5. No new config key.
-
-**Base:** main `d5d81400c`.
-
-**Files:** `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py` (new tests at the end).
-
-**Acceptance gate:** a process that opens the doc tree between the first scan and the removal keeps it; with no process, the tree goes and the next doc run rebuilds it; a leftover renamed tree goes on the next run. test_sweep, test_tmp_sweep and the buildlog record tests pass; types 0.
+#### As-built
+- `prune_doc_index` locks the output root, then `prune_doc_root` takes the rustdoc lock and renames `doc` to `.doc-prune` (`DOC_PRUNE_DIR`) with an exclusive rename (`rename_doc_tree`).
+- `doc_tree_use` checks process exe, cwd and mapped files (`process_uses` without workspace matching) and open fds under the renamed tree. A use restores it to `doc`; no use removes it (`finish_doc_prune`).
+- `recover_doc_prune` handles a leftover `.doc-prune` on the next run: restored when used and `doc` is absent, removed when idle. `walk` keeps `.doc-prune` out of the main sweep.
+- Accepted (review): the window between the final check and `rmtree` (no consumer reaches `.doc-prune` by its doc path); the Mac without `/proc` (the same as the first scan); a crash leftover with a cwd user stays hidden while the root is busy (the next doc run rebuilds `doc`).
+- Row 447ebc0cd on main d5d81400c. Tests in both layouts, 0 failures: 8 suites; types 0. The merge with natest 370 (dad3666a1) is clean; test_sweep and test_tmp_sweep pass on it.
 
 ### Phase 165 — One failed result upload no longer sends a merge gate to natedev  · status: todo
 **Source:** builds, 2026-11-19 02:3x EST: the sdlc pageowner2 land ran its whole suite on natedev (end near 10:10).
