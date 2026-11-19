@@ -3186,6 +3186,10 @@ Base: 44cy (the landing identity). Clone /session/queue/landhold, branch builds-
 2. F050 (pass 14): a scoped sweep that selects the source but not the destination recovers the journal and removes the interrupted stage beside the excluded destination (tmp_sweep.py:1444, scratch.py:2063, :1932).
 3. F051 (pass 14): after `git worktree repair` points a registration at the destination, the sweep keeps the old source, because it checks only that `gitdir` exists (tmp_sweep.py:1107, scratch.py:1614).
 
+### Phase 44dh — Follow-up findings from the natemerge test wait  · status: todo
+**From 44dg closure pass 4, 2026-11-19.** Findings that are not a regression, broken function or failing test move here.
+1. F011 (minor): the Builds page reports the next start's memory need from a gate that is past its route-check deadline and that younger waiters now pass. A probe showed 9 GiB for the bypassed gate when the eligible gate needed 1 GiB. Exclude such gates when it selects the head for the report (memory_admit.py:2050, memory_feed.py:2222).
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
