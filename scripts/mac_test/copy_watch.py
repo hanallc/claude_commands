@@ -32,7 +32,7 @@ from typing import Literal
 
 
 from scripts.build_queue import execution_identity
-from scripts.lib import process_group
+from scripts.direct.group_cleanup import stop_group
 from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state, eligibility
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
@@ -520,12 +520,13 @@ class Watch:
             stopped = Path(f"{self.request.info}.stopped")
             stopped.touch()
             try:
-                process_group.send_process_group(self.step.info.pgid, signal.SIGTERM)
+                signaled = stop_group(self.step.info.pgid, signal.SIGTERM)
             except OSError:
-                stopped.unlink(missing_ok=True)
-            else:
+                signaled = False
+            if signaled:
                 self.outcome = "won"
                 return self.report(win)
+            stopped.unlink(missing_ok=True)
         self.outcome = "natedev_won"
         return self.report()
 

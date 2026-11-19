@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 import shutil
 import subprocess
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import Literal, cast, override
 from unittest.mock import patch
 
-from scripts.lib import berth_board
+from scripts.lib import berth_board, build_folders
 from scripts.lint.memory_test_support import config_environment
 from scripts.mac_test import eligibility, fix_return, offload
 from scripts.mac_test.offload_test_commands import write_shell
@@ -506,6 +507,15 @@ class LocalCopyTests(unittest.TestCase):
         self.assertEqual(fix_return.return_copy(self.worktree, made.folder, self.read), fix_return.FixNone())
         self.assertFalse(made.folder.exists())
 
+    def test_return_keeps_a_copy_with_a_marked_child_lease(self) -> None:
+        made = self.copy()
+        child = made.folder / "child"
+        child.mkdir()
+        with child.with_suffix(".lock").open("w+b") as lease:
+            build_folders.mark_cleanup_incomplete(lease.fileno())
+        self.assertEqual(fix_return.return_copy(self.worktree, made.folder, self.read), fix_return.FixNone())
+        self.assertTrue(child.is_dir(), "the lint copy return removed a marked child")
+
     def test_changed_worktree_refuses_and_deletes_the_copy(self) -> None:
         made = self.copy()
         _ = (made.tree / "ws/src/held.rs").write_text("pub(crate) fn held() {}\n")
@@ -562,6 +572,14 @@ class LocalCopyTests(unittest.TestCase):
         stopped = subprocess.Popen(["true"])
         _ = stopped.wait()
         folder = self.stale_copy(stopped.pid)
+        child = folder / "child"
+        child.mkdir()
+        with child.with_suffix(".lock").open("w+b") as lease:
+            fcntl.flock(lease, fcntl.LOCK_EX)
+            fallback = self.copy()
+            self.assertNotEqual(fallback.folder, folder, "lint copy replacement removed a held child")
+            self.assertTrue(child.is_dir())
+            _ = fix_return.return_copy(self.worktree, fallback.folder, self.read)
         made = self.copy()
         self.assertEqual(made.folder, folder)
         self.assertFalse((folder / "stale").exists())

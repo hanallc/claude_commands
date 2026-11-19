@@ -521,10 +521,19 @@ class CopyWatchProcessTests(unittest.TestCase):
 
     def test_copy_failure_first_stops_the_natedev_group_and_wins(self) -> None:
         step = self.start_step()
+        _ = (self.root / "compile").write_text("go\n")
+        log = self.root / "step.log"
+        self.wait_until(lambda: log.exists() and "Compiling" in log.read_text(), "the local compile")
+        os.kill(step.pid, signal.SIGSTOP)
+        _, status = os.waitpid(step.pid, os.WUNTRACED)
+        self.assertTrue(os.WIFSTOPPED(status))
         self.start_watcher("failed")
         self.compile_and_wait_for_copies(1)
         values = self.finish_watcher(terminate=False)
-        self.assertEqual(step.wait(timeout=test_hang_guard.TEST_HANG_GUARD_SECS), 143)
+        try:
+            self.assertEqual(step.wait(timeout=COPY_FIXTURE_WAIT_SECONDS), 143)
+        except subprocess.TimeoutExpired:
+            self.fail("the stopped natedev group survived TERM")
         self.assertTrue((self.root / "terminated").exists())
         self.assertTrue(Path(f"{self.info}.stopped").exists())
         self.assertEqual((values["copy"], values["copy_count"], values["mac"], values["runner_status"],

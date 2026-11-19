@@ -301,22 +301,12 @@ import time
 
 record = Path(sys.argv[1])
 
-from scripts.direct.cleanup_lease import stop_group
+from scripts.direct.group_cleanup import group_has_live_members, stop_group, wait_for_group_exit
 from scripts.lib.process_start import Started, Zombie, process_start
 
 def identity(pid: int) -> str | None:
     result = process_start(pid)
     return result.start if isinstance(result, (Started, Zombie)) else None
-
-def live_group(group: int) -> bool:
-    try:
-        lines = subprocess.check_output(['ps', '-A', '-o', 'pgid=', '-o', 'stat='],
-                                        text=True).splitlines()
-        return any(int(parts[0]) == group and not parts[1].startswith('Z')
-                   for line in lines if (parts := line.split()) and len(parts) > 1)
-    except (OSError, ValueError, subprocess.CalledProcessError):
-        # Reclaim and release must fail closed if the group cannot be inspected.
-        raise RuntimeError('cannot inspect step process group')
 
 try:
     saved = json.loads(record.read_text())
@@ -326,23 +316,18 @@ except (OSError, ValueError, KeyError, TypeError):
     print('board.sh: invalid step ownership record', file=sys.stderr)
     sys.exit(1)
 
-if identity(group) != start:
-    if live_group(group):
-        print('board.sh: step group leader identity changed', file=sys.stderr)
-        sys.exit(1)
-    sys.exit(0)
-
 try:
+    if identity(group) != start:
+        if group_has_live_members(group):
+            print('board.sh: step group leader identity changed', file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
     stop_group(group, signal.SIGKILL)
-except (OSError, ValueError) as error:
-    print(f"board.sh: could not stop process group {group}: {error}", file=sys.stderr)
-    sys.exit(1)
-
-deadline = time.monotonic() + 2
-while live_group(group) and time.monotonic() < deadline:
-    time.sleep(0.05)
-if live_group(group):
-    print('board.sh: step group still has running processes', file=sys.stderr)
+    if not wait_for_group_exit(group, deadline=time.monotonic() + 2, interval=0.05):
+        print('board.sh: step group still has running processes', file=sys.stderr)
+        sys.exit(1)
+except (OSError, ValueError, subprocess.SubprocessError) as error:
+    print(f"board.sh: could not clean up process group {group}: {error}", file=sys.stderr)
     sys.exit(1)
 PY
 }

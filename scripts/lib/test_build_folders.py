@@ -1042,6 +1042,33 @@ print('signals')
                 cleanup.assert_not_called()
                 self.assertTrue(child.is_dir())
 
+    def test_recursive_removal_keeps_a_child_that_is_still_allocating(self) -> None:
+        parent = self.root / "tree"
+        parent.mkdir()
+        cleanup = mock.Mock()
+        with (parent / "child.lock").open("w+b") as lease:
+            fcntl.flock(lease, fcntl.LOCK_EX)
+            self.assertFalse(folders.remove_build_folder(parent, cleanup, wait=False))
+            cleanup.assert_not_called()
+        self.assertTrue(folders.remove_build_folder(parent, wait=False))
+        self.assertFalse(parent.exists())
+
+    def test_incomplete_slot_repair_keeps_a_child_lease(self) -> None:
+        source, commit, _bare = self.editable_source()
+        spec = folders.BuildFolderSpec(kind="slot", parent=self.root, repository="example", slot=1,
+                                       suffix_length=0, slot_checkout=folders.SlotCheckout(source, commit))
+        slot = folders.build_folder_path(spec)
+        child = slot / "child"
+        child.mkdir(parents=True)
+        with child.with_suffix(".lock").open("w+b") as lease:
+            folders.mark_cleanup_incomplete(lease.fileno())
+        with self.assertRaisesRegex(BlockingIOError, "cannot repair an incomplete slot"):
+            try:
+                _ = folders.create_build_folder(spec)
+            finally:
+                _release_folder(slot)
+        self.assertTrue(child.is_dir())
+
     def test_removal_calls_cleanup_without_creating_an_absent_parent(self) -> None:
         path = self.root / "absent-parent" / "tree"
         for result in (True, False, None):

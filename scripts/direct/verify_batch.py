@@ -99,7 +99,9 @@ class BatchCommands:
             "VERIFY_BATCH_STEP": step, "VERIFY_BATCH_CACHE_HIT": str(cache_hit),
             "VERIFY_BATCH_LINT_PACKAGES": format_packages,
         }
-        status = self.run(command, changes)
+        if isinstance(self.cleanup, ForegroundCleanupLease):
+            changes["VERIFY_BATCH_PLACEMENT_PENDING_FILE"] = str(cache_hit.with_suffix(".placement-pending"))
+        status = self.run(command, changes, lifetime=CommandLifetime.VERIFY_STEP)
         return BatchStepResult(status, cache_hit.is_file())
 
 
@@ -202,12 +204,15 @@ def run_batch(commands: BatchCommands, repo: Path, packages: tuple[str, ...],
     stale = not before_tests
     for package in packages:
         test = commands.verify_step("test", ("test", package), hit)
-        if not test.show("test", package):
+        after_test = commands.tree_key(repo)
+        if not test.show("test", package, "tree check failed" if not after_test else ""):
             passed = False
-        stale |= commands.tree_key(repo) != before_tests
+        stale |= after_test != before_tests
     finish = commands.verify_step("lint", lint_args, hit, format_packages=format_packages)
-    stale |= commands.tree_key(repo) != before_tests
-    if not finish.show("lint", scope, "tests stale" if stale else ""):
+    after_lint = commands.tree_key(repo)
+    stale |= after_lint != before_tests
+    detail = "tree check failed" if not after_lint else "tests stale" if stale else ""
+    if not finish.show("lint", scope, detail):
         passed = False
     print("verify.sh batch result " + ("green" if passed else "red"), flush=True)
     return int(not passed)

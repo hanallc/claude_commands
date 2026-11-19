@@ -590,7 +590,10 @@ collect_child() {
 }
 
 stop_verify_group() {
-    "$PY" "$VERIFY_START_DIR/cleanup_lease.py" cancel-group "$@" || true
+    local status=0
+    "$PY" "$VERIFY_START_DIR/cleanup_lease.py" cancel-group "$@" || status=$?
+    if [[ "${3:-}" == --wait ]]; then return "$status"; fi
+    return 0
 }
 
 # One parent-owned helper serves command substitutions and cleanup traps.
@@ -1861,22 +1864,39 @@ collect_hold_wait() {
     fi
 }
 
+finish_placement_client() {
+    local status=$1
+    HOLD_WAITER_PID=""
+    PLACEMENT_CLIENT_ACTIVE=0
+    if (( status == 0 )) && [[ -n "${VERIFY_BATCH_PLACEMENT_PENDING_FILE:-}" ]]; then
+        rm -f -- "$VERIFY_BATCH_PLACEMENT_PENDING_FILE" || status=$?
+    fi
+    if (( status != 0 )); then
+        PLACEMENT_CLEANUP_INCOMPLETE=1
+    fi
+    return "$status"
+}
+
 interrupt_hold_wait() {
+    local stop_status=0
+    if [[ "${PLACEMENT_CLIENT_ACTIVE:-0}" == 1 && -z "$HOLD_WAITER_PID"
+          && "${!:-}" != "${PLACEMENT_PREVIOUS_JOB:-}" ]]; then
+        HOLD_WAITER_PID=$!
+    fi
     if [[ -n "$HOLD_WAITER_PID" ]]; then
         if [[ "${PLACEMENT_CLIENT_ACTIVE:-0}" == 1 ]]; then
-            stop_verify_group "$HOLD_WAITER_PID"
             if [[ -n "${VERIFY_HELPER_PID:-}" ]]; then
                 kill -TERM "$VERIFY_HELPER_PID" 2>/dev/null || true
                 VERIFY_HELPER_PID=""
             fi
             exec 70>&- 71<&-
             VERIFY_HELPER_INPUT="" VERIFY_HELPER_OUTPUT=""
-            PLACEMENT_CLIENT_ACTIVE=0
+            stop_verify_group "$HOLD_WAITER_PID" 15 --wait || stop_status=$?
+            finish_placement_client "$stop_status" || true
         else
             kill -TERM "$HOLD_WAITER_PID" 2>/dev/null || true
+            HOLD_WAITER_PID=""
         fi
-        # Bash can wait for log readers after the waiter exits.
-        HOLD_WAITER_PID=""
     fi
     if [[ -n "${BUILDLOG_HOLD_WAITER_FILE:-}" && -f "$BUILDLOG_HOLD_WAITER_FILE" ]]; then
         verify_helper "$BUILD_TARGETS_SCRIPT" interrupt-local --call-id "$BUILDLOG_CALL_ID" >/dev/null 2>&1 || true
@@ -1887,7 +1907,7 @@ finish_hold_wait() {
     phase_wait_finish_all
     collect_hold_wait
     if [[ -n "${TOKEN_WAIT_ENTRY:-}" ]]; then rm -f -- "$TOKEN_WAIT_ENTRY"; fi
-    if [[ -n "$HOLD_WAIT_DIR" ]]; then
+    if [[ -n "$HOLD_WAIT_DIR" && "${PLACEMENT_CLEANUP_INCOMPLETE:-0}" != 1 ]]; then
         verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$HOLD_WAIT_DIR"
         HOLD_WAIT_DIR=""
     fi
@@ -2952,16 +2972,28 @@ placement_once() {
         return 0
     fi
     # A builtin wait lets the parent handle TERM during a service outage.
+    local placement_input="${VERIFY_HELPER_INPUT:-}" placement_output="${VERIFY_HELPER_OUTPUT:-}"
+    if [[ -n "${VERIFY_BATCH_PLACEMENT_PENDING_FILE:-}" ]]; then
+        # The batch keeps its cleanup marker until this job ends.
+        (set -o noclobber; : > "$VERIFY_BATCH_PLACEMENT_PENDING_FILE") || return 2
+        # Run placement and its children in the job group that Verify can inspect.
+        placement_input="" placement_output=""
+    fi
+    PLACEMENT_PREVIOUS_JOB=${!:-}
     PLACEMENT_CLIENT_ACTIVE=1
     [[ $- != *m* ]] || monitor=1
     set -m
-    verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" "${placement_args[@]}" -- "${PLACEMENT_COMMAND[@]}" \
+    VERIFY_HELPER_INPUT="$placement_input" VERIFY_HELPER_OUTPUT="$placement_output" \
+        verify_helper "$BUILDLOG_MEM_ADMIT_SCRIPT" "${placement_args[@]}" -- "${PLACEMENT_COMMAND[@]}" \
         > "$HOLD_WAIT_DIR/placement-reply" &
     HOLD_WAITER_PID=$!
     if [[ "$monitor" == 0 ]]; then set +m; fi
     wait "$HOLD_WAITER_PID" || status=$?
-    HOLD_WAITER_PID=""
-    PLACEMENT_CLIENT_ACTIVE=0
+    local group_status=0
+    if [[ -n "${VERIFY_BATCH_PLACEMENT_PENDING_FILE:-}" ]]; then
+        verify_helper "$VERIFY_START_DIR/cleanup_lease.py" group-exit "$HOLD_WAITER_PID" || group_status=$?
+    fi
+    finish_placement_client "$group_status" || return 2
     reply=$(< "$HOLD_WAIT_DIR/placement-reply")
     while IFS= read -r line; do
         case "$line" in

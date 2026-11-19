@@ -5,7 +5,7 @@ from __future__ import annotations
 if __name__ == "__main__":
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -18,7 +18,9 @@ import subprocess
 import sys
 import time
 
-from scripts.lib import build_folder_lock, conf, process_group
+from scripts.direct.group_cleanup import group_has_live_members, wait_for_group_exit
+from scripts.direct.group_cleanup import signal_and_resume as signal_and_resume, stop_group as stop_group
+from scripts.lib import build_folder_lock, conf
 from scripts.lib.build_folders import (
     ForegroundMarker, cleanup_incomplete, mark_cleanup_incomplete as mark_cleanup_incomplete, remove_build_folder,
 )
@@ -36,6 +38,7 @@ class CleanupLeaseUse(Enum):
 class CommandLifetime(Enum):
     FOREGROUND = "foreground"
     GROUP = "group"
+    VERIFY_STEP = "verify-step"
 
 
 @dataclass(frozen=True)
@@ -105,16 +108,6 @@ def command_ended_before_owner(command: int, owner: int) -> bool:
         return command_fd in select.select([command_fd, owner_fd], [], [])[0]
 
 
-def group_has_live_members(group: int, *, timeout: float) -> bool:
-    try:
-        process_group.send_process_group(group, 0)
-    except ProcessLookupError:
-        return False
-    rows = subprocess.check_output(["ps", "-A", "-o", "pgid=", "-o", "stat="], text=True, timeout=timeout)
-    return any(int(fields[0]) == group and not fields[1].startswith("Z")
-               for line in rows.splitlines() if len(fields := line.split()) == 2)
-
-
 def run_command(command: Sequence[str], owner: int, group: int, lease: int, use: CleanupLeaseUse,
                 *, marker: ForegroundMarker = ForegroundMarker.COMMAND,
                 lifetime: CommandLifetime = CommandLifetime.FOREGROUND) -> int:
@@ -144,11 +137,20 @@ def run_command(command: Sequence[str], owner: int, group: int, lease: int, use:
             else:
                 _ = signal_and_resume(child.send_signal, signal.SIGTERM)
         status = child.wait(timeout=max(0, deadline - time.monotonic()) if deadline else None)
-        if owns_group and group_has_live_members(child.pid, timeout=max(0, deadline - time.monotonic())):
-            if ended:
+        if owns_group:
+            if ended and group_has_live_members(child.pid, timeout=max(0, deadline - time.monotonic())):
                 _ = stop_group(child.pid, signal.SIGKILL)
-            if group_has_live_members(child.pid, timeout=max(0, deadline - time.monotonic())):
+            if not wait_for_group_exit(child.pid, deadline=deadline, interval=cleanup_timing().retry_seconds):
                 print(f"foreground cleanup is incomplete for group {child.pid}", file=sys.stderr)
+                return 2
+        if lifetime is CommandLifetime.VERIFY_STEP:
+            pending = Path(os.environ["VERIFY_BATCH_PLACEMENT_PENDING_FILE"])
+            try:
+                _ = pending.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                print("foreground cleanup is incomplete for the placement client", file=sys.stderr)
                 return 2
         marker.finish(lease)
     except subprocess.TimeoutExpired:
@@ -159,25 +161,6 @@ def run_command(command: Sequence[str], owner: int, group: int, lease: int, use:
     return status if status >= 0 else 128 - status
 
 
-def signal_and_resume(send: Callable[[int], None], signum: int) -> bool:
-    """Resume a stopped process after it receives a signal."""
-    try:
-        send(signum)
-    except ProcessLookupError:
-        return False
-    if signum != signal.SIGKILL:
-        try:
-            send(signal.SIGCONT)
-        except ProcessLookupError:
-            pass
-    return True
-
-
-def stop_group(group: int, signum: int) -> bool:
-    """Signal a process group and let its stopped members process the signal."""
-    return signal_and_resume(lambda number: process_group.send_process_group(group, number), signum)
-
-
 def main(argv: Sequence[str]) -> int:
     command, *arguments = argv
     if command == "run":
@@ -186,15 +169,21 @@ def main(argv: Sequence[str]) -> int:
                            marker=ForegroundMarker[arguments[3]], lifetime=CommandLifetime(arguments[5]))
     if command == "remove":
         return 0 if remove_build_folder(Path(arguments[0]), wait=cleanup_timing()) else 2
-    if command == "cancel-group":
+    if command in ("cancel-group", "group-exit"):
         group = int(arguments[0])
-        signum = int(arguments[1]) if len(arguments) > 1 else signal.SIGTERM
         try:
-            _ = stop_group(group, signum)
-        except (ValueError, OSError) as error:
-            print(f"could not stop process group {group}: {error}", file=sys.stderr)
-            return 2
-        return 0
+            if command == "cancel-group":
+                signum = int(arguments[1]) if len(arguments) > 1 else signal.SIGTERM
+                _ = stop_group(group, signum)
+                if "--wait" not in arguments[2:]:
+                    return 0
+            timing = cleanup_timing()
+            if wait_for_group_exit(group, deadline=time.monotonic() + timing.wait_seconds,
+                                   interval=timing.retry_seconds):
+                return 0
+            print(f"process group {group} still has live members", file=sys.stderr)
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            print(f"could not clean up process group {group}: {error}", file=sys.stderr)
     return 2
 
 

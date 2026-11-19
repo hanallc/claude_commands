@@ -18,13 +18,17 @@ from unittest.mock import patch
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.copies.copies_test_support import copies_environment
+from scripts.lib.build_folders import cleanup_incomplete
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.process_group import send_process_group
 from scripts.lib.shell_test_support import shell_function
 from scripts.lib.socket_test_support import ShortUnixSocket
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
+from scripts.direct.cleanup_lease import ForegroundCleanupLease
+from scripts.direct import verify_batch as batch
 from scripts.direct import verify_lint_scope_test_support as support
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB as CARGO_STUB
 from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
@@ -499,10 +503,13 @@ with lock.open("rb") as lease:
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("could not record foreground cleanup", result.stderr)
 
-    def test_interruption_stops_a_stopped_placement_group(self) -> None:
+    def placement_interrupt(self) -> str:
         source = support.VERIFY.read_text()
-        stop = shell_function(source, "stop_verify_group") if "\nstop_verify_group() {" in source else ""
-        script = stop + "\n" + shell_function(source, "interrupt_hold_wait") + """
+        functions = ("stop_verify_group", "finish_placement_client", "interrupt_hold_wait")
+        return "\n".join(shell_function(source, name) for name in functions if f"\n{name}() {{" in source)
+
+    def test_interruption_stops_a_stopped_placement_group(self) -> None:
+        script = self.placement_interrupt() + """
 PY=$1 VERIFY_START_DIR=$2 STEP_RECORD_SCRIPT=$2/step_record.py
 HOLD_WAITER_PID=$3 PLACEMENT_CLIENT_ACTIVE=1
 interrupt_hold_wait
@@ -524,6 +531,71 @@ interrupt_hold_wait
             finally:
                 if placement.poll() is None:
                     placement.kill()
+
+    def test_a_live_placement_group_keeps_the_foreground_marker(self) -> None:
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = write_config_fixture(scratch / "build_admission.conf", "program_stop_seconds=1\n")
+        stop = scratch / "stop"
+        stop_attempt = scratch / "stop-attempt"
+        _ = stop.write_text(f"""#!{sys.executable}
+from pathlib import Path
+import sys
+from unittest.mock import patch
+
+sys.path.insert(0, {str(support.VERIFY.parents[2])!r})
+from scripts.direct import cleanup_lease
+
+def refuse_stop(*_args):
+    Path({str(stop_attempt)!r}).touch()
+    return True
+
+with patch.object(cleanup_lease, "stop_group", side_effect=refuse_stop):
+    raise SystemExit(cleanup_lease.main(sys.argv[2:]))
+""")
+        stop.chmod(0o755)
+        with subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
+                              start_new_session=True) as placement, (scratch / "verify.lock").open("w+b") as lease:
+            try:
+                fcntl.flock(lease.fileno(), fcntl.LOCK_EX)
+                verify = scratch / "verify.sh"
+                pending = scratch / "cache.placement-pending"
+                setup = f"""PY={str(stop)!r}
+VERIFY_START_DIR={str(support.VERIFY.parent)!r}
+HOLD_WAITER_PID={placement.pid} PLACEMENT_CLIENT_ACTIVE=1
+: > {str(pending)!r}
+"""
+                _ = verify.write_text(self.placement_interrupt() + "\n" + setup + "\ninterrupt_hold_wait\nexit 143\n")
+                commands = batch.BatchCommands(verify, (), cleanup=ForegroundCleanupLease(lease.fileno()))
+                commands.environment.update(config_environment(scratch))
+                result = commands.verify_step("test", ("test", "sample"), scratch / "cache")
+                self.assertTrue(stop_attempt.is_file(), "Verify did not attempt to stop the placement group")
+                self.assertIsNone(placement.poll())
+                self.assertTrue(pending.exists(), "Verify removed the record of a live placement group")
+                self.assertTrue(cleanup_incomplete(lease.fileno()),
+                                "the foreground marker cleared with a live placement group")
+                self.assertEqual(result.status, 2)
+            finally:
+                if placement.poll() is None:
+                    placement.kill()
+
+    def test_tree_check_failure_names_the_package_it_followed(self) -> None:
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        result = self.run_python("""
+import sys
+from pathlib import Path
+from unittest.mock import patch
+from scripts.direct import verify_batch as batch
+
+commands = batch.BatchCommands(Path("verify"), ())
+with (
+    patch.object(commands, "tree_key", side_effect=("before", "", "before")),
+    patch.object(commands, "verify_step", return_value=batch.BatchStepResult(0, False)),
+):
+    raise SystemExit(batch.run_batch(commands, Path.cwd(), ("sample",), batch.LintScope.WORKSPACE,
+                                    batch.NoBaselineProof.SKIP, Path(sys.argv[1])))
+""", str(scratch))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("verify.sh batch test sample red cached=no (tree check failed)", result.stdout)
 
     def test_a_failed_copy_cleanup_names_the_baseline_step(self) -> None:
         scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))

@@ -103,7 +103,11 @@ Standalone copy commands keep their existing release behavior.
 The format step uses the lint copy and return path for repositories that configure berth.
 Mend and Clippy use the normal lint checks and repair rules.
 The batch compares the tree key after each test and after lint with the key after formatting.
-A changed or unreadable key makes the lint row red with `tests stale`.
+A changed key makes the lint row red with `tests stale`.
+If a tree check fails after a package test, the package row reports `tree check failed`.
+If the final tree check fails, the lint row reports `tree check failed`.
+The foreground supervisor keeps the batch cleanup marker until Verify confirms the placement group has exited.
+If the stop limit expires, the marker keeps the scratch folder.
 The test and lint children report cache hits from the existing cache lookup.
 The format step and baseline failures run fresh.
 

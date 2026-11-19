@@ -531,11 +531,8 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                                 stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
                                 _ = git_rescue.rescue(path, f"{path.name}-recovery-{stamp}", generated=[path / "target"],
                                                      pass_fds=(descriptor, *held_build_folder_descriptors(), *source_descriptors))
-                            _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "prune", "--expire", "now"],
-                                               check=True, capture_output=True,
-                                               pass_fds=(descriptor, *held_build_folder_descriptors(), *source_descriptors),
-                                               timeout=repository_git_timeout())
-                            _remove_folder(path, directory, existing)
+                            if not _remove_leased_folder(path, directory, None, temporary=False, allocated=existing):
+                                raise BlockingIOError(errno.EWOULDBLOCK, "cannot repair an incomplete slot", str(path))
                             _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "prune", "--expire", "now"],
                                                check=True, capture_output=True,
                                                pass_fds=(descriptor, *held_build_folder_descriptors(), *source_descriptors),
@@ -811,13 +808,28 @@ def _take_removal_lock(path: Path, directory: int, descriptor: int, *,
 
 
 def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool = True,
-                     create: bool = False) -> FolderRemovalLease:
+                     create: bool = False, unpaired: bool = False) -> FolderRemovalLease:
     """Hold the lock if it is free. The stack owns the descriptor."""
     try:
-        descriptor = build_folder_lock.open_lock(path, directory, create=create)
+        if unpaired:
+            # Allocation can hold the lock before it writes the lease or makes the folder.
+            descriptor = os.open(path.name + ".lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                 dir_fd=directory)
+        else:
+            descriptor = build_folder_lock.open_lock(path, directory, create=create)
     except FileNotFoundError:
         return UnreservedRemovalFolder()
+    except OSError as error:
+        if unpaired and error.errno == errno.ELOOP:
+            return UnreservedRemovalFolder()
+        raise
     _ = stack.callback(os.close, descriptor)
+    if unpaired:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            return UnreservedRemovalFolder()
+        if info.st_nlink > 1:
+            return RefusedRemovalLease()
     if not _take_removal_lock(path, directory, descriptor, wait=wait):
         return RefusedRemovalLease()
     _ = stack.callback(_locks.pop, descriptor, None)
@@ -850,26 +862,11 @@ def _hold_child_leases(path: Path, stack: ExitStack, *, dir_fd: int | None = Non
         names = set(folders) | set(files)
         for name in files:
             stem = name.removesuffix(".lock")
-            if stem == name:
+            if not stem or stem == name:
                 continue
             child = (path.parent / top if dir_fd is not None else Path(top)) / stem
-            if stem not in folders and stem + ".lease.json" not in names:
-                # An interrupted removal can leave a marker beside an absent folder.
-                try:
-                    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
-                except FileNotFoundError:
-                    continue
-                except OSError as error:
-                    if error.errno == errno.ELOOP:
-                        continue
-                    raise
-                try:
-                    if stat.S_ISREG(os.fstat(descriptor).st_mode) and cleanup_incomplete(descriptor):
-                        return False
-                finally:
-                    os.close(descriptor)
-                continue
-            if isinstance(_hold_free_lease(child, directory, stack, wait=wait), RefusedRemovalLease):
+            unpaired = stem not in folders and stem + ".lease.json" not in names
+            if isinstance(_hold_free_lease(child, directory, stack, wait=wait, unpaired=unpaired), RefusedRemovalLease):
                 return False
     return True
 
@@ -1134,7 +1131,6 @@ def run_build_command(command: Sequence[str], *, path: Path, environment: Mappin
     """Keep the caller until the command and its descendants stop."""
     import subprocess
     from scripts.lib.descendants import adopt_descendants
-    from scripts.lib.process_group import send_process_group
 
     if not command:
         raise ValueError("run needs a command after --")
@@ -1155,16 +1151,11 @@ def run_build_command(command: Sequence[str], *, path: Path, environment: Mappin
             pass
         _ = child.wait()
         if sys.platform == "darwin":
+            from scripts.direct.group_cleanup import group_has_live_members, stop_group
+
             # A descendant outside the group still holds the slot if it inherits the lock descriptor.
-            try:
-                send_process_group(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            while True:
-                try:
-                    send_process_group(child.pid, 0)
-                except ProcessLookupError:
-                    break
+            _ = stop_group(child.pid, signal.SIGKILL)
+            while group_has_live_members(child.pid):
                 time.sleep(0.01)
         else:
             while True:

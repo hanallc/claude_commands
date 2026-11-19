@@ -268,7 +268,7 @@ class SlotOrderTests(unittest.TestCase):
 
     def test_remote_adoption_replays_with_the_parent_owner_and_original_queue_time(self) -> None:
         arguments_file = self.root / "placement-arguments"
-        functions = shell_functions(CHECKOUT / "scripts/direct/verify.sh", "placement_once")
+        functions = shell_functions(CHECKOUT / "scripts/direct/verify.sh", "finish_placement_client", "placement_once")
         script = functions + r'''
 set -eu
 verify_helper() {

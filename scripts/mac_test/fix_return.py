@@ -41,7 +41,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Callable, Generator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 import fcntl
 import filecmp
@@ -57,6 +57,7 @@ import sys
 from typing import Literal, TypedDict, cast
 
 from scripts.lib import berth_board
+from scripts.lib.build_folders import remove_build_folder
 
 
 @dataclass(frozen=True)
@@ -506,17 +507,19 @@ def claim_folder(parent: Path, owner: int) -> Path:
     """
     parent.mkdir(parents=True, exist_ok=True)
     staged = parent / f".{COPY_NAME}-{owner}.new"
-    shutil.rmtree(staged, ignore_errors=True)
+    if not remove_build_folder(staged, wait=False):
+        raise OSError(f"{staged} is in use by another lint run")
     for name in (COPY_NAME, f"{COPY_NAME}-{owner}"):
         folder = parent / name
-        if folder.exists() and not owner_alive(folder, owner):
-            shutil.rmtree(folder)
+        if folder.exists() and (owner_alive(folder, owner) or not remove_build_folder(folder, wait=False)):
+            continue
         staged.mkdir()
         _ = (staged / OWNER_NAME).write_text(str(owner), encoding="utf-8")
         try:
             os.rename(staged, folder)
         except OSError:
-            shutil.rmtree(staged, ignore_errors=True)
+            if not remove_build_folder(staged, wait=False):
+                raise
             continue
         return folder
     raise OSError(f"{parent / COPY_NAME} is in use by another lint run")
@@ -558,7 +561,8 @@ def make_copy(repo_root: Path, metadata: CargoMetadata, owner: int,
             sent[relative] = before
         _ = (folder / SENT_NAME).write_text(json.dumps(sent), encoding="utf-8")
     except OSError as error:
-        shutil.rmtree(folder, ignore_errors=True)
+        with suppress(OSError):
+            _ = remove_build_folder(folder, wait=False)
         return FixFailed(str(error))
     return CopyMade(folder, tree, tree / workspace.relative_to(root) / "Cargo.toml",
                     Path(metadata["target_directory"]))
@@ -609,7 +613,8 @@ def return_copy(repo_root: Path, folder: Path, board_reader: BoardReader | None 
     except (OSError, ValueError, KeyError, IndexError) as error:
         return FixFailed(str(error))
     finally:
-        shutil.rmtree(folder, ignore_errors=True)
+        with suppress(OSError):
+            _ = remove_build_folder(folder, wait=False)
 
 
 def report_copy(result: FixResult) -> None:
