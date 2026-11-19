@@ -410,7 +410,6 @@ class TargetRemoval:
                         # Keep claims and controller actions excluded throughout resource removal.
                         paths = box.builder_state_paths()
                         _ = locks.enter_context(mac_test.locked(paths.lock))
-                        _ = locks.enter_context(control_lock(self.directory))
                         if box.running_claims(paths):
                             raise ValueError('AWS claims remain live; retry after their completion')
                     changed = action()

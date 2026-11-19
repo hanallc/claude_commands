@@ -857,13 +857,12 @@ def launch_session(
     production = request.production
     launched = herdr.launch_agent(host, production.name,
         session_name, str(request.session_cwd), environment, kind="claude", agent=host_session_name(request),
-        agent_arguments=arguments, opening=herdr.OpeningPrompt(prompt, herdr.SessionTranscript(selected.dir, session_id),
-            published),
+        agent_arguments=arguments, opening=herdr.OpeningPrompt(prompt, herdr.SessionTranscript(selected.dir, session_id), published),
         timeout_ms=timeout_ms)
     if isinstance(launched, herdr.nix_env.Refused):
         raise Refusal(launched.reason)
     outcome = launched.outcome
-    if isinstance(outcome, herdr.PromptSubmitted):
+    if isinstance(outcome, herdr.PromptSubmitted) and outcome.publication_error is None:
         pending.unlink(missing_ok=True)
     return outcome if isinstance(outcome, (herdr.PromptSubmitted, herdr.PromptNotSubmitted)) else herdr.PromptNotSubmitted("launcher returned no submit proof")
 
@@ -929,22 +928,23 @@ def finish_opening(request: UnitLaunch, marked: LabeledSessionFound) -> herdr.Pr
         runtime_id=transcript.session_id, unit_type=saved_unit_type(fields))
     at = datetime.fromisoformat(fields["launched_at"])
     outcome = herdr.submitted_prompt(transcript, fields["prompt"], at)
-    if not isinstance(outcome, herdr.PromptSubmitted):
-        outcome = herdr.Herdr(marked.unit.place.session).submit_opening_prompt(
-            marked.unit.place.pane, herdr.OpeningPrompt(fields["prompt"], transcript), at, int(request.timeout * 1000))
-    if isinstance(outcome, herdr.PromptSubmitted):
+    if outcome.state != "confirmed":
+        place = marked.unit.place
+        opening = herdr.OpeningPrompt(fields["prompt"], transcript, may_type=False)
+        outcome = herdr.Herdr(place.session).submit_opening_prompt(place.pane, opening, at, int(request.timeout * 1000))
+    if outcome.state == "confirmed" and outcome.publication_error is None:
         pending.unlink(missing_ok=True)
     return outcome
 
 
-def close_untyped_session(request: UnitLaunch, outcome: herdr.PromptNotSubmitted) -> str:
+def close_unsent_session(request: UnitLaunch, outcome: herdr.PromptSubmitOutcome) -> str:
     """Close a new session that never got its prompt, so no half-started unit stays behind.
 
     The staff row, .unit.toml and worktree stay: the same command finds them and starts the session
     again. A prompt typed even once may have started work, so that session stays open.
     """
 
-    if not outcome.never_typed:
+    if outcome.state != "not_sent":
         return ""
     found = launched_unit(request)
     if isinstance(found, NoLabeledSession):
@@ -1460,11 +1460,13 @@ def _main(argv: list[str]) -> int:
                     raise Refusal(f"{request.identity.unit}: opening prompt not submitted: {recovered.reason}")
             if isinstance(outcome, herdr.ClaudeTrustNotWritten):
                 return 1
-            if isinstance(outcome, herdr.PromptNotSubmitted) and isinstance(labeled_session, NoLabeledSession):
+            if outcome.state == "confirmed" and outcome.publication_error is not None:
+                raise RuntimeError(f"{request.identity.unit}: staff publication failed: {outcome.publication_error}")
+            if outcome.state != "confirmed" and isinstance(labeled_session, NoLabeledSession):
                 if isinstance(handoff, StoppedSessionHandoff):
                     raise Refusal(f"ATTACH UNPROVEN for {handoff.session_id}: opening prompt not submitted: {outcome.reason}")
                 raise RuntimeError(f"{request.identity.unit}: opening prompt not submitted: {outcome.reason}"
-                                   + close_untyped_session(request, outcome))
+                                   + close_unsent_session(request, outcome))
             if isinstance(handoff, StoppedSessionHandoff):
                 pid = finish_attach(handoff, unit_account, outcome, request.timeout)
                 record(request)

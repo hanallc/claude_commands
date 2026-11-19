@@ -1,17 +1,22 @@
 """Render the accounts board on the Hana console Accounts page."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from enum import StrEnum
 import html
 import json
+import re
 from pathlib import Path
 from statistics import median
 import subprocess
 import sys
 import time
+from typing import TypedDict, cast
 
 from scripts.accounts import accounts, next_moves
-from scripts.lib import conf, waiting_rows
+from scripts.lib import atomic_file, conf, file_lock, waiting_rows
 from scripts.review_links import change_page, console_theme, page_frame, review_link
 
 PAGE_NAME = "accounts.html"
@@ -38,6 +43,169 @@ class Refused:
 class SaveFailed:
     """The checked change could not be saved."""
     reason: str
+
+
+QUOTA_CLEAR_FILE = ".accounts-quota-cleared.json"
+
+
+class QuotaLevel(StrEnum):
+    NONE = "none"
+    WARNING = "warning"
+    URGENT = "urgent"
+
+
+@dataclass(frozen=True)
+class QuotaThresholds:
+    warning: int
+    urgent: int
+
+    def level(self, left: float) -> QuotaLevel:
+        if 0 <= left <= self.urgent:
+            return QuotaLevel.URGENT
+        if self.urgent < left <= self.warning:
+            return QuotaLevel.WARNING
+        return QuotaLevel.NONE
+
+
+class ClearedQuota(TypedDict):
+    level: QuotaLevel
+    reset: str
+
+
+@dataclass(frozen=True)
+class QuotaAlert:
+    level: QuotaLevel
+    left: float
+    reset: str
+
+    @property
+    def name(self) -> str:
+        return f"{self.level.title()}: {round(self.left)}% left"
+
+
+class NavQuota(TypedDict):
+    level: QuotaLevel
+    name: str
+
+
+class InvalidQuotaThresholds(ValueError):
+    """The warning threshold must exceed the urgent threshold."""
+
+
+class UnreadableQuotaState(ValueError):
+    """The clear records could not be read or parsed."""
+
+
+def quota_thresholds() -> QuotaThresholds:
+    settings = conf.read("review_links")
+    warning = settings.whole("accounts_quota_warning_percent")
+    urgent = settings.whole("accounts_quota_urgent_percent")
+    if warning <= urgent:
+        raise InvalidQuotaThresholds("accounts_quota_warning_percent must be greater than accounts_quota_urgent_percent.")
+    return QuotaThresholds(warning, urgent)
+
+
+def quota_state(root: Path) -> Path:
+    return root / change_page.CONSOLE_FOLDER / QUOTA_CLEAR_FILE
+
+
+def account_label(label: str) -> bool:
+    return re.fullmatch(r"(?:claude|codex)[1-9][0-9]*|(?:~)?/[a-zA-Z0-9_./ -]+", label) is not None
+
+
+def cleared_quotas(path: Path) -> dict[str, ClearedQuota]:
+    try:
+        return _parse_cleared_quotas(cast(object, json.loads(path.read_text(encoding="utf-8"))))
+    except FileNotFoundError:
+        return {}
+    except OSError as error:
+        raise UnreadableQuotaState(f"Cannot read {path}: {error.strerror or 'read failed'}.") from error
+    except ValueError as error:
+        raise UnreadableQuotaState(f"Invalid quota clear state in {path}.") from error
+
+
+def _parse_cleared_quotas(value: object) -> dict[str, ClearedQuota]:
+    if not isinstance(value, dict):
+        raise ValueError("The cleared quota file must contain an object.")
+    cleared: dict[str, ClearedQuota] = {}
+    for label, entry in cast(dict[str, object], value).items():
+        if not account_label(label) or not isinstance(entry, dict):
+            raise ValueError("The cleared quota file has an invalid account entry.")
+        fields = cast(dict[str, object], entry)
+        level, reset = fields.get("level"), fields.get("reset")
+        if not isinstance(level, str) or level not in (QuotaLevel.WARNING, QuotaLevel.URGENT) or not isinstance(reset, str):
+            raise ValueError("The cleared quota file has an invalid level or reset.")
+        if reset and datetime.fromisoformat(reset).tzinfo is None:
+            raise ValueError("The quota reset needs a time zone.")
+        cleared[label] = {"level": QuotaLevel(level), "reset": reset}
+    return cleared
+
+
+def active_quotas(quotas: Mapping[str, accounts.WeeklyQuota], thresholds: QuotaThresholds,
+                  cleared: Mapping[str, ClearedQuota]) -> dict[str, QuotaAlert]:
+    alerts: dict[str, QuotaAlert] = {}
+    for label, quota in quotas.items():
+        level = thresholds.level(quota.left)
+        if level is QuotaLevel.NONE or not account_label(label):
+            continue
+        reset = quota.resets_at.astimezone(timezone.utc).isoformat() if isinstance(quota.resets_at, datetime) else ""
+        receipt = cleared.get(label)
+        if (receipt is not None and (not reset or receipt["reset"] == reset)
+                and (receipt["level"] is QuotaLevel.URGENT or receipt["level"] is level)):
+            continue
+        alerts[label] = QuotaAlert(level, quota.left, reset)
+    return alerts
+
+
+def nav_quota(root: Path) -> NavQuota:
+    cleared = cleared_quotas(quota_state(root))
+    thresholds = quota_thresholds()
+    alerts = active_quotas(accounts.stored_weekly_quotas(datetime.now(timezone.utc)), thresholds, cleared)
+    if not alerts:
+        return {"level": QuotaLevel.NONE, "name": ""}
+    alert = min(alerts.values(), key=lambda alert: (alert.level is not QuotaLevel.URGENT, alert.left))
+    return {"level": alert.level, "name": alert.name}
+
+
+def clear_quota(root: Path, label: str, level: str, reset: str) -> Saved | Refused | SaveFailed:
+    """Clear the account's current alert if the submitted level and reset still match."""
+    if not account_label(label) or level not in (QuotaLevel.WARNING, QuotaLevel.URGENT):
+        return Refused("Use an account label and a warning or urgent level.")
+    path = quota_state(root)
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with file_lock.exclusive(path.with_suffix(".lock")):
+            cleared = cleared_quotas(path)
+            current = active_quotas(accounts.stored_weekly_quotas(datetime.now(timezone.utc)), quota_thresholds(), {})
+            alert = current.get(label)
+            if alert is None or alert.level != level or alert.reset != reset:
+                return Refused("The quota alert changed. Read the Accounts page again.")
+            receipt = cleared.get(label)
+            saved_reset = alert.reset or (receipt["reset"] if receipt is not None else "")
+            if receipt and receipt["reset"] == saved_reset and receipt["level"] is QuotaLevel.URGENT:
+                return Saved()
+            cleared[label] = {"level": alert.level, "reset": saved_reset}
+            atomic_file.write_text_atomic(path, json.dumps(cleared, sort_keys=True) + "\n", new_file_mode=0o600)
+    except (UnreadableQuotaState, InvalidQuotaThresholds) as error:
+        return SaveFailed(str(error))
+    except (OSError, ValueError):
+        return SaveFailed("The cleared quota could not be saved.")
+    return Saved()
+
+
+QUOTA_ICONS = {QuotaLevel.WARNING: "triangle-alert", QuotaLevel.URGENT: "octagon-alert"}
+
+
+def quota_icon(level: QuotaLevel) -> str:
+    return page_frame.icon_svg(QUOTA_ICONS[level])
+
+
+def _quota_button(label: str, alert: QuotaAlert) -> str:
+    return (f'<button type="button" class="quota-icon" data-quota-level="{alert.level}" '
+            + f'data-quota-account="{html.escape(label, quote=True)}" '
+            + f'data-quota-reset="{html.escape(alert.reset, quote=True)}" '
+            + f'aria-label="{alert.name}" aria-haspopup="dialog" aria-controls="quota-panel" aria-expanded="false">'
+            + quota_icon(alert.level) + '</button>')
 
 
 def save_color(key: str, value: str) -> Saved | Refused | SaveFailed:
@@ -183,7 +351,7 @@ def _sort_heading(column: accounts.BoardColumn, default: str, descending_columns
             + f'<span class="sort-label">{content}</span></th>')
 
 
-def board(reading: accounts.StatusReading) -> str:
+def board(reading: accounts.StatusReading, alerts: Mapping[str, QuotaAlert] | None = None) -> str:
     """Render the accounts table and its problems."""
     table = accounts.status_board(reading)
     claude = {row.label for row in reading.rows if row.tool == "claude"}
@@ -203,10 +371,17 @@ def board(reading: accounts.StatusReading) -> str:
     head = "".join(heading(column)
                    + ('<th class="left"></th>' if column["key"] in SWATCH_COLUMNS else "")
                    + (next_heading if column["key"] == "roles" else "") for column in table["columns"])
+    def cell(row: accounts.BoardRow, key: str) -> str:
+        content = _spans(row["cells"][key])
+        label = row["cells"]["label"]
+        if key == "left" and alerts and label and (alert := alerts.get(label[0]["text"])) is not None:
+            return _quota_button(label[0]["text"], alert) + content
+        return content
+
     rows = "".join(
         _row_open(row)
         + "".join(f'<td class="{column["align"]}"{" data-account-name" if column["key"] == "label" else ""}>'
-                  + f'{_spans(row["cells"][column["key"]])}</td>'
+                  + f'{cell(row, column["key"])}</td>'
                   + (f'<td class="left">{_swatch(row["cells"][column["key"]])}</td>' if column["key"] in SWATCH_COLUMNS else "")
                   + (f'<td class="left next-cell">{_next_cell(row, reading, labels)}</td>' if column["key"] == "roles" else "")
                   for column in table["columns"])
@@ -237,12 +412,18 @@ def models_board(reading: accounts.StatusReading) -> str:
 def page() -> bytes:
     """Read the stored accounts status, then render the page."""
     reading = accounts.read_status(source=accounts.StoredUsageOnly(), include_models=True)
-    body = board(reading) + models_board(reading)
+    try:
+        cleared = cleared_quotas(quota_state(review_link.review_root()))
+        alerts = active_quotas(accounts.weekly_quotas(reading.rows), quota_thresholds(), cleared)
+    except (UnreadableQuotaState, InvalidQuotaThresholds) as error:
+        reading = replace(reading, notes=(*reading.notes, str(error)))
+        alerts = {}
+    body = board(reading, alerts) + models_board(reading)
     refresh_seconds = conf.read("review_links").number("page_refresh_seconds")
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             + '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Accounts</title>'
             + f'{STYLE}</head><body><main data-refresh-seconds="{refresh_seconds}">' + page_frame.title("Accounts", "accounts")
-            + f'<div data-accounts>{body}</div></main>' + POPUP + MENU
+            + f'<div data-accounts>{body}</div></main>' + POPUP + MENU + QUOTA_PANEL
             + f"<script>{SCRIPT}</script></body></html>").encode()
 
 
@@ -337,6 +518,18 @@ background:none;color:inherit;font:inherit;text-align:left;cursor:pointer}
 .move-menu button:focus-visible{background:var(--hover);outline:none}
 .move-name{font-weight:600}.move-left{color:var(--ink-2)}.move-left.warning{color:var(--warning)}.move-left.error{color:var(--error)}
 .move-empty{padding:6px 10px;color:var(--ink-3)}
+.quota-icon{display:inline-grid;place-items:center;vertical-align:middle;width:22px;height:22px;margin:-3px 5px -3px 0;
+padding:2px;border:0;border-radius:5px;background:transparent;cursor:pointer}
+.quota-icon svg{width:16px;height:16px}
+[data-quota-level=warning]{color:var(--warning)}[data-quota-level=urgent]{color:var(--error)}
+.quota-icon:hover{background:var(--hover)}
+.quota-icon[aria-expanded=true]{box-shadow:0 0 0 2px var(--accent)}
+.quota-icon:focus-visible,.quota-panel button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.quota-panel{position:fixed;z-index:1;width:250px;max-width:calc(100vw - 16px);padding:11px 14px;
+border:1px solid var(--line);border-radius:11px;background:var(--hover);color:var(--ink);box-shadow:0 4px 20px var(--edge);font-size:.86rem}
+.quota-panel p{color:var(--ink-2);margin:2px 0 10px;font-size:.76rem}
+.quota-panel button{border:0;border-radius:7px;padding:5px 14px;background:var(--filter-selected-bg);
+color:var(--filter-selected-ink);font:inherit;font-weight:600;cursor:pointer}
 .problems{list-style:none;padding:0;margin:12px 0 0;font-size:.86rem}
 .problems li{padding:2px 0;color:var(--warning)}.problems li::before{content:"• "}
 </style>"""
@@ -359,6 +552,10 @@ maxlength="7" spellcheck="false" autocomplete="off" required>
 
 MENU = ('<div class="move-menu" role="menu" tabindex="-1" aria-labelledby="move-title" hidden data-move-menu>'
         + '<div id="move-title" class="move-title" data-move-title></div><div data-move-items></div></div>')
+
+QUOTA_PANEL = ('<div class="quota-panel" id="quota-panel" role="dialog" aria-labelledby="quota-title" hidden>'
+               + '<strong id="quota-title"></strong><p data-quota-description></p>'
+               + '<button type="button" data-quota-clear>Clear</button></div>')
 
 SCRIPT = page_frame.REFRESH_SCRIPT + r"""(() => {
 let view = document.querySelector('[data-accounts]');
@@ -440,8 +637,11 @@ let selected=null;
 const menu=document.querySelector('[data-move-menu]'), menuItems=menu.querySelector('[data-move-items]');
 let menuRow=null, menuButton=null;
 const pendingMoves=new Set();
+const quotaPanel=document.querySelector('#quota-panel'), quotaClear=quotaPanel.querySelector('[data-quota-clear]');
+let quotaButton=null, quotaSaving=false;
 const hold=()=>selected ? 'A color is being edited.' : menuRow ? 'An account move is being chosen.'
- : pendingSaves.size ? 'Colors are being saved.' : pendingMoves.size ? 'An account move is being saved.' : '';
+ : pendingSaves.size ? 'Colors are being saved.' : pendingMoves.size ? 'An account move is being saved.'
+ : quotaSaving ? 'A quota alert is being cleared.' : quotaButton ? 'A quota alert is open.' : '';
 const sortSelector='[data-account-sort],[data-model-sort]';
 const sortKey=header=>header.dataset.accountSort ?? header.dataset.modelSort;
 const sortTables=new WeakMap();
@@ -680,6 +880,62 @@ menu.addEventListener('keydown',event=>{
   : at<0 ? (down ? 0 : items.length-1) : (at+(down ? 1 : -1)+items.length)%items.length;
  items[next].focus();
 });
+function closeQuota(restoreFocus){
+ if(!quotaButton) return;
+ const button=quotaButton;
+ quotaButton=null;quotaPanel.hidden=true;button.setAttribute('aria-expanded','false');
+ if(restoreFocus) button.focus({preventScroll:true});
+ updates.changed();
+}
+document.addEventListener('click',event=>{
+ const button=event.target instanceof Element ? event.target.closest('[data-quota-account]') : null;
+ if(!button || quotaSaving) return;
+ const wasOpen=button===quotaButton;
+ closeQuota(false);
+ if(wasOpen) return;
+ quotaButton=button;
+ button.setAttribute('aria-expanded','true');
+ const [level,left]=button.getAttribute('aria-label').split(': ');
+ quotaPanel.querySelector('#quota-title').textContent=button.dataset.quotaAccount+' has '+left;
+ quotaPanel.querySelector('[data-quota-description]').textContent=level+' weekly quota alert';
+ quotaPanel.hidden=false;
+ const box=button.getBoundingClientRect(), size=quotaPanel.getBoundingClientRect();
+ quotaPanel.style.left=Math.max(8,Math.min(box.left-8,innerWidth-size.width-8))+'px';
+ quotaPanel.style.top=Math.max(8,Math.min(box.bottom+8,innerHeight-size.height-8))+'px';
+ quotaClear.focus({preventScroll:true});
+ updates.abandon();
+});
+document.addEventListener('pointerdown',event=>{
+ if(quotaButton && !quotaPanel.contains(event.target) && !(event.target instanceof Element
+     && event.target.closest('[data-quota-account]'))) closeQuota(false);
+});
+document.addEventListener('keydown',event=>{
+ if(event.key==='Escape' && quotaButton){event.preventDefault();closeQuota(true);}
+});
+quotaClear.addEventListener('click',async()=>{
+ if(!quotaButton || quotaSaving) return;
+ const button=quotaButton, {quotaAccount,quotaLevel,quotaReset}=button.dataset;
+ quotaSaving=true;quotaClear.disabled=true;message.hidden=true;
+ try{
+  const response=await fetch(location.pathname,{method:'POST',
+   headers:{'Content-Type':'application/x-www-form-urlencoded'},
+   body:new URLSearchParams({quota_account:quotaAccount,quota_level:quotaLevel,quota_reset:quotaReset})});
+  const result=await response.json();
+  if(!response.ok) throw new Error(result.reason || 'The quota alert could not be cleared.');
+  const cell=button.closest('td'), hadFocus=quotaPanel.contains(document.activeElement);
+  closeQuota(false);
+  for(const icon of view.querySelectorAll('[data-quota-account]')){
+   if(icon.dataset.quotaAccount===quotaAccount) icon.remove();
+  }
+  if(hadFocus){cell.tabIndex=-1;cell.focus({preventScroll:true});}
+  window.parent.postMessage('accounts-quota-cleared',location.origin);
+ }catch(error){
+  message.textContent=error.message || 'The quota alert could not be cleared.';message.hidden=false;
+ }finally{
+  quotaSaving=false;quotaClear.disabled=false;updates.changed();
+ }
+});
+for(const name of ['resize','scroll']) addEventListener(name,()=>closeQuota(false),{passive:true});
 for(const name of ['resize','scroll','blur']) addEventListener(name,closeMenu,{passive:true});
 })();"""
 
