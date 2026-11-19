@@ -2945,12 +2945,13 @@ Work:
 
 ### Phase 44cl — A verify call record splits each wait by its cause  · status: todo
 **From bob via builds, 2026-11-18 20:2x:** in 7 days, 825 h (42%) of Hana verify call time had no recorded cause. Rank: after verify 43h and 44bw, before 44bf and 44j.
-1. The call record gets a slot or folder wait time, written where the slot reply ends the wait (admission_service.py:2114 and the client side).
-2. The call record gets one time field for each other wait cause that the Nov 19 sample read finds (routing, remote start, setup, steps with no record).
-3. The memory wait timer stops counting folder waits (admission_client.py:910).
-4. Per-step journal wait starts at that step, not at the call's first queue time (verify.sh:2521, admission_service.py:2614).
-5. Tests prove that, for a replayed call, the parts sum to elapsed time with no overlap.
-Scope is set from the sample read (phases/44bw/callsample_read.md reply). A cheaper split from existing records replaces new fields where it gives the same answer.
+**Sample read (impl5, 2026-11-18 20:4x, 40 calls, 62.9 h unsplit):** AWS refusal retries 29.4 h (7 calls), admission waits that ended before the final admission and are absent from step totals 17.4 h, routing and hold 6.8 h, remote start 0.35 h, unassigned 8.8 h. Slot or folder wait and local setup have no record.
+1. One record, `placement_wait_s`, for each continuous wait reason, keyed by call id and placement episode. `WaitOutput` (admission_client.py:828) writes it when the reason changes, when placement grants, and when the caller leaves. Reasons: memory, slot, folder, routing, hold, remote start. This keeps abandoned admission waits and splits waits where no Cargo step starts.
+2. The memory wait timer stops counting folder waits (admission_client.py:910).
+3. Per-step journal wait starts at that step, not at the call's first queue time (verify.sh:2521, admission_service.py:2614).
+4. Local setup before the first step (checkout, copy, environment; verify.sh:3946) gets one call-linked time.
+5. An interrupted call and a call whose owner is gone still write their wait records up to the end.
+6. Tests prove that, for a replayed call, the parts sum to elapsed time with no overlap.
 
 ### Phase 44cg — A memory wait fixture gives the same result under load  · status: todo
 **From builds, 2026-11-18 18:3x:** queue's next item after 44cf.
