@@ -388,6 +388,11 @@ def parking_date(moment: datetime, zone: tzinfo) -> str:
     return moment.astimezone(zone).date().isoformat()
 
 
+def list_time(moment: datetime, today: datetime) -> str:
+    local = moment.astimezone(today.tzinfo)
+    return local.strftime("%H:%M %Z" if local.date() == today.date() else "%Y-%m-%d %H:%M %Z")
+
+
 def _time_text(value: Timestamp) -> str:
     return value.isoformat() if isinstance(value, datetime) else ""
 
@@ -452,6 +457,16 @@ def _line(value: str, name: str) -> None:
 def _log_line(value: str, name: str) -> None:
     if not value.strip() or "\n" in value or "\r" in value:
         raise ListError(f"{name} must have one nonempty line")
+
+
+_SOURCE_CLOCK = re.compile(r"(?:^|(?<=[\s,]))(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?"
+                           + r"(?: [A-Z]{2,6}|Z| ?[+-]\d{2}(?::?\d{2})?)?$")
+
+
+def source_without_clock(source: str) -> str:
+    """Remove a hand-written clock time from the end of a log source."""
+    clock = _SOURCE_CLOCK.search(source.rstrip())
+    return source[:clock.start()].rstrip(" ,\t") if clock else source
 
 
 def _staff_id(value: str, name: str) -> None:
@@ -1629,6 +1644,7 @@ def table(keeper: staff.StaffId, *, include_closed: bool = False, include_parked
 def _format_table(items: Sequence[ListItem], record: staff.StaffSnapshot, *, include_parked: bool,
                   show_latest_status: bool = False) -> str:
     moment = now()
+    today = moment.astimezone(user_zone()) if show_latest_status else moment
     visible = [item for item in items if include_parked or not isinstance(item.parked_until, datetime) or item.parked_until <= moment]
     visible.sort(key=order)
     columns = ("#", "Owner", "Producer", "Item", "State", "Next step", "ETA", "Update")
@@ -1649,7 +1665,10 @@ def _format_table(items: Sequence[ListItem], record: staff.StaffSnapshot, *, inc
                  producer.name if producer is not None else item.producer, item.title, state,
                  item.next_step, eta_text(item.eta), "●" if isinstance(item.unread_since, datetime) else "—")
         if show_latest_status:
-            cells += (item.latest_status,)
+            status = item.latest_status
+            if status and isinstance(item.updated, datetime):
+                status += " · " + list_time(item.updated, today)
+            cells += (status,)
         lines.append("| " + " | ".join(" ".join(cell.split()).replace("|", "\\|") for cell in cells) + " |")
     return "\n".join(lines)
 
@@ -1794,6 +1813,9 @@ def main(argv: list[str] | None = None) -> int:
     if name in ("link", "unlink") and not cast(list[ReviewByShownId | ReviewByKey], args.reviews):
         parser.error("use --review or --review-key")
     try:
+        source = cast(str | None, getattr(args, "source", None))
+        if source is not None and source_without_clock(source) != source:
+            raise ListError("Omit the clock time from --source because the tool adds the time.")
         record = staff.snapshot()
         caller = record.by_current_session(staff.caller_identity())
         if caller is None:
@@ -1820,7 +1842,6 @@ def main(argv: list[str] | None = None) -> int:
             identity = cast(str, args.id)
             if identity.isascii() and identity.isdecimal():
                 identity = f"L{identity}"
-            source = cast(str | None, args.source)
             if assigned_to is not AllItems.INCLUDED:
                 options = cast(dict[str, object], vars(args))
                 _check_producer_update_fields(key for key, value in options.items()
@@ -1842,7 +1863,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise ListError(result.reason)
             print(f"answered {identity} {question}")
             return 0
-        source = cast(str, args.source)
+        assert source is not None
         if name == "clean-evidence":
             changed, unchanged = clean_evidence(keeper, source=source)
             print(f"{changed} changed; {unchanged} unchanged")

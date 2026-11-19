@@ -865,6 +865,21 @@ frame.addEventListener('load',async()=>{
             self.assertIn(expected, cell)
             self.assertIn(f"{label}</dt><dd>{cell}</dd>", log)
 
+    def test_latest_status_shows_the_update_time_in_the_user_zone(self) -> None:
+        item = self.add("Status time")
+        updated = NOW + timedelta(minutes=20)
+        with patch.object(the_list, "now", return_value=updated):
+            _ = the_list.update(MORTY.id, item.id, {"latest_status": "The report is ready."}, source="morty")
+        for read_at, expected in ((updated, "13:20 EST"), (updated + timedelta(days=1), "2026-11-16 13:20 EST")):
+            with self.subTest(read_at=read_at), patch.object(time, "time", return_value=read_at.timestamp()):
+                body = list_page.render(self.root / "reviews", include_counts=False).decode()
+                self.assertIn(f'<h3>Latest status · <time datetime="{updated.isoformat()}">{expected}</time></h3>', body)
+
+    def test_log_source_shows_the_recorded_clock_time(self) -> None:
+        log = self.legacy_log('- 2026-11-16 18:20:00+00:00 Updated state: "Working" — morty, 09:00 CST')
+        self.assertIn("morty, 13:20 EST</small>", without_role_colors(log))
+        self.assertNotIn("09:00 CST", log)
+
     def test_legacy_log_text_renders_with_a_new_field_change(self) -> None:
         item = self.add("Keep the original log")
         path = the_list.folder(MORTY.id) / f"{item.id}.md"
@@ -3778,6 +3793,7 @@ window.fetch=async(_url,options)=>{
    link.href=fragment;document.body.append(link);link.click();
    await changed;
   }
+  await new Promise(resolve=>parent.requestAnimationFrame(()=>parent.requestAnimationFrame(resolve)));
   const panel=detail.querySelector('.list-panel');
   const first=panel.querySelector('[data-question="Q1"] p:last-child');
   const second=panel.querySelector('[data-question="Q2"] p:last-child');

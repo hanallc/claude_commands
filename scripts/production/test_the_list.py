@@ -200,12 +200,12 @@ class TheListTests(unittest.TestCase):
                     + "Send design questions on this item to dwight."))
         self.assertEqual(len(self.notices), 4)
         read_command = self.notices[0][1].split("`")[1]
-        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session, "USER_ZONE": "America/New_York"}):
             result, output, error = self.command(*read_command.split()[2:])
         self.assertEqual((result, error), (0, ""))
         self.assertIn("| Latest status |", output)
         self.assertIn("| 1 | show | dwight | Build plan | New; parked until", output)
-        self.assertIn("| The build is complete. |", output)
+        self.assertIn("| The build is complete. · 13:00 EST |", output)
 
     def test_assignment_sends_no_notice_for_same_producer_or_morty(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
@@ -443,6 +443,26 @@ class TheListTests(unittest.TestCase):
             self.assertEqual(self.command("update", "--id", item.id, "--state", "Working"), (0, "", ""))
         read_staff.assert_called_once_with()
         self.assertEqual(the_list.load(MORTY.id, item.id).state, the_list.ItemState.WORKING)
+
+    def test_list_shows_the_saved_update_time_beside_latest_status(self) -> None:
+        item = self.add(changes={"producer": OTHER.id})
+        updated = START + timedelta(minutes=20)
+        with (patch.dict(os.environ, {"USER_ZONE": "America/New_York", "CODEX_THREAD_ID": OTHER.current_session}),
+              patch.object(the_list, "now", return_value=updated)):
+            self.assertEqual(self.command("update", "--id", item.id, "--latest-status", "The report is ready."), (0, "", ""))
+            saved = the_list.load(MORTY.id, item.id)
+            self.assertEqual((saved.updated, saved.log[-1].time), (updated, updated))
+            self.assertIn("The report is ready. · 13:20 EST", self.command("list", "--latest-status")[1])
+
+    def test_update_refuses_a_clock_time_at_the_end_of_source(self) -> None:
+        item = self.add()
+        for clock in ("13:20", "13:20 EST", "13:20+01:00"):
+            with self.subTest(clock=clock):
+                result, output, error = self.command("update", "--id", item.id, "--state", "Working",
+                                                     "--source", "morty: report, " + clock)
+                self.assertEqual((result, output), (1, ""))
+                self.assertIn("the tool adds the time", error)
+                self.assertEqual(the_list.load(MORTY.id, item.id), item)
 
     def test_producer_cannot_run_other_commands(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
