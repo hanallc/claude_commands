@@ -464,6 +464,7 @@ class CargoFolderTests(unittest.TestCase):
     def test_mixed_request_uses_a_free_remote_slot_when_the_local_folder_is_busy(self) -> None:
         for another_remote_step in (False, True):
             with self.subTest(another_remote_step=another_remote_step), PlacementFixture() as fixture:
+                _ = write_config_fixture(fixture.root / "mac_test.conf", "max_active_builds=2\n")
                 local = local_cargo_request(fixture)
                 folder = str(fixture.root / "target")
                 granted, = fixture.connect(with_cargo_folder(local, folder)).replies()
@@ -571,6 +572,22 @@ class MacBuildLimitTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False, assignment=assignment), 0)
         return args
+
+    def test_mac_grant_reserves_capacity_from_a_standalone_claim(self) -> None:
+        with self.mac_fixture(1) as (fixture, paths):
+            request = self.request(fixture, "hana", kind="run")
+            _ = assignment_for(fixture, request)
+            args = mac_test.CliArguments()
+            args.pid = fixture.request().owner.pid
+            args.what = "check cargo-liner"
+            args.worktree = str(fixture.root / "cargo-liner")
+            with mock.patch.object(mac_test, "target_claim_scope", return_value=RepositoryScope("cargo-liner")), \
+                 redirect_stdout(io.StringIO()):
+                self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False), 11)
+                reply, = fixture.connect(wire.CancelPlacement(
+                    "done", request.episode, request.owner, "the step ended")).replies()
+                self.assertIsInstance(reply, wire.Ok)
+                self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False), 0)
 
     def test_mac_limit_counts_grants_before_and_after_claim(self) -> None:
         for limit in (1, 2):

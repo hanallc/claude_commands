@@ -13,19 +13,21 @@ It lists skipped macOS runs on release.
 It sends the holder one message when existing work ends.
 Expiry attempts to remove the block.
 A failed CI restore keeps the block active.
-The claim watcher releases a claim after 15 minutes without Mac work.
+The claim watcher can release an idle claim after `claim_idle_minutes`.
 It sends the holder a message.
 An offloaded run removes its mirror's build output after the run if disk space is below the floor.
 `/build:page` prints the shared build page link.
 The `buildlog` CLI retains coordination state, hold intervals, and detailed Mac step tables.
 
-`max_active_builds` in `config/mac_test.conf` sets the Mac host limit to one build.
-Each repository also has one claim for its mirror.
-Placement counts outstanding grants and active claims across repositories.
-A grant and its claim count once.
-Claim acquisition checks the same limit under the provider lock.
-Retained claims count until settlement.
+`max_active_builds` in `config/mac_test.conf` sets the capacity for each managed Mac target.
+The initial limit is one build across repositories.
+A queue grant reserves a claim under the same lock that a standalone claim uses.
+The runner adopts that claim in place.
+The remote claim keeps capacity until its attempt settles.
 A full Mac uses the existing busy route.
+A replacement grant can clean up an existing claim before it acquires capacity.
+The limit applies to queued Mac runs and standalone claims.
+Interactive Mac terminal work and Hana CI remain outside this limit.
 
 Converted verify steps execute only at the destination assigned by the queue.
 The queue preserves configured target order.
@@ -104,16 +106,26 @@ A PID alone cannot release another attempt.
 
 ### The idle claim — `mac_test.py watch-claim`
 
-A claim from any caller (offload, `mac_run.sh`, a session following `/build:mac`) is released once its Mac has had no Mac process for `claim_idle_minutes` (15) minutes.
+The watcher reads claims under `state.lock`.
+It keeps a live placement reservation until the grant adopts or releases it.
+A remote dispatch keeps the same claim and records a pending start fence before launching SSH.
+A dead remote holder leaves the claim in place.
+The watcher checks its exact start fence outside the lock.
+A confirmed settlement frees that claim even when a different repository is active.
+A timeout or an unconfirmed result keeps the claim for a later check.
 
-- `claim` exit 0 and takeover exit 13 call `start_claim_watcher`, which starts the `systemd-run --user` unit `mac-test-claim-watch-<pid>` running `watch-claim`, unless `claim_watch.lock` is already held. A failed start prints `warning: the Mac claim watcher could not be started`. The watcher runs `claim_watch_pass` every `claim_poll_seconds` (60) and exits once no live claim remains in any claim file, releasing the lock first so the next claimant can start its own.
-- `claim_watch_pass` reads every claim file under `state.lock` and returns at once when no claim is live (a process-bound claim whose process is gone is left to the liveness rules). With no lock held it runs `check_mac_activity(config, host) -> MacActive(count) | MacIdle | ActivityCheckFailed(reason)` once per host, against `remote_host`, or `config.host` for a process-bound claim. The check counts all of the user's Mac work, since a build process cannot be traced to a repository, so a claim is idle only while the Mac runs nothing. `watch_claim` then applies that answer to each claim: it takes `state.lock` again and acts on that claim's file only when `pid`, `proc_start` and `since` are unchanged:
-  - `MacActive`: remove `idle_since`.
-  - `MacIdle` and no `idle_since`: write `idle_since` as now.
-  - `MacIdle` and `idle_since` at least `claim_idle_minutes` old: delete the claim's file, start the block watcher when a block is present (as `release` does), print the message to the watcher's journal, and send it to `session:<holder_session>` through `send_message` with key `mac-claim-idle-<pid>-<since>`. A claim with no `holder_session` sends nothing.
-  - `ActivityCheckFailed`: print `Mac claim activity check failed: <reason>` and change nothing. An unreachable Mac never releases a claim.
-- The message: `Your Mac claim "<what>" (since <HH:MM>) was released at <HH:MM>: nothing ran on the Mac for 15 minutes, so tests waiting for it can run. Claim it again before your next Mac command: ~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what '<what>' --worktree '<worktree>' [--remote '<host>'] (see /build:mac).` The `--worktree` is the claim's own, so the repeated claim keeps its scope; the `--remote` word appears for a remote claim.
-- `mac_activity_script()` runs over one ssh call (`BatchMode=yes`, `ConnectTimeout=connect_timeout_s`, 10 s total) and prints `active=<n>` and `rc=0`; any other answer is `ActivityCheckFailed`. A Mac process is one of the user's processes that `offload.mirror_selector_script(ALL_MIRRORS)` selects (a command line or working directory under `.local/state/mac-test/mirror/`), or whose executable is named `cargo`, `rustc` or `cargo-nextest`, or whose executable path contains `/target/` (test and app binaries). The check sends no signal. The text runs under the Mac's `sh` and `zsh -f`.
+The watcher uses the retained repository's mirror activity for older claims without a fence.
+It uses host activity for claims with a live holder and for old whole-Mac claims without a fence.
+The watcher checks the claim identity and owner again before release.
+It starts the block watcher when a block is present.
+An idle release tells the holder session how to claim again.
+It skips the message if the claim has no holder session.
+
+`start_claim_watcher` starts the systemd user unit `mac-test-claim-watch-<pid>`.
+The watcher uses `claim_watch.lock` so only one runs per target.
+It repeats checks after `claim_poll_seconds` while live or retained claims remain.
+`check_mac_activity` uses an SSH probe that sends no signals.
+The probe counts mirror processes, Cargo, rustc, cargo-nextest, and executables under a target folder.
 
 ### The idle Mac watch — `scripts/buildlog/mac_idle.py`
 
@@ -520,8 +532,10 @@ Both values use the existing configuration reader.
 - A printed `mac_exit=<n>` followed by nothing but `mac_cleanup=` markers is the result of a finished test even if ssh failed afterward. With no such line, a run is lost; reach and control checks require their own `rc=<n>` answer.
 - Tests run nothing on the Mac: stand-in `ssh`, `rsync`, `gh` on `PATH`, state under `MAC_TEST_STATE_DIR`, config under `MAC_TEST_CONFIG`. Tests set these variables for a checkout's scripts; installed scripts refuse to run with either set. A test reaching the footer sets `MAC_TEST_STATE_DIR` too.
 - On the Mac the feature writes and removes only under `~/.local/state/mac-test/`. The cleanup removes nothing but the mirror's `target` folder, and only below `free_floor_gib`; `/tmp` and the user's clones are never touched. Only step records are written there; call records are written on natedev only.
-- The claim files live on natedev. Only claims without `--remote` disappear when the claiming process dies; remote claims remain until their leftovers are confirmed gone, the claim watcher finds the Mac idle for `claim_idle_minutes`, or a hand release.
-- One claim per repository. Two live claims never share a repository, a whole-Mac claim (in `run.json`) excludes every other, and a block refuses claims from other sessions; the Mac's load is never read. The claim watcher removes only a claim that is idle and unchanged since it read it, and a failed activity check never releases one.
+- The claim files live on natedev. A process-bound claim ends when its owner exits.
+- A remote claim keeps capacity until settlement. A failed settlement check keeps the claim in place.
+- Each repository has one claim. A whole-Mac claim excludes other claims.
+- A block refuses new claims from other sessions. The host limit uses claim count.
 - A copy never replaces a copy, and a Mac-only (non-copy) run never gives way; only a live copy claim gives way, and only to a non-copy claim.
 - A copy win stops natedev only through a live group leader whose start time matches; a step that already ended keeps its result.
 

@@ -27,7 +27,7 @@ import threading
 import time
 import uuid
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Callable, Protocol, cast, override
+from typing import Callable, Protocol, cast, override
 
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
@@ -64,9 +64,6 @@ from scripts.build_queue.scope_activity import (
 from scripts.lint.build_shape import build_shape, recorded_build_shape
 from scripts.lib.atomic_file import atomic_sample, write_text_atomic
 from scripts.accounts import outage_alerts
-
-if TYPE_CHECKING:
-    from scripts.mac_test import mac_test
 
 
 
@@ -1397,6 +1394,7 @@ class AdmissionServer:
         self.pending_coordinators: dict[placement.SubmittingOwner, PendingCoordinatorEvidence] = {}
         self.assignments: dict[str, records.SavedPlacementAssignment] = {}
         self.current_assignments: dict[str, str] = {}
+        self.mac_reservation_cleanup: set[str] = {"mac"}
         self.execution_evidence: dict[str, execution_identity.ExecutionEvidence] = {}
         self.prerequisites: dict[str, placement.LocalExecutionPrerequisite] = {}
         self.placement_eligibility: dict[str, tuple[placement.CandidateEligibility, ...]] = {}
@@ -2300,7 +2298,8 @@ class AdmissionServer:
             if placement_request is not None:
                 candidate = next(candidate for candidate in self.placement_eligibility[episode]
                     if candidate.destination.provider == "local" and isinstance(candidate.eligibility, placement.AllowedHost))
-                assignment = self._new_assignment(placement_request, candidate.destination, remote_start_hold_seconds)
+                assignment = self._make_assignment(placement_request, candidate.destination)
+                self._record_assignment(placement_request, assignment, remote_start_hold_seconds)
                 key = execution_identity.attempt_key(episode, assignment.attempt)
                 self.assignments[key] = replace(self.assignments[key], permission=placement.PermissionConsumed(inputs.now))
                 if isinstance(cargo_folder, placement.CargoFolder):
@@ -3594,11 +3593,15 @@ done
                 self._drop_waiter(episode)
         self._prune_host_evidence()
 
-    def _new_assignment(self, request: wire.PlacementRequest,
-                        destination: placement.PlacementDestination, remote_start_hold_seconds: int
-                        ) -> placement.PlacementAssignment:
-        assignment = placement.PlacementAssignment(request.episode, uuid.uuid4().hex, destination,
+    @staticmethod
+    def _make_assignment(request: wire.PlacementRequest,
+                         destination: placement.PlacementDestination) -> placement.PlacementAssignment:
+        return placement.PlacementAssignment(request.episode, uuid.uuid4().hex, destination,
             request.constraints.source_key, request.owner, request.constraints.session, request.since)
+
+    def _record_assignment(self, request: wire.PlacementRequest, assignment: placement.PlacementAssignment,
+                           remote_start_hold_seconds: int) -> None:
+        destination = assignment.destination
         key = execution_identity.attempt_key(request.episode, assignment.attempt)
         evidence_key = self.placement_host_keys[(request.episode, destination)]
         hold = (records.RemoteStartHold(self.clock.now() + remote_start_hold_seconds)
@@ -3608,7 +3611,6 @@ done
             assigned_settings_generation=placement.AssignedSettingsGeneration(evidence_key.configuration_generation),
             remote_start_hold=hold)
         self.current_assignments[request.episode] = key
-        return assignment
 
     def _placement_reply(self, request: wire.PlacementRequest, local_holder: placement.ResourceHolder
                          ) -> wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus:
@@ -3759,21 +3761,41 @@ done
                          and isinstance(record.cargo_folder, placement.CargoFolder))
 
     @staticmethod
-    def _mac_build_capacity(target: str) -> mac_test.MacBuildCapacity | placement.EvidenceNeeded:
-        """Read the local claim snapshot without waiting for the provider lock."""
+    def _reserve_mac_placement(request: wire.PlacementRequest,
+                               assignment: placement.PlacementAssignment) -> placement.HostEligibility:
         from scripts.mac_test import claim_state, mac_test
 
+        target = assignment.destination.target
         with conf.report_key_changes():
             try:
                 paths = claim_state.StatePaths(target_config.ssh_target_state_directory(target), target)
-                claims = tuple(claim for claim in claim_state.read_claims(paths) if mac_test.run_is_live(claim.record))
-                return mac_test.mac_build_capacity(_provider_configuration().read("mac_test"), claims)
+                return mac_test.reserve_mac_placement(paths, assignment,
+                    what=request.profile.step, worktree=request.constraints.repository,
+                    copy=isinstance(request.purpose, placement.SpeculativeCopy),
+                    uses_claim=request.constraints.command_kind not in placement.MAC_RUN_KINDS,
+                    configuration=_provider_configuration().read("mac_test"))
             except (OSError, ValueError) as error:
                 return placement.EvidenceNeeded(f"The Mac build capacity is unreadable: {error}")
+
+    def _clear_closed_mac_reservations(self) -> None:
+        from scripts.mac_test import claim_state, mac_test
+
+        for target in tuple(self.mac_reservation_cleanup):
+            current = {(saved.assignment.episode, saved.assignment.attempt)
+                for key in self.current_assignments.values()
+                if (saved := self.assignments.get(key)) is not None and saved.assignment.destination.target == target}
+            try:
+                paths = claim_state.StatePaths(target_config.ssh_target_state_directory(target), target)
+                if mac_test.clear_closed_mac_reservations(paths, current):
+                    self.mac_reservation_cleanup.remove(target)
+            except (OSError, ValueError):
+                continue
 
     def _placement_pass(self, inputs: records.QueueInputs, policy: records.AdmissionPolicy,
                         remote_start_hold_seconds: int) -> records.QueueInputs:
         """Keep pending remote starts in the local order until their holds end."""
+        if self.mac_reservation_cleanup:
+            self._clear_closed_mac_reservations()
         if not any(self._placement_waiting(request) for request in self.placement_requests.values()):
             self.placement_holds = {}
             self.placement_hold_answers = {}
@@ -3809,13 +3831,6 @@ done
         cargo_folders = dict(inputs.cargo_folders)
         held: list[PlacementHold] = []
         taken: list[placement.PlacementDestination] = []
-        mac_capacity: dict[str, mac_test.MacBuildCapacity | placement.EvidenceNeeded] = {}
-        mac_grants: dict[str, list[placement.PlacementAssignment]] = {}
-        for key in self.current_assignments.values():
-            saved = self.assignments[key]
-            destination = saved.assignment.destination
-            if destination.provider == "mac" and isinstance(saved.state, placement.CurrentAssignment):
-                mac_grants.setdefault(destination.target, []).append(saved.assignment)
         holds: dict[tuple[str, placement.PlacementDestination], float] = {}
         answers: dict[tuple[str, placement.PlacementDestination], float] = {}
         for _, row in ordered:
@@ -3859,28 +3874,15 @@ done
                 if (any(same_remote_resource(other, destination) for other in taken)
                         or self._held_for_older(request, destination, held, holds)):
                     continue
+                assignment = self._make_assignment(request, destination)
                 if destination.provider == "mac":
-                    if destination.target not in mac_capacity:
-                        mac_capacity[destination.target] = self._mac_build_capacity(destination.target)
-                    capacity = mac_capacity[destination.target]
-                    grants = mac_grants.setdefault(destination.target, [])
-                    capacity_wait: placement.HostEligibility
-                    if isinstance(capacity, placement.EvidenceNeeded):
-                        capacity_wait = capacity
-                    elif capacity.blocks_placement(destination.scope,
-                            copy=isinstance(request.purpose, placement.SpeculativeCopy),
-                            uses_claim=request.constraints.command_kind not in placement.MAC_RUN_KINDS, grants=grants):
-                        capacity_wait = placement.TemporaryExclusion("busy")
-                    else:
-                        capacity_wait = placement.AllowedHost()
+                    capacity_wait = self._reserve_mac_placement(request, assignment)
                     if not isinstance(capacity_wait, placement.AllowedHost):
                         updated = replace(candidate, eligibility=capacity_wait)
                         candidates = (*candidates[:index], updated, *candidates[index + 1:])
                         self.placement_eligibility[request.episode] = candidates
                         continue
-                assignment = self._new_assignment(request, destination, remote_start_hold_seconds)
-                if destination.provider == "mac":
-                    mac_grants[destination.target].append(assignment)
+                self._record_assignment(request, assignment, remote_start_hold_seconds)
                 taken.append(destination)
                 if isinstance(request.purpose, placement.SpeculativeCopy):
                     held_copy_destinations.append(candidate.destination)
@@ -4061,9 +4063,13 @@ done
             if request is not None:
                 saved = self._end_remote_start_hold(request, saved)
             del self.current_assignments[assignment.episode]
+            if assignment.destination.provider == "mac":
+                self.mac_reservation_cleanup.add(assignment.destination.target)
         self.assignments[key] = replace(saved, state=placement.ClosedAssignment(reason), retry=retry)
         self._prune_host_evidence()
         self.persist()
+        if self.mac_reservation_cleanup:
+            self._clear_closed_mac_reservations()
         self.next_pass = self.clock.monotonic()
 
     def _settle_hana_prelaunch(self, saved: records.SavedPlacementAssignment,

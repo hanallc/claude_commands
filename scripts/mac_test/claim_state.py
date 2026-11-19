@@ -235,6 +235,7 @@ class ClaimOwnerRecord(TypedDict):
     idle_since: NotRequired[str]
     work_idle_since: NotRequired[str]
     copy: NotRequired[bool]
+    placement_reserved: NotRequired[bool]
     repo_key: NotRequired[str]
     repo_name: NotRequired[str]
     slot: NotRequired[int]
@@ -396,6 +397,10 @@ def read_run(path: Path) -> RunState:
         if values["copy"] is not True:
             raise StateReadError(f"{path} has an invalid copy")
         record["copy"] = True
+    if "placement_reserved" in values:
+        if values["placement_reserved"] is not True or "remote_host" in values:
+            raise StateReadError(f"{path} has an invalid placement reservation")
+        record["placement_reserved"] = True
     if "repo_key" in values or "repo_name" in values:
         record["repo_key"] = required_string(values, "repo_key", path)
         record["repo_name"] = required_string(values, "repo_name", path)
@@ -487,7 +492,10 @@ def read_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
         if "repo_name" in record:
             scope: ClaimScope = RepositoryScope(record["repo_name"], record.get("repo_key", ""), record.get("slot", 0))
         else:
-            scope = target_claim_scope(paths, record["worktree"]) if path == paths.run else RepositoryScope(path.stem)
+            if path == paths.run:
+                scope = WHOLE_MAC if record.get("placement_reserved") else target_claim_scope(paths, record["worktree"])
+            else:
+                scope = RepositoryScope(path.stem)
         held.append(HeldClaim(scope, path, record))
     return tuple(sorted(held, key=lambda claim: datetime.fromisoformat(claim.record["since"])))
 

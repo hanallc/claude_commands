@@ -1,9 +1,4 @@
-"""Take a Mac queue placement, run through SSH, and return the placement.
-
-It sets no signal handler. A signal ends it with its default action; its
-children share its process group; the queue ends the placement when this
-process ends; and the Mac work ends when the SSH input closes.
-"""
+"""Run a reserved Mac placement through SSH and confirm its release."""
 from __future__ import annotations
 
 try:
@@ -30,7 +25,9 @@ import time
 from typing import TextIO, TypedDict, cast
 import uuid
 
+from scripts.build_queue import admission_wire as wire, placement as queue_placement
 from scripts.lib import conf
+from scripts.mac_test import claim_state, eligibility, mac_test, offload
 
 
 def admission_command() -> list[str]:
@@ -38,18 +35,37 @@ def admission_command() -> list[str]:
 
 
 @dataclass(frozen=True)
-class MacPlacement:
-    host: str
-    episode: str
-    attempt: str
+class ArmedMacDispatch:
+    """The reservation and exact fence that protect a Mac launch."""
+
+    assignment: queue_placement.PlacementAssignment
+    paths: claim_state.StatePaths
+    claim: claim_state.HeldClaim
 
 
-def parse_placement(output: str) -> MacPlacement:
-    for line in reversed(output.splitlines()):
-        fields = line.split("\t")
-        if len(fields) == 6:
-            return MacPlacement(fields[2], fields[4], fields[5])
-    raise ValueError("the queue returned no placement")
+@dataclass(frozen=True)
+class NoRemoteDispatch:
+    """The run has yet to arm its Mac claim."""
+
+
+def prepare_dispatch(assignment: queue_placement.PlacementAssignment) -> ArmedMacDispatch:
+    destination = assignment.destination
+    if destination.target != "mac" or destination.provider != "mac" or assignment.owner.pid != os.getpid():
+        raise ValueError("The assignment does not reserve this Mac run")
+    paths = claim_state.state_paths(destination.target)
+    scope_key = mac_test.claim_path(paths, destination.scope).stem
+    reference = queue_placement.assigned_claim_reference(assignment)
+    identity = claim_state.ClaimIdentity(reference.claim_id, reference.episode, reference.attempt)
+    connection = eligibility.read_connection_settings(mac_test.config_path(paths.target))
+    prepare = offload.prepare_start_fence_command(identity, paths.target, scope_key=scope_key)
+    marker = "dispatch_start_prepared=" + offload.pending_start_key(identity)
+    command = prepare + " || exit 1\nprintf '%s\\n' " + shlex.quote(marker)
+    ready = subprocess.run(["ssh", *offload.ssh_options(connection), destination.host, command],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=connection.leftover_timeout_s, check=False)
+    if ready.returncode != 0 or ready.stdout.strip() != marker:
+        raise OSError("The Mac start fence could not be prepared")
+    mac_test.start_claim_watcher(paths)
+    return ArmedMacDispatch(assignment, paths, mac_test.arm_mac_queue_claim(paths, assignment))
 
 
 def placement_arguments(episode: str, since: float, pid: int, worktree: Path, package: str,
@@ -92,13 +108,16 @@ printf '\nmac_exit=%s\n' $code
 """)
 
 
-def remote_command(placement: MacPlacement, cwd: str, argv: list[str], on_close: str) -> list[str]:
+def remote_command(dispatch: ArmedMacDispatch, cwd: str, argv: list[str], on_close: str) -> list[str]:
+    assignment = dispatch.assignment
     work = ("cd " + shlex.quote(cwd) + " && " if cwd else "")
-    work += "MAC_PLACEMENT=" + shlex.quote(placement.episode + "/" + placement.attempt) + " " + shlex.join(argv)
+    work += "MAC_PLACEMENT=" + shlex.quote(assignment.episode + "/" + assignment.attempt) + " " + shlex.join(argv)
     # Ten polls a second while the group ends.
     grace_polls = max(1, math.ceil(conf.read("mac_gate").number("terminate_grace_seconds") * 10))
     wrapper = remote_wrapper(work, on_close, grace_polls)
-    return ["ssh", "-o", "BatchMode=yes", placement.host, "/bin/zsh -c " + shlex.quote(wrapper)]
+    wrapper = offload.fenced_start_command(claim_state.claim_identity(dispatch.claim.record),
+        dispatch.paths.target, wrapper, scope_key=dispatch.claim.path.stem)
+    return ["ssh", "-o", "BatchMode=yes", assignment.destination.host, "/bin/zsh -c " + shlex.quote(wrapper)]
 
 
 class RemoteState(Enum):
@@ -113,7 +132,7 @@ class RemoteRun:
     group: int = 0
 
 
-def stop_remote(placement: MacPlacement, remote: RemoteRun) -> bool:
+def stop_remote(dispatch: ArmedMacDispatch, remote: RemoteRun) -> bool:
     if remote.group == 0:
         return False
     grace = conf.read("mac_gate").number("terminate_grace_seconds")
@@ -127,8 +146,10 @@ groups=$(ps -axo pgid=) || exit 1
 if printf '%s\\n' "$groups" | grep -Eq "^[[:space:]]*$group[[:space:]]*$"; then exit 1; fi
 printf 'mac_stopped=%s\\n' "$group"
 """
-    result = subprocess.run(["ssh", "-o", "BatchMode=yes", placement.host,
-                             "/bin/zsh -c " + shlex.quote(script)], capture_output=True, text=True)
+    connection = eligibility.read_connection_settings(mac_test.config_path(dispatch.paths.target))
+    result = subprocess.run(["ssh", *offload.ssh_options(connection), dispatch.assignment.destination.host,
+        "/bin/zsh -c " + shlex.quote(script)], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        timeout=connection.leftover_timeout_s, check=False)
     return result.returncode == 0 and result.stdout.strip() == f"mac_stopped={remote.group}"
 
 
@@ -152,7 +173,7 @@ def capture_command(command: list[str]) -> tuple[int, str]:
             stop_command(process)
 
 
-def stream_remote(command: list[str], remote: RemoteRun) -> int:
+def stream_remote(command: list[str], remote: RemoteRun, identity: claim_state.ClaimIdentity) -> int:
     # The SSH input stays open and empty while this process lives; the Mac wrapper stops the work when it closes.
     with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8",
                           errors="replace") as process:
@@ -160,7 +181,10 @@ def stream_remote(command: list[str], remote: RemoteRun) -> int:
             remote.state = RemoteState.LIVE
             assert process.stdout is not None
             last = ""
+            fence_key = offload.pending_start_key(identity)
             for line in cast(TextIO, process.stdout):
+                if line.rstrip() in (f"dispatch_start_settled={fence_key}", f"dispatch_start_pending={fence_key}"):
+                    continue
                 if line.startswith("mac_group=") and line.removeprefix("mac_group=").strip().isdigit():
                     remote.group = int(line.removeprefix("mac_group="))
                     continue
@@ -265,7 +289,7 @@ def run(args: Arguments) -> int:
     status = 1
     remote = RemoteRun()
     prepared = False
-    placement = MacPlacement("", episode, "")
+    dispatch: ArmedMacDispatch | NoRemoteDispatch = NoRemoteDispatch()
     receipts = Path.home() / RECEIPTS
     receipts.mkdir(parents=True, exist_ok=True, mode=0o700)
     assignment_file = receipts / (episode + ".json")
@@ -287,14 +311,18 @@ def run(args: Arguments) -> int:
                 print(output, end="", flush=True)
                 status = 9 if args.lifecycle_script and code in (10, 11, 12) else code
             else:
-                placement = parse_placement(output)
-                callback_environment["MAC_QUEUE_HOST"] = placement.host
+                reply = wire.read_assignment(assignment_file)
+                if not isinstance(reply, wire.Assignment) or reply.assignment.episode != episode:
+                    raise ValueError("The queue returned a different placement")
+                assignment = reply.assignment
+                host = assignment.destination.host
+                callback_environment["MAC_QUEUE_HOST"] = host
                 clean_ended_runs(callback_environment)
                 on_close = ""
                 if args.lifecycle_script:
                     prepared = True
                     saved: SavedRun = {"lifecycle_script": args.lifecycle_script, "arguments": original_command,
-                                       "host": placement.host}
+                                       "host": host}
                     _ = (directory / "run.json").write_text(json.dumps(saved))
                     status = run_callback(args.lifecycle_script, "prepare", argv_file, original_command, callback_environment)
                     if status == 0:
@@ -310,16 +338,18 @@ def run(args: Arguments) -> int:
                 if status == 0:
                     # A run that ends before the Mac answers reports a failure, not success.
                     status = 1
-                    status = stream_remote(remote_command(placement, args.cwd, command, on_close), remote)
-        except (OSError, ValueError) as error:
+                    dispatch = prepare_dispatch(assignment)
+                    identity = claim_state.claim_identity(dispatch.claim.record)
+                    status = stream_remote(remote_command(dispatch, args.cwd, command, on_close), remote, identity)
+        except (OSError, ValueError, subprocess.TimeoutExpired, wire.AdmissionUnavailable) as error:
             print(f"mac queue: {error}", file=sys.stderr)
             status = 2
         finally:
             safe = remote.state != RemoteState.LIVE
-            if not safe:
+            if not safe and isinstance(dispatch, ArmedMacDispatch):
                 try:
-                    safe = stop_remote(placement, remote)
-                except OSError:
+                    safe = stop_remote(dispatch, remote)
+                except (OSError, ValueError, subprocess.TimeoutExpired):
                     safe = False
             if prepared and safe:
                 try:
@@ -332,7 +362,13 @@ def run(args: Arguments) -> int:
                     status = status or cleanup_status
             if lease_descriptor >= 0:
                 os.close(lease_descriptor)
-            # A Mac placement has no local grant, so the run returns it with a cancel that names the result.
+            if safe and isinstance(dispatch, ArmedMacDispatch):
+                try:
+                    exact = mac_test.release_exact_claims(dispatch.paths, pid,
+                        claim_state.claim_identity(dispatch.claim.record), "")
+                    safe = isinstance(exact, mac_test.ClaimsReleased) and exact.count == 1
+                except (OSError, ValueError):
+                    safe = False
             reason = (f"the Mac run ended with status {status}" if remote.state != RemoteState.NOT_STARTED
                       else "the Mac run did not start")
             if safe:
@@ -345,10 +381,10 @@ def run(args: Arguments) -> int:
             else:
                 released = False
                 print("mac queue: the Mac run may still be live; placement release is withheld", file=sys.stderr)
-            # The queue ends the placement when this process ends, so the receipt has no later use.
+            # The provider claim retains capacity after the placement owner ends.
             assignment_file.unlink(missing_ok=True)
             if not released:
-                print("mac queue: the placement was not returned; the queue ends it when this run ends", file=sys.stderr)
+                print("mac queue: the placement was not returned", file=sys.stderr)
                 status = status or 1
     return status
 

@@ -473,6 +473,12 @@ def pending_start_path(target: str, identity: claim_state.ClaimIdentity) -> Path
     return claim_state.state_paths(target).directory / "pending-starts" / pending_start_key(identity)
 
 
+def record_pending_start(target: str, identity: claim_state.ClaimIdentity) -> None:
+    path = pending_start_path(target, identity)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(path, pending_start_key(identity))
+
+
 def start_fence_relative(identity: claim_state.ClaimIdentity, target: str, *, scope_key: str = "run") -> Path:
     state = (Path(".local/state/mac-test") if target in ("", "mac")
              else Path(".local/state/build-targets") / target)
@@ -1742,9 +1748,7 @@ def probe_mac(
         timeout_s = config.probe_timeout_s
     identity = controller.claim_identity
     if isinstance(identity, claim_state.ClaimIdentity):
-        path = pending_start_path(target, identity)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(path, pending_start_key(identity))
+        record_pending_start(target, identity)
         script = ("(\n" + script + "\n)\nprobe_status=$?\n"
                   + "if [ \"$probe_status\" -eq 0 ]; then\n"
                   + prepare_start_fence_command(identity, target, scope_key=controller.claim_scope_key) + " || exit 1\nfi\n"

@@ -18,7 +18,7 @@ import unittest
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.mac_test import mac_queue_run
+from scripts.mac_test import mac_queue_run, mac_test
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
@@ -38,7 +38,24 @@ if args[0] == "place-step":
     if os.environ.get("FAKE_QUEUE_REFUSE") == "1":
         print("refused\tclosed")
         raise SystemExit(2)
-    Path(option("--assignment-file")).write_text(json.dumps({"episode":option("--episode"),"attempt":"attempt"}))
+    sys.path.insert(0, os.environ["FAKE_QUEUE_PROJECT"])
+    from scripts.build_hold.owning_session import NoOwningSession
+    from scripts.build_queue import admission_wire as wire, execution_identity, placement
+    from scripts.lib import conf, process_start
+    from scripts.mac_test import claim_state, mac_test
+    pid = int(option("--pid"))
+    start = process_start.process_start(pid)
+    assert isinstance(start, process_start.Started)
+    assignment = placement.PlacementAssignment(option("--episode"), "attempt",
+        placement.PlacementDestination("mac", "mac", "fake-mac", claim_state.RepositoryScope("hana")),
+        execution_identity.SourceKeyKnown("fixture"), placement.SubmittingOwner("fixture", pid, start.start),
+        NoOwningSession(), float(option("--since")))
+    reserve = getattr(mac_test, "reserve_mac_placement", None)
+    if reserve is not None:
+        reserved = reserve(claim_state.state_paths(), assignment, what="fixture", worktree=option("--repo-root"),
+            copy=False, uses_claim=False, configuration=conf.read("mac_test"))
+        assert isinstance(reserved, placement.AllowedHost), reserved
+    wire.write_assignment(Path(option("--assignment-file")), wire.Assignment(assignment))
     print("mac\tmac\tfake-mac\t0\t"+option("--episode")+"\tattempt")
 else:
     if os.environ.get("FAKE_RETURN_FAIL") == "1":
@@ -51,6 +68,13 @@ import json, os, shlex, sys
 from pathlib import Path
 root = Path(os.environ["FAKE_QUEUE_STATE"])
 args = shlex.split(sys.argv[-1])
+if "dispatch_start_prepared=" in sys.argv[-1]:
+    print(args[-1])
+    raise SystemExit(0)
+if "leftovers=0" in sys.argv[-1]:
+    key, = (root / "mac-state" / "pending-starts").iterdir()
+    print(f"dispatch_start_settled={key.name}\nleftovers=0\nrc=0")
+    raise SystemExit(0)
 if "mac_stopped=" in args[-1]:
     (root / "stop").write_text(args[-1])
     if os.environ.get("FAKE_STOP_FAIL") == "1":
@@ -59,6 +83,8 @@ if "mac_stopped=" in args[-1]:
     raise SystemExit(0)
 (root / "remote").write_text(json.dumps(args))
 print("mac_group=4567", flush=True)
+if os.environ.get("FAKE_SSH_LOST") == "1":
+    raise SystemExit(255)
 if os.environ.get("FAKE_SSH_HOLD") == "1":
     (root / "running").write_text(str(os.getpid()))
     # The real ssh sends the end of its input to the Mac wrapper, which stops the work.
@@ -70,6 +96,9 @@ print("Mac output", flush=True)
 if status == 125:
     print("mac cargo gate refused: placement closed; run it through mac_queue_run.py", file=sys.stderr)
 print(f"mac_exit={status}", flush=True)
+if "dispatch_start_settled=" in sys.argv[-1]:
+    key, = (root / "mac-state" / "pending-starts").iterdir()
+    print(f"dispatch_start_pending={key.name}", flush=True)
 '''
 
 
@@ -110,8 +139,14 @@ class QueueRunTests(unittest.TestCase):
         ssh = root / "ssh"
         _ = ssh.write_text(f"#!{sys.executable}\n" + SSH)
         ssh.chmod(0o755)
+        systemd = root / "systemd-run"
+        _ = systemd.write_text("#!/bin/sh\nexit 0\n")
+        systemd.chmod(0o755)
         environment = {**os.environ, **config_environment(root / "config"), "FAKE_QUEUE_STATE": str(root),
+                       "FAKE_QUEUE_PROJECT": str(Path(__file__).resolve().parents[2]),
+                       "MAC_TEST_STATE_DIR": str(root / "mac-state"),
                        "PATH": str(root) + os.pathsep + os.environ["PATH"], "HOME": str(root)}
+        _ = write_config_fixture(root / "config/mac_test.conf", "max_active_builds=1\n")
         _ = write_config_fixture(root / "config/mac_gate.conf", "admission_client_command="
                                  + shlex.join([sys.executable, str(queue)]) + "\n")
         return environment
@@ -158,12 +193,29 @@ class QueueRunTests(unittest.TestCase):
         else:
             self.assertEqual(released[released.index("--reason") + 1], f"the Mac run ended with status {status}")
             remote = cast(list[str], json.loads((root / "remote").read_text()))
-            wrapper = shlex.split(remote[2])
-            work = shlex.split(wrapper[0].removeprefix("work="))
+            work_line = next(line for line in remote[2].splitlines() if line.startswith("work="))
+            work = shlex.split(shlex.split(work_line)[0].removeprefix("work="))
             self.assertEqual(work[:3], ["cd", "/Mac scratch/checkout", "&&"])
             self.assertEqual(work[3], "MAC_PLACEMENT=" + placed[placed.index("--episode") + 1] + "/attempt")
             self.assertEqual(work[4:], self.command(root)[-3:])
             self.assertEqual(result.stdout.splitlines()[-1], f"mac_exit={status}")
+            self.assertEqual(list((root / "mac-state/claims").iterdir()), [])
+            self.assertEqual(list((root / "mac-state/pending-starts").iterdir()), [])
+
+    def test_unconfirmed_stop_retains_the_exact_remote_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = {**self.fixture(root), "FAKE_SSH_LOST": "1", "FAKE_STOP_FAIL": "1"}
+            result = subprocess.run(self.command(root), capture_output=True, text=True, env=environment,
+                                    timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 255, result.stdout + result.stderr)
+            self.assertEqual([event[0] for event in self.events(root)], ["place-step"])
+            record = mac_test.read_run(root / "mac-state/claims/hana.json")
+            assert not isinstance(record, mac_test.NoRun) and "remote_host" in record
+            self.assertEqual(record["remote_host"], "fake-mac")
+            self.assertEqual(record["attempt"], "attempt")
+            self.assertTrue(mac_test.run_is_kept(record))
+            self.assertEqual(len(list((root / "mac-state/pending-starts").iterdir())), 1)
 
     def test_a_signal_ends_the_run_with_its_default_action(self) -> None:
         for waiting, signum in ((False, signal.SIGTERM), (False, signal.SIGHUP), (True, signal.SIGTERM),

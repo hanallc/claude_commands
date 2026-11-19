@@ -3454,6 +3454,32 @@ class ClaimWatchTests(NotificationGuardedTestCase):
     def read_repository_claim(self, name: str) -> dict[str, object]:
         return cast(dict[str, object], json.loads((self.paths.claims / f"{name}.json").read_text()))
 
+    def test_retained_fence_settles_while_another_repository_runs(self) -> None:
+        from scripts.mac_test import claim_state, offload
+
+        _ = write_config_fixture(self.root / "mac_test.conf", "max_active_builds=2\n")
+        ended_pid = os.getpid() + 1
+        _ = self.write_repository_claims(pid=ended_pid)
+        identity = claim_state.ClaimIdentity("claim-hana", "episode-hana", "attempt-1")
+        pending = offload.pending_start_path(self.paths.target, identity)
+        pending.parent.mkdir()
+        _ = pending.write_text(offload.pending_start_key(identity))
+        settled = offload.LeftoverObservation(offload.LeftoversEnded(),
+            "dispatch_start_settled=" + offload.pending_start_key(identity))
+
+        def process_start(pid: int) -> process_identity.Started | process_identity.Gone:
+            return process_identity.Gone() if pid == ended_pid else process_identity.Started("owner-start")
+
+        with mock.patch.object(process_identity, "process_start", side_effect=process_start), \
+             mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacActive(1, 1)), \
+             mock.patch.object(offload, "read_leftovers", return_value=settled) as check:
+            self.assertTrue(mac_test.claim_watch_pass(self.paths, mac_test.read_config()))
+
+        check.assert_called_once()
+        self.assertFalse((self.paths.claims / "hana.json").exists())
+        self.assertFalse(pending.exists())
+        self.assertTrue((self.paths.claims / "cargo-liner.json").exists())
+
     def test_one_activity_check_per_host_serves_every_repository_claim(self) -> None:
         records = self.write_repository_claims()
         with mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()) as activity, \

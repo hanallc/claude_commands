@@ -8,7 +8,7 @@ except FileNotFoundError:
     pass
 
 import argparse
-from collections.abc import Generator, Iterable
+from collections.abc import Generator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -660,7 +660,7 @@ def run_is_kept(run: RunRecord) -> TypeGuard[RemoteJobClaim]:
 
 def run_holds_work(run: RunRecord) -> bool:
     """Report running work without counting claims kept for cleanup."""
-    return run_is_live(run) and not run_is_kept(run)
+    return run_is_live(run) and not run_is_kept(run) and not run.get("placement_reserved")
 
 
 def copy_gives_way(run: RunRecord) -> bool:
@@ -678,24 +678,8 @@ class MacBuildCapacity:
     limit: int
     claims: tuple[HeldClaim, ...]
 
-    def at_limit(self, *, unclaimed_grants: int = 0, yielding_claims: int = 0) -> bool:
-        return len(self.claims) + unclaimed_grants - yielding_claims >= self.limit
-
-    def blocks_placement(self, scope: ClaimScope, *, copy: bool, uses_claim: bool,
-                         grants: Iterable[placement.PlacementAssignment]) -> bool:
-        """Apply the limit and permit cleanup takeover or an overlapping copy to yield."""
-        claimed_attempts = {(claim.record["episode"], claim.record["attempt"]) for claim in self.claims}
-        unclaimed = tuple(grant for grant in grants if (grant.episode, grant.attempt) not in claimed_attempts)
-        if any(scopes_overlap(grant.destination.scope, scope) for grant in unclaimed):
-            return True
-        if not uses_claim:
-            return self.at_limit(unclaimed_grants=len(unclaimed))
-        overlapping = tuple(claim for claim in self.claims if scopes_overlap(claim.scope, scope))
-        if any(run_is_kept(claim.record) for claim in overlapping):
-            # A takeover allows cleanup under the original claim.
-            return False
-        yielding = sum(not copy and copy_gives_way(claim.record) for claim in overlapping)
-        return self.at_limit(unclaimed_grants=len(unclaimed), yielding_claims=yielding)
+    def at_limit(self) -> bool:
+        return len(self.claims) >= self.limit
 
 
 def mac_build_capacity(configuration: conf.ConfigRead, claims: tuple[HeldClaim, ...]) -> MacBuildCapacity:
@@ -727,6 +711,101 @@ def scopes_overlap(first: ClaimScope, second: ClaimScope) -> bool:
         return True
     same_repository = first.key == second.key if first.key and second.key else first.name == second.name
     return same_repository and (not first.slot or not second.slot or first.slot == second.slot)
+
+
+def new_claim_record(scope: ClaimScope, identity: claim_state.ClaimIdentity, *, pid: int, proc_start: str,
+                     what: str, worktree: str, session: SubmittingSession, copy: bool) -> ProcessBoundClaim:
+    record: ProcessBoundClaim = {
+        "claim_id": identity.claim_id, "episode": identity.episode, "attempt": identity.attempt,
+        "submitting_session": claim_state.session_id(session),
+        "pid": pid, "proc_start": proc_start, "what": what, "worktree": worktree,
+        "since": timestamp(utc_now()),
+    }
+    if copy:
+        record["copy"] = True
+    if isinstance(session, OwningSession):
+        record["holder_session"] = session.session_id
+    if isinstance(scope, RepositoryScope):
+        record["repo_name"] = scope.name
+        record["repo_key"] = scope.key
+        if scope.slot:
+            record["slot"] = scope.slot
+    return record
+
+
+def write_claim(paths: StatePaths, scope: ClaimScope, record: RunRecord) -> None:
+    path = claim_path(paths, scope)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(path, record)
+
+
+def reserve_mac_placement(paths: StatePaths, assignment: placement.PlacementAssignment, *,
+                          what: str, worktree: str, copy: bool, uses_claim: bool,
+                          configuration: conf.ConfigRead) -> placement.AllowedHost | placement.TemporaryExclusion:
+    """Reserve capacity before publishing a grant."""
+    from scripts.build_queue import placement
+
+    busy = placement.TemporaryExclusion("busy")
+    with lock_if_available(paths.lock) as acquired:
+        if not acquired:
+            return busy
+        if not isinstance(blocking_claim_block(paths, assignment.session), NoMacBlock):
+            return placement.TemporaryExclusion("blocked")
+        claims = tuple(claim for claim in read_claims(paths) if run_is_live(claim.record))
+        scope = assignment.destination.scope
+        overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, scope))
+        if overlapping:
+            # This grant permits replacement of an existing claim. Acquisition checks capacity again.
+            replaceable = all(not claim.record.get("placement_reserved") and
+                              (run_is_kept(claim.record) or (not copy and copy_gives_way(claim.record)))
+                              for claim in overlapping)
+            return placement.AllowedHost() if uses_claim and replaceable else busy
+        if mac_build_capacity(configuration, claims).at_limit():
+            return busy
+        identity = claim_state.ClaimIdentity(
+            execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
+            assignment.episode, assignment.attempt)
+        record = new_claim_record(scope, identity, pid=assignment.owner.pid, proc_start=assignment.owner.start_time,
+                                  what=what, worktree=worktree, session=assignment.session, copy=copy)
+        record["placement_reserved"] = True
+        write_claim(paths, scope, record)
+        return placement.AllowedHost()
+
+
+def clear_closed_mac_reservations(paths: StatePaths, current_attempts: set[tuple[str, str]]) -> bool:
+    """Remove unused reservations after their grants close."""
+    with lock_if_available(paths.lock) as acquired:
+        if not acquired:
+            return False
+        for claim in read_claims(paths):
+            record = claim.record
+            if record.get("placement_reserved") and (record["episode"], record["attempt"]) not in current_attempts:
+                claim.path.unlink(missing_ok=True)
+    return True
+
+
+def arm_mac_queue_claim(paths: StatePaths, assignment: placement.PlacementAssignment) -> HeldClaim:
+    """Attach the remote start fence to the existing reservation before launch."""
+    from scripts.mac_test import offload
+
+    scope = assignment.destination.scope
+    path = claim_path(paths, scope)
+    identity = claim_state.ClaimIdentity(
+        execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
+        assignment.episode, assignment.attempt)
+    with locked(paths.lock):
+        record = read_run(path)
+        if (isinstance(record, NoRun) or "remote_host" in record or not record.get("placement_reserved")
+                or claim_state.claim_identity(record) != identity or record["pid"] != os.getpid()
+                or not run_is_live(record)):
+            raise ValueError("The Mac placement reservation is unavailable")
+        if not isinstance(blocking_claim_block(paths, assignment.session), NoMacBlock):
+            raise ValueError("The Mac became blocked before launch")
+        offload.record_pending_start(paths.target, identity)
+        armed: RemoteJobClaim = {**record, "remote_host": assignment.destination.host}
+        _ = armed.pop("placement_reserved", None)
+        write_json(path, armed)
+    return HeldClaim(scope, path, armed)
 
 
 def slot_capacity(paths: StatePaths, scope: ClaimScope, *,
@@ -1465,36 +1544,67 @@ def claim_host(run: RunRecord, config: MacTestConfig) -> str:
     return run["remote_host"] if "remote_host" in run else config.host
 
 
-def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
-    """Check every live claim once; return whether another pass may still be needed.
+def retained_claim_activity(paths: StatePaths, scope: RepositoryScope, record: RemoteJobClaim) -> MacActivity:
+    """Read only the retained claim's mirror when it has no start fence."""
+    from scripts.mac_test import eligibility, offload
 
-    One activity check serves every claim on a host. It counts all of the
-    user's Mac work, since a build process cannot be traced to a repository,
-    so a claim is idle only while the Mac runs nothing at all.
-    """
+    repository = eligibility.KnownRepository(scope.name, scope.key)
+    settings = eligibility.read_connection_settings(config_path(paths.target))
+    command = offload.mirror_selector_script(repository, paths.target, record.get("slot", 0) or 1) + r"""
+pids=$(select_leftovers) || exit 1
+count=$(printf '%s\n' "$pids" | awk 'NF { count++ } END { print count+0 }') || exit 1
+printf 'leftovers=%s\nrc=0\n' "$count"
+"""
+    result = offload.read_leftovers(settings, record["remote_host"], command, paths.target).result
+    if isinstance(result, offload.LeftoversEnded):
+        return MacIdle()
+    if isinstance(result, offload.LeftoversRemain) and isinstance(result.count, int):
+        return MacActive(result.count, result.count)
+    return ActivityCheckFailed("The retained claim's work is unconfirmed")
+
+
+def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
+    """Check local holders and settle retained remote claims."""
+    from scripts.mac_test import offload
 
     with locked(paths.lock):
         claims = tuple(claim for claim in read_claims(paths) if run_is_live(claim.record))
     if not claims:
         return False
     if paths.platform == "linux":
-        # The Linux controller must confirm remote cleanup before claim removal.
+        # The Linux controller confirms remote cleanup.
         return True
     activity: dict[str, MacActivity] = {}
     traffic: dict[str, transfer_bytes.TransferLedger] = {}
+    now = utc_now()
+    watched = False
     for claim in claims:
-        host = claim_host(claim.record, config)
+        record = claim.record
+        if record.get("placement_reserved"):
+            watched = True
+            continue
+        if run_is_kept(record):
+            try:
+                identity = claim_state.claim_identity(record)
+                if offload.pending_start_path(paths.target, identity).exists():
+                    result = release_exact_claims(paths, record["pid"], identity, "")
+                    watched |= isinstance(result, ClaimReleaseRefused)
+                    continue
+                if isinstance(claim.scope, RepositoryScope):
+                    observed = retained_claim_activity(paths, claim.scope, record)
+                    watched |= watch_claim(paths, config, claim, observed, now)
+                    continue
+            except (OSError, ValueError) as error:
+                print(f"Mac claim settlement check failed: {error}", flush=True)
+                watched = True
+                continue
+        host = claim_host(record, config)
         if host not in activity:
             traffic[host] = transfer_bytes.TransferLedger()
             with transfer_bytes.measure_transfers(traffic[host]):
                 activity[host] = check_mac_activity(config, host)
-    now = utc_now()
-    watched = False
-    for claim in claims:
-        host = claim_host(claim.record, config)
         with transfer_bytes.measure_transfers(traffic[host]):
-            if watch_claim(paths, config, claim, activity[host], now):
-                watched = True
+            watched |= watch_claim(paths, config, claim, activity[host], now)
     return watched
 
 
@@ -1563,7 +1673,9 @@ def watch_claim(
     text = (
         f'Your Mac claim "{current["what"]}" '
         + f"(since {local_time(current['since'], include_zone=False)}) was released at {released_at}: "
-        + f"nothing ran on the Mac for {config.claim_idle_minutes:g} minutes, so tests waiting for it can run. "
+        + (f"its mirror was idle for {config.claim_idle_minutes:g} minutes, so tests waiting for it can run. "
+           if isinstance(claim.scope, RepositoryScope) and run_is_kept(current)
+           else f"nothing ran on the Mac for {config.claim_idle_minutes:g} minutes, so tests waiting for it can run. ")
         + "Claim it again before your next Mac command: "
         + "~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ "
         + f"--what {quoted_what} --worktree {quoted_worktree}{remote_argument} (see /build:mac)."
@@ -1916,10 +2028,26 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
                 return take_over_kept_claim(args, claim, record, session=session)
     if not isinstance(block, NoMacBlock):
         return blocked_claim(block)
-    owner = session
     if overlapping:
+        for claim in overlapping:
+            record = claim.record
+            if (record.get("placement_reserved") and scope == claim.scope
+                    and not isinstance(assignment, UnassignedClaim)
+                    and claim_state.claim_identity(record) == identity
+                    and record["pid"] == assignment.owner.pid and record["proc_start"] == assignment.owner.start_time):
+                proc_start = process_identity.process_start(args.pid)
+                if not isinstance(proc_start, process_identity.Started):
+                    return ClaimFinished(1)
+                claimed = new_claim_record(scope, identity, pid=args.pid, proc_start=proc_start.start,
+                                           what=args.what, worktree=args.worktree, session=session, copy=args.copy)
+                adopted: RunRecord = {**claimed, "remote_host": args.remote} if isinstance(args.remote, str) else claimed
+                write_json(claim.path, adopted)
+                print_claim_identity(args, adopted)
+                print("claimed")
+                return ClaimFinished(0)
         # A test copy gives way to any new step; a copy never replaces a copy.
-        if not args.copy and all(copy_gives_way(claim.record) for claim in overlapping):
+        if not args.copy and all(not claim.record.get("placement_reserved") and copy_gives_way(claim.record)
+                                 for claim in overlapping):
             return ClaimHeldByCopy(tuple(claim.record for claim in overlapping))
         return ClaimBusy(overlapping[0].record)
     if paths.platform == "macos":
@@ -1934,32 +2062,12 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     if not isinstance(proc_start, process_identity.Started):
         print(f"cannot claim: process {args.pid} is not running", file=sys.stderr)
         return ClaimFinished(1)
-    claimed: RunRecord = {
-        "claim_id": args.claim_id or uuid.uuid4().hex,
-        "episode": args.episode or uuid.uuid4().hex,
-        "attempt": args.attempt or uuid.uuid4().hex,
-        "submitting_session": claim_state.session_id(session),
-        "pid": args.pid,
-        "proc_start": proc_start.start,
-        "what": args.what,
-        "worktree": args.worktree,
-        "since": timestamp(utc_now()),
-    }
-    if args.copy:
-        claimed["copy"] = True
-    if isinstance(args.remote, str):
-        remote_claim: RemoteJobClaim = {**claimed, "remote_host": args.remote}
-        claimed = remote_claim
-    if isinstance(owner, OwningSession):
-        claimed["holder_session"] = owner.session_id
-    if isinstance(scope, RepositoryScope):
-        claimed["repo_name"] = scope.name
-        claimed["repo_key"] = scope.key
-        if scope.slot:
-            claimed["slot"] = scope.slot
-    path = claim_path(paths, scope)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_json(path, claimed)
+    identity = claim_state.ClaimIdentity(args.claim_id or uuid.uuid4().hex, args.episode or uuid.uuid4().hex,
+                                         args.attempt or uuid.uuid4().hex)
+    record = new_claim_record(scope, identity, pid=args.pid, proc_start=proc_start.start, what=args.what,
+                              worktree=args.worktree, session=session, copy=args.copy)
+    claimed: RunRecord = {**record, "remote_host": args.remote} if isinstance(args.remote, str) else record
+    write_claim(paths, scope, claimed)
     print_claim_identity(args, claimed)
     if isinstance(scope, RepositoryScope) and scope.slot:
         remember_slot(paths, scope, claimed)
