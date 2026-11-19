@@ -1,0 +1,8 @@
+{
+  "build_admission": {
+    "head_stall_alert_minutes": 2
+  },
+  "hana_aws": {
+    "source_allowed_ignored": 1
+  }
+}

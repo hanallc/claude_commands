@@ -907,18 +907,26 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(403, {"error": refusal or "Open the New item dialog from Review."})
             return
         try:
+            fields: dict[str, object] = {"token": server.new_item_token}
             if selected:
-                owner = review_submissions.page_owner(selected[0], conf.read_or_repository("console"), staff.local_snapshot())
+                settings = conf.read_or_repository("console")
+                members = staff.local_snapshot()
+                owner = review_submissions.page_owner(selected[0], settings, members)
+                producer = review_submissions.list_producer(settings, members)
                 recipients: list[review_submissions.RecipientOption] = []
+                fields["page_owner"] = ""
                 if isinstance(owner, staff.StaffRow):
                     recipients.append({"id": owner.id, "name": owner.name, "proposal": False})
+                    fields["page_owner"] = owner.id
+                if isinstance(producer, staff.StaffRow) and producer != owner:
+                    recipients.append({"id": producer.id, "name": producer.name, "proposal": False})
             else:
                 recipients = review_submissions.recipient_options(staff.snapshot())
         except (OSError, ValueError) as error:
             print(f"review-links New item recipients: {error}", file=sys.stderr)
             self.json_response(503, {"error": "The recipients are unavailable."})
             return
-        self.json_response(200, {"token": server.new_item_token, "recipients": recipients})
+        self.json_response(200, {**fields, "recipients": recipients})
 
     def new_item_post(self) -> None:
         """File and publish a native record before sending its message."""

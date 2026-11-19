@@ -141,6 +141,7 @@ class ReviewSnapshot:
     browser: change_page.ReviewBrowser
     words_rows: int
     refresh_seconds: float
+    card_motion: page_frame.CardMotion
     assets: dict[str,str]
     zone: ZoneInfo
     source_stamps: dict[Path, FileStamp]
@@ -310,7 +311,9 @@ def pack_snapshot(snapshot: ReviewSnapshot, index: str, started: float) -> Revie
     payload = ('{"version":'+json.dumps(snapshot.version)+',"index":'+index
                +',"notices":'+json.dumps(snapshot.notices)
                +',"presentation":'+json.dumps({'zone':snapshot.zone.key,'later':dict(snapshot.later),
-                                                'titleLimit':snapshot.title_limit})
+                                                'titleLimit':snapshot.title_limit,
+                                                'cardFadeOutMs':snapshot.card_motion.fade_out_ms,
+                                                'cardFadeInMs':snapshot.card_motion.fade_in_ms})
                +',"facts":'+json.dumps(snapshot.facts())+'}').encode()
     page = render_shell(snapshot,index,started,snapshot.read_at)
     return replace(snapshot,page=page,payload=payload,page_gzip=gzip.compress(page,compresslevel=1,mtime=0),
@@ -359,14 +362,16 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
     settings = conf.read('review_links')
     words_rows = settings.whole('review_words_rows')
     refresh_seconds = settings.number('page_refresh_seconds')
+    card_motion = page_frame.CardMotion.read(settings)
     later = later_settings(settings)
     title_limit = conf.read_or_repository('production').whole('question_title_max_chars')
     index = index_json(entries)
     notices = tuple(sources.notices.values())
-    retained = repr((records, assets, members.rows, browser, words_rows, refresh_seconds, zone.key, notices, unavailable_cards, later, title_limit, names.colors))
+    retained = repr((records, assets, members.rows, browser, words_rows, refresh_seconds, card_motion, zone.key,
+                     notices, unavailable_cards, later, title_limit, names.colors))
     version = hashlib.sha256((index+retained).encode()).hexdigest()[:20]
     snapshot = ReviewSnapshot(version,records,entries,members,
-        browser,words_rows,refresh_seconds,assets,zone,sources.before_read,later,names,read_at=read_at,
+        browser,words_rows,refresh_seconds,card_motion,assets,zone,sources.before_read,later,names,read_at=read_at,
         notices=notices, unavailable_cards=frozenset(unavailable_cards),
         title_limit=title_limit, submission_keys=submission_keys)
     return pack_snapshot(snapshot, index, started)
@@ -841,6 +846,7 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
     new_button = '<button class="review-new" type="button" data-review-new><span aria-hidden="true">+</span>New</button>'
     content = (record_table.STYLE+record_table.DATE_TIME_STYLE+STYLE+page_frame.title('Review', 'review', action=new_button)
         +f'<div data-review data-version="{snapshot.version}" data-show="{show}" data-refresh-seconds="{snapshot.refresh_seconds}" '
+        +snapshot.card_motion.attributes()+' '
         +f'data-title-limit="{snapshot.title_limit}" data-zone="{html.escape(snapshot.zone.key, quote=True)}" '
         +f'data-later="{html.escape(json.dumps(dict(snapshot.later)), quote=True)}">'
         +record_table.labelled_chip_row('Type', chips, chip_classes='review-types')
@@ -1053,17 +1059,17 @@ const firstReviewCard=(()=>{
 })();
 '''
 
-SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + record_table.DATE_TIME_SCRIPT + console.REVIEW_PLACE_SCRIPT + r'''(reviewPlace => {
+SCRIPT = (page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + record_table.SCRIPT
+          + record_table.DATE_TIME_SCRIPT + console.REVIEW_PLACE_SCRIPT + r'''(reviewPlace => {
 let content=document.querySelector('[data-review]');
-let selectedShow=content.dataset.show;
 const drafts=new Map(),saved=new Map(),bodies=new Map(),bodyRequests=new Map();
 const pendingSaves=new Map();
 const scrollDepartures=new Set();
 const savedVerdictsKey='review-saved-verdicts:'+location.pathname;
 const kinds=['question','change','investigation','proposal','efficiency','bug'],states=['Open','Waiting','Validating'];
 let index=readIndex(JSON.parse(content.querySelector('[data-review-index]').textContent));
-let focusAfterLoad=null,conflictKey='',firstRequest=firstReviewCard;
-let deferredLink=null,revealCreated='';
+let focusAfterLoad=null,firstRequest=firstReviewCard;
+let deferredLink=null,revealCreated=null;
 function indexEntry(payload,row,at){
  const owner=payload.n[row[3]],source=payload.n[row[4]];
  return {key:row[0],id:row[1] || row[0],type:kinds[row[2]],owner:owner[0],sourceOwner:source[0],
@@ -1175,13 +1181,13 @@ const view=createRecordTable({content:()=>content,single:true,
  },
  sortValues:data=>data.sortValues===undefined ? entrySortValues(data) : undefined,
  applied:(_items,{type,show,owner,query,sourceOwner,keys})=>{
-  selectedShow=show;content.dataset.show=show;loadBodies();
+  content.dataset.show=show;loadBodies();
   const eligibleOwners=allEntries().filter(entry=>matches(entry,{type,query,keys}));
   const shownOwners=matching({show,type,query,keys});
   const matchesOwner=(entry,id)=>!id || entry.owner===id || isInvestigation(entry) && entry.sourceOwner===id;
   content.querySelectorAll('[data-owner-chip]').forEach(button=>{
    const id=button.dataset.ownerChip;
-   button.hidden=Boolean(id) && !eligibleOwners.some(entry=>matchesOwner(entry,id));
+   button.hidden=Boolean(id) && id!==owner && !eligibleOwners.some(entry=>matchesOwner(entry,id));
    button.querySelector('b').textContent=shownOwners.filter(entry=>matchesOwner(entry,id)).length;
   });
   content.querySelectorAll('[data-show-chip]').forEach(button=>{
@@ -1300,8 +1306,7 @@ function rememberForm(form){
 function drawSaveState(key,form=mountedRow(key)?.querySelector('[data-review-form]')){
  if(!form) return;
  const pending=pendingSaves.get(key);
- if(pending) form.dataset.sending='true';else delete form.dataset.sending;
- form.querySelectorAll('button').forEach(button=>button.disabled=Boolean(pending));
+ setCardSubmitting(form,Boolean(pending));
  form.querySelector('[data-send-status]').textContent=pending?.notice || view.actionNotice(form.closest('[data-list-item]'));
 }
 function bindForm(row){
@@ -1319,7 +1324,7 @@ function bindForm(row){
  choices.forEach(choice=>choice.addEventListener('change',()=>{words.value=choice.value;remember();words.focus();}));
  [words,later].filter(Boolean).forEach(field=>{field.addEventListener('input',remember);field.addEventListener('change',remember);});
  const send=async(outcome,until)=>{
-   if(pendingSaves.has(key)) return;
+   if(cardSubmitBlocked(form,view.rowFading(key)) || pendingSaves.has(key)) return;
    const data=new URLSearchParams(new FormData(form));data.set('outcome',outcome);
    if(outcome==='later') data.set('later',until);
    remember();
@@ -1335,7 +1340,7 @@ function bindForm(row){
     if(!response.ok){
      const reason=result.reason || 'HTTP '+response.status;
      if(response.status===409){
-      conflictKey=key;notice.textContent='Not saved: '+reason;notice.hidden=false;
+      notice.textContent='Not saved: '+reason;notice.hidden=false;
      }
      throw new Error(reason);
     }
@@ -1368,7 +1373,7 @@ function bindForm(row){
     view.showActionResult(row,submission,key,{kind:'failure',message:'Not saved: '+error.message});
    }
    finally{
-    pendingSaves.delete(key);delete form.dataset.sending;drawSaveState(key);
+    pendingSaves.delete(key);setCardSubmitting(form,false);drawSaveState(key);
     if(isDeferredLink(key)){
      const link=deferredLink;
      await afterRowAnimations(()=>{
@@ -1421,25 +1426,14 @@ function bindLater(form,pick){
   summaryPrefix:'Hides until ',prepareMenu});
 }
 function bind(){view.replace(false);}
-function revealConflict(){
- const key=conflictKey;conflictKey='';
- const entry=index.get(key);
- if(!entry || !view.opened.has(key) || matches(entry,{show:selectedShow})) return false;
- const params=new URLSearchParams(location.hash.slice(1));
- params.set('show',entry.state==='Open' ? 'open' : entry.state);params.set('item',key);
- history.replaceState(null,'',location.pathname+'#'+params);
- view.place();
- return true;
-}
 function revealNewItem(){
- const key=revealCreated;
- if(!index.has(key)) return false;
- revealCreated='';
- view.saveDeparturePlace();
- const params=new URLSearchParams(location.hash.slice(1));
- params.set('jump',key);
- history.pushState(null,'',location.pathname+'#'+params);
- return followItemLink({inheritFilters:true});
+ if(!revealCreated || !index.has(revealCreated.key)) return false;
+ const {key,id}=revealCreated;
+ revealCreated=null;
+ if(view.revealMatchingItem(key)) return true;
+ const notice=content.querySelector('[data-review-notice]');
+ notice.textContent='Saved '+id+'.';notice.hidden=false;
+ return false;
 }
 async function refresh(_supersede=false,current=()=>true){
  if(pendingSaves.size || dateTimePickerOpen(content)) return;
@@ -1452,7 +1446,7 @@ async function refresh(_supersede=false,current=()=>true){
   return afterRowAnimations(()=>{
    for(const [key,result] of saved) if(result.later && Date.now()>=result.later) saved.delete(key);
    content.querySelectorAll('[data-body-loaded="failed"]').forEach(row=>delete row.dataset.bodyLoaded);
-   revealConflict();view.apply(false);revealNewItem();content.dispatchEvent(new Event('review-refreshed'));return version.facts;
+   view.apply(false);revealNewItem();content.dispatchEvent(new Event('review-refreshed'));return version.facts;
   },canApply);
  }
  const fresh=await fetch(location.pathname+'?'+new URLSearchParams({index:'1',version:version.version}),{cache:'no-store'});
@@ -1472,6 +1466,8 @@ function applyReviewIndex(payload){
   content.dataset.zone=payload.presentation.zone;
   content.dataset.later=JSON.stringify(payload.presentation.later);
   content.dataset.titleLimit=payload.presentation.titleLimit;
+  content.dataset.cardFadeOutMs=payload.presentation.cardFadeOutMs;
+  content.dataset.cardFadeInMs=payload.presentation.cardFadeInMs;
  }
  content.querySelector('[data-review-index]').textContent=JSON.stringify(payload.index);
  const notices=content.querySelector('[data-review-source-notices]');
@@ -1482,6 +1478,7 @@ function applyReviewIndex(payload){
  bodies.clear();bodyRequests.clear();
  const menu=content.querySelector('#list-owner'),pairs=new Map();
  const focusedOwner=document.activeElement?.dataset.ownerChip;
+ const selectedOwner=menu.querySelector('[aria-pressed="true"]')?.dataset.ownerChip;
  for(const entry of index.values()){
   pairs.set(entry.owner,{name:entry.ownerName,markup:entry.ownerHtml});
  }
@@ -1490,7 +1487,7 @@ function applyReviewIndex(payload){
  }
  for(const button of menu.querySelectorAll('[data-owner-chip]')){
   const id=button.dataset.ownerChip;
-  if(id && !pairs.has(id)) button.remove();
+  if(id && id!==selectedOwner && !pairs.has(id)) button.remove();
  }
  for(const [id,{name,markup}] of [...pairs].sort((a,b)=>a[1].name.localeCompare(b[1].name))){
   let button=menu.querySelector('[data-owner-chip="'+CSS.escape(id)+'"]');
@@ -1513,12 +1510,12 @@ function applyReviewIndex(payload){
  }
  storeSavedVerdicts();
  for(const [key,result] of saved) savedEntry(key,result);
- const revealed=revealConflict();bind();view.apply(false);
+ bind();view.apply(false);
  if(focusAfterLoad) restoreFocus(focusAfterLoad.key);
  if(focusedOwner!==undefined && (!document.activeElement?.hasAttribute('data-owner-chip') || document.activeElement.hidden))
   menu.querySelector('[aria-pressed="true"]')?.focus({preventScroll:true});
  content.dataset.loaded='true';
- if(!revealNewItem() && !revealed) scrollTo({top,behavior:'instant'});
+ if(!revealNewItem()) scrollTo({top,behavior:'instant'});
  content.dispatchEvent(new Event('review-refreshed'));
 }
 bind();
@@ -1528,8 +1525,11 @@ document.querySelector('[data-review-new]').addEventListener('click',event=>{
  window.reviewNewItem.open({trigger:event.currentTarget});
 });
 document.addEventListener('review-item-created',event=>{
- if(typeof event.detail?.key!=='string') return;
- revealCreated=event.detail.key;
+ const {key,id}=event.detail ?? {};
+ if(typeof key!=='string' || typeof id!=='string') return;
+ const notice=content.querySelector('[data-review-notice]');
+ notice.textContent='';notice.hidden=true;
+ revealCreated={key,id};
  void pageRefresh.refresh(true);
 });
 function itemLinkKey(){
@@ -1559,7 +1559,7 @@ if(frame?.reviewPlace){
   history.replaceState({recordTable:table},'');
 }
 if(history.state?.recordTable) view.restorePlace();
-else if(!followItemLink()){view.place();view.apply();}
+else if(!followItemLink()){view.place();view.apply(true,{normalizeOwner:true});}
 function isDeferredLink(key){return deferredLink?.key===key && deferredLink.href===location.href;}
 function restorePlace(event){
  const key=itemLinkKey();
@@ -1572,4 +1572,4 @@ function restorePlace(event){
 }
 addEventListener('popstate',restorePlace);
 addEventListener('hashchange',restorePlace);
-})(legacyReviewPlace);'''
+})(legacyReviewPlace);''')

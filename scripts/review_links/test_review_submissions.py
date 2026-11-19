@@ -241,6 +241,33 @@ class ReviewSubmissionTests(unittest.TestCase):
         self.assertEqual([record.id for record in investigation.records(OWNER)], [saved.id])
         self.assertEqual(investigation.records(PRODUCER), [])
 
+    def test_list_producer_uses_native_stores_without_its_staff_document(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.root / "config")})))
+        _ = write_config_fixture(conf.path("console"),
+                                 f"page.review.owner={OWNER}\npage.list.owner={PRODUCER}\n")
+        morty = replace(self.members.rows[1], name="morty",
+                        doc=staff.LiveDoc(local_machine(), self.root / "unavailable.md"))
+        members = replace(self.members, rows=(self.members.rows[0], morty))
+        _ = self.enterContext(patch.object(staff, "snapshot", return_value=members))
+        for at, kind in enumerate((submissions.SubmissionKind.QUESTION, submissions.SubmissionKind.INVESTIGATION,
+                                   submissions.SubmissionKind.BUG)):
+            with self.subTest(kind=kind):
+                standard = replace(request(kind, recipient=PRODUCER), request_id=f"r2-{at:032x}")
+                selected = replace(standard, page="review", page_recipient=new_item_dialog.PageRecipient.LIST_OWNER)
+                saved = submissions.submit(selected)
+                folder = (record_store.default_question_folder(PRODUCER) if kind == submissions.SubmissionKind.QUESTION
+                          else investigation.folder(PRODUCER))
+                self.assertTrue(saved.path.is_relative_to(folder))
+                self.assertEqual(saved.owner, morty.id)
+                self.assertEqual(submissions.submit(selected).key, saved.key)
+                self.assertEqual(submissions.submit(standard).key, saved.key)
+                default = replace(selected, recipient_id=OWNER, page_recipient=new_item_dialog.PageRecipient.PAGE_OWNER)
+                self.assertNotEqual(submissions.submit(default).key, saved.key)
+        with self.assertRaisesRegex(submissions.SubmissionConflict, "List owner is unavailable"):
+            invalid = replace(request(recipient=OWNER), page="review",
+                              page_recipient=new_item_dialog.PageRecipient.LIST_OWNER)
+            _ = submissions.submit(invalid)
+
     def test_draft_id_files_changed_content_before_and_after_native_write(self) -> None:
         original = replace(request(), request_id="r2-" + "b" * 32, images=(IMAGE,))
         changed_words = replace(original, words="A different report")
