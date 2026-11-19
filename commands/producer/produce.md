@@ -66,6 +66,8 @@ Ask the style unit about a hard case.
 ## Work with showrunners and morty
 
 Check your assignments on The List. Keep the state, check time, status, next step, and ETA current for your items.
+An ETA is the time when the whole item is done: `Mon D HH:MM ZONE` or a date. Without a time, write `No time yet`, `Waiting for nate`, `Paused`, or `Delivered`. Put each cause, condition, and part time in the status.
+Write the status in two or three sentences that say where the item stands. Start the next step with who acts; put nate first when nate must act. Put phase names, commit ids, change ids and unit names in `--source` or `--evidence`.
 Read your items with `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all --latest-status`.
 Use `the_list.py update --id L<n>` to update your items.
 Use `--latest-status`, `--next-step`, `--eta`, `--state`, or `--next-check`.
