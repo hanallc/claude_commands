@@ -197,10 +197,11 @@ def run_batch(commands: BatchCommands, repo: Path, packages: tuple[str, ...],
     lint_args = ("lint", packages[0]) if lint is LintScope.PACKAGES else ("lint",)
     format_packages = scope if lint is LintScope.PACKAGES else ""
     hit = scratch / "cache-hit"
-    if not commands.verify_step("format", lint_args, hit, format_packages=format_packages).show("format", scope):
+    formatting = commands.verify_step("format", lint_args, hit, format_packages=format_packages)
+    before_tests = commands.tree_key(repo)
+    if not formatting.show("format", scope, "tree check failed" if not before_tests else ""):
         passed = False
 
-    before_tests = commands.tree_key(repo)
     stale = not before_tests
     for package in packages:
         test = commands.verify_step("test", ("test", package), hit)

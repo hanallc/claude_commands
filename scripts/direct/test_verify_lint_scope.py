@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import redirect_stdout
 import fcntl
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -577,6 +579,20 @@ HOLD_WAITER_PID={placement.pid} PLACEMENT_CLIENT_ACTIVE=1
             finally:
                 if placement.poll() is None:
                     placement.kill()
+
+    def test_tree_check_failure_names_format_and_its_scope(self) -> None:
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        commands = batch.BatchCommands(Path("verify"), ())
+        with (
+            patch.object(commands, "tree_key", side_effect=("", "tree", "tree", "tree")),
+            patch.object(commands, "verify_step", return_value=batch.BatchStepResult(0, False)),
+            redirect_stdout(StringIO()) as output,
+        ):
+            status = batch.run_batch(commands, scratch, ("sample", "other"), batch.LintScope.PACKAGES,
+                                     batch.NoBaselineProof.SKIP, scratch)
+        self.assertEqual(status, 1)
+        self.assertIn("verify.sh batch format sample,other red cached=no (tree check failed)",
+                      output.getvalue().splitlines())
 
     def test_tree_check_failure_names_the_package_it_followed(self) -> None:
         scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
