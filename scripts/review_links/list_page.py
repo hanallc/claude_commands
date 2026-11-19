@@ -235,9 +235,9 @@ def item_log_html(item: the_list.ListItem, today: datetime, names: staff_names.S
         if answer is None or identity in unread_answers:
             continue
         asked = datetime.fromisoformat(question.asked_at).astimezone(UTC)
-        answered = datetime.fromisoformat(answer.answered_at).astimezone(UTC)
         question_body = "Question " + html.escape(identity) + log_source_html("nate", names)
         entry = answer_entries.get(identity)
+        answered = entry.time if entry is not None else datetime.fromisoformat(answer.answered_at).astimezone(UTC)
         source = the_list.source_without_clock(entry.source) if entry is not None else item.producer
         answer_body = "Answer" + log_source_html(source, names)
         rows.append((asked, log_row(f"{identity}-asked", asked,

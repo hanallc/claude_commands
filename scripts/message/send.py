@@ -177,7 +177,7 @@ from scripts.message import rca  # noqa: E402
 from scripts.message import repeat_guard  # noqa: E402
 from scripts.notify import review  # noqa: E402
 from scripts.notify import silence  # noqa: E402
-from scripts.lib.user_zone import user_zone, zone_label  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
                          UserAction, NoActionRequired, action_conflicts, first_line, named_places, parse_user_action,
@@ -4824,16 +4824,20 @@ def shown_sender_line(sender: str, display: str) -> str:
 
 
 def sent_line(at: datetime) -> str:
-    local = at.astimezone(user_zone())
-    return f"\nSent: {local:%H:%M} {zone_label(at)}"
+    try:
+        zone = user_zone()
+    except (OSError, ValueError) as error:
+        print(f"send.py: Sent line omitted: {one_line(str(error))}", file=sys.stderr)
+        return ""
+    local = at.astimezone(zone)
+    return f"\nSent: {local:%H:%M} {local.tzname() or zone.key}"
 
 
 def queued_sent_line(stored_time: str) -> str:
     try:
-        at = datetime.fromisoformat(stored_time)
-    except ValueError:
-        at = now()
-    return sent_line(at)
+        return sent_line(datetime.fromisoformat(stored_time))
+    except (OverflowError, ValueError):
+        return ""
 
 
 MESSAGE_LINE_BREAK = re.compile(r"\r\n|[\n\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
@@ -4878,7 +4882,7 @@ def send(options: Options) -> Result:
     if not isinstance(options.recipient_identity, LogicalRecipientIdentity):
         return _send(options, membership=membership)
     identity = Message(options.recipient_identity.name, options.sender or default_sender(),
-                       options.summary or "", "", options.key)
+                       options.summary or "", "", options.key, sent_header="")
     with delivery_turn(identity) as acquired:
         if not acquired:
             return Result("retry", f"key {options.key!r} has a delivery in progress; retry")

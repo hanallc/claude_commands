@@ -1253,6 +1253,22 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(replay.count("Sender native id: unavailable"), 1)
         self.assertIn("from reply-name", replay)
 
+    def test_pending_delivers_a_batch_with_an_unusable_sent_time(self) -> None:
+        self.session("recipient", "Recipient")
+        path = send.queue_for("session:recipient")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {"time": "2026-11-19T06:12:00+00:00", "from": "Sender", "to": "session:recipient",
+                 "summary": "Message", "text": "Valid body", "key": None, "reason": "offline"}
+        for bad_time in ("0000 unreadable", "0001-01-01T00:00:00+00:00"):
+            with self.subTest(time=bad_time), mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
+                bad = {**entry, "time": bad_time, "text": "Body without a Sent line"}
+                _ = path.write_text(json.dumps(bad) + "\n" + json.dumps(entry) + "\n")
+                bad_message, valid_message = send.pending("session:recipient").split("\n\n")
+                self.assertIn("Body without a Sent line", bad_message)
+                self.assertNotIn("\nSent:", bad_message)
+                self.assertIn("\nSent: 01:12 EST\nValid body", valid_message)
+                self.assertEqual(send.pending("session:recipient"), "")
+
     def test_socket_queue_recovery_keeps_the_origin_stamp(self) -> None:
         address = self.relay_record(42, "recipient")
         self.session("recipient", "Recipient")
@@ -2635,11 +2651,13 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual([entry["from"] for entry in self.log()], ["sender-address", "sender-address"])
 
     def test_daemon_payload_shows_sender_without_changing_address_thread_or_log(self) -> None:
-        original = "Message from sender-address: Preview\n\nbody"
-        for sender_rows, shown, zone, stamp in (
-            ([self.sender_entry()], "\nShown sender: sdlc · roles · worker test", "America/New_York", "01:12 EST"),
-            ([], "", "Asia/Kolkata", "11:42 IST"),
+        for sender_rows, shown, zone, sent_header in (
+            ([self.sender_entry()], "\nShown sender: sdlc · roles · worker test", "America/New_York", "\nSent: 01:12 EST"),
+            ([], "", "Asia/Kolkata", "\nSent: 11:42 IST"),
+            ([], "", "Invalid/Zone", ""),
         ):
+            body = f"Message for {zone}"
+            original = f"Message from sender-address: Preview\n\n{body}"
             with (
                 self.subTest(zone=zone, shown=bool(shown)),
                 mock.patch.dict(os.environ, {"USER_ZONE": zone}),
@@ -2647,12 +2665,16 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 mock.patch.object(roster, "sender_identity", return_value=roster.ClaudeSession("sender")),
                 mock.patch.object(roster, "roster", return_value=self.recipient_roster([*sender_rows, self.daemon_row("thread-address")], [])),
                 mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued()) as queue,
+                redirect_stderr(io.StringIO()) as errors,
             ):
                 self.assertEqual(send.send(local_options([
                     "--to", "codex:thread-address", "--from", "sender-address", "--text", original,
                 ])).outcome, "sent")
-                expected = f"Message from sender-address: Preview\nSender native id: session:sender{shown}\nSent: {stamp}\n\nbody"
+                expected = f"Message from sender-address: Preview\nSender native id: session:sender{shown}{sent_header}\n\n{body}"
                 queue.assert_called_once_with(self.daemon_owner(), "thread-address", expected, timeout=send.delivery_timeout())
+                if not sent_header:
+                    self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                    self.assertIn("USER_ZONE", errors.getvalue())
                 logged = self.log()[-1]
                 self.assertEqual((logged["from"], logged["to"], logged["text"]),
                                  ("sender-address", "codex:thread-address", original))
