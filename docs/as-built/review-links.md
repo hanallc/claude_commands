@@ -383,7 +383,7 @@ The copy fades and collapses while the rows below slide up.
 `card_fade_out_ms` in `config/review_links.conf` sets the duration. Its initial value is 450 ms.
 The Review page can restore a pending card after the user scrolls one viewport.
 The redraw that restores this card waits for all row animations to end.
-When Later hides the last card for an owner, the Owner filter resets after the fade ends.
+When Later hides the last card for an owner, the Owner filter stays selected with a zero count.
 A save can change the card's sort values. The copy keeps its previous values until the fade ends.
 If the request fails, the row slides back into view and the current card stays selected.
 `card_fade_in_ms` sets the duration of the return. Its initial value is 600 ms.
@@ -399,10 +399,10 @@ The reduced motion preference disables row animations.
 The shared `record-id` class keeps each ID and its expand arrow on one line.
 Each row becomes a card at phone width.
 The Type, Show and Owner rows use native buttons with a count and a pressed state.
-The Owner row shows owners with the selected type and words in any Show state.
+The Owner row shows the selected owner and owners with the selected type and words in any Show state.
 It hides the other Owner chips.
 Each Owner count uses the selected type, Show and words across all sources.
-An owner without that type and words returns to All.
+An explicit filter change can return the Owner filter to All when no items match the type and words.
 An owner with matching rows in another Show stays selected with a zero count.
 All stays first and counts every matching row.
 An unknown owner returns to All and clears both owner and source-owner constraints.
@@ -452,6 +452,10 @@ The browser keeps each pending save by key while the form leaves the window.
 Review and The List use Show chips.
 The shared table tracks the selected Show chip.
 The address and refresh retain the selected Show view.
+Review submissions retain the Type, Show and Owner chips and the search words.
+A new item opens when it matches the current filters.
+Review shows a save confirmation when the current filters hide the new item.
+A save conflict shows its reason and preserves the current filters.
 The Type, Show and Owner chip rows wrap at phone width.
 If a refresh hides the focused Owner chip, focus moves to the selected Owner chip.
 All types that wait on the user have the state Open.

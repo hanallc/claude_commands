@@ -1490,10 +1490,10 @@ class ReviewPageTests(unittest.TestCase):
   conflict='/resolve-conflict';
   const stale=form('page-owner/C4');
   stale.requestSubmit(stale.querySelector('button[value=works]'));
-  await until(()=>row('page-owner/C4')?.dataset.state==='Done' && form('page-owner/C4'),'the Done conflict form');
-  check(document.querySelector('[data-review]').dataset.show==='Done' &&
-   form('page-owner/C4').querySelector('[data-send-status]').textContent.includes('This item is already Done.'),
-   'F015: HTTP 409 refreshes the index and reveals the Done card with the reason.');
+  await until(()=>!row('page-owner/C4') && !stale.dataset.sending,'the refreshed Open view');
+  check(document.querySelector('[data-review]').dataset.show==='open' &&
+   document.querySelector('[data-review-notice]').textContent.includes('This item is already Done.'),
+   'A verdict conflict keeps Open selected and shows the reason.');
   await open('page-owner/C6');
   conflict='/remove-conflict';
   const removed=form('page-owner/C6');
@@ -3452,24 +3452,27 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         markup = page.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
         self.assertEqual(firefox_probe_results(markup.encode()), [[]])
 
-    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
-    def test_new_bug_opens_after_refresh_and_keeps_the_matching_owner_filter(self) -> None:
+    def new_item_filter_page(self, kind: new_item_dialog.SubmissionKind, *, matches_filters: bool = False) -> bytes:
         owner = self.ready_submission_recipient()
         _ = self.question('Keep this question')
         cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
         before = cache.get()
-        created = cache.create_submission(self.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id))
+        request = self.submission_request(kind, owner.id)
+        if matches_filters:
+            request = replace(request, words='Keep this question too.')
+        created = cache.create_submission(request)
         fresh = cache.get()
         values = {
-            'owner': owner.id, 'key': created.key, 'id': created.saved.id,
+            'owner': owner.id, 'key': created.key, 'id': created.saved.id, 'kind': kind,
+            'words': request.words, 'matches': matches_filters,
             'body': fresh.body(created.key).decode(), 'snapshot': cast(object, json.loads(fresh.index_response())),
         }
         setup = r'''<script>
 const fixture=FIXTURE, nativeFetch=fetch;
 let sent=false;
-history.replaceState(null,'','#'+new URLSearchParams({
- owner:fixture.owner,type:'question',show:'open',q:'keep this question'
-}));
+const selection={owner:fixture.owner,type:fixture.matches?fixture.kind:'question',
+ show:fixture.matches?'all':'open',q:'keep this question'};
+history.replaceState(null,'','#'+new URLSearchParams(selection));
 window.fetch=async(url,options={})=>{
  const route=new URL(url,location.href);
  if(route.pathname==='/console/review/new-item'){
@@ -3477,7 +3480,7 @@ window.fetch=async(url,options={})=>{
    sent=true;
    return Response.json({id:fixture.id,key:fixture.key,version:fixture.snapshot.version});
   }
-  return Response.json({token:'fixture',recipients:[{id:fixture.owner,name:'page-owner'}]});
+  return Response.json({token:'fixture',recipients:[{id:fixture.owner,name:'page-owner',proposal:true}]});
  }
  if(sent && route.searchParams.has('body')) return new Response(fixture.body,{
   headers:{'X-Review-Version':fixture.snapshot.version}
@@ -3492,7 +3495,7 @@ window.fetch=async(url,options={})=>{
  const review=document.querySelector('[data-review]'), dialog=document.querySelector('#review-new-item');
  const params=()=>new URLSearchParams(location.hash.slice(1));
  try {
-  const previous=history.length;
+  const previous=history.length, previousHash=location.hash;
   check(params().get('owner')===fixture.owner, 'The original owner filter is active.');
   const recipients=dialog.querySelector('[data-recipients]');
   const ready=new Promise(resolve=>{
@@ -3504,33 +3507,53 @@ window.fetch=async(url,options={})=>{
   });
   document.querySelector('[data-review-new]').click();
   if(!dialog.open) throw new Error('New must open the dialog.');
-  dialog.querySelector('[name="kind"][value="bug"]').click();
+  dialog.querySelector('[name="kind"][value="'+fixture.kind+'"]').click();
   (await ready).click();
   const words=dialog.querySelector('[name="words"]');
-  words.value='Check the Bug record.';
+  words.value=fixture.words;
   words.dispatchEvent(new Event('input',{bubbles:true}));
   const refreshed=new Promise(resolve=>review.addEventListener('review-refreshed',resolve,{once:true}));
   dialog.querySelector('[type="submit"]').click();
   await refreshed;
   const row=review.querySelector('[data-key="'+CSS.escape(fixture.key)+'"]');
-  check(row?.dataset.type==='bug' && !row.hidden && row.querySelector('[data-detail]').hidden===false,
-        'The refreshed index reveals and opens the new Bug.');
-  check(params().get('item')===fixture.key && params().get('show')==='all' &&
-        !params().get('type') && !params().get('q') && params().get('owner')===fixture.owner,
-        'The jump keeps the matching owner and clears the filters that hide the new Bug.');
-  check(history.length===previous+1, 'The jump adds one history entry.');
-  if(history.length===previous+1){
-   const restored=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
-   history.back();
-   await restored;
-   check(params().get('type')==='question' && params().get('show')==='open' &&
-         params().get('q')==='keep this question', 'Back restores the former filters.');
+  check(Object.entries(selection).every(([key,value])=>params().get(key)===value),
+        'Send keeps every filter in the address.');
+  check(review.querySelector('[data-show-chip][aria-pressed="true"]').dataset.showChip===selection.show &&
+   review.querySelector('[data-type-chip][aria-pressed="true"]').dataset.typeChip===selection.type &&
+   review.querySelector('[data-owner-chip][aria-pressed="true"]').dataset.ownerChip===selection.owner &&
+   review.querySelector('#list-search').value===selection.q,'Send keeps each selected control.');
+  if(fixture.matches){
+   check(row && !row.querySelector('[data-detail]').hidden,'The new item opens when it matches the filters.');
+   check(history.length===previous+1,'Opening the item adds one history entry.');
+   if(history.length===previous+1){
+    const restored=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+    history.back();
+    await restored;
+    check(location.hash===previousHash && !params().has('item') &&
+     review.querySelector('[data-key="'+CSS.escape(fixture.key)+'"] [data-detail]').hidden,
+     'Back restores the previous filters and closes the new item.');
+   }
+  }else{
+   check(!row && history.length===previous,'Send keeps a hidden item outside the view.');
+   check(review.querySelector('[data-review-notice]').textContent==='Saved '+fixture.id+'.',
+         'A hidden item has a save confirmation.');
   }
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
         markup = before.render().decode().replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        return markup.encode()
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_new_items_keep_every_review_filter(self) -> None:
+        for kind in new_item_dialog.SubmissionKind:
+            with self.subTest(kind=kind):
+                self.assertEqual(firefox_probe_results(self.new_item_filter_page(kind)), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_new_item_opens_when_it_matches_every_review_filter(self) -> None:
+        page = self.new_item_filter_page(new_item_dialog.SubmissionKind.QUESTION, matches_filters=True)
+        self.assertEqual(firefox_probe_results(page), [[]])
 
     def test_the_reader_counts_only_for_you_across_all_five_stores(self) -> None:
         _ = self.investigation()
@@ -3974,12 +3997,48 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  if(CANCEL) document.querySelector('[data-sort="3"]').click();
  else exit.finish();
  await frame();
- check(!copy(panel) && selected()?.dataset.ownerChip==='' && owner.hidden,
-  'The Owner filter resets when the fade ends or the redraw cancels it.');
- check(rows().length===1 && rows()[0].dataset.key==='builds/C1' && posts.size===1,
-  'The deferred save hides the card and shows the other owner’s card after one POST.');
+ check(!copy(panel) && selected()===owner && !owner.hidden,
+  'The Owner filter stays selected after the fade.');
+ check(!rows().length && posts.size===1,'Later hides the last card in this view.');
  check(postCount===1,'Later sends exactly one POST.');
 """.replace('CANCEL', json.dumps(cancel)))
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_review_card_submits_keep_every_filter(self) -> None:
+        _ = self.question('Keep this question')
+        source = browser_markup(self.root)
+        for kind, outcome, state in (
+            ('question', 'answer', 'Done'),
+            ('change', 'works', 'Done'),
+            ('change', 'not works', 'Done'),
+            ('change', 'feedback', 'Validating'),
+            ('change', 'question', 'Validating'),
+            ('change', 'validate', 'Validating'),
+        ):
+            with self.subTest(outcome=outcome):
+                settings = json.dumps({'kind': kind, 'outcome': outcome, 'state': state})
+                self.check_card_motion(source, 'const action='+settings+r""";
+ const initial=rows().find(row=>row.dataset.type===action.kind);
+ const filters={type:action.kind,show:'open',owner:initial.dataset.owner,q:initial.dataset.number};
+ history.replaceState(null,'','#'+new URLSearchParams(filters));
+ dispatchEvent(new HashChangeEvent('hashchange'));
+ const row=rows().find(row=>row.dataset.key===initial.dataset.key);
+ const form=await openCard(row);
+ form.elements.feedback.value='Save these words.';
+ form.requestSubmit(form.querySelector('[value="'+action.outcome+'"]'));
+ const clip=copy(panelId(row));
+ const motion=clip?.getAnimations()[0];
+ if(!motion || !posts.has(row.dataset.key)) throw new Error('The save must start the fade.');
+ posts.get(row.dataset.key)({ok:true,json:async()=>({answer:'saved',state:action.state,later:0})});
+ motion.finish();await frame();
+ const place=new URLSearchParams(location.hash.slice(1));
+ check(Object.entries(filters).every(([key,value])=>place.get(key)===value),
+  'The card submit keeps every filter in the address.');
+ check(document.querySelector('[data-type-chip][aria-pressed="true"]').dataset.typeChip===filters.type &&
+  document.querySelector('[data-show-chip][aria-pressed="true"]').dataset.showChip===filters.show &&
+  document.querySelector('[data-owner-chip][aria-pressed="true"]').dataset.ownerChip===filters.owner &&
+  document.querySelector('#list-search').value===filters.q,'The card submit keeps each selected control.');
+""")
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_refused_card_reverses_above_the_next_departing_card(self) -> None:
