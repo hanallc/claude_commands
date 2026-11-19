@@ -270,8 +270,11 @@ class NatedevJobOnMac:
     """A local or CI job is working on the Mac."""
 
 
+@dataclass(frozen=True)
 class FreeMac:
     """No block or live claim reserves the Mac."""
+
+    kept_claims: int = 0
 
 
 @dataclass(frozen=True)
@@ -302,10 +305,9 @@ def mac_work(paths: MacIdlePaths, now: float, *, waiting_for_mac: bool = False
     from scripts.mac_test import mac_test
 
     try:
-        if (paths.mac_state / "run.json").exists():
-            return NatedevJobOnMac()
-        live = tuple(claim for claim in mac_test.read_claims(mac_test.StatePaths(paths.mac_state))
-                     if mac_test.run_is_live(claim.record))
+        claims = tuple(mac_test.read_claims(mac_test.StatePaths(paths.mac_state)))
+        live = tuple(claim for claim in claims
+                     if mac_test.run_holds_work(claim.record))
         block = mac_test.read_block(paths.mac_state / "block.json")
         if (any("work_idle_since" not in claim.record for claim in live)
                 or isinstance(block, mac_test.PendingMacBlock)
@@ -330,7 +332,7 @@ def mac_work(paths: MacIdlePaths, now: float, *, waiting_for_mac: bool = False
             config = mac_test.read_config()
             if config.ci_repo and isinstance(mac_test.ci_activity(config), mac_test.CiMacJobRunning):
                 return NatedevJobOnMac()
-        return FreeMac()
+        return FreeMac(sum(mac_test.run_is_kept(claim.record) for claim in claims))
     except (OSError, ValueError, UnicodeError) as error:
         return MacStateUnreadable(str(error))
 
@@ -458,6 +460,7 @@ def watch_once(paths: MacIdlePaths, now: float) -> None:
                 saved["state"] = "idle"
                 if isinstance(reading, FreeMac):
                     saved["cause"] = "free"
+                    saved["kept_claims"] = reading.kept_claims
                     write_record(idle_file, {"since": since})
                 else:
                     saved["cause"], saved["detail"] = reading.cause, reading.detail

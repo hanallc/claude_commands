@@ -18,7 +18,9 @@ from pathlib import Path
 from scripts.build_queue import execution_identity
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import placement
-from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
+from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, VERIFY_VERBS as VERIFY_VERBS,
+    GateJobNotRecorded, NotVerifyCall as NotVerifyCall, StepJob, VerifyCall as VerifyCall,
+    VerifyStep as VerifyStep, VerifyVerb as VerifyVerb)
 from scripts.build_queue.snapshot_codec import public_queue_text, select_queue_name
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
@@ -663,6 +665,7 @@ class Waiter(TypedDict):
     test_threads: NotRequired[int | None]
     # Requests can record a route. Direct commands without a reason use DIRECT_CARGO.
     route: NotRequired[StepRoute]
+    verify: NotRequired[VerifyCall]
     job: NotRequired[StepJob]
 
 
@@ -1047,6 +1050,7 @@ class WaitingStep:
     run: LiveBuildRun | NoLiveBuildRun = field(default=NoLiveBuildRun(), kw_only=True)
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
+    verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
     ci_runner: str = field(default="", kw_only=True)
 
@@ -1067,8 +1071,10 @@ class RunningStep:
     project: str = ""
     execution: execution_identity.ExecutionEvidence = execution_identity.ExecutionNotStarted()
     assignment_host: str = ""
+    mac_placement: str = field(default="", kw_only=True)
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
+    verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
     ci_runner: str = field(default="", kw_only=True)
 

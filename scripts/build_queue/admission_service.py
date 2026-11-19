@@ -1880,6 +1880,8 @@ class AdmissionServer:
             "repository_name": profile.repo,
             "route": request.route if isinstance(request, wire.AdmitRequest) else records.DIRECT_CARGO,
         }
+        if isinstance(identity.verify, records.VerifyCall):
+            row["verify"] = identity.verify
         if isinstance(identity.job, StepJob):
             row["job"] = identity.job
         if isinstance(request, ServiceEstimatedAdmission):
@@ -2115,6 +2117,9 @@ class AdmissionServer:
                 running.append(step)
                 continue
             row, step, use = next(attributed)
+            waiter = row.get("queue_waiter")
+            if waiter is not None and "verify" in waiter:
+                step = replace(step, verify=waiter["verify"])
             if row["step"] not in gate.PROGRESS_STEPS:
                 running.append(step)
                 continue
@@ -2500,7 +2505,8 @@ class AdmissionServer:
             assert isinstance(place, wire.CloudPlace)
             waiter = record.queue_waiter
             identity = wire.Identity(waiter.get("session_id", ""), waiter.get("session_name", ""),
-                record.step, record.worktree, waiter.get("unit", ""), job=record.gate_job)
+                record.step, record.worktree, waiter.get("unit", ""), job=record.gate_job,
+                verify=waiter.get("verify", records.NotVerifyCall()))
             sidecar = Path(record.sidecar)
             started_at = step_estimator.epoch(record.admitted_at)
             current = cloud_progress.read(sidecar) if record.sidecar else cloud_progress.NoCloudProgress()
@@ -2618,7 +2624,9 @@ class AdmissionServer:
                 identity.folder or request.profile.worktree, 0, records.RemoteMemoryUnavailable("remote memory is unavailable"),
                 pid=pid, started_at=saved.permission.consumed_at if isinstance(saved.permission, placement.PermissionConsumed) else 0,
                 unit=identity.unit, project=gate.step_project(request.profile.repo), execution=evidence,
-                assignment_host=assignment.destination.host))
+                assignment_host=assignment.destination.host, verify=identity.verify,
+                mac_placement=f"{assignment.episode}/{assignment.attempt}"
+                    if assignment.destination.provider == "mac" else ""))
         if not remote:
             return reading
         explained = tuple(records.ExplainedRunningStep(step, records.AdmissionTimeNotRecorded(), 0, 0, 0,
@@ -2634,12 +2642,15 @@ class AdmissionServer:
             return
         reading = replace(gate.queue_read_from_pass(self.last_inputs, self.last_policy, self.last_result),
                           diagnostics=self.last_diagnostics)
+        waiting = tuple(replace(step, verify=row["verify"]) if "verify" in row else step
+                        for step, (_, row) in zip(reading.view.waiting, reading.ordered, strict=True))
+        reading = replace(reading, view=replace(reading.view, waiting=waiting))
         ci_holds = self._ci_hold_reasons()
         if ci_holds:
             held_steps = tuple(records.WaitingStep(row["pid"], row.get("session_id", ""), row.get("session_name", ""),
                 row.get("step", ""), row.get("folder", ""), row["since"], row["need"], reason,
                 row.get("unit", ""), route=records.waiter_route(row), job=row.get("job", GATE_JOB_NOT_RECORDED),
-                ci_runner=row.get("ci_runner", ""))
+                ci_runner=row.get("ci_runner", ""), verify=row.get("verify", records.NotVerifyCall()))
                 for episode, reason in ci_holds.items() for row in (self.waiters[episode].row,))
             reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, *held_steps)),
                 ordered=[*reading.ordered, *((self.state_dir / records.waiter_owner(self.waiters[episode].row),
@@ -3095,7 +3106,7 @@ class AdmissionServer:
         scope = claim_state.target_claim_scope(paths, request.constraints.repository)
         for claim in held:
             if (mac_test.scopes_overlap(claim.scope, scope)
-                    and mac_test.run_is_live(claim.record)):
+                    and mac_test.run_holds_work(claim.record)):
                 diagnostic = placement.BusyProviderDiagnostic(destination.target, claim.record["what"], claim.record["since"])
                 session_id = claim.record.get("holder_session", "")
                 if session_id and session_id != claim_state.session_id(key.session):
