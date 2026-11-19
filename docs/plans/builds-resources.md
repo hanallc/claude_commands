@@ -2965,3 +2965,23 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 - Checkpoint `9b022b16b`; row `2604acf72` on the Phase 160 row `46539f832`, branch `builds-resources-p161`.
 
 **Files:** `scripts/aws_target/spot_table.py`, `scripts/aws_target/test_aws_page.py`, `scripts/aws_target/test_control.py`.
+
+### Phase 162 — The Gate column takes only zones with gate boxes  · status: todo
+**Source:** builds, 2026-11-19 00:5x EST, from the Phase 161 blind review.
+**Cause:** `spot_table` prices each Gate cell at the lowest Spot price of any zone in the snapshot. Placement and the break-even card take only the zones in `gate-deployment.json` (`run_cost.gate_variant_eligibility`). A cheap zone with no gate boxes makes the Gate column and the cheapest-gate line show a price placement cannot get.
+
+#### Work Order
+
+**Goal:** a Gate cell uses only the zones where that type has gate boxes in that region, as placement does.
+
+**Spec:**
+1. The Gate grid and the cheapest-gate line take the lowest price among the deployed zones of the region and type. The Spot column keeps the lowest price of any zone.
+2. A region and type with no deployed zone, or no current price in one, shows a short note in the Gate cell, not a price.
+3. Read the deployment through the code that placement uses; keep one reader.
+4. No change to placement, `cloud_gate.py` or any config key.
+
+**Base:** row `2604acf72` (Phase 161).
+
+**Files:** `scripts/aws_target/spot_table.py`, `scripts/aws_target/run_cost.py` (only to share the deployment reader), tests in `test_aws_page.py` or `test_control.py`.
+
+**Acceptance gate:** a test with a cheap zone that has no gate boxes shows the Gate cell at the deployed zone's price, equal to the break-even card; a type with no deployment shows the note. Types 0; the aws page and aws_target suites pass on the row.
