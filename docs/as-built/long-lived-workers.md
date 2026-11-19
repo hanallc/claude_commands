@@ -706,14 +706,24 @@ The supervisor waits for this process before it marks the run finished.
 The command runs in its own session, including through a systemd scope prefix.
 The record saves the command's process group as `command_group`.
 The supervisor installs no signal handler.
-`detached_runs.py stop` and a build hold stop send TERM to the command group only.
-Each checks the supervisor and the command leader identity first, and saves a stop reason.
-The supervisor stays alive, records the exit status and delivers the result.
-A result with a stop reason reads `STOPPED (exit <n>)` and carries a `Stop reason:` line.
+`detached_runs.py stop` and a build hold stop send TERM to the command group.
+Each checks the supervisor and the command leader identity before it signals the group.
+Each stages the stop reason before it sends TERM.
+The supervisor stays alive to record the exit status and deliver the result.
+The result uses the command's exit status and includes the saved reason.
+A self-stop requires a native Claude session record or Codex pane report for the caller.
+The caller's worker staff ID must match the run's owner.
+Missing records, unreadable records, and conflicting identities prevent a self-stop.
+The self-stop saves `self_stop: true` with the stop reason.
+The supervisor keeps the pass active and sends the result to the owning worker.
+Delivery stays pending if the worker cannot receive the result.
+If the worker's staff row is gone, the director receives the run result.
+A stop from another caller can cancel the owning pass.
 New worker runs save the recorder pass ID or the reason the lookup failed.
-An unavailable pass ID prevents cancellation.
+An unavailable pass ID prevents cancellation of the pass.
 For older runs, the stop checks the fixed worker ID, run folder, and pass start time.
-After an explicit stop, the supervisor records the leader's exit status and waits for the entire group to end.
+For either stop kind, the supervisor records the leader's exit status.
+The supervisor waits for the entire group to end.
 The supervisor starts delivery once the group ends.
 The run stays pending for completion readers until delivery or the reaper confirms that the group ended.
 The folder reader finds pending stops by index and verifies their status in the run record.
@@ -743,8 +753,8 @@ The recorder retains the original prompt and reply path after a replacement pass
 If the Stop event has no DONE marker, the hook uses each unsaved receipt to check the transcript for its DONE marker.
 The hook records an unreadable archived reply in `turn-end-ignored.jsonl` and continues with the current pass.
 A run without a pane pass uses the ordinary result delivery.
-A newer run of the same command suppresses the older orphan result.
-A repeated stop sends no additional signal or notice.
+A newer run of the same command suppresses the older orphan result for an ordinary run.
+A repeated request to stop a pass sends no additional signal or notice.
 If the supervisor dies, the orphan reaper finishes the record and delivers the result.
 The next start, worker restore, or explicit `detached_runs.py reap` invokes this recovery.
 The result carries `Detached run: <run_id>` as its stable marker.
