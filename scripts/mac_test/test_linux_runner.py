@@ -26,7 +26,7 @@ from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.copies.copies_test_support import copies_environment
 from scripts.mac_test import eligibility, claim_state, linux_runner, mac_test, offload, test_target_slots
-from scripts.mac_test.offload_test_commands import WorkspaceSweepFixture
+from scripts.mac_test.offload_test_commands import WORKSPACE_SWEEP_SETTINGS, WorkspaceSweepFixture
 from scripts.mac_test.offload_test_support import mirror_use_payload
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -215,7 +215,7 @@ class LinuxShellTests(unittest.TestCase):
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
         )
         _ = (self.root / "mac.conf").write_text("offload=on\nhost=fake-mac\nlinux_only.phase-copy=\n")
-        _ = write_config_fixture(self.root / "lint.conf", "recent_minutes=60\n")
+        _ = (self.root / "lint.conf").write_text(WORKSPACE_SWEEP_SETTINGS)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "BUILD_TARGETS_CONFIG": str(registry), "CONF_DIR": str(self.root),
         })))

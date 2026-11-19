@@ -44,6 +44,50 @@ def write_shell(path: Path, source: str) -> None:
     path.chmod(0o755)
 
 
+WORKSPACE_SWEEP_SETTINGS = """\
+# range: 0..
+recent_minutes=60
+# range: 0..
+sweep_budget_gib=24
+sweep_budget_gib.hana=96
+# range: 0..
+sweep_doc_index_mib=250
+# whole: 1..
+sweep_max_tree_depth=3
+# whole: 1..
+sweep_floor_search_depth=8
+sweep_floor_skip=.git node_modules
+# whole: 1..
+sweep_discovery_workers=4
+# whole: 1..
+sweep_dep_info_head_bytes=4096
+# whole: 1..
+sweep_proc_locks_reads=3
+# range: 0..
+sweep_holder_lookback_seconds=180
+# range: 0..
+sweep_delete_stamp_grace_seconds=2
+# range: 0..
+sweep_phone_floor_gib=0
+# range: 0..
+sweep_phone_rearm_gib=5
+# range: 0..
+sweep_phone_rearm_minutes=60
+# range: 0..
+sweep_alert_interval_seconds=3600
+# whole: 1..
+sweep_message_limit=1024
+# range: 3..5
+sweep_alert_folder_count=3
+# range: 0..
+sweep_crossing_repeat_minutes=525600
+# whole: 1..
+sweep_push_text_limit=500
+# range: 0..
+sweep_sender_timeout_seconds=30
+"""
+
+
 @dataclass(frozen=True)
 class WorkspaceSweepFixture:
     proc: Path

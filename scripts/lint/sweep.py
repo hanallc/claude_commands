@@ -1426,7 +1426,7 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
             next((argument for argument in argv[1:] if not argument.startswith("-")), "")) == "verify.sh")
         if verify or NEXTEST_ARG in argv[1:2] or command == f"cargo-{NEXTEST_ARG}":
             runner = "verify.sh" if verify else "cargo-nextest"
-            for target in workspace_targets(argv, cwd, os.path.join(base, "environ"), owners, runner):
+            for target in workspace_targets(argv, cwd, os.path.join(base, "environ"), owners):
                 if target in checked:
                     _ = found.setdefault(target, TargetUse(pid, f"runs {runner} in {cwd}"))
     return {target: found[target] for target in owners if target in found}
@@ -1645,8 +1645,7 @@ def floor_holders(busy: Mapping[str, TargetUse | LockHeld | BuildHoldTarget | No
     return sorted(holders, key=lambda holder: (-holder.bytes, holder.path))
 
 
-def workspace_targets(argv: list[str], cwd: str, environ: str, targets: Sequence[str],
-                      runner: Literal["verify.sh", "cargo-nextest"]) -> list[str]:
+def workspace_targets(argv: list[str], cwd: str, environ: str, targets: Sequence[str]) -> list[str]:
     """Resolve Cargo's artifact and intermediate folders through one busy check."""
     try:
         with open(environ, "rb") as handle:
@@ -1656,19 +1655,11 @@ def workspace_targets(argv: list[str], cwd: str, environ: str, targets: Sequence
     environment = dict(entry.split("=", 1) for entry in entries if "=" in entry)
     settings = cargo_folder_settings(argv, cwd, environment)
     cargo_home = cargo_home_folder(cwd, environment)
-    chosen: set[str] = set()
-    for key, setting in settings.items():
-        try:
-            folder = (cargo_build_folder(setting, argv, cwd, cargo_home) if key == "build-dir"
-                      else os.path.realpath(setting.base / setting.value))
-        except FileNotFoundError as error:
-            # verify.sh can run outside a Cargo workspace. A workspace template has no path there.
-            if runner == "verify.sh" and cast(object, error.filename) == os.path.join(cwd, "Cargo.toml"):
-                continue
-            return list(targets)
-        except (OSError, ValueError):
-            return list(targets)
-        chosen.add(folder)
+    try:
+        chosen = {cargo_build_folder(setting, argv, cwd, cargo_home) if key == "build-dir"
+                  else os.path.realpath(setting.base / setting.value) for key, setting in settings.items()}
+    except (OSError, ValueError):
+        return list(targets)
     owners = targets if isinstance(targets, TargetOwnerIndex) else TargetOwnerIndex(targets)
     return [owner.target for path, owner in owners.by_path.items() if path in chosen
             or ("target-dir" not in settings
@@ -2177,10 +2168,11 @@ def trim_row_recorded(take: TrimTake) -> bool:
 
 @contextmanager
 def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], scan: Scan,
-                     dry_run: bool, owners: TargetOwnerIndex) -> Generator[None]:
-    """One write-ahead deletion and publication path for budget and floor takes."""
+                     dry_run: bool, owners: TargetOwnerIndex, *,
+                     lint_settings: conf.ConfigRead, proc: str) -> Generator[dict[str, TargetUse | BuildHoldTarget]]:
+    """Keep the trim locked and report any users that block its recovery."""
     if dry_run:
-        yield
+        yield {}
         return
     target = os.path.abspath(target)
     path = trim_intent_path(target)
@@ -2196,6 +2188,10 @@ def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], s
         if path.exists():
             unfinished = load_trim_for_recovery(path)
             if not isinstance(unfinished, DamagedTrimIntentSetAside):
+                uses = trim_output_uses(unfinished, lint_settings=lint_settings, proc=proc)
+                if uses:
+                    yield uses
+                    return
                 _ = unfinished.recover()
                 recovered = unfinished.publish()
                 if not recovered:
@@ -2205,7 +2201,7 @@ def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], s
         active.update({whole.target: take for whole in whole_targets})
         token = TRIM_TAKES.set(active)
         try:
-            yield
+            yield {}
             # A failed append keeps its completed intent for the next invocation.
             if recovered and path.exists() and not take.publish():
                 return
@@ -2225,6 +2221,15 @@ def trim_inside(take: TrimTake, roots: Sequence[str]) -> bool:
     """Whether every output root of take is inside one of roots."""
     return all(any(Path(output).is_relative_to(root) for root in roots)
                for output in take.output_roots or (take.target,))
+
+
+def trim_output_uses(take: TrimTake, *, lint_settings: conf.ConfigRead,
+                     proc: str) -> dict[str, TargetUse | BuildHoldTarget]:
+    roots = take.output_roots
+    if len(roots) <= 1:
+        return {}
+    holds = build_hold_targets(roots, {}, lint_settings=lint_settings, proc=proc)
+    return dict(holds) if holds else dict(process_uses(TargetOwnerIndex(roots), proc))
 
 
 def saved_trim_outside(roots: Sequence[str]) -> str | None:
@@ -2267,11 +2272,9 @@ def recover_pending_trims(locked_targets: Sequence[str] = (), *,
                     roots = take.output_roots or (take.target,)
                     if scope is TrimRecovery.INSIDE_SWEPT_ROOTS and not trim_inside(take, locked_targets):
                         continue
+                    if trim_output_uses(take, lint_settings=lint_settings, proc=proc):
+                        continue
                     if len(roots) > 1:
-                        owners = TargetOwnerIndex(roots)
-                        if (build_hold_targets(roots, {}, lint_settings=lint_settings, proc=proc)
-                                or process_uses(owners, proc)):
-                            continue
                         acquired = True
                         for root in sorted(roots):
                             if root not in locked_targets and not guards.enter_context(scratch.removal_lock(Path(root))):
@@ -2639,7 +2642,11 @@ def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run:
     owners = TargetOwnerIndex(roots)
     with ExitStack() as takes:
         for root in roots:
-            takes.enter_context(recoverable_trim(root, "budget take", scan, dry_run, owners))
+            uses = takes.enter_context(recoverable_trim(root, "budget take", scan, dry_run, owners,
+                                                       lint_settings=lint_settings, proc=proc))
+            if uses:
+                print(f"lint sweep: saved trim for {root} has active output; skipped")
+                return 0
         left, failures = shrink(
             scan, total, budget, dry_run,
             lambda group: (float(group.last_used > now - recent_minutes * 60), *unit_age(group, now)),
@@ -2939,7 +2946,11 @@ def shrink_floor(
                         locks.held.append(held)
                     if blocked:
                         continue
-                with recoverable_trim(root, "floor take", scan, dry_run, owners):
+                with recoverable_trim(root, "floor take", scan, dry_run, owners,
+                                      lint_settings=lint_settings, proc=PROC_DIR) as uses:
+                    if uses:
+                        busy.update(uses)
+                        continue
                     for group in candidates:
                         if left <= budget:
                             break

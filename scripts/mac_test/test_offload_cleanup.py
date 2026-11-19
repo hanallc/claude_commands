@@ -18,7 +18,8 @@ from typing import cast, override
 from unittest import mock
 from scripts.mac_test import eligibility, offload, mac_test, nextest_log
 from scripts.mac_test.offload_test_commands import (
-    ACTIVITY_SELECTOR_STUB, WorkspaceSweepFixture, configure_nextest_trim, install_nextest_log_writer, write_shell,
+    ACTIVITY_SELECTOR_STUB, WORKSPACE_SWEEP_SETTINGS, WorkspaceSweepFixture, configure_nextest_trim,
+    install_nextest_log_writer, write_shell,
 )
 from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
 from scripts.lib import conf, test_hang_guard
@@ -142,7 +143,8 @@ class MacTargetCleanupShellTests(unittest.TestCase):
         self.bin_directory = self.root / "bin"
         self.bin_directory.mkdir()
         self.configuration_environment = config_environment(self.root / "configuration")
-        _ = write_config_fixture(self.root / "configuration/lint.conf", "recent_minutes=60\n")
+        (self.root / "configuration").mkdir(exist_ok=True)
+        _ = (self.root / "configuration/lint.conf").write_text(WORKSPACE_SWEEP_SETTINGS)
         self.configuration_environment.update({
             "LINT_SWEEP_STATE_DIR": str(self.root / "sweep-state"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),

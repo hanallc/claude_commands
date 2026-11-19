@@ -1075,7 +1075,7 @@ class ProcessUseTests(SweepCase):
                 self.assertEqual(self.uses(), {str(self.other): f"runs cargo-nextest in {self.workspace}"})
                 shutil.rmtree(self.proc)
 
-    def test_verify_outside_cargo_keeps_only_its_own_output_when_a_template_needs_a_manifest(self) -> None:
+    def test_verify_keeps_all_outputs_when_a_template_needs_a_missing_manifest(self) -> None:
         cargo_home = self.base / "cargo-home"
         cargo_home.mkdir()
         _ = (cargo_home / "config.toml").write_text('[build]\nbuild-dir = "{workspace-root}/build"\n')
@@ -1084,12 +1084,12 @@ class ProcessUseTests(SweepCase):
         reason = f"runs verify.sh in {self.workspace}"
 
         fake_process(self.proc, 10, cwd=str(self.workspace), argv=argv, environ=environment)
-        self.assertEqual(self.uses(), {str(self.hana): reason})
+        self.assertEqual(self.uses(), {str(self.hana): reason, str(self.other): reason})
 
         shutil.rmtree(self.proc)
         fake_process(self.proc, 10, cwd=str(self.workspace), argv=argv,
                      environ=(*environment, f"CARGO_TARGET_DIR={self.other}"))
-        self.assertEqual(self.uses(), {str(self.other): reason})
+        self.assertEqual(self.uses(), {str(self.hana): reason, str(self.other): reason})
 
     def test_nextest_shared_reader_keeps_legacy_override_and_invalid_config_behavior(self) -> None:
         config = self.workspace / ".cargo"
@@ -1959,7 +1959,8 @@ class FloorTests(SweepCase):
         with (mock.patch.object(sweep, "remove_entry", side_effect=stop_at_artifact),
               self.assertRaises(KeyboardInterrupt)):
             with sweep.recoverable_trim(str(mapping.build_directory), "floor take", scan, False,
-                                        sweep.TargetOwnerIndex(roots)):
+                                        sweep.TargetOwnerIndex(roots), lint_settings=conf.read("lint"),
+                                        proc=str(base / "proc")):
                 _ = sweep.reclaim(group, scan, dict(scan.links), False)
         self.assertTrue(stopped)
         self.assertFalse(own.exists())
@@ -1987,6 +1988,41 @@ class FloorTests(SweepCase):
         sweep.trim_intent_path(take.target).parent.mkdir(parents=True, exist_ok=True)
         take.prepare(group)
         return take
+
+    def test_workspace_leaves_a_saved_pair_pending_when_a_process_starts_after_the_first_scan(self) -> None:
+        process_uses = sweep.process_uses
+        base = self.base()
+        mapping, own, artifact = self.paired_output(base)
+        take = self.prepare_pair_take(mapping)
+        intent = sweep.trim_intent_path(take.target)
+        pending = intent.read_bytes()
+        roots = [str(mapping.build_directory), str(mapping.target_directory)]
+        proc = base / "proc"
+        proc.mkdir()
+        scans = 0
+
+        def scan_processes(targets: Sequence[str], table: str) -> dict[str, sweep.TargetUse]:
+            nonlocal scans
+            self.assertEqual(table, str(proc))
+            scans += 1
+            if scans == 2:
+                fake_process(proc, 10, cwd=str(mapping.target_directory))
+            return process_uses(targets, table)
+
+        output = io.StringIO()
+        with (mock.patch.object(sweep, "cargo_roots", return_value=roots),
+              mock.patch.object(sweep, "process_uses", side_effect=scan_processes),
+              mock.patch.object(sweep, "remove_entry", wraps=sweep.remove_entry) as remove,
+              mock.patch.dict(os.environ, {sweep.BUDGET_ENV: "0"}),
+              redirect_stdout(output)):
+            self.assertEqual(sweep.sweep_workspace(None, conf.read("lint"), False, 60, proc=str(proc)), 0)
+        self.assertEqual(scans, 3)
+        self.assertIn("has active output; skipped", output.getvalue())
+        remove.assert_not_called()
+        self.assertTrue(own.exists())
+        self.assertTrue(artifact.exists())
+        self.assertEqual(intent.read_bytes(), pending)
+        self.assertEqual(self.trim_rows(), [])
 
     def test_changed_pair_entries_clear_the_old_intent_and_allow_a_new_take(self) -> None:
         base = self.base()
