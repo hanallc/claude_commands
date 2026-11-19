@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from scripts.build_queue import execution_identity
 from scripts.build_hold.shared_state_defaults import DEFAULT_ADMISSION_SOCKET as DEFAULT_ADMISSION_SOCKET
 from typing import TYPE_CHECKING, TypeVar, cast
 
@@ -14,7 +15,6 @@ from scripts.build_queue import snapshot_codec as codec
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_targets import target_config
-from scripts.build_targets.execution_transport import HanaControlTransport
 
 if TYPE_CHECKING:
     from scripts.build_queue import admission_records as records
@@ -455,6 +455,7 @@ def placement_configuration_digest(target_name: str, settings: placement.Provide
                                    transport_for: Callable[[target_config.SshTarget], ExecutionTransport],
                                    read_bytes: Callable[[Path], bytes]) -> str:
     """Hash the configuration for placement or an adapter refusal."""
+    from scripts.build_targets.execution_transport import HanaControlTransport
     from scripts.lib import conf
 
     paths = {conf.path("build_targets"), conf.path("build_admission"), conf.path("mac_test")}
@@ -463,7 +464,13 @@ def placement_configuration_digest(target_name: str, settings: placement.Provide
     for target in targets:
         if isinstance(target, target_config.SshTarget) and target.name == target_name:
             paths.add(target.settings)
-            if isinstance(transport_for(target), HanaControlTransport):
+            if target.platform != "linux":
+                continue
+            try:
+                transport = transport_for(records.ssh_target_settings(target, settings))
+            except conf.Unusable:
+                continue
+            if isinstance(transport, HanaControlTransport):
                 paths.add(conf.path("aws_target"))
     digest = hashlib.sha256()
     for path in sorted(paths):
@@ -472,6 +479,10 @@ def placement_configuration_digest(target_name: str, settings: placement.Provide
             contents = read_bytes(path)
         except FileNotFoundError:
             contents = b"missing"
+        except OSError as error:
+            # The provider reads and reports its own settings error.
+            digest.update(b"\0unreadable\0")
+            contents = type(error).__name__.encode()
         digest.update(contents)
     return digest.hexdigest()
 
@@ -504,7 +515,7 @@ class ExecutionReport(CallerCode):
     request_id: str
     assignment: placement.PlacementAssignment
     claim: placement.ProviderClaimReference | placement.NoProviderClaim
-    evidence: placement.ExecutionEvidence
+    evidence: execution_identity.ExecutionEvidence
     outcome: placement.AttemptOutcome = field(default_factory=lambda: placement.AttemptOutcomeUnavailable("not supplied"))
     path: placement.DispatchPathState = field(default_factory=lambda: placement.DispatchPathPending("not confirmed"))
 

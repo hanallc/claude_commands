@@ -731,7 +731,10 @@ The default order uses `the_list.order`, which the CLI also uses.
 User decisions come first, then unread updates, then the earliest next check.
 A column button sorts its values; a second click reverses that order.
 
-The List starts with All selected in its single row of status chips.
+The List starts with All selected in the Owner, Producer, and Show rows.
+Owner and Producer list staff in name order after All and omit the `-unit` suffix from names.
+The address keeps the original staff IDs, including `all` when it identifies a staff member.
+The words box sits beside the Producer chips and wraps below them when space is limited.
 The chip order is All, Needs me, Morty answering, Working, Blocked, Parked, and Closed.
 Morty answering includes all items with an open question, including parked items and items that need Resend.
 The other status chips contain items with no open question.
@@ -742,9 +745,10 @@ Parked includes items with a future parking time in states other than Done and C
 Closed includes items in Done or Closed, even when they have a future parking time.
 Each item belongs to one status category. The six counts add up to All.
 The Unread only switch limits the visible items and chip counts to unread items.
-The Owner and Producer menus and the words box also limit the chip counts.
+Each chip count reflects the words box and the filters in the other rows.
 The “need you” total uses the Needs me chip count.
 A zero-count chip stays visible and dimmed.
+The chip rows wrap when the available width decreases.
 
 The Expand all and Collapse all buttons sit above the number column at the left of the item count row.
 They use the vendored Lucide icons `chevrons-up-down` and `chevrons-down-up`.

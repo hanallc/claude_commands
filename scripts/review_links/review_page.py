@@ -24,20 +24,22 @@ from scripts.production import change_review, change_routing, proposal_issue, st
 from scripts.production.record_store import state_root
 from scripts.lib import urgency
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_items, review_link
-from scripts.review_links import review_legacy
+from scripts.review_links import new_item_dialog, review_submissions
 from scripts.review_links import question_record, review_actions, staff_names
 from scripts.review_links.review_items import ReviewItem, ReviewSourceStamps, ReviewState, ReviewType, guard_source
 from scripts.review_links.review_items import source_stamp as source_stamp
 
 PAGE_PATH = '/console/review.html'
+NEW_ITEM_PATH = '/console/review/new-item'
+ATTACHMENT_PATH = '/console/review/attachment'
 HEADERS = ('Id', 'Type', 'Owner', 'Item', 'State', 'Age')
 TYPES = tuple(ReviewType)
 ICONS = {ReviewType.QUESTION: 'circle-help', ReviewType.CHANGE: 'diff', ReviewType.INVESTIGATION: 'microscope',
-         ReviewType.PROPOSAL: 'lamp', ReviewType.EFFICIENCY: 'zap'}
+         ReviewType.PROPOSAL: 'lamp', ReviewType.EFFICIENCY: 'zap', ReviewType.BUG: 'bug'}
 INDEX_STATES = (ReviewState.OPEN, ReviewState.WAITING, ReviewState.DONE, ReviewState.VALIDATING)
 SHOWS = (('open', 'Open'), (ReviewState.VALIDATING, ReviewState.VALIDATING), ('Done', 'Done'), ('all', 'All'))
 LABELS = {ReviewType.QUESTION: 'Questions', ReviewType.CHANGE: 'Changes', ReviewType.INVESTIGATION: 'Investigations',
-          ReviewType.PROPOSAL: 'Proposals', ReviewType.EFFICIENCY: 'Efficiencies'}
+          ReviewType.PROPOSAL: 'Proposals', ReviewType.EFFICIENCY: 'Efficiencies', ReviewType.BUG: 'Bugs'}
 LATER_PRESETS = (('soon', ''), ('evening', 'This evening'), ('morning', 'Tomorrow morning'), ('week', 'Next week'))
 # Weekday names in the order of the browser's getUTCDay.
 WEEKDAYS = ('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday')
@@ -63,6 +65,7 @@ class ReviewIndexEntry(TypedDict):
     sourceHtml: str
     urgency: str
     handoff: NotRequired[tuple[str, str]]
+    waitingWhy: NotRequired[str]
 
 
 def record_revision(item: ReviewItem, assets: Mapping[str, str]) -> str:
@@ -70,7 +73,8 @@ def record_revision(item: ReviewItem, assets: Mapping[str, str]) -> str:
     source = item.source
     # A Change verdict follows the current production when staff move.
     record = (source.path, source.row, source.slots, item.times.later) if isinstance(source, review_items.ChangeSource) else item
-    retained = (record, assets.get(item.key, ''), assets.get('image:'+item.key, ''))
+    retained = (record, assets.get(item.key, ''), assets.get('image:'+item.key, ''),
+                assets.get('submission:'+item.key, ''))
     return hashlib.sha256(repr(retained).encode()).hexdigest()[:16]
 
 
@@ -91,7 +95,8 @@ def index_json(entries: list[ReviewIndexEntry]) -> str:
              references[(entry['sourceOwner'],entry['sourceName'],entry['sourceHtml'])],
              entry['title'], INDEX_STATES.index(entry['state']), entry['filed'], entry['updated'],
              entry['hiddenUntil'], '' if entry['urgency']=='normal' else entry['urgency'],
-             *([entry['handoff']] if 'handoff' in entry else [])] for entry in entries]
+             *([entry.get('handoff'), entry['waitingWhy']] if 'waitingWhy' in entry
+               else [entry['handoff']] if 'handoff' in entry else [])] for entry in entries]
     return json.dumps({'n':list(names),'r':rows},ensure_ascii=False,separators=(',',':')).replace(
         '&','\\u0026').replace('<','\\u003c').replace('>','\\u003e')
 
@@ -147,6 +152,7 @@ class ReviewSnapshot:
     notices: tuple[str, ...] = ()
     unavailable_cards: frozenset[str] = frozenset()
     title_limit: int = 100
+    submission_keys: dict[str, str] = field(default_factory=dict)
 
     def facts(self) -> dict[str,float]:
         return {'readAt':self.read_at,'renderSeconds':self.render_seconds,'answeredAt':time.time()}
@@ -193,6 +199,38 @@ def retain_asset(item: ReviewItem, assets: dict[str, str]) -> None:
         assets[item.key] = change_page.review_text_html(FRONT_MATTER.sub('', text, count=1).strip(), inline=True)
     elif isinstance(source, review_items.ChangeSource) and source.row.get('Image'):
         assets['image:'+item.key] = change_review.image_path(source.row['Image'])
+    origin = review_items.submission_origin(item)
+    if isinstance(origin, new_item_dialog.ReviewSubmission):
+        assets['submission:'+item.key] = submission_assets(item.key, origin)
+
+
+def submission_assets(key: str, origin: new_item_dialog.ReviewSubmission) -> str:
+    """Render the saved evidence and references for one lazy card."""
+    evidence = origin.evidence
+    body = ''
+    if isinstance(evidence, new_item_dialog.BuildStepEvidence):
+        cells = ''.join('<div><dt>'+html.escape(cell.label)+'</dt><dd>'+html.escape(cell.value)+'</dd></div>'
+                        for cell in evidence.cells)
+        memory = evidence.memory
+        segments = ' · '.join(f'{part.label} {part.gib:g} GiB' for part in memory.segments)
+        tip = ''.join('<div><dd>'+html.escape(part.text)+'</dd></div>'
+                      if isinstance(part, (new_item_dialog.TipDetail, new_item_dialog.TipCaption))
+                      else '<div><dt>'+html.escape(part.label)+'</dt><dd>'+html.escape(part.value)+'</dd></div>'
+                      for part in evidence.tip)
+        body = ('<section data-submission-evidence><h3>Evidence</h3><strong>'+html.escape(evidence.title)
+                +'</strong><p>'+html.escape(evidence.owner)+' · '+html.escape(evidence.captured_at)
+                +'</p><dl>'+cells+'</dl><p>'+f'{memory.free_for_next_gib:g} GiB free for the next step · '
+                +f'Queue cap {memory.queue_cap_gib:g} GiB</p><p>'+html.escape(segments)
+                +'</p><strong>'+html.escape(evidence.tip_title)+'</strong><p>'+html.escape(evidence.tip_status)
+                +'</p><dl>'+tip+'</dl></section>')
+    if origin.images:
+        links: list[str] = []
+        for at, image in enumerate(origin.images, 1):
+            url = html.escape(ATTACHMENT_PATH+'?'+urlencode({'key': key, 'id': image.id}), quote=True)
+            links.append(f'<a href="{url}" target="_blank" rel="noopener"><img loading="lazy" '
+                         + f'src="{url}" alt="Attachment {at}"></a>')
+        body += '<section class="review-attachments"><h3>Attachments</h3>'+''.join(links)+'</section>'
+    return body
 
 
 def card_entry(item: ReviewItem, members: staff.StaffSnapshot, names: staff_names.StaffNames, *,
@@ -212,6 +250,9 @@ def card_entry(item: ReviewItem, members: staff.StaffSnapshot, names: staff_name
             requested = change_page.handoff_time(path, requested)
         requested = requested.astimezone(user_zone())
         entry['handoff'] = (requested.isoformat(), requested.strftime('%b %d %H:%M %Z'))
+    if (item.state == ReviewState.WAITING and item.waiting_why
+            and isinstance(review_items.submission_origin(item), new_item_dialog.ReviewSubmission)):
+        entry['waitingWhy'] = item.waiting_why
     validate_text(entry['title'])
     for value in entry.values():
         if isinstance(value, str):
@@ -261,6 +302,7 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
     records: dict[str, ReviewItem] = {}
     entries: list[ReviewIndexEntry] = []
     assets: dict[str, str] = {}
+    submission_keys: dict[str, str] = {}
     unavailable_cards: set[str] = set()
     for item in review_items.read(root, members=members, sources=sources, assign_ids=False):
         path = review_items.source_path(item)
@@ -277,6 +319,9 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
                 summary = card_entry(replace(item, title='Card unavailable'), members, names, root=root)
             else:
                 assets.update(record_assets)
+                origin = review_items.submission_origin(item)
+                if isinstance(origin, new_item_dialog.ReviewSubmission):
+                    submission_keys[origin.request_id] = item.key
             entries.append(summary)
             records[item.key] = item
     browser = change_page.ReviewBrowser(token, initial)
@@ -292,7 +337,7 @@ def build_snapshot(root: Path) -> ReviewSnapshot:
     snapshot = ReviewSnapshot(version,records,entries,members,
         browser,words_rows,refresh_seconds,assets,zone,sources.before_read,later,names,read_at=read_at,
         notices=notices, unavailable_cards=frozenset(unavailable_cards),
-        title_limit=title_limit)
+        title_limit=title_limit, submission_keys=submission_keys)
     return pack_snapshot(snapshot, index, started)
 
 
@@ -313,6 +358,14 @@ class ReviewSave:
     answer: str
     version: str
     item: ReviewItem | ReviewRecordNotPublished
+
+
+@dataclass(frozen=True)
+class PublishedSubmission:
+    """A native Send in the current Review index."""
+    saved: review_submissions.SavedSubmission
+    key: str
+    version: str
 
 
 @dataclass
@@ -396,30 +449,86 @@ class ReviewSnapshotCache:
 
     def publish_record(self, current: ReviewSnapshot, key: str) -> ReviewSnapshot:
         """Replace or remove one record while serving the previous version to readers."""
+        members = staff.snapshot()
+        try:
+            item = review_items.read_current(self.root, current.records[key], members)
+            return self.publish_item(current, key, item, members)
+        except (FileNotFoundError, review_items.ReviewRecordMissing):
+            return self.publish_item(current, key, ReviewRecordNotPublished(), members)
+
+    def create_submission(self, request: new_item_dialog.NewItemRequest) -> PublishedSubmission:
+        """File the new record and publish it from its exact native path."""
+        _ = self.get()
+        with self._save_lock:
+            current = self.get()
+            saved = review_submissions.submit(request, members=staff.snapshot())
+            members = staff.snapshot()
+            path = saved.path
+            stamps = {source: source_stamp(source) for source in (path, path.parent)}
+            try:
+                projected = review_items.submission_item(saved, members)
+                previous_key = current.submission_keys.get(saved.request_id, projected.key)
+                previous = current.records.get(previous_key)
+                if isinstance(projected.source, review_items.ProposalSource) and previous is not None:
+                    projected = replace(projected, queue_after=previous.queue_after)
+                item = review_items.read_current(self.root, projected, members)
+                origin = review_items.submission_origin(item)
+                if not isinstance(origin, new_item_dialog.ReviewSubmission) or origin.request_id != saved.request_id:
+                    raise review_items.ReviewRecordChanged('The saved Review item changed.')
+                fresh = self.publish_item(current, item.key, item, members, stamps=stamps,
+                                          replaced_key=previous_key)
+            finally:
+                self.invalidate()
+            return PublishedSubmission(saved, item.key, fresh.version)
+
+    def publish_item(self, current: ReviewSnapshot, key: str, item: ReviewItem | ReviewRecordNotPublished,
+                     members: staff.StaffSnapshot, *, stamps: Mapping[Path, tuple[int, int]] | None = None,
+                     replaced_key: str = '') -> ReviewSnapshot:
+        """Insert, replace or remove one retained record."""
         started = time.perf_counter()
         records = current.records.copy()
         assets = current.assets.copy()
-        _ = assets.pop(key, None)
-        _ = assets.pop('image:'+key, None)
-        members = staff.snapshot()
+        asset_keys = (key, 'image:'+key, 'submission:'+key)
+        previous_key = replaced_key or key
+        previous = records.get(previous_key)
+        if previous_key != key:
+            _ = records.pop(previous_key, None)
+        for removed in {previous_key, key}:
+            for asset in (removed, 'image:'+removed, 'submission:'+removed):
+                _ = assets.pop(asset, None)
+        submission_keys = current.submission_keys.copy()
+        if previous is not None:
+            previous_origin = review_items.submission_origin(previous)
+            if isinstance(previous_origin, new_item_dialog.ReviewSubmission):
+                _ = submission_keys.pop(previous_origin.request_id, None)
         names = staff_names.StaffNames(members)
-        try:
-            item = review_items.read_current(self.root, records[key], members)
-            item = review_items.normalize_times(item, current.zone)
-            retain_asset(item, assets)
-        except (FileNotFoundError, review_items.ReviewRecordMissing):
-            del records[key]
+        if isinstance(item, ReviewRecordNotPublished):
+            _ = records.pop(key, None)
             entries = [entry for entry in current.entries if entry['key'] != key]
             record_version = key
         else:
+            item = review_items.normalize_times(item, current.zone)
+            retain_asset(item, assets)
+            if (stamps is not None and current.records.get(key) == item and members == current.members
+                    and key not in current.unavailable_cards
+                    and all(assets.get(asset) == current.assets.get(asset) for asset in asset_keys)):
+                return current
             records[key] = item
-            validate_body_inputs(item, {name: assets[name] for name in (key, 'image:'+key) if name in assets})
+            origin = review_items.submission_origin(item)
+            if isinstance(origin, new_item_dialog.ReviewSubmission):
+                submission_keys[origin.request_id] = key
+            validate_body_inputs(item, {asset: assets[asset] for asset in asset_keys if asset in assets})
             updated_entry = card_entry(item, members, names, root=self.root)
-            entries = [updated_entry if entry['key'] == key else entry for entry in current.entries]
-            record_version = repr((item, assets.get(key), assets.get('image:'+key)))
+            entries = [updated_entry if entry['key'] == previous_key else entry for entry in current.entries
+                       if entry['key'] != key or key == previous_key]
+            if previous_key not in current.records:
+                entries.append(updated_entry)
+            record_version = repr((item, tuple(assets.get(asset) for asset in asset_keys)))
         version = hashlib.sha256((current.version+record_version).encode()).hexdigest()[:20]
         fresh = pack_snapshot(replace(current, version=version, members=members, names=names, records=records, assets=assets, entries=entries,
-                                      unavailable_cards=current.unavailable_cards-{key}),
+                                      source_stamps={**current.source_stamps, **stamps} if stamps is not None else current.source_stamps,
+                                      unavailable_cards=current.unavailable_cards-{key, previous_key},
+                                      submission_keys=submission_keys),
                               index_json(entries), started)
         with self._condition:
             self._snapshot = fresh
@@ -529,15 +638,20 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
          else closes).append(button)
     heading = (page_frame.ReturningActionHeading.SENDS_TO_SHOWRUNNER if item.type == ReviewType.CHANGE
                else page_frame.ReturningActionHeading.ITEM_RETURNS)
-    presets = ''.join(f'<button type="button" role="menuitem" tabindex="-1" data-later-preset="{key}">'
-                      +f'<span>{html.escape(label or soon)}</span><small></small></button>' for key, label in LATER_PRESETS)
-    later = ('<button type="button" aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later <span aria-hidden="true">▾</span></button>'
-               +'<div role="menu" aria-label="Hide until" data-later-menu hidden>'+presets+'<hr>'
-               +'<button type="button" role="menuitem" tabindex="-1" data-later-choose><span>Choose a time…</span></button>'
-               +record_table.date_time_picker(field='later', action='outcome', value='later')+'</div>')
-    return ('<form method="post" data-review-form>'+hidden+f'<label for="words-{html.escape(item.key, quote=True)}">Your words</label>'
-            + f'<textarea id="words-{html.escape(item.key, quote=True)}" name="feedback" rows="{words_rows}" '
-            + 'placeholder="Type your words. They go with the button that you press."></textarea>'
+    later = ''
+    if item.state != ReviewState.DONE:
+        presets = ''.join(f'<button type="button" role="menuitem" tabindex="-1" data-later-preset="{key}">'
+                          +f'<span>{html.escape(label or soon)}</span><small></small></button>' for key, label in LATER_PRESETS)
+        later = ('<button type="button" aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later <span aria-hidden="true">▾</span></button>'
+                 +'<div role="menu" aria-label="Hide until" data-later-menu hidden>'+presets+'<hr>'
+                 +'<button type="button" role="menuitem" tabindex="-1" data-later-choose><span>Choose a time…</span></button>'
+                 +record_table.date_time_picker(field='later', action='outcome', value='later')+'</div>')
+    words = ''
+    if closes or returns or later:
+        field = 'words-'+html.escape(item.key, quote=True)
+        words = (f'<label for="{field}">Your words</label><textarea id="{field}" name="feedback" rows="{words_rows}" '
+                 + 'placeholder="Type your words. They go with the button that you press."></textarea>')
+    return ('<form method="post" data-review-form>'+hidden+words
             + page_frame.review_action_groups(''.join(closes), ''.join(returns), later, returning_heading=heading)
             + '<span role="status" data-send-status></span></form>')
 
@@ -559,7 +673,10 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
             body += '<p>No showrunner owns this question.</p>'
     elif isinstance(source, review_items.ChangeSource):
         row = source.row
-        body = section('How to check', row.get('How to check', ''))+section('Proof', row.get('What you see', '') or row.get('Proof', ''))
+        body = section('How to check', row.get('How to check', ''))
+        proof = row.get('What you see', '') or row.get('Proof', '')
+        if proof.strip():
+            body += section('Proof', proof)
         if isinstance(source.slots.question, change_page.AnsweredQuestion):
             body += answer_section(source.slots.question.answer)
         if path := inputs.assets.get('image:'+item.key):
@@ -583,6 +700,7 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
         +' <small>— '+names.html(entry.who)+'</small></span></li>' for entry in reversed(item.log))
     owner = owner_name(item, inputs.members)
     fallback = '<section data-title-fallback hidden><h3>Item</h3><p>'+html.escape(item.title)+'</p></section>'
+    body += inputs.assets.get('submission:'+item.key, '')
     return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+'<div data-review-body>'+body+'</div></div><section><h3>Log · newest first</h3>'
             +'<ol class="list-log">'+logs+'</ol></section>'+form(item, inputs.browser, inputs.words_rows, record_revision(item, inputs.assets), soon=inputs.soon_label)
             +'<p class="review-source">Owner: '+names.html(item.owner, owner)+' · Source: '
@@ -605,13 +723,15 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
     entries = snapshot.entries
     owners = {entry['owner']:(entry['ownerName'], entry['ownerHtml']) for entry in entries}
     owners.update({entry['sourceOwner']:(entry['sourceName'], entry['sourceHtml'])
-                   for entry in entries if entry['type']==ReviewType.INVESTIGATION})
+                   for entry in entries if entry['type'] in review_items.INVESTIGATION_TYPES})
     owner_chips = '<button id="review-owner-all" type="button" data-owner-chip="" aria-pressed="true">All <b></b></button>'
     for owner, (name, markup) in sorted(owners.items(), key=lambda pair: pair[1][0].casefold()):
         identity, label = html.escape(owner, quote=True), html.escape(name, quote=True)
         owner_chips += (f'<button id="review-owner-{identity}" type="button" data-owner-chip="{identity}" '
                         +f'data-owner-name="{label}" aria-pressed="false">{markup or label} <b></b></button>')
     chips = '<button id="review-type-all" type="button" data-type-chip="" aria-pressed="true">All <b></b></button>'
+    chips += ('<button type="button" data-type-chip="investigations" aria-pressed="false" hidden>'
+              'Investigations and Bugs <b></b></button>')
     chips += ''.join('<button id="review-type-'+kind+'" type="button" data-type-chip="'+kind+'" aria-pressed="false">'+icon(kind)+LABELS[kind]
                      +' <b></b></button>' for kind in TYPES)
     shows = ''.join('<button id="review-show-'+value.lower().replace(' ', '-')+'" type="button" data-show-chip="'
@@ -619,7 +739,8 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
                     +' <b></b></button>' for value, label in SHOWS)
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" data-sort="{index}">{label}'
                       +'<span data-sort-mark aria-hidden="true"></span></button></th>' for index, label in enumerate(HEADERS))
-    content = (record_table.STYLE+record_table.DATE_TIME_STYLE+STYLE+page_frame.title('Review', 'review')
+    new_button = '<button class="review-new" type="button" data-review-new><span aria-hidden="true">+</span>New</button>'
+    content = (record_table.STYLE+record_table.DATE_TIME_STYLE+STYLE+page_frame.title('Review', 'review', action=new_button)
         +f'<div data-review data-version="{snapshot.version}" data-show="{show}" data-refresh-seconds="{snapshot.refresh_seconds}" '
         +f'data-title-limit="{snapshot.title_limit}" data-zone="{html.escape(snapshot.zone.key, quote=True)}" '
         +f'data-later="{html.escape(json.dumps(dict(snapshot.later)), quote=True)}">'
@@ -638,7 +759,8 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
         +'<colgroup><col style="width:17%"><col style="width:13%"><col style="width:14%"><col style="width:37%">'
         +'<col style="width:12%"><col style="width:7%"></colgroup><thead><tr>'+headers+'</tr></thead>'
         +'<tbody data-window-before></tbody><tbody data-window-after></tbody>'
-        +'</table><p data-empty hidden>No items in this view.</p></div></div><script>'+SCRIPT+'</script>')
+        +'</table><p data-empty hidden>No items in this view.</p></div></div>'
+        +new_item_dialog.render()+'<script>'+SCRIPT+'</script>')
     return page_frame.rendered(change_page.document(content, 'Review'), started, read_at)
 
 
@@ -739,7 +861,7 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
         if outcome not in item.actions:
             raise question_record.AnswerRefused('choose an action on this card')
         delivery, answer = (review_actions.investigation_action(item,outcome,words,status)
-                            if item.type == ReviewType.INVESTIGATION else
+                            if isinstance(item.source, review_items.InvestigationSource) else
                             review_actions.decision_action(item,outcome,words,status))
         if outcome == 'question' and isinstance(delivery, change_page.MessageDelivery):
             delivery = review_actions.track_question(delivery, key, words, status)
@@ -768,16 +890,22 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
 
 STYLE = '''<style>
 .review-title{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.review-new span{font-size:1.2em;line-height:1}
+.review-waiting-why{display:block;color:var(--ink-3);font-size:.85em}
+.review-attachments img{max-width:min(240px,100%);max-height:160px;object-fit:contain;margin-inline-end:8px}
 [data-review] .record-filter-row{margin-bottom:12px}
 .record-filter-row>.review-types{gap:8px}
 .review-types button{max-width:100%;overflow-wrap:anywhere}
-:is(.review-types button,[data-clear-linked-reviews]){display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;min-height:36px;
+:is(.review-types button,[data-clear-linked-reviews],.review-new){display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;min-height:36px;
 background:var(--card);border:1px solid var(--line);border-radius:999px;color:var(--ink-2);padding:5px 14px;margin:0}
+.page-heading:has(>.review-new)>.page-title{padding-inline-end:6rem}
+.page-heading>.review-new{position:absolute;inset-inline-end:0;inset-block-start:50%;transform:translateY(-50%);
+color:var(--accent);white-space:nowrap}
 :is(.review-types button,[data-clear-linked-reviews])[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
 #review-show-validating[data-empty-count]{opacity:.55}
 .review-icon{display:inline-flex;vertical-align:middle;margin-right:5px}.review-icon svg{width:18px;height:18px}
 .question{--type-color:#b99aff}.change{--type-color:#62b7ef}.investigation{--type-color:#30c1ad}
-.proposal{--type-color:#f27ab8}.efficiency{--type-color:#a3d63a}
+.proposal{--type-color:#f27ab8}.efficiency{--type-color:#a3d63a}.bug{--type-color:#ed876b}
 .review-icon{color:var(--type-color)}.review-panel{border-left-color:var(--type-color);grid-template-columns:1.25fr 1fr;padding:0 20px 18px 58px;gap:4px 28px}
 .review-panel [data-review-form]{grid-column:1/-1;border-top:1px solid var(--line);padding-top:12px;margin-top:10px}
 [data-review-form] label{display:block;font-weight:600;margin-bottom:6px}
@@ -824,19 +952,22 @@ const firstReviewCard=(()=>{
 })();
 '''
 
-SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + record_table.DATE_TIME_SCRIPT + review_legacy.SCRIPT + r'''(() => {
+SCRIPT = page_frame.REFRESH_SCRIPT + record_table.SCRIPT + record_table.DATE_TIME_SCRIPT + console.REVIEW_PLACE_SCRIPT + r'''(reviewPlace => {
 let content=document.querySelector('[data-review]');
 let selectedShow=content.dataset.show;
 const drafts=new Map(),saved=new Map(),bodies=new Map(),bodyRequests=new Map();
 const pendingSaves=new Map();
-const kinds=['question','change','investigation','proposal','efficiency'],states=['Open','Waiting','Done','Validating'];
+const savedVerdictsKey='review-saved-verdicts:'+location.pathname;
+const kinds=['question','change','investigation','proposal','efficiency','bug'],states=['Open','Waiting','Done','Validating'];
 let index=readIndex(JSON.parse(content.querySelector('[data-review-index]').textContent));
 let focusAfterLoad=null,conflictKey='',firstRequest=firstReviewCard;
+let deferredLink=null,revealCreated='';
 function indexEntry(payload,row,at){
  const owner=payload.n[row[3]],source=payload.n[row[4]];
  return {key:row[0],id:row[1] || row[0],type:kinds[row[2]],owner:owner[0],sourceOwner:source[0],
   ownerName:owner[1],sourceName:source[1],title:row[5],state:states[row[6]],filed:row[7],updated:row[8],
-   hiddenUntil:row[9],ownerHtml:owner[2],sourceHtml:source[2],urgency:row[10] || 'normal',handoff:row[11],order:at+row[6]*payload.r.length};
+   hiddenUntil:row[9],ownerHtml:owner[2],sourceHtml:source[2],urgency:row[10] || 'normal',handoff:row[11],
+   waitingWhy:row[12],order:at+row[6]*payload.r.length};
 }
 function readIndex(payload){
  return new Map(payload.r.map((row,at)=>[row[0],indexEntry(payload,row,at)]));
@@ -858,11 +989,13 @@ function summary(entry){
  const handoff=entry.handoff;
  const handoffLine=validating && handoff ? '<span class="review-handoff">With <span title="'+escapeText(entry.ownerName)+
   '">'+escapeText(entry.ownerName)+'</span> since <time datetime="'+escapeText(handoff[0])+'">'+escapeText(handoff[1])+'</time></span>' : '';
+ const waitingLine=entry.state==='Waiting' && entry.waitingWhy ?
+  '<span class="review-waiting-why">'+escapeText(entry.waitingWhy)+'</span>' : '';
  const cells=[validating ? '<span class="list-toggle" tabindex="-1">'+escapeText(entry.id)+'</span>' : '<button type="button" class="list-toggle" aria-expanded="false" aria-controls="'+panel+'">'
   +'<span class="list-chevron" aria-hidden="true">›</span>'+escapeText(entry.id)+'</button>',
   icon+entry.type[0].toUpperCase()+entry.type.slice(1),colored(entry.ownerName,entry.ownerHtml)
   +(entry.sourceName!==entry.ownerName ? '<small>· '+colored(entry.sourceName,entry.sourceHtml)+'</small>' : ''),
-  '<strong class="review-title" title="'+escapeText(entry.title)+'">'+escapeText(short===entry.title ? short : short+'…')+'</strong>'+handoffLine+(entry.urgency!=='normal' ? '<small>'+escapeText({user:'Important',blocks:'Blocks work',soon:'Due soon',later:'Later'}[entry.urgency])+'</small>' : ''),
+  '<strong class="review-title" title="'+escapeText(entry.title)+'">'+escapeText(short===entry.title ? short : short+'…')+'</strong>'+handoffLine+waitingLine+(entry.urgency!=='normal' ? '<small>'+escapeText({user:'Important',blocks:'Blocks work',soon:'Due soon',later:'Later'}[entry.urgency])+'</small>' : ''),
   '<span class="list-state '+(entry.state==='Open' ? 'warning' : 'muted')+'">'+entry.state+'</span>',stamp];
  node.innerHTML='<tr class="list-row">'+cells.map((cell,at)=>'<td'+(at===0 ? ' class="record-id"' : '')+' data-label="'+['Id','Type','Owner','Item','State','Age'][at]+'">'+cell+'</td>').join('')
   +'</tr><tr data-detail id="'+panel+'" hidden><td colspan="6"><p role="status">Loading the item…</p></td></tr>';
@@ -871,16 +1004,35 @@ function summary(entry){
 function matches(entry,{owner='',show='all',query='',type='',sourceOwner='',keys}){
  const linked=keys?.has(entry.key);
  return (!keys?.size || linked) && (linked || view.linkedItem===entry.key || entry.hiddenUntil<=Date.now()) &&
-  (!owner || entry.owner===owner || entry.type==='investigation' && entry.sourceOwner===owner) &&
-  (!type || entry.type===type) && (!sourceOwner || entry.sourceOwner===sourceOwner) &&
+  (!owner || entry.owner===owner || isInvestigation(entry) && entry.sourceOwner===owner) &&
+  (!type || (type==='investigations' ? isInvestigation(entry) : entry.type===type)) &&
+  (!sourceOwner || entry.sourceOwner===sourceOwner) &&
   (!query || entry.id.toLowerCase().includes(query) || entry.title.toLowerCase().includes(query)) &&
   (show==='all' || entry.state===(show==='open' ? 'Open' : show));
 }
+function isInvestigation(entry){return entry.type==='investigation' || entry.type==='bug';}
 function matching(filters){return allEntries().filter(entry=>!pendingSaves.has(entry.key) && matches(entry,filters));}
 function savedEntry(key,result){
  const entry=index.get(key);if(!entry) return;
  entry.state=result.state;entry.hiddenUntil=result.later;
 }
+function snapshotPrecedesSave(entry,result){
+ return entry?.state===result.previousState && entry.updated===result.updated;
+}
+function storeSavedVerdicts(){
+ const verdicts=[...saved].filter(([,result])=>result.closes && result.awaitingSnapshot);
+ try{
+  if(verdicts.length) sessionStorage.setItem(savedVerdictsKey,JSON.stringify(verdicts));
+  else sessionStorage.removeItem(savedVerdictsKey);
+ }catch{}
+}
+try{
+ for(const [key,result] of JSON.parse(sessionStorage.getItem(savedVerdictsKey) || '[]')){
+  if(!snapshotPrecedesSave(index.get(key),result)) continue;
+  saved.set(key,{...result,restored:true});savedEntry(key,result);
+ }
+}catch{}
+storeSavedVerdicts();
 const view=createRecordTable({content:()=>content,single:true,
  entries:allEntries,mount:summary,mounted:()=>loadBodies(),
  focusKey:()=>focusAfterLoad?.key,
@@ -913,7 +1065,7 @@ const view=createRecordTable({content:()=>content,single:true,
   selectedShow=show;content.dataset.show=show;loadBodies();
   const eligibleOwners=allEntries().filter(entry=>matches(entry,{type,query,keys}));
   const shownOwners=matching({show,type,query,keys});
-  const matchesOwner=(entry,id)=>!id || entry.owner===id || entry.type==='investigation' && entry.sourceOwner===id;
+  const matchesOwner=(entry,id)=>!id || entry.owner===id || isInvestigation(entry) && entry.sourceOwner===id;
   content.querySelectorAll('[data-owner-chip]').forEach(button=>{
    const id=button.dataset.ownerChip;
    button.hidden=Boolean(id) && !eligibleOwners.some(entry=>matchesOwner(entry,id));
@@ -926,6 +1078,7 @@ const view=createRecordTable({content:()=>content,single:true,
    button.toggleAttribute('data-empty-count',count===0);
   });
   content.querySelectorAll('[data-type-chip]').forEach(button=>{
+   if(button.dataset.typeChip==='investigations') button.hidden=type!=='investigations';
    button.setAttribute('aria-pressed',String(button.dataset.typeChip===type));
    button.querySelector('b').textContent=matching({owner,show,query,sourceOwner,keys,type:button.dataset.typeChip}).length;
   });
@@ -1013,11 +1166,11 @@ function loadBodies(){
  });
 }
 function rememberForm(form){
- if(!form) return;
+ if(!form?.elements.feedback) return;
  const row=form.closest('[data-list-item]');
  if(pendingSaves.get(row.dataset.key)?.saved) return;
  const choices=[...row.querySelectorAll('input[name=choice]')];
- drafts.set(row.dataset.key,{feedback:form.elements.feedback.value,later:form.elements.later.value,
+ drafts.set(row.dataset.key,{feedback:form.elements.feedback.value,later:form.elements.later?.value ?? '',
   choice:choices.find(choice=>choice.checked)?.value || ''});
 }
 function drawSaveState(key,form=mountedRow(key)?.querySelector('[data-review-form]')){
@@ -1032,14 +1185,15 @@ function bindForm(row){
  form.dataset.bound='true';
  const key=row.dataset.key,words=form.elements.feedback,later=form.elements.later;
  drawSaveState(key,form);
+ if(!words) return;
  const choices=[...row.querySelectorAll('input[name=choice]')];
  if(drafts.has(key)){
-  const draft=drafts.get(key);words.value=draft.feedback;later.value=draft.later;
+  const draft=drafts.get(key);words.value=draft.feedback;if(later) later.value=draft.later;
   choices.forEach(choice=>choice.checked=choice.value===draft.choice);
  }
  const remember=()=>rememberForm(form);
  choices.forEach(choice=>choice.addEventListener('change',()=>{words.value=choice.value;remember();words.focus();}));
- [words,later].forEach(field=>{field.addEventListener('input',remember);field.addEventListener('change',remember);});
+ [words,later].filter(Boolean).forEach(field=>{field.addEventListener('input',remember);field.addEventListener('change',remember);});
  const send=async(outcome,until)=>{
    if(pendingSaves.has(key)) return;
    const data=new URLSearchParams(new FormData(form));data.set('outcome',outcome);
@@ -1063,14 +1217,15 @@ function bindForm(row){
     pending.saved=true;
     drafts.delete(key);
     const handed=row.dataset.type==='change' && ['validate','question','feedback'].includes(outcome);
-    saved.set(key,{updated:row.dataset.updated,previousState:row.dataset.state,
+    const marker={updated:row.dataset.updated,previousState:row.dataset.state,
      handed,state:result.state ?? (handed ? 'Validating' : outcome==='question' ? 'Waiting' : outcome==='later' ? row.dataset.state : 'Done'),
      later:result.later ?? (outcome==='later' ? Date.parse(data.get('later')) : 0),
      question:data.get('outcome')==='question',
-     closes:!handed && !['question','later'].includes(outcome),awaitingSnapshot:true});
-    savedEntry(key,saved.get(key));
+     closes:!handed && !['question','later'].includes(outcome),awaitingSnapshot:true};
+    saved.set(key,marker);savedEntry(key,marker);
+    if(marker.closes) storeSavedVerdicts();
     pendingSaves.delete(key);
-    view.closeCard(key);
+    if(!isDeferredLink(key)) view.closeCard(key);
     view.showActionResult(row,submission,key,{kind:'success',message:'Saved: '+result.answer});
     if(handed && parent!==window) parent.postMessage('for-you-completed',location.origin);
    }catch(error){
@@ -1079,7 +1234,17 @@ function bindForm(row){
    }
    finally{
     pendingSaves.delete(key);delete form.dataset.sending;drawSaveState(key);
-    followItemLink({inheritFilters:true,unappliedOnly:true});
+    if(isDeferredLink(key)){
+     const link=deferredLink;
+     while(deferredLink===link && isDeferredLink(key) && view.hasActiveRowAnimations) await view.settled();
+     if(deferredLink===link && isDeferredLink(key)){
+      deferredLink=null;
+      followItemLink({inheritFilters:true});
+     }
+    }else if(deferredLink?.href!==location.href){
+     deferredLink=null;
+     followItemLink({inheritFilters:true,unappliedOnly:true});
+    }
     if(!pendingSaves.size) void pageRefresh.refresh(true);
    }
   };
@@ -1092,9 +1257,9 @@ function bindForm(row){
     closeDateTimePicker(form.querySelector('[data-later-menu]'),false);
     void send(outcome,new Date(at).toISOString());return;
    }
-   void send(outcome,later.value);
+   void send(outcome);
   });
-  bindLater(form,until=>void send('later',until));
+  if(later) bindLater(form,until=>void send('later',until));
 }
 function laterTimes(now){
  const settings=JSON.parse(content.dataset.later),today=zoneParts(content.dataset.zone,now);
@@ -1135,6 +1300,16 @@ function revealConflict(){
  view.place();
  return true;
 }
+function revealNewItem(){
+ const key=revealCreated;
+ if(!index.has(key)) return false;
+ revealCreated='';
+ view.saveDeparturePlace();
+ const params=new URLSearchParams(location.hash.slice(1));
+ params.set('jump',key);
+ history.pushState(null,'',location.pathname+'#'+params);
+ return followItemLink({inheritFilters:true});
+}
 async function refresh(_supersede=false,current=()=>true){
  if(pendingSaves.size || dateTimePickerOpen(content)) return;
  const response=await fetch(location.pathname+'?'+new URLSearchParams({version:'1'}),{cache:'no-store'});
@@ -1146,7 +1321,7 @@ async function refresh(_supersede=false,current=()=>true){
   if(pendingSaves.size || !current()) return;
   for(const [key,result] of saved) if(result.later && Date.now()>=result.later) saved.delete(key);
   content.querySelectorAll('[data-body-loaded="failed"]').forEach(row=>delete row.dataset.bodyLoaded);
-  revealConflict();view.apply(false);content.dispatchEvent(new Event('review-refreshed'));return version.facts;
+  revealConflict();view.apply(false);revealNewItem();content.dispatchEvent(new Event('review-refreshed'));return version.facts;
  }
  const fresh=await fetch(location.pathname+'?'+new URLSearchParams({index:'1',version:version.version}),{cache:'no-store'});
  if(!fresh.ok) throw new Error('HTTP '+fresh.status);
@@ -1175,7 +1350,7 @@ async function refresh(_supersede=false,current=()=>true){
   pairs.set(entry.owner,{name:entry.ownerName,markup:entry.ownerHtml});
  }
  for(const entry of index.values()){
-  if(entry.type==='investigation') pairs.set(entry.sourceOwner,{name:entry.sourceName,markup:entry.sourceHtml});
+  if(isInvestigation(entry)) pairs.set(entry.sourceOwner,{name:entry.sourceName,markup:entry.sourceHtml});
  }
  for(const button of menu.querySelectorAll('[data-owner-chip]')){
   const id=button.dataset.ownerChip;
@@ -1195,34 +1370,60 @@ async function refresh(_supersede=false,current=()=>true){
   const entry=index.get(key);
   if(!entry || (result.later && Date.now()>=result.later)) {saved.delete(key);continue;}
   // The index supplies the state and update time for each row.
-  const submitted=entry.state===result.previousState && entry.updated===result.updated;
-  if(!submitted && (result.handed || entry.state!==result.state)){saved.delete(key);continue;}
+  const submitted=snapshotPrecedesSave(entry,result);
+  if(!submitted && (result.restored || result.handed || entry.state!==result.state)){saved.delete(key);continue;}
   if(!result.closes && !result.question && !result.later && !submitted) saved.delete(key);
   else result.awaitingSnapshot=submitted;
  }
+ storeSavedVerdicts();
  for(const [key,result] of saved) savedEntry(key,result);
  const revealed=revealConflict();bind();view.apply(false);
  if(focusAfterLoad) restoreFocus(focusAfterLoad.key);
  if(focusedOwner!==undefined && (!document.activeElement?.hasAttribute('data-owner-chip') || document.activeElement.hidden))
   menu.querySelector('[aria-pressed="true"]')?.focus({preventScroll:true});
- content.dataset.loaded='true';content.dispatchEvent(new Event('review-refreshed'));
- if(!revealed) scrollTo({top,behavior:'instant'});
+ content.dataset.loaded='true';
+ if(!revealNewItem() && !revealed) scrollTo({top,behavior:'instant'});
+ content.dispatchEvent(new Event('review-refreshed'));
  return {...payload.facts,answeredAt:version.facts.answeredAt};
 }
 bind();
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
+document.querySelector('[data-review-new]').addEventListener('click',event=>{
+ window.reviewNewItem.open({trigger:event.currentTarget});
+});
+document.addEventListener('review-item-created',event=>{
+ if(typeof event.detail?.key!=='string') return;
+ revealCreated=event.detail.key;
+ void pageRefresh.refresh(true);
+});
 function followItemLink(options){
  return view.followItemLink({...options,beforeJump:key=>{
   if(pendingSaves.has(key)) return false;
-  if(!saved.get(key)?.closes && !saved.get(key)?.question) saved.delete(key);
+  const marker=saved.get(key);
+  if(marker && !marker.closes && !marker.question && !marker.handed) saved.delete(key);
   return true;
  }});
 }
-if(!followItemLink()){view.place();view.apply();}
+const frame=window.frameElement;
+if(frame?.reviewPlace){
+ const {place,table}=frame.reviewPlace;
+ delete frame.reviewPlace;
+ if(!history.state?.recordTable && place===location.pathname+location.search+location.hash)
+  history.replaceState({recordTable:table},'');
+}
+if(history.state?.recordTable) view.restorePlace();
+else if(!followItemLink()){view.place();view.apply();}
+function isDeferredLink(key){return deferredLink?.key===key && deferredLink.href===location.href;}
 function restorePlace(event){
+ const params=new URLSearchParams(location.hash.slice(1));
+ const key=params.get('jump') || params.get('item') || new URLSearchParams(location.search).get('item');
+ if(pendingSaves.has(key)){
+  deferredLink={key,href:location.href};return;
+ }
+ deferredLink=null;
  if(event.type==='hashchange' && !history.state?.recordTable && followItemLink({inheritFilters:true})) return;
  view.restorePlace(event);
 }
 addEventListener('popstate',restorePlace);
 addEventListener('hashchange',restorePlace);
-})();'''
+})(legacyReviewPlace);'''

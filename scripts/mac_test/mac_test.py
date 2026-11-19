@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Literal, TypeGuard, cast
 from urllib.parse import quote
 
 
+from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state
@@ -692,13 +693,14 @@ def scopes_overlap(first: ClaimScope, second: ClaimScope) -> bool:
     return same_repository and (not first.slot or not second.slot or first.slot == second.slot)
 
 
-def slot_capacity(paths: StatePaths, scope: ClaimScope) -> int:
+def slot_capacity(paths: StatePaths, scope: ClaimScope, *,
+                  configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> int:
     if target_config.uses_legacy_mac_layout(paths.platform) or isinstance(scope, WholeMacScope):
         return 1
-    values = conf.read(config_path(paths.target)).values()
-    missing = (target_config.MissingSlotCapacity.REQUIRE_CONFIGURED if scope.key else
-               target_config.MissingSlotCapacity.SINGLE_SLOT)
-    return target_config.slot_capacity(values, scope.name, missing=missing)
+    settings = conf.read(config_path(paths.target)) if isinstance(configuration, conf.UseConfiguredValue) else configuration
+    missing = (target_config.MissingSlotCapacity.REQUIRE_CONFIGURED if scope.key
+               else target_config.MissingSlotCapacity.SINGLE_SLOT)
+    return target_config.slot_capacity(settings, scope.name, missing=missing)
 
 
 def affinity_path(paths: StatePaths, scope: RepositoryScope) -> Path:
@@ -2019,8 +2021,6 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
         assignment = saved.assignment
     session = claim_state.submitting_session(session)
     if not isinstance(assignment, UnassignedClaim):
-        from scripts.build_queue import placement
-
         destination = assignment.destination
         if destination.target != (args.target or "mac") or destination.provider not in ("mac", "ssh"):
             return 12
@@ -2030,7 +2030,7 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
         if not args.from_pid:
             args.episode, args.attempt = assignment.episode, assignment.attempt
             if not args.claim_id:
-                args.claim_id = placement.assigned_claim_id(assignment.episode, assignment.attempt)
+                args.claim_id = execution_identity.assigned_claim_id(assignment.episode, assignment.attempt)
         session = assignment.session
     else:
         scope = target_claim_scope(paths, args.worktree)
@@ -2166,6 +2166,7 @@ def command_release(args: CliArguments, paths: StatePaths, *, provider_lock_held
 def free_now(
     paths: StatePaths, settings: Path | eligibility.DefaultMacSettings, repo_root: Path, copy: bool = False,
     *, session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
+    configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
 ) -> FreeNowAnswer:
     """Whether a claim for repo_root's repository made now could start a Mac run.
 
@@ -2180,7 +2181,12 @@ def free_now(
     from scripts.mac_test import eligibility
     from scripts.buildlog import repository
 
-    if not eligibility.read_config(settings).enabled:
+    if isinstance(configuration, conf.ConfigRead):
+        capacity_settings = configuration
+    else:
+        path = eligibility.config_path() if isinstance(settings, eligibility.DefaultMacSettings) else settings
+        capacity_settings = conf.read(path)
+    if not capacity_settings.value("offload", conf.on_off):
         return "off"
     backoff = (eligibility.read_backoff(time.time()) if paths.target == "mac"
                else eligibility.read_backoff(time.time(), paths.target))
@@ -2203,8 +2209,10 @@ def free_now(
     if not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope):
         try:
             scopes = tuple(RepositoryScope(scope.name, scope.key, slot)
-                           for slot in range(1, slot_capacity(paths, scope) + 1))
-        except (OSError, ConfigError):
+                           for slot in range(1, slot_capacity(paths, scope, configuration=capacity_settings) + 1))
+        except (OSError, ConfigError) as error:
+            if isinstance(error, conf.Unusable) and isinstance(configuration, conf.ConfigRead):
+                raise
             return "state"
     held = all(any(
         scopes_overlap(claim.scope, candidate) and run_is_live(claim.record) and not run_is_kept(claim.record)

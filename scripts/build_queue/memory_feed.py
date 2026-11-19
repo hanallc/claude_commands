@@ -33,6 +33,7 @@ if __name__ == "__main__":
 
 FEED_IMPORT_STARTED_AT_NS = time.time_ns()
 
+from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_code
 
 
@@ -67,6 +68,7 @@ from scripts.message.owner_role import OwnerRole
 from scripts.production import staff
 from scripts.lib import build_slots, conf
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.proc_text import read_proc_text
 from scripts.lib.user_zone import user_zone
 from scripts.review_links import console_theme, page_frame, review_link
 from scripts.review_links import staff_names
@@ -1062,7 +1064,7 @@ def read_ci_runner(unit: Path, proc: Path) -> CIRunner:
     name = unit.name.removeprefix("github-runner-").removesuffix(".service")
     try:
         used = gib(gate.slice_working_set(unit).bytes)
-        boot = float(next(line.split()[1] for line in (proc / "stat").read_text().splitlines()
+        boot = float(next(line.split()[1] for line in read_proc_text(proc / "stat").splitlines()
                           if line.startswith("btime ")))
         ticks = int(os.sysconf("SC_CLK_TCK"))
         members: set[int] = set()
@@ -1074,12 +1076,11 @@ def read_ci_runner(unit: Path, proc: Path) -> CIRunner:
         processes: dict[int, RunnerProcess] = {}
         for pid in sorted(members):
             try:
-                stat = (proc / str(pid) / "stat").read_text()
+                stat = read_proc_text(proc / str(pid) / "stat")
                 fields = stat.rsplit(") ", 1)[1].split()
                 if fields[0] in ("Z", "X"):
                     continue
-                command = tuple(part for part in (proc / str(pid) / "cmdline").read_bytes()
-                                .decode(errors="replace").split("\0") if part)
+                command = tuple(part for part in read_proc_text(proc / str(pid) / "cmdline").split("\0") if part)
                 processes[pid] = RunnerProcess(pid, int(fields[1]), boot + int(fields[19]) / ticks,
                                                stat.split("(", 1)[1].rsplit(") ", 1)[0], command)
             except FileNotFoundError:
@@ -1244,7 +1245,7 @@ def local_step_name(step: admission_records.RunningStep | admission_records.Wait
 def has_controlling_terminal(pid: int, start: str) -> bool:
     """Use the terminal of the recorded process lifetime."""
     try:
-        fields = (PROC / str(pid) / "stat").read_text().rsplit(") ", 1)[1].split()
+        fields = read_proc_text(PROC / str(pid) / "stat").rsplit(") ", 1)[1].split()
         return fields[19] == start and fields[0] not in ("Z", "X") and int(fields[4]) != 0
     except (OSError, ValueError, IndexError):
         return False
@@ -1446,7 +1447,7 @@ def read_stalls() -> PressureValues:
     """Read the current ten-second memory stall averages."""
     path = PROC / "pressure/memory"
     try:
-        lines = path.read_text().splitlines()
+        lines = read_proc_text(path).splitlines()
     except OSError:
         missing = PressureNotRecorded(f"Pressure is unreadable: {path}")
         return {"some": missing, "full": missing}
@@ -1595,7 +1596,7 @@ def parent_pid(pid: int) -> int:
     """Read the parent of pid, or 0 when the process is gone."""
     try:
         # The command name can hold spaces and parentheses, so read the fields after its last ")".
-        return int((PROC / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[1])
+        return int(read_proc_text(PROC / str(pid) / "stat").rsplit(")", 1)[1].split()[1])
     except (OSError, IndexError, ValueError):
         return 0
 
@@ -1841,7 +1842,8 @@ def read_swap(steps: Sequence[admission_records.RunningStep], labels: Mapping[st
         path = PROC / "meminfo"
         try:
             values = {fields[0].removesuffix(":"): int(fields[1]) * 1024
-                      for line in path.read_text().splitlines() if (fields := line.split()) and fields[0] in ("SwapTotal:", "SwapFree:")}
+                      for line in read_proc_text(path).splitlines()
+                      if (fields := line.split()) and fields[0] in ("SwapTotal:", "SwapFree:")}
             capacity = values["SwapTotal"]
             used = capacity - values["SwapFree"]
         except (OSError, ValueError, KeyError, IndexError):
@@ -1951,7 +1953,8 @@ CACHE_FIELDS = ("Buffers", "Cached", "Shmem", "KReclaimable", "MemAvailable", "M
 def scope_program(path: Path) -> str:
     """Name a run scope by its program only when every member runs that program."""
     try:
-        programs = {(PROC / pid / "comm").read_text().strip() for pid in (path / "cgroup.procs").read_text().split()}
+        programs = {read_proc_text(PROC / pid / "comm").strip()
+                    for pid in (path / "cgroup.procs").read_text().split()}
     except OSError:
         programs = set[str]()
     if len(programs) != 1:
@@ -2002,7 +2005,7 @@ def meminfo_bytes() -> dict[str, int] | admission_records.ReadingUnavailable:
     path = PROC / "meminfo"
     try:
         return {fields[0].removesuffix(":"): int(fields[1]) * 1024
-                for line in path.read_text().splitlines() if (fields := line.split()) and len(fields) >= 2}
+                for line in read_proc_text(path).splitlines() if (fields := line.split()) and len(fields) >= 2}
     except (OSError, ValueError) as error:
         return admission_records.ReadingUnavailable(f"{path}: {error}")
 
@@ -2038,7 +2041,7 @@ def memmap_reading() -> RamReading:
     """Read the page descriptors allocated after boot, from /proc/vmstat nr_memmap_pages."""
     path = PROC / "vmstat"
     try:
-        pages = dict(line.split() for line in path.read_text().splitlines())["nr_memmap_pages"]
+        pages = dict(line.split() for line in read_proc_text(path).splitlines())["nr_memmap_pages"]
         return int(pages) * os.sysconf("SC_PAGE_SIZE")
     except (OSError, ValueError, KeyError) as error:
         return admission_records.ReadingUnavailable(f"{path}: {error!r}")
@@ -2390,7 +2393,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             remote_row: RunRow = {**queue_row_labels(title_step, display_name, unit=owner.unit),
                 "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
                 **owner.fields(),
-                "state": "running" if isinstance(step.execution, placement.ObservedExecution) else "uncertain",
+                "state": "running" if isinstance(step.execution, execution_identity.ObservedExecution) else "uncertain",
                 "pid": step.pid, "detail": detail, "used": admission_records.RunUseUnavailable(memory.reason),
                 "counted": 0.0, "reserved": 0.0, "started_at": step.started_at,
                 "progress": row_progress((step,), progress.TOKEN_WAIT_REASON),

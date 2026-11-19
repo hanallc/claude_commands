@@ -21,7 +21,7 @@ from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 
 if TYPE_CHECKING:
-    from scripts.aws_target.hana_execution import HanaExecutionAccess, HanaExecutionEnvelope, HanaCommandObservation
+    from scripts.aws_target.hana_protocol import HanaExecutionAccess, HanaExecutionObservation
     from scripts.aws_target.hana_result import HanaAttemptKey
 
 # Use this mapping for provider calls and policy coverage tests.
@@ -109,15 +109,15 @@ class AwsHanaProvider:
         return s3_presign.SigningKey(ledger.text(credentials, 'AccessKeyId'), ledger.text(credentials, 'SecretAccessKey'),
                                     str(credentials.get('SessionToken', '')))
 
-    def _object(self, key: str, document: dict[str, object] | None = None) -> dict[str, object]:
+    def _object(self, key: str, content: bytes | None = None) -> dict[str, object]:
         if not self.bucket:
             raise ProviderPending('Hana setup has no control bucket')
         with tempfile.TemporaryDirectory(prefix='hana-object-', dir=self.directory) as folder:
             path = Path(folder) / 'object.json'
-            if document is not None:
-                _ = path.write_text(json.dumps(document))
+            if content is not None:
+                _ = path.write_bytes(content)
                 _ = self._call('put-object', '--bucket', self.bucket, '--key', key, '--body', str(path))
-                return document
+                return {}
             _ = self._call('get-object', '--bucket', self.bucket, '--key', key, str(path))
             return remote.read_record(path)
 
@@ -138,7 +138,7 @@ class AwsHanaProvider:
 
     def execution_access(self, key: HanaAttemptKey) -> HanaExecutionAccess:
         """Grant bounded root publication access for this exact execution."""
-        from scripts.aws_target.hana_execution import HanaExecutionAccess
+        from scripts.aws_target.hana_protocol import HanaExecutionAccess
 
         prefix = self._execution_prefix(key)
         signing = self.signing_key()
@@ -164,17 +164,17 @@ class AwsHanaProvider:
                 return expires
         raise ProviderPending('The Hana boot control deadline is unavailable')
 
-    def publish_execution(self, envelope: HanaExecutionEnvelope) -> None:
+    def publish_execution(self, content: bytes) -> None:
         """Publish one bounded command or an idempotent exact-attempt fence."""
-        from scripts.aws_target.hana_execution import HanaCommandEnvelope, HanaFenceEnvelope, encode_envelope
+        from scripts.aws_target.hana_protocol import HanaCommandEnvelope, HanaFenceEnvelope, decode_envelope
 
-        content = encode_envelope(envelope)
+        envelope = decode_envelope(content)
         key = envelope.request.key if isinstance(envelope, HanaCommandEnvelope) else envelope.key
         _ = self._execution_prefix(key)
         prefix = 'control/' + key.generation.deployment + '/' + key.generation.start_token
         suffix = '/fence.json' if isinstance(envelope, HanaFenceEnvelope) else '/command.json'
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        _ = self._object(prefix + suffix, ledger.mapping(cast(object, json.loads(content))))
+        _ = self._object(prefix + suffix, content)
 
     def _execution_bytes(self, key: HanaAttemptKey, suffix: str, maximum: int, timeout_s: float) -> bytes:
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -186,9 +186,9 @@ class AwsHanaProvider:
                 raise ProviderPending('The Hana execution object exceeds its protocol bound')
             return path.read_bytes()
 
-    def observe_execution(self, key: HanaAttemptKey, *, timeout_s: float | None = None) -> HanaCommandObservation:
+    def observe_execution(self, key: HanaAttemptKey, *, timeout_s: float | None = None) -> HanaExecutionObservation:
         """Read execution evidence without repeating command publication."""
-        from scripts.aws_target.hana_execution import CONTROL_MAX_BYTES, decode_observation
+        from scripts.aws_target.hana_protocol import CONTROL_MAX_BYTES, decode_observation
 
         timeout = self.api.timeout_s if timeout_s is None else min(self.api.timeout_s, timeout_s)
         return decode_observation(self._execution_bytes(key, '/observation.json', CONTROL_MAX_BYTES, timeout))
@@ -263,7 +263,7 @@ class AwsHanaProvider:
             raise ValueError('The saved Hana bootstrap progress is invalid')
         descriptor = ledger.mapping(saved['descriptor'])
         for index, (suffix, document) in enumerate(BOOTSTRAP_OBJECTS[completed:], start=completed + 1):
-            _ = self._object(prefix + suffix, document)
+            _ = self._object(prefix + suffix, json.dumps(document).encode())
             # Save each write so the next tick can continue after a timeout.
             saved['bootstrap_puts'] = index
             self._save_mutation(path, saved)
@@ -290,10 +290,13 @@ class AwsHanaProvider:
                 if saved:
                     recovered = self._recover(identity, start, operation, path, saved)
                     if isinstance(recovered, box.MutationUnresolved):
-                        if (operation.action != box.Action.BOOTSTRAP or recovered.observed.state != 'stopped'
-                                or not isinstance(start, box.DemandStart)):
+                        if operation.action == box.Action.STOP:
+                            self._dispatch(identity, start, operation, path, saved)
+                        elif (operation.action == box.Action.BOOTSTRAP and recovered.observed.state == 'stopped'
+                              and isinstance(start, box.DemandStart)):
+                            self._write_bootstrap(identity, start, path, saved)
+                        else:
                             raise ProviderPending('The Hana ' + operation.action.value + ' operation remains unresolved')
-                        self._write_bootstrap(identity, start, path, saved)
                     elif operation.action != box.Action.BOOTSTRAP:
                         return self._accepted(identity, start, operation)
                 else:
@@ -326,10 +329,10 @@ class AwsHanaProvider:
         elif operation.action == box.Action.PUBLISH:
             if not isinstance(start, box.DemandStart) or not isinstance(operation.permit, hana_guest.WorkPermit):
                 raise ValueError('Hana publication needs a boot permit')
-            _ = self._object(self._prefix(identity, start) + '/permit.json', {
+            _ = self._object(self._prefix(identity, start) + '/permit.json', json.dumps({
                 'token': operation.token, 'deployment': identity.deployment, 'start_token': start.token,
                 'permit': asdict(operation.permit), 'expected_generation': operation.expected_generation,
-                'execution': operation.execution})
+                'execution': operation.execution}).encode())
 
     def _accepted(self, identity: box.DeploymentIdentity, start: box.DemandStart | box.NoDemandStart,
                   operation: box.PendingOperation) -> box.ProviderReply:
