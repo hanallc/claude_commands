@@ -12,6 +12,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from enum import StrEnum
 from hashlib import sha256
 import json
 import os
@@ -85,6 +86,25 @@ SPOT_INTERRUPTION_CODES = frozenset(('Server.SpotInstanceTermination', 'Server.S
 RESULT_FILE = 'remote-result.json'
 
 
+class LogUploadFailed(ValueError):
+    """The box published a result after its final log upload failed."""
+
+
+class RetryableCloudFailure(StrEnum):
+    SPOT = 'interrupted'
+    BOX = 'box-failed'
+    NONE = 'no retry'
+
+
+def retryable_cloud_failure(outcome: dict[str, object]) -> RetryableCloudFailure:
+    status = outcome.get('status')
+    if status == RetryableCloudFailure.SPOT and outcome.get('interruption_code') in SPOT_INTERRUPTION_CODES:
+        return RetryableCloudFailure.SPOT
+    if status == RetryableCloudFailure.BOX:
+        return RetryableCloudFailure.BOX
+    return RetryableCloudFailure.NONE
+
+
 def settings() -> conf.ConfigRead:
     return conf.read_or_repository('cloud_gate')
 
@@ -113,6 +133,24 @@ def aws_down(reason: str) -> bool:
     return any(code in reason for code in ('Could not connect to the endpoint', 'EndpointConnectionError',
                                            'ServiceUnavailable', 'InternalError', 'RequestTimeout', 'Connection timed out',
                                            'InternalFailure', 'ServerInternal', '(Unavailable)'))
+
+
+class _PollOutage:
+    def __init__(self) -> None:
+        self._started_at: float = float('inf')
+
+    def reset(self) -> None:
+        self._started_at = float('inf')
+
+    def retry_after_failure(self, error: AwsUnavailable, now: float) -> bool:
+        if not aws_down(str(error)):
+            return False
+        if self._started_at == float('inf'):
+            self._started_at = now
+        if now - self._started_at >= settings().number('observe_outage_s'):
+            return False
+        print(f'Cloud gate poll skipped: {error}', flush=True)
+        return True
 
 
 def not_sent(reason: str) -> bool:
@@ -820,6 +858,12 @@ class GateWorker:
         self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
         return LocalFallback('Spot capacity is unavailable in every configured region')
 
+    def artifact_etags(self, bucket: str, prefix: str) -> dict[str, str]:
+        listing = self.api.call('list-objects-v2', '--bucket', bucket, '--prefix', prefix,
+                                '--no-paginate', service='s3api')
+        return {ledger.text(row, 'Key'): ledger.text(row, 'ETag')
+                for row in ledger.rows({'Contents': listing.get('Contents', [])}, 'Contents')}
+
     def execute(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> dict[str, object]:
         attempt = ledger.text(request, 'attempt')
         row: dict[str, object] = {}
@@ -860,7 +904,10 @@ class GateWorker:
             if isinstance(launched, LocalFallback):
                 return {'status': 'fallback', 'reason': launched.reason}
             instance = launched
-            prefix = 'artifacts/' + attempt
+            prefix = 'artifacts/' + attempt + '/'
+            log_key = prefix + 'gate.log'
+            boot_error_key = prefix + 'boot-error.json'
+            result_key = prefix + 'result.json'
             try:
                 arguments = ledger.mapping(read(folder / 'launch.json')['arguments'])
                 self.size_vcpus = int(ledger.text(arguments, 'InstanceType').split('.')[1].removesuffix('xlarge')) * 4
@@ -871,23 +918,58 @@ class GateWorker:
                     print(f'Gate time limit disabled: no passing history for {self.size_vcpus} vCPUs', flush=True)
                 began = 0.0
                 deadline = float('inf')
-                outage_since: float | None = None
+                ec2_outage = _PollOutage()
+                s3_outage = _PollOutage()
+                bucket = ledger.text(deployment, 'bucket')
+                downloaded_log_etag = ''
+                instance_check_s = settings().whole('instance_check_s')
+                next_instance_check = time.monotonic()
                 while self.clock() < ledger.instant(request, 'expires'):
+                    now = time.monotonic()
+                    deadline_reached = now >= deadline
+                    stop_reason = ''
+                    stop_code = ''
+                    ec2_error: AwsUnavailable | None = None
+                    if deadline_reached or now >= next_instance_check:
+                        next_instance_check = now + instance_check_s
+                        try:
+                            regional_api = self.regional_api(self.box_region)
+                            state = regional_api.observe(instance, int(self.clock())).state
+                            if state not in ('pending', 'running'):
+                                reply = regional_api.call('describe-instances', '--instance-ids', instance)
+                                stopped = ledger.rows(ledger.rows(reply, 'Reservations')[0], 'Instances')[0]
+                                reason = ledger.mapping(stopped.get('StateReason', {}))
+                                stop_code = str(reason.get('Code', ''))
+                                detail = ': '.join(ledger.text(reason, key) for key in ('Code', 'Message') if reason.get(key))
+                                stop_reason = 'The instance stopped without a final result' + (f' ({detail})' if detail else '')
+                            ec2_outage.reset()
+                        except subprocess.TimeoutExpired:
+                            pass
+                        except AwsUnavailable as error:
+                            if not ec2_outage.retry_after_failure(error, self.clock()):
+                                ec2_error = error
                     try:
-                        bucket = ledger.text(deployment, 'bucket')
-                        if self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
-                            self.publish_log(folder)
-                            if not began and 'Runner: ' in (folder / 'gate.log').read_text():
-                                began = time.monotonic()
-                                deadline = began + limit if limit else float('inf')
-                        if self.download(bucket, prefix + '/boot-error.json', folder / 'boot-error.json'):
-                            raise ValueError(ledger.text(read(folder / 'boot-error.json'), 'error'))
-                        if self.download(bucket, prefix + '/result.json', folder / RESULT_FILE):
+                        etags = self.artifact_etags(bucket, prefix)
+                        log_etag = etags.get(log_key, '')
+                        log_changed = bool(log_etag and log_etag != downloaded_log_etag)
+                        if boot_error_key in etags and self.download(bucket, boot_error_key, folder / 'boot-error.json'):
+                            reason = ledger.text(read(folder / 'boot-error.json'), 'error')
+                            if log_changed:
+                                try:
+                                    if self.download(bucket, log_key, folder / 'gate.log'):
+                                        self.publish_log(folder)
+                                except subprocess.TimeoutExpired:
+                                    pass
+                            return {'status': RetryableCloudFailure.BOX.value, 'reason': reason}
+                        if result_key in etags and self.download(bucket, result_key, folder / RESULT_FILE):
                             received_at = int(self.clock())
-                            if not self.download(bucket, prefix + '/gate.log', folder / 'gate.log'):
-                                raise ValueError('The final log is absent')
                             result = read(folder / RESULT_FILE)
-                            validate_result(result, request, instance=instance)
+                            try:
+                                validate_result(result, request, instance=instance)
+                            except LogUploadFailed as error:
+                                return {'status': RetryableCloudFailure.BOX.value, 'reason': str(error)}
+                            if not self.download(bucket, log_key, folder / 'gate.log'):
+                                raise ValueError('The final log is absent')
                             if request.get('task') == 'paired' and any(
                                     sample['instance_type'] != arguments['InstanceType'] for sample in ledger.rows(result, 'runs')):
                                 raise ValueError('The sample instance type differs from the launch')
@@ -900,28 +982,25 @@ class GateWorker:
                             row = result
                             self.publish_log(folder)
                             break
-                        state = self.regional_api(self.box_region).observe(instance, int(self.clock())).state
-                        if state not in ('pending', 'running'):
-                            reply = self.regional_api(self.box_region).call('describe-instances', '--instance-ids', instance)
-                            stopped = ledger.rows(ledger.rows(reply, 'Reservations')[0], 'Instances')[0]
-                            reason = ledger.mapping(stopped.get('StateReason', {}))
-                            code = str(reason.get('Code', ''))
-                            if code in SPOT_INTERRUPTION_CODES:
-                                interruption_code = code
-                            detail = ': '.join(ledger.text(reason, key) for key in ('Code', 'Message') if reason.get(key))
-                            raise ValueError('The instance stopped without a final result' + (f' ({detail})' if detail else ''))
-                        outage_since = None
+                        if result_key not in etags and log_changed and self.download(bucket, log_key, folder / 'gate.log'):
+                            downloaded_log_etag = log_etag
+                            self.publish_log(folder)
+                            if not began and 'Runner: ' in (folder / 'gate.log').read_text():
+                                began = time.monotonic()
+                                deadline = began + limit if limit else float('inf')
+                        s3_outage.reset()
                     except subprocess.TimeoutExpired:
                         pass
                     except AwsUnavailable as error:
-                        # The box keeps running through a short AWS outage; a long one ends the cloud try.
-                        if not aws_down(str(error)):
+                        if not s3_outage.retry_after_failure(error, self.clock()):
                             raise
-                        outage_since = self.clock() if outage_since is None else outage_since
-                        if self.clock() - outage_since >= settings().number('observe_outage_s'):
-                            raise
-                        print(f'Cloud gate poll skipped: {error}', flush=True)
-                    if time.monotonic() >= deadline:
+                    if ec2_error is not None:
+                        raise ec2_error
+                    if stop_reason:
+                        if stop_code in SPOT_INTERRUPTION_CODES:
+                            interruption_code = stop_code
+                        raise ValueError(stop_reason)
+                    if deadline_reached:
                         text = (folder / 'gate.log').read_text() if (folder / 'gate.log').exists() else ''
                         row = time_limit_result(request, text, time.monotonic() - began, limit, self.size_vcpus)
                         save(folder / RESULT_FILE, row)
@@ -1001,8 +1080,10 @@ def validate_result(row: dict[str, object], request: dict[str, object], *, insta
     for key in ('attempt', 'commit', 'tree'):
         if row.get(key) != request[key]:
             raise ValueError('The result differs from the current ' + key)
+    if row.get('log_error'):
+        raise LogUploadFailed('The final log upload failed')
     run = gate_box.decode_run(row['gate'])
-    if row.get('log_error') or row.get('verdict') != ('pass' if run.passed else 'fail'):
+    if row.get('verdict') != ('pass' if run.passed else 'fail'):
         raise ValueError('The result has no complete verdict and log')
     modules = ['scripts/' + job.suite + '/' + job.module for job in run.jobs]
     if (any(job.kind is not gate.GateJobKind.TEST_MODULE for job in run.jobs)
@@ -1195,8 +1276,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
         if not regional.get('image') or not regional.get('template'):
             return LocalFallback('image or stack is absent')
         retrying = same_request and saved_result.get('status') not in ('complete', 'fallback') and (
-            bool(previous.get('retry_launch')) or saved_result.get('status') == 'interrupted'
-            and saved_result.get('interruption_code') in SPOT_INTERRUPTION_CODES)
+            bool(previous.get('retry_launch')) or retryable_cloud_failure(saved_result) is not RetryableCloudFailure.NONE)
         book = ledger.CostLedger(directory)
         ended = book.path.exists() and any(
             row.attempt == folder.name and isinstance(row.state, (ledger.GateAbsent, ledger.GateTerminated))
@@ -1209,23 +1289,36 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
         retry_launch = ledger.mapping(previous.get('retry_launch', {})) if retrying else {}
         attempt.interruptions = int(str(previous.get('spot_interruptions', 0))) if retrying else 0
         counted_interruption = str(previous.get('counted_interruption', '')) if retrying else ''
-        retry_limit = settings().whole('spot_interruption_retries')
+        box_failures = int(str(previous.get('box_failures', 0))) if retrying else 0
+        counted_box_failure = str(previous.get('counted_box_failure', '')) if retrying else ''
+        last_box_failure = str(previous.get('last_box_failure', '')) if retrying else ''
+        values = settings()
+        retry_limit = values.whole('spot_interruption_retries')
+        box_retry_limit = values.whole('box_failure_retries')
         if retrying:
             retry_limit = min(retry_limit, int(str(previous.get('spot_retry_limit', retry_limit))))
+            box_retry_limit = min(box_retry_limit, int(str(previous.get('box_retry_limit', box_retry_limit))))
         with cloud_reservation(repo, sidecar, mode) as reservation:
             while True:
                 state: dict[str, object] = {'attempt': folder.name, **identity,
                     'spot_interruptions': attempt.interruptions, 'counted_interruption': counted_interruption,
-                    'retry_launch': retry_launch, 'spot_retry_limit': retry_limit}
+                    'retry_launch': retry_launch, 'spot_retry_limit': retry_limit,
+                    'box_failures': box_failures, 'counted_box_failure': counted_box_failure,
+                    'box_retry_limit': box_retry_limit, 'last_box_failure': last_box_failure}
                 save(current, state)
                 result_path = folder / 'outcome.json'
                 result = read(result_path) if result_path.exists() else {}
-                if result.get('status') == 'interrupted' and result.get('interruption_code') in SPOT_INTERRUPTION_CODES:
+                failure = retryable_cloud_failure(result)
+                if failure is not RetryableCloudFailure.NONE:
                     outcome = LocalFallback(ledger.text(result, 'reason'))
                 else:
-                    if attempt.interruptions > retry_limit and not (folder / 'launch.json').exists():
-                        reservation.status = 0
-                        return LocalFallback('The Spot interruption retry limit is reached')
+                    if not (folder / 'launch.json').exists():
+                        if attempt.interruptions > retry_limit:
+                            reservation.status = 0
+                            return LocalFallback('The Spot interruption retry limit is reached')
+                        if box_failures > box_retry_limit:
+                            reservation.status = 0
+                            return LocalFallback(f'The box failure retry limit is reached: {last_box_failure}')
                     command = service_command('scripts.aws_target.cloud_gate',
                         ['--worker', str(folder), '--directory', str(directory), '--sidecar', str(sidecar),
                          '--settings', str(account_settings_path())], 'cloud-gate-' + folder.name)
@@ -1240,24 +1333,37 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                     save(folder / 'deployment.json', deployment)
                     outcome = run_service(repo, folder, request, command, service)
                     result = read(result_path) if result_path.exists() else {}
+                    failure = retryable_cloud_failure(result)
                 if isinstance(outcome, CloudCompleted):
                     reservation.status = int(not outcome.run.passed)
                     return outcome
                 reservation.status = 0
-                if result.get('status') != 'interrupted' or result.get('interruption_code') not in SPOT_INTERRUPTION_CODES:
+                if failure is RetryableCloudFailure.NONE:
                     return outcome
-                if counted_interruption != folder.name:
-                    attempt.interruptions += 1
-                    counted_interruption = folder.name
+                if failure is RetryableCloudFailure.SPOT:
+                    if counted_interruption != folder.name:
+                        attempt.interruptions += 1
+                        counted_interruption = folder.name
+                else:
+                    last_box_failure = outcome.reason
+                    if counted_box_failure != folder.name:
+                        box_failures += 1
+                        counted_box_failure = folder.name
                 launch = read(folder / 'launch.json')
                 next_variant = ledger.instant(launch, 'variant') + 1
                 retry_launch = {key: launch[key] for key in ('variants', 'spot_price_reads') if key in launch}
                 retry_launch['variant'] = next_variant
                 save(current, {**state, 'spot_interruptions': attempt.interruptions,
-                               'counted_interruption': counted_interruption, 'retry_launch': retry_launch})
+                               'counted_interruption': counted_interruption, 'retry_launch': retry_launch,
+                               'box_failures': box_failures, 'counted_box_failure': counted_box_failure,
+                               'last_box_failure': last_box_failure})
                 if attempt.interruptions > retry_limit:
                     return LocalFallback('The Spot interruption retry limit is reached')
+                if box_failures > box_retry_limit:
+                    return LocalFallback(f'The box failure retry limit is reached: {last_box_failure}')
                 if next_variant >= len(ledger.rows(launch, 'variants')):
+                    if failure is RetryableCloudFailure.BOX:
+                        return LocalFallback(f'Box failure: {last_box_failure}. No cloud capacity choice remains')
                     return LocalFallback('No cloud capacity choice remains')
                 folder = root / uuid4().hex
                 attempt.identifier = folder.name

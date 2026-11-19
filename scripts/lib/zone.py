@@ -146,8 +146,8 @@ def notice(zone: str, before: str) -> str:
     label = now.tzname() or zone
     return (f"The user's time zone is now {zone} ({label}, {_offset(now)}) as of {now:%H:%M} {label}; it was {before}. "
             + "config/user_zone.conf says so on both machines. Write every time you give the user "
-            + f"in {label}, with its label. Read the clock with TZ=$(python3 ~/.claude/scripts/lib/user_zone.py) "
-            + "date '+%H:%M %Z', never with bare date, because each machine's clock keeps its own zone. "
+            + f"in {label}, with its label. Write no present time. Write only future times, such as an ETA. "
+            + "The tools add the present time. "
             + "Scripts that read user_zone.py change by themselves. Change any note of yours that names the old zone.")
 
 
