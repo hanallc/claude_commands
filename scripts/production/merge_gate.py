@@ -2146,16 +2146,9 @@ def merge_checkpoint(args: GateArguments) -> int:
         if merged != baseline:
             write_push_record(push_record_path(repo, "checkpoint", origin + ":" + checkpoint),
                               RecordedPush(baseline, merged, checkpoint))
-        previous_unit = os.environ.get(admission_records.BUILDLOG_UNIT)
-        os.environ[admission_records.BUILDLOG_UNIT] = args.unit
-        try:
+        with gate_unit(args.unit):
             suites = run_gate_suites(repo, args.type_dirs, float(args.module_time_limit_s),
-                                source="checkpoint", full=args.full)
-        finally:
-            if previous_unit is None:
-                _ = os.environ.pop(admission_records.BUILDLOG_UNIT, None)
-            else:
-                os.environ[admission_records.BUILDLOG_UNIT] = previous_unit
+                                    source="checkpoint", full=args.full)
         if not suites.passed:
             if suites.time_limit_report:
                 tell_time_limit(args.unit, repo, suites)
@@ -2628,6 +2621,32 @@ def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
     _ = parser.add_argument("--full", action="store_true", help="run all test modules even with a certified base")
     _ = parser.add_argument("--module", action="append", default=[], dest="modules",
                             help="run only this module, named as the gate prints it (suite/module), with no gate record")
+
+
+@contextmanager
+def gate_unit(unit: str = "") -> Generator[None]:
+    """Set the gate unit for admission and launch records."""
+    key = admission_records.BUILDLOG_UNIT
+    previous = os.environ.get(key)
+    if not unit and not previous:
+        from scripts.message import unit_labels
+        from scripts.production import staff
+
+        if caller := staff.caller_identity():
+            labels = unit_labels.unit_labels_for([caller], os.environ).get(caller)
+            if labels is not None and labels.unit != "—":
+                unit = labels.unit
+    if not unit:
+        yield
+        return
+    os.environ[key] = unit
+    try:
+        yield
+    finally:
+        if previous is None:
+            _ = os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
 
 
 class CloudGateRoute(Protocol):

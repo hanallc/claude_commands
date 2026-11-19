@@ -99,6 +99,8 @@ def save(path: Path, row: dict[str, object]) -> None:
 
 def append_launch(directory: Path, row: dict[str, object]) -> None:
     """Append one event with the existing launch record lock and format."""
+    if unit := os.environ.get(admission_records.BUILDLOG_UNIT):
+        row = {**row, 'unit': unit}
     with store.locked_append(directory / 'cloud-gate-launches.jsonl') as handle:
         store.append_locked(handle, row)
 

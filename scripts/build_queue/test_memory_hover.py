@@ -1189,6 +1189,17 @@ process.stdout.write(JSON.stringify(steps));
             ["ignored", 2, False], ["foreign", 2, False], ["resumed", 4, True],
             ["input, textarea, select, button, summary, [contenteditable]"]])
 
+    def test_aws_cost_hover_uses_the_label_and_value_grid(self) -> None:
+        data = {"costs": {"today": {"amount": "$4.00", "limit": "$20.00"}, "accounting_zone": "America/New_York"}}
+        markup = str(self.page_expression(
+            "(awsCosts = data.costs, tooltipHtml('aws-cost:today', data))", data, walk=True))
+        grid = ElementTree.fromstring(markup)
+        self.assertEqual((grid.tag, grid.get("class")), ("dl", "tip"))
+        fields = [(label.text, value.text) for label, value in zip(grid.findall("dt"), grid.findall("dd"), strict=True)]
+        self.assertEqual(fields, [("Today (estimated)", "$4.00 of $20.00"), ("Source", "Saved ledger and bills"),
+                                  ("Day boundary", "America/New_York"),
+                                  ("Estimate", "Includes full-day non-compute costs from the latest bill when available")])
+
     def page_expression(self, expression: str, data: object, *, walk: bool = False, swap: bool = False) -> object:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         functions = html[html.index("function field("):html.index("const tip =")]

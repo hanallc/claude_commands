@@ -18,7 +18,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     merge_gate.add_suite_arguments(parser)
     args = cast(merge_gate.GateArguments, parser.parse_args(argv))
-    with test_run_folder():
+    with test_run_folder(), merge_gate.gate_unit():
         return merge_gate.run_tests_only(args, merge_gate.SuiteMode.TARGETED_TEST)
 
 

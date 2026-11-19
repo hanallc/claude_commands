@@ -1347,7 +1347,8 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
 
     def test_capacity_tries_every_zone_before_the_smaller_size(self) -> None:
         self.fake.refusals = ['An error occurred (InsufficientInstanceCapacity) when calling the RunInstances operation: fixture'] * 3
-        self.assertEqual(self.execute()['status'], 'complete')
+        with mock.patch.dict(os.environ, {admission_records.BUILDLOG_UNIT: ""}):
+            self.assertEqual(self.execute()['status'], 'complete')
         choices = [(row['InstanceType'], ledger.rows(row, 'NetworkInterfaces')[0]['SubnetId'])
                    for row in self.fake.launches]
         self.assertEqual(choices, [('m7a.8xlarge', 'fixture-a'), ('m7a.8xlarge', 'fixture-b'),
@@ -1362,10 +1363,12 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.request['mode'] = 'targeted-test'
         cloud_gate.save(self.folder / 'request.json', self.request)
         self.fake.refusals = ['An error occurred (InsufficientInstanceCapacity) when calling the RunInstances operation: fixture']
-        self.assertEqual(self.execute()['status'], 'complete')
+        with mock.patch.dict(os.environ, {admission_records.BUILDLOG_UNIT: "fixture-unit"}):
+            self.assertEqual(self.execute()['status'], 'complete')
         rows = self.book.launches()
         self.assertEqual([row['result'] for row in rows], ['refused', 'launched', 'finished'])
         self.assertTrue(all(row['mode'] == 'targeted-test' for row in rows))
+        self.assertEqual([row['unit'] for row in rows], ['fixture-unit'] * 3)
 
     def test_all_capacity_refusals_allow_local_fallback(self) -> None:
         self.fake.refusals = ['An error occurred (InsufficientInstanceCapacity) when calling the RunInstances operation: fixture'] * 4

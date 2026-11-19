@@ -11,6 +11,7 @@
 // Add --wait-tip as the fourth argument for the waiting step hover images.
 // Add --macroute as the fourth argument for the Mac route and width images.
 // Use --headcount to compare the Running and Queued headers.
+// Add --awscosts as the fourth argument to save the AWS costs pane.
 // Use --rowask to capture the rows and the New item dialog.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
@@ -74,6 +75,7 @@ try {
   const macrouteComparison = comparison === '--macroute';
   const headcountComparison = comparison === '--headcount';
   const rowAskComparison = comparison === '--rowask';
+  const awsCostsComparison = comparison === '--awscosts';
   const comparisonImages = Boolean(comparison || beforePage || swapBeforePage || requestedShot);
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const fixtureTime = readings.good.read_at;
@@ -551,7 +553,45 @@ try {
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
           for (const width of widths) {
             await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
+            await show(readings.aws_costs);
+            const awsPane = await evaluate(`(() => {
+              const pane = document.querySelector('#aws-costs');
+              const totals = [...pane.querySelectorAll('.aws-total')].map(card => [...card.children].map(cell => cell.textContent));
+              const units = [...pane.querySelectorAll('tbody tr')].map(row => row.cells[0].textContent);
+              const fields = [...pane.querySelectorAll('.aws-values dd')].map(cell => cell.textContent);
+              return {totals, units, fields, fits:pane.scrollWidth <= pane.clientWidth};
+            })()`);
+            assert.deepEqual(awsPane, {
+              totals:[['Yesterday','$12.00'],['Today (estimated)','$4.00 of $20.00'],['Month to date','$16.00 of $400.00']],
+              units:['research','Unit not recorded','report'],
+              fields:['$6.00','$2.00','$3.00','$6.20/month','$24.80/month','$31.00/month'], fits:true
+            });
+            if (theme === 'dark' && width === 1400) {
+              const awsTip = await evaluate(`(() => {
+                const section = document.querySelector('#aws-costs');
+                section.scrollIntoView({block:'center'});
+                const heading = section.querySelector('[data-tip="aws-cost:gates"]');
+                const bounds = heading.getBoundingClientRect();
+                showTip(heading.dataset.tip, bounds.left + 30, bounds.bottom);
+                const grid = document.querySelector('#tip dl.tip');
+                const pairs = [...grid.querySelectorAll('dt')].map(label => [label.textContent, label.nextElementSibling.textContent]);
+                return {pairs, columns:getComputedStyle(grid).gridTemplateColumns.split(' ').length};
+              })()`);
+              assert.equal(awsTip.columns, 2);
+              assert.deepEqual(awsTip.pairs, [['Billed gate spend',''],['Period','Month to date'],
+                ['Basis','Recorded box time'],['Full merge gates','$6.00'],['Targeted tests','$2.00'],
+                ['Average per merge gate','$3.00']]);
+              await evaluate('hideTip()');
+              if (awsCostsComparison) {
+                const clip = await evaluate(`(() => {
+                  const r = document.querySelector('#aws-costs').getBoundingClientRect();
+                  return {x:r.left+scrollX, y:r.top+scrollY, width:r.width, height:r.height, scale:1};
+                })()`);
+                await saveScreenshot('after-awscosts-dark',{captureBeyondViewport:true,clip});
+              }
+            }
             await show(base);
+            assert.equal(await evaluate(`document.querySelector('[data-tip="aws-cost:yesterday"] strong').textContent`), 'no record');
             // A render keeps the viewed row in place, so the scroll of the last width stays; the pixel checks read from the top.
             await evaluate('scrollTo(0,0)');
             const timeCells = await evaluate(`({
