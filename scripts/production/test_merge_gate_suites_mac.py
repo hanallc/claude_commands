@@ -64,6 +64,12 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                 _ = threading.Event().wait(TEST_HANG_GUARD_SECS)
         case "crash":
             os._exit(17)
+        case "empty":
+            os._exit(0)
+        case "invalid":
+            # The route command passes the result writer as its third argument.
+            _ = os.write(int(sys.argv[3]), b"invalid JSON")
+            os._exit(0)
         case _:
             raise ValueError("unknown Mac fixture action")
     return gate_box.decode_run(plan["gate"]) if "gate" in plan else ledger.text(plan, "miss")
@@ -124,7 +130,8 @@ class MacGateSuitesTests(GateSuitesFixture):
         _ = self.enterContext(redirect_stdout(self.output))
 
     def set_mac_result(self, result: merge_gate.GateRun | str, *,
-                       action: Literal["return", "await-linux", "check-recovery", "cancel", "hold", "crash"] = "return") -> None:
+                       action: Literal["return", "await-linux", "check-recovery", "cancel", "hold", "crash",
+                                       "empty", "invalid"] = "return") -> None:
         (self.state / "mac-call.json").unlink(missing_ok=True)
         plan = {"miss": result} if isinstance(result, str) else {"gate": gate_box.encode_run(result)}
         cloud_gate.save(self.state / "mac-plan.json", {**plan, "action": action})
@@ -166,8 +173,9 @@ class MacGateSuitesTests(GateSuitesFixture):
     @gate_suites("lib")
     def test_natedev_starts_without_a_route_thread_and_the_mac_child_inherits_the_mask(self) -> None:
         self.read_modules.return_value = (LIB_SECOND,)
-        self.set_mac_result(merge_gate.GateRun((merge_gate.GateJobResult("lib", "test_second.py", 0, 1, ""),), 1, 0),
-                            action="await-linux")
+        mac_output = "fixture Mac output\n" * 65_536
+        mac_job = merge_gate.GateJobResult("lib", "test_second.py", 0, 1, mac_output)
+        self.set_mac_result(merge_gate.GateRun((mac_job,), 1, 0), action="await-linux")
         threads = set(threading.enumerate())
         mask = blocked_signals()
 
@@ -188,6 +196,7 @@ class MacGateSuitesTests(GateSuitesFixture):
         self.assert_cloud_routed(LIB_FIRST)
         self.assertEqual([row["module"] for row in self.module_events() if row["event"] == "start"], ["test_first.py"])
         self.assertEqual([job.module for job in run.jobs], ["test_first.py", "test_second.py"])
+        self.assertEqual(run.jobs[1].output, mac_output)
 
     @gate_suites("hooks", "lib")
     def test_mac_miss_uses_the_natedev_verdict_and_keeps_mac_passes(self) -> None:
@@ -277,17 +286,15 @@ class MacGateSuitesTests(GateSuitesFixture):
 
     @gate_suites("lib")
     def test_unusable_mac_child_results_give_a_miss(self) -> None:
-        for case, reason in (("crash", "exited with status 17"),
-                             ("missing", "returned no result"), ("invalid", "returned an invalid result")):
+        cases: tuple[tuple[Literal["crash", "empty", "invalid"], str], ...] = (
+            ("crash", "exited with status 17"),
+            ("empty", "returned no result"),
+            ("invalid", "returned an invalid result"),
+        )
+        for case, reason in cases:
             with self.subTest(case=case):
-                self.set_mac_result("fixture miss", action="crash" if case == "crash" else "return")
+                self.set_mac_result("fixture miss", action=case)
                 with self.start_fixture_mac() as mac:
-                    if case != "crash":
-                        self.assertEqual(mac.process.wait(timeout=TEST_HANG_GUARD_SECS), 0)
-                        if case == "missing":
-                            mac.result_path.unlink()
-                        else:
-                            self.write(mac.result_path, "invalid JSON")
                     result = mac.result()
                     assert isinstance(result, mac_gate_process.MacGateMiss)
                     self.assertIn(reason, result.reason)
@@ -316,6 +323,16 @@ class MacGateSuitesTests(GateSuitesFixture):
     @gate_suites("lib")
     def test_sigterm_closes_the_mac_cancellation_pipe_on_process_exit(self) -> None:
         self.assert_sigterm_closes_the_mac_pipe(protected=False)
+
+    @gate_suites("lib")
+    def test_sigterm_leaves_no_mac_result_folder(self) -> None:
+        temp_root = self.state / "mac-route-temp"
+        temp_root.mkdir()
+        with mock.patch.dict(os.environ, {"TMPDIR": str(temp_root)}):
+            self.assert_sigterm_closes_the_mac_pipe(protected=False)
+        pid = ledger.instant(cloud_gate.read(self.state / "mac-call.json"), "pid")
+        self.assert_process_stopped(pid)
+        self.assertEqual(list(temp_root.glob("mac-gate-result-*")), [])
 
     @gate_suites("lib")
     def test_sigterm_waits_for_linux_to_record_its_cpu_slot(self) -> None:

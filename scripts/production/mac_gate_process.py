@@ -13,9 +13,8 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
-import tempfile
 import time
-from typing import cast
+from typing import BinaryIO, cast
 
 from scripts.aws_target import gate_box, ledger
 from scripts.lib import process_group
@@ -38,18 +37,21 @@ class MacGateMiss:
 
 @dataclass(frozen=True)
 class MacGateProcess:
-    """Read a Mac gate result after its process exits."""
+    """Read the Mac result pipe and reap the child."""
     process: subprocess.Popen[bytes]
-    result_path: Path
+    result_reader: BinaryIO
     started_at: float
 
     def result(self) -> GateRun | MacGateMiss:
-        status = self.process.wait()
-        if status:
-            return MacGateMiss(f"The Mac route process exited with status {status}",
-                               time.monotonic() - self.started_at)
         try:
-            row = ledger.mapping(cast(object, json.loads(self.result_path.read_text())))
+            payload = self.result_reader.read()
+            status = self.process.wait()
+            if status:
+                return MacGateMiss(f"The Mac route process exited with status {status}",
+                                   time.monotonic() - self.started_at)
+            if not payload:
+                return MacGateMiss("The Mac route process returned no result", time.monotonic() - self.started_at)
+            row = ledger.mapping(cast(object, json.loads(payload)))
             if "gate" in row:
                 return gate_box.decode_run(row["gate"])
             seconds = row["seconds"]
@@ -57,11 +59,9 @@ class MacGateProcess:
                     or not math.isfinite(seconds) or seconds < 0):
                 raise ValueError("invalid elapsed time")
             return MacGateMiss(ledger.text(row, "miss"), seconds)
-        except FileNotFoundError:
-            reason = "The Mac route process returned no result"
         except (OSError, ValueError, TypeError, KeyError, OverflowError) as error:
-            reason = f"The Mac route process returned an invalid result ({error})"
-        return MacGateMiss(reason, time.monotonic() - self.started_at)
+            return MacGateMiss(f"The Mac route process returned an invalid result ({error})",
+                               time.monotonic() - self.started_at)
 
 
 @contextmanager
@@ -69,24 +69,29 @@ def start_mac_gate(module: str, repo: Path, *, mode: SuiteMode, full: bool,
                    module_time_limit_s: float, selected: TreeSelection) -> Generator[MacGateProcess]:
     """Close the cancellation writer before reaping the child."""
     repo = repo.resolve()
-    with tempfile.TemporaryDirectory(prefix="mac-gate-result-") as folder, ExitStack() as cancellation:
-        result_path = Path(folder) / "result.json"
-        reader, writer = os.pipe()
-        _ = cancellation.enter_context(os.fdopen(writer, "wb"))
-        command = [sys.executable, "-m", "scripts.production.mac_gate_process",
-                   module, str(repo), str(result_path), str(reader),
-                   mode.value, str(int(full)), str(module_time_limit_s), selected.tree, *selected.paths]
-        started_at = time.monotonic()
-        with os.fdopen(reader, "rb"):
+    with ExitStack() as parent_ends:
+        cancel_read, cancel_write = os.pipe()
+        cancel_writer = parent_ends.enter_context(os.fdopen(cancel_write, "wb"))
+        with ExitStack() as child_ends:
+            _ = child_ends.enter_context(os.fdopen(cancel_read, "rb"))
+            result_read, result_write = os.pipe()
+            _ = child_ends.enter_context(os.fdopen(result_write, "wb"))
+            result_reader = parent_ends.enter_context(os.fdopen(result_read, "rb"))
+            command = [sys.executable, "-m", "scripts.production.mac_gate_process",
+                       module, str(repo), str(result_write), str(cancel_read),
+                       mode.value, str(int(full)), str(module_time_limit_s), selected.tree, *selected.paths]
+            started_at = time.monotonic()
             process = subprocess.Popen(command, cwd=Path(__file__).resolve().parents[2],
                                        stdin=subprocess.DEVNULL, start_new_session=True,
-                                       pass_fds=(reader,), restore_signals=False)
+                                       pass_fds=(cancel_read, result_write), restore_signals=False)
         try:
-            yield MacGateProcess(process, result_path, started_at)
-            cancellation.close()
-            _ = process.wait()
+            yield MacGateProcess(process, result_reader, started_at)
+            cancel_writer.close()
+            if process.returncode is None:
+                _ = result_reader.read()
+                _ = process.wait()
         except BaseException:
-            cancellation.close()
+            cancel_writer.close()
             if process.returncode is None:
                 with suppress(ProcessLookupError):
                     process_group.send_process_group(process.pid, signal.SIGKILL)
@@ -95,7 +100,9 @@ def start_mac_gate(module: str, repo: Path, *, mode: SuiteMode, full: bool,
 
 
 def main(arguments: Sequence[str]) -> None:
-    module, repo, result_path, reader, mode, full, time_limit, tree, *paths = arguments
+    module, repo, result_writer, reader, mode, full, time_limit, tree, *paths = arguments
+    result_fd = int(result_writer)
+    os.set_inheritable(result_fd, False)
     mac = load_mac_gate_route(module)
     started_at = time.monotonic()
     with os.fdopen(int(reader), "rb") as read_end:
@@ -104,7 +111,8 @@ def main(arguments: Sequence[str]) -> None:
                            cancellation=MacGateCancellation(read_end.fileno()))
     row = ({"miss": result, "seconds": time.monotonic() - started_at} if isinstance(result, str)
            else {"gate": gate_box.encode_run(result)})
-    _ = Path(result_path).write_text(json.dumps(row))
+    with suppress(BrokenPipeError), os.fdopen(result_fd, "wb") as write_end:
+        _ = write_end.write(json.dumps(row).encode("utf-8"))
 
 
 if __name__ == "__main__":
