@@ -603,7 +603,7 @@ class UnusableAdmissionConfiguration:
     reason: str
 
 
-MERGE_TEST_WAIT_KEY = "claude_commands_tests_wait_for_landing"
+MERGE_TEST_WAIT_KEY = "claude_commands_natedev_waits_for_landing"
 MERGE_TEST_REROUTE_KEY = "claude_commands_reroute_seconds"
 
 

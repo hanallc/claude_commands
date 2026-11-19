@@ -99,9 +99,9 @@ An AWS merge test leaves the natedev queue open.
 AWS jobs and local jobs from other repositories can start during the hold.
 Running steps continue.
 
-`claude_commands_tests_wait_for_landing=on` in `config/build_admission.conf` enables the rule.
+`claude_commands_natedev_waits_for_landing=on` in `config/build_admission.conf` enables the rule.
 The service reads the setting for each admission pass.
-Set `claude_commands_tests_wait_for_landing=off` to disable the rule.
+Set `claude_commands_natedev_waits_for_landing=off` to disable the rule.
 
 The wait line and the Builds page show this reason.
 
