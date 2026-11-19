@@ -18,7 +18,7 @@ from collections.abc import Callable, Sequence
 from importlib.machinery import ModuleSpec, PathFinder
 from importlib.util import module_from_spec, spec_from_file_location
 from types import CodeType, ModuleType
-from typing import cast
+from typing import Protocol, cast
 
 
 STARTUP_FILES = ("scripts/lib/py", "scripts/lib/package_root.py", "scripts/lib/python_startup/sitecustomize.py",
@@ -36,27 +36,31 @@ DATACLASS_CODE_TOUCH_SECONDS = 86400
 _dataclass_code_folder: list[str] = []
 
 
-def _load_raw_starts() -> ModuleType:
-    """Load the classifier without selecting a package checkout."""
+class RawStarts(Protocol):
+    def is_test_start(self, argv: Sequence[str], /) -> bool: ...
+    def python_target(self, argv: tuple[str, ...], /) -> tuple[str, ...]: ...
+
+
+def _load_raw_starts() -> RawStarts:
+    """Load the classifier only for interpreter startup."""
     name = "_devtools_raw_starts"
-    if name in sys.modules:
-        return sys.modules[name]
+    module = sys.modules.get(name)
+    if module is not None:
+        return cast(RawStarts, cast(object, module))
     path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "raw_starts.py")
-    spec = spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise SystemExit(f"walled tests: cannot load {path}")
-    module = module_from_spec(spec)
     try:
+        spec = spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            raise ImportError("no classifier loader")
+        module = module_from_spec(spec)
         spec.loader.exec_module(module)
-    except OSError as error:
+        classifier = cast(RawStarts, cast(object, module))
+        if not callable(classifier.is_test_start) or not callable(classifier.python_target):
+            raise TypeError("invalid classifier entry points")
+    except Exception as error:
         raise SystemExit(f"walled tests: cannot load {path}: {error}") from error
     sys.modules[name] = module
-    return module
-
-
-_raw_starts = _load_raw_starts()
-is_test_start = cast(Callable[[Sequence[str]], bool], _raw_starts.__dict__["is_test_start"])
-python_target = cast(Callable[[tuple[str, ...]], tuple[str, ...]], _raw_starts.__dict__["python_target"])
+    return classifier
 
 
 def checkout_root(start: str) -> str:
@@ -266,11 +270,12 @@ def kernel_guarded() -> bool:
 
 
 def _start_test_run(selected: str) -> None:
+    classifier = _load_raw_starts()
     original = sys.orig_argv
     target = ["python", *original[1:]]
     if __name__ == "_shim_python_startup":
         # The isolated shim uses a Python command string to start the target.
-        bootstrap = python_target(tuple(original[1:]))
+        bootstrap = classifier.python_target(tuple(original[1:]))
         if len(bootstrap) < 5 or bootstrap[0] != "-c":
             return
         mode, entry = bootstrap[3:5]
@@ -278,7 +283,7 @@ def _start_test_run(selected: str) -> None:
             target = ["python", "-m", entry]
         elif mode == "file":
             target = ["python", "--", entry]
-    if not is_test_start(target):
+    if not classifier.is_test_start(target):
         return
     if not kernel_guarded():
         guard = os.path.join(selected, "scripts/lib/walled_tests.py")

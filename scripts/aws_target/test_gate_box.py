@@ -10,6 +10,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
+import textwrap
 import tempfile
 from types import SimpleNamespace
 from typing import Self, cast, override
@@ -95,6 +96,25 @@ class GateBoxTests(unittest.TestCase):
         self.assertIn("'HEAD^{tree}'", gate_box.GUEST)
         self.assertIn("'update-ref', 'refs/remotes/origin/main', gate_request['origin_main']", gate_box.GUEST)
         self.assertIn("'fetch', str(root / 'source.bundle'), links['commit']", gate_box.GUEST)
+
+    def test_guest_selects_a_checkout_without_a_classifier(self) -> None:
+        source = gate_box.GUEST.split("        from types import ModuleType\n", 1)[1]
+        startup = textwrap.dedent("        from types import ModuleType\n"
+                                  + source.split("        candidate_path =", 1)[0])
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            shim = repo / "scripts/lib/py"
+            shim.parent.mkdir(parents=True)
+            shim.touch()
+            with (mock.patch.object(sys, "path", sys.path.copy()), mock.patch.object(sys, "argv", ["-c"]),
+                  mock.patch.dict(os.environ),
+                  mock.patch.dict(sys.modules), mock.patch.object(os, "getcwd", return_value=str(repo))):
+                _ = sys.modules.pop("_devtools_checkout", None)
+                _ = sys.modules.pop("_devtools_raw_starts", None)
+                namespace: dict[str, object] = {"repo": repo, "sys": sys}
+                exec(startup, namespace)
+                self.assertIn(str(repo), sys.path)
+                self.assertNotIn("_devtools_raw_starts", sys.modules)
 
     def test_guest_names_no_merge_gate_signal_function(self) -> None:
         for code in (gate_box.GUEST, gate_box.CANDIDATE_GUEST, gate_box.PAIRED_GUEST):

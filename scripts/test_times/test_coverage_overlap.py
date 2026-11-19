@@ -19,6 +19,7 @@ import unittest
 from unittest import mock
 
 
+from scripts.buildlog import treekey
 from scripts.lib import build_folders, walled_tests
 from scripts.lib.checkout_test_support import copy_test_runner
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
@@ -232,9 +233,11 @@ class CoverageOverlapTests(unittest.TestCase):
             with (mock.patch.object(sys, "orig_argv", original),
                   mock.patch.dict(os.environ, {"COVERAGE_OUT": str(output)}),
                   mock.patch.object(walled_tests, "guarded", return_value=False),
+                  mock.patch.object(treekey, "tree_key", return_value="fixture-tree") as tree_key,
                   mock.patch.object(walled_tests, "run", side_effect=run),
                   mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(folder))):
                 self.assertEqual(coverage_overlap.main(arguments), 1)
+            tree_key.assert_called_once()
             self.assertEqual(output.read_text(encoding="utf-8"), '{"tests": []}\n')
 
     @contextmanager
@@ -281,6 +284,9 @@ class CoverageOverlapTests(unittest.TestCase):
                 check=True, timeout=TEST_HANG_GUARD_SECS,
             )
             _ = commit_repository(root, "Create coverage fixtures", env=env)
+            tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=root, env=env,
+                                           timeout=TEST_HANG_GUARD_SECS)
+            env["COVERAGE_TREE_SHA"] = treekey.committed_tree_key(tree.strip())
             patterns = sorted(Path(name).name for name in sources
                               if Path(name).name.startswith("test_") and Path(name).suffix == ".py")
             result = subprocess.run(

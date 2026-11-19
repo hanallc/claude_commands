@@ -308,9 +308,13 @@ def print_candidates(rows: Sequence[CoverageRow]) -> None:
 
 def run_with_output(command: list[str], output: Path) -> int:
     """Publish the report from the private job folder after the child exits."""
+    tree = treekey.tree_key(str(REPOSITORY))
+    if tree is None:
+        print("coverage overlap: cannot read the tree sha", file=sys.stderr)
+        return 2
     with build_folders.tool_folder("coverage-overlap") as folder:
         report = folder.resolve() / "coverage.json"
-        environment = {**os.environ, "COVERAGE_OUT": str(report)}
+        environment = {**os.environ, "COVERAGE_OUT": str(report), "COVERAGE_TREE_SHA": tree}
         with walled_tests.gate_inputs(REPOSITORY, environment, read_only=()):
             status = walled_tests.run(command, folder)
         try:
@@ -350,12 +354,10 @@ def main(argv: list[str]) -> int:
         return 2
     output = os.environ.pop("COVERAGE_OUT", "")
     _ = os.environ.pop("TEST_TIMES_OUT", None)
-    tree = ""
-    if output:
-        tree = treekey.tree_key(str(REPOSITORY))
-        if tree is None:
-            print("coverage overlap: cannot read the tree sha", file=sys.stderr)
-            return 2
+    tree = os.environ.pop("COVERAGE_TREE_SHA", "")
+    if output and not tree:
+        print("coverage overlap: missing caller tree sha", file=sys.stderr)
+        return 2
 
     def load_suite() -> unittest.TestSuite:
         loader = unittest.TestLoader()

@@ -53,6 +53,7 @@ import os
 from pathlib import Path
 import re
 import select
+from selectors import EVENT_READ, PollSelector
 import shlex
 import shutil
 import signal
@@ -276,6 +277,8 @@ class RunningGateJob:
     memory_stopped: bool = False
     folder_cleanup: ExitStack = field(default_factory=ExitStack)
     scope: Path | None = None
+    stop_error: str = ""
+    stopped: bool = False
 
 
 @dataclass(frozen=True)
@@ -674,6 +677,7 @@ class GateRecovery:
     rollback_head: str = ""
     rollback_source: str = ""
     scopes: set[Path] = field(default_factory=set)
+    unresolved: bool = False
 
     def save(self) -> None:
         write_text_atomic(self.path, json.dumps({
@@ -703,54 +707,26 @@ class GateRecovery:
 
     def recover(self) -> None:
         """Stop recorded groups before removing their folders and undoing the merge."""
+        deadline = module_stop_deadline()
+        missing: list[Path] = []
         for scope in self.scopes:
-            _ = stop_module_scope(scope)
-        stopping: set[int] = set()
+            result = stop_module_scope(scope, deadline)
+            if result is ScopeStop.UNRESOLVED:
+                raise GateRefused(f"Module stop unresolved for {scope}. Keep recovery record {self.path}.")
+            if result is ScopeStop.ABSENT:
+                missing.append(scope)
         for pid, start in self.groups.items():
             identity = process_start(pid)
             if isinstance(identity, Unreadable):
                 raise GateRefused(f"cannot recover gate group {pid}: {identity.reason}")
             if isinstance(identity, (Started, Zombie)) and identity.start != start:
                 continue
-            try:
-                process_group.send_process_group(pid, signal.SIGTERM)
-                stopping.add(pid)
-            except ProcessLookupError:
-                pass
-        deadline = time.monotonic() + admission_records.read_memory_config().program_stop_seconds
-        for pid in stopping:
-            try:
-                descriptor = os.pidfd_open(pid)
-            except ProcessLookupError:
-                pass
-            else:
-                try:
-                    _ = select.select([descriptor], [], [], max(0, deadline - time.monotonic()))
-                finally:
-                    os.close(descriptor)
-            try:
-                process_group.send_process_group(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        # A dead leader can leave writers in its group. Wait before deleting their files.
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdecimal():
-                continue
-            try:
-                fields = (entry / "stat").read_bytes().rsplit(b")", 1)[1].split()
-                if int(fields[2]) not in stopping or fields[0] == b"Z":
-                    continue
-                descriptor = os.pidfd_open(int(entry.name))
-            except (FileNotFoundError, ProcessLookupError):
-                continue
-            try:
-                if not select.select([descriptor], [], [], admission_records.read_memory_config().program_stop_seconds)[0]:
-                    raise GateRefused(f"gate group member {entry.name} did not stop")
-            finally:
-                os.close(descriptor)
+            if not stop_module_group(pid, deadline):
+                raise GateRefused(f"Module stop unresolved for group {pid}. Keep recovery record {self.path}.")
+        for scope in missing:
+            if stop_module_scope(scope, deadline) is ScopeStop.UNRESOLVED:
+                raise GateRefused(f"Module stop unresolved for {scope}. Keep recovery record {self.path}.")
         self.groups.clear()
-        for scope in self.scopes:
-            _ = stop_module_scope(scope)
         self.scopes.clear()
         self.save()
         while self.tokens:
@@ -904,17 +880,35 @@ def private_gate_recovery(repo: Path, parent: Path) -> Generator[GateRecovery]:
     identity = process_start(os.getpid())
     if not isinstance(identity, Started):
         raise GateRefused("the gate has no readable process start")
-    with tempfile.TemporaryDirectory(prefix="merge-gate-recovery-", dir=parent) as folder:
-        directory = Path(folder)
+    directory = Path(tempfile.mkdtemp(prefix="merge-gate-recovery-", dir=parent))
+    recovery = GateRecovery(directory / "run.json", str(repo.resolve()), os.getpid(), identity.start)
+    try:
         with (directory / "operation.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_SH)
-            recovery = GateRecovery(directory / "run.json", str(repo.resolve()), os.getpid(), identity.start)
             recovery.save()
             token = ACTIVE_GATE_RECOVERY.set(recovery)
             try:
                 yield recovery
             finally:
                 ACTIVE_GATE_RECOVERY.reset(token)
+    finally:
+        if not recovery.unresolved:
+            shutil.rmtree(directory)
+
+
+# Keep the folder contexts active until recovery can prove the jobs stopped.
+_retained_gate_folders: list[ExitStack] = []
+
+
+def retain_gate_folder(folder: Path, cleanup: ExitStack) -> None:
+    _retained_gate_folders.append(cleanup.pop_all())
+    # Keep the lock through interpreter cleanup. The kernel closes it on exit.
+    try:
+        descriptor = build_folders.build_folder_lock_fd(folder)
+    except StopIteration:
+        pass
+    else:
+        _ = os.dup(descriptor)
 
 
 @contextmanager
@@ -927,9 +921,12 @@ def gate_temporary(recovery: GateRecovery, tool: str, parent: Path) -> Generator
         try:
             yield folder
         finally:
-            cleanup.close()
-            recovery.folders.remove(str(folder))
-            recovery.save()
+            if recovery.unresolved:
+                retain_gate_folder(folder, cleanup)
+            else:
+                cleanup.close()
+                recovery.folders.remove(str(folder))
+                recovery.save()
 
 
 def typecheck_venv_path() -> Path:
@@ -1011,10 +1008,25 @@ def reap_gate_job(job: RunningGateJob, *, block: bool = False) -> None:
             job.cpu_seconds = usage.ru_utime + usage.ru_stime
 
 
-def stop_module_scope(scope: Path) -> bool:
-    """Stop the scope and wait for the kernel to report that it is empty."""
+class ScopeStop(Enum):
+    ABSENT = auto()
+    STOPPED = auto()
+    UNRESOLVED = auto()
+
+
+def module_stop_deadline() -> float:
+    return time.monotonic() + conf.read("build_admission").number("program_stop_seconds")
+
+
+def wait_milliseconds(deadline: float) -> int:
+    return max(0, math.ceil((deadline - time.monotonic()) * 1000))
+
+
+def stop_module_scope(scope: Path, deadline: float | None = None) -> ScopeStop:
+    """Stop a scope and check its population before the deadline."""
+    if deadline is None:
+        deadline = module_stop_deadline()
     found = False
-    reported = False
     while True:
         try:
             with (scope / "cgroup.events").open() as events:
@@ -1025,63 +1037,118 @@ def stop_module_scope(scope: Path) -> bool:
                 while True:
                     _ = events.seek(0)
                     if "populated 0" in events.read().splitlines() or not scope.exists():
-                        return True
-                    _ = changed.poll(1000)
+                        return ScopeStop.STOPPED
+                    remaining = wait_milliseconds(deadline)
+                    if not remaining:
+                        return ScopeStop.UNRESOLVED
+                    _ = changed.poll(min(1000, remaining))
         except OSError as error:
             if error.errno in (errno.ENOENT, errno.ENODEV) and not scope.exists():
                 # The kernel removes a cgroup only after it is empty.
-                return found
-            if not reported:
-                print(f"Module scope stop failed for {scope.name} ({error}). Retain the job folder.", flush=True)
-                reported = True
-            time.sleep(1)
+                return ScopeStop.STOPPED if found else ScopeStop.ABSENT
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return ScopeStop.UNRESOLVED
+            time.sleep(min(0.1, remaining))
 
 
-def kill_job_group(job: RunningGateJob) -> None:
-    # Also run this after the leader exits: a successful module may have leaked
-    # children. SIGKILL prevents a child that ignores TERM from surviving cleanup.
-    scope = job.scope
-    stopped = scope is not None and stop_module_scope(scope)
-    if not stopped and (scope is None or job.process.returncode is None):
+def process_exited(pid: int, deadline: float) -> bool:
+    try:
+        descriptor = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return True
+    try:
+        with PollSelector() as exits:
+            _ = exits.register(descriptor, EVENT_READ)
+            return bool(exits.select(max(0, deadline - time.monotonic())))
+    finally:
+        os.close(descriptor)
+
+
+def stop_module_group(group: int, deadline: float) -> bool:
+    """Kill the launch group and confirm that its remaining members exited."""
+    try:
+        process_group.send_process_group(group, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdecimal():
+            continue
         try:
-            process_group.send_process_group(job.process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    reap_gate_job(job, block=True)
-    if scope is not None and not stopped:
-        # A scope can appear between the first lookup and the group stop.
-        _ = stop_module_scope(scope)
+            fields = (entry / "stat").read_bytes().rsplit(b")", 1)[1].split()
+        except FileNotFoundError:
+            continue
+        if fields[0] not in (b"Z", b"X") and int(fields[2]) == group:
+            if not process_exited(int(entry.name), deadline):
+                return False
+    return True
+
+
+def kill_job_group(job: RunningGateJob) -> bool:
+    if job.stopped:
+        return True
+    if job.stop_error:
+        return False
+    deadline = module_stop_deadline()
+    scope = job.scope
+    result = ScopeStop.ABSENT if scope is None else stop_module_scope(scope, deadline)
+    try:
+        missing_leader = job.process.returncode is not None or process_exited(job.process.pid, time.monotonic())
+        if result is ScopeStop.STOPPED and missing_leader:
+            stopped = True
+        else:
+            stopped = stop_module_group(job.process.pid, deadline)
+            if stopped and result is not ScopeStop.UNRESOLVED and scope is not None:
+                # The launcher can join the scope before the group stop takes effect.
+                result = stop_module_scope(scope, deadline)
+            stopped = stopped and result is not ScopeStop.UNRESOLVED and (
+                missing_leader or process_exited(job.process.pid, deadline))
+    except OSError as error:
+        stopped = False
+        detail = f" ({error})"
+    else:
+        detail = ""
     recovery = ACTIVE_GATE_RECOVERY.get()
+    if not stopped:
+        location = scope if scope is not None else f"group {job.process.pid}"
+        job.stop_error = f"Module stop unresolved for {location}{detail}. Keep the job folder {job.log.parent}."
+        print(job.stop_error, flush=True)
+        if isinstance(recovery, GateRecovery):
+            recovery.unresolved = True
+            retain_gate_folder(job.log.parent, job.folder_cleanup)
+            print(f"Keep recovery record {recovery.path}.", flush=True)
+        return False
+    reap_gate_job(job, block=True)
     if isinstance(recovery, GateRecovery):
         recovery.remove_group(job.process.pid, scope)
+    job.stopped = True
+    return True
 
 
 def stop_gate_jobs(jobs: Sequence[RunningGateJob]) -> None:
-    """Stop all groups with one deadline, then reap their leaders."""
+    """Stop all groups before returning an unresolved stop."""
     unscoped: list[RunningGateJob] = []
     for job in jobs:
-        if job.scope is None:
+        if job.scope is None and not job.stop_error and not job.stopped:
             unscoped.append(job)
-        else:
-            kill_job_group(job)
-    if not unscoped:
-        return
-    config = admission_records.read_memory_config()
-    deadline = time.monotonic() + config.program_stop_seconds
-    for job in unscoped:
-        try:
-            process_group.send_process_group(job.process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    while True:
+    if unscoped:
+        config = admission_records.read_memory_config()
+        deadline = time.monotonic() + config.program_stop_seconds
         for job in unscoped:
-            reap_gate_job(job)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0 or all(job.process.returncode is not None for job in unscoped):
-            break
-        time.sleep(min(config.program_sample_seconds, remaining))
-    for job in unscoped:
-        kill_job_group(job)
+            try:
+                process_group.send_process_group(job.process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        while True:
+            for job in unscoped:
+                reap_gate_job(job)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or all(job.process.returncode is not None for job in unscoped):
+                break
+            time.sleep(min(config.program_sample_seconds, remaining))
+    unresolved = [job.stop_error for job in jobs if not kill_job_group(job)]
+    if unresolved:
+        raise GateRefused(unresolved[0])
 
 
 def read_time_limit(vcpus: int, modules: Sequence[str], jobs: int,
@@ -1139,7 +1206,8 @@ def module_order(modules: Sequence[tuple[str, Path]], timings: dict[str, float],
 
 def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
                    environment: dict[str, str], log: Path, *,
-                   kind: GateJobKind = GateJobKind.TEST_MODULE) -> RunningGateJob:
+                   kind: GateJobKind = GateJobKind.TEST_MODULE,
+                   pass_fds: tuple[int, ...] = ()) -> RunningGateJob:
     output = log.open("w+")
     started = time.monotonic()
     started_at = time.time()
@@ -1149,7 +1217,7 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
             process = subprocess.Popen([sys.executable, "-I", "-c", SUITE_BOOTSTRAP, *argv],
                                        cwd=repo, env={**host_environment, "MERGE_GATE_PARENT_PID": str(os.getpid())},
                                        stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, text=True,
-                                       start_new_session=True)
+                                       start_new_session=True, pass_fds=pass_fds)
             recovery = ACTIVE_GATE_RECOVERY.get()
             if isinstance(recovery, GateRecovery):
                 recovery.add_group(process.pid)
@@ -1191,7 +1259,8 @@ raise SystemExit(99)
 
 def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
     seconds = time.monotonic() - job.started
-    kill_job_group(job)
+    if not kill_job_group(job):
+        raise GateRefused(job.stop_error)
     job.output.close()
     captured = job.log.read_text(errors="replace")
     marker = job.log.parent / "build-tool-calls.jsonl"
@@ -1797,9 +1866,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         candidate = [checker, "--pythonpath", str(types_python), *type_dirs]
                     else:
                         candidate = [python, str(runner), str(path.parent), path.name]
+                    lease_fd = None if walled_tests.guarded() else build_folders.build_folder_lock_fd(root)
                     try:
                         with walled_tests.gate_inputs(repo, job_environment, read_only=read_only):
-                            argv = walled_tests.command(candidate, root)
+                            argv = walled_tests.command(candidate, root, lease_fd=lease_fd)
                     except walled_tests.WallsUnavailable as error:
                         raise GateRefused(str(error)) from error
                     scope = None
@@ -1810,7 +1880,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         if scope is not None:
                             recovery.scopes.add(scope)
                             recovery.save()
-                        if request.kind is GateJobKind.TYPE_CHECK:
+                        if lease_fd is not None:
+                            job = start_gate_job(suite, path, argv, repo, job_environment, log,
+                                                 kind=request.kind, pass_fds=(lease_fd,))
+                        elif request.kind is GateJobKind.TYPE_CHECK:
                             job = start_gate_job(suite, path, argv, repo, job_environment, log, kind=request.kind)
                         else:
                             job = start_gate_job(suite, path, argv, repo, job_environment, log)
@@ -1848,11 +1921,13 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         finally:
             # Only terminate groups created by this runner. Reap them before tmpfs cleanup.
             with cancellation.defer_cleanup_signals():
-                stop_gate_jobs(running)
-                for job in running:
-                    job.output.close()
-                    if isinstance(job.cpu_slot, SharedCPUSlot):
-                        job.cpu_slot.release()
+                try:
+                    stop_gate_jobs(running)
+                finally:
+                    for job in running:
+                        job.output.close()
+                        if isinstance(job.cpu_slot, SharedCPUSlot):
+                            job.cpu_slot.release()
             if shared:
                 save_measures(timings_path, timings)
                 save_measures(cpu_path, cpu_measures)

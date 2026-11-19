@@ -119,6 +119,19 @@ class PythonRootTests(unittest.TestCase):
             sitecustomize._start_test_run("/checkout")  # pyright: ignore[reportPrivateUsage]
         guarded.assert_called_once_with()
 
+    def test_invalid_classifier_source_refuses_a_test_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "raw_starts.py"
+            _ = source.write_text("def invalid syntax\n")
+            selected = root / "python_startup/sitecustomize.py"
+            with (mock.patch.object(sitecustomize, "__file__", str(selected)),
+                  mock.patch.object(sys, "orig_argv", [sys.executable, "-m", "unittest"]),
+                  mock.patch.dict(sys.modules)):
+                _ = sys.modules.pop("_devtools_raw_starts", None)
+                with self.assertRaisesRegex(SystemExit, "walled tests: cannot load .*invalid syntax"):
+                    sitecustomize._start_test_run(str(root))  # pyright: ignore[reportPrivateUsage]
+
     def checkout(self, root: Path, value: str) -> Path:
         library = root / "scripts/lib"
         copy_startup(root)

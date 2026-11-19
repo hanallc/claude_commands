@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import runpy
 import select
-import signal
 import socket
 import subprocess
 import sys
@@ -19,7 +18,7 @@ import unittest
 from unittest import mock
 from uuid import uuid4
 
-from scripts.lib import conf, walled_tests
+from scripts.lib import build_folders, conf, walled_tests
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import merge_gate
 
@@ -47,17 +46,6 @@ AUDITED_TESTS = (
     + ".test_shell_reports_helper_faults_but_keeps_unusable_results_quiet",
     "scripts.buildlog.test_record.RecordTests.test_step_record_fields",
 )
-CHILD_LABEL = "test-guard-setsid-child"
-CHILD = """import select, sys
-with open(sys.argv[1], 'wb', buffering=0) as ready:
-    ready.write(b'1')
-select.select([], [], [])
-"""
-MODULE = """import subprocess, sys
-child = subprocess.Popen([sys.executable, '-I', '-c', sys.argv[2], sys.argv[1], sys.argv[3]],
-                         start_new_session=True)
-raise SystemExit(child.wait())
-"""
 
 
 def parent_pid(pid: int) -> int:
@@ -274,49 +262,40 @@ class TestWallsProof(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "the required test walls are absent after launch"):
                 walled_tests.main(["--inside", sys.executable, "-I", "-c", "raise SystemExit(0)"])
 
-    def test_gate_stop_removes_a_descendant_in_its_own_session(self) -> None:
-        marker = self.job / "untrusted-startup"
-        _ = (self.job / "sitecustomize.py").write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
+    def test_gate_stop_ends_the_namespace_during_startup(self) -> None:
+        folder = self.enterContext(build_folders.tool_folder("launch", self.job))
+        lease = build_folders.build_folder_lock_fd(folder)
+        marker = folder / "command-started"
+        startup = self.job / "sitecustomize.py"
+        _ = startup.write_text("raise SystemExit('untrusted startup ran')\n")
         environment = {**os.environ, "PYTHONPATH": str(self.job)}
-        channel = self.job / "ready"
-        os.mkfifo(channel, 0o600)
-        argv = self.guarded_command(
-            [sys.executable, "-I", "-c", MODULE, str(channel), CHILD, CHILD_LABEL], environment)
-        match = [os.fsencode(channel), CHILD_LABEL.encode()]
-        with channel.open("r+b", buffering=0) as ready:
-            job = merge_gate.start_gate_job("lib", Path(__file__), argv, CHECKOUT,
-                                           environment, self.job / "gate.log")
-            try:
-                reader = select.poll()
-                leader = os.pidfd_open(job.process.pid)
-                self.addCleanup(os.close, leader)
-                reader.register(ready, select.POLLIN)
-                reader.register(leader, select.POLLIN)
-                events = dict(reader.poll(TEST_HANG_GUARD_SECS * 1000))
-                self.assertTrue(events.get(ready.fileno(), 0) & select.POLLIN, job.log.read_text())
-                self.assertEqual(ready.read(1), b"1")
-                self.assertFalse(marker.exists(), "The gate bootstrap ran untrusted startup code.")
-                descendants: list[int] = []
-                for process in Path("/proc").glob("[0-9]*/cmdline"):
-                    try:
-                        arguments = process.read_bytes().rstrip(b"\0").split(b"\0")
-                    except (FileNotFoundError, ProcessLookupError):
-                        continue
-                    if arguments[-2:] == match:
-                        descendants.append(int(process.parent.name))
-                child, = descendants
-                self.assertEqual(os.getsid(child), child)
-                descriptor = os.pidfd_open(child)
-                self.addCleanup(os.close, descriptor)
-            finally:
-                merge_gate.kill_job_group(job)
-                job.output.close()
-                job.folder_cleanup.close()
-        stopped = select.poll()
-        stopped.register(descriptor, select.POLLHUP)
-        if not stopped.poll(TEST_HANG_GUARD_SECS * 1000):
-            signal.pidfd_send_signal(descriptor, signal.SIGKILL)
-            self.fail("The descendant stayed alive.")
+        info_read, info_write = os.pipe()
+        block_read, block_write = os.pipe()
+        status = self.enterContext(os.fdopen(info_read, "rb"))
+        for descriptor in (block_read, block_write):
+            self.addCleanup(os.close, descriptor)
+        with (mock.patch.object(walled_tests, "guarded", return_value=False),
+              walled_tests.gate_inputs(CHECKOUT, environment, read_only=())):
+            argv = walled_tests.command(["touch", str(marker)], folder, lease_fd=lease)
+        argv[1:1] = ["--info-fd", str(info_write), "--block-fd", str(block_read)]
+        with os.fdopen(info_write, "wb"):
+            job = merge_gate.start_gate_job("lib", Path(__file__), argv, CHECKOUT, environment,
+                                           folder / "gate.log", pass_fds=(lease, info_write, block_read))
+        self.addCleanup(job.output.close)
+        try:
+            ready, _, _ = select.select([info_read], [], [], TEST_HANG_GUARD_SECS)
+            self.assertTrue(ready, job.log.read_text())
+            info = cast(dict[str, int], json.load(status))
+            pid = info["child-pid"]
+            descriptor = os.pidfd_open(pid)
+            self.addCleanup(os.close, descriptor)
+            self.assertEqual(os.getpgid(pid), job.process.pid)
+            self.assertFalse(marker.exists())
+            self.assertNotIn("untrusted startup ran", job.log.read_text())
+        finally:
+            self.assertTrue(merge_gate.kill_job_group(job), job.stop_error)
+        self.assertTrue(select.select([descriptor], [], [], 0)[0], "The namespace PID 1 stayed alive.")
+        self.assertFalse(marker.exists())
 
 
 class TestWallsHookProof(unittest.TestCase):

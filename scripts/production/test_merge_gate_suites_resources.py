@@ -266,7 +266,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
         self.assertEqual(finished.process.returncode, 7)
         self.assertGreater(finished.cpu_seconds, 0.0)
         for job in jobs:
-            merge_gate.kill_job_group(job)
+            self.assertTrue(merge_gate.kill_job_group(job), job.stop_error)
         self.assertEqual(finished.process.returncode, 7)
         self.assertEqual(running.process.returncode, -signal.SIGKILL)
 
@@ -568,9 +568,9 @@ class MergeGateResourcesTests(GateSuitesFixture):
             sampled.update(roots)
             return dict.fromkeys(roots, 1.0)
 
-        def kill_module(job: merge_gate.RunningGateJob) -> None:
+        def kill_module(job: merge_gate.RunningGateJob) -> bool:
             killed[job.process.pid] = job
-            kill(job)
+            return kill(job)
 
         def notify_scope_change(_timeout_ms: int) -> None:
             job, = killed.values()
@@ -621,6 +621,25 @@ class MergeGateResourcesTests(GateSuitesFixture):
         self.assertTrue(cpu_path.is_file())
         self.assertEqual(merge_gate.read_measures(cpu_path), {"hooks/test_first.py": 12.0})
         self.assertGreater(result.jobs[0].cpu_seconds, 0.0)
+
+    def test_scope_stop_preserves_the_record_when_the_deadline_expires(self) -> None:
+        scope = self.root / "stuck.scope"
+        self.write(scope / "cgroup.events", "populated 1\n")
+        self.write(scope / "cgroup.kill", "")
+        record = self.state / "active.json"
+        recovery = merge_gate.GateRecovery(record, str(self.checkout), os.getpid(), "fixture",
+                                           folders=[str(self.root)], scopes={scope})
+        recovery.save()
+        before = record.read_bytes()
+        poll = mock.Mock()
+        with (mock.patch.object(merge_gate, "module_stop_deadline", return_value=0.0),
+              mock.patch.object(select, "poll", return_value=mock.Mock(poll=poll))):
+            with self.assertRaisesRegex(GateRefused, "Module stop unresolved"):
+                recovery.recover()
+        self.assertEqual((scope / "cgroup.kill").read_text(), "1\n")
+        self.assertEqual(record.read_bytes(), before)
+        self.assertTrue(self.root.is_dir())
+        poll.assert_not_called()
 
     def test_module_time_limit_kills_and_reaps_a_detached_orphan(self) -> None:
         processes = OwnedTestProcesses()

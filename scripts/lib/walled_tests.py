@@ -74,7 +74,7 @@ def _kept_environment(settings: conf.ConfigRead, environment: Mapping[str, str])
     return {key: environment[key] for key in keys if key in environment}
 
 
-def command(argv: Sequence[str], job_folder: Path) -> list[str]:
+def command(argv: Sequence[str], job_folder: Path, *, lease_fd: int | None = None) -> list[str]:
     """Build a guarded command. The caller owns the job folder lease."""
     if not argv:
         raise WallsUnavailable("a guarded command requires an executable")
@@ -88,6 +88,8 @@ def command(argv: Sequence[str], job_folder: Path) -> list[str]:
         values.update(TMPDIR=tmp, TMP=tmp, TEMP=tmp, MERGE_GATE_PARENT_PID="1")
         if source.get("COVERAGE_OUT") == f"{tmp}/coverage.json":
             values["COVERAGE_OUT"] = f"{tmp}/coverage.json"
+            if "COVERAGE_TREE_SHA" in source:
+                values["COVERAGE_TREE_SHA"] = source["COVERAGE_TREE_SHA"]
         _ = values.pop("DBUS_SESSION_BUS_ADDRESS", None)
         _ = values.setdefault("BUILDLOG_DIR", f"{tmp}/buildlog")
         _ = values.setdefault("SESSION_TEMP_ROOT", f"{tmp}/session")
@@ -119,8 +121,15 @@ def command(argv: Sequence[str], job_folder: Path) -> list[str]:
         _ = (account / "group").write_text(f"test:x:{gid}:\n", encoding="ascii")
         arguments = [str(executable), "--unshare-user", "--unshare-pid", "--unshare-net",
                      "--unshare-cgroup", "--unshare-ipc", "--unshare-uts", "--cap-drop", "ALL",
-                     "--new-session", "--die-with-parent", "--clearenv", "--proc", "/proc", "--dev", "/dev",
+                     "--die-with-parent", "--clearenv", "--proc", "/proc", "--dev", "/dev",
                      "--tmpfs", "/tmp", "--tmpfs", "/dev/shm", "--dir", HOME]
+        if lease_fd is None:
+            arguments.append("--new-session")
+        else:
+            # The gate starts a private session with no terminal.
+            # Keep PID 1 in that group from clone through exit.
+            # PID 1 holds the folder lease even if the gate exits.
+            arguments.extend(("--sync-fd", str(lease_fd)))
         for path in ("/nix/store", "/bin", "/usr/bin"):
             arguments.extend(("--ro-bind", path, path))
         for name in ("passwd", "group"):

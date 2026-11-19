@@ -399,7 +399,7 @@ try:
         os.chdir(repo)
         from types import ModuleType
         startup = ModuleType('_devtools_python_startup')
-        startup.__file__ = __GATE_STARTUP_FILENAME__
+        startup.__file__ = str(repo / 'scripts/lib/python_startup/sitecustomize.py')
         sys.modules[startup.__name__] = startup
         exec(__GATE_STARTUP_SOURCE__, startup.__dict__)
         startup.select_checkout(sys.argv)
@@ -440,8 +440,7 @@ finally:
     publish('result' if links['step'] == 'size' else 'ready-' + links['boot'])
     if links['step'] == 'start' and result['verdict'] == 'ready':
         (root / 'prepared').touch()
-'''.replace('__GATE_STARTUP_SOURCE__', repr(inspect.getsource(python_startup)))
-    .replace('__GATE_STARTUP_FILENAME__', repr(python_startup.__file__)))
+'''.replace('__GATE_STARTUP_SOURCE__', repr(inspect.getsource(python_startup))))
 
 
 def log_upload(links: dict[str, str]) -> str:
