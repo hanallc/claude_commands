@@ -2980,3 +2980,22 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 - Checkpoint `b3ba4334c`; row `7a8fc310f` on the Phase 161 row `2604acf72`, branch `builds-resources-p162`.
 
 **Files:** `scripts/aws_target/spot_table.py`, `run_cost.py`, `aws_page.py`, `test_aws_page.py`, `test_control.py`.
+
+### Phase 163 — Placement reads its run history through the shared function  · status: todo
+**Source:** builds, 2026-11-19 01:3x EST, from the Phase 162 as-built.
+**Cause:** `run_cost.placement_run_evidence` (Phase 162) copies the history read in `cloud_gate.GateWorker.rank_variants` (lines 571-579). The rule lives in two places.
+
+#### Work Order
+
+**Goal:** placement, the Gate column and the break-even card read gate run history through one function; the copy in `cloud_gate.py` goes away.
+
+**Spec:**
+1. `rank_variants` gets its launch rows and its run evidence from the `run_cost` function. It reads the launch history once; its refused-zone check uses the same rows.
+2. No behavior change: the same window, the same evidence, the same order of variants.
+3. `cloud_gate.py` is aws's file. Tell aws the lines before the edit; merge after aws's runner-start fix.
+
+**Base:** row `7a8fc310f` (Phase 162).
+
+**Files:** `scripts/aws_target/cloud_gate.py`, `scripts/aws_target/run_cost.py`, `scripts/aws_target/test_cloud_gate.py` (only if a test needs a change).
+
+**Acceptance gate:** test_cloud_gate and the aws page suites pass unchanged; types 0; grep finds one `gate_launch_history(` call for placement's window.
