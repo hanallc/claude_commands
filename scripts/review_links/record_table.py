@@ -242,11 +242,33 @@ SCRIPT = r'''const filterControl={
   }
  }
 };
+function recordPlaceParams(){
+ const params=new URLSearchParams(location.search);
+ const fragment=new URLSearchParams(location.hash.slice(1));
+ for(const key of new Set(fragment.keys())) params.delete(key);
+ for(const [key,value] of fragment) params.append(key,value);
+ return params;
+}
+function recordItemLink(params,resolve){
+ const item=params.get('jump') || params.get('item'),saved=history.state?.recordTable;
+ return item && (!saved || saved.pendingItem) ? resolve(item) : item;
+}
+function resolveShownRecordId(index,value){
+ if(!value || index.has(value)) return value;
+ const shown=value.toLowerCase();
+ let key=null;
+ for(const entry of index.values()){
+  if(entry.id.toLowerCase()!==shown) continue;
+  if(key!==null) return value;
+  key=entry.key;
+ }
+ return key ?? value;
+}
 function createRecordTable(options){
 const contentProxy=()=>options.content();
 const defaultShow=options.defaultShow ?? 'open';
 let content=contentProxy(),owner='',show=defaultShow,query='',sort='',direction='asc',type='',sourceOwner='',keys=new Set();
-let linkedItem='',revealedLinkedItem='';
+let linkedItem='',revealedLinkedItem='',pendingItem=false;
 let placeHash=location.hash;
 let highlightedRow,highlightTimer;
 const opened=new Set(),filterNames=options.filters || [],filters={};
@@ -385,13 +407,12 @@ function filterSelection(name){
  };
 }
 function placeParams(){
- const params=new URLSearchParams(location.search);
- const fragment=new URLSearchParams(location.hash.slice(1));
- for(const key of new Set(fragment.keys())) params.delete(key);
- for(const [key,value] of fragment) params.append(key,value);
+ const params=recordPlaceParams();
  options.place?.(params);
  return params;
 }
+const resolveItem=value=>options.resolveItem?.(value) ?? value;
+const itemLinkKey=()=>recordItemLink(placeParams(),resolveItem);
 function place(){return readPlace(placeParams());}
 function itemWithKey(key){
  if(options.hasKey && !options.hasKey(key)) return;
@@ -418,6 +439,7 @@ function readPlace(params,followingItemLink=false){
  const saved=followingItemLink ? null : history.state?.recordTable;
  linkedItem=options.missingItem ? saved?.linkedItem ?? (
   !options.persistLinkedTarget || params.get('linked')==='1' ? item ?? '' : '') : '';
+ pendingItem=Boolean(options.resolveItem && linkedItem && saved?.pendingItem);
  const reveal=options.revealLinked && params.get('reveal')==='1';
  revealedLinkedItem=reveal || saved?.revealedLinkedItem===linkedItem ? linkedItem : '';
  if(saved && (!options.mount || saved.top!==undefined)){
@@ -431,7 +453,12 @@ function readPlace(params,followingItemLink=false){
 function followItemLink({inheritFilters=false,unappliedOnly=false,beforeJump}={}){
  if(unappliedOnly && location.hash===placeHash) return false;
  const params=placeParams();
- const jumpKey=params.get('jump'),key=jumpKey || params.get('item');
+ let unresolved=false;
+ const key=recordItemLink(params,value=>{
+  const resolved=resolveItem(value);
+  unresolved=Boolean(options.resolveItem && !options.hasKey?.(resolved));
+  return resolved;
+ });
  if(!key) return false;
  const motion=rowMotion.size ? motionsByKey().get(key) : undefined;
  if(motion){
@@ -448,7 +475,14 @@ function followItemLink({inheritFilters=false,unappliedOnly=false,beforeJump}={}
   if(!params.has('key')) keys.forEach(key=>params.append('key',key));
  }
  readPlace(params,true);
- jump(key,{pushPlace:false,focusTarget:Boolean(jumpKey),keepMatchingFilters:true});
+ jump(key,{pushPlace:false,focusTarget:Boolean(params.get('jump')),keepMatchingFilters:true,unresolved});
+ return true;
+}
+function retryItemLink(){
+ if(!pendingItem || !linkedItem || location.hash!==placeHash) return false;
+ const key=resolveItem(linkedItem);
+ if(!options.hasKey?.(key)) return false;
+ jump(key,{pushPlace:false,focusTarget:false,keepMatchingFilters:true});
  return true;
 }
 function compare(a,b){
@@ -694,6 +728,9 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
    filterNames.some(name=>filters[name]!==previousFilters[name])))
   writePlace(pushPlace,top);
 }
+function placeState(top){
+ return {recordTable:{opened:[...opened],linkedItem,revealedLinkedItem,top,...(linkedItem && pendingItem ? {pendingItem:true} : {})}};
+}
 function writePlace(push=false,top){
  const place=new URLSearchParams({owner,show,q:query,sort,dir:direction,...(type ? {type} : {}),...(sourceOwner ? {'source-owner':sourceOwner} : {}),
   ...Object.fromEntries(filterNames.filter(name=>filters[name]).map(name=>[name,filters[name]]))});
@@ -702,7 +739,7 @@ function writePlace(push=false,top){
  if(options.persistLinkedTarget && linkedItem) place.set('linked','1');
  if(linkedItem && revealedLinkedItem===linkedItem) place.set('reveal','1');
  keys.forEach(key=>place.append('key',key));
- const hash='#'+place,state={recordTable:{opened:[...opened],linkedItem,revealedLinkedItem,top}};
+ const hash='#'+place,state=placeState(top);
  if(push && hash!==location.hash) history.pushState(state,'',location.pathname+hash);
  else history.replaceState(state,'',location.pathname+hash);
  placeHash=location.hash;
@@ -712,6 +749,7 @@ function restorePlace(event){
  // A changed fragment sends hashchange after popstate.
  if(event?.type==='popstate' && location.hash!==placeHash) return;
  const top=place();
+ if(retryItemLink()) return;
  apply(false,{top,normalizeOwner:!history.state?.recordTable});
  if(Number.isFinite(top)) scrollTo({top,behavior:'instant'});
 }
@@ -719,12 +757,13 @@ function saveDeparturePlace(){
  if(sharedWords() && query!==words().value){
   query=words().value;
   writePlace(false,scrollY);
- }else history.replaceState({recordTable:{opened:[...opened],linkedItem,revealedLinkedItem,top:scrollY}},'');
+ }else history.replaceState(placeState(scrollY),'');
 }
-function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,preserveFilters=false}={}){
+function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,preserveFilters=false,unresolved=false}={}){
  if(pushPlace) saveDeparturePlace();
  const target=itemWithKey(key);
  linkedItem=options.missingItem ? key : '';
+ pendingItem=unresolved;
  if(target){
   if(keys.size) keys.add(key);
   if(options.single) opened.clear();
@@ -813,7 +852,7 @@ function bind(){
   type=button.dataset.typeChip;changeFilter();
  }));
 }
-return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,saveDeparturePlace,get linkedItem(){return linkedItem;},
+return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,retryItemLink,itemLinkKey,saveDeparturePlace,get linkedItem(){return linkedItem;},
  revealMatchingItem(key){
   const target=itemWithKey(key);
   const selection=currentSelection({query:words().value.trim().toLowerCase()});

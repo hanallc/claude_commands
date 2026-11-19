@@ -315,7 +315,11 @@ window.fetch=(url,options)=>{
  const words=document.querySelector('#list-search');
  words.value='which layout';words.dispatchEvent(new Event('input',{bubbles:true}));
  document.querySelector('[data-sort="3"]').click();
- const place=()=>{const params=new URLSearchParams(location.hash.slice(1));params.delete('item');return params.toString();};
+ const place=()=>{
+  const params=new URLSearchParams(location.hash.slice(1));
+  for(const field of ['item','linked','reveal']) params.delete(field);
+  return params.toString();
+ };
  const form=await openCard(rows().find(item=>item.dataset.key===row.dataset.key));
  const before=place(),card=form.closest('.review-panel');
  check(card.querySelector('[data-review-body]').textContent.includes('Which layout should I use?') &&
@@ -4662,21 +4666,73 @@ window.fetch=(url,options={})=>{
  if(options.method==='POST') return Promise.resolve(Response.json({answer:'works'}));
  return sendProbe(url,options);
 };
-if(!sessionStorage.getItem('review-reload')) history.replaceState(null,'','#item=page-owner%2FC1');
+if(!sessionStorage.getItem('review-reload')) history.replaceState(null,'','#'+new URLSearchParams({item:INITIAL_ITEM}));
+</script>"""
+        count_requests = r"""<script>
+let arrivingReviewRow;
+const removeSavedRow=CASE==='restored' && sessionStorage.getItem('review-reload');
+if(CASE==='appearance' || removeSavedRow){
+ const node=document.querySelector('[data-review-index]'),index=JSON.parse(node.textContent);
+ const key=removeSavedRow ? 'page-owner/C1' : 'page-owner/C2';
+ const [removed]=index.r.splice(index.r.findIndex(entry=>entry[0]===key),1);
+ if(!removeSavedRow){arrivingReviewRow=removed;arrivingReviewRow[1]='builds/C2';}
+ node.textContent=JSON.stringify(index);
+}
+const initialBodyRequests=[],fetchBody=fetch;
+window.fetch=(url,options)=>{
+ const key=new URL(url,location.href).searchParams.get('body');
+ if(key) initialBodyRequests.push(key);
+ return fetchBody(url,options);
+};
 </script>"""
         probe = r"""<script>
 (async()=>{
- const failures=[],key='page-owner/C1',check=(condition,message)=>{if(!condition) failures.push(message);};
+ const failures=[],key='page-owner/C1',otherKey='page-owner/C2';
+ const check=(condition,message)=>{if(!condition) failures.push(message);};
  const content=document.querySelector('[data-review]');
- const row=()=>content.querySelector('[data-key="'+key+'"]');
+ const row=(item=key)=>content.querySelector('[data-key="'+item+'"]');
+ const expanded=item=>row(item)?.querySelector('.list-toggle').getAttribute('aria-expanded')==='true';
+ const notice=content.querySelector('[data-missing-item]');
+ const addressItem=()=>new URLSearchParams(location.hash.slice(1)).get('item');
  const fetchCard=fetch;
  window.fetch=(url,options)=>new URL(url,location.href).search==='?version=1'
   ? Promise.resolve(Response.json({version:content.dataset.version,facts:pageRefreshFacts()}))
   : fetchCard(url,options);
+ const follow=async item=>{
+  const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+  location.hash=new URLSearchParams({item});
+  await changed;
+ };
+ const refreshIndex=async update=>{
+  const index=JSON.parse(content.querySelector('[data-review-index]').textContent);
+  update(index);
+  const facts=pageRefreshFacts(),version='confirmed';
+  window.fetch=(url,options)=>{
+   const params=new URL(url,location.href).searchParams;
+   if(params.has('index')) return Promise.resolve(Response.json({index,version,facts}));
+   if(params.has('version') && !params.has('body')) return Promise.resolve(Response.json({version,facts}));
+   return fetchCard(url,options);
+  };
+  const refreshed=new Promise(resolve=>content.addEventListener('review-refreshed',resolve,{once:true}));
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+  await refreshed;
+ };
  try{
-  if(!sessionStorage.getItem('review-reload')){
+  if(CASE==='appearance'){
+   check(!notice.hidden && addressItem()==='builds/C2' && !row(otherKey),
+    'Review shows the notice while the shown ID is missing.');
+   await refreshIndex(index=>index.r.push(arrivingReviewRow));
+   await readyReviewCard(row(otherKey));
+   check(expanded(otherKey) && notice.hidden && addressItem()===otherKey,
+    'A refresh resolves the missing shown ID and opens its card.');
+  }else if(!sessionStorage.getItem('review-reload')){
    if(CASE==='verdict'){
     const form=await readyReviewCard(row());
+    check(expanded(key) && notice.hidden,
+     'A link opens the Change by its shown ID with different letter case.');
+    check(addressItem()===key,'The address uses the row key after the shown ID resolves.');
+    check(initialBodyRequests.length===1 && initialBodyRequests[0]===key,
+     'The first card request uses the row key and loads the body once.');
     const saved=new Promise(resolve=>{
      const observer=new MutationObserver(()=>{
       if(!form.dataset.sending){observer.disconnect();resolve();}
@@ -4686,28 +4742,30 @@ if(!sessionStorage.getItem('review-reload')) history.replaceState(null,'','#item
     form.requestSubmit(form.querySelector('[value="works"]'));
     await saved;
     history.replaceState(null,'','#item=page-owner%2FC1');
+   }else if(CASE==='restored'){
+    check(expanded(key) && notice.hidden && history.state?.recordTable?.linkedItem===key,
+     'Review saves the key of the open card.');
    }else content.querySelector('[data-show-chip="open"]').click();
-   sessionStorage.setItem('review-reload','1');
-   location.reload();return;
-  }
-  if(CASE==='verdict'){
+   if(!failures.length){
+    sessionStorage.setItem('review-reload','1');
+    location.reload();return;
+   }
+  }else if(CASE==='verdict'){
    const savedKey='review-saved-verdicts:'+location.pathname;
-   check(!row() && !content.querySelector('[data-missing-item]').hidden && sessionStorage.getItem(savedKey),
+   check(!row() && !notice.hidden && sessionStorage.getItem(savedKey),
     'A reload hides the completed Change while the snapshot still contains it.');
-   const index=JSON.parse(content.querySelector('[data-review-index]').textContent);
-   index.r=index.r.filter(entry=>entry[0]!==key);
-   const facts=pageRefreshFacts(),version='confirmed';
-   window.fetch=(url,options)=>{
-    const params=new URL(url,location.href).searchParams;
-    if(params.has('index')) return Promise.resolve(Response.json({index,version,facts}));
-    if(params.has('version') && !params.has('body')) return Promise.resolve(Response.json({version,facts}));
-    return fetchCard(url,options);
-   };
-   const refreshed=new Promise(resolve=>content.addEventListener('review-refreshed',resolve,{once:true}));
-   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
-   await refreshed;
+   await refreshIndex(index=>{index.r=index.r.filter(entry=>entry[0]!==key);});
    check(!row() && !sessionStorage.getItem(savedKey),
     'The new snapshot confirms the removal and clears the saved verdict marker.');
+   await follow(otherKey);
+   check(expanded(otherKey) && notice.hidden,'An open card hides the missing item notice.');
+   await follow('unknown/C1');
+   check(!notice.hidden && notice.textContent==='This review is no longer on the Review page.',
+    'An unknown ID shows the missing item notice.');
+  }else if(CASE==='restored'){
+   check(!row() && row(otherKey) && !expanded(otherKey) && !notice.hidden && addressItem()===key,
+    'A missing saved key does not open a card with the same shown ID.');
+   check(initialBodyRequests.length===0,'Review does not request a card for the missing saved key.');
   }else{
    check(content.dataset.show==='open' && !row(),'A reload restores Open when the address names a Done Change.');
   }
@@ -4715,12 +4773,25 @@ if(!sessionStorage.getItem('review-reload')) history.replaceState(null,'','#item
  await sendProbe('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>"""
-        for case in ('verdict', 'show'):
+        for case in ('verdict', 'restored', 'appearance', 'show'):
             with self.subTest(case=case):
                 if case == 'show':
                     _ = change_review.record_verdict(self.fixture.review_list, 'C1', 'works',
                                                      datetime.now(user_zone()).date(), self.fixture.production)
-                page = browser_markup(self.root).replace('<head>', '<head>'+setup, 1)
+                shown_ids = {'page-owner/C1': 'builds/C1'} if case == 'verdict' else {}
+                if case == 'restored':
+                    shown_ids = {'page-owner/C2': 'page-owner/C1'}
+                if shown_ids:
+                    records = [replace(item, id=shown_ids[item.key]) if item.key in shown_ids else item
+                               for item in review_items.read(self.root)]
+                    with patch.object(review_items, 'read', return_value=records):
+                        page = browser_markup(self.root)
+                else:
+                    page = browser_markup(self.root)
+                item = {'verdict': 'BUILDS/c1', 'appearance': 'builds/C2'}.get(case, 'page-owner/C1')
+                page = page.replace('<head>', '<head>'+setup.replace('INITIAL_ITEM', json.dumps(item)), 1)
+                request_script = '<script>'+review_page.CARD_REQUEST_SCRIPT
+                page = page.replace(request_script, count_requests.replace('CASE', json.dumps(case))+request_script, 1)
                 page = page.replace('</body>', probe.replace('CASE', json.dumps(case))+'</body>', 1)
                 self.assertEqual(firefox_probe_results(page.encode()), [[]])
 

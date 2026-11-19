@@ -893,7 +893,7 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
         +'</div><p data-missing-item role="status" hidden></p><p role="status" data-review-notice hidden></p><p data-hidden-action-status role="status" hidden></p>'
         +'<ul data-review-source-notices'+('' if snapshot.notices else ' hidden')+'>'
         +''.join('<li>'+html.escape(notice)+'</li>' for notice in snapshot.notices)+'</ul>'
-        +'<script>'+CARD_REQUEST_SCRIPT+'</script><script type="application/json" data-review-index>'+index+'</script>'
+        +'<script type="application/json" data-review-index>'+index+'</script><script>'+CARD_REQUEST_SCRIPT+'</script>'
         +'<div class="list-table"><table aria-label="Review">'
         +'<colgroup><col style="width:17%"><col style="width:13%"><col style="width:14%"><col style="width:37%">'
         +'<col style="width:12%"><col style="width:7%"></colgroup><thead><tr>'+headers+'</tr></thead>'
@@ -1141,33 +1141,8 @@ background:var(--card);color:var(--ink)}.review-actions .primary{background:var(
 @media(max-width:480px){[data-review] .record-filter-row{grid-template-columns:minmax(0,1fr)}}
 </style>'''
 
-CARD_REQUEST_SCRIPT = r'''
-function requestReviewCard(key,version){
- return fetch(location.pathname+'?'+new URLSearchParams({body:key,version}),{cache:'no-store'})
-  .then(async response=>({response,text:response.ok ? await response.text() : ''}));
-}
-const firstReviewCard=(()=>{
- const fragment=new URLSearchParams(location.hash.slice(1));
- const key=fragment.get('jump') || fragment.get('item') || new URLSearchParams(location.search).get('item');
- if(!key) return null;
- const version=document.querySelector('[data-review]').dataset.version;
- const result=requestReviewCard(key,version);
- void result.catch(()=>{});
- return {key,version,result};
-})();
-'''
-
-SCRIPT = (page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + record_table.SCRIPT
-          + record_table.DATE_TIME_SCRIPT + console.REVIEW_PLACE_SCRIPT + r'''(reviewPlace => {
-let content=document.querySelector('[data-review]');
-const drafts=new Map(),saved=new Map(),bodies=new Map(),bodyRequests=new Map();
-const pendingSaves=new Map();
-const scrollDepartures=new Set();
-const savedVerdictsKey='review-saved-verdicts:'+location.pathname;
+CARD_REQUEST_SCRIPT = record_table.SCRIPT + console.REVIEW_PLACE_SCRIPT + r'''
 const kinds=''' + json.dumps(WIRE_TYPES) + ''',states=''' + json.dumps(INDEX_STATES) + r''';
-let index=readIndex(JSON.parse(content.querySelector('[data-review-index]').textContent));
-let focusAfterLoad=null,firstRequest=firstReviewCard;
-let deferredLink=null,revealCreated=null;
 function indexEntry(payload,row,at){
  const owner=payload.n[row[3]],source=payload.n[row[4]];
  return {key:row[0],id:row[1] || row[0],type:row[13]?'response':kinds[row[2]],owner:owner[0],sourceOwner:source[0],
@@ -1178,6 +1153,39 @@ function indexEntry(payload,row,at){
 function readIndex(payload){
  return new Map(payload.r.map((row,at)=>[row[0],indexEntry(payload,row,at)]));
 }
+let index=readIndex(JSON.parse(document.querySelector('[data-review-index]').textContent));
+function requestReviewCard(key,version){
+ return fetch(location.pathname+'?'+new URLSearchParams({body:key,version}),{cache:'no-store'})
+  .then(async response=>({response,text:response.ok ? await response.text() : ''}));
+}
+const firstReviewCard=(()=>{
+ const frame=window.frameElement;
+ if(frame?.reviewPlace){
+  const {place,table}=frame.reviewPlace;
+  delete frame.reviewPlace;
+  if(!history.state?.recordTable && place===location.pathname+location.search+location.hash)
+   history.replaceState({recordTable:table},'');
+ }
+ const params=recordPlaceParams();
+ legacyReviewPlace(params);
+ const key=recordItemLink(params,value=>resolveShownRecordId(index,value));
+ if(!index.has(key)) return null;
+ const version=document.querySelector('[data-review]').dataset.version;
+ const result=requestReviewCard(key,version);
+ void result.catch(()=>{});
+ return {key,version,result};
+})();
+'''
+
+SCRIPT = (page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT
+          + record_table.DATE_TIME_SCRIPT + r'''(reviewPlace => {
+let content=document.querySelector('[data-review]');
+const drafts=new Map(),saved=new Map(),bodies=new Map(),bodyRequests=new Map();
+const pendingSaves=new Map();
+const scrollDepartures=new Set();
+const savedVerdictsKey='review-saved-verdicts:'+location.pathname;
+let focusAfterLoad=null,firstRequest=firstReviewCard;
+let deferredLink=null,revealCreated=null;
 function allEntries(){return [...index.values()];}
 const escapeText=value=>String(value).replace(/[&<>"']/g,letter=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[letter]));
 const colored=(name,markup)=>markup || escapeText(name);
@@ -1272,7 +1280,8 @@ const view=createRecordTable({content:()=>content,single:true,
   return button ? button.dataset.ownerChip : owner;
  },
  selectOwner:({owner,type,query,keys})=>!owner || allEntries().some(entry=>matches(entry,{owner,type,query,keys})) ? owner : '',
- hasKey:key=>allEntries().some(entry=>entry.key===key),
+ resolveItem:value=>resolveShownRecordId(index,value),
+ hasKey:key=>index.has(key),
  shows:showValues,
  visible:(data,filters)=>{
   const key=data.key,entry=index.get(key),departure=saved.get(key);
@@ -1620,12 +1629,14 @@ function applyReviewIndex(payload){
  }
  storeSavedVerdicts();
  for(const [key,result] of saved) savedEntry(key,result);
- bind();view.apply(false);
+ bind();
+ const openedLink=view.retryItemLink();
+ if(!openedLink) view.apply(false);
  if(focusAfterLoad) restoreFocus(focusAfterLoad.key);
  if(focusedOwner!==undefined && (!document.activeElement?.hasAttribute('data-owner-chip') || document.activeElement.hidden))
   menu.querySelector('[aria-pressed="true"]')?.focus({preventScroll:true});
  content.dataset.loaded='true';
- if(!revealNewItem()) scrollTo({top,behavior:'instant'});
+ if(!revealNewItem() && !openedLink) scrollTo({top,behavior:'instant'});
  content.dispatchEvent(new Event('review-refreshed'));
 }
 bind();
@@ -1642,11 +1653,6 @@ document.addEventListener('review-item-created',event=>{
  revealCreated={key,id};
  void pageRefresh.refresh(true);
 });
-function itemLinkKey(){
- const fragment=new URLSearchParams(location.hash.slice(1)),search=new URLSearchParams(location.search);
- const field=name=>fragment.get(name) ?? search.get(name);
- return field('jump') || (field('item') ?? field('row'));
-}
 function followItemLink(options){
  const applyLink=unappliedOnly=>view.followItemLink({...options,unappliedOnly,beforeJump:key=>{
   if(pendingSaves.has(key)) return false;
@@ -1654,25 +1660,18 @@ function followItemLink(options){
   if(marker && !marker.closes && !marker.question && !marker.handed) saved.delete(key);
   return true;
  }});
- const key=view.hasActiveRowAnimations ? itemLinkKey() : null;
+ const key=view.hasActiveRowAnimations ? view.itemLinkKey() : null;
  if(!key || !content.querySelector('[data-record-motion] .list-toggle[aria-controls="'+CSS.escape(detailId(key))+'"]'))
   return applyLink(options?.unappliedOnly);
  const href=location.href;
  void afterRowAnimations(()=>applyLink(true),()=>location.href===href);
  return true;
 }
-const frame=window.frameElement;
-if(frame?.reviewPlace){
- const {place,table}=frame.reviewPlace;
- delete frame.reviewPlace;
- if(!history.state?.recordTable && place===location.pathname+location.search+location.hash)
-  history.replaceState({recordTable:table},'');
-}
 if(history.state?.recordTable) view.restorePlace();
 else if(!followItemLink()){view.place();view.apply(true,{normalizeOwner:true});}
 function isDeferredLink(key){return deferredLink?.key===key && deferredLink.href===location.href;}
 function restorePlace(event){
- const key=itemLinkKey();
+ const key=view.itemLinkKey();
  if(pendingSaves.has(key)){
   deferredLink={key,href:location.href};return;
  }

@@ -1393,6 +1393,7 @@ An older row without Kind shows no kind line.
 The page shows every row with its recorded kind.
 
 The Review address is `/console/review.html`.
+A link can name a row by its key or by the ID the row shows.
 Each Change card shows its check text and recorded proof as plain paragraphs that keep their line breaks.
 A showrunner Answer on a Change or Investigation card, and a Reply on a Question card, show code blocks with a copy control.
 A code block is fenced code or a line that holds only one backtick span.
