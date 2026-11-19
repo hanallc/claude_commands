@@ -4459,6 +4459,7 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 
 #### Work Order
 
+The shell hook and Python startup use `scripts/lib/direct_test_starts.py` to identify test starts.
 A raw interpreter at a shell can run outside Bubblewrap.
 Shell startup files and Python `.pth` files run before Bubblewrap starts.
 The kernel ends all nested gate processes when PID 1 of the outer job exits.

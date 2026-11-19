@@ -110,11 +110,11 @@ class GateBoxTests(unittest.TestCase):
                   mock.patch.dict(os.environ),
                   mock.patch.dict(sys.modules), mock.patch.object(os, "getcwd", return_value=str(repo))):
                 _ = sys.modules.pop("_devtools_checkout", None)
-                _ = sys.modules.pop("_devtools_raw_starts", None)
+                _ = sys.modules.pop("_devtools_direct_test_starts", None)
                 namespace: dict[str, object] = {"repo": repo, "sys": sys}
                 exec(startup, namespace)
                 self.assertIn(str(repo), sys.path)
-                self.assertNotIn("_devtools_raw_starts", sys.modules)
+                self.assertNotIn("_devtools_direct_test_starts", sys.modules)
 
     def test_guest_names_no_merge_gate_signal_function(self) -> None:
         for code in (gate_box.GUEST, gate_box.CANDIDATE_GUEST, gate_box.PAIRED_GUEST):

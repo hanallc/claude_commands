@@ -122,13 +122,13 @@ class PythonRootTests(unittest.TestCase):
     def test_invalid_classifier_source_refuses_a_test_start(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = root / "raw_starts.py"
+            source = root / "direct_test_starts.py"
             _ = source.write_text("def invalid syntax\n")
             selected = root / "python_startup/sitecustomize.py"
             with (mock.patch.object(sitecustomize, "__file__", str(selected)),
                   mock.patch.object(sys, "orig_argv", [sys.executable, "-m", "unittest"]),
                   mock.patch.dict(sys.modules)):
-                _ = sys.modules.pop("_devtools_raw_starts", None)
+                _ = sys.modules.pop("_devtools_direct_test_starts", None)
                 with self.assertRaisesRegex(SystemExit, "Bubblewrap tests: cannot load .*invalid syntax"):
                     sitecustomize._start_test_run(str(root))  # pyright: ignore[reportPrivateUsage]
 

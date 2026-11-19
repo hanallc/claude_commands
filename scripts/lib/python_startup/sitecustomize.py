@@ -22,7 +22,7 @@ from typing import Protocol, cast
 
 
 STARTUP_FILES = ("scripts/lib/py", "scripts/lib/package_root.py", "scripts/lib/python_startup/sitecustomize.py",
-                 "scripts/lib/raw_starts.py")
+                 "scripts/lib/direct_test_starts.py")
 TEST_RUNNER_FILES = (*STARTUP_FILES, "scripts/test_times/module_run.py", "scripts/lib/descendants.py",
                      "scripts/lib/conf_reads.py", "scripts/lib/build_folders.py", "scripts/lib/build_folder_lock.py",
                      "scripts/lib/boot_identity.py",
@@ -36,25 +36,25 @@ DATACLASS_CODE_TOUCH_SECONDS = 86400
 _dataclass_code_folder: list[str] = []
 
 
-class RawStarts(Protocol):
+class DirectTestStarts(Protocol):
     def is_test_start(self, argv: Sequence[str], /) -> bool: ...
     def python_target(self, argv: tuple[str, ...], /) -> tuple[str, ...]: ...
 
 
-def _load_raw_starts() -> RawStarts:
+def _load_direct_test_starts() -> DirectTestStarts:
     """Load the classifier only for interpreter startup."""
-    name = "_devtools_raw_starts"
+    name = "_devtools_direct_test_starts"
     module = sys.modules.get(name)
     if module is not None:
-        return cast(RawStarts, cast(object, module))
-    path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "raw_starts.py")
+        return cast(DirectTestStarts, cast(object, module))
+    path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "direct_test_starts.py")
     try:
         spec = spec_from_file_location(name, path)
         if spec is None or spec.loader is None:
             raise ImportError("no classifier loader")
         module = module_from_spec(spec)
         spec.loader.exec_module(module)
-        classifier = cast(RawStarts, cast(object, module))
+        classifier = cast(DirectTestStarts, cast(object, module))
         if not callable(classifier.is_test_start) or not callable(classifier.python_target):
             raise TypeError("invalid classifier entry points")
     except Exception as error:
@@ -270,7 +270,7 @@ def kernel_guarded() -> bool:
 
 
 def _start_test_run(selected: str) -> None:
-    classifier = _load_raw_starts()
+    classifier = _load_direct_test_starts()
     original = sys.orig_argv
     target = ["python", *original[1:]]
     if __name__ == "_shim_python_startup":

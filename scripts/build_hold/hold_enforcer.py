@@ -34,7 +34,7 @@ from scripts.mac_test import claim_state
 from scripts.build_hold import override_guard
 from scripts.build_hold.shared_state_defaults import DEFAULT_ENFORCER_DIRECTORY as DEFAULT_STATE_DIRECTORY
 from scripts.buildlog.parse import CARGO_BUILD_VERBS, cargo_subcommand
-from scripts.lib.raw_starts import python_target
+from scripts.lib.direct_test_starts import python_target
 from scripts.lib.suite_runners import SUITE_RUNNERS, starts_suite_runner
 
 from scripts.direct import step_record

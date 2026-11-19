@@ -19,7 +19,7 @@ from typing import TypedDict, cast
 from scripts.buildlog.parse import CARGO_BUILD_VERBS, cargo_subcommand
 from scripts.hooks.tool_call_text import scan_text
 
-from scripts.lib.raw_starts import SHELLS, is_python_command, is_test_start, python_target, shell_target
+from scripts.lib.direct_test_starts import SHELLS, is_python_command, is_test_start, python_target, shell_target
 from scripts.lib.suite_runners import SUITE_RUNNERS, starts_suite_runner
 
 GUARD = Path("scripts/lib/bubble_wrapped_tests.py")

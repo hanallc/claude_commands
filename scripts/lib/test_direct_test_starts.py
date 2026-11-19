@@ -2,10 +2,10 @@
 
 import unittest
 
-from scripts.lib.raw_starts import is_test_start, python_target
+from scripts.lib.direct_test_starts import is_test_start, python_target
 
 
-class RawStartTests(unittest.TestCase):
+class TestDirectTestStarts(unittest.TestCase):
     def test_test_starts(self) -> None:
         commands = (
             ("python3", "-m", "unittest", "suite"),
