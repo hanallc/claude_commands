@@ -8,31 +8,32 @@ import os
 import signal
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import unittest
 from collections.abc import Callable
+from contextlib import suppress
 from unittest import mock
 from pathlib import Path
-from typing import TypedDict, cast, final, override
-from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
+from typing import ClassVar, TypedDict, cast, final, override
 
 from scripts.copies import copies
-from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.wait_for_test_state import wait_until
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lib.fork_test_support import ForkChildren
 from scripts.lib.process_group import send_process_group
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.mac_test import floor_claims
-from scripts.production.cli_fixture import ImmutableGitSeed
+from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli, process_boundary, process_boundary_for_case
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("mac_run.sh")
-MAC_TEST = SCRIPT.parent.parent / "mac_test" / "mac_test.py"
+SCRIPTS = SCRIPT.parents[1]
+MAC_TEST = SCRIPTS / "mac_test" / "mac_test.py"
 SHA = "1234567890abcdef1234567890abcdef12345678"
 MAC_RUN_CONFIG = {
     "mac_run_host": "natemccoy@mac",
@@ -51,6 +52,35 @@ MAC_RUN_CONFIG = {
     "mac_run_example_log_prefix": "/tmp/mac_run_",
     "mac_run_source": "~/rust/hana",
 }
+MAC_TEST_CONFIG = """host=mac
+ci_repo=
+# range: 5e-324..
+connect_timeout_s=6
+# range: 5e-324..
+gh_timeout_s=30
+# range: 5e-324..
+block_hours=4
+# range: 5e-324..
+block_max_hours=48
+# range: 5e-324..
+block_warn_minutes=15
+# range: 5e-324..
+claim_idle_minutes=15
+# range: 5e-324..
+claim_poll_seconds=60
+# range: 5e-324..
+leftover_timeout_s=10
+# range: 5e-324..
+alert_seconds=180
+# range: 5e-324..
+push_seconds=600
+# range: 5e-324..
+stale_seconds=300
+# range: 5e-324..
+repeat_minutes=1440
+# range: 5e-324..
+send_timeout_s=180
+"""
 # owning_session.owning_session() reads these; a Mac block admits the session they name.
 SESSION_SELECTORS = frozenset({
     "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "UNIT_RUN_DIR", "UNIT_SESSION_DIR",
@@ -65,13 +95,78 @@ class CommandEvent(TypedDict):
     input: str
 
 
+class CopiesInvocation(TypedDict):
+    arguments: list[str]
+    cwd: str
+    environment: dict[str, str]
+
+
+COPIES_DISPATCHER = r'''#!/bin/sh
+case "$1:$2" in
+    */copies/copies.py:register-remote|*/copies/copies.py:unregister-remote)
+        if [ -n "$MAC_RUN_COPIES_SOCKET" ]; then
+            shift
+            exec "$MAC_RUN_PYTHON" -IS "$MAC_RUN_COPIES_CLIENT" "$@"
+        fi ;;
+esac
+exec "$MAC_RUN_PYTHON" "$@"
+'''
+
+
+COPIES_CLIENT = r'''
+import json
+import os
+import socket
+import sys
+
+with socket.socket(socket.AF_UNIX) as connection:
+    connection.settimeout(__HANG_GUARD__)
+    connection.connect(os.environ["MAC_RUN_COPIES_SOCKET"])
+    with connection.makefile("rw", encoding="utf-8") as stream:
+        stream.write(json.dumps({"arguments": sys.argv[1:], "cwd": os.getcwd(),
+                                 "environment": dict(os.environ)}) + "\n")
+        stream.flush()
+        status, stdout, stderr = json.loads(stream.readline())
+sys.stdout.write(stdout)
+sys.stderr.write(stderr)
+raise SystemExit(status)
+'''.replace("__HANG_GUARD__", str(TEST_HANG_GUARD_SECS))
+
+
+def serve_copies_commands(listener: socket.socket) -> int:
+    """Run local registry commands with the client shell's arguments and environment."""
+    with listener:
+        while True:
+            connection = listener.accept()[0]
+            with connection, connection.makefile("r", encoding="utf-8") as stream:
+                line = stream.readline()
+                if not line:
+                    continue
+                invocation = cast(CopiesInvocation, json.loads(line))
+                arguments = invocation["arguments"]
+                result = invoke_cli(copies, lambda: copies.main(arguments), arguments,
+                                    invocation["environment"], Path(invocation["cwd"]))
+                reply = json.dumps([result.returncode, result.stdout, result.stderr]) + "\n"
+                with suppress(BrokenPipeError, ConnectionResetError):
+                    connection.sendall(reply.encode("utf-8"))
+
+
 COMMAND_STUB = r'''
 run_real_copies() {
     export PATH=$MAC_RUN_REAL_PATH
     export COPIES_CONFIG=$MAC_RUN_REMOTE_COPIES_CONFIG
     export MAC_TEST_STATE_DIR=$MAC_RUN_REMOTE_CLAIMS
-    eval "$remote"
-    exit $?
+    local request=${remote%'; echo mac_exit=$?'}
+    local -a words
+    words=("${(@Q)${(z)request}}")
+    case ${words[2]} in
+        '~/.claude/scripts/copies/copies.py'|'~/.claude/scripts/lib/scratch.py') ;;
+        *) exit 99 ;;
+    esac
+    MAC_RUN_COPIES_SOCKET= "$MAC_RUN_TEST_SCRIPTS/lib/py" \
+        "$MAC_RUN_TEST_SCRIPTS/${words[2]#\~/.claude/scripts/}" "${words[@]:2}"
+    print -r -- "mac_exit=$?"
+    exit 0
 }
 state=$MAC_RUN_STUB_STATE
 command=${0:t}
@@ -286,6 +381,40 @@ if os.environ.get("MAC_TEST_ADVANCE_WAIT") == "1":
 
 @final
 class MacRunTests(unittest.TestCase):
+    clone_source: ClassVar[Path]
+    clone_head: ClassVar[str]
+    clone_git_config: ClassVar[Path]
+    copies_socket: ClassVar[Path]
+    copies_dispatcher: ClassVar[Path]
+    copies_client: ClassVar[Path]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        directory = tempfile.TemporaryDirectory(prefix="mac-run-source-")
+        cls.addClassCleanup(directory.cleanup)
+        root = Path(directory.name)
+        cls.clone_source = ImmutableGitSeed.create(root, "main", "Clone Tests", "clone@example.invalid",
+                                                    {"source.txt": "content\n"}).checkout
+        cls.clone_git_config = root / "git-config"
+        cls.clone_head = subprocess.check_output(
+            ["git", "-C", str(cls.clone_source), "rev-parse", "HEAD"], text=True,
+            env={**os.environ, "GIT_CONFIG_GLOBAL": str(cls.clone_git_config), "GIT_CONFIG_NOSYSTEM": "1"},
+            timeout=TEST_HANG_GUARD_SECS,
+        ).strip()
+        socket_folder = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="mac-run-", dir="/tmp")))
+        cls.copies_socket = socket_folder / "copies"
+        cls.copies_dispatcher = socket_folder / "python"
+        _ = cls.copies_dispatcher.write_text(COPIES_DISPATCHER)
+        cls.copies_dispatcher.chmod(0o755)
+        cls.copies_client = socket_folder / "client.py"
+        _ = cls.copies_client.write_text(COPIES_CLIENT)
+        children = cls.enterClassContext(ForkChildren())
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(cls.copies_socket))
+            listener.listen()
+            _ = children.start(lambda: serve_copies_commands(listener))
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
@@ -303,8 +432,6 @@ class MacRunTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home = self.root / "home"
         self.home.mkdir()
-        _ = copy_helpers(self.home, *COPY_HELPERS, "scripts/hana_instances", "scripts/accounts",
-                         "scripts/whoami", "scripts/notify", "scripts/maintenance", "config")
         self.state_directory = self.root / "mac-test-state"
         self.stub_state = self.root / "stub-state"
         self.stub_state.mkdir()
@@ -315,18 +442,18 @@ class MacRunTests(unittest.TestCase):
         self.config_path = self.root / "config/mac_test.conf"
         self.temp_directory = self.root / "tmp"
         self.temp_directory.mkdir()
-        _ = write_config_fixture(self.config_path, "ci_repo=\nconnect_timeout_s=6\n"
-                                 + "block_hours=4\nblock_max_hours=48\nclaim_poll_seconds=60\n")
+        self.config_path.parent.mkdir()
+        _ = self.config_path.write_text(MAC_TEST_CONFIG)
         self.write_production_config()
         queue = self.root / "fake-queue.py"
         _ = queue.write_text(QUEUE_STUB)
-        _ = write_config_fixture(self.root / "config/mac_gate.conf",
-            "admission_client_command=" + shlex.join([str(SCRIPT.parents[1] / "lib/py"), str(queue)])
-            + "\nterminate_grace_seconds=3\n")
+        queue_command = shlex.join([str(SCRIPTS / "lib/py"), str(queue)])
+        _ = (self.root / "config/mac_gate.conf").write_text(
+            f"admission_client_command={queue_command}\n# range: 5e-324..\nterminate_grace_seconds=3\n",
+        )
+        self.write_folder_config()
         copies_config = self.config_path.parent / "copies.conf"
-        _ = write_config_fixture(copies_config, f"remote_registry={self.root / 'mirrors'}\n"
-                                 + "owner.verify=verify\nwait_seconds=0.01\n"
-                                 + "git_timeout_seconds=10\nguard_timeout_seconds=10\n")
+        self.write_copies_config(copies_config, self.root / "mirrors")
         stub = self.bin_directory / "command-stub"
         self.write_executable(stub, COMMAND_STUB)
         for name in ("ssh", "scp", "git", "systemd-run", "gh", "rsync", "curl"):
@@ -337,7 +464,8 @@ class MacRunTests(unittest.TestCase):
             SITE_CUSTOMIZE, encoding="utf-8"
         )
         # The runner's session must not own the fixture's Mac block.
-        seed_interpreter_cache(self.root / "cache")
+        boundary = process_boundary_for_case(self)
+        seed_interpreter_cache(self.root / "cache", sys.executable if boundary else self.copies_dispatcher)
         self.environment = {
             **{name: value for name, value in os.environ.items() if name not in SESSION_SELECTORS},
             "HOME": str(self.home),
@@ -345,12 +473,21 @@ class MacRunTests(unittest.TestCase):
             "__ETC_ZSHENV_SOURCED": "1",
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "PYTHONPATH": str(startup),
+            "CONF_DIR": str(self.config_path.parent),
             "COPIES_CONFIG": str(copies_config),
             "MAC_TEST_STATE_DIR": str(self.state_directory),
-            **config_environment(self.config_path.parent),
+            "STAFF_FILE": str(self.root / "staff.json"),
+            "USER_ZONE": "UTC",
+            "SCRATCH_ROOT": str(self.root / "scratch"),
+            "SCRATCH_COPIES_ROOT": str(self.root / "workspaces"),
+            "SCRATCH_HOLDS": str(self.root / "holds.json"),
+            "SESSION_TEMP_ROOT": str(self.root / "session"),
+            "SESSION_FORMER_ROOT": str(self.root / "former-session"),
             "MAC_RUN_STUB_STATE": str(self.stub_state),
             "MAC_RUN_SHA": SHA,
             "MAC_RUN_PYTHON": sys.executable,
+            "MAC_RUN_COPIES_SOCKET": "" if boundary else str(self.copies_socket),
+            "MAC_RUN_COPIES_CLIENT": str(self.copies_client),
             "MAC_RUN_CHECKOUT": str(self.home / "scratch" / "gate-mac-run-private" / "checkout"),
             "HANA_TEST_PURPOSE": "Mac launch coordination",
             "TMPDIR": str(self.temp_directory),
@@ -362,6 +499,44 @@ class MacRunTests(unittest.TestCase):
         settings = MAC_RUN_CONFIG | overrides
         _ = (self.config_path.parent / "production.conf").write_text(
             "".join(f"{name}={value}\n" for name, value in settings.items())
+        )
+
+    def write_folder_config(self) -> None:
+        config = self.config_path.parent
+        _ = (config / "build_targets.conf").write_text(
+            "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n",
+        )
+        _ = (config / "build_folders.conf").write_text(
+            """patterns.legacy-unique={purpose}{suffix}
+patterns.scratch={purpose}-{suffix}
+# range: 0.001..60
+locks.probe_wait_seconds=0.25
+# range: 0.001..1
+locks.probe_retry_seconds=1
+""",
+        )
+        _ = (config / "scratch.conf").write_text(
+            f"""visible_root={self.root / 'repro'}
+# whole: 1..
+default_life_seconds=86400
+# whole: 1..
+suffix_length=6
+# whole: 1..
+record_lock_attempts=3
+# whole: 1..
+repo_depth=3
+repo_skip=target node_modules .git
+""",
+        )
+
+    def write_copies_config(self, path: Path, registry: Path) -> None:
+        _ = path.write_text(
+            f"""remote_registry={registry}
+owner.verify=verify
+wait_seconds=0.01
+git_timeout_seconds=10
+guard_timeout_seconds=10
+""",
         )
 
     def write_executable(self, path: Path, source: str) -> None:
@@ -543,8 +718,9 @@ class MacRunTests(unittest.TestCase):
             smoke_ready_seconds="300", smoke_exit_seconds="30", smoke_connect_seconds="1",
             smoke_call_seconds="5", smoke_signal_grace_seconds="2", smoke_poll_seconds="1",
         )
-        _ = write_config_fixture(self.root / "config/hana_shot.conf",
-                                 "refused_port=17461\nhost=192.0.2.46\n")
+        _ = (self.root / "config/hana_shot.conf").write_text(
+            "# whole: 1..\nrefused_port=17461\nhost=192.0.2.46\n",
+        )
         script = SCRIPT.with_name("smoke_launch.sh")
 
         def smoke(port: str) -> subprocess.CompletedProcess[str]:
@@ -797,25 +973,16 @@ cleanup_mac_run
 
     def assert_clone_records_after_cleanup(self, cleanup_status: int, *,
                                            prepare_cleanup: Callable[[Path], None] = lambda _: None) -> None:
-        source = ImmutableGitSeed.create(self.root, "main", "Clone Tests", "clone@example.invalid",
-                                         {"source.txt": "content\n"}).checkout
-        head = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"],
-                              capture_output=True, text=True, check=True).stdout.strip()
-        self.write_production_config(mac_run_source=str(source))
-        local = self.root / "local-copies"
-        remote = self.root / "remote-copies"
-        local.mkdir()
-        remote.mkdir()
-        local_environment = copies_environment(local)
-        remote_environment = copies_environment(remote)
-        _ = shutil.copy2(Path(local_environment["CONF_DIR"]) / "build_folders.conf",
-                         Path(self.environment["CONF_DIR"]) / "build_folders.conf")
-        self.environment.update({key: value for key, value in local_environment.items()
-                                 if key not in ("HOME", "CONF_DIR")})
+        self.write_production_config(mac_run_source=str(self.clone_source))
+        local_config = self.environment["COPIES_CONFIG"]
+        remote_config = self.root / "remote-copies.conf"
+        self.write_copies_config(remote_config, self.root / "remote-mirrors")
         self.environment.update({
-            "MAC_RUN_SHA": head, "MAC_RUN_REAL_COPIES": "1", "MAC_RUN_REAL_PATH": os.environ["PATH"],
-            "MAC_RUN_REMOTE_COPIES_CONFIG": remote_environment["COPIES_CONFIG"],
+            "MAC_RUN_SHA": self.clone_head, "MAC_RUN_REAL_COPIES": "1", "MAC_RUN_REAL_PATH": os.environ["PATH"],
+            "MAC_RUN_REMOTE_COPIES_CONFIG": str(remote_config),
             "MAC_RUN_REMOTE_CLAIMS": str(self.root / "remote-claims"),
+            "MAC_RUN_TEST_SCRIPTS": str(SCRIPTS),
+            "GIT_CONFIG_GLOBAL": str(self.clone_git_config), "GIT_CONFIG_NOSYSTEM": "1",
         })
         process = self.start_mac_run(extra={"MAC_RUN_HOLD_BUILD": "1", "MAC_RUN_CLEANUP_STATUS": str(cleanup_status)})
         try:
@@ -824,8 +991,8 @@ cleanup_mac_run
             if process.poll() is not None:
                 output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.fail(output + errors)
-            before_local = self.clone_registry_records(local_environment["COPIES_CONFIG"])
-            before_remote = self.clone_registry_records(remote_environment["COPIES_CONFIG"])
+            before_local = self.clone_registry_records(local_config)
+            before_remote = self.clone_registry_records(str(remote_config))
             self.assertEqual(len(before_local), 1)
             self.assertEqual(len(before_remote), 1)
             self.assertEqual(before_local[0]["path"], before_remote[0]["path"])
@@ -842,8 +1009,8 @@ cleanup_mac_run
         # The next run cleans the records of the run that the signal ended.
         after = self.mac_run(extra={"MAC_RUN_CLEANUP_STATUS": str(cleanup_status)})
         self.assertEqual(after.returncode, cleanup_status and 4, after.stdout + after.stderr)
-        for name, settings, before in (("natedev", local_environment["COPIES_CONFIG"], before_local),
-                                       ("Mac", remote_environment["COPIES_CONFIG"], before_remote)):
+        for name, settings, before in (("natedev", local_config, before_local),
+                                       ("Mac", str(remote_config), before_remote)):
             with self.subTest(registry=name):
                 records = self.clone_registry_records(settings)
                 if cleanup_status:
@@ -852,6 +1019,7 @@ cleanup_mac_run
                 else:
                     self.assertEqual(records, [])
 
+    @process_boundary
     def test_successful_clone_cleanup_removes_both_registry_records(self) -> None:
         self.assert_clone_records_after_cleanup(0)
 
@@ -864,7 +1032,10 @@ cleanup_mac_run
             patterns = {f"/{name}" for name in floor_claims.MIRROR_METADATA}
             _ = exclude.write_text("\n".join(line for line in exclude.read_text().splitlines()
                                            if line not in patterns) + "\n")
-            status = copies.git(checkout, "status", "--porcelain").decode().splitlines()
+            with mock.patch.dict(os.environ, {"COPIES_CONFIG": self.environment["COPIES_CONFIG"],
+                                             "GIT_CONFIG_GLOBAL": str(self.clone_git_config),
+                                             "GIT_CONFIG_NOSYSTEM": "1"}):
+                status = copies.git(checkout, "status", "--porcelain").decode().splitlines()
             self.assertEqual(set(status), {f"?? {name}" for name in floor_claims.MIRROR_METADATA})
 
         self.assert_clone_records_after_cleanup(0, prepare_cleanup=remove_exclusions)
