@@ -4835,7 +4835,8 @@ def sent_line(at: datetime) -> str:
 
 def queued_sent_line(stored_time: str) -> str:
     try:
-        return sent_line(datetime.fromisoformat(stored_time))
+        at = datetime.fromisoformat(stored_time)
+        return sent_line(at) if at.utcoffset() is not None else ""
     except (OverflowError, ValueError):
         return ""
 

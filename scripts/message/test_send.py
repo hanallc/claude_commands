@@ -1259,7 +1259,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         entry = {"time": "2026-11-19T06:12:00+00:00", "from": "Sender", "to": "session:recipient",
                  "summary": "Message", "text": "Valid body", "key": None, "reason": "offline"}
-        for bad_time in ("0000 unreadable", "0001-01-01T00:00:00+00:00"):
+        for bad_time in ("0000 unreadable", "0001-01-01T00:00:00+00:00", "2026-11-19", "2026-11-19T05:00:00"):
             with self.subTest(time=bad_time), mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
                 bad = {**entry, "time": bad_time, "text": "Body without a Sent line"}
                 _ = path.write_text(json.dumps(bad) + "\n" + json.dumps(entry) + "\n")
