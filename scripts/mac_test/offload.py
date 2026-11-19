@@ -10,6 +10,7 @@ except FileNotFoundError:
 import argparse
 from collections.abc import Generator, Sequence
 from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from functools import partial
 from importlib import import_module
@@ -566,6 +567,18 @@ def fenced_start_command(identity: claim_state.ClaimIdentity, target: str, comma
             + '\nexit "$dispatch_status"')
 
 
+class MirrorNotLeased:
+    """The request has no per-run mirror lease."""
+
+
+@dataclass(frozen=True)
+class LeasedMirror:
+    """A mirror and the stack that releases its lease."""
+
+    mirror: copies.RemoteMirror
+    lease: ExitStack
+
+
 @dataclass(frozen=True)
 class OffloadRequest:
     """One Mac verb, its arguments and the metadata sent with it.
@@ -592,6 +605,7 @@ class OffloadRequest:
     repository_scope: copy_record.RepositoryScope = copy_record.ALL_REPOSITORIES
     kind: str = ""
     placement: DirectOffloadRequest | AssignedOffloadRequest = DirectOffloadRequest()
+    leased_mirror: copies.RemoteMirror | MirrorNotLeased = MirrorNotLeased()
 
     @property
     def source_root(self) -> Path:
@@ -1384,8 +1398,18 @@ def linux_mirror_root() -> Path:
     return Path('.local/state/build-target/mirror')
 
 
+class ReadMacMirrorRoot:
+    """No run has selected a Mac mirror root in this context."""
+
+
+RUN_MAC_MIRROR_ROOT = ContextVar[MacMirrorRoot | ReadMacMirrorRoot]("run_mac_mirror_root", default=ReadMacMirrorRoot())
+
+
 def mac_mirror_root() -> MacMirrorRoot:
     """Read the remote mirror root without expanding the local home folder."""
+    selected = RUN_MAC_MIRROR_ROOT.get()
+    if isinstance(selected, MacMirrorRoot):
+        return selected
     return conf.read("mac_test").value("mirror_root", MacMirrorRoot.parse)
 
 
@@ -1988,7 +2012,8 @@ def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repos
     if has_custom_target(request.nextest_words):
         return "echo mac_cleanup=skipped"
     budget = config.values.get(f"mac_budget_gib.{repository.name}", config.default_target_budget_gib)
-    return remote_cleanup_script(remote_mirror(repository, request.target, request.slot), budget, config.free_floor_gib)
+    mirror = mirror_path_for_request(request, repository)
+    return remote_cleanup_script(mirror, budget, config.free_floor_gib)
 
 
 def remote_cleanup_script(mirror: str, budget: str, free_floor_gib: float) -> str:
@@ -2040,7 +2065,7 @@ def remote_test_command(
         from scripts.mac_test import linux_runner
         words = request.nextest_words
         return linux_runner.command_script(
-            remote_mirror(repository, request.target, request.slot),
+            mirror_path_for_request(request, repository),
             {**runner_values(config, request.target), "step_kind": request.kind or eligibility.verb_kind(request.verb)},
             repository.policy_name, request.verb, words, request.call_id,
             sent_tree_key.value if isinstance(sent_tree_key, KnownTreeKey) else "",
@@ -2058,7 +2083,8 @@ def remote_test_command(
         if isinstance(sent_tree_key, KnownTreeKey) else ""
     )
     repo_identity = f"BUILDLOG_REPO_IDENTITY={shlex.quote(repository.key)} " if repository.key else ""
-    mirror = legacy_mac_mirror(repository)
+    mirror = (legacy_mac_mirror(repository) if isinstance(request.leased_mirror, MirrorNotLeased)
+              else request.leased_mirror.path)
     target = shlex.quote(f"{mirror}/target")
     if isinstance(request.fetch, FetchFolder):
         cleanup_command = "echo mac_cleanup=kept"
@@ -2170,8 +2196,9 @@ def fetch_folder(
         if destination.exists() or destination.is_symlink() or partial.exists() or partial.is_symlink():
             return FetchFailed("the fetched destination already exists")
         quoted = shlex.quote(folder.value)
+        mirror = mirror_path_for_request(request, repository)
         size_command = (
-            f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
+            f"cd {shlex.quote(mirror)} && "
             + f"if [ -d {quoted} ]; then "
             + f"if size=$(du -sk {quoted}); then "
             + "printf 'fetch_kib=%s\\nrc=0\\n' \"${size%%[[:space:]]*}\"; else exit 1; fi; "
@@ -2194,7 +2221,7 @@ def fetch_folder(
         landing.mkdir(parents=True)
         copied = controller.capture([
             "rsync", "-rlp", "--compress", "--safe-links", "-e", shlex.join(["ssh", *ssh_options(config.connection)]),
-            f"{config.host}:{remote_mirror(repository, request.target, request.slot)}/{folder.value}/", f"{landing}/",
+            f"{config.host}:{mirror}/{folder.value}/", f"{landing}/",
         ])
         if not isinstance(copied, CommandOutput) or copied.status != 0:
             return FetchFailed("the folder copy from the Mac failed")
@@ -2230,7 +2257,7 @@ def return_fix(
     ignored = ignored_paths(controller, request.repo_root)
     if isinstance(ignored, IgnoredPathListingFailed):
         return fix_return.FixFailed("git did not list the ignored paths")
-    mirror = remote_mirror(repository, request.target, request.slot)
+    mirror = mirror_path_for_request(request, repository)
     transport = ["-e", shlex.join(["ssh", *ssh_options(config.connection)])]
     metadata = [f"--exclude=/{name}" for name in floor_claims.MIRROR_METADATA]
     root = request.repo_root
@@ -2617,7 +2644,8 @@ def claimed_run(
         if linux:
             running = f"running on {request.target} (Linux, host {probe.hostname})"
         print(f"mac_test: {running}; tree copied in {copy_seconds:.1f} s", flush=True)
-        copies.register_remote(request_mirror(config, request, repository))
+        mirror = request_mirror(config, request, repository)
+        copies.register_remote(mirror)
         if isinstance(request.placement, AssignedOffloadRequest):
             from scripts.build_queue import admission_client, admission_protocol as wire
 
@@ -2653,7 +2681,7 @@ def claimed_run(
             evidence.launch_authorized = True
         release_allowed = False
         identity = controller.claim_identity
-        command = copies.remote_use_command(request_mirror(config, request, repository), step_command)
+        command = copies.remote_use_command(mirror, step_command)
         if isinstance(identity, claim_state.ClaimIdentity):
             command = fenced_start_command(identity, request.target, command, scope_key=controller.claim_scope_key)
         remote_status = controller.stream_mac_run(
@@ -2698,14 +2726,14 @@ def claimed_run(
         if not linux and isinstance(remote_status, ReportedMacStatus) and isinstance(request.fetch, FetchFolder):
             cleanup = controller.stream_mac_run([
                 *ssh_prefix(config),
-                copies.remote_use_command(request_mirror(config, request, repository),
+                copies.remote_use_command(mirror,
                     f"echo mac_exit={remote_status.status}; " + remote_cleanup_command(config, request, repository)),
             ])
             remote_status = replace(remote_status, cleanup=(cleanup.cleanup if isinstance(cleanup, ReportedMacStatus)
                                                           else CleanupUnconfirmed()))
         evidence.completion = "confirmed"
         report_cleanup(remote_status.cleanup, request.target,
-                       path=f"~/{mirror_target(repository, request.target, request.slot)}",
+                       path=f"~/{mirror.path}/target",
                        free_floor_gib=config.free_floor_gib)
         if isinstance(remote_status.cleanup, CleanupUnconfirmed):
             checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
@@ -3175,18 +3203,22 @@ def run_offload(
 
     try:
         with ExitStack() as admission_leases:
+            if not linux:
+                token = RUN_MAC_MIRROR_ROOT.set(mac_mirror_root())
+                _ = admission_leases.callback(RUN_MAC_MIRROR_ROOT.reset, token)
             slots = (target_config.slot_capacity(config.values, repository.name,
                      missing=target_config.MissingSlotCapacity.SINGLE_SLOT) if linux else 1)
-            leases: dict[int, ExitStack] = {}
+            leases: dict[int, LeasedMirror] = {}
             selected_slots = ((request.placement.assignment.destination.slot or 1,)
                               if isinstance(request.placement, AssignedOffloadRequest) else range(1, slots + 1))
             for slot in selected_slots:
                 lease = ExitStack()
+                mirror = request_mirror(config, replace(request, slot=slot), repository)
                 try:
-                    lease.enter_context(copies.remote_lease(request_mirror(config, replace(request, slot=slot), repository)))
+                    lease.enter_context(copies.remote_lease(mirror))
                 except copies.BusyRemoteMirror:
                     continue
-                leases[slot] = admission_leases.enter_context(lease)
+                leases[slot] = LeasedMirror(mirror, admission_leases.enter_context(lease))
             result = leased_offload(controller, config, request, repository, started, linux, leases)
             if isinstance(result, DeclinedMacRun) and result.reason == "copy" and mirror_busy_refusal(result.detail):
                 write_mirror_busy(config, repository.name, request.target)
@@ -3195,9 +3227,17 @@ def run_offload(
         return DeclinedMacRun("copy", elapsed_seconds(started), str(error))
 
 
+def mirror_path_for_request(request: OffloadRequest, repository: KnownRepository) -> str:
+    if isinstance(request.leased_mirror, MirrorNotLeased):
+        return remote_mirror(repository, request.target, request.slot)
+    return request.leased_mirror.path
+
+
 def request_mirror(config: OffloadConfig, request: OffloadRequest, repository: KnownRepository) -> copies.RemoteMirror:
     from scripts.copies import copies
 
+    if not isinstance(request.leased_mirror, MirrorNotLeased):
+        return request.leased_mirror
     scope = request.repository_scope
     if isinstance(scope, copies.AllRepositories):
         scope = copies.SelectedRepository(repository.name)
@@ -3208,7 +3248,7 @@ def request_mirror(config: OffloadConfig, request: OffloadRequest, repository: K
 
 def leased_offload(controller: ProcessController, config: OffloadConfig, request: OffloadRequest,
                    repository: KnownRepository, started: float, linux: bool,
-                   leases: dict[int, ExitStack]) -> MacOffloadResult:
+                   leases: dict[int, LeasedMirror]) -> MacOffloadResult:
     if not leases:
         write_mirror_busy(config, repository.name, request.target)
         return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
@@ -3250,8 +3290,8 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
         return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
     for slot, lease in leases.items():
         if slot != claim.slot:
-            lease.close()
-    selected = replace(request, slot=claim.slot)
+            lease.lease.close()
+    selected = replace(request, slot=claim.slot, leased_mirror=leases[claim.slot].mirror)
     result = claimed_run(controller, config, selected, repository, started)
     if linux and isinstance(result, PassedOnMac):
         return PassedOnTarget(result.seconds, result.build_target_directory)
