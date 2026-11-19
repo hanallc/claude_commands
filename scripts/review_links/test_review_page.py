@@ -18,6 +18,7 @@ import threading
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, tzinfo
+from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Self, TextIO, cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -1095,9 +1096,11 @@ class ReviewPageTests(unittest.TestCase):
             _ = snapshot.body('missing/key')
 
     def test_snapshot_changes_outside_requests_and_retains_the_current_version(self) -> None:
-        cache = review_page.ReviewSnapshotCache(self.root)
+        members = staff.snapshot()
+        cache = review_page.ReviewSnapshotCache(self.root, staff_scope=partial(staff.supplied_snapshot, members))
         self.addCleanup(cache.close)
         previous = cache.get()
+        self.assertIs(previous.members, members)
         entered, release, completed = threading.Event(), threading.Event(), threading.Event()
         original = review_page.build_snapshot
 
@@ -1121,6 +1124,7 @@ class ReviewPageTests(unittest.TestCase):
             self.assertTrue(completed.wait(TEST_HANG_GUARD_SECS))
         cache.synchronize()
         fresh = cache.get()
+        self.assertIs(fresh.members, members)
         self.assertNotEqual(fresh.version, previous.version)
         self.assertIn('A newly filed question?', fresh.render().decode())
 

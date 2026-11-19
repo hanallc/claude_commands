@@ -25,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from http.client import HTTPConnection
 from io import StringIO
 from pathlib import Path
@@ -169,6 +170,120 @@ class ReviewLinksServerTests(unittest.TestCase):
             return HttpReply(response.status, response.getheader('Content-Type', ''), response.read())
         finally:
             connection.close()
+
+    def test_remote_staff_reads_reuse_the_snapshot_until_it_expires(self) -> None:
+        seconds = conf.read("review_links").number("staff_snapshot_seconds")
+        for mode, expected in (
+            ("owner", ((200, 1), (200, 2), (200, 3))),
+            ("remote", ((200, 1), (200, 1), (200, 2))),
+            ("remote failure", ((503, 2), (503, 3), (200, 4))),
+        ):
+            self.server.clear_staff_snapshot()
+            now = 100.0
+            delay = seconds / 2 if mode == "remote failure" else 0
+            finished = now + delay
+            reads = 0
+
+            def read() -> staff.StaffSnapshot:
+                nonlocal now, reads
+                reads += 1
+                if mode == "remote failure" and now < finished + seconds:
+                    if reads == 1:
+                        now += delay
+                    raise staff.StaffUnreadable("The staff authority is unavailable.")
+                return staff.local_snapshot()
+
+            with (self.subTest(mode=mode),
+                  patch.object(staff, "is_owner", lambda: mode == "owner"),
+                  patch.object(staff, "authority_snapshot", read),
+                  patch.object(self.server, "verified_tailscale_address", self.server.bound_address),
+                  patch.object(time, "monotonic", lambda: now)):
+                for at, (status, count) in zip((now, finished + seconds * 0.75, finished + seconds + 1), expected):
+                    now = at
+                    self.assertEqual(self.new_item_http().status, status)
+                    self.assertEqual(reads, count)
+
+    def test_post_discards_the_cached_staff_snapshot(self) -> None:
+        configuration = self.root.parent / "cache-config"
+        _ = shutil.copytree(conf.path("review_links").parent, configuration)
+        _ = write_config_fixture(configuration / "disks.conf", f"output_folder={self.root / 'disks'}\n")
+        _ = write_config_fixture(configuration / "memory_feed.conf", f"output_folder={self.root / 'builds'}\n")
+        complete = threading.Event()
+        reads: list[staff.StaffSnapshot] = []
+        during_post: list[tuple[int, int]] = []
+        get_recipients = self.new_item_http
+
+        class StaffCacheFixtureHandler(serve.ReviewLinksHandler):
+            @override
+            def do_POST(self) -> None:
+                try:
+                    super().do_POST()
+                finally:
+                    complete.set()
+
+            @override
+            def new_item_post(self) -> None:
+                during_post.append((get_recipients().status, len(reads)))
+                super().new_item_post()
+
+        def read() -> staff.StaffSnapshot:
+            members = staff.local_snapshot()
+            reads.append(members)
+            return members
+
+        def post_action(path: str, body: str) -> int:
+            complete.clear()
+            status = self.post(path, body)[0]
+            self.assertTrue(complete.wait(TEST_HANG_GUARD_SECS))
+            return status
+
+        def new_item() -> int:
+            self.server.clear_staff_snapshot()
+            before = len(reads)
+            complete.clear()
+            status = self.new_item_http(b"{").status
+            self.assertTrue(complete.wait(TEST_HANG_GUARD_SECS))
+            self.assertEqual(during_post, [(200, before + 1)])
+            return status
+
+        with (patch.dict(os.environ, {"CONF_DIR": str(configuration),
+                                      "REVIEW_LINKS_ROOT": str(self.root), "REVIEW_LINKS_HOST": "127.0.0.1",
+                                      "XDG_STATE_HOME": str(self.root.parent / "state")}),
+              patch.object(accounts_page, "TUNE", (sys.executable, "-c", "pass")),
+              patch.object(self.server, "RequestHandlerClass", StaffCacheFixtureHandler),
+              patch.object(self.server, "verified_tailscale_address", self.server.bound_address)):
+            cache = self.server.review_cache
+            cache.invalidate()
+            cache.synchronize()
+            previous = cache.get()
+            with (patch.object(staff, "is_owner", lambda: False),
+                  patch.object(staff, "authority_snapshot", read),
+                  patch.object(time, "monotonic", lambda: 100.0)):
+                self.assertEqual(reads, [])
+                self.assertEqual(self.new_item_http().status, 200)
+                self.assertEqual(len(reads), 1)
+                for action, submit, status, additional_reads in (
+                    ("console", lambda: self.request("/console/").status, 200, 0),
+                    ("news", partial(post_action, "/console/news", "open=review"), 200, 0),
+                    ("Accounts color", partial(post_action, accounts_page.PAGE_PATH, "key=role.worker&value=%23010203"), 200, 0),
+                    ("new item", new_item, 400, 2),
+                ):
+                    with self.subTest(action=action):
+                        before = len(reads)
+                        self.assertEqual(submit(), status)
+                        self.assertEqual(self.new_item_http().status, 200)
+                        count = before + additional_reads
+                        self.assertEqual(len(reads), count)
+                        for _ in range(2):
+                            cache.invalidate()
+                            cache.synchronize()
+                            current = cache.get()
+                            self.assertIsNot(current, previous)
+                            self.assertEqual(len(reads), count)
+                            self.assertIs(current.members, reads[-1])
+                            previous = current
+                        self.assertEqual(self.new_item_http().status, 200)
+                        self.assertEqual(len(reads), count)
 
     def test_new_item_options_and_refusals(self) -> None:
         case = self.review_fixture()
