@@ -1438,6 +1438,30 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
 
+### Phase 86 — A merge run survives an account move, and a changed batch after a stopped run is refused  · status: todo
+**Depends on:** none (branch from main 815070e57)
+
+#### Work Order
+
+**Goal:** the sdlc showrunner (about 10:00 EST Nov 19; nate approved both on the Review page at 09:48 EST, via dwight). On Nov 19 the 06:55 and 07:16 EST account moves killed spacetime merge batches 1119a and 1119c, one during its test. At about 01:00 EST spacetime reran stopped batch 1118c with one more row; `resume_merged_items` resumed the merged items alone and tested an item without the new fix.
+
+**Spec:**
+1. A `merge_checkpoint.py` run outlives an account move of the session that started it. Find the real cause of the 1119a and 1119c stops first: the process tree, the starting route (detached_runs.py or a direct call) and what the move ended.
+2. Start the run in its own process session, away from the starting session. The move must not end it.
+3. Keep the run record, so a stop still goes through `detached_runs.py stop`. Add no signal handler.
+4. When a stopped batch left unpushed merges and the new batch differs from it, `merge_checkpoint.py --batch` refuses. The refusal names the step: reset the merge branch to its pushed tip, then start a fresh batch.
+5. A rerun of the same stopped batch keeps today's resume.
+6. Add rows to the existing tests: a move-shaped stop of the starting session leaves the run live; a changed batch over unpushed merges refuses with the step; the same batch resumes.
+
+**Files:** `scripts/production/merge_checkpoint.py`, its tests, the starting route the cause names, `docs/as-built/` where it states the merge run rules.
+
+**Workers:** 1 writer.
+
+**Order:** after phase 85; the showrunner orders the merge.
+
+**Acceptance gate:**
+1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
