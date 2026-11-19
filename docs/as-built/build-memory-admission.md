@@ -1946,9 +1946,9 @@ Each later finalization attempt uses the same guard, so other admissions continu
 For a local `merge-gate` request, the service reads the PID from the socket credentials.
 The peer must be the request owner or one of its descendants.
 An ancestor of the peer must match a live land record by PID and process start time.
-The service also checks that the request session's staff chain reaches the fixed staff ID of `natemerge`.
+The shared check reads the land process's session and checks its staff chain for the fixed staff ID of `natemerge`.
 A unit trial without a matching land record keeps its normal place.
-The service checks the land record and process again before it changes the order.
+The service repeats the shared check for that land before it changes the order.
 
 The first eligible test from each land can move ahead in the natedev memory queue.
 It must fit within the normal memory limits with all current claims in place.

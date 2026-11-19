@@ -889,6 +889,37 @@ class LandingWaitTests(unittest.TestCase):
         assert isinstance(request.profile, records.StepProfile)
         return replace(request, identity=replace(request.identity, job=job), profile=replace(request.profile, repo=repository))
 
+    def test_landing_test_checks_the_land_session_and_the_socket_peer_owner(self) -> None:
+        merge_member = staff.StaffRow(gate.NATEMERGE_STAFF_ID, "producer", "natemerge", staff.StaffRoot(),
+                                      current_session=staff.StaffId("merge-session"))
+        worker = staff.StaffRow(staff.StaffId("land-worker"), "worker", "land", staff.ReportsTo(merge_member.id),
+                                current_session=staff.StaffId("land-session"))
+        with AdmissionFixture() as fixture, mock.patch.object(staff, "local_snapshot",
+                return_value=staff.StaffSnapshot((merge_member, worker))), mock.patch.dict(os.environ, {
+                "MERGE_GATE_STATE_DIR": str(fixture.root / "merge-state")}):
+            proc = fixture.proc.path
+            land = wire.Owner(10, "10")
+            owner = wire.Owner(101, "20")
+            write_process(proc, land.pid, start=land.start_time)
+            write_process(proc, owner.pid, start=owner.start_time, parent=land.pid)
+            write_process(proc, os.getpid(), start="30", parent=owner.pid)
+            directory = fixture.root / "merge-state" / "lands"
+            directory.mkdir(parents=True)
+            _ = (directory / "10.json").write_text(json.dumps({"pid": land.pid, "start": land.start_time, "commits": ["abc"]}))
+            environ = proc / str(land.pid) / "environ"
+            request = fixture.request(owner=owner, step="merge-gate")
+            client_socket, service_socket = socket.socketpair()
+            with client_socket, service_socket:
+                connection = service.Connection(service_socket)
+                _ = environ.write_bytes(b"CODEX_THREAD_ID=land-session\0")
+                request = replace(request, identity=replace(request.identity, session_id=""))
+                self.assertEqual(service.landing_test(request, proc, connection), service.LandingTest(land))
+                wrong_owner = replace(request, owner=replace(owner, start_time="19"))
+                self.assertEqual(service.landing_test(wrong_owner, proc, connection), service.OrdinaryTest())
+                _ = environ.write_bytes(b"CODEX_THREAD_ID=trial-session\0")
+                request = replace(request, identity=replace(request.identity, session_id="merge-session"))
+                self.assertEqual(service.landing_test(request, proc, connection), service.OrdinaryTest())
+
     def test_landing_holds_ordinary_steps_and_publishes_the_reason(self) -> None:
         for step, job in (("merge-gate", StepJob("test-all")), ("merge-gate", StepJob("test-modules")),
                           ("targeted-test", StepJob("test-affected")), ("merge-gate", StepJob("test-nightly")),

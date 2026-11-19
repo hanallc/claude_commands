@@ -404,7 +404,7 @@ def admitted_gate_job(request: wire.AdmitRequest, proc: Path) -> StepJob | GateJ
 
 @dataclass(frozen=True)
 class LandingTest:
-    """The gate has a live land ancestor and a natemerge staff ancestor."""
+    """The gate descends from a live natemerge land."""
 
     land: wire.Owner
 
@@ -414,25 +414,11 @@ class OrdinaryTest:
     """The request has no verified landing priority."""
 
 
-def live_land(owner: wire.Owner) -> bool:
-    """Check that the land record and process have the same identity."""
-    try:
-        parsed = cast(object, json.loads((land_runs.lands_dir() / f"{owner.pid}.json").read_text()))
-    except (OSError, ValueError):
-        return False
-    if not isinstance(parsed, dict):
-        return False
-    row = cast(dict[str, object], parsed)
-    return (row.get("pid") == owner.pid and row.get("start") == owner.start_time
-            and process_start(owner.pid) == Started(owner.start_time))
-
-
 def landing_test(request: wire.AdmitRequest | wire.LaunchRequest, proc: Path,
                  connection: Connection | NoConnection) -> LandingTest | OrdinaryTest:
-    """Match the socket peer of a local gate to its land process."""
+    """Check the local gate's owner and find the land in its socket peer's lineage."""
     if (not isinstance(request, wire.AdmitRequest) or not isinstance(request.place, wire.LocalPlace)
-            or request.profile.step != "merge-gate" or not request.identity.session_id
-            or isinstance(connection, NoConnection)):
+            or request.profile.step != "merge-gate" or isinstance(connection, NoConnection)):
         return OrdinaryTest()
     from scripts.build_hold import build_hold
     from scripts.build_targets import build_targets
@@ -442,18 +428,10 @@ def landing_test(request: wire.AdmitRequest | wire.LaunchRequest, proc: Path,
     owner = build_hold.ProcessIdentity(request.owner.pid, request.owner.start_time)
     if not isinstance(lineage, build_targets.ConfirmedCallerLineage) or owner not in lineage.processes:
         return OrdinaryTest()
-    for ancestor in sorted(lineage.processes, key=lambda item: (int(item.start_time), item.pid), reverse=True):
-        land = wire.Owner(ancestor.pid, ancestor.start_time)
-        if ancestor.pid == pid or not live_land(land):
-            continue
-        try:
-            members = staff.local_snapshot()
-        except staff.StaffUnreadable:
-            break
-        if any(map(gate.is_natemerge, gate.queue_staff_chain(members, request.identity.session_id))):
-            return LandingTest(land)
-        break
-    return OrdinaryTest()
+    land = land_runs.natemerge_land(proc, lineage.processes)
+    if isinstance(land, land_runs.NoNatemergeLand):
+        return OrdinaryTest()
+    return LandingTest(wire.Owner(land.pid, land.start_time))
 
 
 def landing_pass_limit() -> int:
@@ -1869,6 +1847,8 @@ class AdmissionServer:
     def _landing_order(self, inputs: records.QueueInputs, policy: records.AdmissionPolicy
                        ) -> tuple[records.QueueInputs, gate.PassResult, LandingAdmission | NoLandingAdmission]:
         """Use the promoted order only if the landing can start in that order."""
+        from scripts.build_hold.build_hold import ProcessIdentity
+
         landings = {records.waiter_owner(waiting.row): waiting for waiting in self.waiters.values()
                     if isinstance(waiting.landing, LandingTest)}
         limit = landing_pass_limit() if landings else 0
@@ -1892,8 +1872,7 @@ class AdmissionServer:
                     passed = tuple(place for position, place in preceding if position >= destination)
                     land = waiting.landing.land
                     if ((not preceding or passed)
-                            and records.run_owner(land.pid, land.start_time) not in self.landing_first_places
-                            and live_land(land)):
+                            and records.run_owner(land.pid, land.start_time) not in self.landing_first_places):
                         trial_inputs = inputs
                         claim_policy = gate.ContinuationClaimPolicy.RELEASE_FOR_EARLIER_WAITER
                         if passed:
@@ -1906,8 +1885,10 @@ class AdmissionServer:
                         decision = trial.rows[destination if passed else index]
                         if (isinstance(decision.admission, gate.ProposedAdmission)
                                 and isinstance(decision.decision.room.basis, (records.Fits, records.WithinSlot))):
-                            claim = LandingFirstPlace(land, waiting.request.episode)
-                            return trial_inputs, trial, LandingAdmission(claim, passed, destination == 0)
+                            live = land_runs.natemerge_land(self.proc.path, frozenset({ProcessIdentity(land.pid, land.start_time)}))
+                            if not isinstance(live, land_runs.NoNatemergeLand):
+                                claim = LandingFirstPlace(land, waiting.request.episode)
+                                return trial_inputs, trial, LandingAdmission(claim, passed, destination == 0)
                 preceding.append((index, place))
                 count = self.landing_pass_counts.get(key)
                 if count is not None and count.count >= limit:
