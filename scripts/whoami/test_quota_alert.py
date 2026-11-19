@@ -32,10 +32,9 @@ setUpModule = support.setUpModule
 
 
 def write_settings(config: quota_alert.Config) -> None:
-    """Write the five settings with their configured types."""
+    """Write the four settings with their configured types."""
     _ = quota_alert.CONFIG.write_text(
         f"# range: 0..\nthreshold_percent={config['threshold_percent']}\n"
-        + f"# range: 0..\nrepeat_minutes={config['repeat_minutes']}\n"
         + f"# range: 0..\nstall_minutes={config['stall_minutes']}\n"
         + f"faults_to={config['faults_to']}\nalways={' '.join(config['always'])}\n")
 
@@ -107,8 +106,6 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         named_config = self.root / "named-showrunners.conf"
         _ = named_config.write_text(("""# range: 0..
 threshold_percent=7
-# range: 0..
-repeat_minutes=45
 # range: 0..
 stall_minutes=9
 faults_to=fault-handler
