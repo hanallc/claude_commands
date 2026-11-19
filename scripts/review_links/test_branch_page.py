@@ -26,7 +26,7 @@ from scripts.agents import remote
 from scripts.lib import file_lock
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
-from scripts.review_links import branch_page, change_page, serve
+from scripts.review_links import branch_page, change_page, page_frame, serve
 
 
 class BranchForm(HTMLParser):
@@ -202,6 +202,7 @@ class BranchPageTests(unittest.TestCase):
         page = branch_page.BranchPage(Path(), (row, replace(row, unit="nate")), "private", member.id, Path())
         with patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))):
             body = branch_page.render(page).decode()
+        self.assertEqual(body.count(page_frame.BUTTON_STATES), 1)
         self.assertRegex(body, r'data-color-text="role.unit-director"[^>]*>Builder</span>')
         self.assertIn('Unit: nate — not active', body)
 
