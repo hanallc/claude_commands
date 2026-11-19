@@ -906,8 +906,12 @@ def wait_reasons(result: records.AdmissionWaitSnapshot) -> tuple[str, ...]:
     return (records.reason_phrase(cause, ()),)
 
 
-def blocking_waiter_text(place: str, name: str, step: str, unit: str, need_gib: float) -> str:
+def blocking_waiter_text(place: str, name: str, step: str, unit: str, need_gib: float, *,
+                         fallback_name: str = "") -> str:
     """Name the step that holds the row and give its position."""
+    name = snapshot_codec.select_queue_name(name, fallback_name)
+    step = snapshot_codec.public_queue_text(step)
+    unit = snapshot_codec.public_queue_text(unit)
     label = " · ".join(part for part in (name, step) if part)
     if place == "behind #1":
         label = f"head {label} needs {need_gib:.1f} GiB"
@@ -1069,8 +1073,9 @@ class WaitOutput:
         order = snapshot.decision.order_hold
         if isinstance(cause, records.BehindHead) and isinstance(order, records.HeldBehindHead):
             blocker = order.waiter
-            reasons = (blocking_waiter_text(reply.text, blocker.get("session_name") or cause.head_name,
-                blocker.get("step", ""), blocker.get("unit", ""), blocker["need"] / records.GIB),)
+            reasons = (blocking_waiter_text(reply.text, blocker.get("session_name", ""),
+                blocker.get("step", ""), blocker.get("unit", ""), blocker["need"] / records.GIB,
+                fallback_name=cause.head_name),)
         else:
             reasons = wait_reasons(snapshot)
         behind = isinstance(cause, records.BehindHead)

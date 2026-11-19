@@ -5452,6 +5452,22 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(own.reading.explanation.decided_from, inputs)
 
 
+    def test_wait_line_skips_unusable_names_in_order(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            for unit, caller, folder, expected in (
+                ("explicit unit", "saved caller", "/private/folder", "explicit unit"),
+                ("—", "saved caller", "/private/folder", "saved caller"),
+                ("$UNIT", "owner not recorded", "/private/folder", "folder"),
+                ("  ", "556caf6e-713d-47c0-a8fc-5dd5e8c26ce4", "/private/$FOLDER", "unregistered session"),
+            ):
+                with self.subTest(unit=unit, caller=caller, folder=folder):
+                    row: records.Waiter = {"pid": request.owner.pid, "start_time": request.owner.start_time,
+                        "since": request.since, "need": GIB, "step": "nextest", "session_name": caller,
+                        "unit": unit, "folder": folder}
+                    waiting = service.WaitingAdmission(request, row, service.NO_CONNECTION)
+                    self.assertEqual(service.wait_line_name(waiting), f"{expected} · nextest")
+
     def test_wait_lines_then_ranked_admissions_and_release_frees_charge(self) -> None:
         for owner_name in ("session", "CI", "unit", "folder", "pid", "continuation"):
             with self.subTest(owner=owner_name), AdmissionFixture() as fixture:

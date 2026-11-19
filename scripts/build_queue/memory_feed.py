@@ -355,6 +355,7 @@ class HeadRoom(TypedDict):
 
 class RowQueueNotes(TypedDict):
     caller: NotRequired[str]
+    owner_text: NotRequired[str]
     name_parts: NotRequired[list[staff_names.NamePart]]
     detail_parts: NotRequired[list[staff_names.NamePart]]
     about_parts: NotRequired[list[staff_names.NamePart]]
@@ -380,6 +381,7 @@ class RowQueueNotes(TypedDict):
 
 class PageOwnerLabels(TypedDict):
     caller: NotRequired[str]
+    owner_text: str
     showrunner: str
     unit: str
     ci_label: str
@@ -521,12 +523,17 @@ def staff_unit(identity: unit_labels.UnitLabels, *, missing: Literal["", "—"] 
 
 
 def page_owner_labels(identity: unit_labels.UnitLabels, *, ci_label: str = "",
-                      unit: UnitCell = "") -> PageOwnerLabels:
+                      unit: UnitCell = "", caller: str = "") -> PageOwnerLabels:
     """Show the resolved owner and unit, or the CI label."""
     runner = unit_labels.Runner.UNKNOWN if ci_label else identity.runner
-    return {"showrunner": "" if ci_label else identity.owner_text,
+    showrunner = "—" if identity.owner_text == "—" else public_queue_text(identity.owner_text)
+    fields: PageOwnerLabels = {"showrunner": "" if ci_label else showrunner,
             "unit": "" if ci_label else unit, "ci_label": ci_label, "runner": runner,
-            "worker": identity.session if runner is unit_labels.Runner.WORKER else ""}
+            "owner_text": codec.select_queue_name(caller, ci_label, showrunner),
+            "worker": public_queue_text(identity.session) if runner is unit_labels.Runner.WORKER else ""}
+    if caller:
+        fields["caller"] = caller
+    return fields
 
 
 def ci_step_label(runner: str, job: str) -> str:
@@ -536,7 +543,8 @@ def ci_step_label(runner: str, job: str) -> str:
         label = template.format(runner=runner, job=job)
     except (ValueError, KeyError, AttributeError, IndexError):
         label = f"{QueueKind.CI.value} · {runner} · {job}"
-    return " · ".join(shown for part in label.split(" · ") if (shown := public_queue_text(part))) or QueueKind.CI.value
+    return codec.select_queue_name(
+        " · ".join(shown for part in label.split(" · ") if (shown := public_queue_text(part))), QueueKind.CI.value)
 
 
 class SlotPlace(TypedDict):
@@ -564,8 +572,10 @@ class NamedQueueRow(TypedDict):
 
 
 def queue_row_labels(step: QueueRowName, name: QueueRowName, *, unit: UnitCell = "",
-                     ci_label: str = "") -> NamedQueueRow:
+                     ci_label: str = "", caller: str = "") -> NamedQueueRow:
     """Give the page a name and the parts of its tooltip title."""
+    name = QueueRowName.owner_only(name, step, caller, ci_label)
+    step = QueueRowName.owner_only(step, name)
     if ci_label:
         return {"name": name, "title": {"unit": "", "step": CIJobTitle(ci_label)}}
     if isinstance(unit, StaffUnitName) and step != unit:
@@ -834,12 +844,13 @@ def repository_slot_row(slot: wire.RepositorySlotRow, names: StepNames, members:
                else members.labels_for(identity.session_id, slot.machine, source))
     label = current or unit_labels.UnitLabels("")
     unit = staff_unit(label)
-    showrunner = public_owner_name(label.showrunner) or recorded_caller_name(identity.session_id, identity.name, str(source))
+    showrunner = codec.select_queue_name(public_owner_name(label.showrunner),
+                                         recorded_caller_name(identity.session_id, identity.name, str(source)))
     if isinstance(step, NoNamedStep):
-        step = QueueRowName.owner_only(unit or showrunner) if legacy_gate else QueueRowName.repository(slot.wait.repository, str(source))
+        step = QueueRowName.owner_only(unit, showrunner) if legacy_gate else QueueRowName.repository(slot.wait.repository, str(source))
     if isinstance(step, NoNamedStep):
         return step
-    return {"kind": "repository-slot", **queue_row_labels(step, step, unit=unit),
+    return {"kind": "repository-slot", **queue_row_labels(step, step, unit=unit, caller=showrunner),
             **page_owner_labels(replace(label, showrunner=showrunner), unit=unit),
             "pid": slot.owner.pid, "detail": slot.wait.repository, "need": 0.0, "since": slot.since,
             "reason": slot.wait.text, "fits": False, "why": "build slot", "runs_on": slot.machine}
@@ -1161,7 +1172,7 @@ def build_ci_row(used: float, now: float,
     label = ci_step_label(busy[0]["name"] if busy else "", job)
     name = QueueRowName.fixed(QueueKind.CI)
     return {**queue_row_labels(name, name, ci_label=label),
-            "showrunner": "", "unit": "", "ci_label": label,
+            "showrunner": "", "unit": "", "ci_label": label, "owner_text": label.split(" · ", 1)[0],
             "state": detail if not busy else "",
             "pid": pid, "detail": detail, "used": used,
             "counted": 0.0, "reserved": 0.0, "started_at": busy[0]["started_at"] if busy else 0,
@@ -1202,6 +1213,14 @@ def step_runner(step: admission_records.RunningStep | admission_records.WaitingS
     return step.ci_runner or (step.unit if not step.session_id and step.unit in runners else "")
 
 
+def recorded_ci_label(step: admission_records.RunningStep | admission_records.WaitingStep,
+                      runners: frozenset[str]) -> str:
+    runner = step_runner(step, runners)
+    if not runner:
+        return ""
+    return public_owner_name(step.session_name, step.session_id) or ci_step_label(runner, "")
+
+
 def feed_step_labels(step: admission_records.RunningStep | admission_records.WaitingStep,
                      labels: Mapping[str, unit_labels.UnitLabels], runners: frozenset[str]) -> unit_labels.UnitLabels:
     """Use the CI runner record instead of an absent staff owner."""
@@ -1217,13 +1236,10 @@ class StepPageOwner:
     unit: UnitCell = ""
 
     def fields(self, *, ci_label: str = "") -> PageOwnerLabels:
-        fields = page_owner_labels(self.labels, ci_label=ci_label, unit=self.unit)
-        if self.caller:
-            fields["caller"] = self.caller
-        return fields
+        return page_owner_labels(self.labels, ci_label=ci_label, unit=self.unit, caller=self.caller)
 
     def neutral_name(self) -> QueueRowName:
-        return QueueRowName.owner_only(public_queue_text(self.unit) or public_queue_text(self.labels.owner_text) or self.caller)
+        return QueueRowName.owner_only(self.unit, self.labels.owner_text, self.caller)
 
 
 @dataclass(frozen=True)
@@ -1257,8 +1273,9 @@ def step_page_owner(step: admission_records.RunningStep | admission_records.Wait
     identity = feed_step_labels(step, labels, runners)
     machine = admission_records.execution_host(step, local_host) if isinstance(step, admission_records.RunningStep) else local_host
     folder = Path(step.folder)
-    if not step_runner(step, runners):
-        current = members.labels_for(step.session_id, machine, folder) or labels.get(step.session_id)
+    if ci_label := recorded_ci_label(step, runners):
+        return StepPageOwner(replace(identity, showrunner="", unit=""), ci_label)
+    for current in (members.labels_for(step.session_id, machine, folder), labels.get(step.session_id)):
         if current is not None and public_owner_name(current.owner_text, step.session_id):
             return StepPageOwner(current, unit=staff_unit(current, missing="—"))
     caller = recorded_caller_name(step.session_id, step.session_name, step.folder)
@@ -1367,9 +1384,11 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
         ci=ci, current=staff_names.text_parts(name))
     parts.extend(staff_names.text_parts(" · " + shown_gate if shown_gate else ""))
     unit = staff_unit(identity, missing="—")
-    return {"kind": "mac-build", **queue_row_labels(title_step, display_name, unit=unit, ci_label=label),
+    caller = "" if label or public_queue_text(identity.owner_text) else codec.select_queue_name(
+        public_owner_name(identity.session, build.session))
+    return {"kind": "mac-build", **queue_row_labels(title_step, display_name, unit=unit, ci_label=label, caller=caller),
             "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
-            **page_owner_labels(identity, ci_label=label, unit=unit), "gate_label": gate, "repository": build.repository,
+            **page_owner_labels(identity, ci_label=label, unit=unit, caller=caller), "gate_label": gate, "repository": build.repository,
             "pid": build.pid, "machine": "mac", "started_at": build.started_at, "read_at": reading.read_at,
             "used": gib(build.resident_bytes) if isinstance(build.resident_bytes, int) else build.resident_bytes,
             "stage": build.stage, "vcpus": queue_view.mac_command_jobs(build.command),
@@ -2318,7 +2337,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     walk: list[RunRow] = []
     for hold in captured.runs:
         step = by_owner.get(hold.memory.owner)
-        ci_label = step.session_name if step is not None and step_runner(step, ci_runners) else ""
+        ci_label = recorded_ci_label(step, ci_runners) if step is not None else ""
         job = local_job(step) if step is not None and not ci_label else NotGateStep()
         if step is None:
             slot = held_slots.get(hold.memory.owner)
@@ -2331,8 +2350,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             title_step = ended_step_name(slot.identity, names)
             if isinstance(title_step, NoNamedStep):
                 continue
-            caller = slot.identity.caller_name
-            owner = StepPageOwner(labels_for_slot, caller if isinstance(caller, str) else "",
+            caller = codec.select_queue_name(slot.identity.caller_name)
+            owner = StepPageOwner(labels_for_slot, caller,
                                   unit=staff_unit(labels_for_slot))
             display_name = title_step
             parts: list[staff_names.NamePart] = []
@@ -2348,7 +2367,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         run = hold.memory.run
         pid = (step.run.pid if isinstance(step.run, LiveBuildRun) else step.pid) if step is not None else (
             run.pid if isinstance(run, LiveBuildRun) else admission_records.PidNotRecorded())
-        row_labels = queue_row_labels(title_step, display_name, unit=owner.unit, ci_label=ci_label)
+        row_labels = queue_row_labels(title_step, display_name, unit=owner.unit, ci_label=ci_label, caller=owner.caller)
         walk.append({**row_labels,
                      "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
                      **owner.fields(ci_label=ci_label), "between_steps": step is None,
@@ -2388,7 +2407,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             display_name = (title_step.with_prefix(step_owner_name(shown_step, labels))
                 if not unknown_gate and isinstance(recorded_step(verb, names), QueueRowName) else title_step)
             parts = [] if unknown_gate else current_step_parts(shown_step, names, identity, labels)
-            remote_row: RunRow = {**queue_row_labels(title_step, display_name, unit=owner.unit),
+            remote_row: RunRow = {**queue_row_labels(title_step, display_name, unit=owner.unit, caller=owner.caller),
                 "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
                 **owner.fields(),
                 "state": "running" if isinstance(step.execution, placement.ObservedExecution) else "uncertain",
@@ -2490,18 +2509,18 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             if blocker:
                 ahead = waiting[blocker - 1]
                 reason = admission_client.blocking_waiter_text(f"behind #{blocker}",
-                    ahead.session_name or cause.head_name, ahead.step, ahead.unit, ahead.need / GIB)
+                    ahead.session_name, ahead.step, ahead.unit, ahead.need / GIB, fallback_name=cause.head_name)
             else:
-                reason = f"behind {cause.head_name}"
+                reason = f"behind {codec.select_queue_name(cause.head_name)}"
         else:
             reason = reason_phrase(waiter.reason, waiting)
-        ci_label = waiter.session_name if step_runner(waiter, ci_runners) else ""
+        ci_label = recorded_ci_label(waiter, ci_runners)
         job = NotGateStep() if ci_label else local_job(waiter)
         shown_waiter = replace(waiter, step=job_step(job, waiter.step), unit=identity.unit)
         named = local_step_name(shown_waiter, owner, names, labels, ci_label)
         if isinstance(named, NoNamedStep):
             continue
-        waiters[place] = {**queue_row_labels(named.title, named.name, unit=owner.unit, ci_label=ci_label),
+        waiters[place] = {**queue_row_labels(named.title, named.name, unit=owner.unit, ci_label=ci_label, caller=owner.caller),
                         "name_parts": named.parts if staff_names.parts_text(named.parts) == named.name else staff_names.text_parts(named.name),
                         **owner.fields(ci_label=ci_label),
                         "pid": (waiter.run.pid if isinstance(waiter.run, LiveBuildRun) else waiter.pid), "detail": "" if ci_label else identity.unit,
@@ -2530,7 +2549,10 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             mac_units = mac_build_units(mac_reading.builds, target_availability.mac_claims(snapshots))
         for build in mac_reading.builds:
             current = members.labels_for(build.session, mac_machine, Path(build.folder))
-            work_rows.append(mac_work_row(build, mac_reading, current or mac_units.get(build.pid, unit_labels.UnitLabels("")),
+            claim = mac_units.get(build.pid)
+            identity = current if current is not None and public_owner_name(current.owner_text, build.session) else (
+                claim or current or unit_labels.UnitLabels(""))
+            work_rows.append(mac_work_row(build, mac_reading, identity,
                                           names=names, slot_roots=slot_roots, slot_machine=mac_machine))
     work_rows.sort(key=lambda row: row["started_at"])
     waiting_rows: list[WaitRow | CloudWaitRow] = list(waiters.values())
@@ -2551,29 +2573,30 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         for cloud in rows:
             information = queue_view.cloud_work(cloud, explanation.now, parsed.cloud_gate_stale_pushes, interval)
             recorded = cloud.identity
-            current = members.labels_for(recorded.session_id, machine, Path(recorded.folder)) or cloud_labels.get(recorded.session_id)
+            current = next((label for label in (
+                members.labels_for(recorded.session_id, machine, Path(recorded.folder)), cloud_labels.get(recorded.session_id)
+            ) if label is not None and public_owner_name(label.owner_text, recorded.session_id)), None)
             unit = staff_unit(current, missing="—") if current is not None else ""
-            owner = public_owner_name(current.owner_text, recorded.session_id) if current is not None else ""
-            identity = current if current is not None and owner else unit_labels.UnitLabels(
+            identity = current if current is not None else unit_labels.UnitLabels(
                 recorded_caller_name(recorded.session_id, recorded.name, recorded.folder))
             job = cloud.identity.job if isinstance(cloud.identity.job, StepJob) else step_job(
                 cloud.identity.step, cloud.owner.pid, PROC, start_time=cloud.owner.start_time)
             step = job_step(job, cloud.identity.step)
             if step in GATE_STEPS:
-                title_step = display_name = QueueRowName.owner_only(public_queue_text(unit)
-                    or identity.owner_text)
+                title_step = display_name = QueueRowName.owner_only(unit, identity.owner_text)
                 parts = staff_names.text_parts(display_name)
-                if owner and not public_owner_name(recorded.name, recorded.session_id):
+                if current is not None and not public_owner_name(recorded.name, recorded.session_id):
                     parts = queue_owner_parts(names, step, unit, identity.role, current=parts)
-                    display_name = QueueRowName.owner_only(staff_names.parts_text(parts) or title_step)
+                    display_name = QueueRowName.owner_only(staff_names.parts_text(parts), title_step)
             else:
                 title_step = build_row_step(step, "", "", "", names, kind=QueueKind.AWS)
                 display_name = title_step.for_owner(names, step, unit, identity.role)
                 parts = queue_owner_parts(names, step, unit, identity.role)
                 if title_step == QueueKind.AWS.value and isinstance(program := QueueRowName.recorded_program(step), QueueRowName):
                     title_step = program
-                    display_name = QueueRowName.owner_only(staff_names.parts_text(parts) or program)
-            values: CloudWorkRow = {"kind": "cloud", **queue_row_labels(title_step, display_name, unit=unit),
+                    display_name = QueueRowName.owner_only(staff_names.parts_text(parts), program)
+            values: CloudWorkRow = {"kind": "cloud", **queue_row_labels(title_step, display_name, unit=unit,
+                                                                         caller=identity.owner_text),
                 "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
                 **page_owner_labels(identity, unit=unit), "pid": cloud.owner.pid,
                 "detail": identity.unit, "machine": "" if isinstance(cloud.wait, wire.CloudSlotWait) else "aws",

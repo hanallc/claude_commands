@@ -1324,7 +1324,8 @@ def wait_line_name(waiting: WaitingAdmission) -> str:
     row = waiting.row
     identity = gate.RecordedQueueIdentities().identity(row["pid"], cast(dict[str, object], cast(object, row)))
     name = gate.waiter_unit_name(identity, row["pid"])
-    return f"{name} · {identity['step']}" if identity["step"] else name
+    step = codec.public_queue_text(identity["step"])
+    return f"{name} · {step}" if step else name
 
 
 def peer_uid(connection: Connection | NoConnection) -> int:

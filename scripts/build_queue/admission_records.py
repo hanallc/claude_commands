@@ -18,6 +18,7 @@ from pathlib import Path
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import placement
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
+from scripts.build_queue.snapshot_codec import public_queue_text, select_queue_name
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
@@ -1592,16 +1593,17 @@ def queue_caller(session_id: str, staff_id: str, exported_name: str, session_fol
                  worktree: str, *, members: QueueStaff = NO_STAFF_LOOKUP, unit: str = "") -> QueueCaller:
     """Resolve the caller name and its unit for queue priority."""
     reference = session_id or staff_id
+    staff_name = ""
     if isinstance(members, staff.StaffSnapshot) and reference and (member := members.by_member_reference(reference)):
         if not unit:
             owner = members.parent_of(member) if member.kind == "worker" else member
             unit = owner.name if owner is not None and owner.kind == "unit" else ""
         session_id = session_id or member.current_session
-        exported_name = member.name.strip() or exported_name
-    name = exported_name.strip() or Path(session_folder).name.strip()
-    if not name and not reference and (folder := Path(worktree).name.strip()):
-        name = f"terminal · {folder}"
-    return QueueCaller(session_id, name or "unregistered session", unit)
+        staff_name = member.name
+    folder = public_queue_text(Path(worktree).name) if not reference else ""
+    name = select_queue_name(staff_name, exported_name, Path(session_folder).name,
+                             f"terminal · {folder}" if folder else "")
+    return QueueCaller(session_id, name, unit)
 
 
 def waiter_identity(step: str, worktree: str) -> WaiterIdentity:

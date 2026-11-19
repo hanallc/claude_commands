@@ -2027,7 +2027,10 @@ A completed step leaves its run a slot for `slot_gap_seconds`, currently 10 seco
 The slot keeps the caller name from the reservation, including when a continuation claims the slot.
 The snapshot decoder restores a missing caller name from the matching reservation.
 If the reservation has no usable name, the decoder looks up the fixed staff ID in the supplied staff snapshot.
-An unknown staff ID shows `unregistered session`.
+If the decoder finds no usable name, it supplies the label `unregistered session`.
+The feed and wait lines use the first usable name in each list of candidates.
+The feed keeps the caller separate from the step name.
+The Builds page uses the names and hover titles from the feed.
 A continuation within the slot bypasses order, spacing, and pressure.
 A larger continuation holds the slot and requests only its extra memory before new runs.
 A closed connection frees its claim. An idle slot expires or ends with its verified run owner.

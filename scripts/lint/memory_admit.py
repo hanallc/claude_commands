@@ -1658,8 +1658,8 @@ def reservation_stem(directory: Path, pid: int, start_time: str, admitted_ns: in
     return directory / f"{pid}-{start_time}-{admitted_ns}"
 
 
-def waiter_unit_name(identity: WaiterIdentity, pid: int) -> str:
-    return identity.get("unit") or identity["session_name"] or Path(identity["folder"]).name or str(pid)
+def waiter_unit_name(identity: WaiterIdentity, _pid: int) -> str:
+    return codec.select_queue_name(identity.get("unit"), identity["session_name"], Path(identity["folder"]).name)
 
 
 class QueueIdentityReader:

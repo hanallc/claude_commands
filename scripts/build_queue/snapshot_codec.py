@@ -121,8 +121,21 @@ def ended_step_facts(value: object) -> object:
             **({"caller_name": identity["caller_name"]} if "caller_name" in identity else {})}
 
 
-def usable_caller(value: object) -> str:
-    return value if isinstance(value, str) and value.strip() not in ("", "—") else ""
+def public_queue_text(value: object) -> str:
+    """Return text that can appear in a queue name or owner field."""
+    if not isinstance(value, str):
+        return ""
+    text = " ".join(value.split())
+    if text in ("", "—", "owner not recorded") or "$" in text:
+        return ""
+    from scripts.lib.build_steps import RAW_ID
+
+    return "" if RAW_ID.search(text) else text
+
+
+def select_queue_name(*candidates: object) -> str:
+    """Use the first public name, or the label for an unknown caller."""
+    return next((name for value in candidates if (name := public_queue_text(value))), "unregistered session")
 
 
 def recover_slot_callers(record: dict[str, object]) -> dict[str, object]:
@@ -140,7 +153,7 @@ def recover_slot_callers(record: dict[str, object]) -> dict[str, object]:
             key = reservation.get("reservation_id")
             identity = reservation.get("queue_waiter", reservation)
             if isinstance(key, str) and isinstance(identity, dict):
-                name = usable_caller(cast(dict[str, object], identity).get("session_name"))
+                name = public_queue_text(cast(dict[str, object], identity).get("session_name"))
                 if name:
                     callers[key] = name
 
@@ -156,15 +169,18 @@ def recover_slot_callers(record: dict[str, object]) -> dict[str, object]:
         if not isinstance(identity, dict):
             return slot
         facts = cast(dict[str, object], identity)
-        if facts.get("kind") != "EndedStepFacts" or usable_caller(facts.get("caller_name")):
+        if facts.get("kind") != "EndedStepFacts":
             return slot
+        stored = public_queue_text(facts.get("caller_name"))
         key = slot.get("reservation")
         name = callers.get(key, "") if isinstance(key, str) else ""
         staff_id = facts.get("staff_id")
-        if not name and members is not None and isinstance(staff_id, str):
-            member = members.by_id(cast("StaffId", staff_id))
-            name = (usable_caller(member.name) if member is not None else "") or "unregistered session"
-        return {**slot, "identity": {**facts, "caller_name": name}} if name else slot
+        member = (members.by_id(cast("StaffId", staff_id))
+                  if not (stored or name) and members is not None and isinstance(staff_id, str) else None)
+        if members is None and not (stored or name):
+            return slot
+        caller = select_queue_name(stored, name, member.name if member is not None else "")
+        return slot if caller == facts.get("caller_name") else {**slot, "identity": {**facts, "caller_name": caller}}
 
     return {**record, "slots": [recover(slot) for slot in cast(list[object], slots)]}
 

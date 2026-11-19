@@ -1556,6 +1556,11 @@ process.stdout.write(JSON.stringify({
             (" \t", worker.id, worker.name),
             ("—", worker.id, worker.name),
             (None, staff.StaffId("missing"), "unregistered session"),
+            (None, admission_records.NoEndedStepStaff(), "unregistered session"),
+            ("—", admission_records.NoEndedStepStaff(), "unregistered session"),
+            ("owner not recorded", worker.id, worker.name),
+            ("$CALLER", worker.id, worker.name),
+            ("556caf6e-713d-47c0-a8fc-5dd5e8c26ce4", worker.id, worker.name),
             ("saved caller", staff.StaffId("missing"), "saved caller"),
         ):
             for legacy in (False, True):
@@ -2708,6 +2713,48 @@ process.stdout.write(JSON.stringify({
                     self.assertEqual(row.get("showrunner"), "hana")
                     self.assertEqual(row["unit"], owner.unit)
 
+    def caller_selection_page(self) -> memory_feed.MemoryPage:
+        """Decode work rows with both usable and unusable names."""
+        initial = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
+        inputs = initial.explanation.decided_from
+        now = inputs.now
+        worker = staff.StaffRow(staff.StaffId("fixed-worker"), "worker", "held caller", staff.StaffRoot(),
+                                current_session=staff.StaffId("new-worker-session"))
+        absent = admission_records.EndedStepFactNotRecorded()
+        facts = admission_records.EndedStepFacts("merge-gate", admission_records.PackageNotRecorded(),
+                                                  absent, absent, worker.id, caller_name="$CALLER")
+        retained = admission_records.BetweenStepsSlot(LiveBuildRun(301, "301", now - 5), "retained",
+                                                      admission_records.GIB, now + 10, facts)
+        continued = replace(retained, run=LiveBuildRun(302, "302", now - 5), reservation="continued",
+                            identity=replace(facts, staff_id=admission_records.NoEndedStepStaff()))
+        ci = replace(inputs.running[0], ci_runner="hana-linux-2", session_name="—")
+        local = replace(initial.view.waiting[0], session_name="recorded local", step="merge-gate")
+        reading = gate.queue_read_from(replace(inputs, running=(ci,),
+            slots=(retained, admission_records.ContinuationSlot(continued, "next"))), admission_policy_fixture())
+        cloud = cloud_reading(replace(reading, view=replace(reading.view, waiting=(local,))))
+        cloud = replace(cloud, cloud=tuple(replace(row, identity=replace(
+            row.identity, name="recorded cloud", step="merge-gate")) for row in cloud.cloud))
+        slot = wire.RepositorySlotRow(wire.Owner(303, "303"),
+            wire.Identity("slot-session", "recorded slot", "merge-gate", "/private/widget"),
+            now - 30, "natedev", wire.RepositorySlotWaiting("widget", (1,), 1, "slots.natedev.widget.max"))
+        message = wire.encode_reply(wire.ViewReply(replace(cloud, repository_slots=(slot,))))
+        mac = queue_view.MacBuild(304, "/private/hana", now - 45, "cargo nextest run --jobs=8", "hana",
+                                   queue_view.MacTesting(305), admission_records.GIB)
+
+        def view() -> wire.CloudQueueRead:
+            reply = wire.parse_reply(message)
+            assert isinstance(reply, wire.ViewReply) and isinstance(reply.reading, wire.CloudQueueRead)
+            return reply.reading
+
+        unknown = unit_labels.UnitLabels("$OWNER")
+        labels = {session: unknown for session in (local.session_id, *(row.identity.session_id for row in cloud.cloud))}
+        with (mock.patch.object(admission_client, "view", side_effect=view),
+              mock.patch.object(unit_labels, "unit_labels_for", return_value=labels),
+              mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((worker,))),
+              mock.patch.object(queue_view, "read_mac_builds", return_value=queue_view.MacBuildReading(now, (mac,))),
+              mock.patch.object(memory_feed, "mac_build_units", return_value={mac.pid: unknown})):
+            return memory_feed.reading()
+
     def test_mac_ci_uses_the_configured_label_without_a_staff_owner(self) -> None:
         _ = (self.root / "build_admission.conf").write_text("ci_label=hana CI · {runner} · {job}\n")
         page = self.owner_machine_page(unit_labels.UnitLabels("unknown"), ci=True)
@@ -2832,6 +2879,21 @@ process.stdout.write(JSON.stringify({
                 page = self.cloud_owner_page(step, owner, identity=wire.Identity("old-cloud", "", step, ""))
                 self.assertEqual([row["name"] for row in page["walk"] if row.get("kind") == "cloud"], [expected])
                 self.assertEqual([row["name"] for row in page["waiters"] if row.get("kind") == "cloud"], [expected])
+
+    def test_unusable_cloud_templates_keep_the_owner_name(self) -> None:
+        director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
+                                          unit_labels.DirectsUnit("panes"))
+        config = self.root / "build_steps.conf"
+        template = config.read_text()
+        step = "targeted-test"
+        for text in ("—", "owner not recorded", "${unit}", "556caf6e-713d-47c0-a8fc-5dd5e8c26ce4"):
+            with self.subTest(template=text):
+                _ = config.write_text(template.replace("owned.targeted-test={unit} targeted",
+                                                        f"owned.targeted-test={text}"))
+                page = self.cloud_owner_page(step, director, identity=wire.Identity("legacy", "", step, ""))
+                for table, pid in ((page["walk"], 700001), (page["waiters"], 700002)):
+                    row, = [row for row in table if row.get("kind") == "cloud"]
+                    self.assertEqual((row["pid"], row["name"], row["title"]["step"]), (pid, "panes", "panes"))
 
     def test_detached_and_systemd_cloud_rows_use_the_fixed_staff_owner(self) -> None:
         with isolated_staff_file(self.root / "staff.json", {}):
@@ -3458,6 +3520,7 @@ def write_browser_fixture(folder: Path) -> None:
             runs=(replace(room.runs[0], memory=missing),))
         readings["missing_use"] = replace(base, explanation=replace(base.explanation, room=missing_room))
         pages: dict[str, object] = {}
+        pages["caller_selection"] = json.loads(memory_feed.page_json(fixture.caller_selection_page()))
         reports: dict[str, memory_feed.ReportFile] = {}
         director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
                                           unit_labels.DirectsUnit("panes"))
