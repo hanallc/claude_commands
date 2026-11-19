@@ -1011,8 +1011,14 @@ async (find, whenPageShows, check) => {
     def test_browser_removes_the_card_and_recounts_until_the_owner_answers(self) -> None:
         _ = self.register('Another image')
         probe = r'''
-async (find, whenPageShows, check, controlRefresh) => {
- const tick = controlRefresh();
+async (find, whenPageShows, check) => {
+ const postFixture = path => fetch(path, {method:'POST', signal:AbortSignal.timeout(20000)});
+ const refresh = () => {
+  const list = document.querySelector('[data-images]');
+  const replaced = whenPageShows('the refreshed image list', () => !list.isConnected);
+  document.dispatchEvent(new Event('visibilitychange'));
+  return replaced;
+ };
  const card = () => find('Question fixture');
  const ask = () => card().querySelector('button[value="question"]');
  const count = () => document.querySelector('.group-count')?.textContent;
@@ -1026,13 +1032,11 @@ async (find, whenPageShows, check, controlRefresh) => {
  check(form.isConnected, 'The card stays until the request saves.');
  await whenPageShows('the card removed', () => !card());
  check(count() === '1', 'The owner count drops as soon as the card leaves.');
- check((await fetch('/fixture-delivery', {method:'POST'})).ok, 'The fixture completes delivery.');
- await tick();
- const waitingList = document.querySelector('[data-images]');
- await whenPageShows('the refreshed waiting list', () => !waitingList.isConnected);
+ check((await postFixture('/fixture-delivery')).ok, 'The fixture completes delivery.');
+ await refresh();
  check(!card() && count() === '1', 'Delivery alone leaves the card out of the count.');
- await fetch('/fixture-answer', {method:'POST'});
- await Promise.all([whenPageShows('the answered card', card), tick()]);
+ check((await postFixture('/fixture-answer')).ok, 'The fixture records the answer.');
+ await Promise.all([whenPageShows('the answered card', card), refresh()]);
  const question = card().querySelector('.page-question').textContent;
  check(question.includes('Which check passed?') && question.includes('The gate passed.'),
        'The returned card shows the question and answer.');
@@ -1045,8 +1049,8 @@ async (find, whenPageShows, check, controlRefresh) => {
  card().querySelector('form').elements.feedback.value = 'Which check failed?';
  card().querySelector('form').requestSubmit(ask());
  await whenPageShows('the card removed again', () => !card());
- check((await fetch('/fixture-failure', {method:'POST'})).ok, 'The fixture records the delivery failure.');
- document.dispatchEvent(new Event('visibilitychange'));
+ check((await postFixture('/fixture-failure')).ok, 'The fixture records the delivery failure.');
+ await refresh();
  await whenPageShows('the card with the failed question', card);
  check(count() === '2', 'The owner count includes the card after a delivery failure.');
  check(card().querySelector('[data-question="Q2"] [role="status"]').textContent ===
@@ -1054,8 +1058,8 @@ async (find, whenPageShows, check, controlRefresh) => {
  card().querySelector('form').elements.feedback.value = 'Which check failed?';
  card().querySelector('form').requestSubmit(ask());
  await whenPageShows('the card removed after resend', () => !card());
- check((await fetch('/fixture-resend', {method:'POST'})).ok, 'The fixture records the successful resend.');
- await tick();
+ check((await postFixture('/fixture-resend')).ok, 'The fixture records the successful resend.');
+ await refresh();
  check(!card() && count() === '1', 'The successful resend keeps the card out of the count.');
 }'''
         requests = self.run_question_browser(self.question_probe(probe))
