@@ -274,6 +274,44 @@ class HanaSourceTests(unittest.TestCase):
             _ = self.prepare()
         self.assertEqual(self.objects.uploads, [])
 
+    def test_ignored_inputs_use_the_allowed_list_and_name_the_refused_path(self) -> None:
+        settings = self.root / 'source-inputs.conf'
+        _ = (self.checkout / '.gitignore').write_text(
+            '/private.bin\n/.clippy.toml\n/.env\n/crates/x/.env\n/generated.rs\n/.cache/\n/.link\n/odd/\n')
+        cases = (
+            ('private.bin', 'private.bin', ''),
+            ('.clippy.toml', '.clippy.toml', ''),
+            ('.env', '.env', ''),
+            ('crates/x/.env', 'crates/x/.env', ''),
+            ('generated.rs', 'generated.rs', ''),
+            ('.cache/x', '.cache/x', ''),
+            ('.cache/x', '.cache/x', '.cache/'),
+            ('.link', '.link', ''),
+            (os.fsdecode(b'odd/line\n\x1b[31m\xff'), r'odd/line\n\x1b[31m\udcff', ''),
+        )
+        for path, displayed_path, allowed in cases:
+            with self.subTest(path=path, allowed=allowed):
+                _ = settings.write_text(f'source_allowed_ignored=target/ {allowed}\nsource_forbidden_paths=*.key\n')
+                ignored = self.checkout / path
+                ignored.parent.mkdir(parents=True, exist_ok=True)
+                if path == '.link':
+                    ignored.symlink_to('tracked')
+                else:
+                    _ = ignored.write_text('ignored input\n')
+                try:
+                    if allowed:
+                        transport.check_inputs(self.checkout, conf.read(settings))
+                        commit = copies.capture_source(self.checkout)
+                        self.assertNotIn(path, self.git('ls-tree', '-r', '--name-only', '-z', commit).split('\0'))
+                    else:
+                        with self.assertRaises(hana_protocol.SourceRefused) as refused:
+                            transport.check_inputs(self.checkout, conf.read(settings))
+                        self.assertEqual(str(refused.exception),
+                                         'IgnoredInput: source has an ignored path outside source_allowed_ignored: '
+                                         + displayed_path)
+                finally:
+                    ignored.unlink()
+
     def test_credentials_and_disallowed_environment_refuse_before_upload(self) -> None:
         _ = (self.checkout / '.env').write_text('fixture secret')
         with self.assertRaisesRegex(hana_protocol.SourceRefused, 'CredentialOrBuildInput: .* forbidden path .env'):

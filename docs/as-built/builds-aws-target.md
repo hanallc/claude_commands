@@ -1434,8 +1434,9 @@ The copies private index includes staged, unstaged, deleted, and permitted untra
 The caller's index and refs remain unchanged.
 The existing tree key and a second private capture detect content and executable mode changes.
 Both capture paths refuse new Git links with `NestedRepository`.
-The sender refuses unexpected ignored inputs, credential paths, Git links, and disallowed environment variables.
-It sends no ignored files, HOME, or target output.
+The sender never sends ignored files. A build can read these files, so the source check refuses each ignored file outside `source_allowed_ignored`.
+The refusal names the first path. Remove the file or ask the user to approve a list entry.
+The sender refuses credential paths, Git links, and disallowed environment variables. It omits HOME and target output.
 
 When source preparation fails before the command starts, offload reports the cause as a typed admission refusal.
 The queue records `DoNotRetry` and the build runs locally.
