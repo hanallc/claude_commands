@@ -360,7 +360,7 @@ The journal stores these lifecycle states:
 | State | Meaning |
 | --- | --- |
 | Unprovisioned | No setup has registered a deployment. |
-| Idle-stopped | A deliberate idle stop permits a later demand start. |
+| Idle-stopped | A confirmed idle or interruption recovery stop permits a later demand start. |
 | Interrupted | Only EC2 can restart the interrupted Spot instance. |
 | Stopped-unknown | An unknown stop cause forbids a manual restart. |
 | Starting | A committed claim owns the unresolved demand start. |
@@ -376,8 +376,18 @@ The controller refuses claim release while a start or provider operation remains
 Idle stop and claim creation use the same lock.
 A committed claim prevents idle stop.
 A saved idle-stop intent refuses a later claim until stop confirmation.
-A confirmed interruption takes priority over a pending idle stop.
+A confirmed interruption takes priority over a pending stop.
 The controller records `INTERRUPTED` and refuses a manual restart.
+A stopped observation with an unknown cause preserves `INTERRUPTED`.
+If EC2 restarts the box without a claim, the controller saves its stop decision before it calls the provider.
+The decision records the generation and whether an interruption came before the restart.
+Another running observation keeps the stop in progress.
+If the running box enters a new generation, the controller saves a new stop decision for that generation.
+After compute exposure closes, a fresh stopped observation settles the unclaimed stop decision for the same generation.
+The controller records `IDLE_STOPPED` if that decision followed an interruption.
+A stopped observation from a different generation preserves `INTERRUPTED` if the old decision followed an interruption.
+An unclaimed stop with no prior interruption ends at `STOPPED_UNKNOWN`.
+The decision applies whether the controller or the guest stops the box.
 
 Phase C reserves compute before the next boot identity exists through `reserve_start()`.
 `check_start()` rechecks current caps before bootstrap, start, and permit publication.
@@ -1434,8 +1444,12 @@ The copies private index includes staged, unstaged, deleted, and permitted untra
 The caller's index and refs remain unchanged.
 The existing tree key and a second private capture detect content and executable mode changes.
 Both capture paths refuse new Git links with `NestedRepository`.
-The sender refuses unexpected ignored inputs, credential paths, Git links, and disallowed environment variables.
-It sends no ignored files, HOME, or target output.
+The sender never sends ignored files. A build can read these files, so the source check refuses each ignored file outside `source_allowed_ignored`.
+The refusal names the first path. Remove the file or ask the user to approve a list entry.
+The sender refuses credential paths, Git links, and disallowed environment variables. It omits HOME and target output.
+The sender checks local input paths before it requests a Hana claim.
+The sender refuses the source early only if it confirms that no execution is bound.
+Hana can start if an ignored file appears after the first check. The check after adoption then refuses the file.
 
 When source preparation fails before the command starts, offload reports the cause as a typed admission refusal.
 The queue records `DoNotRetry` and the build runs locally.
@@ -1601,3 +1615,37 @@ An exact current assignment and live holder establish the `remote_waiter` hold c
 A drain preserves that waiter without granting local memory or a Cargo token.
 Unassigned callers retain the existing drain behavior.
 Phase E adds no stored shape or queue wire field.
+
+### Pinned Hana GPU nextest pilot
+
+Run the gate setup command on natedev.
+
+```sh
+python3 scripts/aws_target/deploy.py up --workload merge-gates --approve-resources
+```
+
+The GPU probe prints its verdict. The verdict is available only in the command output.
+
+After the GPU setup probe passes, set `hana_gpu_route_enabled=on` in `config/cloud_gate.conf`.
+The route checks the deployment record for every type in `hana_gpu_instance_types`.
+
+Run the pilot from the Hana checkout.
+
+```sh
+~/.claude/scripts/direct/verify.sh test hana_mimesis_tools --test shader_variants --target hana-gpu
+```
+
+The queue offers one Linux slot for the package and test pairs in `hana_gpu_selections`.
+The executor captures the caller tree and passes the commit to the one-step GPU nextest worker.
+The worker uses the selected nextest profile and returns the exit status and both output streams.
+Cancellation in `verify.sh` stops the assigned GPU service and starts its cleanup.
+If only the runner dies, the GPU service can continue until the trial expires.
+The guest shuts down by the booking start time plus `hana_gpu_lifetime_minutes` from `config/cloud_gate.conf`.
+The gate expiry job uses the same deadline and the reservation allows 67 additional minutes for delivery and retries.
+The queue retains the claim until cleanup confirms termination or the ledger confirms that all bookings for the trial are closed.
+A settled infrastructure refusal releases the slot.
+A `HanaCommandAdmissionRefused` result prevents another attempt on the target for the same placement request.
+The queue gets a settled refusal only after the exact claim is free.
+A pinned call prints the cause of the refusal and exits with status 2.
+
+The `hana-aws` target handles check and clippy steps.

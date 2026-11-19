@@ -6701,7 +6701,8 @@ def finish_turn_wait(session_dir: Path, owner_session: str, *, source: str, prom
         user_wait = wait.get("wait_kind") == "WaitingForUser"
         body = message.body if isinstance(message, VerifiedSupplierMessage) else ""
         body = re.sub(r'^[^\r\n]*: [^\r\n]*\r?\nSender native id: [^\r\n]+\r?\n'
-                      + r'(?:Shown sender: [^\r\n]+\r?\n)?Tag: [a-fA-F0-9]{8}\r?\n\r?\n',
+                      + r'(?:Shown sender: [^\r\n]+\r?\n)?(?:Sent: [0-9]{2}:[0-9]{2} [^\r\n]+\r?\n)?'
+                      + r'Tag: [a-fA-F0-9]{8}\r?\n\r?\n',
                       "", body, count=1)
         relay = from_supplier and body.lstrip().startswith("From the user (via the showrunner):")
         if not ((user_wait and (source == "TYPED" or relay)) or (not user_wait and from_supplier)):
