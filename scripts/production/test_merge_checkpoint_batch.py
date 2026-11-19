@@ -501,19 +501,35 @@ raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
         missing = "refs/tags/absent-beta-checkpoint"
         lines = [self.batch_line("alpha", "2", first), self.batch_line("beta", "2", missing)]
 
-        with patch.object(merge_checkpoint, "merge", wraps=merge_checkpoint.merge) as merge:
-            result = self.land_batch(lines)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertRegex(result.stdout, rf"input: failed.*beta phase 2.*{missing}")
-        merge.assert_not_called()
-        self.assertEqual(self.git("rev-parse", "HEAD"), published)
-        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), published)
-        self.assertFalse(self.batch_record().exists())
-        self.assertEqual(self.git("for-each-ref", "refs/merge-checkpoint/"), "")
+        for cleanup_fails in (False, True):
+            with self.subTest(cleanup_fails=cleanup_fails):
+                if cleanup_fails:
+                    git = shutil.which("git", path=self.env["PATH"])
+                    assert git is not None
+                    self.executable(self.bin / "git", f'''#!/bin/sh
+if [ "$3" = update-ref ] && [ "$5" = --stdin ]; then
+    echo 'fixture cannot delete private refs' >&2
+    exit 1
+fi
+exec {shlex.quote(git)} "$@"
+''')
+                with patch.object(merge_checkpoint, "merge", wraps=merge_checkpoint.merge) as merge:
+                    result = self.land_batch(lines)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertRegex(result.stdout, rf"input: failed.*beta phase 2.*{missing}")
+                merge.assert_not_called()
+                self.assertEqual(self.git("rev-parse", "HEAD"), published)
+                self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), published)
+                self.assertFalse(self.batch_record().exists())
+                if cleanup_fails:
+                    self.assertRegex(result.stdout, r"batch: warning.*fixture cannot delete private refs")
+                else:
+                    self.assertEqual(self.git("for-each-ref", "refs/merge-checkpoint/"), "")
 
     def test_a_stopped_batch_resumes_after_fetching_a_later_checkpoint(self) -> None:
+        phase_refs = ("refs/remotes/origin/beta-phase", "origin/beta-phase")
         for case in ("unit branch hash", "unit branch ref", "phase branch only", "unit branch missing",
-                     "private ref from a killed run"):
+                     "private ref from a killed run", *phase_refs):
             with self.subTest(case=case):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
@@ -529,18 +545,23 @@ raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
                 _ = self.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m",
                              "beta work\n\nChange-Review: none — fixture code only", cwd=writer)
                 second = self.git("rev-parse", "HEAD", cwd=writer)
-                phase_branch = case in ("phase branch only", "unit branch missing", "private ref from a killed run")
+                phase_branch = case in ("phase branch only", "unit branch missing", "private ref from a killed run",
+                                        *phase_refs)
                 target = "HEAD:refs/heads/beta-phase" if phase_branch else "beta-branch"
                 _ = self.git("push", "origin", target, cwd=writer)
                 if case == "unit branch missing":
                     _ = self.git("update-ref", "-d", "refs/heads/beta-branch", cwd=self.origin)
                 if case == "private ref from a killed run":
                     _ = self.git("update-ref", "refs/merge-checkpoint/origin/beta-phase", published)
+                if case == "refs/remotes/origin/beta-phase":
+                    _ = self.git("update-ref", case, published)
                 absent = subprocess.run(["git", "cat-file", "-e", f"{second}^{{commit}}"], cwd=self.checkout,
                                         env=self.env, capture_output=True, text=True, check=False,
                                         timeout=TEST_HANG_GUARD_SECS)
                 self.assertNotEqual(absent.returncode, 0)
                 checkpoint = "refs/remotes/origin/beta-branch" if case == "unit branch ref" else second
+                if case in phase_refs:
+                    checkpoint = case
                 lines = [self.batch_line("alpha", "2", first), self.batch_line("beta", "2", checkpoint)]
 
                 if phase_branch:

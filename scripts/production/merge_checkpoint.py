@@ -1815,6 +1815,16 @@ def unpushed_merge_sources(checkout: Path, published: str) -> set[str]:
     return {line.split()[1] for line in parents.splitlines()}
 
 
+def delete_batch_origin_refs(checkout: Path) -> None:
+    refs = git(checkout, "for-each-ref", "--format=%(refname)", f"{BATCH_ORIGIN_HEADS}/")
+    _ = good(refs, "batch")
+    if refs.stdout:
+        deletes = "".join(f"delete {ref}\n" for ref in refs.stdout.rstrip("\n").split("\n"))
+        removed = subprocess.run(["git", "-C", str(checkout), "update-ref", "--no-deref", "--stdin"],
+                                 input=deletes, capture_output=True, text=True, check=False)
+        _ = good(removed, "batch")
+
+
 @contextmanager
 def batch_resume_record(requests: tuple[MergeRequest, ...]) -> Generator[BatchResumeRecord]:
     """Keep the ordered arguments and commit hashes while the batch has unpushed merges."""
@@ -1829,25 +1839,27 @@ def batch_resume_record(requests: tuple[MergeRequest, ...]) -> Generator[BatchRe
         _ = good(git(checkout, "fetch", "--prune", "--no-write-fetch-head", "--refmap=", "origin",
                      f"+refs/heads/{production.merge_branch}:{upstream}",
                      f"+refs/heads/*:{BATCH_ORIGIN_HEADS}/*"), "batch")
-        for branch in dict.fromkeys(request.unit.branch for request in requests):
-            head = git(checkout, "rev-parse", "--verify", "--quiet", f"{BATCH_ORIGIN_HEADS}/{branch}")
-            if head.returncode == 1:
-                continue
-            commit = good(head, "batch")
-            _ = good(git(checkout, "update-ref", f"refs/remotes/origin/{branch}", commit), "batch")
         for request in requests:
+            origin_ref = request.commit.removeprefix("refs/remotes/")
+            if origin_ref.startswith("origin/"):
+                private_ref = f"{BATCH_ORIGIN_HEADS}/{origin_ref.removeprefix('origin/')}"
+                present = git(checkout, "show-ref", "--verify", "--quiet", private_ref)
+                if present.returncode != 1:
+                    _ = good(present, "batch")
+                    request = request._replace(commit=private_ref)
             try:
                 checkpoints.append(resolved_checkpoint(request))
             except checkpoint_gate.Stop as error:
                 raise Refusal(f"{request.unit.name} phase {request.phase}: {error}") from error
-    finally:
-        refs = git(checkout, "for-each-ref", "--format=%(refname)", f"{BATCH_ORIGIN_HEADS}/")
-        _ = good(refs, "batch")
-        if refs.stdout:
-            deletes = "".join(f"delete {ref}\n" for ref in refs.stdout.rstrip("\n").split("\n"))
-            removed = subprocess.run(["git", "-C", str(checkout), "update-ref", "--no-deref", "--stdin"],
-                                     input=deletes, capture_output=True, text=True, check=False)
-            _ = good(removed, "batch")
+    except BaseException:
+        try:
+            delete_batch_origin_refs(checkout)
+        except (OSError, ValueError, checkpoint_gate.Stop) as cleanup_error:
+            detail = f"could not delete private origin refs ({cleanup_error})".replace("\n", " ")
+            checkpoint_gate.report("batch", "warning", detail)
+        raise
+    else:
+        delete_batch_origin_refs(checkout)
     record = BatchResumeRecord(path, tuple(checkpoints))
     contents = record.contents()
     sources = unpushed_merge_sources(checkout, upstream)
