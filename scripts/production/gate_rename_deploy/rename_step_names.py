@@ -2,6 +2,10 @@
 # Gate rename chunk 6 deletes this folder and its configuration after deployment.
 """Convert stored gate step names during deployment.
 
+Reverse converts every matching value to a name the old code can read.
+This includes values that new code wrote before the forward deployment.
+In both directions, refuse if both profile keys exist.
+
 Set a natedev drain hold first.
 Stop the admission socket, admission service, memory feed, and buildlog timer.
 Wait for the buildlog service to stop.
@@ -13,8 +17,8 @@ The program never stops services or changes a hold.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterator, Mapping, Sequence
-from contextlib import closing
+from collections.abc import Generator, Iterator, Mapping, Sequence
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -35,7 +39,9 @@ from scripts.build_queue import memory_files, progress_profile
 from scripts.build_targets import target_config
 from scripts.buildlog import store
 from scripts.lib import build_folders, conf, session_folder
+from scripts.lib.atomic_file import sync_folder, write_text_atomic
 from scripts.lib.process_start import Started, Unreadable, process_start
+from scripts.lint import memory_admit
 from scripts.mac_test import mac_queue_run
 from scripts.production.gate_rename_deploy import move_gate_state
 
@@ -116,6 +122,27 @@ class ProfileRename:
 
     old: Path
     new: Path
+
+
+@dataclass(frozen=True)
+class ConversionWrites:
+    """Record a possible live change before the first publication."""
+
+    marker: Path | None
+
+    @contextmanager
+    def publish(self, *, unchanged_errors: tuple[type[Exception], ...] = ()) -> Generator[None]:
+        marker = self.marker
+        first = marker if marker is not None and not marker.exists() else None
+        if first is not None:
+            write_text_atomic(first, "Conversion can have written live records.\n", new_file_mode=0o600)
+        try:
+            yield
+        except unchanged_errors:
+            if first is not None:
+                first.unlink()
+                sync_folder(first.parent)
+            raise
 
 
 def report(message: str, started: float, count: int = 0) -> None:
@@ -232,7 +259,7 @@ def convert(value: JsonValue, fields: frozenset[str], names: Mapping[str, str]) 
 
 
 def records(path: Path) -> Iterator[tuple[bytes, JsonValue]]:
-    with path.open("rb") as stream:
+    with (gzip.open(path, "rb") if path.suffix == ".gz" else path.open("rb")) as stream:
         if path.suffix == ".jsonl":
             for line in stream:
                 if line.strip():
@@ -240,7 +267,7 @@ def records(path: Path) -> Iterator[tuple[bytes, JsonValue]]:
                 else:
                     yield line, None
         else:
-            data = gzip.decompress(stream.read()) if path.suffix == ".gz" else stream.read()
+            data = stream.read()
             yield data, cast(JsonValue, json.loads(data))
 
 
@@ -333,8 +360,14 @@ def profile_renames(roots: RecordRoots, hosts: set[str]) -> list[ProfileRename]:
     parent = roots.buildlog / "admission/progress_profiles"
     renames: list[ProfileRename] = []
     old_step, new_step = roots.direction.gate_steps()
+    if hasattr(memory_admit, "GATE_TESTS"):
+        shapes = (memory_admit.GATE_TESTS, memory_admit.GATE_TYPES)
+    else:
+        # The old code uses these names for the same shapes.
+        shapes = (cast(str, getattr(memory_admit, "MERGE_GATE_TESTS")),
+                  cast(str, getattr(memory_admit, "MERGE_GATE_TYPES")))
     for host in sorted(hosts):
-        for shape in ("tests", "types"):
+        for shape in shapes:
             old = parent / progress_profile.profile_key((host, old_step, shape))
             new = parent / progress_profile.profile_key((host, new_step, shape))
             if not os.path.lexists(old):
@@ -360,7 +393,7 @@ def inspect_indexes(roots: RecordRoots) -> list[Path]:
     return paths
 
 
-def write_record(change: RecordChange, names: Mapping[str, str]) -> None:
+def write_record(change: RecordChange, names: Mapping[str, str], writes: ConversionWrites) -> None:
     started = time.monotonic()
     if RecordVersion.read(change.path) != change.version:
         raise Refused(f"record changed before conversion: {change.path}")
@@ -380,16 +413,18 @@ def write_record(change: RecordChange, names: Mapping[str, str]) -> None:
         if count != change.count or RecordVersion.read(change.path) != change.version:
             raise Refused(f"record changed during conversion: {change.path}")
         temp.chmod(mode)
-        os.replace(temp, change.path)
+        with writes.publish(unchanged_errors=(OSError,)):
+            os.replace(temp, change.path)
+        sync_folder(change.path.parent)
         report(f"Converted {change.path}", started, count)
     finally:
         temp.unlink(missing_ok=True)
 
 
-def update_index(path: Path, names: Mapping[str, str]) -> int:
+def update_index(path: Path, names: Mapping[str, str], writes: ConversionWrites) -> int:
     started = time.monotonic()
     count = 0
-    with closing(sqlite3.connect(path)) as connection, connection:
+    with closing(sqlite3.connect(path)) as connection:
         tables = {str(row[0]) for row in cast(list[tuple[str]], connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall())}
         for table in ("gate_runs", "steps"):
@@ -398,6 +433,15 @@ def update_index(path: Path, names: Mapping[str, str]) -> int:
             for old, new in names.items():
                 cursor = connection.execute(f"UPDATE {table} SET step = ? WHERE step = ?", (new, old))
                 count += cursor.rowcount
+        if count:
+            with writes.publish(unchanged_errors=(Refused,)):
+                try:
+                    connection.commit()
+                except sqlite3.Error as error:
+                    if connection.in_transaction:
+                        connection.rollback()
+                        raise Refused(f"index commit rolled back: {path}: {error}") from error
+                    raise
     report(f"Converted index {path}", started, count)
     return count
 
@@ -435,27 +479,30 @@ def inspect_conversion(roots: RecordRoots, started: float) -> Conversion:
     return Conversion(changes, renames, indexes, caches)
 
 
-def migrate(roots: RecordRoots) -> int:
+def migrate(roots: RecordRoots, writes: ConversionWrites) -> int:
     started = time.monotonic()
     conversion = inspect_conversion(roots, started)
     changes, renames, indexes, caches = conversion.changes, conversion.renames, conversion.indexes, conversion.caches
     count = 0
     names = roots.direction.names()
     for change in changes:
-        write_record(change, names)
+        write_record(change, names, writes)
         count += change.count
     for rename in renames:
         began = time.monotonic()
         if os.path.lexists(rename.new):
             raise Refused(f"replacement profile appeared: {rename.new}")
-        os.rename(rename.old, rename.new)
+        with writes.publish(unchanged_errors=(FileExistsError,)):
+            move_gate_state.rename_folder(rename.old, rename.new)
         report(f"Renamed profile {rename.old} -> {rename.new}", began, 1)
         count += 1
     for path in indexes:
-        count += update_index(path, names)
+        count += update_index(path, names, writes)
     for path in caches:
         began = time.monotonic()
-        path.unlink()
+        with writes.publish(unchanged_errors=(OSError,)):
+            path.unlink()
+        sync_folder(path.parent)
         report(f"Removed derived cache {path}", began, 1)
         count += 1
     report("Affected-test profile folders stay unchanged; the existing profile sweep removes stale or invalid records", started)
@@ -558,6 +605,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--aws-state", type=Path)
     _ = parser.add_argument("--review-page", type=Path)
     _ = parser.add_argument("--reverse", action="store_true")
+    _ = parser.add_argument("--write-marker", type=Path, help=argparse.SUPPRESS)
     _ = parser.add_argument("--wait-root", type=Path, action="append", default=None,
                             help="search this assignment folder; repeat to replace the default search folders")
     _ = parser.add_argument("--cloud-root", type=Path, action="append", default=None,
@@ -583,7 +631,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             wait_roots, cloud_roots, direction)
         check = cast(str | None, args.check)
         if check is None:
-            return migrate(roots)
+            return migrate(roots, ConversionWrites(cast(Path | None, args.write_marker)))
         started = time.monotonic()
         if check == "early":
             check_early(roots)
@@ -591,7 +639,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             _ = inspect_conversion(roots, started)
         report(f"Check passed: {check}", started)
         return 0
-    except (Refused, OSError, ValueError, sqlite3.Error) as error:
+    except (Refused, OSError, EOFError, ValueError, sqlite3.Error) as error:
         report(f"Refused: {error}", time.monotonic())
         return 2
 

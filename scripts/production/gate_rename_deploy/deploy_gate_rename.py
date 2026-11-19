@@ -13,28 +13,40 @@ import json
 import os
 from pathlib import Path
 import select
+import shlex
 import subprocess
 import tempfile
 import time
 from typing import cast
 from zoneinfo import ZoneInfo
 
-from scripts.build_hold import build_hold, hold_enforcer
+from scripts.build_hold import build_hold, hold_enforcer, override_guard
 from scripts.build_hold.owning_session import OwningSession
-from scripts.lib import conf, user_zone
+from scripts.lib import conf, conf_reads, session_folder, user_zone
+from scripts.lib.atomic_file import sync_folder, write_text_atomic
 from scripts.lib.process_start import Started, Unreadable, process_start
+from scripts.production.gate_rename_deploy import move_gate_state
 from scripts.production.gate_rename_deploy import rename_step_names as rename
 from scripts.production.gate_rename_deploy.rename_step_names import Direction
 
 HOLDER = "gate-rename-deploy"
 HERE = Path(__file__).resolve().parent
-PROC_ROOT = Path(os.environ.get("VERIFY_PROC_ROOT", "/proc"))
+PATH_OVERRIDES = (
+    *override_guard.OVERRIDE_VARIABLES,
+    "BUILDLOG_DIR", "BUILD_TARGETS_STATE_DIR", "VERIFY_STEPS_DIR", "VERIFY_PROC_ROOT",
+    "BUILD_HOLD_ENFORCER_DIR", "BUILD_HOLD_CGROUP_ROOT", "GATE_STATE_DIR", "MERGE_GATE_STATE_DIR",
+    session_folder.ROOT_ENV, "TMPDIR", "TEMP", "TMP", "USER_ZONE_CONF", conf_reads.CONF_READ_LOG,
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_CONFIG", "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL",
+)
+PROC_ROOT = move_gate_state.PROC_ROOT
 NAMES = ("", "Wait for old AWS attempts", "Set the drain hold", "Wait for kept builds", "Stop waiting gates",
          "Check the conditions before the stop", "Stop services", "Check the buildlog service",
          "Check every conversion condition", "Move the gate folder", "Convert step names",
          "Check the unchanged second conversion", "Start services", "Release the owned hold")
 LAST = len(NAMES) - 1
-STOP_STEP, MOVE_STEP, CONVERT_STEP = 6, 9, 10
+STOP_STEP, MOVE_STEP, CONVERT_STEP, RESTART_STEP = 6, 9, 10, 12
 
 
 @dataclass(frozen=True)
@@ -59,8 +71,7 @@ class DeploymentState:
     owns_hold: bool = False
     stopped_at: float = 0.0
     stop_seconds: float = 0.0
-    # True from the save before the move until the conversion completes.
-    moved_folder: bool = False
+    move_source: tuple[int, int] | None = None
     recovery: NoRecovery | RecoveryRequired = field(default_factory=NoRecovery)
     direction: Direction = Direction.FORWARD
 
@@ -89,7 +100,12 @@ class DeploymentPaths:
     journal: Path
     roots: rename.RecordRoots
     settings: DeploymentSettings
+    lock_fd: int
     discovery_arguments: tuple[str, ...] = ()
+
+    @property
+    def write_marker(self) -> Path:
+        return self.journal.with_name("conversion-writes")
 
 
 class DeploymentFailed(Exception):
@@ -105,16 +121,7 @@ def say(message: str) -> None:
 
 
 def save(paths: DeploymentPaths, state: DeploymentState) -> None:
-    descriptor, name = tempfile.mkstemp(prefix=".deploy-state-", dir=paths.journal.parent)
-    temporary = Path(name)
-    try:
-        with os.fdopen(descriptor, "w") as stream:
-            json.dump(asdict(state), stream)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, paths.journal)
-    finally:
-        temporary.unlink(missing_ok=True)
+    write_text_atomic(paths.journal, json.dumps(asdict(state)), new_file_mode=0o600)
 
 
 def load(path: Path, reverse: bool) -> DeploymentState:
@@ -123,11 +130,19 @@ def load(path: Path, reverse: bool) -> DeploymentState:
     value = cast(dict[str, object], json.loads(path.read_text()))
     step, owned = value.get("next_step"), value.get("owns_hold")
     began, total = value.get("stopped_at"), value.get("stop_seconds")
-    moved = value.get("moved_folder", False)
+    moved = value.get("move_source")
     if (not isinstance(step, int) or isinstance(step, bool) or not 1 <= step <= LAST + 1
-            or not isinstance(owned, bool) or not isinstance(moved, bool) or not isinstance(began, (int, float))
+            or not isinstance(owned, bool) or not isinstance(began, (int, float))
             or not isinstance(total, (int, float)) or began < 0 or total < 0):
         raise DeploymentFailed(f"Invalid state file. Restore it before another run: {path}")
+    move_source = None
+    if moved is not None:
+        if not isinstance(moved, list) or len(cast(list[object], moved)) != 2:
+            raise DeploymentFailed(f"Invalid source folder identity in the state file: {path}")
+        device, inode = cast(list[object], moved)
+        if type(device) is not int or type(inode) is not int:
+            raise DeploymentFailed(f"Invalid source folder identity in the state file: {path}")
+        move_source = (device, inode)
     recovery_value = value.get("recovery", {})
     recovery: NoRecovery | RecoveryRequired = NoRecovery()
     if recovery_value != {}:
@@ -149,7 +164,7 @@ def load(path: Path, reverse: bool) -> DeploymentState:
         if step != LAST + 1:
             raise DeploymentFailed(f"Complete the {direction.value} deployment before changing direction.", 2)
         return DeploymentState(direction=requested)
-    return DeploymentState(step, owned, float(began), float(total), moved, recovery, direction)
+    return DeploymentState(step, owned, float(began), float(total), move_source, recovery, direction)
 
 
 def require_installed_code(tree: Path, direction: Direction) -> None:
@@ -179,10 +194,11 @@ def require_installed_code(tree: Path, direction: Direction) -> None:
     expected = "old" if reverse else "new"
     raise DeploymentFailed(f"Install the {expected} gate code in the live checkout before deployment.", 2)
 
-def run(settings: DeploymentSettings, command: Sequence[str], label: str) -> str:
+def run(settings: DeploymentSettings, command: Sequence[str], label: str, *, lock_fd: int | None = None) -> str:
     """Keep terminal input for sudo and summarize the child output."""
     with tempfile.TemporaryFile(mode="w+t") as output:
-        with subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, text=True) as child:
+        pass_fds = () if lock_fd is None else (lock_fd,)
+        with subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, text=True, pass_fds=pass_fds) as child:
             while True:
                 try:
                     status = child.wait(timeout=settings.heartbeat_seconds)
@@ -199,7 +215,8 @@ def run(settings: DeploymentSettings, command: Sequence[str], label: str) -> str
 
 
 def service(paths: DeploymentPaths, action: str, unit: str, *, user: bool = False) -> None:
-    _ = run(paths.settings, [*(["systemctl", "--user"] if user else ["sudo", "systemctl"]), action, unit], f"{action} {unit}")
+    _ = run(paths.settings, [*(["systemctl", "--user"] if user else ["sudo", "systemctl"]), action, unit],
+            f"{action} {unit}", lock_fd=paths.lock_fd)
 
 
 def hold_command(paths: DeploymentPaths, action: str) -> None:
@@ -209,7 +226,7 @@ def hold_command(paths: DeploymentPaths, action: str) -> None:
         eta = datetime.now(paths.settings.zone) + timedelta(hours=paths.settings.hold_eta_hours)
         command += ["--for", "gate folder and step-name deployment", "--release-eta", eta.strftime("%H:%M"),
                     "--zone", paths.settings.zone.key]
-    _ = run(paths.settings, command, f"{action} natedev")
+    _ = run(paths.settings, command, f"{action} natedev", lock_fd=paths.lock_fd)
 
 
 def wait_cloud(roots: rename.RecordRoots, settings: DeploymentSettings) -> None:
@@ -311,18 +328,25 @@ def move_paths(paths: DeploymentPaths) -> tuple[Path, Path]:
     return parent / source, parent / destination
 
 
+def folder_identity(folder: Path) -> tuple[int, int] | None:
+    try:
+        status = folder.lstat()
+        return status.st_dev, status.st_ino
+    except FileNotFoundError:
+        return None
+
+
 def move_back(paths: DeploymentPaths, state: DeploymentState) -> None:
     """Return the gate folder before services start with unconverted step names."""
-    if not state.moved_folder:
+    if state.move_source is None:
         return
     old, new = move_paths(paths)
-    if os.path.lexists(new) and not os.path.lexists(old):
-        os.rename(new, old)
+    if folder_identity(old) != state.move_source:
+        if folder_identity(new) != state.move_source:
+            raise DeploymentFailed(f"Cannot find the original gate folder at {old} or {new}.")
+        move_gate_state.rename_folder(new, old)
         say(f"Moved the gate folder back: {new} -> {old}")
-    elif not os.path.lexists(old) or os.path.lexists(new):
-        raise DeploymentFailed(f"Cannot move the gate folder back: old exists={os.path.lexists(old)}; "
-                               + f"new exists={os.path.lexists(new)}. Restore {old} before services start.")
-    state.moved_folder = False
+    state.move_source = None
     save(paths, state)
 
 
@@ -332,7 +356,7 @@ def restart(paths: DeploymentPaths, state: DeploymentState) -> None:
                        (False, "build-memory-feed.service"), (True, "buildlog.timer")):
         try:
             service(paths, "start", unit, user=user)
-        except DeploymentFailed as error:
+        except (DeploymentFailed, OSError) as error:
             errors.append(str(error))
     if errors:
         raise DeploymentFailed("Services did not start. Restore them before releasing the hold: " + "; ".join(errors))
@@ -419,28 +443,44 @@ def execute_step(number: int, paths: DeploymentPaths, state: DeploymentState) ->
                  "--old", str(old), "--new", str(new)], NAMES[number])
     elif number == MOVE_STEP:
         old, new = move_paths(paths)
-        if os.path.lexists(old):
-            state.moved_folder = True
+        source, target = folder_identity(old), folder_identity(new)
+        if source is not None and target is not None:
+            raise DeploymentFailed(f"Both gate folders exist: {old} and {new}.", 2)
+        if source is not None:
+            if state.move_source is not None and state.move_source != source:
+                raise DeploymentFailed(f"The gate folder changed before the move: {old}.", 2)
+            state.move_source = source
             save(paths, state)
             _ = run(paths.settings, [str(paths.tree / "scripts/lib/py"), str(HERE / "move_gate_state.py"),
-                     "--old", str(old), "--new", str(new)], NAMES[number])
+                     "--old", str(old), "--new", str(new)], NAMES[number], lock_fd=paths.lock_fd)
+            if folder_identity(new) != source:
+                raise DeploymentFailed(f"The gate folder did not reach {new}.", 2)
+        elif state.move_source is not None:
+            if target != state.move_source:
+                raise DeploymentFailed(f"Cannot find the original gate folder at {old} or {new}.", 2)
+            move_gate_state.remove_typecheck_environment(new)
         else:
-            say("The gate folder move is complete or no old folder exists.")
+            say("No source gate folder exists.")
     elif number in (CONVERT_STEP, 11):
         roots = discover_roots(paths)
         output = run(paths.settings, [str(paths.tree / "scripts/lib/py"), str(HERE / "rename_step_names.py"),
-                     *conversion_arguments(roots)], NAMES[number])
+                     "--write-marker", str(paths.write_marker), *conversion_arguments(roots)], NAMES[number],
+                     lock_fd=paths.lock_fd)
         last = output.strip().splitlines()[-1] if output.strip() else ""
         if number == 11 and not last.endswith("changed=0"):
             raise DeploymentFailed("The second conversion changed records. Inspect the writers before another run.", 2)
         say(last.split("Conversion complete;")[-1].strip())
-        if number == CONVERT_STEP and state.moved_folder:
-            state.moved_folder = False
-            save(paths, state)
-    elif number == 12:
+    elif number == RESTART_STEP:
         restart(paths, state)
+        clear_write_marker(paths)
     elif number == LAST:
         release_owned(paths, state)
+
+
+def clear_write_marker(paths: DeploymentPaths) -> None:
+    if paths.write_marker.exists():
+        paths.write_marker.unlink()
+        sync_folder(paths.write_marker.parent)
 
 
 def recover(paths: DeploymentPaths, state: DeploymentState, failure: RecoveryRequired) -> int:
@@ -448,12 +488,18 @@ def recover(paths: DeploymentPaths, state: DeploymentState, failure: RecoveryReq
     say("Cancel the complete foreground caller with Ctrl-C.")
     say("For a detached caller: detached_runs.py stop --reason 'gate rename deployment' <record.json>.")
     say("For a scoped caller: systemctl --user stop <unit.scope>.")
-    try:
-        if failure.step in (MOVE_STEP, CONVERT_STEP):
+    if MOVE_STEP <= failure.step < RESTART_STEP:
+        try:
             move_back(paths, state)
+        except (DeploymentFailed, OSError, ValueError) as error:
+            say(f"Gate folder recovery needs attention: {error}")
+    try:
         if state.stopped_at or failure.step >= STOP_STEP:
             restart(paths, state)
         release_owned(paths, state)
+        if failure.step >= RESTART_STEP:
+            clear_write_marker(paths)
+        state.move_source = None
         state.next_step = 2
         state.recovery = NoRecovery()
         save(paths, state)
@@ -465,6 +511,15 @@ def recover(paths: DeploymentPaths, state: DeploymentState, failure: RecoveryReq
     return failure.status
 
 
+def report_conversion_failure(paths: DeploymentPaths, failure: RecoveryRequired) -> int:
+    say(f"Failed step {failure.step}: {failure.message}")
+    say("The records can be mixed. Keep the services stopped and the drain hold in force.")
+    arguments = shlex.join(paths.discovery_arguments)
+    command = "bash ~/.claude/scripts/production/gate_rename_deploy/deploy_gate_rename.sh"
+    say(f"After correcting the cause, continue with: {command}" + (f" {arguments}" if arguments else ""))
+    return failure.status
+
+
 def deploy(paths: DeploymentPaths, state: DeploymentState, *,
            after_step: Callable[[int], None] = lambda _step: None) -> int:
     require_installed_code(paths.tree, state.direction)
@@ -473,8 +528,9 @@ def deploy(paths: DeploymentPaths, state: DeploymentState, *,
     if state.next_step == LAST + 1:
         say(f"Deployment already complete. Total stop time: {state.stop_seconds:.2f} s.")
         return 0
-    save(paths, state)
+    number = state.next_step
     try:
+        save(paths, state)
         while state.next_step <= LAST:
             number = state.next_step
             say(f"{number}. {NAMES[number]}")
@@ -485,11 +541,28 @@ def deploy(paths: DeploymentPaths, state: DeploymentState, *,
             after_step(number)
     except (DeploymentFailed, rename.Refused, OSError, ValueError) as error:
         status = error.status if isinstance(error, DeploymentFailed) else 1
-        state.recovery = RecoveryRequired(state.next_step, status, str(error))
-        save(paths, state)
+        failure = RecoveryRequired(number, status, str(error))
+        if number < RESTART_STEP and paths.write_marker.exists():
+            # The saved step can run again without replacing completed conversions.
+            return report_conversion_failure(paths, failure)
+        state.recovery = failure
+        try:
+            save(paths, state)
+        except OSError as journal_error:
+            say(f"Cannot save the recovery step: {journal_error}")
         return recover(paths, state, state.recovery)
     say(f"Total stop time: {state.stop_seconds:.2f} s.")
     return 0
+
+
+def checked_home() -> Path:
+    for name in PATH_OVERRIDES:
+        if name in os.environ:
+            raise DeploymentFailed(f"Unset {name} before deployment.", 2)
+    home = override_guard.user_home()
+    if Path.home().resolve() != home.resolve():
+        raise DeploymentFailed("HOME must name the account's home folder.", 2)
+    return home
 
 
 def main() -> int:
@@ -499,9 +572,11 @@ def main() -> int:
     _ = parser.add_argument("--reverse", action="store_true", help="undo the deployment with the old gate code installed")
     _ = parser.add_argument("--discover", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    home = Path.home()
     tree = HERE.parents[2]
     try:
+        home = checked_home()
+        if tree != (home / ".claude").resolve():
+            raise DeploymentFailed("Run the deploy command from the live checkout at ~/.claude.", 2)
         configuration = conf.read("gate_rename_deploy")
         settings = DeploymentSettings.read(configuration)
         os.environ["TZ"] = settings.zone.key
@@ -531,7 +606,7 @@ def main() -> int:
             roots = rename.configured_roots(state.direction)
             discovery = tuple(word for flag, folders in (("--wait-root", wait), ("--cloud-root", cloud))
                               for folder in folders or () for word in (flag, str(folder)))
-            paths = DeploymentPaths(tree, home, journal, roots, settings, discovery)
+            paths = DeploymentPaths(tree, home, journal, roots, settings, lock.fileno(), discovery)
             return deploy(paths, state)
     except (DeploymentFailed, rename.Refused, OSError, ValueError, SyntaxError) as error:
         say(f"Refused: {error}")

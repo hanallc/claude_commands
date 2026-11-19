@@ -4575,10 +4575,16 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - Order: check the new code by content, wait for old AWS attempts, set a natedev drain hold unless one is in force, wait for the kept builds, stop `buildlog.timer` and the admission socket, admission and memory feed services, require the buildlog service inactive, run `move_gate_state.py` when needed, convert, convert again and require `changed=0`, start the services, release its own hold. Each step prints its name, its done time and a heartbeat.
 - It finds the assignment and cloud folders again just before each conversion (review F003).
 - A state file in the Git directory keeps the direction and the next step for an interrupted run.
-  A refusal saves a recovery point before services restart (F002). It gives the command to cancel the caller.
-  It restores the services and releases its hold. It resumes release when the holder file or a matching release record exists.
+  Each child that can change the deployment inherits the deployment lock.
+  A refusal before the first conversion write restores the services and releases the owned hold.
+  A failure after a conversion write keeps the services stopped and the hold in force.
+  The command prints how to continue from the saved step.
+  It resumes release when the holder file or a matching release record exists.
   An unpublished hold needs no release (F001).
 - A 16.6 GB copy of the live records: full run passed with a stop time of 187 seconds; a stop after each step resumed; refusal recovery, a completed rerun and an existing hold passed. The two folder searches add about 1 minute of stop time.
 - To reverse the deployment, install the old gate code. Keep the deploy folder and its configuration in the live checkout.
   Run the same command with `--reverse`. It uses the same hold, service stops and two conversion passes.
+  Reverse converts all matching step names to names the old code can read.
+  It includes values that new code wrote before the forward deployment.
+  Both directions refuse if both profile keys exist.
 - Checkpoint 403ec6239.

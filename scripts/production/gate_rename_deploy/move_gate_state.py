@@ -29,6 +29,7 @@ import sys
 from typing import cast
 
 from scripts.build_hold import build_hold
+from scripts.lib.session_move import open_directory, rename_exclusive
 
 PROC_ROOT = Path(os.environ.get("VERIFY_PROC_ROOT", "/proc"))
 SKIPPED_PIDS: set[int] = set()
@@ -48,6 +49,23 @@ def step(message: str) -> None:
 
 def exists(path: Path) -> bool:
     return os.path.lexists(path)
+
+
+def rename_folder(old: Path, new: Path) -> None:
+    """Move a folder only when the destination is absent."""
+    with ExitStack() as parents:
+        source = parents.enter_context(open_directory(old.parent.resolve()))
+        target = source if old.parent == new.parent else parents.enter_context(open_directory(new.parent.resolve()))
+        rename_exclusive(source, old.name, target, new.name)
+
+
+def remove_typecheck_environment(folder: Path) -> None:
+    venv = folder / "typecheck-venv"
+    if venv.is_symlink():
+        venv.unlink()
+    elif venv.exists():
+        shutil.rmtree(venv)
+    step(f"Removed the type-check environment: {venv}")
 
 
 def require_hold() -> None:
@@ -207,18 +225,13 @@ def move_state(old: Path, new: Path) -> int:
     drain(old)
     refuse_record_paths(old)
     drain(old)
-    venv = old / "typecheck-venv"
-    if venv.is_symlink():
-        venv.unlink()
-    elif venv.exists():
-        shutil.rmtree(venv)
-    step(f"Removed the type-check environment: {venv}")
-    drain(old)
-    if exists(new):
+    try:
+        rename_folder(old, new)
+    except FileExistsError:
         step("Refused: the new folder appeared before the rename")
         return 2
-    os.rename(old, new)
     step(f"Renamed folder: {old} -> {new}")
+    remove_typecheck_environment(new)
     step(f"Move complete: {new}")
     return 0
 
