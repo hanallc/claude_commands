@@ -2943,6 +2943,15 @@ Work:
 5. Old wire and snapshot records upgrade to the identity before the strict reader runs; pinned clients keep working.
 6. Tests replace the ones that let unnamed rows drop off the page. They cover release, continuation, restart, snapshot round trip, missing staff, Mac ownership and an empty process scope, and check the page's caller text.
 
+### Phase 44cl — A verify call record splits each wait by its cause  · status: todo
+**From bob via builds, 2026-11-18 20:2x:** in 7 days, 825 h (42%) of Hana verify call time had no recorded cause. Rank: after verify 43h and 44bw, before 44bf and 44j.
+1. The call record gets a slot or folder wait time, written where the slot reply ends the wait (admission_service.py:2114 and the client side).
+2. The call record gets one time field for each other wait cause that the Nov 19 sample read finds (routing, remote start, setup, steps with no record).
+3. The memory wait timer stops counting folder waits (admission_client.py:910).
+4. Per-step journal wait starts at that step, not at the call's first queue time (verify.sh:2521, admission_service.py:2614).
+5. Tests prove that, for a replayed call, the parts sum to elapsed time with no overlap.
+Scope is set from the sample read (phases/44bw/callsample_read.md reply). A cheaper split from existing records replaces new fields where it gives the same answer.
+
 ### Phase 44cg — A memory wait fixture gives the same result under load  · status: todo
 **From builds, 2026-11-18 18:3x:** queue's next item after 44cf.
 
