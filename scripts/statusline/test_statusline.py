@@ -33,7 +33,8 @@ from scripts.production import footer_counts, investigation, session_labels, sta
 from scripts.production.issues import ALL_FIELDS, Issue
 from scripts.rebuild import need
 from scripts.agents import remote
-from scripts.statusline import adhoc_items, assignment, counts_row, rebuild_row
+from scripts.review_links import for_you
+from scripts.statusline import adhoc_items, assignment, counts_row, rebuild_row, statusline_rows
 
 PROGRAM = Path(__file__).with_name("statusline.jq")
 SHIPPED_COLORS = PROGRAM.parents[2] / "config/statusline.conf"
@@ -449,7 +450,6 @@ class ColorTests(unittest.TestCase):
 
 class ForYouStatusTests(unittest.TestCase):
     def test_global_count_uses_the_shared_reader_and_refuses_incomplete_sources(self) -> None:
-        from scripts.review_links import for_you
         row = for_you.ForYouRow("action/fixture", "action", "Restore access", "github-warmup", "mac",
                                 "/fixture", "sdlc", "Login", "Release", "", "open", "manual", "")
         for rows, failures, expected in (((row,), (), "1"), ((), (), "0"),
@@ -469,7 +469,7 @@ class ForYouStatusTests(unittest.TestCase):
             connection = Mock(getresponse=Mock(return_value=response))
             with (patch.dict(os.environ, {"CONF_DIR": directory}, clear=True),
                   patch.object(subprocess, "check_output", return_value="100.64.0.42\n") as address,
-                  patch.object(counts_row, "HTTPConnection", return_value=connection) as connect):
+                  patch.object(statusline_rows, "HTTPConnection", return_value=connection) as connect):
                 self.assertEqual(counts_row.console_action_count(), "3")
                 connect.assert_called_once_with("100.64.0.42", 8765, timeout=2)
                 address.assert_called_once_with(

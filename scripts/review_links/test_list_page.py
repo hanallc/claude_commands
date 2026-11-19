@@ -100,7 +100,7 @@ class _Browser:
 
 
 class _Chrome(_Browser):
-    """Keep the browser and open an isolated target for each probe."""
+    """Keep one Chrome target and start each probe in a new document."""
 
     def __init__(self, root: Path) -> None:
         self.root: Path = root
@@ -120,6 +120,12 @@ class _Chrome(_Browser):
             writer = process.stdin
             assert writer is not None
             os.set_blocking(writer.fileno(), False)
+            context = self.command("Target.createBrowserContext", {})["browserContextId"]
+            target = self.command("Target.createTarget", {"url": "about:blank", "browserContextId": context})
+            self.session: str = cast(str, self.command("Target.attachToTarget",
+                {"targetId": target["targetId"], "flatten": True})["sessionId"])
+            _ = self.command("Page.enable", {}, self.session)
+            _ = self.command("Page.setLifecycleEventsEnabled", {"enabled": True}, self.session)
 
     def read(self, deadline: float) -> dict[str, object]:
         reader = self.process.stdout
@@ -171,47 +177,52 @@ class _Chrome(_Browser):
                     raise RuntimeError(f"{method}: {reply['error']}")
                 return cast(dict[str, object], reply["result"])
 
+    def navigate(self, destination: str) -> None:
+        navigation = self.command("Page.navigate", {"url": destination}, self.session)
+        if "errorText" in navigation:
+            raise RuntimeError(f"Page.navigate: {navigation['errorText']}")
+        load = (self.session, cast(str, navigation["loaderId"]))
+        deadline = time.monotonic() + 20
+        while load not in self.loaded:
+            _ = self.read(deadline)
+
     def dom(self, page: Path, marker: str, *, reduced_motion: bool,
             window_size: tuple[int, int] | None) -> subprocess.CompletedProcess[str]:
         with self.stop_on_error():
-            context = cast(str, self.command("Target.createBrowserContext", {})["browserContextId"])
-            target = self.command("Target.createTarget", {"url": "about:blank", "browserContextId": context})
-            session = cast(str, self.command("Target.attachToTarget",
-                {"targetId": target["targetId"], "flatten": True})["sessionId"])
-            _ = self.command("Page.enable", {}, session)
-            _ = self.command("Page.setLifecycleEventsEnabled", {"enabled": True}, session)
+            session = self.session
             if window_size is not None:
                 width, height = window_size
                 _ = self.command("Emulation.setDeviceMetricsOverride",
                     {"width": width, "height": height, "deviceScaleFactor": 1, "mobile": False}, session)
-            if reduced_motion:
-                _ = self.command("Emulation.setEmulatedMedia",
-                    {"features": [{"name": "prefers-reduced-motion", "value": "reduce"}]}, session)
+            else:
+                _ = self.command("Emulation.clearDeviceMetricsOverride", {}, session)
+            features = [{"name": "prefers-reduced-motion", "value": "reduce"}] if reduced_motion else []
+            _ = self.command("Emulation.setEmulatedMedia", {"features": features}, session)
             destination = page.as_uri()
             # Evaluate the promise in the new document, after the navigation.
             marker_literal = json.dumps(marker)
             script = (
+                "try { sessionStorage.clear(); localStorage.clear(); }"
+                "catch (error) { if (error.name !== 'SecurityError') throw error; }"
                 "globalThis.fixtureDOM = new Promise(resolve => {"
-                "const finish = () => { observer.disconnect(); resolve(document.documentElement.outerHTML); };"
-                f"const observer = new MutationObserver(() => {{ if (document.getElementById({marker_literal})) finish(); }});"
+                "const observer = new MutationObserver(() => {"
+                f"const result = document.getElementById({marker_literal});"
+                "if (result) { observer.disconnect(); resolve(result.outerHTML); }"
+                "});"
                 "observer.observe(document, {childList: true, subtree: true});"
                 "});"
             )
-            _ = self.command("Page.addScriptToEvaluateOnNewDocument", {"source": script}, session)
-            navigation = self.command("Page.navigate", {"url": destination}, session)
-            if "errorText" in navigation:
-                raise RuntimeError(f"Page.navigate: {navigation['errorText']}")
-            load = (session, cast(str, navigation["loaderId"]))
-            deadline = time.monotonic() + 20
-            while load not in self.loaded:
-                _ = self.read(deadline)
+            hook = self.command("Page.addScriptToEvaluateOnNewDocument", {"source": script}, session)
+            self.navigate(destination)
             try:
                 response = self.command("Runtime.evaluate",
                     {"expression": "globalThis.fixtureDOM", "awaitPromise": True, "returnByValue": True}, session)
             except TimeoutError as error:
                 raise TimeoutError(f"Chrome did not find {marker} in {destination}") from error
             result = cast(dict[str, object], response["result"])
-            _ = self.command("Target.disposeBrowserContext", {"browserContextId": context})
+            _ = self.command("Page.removeScriptToEvaluateOnNewDocument", {"identifier": hook["identifier"]}, session)
+            self.navigate("about:blank")
+            _ = self.command("Page.resetNavigationHistory", {}, session)
             self.loaded.clear()
             return subprocess.CompletedProcess(destination, 0, str(result.get("value", "")), "")
 
@@ -374,9 +385,9 @@ class ListPageTests(unittest.TestCase):
         cls.addClassCleanup(cls._firefox.close)
         return cls._firefox
 
-    def firefox_screenshot(self, destination: str, path: Path, width: int, height: int,
-                           complete: threading.Event | None = None, *, dark: bool = False
-                           ) -> subprocess.CompletedProcess[str]:
+    def firefox_view(self, destination: str, path: Path | None, width: int, height: int,
+                     complete: threading.Event | None = None, *, dark: bool = False
+                     ) -> subprocess.CompletedProcess[str]:
         try:
             browser = self.firefox()
             with browser.page(destination, width, height, dark=dark):
@@ -384,9 +395,10 @@ class ListPageTests(unittest.TestCase):
                     browser.wait_for_load(destination)
                 elif not complete.wait(45):
                     raise TimeoutError("Firefox did not report the page result")
-                browser.screenshot(path)
+                if path is not None:
+                    browser.screenshot(path)
         except (OSError, RuntimeError) as error:
-            raise RuntimeError(f"Firefox screenshot failed for {destination}") from error
+            raise RuntimeError(f"Firefox could not show {destination}") from error
         return subprocess.CompletedProcess(destination, 0, "", "")
 
     def test_review_links_keep_the_console_and_jump_to_cards_in_every_state(self) -> None:
@@ -895,7 +907,7 @@ if(proof){const keepOpen=new Image();keepOpen.hidden=true;keepOpen.src='/complet
                             with self.firefox().page(url, 1440, 1100, dark=True, reduced_motion=shot == 'reduced'):
                                 self.assertTrue(complete.wait(35), "The browser must report its click results")
                         else:
-                            done = self.firefox_screenshot(url + '&proof=' + shot,
+                            done = self.firefox_view(url + '&proof=' + shot,
                                 output / f'listlinks-{shot}-dark.png', 1440, 1100, complete, dark=True)
                             self.assertEqual(done.returncode, 0, done.stderr)
                     finally:
@@ -1134,7 +1146,7 @@ frame.addEventListener('load',async()=>{
                         url = "/console/" + console.place_query("list", place)
                         destination = f'http://127.0.0.1:{server.server_port}{url}&number={number}&case={case}'
                         if case == "proof" and proof:
-                            result = self.firefox_screenshot(destination, Path(proof), 1440, 1100, complete, dark=True)
+                            result = self.firefox_view(destination, Path(proof), 1440, 1100, complete, dark=True)
                             self.assertEqual(result.returncode, 0, result.stderr)
                         else:
                             with self.firefox().page(destination, 1440, 1100, dark=True):
@@ -2769,7 +2781,11 @@ observer.observe(original.parentNode,{childList:true});
             _ = self.add(f"List item {number}", number=number)
         with patch.object(list_page, "counts_strip", return_value=""):
             page = list_page.render(self.root / "reviews")
-        self.assertEqual(save_notice_failures(page, 'remove'), [[]])
+        def load(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            return self.firefox_view(arguments[-1], None, 1366, 768)
+
+        with patch("scripts.review_links.test_accounts_page.subprocess", SimpleNamespace(run=load)):
+            self.assertEqual(save_notice_failures(page, 'remove'), [[]])
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_keeps_the_question_request_after_a_service_failure(self) -> None:
@@ -4161,11 +4177,7 @@ requestAnimationFrame(()=>requestAnimationFrame(()=>{frame.src='/page';}));
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
-                profile = self.root / "answer-profile"
-                profile.mkdir(exist_ok=True)
-                browser = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
-                    '--window-size', '1280,900', '--screenshot', str(self.root / 'answer.png'),
-                    f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=45)
+                browser = self.firefox_view(f'http://127.0.0.1:{server.server_port}/', None, 1280, 900, complete)
                 self.assertEqual(browser.returncode, 0, browser.stderr)
                 self.assertEqual(results, [[]])
             finally:
@@ -4342,8 +4354,8 @@ const change=async path=>{
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
-                browser = self.firefox_screenshot(f'http://127.0.0.1:{server.server_port}/proof',
-                                                  self.root / 'ask.png', 1440, 900, complete)
+                browser = self.firefox_view(f'http://127.0.0.1:{server.server_port}/proof',
+                                            None, 1440, 900, complete)
                 self.assertEqual(browser.returncode, 0, browser.stderr)
                 self.assertEqual(results, [[]])
             finally:
@@ -4776,7 +4788,7 @@ window.fetch=async(_path,options={})=>{
         def screenshot(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
             path = Path(arguments[arguments.index("--screenshot") + 1])
             width, _, height = arguments[arguments.index("--window-size") + 1].partition(",")
-            return self.firefox_screenshot(arguments[-1], path, int(width), int(height))
+            return self.firefox_view(arguments[-1], path, int(width), int(height))
 
         with patch("scripts.review_links.test_page_frame.subprocess", SimpleNamespace(run=screenshot)):
             assert_status_states(self, list_page.render(self.root / "reviews").decode(), 15)
@@ -5221,8 +5233,8 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify([...failed,...er
                     thread.start()
                     try:
                         with patch.object(change_page, "send_to_staff") as sends:
-                            done = self.firefox_screenshot(f'http://127.0.0.1:{server.server_port}/',
-                                                           self.root / f'page-{width}.png', width, 900, complete)
+                            done = self.firefox_view(f'http://127.0.0.1:{server.server_port}/',
+                                                     None, width, 900, complete)
                             self.assertEqual(done.returncode, 0, done.stderr)
                             self.assertEqual(results, [[]])
                             sends.assert_called_once()
