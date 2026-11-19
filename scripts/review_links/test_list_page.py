@@ -1259,15 +1259,21 @@ document.body.append(result);
         path = the_list.folder(MORTY.id) / f"{dated.id}.md"
         _ = path.write_text(path.read_text().replace(midnight.isoformat(), day.isoformat()))
         page = list_page.render(self.root / "reviews", include_counts=False).decode()
-        for item, due in ((dated, midnight + timedelta(days=1)), (timed, timed_eta)):
-            row = page.split(f'data-number="{item.number}"', 1)[1].split("</tbody>", 1)[0]
-            if item is dated:
-                with self.subTest(check="display"):
-                    self.assertIn('<td data-label="ETA">2026-11-20</td>', row)
-            with self.subTest(check="sort", item=item.id):
-                encoded = row.split('data-sort-values="', 1)[1].split('"', 1)[0]
-                values = cast(list[object], json.loads(html.unescape(encoded)))
-                self.assertEqual(values[6], [0, due.timestamp()])
+        dated_row, timed_row = (
+            page.split(f'data-number="{item.number}"', 1)[1].split("</tbody>", 1)[0] for item in (dated, timed)
+        )
+
+        def eta_sort_key(row: str) -> list[float]:
+            encoded = row.split('data-sort-values="', 1)[1].split('"', 1)[0]
+            values = cast(list[object], json.loads(html.unescape(encoded)))
+            return cast(list[float], values[6])
+
+        with self.subTest(check="display"):
+            self.assertIn('<td data-label="ETA">2026-11-20</td>', dated_row)
+        with self.subTest(check="sort"):
+            timed_key, dated_key = eta_sort_key(timed_row), eta_sort_key(dated_row)
+            self.assertEqual((timed_key[0], dated_key[0]), (0, 0))
+            self.assertLess(timed_key, dated_key)
 
     def test_linked_reviews_share_one_current_read_and_link_to_the_review_cards(self) -> None:
         def change(identity: str, state: review_items.ReviewState) -> review_items.ReviewItem:

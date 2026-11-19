@@ -173,6 +173,7 @@ class TheListTests(unittest.TestCase):
     def test_eta_due_uses_the_next_local_day_for_a_date_and_the_end_of_a_range(self) -> None:
         cases = (
             (date(2026, 3, 8), datetime(2026, 3, 9, 4, tzinfo=UTC)),
+            (date.max, None),
             (START, START),
             (the_list.EtaRange(START, START + timedelta(hours=1)), START + timedelta(hours=1)),
             (the_list.EtaStatus.PAUSED, None),

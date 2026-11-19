@@ -538,7 +538,7 @@ def eta_text(value: Eta) -> str:
 def eta_due(eta: Eta) -> datetime | None:
     if isinstance(eta, datetime):
         return eta
-    if isinstance(eta, date):
+    if isinstance(eta, date) and eta < date.max:
         return datetime.combine(eta + timedelta(days=1), time.min, tzinfo=user_zone())
     if isinstance(eta, EtaRange):
         return eta.latest
