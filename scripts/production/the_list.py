@@ -14,7 +14,7 @@ import re
 import subprocess
 import sys
 import threading
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
@@ -1189,8 +1189,26 @@ def update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source
     return _update(keeper, identity, changes, source=source).item
 
 
+_PRODUCER_UPDATE_FIELDS = ("latest_status", "next_step", "eta", "state", "next_check")
+_PRODUCER_UPDATE_OPTIONS = tuple("--" + field.replace("_", "-") for field in _PRODUCER_UPDATE_FIELDS)
+
+
+def _check_producer_update_fields(fields: Iterable[str]) -> None:
+    refused = sorted("--" + field.replace("_", "-") for field in set(fields).difference(_PRODUCER_UPDATE_FIELDS))
+    if refused:
+        raise ListError(f"producers can update only {', '.join(_PRODUCER_UPDATE_OPTIONS)}. "
+                        + f"Refused options: {', '.join(refused)}")
+
+
 def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source: str,
             assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListEdit:
+    if assigned_to is not AllItems.INCLUDED:
+        _check_producer_update_fields(changes)
+        producer = staff.by_id(assigned_to)
+        if producer is None or producer.kind != "producer":
+            raise ListError("the assigned producer has no producer staff row")
+        source = producer.name
+
     def edit(item: ListItem, _: datetime) -> ListItem:
         _open(item)
         if changes.get("state") == ItemState.CLOSED:
@@ -1693,10 +1711,6 @@ def _send_assignment_notice(recipient: staff.StaffRow, text: str) -> None:
     raise ListError((result.stderr or result.stdout).strip() or "message delivery failed")
 
 
-_PRODUCER_UPDATE_FIELDS = ("latest_status", "next_step", "eta", "state", "next_check")
-_PRODUCER_UPDATE_OPTIONS = tuple("--" + field.replace("_", "-") for field in _PRODUCER_UPDATE_FIELDS)
-
-
 def _notify_producer_assignment(item: ListItem, previous_producer: staff.StaffId, keeper: staff.StaffId) -> int:
     if item.producer in (keeper, previous_producer):
         return 0
@@ -1803,17 +1817,13 @@ def main(argv: list[str] | None = None) -> int:
             identity = cast(str, args.id)
             if identity.isascii() and identity.isdecimal():
                 identity = f"L{identity}"
+            source = cast(str | None, args.source)
             if assigned_to is not AllItems.INCLUDED:
                 options = cast(dict[str, object], vars(args))
-                allowed = {"command", "id", "source", *_PRODUCER_UPDATE_FIELDS}
-                refused = sorted(f"--{key.replace('_', '-')}" for key, value in options.items()
-                                 if value is not None and key not in allowed)
-                if refused:
-                    raise ListError(f"producers can update only {', '.join(_PRODUCER_UPDATE_OPTIONS)}. "
-                                    + f"Refused options: {', '.join(refused)}")
-                _ = _update(keeper, identity, _cli_changes(args, record), source=caller.name, assigned_to=assigned_to)
+                _check_producer_update_fields(key for key, value in options.items()
+                                              if value is not None and key not in {"command", "id", "source"})
+                _ = _update(keeper, identity, _cli_changes(args, record), source=source or "", assigned_to=assigned_to)
                 return 0
-            source = cast(str | None, args.source)
             if source is None:
                 parser.error("update requires --source for morty")
             changed = _update(keeper, identity, _cli_changes(args, record), source=source)

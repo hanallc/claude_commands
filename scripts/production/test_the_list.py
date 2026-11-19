@@ -12,7 +12,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast, final, override
+from typing import Protocol, cast, final, override
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
@@ -27,6 +27,14 @@ MORTY = staff.StaffRow(staff.StaffId("536997b5-4415-4cb1-b683-d777e02e9a22"), "p
 BOB = staff.StaffRow(staff.StaffId("a02a55c8-a2c4-47d9-bf99-fd30ffe75247"), "producer", "bob", staff.StaffRoot(),
                      current_session=staff.StaffId("32c954ea-25b3-44e7-9eed-3218ce9df1d6"))
 START = datetime(2026, 11, 16, 18, tzinfo=UTC)
+
+
+class ProducerScopedUpdate(Protocol):
+    def __call__(self, keeper: staff.StaffId, identity: str, changes: the_list.ItemChanges, *,
+                 source: str, assigned_to: staff.StaffId) -> the_list.ListEdit: ...
+
+
+scoped_update = cast(ProducerScopedUpdate, getattr(the_list, "_update"))
 
 
 @final
@@ -363,6 +371,9 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(saved.state, the_list.ItemState.WORKING)
         with self.assertRaisesRegex(the_list.ListError, "use close"):
             _ = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.CLOSED}, source=OTHER.name)
+        with self.assertRaisesRegex(the_list.ListError, "use close"):
+            _ = scoped_update(MORTY.id, item.id, {"state": the_list.ItemState.CLOSED},
+                              source=OTHER.name, assigned_to=OTHER.id)
         self.assertEqual(the_list.load(MORTY.id, item.id), saved)
 
     def test_producer_sets_next_check_with_its_name_as_source(self) -> None:
@@ -401,6 +412,20 @@ class TheListTests(unittest.TestCase):
                     self.assertIn(f"Refused options: {field}", error)
                     self.assertEqual(the_list.load(MORTY.id, item.id), item)
         self.assertEqual(self.notices, [])
+
+    def test_producer_scoped_update_cannot_reassign_an_item(self) -> None:
+        item = self.add(changes={"producer": OTHER.id})
+        with self.assertRaisesRegex(the_list.ListError, "Refused options: --producer"):
+            _ = scoped_update(MORTY.id, item.id, {"producer": BOB.id}, source=OTHER.name, assigned_to=OTHER.id)
+        self.assertEqual(the_list.load(MORTY.id, item.id), item)
+
+    def test_producer_scoped_update_logs_its_own_name(self) -> None:
+        item = self.add(changes={"producer": OTHER.id})
+        _ = scoped_update(MORTY.id, item.id, {"latest_status": "The plan is ready."},
+                          source=MORTY.name, assigned_to=OTHER.id)
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(saved.latest_status, "The plan is ready.")
+        self.assertEqual(saved.log[-1].source, OTHER.name)
 
     def test_producer_cannot_run_other_commands(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
