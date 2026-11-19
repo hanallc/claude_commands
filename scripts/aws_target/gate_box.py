@@ -6,7 +6,7 @@ import inspect
 import json
 import shlex
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 from enum import StrEnum
 import math
 
@@ -252,7 +252,8 @@ try:
                                         module_time_limit_s=links['module_time_limit_s'])
         if links.get('production'):
             result['record'] = completion_record(gate, links['attempt'], links['commit'], links['tree'], os.uname().nodename,
-                                                 result['gate_started_at'], time.time(), links['mode'])
+                                                 result['gate_started_at'], time.time(), links['mode'],
+                                                 split=gate_request.get('split') is True)
             dirty = gate_request['dirty_paths']
             result['record'].update(head=gate_request['head'], dirty=bool(dirty), dirty_paths=dirty,
                                     dirty_path_count=len(dirty))
@@ -648,18 +649,23 @@ def execution_records(value: GateRun) -> list[gate_record.Execution]:
             for job in value.executions or value.jobs]
 
 
+def completion_selection(mode: str, *, split: bool) -> Literal["full", "affected", "subset"]:
+    """Classify a record from the assignment."""
+    if split:
+        return "subset"
+    return "affected" if mode == "targeted-test" else "full"
+
+
 def completion_record(value: object, attempt: str, commit: str, tree: str, host: str,
-                      started: float, ended: float, mode: str) -> dict[str, object]:
+                      started: float, ended: float, mode: str, *, split: bool = False) -> dict[str, object]:
     """Return an explicit buildlog record with the remote host identity."""
     from scripts.test_times import gate_record
     from datetime import UTC
     from scripts.buildlog import record, store
-    from scripts.production.gate_routes import GateRun, ModuleCoverage
+    from scripts.production.gate_routes import GateRun
     import os
     if not isinstance(value, GateRun):
         raise TypeError('expected a completed gate')
-    selection = 'subset' if value.coverage is ModuleCoverage.SUBSET else (
-        'affected' if mode == 'targeted-test' else 'full')
     modules = gate_record.module_runs(execution_records(value), gate_record.slow_test_s())
     suites = [{'suite': suite, 'wall_s': max((job.seconds for job in value.jobs if job.suite == suite), default=0),
                'status': int(any(job.returncode for job in value.jobs if job.suite == suite))}
@@ -667,7 +673,7 @@ def completion_record(value: object, attempt: str, commit: str, tree: str, host:
     return {'kind': 'gate_run', 'v': record.RECORD_VERSION, 'id': 'gate-' + attempt, 'host': host,
             'started_at': datetime.fromtimestamp(started, UTC).isoformat(),
             'ended_at': datetime.fromtimestamp(ended, UTC).isoformat(), 'wall_s': value.seconds,
-            'hold_wait_s': 0, 'selection': selection,
+            'hold_wait_s': 0, 'selection': completion_selection(mode, split=split),
             'reason': 'time limit' if value.time_limit_report else 'cloud gate',
             'vcpus': os.cpu_count() or 1, 'status': int(not value.passed), 'max_jobs': os.cpu_count() or 1,
             'peak_mib': value.peak_memory_mib, 'cap_mib': 0, 'checkout': '/var/lib/gate-trial/repo',

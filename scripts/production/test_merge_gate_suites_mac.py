@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, suppress
 import io
 import os
 from pathlib import Path
@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from typing import cast, final, override
 from unittest import mock
 
-from scripts.aws_target import cloud_gate
+from scripts.aws_target import cloud_gate, ledger
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import merge_gate
@@ -33,13 +33,16 @@ LIB_SECOND = "scripts/lib/test_second.py"
 MESSAGE = "scripts/message/test_first.py"
 
 TERM_PROBE = """
+import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 from threading import Event
+from unittest.mock import patch
 
 from scripts.production.gate_routes import SuiteMode, TreeSelection
-from scripts.production.merge_gate import start_mac_gate
+from scripts.production.merge_gate import ACTIVE_GATE_RECOVERY, GateRecovery, SharedCPUPool, start_mac_gate
 
 state = Path(sys.argv[1])
 
@@ -55,6 +58,21 @@ class FakeMac:
 
 with start_mac_gate(FakeMac(), state, mode=SuiteMode.MERGE_GATE, full=False,
                     module_time_limit_s=1, selected=TreeSelection(('scripts/lib/test_first.py',), 'tree')):
+    if sys.argv[2] == 'protected':
+        reader, writer = os.pipe()
+        os.write(writer, b'Q')
+        recovery = GateRecovery(state / 'recovery.json', str(state), os.getpid(), 'fixture')
+        ACTIVE_GATE_RECOVERY.set(recovery)
+        save = recovery.save
+
+        def pause_before_save():
+            (state / 'protected').touch()
+            assert sys.stdin.buffer.read(1) == b'r'
+            assert signal.SIGTERM in signal.sigpending()
+            save()
+
+        with patch.object(recovery, 'save', pause_before_save):
+            SharedCPUPool(reader, reader).try_acquire()
     Event().wait()
 """
 
@@ -217,19 +235,72 @@ class MacGateSuitesTests(GateSuitesFixture):
                     release.set()
                     self.assertTrue(finished.wait(10))
 
-    @gate_suites("lib")
-    def test_sigterm_closes_the_mac_cancellation_pipe_on_process_exit(self) -> None:
+    def assert_sigterm_closes_the_mac_pipe(self, *, protected: bool) -> None:
         source = Path(__file__).resolve().parents[2]
-        with subprocess.Popen([sys.executable, "-c", TERM_PROBE, str(self.state)], cwd=source,
-                              stdin=subprocess.DEVNULL) as gate:
+        mode = "protected" if protected else "idle"
+        with subprocess.Popen([sys.executable, "-c", TERM_PROBE, str(self.state), mode], cwd=source,
+                              stdin=subprocess.PIPE) as gate:
             try:
                 wait_until((self.state / "watching").exists, self.state, processes=(gate,))
+                if protected:
+                    wait_until((self.state / "protected").exists, self.state, processes=(gate,))
                 gate.terminate()
+                if protected:
+                    assert gate.stdin is not None
+                    with suppress(BrokenPipeError):
+                        _ = os.write(gate.stdin.fileno(), b"r")
                 self.assertEqual(gate.wait(timeout=10), -signal.SIGTERM)
                 wait_until((self.state / "cancelled").exists, self.state)
             finally:
                 if gate.poll() is None:
                     gate.kill()
+
+    @gate_suites("lib")
+    def test_sigterm_closes_the_mac_cancellation_pipe_on_process_exit(self) -> None:
+        self.assert_sigterm_closes_the_mac_pipe(protected=False)
+
+    @gate_suites("lib")
+    def test_sigterm_waits_for_linux_to_record_its_cpu_slot(self) -> None:
+        self.assert_sigterm_closes_the_mac_pipe(protected=True)
+        path = self.state / "recovery.json"
+        self.assertTrue(path.exists(), "Linux lost its CPU slot record")
+        token, = ledger.rows(cloud_gate.read(path), "tokens")
+        self.assertEqual(token["value"], b"Q".hex())
+
+    @gate_suites("lib")
+    def test_only_linux_writes_recovery_during_concurrent_registration(self) -> None:
+        self.read_modules.return_value = (LIB_SECOND,)
+        recovery = merge_gate.GateRecovery(self.state / "recovery.json", str(self.checkout), os.getpid(), "fixture")
+        register = threading.Barrier(2)
+        writers: list[threading.Thread] = []
+        save = recovery.save
+
+        def record_writer() -> None:
+            writers.append(threading.current_thread())
+            save()
+
+        def mac_result(*_arguments: object, **_options: object) -> merge_gate.GateRun:
+            _ = register.wait(timeout=10)
+            _ = merge_gate.checked_git(self.checkout, "rev-parse", "HEAD")
+            return merge_gate.GateRun((merge_gate.GateJobResult("lib", "test_second.py", 0, 1, ""),), 1, 0)
+
+        def linux_result(*_arguments: object, **_options: object) -> merge_gate.GateRun:
+            _ = register.wait(timeout=10)
+            recovery.add_group(os.getpid())
+            return merge_gate.GateRun((merge_gate.GateJobResult("lib", "test_first.py", 0, 1, ""),), 1, 0)
+
+        self.mac_route.side_effect = mac_result
+        self.cloud_route.side_effect = linux_result
+        owner = merge_gate.ACTIVE_GATE_RECOVERY.set(recovery)
+        try:
+            with mock.patch.object(recovery, "save", record_writer):
+                run = merge_gate.run_gate_suites(self.checkout)
+        finally:
+            merge_gate.ACTIVE_GATE_RECOVERY.reset(owner)
+        self.assertTrue(run.passed, self.output.getvalue())
+        self.assertEqual(set(writers), {threading.main_thread()})
+        saved = cloud_gate.read(recovery.path)
+        self.assertEqual(set(ledger.mapping(saved["groups"])), {str(os.getpid())})
 
     @gate_suites("hooks")
     def test_empty_list_preserves_the_old_cloud_and_local_calls_and_output(self) -> None:

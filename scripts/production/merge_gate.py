@@ -39,7 +39,7 @@ from collections import deque
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import Future
 from contextlib import ExitStack, closing, contextmanager, nullcontext
-from contextvars import ContextVar, copy_context
+from contextvars import Context, ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum, auto
@@ -2615,7 +2615,9 @@ def start_mac_gate(mac: MacGateRoute, repo: Path, *, mode: SuiteMode, full: bool
             outcome.set_result(observed)
 
     with os.fdopen(writer, "wb"):
-        threading.Thread(target=copy_context().run, args=(run,), daemon=True, name="mac-gate-route").start()
+        # The Linux caller owns gate recovery. The Mac route uses the cancellation pipe.
+        worker = threading.Thread(target=Context().run, args=(run,), daemon=True, name="mac-gate-route")
+        cancellation.start_masked_thread(worker)
         yield outcome
 
 

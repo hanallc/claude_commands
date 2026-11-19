@@ -16,7 +16,7 @@ from typing import Self, cast, override
 import unittest
 from unittest import mock
 
-from scripts.aws_target import aws_trial, gate_box, ledger
+from scripts.aws_target import aws_trial, cloud_gate, gate_box, ledger
 from scripts.aws_target import test_aws_trial as trial_tests
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import merge_gate as gate
@@ -248,7 +248,7 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
                     + f'CANDIDATE_GUEST = {gate_box.CANDIDATE_GUEST!r}\n'
                     + inspect.getsource(gate_box.run_guest)
                     + '\ndef encode_run(run): return {"passed": run.passed}\n'
-                    + 'def completion_record(*args): return {"kind": "gate_run"}\n')
+                    + 'def completion_record(*args, **kwargs): return {"kind": "gate_run"}\n')
                 if candidate_change == 'rename':
                     for relative in ('scripts/aws_target/gate_box.py', 'scripts/production/merge_gate.py'):
                         path = repo / relative
@@ -398,15 +398,44 @@ else:
         self.assertEqual(module["folder_scans"], ["scripts/fixture"])
         self.assertEqual([row["test"] for row in ledger.rows(module, "tests")], ["Fixture.test_slow"])
 
-    def test_aws_subset_does_not_record_a_full_run(self) -> None:
+    def test_aws_selection_records_the_assignment(self) -> None:
         from scripts.production.gate_routes import ModuleCoverage
 
         job = gate.GateJobResult("fixture", "test_one.py", 0, 2, "")
-        for coverage, selection in ((ModuleCoverage.COMPLETE, "full"), (ModuleCoverage.SUBSET, "subset")):
-            with self.subTest(coverage=coverage):
-                run = gate.GateRun((job,), 2, 0, coverage=coverage)
-                record = gate_box.completion_record(run, "attempt", "commit", "tree", "remote-host", 9, 15, "merge-gate")
-                self.assertEqual(record["selection"], selection)
+        run = gate.GateRun((job,), 2, 0, coverage=ModuleCoverage.SUBSET)
+        affected = gate_box.completion_record(
+            run, "attempt", "commit", "tree", "remote-host", 9, 15, "targeted-test")
+        self.assertEqual(affected["selection"], "affected")
+        for mode in ("targeted-test", "merge-gate"):
+            with self.subTest(mode=mode):
+                record = gate_box.completion_record(
+                    run, "attempt", "commit", "tree", "remote-host", 9, 15, mode, split=True)
+                self.assertEqual(record["selection"], "subset")
+
+    def test_controller_reclassifies_an_older_guest_record_before_import(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            job = gate.GateJobResult("fixture", "test_one.py", 0, 2, "")
+            run = gate.GateRun((job,), 2, 0)
+            keys = {"attempt": "attempt", "commit": "commit", "tree": "tree"}
+            guest_record = gate_box.completion_record(run, "attempt", "commit", "tree", "remote-host", 9, 15, "merge-gate")
+            self.assertEqual(guest_record["selection"], "full")
+            row: dict[str, object] = {
+                **keys, "host": "remote-host", "verdict": "pass", "gate": gate_box.encode_run(run),
+                "record": guest_record,
+            }
+            cloud_gate.save(folder / "outcome.json", {"status": "complete", "result": row})
+            _ = (folder / "gate.log").write_text("")
+            for mode, split, selection in (("merge-gate", True, "subset"), ("targeted-test", False, "affected")):
+                with self.subTest(mode=mode, split=split):
+                    request: dict[str, object] = {
+                        **keys, "head": "head", "mode": mode, "modules": ["scripts/fixture/test_one.py"], "split": split,
+                    }
+                    with (mock.patch.object(gate, "checked_git", return_value="head"),
+                          mock.patch.object(cloud_gate, "import_record") as import_record):
+                        result = cloud_gate.run_service(folder, folder, request, (), lambda _: 0)
+                    self.assertIsInstance(result, cloud_gate.CloudCompleted)
+                    import_record.assert_called_once_with(folder, {**row, "record": {**guest_record, "selection": selection}})
 
     def test_result_round_trip_preserves_reruns_and_test_failures(self) -> None:
         first = gate.GateJobResult('fixture', 'test_one.py', 1, 2, 'failed', cpu_seconds=1, peak_mib=3,

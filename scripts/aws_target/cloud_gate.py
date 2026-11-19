@@ -42,6 +42,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue import admission_records
 from scripts.production import affected_modules
 from scripts.production.gate_modules import GateRefused, discover_test_modules
+from scripts.production.gate_routes import AssignedModules
 from scripts.production import merge_gate as gate
 from scripts.test_times import gate_record
 
@@ -1154,6 +1155,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
               service: Callable[[Sequence[str]], int], attempt: CloudAttempt,
               selected: gate.AllModules | gate.TreeSelection = gate.ALL_MODULES) -> LocalFallback | CloudCompleted:
     directory = attempt.directory
+    split = isinstance(selected, AssignedModules)
     deployment_path = directory / 'gate-deployment.json'
     root = Path(gate.checked_git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'cloud-gates'))
     with control_lock(root):
@@ -1173,6 +1175,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
         if same_request and saved_result.get('status') == 'complete' and not _outcome_imported(folder):
             try:
                 request = read(folder / 'request.json')
+                request['split'] = split
                 saved_attempt = request.setdefault('attempt', folder.name)
                 if (request.get('tree') != identity['tree'] or request.get('head') != identity['commit']
                         or saved_attempt != folder.name):
@@ -1234,6 +1237,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                     if request['tree'] != identity['tree'] or request['head'] != identity['commit']:
                         raise GateRefused('The checkout changed between cloud attempts')
                     request['full'] = full
+                    request['split'] = split
                     if retry_launch:
                         request['retry_launch'] = retry_launch
                     save(folder / 'request.json', request)
@@ -1310,11 +1314,13 @@ def _complete_outcome(repo: Path, folder: Path, request: dict[str, object],
     try:
         validate_result(row, request)
         head = ledger.text(request, 'head')
+        selection = gate_box.completion_selection(ledger.text(request, 'mode'), split=request.get('split') is True)
     except (OSError, ValueError, KeyError, TypeError) as error:
         return LocalFallback(str(error))
     if gate.checked_git(repo, 'rev-parse', 'HEAD') != head:
         return LocalFallback('The checkout changed during the cloud attempt')
-    import_record(folder, row)
+    record = {**ledger.mapping(row['record']), 'selection': selection}
+    import_record(folder, {**row, 'record': record})
     print((folder / 'gate.log').read_text(), end='', flush=True)
     return CloudCompleted(gate_box.decode_run(row['gate']))
 
