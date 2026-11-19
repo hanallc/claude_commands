@@ -5,7 +5,6 @@ from __future__ import annotations
 from scripts.lib.checkout_test_support import copy_startup
 
 import ast
-from collections.abc import Callable
 from contextlib import redirect_stderr
 import io
 import json
@@ -20,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from typing import cast, override
+from typing import override
 from unittest.mock import MagicMock, patch
 
 from scripts.direct.verify_shell_test_support import verify_cancellation_functions
@@ -226,8 +225,7 @@ class ShellProcessGroupTests(PrivateGroupFixture):
         home = self.root / "home"
         home.mkdir()
         self.environment = {**os.environ, **config_environment(self.root / "config"),
-                            "HOME": str(home), **interpreter_cache_environment(self.root / "cache"),
-                            "VERIFY_PROCESS_GROUP_LIB": str(self.root / "scripts/lib")}
+                            "HOME": str(home), **interpreter_cache_environment(self.root / "cache")}
 
     def release_child_group(self, child: subprocess.Popen[str]) -> subprocess.CompletedProcess[str]:
         board = self.root / "scripts/direct/board.sh"
@@ -247,19 +245,6 @@ class ShellProcessGroupTests(PrivateGroupFixture):
             ["bash", str(board), "release", str(session), "impl", "cargo", "--pid", str(child.pid)],
             env=self.environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
         )
-
-    def forward(self) -> Callable[[int, object], None]:
-        """Load the real embedded handler without executing its fork or signals."""
-        source = (self.root / "scripts/direct/verify.sh").read_text()
-        embedded = source.split("STEP_OWNER_PY='", 1)[1].split("\n'\n", 1)[0]
-        tree = ast.parse(embedded)
-        statements = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
-        handlers = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "forward"]
-        self.assertEqual(len(handlers), 1)
-        module = ast.Module(body=[*statements, handlers[0]], type_ignores=[])
-        namespace: dict[str, object] = {"child": self.private_child().pid}
-        exec(compile(module, str(self.root / "scripts/direct/verify.sh"), "exec"), namespace)
-        return cast(Callable[[int, object], None], namespace["forward"])
 
     def fake_helper(self, status: int) -> None:
         _ = (self.root / "scripts/lib/process_group.py").write_text(
@@ -282,7 +267,6 @@ CMD=check
 RUN_STARTED=0
 after_tree_change() { return 0; }
 stop_tree_watch() { :; }
-release_token() { :; }
 note_event() { :; }
 interrupt_hold_wait() { :; }
 verify_cleanup() { :; }
@@ -338,36 +322,6 @@ final_pass_finish() { :; }
                 self.assertTrue((self.root / "session/locks/cargo.d").exists())
                 self.assertIsNone(child.poll(), "helper refusal must not signal the individual child")
                 shutil.rmtree(self.root / "session")
-
-    def test_verify_forward_uses_its_local_helper_without_an_individual_signal(self) -> None:
-        self.fake_helper(0)
-        forward = self.forward()
-        with patch.dict(os.environ, self.environment), patch.object(os, "kill") as individual:
-            forward(signal.SIGTERM, None)
-        individual.assert_not_called()
-        self.assertTrue((self.root / "helper-arguments").read_text().endswith(f" {signal.SIGTERM}"))
-
-    def test_verify_helper_failure_reports_the_cause_without_individual_fallback(self) -> None:
-        forward = self.forward()
-        for failure in ("missing", "refused"):
-            with self.subTest(failure=failure):
-                self.fake_helper(2)
-                if failure == "missing":
-                    (self.root / "scripts/lib/process_group.py").unlink()
-                with patch.dict(os.environ, self.environment), patch.object(os, "kill") as individual:
-                    with self.assertRaises(SystemExit) as refused:
-                        forward(signal.SIGTERM, None)
-                individual.assert_not_called()
-                self.assertIn("process group helper failed", str(refused.exception))
-                self.assertIn("process_group.py" if failure == "missing" else "fixture helper diagnostic", str(refused.exception))
-
-    def test_verify_only_uses_individual_fallback_for_a_missing_group(self) -> None:
-        self.fake_helper(3)
-        forward = self.forward()
-        with patch.dict(os.environ, self.environment), patch.object(os, "kill") as individual:
-            forward(signal.SIGTERM, None)
-        arguments = (self.root / "helper-arguments").read_text().split()
-        individual.assert_called_once_with(int(arguments[0]), signal.SIGTERM)
 
 
 class ProcessGroupSourceTests(unittest.TestCase):
