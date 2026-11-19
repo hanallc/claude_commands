@@ -11,7 +11,7 @@ import traceback
 def write_refusal(reason: str) -> None:
     """Use the refusal record shared by command and source update replies."""
     _ = sys.stdout.buffer.write(json.dumps({'refused': reason}, separators=(',', ':')).encode())
-    sys.stdout.buffer.flush()
+    _ = sys.stdout.buffer.flush()
 
 
 def main() -> int:
