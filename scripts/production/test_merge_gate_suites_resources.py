@@ -54,7 +54,7 @@ class CpuUsageTest(unittest.TestCase):
 if __name__ == "__main__":
     Path(sys.argv[2]).write_text(str(spin_cpu(float(sys.argv[1]))))
 '''
-from scripts.lib import cancellation, copy_record, scratch
+from scripts.lib import cancellation, copy_record, process_group, scratch
 from scripts.message.process_test_support import OwnedTestProcesses
 
 
@@ -553,8 +553,10 @@ class MergeGateResourcesTests(GateSuitesFixture):
         monotonic = time.monotonic
         deadline = monotonic() + TEST_HANG_GUARD_SECS
         sampled: set[int] = set()
-        killed: list[int] = []
+        killed: dict[int, merge_gate.RunningGateJob] = {}
+        scope_reads: list[tuple[str, str, bool]] = []
         kill = merge_gate.kill_job_group
+        send_group_signal = process_group.send_process_group
 
         def module_clock() -> float:
             if monotonic() >= deadline:
@@ -567,11 +569,30 @@ class MergeGateResourcesTests(GateSuitesFixture):
             return dict.fromkeys(roots, 1.0)
 
         def kill_module(job: merge_gate.RunningGateJob) -> None:
-            killed.append(job.process.pid)
+            killed[job.process.pid] = job
             kill(job)
 
-        with mock.patch.dict(os.environ, self.environment), \
+        def notify_scope_change(_timeout_ms: int) -> None:
+            job, = killed.values()
+            scope = job.scope
+            assert scope is not None
+            events = scope / "cgroup.events"
+            scope_reads.append(((scope / "cgroup.kill").read_text(), events.read_text(), job.log.parent.is_dir()))
+            if len(scope_reads) == 2:
+                # The fake scope stops the fixture process before it reports empty.
+                send_group_signal(job.process.pid, signal.SIGKILL)
+                self.assert_process_stopped(job.process.pid)
+                self.write(events, "populated 0\n")
+
+        register = mock.Mock()
+        poll = mock.Mock(side_effect=notify_scope_change)
+        changed = mock.Mock(register=register, poll=poll)
+        selectors = mock.Mock(wraps=select, poll=mock.Mock(return_value=changed),
+                              POLLPRI=select.POLLPRI, POLLERR=select.POLLERR)
+        with self.fake_module_scopes() as cgroups, \
                 mock.patch.object(queue_place, "in_builds_slice", return_value=False), \
+                mock.patch.object(merge_gate, "select", selectors), \
+                mock.patch.object(process_group, "send_process_group", wraps=send_group_signal) as group_stop, \
                 mock.patch("scripts.production.merge_gate.time.monotonic", side_effect=module_clock), \
                 mock.patch.object(merge_gate, "process_memory_mib", side_effect=sample), \
                 mock.patch.object(merge_gate, "kill_job_group", side_effect=kill_module), redirect_stdout(output):
@@ -582,7 +603,17 @@ class MergeGateResourcesTests(GateSuitesFixture):
         held = int((self.state / "module-held").read_text())
         self.assert_process_stopped(held)
         self.assertIn(held, sampled)
-        self.assertEqual(set(killed), {held})
+        job, = killed.values()
+        self.assertEqual(job.process.pid, held)
+        self.assertEqual(scope_reads, [("1\n", "populated 1\n", True)] * 2)
+        group_stop.assert_not_called()
+        register.assert_any_call(mock.ANY, select.POLLPRI | select.POLLERR)
+        self.assertEqual(poll.call_count, 2)
+        scope = job.scope
+        assert scope is not None
+        self.assertEqual(scope.parent, cgroups)
+        self.assertEqual((scope / "cgroup.events").read_text(), "populated 0\n")
+        self.assertFalse(job.log.parent.exists())
         scopes = [call for call in self.calls() if call["tool"] == "systemd-run" and call["args"][-1] != "true"]
         self.assertEqual([call["pid"] for call in scopes], [held])
         starts = [row for row in self.module_events() if row["event"] == "start"]

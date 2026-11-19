@@ -31,7 +31,7 @@ from unittest import mock
 
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, only_admitted
-from scripts.lib import build_folders
+from scripts.lib import build_folders, conf, walled_tests
 from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lint import memory_admit, sweep
 from scripts.lint.memory_test_support import config_environment, fake_memory_readings, write_config_fixture
@@ -74,7 +74,16 @@ with (state / "tools.jsonl").open("a") as output:
 if name == "systemd-run":
     if (state / "scope-fails").exists():
         raise SystemExit(1)
-    command = sys.argv[sys.argv.index("--") + 1:]
+    separator = sys.argv.index("--")
+    unit = next((option.removeprefix("--unit=") for option in sys.argv[1:separator]
+                 if option.startswith("--unit=")), "")
+    if unit:
+        scope = Path(os.environ["BUILDLOG_BUILDS_CGROUP"]) / unit
+        scope.mkdir()
+        (scope / "cgroup.kill").write_text("")
+        populated = int((state / "hold-module").exists())
+        (scope / "cgroup.events").write_text(f"populated {populated}\\n")
+    command = sys.argv[separator + 1:]
     os.execvp(command[0], command)
 if name == "basedpyright":
     (state / "types-ran").write_text("ran")
@@ -379,6 +388,22 @@ class MergeGateFixture(unittest.TestCase):
 
     def record_module_peaks(self, peaks: dict[str, float]) -> None:
         merge_gate.save_measures(self.state / "runner" / "module_peak_mib.json", peaks)
+
+    @contextlib.contextmanager
+    def fake_module_scopes(self) -> Generator[Path]:
+        """Use private scope files and retain the variables for the fixture tools."""
+        cgroups = self.root / "builds.slice"
+        self.write(cgroups / "cgroup.kill", "")
+        self.write(cgroups / "cgroup.events", "populated 0\n")
+        settings = conf.read(walled_tests.CONFIG)
+        kept = (*settings.words("kept_environment"), "BUILDLOG_BUILDS_CGROUP", "CONF_DIR",
+                "MERGE_GATE_TEST_STATE", "MERGE_GATE_TEST_REPO")
+        configuration = self.root / "config/walled_tests.conf"
+        self.write(configuration, f"bubblewrap={settings.text('bubblewrap')}\n"
+                   + f"kept_environment={' '.join(kept)}\n")
+        with mock.patch.dict(self.environment, {"BUILDLOG_BUILDS_CGROUP": str(cgroups)}), \
+                mock.patch.dict(os.environ, self.environment), mock.patch.object(walled_tests, "CONFIG", configuration):
+            yield cgroups
 
     @contextlib.contextmanager
     def sampling_module_memory(self, attempts: dict[str, Sequence[float]]) -> Generator[list[merge_gate.RunningGateJob]]:
