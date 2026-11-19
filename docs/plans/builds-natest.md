@@ -130,3 +130,24 @@
   2. 20 repeated runs pass, TMPDIR=/tmp, 2 GB scope.
   3. basedpyright zero errors and warnings on changed files.
   4. Full natedev gate passes (reds that also occur on base do not count).
+
+### Phase 388 — each gate test module starts with a clean environment  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** the merge gate and targeted_test.py start each test module with an environment allow list, so no module inherits caller BASH_ENV, GIT_INDEX_FILE or another caller variable (builds ask: 333 of 864 modules inherit them; inventory /tmp/claude/unit/c48c71f4-70c9-4f7b-b4bb-ce60eed7f1f4/phases/43s/impl_report_5.md, Audit inventory).
+- **Spec:**
+  1. Fix it in one place: `test_module_environment` in merge_gate.py (about line 1108), which both the gate and targeted_test.py use. Build the child environment from an allow list, not from the caller's whole environment.
+  2. The allow list keeps what the runner and the modules need (PATH, HOME, LANG, TMPDIR and the gate's own variables). Name each kept variable and why. A module that needs a caller variable gets it from the runner, not from the caller.
+  3. verify's helper `verify_test_environment` (43s) is not on origin/main. Do not take code from it. Keep one allow list in merge_gate.py; the later of the two to land switches to the other, so one helper remains.
+  4. Failing first: one test row sets BASH_ENV and GIT_INDEX_FILE to traps and runs a module through the runner. It fails on the base and passes on the fix.
+  5. Type check jobs keep their current environment unless the same leak reaches them.
+- **Files:** `scripts/production/merge_gate.py`; one test module of the gate (`test_merge_gate_suites*.py` or `test_targeted_test.py`) for the new row; `merge_gate_test_support.py` only if the row needs it.
+- **Workers:** 1 writer. One function and one test row.
+  - impl: all files.
+- **Constraints from prior phases:** 383 (gate recovery) changes merge_gate.py GateRecovery; 355 takes this change at its next merge of main. No test or profile makes load on purpose.
+- **Acceptance gate:**
+  1. The new row fails on ece29778b and passes on the fix.
+  2. 20 repeated runs of the gate test modules pass, TMPDIR=/tmp, 2 GB scope.
+  3. basedpyright zero errors and warnings on changed files.
+  4. Full natedev gate passes (reds that also occur on base do not count).
