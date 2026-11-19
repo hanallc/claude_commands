@@ -387,6 +387,24 @@ class ReviewLinksServerTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    def test_review_index_omits_an_unknown_handoff_time(self) -> None:
+        case = self.review_fixture(changes=2)
+        saved = '2026-11-16T12:49:08-05:00'
+        for row, time_fields in (('C1', {}), ('C2', {'handed_at': saved})):
+            path = change_routing.delivery_path(case.root, case.fixture.review_list, row)
+            _ = path.write_text(json.dumps({'validation': {'attempt': row, 'state': 'sent'}, **time_fields}))
+            os.utime(path, (1795123200, 1795123200))
+        snapshot = review_page.build_snapshot(case.root)
+        with patch.object(review_page.ReviewSnapshotCache, 'get', return_value=snapshot):
+            reply = self.request(review_page.PAGE_PATH + '?index=1')
+        self.assertEqual(reply.status, 200)
+        entries = {entry['key']: entry for entry in
+                   test_review_page.unpack_index(json.dumps(json.loads(reply.body)['index']))}
+        unknown = entries['page-owner/C1']
+        self.assertEqual(unknown['state'], review_items.ReviewState.VALIDATING)
+        self.assertNotIn('handoff', unknown)
+        self.assertEqual(entries['page-owner/C2'].get('handoff'), (saved, 'Nov 16 12:49 EST'))
+
     def test_review_get_initializes_a_fresh_root(self) -> None:
         _ = self.review_fixture()
         self.assertFalse((self.root / change_page.CONSOLE_FOLDER / change_page.BROWSER_MANIFEST).exists())
