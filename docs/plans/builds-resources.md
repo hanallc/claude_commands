@@ -3026,23 +3026,15 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 - Accepted (review): a result published during the progress-log download at the deadline (main has the same window); a poll that crosses both the gate deadline and the attempt expiry; a list-only AccessDenied (the deploy probe checks `list-objects-v2`); one final gate.log get per gate.
 - Row dd4a56aae on the Phase 165 row 75b8c2eb9. Tests in both layouts, 0 failures: 6 suites; types 0.
 
-### Phase 167 — A verify.sh run outside a Cargo workspace holds no cargo target  · status: todo
-**Source:** builds (from sdlc), 2026-11-19 04:1x EST: the disk floor sweep named pid 3179104 (devtools' consolecheck `verify.sh`, a Python-only suite) as the owner of four hana targets (about 380 GiB) and skipped them.
-**Cause:** `sweep.workspace_targets` resolves the runner's `build-dir`. The global Cargo config sets `/build/paths{workspace-root}`. The run's cwd (`~/worktrees/devtools-consolecheck`) has no `Cargo.toml` at or above it, so `cargo_workspace_manifest` raises `FileNotFoundError`, and the `except (OSError, ValueError)` branch returns every target as busy.
+### Phase 167 — A verify.sh run outside a Cargo workspace holds no cargo target  · status: done
+**Source:** builds (from sdlc), 2026-11-19 04:1x EST: the disk floor sweep named pid 3179104 (devtools' consolecheck `verify.sh`, a Python-only suite) as the owner of the hana targets and about 230 others.
 
-#### Work Order
-
-**Goal:** a verify.sh or cargo-nextest run with no Cargo manifest holds no workspace target.
-
-**Spec:**
-1. No `Cargo.toml` at or above the cwd and no `--manifest-path`: the runner has no workspace, so `workspace_targets` returns no target.
-2. Other unreadable workspace state (a manifest that cannot be read or parsed, an unknown template) still keeps every target busy.
-
-**Base:** main `764582979`.
-
-**Files:** `scripts/lint/sweep.py` (or `scripts/lib/cargo_target_config.py` if the manifest check belongs there), `scripts/lint/test_sweep.py` (a row in `test_a_nextest_run_uses_its_workspace_target_between_test_binaries`'s table).
-
-**Acceptance gate:** the new row passes; test_sweep, test_tmp_sweep and the cargo_target_config tests pass in both layouts; types 0.
+#### As-built
+- Cause: the global Cargo config sets `build-dir = /build/paths{workspace-root}`. With no `Cargo.toml` at or above the cwd, `cargo_workspace_manifest` raised `FileNotFoundError`, and `workspace_targets` kept every target busy.
+- `cargo_target_config.NoCargoManifest(FileNotFoundError)` marks "no manifest in the cwd or a parent". `_cargo_manifest_exists` counts only a regular file after links; a FIFO or folder is skipped, and a dangling link stays unreadable.
+- `cargo_build_folder` keeps main's signature and looks up the manifest only for `{workspace-root}` and `{workspace-path-hash}`, so fixed paths resolve with no manifest.
+- `workspace_targets(..., verify_runner=)`: on `NoCargoManifest`, a verify.sh runner holds no workspace target; a cargo-nextest runner keeps every target busy, as on main. Other unreadable state keeps every target busy.
+- Row ee6d82130 on main 764582979. Tests in both layouts, 0 failures: 10 suites; types 0.
 
 ### Phase 168 — One lint.conf key sets the /build disk floor  · status: todo
 **Source:** builds, 2026-11-19 04:3x EST: natedev ruled that the /build floor should be 300 GiB, not `sweep_free_floor_percent=20` (733.3 GiB). The value change needs the user's go. This phase only makes it one key and keeps today's value.
