@@ -771,12 +771,15 @@ remove_step_record() {
 # One classifier preserves signal retries and checks the failed crate for silent exits.
 memory_kill_in_journal() {
     local started=$1 ended=$2 log=$3
-    "$PY" "$VERIFY_START_DIR/memory_kill.py" "$started" "$ended" "$log"
+    "$PY" "$VERIFY_START_DIR/memory_kill.py" "$started" "$ended" "$log" --report-kill-diagnostic
 }
 
 step_was_killed_for_memory() {
-    local log=$1 started=$2 ended=$3
-    memory_kill_in_journal "$started" "$ended" "$log"
+    local log=$1 started=$2 ended=$3 diagnostic status=0
+    diagnostic="$(memory_kill_in_journal "$started" "$ended" "$log")" || status=$?
+    # A kill diagnostic prevents a verdict even when the journal cannot confirm an OOM.
+    if [[ "$diagnostic" == 1 ]]; then RUN_LAST_ATTEMPT_KILLED=1; fi
+    return "$status"
 }
 
 step_writes_tree() {
@@ -993,9 +996,6 @@ run_step() {
         fi
         ended="$(date '+%Y-%m-%d %H:%M:%S %z')"
         RUN_LAST_ATTEMPT_KILLED=0
-        if grep -qaE 'SIGKILL|signal: 9' "$step_log"; then
-            RUN_LAST_ATTEMPT_KILLED=1
-        fi
         if ! step_was_killed_for_memory "$step_log" "$started" "$ended"; then
             rm -f "$step_log"
             return "$status"
@@ -2274,7 +2274,7 @@ try_mac_test() {
     trap 'forward_mac_runner_signal HUP 129' HUP
     REMOTE_BUILD_TARGET_DIR=""
     local runner_status result_status result_text="" result_word="" result_reason="" mac_owns_watch=0
-    local result_seconds="" result_holder="" result_fetch=failed result_usable=0 name
+    local result_seconds="" result_holder="" result_fetch=failed result_usable=0 result_killed=0 name
     MAC_FIX_RESULT=""
     local runner_root=${STEP_REMOTE_REPO_ROOT:-${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}}
     local runner_args=(run --repo-root "$runner_root"
@@ -2398,6 +2398,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             IFS= read -r result_fetch || true
             IFS= read -r MAC_FIX_RESULT || true
             IFS= read -r REMOTE_BUILD_TARGET_DIR || true
+            IFS= read -r result_killed || true
         } <<< "$result_text"
     else
         result_status=$?
@@ -2453,6 +2454,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             return
             ;;
         failed|prelaunch_failed)
+            RUN_LAST_ATTEMPT_KILLED=${result_killed:-0}
             exec 9>&-
             rm -f "$MAC_LOG_FILE"
             MAC_LOG_FILE=""

@@ -54,6 +54,7 @@ from scripts.mac_test import fix_return
 from scripts.mac_test.fix_return import FIX_NOT_RUN, FixResult
 from scripts.build_hold import override_guard
 from scripts.lib import copy_record
+from scripts.direct.memory_kill import has_kill_diagnostic
 from scripts.direct.step_selection import Pinned
 
 if TYPE_CHECKING:
@@ -197,6 +198,7 @@ class FailedOnMac:
     status: int
     seconds: float
     fetch: FetchResult = FetchNotRun()
+    kill_diagnostic_seen: bool = False
 
 
 @dataclass(frozen=True)
@@ -791,6 +793,7 @@ class ReportedMacStatus:
     status: int
     cleanup: CleanupOutcome = CleanupUnconfirmed()
     build_target_directory: str = ""
+    kill_diagnostic_seen: bool = False
 
 
 @dataclass(frozen=True)
@@ -1093,6 +1096,7 @@ class ProcessController:
         mismatch = ""
         mirror_refused = False
         build_target_directory = ""
+        kill_diagnostic_seen = False
         received_bytes = 0
         finished_output = False
         try:
@@ -1160,6 +1164,7 @@ class ProcessController:
                     held_status_line = ""
                 status = MISSING_MAC_STATUS
                 cleanup = CleanupUnconfirmed()
+                kill_diagnostic_seen = kill_diagnostic_seen or has_kill_diagnostic(line)
                 print(line, end="", flush=True)
             finished_output = True
             exit_status = process.wait()
@@ -1180,7 +1185,7 @@ class ProcessController:
         if mismatch and not isinstance(status, (ReportedMacStatus, MacNextestSetupFailed)):
             return ToolVersionMismatch(mismatch)
         if isinstance(status, ReportedMacStatus):
-            return ReportedMacStatus(status.status, cleanup, build_target_directory)
+            return ReportedMacStatus(status.status, cleanup, build_target_directory, kill_diagnostic_seen)
         if isinstance(status, MacNextestSetupFailed):
             return MacNextestSetupFailed(cleanup)
         if mirror_refused:
@@ -1318,6 +1323,8 @@ def write_result(
                        + f"unresolved_count={count}\nevidence_at={evidence.evidence_at}\n")
         if isinstance(result, (PassedOnMac, PassedOnTarget)) and result.build_target_directory:
             details += f'build_target_directory={result.build_target_directory}\n'
+        if isinstance(result, FailedOnMac) and not linux and eligibility.verb_kind(verb) == "lint":
+            details += f"kill_diagnostic={int(result.kill_diagnostic_seen)}\n"
         _ = destination.path.write_text(
             f"{prefix}\nreason={reason}\nseconds={result.seconds:.6f}\n" + holder_line + details
             + (f"fetch={fetch_word(fetched)}\n" if isinstance(fetch, FetchFolder) else "")
@@ -2712,7 +2719,8 @@ def claimed_run(
             return PassedOnMac(seconds, fetched, remote_status.build_target_directory, fixed)
         if remote_status.status == 4 and request.verb == "nextest":
             return NoTestMatchedOnMac(seconds, fetched)
-        return FailedOnMac(remote_status.status, seconds, fetched)
+        return FailedOnMac(remote_status.status, seconds, fetched,
+                           kill_diagnostic_seen=remote_status.kill_diagnostic_seen)
     except OffloadInterrupted:
         controller.stop()
         if not release_allowed and isinstance(controller.pending, SettledDispatchOperations):

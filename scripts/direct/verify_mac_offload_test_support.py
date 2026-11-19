@@ -714,7 +714,8 @@ if answer.exists():
     mode, reason, status_text = answer.read_text().splitlines()
     runner_status = int(status_text)
 # runner-answer-<verb> answers one verb: mode, reason, status, then an optional fix= word.
-verb_answer = root / ("runner-answer-" + (arguments[arguments.index("--verb") + 1] if "--verb" in arguments else ""))
+verb = arguments[arguments.index("--verb") + 1] if "--verb" in arguments else ""
+verb_answer = root / ("runner-answer-" + verb)
 if verb_answer.exists():
     mode, reason, status_text, *fix_words = verb_answer.read_text().splitlines()
     runner_status = int(status_text)
@@ -741,7 +742,9 @@ else:
         + "reason=" + reason + "\n"
         + "seconds=" + os.environ.get("TEST_RUNNER_SECONDS", "3.25") + "\n"
         + ("fetch=" + os.environ["TEST_RUNNER_FETCH"] + "\n" if "TEST_RUNNER_FETCH" in os.environ else "")
-        + ("fix=" + fix + "\n" if fix else ""),
+        + ("fix=" + fix + "\n" if fix else "")
+        + ("kill_diagnostic=1\n" if mode == "failed" and verb
+           and verb == os.environ.get("TEST_RUNNER_KILLED_VERB") else ""),
         encoding="utf-8",
     )
 if mode == "declined":

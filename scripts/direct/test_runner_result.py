@@ -136,15 +136,19 @@ class RunnerResultTests(unittest.TestCase):
         target.unlink()
         self.assertIsInstance(read_result(self.path, 0, True), UnusableRunnerResult)
 
-    def test_main_writes_seven_lines_with_empty_fields(self) -> None:
+    def test_main_writes_result_fields_and_the_kill_flag(self) -> None:
         self.write("mac=passed\nfetch=\n")
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(runner_result.main([str(self.path), "0", "1"]), 0)
-        self.assertEqual(output.getvalue(), "passed\n\n\n\n\n\n\n")
+        self.assertEqual(output.getvalue(), "passed\n\n\n\n\n\n\n0\n")
         self.write("mac=declined\nreason=busy\nseconds=2\nholder=owner\nfetch=fetched\nfix=fixed\nbuild_target_directory=/target\n")
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(runner_result.main([str(self.path), "75", "0"]), 0)
-        self.assertEqual(output.getvalue(), "declined\nbusy\n2\nowner\nfetched\nfixed\n/target\n")
+        self.assertEqual(output.getvalue(), "declined\nbusy\n2\nowner\nfetched\nfixed\n/target\n0\n")
+        self.write("mac=failed\nkill_diagnostic=1\n")
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(runner_result.main([str(self.path), "101", "1"]), 0)
+        self.assertEqual(output.getvalue(), "failed\n\n\n\nfailed\n\n\n1\n")
 
     def test_main_returns_failure_without_result_fields(self) -> None:
         with redirect_stdout(io.StringIO()) as output:
@@ -182,7 +186,7 @@ verify_helper() { return "$HELPER_STATUS"; }
         call = verify_helper.HelperCall(str(Path(runner_result.__file__)), str(self.root),
                                         [str(self.path), "0", "1"], dict(os.environ), "", [])
         self.assertEqual(verify_helper.run_call(call, {call.program: program}),
-                         ("0", "passed\n\n\n\nfailed\n\n\n", ""))
+                         ("0", "passed\n\n\n\nfailed\n\n\n0\n", ""))
         self.path.unlink()
         self.assertEqual(verify_helper.run_call(call, {call.program: program}), ("1", "", ""))
 
