@@ -136,6 +136,11 @@ gate_wait_usd_per_minute=0
     def snapshot(self) -> int:
         return aws_target.snapshot(self.settings, self.state, execute=self.execute, clock=self.clock, notify=self.notify)
 
+    def deploy_gate_zones(self) -> None:
+        _ = (self.state / 'gate-deployment.json').write_text(json.dumps({'regions': [
+            {'region': region, 'subnets': [{'id': 'subnet-' + region, 'zone': region + 'a'}]} for region in self.regions
+        ]}))
+
     def test_snapshot_writes_prices_and_quotas_with_one_atomic_write_and_limits_repeats(self) -> None:
         self.assertFalse((self.state / 'gate-deployment.json').exists())
         with mock.patch.object(aws_target, 'write_text_atomic', wraps=atomic_file.write_text_atomic) as write:
@@ -340,6 +345,7 @@ gate_wait_usd_per_minute=0
 
     def test_table_ranks_cost_per_run_with_region_times_and_marks_other_region_times(self) -> None:
         self.assertEqual(self.snapshot(), 0)
+        self.deploy_gate_zones()
         fast, slow = self.standard
         home, other = self.regions
         events: list[dict[str, object]] = []
@@ -402,6 +408,7 @@ gate_wait_usd_per_minute=0
 
     def test_each_scope_counts_only_its_run_kinds(self) -> None:
         self.assertEqual(self.snapshot(), 0)
+        self.deploy_gate_zones()
         size = self.standard[0]
         home = self.regions[0]
         events: list[dict[str, object]] = []
@@ -550,10 +557,11 @@ gate_wait_usd_per_minute=0
 
     def test_paid_cells_name_why_no_bill_counts_and_the_cheapest_is_a_placement_type(self) -> None:
         self.assertEqual(self.snapshot(), 0)
+        self.deploy_gate_zones()
         size, = self.compare
         home = self.regions[0]
         events: list[dict[str, object]] = []
-        # A short targeted run of a type that placement never picks: the cheapest estimate, but not a candidate.
+        # The ledger contains a short targeted run of a type outside the deployment.
         for attempt, kind, mode, box_s in (('a', self.standard[0], 'merge-gate', 360), ('b', size, 'targeted-test', 60)):
             row: dict[str, object] = {'attempt': attempt, 'instance_type': kind, 'mode': mode, 'region': home}
             events.extend(({**row, 'time': self.clock.now - 3600 - box_s, 'result': 'launched'},
