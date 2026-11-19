@@ -21,7 +21,7 @@ from scripts.review_links.test_page_frame import assert_status_states
 from scripts.aws_target import admin_secrets, aws_page, aws_target, deploy, ledger, run_cost, spend, spot_table
 from scripts.aws_target import config as aws_config
 from scripts.aws_target.control_test_support import TestClock
-from scripts.aws_target.ledger_test_support import CostFixture
+from scripts.aws_target.ledger_test_support import CostFixture, text_setting
 from scripts.lib import atomic_file, conf
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_budget
@@ -864,27 +864,41 @@ class HoursCheckTests(CostFixture):
     limit: Decimal = Decimal(0)
     observations: list[ledger.InstanceObservation] = []
     reservations: list[ledger.GateReservation] = []
+    exposures: list[ledger.HanaComputeExposure] = []
     bills: list[ledger.ChargeRead] = []
     notice_commands: list[tuple[str, ...]] = []
 
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.configure("# whole: 1..\nrun_cost_days=7\n# range: 0.001..\nsnapshot_notification_timeout_s=5\n"
-                       + "# range: 0..1\nbilled_hours_gap_max_ratio=0.15\n")
-        _ = write_config_fixture(self.root / 'cloud_gate.conf')
+        self.configure('region=us-east-1\ninstance_type=m7a.4xlarge\n'
+                       + '# whole: 1..\nrun_cost_days=7\n# whole: 1..\nprice_max_age_seconds=7200\n'
+                       + '# range: 0.001..\nsnapshot_notification_timeout_s=5\n'
+                       + '# range: 0..1\nbilled_hours_gap_max_ratio=0.15\n')
+        _ = write_config_fixture(self.root / 'cloud_gate.conf',
+                                 'instance_types=c7a.4xlarge\nprice_compare_instance_types=m7a.8xlarge\n'
+                                 + 'gpu_instance_types=g4dn.xlarge\nhana_gpu_instance_types=g6.2xlarge\n'
+                                 + 'spot_candidate_regions=us-east-1 us-east-2\n'
+                                 + '# range: 0..100\ngate_wait_usd_per_minute=0\n'
+                                 + 'unmeasured_region_extra_seconds={}\n# whole: 1..60\nlifetime_minutes=20\n')
         self.clock = TestClock()
         configuration = conf.read(self.settings)
         self.home = configuration.text('region')
-        self.other = next(region for region in ledger.REGION_USAGE_PREFIXES if region != self.home)
+        self.other = 'us-east-2'
         self.size = conf.read_or_repository('cloud_gate').words('instance_types')[0]
+        workload = self.root / 'hana_aws.conf'
+        text_setting(workload, 'region', self.other)
+        text_setting(workload, 'instance_type', 'm7a.2xlarge')
+        text_setting(workload, 'fallback_instance_types', f'{self.size},m6a.4xlarge')
         self.builder = configuration.text('instance_type')
         self.observations = []
         self.limit = conf.decimal(configuration.text('billed_hours_gap_max_ratio'))
         self.reservations, self.bills, self.notice_commands = [], [], []
+        self.exposures = []
 
         def evidence(_book: ledger.CostLedger) -> ledger.LedgerEvidence:
-            return ledger.LedgerEvidence(observations=list(self.observations), gate_reservations=list(self.reservations))
+            return ledger.LedgerEvidence(observations=list(self.observations), gate_reservations=list(self.reservations),
+                                         hana_compute=list(self.exposures))
 
         def bills(_book: ledger.CostLedger) -> tuple[ledger.ChargeRead, ...]:
             return tuple(self.bills)
@@ -914,8 +928,10 @@ class HoursCheckTests(CostFixture):
     def checks(self) -> dict[run_cost.DayKey, run_cost.HoursCheck]:
         end = datetime.fromtimestamp(self.clock.now, UTC)
         days = conf.read(self.settings).whole('run_cost_days')
+        scope = aws_target.hours_check_scope(conf.read_or_repository('cloud_gate'))
+        scope = replace(scope, sizes=(*scope.sizes, self.builder))
         return run_cost.day_hours_checks(ledger.CostLedger(self.state), end - timedelta(days=days), end, self.home,
-                                         self.builder, (self.size, self.builder), self.limit)
+                                         self.builder, scope, self.limit)
 
     def notice_run(self, *, code: int = 0, stdout: str = 'SENT: fixture\n', sender_times_out: bool = False) -> int:
         def run(arguments: Sequence[str], *, capture_output: bool, text: bool, check: bool,
@@ -965,7 +981,7 @@ class HoursCheckTests(CostFixture):
         self.assertNotIn((self.size, self.home, self.day(0).date().isoformat()), checks)
         end = datetime.fromtimestamp(self.clock.now, UTC)
         window = run_cost.hours_checks(ledger.CostLedger(self.state), end - timedelta(days=3), end, self.home,
-                                       self.builder, (self.size,), self.limit)
+                                       self.builder, run_cost.SpotHoursScope((self.size,), {}), self.limit)
         self.assertEqual(window[self.size, self.home],
                          run_cost.hours_check(within + above, Decimal(2), self.limit))
         self.assertEqual(window[self.size, self.other], run_cost.HoursCheck(Decimal(0), Decimal('0.5'), Decimal(1), True))
@@ -997,6 +1013,111 @@ class HoursCheckTests(CostFixture):
                          run_cost.HoursCheck(Decimal(1), Decimal(0), None, True))
         self.assertEqual(checks[self.size, self.other, self.day(2).date().isoformat()],
                          run_cost.HoursCheck(None, Decimal(1), None, False))
+
+    def test_hana_exposure_sets_the_upper_bound(self) -> None:
+        day = self.day(1)
+        at = int(day.timestamp())
+        stop = at + 11232
+        self.exposures.append(ledger.HanaComputeExposure(at, stop, 1, Decimal('.25'),
+            ledger.HanaExposureClosed(stop), self.size, region=self.other))
+        for billed, over in (('0.49', False), ('0', False), ('3.588', False), ('4.0', True)):
+            with self.subTest(billed=billed):
+                self.bills.clear()
+                self.bill(day, {(self.size, self.other): Decimal(billed)} if billed != '0' else {})
+                check = self.checks()[self.size, self.other, day.date().isoformat()]
+                self.assertEqual((check.billed_hours, check.box_hours, check.hana_reserved_hours, check.hours_gap_over),
+                                 (Decimal(billed), Decimal(0), Decimal('3.12'), over))
+
+        self.gate(self.size, self.other, day, 3600)
+        self.bills.clear()
+        self.bill(day, {(self.size, self.other): Decimal('.84')})
+        check = self.checks()[self.size, self.other, day.date().isoformat()]
+        self.assertTrue(check.hours_gap_over)
+        self.assertEqual(check.hours_gap_ratio, Decimal('.16'))
+
+    def test_gate_only_hours_keep_both_limits(self) -> None:
+        day = self.day(1)
+        self.gate(self.size, self.home, day, 3600)
+        for billed, over in (('0.84', True), ('0.85', False), ('1.15', False), ('1.16', True)):
+            with self.subTest(billed=billed):
+                self.bills.clear()
+                self.bill(day, {(self.size, self.home): Decimal(billed)})
+                check = self.checks()[self.size, self.home, day.date().isoformat()]
+                self.assertEqual(check.hours_gap_over, over)
+                self.assertEqual(check.hours_gap_ratio, abs(Decimal(billed) - 1))
+
+    def test_gate_only_check_preserves_ratio_rounding(self) -> None:
+        day = self.day(1)
+        self.gate(self.size, self.home, day, 1)
+        self.bill(day, {(self.size, self.home): Decimal('0.0003194444444444444444444444445')})
+        check = self.checks()[self.size, self.home, day.date().isoformat()]
+        self.assertTrue(check.hours_gap_over)
+
+    def test_hana_midnight_split_and_open_exposure_past_its_permit(self) -> None:
+        two, one = self.day(2), self.day(1)
+        midnight = int(one.timestamp())
+        self.exposures.extend((
+            ledger.HanaComputeExposure(midnight - 900, midnight + 900, 1, Decimal('.25'),
+                ledger.HanaExposureClosed(midnight + 900), self.size, region=self.other),
+            ledger.HanaComputeExposure(midnight + 22 * 3600, midnight + 22 * 3600 + 60, 2, Decimal('.25'),
+                instance_type=self.size, region=self.other),
+        ))
+        checks = self.checks()
+        self.assertEqual(checks[self.size, self.other, two.date().isoformat()].hana_reserved_hours, Decimal('.25'))
+        self.assertEqual(checks[self.size, self.other, one.date().isoformat()].hana_reserved_hours, Decimal('2.25'))
+
+    def test_hana_types_share_regional_hours_and_count_the_first_row_per_generation(self) -> None:
+        day = self.day(1)
+        at = int(day.timestamp())
+        primary, fallback, gate_only = 'm7a.2xlarge', 'm6a.4xlarge', 'm7a.8xlarge'
+        first = ledger.HanaComputeExposure(at, at + 3600, 1, Decimal('.25'),
+            ledger.HanaExposureClosed(at + 3600), primary, region=self.other)
+        self.exposures.extend((first, replace(first, state=ledger.HanaExposureClosed(at + 7200)),
+                               replace(first, generation=2, region=self.home),
+                               replace(first, generation=3, instance_type='')))
+        self.bill(day, {(primary, self.other): Decimal(1), (fallback, self.other): Decimal(1),
+                        (fallback, self.home): Decimal(1), (gate_only, self.other): Decimal(1)})
+        checks = self.checks()
+        for size in (primary, fallback, self.size):
+            check = checks[size, self.other, day.date().isoformat()]
+            self.assertEqual(check.hana_reserved_hours, Decimal(2))
+            self.assertFalse(check.hours_gap_over)
+        self.assertTrue(checks[fallback, self.home, day.date().isoformat()].hours_gap_over)
+        self.assertTrue(checks[gate_only, self.other, day.date().isoformat()].hours_gap_over)
+
+    def test_fallback_hana_type_outside_the_gate_list_sends_a_notice_with_reserved_hours(self) -> None:
+        fallback = 'm6a.4xlarge'
+        text_setting(self.root / 'hana_aws.conf', 'mount_timeout_seconds', 'invalid')
+        self.assertNotIn(fallback, aws_target.gate_sizes(conf.read(self.root / 'cloud_gate.conf')))
+        day = self.day(1)
+        at = int(day.timestamp())
+        self.exposures.append(ledger.HanaComputeExposure(at, at + 3600, 1, Decimal('.25'),
+            ledger.HanaExposureClosed(at + 3600), fallback, region=self.other))
+        self.bill(day, {(fallback, self.other): Decimal(2)})
+        self.assertEqual(self.notice_run(), 0)
+        command, = self.notice_commands
+        self.assertIn('The ledger also reserves 1.00 h of Hana box time in that region for that day.', command[-1])
+        claims = ledger.mapping(cast(object, json.loads((self.state / 'hours-gap-notices.json').read_text())))
+        self.assertEqual(claims['claimed'], [f'aws-hours-gap:{fallback}:{self.other}:{day.date().isoformat()}'])
+        table = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
+        row = next(row for row in table.rows if row[0] == fallback)
+        self.assertEqual(row[table.headers.index(self.other)], '2.0/0.0 + 1.00 reserved (100%) over')
+
+    def test_unusable_hana_size_setting_preserves_gate_notices_and_table(self) -> None:
+        text_setting(self.root / 'hana_aws.conf', 'fallback_instance_types', 'm6a.4xlarge,')
+        day = self.day(1)
+        at = int(day.timestamp())
+        self.gate(self.size, self.other, day, 3600)
+        self.exposures.append(ledger.HanaComputeExposure(at, at + 3600, 1, Decimal('.25'),
+            ledger.HanaExposureClosed(at + 3600), self.size, region=self.other))
+        self.bill(day, {(self.size, self.other): Decimal(2)})
+        self.assertEqual(self.notice_run(), 0)
+        command, = self.notice_commands
+        self.assertIn('The gap is 100%.', command[-1])
+        self.assertNotIn('Hana box time', command[-1])
+        table = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
+        row, = table.rows
+        self.assertEqual(row[table.headers.index(self.other)], '2.0/1.0 (100%) over')
 
     def test_gap_sends_one_staff_message_and_no_user_push(self) -> None:
         one = self.day(1)
@@ -1036,6 +1157,17 @@ class HoursCheckTests(CostFixture):
         self.assertEqual(cells[gpu][self.home], 'not billed')
         self.assertIn(f'above {self.limit:.0%}', tables.hours_note)
         self.assertEqual(tables.hours.title, 'Billed hours / box hours')
+
+    def test_spot_table_keeps_gate_hours_and_shows_the_hana_allowance(self) -> None:
+        day = self.day(1)
+        at = int(day.timestamp())
+        self.gate(self.size, self.other, day, 3600)
+        self.exposures.append(ledger.HanaComputeExposure(at, at + 7200, 1, Decimal('.25'),
+            ledger.HanaExposureClosed(at + 7200), self.size, region=self.other))
+        self.bill(day, {(self.size, self.other): Decimal(3)})
+        table = spot_table.spot_tables(self.state, self.clock.now, settings_path=self.settings).hours
+        row = next(row for row in table.rows if row[0] == self.size)
+        self.assertEqual(row[table.headers.index(self.other)], '3.0/1.0 + 2.00 reserved (0%)')
 
     def test_failed_notice_stays_pending_and_old_days_leave_the_claims(self) -> None:
         one = self.day(1)

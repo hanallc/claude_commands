@@ -21,7 +21,7 @@ import sys
 import time
 from typing import cast, final
 
-from scripts.aws_target import ledger, measurement, price_days, run_cost
+from scripts.aws_target import hana_spend, ledger, measurement, price_days, run_cost
 from scripts.aws_target.aws_cli import aws_error_code
 from scripts.aws_target.aws_cli import AwsCli as AwsCli, AwsExecutor as AwsExecutor, AwsUnavailable as AwsUnavailable, execute_command as execute_command
 from scripts.aws_target.config import read_settings
@@ -141,6 +141,18 @@ def gate_sizes(values: conf.ConfigRead) -> tuple[str, ...]:
     """Every type a cloud gate can launch or compare."""
     return tuple(dict.fromkeys((*values.words('instance_types'), *values.words('price_compare_instance_types'),
                                 *gpu_price_sizes(values))))
+
+
+def hours_check_scope(gate: conf.ConfigRead) -> run_cost.SpotHoursScope:
+    sizes = gate_sizes(gate)
+    try:
+        configuration = conf.read_or_repository('hana_aws')
+        region = configuration.text('region')
+        primary = configuration.text('instance_type')
+        hana = (primary, *hana_spend.read_fallback_instance_types(configuration, primary))
+    except conf.Unusable:
+        return run_cost.SpotHoursScope(sizes, {})
+    return run_cost.SpotHoursScope(tuple(dict.fromkeys((*sizes, *hana))), {region: hana})
 
 
 def spot_placement_requests(values: conf.ConfigRead) -> tuple[ledger.SpotPlacementRequest, ...]:
@@ -287,10 +299,13 @@ def placement_snapshot(settings_path: Path, directory: Path, *, execute: AwsExec
 def hours_gap_message(day: str, size: str, region: str, check: run_cost.HoursCheck, limit: Decimal) -> str:
     gap = (f'The gap is {check.hours_gap_ratio:.0%}.' if check.hours_gap_ratio is not None
            else 'The gap covers all billed hours.')
+    reservation = ((f'The ledger also reserves {check.hana_reserved_hours:.2f} h of Hana box time in that region for that day.',)
+                   if check.hana_reserved_hours else ())
     return '\n'.join((
         'AWS Spot hours differ from the cost ledger.',
         f'On {day} UTC, AWS billed {check.billed_hours or 0:.2f} h of {size} Spot in {region}.',
         f'The cost ledger records {check.box_hours:.2f} h for that size, region, and day.',
+        *reservation,
         f'{gap} The limit is {limit:.0%}.',
         'File an investigation for this gap and add it to the list.',
     ))
@@ -317,9 +332,9 @@ def hours_gap_notices(settings_path: Path, directory: Path, *, clock: Callable[[
     days = configuration.whole('run_cost_days')
     start = end - timedelta(days=days)
     try:
+        scope = hours_check_scope(conf.read_or_repository('cloud_gate'))
         checks = run_cost.day_hours_checks(ledger.CostLedger(directory), start, end, configuration.text('region'),
-                                           configuration.text('instance_type'),
-                                           gate_sizes(conf.read_or_repository('cloud_gate')), limit)
+                                           configuration.text('instance_type'), scope, limit)
     except (ledger.LedgerUnavailable, OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
         print(f'aws_target: hours check unavailable: {type(error).__name__}: {error}', file=sys.stderr)
         return 1

@@ -1013,7 +1013,8 @@ The next line names the cheapest merge gate by estimate.
 Below them, two tables show the refused requests and the launched boxes of each type and region.
 Refused requests are capacity and quota refusals.
 The last table shows billed hours / box hours for each type and region, from `run_cost.hours_checks`.
-A cell is `<billed>/<box> (<gap>)`, such as `9.2/8.8 (4%)`, with `over` when `hours_gap_over` is set.
+A cell shows `<billed>/<box> (<gap>)`, such as `9.2/8.8 (4%)`.
+The cell lists any Hana reservation after the recorded box hours and marks a gap above the limit with `over`.
 A type and region without a bill read shows `not billed`. Only types with hours have a row.
 An unreadable cost ledger shows a note in place of the billed hours.
 
@@ -1082,19 +1083,27 @@ It compares the billed Spot hours with the recorded box hours for each type, reg
    Its time runs from each `running` observation in the cost ledger to the next other state.
    A `running` observation with no later state counts to the window end.
    Reason: on 2026-11-08 the builder box ran 8.8 h, and the check reported its Spot hours as a gate gap.
-3. The gap ratio is `abs(billed - box) / box`.
-   A gap above `billed_hours_gap_max_ratio=0.15` in `aws_target.conf` is over.
-   Billed hours with no box hours are also over.
+3. The check counts the first exposure per generation in the configured Hana region and splits its hours at UTC midnight.
+   The check counts open exposures through check time and adds the same regional total to the upper bound for each Hana type.
+   The check uses the gate and builder hours for the original ratio comparison when the bill is below them or the Hana allowance is zero.
+   A positive allowance raises the upper limit to `(box hours + Hana exposure hours) × (1 + limit)`.
+   Both comparisons use `billed_hours_gap_max_ratio` from `aws_target.conf`.
+
+Hana exposure hours can hide that many hours from an unknown box of any configured Hana type in the region on that day.
+
 `run_cost.day_hours_checks` gives one `HoursCheck` per type, region and day in the window.
 Days run from the window start day up to, but not including, the end day, like the bill split.
 `run_cost.hours_checks` sums the days with a bill read for each type and region, for the billed hours table on the AWS page.
-`HoursCheck` holds `billed_hours`, `box_hours`, `hours_gap_ratio` and `hours_gap_over`.
-Without a bill read, `billed_hours` and `hours_gap_ratio` are `None`, and `box_hours` counts every day.
+`HoursCheck` records `billed_hours`, `box_hours`, `hana_reserved_hours`, `hours_gap_ratio`, and `hours_gap_over`.
+The gap ratio is the distance outside the range divided by the bound on that side.
+Without a bill read, the recorded and reserved hours count every day in the window.
 `aws_target.hourly` checks the last `run_cost_days` days after its price read.
 `buildlog hourly` and `aws_target.py snapshot` both call it.
-It checks the types the snapshot reads: `instance_types`, `price_compare_instance_types` and `gpu_instance_types`.
+The notices and the table use the same list of gate types and Hana's primary and fallback types.
+If the Hana region or type settings are unavailable, both use the gate types and a zero Hana allowance.
 For each type, region, and UTC day above the limit, the check sends a message to bob's fixed staff ID.
 The message gives the billed hours, ledger hours, gap, and limit.
+The message includes exposure hours for the region and day when a Hana allowance applies.
 It asks bob to file an investigation and add it to the list.
 The check saves the key `aws-hours-gap:<type>:<region>:<day>` in `hours-gap-notices.json` after `SENT`, `SKIPPED`, or `QUEUED`.
 After a failure or timeout, the next hourly run tries again.
