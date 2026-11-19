@@ -36,6 +36,7 @@ from scripts.message import send
 from scripts.buildlog.test_index import use_test_log
 from scripts.direct.verify_mac_memory_retry_test_support import VerifyMacMemoryRetryFixture
 from scripts.lib.process_group import send_process_group
+from scripts.lib.shell_test_support import shell_functions
 
 use_test_log()
 REAL_NOTIFY_OUTAGE = mac_idle.notify_outage
@@ -223,20 +224,18 @@ class MacIdleTests(NotificationGuardedTestCase):
 
     def test_tree_writing_lint_wait_is_local_and_next_judgment_counts_again(self) -> None:
         verify = mac_idle.SCRIPTS / "direct/verify.sh"
-        source = verify.read_text()
-        functions: list[str] = []
-        for name in ("publish_step_state", "step_state", "step_writes_tree", "finish_step_token", "run", "run_step"):
-            start = source.index(f"\n{name}() {{") + 1
-            end = source.index("\n}\n", start) + 2
-            functions.append(source[start:end])
-        script = "\n".join(functions) + r'''
+        script = shell_functions(
+            verify, "publish_step_state", "step_state", "step_writes_tree", "run", "run_step",
+            "place_compiling_step", "settle_placed_scope",
+        ) + r'''
 set -uo pipefail
 STEP_RECORD_ACTIVE=1; STEP_RUNS_ON=any_target; CMD=lint
-TOKEN_USED=0; TOKEN_HELD=0; TOKEN_WAITED=0; LINT_LEFT_QUEUE_STATUS=75
+BUILDLOG_SELECTED_LOCAL_GRANT="" PLACEMENT_SCOPE_STATE="" PLACEMENT_SCOPE_UNRESOLVED=0
 STEP_RECORD_PATH=$TEST_RECORD
 STEP_STATE_PATH=${TEST_RECORD%.json}.state
 STEP_RECORD_TEXT=$(< "$STEP_RECORD_PATH")
 buildlog_step_compiles() { return 0; }
+step_uses_build_scope() { return 1; }
 route_compiling_step() {
     STEP_RAN_ON_MAC=0
     step_state waiting_hold
