@@ -355,11 +355,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 snapshot = cast(ReviewLinksServer,self.server).review_cache.get()
                 fields = parse_qs(route.query)
                 if 'body' in fields:
+                    view = (review_page.ReviewBodyView.CARD if fields.get('view') == ['card']
+                            else review_page.ReviewBodyView.TABLE)
                     try:
-                        content = snapshot.body(fields['body'][0])
+                        content = snapshot.body(fields['body'][0], view=view)
                     except LookupError as error:
-                        self.review_response(html.escape(str(error)).encode(), 'text/html; charset=utf-8',
-                                             version=snapshot.version, status=404)
+                        message = html.escape(str(error))
+                        content = (change_page.document(f'<p role="status">{message}</p>', 'Review card')
+                                   if view is review_page.ReviewBodyView.CARD else message.encode())
+                        self.review_response(content, 'text/html; charset=utf-8', version=snapshot.version, status=404)
                     else:
                         self.review_response(content, 'text/html; charset=utf-8', version=snapshot.version)
                     return None

@@ -807,24 +807,34 @@ An item without links shows no review line.
 The open row repeats the line above its actions and shows each review's shown ID.
 Only types in `review_page.TYPES` link to Review cards.
 Other types and missing reviews show plain text.
-Review links use the console place query, so the navigator remains visible.
-A card link opens and highlights that card in the full Review list.
-The link uses the current Review filters. The same jump rule applies to List and Review.
-If the filters hide the target, the jump sets Show and Owner to All.
-The jump also clears other filters that hide the target.
-The linked parked card stays visible while its details are open, including after reload.
-A successful action that closes the linked card removes its target from the address.
-Back restores the List search text, scroll position, and surviving open rows for that history entry.
-The List saves the search text that is in the box when the user clicks the link.
-The List removes stale filters after it restores the open rows.
-The browser tab keeps at most eight return records for up to one hour.
-Repeated Back navigation can use the same record until it expires or the tab removes it.
-Reload keeps the Review card open with the current filters.
-A summary for one available review opens its card in the full list.
-A summary for multiple available reviews selects those reviews through the All view.
-The Linked reviews chip clears that selection with one click.
-A summary without an available review shows plain text.
-If the linked card disappears after the List renders, Review shows a missing-card message.
+A review ID opens one card in a dialog on the List.
+A summary links to the card when exactly one review is available.
+A summary for zero or multiple available reviews is plain text.
+The List loads the card document only when the dialog opens.
+The existing Review body route supplies the summary, body, styles, and controls.
+The Review table uses the same card renderer and action code.
+The dialog shows every state, including Done.
+A Validating card shows its details and has no actions.
+If the record disappears, the dialog shows a message.
+Escape, Close, and a click outside the card close the dialog.
+Focus returns to the List link.
+The dialog fills the screen at the console's phone breakpoint, including on the direct List page.
+On a desktop, the List centers the dialog.
+Switching browser tabs keeps the dialog and its draft.
+Changing console pages closes an idle dialog when it has no draft.
+The dialog preserves the List and Review addresses and filters.
+The verdict, feedback, and Later controls use the Review save path.
+During a save, the dialog stays open and disables its buttons.
+A failed save keeps the draft and shows the reason.
+Review and the dialog use the same recovery code to load the current revision and keep the draft.
+The draft store uses the record key and tracks edits across form replacements.
+Recovery preserves edits made after the conflict, including cleared words.
+The recovery lock applies to the stale revision.
+After a save, Close, Escape, and a click outside work while the List refreshes.
+A completed refresh closes the dialog.
+If the List request fails or times out, the next periodic refresh can update the row.
+List and Review refresh requests use `page_request_timeout_seconds`.
+If a List action is pending, the refresh starts after that action ends.
 An explicit item target joins the linked selection and opens its card.
 The shared table names each linked key that the page cannot find.
 It keeps the found cards when another linked key is missing.

@@ -135,6 +135,8 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn('aria-label="Open navigation"', source)
         self.assertIn('class="lucide lucide-menu"', source)
         self.assertIn('.sidebar .brand,.collapsed .sidebar{display:none}', source)
+        self.assertEqual(source.count(f'@media {console.PHONE_QUERY}'), 2)
+        self.assertIn(f"matchMedia('{console.PHONE_QUERY}')", source)
         self.assertNotIn('page-header', source)
         self.assertIn('.workspace{flex:1;width:100%}', source)
         self.assertIn("mobileToggle.setAttribute('aria-expanded', String(!value))", source)

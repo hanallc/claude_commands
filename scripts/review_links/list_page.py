@@ -342,11 +342,9 @@ def question_resend(resend: the_list.QuestionResend, today: datetime) -> str:
             + f'<p>{html.escape(question.words)}</p>' + action + '</section>')
 
 
-def review_place(keys: tuple[str, ...]) -> str:
-    """Open one linked card or select a group of linked reviews."""
-    if len(keys) == 1:
-        return review_page.PAGE_PATH + '?show=all#' + urlencode({"show": "open", "jump": keys[0]})
-    return review_page.PAGE_PATH + '?show=all#' + urlencode([("key", key) for key in keys])
+def review_card_link(key: str, label: str) -> str:
+    url = html.escape(review_page.card_url(key), quote=True)
+    return f'<a href="{url}" data-list-review-card="" aria-haspopup="dialog">{html.escape(label)}</a>'
 
 
 def review_summary(item: the_list.ListItem, reviews: Mapping[str, review_items.ReviewItem], today: datetime) -> str:
@@ -364,7 +362,7 @@ def review_summary(item: the_list.ListItem, reviews: Mapping[str, review_items.R
     else:
         text = "Reviews done — decide: close, keep or park"
     destinations = tuple(review.key for review in linked if review.type in review_page.TYPES)
-    return count_link("review", review_place(destinations), text) if destinations else text
+    return review_card_link(destinations[0], text) if len(destinations) == 1 else text
 
 
 def review_card(identity: str, reviews: Mapping[str, review_items.ReviewItem]) -> str:
@@ -372,10 +370,9 @@ def review_card(identity: str, reviews: Mapping[str, review_items.ReviewItem]) -
     if identity not in reviews:
         return html.escape(identity)
     review = reviews[identity]
-    label = html.escape(review.id)
     if review.type not in review_page.TYPES:
-        return label
-    return count_link("review", review_place((review.key,)), label)
+        return html.escape(review.id)
+    return review_card_link(review.key, review.id)
 
 
 WAITING_NOTE = "The producer will answer."
@@ -762,8 +759,7 @@ def change_counts() -> dict[str, int]:
 def count_link(page: str, place: str, text: str) -> str:
     """Open the count's page through the console navigation."""
     path = f"/{change_page.CONSOLE_FOLDER}/" + console.place_query(page, place)
-    review_link_attr = ' data-list-review-link=""' if page == "review" else ''
-    return f'<a href="{html.escape(path, quote=True)}" target="_top"{review_link_attr}>{text}</a>'
+    return f'<a href="{html.escape(path, quote=True)}" target="_top">{text}</a>'
 
 
 def counts_strip(members: staff.StaffSnapshot, names: staff_names.StaffNames) -> str:
@@ -861,6 +857,7 @@ def render(root: Path, *, include_counts: bool = True,
                '<col style="width:8%"></colgroup>')
     settings = conf.read("review_links")
     seconds = settings.number("page_refresh_seconds")
+    request_timeout = settings.whole("page_request_timeout_seconds")
     morning = record_table.clock_minutes(settings, "later_morning")
     log_max_height = settings.whole("list_log_max_height_rem")
     counts = counts_strip(members, names) if include_counts else ''
@@ -870,6 +867,7 @@ def render(root: Path, *, include_counts: bool = True,
                                                     ("collapse", "Collapse all", "chevrons-down-up")))
     content = (STYLE + page_frame.title("The List", "list")
                + f'<div data-list data-refresh-seconds="{seconds}" data-zone="{html.escape(zone.key, quote=True)}"'
+               + f' data-request-timeout-seconds="{request_timeout}"'
                + f' data-closed-keys="{html.escape(json.dumps(closed_keys), quote=True)}"'
                + f' data-park-morning="{morning}" style="--list-log-max-height:{log_max_height}rem">'
                + '<div data-record-filters>'
@@ -892,11 +890,25 @@ def render(root: Path, *, include_counts: bool = True,
                + '<section data-linked-item hidden><h2 id="list-linked-heading">Linked item outside filters</h2>'
                + '<div class="list-table"><table aria-labelledby="list-linked-heading">' + columns
                + '<thead><tr>' + linked_headers + '</tr></thead></table></div></section>'
-               + counts + '</div><script>' + SCRIPT + '</script>')
+               + counts + '</div>'
+               + '<dialog data-list-review-dialog aria-label="Review card"><div class="list-review-close">'
+               + '<button type="button" autofocus>Close</button></div></dialog>'
+               + '<script>' + SCRIPT + '</script>')
     return page_frame.rendered(change_page.document(content, "The List"), started, read_at)
 
 
 STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '''<style>
+[data-list-review-dialog]{width:min(1060px,calc(100% - 48px));max-width:none;max-height:none;padding:0;
+border:1px solid var(--line);border-radius:12px;background:var(--bg);color:var(--ink);overflow:hidden;box-sizing:border-box}
+[data-list-review-dialog]::backdrop{background:#0009}
+.list-review-close{display:flex;justify-content:flex-end;padding:8px 12px}
+.list-review-close button{margin:0;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink)}
+[data-list-review-dialog] iframe{display:block;width:100%;height:var(--review-card-height,15rem);
+max-height:calc(100dvh - 108px);border:0}
+:root:has([data-list-review-dialog][open][data-fullscreen]){overflow:hidden;scrollbar-gutter:auto}
+[data-list-review-dialog][data-fullscreen]{width:100vw;height:100dvh;border:0;border-radius:0;margin:0}
+[data-list-review-dialog][data-fullscreen][open]{display:grid;grid-template-rows:auto minmax(0,1fr)}
+[data-list-review-dialog][data-fullscreen] iframe{height:100%;max-height:none}
 [data-record-filters] .record-filter-row button{max-width:100%;overflow-wrap:anywhere}
 .list-producer-filter{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin-bottom:8px}
 .list-producer-filter .record-filter-row{flex:1 1 auto;min-width:0;max-width:100%;margin:0}
@@ -955,6 +967,7 @@ background:var(--ink-2);border-radius:50%}
 .list-table td[data-label="Producer"],.list-table td[data-label="ETA"]{color:var(--ink-2)}
 @media(max-width:960px){
 .list-expansion button{width:34px;height:34px}
+.list-table .list-row .record-id{width:auto}
 .list-table .list-row td[data-label="Producer"]{font-size:inherit}.list-table .list-row td[data-label="Item"]{font-size:17px}
 .list-table .list-row td[data-label="State"]::before{content:none}
 .list-table [data-keeper-produces=true] .list-row td[data-label="Producer"]{display:none}
@@ -982,7 +995,14 @@ const chipFor=data=>{
 };
 let content=document.querySelector('[data-list]');
 let closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
-let saving=0;
+let saving=0,listSaveVersion=0;
+function startListSave(){
+ saving++;listSaveVersion++;pageRefresh.abandon();
+}
+function refreshAfterListSave(needed){
+ if(savedReview) void refreshSavedReview();
+ else if(needed) void pageRefresh.refresh(true);
+}
 const drafts=new Map();
 const unparkMessages={
  cleared:'Unparked',
@@ -1106,7 +1126,7 @@ async function markOpenedAnswerRead(item,watch){
  const body=new URLSearchParams({keeper,id,request,token,action:'read',words:'',until:''});
  const submission=tableView.startAction(item);
  const pending={keepOpen:true};
- pendingOpenReads.set(key,pending);saving++;pageRefresh.abandon();
+ pendingOpenReads.set(key,pending);startListSave();
  let saved=false;
  try{
   const response=await fetch(location.pathname,{method:'POST',body});
@@ -1123,7 +1143,7 @@ async function markOpenedAnswerRead(item,watch){
    {kind:'failure',message:'Read not confirmed: '+error.message});
  }finally{
   pendingOpenReads.delete(key);saving--;
-  if(saved) void pageRefresh.refresh(true);
+  refreshAfterListSave(saved);
  }
 }
 const tableView=createRecordTable({content:()=>content,
@@ -1314,7 +1334,7 @@ function bindFeedbackForm(form){
    if(parks) data.set('until',parkingTime);
    if(!retry){unconfirmed.add(attempt);fresh=newRequest();}
    retainDraft();
-   form.dataset.sending='true';saving++;pageRefresh.abandon();
+   form.dataset.sending='true';startListSave();
    const hadFocus=asksQuestion && item.contains(document.activeElement);
    let focusChoice;
    const trackFocus=event=>{if(event.target!==document.body) focusChoice=event.target;};
@@ -1437,14 +1457,15 @@ function bindFeedbackForm(form){
       }
      }
     }
-    if((saved && item.dataset.waitingForAnswer!=='true') ||
-      (!saved && !refused && (parks || action==='remove'))) void pageRefresh.refresh(true);
+    refreshAfterListSave((saved && item.dataset.waitingForAnswer!=='true') ||
+      (!saved && !refused && (parks || action==='remove')));
    }
   });
 }
 async function refresh(_supersede=false,current=()=>true){
  if(saving || dateTimePickerOpen(content)) return;
- const response=await fetch(location.pathname,{cache:'no-store'});
+ const signal=AbortSignal.timeout(Number(content.dataset.requestTimeoutSeconds)*1000);
+ const response=await fetch(location.pathname,{cache:'no-store',signal});
  if(!response.ok) throw new Error('HTTP '+response.status);
  const page=new DOMParser().parseFromString(await response.text(),'text/html');
  const fresh=page.querySelector('[data-list]');
@@ -1453,6 +1474,7 @@ async function refresh(_supersede=false,current=()=>true){
  if(saving || dateTimePickerOpen(content) || !current()) return;
  const top=scrollY,field=listOwnsFocus() ? document.activeElement : null;
  const focus=field?.id,start=field?.selectionStart,end=field?.selectionEnd;
+ const reviewLink=field?.matches('[data-list-review-card]') ? reviewLinkPlace(field) : null;
  const action=field?.matches('button[name="action"]') ? field.value : '';
  const focusedRow=action || field?.matches('.list-toggle') ? field.closest('[data-list-item]')?.dataset.key : '';
  rememberLogPositions();
@@ -1469,6 +1491,7 @@ async function refresh(_supersede=false,current=()=>true){
  }
  if(focus){const field=document.getElementById(focus);field?.focus({preventScroll:true});
   if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number') field.setSelectionRange(start,end);}
+ if(reviewLink) restoreReviewLink(reviewLink);
  if(focusedRow){
   const row=[...content.querySelectorAll('[data-list-item]')].find(item=>item.dataset.key===focusedRow && !item.hidden);
   const button=action && row?.querySelector('[data-detail]:not([hidden]) button[name="action"][value="'+CSS.escape(action)+'"]:enabled');
@@ -1478,97 +1501,109 @@ async function refresh(_supersede=false,current=()=>true){
  watchLinkedAnswer();
  return pageRefreshFacts(page);
 }
-const listReturnParam='list-return',listReturnsKey='console.list.review-returns';
-const maxListReturns=8,maxOpenRows=128,maxRowKeyLength=128,listReturnAge=60*60*1000;
-function reviewDestination(link){
- const destination=new URL(link.href),target=new URL(destination.searchParams.get('at.review'),location.href);
- const jump=new URLSearchParams(target.hash.slice(1)).get('jump');
- if(!jump) return;
- const previous=new URL(parent.location.href).searchParams.get('at.review');
- const filters=new URLSearchParams({show:'open',jump});
- if(previous){
-  const place=new URL(previous,location.href);
-  if(place.origin===location.origin && place.pathname===target.pathname){
-   const fragment=new URLSearchParams(place.hash.slice(1));
-   for(const name of ['show','owner','type','q','sort','dir','source-owner']){
-    const value=fragment.get(name) ?? place.searchParams.get(name);
-    if(value!==null) filters.set(name,value);
-   }
-  }
+const reviewDialog=document.querySelector('[data-list-review-dialog]');
+const reviewClose=reviewDialog.querySelector('button');
+const listHost=window.frameElement?.matches('iframe[data-console-page="list"]') ? window.frameElement : null;
+let activeReview,savedReview,refreshingReview=false;
+function fitReviewDialog(){
+ const phone=(listHost?.ownerDocument.defaultView || window).matchMedia(''' + json.dumps(console.PHONE_QUERY) + r''');
+ const style=listHost?.ownerDocument.createElement('style');
+ if(style){
+  style.textContent='.frame-area > iframe[data-list-review-fullscreen]{position:fixed;inset:0;width:100vw;height:100dvh;z-index:9}';
+  listHost.ownerDocument.head.append(style);
  }
- target.hash=filters;
- destination.searchParams.set('at.review',target.pathname+target.search+target.hash);
- link.href=destination;
+ const fit=()=>{
+  reviewDialog.toggleAttribute('data-fullscreen',phone.matches);
+  listHost?.toggleAttribute('data-list-review-fullscreen',phone.matches);
+ };
+ phone.addEventListener('change',fit);fit();
+ return ()=>{
+  phone.removeEventListener('change',fit);style?.remove();
+  reviewDialog.removeAttribute('data-fullscreen');listHost?.removeAttribute('data-list-review-fullscreen');
+ };
 }
-function listReturns(){
- const raw=sessionStorage.getItem(listReturnsKey);
- if(!raw || raw.length>maxListReturns*(maxOpenRows*(maxRowKeyLength+3)+200)) return [];
- let records;
- try{records=JSON.parse(raw);}catch(_){return [];}
- if(!Array.isArray(records)) return [];
- const now=Date.now();
- return records.filter(record=>record && typeof record.id==='string' &&
-  Number.isFinite(record.saved) && record.saved<=now && now-record.saved<listReturnAge &&
-  Number.isFinite(record.top) && record.top>=0 &&
-  Array.isArray(record.opened) && record.opened.length<=maxOpenRows &&
-  record.opened.every(key=>typeof key==='string' && key.length<=maxRowKeyLength)).slice(-maxListReturns);
+function reviewLinkPlace(link){
+ const row=link.closest('[data-list-item]'),href=link.getAttribute('href');
+ const selector='[data-list-review-card][href="'+CSS.escape(href)+'"]';
+ return {key:row.dataset.key,selector,position:[...row.querySelectorAll(selector)].indexOf(link)};
 }
-function writeListReturns(records){
- if(records.length) sessionStorage.setItem(listReturnsKey,JSON.stringify(records));
- else sessionStorage.removeItem(listReturnsKey);
+function restoreReviewLink({key,selector,position}){
+ const row=content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]:not([hidden])');
+ const link=row?.querySelectorAll(selector)[position];
+ const target=link?.getClientRects().length ? link : row?.querySelector('.list-toggle');
+ (target || content.querySelector('#list-search')).focus({preventScroll:true});
 }
-function saveListReturn(){
- tableView.saveDeparturePlace();
- const outer=new URL(parent.location.href),prior=outer.searchParams.get(listReturnParam);
- const records=listReturns();
- const id=records.some(record=>record.id===prior) ? prior : Array.from(crypto.getRandomValues(new Uint32Array(4))).join('-');
- const opened=[...tableView.opened].filter(key=>key.length<=maxRowKeyLength).slice(0,maxOpenRows);
- const retained=records.filter(record=>record.id!==id);
- writeListReturns([...retained,{id,saved:Date.now(),opened,top:scrollY}].slice(-maxListReturns));
- outer.searchParams.set(listReturnParam,id);
- if(parent!==window) outer.searchParams.set('at.list',location.pathname+location.search+location.hash);
- parent.history.replaceState(parent.history.state,'',outer);
+function closeReviewCard(){
+ const card=activeReview;
+ if(!card || card.frame.hasAttribute('data-saving')) return;
+ activeReview=null;
+ reviewDialog.close();
+ card.restoreHost?.();
+ card.remove();
+ reviewClose.disabled=false;
+ if(!listHost?.hidden && document.visibilityState==='visible') restoreReviewLink(card.link);
 }
-function prepareReviewLink(event){
- const link=event.target.closest('a[data-list-review-link]');
- if(!link || event.defaultPrevented) return;
- try{
-  reviewDestination(link);
-  if(event.type==='click' && event.button===0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey)
-   saveListReturn();
- }catch(_){}
+async function refreshSavedReview(){
+ if(saving || refreshingReview || !savedReview) return;
+ const card=savedReview;
+ refreshingReview=true;
+ const version=listSaveVersion;
+ await pageRefresh.refresh(true);
+ refreshingReview=false;
+ if(savedReview!==card || version!==listSaveVersion){
+  void refreshSavedReview();
+  return;
+ }
+ savedReview=null;
+ if(activeReview===card) closeReviewCard();
 }
-for(const event of ['click','auxclick','contextmenu','focusin']) document.addEventListener(event,prepareReviewLink);
-function listReturnForEntry(){
- const outer=new URL(parent.location.href),id=outer.searchParams.get(listReturnParam);
- if(!id) return;
- try{
-  const records=listReturns();
-  writeListReturns(records);
-  return records.find(record=>record.id===id);
- }catch(_){}
-}
-function restoreListRows(record){
- const surviving=new Set([...content.querySelectorAll('[data-list-item]')].map(row=>row.dataset.key));
- tableView.opened.clear();
- for(const key of record.opened) if(surviving.has(key)) tableView.opened.add(key);
-}
-function restoreListScroll(top){
- requestAnimationFrame(()=>requestAnimationFrame(()=>scrollTo({top,behavior:'instant'})));
-}
-tableView.place();
-const listReturn=parent.performance.getEntriesByType('navigation')[0]?.type==='back_forward' ? listReturnForEntry() : undefined;
-if(listReturn) restoreListRows(listReturn);
-tableView.bind();bindListControls();tableView.apply(true,{top:listReturn?.top,dismissMissingItem:Boolean(listReturn)});
-if(listReturn) restoreListScroll(listReturn.top);
-addEventListener('pageshow',event=>{
- if(!event.persisted) return;
- const record=listReturnForEntry();
- if(!record) return;
- tableView.place();restoreListRows(record);
- tableView.apply(true,{top:record.top,dismissMissingItem:true});
- restoreListScroll(record.top);
+if(listHost) new MutationObserver(()=>{
+ if(!listHost.hidden) return;
+ const doc=activeReview?.frame.contentDocument;
+ const form=doc?.querySelector('[data-review-form]');
+ if(!form?.elements.feedback?.value && !form?.elements.later?.value && !doc?.querySelector('[data-review-draft]'))
+  closeReviewCard();
+}).observe(listHost,{attributes:true,attributeFilter:['hidden']});
+reviewClose.addEventListener('click',()=>closeReviewCard());
+reviewDialog.addEventListener('cancel',event=>{event.preventDefault();closeReviewCard();});
+let pressedBackdrop=false;
+reviewDialog.addEventListener('pointerdown',event=>{pressedBackdrop=event.target===reviewDialog;});
+reviewDialog.addEventListener('click',event=>{
+ if(pressedBackdrop && event.target===reviewDialog) closeReviewCard();
 });
+document.addEventListener('click',event=>{
+ const link=event.target instanceof Element && event.target.closest('a[data-list-review-card]');
+ if(!link || event.defaultPrevented || event.button!==0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+ event.preventDefault();
+ if(activeReview) return;
+ const frame=document.createElement('iframe');
+ frame.title='Review card';
+ frame.src=link.href;
+ const observer=new ResizeObserver(([entry])=>frame.style.setProperty('--review-card-height',Math.ceil(entry.borderBoxSize[0].blockSize)+'px'));
+ const card={frame,link:reviewLinkPlace(link),restoreHost:fitReviewDialog(),
+  remove:()=>{observer.disconnect();frame.remove();}};
+ activeReview=card;
+ frame.addEventListener('load',()=>{
+  const doc=frame.contentDocument;
+  const main=doc?.querySelector('main');
+  if(main) observer.observe(main,{box:'border-box'});
+  doc?.addEventListener('keydown',event=>{
+   if(event.key==='Escape' && !event.defaultPrevented && activeReview===card){
+    event.preventDefault();closeReviewCard();
+   }
+  });
+ });
+ frame.addEventListener('review-card-busy',()=>{reviewClose.disabled=frame.hasAttribute('data-saving');});
+ frame.addEventListener('review-card-saved',()=>{
+  savedReview=card;
+  void refreshSavedReview();
+ });
+ reviewDialog.append(frame);
+ pressedBackdrop=false;
+ reviewDialog.showModal();
+});
+tableView.place();
+tableView.bind();bindListControls();tableView.apply(true);
 addEventListener('popstate',tableView.restorePlace);
 addEventListener('hashchange',event=>{
  tableView.restorePlace(event);
@@ -1584,5 +1619,5 @@ function watchLinkedAnswer(){
  const row=[...content.querySelectorAll('[data-list-item]:not([hidden])')].find(item=>item.dataset.key===tableView.linkedItem);
  if(row) watchOpenedAnswer(row);
 }
-if(!listReturn) watchLinkedAnswer();
+watchLinkedAnswer();
 })();''')

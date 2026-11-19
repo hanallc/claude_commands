@@ -928,6 +928,24 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(cache.get().records[key].state, review_items.ReviewState.VALIDATING)
         self.assertEqual(list(case.root.glob('.review-link-scratch-*')), [])
 
+    def test_review_body_can_serve_a_read_only_validating_card(self) -> None:
+        case = self.review_fixture(changes=1)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        key = 'page-owner/C1'
+        _ = cache.save(case.card_body(cache.get(), key, 'question', 'What changed?'), case.status)
+        with patch.object(self.server, 'review_cache', cache):
+            table = self.request(review_page.PAGE_PATH + '?' + urlencode({'body': key}))
+            card = self.request(review_page.card_url(key))
+            missing = self.request(review_page.card_url('missing/key'))
+        self.assertEqual(table.status, 404)
+        self.assertEqual(card.status, 200)
+        self.assertIn(b'<template data-card-body><div class="list-panel review-panel change">', card.body)
+        self.assertIn(b'<h3>How to check</h3>', card.body)
+        self.assertNotIn(b'<form method="post"', card.body)
+        self.assertEqual(missing.status, 404)
+        self.assertIn(b'role="status"', missing.body)
+
     def test_review_recovery_isolates_unreadable_lists_and_releases_locks_before_cleanup(self) -> None:
         case = self.review_fixture(changes=3)
         listing = case.fixture.review_list
@@ -1124,16 +1142,27 @@ class ReviewLinksServerTests(unittest.TestCase):
         previous = cache.get()
         request = case.card_body(previous, proposal, 'approve')
         path = Path(proposal.removeprefix('proposal/'))
-        _ = path.write_text(path.read_text().replace('Run fewer checks.', 'Run a different check.'))
-        fresh = cache.publish_record(previous, proposal)
-        self.assertEqual(fresh.records[proposal].state, previous.records[proposal].state)
-        self.assertIn(b'Run a different check.', fresh.body(proposal))
         with patch.object(self.server, 'review_cache', cache), patch.object(
                 serve, 'tailscale_ip', return_value='127.0.0.1'), patch.object(
                 review_actions, 'decision_action', return_value=(change_page.NoMessageDelivery(), 'approved')) as action:
+            first = self.request(review_page.card_url(proposal))
+            self.assertEqual(first.status, 200)
+            _ = path.write_text(path.read_text().replace('Run fewer checks.', 'Run a different check.'))
             status, reply = self.post(review_page.PAGE_PATH, request)
             self.assertEqual(status, 409, reply)
             action.assert_not_called()
+            fresh = cache.get()
+            self.assertEqual(fresh.records[proposal].state, previous.records[proposal].state)
+            revision = review_page.record_revision(fresh.records[proposal], fresh.assets)
+            self.assertNotIn(revision.encode(), first.body)
+            card = self.request(review_page.card_url(proposal))
+            self.assertEqual(card.status, 200)
+            self.assertIn(b'Run a different check.', card.body)
+            self.assertIn(f'name="revision" value="{revision}"'.encode(), card.body)
+            table_body = self.request(review_page.PAGE_PATH + '?' + urlencode({'body': proposal, 'version': fresh.version}))
+            self.assertEqual(table_body.status, 200)
+            self.assertIn(b'Run a different check.', table_body.body)
+            self.assertIn(f'name="revision" value="{revision}"'.encode(), table_body.body)
             status, reply = self.post(review_page.PAGE_PATH, case.card_body(fresh, proposal, 'approve'))
             self.assertEqual(status, 200, reply)
             action.assert_called_once()
