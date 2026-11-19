@@ -32,7 +32,7 @@ import time
 import types
 import subprocess
 import unittest
-from typing import cast, override
+from typing import ClassVar, cast, override
 from unittest import mock
 
 from scripts.lint.memory_test_support import write_config_fixture, commit_config_fixture
@@ -49,7 +49,7 @@ from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.lib.user_zone import user_zone
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import session_send
-from scripts.production import staff
+from scripts.production import land_runs, staff
 from scripts.message.session_send_test_support import forbid_real_sender
 from scripts.message.roster import UnitLabels
 from scripts.lint.build_shape import build_shape
@@ -874,6 +874,135 @@ class StateCheckTests(unittest.TestCase):
                 self.assertEqual(service.state_check(root), 2)
             self.assertIn("stored placement records require external conversion", output.getvalue())
             self.assertEqual((root / "state.json").read_bytes(), before)
+
+
+class LandingWaitTests(unittest.TestCase):
+    ALL_TESTS: ClassVar[StepJob] = StepJob("test-all")
+
+    def configure_wait(self, fixture: AdmissionFixture, *, enabled: bool = True) -> None:
+        write_memory_config(fixture.root / "build_admission.conf", landing_wait="on" if enabled else "off",
+                            waiting_pass_seconds="1")
+
+    def gate_request(self, fixture: AdmissionFixture, job: StepJob | GateJobNotRecorded = ALL_TESTS,
+                     *, step: str = "merge-gate", repository: str = "claude_commands") -> wire.AdmitRequest:
+        request = fixture.request(need=GIB, step=step)
+        assert isinstance(request.profile, records.StepProfile)
+        return replace(request, identity=replace(request.identity, job=job), profile=replace(request.profile, repo=repository))
+
+    def test_landing_holds_ordinary_steps_and_publishes_the_reason(self) -> None:
+        for step, job in (("merge-gate", StepJob("test-all")), ("merge-gate", StepJob("test-modules")),
+                          ("targeted-test", StepJob("test-affected")), ("merge-gate", StepJob("test-nightly")),
+                          ("merge-gate", StepJob("promote")), ("nextest", GateJobNotRecorded())):
+            with self.subTest(job=job), AdmissionFixture() as fixture:
+                self.configure_wait(fixture)
+                request = self.gate_request(fixture, job, step=step)
+                with mock.patch.object(land_runs, "landing_active", return_value=land_runs.LandingOn(land_runs.LiveLand())) as signal:
+                    reply, = fixture.server.handle_request(request)
+                signal.assert_called_once_with()
+                self.assertIsInstance(reply, wire.Wait)
+                assert isinstance(reply, wire.Wait)
+                self.assertEqual(reply.text, "waits for natemerge's landing")
+                self.assertEqual(wire.parse_reply(wire.encode_reply(reply)), reply)
+                with mock.patch("sys.stderr", new_callable=io.StringIO) as errors:
+                    client.WaitOutput()(reply)
+                self.assertIn(reply.text, errors.getvalue())
+                view, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(view, wire.ViewReply)
+                waiting, = view.reading.view.waiting
+                self.assertEqual(records.reason_phrase(waiting.reason, (waiting,)), reply.text)
+                self.assertNotIn(request.episode, fixture.server.reservations)
+
+    def test_gate_program_uses_the_repository_of_its_checkout(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.configure_wait(fixture)
+            checkout = fixture.root / "private-copy"
+            checkout.mkdir()
+            _ = subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+            _ = subprocess.run(["git", "-C", str(checkout), "remote", "add", "origin",
+                            "https://example.test/claude_commands.git"], check=True)
+            request = self.gate_request(fixture, GateJobNotRecorded())
+            profile = records.ProgramProfile("merge-gate", str(fixture.root / ".claude"), str(checkout),
+                records.HistoryPeakSizing(GIB, records.FirstProgramPeak(GIB), fixture.clock.now()))
+            request = replace(request, profile=profile)
+            cmdline = fixture.proc.path / str(request.owner.pid) / "cmdline"
+            _ = cmdline.write_bytes(b"python3\0merge_gate.py\0--tests-only\0")
+            with mock.patch.object(land_runs, "landing_active", return_value=land_runs.LandingOn(land_runs.LiveLand())):
+                reply, = fixture.server.handle_request(request)
+            self.assertIsInstance(reply, wire.Wait)
+            row = fixture.server.waiters[request.episode].row
+            self.assertEqual(row.get("job"), StepJob("test-all"))
+            self.assertEqual(row.get("repository_name"), "claude_commands")
+
+    def test_integrate_and_hana_can_start_past_a_held_waiter(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.configure_wait(fixture)
+            ordinary = self.gate_request(fixture)
+            own = self.gate_request(fixture, StepJob("integrate"))
+            hana = self.gate_request(fixture, GateJobNotRecorded(), step="nextest", repository="hana")
+            with mock.patch.object(land_runs, "landing_active", return_value=land_runs.LandingOn(land_runs.RunnerTaking())):
+                reply, = fixture.server.handle_request(ordinary)
+                self.assertIsInstance(reply, wire.Wait)
+                _ = only_admitted(fixture.server.handle_request(own))
+                fixture.allow_next_start()
+                _ = only_admitted(fixture.server.handle_request(hana))
+            self.assertEqual(list(fixture.server.reservations), [own.episode, hana.episode])
+            self.assertEqual(list(fixture.server.waiters), [ordinary.episode])
+
+    def test_turning_landing_wait_off_releases_the_waiter_on_the_next_pass(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.configure_wait(fixture)
+            request = self.gate_request(fixture)
+            with mock.patch.object(land_runs, "landing_active", return_value=land_runs.LandingOn(land_runs.RunnerTaking())) as signal:
+                reply, = fixture.server.handle_request(request)
+                self.assertIsInstance(reply, wire.Wait)
+                self.configure_wait(fixture, enabled=False)
+                fixture.clock.advance(1)
+                _ = fixture.run_pass()
+                self.assertIn(request.episode, fixture.server.reservations)
+            signal.assert_called_once_with()
+
+    def test_aws_placement_can_start_when_the_local_candidate_waits(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request, publish_candidate
+
+        with PlacementFixture() as fixture:
+            self.configure_wait(fixture)
+            _ = write_config_fixture(fixture.root / "linux.conf", "probe_timeout_s=1\n", template="mac_test")
+            _ = (fixture.root / "build_targets.conf").write_text(
+                "targets=aws\nkind.aws=ssh\nplatform.aws=linux\nsettings.aws=linux.conf\n")
+            request = placement_request(fixture)
+            assert isinstance(request.profile, records.StepProfile)
+            candidate, = request.constraints.candidates
+            aws = replace(candidate, destination=replace(candidate.destination, provider="ssh", target="aws", host="fixture-aws"))
+            request = replace(request, identity=replace(request.identity, step="merge-gate", job=StepJob("test-all")),
+                profile=replace(request.profile, repo="claude_commands", step="merge-gate"))
+            _ = publish_candidate(fixture, replace(request, constraints=replace(request.constraints, candidates=(aws,))))
+            local = local_candidate(fixture)
+            _ = publish_candidate(fixture, replace(request, constraints=replace(request.constraints, candidates=(local,))))
+            request = replace(request, constraints=replace(request.constraints, candidates=(local, aws)))
+            with mock.patch.object(land_runs, "landing_active", return_value=land_runs.LandingOn(land_runs.LiveLand())):
+                reply, = fixture.server.handle_request(request)
+            assert isinstance(reply, wire.Assignment), reply
+            self.assertEqual(reply.assignment.destination, aws.destination)
+            self.assertNotIn(request.episode, fixture.server.reservations)
+
+    def test_held_waiters_start_in_arrival_order_after_the_signal_ends(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.configure_wait(fixture)
+            older = self.gate_request(fixture)
+            fixture.clock.advance(0.5)
+            newer = self.gate_request(fixture)
+            with mock.patch.object(land_runs, "landing_active", return_value=land_runs.LandingOn(land_runs.RunnerTaking())) as signal:
+                for request in (newer, older):
+                    reply, = fixture.server.handle_request(request)
+                    self.assertIsInstance(reply, wire.Wait)
+                self.assertEqual(fixture.server.next_pass, fixture.clock.monotonic() + 1)
+                signal.return_value = land_runs.LandingOff()
+                fixture.clock.advance(1)
+                _ = fixture.run_pass()
+                self.assertEqual(list(fixture.server.reservations), [older.episode])
+                fixture.allow_next_start()
+                _ = fixture.run_pass()
+            self.assertEqual(list(fixture.server.reservations), [older.episode, newer.episode])
 
 
 class LocalHoldPlacementTests(unittest.TestCase):

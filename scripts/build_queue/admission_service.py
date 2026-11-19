@@ -395,7 +395,7 @@ def admitted_gate_job(request: wire.AdmitRequest, proc: Path) -> StepJob | GateJ
     if isinstance(request.identity.job, StepJob):
         return request.identity.job
     step = request.profile.step
-    if isinstance(request.place, wire.LocalPlace) and isinstance(request.run, wire.RunIdentity) and step in GATE_PROGRAMS:
+    if isinstance(request.place, wire.LocalPlace) and step in GATE_PROGRAMS:
         job = gate_job_from_process(step, proc / str(request.owner.pid), start_time=request.owner.start_time)
         if isinstance(job, StepJob):
             return job
@@ -1879,7 +1879,9 @@ class AdmissionServer:
                 if not gate.can_use_natedev(row):
                     continue
                 owner = records.waiter_owner(row)
-                if isinstance(gate.waiter_state(row), records.TokenWaitingWaiter) and owner not in inputs.pending_remote_starts:
+                if (gate.waits_for_landing(inputs, row)
+                        or isinstance(gate.waiter_state(row), records.TokenWaitingWaiter)
+                        and owner not in inputs.pending_remote_starts):
                     continue
                 key = _place_key(wire.Owner(row["pid"], row["start_time"]), row["since"])
                 place = self.places.get(key)
@@ -2035,8 +2037,9 @@ class AdmissionServer:
             "repository_name": profile.repo,
             "route": request.route if isinstance(request, wire.AdmitRequest) else records.DIRECT_CARGO,
         }
-        if isinstance(identity.job, StepJob):
-            row["job"] = identity.job
+        job = admitted_gate_job(request, self.proc.path) if isinstance(request, wire.AdmitRequest) else identity.job
+        if isinstance(job, StepJob):
+            row["job"] = job
         if isinstance(place, WaiterPlace) and not isinstance(place.priority_since, OrderNotStarted):
             row["priority_since"] = place.priority_since
         if isinstance(place, WaiterPlace) and not isinstance(place.token_left_at, TokenNotLeft):
@@ -2047,6 +2050,11 @@ class AdmissionServer:
             row["repo_identity"] = profile.repository.key
             row["repository_name"] = profile.repository.name or profile.repo
             row["legacy_name"] = profile.repository.legacy_name
+        elif isinstance(profile, records.ProgramProfile):
+            # The program profile records the tools path. Read the repository name from the checkout.
+            repository, _worktree = step_estimator.git_identity([profile.program], profile.worktree)
+            if isinstance(repository, records.RepositoryIdentity):
+                row["repository_name"] = repository.name
         if isinstance(request, wire.AdmitRequest):
             row["package"] = step_estimator.test_package(list(request.argv))
             row["filters"] = list(step_estimator.test_filters(list(request.argv)))
@@ -2086,7 +2094,7 @@ class AdmissionServer:
         return self.proc.lifetime(reservation_row(record), self._live(record.owner))
 
     def _inputs(self, config: records.MemoryConfig, profile_rank: int, profile_share: int,
-                sweep_seconds: float) -> records.QueueInputs:
+                sweep_seconds: float, landing_wait: bool) -> records.QueueInputs:
         now = self.clock.now()
         plan = self._reading_plan(config)
         if isinstance(self.system_reader, NoSystemReader):
@@ -2152,8 +2160,10 @@ class AdmissionServer:
             and isinstance(self.assignments[key].remote_start_hold, records.RemoteStartHold))
         local_owners: set[str] = set()
         local_waits: dict[str, placement.EvidenceNeeded] = {}
+        landing_waiters: set[str] = set()
         for episode, waiting in self.waiters.items():
-            owner = records.waiter_owner(waiting.row)
+            row = waiting.row
+            owner = records.waiter_owner(row)
             request = self.placement_requests.get(episode)
             eligibility = placement.AllowedHost() if request is None else self._local_placement_eligibility(request)
             if isinstance(eligibility, placement.EvidenceNeeded):
@@ -2161,9 +2171,14 @@ class AdmissionServer:
             if (isinstance(eligibility, (placement.AllowedHost, placement.EvidenceNeeded))
                     or owner in pending_remote_starts and eligibility != placement.TemporaryExclusion("blocked")):
                 local_owners.add(owner)
+                job = row.get("job", GATE_JOB_NOT_RECORDED)
+                if (landing_wait and row.get("repository_name") == "claude_commands" and gate.can_use_natedev(row)
+                        and not (isinstance(job, StepJob) and job.step == "integrate")):
+                    landing_waiters.add(owner)
         inputs = gate.build_queue_inputs([(path, row) for path, row in ordered
             if records.waiter_owner(row) in local_owners], memories, readings, now, priority, unowned)
-        inputs = replace(inputs, pending_remote_starts=pending_remote_starts & local_owners, local_waits=local_waits)
+        inputs = replace(inputs, pending_remote_starts=pending_remote_starts & local_owners, local_waits=local_waits,
+                         landing_waiters=frozenset(landing_waiters))
         represented = {(step.run.pid, step.run.start_time) for step in inputs.running
                        if isinstance(step.run, LiveBuildRun)}
         between = tuple(step for step in evidence.between
@@ -2445,8 +2460,9 @@ class AdmissionServer:
         self._settle_attempt_reports(evidence_keys)
         remote_start_hold_seconds = self.configuration.remote_start_hold_seconds
         self._prepare_placements(evidence_keys, remote_start_hold_seconds)
+        landing_wait = self.configuration.landing_wait and isinstance(land_runs.landing_active(), land_runs.LandingOn)
         inputs = self._inputs(config, self.configuration.progress_profile_rank, self.configuration.peak_history_share_percent,
-                              self.configuration.progress_profile_sweep_seconds)
+                              self.configuration.progress_profile_sweep_seconds, landing_wait)
         ci_holds = self._ci_hold_reasons()
         if ci_holds:
             held_owners = {records.waiter_owner(self.waiters[episode].row) for episode in ci_holds}
@@ -2919,7 +2935,7 @@ class AdmissionServer:
             profile.repository.key if isinstance(profile.repository, records.RepositoryIdentity) else "",
             profile.scope, step_estimator.test_package(list(request.argv)), tuple(step_estimator.test_filters(list(request.argv))),
             shape, run=request.run, place=request.place, cargo_folder=cargo_folder,
-            gate_job=admitted_gate_job(request, self.proc.path), landing_merge=isinstance(waiting.landing, LandingTest))
+            gate_job=waiting.row.get("job", GATE_JOB_NOT_RECORDED), landing_merge=isinstance(waiting.landing, LandingTest))
         self.writes.register(record)
         if cloud:
             return record
@@ -3906,7 +3922,7 @@ done
         if waiting is not None and isinstance(waiting.last_reply, wire.Wait):
             reason = waiting.last_reply.reason
             cause = reason.cause if isinstance(reason, records.HeadAdmissionStatus) else reason
-            if isinstance(cause, placement.CargoFolderWait):
+            if isinstance(cause, (placement.CargoFolderWait, records.LandingWait)):
                 return wire.PlacementWait(request.episode, request.since, position, candidates,
                     waiting.last_reply, diagnostics, disk_exclusions, retry_notices)
         if any(isinstance(candidate.eligibility, placement.EvidenceNeeded) for candidate in candidates):
@@ -3996,7 +4012,8 @@ done
             waiting_for: list[PlacementHold] = []
             for candidate in self.placement_eligibility.get(request.episode, ()):
                 destination = candidate.destination
-                if destination.provider == "local" and request.constraints.cargo_folder in local_occupied:
+                if destination.provider == "local" and (owner in inputs.landing_waiters
+                        or request.constraints.cargo_folder in local_occupied):
                     continue
                 if (initial_readiness_unchecked and destination.provider == "local"
                         and isinstance(candidate.eligibility, placement.EvidenceNeeded)):

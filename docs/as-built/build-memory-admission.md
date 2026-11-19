@@ -91,6 +91,24 @@ The service reads the threshold at use.
 An unusable threshold logs once through the existing configuration diagnostics.
 Requests and cleanup continue when this logging setting is unusable.
 
+### Landing wait on natedev
+
+The admission service holds new `claude_commands` steps on natedev while `landing_active()` reports `LandingOn`.
+A live land record or a live runner lease in state `taking` keeps the signal on.
+Steps with the recorded `integrate` gate job can start during the landing.
+Steps that already started continue.
+
+`landing_wait=on` in `config/build_admission.conf` enables the rule.
+The service reads the setting for each admission pass.
+Set `landing_wait=off` to disable the rule.
+AWS placements and steps from other repositories, including Hana, can still start.
+
+Held tests keep their queue positions.
+The `verify.sh` wait line and the Builds page show "waits for natemerge's landing".
+The next admission pass checks the signal again.
+The default interval is one second while steps wait (`waiting_pass_seconds`).
+A runner that hangs with the signal on can hold matching tests until the runner stops.
+
 ### Placement status
 
 `PlacementStatusRequest(episode, attempt)` reads the saved assignment without changing state or launch permission.
