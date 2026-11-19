@@ -6841,6 +6841,28 @@ class HerdrTests(unittest.TestCase):
                 reports = unit_lookup.observed_session_labels(running=[]).unreadable_pane_lists
             self.assertEqual([report.session for report in reports], ["fixture"])
 
+    def test_report_reads_the_new_pane_reply_after_an_action(self) -> None:
+        command = ["pane", "list"]
+        self.configure_herdr(command, json.dumps({"result": {"panes": [{"pane_id": "before"}]}}))
+        with herdr.observation_snapshot(), herdr.pane_snapshot() as panes:
+            self.assertEqual([pane["pane_id"] for pane in panes("fixture")], ["before"])
+            with herdr.process_action():
+                self.configure_herdr(command, json.dumps({"result": {"panes": [{"pane_id": "after"}]}}))
+            self.assertEqual([pane["pane_id"] for pane in panes("fixture")], ["after"])
+
+    def test_darwin_shared_listener_is_a_placement_scan_failure(self) -> None:
+        processes = [herdr._UserProcess(pid, 1, "herdr", herdr.ReadProcessArguments(("herdr",)))  # pyright: ignore[reportPrivateUsage]
+                     for pid in (10, 20)]
+        path = self.root / "config/herdr/herdr.sock"
+        listeners = [herdr._BoundUnixSocket(pid, path) for pid in (10, 20)]  # pyright: ignore[reportPrivateUsage]
+        for visible in (processes, processes[:1]):
+            with (self.subTest(visible=len(visible)), patch.object(herdr, "_PLATFORM", "darwin"),
+                  patch.object(herdr, "_darwin_processes", return_value=visible),
+                  patch.object(herdr, "_darwin_bound_sockets", return_value=listeners)):
+                observed = herdr.herdr_places()
+                self.assertEqual(observed.placements, {})
+                self.assertEqual(observed.scan_failures, ("cannot establish a socket owner for herdr session default",))
+
     def test_process_snapshot_is_released_on_error_and_not_shared_with_another_thread(self) -> None:
         from concurrent.futures import ThreadPoolExecutor
 

@@ -1,4 +1,4 @@
-import { BATCH, PATHS, POLL_MS, VERSION, isEntryId, isOutboxClaim, isOutboxEntry } from "./protocol";
+import { BATCH, PATHS, POLL_MS, VERSION, isEntryId, isFieldlessOutcome, isOutboxClaim, isOutboxEntry } from "./protocol";
 import type { Heartbeat, Outbox, OutboxClaim, OutboxEntry, OutboxResult, PostmasterCalls, Replies, RouteToken } from "./protocol";
 
 type EntryRead = { status: "valid"; entry: OutboxEntry } | { status: "unreadable" };
@@ -80,8 +80,19 @@ export async function startOutbox(calls: PostmasterCalls, replies: Replies): Pro
       if (withdrawal.kind === "durable") pendingWithdrawals.delete(key);
     }
   };
-  const result = async (id: string, claimed_ms: number, sha256: string, outcome: OutboxResult["outcome"], detail: string): Promise<void> => {
-    pending.set(id, { path: path(PATHS.results, id), result: { id, outcome, detail, sha256, claimed_ms, finished_ms: calls.now() } });
+  const result = async (id: string, read: EntryRead, claimed_ms: number, sha256: string,
+                        outcome: OutboxResult["outcome"], detail: string): Promise<void> => {
+    const fields = { id, detail, sha256, claimed_ms, finished_ms: calls.now() };
+    let receipt: OutboxResult;
+    if (read.status === "valid") {
+      const { session_id, recipient_pid, recipient_start } = read.entry;
+      receipt = { ...fields, outcome, session_id, recipient_pid, recipient_start };
+    } else if (isFieldlessOutcome(outcome)) {
+      receipt = { ...fields, outcome };
+    } else {
+      throw new Error("This receipt outcome requires a recipient");
+    }
+    pending.set(id, { path: path(PATHS.results, id), result: receipt });
     await flush();
   };
   const deliver = async (id: string): Promise<void> => {
@@ -95,10 +106,10 @@ export async function startOutbox(calls: PostmasterCalls, replies: Replies): Pro
     try {
       const present = await calls.fs.exists(path(PATHS.outbox, id));
       sha256 = await textHash(read.status === "valid" ? read.entry.text : "");
-      if (!present) return await result(id, claimed_ms, sha256, "withdrawn", "sender withdrew entry");
-      if (read.status === "unreadable") return await result(id, claimed_ms, sha256, "failed", "unreadable entry");
+      if (!present) return await result(id, read, claimed_ms, sha256, "withdrawn", "sender withdrew entry");
+      if (read.status === "unreadable") return await result(id, read, claimed_ms, sha256, "failed", "unreadable entry");
       const entry = read.entry;
-      if (entry.deadline_ms < calls.now()) return await result(id, claimed_ms, sha256, "expired", "entry deadline passed");
+      if (entry.deadline_ms < calls.now()) return await result(id, read, claimed_ms, sha256, "expired", "entry deadline passed");
       const token = await replies.sending(entry, calls.now());
       sendAttempted = true;
       const answer = await calls.session.send({ to: { sessionId: entry.session_id }, text: entry.text });
@@ -106,10 +117,10 @@ export async function startOutbox(calls: PostmasterCalls, replies: Replies): Pro
         const withdrawal = await withdraw(token);
         if (withdrawal.kind === "awaiting durable write") pendingWithdrawals.set(token.key, withdrawal.token);
       }
-      await result(id, claimed_ms, sha256, answer.isDelivered ? "delivered" : "failed", answer.isDelivered ? "" : answer.reason);
+      await result(id, read, claimed_ms, sha256, answer.isDelivered ? "delivered" : "failed", answer.isDelivered ? "" : answer.reason);
     } catch (error) {
       await writeError(calls, directory, error);
-      await result(id, claimed_ms, sha256, sendAttempted ? "abandoned" : "failed", errorText(error));
+      await result(id, read, claimed_ms, sha256, sendAttempted ? "abandoned" : "failed", errorText(error));
     }
   };
   const oldClaim = async (id: string): Promise<void> => {
@@ -119,7 +130,7 @@ export async function startOutbox(calls: PostmasterCalls, replies: Replies): Pro
     if (value.run === run) return;
     const read = await readEntry(id);
     const sha256 = await textHash(read.status === "valid" ? read.entry.text : "");
-    await result(id, value.claimed_ms, sha256, "abandoned", "earlier worker left a claim without a result");
+    await result(id, read, value.claimed_ms, sha256, "abandoned", "earlier worker left a claim without a result");
   };
   const listIds = async (folder: string): Promise<string[]> => {
     if (!await calls.fs.exists(`${directory}/${folder}`)) {

@@ -2098,6 +2098,43 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertEqual(json.loads(body), {"reason": f"Invalid quota clear state in {state}."})
                     self.assertEqual(state.read_bytes(), contents)
 
+    def test_quota_clear_accepts_a_submitted_reset_from_the_same_week(self) -> None:
+        from scripts.accounts import accounts
+
+        reset = datetime.now(timezone.utc) + timedelta(days=1)
+        state = accounts_page.quota_state(self.root)
+        quotas = {"claude1": accounts.WeeklyQuota(4, reset)}
+        cases = ((reset - timedelta(days=7), 400),
+                 (reset + timedelta(microseconds=526917), 200))
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(accounts, "stored_weekly_quotas", return_value=quotas)):
+            for submitted, status in cases:
+                with self.subTest(submitted=submitted):
+                    form = urlencode({"quota_account": "claude1", "quota_level": "urgent",
+                                      "quota_reset": submitted.isoformat()})
+                    self.assertEqual(self.post(accounts_page.PAGE_PATH, form)[0], status)
+                    if status == 400:
+                        self.assertFalse(state.exists())
+                    else:
+                        self.assertEqual(json.loads(state.read_text()), {
+                            "claude1": {"level": "urgent", "reset": reset.isoformat()},
+                        })
+
+    def test_warning_clear_keeps_an_urgent_record_for_the_same_week(self) -> None:
+        from scripts.accounts import accounts
+
+        reset = datetime.now(timezone.utc) + timedelta(days=1)
+        quotas = {"claude1": accounts.WeeklyQuota(9, reset)}
+        state = accounts_page.quota_state(self.root)
+        state.parent.mkdir(parents=True, exist_ok=True)
+        receipt = {"claude1": {"level": "urgent", "reset": (reset - timedelta(microseconds=526917)).isoformat()}}
+        _ = state.write_text(json.dumps(receipt), encoding="utf-8")
+        form = urlencode({"quota_account": "claude1", "quota_level": "warning", "quota_reset": reset.isoformat()})
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(accounts, "stored_weekly_quotas", return_value=quotas)):
+            self.assertEqual(self.post(accounts_page.PAGE_PATH, form)[0], 200)
+        self.assertEqual(json.loads(state.read_text()), receipt)
+
     def test_accounts_post_saves_and_clears_a_producers_next_move(self) -> None:
         from scripts.accounts import accounts, next_moves
 
