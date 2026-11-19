@@ -37,7 +37,8 @@ def _template(name: str) -> Path:
 
 
 # Test clocks move only when a test moves them, so a test configuration has no pass gap unless the test sets one.
-TEST_CONFIG_DEFAULTS = {"build_admission.conf": "min_pass_gap_seconds=0\n"}
+# Tests keep the whole build reserve, so their room numbers do not follow the tunable share.
+TEST_CONFIG_DEFAULTS = {"build_admission.conf": "min_pass_gap_seconds=0\nbuild_reserve_share_percent=100\n"}
 
 
 def write_config_fixture(path: Path, overrides: str = "", *, template: str | None = None) -> int:
