@@ -23,10 +23,30 @@ from scripts.build_queue.queue_snapshot import QueueSnapshot, read_queue_snapsho
 from scripts.buildlog import store
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lint import memory_admit as gate
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 SENDER = "head-stall watch"
 TIMES_TAIL_BYTES = 1 << 20
+PROC = gate.PROC
+
+
+@dataclass(frozen=True)
+class CompleteCompilerScan:
+    """The capture has no unreadable compiler readings."""
+
+
+@dataclass(frozen=True)
+class UnreadableCompilers:
+    count: int
+
+
+@dataclass(frozen=True)
+class CompilerScanCountUnavailable:
+    """The alert cannot count the unreadable compilers."""
+
+
+type CompilerScan = CompleteCompilerScan | UnreadableCompilers | CompilerScanCountUnavailable
 
 
 @dataclass(frozen=True)
@@ -35,7 +55,7 @@ class Holder:
     folder: str
     pid: int | None
     promise: int
-    used: int | None
+    used: int | records.RunUseUnavailable
 
 
 @dataclass(frozen=True)
@@ -49,6 +69,7 @@ class HeadStall:
     waited: float
     quiet: float
     holders: tuple[Holder, ...]
+    compiler_scan: CompilerScan
 
 
 @dataclass(frozen=True)
@@ -99,10 +120,35 @@ def last_admission(times: Path) -> float:
     return 0.0
 
 
-def _used(memory: records.StepMemory) -> int | None:
-    if isinstance(memory, (records.PromisedMemory, records.MeasuredMemory)):
-        return memory.bytes
-    return None
+def _compiler_scan(running: tuple[records.RunningStep, ...]) -> CompilerScan:
+    for step in running:
+        memory = step.measured
+        if not isinstance(memory, records.CompilerServiceMemory):
+            continue
+        source = memory.anonymous_source
+        if isinstance(source, records.ScopeSource):
+            if all(isinstance(job.use, records.AnonymousRunUse) for job in memory.jobs):
+                return CompleteCompilerScan()
+            members = source.members
+        else:
+            path = gate.builds_slice_cgroup() / "sccache.service" / "cgroup.procs"
+            gate.check_memory_reading(path)
+            try:
+                members = frozenset(int(pid) for pid in path.read_text().split())
+            except (OSError, ValueError):
+                return CompilerScanCountUnavailable()
+        unreadable = 0
+        for pid in members:
+            scope = gate.named_step_scope(pid, PROC)
+            if isinstance(scope, records.ReadingUnavailable) and pid != memory.pid:
+                unreadable += 1
+            elif isinstance(scope, Path):
+                use = gate.process_memory({pid}, PROC).anonymous
+                if isinstance(use, records.RunUseUnavailable):
+                    unreadable += 1
+        # A compiler can end after the capture. A later read cannot prove that the capture was complete.
+        return UnreadableCompilers(unreadable) if unreadable else CompilerScanCountUnavailable()
+    return CompilerScanCountUnavailable()
 
 
 def find_stall(snapshot: QueueSnapshot, admitted: float, now: float, limit: float) -> HeadStall | NoStall:
@@ -116,11 +162,12 @@ def find_stall(snapshot: QueueSnapshot, admitted: float, now: float, limit: floa
     quiet = now - last_start
     if waited < limit or quiet < limit:
         return NoStall()
-    holders = tuple(Holder(step.step, step.folder, step.pid if isinstance(step.pid, int) else None,
-                           step.promise, _used(step.measured)) for step in running)
+    holders = tuple(Holder(step.step, step.folder, step.pid if isinstance(step.pid, int) else None, step.promise,
+                           attributed.use.bytes if isinstance(attributed.use, records.AnonymousRunUse) else attributed.use)
+                    for _, step, attributed in gate.attributed_step_uses(inputs) if step.promise > 0)
     # A start ends the stall, so the head and the last start name one stall.
     return HeadStall(f"{head['pid']}:{head['start_time']}:{int(last_start)}", head.get("step", "step"), head.get("folder", ""),
-                     head["pid"], head["need"], waited, quiet, holders)
+                     head["pid"], head["need"], waited, quiet, holders, _compiler_scan(inputs.running))
 
 
 def current_stall(paths: StallPaths, now: float, limit: float, freshest: float) -> HeadStall | NoStall:
@@ -136,9 +183,16 @@ def _folder_name(folder: str) -> str:
 
 def builds_text(stall: HeadStall) -> str:
     lines = [f"The build queue head has waited {stall.waited / 60:.0f} min. No step started for {stall.quiet / 60:.0f} min.",
-             f"Head: {stall.step} in {_folder_name(stall.folder)} (pid {stall.pid}) needs {gib(stall.need)}.", "Holders:"]
+             f"Head: {stall.step} in {_folder_name(stall.folder)} (pid {stall.pid}) needs {gib(stall.need)}."]
+    scan = stall.compiler_scan
+    if isinstance(scan, UnreadableCompilers):
+        compilers = "compiler" if scan.count == 1 else "compilers"
+        lines.append(f"sccache: {scan.count} {compilers} not readable; uses can be low")
+    elif isinstance(scan, CompilerScanCountUnavailable):
+        lines.append("sccache: compiler scan incomplete; uses can be low")
+    lines.append("Holders:")
     for holder in stall.holders:
-        used = gib(holder.used) if holder.used is not None else "unknown"
+        used = gib(holder.used) if isinstance(holder.used, int) else "unknown"
         pid = f"pid {holder.pid}" if holder.pid is not None else "pid unknown"
         lines.append(f"- {holder.step} in {_folder_name(holder.folder)} ({pid}): promise {gib(holder.promise)}, uses {used}")
     lines.append("The head starts only when a holder ends. Check each holder that uses much less than its promise.")
