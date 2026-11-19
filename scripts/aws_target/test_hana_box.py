@@ -640,7 +640,9 @@ class HanaBoxTests(CostFixture):
         self.assertEqual(intent['expected_generation'], old)
         self.assertGreater(self.generation(), old)
         self.assertEqual(ledger.rows(self.record(), 'claims')[0], claim)
+        observed_at = self.record()['observed_at']
         _ = self.tick()
+        self.assertEqual(self.record()['observed_at'], observed_at)
         self.assertEqual(ledger.rows(self.record(), 'claims')[0], claim)
 
     def test_refresh_failure_does_not_stop_lifecycle_recovery(self) -> None:

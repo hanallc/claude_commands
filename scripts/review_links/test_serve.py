@@ -23,7 +23,7 @@ import time
 import unittest
 from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from http.client import HTTPConnection, RemoteDisconnected
@@ -47,9 +47,9 @@ from scripts.production import change_review, change_routing, investigation, nex
 from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
-from scripts.review_links import new_item_dialog, review_submissions
+from scripts.review_links import new_item_dialog, page_question, review_submissions
 from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, review_actions, review_later, review_page, review_items, serve, test_review_page
-from scripts.lib import atomic_file, conf, scratch
+from scripts.lib import atomic_file, conf, file_lock, scratch
 from scripts.feature_log import feature_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -128,6 +128,7 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(change_page, "recover_pending"),
               patch.object(list_page, "recover_pending")):
             server = serve.ReviewLinksServer(("127.0.0.1", 0), self.root)
+        server.review_cache.synchronize()
         self._server = server
         complete = self.review_post_done
         new_item_complete = self.new_item_post_done
@@ -1242,6 +1243,39 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertLess(len(wire),len(snapshot.index_response()))
             finally:
                 connection.close()
+
+    def test_server_initializes_review_on_a_fresh_root(self) -> None:
+        with (patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending")):
+            server = self.enterContext(serve.ReviewLinksServer(("127.0.0.1", 0), self.root, initialize_review=True))
+        server.review_cache.synchronize()
+        self.assertTrue((self.root / change_page.CONSOLE_FOLDER / change_page.BROWSER_MANIFEST).exists())
+        self.port = server.server_port
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, TEST_HANG_GUARD_SECS)
+        self.addCleanup(server.shutdown)
+        reply = self.request(review_page.PAGE_PATH)
+        self.assertEqual(reply.status, 200)
+        self.assertIn(b'data-review-index', reply.body)
+
+    def test_review_index_omits_an_unknown_handoff_time(self) -> None:
+        case = self.review_fixture(changes=2)
+        saved = '2026-11-16T12:49:08-05:00'
+        for row, time_fields in (('C1', {}), ('C2', {'handed_at': saved})):
+            path = change_routing.delivery_path(case.root, case.fixture.review_list, row)
+            _ = path.write_text(json.dumps({'validation': {'attempt': row, 'state': 'sent'}, **time_fields}))
+            os.utime(path, (1795123200, 1795123200))
+        snapshot = review_page.build_snapshot(case.root)
+        with patch.object(review_page.ReviewSnapshotCache, 'get', return_value=snapshot):
+            reply = self.request(review_page.PAGE_PATH + '?index=1')
+        self.assertEqual(reply.status, 200)
+        entries = {entry['key']: entry for entry in
+                   test_review_page.unpack_index(json.dumps(json.loads(reply.body)['index']))}
+        unknown = entries['page-owner/C1']
+        self.assertEqual(unknown['state'], review_items.ReviewState.VALIDATING)
+        self.assertNotIn('handoff', unknown)
+        self.assertEqual(entries['page-owner/C2'].get('handoff'), (saved, 'Nov 16 12:49 EST'))
 
     def test_review_get_initializes_a_fresh_root(self) -> None:
         _ = self.review_fixture()
@@ -2439,6 +2473,154 @@ class ReviewLinksServerTests(unittest.TestCase):
                 with self.assertRaises(FileNotFoundError):
                     _ = serve.old_console_link(self.root, path)
 
+    def test_list_get_does_not_release_a_ready_delivery_park(self) -> None:
+        with patch.object(serve, "release_delivery_parks"):
+            case = self.review_fixture(changes=1)
+            change = next(item for item in review_items.read(case.root) if item.type == review_items.ReviewType.CHANGE)
+            self.assertTrue(change.for_you(the_list.now()))
+            keeper = staff.StaffId(str(uuid4()))
+            morty = staff.StaffRow(keeper, "producer", "morty", staff.StaffRoot(), current_session=keeper)
+            members = staff.StaffSnapshot((*staff.snapshot().rows, morty))
+            with patch.object(staff, "snapshot", return_value=members):
+                item = the_list.add(morty.id, "Leave the park to the owner", owner=change.owner, source="morty", changes={})
+                _ = the_list.link(morty.id, item.id, (change.key,), source="morty")
+                parked = the_list.park(morty.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
+                with patch.object(the_list, "_save", side_effect=OSError("The List store is read-only.")) as save:
+                    reply = self.request(list_page.PAGE_PATH)
+                self.assertEqual(reply.status, 200)
+                self.assertIn(b"Parked until delivered", reply.body)
+                save.assert_not_called()
+                self.assertEqual(the_list.load(morty.id, item.id), parked)
+
+    def test_delivery_park_scan_keeps_serving_and_retries_after_a_malformed_review_list(self) -> None:
+        self.server.review_cache.close()
+        case = self.review_fixture(changes=1)
+        change = next(item for item in review_items.read(case.root) if item.type == review_items.ReviewType.CHANGE)
+        self.assertTrue(change.for_you(the_list.now()))
+        keeper = staff.StaffId(str(uuid4()))
+        morty = staff.StaffRow(keeper, "producer", "morty", staff.StaffRoot(), current_session=keeper)
+        members = staff.StaffSnapshot((*staff.snapshot().rows, morty))
+        listing = case.fixture.review_list
+        original = listing.read_bytes()
+        entered, finish_check = threading.Event(), threading.Event()
+        read_current = review_items.read_current
+
+        def check(root: Path, item: review_items.ReviewItem, members: staff.StaffSnapshot) -> review_items.ReviewItem:
+            entered.set()
+            if not finish_check.wait(TEST_HANG_GUARD_SECS):
+                raise TimeoutError("The test did not finish the release check.")
+            return read_current(root, item, members)
+
+        with (patch.object(staff, "snapshot", return_value=members),
+              patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending"),
+              patch.object(review_items, "read_current", side_effect=check),
+              patch.object(change_page, "send_question", return_value=question_outcome()),
+              redirect_stderr(StringIO()) as errors, ExitStack() as running):
+            item = the_list.add(keeper, "Release after the list is repaired", owner=change.owner, source="morty", changes={})
+            _ = the_list.link(keeper, item.id, (change.key,), source="morty")
+            status = change_page.DeliveryStatus(case.root)
+            question = "Which check passed?"
+            asked = the_list.ask_question(keeper, item.id, the_list.PageRequest("ask", "question", question), status)
+            change_page.deliver(asked, status)
+            parked = the_list.park(keeper, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
+            server = running.enter_context(
+                serve.ReviewLinksServer(("127.0.0.1", 0), case.root, initialize_review=True))
+            self.port = server.server_port
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            _ = running.callback(thread.join, TEST_HANG_GUARD_SECS)
+            _ = running.callback(server.shutdown)
+            try:
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+                reply = self.request(list_page.PAGE_PATH)
+                self.assertEqual(reply.status, 200)
+                self.assertIn(b"Parked until delivered", reply.body)
+                self.assertIn(b'data-waiting-for-answer="true"', reply.body)
+                self.assertIn(question.encode(), reply.body)
+                self.assertEqual(self.request(review_page.PAGE_PATH).status, 200)
+                _ = listing.write_text("# Malformed change review\n")
+            finally:
+                finish_check.set()
+            server.review_cache.synchronize()
+            self.assertIn("review-links List delivery park", errors.getvalue())
+            self.assertEqual(the_list.load(keeper, item.id), parked)
+            self.assertEqual(self.request(review_page.PAGE_PATH).status, 200)
+            _ = listing.write_bytes(original)
+            server.review_cache.invalidate()
+            server.review_cache.synchronize()
+            saved = the_list.load(keeper, item.id)
+            self.assertEqual(saved.log[-1].what,
+                             the_list.UnparkedForDelivery(the_list.LinkedChangeDelivered(change.key)))
+            self.assertEqual(len(saved.log), len(parked.log) + 1)
+
+    def test_delivery_park_retries_after_list_ask_and_busy_review_locks(self) -> None:
+        self.server.review_cache.close()
+        case = self.review_fixture(changes=1)
+        change = next(item for item in review_items.read(case.root) if item.type == review_items.ReviewType.CHANGE)
+        keeper = staff.StaffId(str(uuid4()))
+        item = the_list.add(keeper, "Release after Ask", owner=change.owner, source="morty", changes={})
+        _ = the_list.link(keeper, item.id, (change.key,), source="morty")
+        parked = the_list.park(keeper, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
+        list_locked, finish_ask = threading.Event(), threading.Event()
+        ask = page_question.ask
+
+        def claim(store: page_question.QuestionStore, target: change_page.QuestionDeliveryTarget, words: str,
+                  status: change_page.DeliveryStatus, *, resend_unknown: bool = False,
+                  resend_request: str = "") -> change_page.MessageDelivery:
+            list_locked.set()
+            if not finish_ask.wait(TEST_HANG_GUARD_SECS):
+                raise TimeoutError("The test did not finish Ask.")
+            return ask(store, target, words, status, resend_unknown=resend_unknown, resend_request=resend_request)
+
+        with (patch.object(page_question, "ask", side_effect=claim),
+              patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending"),
+              patch.object(change_page, "send_question", return_value=question_outcome()),
+              ExitStack() as running):
+            pool = running.enter_context(ThreadPoolExecutor(max_workers=1))
+            status = change_page.DeliveryStatus(case.root)
+            question = the_list.PageRequest("ask", "question", "Which check passed?")
+            asked = pool.submit(the_list.ask_question, keeper, item.id, question, status)
+            try:
+                self.assertTrue(list_locked.wait(TEST_HANG_GUARD_SECS))
+                server = running.enter_context(
+                    serve.ReviewLinksServer(("127.0.0.1", 0), case.root, initialize_review=True))
+                server.review_cache.synchronize()
+                self.assertEqual(the_list.load(keeper, item.id), parked)
+                with change_review.review_delivery_lock(case.root, wait=False) as lock:
+                    self.assertIs(lock, file_lock.LockResult.ACQUIRED)
+            finally:
+                finish_ask.set()
+            change_page.deliver(asked.result(timeout=TEST_HANG_GUARD_SECS), status)
+            pending = the_list.load(keeper, item.id)
+            self.assertEqual([saved.words for saved in pending.questions], [question.words])
+            self.assertIs(pending.parked_until, the_list.ParkUntilDelivered.DELIVERED)
+
+            with change_review.review_delivery_lock(case.root):
+                server.review_cache.invalidate()
+                server.review_cache.synchronize()
+                self.assertEqual(the_list.load(keeper, item.id), pending)
+
+            directory = os.open(case.fixture.review_list.parent, os.O_RDONLY)
+            try:
+                fcntl.flock(directory, fcntl.LOCK_EX)
+                server.review_cache.invalidate()
+                server.review_cache.synchronize()
+                self.assertEqual(the_list.load(keeper, item.id), pending)
+            finally:
+                os.close(directory)
+
+            server.review_cache.invalidate()
+            server.review_cache.synchronize()
+            released = the_list.load(keeper, item.id)
+            events = [entry.what for entry in released.log if isinstance(entry.what, the_list.UnparkedForDelivery)]
+            self.assertEqual(events, [the_list.UnparkedForDelivery(the_list.LinkedChangeDelivered(change.key))])
+            self.assertEqual(released.questions, pending.questions)
+            server.review_cache.invalidate()
+            server.review_cache.synchronize()
+            self.assertEqual(the_list.load(keeper, item.id), released)
+
     def test_list_feedback_saves_before_delivery_and_recovers_at_server_start(self) -> None:
         morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
                                current_session=staff.StaffId("fixture-morty-session"))
@@ -2697,6 +2879,15 @@ class ReviewLinksServerTests(unittest.TestCase):
         item = the_list.add(morty.id, "The question item", owner=the_list.UnassignedOwner.NATE, source="nate", changes={})
         words = "Which check passed?"
         started, release, finished = threading.Event(), threading.Event(), threading.Event()
+        claiming, resume_claim = threading.Event(), threading.Event()
+        claim_question = change_page.claim_question
+
+        def claim(status: change_page.DeliveryStatus,
+                  delivery: change_page.VerifiedQuestionAttempt) -> change_page.PageQuestionSend:
+            claiming.set()
+            if not resume_claim.wait(TEST_HANG_GUARD_SECS):
+                raise TimeoutError("The test did not resume the send claim.")
+            return claim_question(status, delivery)
         deliveries: list[tuple[staff.StaffId, str]] = []
 
         def send(recipient: staff.StaffId, message: str, _message_id: str
@@ -2723,7 +2914,20 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(change_page, "send_question", side_effect=send),
               patch.object(change_page, "deliver", side_effect=deliver)):
             try:
-                code, body = self.post(list_page.PAGE_PATH, urlencode(fields))
+                with (self.subTest("List GET during the send claim"),
+                      ThreadPoolExecutor(max_workers=1) as pool,
+                      patch.object(change_page, "claim_question", side_effect=claim)):
+                    ask = pool.submit(self.post, list_page.PAGE_PATH, urlencode(fields))
+                    try:
+                        self.assertTrue(claiming.wait(TEST_HANG_GUARD_SECS))
+                        with patch.object(change_page, "_question_lock_state") as probe:
+                            reply = self.request(list_page.PAGE_PATH)
+                            self.assertEqual(reply.status, 200)
+                            self.assertIn(words.encode(), reply.body)
+                            probe.assert_not_called()
+                    finally:
+                        resume_claim.set()
+                    code, body = ask.result(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(code, 200)
                 self.assertEqual(json.loads(body)["state"], "saved")
                 self.assertEqual(json.loads(body)["waiting_for_answer"], "true")
@@ -2955,6 +3159,43 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertEqual(code, 503)
                     self.assertEqual(json.loads(body), {"reason": f"Invalid quota clear state in {state}."})
                     self.assertEqual(state.read_bytes(), contents)
+
+    def test_quota_clear_accepts_a_submitted_reset_from_the_same_week(self) -> None:
+        from scripts.accounts import accounts
+
+        reset = datetime.now(timezone.utc) + timedelta(days=1)
+        state = accounts_page.quota_state(self.root)
+        quotas = {"claude1": accounts.WeeklyQuota(4, reset)}
+        cases = ((reset - timedelta(days=7), 400),
+                 (reset + timedelta(microseconds=526917), 200))
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(accounts, "stored_weekly_quotas", return_value=quotas)):
+            for submitted, status in cases:
+                with self.subTest(submitted=submitted):
+                    form = urlencode({"quota_account": "claude1", "quota_level": "urgent",
+                                      "quota_reset": submitted.isoformat()})
+                    self.assertEqual(self.post(accounts_page.PAGE_PATH, form)[0], status)
+                    if status == 400:
+                        self.assertFalse(state.exists())
+                    else:
+                        self.assertEqual(json.loads(state.read_text()), {
+                            "claude1": {"level": "urgent", "reset": reset.isoformat()},
+                        })
+
+    def test_warning_clear_keeps_an_urgent_record_for_the_same_week(self) -> None:
+        from scripts.accounts import accounts
+
+        reset = datetime.now(timezone.utc) + timedelta(days=1)
+        quotas = {"claude1": accounts.WeeklyQuota(9, reset)}
+        state = accounts_page.quota_state(self.root)
+        state.parent.mkdir(parents=True, exist_ok=True)
+        receipt = {"claude1": {"level": "urgent", "reset": (reset - timedelta(microseconds=526917)).isoformat()}}
+        _ = state.write_text(json.dumps(receipt), encoding="utf-8")
+        form = urlencode({"quota_account": "claude1", "quota_level": "warning", "quota_reset": reset.isoformat()})
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(accounts, "stored_weekly_quotas", return_value=quotas)):
+            self.assertEqual(self.post(accounts_page.PAGE_PATH, form)[0], 200)
+        self.assertEqual(json.loads(state.read_text()), receipt)
 
     def test_accounts_post_saves_and_clears_a_producers_next_move(self) -> None:
         from scripts.accounts import accounts, next_moves
@@ -3610,6 +3851,7 @@ class ServerCodeHealthTests(unittest.TestCase):
 
     def test_unchanged_code_keeps_serving_and_reads_settings_only_when_the_check_is_due(self) -> None:
         server = self.start_server()
+        server.review_cache.synchronize()
         with patch.object(conf, "read", wraps=conf.read) as read:
             self.elapsed = 104.0
             server.service_actions()
@@ -3722,8 +3964,8 @@ sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 
 class ObservedServer(serve.ReviewLinksServer):
-    def __init__(self, address, root):
-        super().__init__(address, root)
+    def __init__(self, address, root, *, initialize_review=False):
+        super().__init__(address, root, initialize_review=initialize_review)
         os.environ["REVIEW_TEST_PORT"] = str(self.server_port)
         line = f"{os.getpid()} {module.VALUE} {self.server_port}"
         with (checkout / "starts.txt").open("a") as output:

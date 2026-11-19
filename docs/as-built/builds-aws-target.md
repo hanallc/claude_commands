@@ -1551,6 +1551,15 @@ Permit renewals retain that generation.
 F1 receives `HanaClaimPending`, `HanaClaimAdopted`, `HanaClaimRefused`, `HanaClaimRetained`, or `HanaClaimResourcesHeld` from `claim_assigned()`.
 `HanaClaimResourcesHeld` means a resource command holds Hana and prevents a new claim.
 Only an adopted claim can request the queue's first launch authorization.
+At authorization, the queue reads the exact Hana claim and lifecycle row from local files.
+These reads take no provider locks and make no AWS calls.
+The queue checks the claim, holder, session, host, boot generation, and active permit.
+The queue also checks the estimated memory peak against the Hana memory limit.
+Before publication, the sender reports a source, holder, authorization, permit, or journal refusal with its cause.
+If the queue refuses authorization, the sender uses the queue's reason.
+The queue reports whether adoption evidence is stale or unavailable and includes the reason.
+If release fails, the sender reports pending settlement and the queue keeps the assignment.
+The runner returns the confirmed guest refusal with its original reason and records that cleanup remains unconfirmed.
 `release_assigned()` requires F1's durable command settlement before lifecycle and target claim release.
 An exact guest observation can settle an accepted execution that ended without a compiler result.
 The observation must confirm termination and lease release, and the sender must have issued no source update.

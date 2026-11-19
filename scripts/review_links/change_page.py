@@ -29,7 +29,7 @@ from functools import partial
 from pathlib import Path
 from typing import IO, Literal, NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, urlsplit
-from weakref import WeakSet, finalize
+from weakref import WeakSet, WeakValueDictionary, finalize
 
 from scripts.agents import remote
 from scripts.lib import build_folders, process_start
@@ -139,19 +139,26 @@ WITH_SHOWRUNNER = "This change is already with the showrunner."
 CHANGE_HANDOFFS = frozenset(("validate", "question", "feedback"))
 
 
-def handoff_time(path: Path, fallback: datetime) -> datetime:
-    """Read the request time, or use the file time for an older request."""
+def read_handed_at(path: Path) -> str | None:
+    """Read the saved hand-off field without changing its value."""
     try:
-        with path.open(encoding="utf-8") as stream:
-            fields = cast(object, json.load(stream))
-            if isinstance(fields, dict):
-                saved = cast(dict[str, object], fields).get("handed_at")
-                if isinstance(saved, str):
-                    parsed = datetime.fromisoformat(saved)
-                    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=user_zone())
-            return datetime.fromtimestamp(os.fstat(stream.fileno()).st_mtime, user_zone())
+        fields = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except (FileNotFoundError, ValueError):
+        return None
+    saved = cast(dict[str, object], fields).get("handed_at") if isinstance(fields, dict) else None
+    return saved if isinstance(saved, str) else None
+
+
+def handoff_time(path: Path) -> datetime | None:
+    """Read the saved hand-off time."""
+    try:
+        saved = read_handed_at(path)
+        if saved is None:
+            return None
+        parsed = datetime.fromisoformat(saved)
     except (OSError, ValueError):
-        return fallback
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=user_zone())
 
 
 def require_user_turn(slots: DeliverySlots) -> None:
@@ -455,6 +462,15 @@ def _question_lock_path(path: Path) -> Path:
 
 
 type QuestionLockState = Literal["held", "released", "unreadable"]
+type QuestionJobObservation = QuestionLockState | Literal["unobserved"]
+
+_local_question_jobs: WeakValueDictionary[Path, IO[str]] = WeakValueDictionary()
+
+
+def _published_question_job(path: Path) -> Literal["held", "unobserved"]:
+    """Observe a job in this process without taking its lock."""
+    job = _local_question_jobs.get(path.resolve())
+    return "held" if job is not None and not job.closed else "unobserved"
 
 
 def _question_lock_state(path: Path) -> QuestionLockState:
@@ -537,10 +553,20 @@ def _legacy(status: DeliveryStatus, page: ReviewPage, saved: SavedQuestionDelive
 
 
 def question_delivery_view(status: DeliveryStatus, saved: SavedQuestionDelivery) -> QuestionDeliveryView:
-    """Read the delivery state and Resend eligibility under the delivery lock."""
+    """Check Resend eligibility under the delivery lock."""
+    return _question_delivery_view(status, saved, _question_lock_state)
+
+
+def published_question_delivery_view(status: DeliveryStatus, saved: SavedQuestionDelivery) -> QuestionDeliveryView:
+    """Read the published attempt for display."""
+    return _question_delivery_view(status, saved, _published_question_job)
+
+
+def _question_delivery_view(status: DeliveryStatus, saved: SavedQuestionDelivery,
+                            observe_job: Callable[[Path], QuestionJobObservation]) -> QuestionDeliveryView:
     page = saved.page()
     path = status.path(page, saved.source.row)
-    lock = _question_lock_state(_question_lock_path(path))
+    lock = observe_job(_question_lock_path(path))
     record: QuestionAttempt | NoQuestionAttempt = NoQuestionAttempt()
     owner: QuestionSendOwner | NoQuestionSendOwner = NoQuestionSendOwner()
     try:
@@ -554,7 +580,7 @@ def question_delivery_view(status: DeliveryStatus, saved: SavedQuestionDelivery)
             owner = record.owner
             if lock == "released" and isinstance(owner, QuestionSendOwner):
                 # Check the per-attempt lock from older records.
-                lock = _question_lock_state(_question_lock_path(path).with_name(owner.job_id))
+                lock = observe_job(_question_lock_path(path).with_name(owner.job_id))
     except (FileNotFoundError, ValueError):
         state = QuestionSendState.UNKNOWN
     except OSError:
@@ -629,6 +655,7 @@ def claim_question(status: DeliveryStatus, delivery: VerifiedQuestionAttempt) ->
     lock = lock_path.open("a+", encoding="utf-8")
     try:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _local_question_jobs[lock_path.resolve()] = lock
         claimed = replace(record, revision=record.revision + 1, state=QuestionSendState.CLAIMED, owner=owner)
         advance_question_attempt(path, record, claimed)
         status.question_jobs.add(lock)
@@ -1063,9 +1090,11 @@ class DeliveryStatus:
         if saved_question is not None and isinstance(question, (OpenFeedback, CompletedFeedback)):
             saved_question["kind"] = "feedback"
         path = self.path(page, row)
-        if re.fullmatch(r"C\d+", row) and not slots.waits_for_user(False):
-            now = datetime.fromtimestamp(time.time(), user_zone())
-            fields["handed_at"] = (now if new_handoff else handoff_time(path, now)).isoformat()
+        if fields and re.fullmatch(r"C\d+", row):
+            if new_handoff:
+                fields["handed_at"] = datetime.fromtimestamp(time.time(), user_zone()).isoformat()
+            elif (saved := read_handed_at(path)) is not None:
+                fields["handed_at"] = saved
         published = False
         try:
             if fields:
