@@ -5231,3 +5231,24 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - impl: the test module, its support and any copies.py cause.
 
 **Acceptance gate:** an AWS pair (3 rounds) shows the median CPU at half or less, or a floor result with its cause; the module passes 20 times under load in a 2 GB scope; the full suite is green.
+
+### Phase 370 — mac_test disk cleanup tests see no live processes  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the mac_test disk cleanup tests pass while a live `verify.sh` runs in another worktree.
+
+**Spec:**
+- Builds report, 2026-11-18 22:11 EST: the mac_test suite fails 11 cases in 4 disk cleanup tests whenever a live `verify.sh` runs in another worktree. The sweep fixtures match live processes. Seen on several trees and on AWS.
+1. Reproduce: run the mac_test suite while a `verify.sh` runs in another worktree. Name the 4 tests and the process scan they reach.
+2. Give the sweep one process source. Production reads the live process table; tests pass a fixture table. No test reads the live table.
+3. Fix the cause in the sweep code when its process match is also too wide for production, for example when it matches a process in another worktree.
+- Every assertion remains. Tests read no /tune-changeable value. No lazy imports, no copies, no signal handlers.
+
+**Files:** the 4 mac_test disk cleanup test modules and their support; the sweep module only when the cause lives there.
+
+**Workers:** 1 writer. One fixture cause.
+- impl: the tests, their support and any sweep cause.
+
+**Acceptance gate:** the 4 tests pass 20 times while a live `verify.sh` runs in another worktree; the full suite is green.
