@@ -1364,7 +1364,7 @@ function renderWalk(d) {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
     const tip = `wait:${w.key}`;
     cells(place, w.name, ago(w.since, d.read_at), rowUnit(w), w.pid, w.machine ? [w.machine] : w.targets || [], null, tip, `wait${i === 0 ? " wait-first" : ""}`);
-    const note = ["the build in the same Cargo folder", "natemerge's landing"].includes(w.why) ? w.reason : "";
+    const note = ["the build in the same Cargo folder", "natemerge's merge test"].includes(w.why) ? w.reason : "";
     rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${rowLabel(w.name, rowOwner(w, true), note)}` +
       (w.kind === "cloud" ? cloudStatus(w, tip) : rowMemory(tip)) +
       `</div>`);

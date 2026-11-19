@@ -14,7 +14,7 @@ from collections.abc import Collection, Generator, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 from scripts.lib import file_lock
 from scripts.lib.atomic_file import write_text_atomic
@@ -38,35 +38,6 @@ class LandRecord(TypedDict):
     owners: NotRequired[list[str]]
 
 
-RunnerState = Literal["taking", "empty"]
-
-
-class RunnerLease(TypedDict):
-    pid: int
-    start: str
-    state: RunnerState
-
-
-@dataclass(frozen=True)
-class LiveLand:
-    """A live process has a land record."""
-
-
-@dataclass(frozen=True)
-class RunnerTaking:
-    """A live runner took an item and has yet to find the line empty."""
-
-
-@dataclass(frozen=True)
-class LandingOn:
-    reason: LiveLand | RunnerTaking
-
-
-@dataclass(frozen=True)
-class LandingOff:
-    """No live land or runner lease holds the queue."""
-
-
 class LandResult(TypedDict):
     commit: str
     production: str
@@ -86,10 +57,6 @@ def state_dir() -> Path:
 
 def lands_dir() -> Path:
     return state_dir() / "lands"
-
-
-def runner_path() -> Path:
-    return state_dir() / "runner.json"
 
 
 def results_path() -> Path:
@@ -177,26 +144,6 @@ def natemerge_land(proc: Path, lineage: frozenset[ProcessIdentity]) -> ProcessId
             return ancestor
         return NoNatemergeLand()
     return NoNatemergeLand()
-
-
-def landing_active() -> LandingOn | LandingOff:
-    """Read the landing signal. Leave all records on disk."""
-    for _, record in _land_records():
-        if process_start(record["pid"]) == Started(record["start"]):
-            return LandingOn(LiveLand())
-    try:
-        parsed = cast(object, json.loads(runner_path().read_text(encoding="utf-8")))
-    except (OSError, RuntimeError, ValueError):
-        return LandingOff()
-    if not isinstance(parsed, dict):
-        return LandingOff()
-    lease = cast(dict[str, object], parsed)
-    if lease.get("state") != "taking":
-        return LandingOff()
-    pid, start = lease.get("pid"), lease.get("start")
-    if type(pid) is int and pid > 0 and isinstance(start, str) and start and process_start(pid) == Started(start):
-        return LandingOn(RunnerTaking())
-    return LandingOff()
 
 
 def running_lands() -> dict[str, str]:

@@ -593,7 +593,7 @@ class UsableAdmissionConfiguration:
     peak_history_share_percent: int
     progress_profile_sweep_seconds: float
     remote_start_hold_seconds: int
-    landing_wait: bool = False
+    hold_for_merge_test: bool = False
 
 
 @dataclass(frozen=True)
@@ -601,7 +601,7 @@ class UnusableAdmissionConfiguration:
     reason: str
 
 
-LANDING_WAIT_KEY = "landing_wait"
+MERGE_TEST_WAIT_KEY = "claude_commands_tests_wait_for_landing"
 
 
 def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdmissionConfiguration:
@@ -615,12 +615,12 @@ def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdm
             peak_history_share_percent = settings.whole("peak_history_share_percent")
             progress_profile_sweep_seconds = settings.number("progress_profile_sweep_seconds")
             remote_start_hold_seconds = settings.whole("remote_start_hold_seconds")
-            landing_wait = settings.value(LANDING_WAIT_KEY, conf.on_off, default=False)
+            hold_for_merge_test = settings.value(MERGE_TEST_WAIT_KEY, conf.on_off, default=False)
         config = records.read_memory_config(report=False)
         return UsableAdmissionConfiguration(replace(config,
             diagnostics=(*config.diagnostics, *records.configuration_diagnostics(messages))),
             cloud_gate_slots, cloud_gate_stale_pushes, progress_profile_rank, peak_history_share_percent,
-            progress_profile_sweep_seconds, remote_start_hold_seconds, landing_wait)
+            progress_profile_sweep_seconds, remote_start_hold_seconds, hold_for_merge_test)
     except conf.Unusable as error:
         return UnusableAdmissionConfiguration(str(error))
 

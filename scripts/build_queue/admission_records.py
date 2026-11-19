@@ -979,10 +979,10 @@ class NatedevHeld:
 
 @dataclass(frozen=True)
 class LandingWait:
-    """The landing holds this step on natedev."""
+    """Natemerge's merge test holds this step on natedev."""
 
 
-LANDING_WAIT_TEXT = "waits for natemerge's landing"
+LANDING_WAIT_TEXT = "waits for natemerge's merge test"
 
 
 HeadCause = (MemoryPressure | PressureUnavailable | ReadingUnavailable | StartSpacingWait | NeedsMemory | EstimateExpired

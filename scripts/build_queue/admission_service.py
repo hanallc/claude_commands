@@ -2075,7 +2075,7 @@ class AdmissionServer:
         return self.proc.lifetime(reservation_row(record), self._live(record.owner))
 
     def _inputs(self, config: records.MemoryConfig, profile_rank: int, profile_share: int,
-                sweep_seconds: float, landing_wait: bool) -> records.QueueInputs:
+                sweep_seconds: float) -> records.QueueInputs:
         now = self.clock.now()
         plan = self._reading_plan(config)
         if isinstance(self.system_reader, NoSystemReader):
@@ -2141,7 +2141,6 @@ class AdmissionServer:
             and isinstance(self.assignments[key].remote_start_hold, records.RemoteStartHold))
         local_owners: set[str] = set()
         local_waits: dict[str, placement.EvidenceNeeded] = {}
-        landing_waiters: set[str] = set()
         for episode, waiting in self.waiters.items():
             row = waiting.row
             owner = records.waiter_owner(row)
@@ -2152,14 +2151,9 @@ class AdmissionServer:
             if (isinstance(eligibility, (placement.AllowedHost, placement.EvidenceNeeded))
                     or owner in pending_remote_starts and eligibility != placement.TemporaryExclusion("blocked")):
                 local_owners.add(owner)
-                job = row.get("job", GATE_JOB_NOT_RECORDED)
-                if (landing_wait and row.get("repository_name") == "claude_commands" and gate.can_use_natedev(row)
-                        and not (isinstance(job, StepJob) and job.step == "integrate")):
-                    landing_waiters.add(owner)
         inputs = gate.build_queue_inputs([(path, row) for path, row in ordered
             if records.waiter_owner(row) in local_owners], memories, readings, now, priority, unowned)
-        inputs = replace(inputs, pending_remote_starts=pending_remote_starts & local_owners, local_waits=local_waits,
-                         landing_waiters=frozenset(landing_waiters))
+        inputs = replace(inputs, pending_remote_starts=pending_remote_starts & local_owners, local_waits=local_waits)
         represented = {(step.run.pid, step.run.start_time) for step in inputs.running
                        if isinstance(step.run, LiveBuildRun)}
         between = tuple(step for step in evidence.between
@@ -2172,6 +2166,29 @@ class AdmissionServer:
             self.next_progress_sweep = self.clock.monotonic() + config.running_pass_seconds
         return self._progress_inputs(self._inputs_with_current_slots(inputs), dict(evidence.processes),
                                      config.policy, profile_rank, profile_share)
+
+    def _hold_for_merge_test(self, inputs: records.QueueInputs) -> records.QueueInputs:
+        """Hold local steps while an integrate job needs a place or has a reservation."""
+        integrate = StepJob("integrate")
+        local_owners = inputs.waiter_orders.keys() - inputs.pending_remote_starts
+        local_integrate = any(row.get("job") == integrate for row in inputs.reservations)
+        if not local_integrate:
+            local_integrate = any(
+                waiting.row.get("job") == integrate
+                and records.waiter_owner(waiting.row) in local_owners
+                and gate.can_use_natedev(waiting.row)
+                and isinstance(waiting.request, wire.AdmitRequest)
+                and isinstance(waiting.request.place, wire.LocalPlace)
+                and (episode not in self.placement_requests or all(
+                    candidate.destination.provider == "local" or isinstance(candidate.eligibility, placement.FixedExclusion)
+                    for candidate in self.placement_eligibility.get(episode, ())))
+                for episode, waiting in self.waiters.items())
+        if not local_integrate:
+            return inputs
+        return replace(inputs, landing_waiters=frozenset(
+            records.waiter_owner(row) for _, row in inputs.ordered
+            if row.get("repository_name") == "claude_commands" and row.get("job") != integrate
+            and gate.can_use_natedev(row)))
 
     def _unowned_memory(self, evidence: SystemEvidence, rows: list[records.Reservation]
                         ) -> tuple[records.UnownedSliceMemory, ...]:
@@ -2441,14 +2458,15 @@ class AdmissionServer:
         self._settle_attempt_reports(evidence_keys)
         remote_start_hold_seconds = self.configuration.remote_start_hold_seconds
         self._prepare_placements(evidence_keys, remote_start_hold_seconds)
-        landing_wait = self.configuration.landing_wait and isinstance(land_runs.landing_active(), land_runs.LandingOn)
         inputs = self._inputs(config, self.configuration.progress_profile_rank, self.configuration.peak_history_share_percent,
-                              self.configuration.progress_profile_sweep_seconds, landing_wait)
+                              self.configuration.progress_profile_sweep_seconds)
         ci_holds = self._ci_hold_reasons()
         if ci_holds:
             held_owners = {records.waiter_owner(self.waiters[episode].row) for episode in ci_holds}
             inputs = replace(inputs, ordered=[(path, row) for path, row in inputs.ordered
                                              if records.waiter_owner(row) not in held_owners])
+        if self.configuration.hold_for_merge_test:
+            inputs = self._hold_for_merge_test(inputs)
         inputs = self._placement_pass(inputs, policy, remote_start_hold_seconds)
         inputs, result, landing_admission = self._landing_order(inputs, policy)
         for reservation in result.policy.returned_claims:

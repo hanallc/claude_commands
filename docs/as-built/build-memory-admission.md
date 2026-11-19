@@ -91,23 +91,22 @@ The service reads the threshold at use.
 An unusable threshold logs once through the existing configuration diagnostics.
 Requests and cleanup continue when this logging setting is unusable.
 
-### Landing wait on natedev
+### Merge test hold on natedev
 
-The admission service holds new `claude_commands` steps on natedev while `landing_active()` reports `LandingOn`.
-A live land record or a live runner lease in state `taking` keeps the signal on.
-Steps with the recorded `integrate` gate job can start during the landing.
-Steps that already started continue.
+A merge test that has the `integrate` job holds new `claude_commands` steps while it waits for or uses a local place.
+The merge gate tries AWS first and requests a local place when it falls back to natedev.
+An AWS merge test leaves the natedev queue open.
+AWS jobs and local jobs from other repositories can start during the hold.
+Running steps continue.
 
-`landing_wait=on` in `config/build_admission.conf` enables the rule.
+`claude_commands_tests_wait_for_landing=on` in `config/build_admission.conf` enables the rule.
 The service reads the setting for each admission pass.
-Set `landing_wait=off` to disable the rule.
-AWS placements and steps from other repositories, including Hana, can still start.
+Set `claude_commands_tests_wait_for_landing=off` to disable the rule.
 
-Held tests keep their queue positions.
-The `verify.sh` wait line and the Builds page show "waits for natemerge's landing".
-The next admission pass checks the signal again.
+Held tests keep their arrival order.
+The `verify.sh` wait line and the Builds page show "waits for natemerge's merge test".
+The next admission pass checks for a local merge test again.
 The default interval is one second while steps wait (`waiting_pass_seconds`).
-A runner that hangs with the signal on can hold matching tests until the runner stops.
 
 ### Placement status
 
