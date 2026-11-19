@@ -90,8 +90,11 @@ def check_inputs(source: Path, configuration: conf.ConfigRead) -> None:
     allowed = configuration.words('source_allowed_ignored')
     ignored = copies.git(source, 'ls-files', '--others', '--ignored', '--exclude-standard', '-z')
     for raw in ignored.split(b'\0'):
-        if raw and not any(path_matches(os.fsdecode(raw), pattern) for pattern in allowed):
-            raise hana_protocol.SourceRefused('IgnoredInput: source has an ignored path outside source_allowed_ignored')
+        path = os.fsdecode(raw)
+        if path and not any(path_matches(path, pattern) for pattern in allowed):
+            display_path = repr(path)[1:-1]
+            raise hana_protocol.SourceRefused('IgnoredInput: source has an ignored path outside source_allowed_ignored: '
+                                              + display_path)
     if any(row.startswith(b'160000 ') for row in copies.git(source, 'ls-files', '--stage', '-z').split(b'\0')):
         raise hana_protocol.SourceRefused('SubmoduleInput: source contains an unsupported Git link')
     forbidden = configuration.words('source_forbidden_paths')

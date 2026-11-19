@@ -520,6 +520,8 @@ def retry_decision(destination: PlacementDestination, reason: str | execution_id
     """Keep the existing remote decline delays separate from evidence age."""
     if isinstance(reason, execution_identity.HanaCommandAdmissionRefused):
         return DoNotRetry(reason.reason)
+    if destination.target == "hana-gpu" and reason not in ("busy", "blocked"):
+        return DoNotRetry(reason)
     if reason in SETTINGS_REFUSAL_REASONS or reason in ("no_tests", "linux_only", "local_flag", "command"):
         return DoNotRetry(reason)
     delay = 180 if destination.provider == "mac" and reason not in ("busy", "blocked", "disk") else 0

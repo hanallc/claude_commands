@@ -11,6 +11,7 @@ import argparse
 from collections.abc import Generator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
+from functools import partial
 from importlib import import_module
 import fcntl
 import hashlib
@@ -424,6 +425,19 @@ class PendingHanaOperation:
 @dataclass(frozen=True)
 class NoHanaSettlement:
     """This controller has no settled Hana outcome."""
+
+
+@dataclass(frozen=True)
+class HanaCommandOutput:
+    stdout: bytes = b''
+    stderr: bytes = b''
+
+
+@dataclass(frozen=True)
+class OffloadRecordWrite:
+    """One record write and the name to print if it fails."""
+    name: str
+    write: Callable[[], object]
 
 
 @dataclass(frozen=True)
@@ -887,6 +901,8 @@ class ProcessController:
         self.copy_failure_detail: str = ""
         self.placement: DirectOffloadRequest | AssignedOffloadRequest = DirectOffloadRequest()
         self.pending: SettledDispatchOperations | PendingClaimOperation | PendingStartOperation | AcknowledgedStartOperation | PendingHanaOperation = SettledDispatchOperations()
+        self.hana_output: HanaCommandOutput = HanaCommandOutput()
+        self.hana_record_writes: list[OffloadRecordWrite] = []
         self.hana_settlement: hana_execution.HanaSettled | NoHanaSettlement = NoHanaSettlement()
         self.expected_claim: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY
         self.claim_identity: claim_state.ClaimIdentity | claim_state.NoClaimIdentity = claim_state.NO_CLAIM_IDENTITY
@@ -2839,16 +2855,15 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
     evidence = controller.attempt_evidence
     evidence.slot = request.slot
     controller.placement = request.placement
-    controller.pending = PendingHanaOperation()
 
-    def release() -> bool:
+    def release() -> hana.HanaClaimRelease:
         return hana.release_assigned(assignment, holder, lifecycle)
 
-    def remember_pending_refusal(reference: placement.ProviderClaimReference
+    def remember_pending_refusal(reference: placement.ProviderClaimReference, reason: str
                                  ) -> execution_identity.HanaCommandAdmissionRefused | hana_protocol.NoCommandAdmissionRefusal:
         refusal = execution.read_claim_admission_refusal(lifecycle.directory, reference, require_release=False)
         if isinstance(refusal, execution_identity.HanaCommandAdmissionRefused):
-            controller.pending = PendingHanaOperation(refusal)
+            controller.pending = PendingHanaOperation(refusal, reason)
             evidence.provider = reference
             evidence.execution = execution_identity.ExecutionNotStarted()
         return refusal
@@ -2866,11 +2881,30 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
             evidence.cleanup = 'confirmed'
             evidence.unresolved_count = 0
             return HanaCommandAdmissionRefused(closed.outcome.reason, elapsed_seconds(started))
-        pending = remember_pending_refusal(reference)
-        if isinstance(pending, execution_identity.HanaCommandAdmissionRefused):
-            return HanaCommandAdmissionRefused(pending.reason, elapsed_seconds(started))
+        if isinstance(closed, execution.HanaSettlementPending):
+            pending = remember_pending_refusal(reference, closed.reason)
+            if isinstance(pending, execution_identity.HanaCommandAdmissionRefused):
+                return HanaCommandAdmissionRefused(pending.reason, elapsed_seconds(started))
         return DeclinedMacRun('state', elapsed_seconds(started), refusal.reason)
 
+    try:
+        hana_transport.check_inputs(request.source_root, configuration)
+    except (OSError, ValueError, RuntimeError, SyntaxError, TypeError, KeyError, subprocess.SubprocessError,
+            copies.CopyError) as error:
+        if not lifecycle.execution_bound(placement.assigned_claim_reference(assignment).claim_id):
+            label = ('The Hana source capture failed'
+                     if isinstance(error, subprocess.SubprocessError) or isinstance(error.__cause__, subprocess.SubprocessError)
+                     else 'The Hana payload could not be prepared')
+            reason = f'{label}: {error}'
+            refusal = execution_identity.HanaCommandAdmissionRefused(' '.join(reason.splitlines()))
+            controller.hana_settlement = execution.HanaAdmissionRefusalSettled(
+                refusal, execution_identity.ExecutionNotStarted())
+            evidence.execution = controller.hana_settlement.evidence
+            evidence.cleanup = 'confirmed'
+            evidence.unresolved_count = 0
+            return HanaCommandAdmissionRefused(refusal.reason, elapsed_seconds(started))
+
+    controller.pending = PendingHanaOperation()
     claim = hana.claim_assigned(assignment, holder, lifecycle, worktree=str(request.repo_root))
     while isinstance(claim, hana.HanaClaimPending) and time.time() < claim.deadline:
         evidence.provider = claim.reference
@@ -2964,9 +2998,8 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
             admission_refusal = state
         else:
             evidence.execution = state.evidence
-        if isinstance(state, execution.DispatchSettled):
-            accepted = execution.replay_accepted_result(lifecycle.directory, prepared, transport.host,
-                                                        lambda: hana_source_key(request.source_root))
+        if isinstance(state, (execution.DispatchFenced, execution.DispatchSettled)):
+            accepted = execution.replay_accepted_result(lifecycle.directory, prepared)
         while (not isinstance(state, (execution.DispatchFenced, execution.DispatchSettled,
                                      execution_identity.HanaCommandAdmissionRefused))
                 and execution.dispatch_publication_attempted(lifecycle.directory, prepared)):
@@ -3062,15 +3095,34 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
                 evidence.execution = settlement.evidence
                 evidence.cleanup = 'confirmed'
                 evidence.unresolved_count = 0
-            elif isinstance(settlement, execution.HanaAdmissionRefusalClaimRetained):
-                controller.pending = PendingHanaOperation(settlement.outcome, settlement.reason)
-                evidence.execution = execution_identity.ExecutionNotStarted()
-            elif isinstance(remember_pending_refusal(claim.reserved.claim.reference), hana_protocol.NoCommandAdmissionRefusal):
-                controller.pending = (PendingHanaOperation(placement.AttemptOutcomeUnavailable(reason))
-                                      if result_transfer_lost else PendingHanaOperation())
-    if isinstance(settlement, execution.HanaGuestEndedClaimRetained):
-        return HanaGuestEndedRun(elapsed_seconds(started), settlement.reason)
-    if not isinstance(settlement, execution.HanaSettled):
+            elif isinstance(settlement, execution.HanaCleanupPending) and isinstance(settlement.command.outcome,
+                    (placement.AttemptCompleted, execution_identity.HanaCommandAdmissionRefused)):
+                controller.pending = PendingHanaOperation(settlement.command.outcome, settlement.reason)
+                evidence.execution = settlement.command.evidence
+            elif isinstance(remember_pending_refusal(claim.reserved.claim.reference, settlement.reason),
+                            hana_protocol.NoCommandAdmissionRefusal):
+                controller.pending = (PendingHanaOperation(placement.AttemptOutcomeUnavailable(reason), settlement.reason)
+                                      if result_transfer_lost else PendingHanaOperation(reason=settlement.reason))
+    terminal = settlement.command if isinstance(settlement, execution.HanaCleanupPending) else settlement
+    completed = isinstance(terminal, execution.HanaSettled) and isinstance(terminal.outcome, placement.AttemptCompleted)
+    context = record.HanaStepContext(request.target, request.verb, repository.key, str(request.repo_root), '')
+    charge = OffloadRecordWrite('the Hana attempt charge', partial(
+        execution.record_attempt_charge, lifecycle.directory, prepared, evidence.traffic.transfers,
+        remote_started_at, time.time()))
+    if completed and isinstance(accepted, hana_result.AcceptedHanaResult):
+        controller.hana_record_writes.extend((
+            OffloadRecordWrite('the Hana result', partial(record.publish_hana_result, accepted, prepared.link, context)),
+            charge,
+        ))
+        evidence.completion = 'confirmed'
+        result = accepted.result
+        controller.hana_output = HanaCommandOutput(result.stdout, result.stderr)
+        return PassedOnTarget(result.execution_seconds) if result.status == 0 else FailedOnTarget(result.status, result.execution_seconds)
+    if isinstance(settlement, execution.HanaSettled):
+        controller.hana_record_writes.append(charge)
+    if isinstance(settlement, execution.HanaSettlementPending):
+        if isinstance(terminal, execution.HanaGuestEndedWithoutResult):
+            return HanaGuestEndedRun(elapsed_seconds(started), terminal.outcome.reason)
         if (isinstance(controller.pending, PendingHanaOperation)
                 and isinstance(refusal := controller.pending.outcome, execution_identity.HanaCommandAdmissionRefused)):
             return HanaCommandAdmissionRefused(refusal.reason, elapsed_seconds(started))
@@ -3078,38 +3130,19 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
             return HanaCommandAdmissionRefused(state.reason, elapsed_seconds(started))
         detail = f'{reason}. {settlement.reason}' if result_transfer_lost else settlement.reason
         return LostMacRun(elapsed_seconds(started), detail)
-    execution.record_attempt_charge(lifecycle.directory, prepared, evidence.traffic.transfers,
-                                    remote_started_at, time.time())
-    context = record.HanaStepContext(request.target, request.verb, repository.key, str(request.repo_root), '')
-    if isinstance(accepted, hana_result.AcceptedHanaResult):
-        if hana_source_key(request.source_root) != prepared.source_key:
-            reason = execution.SOURCE_CHANGED_BEFORE_RESULT_PUBLICATION
-        else:
-            evidence.completion = 'confirmed'
-            result = accepted.result
-            _ = record.publish_hana_result(accepted, prepared.link, context)
-            _ = sys.stdout.buffer.write(result.stdout)
-            _ = sys.stderr.buffer.write(result.stderr)
-            return PassedOnTarget(result.execution_seconds) if result.status == 0 else FailedOnTarget(result.status, result.execution_seconds)
     if isinstance(settlement, (execution.HanaAdmissionRefusalSettled, execution.HanaGuestEndedWithoutResult)):
         reason = settlement.outcome.reason
-        rejected = settlement
-    else:
-        rejected = execution.reject_settled_result(lifecycle.directory, prepared, reason)
-    if isinstance(rejected, execution.HanaSettlementPending):
-        controller.hana_settlement = NoHanaSettlement()
-        controller.pending = PendingHanaOperation()
-        return LostMacRun(elapsed_seconds(started), rejected.reason)
-    controller.hana_settlement = rejected
     if evidence.launch_authorized:
         placement_file = os.environ.get('BUILDLOG_PLACEMENT_FILE', '')
         if placement_file:
-            record.save_hana_fallback_link(Path(placement_file), prepared.key, prepared.link)
-        _ = record.publish_hana_loss(prepared.key, prepared.link, context, transport.host,
-                                    remote_started_at, time.time(), reason)
-    if isinstance(rejected.outcome, execution_identity.HanaCommandAdmissionRefused):
+            controller.hana_record_writes.append(OffloadRecordWrite('the Hana fallback link', partial(
+                record.save_hana_fallback_link, Path(placement_file), prepared.key, prepared.link)))
+        controller.hana_record_writes.append(OffloadRecordWrite('the Hana loss', partial(
+            record.publish_hana_loss, prepared.key, prepared.link, context, transport.host,
+            remote_started_at, time.time(), reason)))
+    if isinstance(settlement.outcome, execution_identity.HanaCommandAdmissionRefused):
         return HanaCommandAdmissionRefused(reason, elapsed_seconds(started))
-    if isinstance(rejected, execution.HanaGuestEndedWithoutResult):
+    if isinstance(settlement, execution.HanaGuestEndedWithoutResult):
         return HanaGuestEndedRun(elapsed_seconds(started), reason)
     return LostMacRun(elapsed_seconds(started), reason)
 
@@ -3494,6 +3527,37 @@ def report_placement_result(controller: ProcessController, request: OffloadReque
                                                                evidence.execution, outcome, path))
 
 
+def write_attempt_records(controller: ProcessController, request: OffloadRequest, result: MacOffloadResult, started: float,
+                          hana_writes: Sequence[OffloadRecordWrite] = ()) -> None:
+    writes = (
+        *hana_writes,
+        OffloadRecordWrite('the placement report', partial(report_placement_result, controller, request, result)),
+        OffloadRecordWrite('the attempt', partial(persist_attempt, request, result, controller.attempt_evidence, started)),
+    )
+    for entry in writes:
+        try:
+            _ = entry.write()
+        except Exception as error:
+            print(f'offload: Cannot record {entry.name} ({type(error).__name__}).', file=sys.stderr)
+
+
+def finish_offload(controller: ProcessController, request: OffloadRequest, result: MacOffloadResult, started: float) -> int:
+    """Deliver the result before any record write for this completion."""
+    output = controller.hana_output
+    if output.stdout:
+        _ = sys.stdout.buffer.write(output.stdout)
+        _ = sys.stdout.buffer.flush()
+    if output.stderr:
+        _ = sys.stderr.buffer.write(output.stderr)
+        _ = sys.stderr.buffer.flush()
+    status = write_result(result, request.result, request.last_decline, request.verb, request.target,
+                          controller.attempt_evidence, request.fetch)
+    if isinstance(controller.pending, PendingHanaOperation):
+        print(f'offload: Hana cleanup pending. {controller.pending.reason}', file=sys.stderr)
+    write_attempt_records(controller, request, result, started, controller.hana_record_writes)
+    return status
+
+
 def main() -> int:
     override_guard.refuse_overrides(Path(__file__), "mac_test/offload.py")
     from scripts.build_queue import admission_protocol as wire
@@ -3558,12 +3622,10 @@ def main() -> int:
             started = time.monotonic()
             result = LostMacRun(0, "replacement placement did not complete")
             request = submit_direct_placement(request, since, config)
-        status = write_result(result, request.result, request.last_decline, request.verb, request.target,
-                              controller.attempt_evidence, request.fetch)
-        return status
+        return finish_offload(controller, request, result, started)
     except OffloadInterrupted as interrupted:
         result = LostMacRun(elapsed_seconds(started), f"interrupted by signal {interrupted.signal_number}")
-        return 128 + interrupted.signal_number
+        status = 128 + interrupted.signal_number
     except Exception:
         traceback.print_exc()
         if isinstance(request.result, ResultFile):
@@ -3571,16 +3633,9 @@ def main() -> int:
                 request.result.path.unlink(missing_ok=True)
             except OSError:
                 pass
-        return 75
-    finally:
-        try:
-            report_placement_result(controller, request, result)
-        except (wire.AdmissionUnavailable, OSError, ValueError, ConnectionError) as error:
-            print(f"offload: cannot report placement: {error}", file=sys.stderr)
-        try:
-            persist_attempt(request, result, controller.attempt_evidence, started)
-        except (OSError, ValueError) as error:
-            print(f"offload: cannot record the attempt: {error}", file=sys.stderr)
+        status = 75
+    write_attempt_records(controller, request, result, started)
+    return status
 
 
 if __name__ == "__main__":

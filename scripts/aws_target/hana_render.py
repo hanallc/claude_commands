@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -32,6 +32,7 @@ IMAGE_SETTINGS = {
 }
 IMAGE_FILE_LIST = Path('scripts/aws_target/hana_image.files')
 RUNTIME_FILE_LIST = Path('scripts/aws_target/hana_render.files')
+RUNNER_ENTRY = Path('scripts/aws_target/hana_runner_entry.py')
 
 
 @dataclass(frozen=True)
@@ -209,16 +210,15 @@ def runtime_files(checkout: Path, configuration: Path | conf.ConfigRead) -> tupl
     folder_config = config_text({key: setting for key, setting in folder_defaults.items()
         if not any(key == base or key.startswith(base + '.') for base in (*image_roots, *SLOT_PROBE_KEYS))
         and (not key.startswith('slots.') or key in ('slots.unused_days', 'slots.wait_seconds'))})
+    files = {file.path: file for file in _listed_files(checkout, RUNTIME_FILE_LIST)}
+    entry = files.pop(RUNNER_ENTRY)
     return (
-        *_listed_files(checkout, RUNTIME_FILE_LIST),
+        *files.values(),
+        replace(entry, path=Path('runner.py')),
         RenderedGuestFile(Path('config/hana_aws.conf'), 0o644, runtime_config.encode()),
         RenderedGuestFile(Path('config/build_targets.conf'), 0o644, shell_config.encode()),
         RenderedGuestFile(Path('config/copies.conf'), 0o644, copies_config.encode()),
         RenderedGuestFile(Path('config/build_folders.conf'), 0o644, folder_config.encode()),
-        RenderedGuestFile(Path('runner.py'), 0o644,
-            b'import sys\nfrom pathlib import Path\n'
-            + b'sys.path.insert(0, str(Path(__file__).resolve().parent))\n'
-            + b'from scripts.aws_target.hana_runner import main\nraise SystemExit(main())\n'),
     )
 
 
