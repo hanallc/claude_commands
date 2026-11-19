@@ -372,17 +372,17 @@ merge_gate.start_gate_job = stop_after_start
                 self.environment["TMPDIR"] = str(parent)
                 # The supported whole-machine path has no queue-owned handlers.
                 preamble = """signal.signal(signal.SIGINT, signal.SIG_DFL)
-def whole_gate(repo, type_dirs, module_time_limit_s, **options):
+def whole_gate(repo, module_time_limit_s, **options):
     with merge_gate.shared_cpu_pool() as pool:
         pool.try_acquire()
-        return merge_gate.run_suites(repo, type_dirs, module_time_limit_s, machine=merge_gate.WholeMachine())
+        return merge_gate.run_suites(repo, module_time_limit_s=module_time_limit_s, machine=merge_gate.WholeMachine())
 merge_gate.run_gate_suites = whole_gate
 """
                 process = subprocess.Popen(
                     [*self.gate_command(preamble=preamble), "--repo", str(self.checkout), "--merge-branch", "integration",
                      "--unit-branch", "unit-phase", "--checkpoint", self.checkpoint, "--previous-checkpoint", self.base,
                      "--unit", "fixture", "--phase", "repair",
-                     "--production", "quiet", "--type-dirs", "scripts"], env=self.environment, stdin=subprocess.DEVNULL,
+                     "--production", "quiet"], env=self.environment, stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 try:
                     wait_until(lambda: (self.state / "module-held").exists() or process.poll() is not None,

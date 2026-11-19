@@ -471,7 +471,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
         self.assertIn("memory governor 0.261719 GiB", result.stdout)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
         self.assert_not_pushed()
-        self.assertEqual(len([call for call in self.calls() if call["tool"] == "basedpyright"]), 1)
+        self.assertFalse(any(call["tool"] == "basedpyright" for call in self.calls()))
         self.assertFalse(any(call["tool"] == "ssh" for call in self.calls()))
 
     @gate_suites("lib", "hooks")

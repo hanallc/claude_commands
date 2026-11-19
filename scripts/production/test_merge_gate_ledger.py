@@ -149,14 +149,14 @@ class MergeGateLedgerTests(MergeGateFixture):
             ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S %Z")
         self.assertIn(f"tests reused from {cast(str, record['tree'])[:12]} ({when}, tests-only, {self.checkout})", second.stdout)
 
-    def test_checkpoint_reuses_unit_tree_and_still_runs_types(self) -> None:
+    def test_checkpoint_reuses_unit_tree_without_running_types(self) -> None:
         first = self.run_gate("--tests-only", "--repo", str(self.unit))
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.clear_gate_events()
         second = self.run_gate()
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         self.assertEqual(self.module_events(), [])
-        self.assertTrue((self.state / "types-ran").exists())
+        self.assertFalse((self.state / "types-ran").exists())
         self.assertIn("tests reused from", second.stdout)
         self.assertEqual(self.git(self.origin, "rev-parse", "integration"), self.git(self.checkout, "rev-parse", "HEAD"))
 
@@ -270,7 +270,7 @@ class MergeGateLedgerTests(MergeGateFixture):
         marker = Path(self.environment["MERGE_GATE_STATE_DIR"]) / "full-required"
         for red in (True, False):
             with self.subTest(red=red):
-                def suite_run(repo: Path, type_dirs: list[str], *, module_time_limit_s: float,
+                def suite_run(repo: Path, type_dirs: tuple[str, ...], *, module_time_limit_s: float,
                               full: bool) -> merge_gate.GateRun:
                     self.assertNotEqual(repo, self.checkout)
                     self.assertTrue((repo / ".git").is_file())
@@ -278,7 +278,7 @@ class MergeGateLedgerTests(MergeGateFixture):
                     self.assertEqual(merge_gate.checked_git(repo, "status", "--porcelain"), "")
                     self.assertTrue(full)
                     self.assertGreater(module_time_limit_s, 0)
-                    self.assertEqual(type_dirs, ["scripts"])
+                    self.assertEqual(type_dirs, ("scripts",))
                     self.write(repo / "subject.txt", "only the copy changes\n")
                     copies.append(repo)
                     caches.append((repo / "target").resolve())
@@ -419,18 +419,19 @@ class MergeGateLedgerTests(MergeGateFixture):
                     self.assertEqual(self.pass_records(), [])
                 _ = self.git(self.checkout, "restore", "subject.txt")
 
-    def test_reused_modules_do_not_hide_a_red_type_job(self) -> None:
+    def test_checkpoint_with_reused_tests_does_not_run_a_red_type_check(self) -> None:
         first = self.run_gate("--tests-only", "--repo", str(self.unit))
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.clear_gate_events()
         self.write(self.state / "types-red", "red")
         result = self.run_gate()
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("tests reused from", result.stdout)
-        self.assertIn("basedpyright: RED", result.stdout)
+        self.assertFalse(any(call["tool"] == "basedpyright" for call in self.calls()))
         self.assertEqual(self.module_events(), [])
-        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
-        self.assert_not_pushed()
+        merged = self.git(self.checkout, "rev-parse", "HEAD")
+        self.assertNotEqual(merged, self.base)
+        self.assertEqual(self.git(self.origin, "rev-parse", "integration"), merged)
 
 
 if __name__ == "__main__":

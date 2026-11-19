@@ -192,7 +192,7 @@ class MergeGateTestTimesTests(MergeGateFixture):
             self.assertIn("test-times.json", row["times_missing"])
             self.assertEqual((row["restart"], row["tests_run"], row["tests_s"], row["tests"]), ("", 0, 0.0, []))
 
-    def test_full_and_reused_runs_keep_the_type_job_without_missing_times(self) -> None:
+    def test_full_and_reused_runs_record_no_type_job(self) -> None:
         first = self.run_gate("--full")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         full = self.only_record()
@@ -208,12 +208,10 @@ class MergeGateTestTimesTests(MergeGateFixture):
                          ("reused", "", "tests-only", 0))
         self.assertEqual(reused["suites"], [])
         self.assertEqual(self.module_events(), [])
-        self.assertEqual(len(reused["modules"]), 1)
-        for record in (full, reused):
-            types, = [row for row in record["modules"] if (row["suite"], row["module"]) == gate_record.TYPE_CHECK_JOB]
-            self.assertEqual((types["attempt"], types["status"], types["restart"], types["times_missing"]), (1, 0, "", ""))
-            self.assertEqual((types["tests"], types["tests_run"], types["failures"], types["errors"], types["skipped"],
-                              types["tests_s"]), ([], 0, 0, 0, 0, 0))
+        self.assertEqual(reused["modules"], [])
+        self.assertTrue(full["modules"])
+        self.assertFalse(any((row["suite"], row["module"]) == gate_record.TYPE_CHECK_JOB
+                             for row in full["modules"]))
 
     def test_record_write_and_config_failures_keep_the_output_and_verdict(self) -> None:
         # Each compared run uses the same completed type environment.
