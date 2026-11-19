@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
 import ctypes
+import errno
 import io
 import json
 import os
@@ -116,6 +117,22 @@ if "dispatch_start_settled=" in sys.argv[-1]:
 '''
 
 
+LIFECYCLE = '''
+import json, os, sys
+from pathlib import Path
+
+phase, path, *arguments = sys.argv[1:]
+argv_file = Path(path)
+if phase == "prepare":
+    argv_file.write_text(json.dumps(arguments))
+else:
+    assert phase == "cleanup"
+    assert json.loads(argv_file.read_text()) == arguments
+with (Path(os.environ["FAKE_QUEUE_STATE"]) / "lifecycle-events").open("a") as stream:
+    print(json.dumps([phase, argv_file.parent.name, os.environ["MAC_QUEUE_HOST"]]), file=stream)
+'''
+
+
 def plain_ssh_builds(root: Path) -> list[str]:
     forbidden = re.compile(r"\b(?:ssh|on_mac)\b[^\n]*(?:\bcargo(?:\s|$)|\brustc(?:\s|$)|\bnextest(?:\s|$)|scripts/lint/lint\b|/target/(?:debug|release)/)")
     findings: list[str] = []
@@ -165,9 +182,9 @@ class QueueRunTests(unittest.TestCase):
                                  + shlex.join([sys.executable, str(queue)]) + "\n")
         return environment
 
-    def command(self, root: Path, kind: str = "shot") -> list[str]:
+    def command(self, root: Path, kind: str = "shot", *, options: tuple[str, ...] = ()) -> list[str]:
         return [sys.executable, "-m", "scripts.mac_test.mac_queue_run", "--what", "camera shot", "--kind", kind,
-                "--package", "hana", "--worktree", str(root), "--cwd", "/Mac scratch/checkout", "--",
+                "--package", "hana", "--worktree", str(root), "--cwd", "/Mac scratch/checkout", *options, "--",
                 "/bin/zsh", "-c", "cargo build -p hana; printf '%s' 'quoted value'"]
 
     def events(self, root: Path) -> list[list[str]]:
@@ -261,6 +278,40 @@ class QueueRunTests(unittest.TestCase):
             self.assertEqual([event[0] for event in self.events(root)], ["place-step"])
             self.assertTrue((root / "mac-state/claims/hana.json").exists())
 
+    def test_lost_ssh_preserves_lifecycle_cleanup_for_the_next_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = self.fixture(root)
+            lifecycle = root / "lifecycle"
+            _ = lifecycle.write_text(f"#!{sys.executable}\n" + LIFECYCLE)
+            lifecycle.chmod(0o755)
+            lifecycle_events = root / "lifecycle-events"
+            lost = subprocess.run(self.command(root, options=("--lifecycle-script", str(lifecycle))),
+                                  capture_output=True, text=True, env={**environment, "FAKE_SSH_LOST": "1"},
+                                  timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(lost.returncode, 255, lost.stdout + lost.stderr)
+            placed, = self.events(root)
+            episode = placed[placed.index("--episode") + 1]
+            saved = root / mac_queue_run.RUNS / episode
+            record = cast(mac_queue_run.SavedRun, json.loads((saved / "run.json").read_text()))
+            self.assertEqual(record, {"lifecycle_script": str(lifecycle), "arguments": self.command(root)[-3:],
+                                      "host": "fake-mac"})
+            prepared = json.dumps(["prepare", episode, "fake-mac"])
+            self.assertEqual(lifecycle_events.read_text().splitlines(), [prepared])
+            with mock.patch.dict(os.environ, environment):
+                paths = mac_test.state_paths()
+                self.assertEqual(len(mac_test.read_claims(paths)), 1)
+                mac_test.settle_retained_mac_claims(paths, mac_test.config_path())
+                self.assertEqual(mac_test.read_claims(paths), ())
+
+            later = subprocess.run(self.command(root), capture_output=True, text=True, env=environment,
+                                    timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(later.returncode, 0, later.stdout + later.stderr)
+            self.assertEqual(lifecycle_events.read_text().splitlines(),
+                             [prepared, json.dumps(["cleanup", episode, "fake-mac"])])
+            self.assertFalse(saved.exists())
+            self.assertEqual([event[0] for event in self.events(root)], ["place-step", "place-step", "cancel-placement"])
+
     def test_process_scan_distinguishes_a_confirmed_exit_from_an_unreadable_environment(self) -> None:
         arguments = shlex.split(mac_process_environment.placement_pids_command("episode", "attempt"))
 
@@ -269,12 +320,17 @@ class QueueRunTests(unittest.TestCase):
             self.assertEqual(command[-1], "pid=,uid=,stat=")
             return f"4567 {os.getuid()} S\n4568 {os.getuid()} S\n"
 
-        for outcome in ("exited", "size failed", "read failed", "malformed", "unmarked", "matching"):
+        exit_errors = {"exited": ProcessLookupError(errno.ESRCH, "process exited"),
+                       "exit check failed": PermissionError(errno.EPERM, "process is unreadable")}
+        for outcome in ("exited", "size failed", "read failed", "exit check failed", "malformed",
+                        "arguments only", "unterminated environment", "empty", "unmarked", "matching", "apple metadata"):
             with self.subTest(outcome=outcome):
-                field = b"MAC_PLACEMENT=episode/attempt" if outcome == "matching" else b"HOME=/fixture"
-                data = struct.pack("i", 1) + b"/bin/build\0\0build\0" + field + b"\0\0"
-                if outcome == "malformed":
-                    data = data[:-2]
+                matching = outcome in ("matching", "apple metadata")
+                field = b"MAC_PLACEMENT=episode/attempt" if matching else b"HOME=/fixture"
+                header = struct.pack("i", 1) + b"/bin/build\0\0build\0"
+                environments = {"arguments only": b"", "malformed": field, "unterminated environment": field + b"\0",
+                                "empty": b"\0", "apple metadata": field + b"\0commpage_pfz=0x123\0stack_guard=0x456\0"}
+                data = header + environments.get(outcome, field + b"\0\0")
 
                 def sysctl(mib: ctypes.Array[ctypes.c_int], _count: int, buffer: object, size: object,
                            _new: object, _new_count: int) -> int:
@@ -282,7 +338,7 @@ class QueueRunTests(unittest.TestCase):
                         length = ctypes.cast(cast(ctypes.c_void_p, size), ctypes.POINTER(ctypes.c_size_t))
                         length.contents.value = len(data)
                         return int(outcome == "size failed" or (outcome == "exited" and mib[2] == 4567))
-                    if outcome == "read failed":
+                    if outcome in ("read failed", "exit check failed"):
                         return 1
                     _ = ctypes.memmove(cast(ctypes.c_void_p, buffer), data, len(data))
                     return 0
@@ -291,19 +347,19 @@ class QueueRunTests(unittest.TestCase):
                 output, errors = io.StringIO(), io.StringIO()
                 with (mock.patch.object(sys, "platform", "darwin"), mock.patch.object(sys, "argv", arguments[2:]),
                       mock.patch.object(ctypes, "CDLL", return_value=kernel),
-                      mock.patch.object(os, "kill", side_effect=ProcessLookupError if outcome == "exited" else None) as check,
+                      mock.patch.object(os, "kill", side_effect=exit_errors.get(outcome)) as check,
                       mock.patch.object(subprocess, "check_output", side_effect=process_list),
                       redirect_stdout(output), redirect_stderr(errors), self.assertRaises(SystemExit) as status):
                     exec(compile(arguments[2], "<placement process probe>", "exec"), {"__name__": "__main__"})
-                if outcome in ("exited", "unmarked", "matching"):
+                if matching or outcome in ("exited", "empty", "unmarked"):
                     self.assertEqual(status.exception.code, 0)
-                    self.assertEqual(output.getvalue(), "4567\n4568\n" if outcome == "matching" else "")
+                    self.assertEqual(output.getvalue(), "4567\n4568\n" if matching else "")
                     self.assertEqual(errors.getvalue(), "")
                 else:
                     self.assertEqual(status.exception.code, 1)
                     self.assertEqual(output.getvalue(), "")
                     self.assertIn("cannot check Mac process 4567", errors.getvalue())
-                if outcome == "exited":
+                if outcome in exit_errors:
                     check.assert_called_once_with(4567, 0)
 
     def test_a_signal_ends_the_run_with_its_default_action(self) -> None:

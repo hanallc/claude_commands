@@ -4,6 +4,7 @@ import ctypes
 from dataclasses import dataclass
 import inspect
 import os
+import re
 import shlex
 import struct
 import subprocess
@@ -80,16 +81,22 @@ def cargo_environment(data: bytes) -> ProcessEnvironment | ProcessEnvironmentUnr
     if len(fields) <= argc or fields[-1]:
         return invalid
     selected: dict[str, str] = {}
-    for field in fields[argc:]:
+    terminated = False
+    # split adds a final empty item for the last string's NUL. Skip that item.
+    for field in fields[argc:-1]:
         if not field:
+            terminated = True
             break
         key, separator, value = field.partition(b"=")
         if not key or not separator:
             return invalid
+        # XNU adds this field after the environment, even when alignment adds no padding.
+        if key == b"commpage_pfz" and re.fullmatch(rb"0x[0-9a-f]+", value):
+            terminated = True
         if key in (b"CARGO_TARGET_DIR", b"CARGO_BUILD_TARGET_DIR", b"CARGO_HOME", b"HOME",
                    b"RUNNER_NAME", b"GITHUB_JOB", b"MAC_PLACEMENT"):
             selected[os.fsdecode(key)] = os.fsdecode(value)
-    return ProcessEnvironment(selected)
+    return ProcessEnvironment(selected) if terminated else invalid
 
 
 def print_placement_pids(placement: str) -> int:

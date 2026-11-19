@@ -118,6 +118,7 @@ Verify's claim watcher can also retry a retained Verify claim.
 The release check closes the exact attempt's start fence outside `state.lock`.
 For Verify, it checks for processes that refer to the claimed mirror or use that mirror as their working directory.
 For a queue run, it checks the exact `MAC_PLACEMENT` value of each live process in the SSH user's process snapshot.
+The parser requires a separate NUL after the environment fields or the XNU `commpage_pfz` metadata field.
 After a failed environment read, the check asks the kernel if the PID still exists.
 The check skips a PID when the kernel confirms its absence.
 It releases the claim when the fence has settled and the process check finds no matching processes.
@@ -126,6 +127,7 @@ A timeout, an unconfirmed check, or a matching process keeps the claim for a lat
 
 When the SSH input closes, the remote watcher checks its own group membership before each pass that sends signals.
 If SSH returns no exit status, the queue runner keeps the claim and any pending cleanup record.
+A later run with an assignment retries the pending cleanup.
 
 The watcher uses the retained repository's mirror activity for older claims without a fence.
 It uses host activity for claims with a live holder and for old whole-Mac claims without a fence.
