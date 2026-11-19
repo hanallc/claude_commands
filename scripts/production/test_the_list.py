@@ -138,16 +138,29 @@ class TheListTests(unittest.TestCase):
                 for text, expected in cases:
                     with self.subTest(action=action, eta=text):
                         if action == "add":
-                            code, output, error = self.command("add", "--title", "Check the ETA", "--owner", RUNNER.id,
-                                                               "--source", "nate", "--eta", text)
+                            command = ("add", "--title", "Check the ETA", "--owner", RUNNER.id)
+                            code, output, error = self.command(*command, "--source", "nate", "--eta", text)
                             self.assertEqual((code, error), (0, ""))
                             identity = output.strip()
                         else:
                             identity = self.add().id
-                            self.assertEqual(self.command("update", "--id", identity, "--source", "nate", "--eta", text),
-                                             (0, "", ""))
+                            command = ("update", "--id", identity)
+                            self.assertEqual(self.command(*command, "--source", "nate", "--eta", text), (0, "", ""))
                         saved = the_list.load(MORTY.id, identity)
                         self.assertEqual(saved.eta, expected)
+                        if text in ("Paused", "Delivered"):
+                            result, output, error = self.command(*command, "--source", "nate", "--eta", text.lower())
+                            self.assertEqual((result, output), (1, ""), error)
+                            self.assertIn("put the reason in --latest-status", error)
+
+    def test_date_only_eta_uses_the_first_valid_time_when_midnight_is_skipped(self) -> None:
+        with (patch.dict(os.environ, {"USER_ZONE": "America/Havana"}),
+              patch.object(the_list, "now", return_value=datetime(2026, 3, 1, 12, tzinfo=UTC))):
+            result = self.command("add", "--title", "Check the ETA", "--owner", RUNNER.id,
+                                  "--source", "nate", "--eta", "Mar 8")
+        self.assertEqual(result, (0, "L1\n", ""))
+        saved = the_list.load(MORTY.id, "L1")
+        self.assertEqual(the_list.eta_text(saved.eta), "2026-03-08T01:00:00-04:00")
 
     def test_eta_refuses_other_forms_on_add_and_update(self) -> None:
         item = self.add()
@@ -178,6 +191,10 @@ class TheListTests(unittest.TestCase):
                 saved = the_list.load(MORTY.id, item.id)
                 self.assertEqual(saved.eta, eta)
                 self.assertEqual(saved.log[0], item.log[0])
+                result, output, error = self.command("update", "--id", item.id, "--source", "nate",
+                                                     "--eta", the_list.eta_text(eta))
+                self.assertEqual((result, output), (1, ""), error)
+                self.assertIn("put the reason in --latest-status", error)
 
     def test_producer_takes_a_producer_name_or_staff_id_and_shows_its_name(self) -> None:
         self.assertEqual(self.command("add", "--title", "Plan the year", "--owner", RUNNER.id, "--producer", "dwight",

@@ -558,7 +558,7 @@ The `the_list.py list` command still shows the item.
 The producer uses `the_list.py answer` to save an answer and mark the item unread.
 Add and update accept `Mon D`, `Mon D HH:MM ZONE`, `No time yet`, `Waiting for nate`, `Paused`, and `Delivered` as an ETA.
 The command selects the date nearest to today in the user's time zone.
-A date alone uses local midnight.
+A date alone uses the first valid local instant on that date.
 Put the reason in `--latest-status`.
 The store still reads ISO times, ranges, text descriptions, `Not asked`, and `Pending` from existing records.
 The `eta_kind` field marks text descriptions as `text` and other estimates as `time or status`.

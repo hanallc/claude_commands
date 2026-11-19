@@ -517,9 +517,10 @@ def _cli_eta(text: str) -> datetime | EtaStatus:
     if not dates:
         raise ListError(_ETA_INPUT_ERROR)
     nearest = min(dates, key=lambda candidate: abs(candidate - today))
-    moment = datetime(nearest.year, month, day, int(match[3] or "0"), int(match[4] or "0"), tzinfo=zone)
     if match[5] is None:
-        return moment
+        midnight = datetime(nearest.year, month, day, tzinfo=zone)
+        return midnight.astimezone(UTC).astimezone(zone)
+    moment = datetime(nearest.year, month, day, int(match[3]), int(match[4]), tzinfo=zone)
     for fold in (0, 1):
         local = moment.replace(fold=fold)
         if local.astimezone(UTC).astimezone(zone) == local and zone_label(local) == match[5]:
