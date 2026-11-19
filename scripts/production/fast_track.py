@@ -87,6 +87,20 @@ class PushAttempt(TypedDict):
 
 
 @dataclass(frozen=True)
+class WorktreePatch:
+    """The selected worktree changes and the tree that contains them."""
+    patch: bytes
+    tree: str
+
+
+@dataclass(frozen=True)
+class StagedWorktree:
+    """A private index with the selected paths staged against HEAD."""
+    environment: dict[str, str]
+    paths: list[str]
+
+
+@dataclass(frozen=True)
 class SelectedPatch:
     """The patch and recovery states selected before any checks."""
     patch: bytes
@@ -208,23 +222,57 @@ def selected_paths(repo: Path, names: list[str], config: FastTrackLimits) -> lis
     return paths
 
 
-def patch_for(runner: GitRunner, repo: Path, paths: list[str]) -> bytes:
-    """Use a private index to include new files without changing the director's index."""
+@contextmanager
+def stage_worktree(runner: GitRunner, repo: Path, head: str, paths: list[str]) -> Generator[StagedWorktree]:
+    """Stage selected paths without changing the director's index."""
     with build_folders.tool_folder("fast-track-index") as temporary:
         environment = {**os.environ, "GIT_INDEX_FILE": str(temporary / "index"),
                        "GIT_LITERAL_PATHSPECS": "1"}
-        _ = runner.git(repo, "read-tree", "HEAD", environment=environment)
+        _ = runner.git(repo, "read-tree", head, environment=environment)
         # A missing untracked path after a successful restore is an empty patch.
-        tracked = set(runner.git(repo, "ls-tree", "-r", "--name-only", "HEAD").splitlines())
-        existing = [p for p in paths if any(t == p or t.startswith(p + "/") for t in tracked) or (repo / p).exists() or (repo / p).is_symlink()]
-        if not existing:
-            return b""
-        _ = runner.git(repo, "add", "--force", "--all", "--", *existing, environment=environment)
-        result = runner.run_bytes(repo, "diff", "--cached", "--binary", "--full-index",
-                                  "--no-renames", "HEAD", "--", *existing, environment=environment)
+        missing = [p for p in paths if not (repo / p).exists() and not (repo / p).is_symlink()]
+        if missing:
+            tracked = runner.git(repo, "ls-tree", "-r", "--name-only", head, "--", *missing).splitlines()
+            paths = [p for p in paths if p not in missing or any(t == p or t.startswith(p + "/") for t in tracked)]
+        if paths:
+            _ = runner.git(repo, "add", "--force", "--all", "--", *paths, environment=environment)
+        yield StagedWorktree(environment, paths)
+
+
+def staged_diff(runner: GitRunner, repo: Path, head: str, staged: StagedWorktree, *arguments: str) -> bytes:
+    result = runner.run_bytes(repo, "diff", "--cached", "--binary", "--full-index", "--no-renames",
+                              head, *arguments, environment=staged.environment)
+    if result.returncode:
+        raise Refused(result.stderr.decode(errors="replace"))
+    return result.stdout
+
+
+def patch_for(runner: GitRunner, repo: Path, head: str, paths: list[str]) -> WorktreePatch:
+    """Return the patch and the tree it selects."""
+    with stage_worktree(runner, repo, head, paths) as staged:
+        if not staged.paths:
+            return WorktreePatch(b"", runner.git(repo, "rev-parse", f"{head}^{{tree}}").strip())
+
+        config = runner.run(repo, "config", "--name-only", "--get-regexp", r"^(apply|diff|submodule)\.")
+        if config.returncode not in (0, 1):
+            raise Refused(failure_detail(config))
+        if not (config.stdout or (repo / ".gitmodules").exists()
+                or "GIT_DIFF_OPTS" in os.environ or "GIT_EXTERNAL_DIFF" in os.environ):
+            raw, _, patch = staged_diff(runner, repo, head, staged, "--raw", "-z").partition(b"\0\0")
+            changed = [os.fsdecode(path) for path in raw.split(b"\0")[1::2]]
+            if all(any(path == selected or path.startswith(selected + "/") or selected == "."
+                       for selected in staged.paths) for path in changed):
+                return WorktreePatch(patch, runner.git(repo, "write-tree", environment=staged.environment).strip())
+
+        # Git settings can alter patch application. Adding a child can also remove an unselected parent.
+        patch = staged_diff(runner, repo, head, staged, "--", *staged.paths)
+        if not patch:
+            return WorktreePatch(b"", runner.git(repo, "rev-parse", f"{head}^{{tree}}").strip())
+        _ = runner.git(repo, "read-tree", head, environment=staged.environment)
+        result = runner.run_bytes(repo, "apply", "--cached", input=patch, environment=staged.environment)
         if result.returncode:
             raise Refused(result.stderr.decode(errors="replace"))
-        return result.stdout
+        return WorktreePatch(patch, runner.git(repo, "write-tree", environment=staged.environment).strip())
 
 
 def patch_counts(runner: GitRunner, repo: Path, patch: bytes) -> list[tuple[str, int, int]]:
@@ -495,19 +543,11 @@ def select_patch(runner: GitRunner, repo: Path, paths: list[str]) -> Generator[S
         index = runner.git(repo, "write-tree").strip()
         commands = f"update {prefix}/head {head}\nupdate {prefix}/index {index}\n"
         _ = runner.git(repo, "update-ref", "--stdin", input=commands.encode())
-        patch = patch_for(runner, repo, paths)
+        worktree = patch_for(runner, repo, head, paths)
         if runner.git(repo, "rev-parse", "HEAD").strip() != head:
             raise Refused("HEAD changed while selecting the patch; retry the command")
-        with build_folders.tool_folder("fast-track-restore-index") as temporary:
-            environment = {**os.environ, "GIT_INDEX_FILE": str(temporary / "index")}
-            _ = runner.git(repo, "read-tree", head, environment=environment)
-            if patch:
-                result = runner.run_bytes(repo, "apply", "--cached", input=patch, environment=environment)
-                if result.returncode:
-                    raise Refused(result.stderr.decode(errors="replace"))
-            tree = runner.git(repo, "write-tree", environment=environment).strip()
-        _ = runner.git(repo, "update-ref", prefix + "/worktree", tree)
-        yield SelectedPatch(patch, head, tree, index, prefix)
+        _ = runner.git(repo, "update-ref", prefix + "/worktree", worktree.tree)
+        yield SelectedPatch(worktree.patch, head, worktree.tree, index, prefix)
     finally:
         drop_recovery_refs(runner, repo, prefix)
 
@@ -696,7 +736,12 @@ def reconcile(runner: GitRunner, repo: Path, unit: str, *, finish: bool = False,
                 matches = bool(paths) and same_selection(list(paths), row["paths"])
                 overlap = selections_overlap(paths, row["paths"])
                 unfinished = (not attempt["restored"] and not attempt["restore_closed"]) or not attempt["promoted"]
-                patch = patch_for(runner, repo, list(paths)) if matches else b""
+                patch = b""
+                if matches:
+                    head = runner.git(repo, "rev-parse", "HEAD").strip()
+                    with stage_worktree(runner, repo, head, list(paths)) as staged:
+                        if staged.paths:
+                            patch = staged_diff(runner, repo, head, staged, "--", *staged.paths)
                 repeat = matches and (not patch or hashlib.sha256(patch).hexdigest() == row["patch_sha256"])
                 if not unfinished and not repeat:
                     continue

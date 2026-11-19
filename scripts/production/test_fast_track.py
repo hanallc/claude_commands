@@ -551,6 +551,25 @@ class FastTrackTests(MergeCheckpointFixture):
         self.assertEqual(len(self.records()), 1)
         self.assertEqual(len(self.observations("types")), 1)
 
+    def test_selected_tree_matches_applying_the_patch_to_head(self) -> None:
+        added, changed, deleted, untracked = [f"folder/{name}.txt" for name in
+                                             ("added", "file0", "file1", "untracked")]
+        self.write(self.unit, added, "staged addition\n")
+        _ = self.git("add", "--", added, cwd=self.unit)
+        self.write(self.unit, changed, "changed\n")
+        (self.unit / deleted).unlink()
+        self.write(self.unit, untracked, "untracked\n")
+        paths = [added, changed, deleted, untracked]
+        runner = fast_track.GitRunner()
+        with patch.dict(os.environ, self.env, clear=True), fast_track.select_patch(runner, self.unit, paths) as selection:
+            environment = {**os.environ, "GIT_INDEX_FILE": str(self.root / "patch-comparison-index")}
+            _ = runner.git(self.unit, "read-tree", selection.worktree_head, environment=environment)
+            _ = runner.git(self.unit, "apply", "--cached", input=selection.patch, environment=environment)
+            expected_tree = runner.git(self.unit, "write-tree", environment=environment).strip()
+            self.assertEqual(selection.worktree_tree, expected_tree)
+            self.assertCountEqual([path for path, _, _ in fast_track.patch_counts(
+                runner, self.unit, selection.patch)], paths)
+
     def test_deleted_python_module_still_runs_its_direct_importing_tests(self) -> None:
         (self.unit / "scripts/sample/item.py").unlink()
         result = self.fast_track()
