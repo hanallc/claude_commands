@@ -874,8 +874,24 @@ They subtract that day's existing usage and add the newest complete AWS amount.
 An account bill qualifies when the name, day label, and bounds match one full UTC day.
 The bill must exclude credits and give at least USD 0.01 before rounding.
 The read time must be valid and at least `bill_complete_after_seconds` after the day ends.
-This setting is 172800 seconds. The read time cannot be in the future.
+The read time cannot be in the future.
 The adjustment preserves query fees and any open gate allowances or reservations already in the total.
+The report's costs pane must call `CostLedger.accrued_cost` for the current day or month to date.
+The function returns `cost`, `limit_count`, and the cost and bill state for each UTC day in the window.
+`cost` is the ledger estimate plus the same complete-day adjustment that the guard uses.
+`limit_count` is the admission guard's value, equal to `cost` plus reserves and headroom.
+The function reports an unavailable limit count when the admission guard cannot calculate it.
+The per-day costs add up to `cost` and include separately named query fees and any rounding adjustment.
+The pane displays a counted bill as “Billed, final” only when the bill sets `provisional` to JSON `false`.
+The pane displays all other counted bills as “Billed, not final”.
+The pane displays other days as “Estimate”.
+An estimate can show `aws_amount_so_far` when a valid saved bill has yet to meet the age requirement.
+The tooltip labels this value “AWS amount so far”.
+The pane's “Time on AWS” row reads `run_cost.hana_billed_hours` for one UTC day.
+The reader returns billed Spot hours for Hana's configured region and machine types.
+The file name, day label, and bounds must match the requested full UTC day.
+A valid bill with no matching usage gives zero hours.
+A missing or damaged bill gives no record.
 Missing cost rows contribute zero.
 The configured allowance supplies the cost when no needed bill rows exist or the S3 share has no launch count.
 The spending limits do not change.

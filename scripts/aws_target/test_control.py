@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from contextlib import redirect_stderr
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from io import StringIO
 import fcntl
@@ -21,7 +21,7 @@ from scripts.review_links.test_page_frame import assert_status_states
 from scripts.aws_target import admin_secrets, aws_page, aws_target, deploy, ledger, run_cost, spend, spot_table
 from scripts.aws_target import config as aws_config
 from scripts.aws_target.control_test_support import TestClock
-from scripts.aws_target.ledger_test_support import CostFixture
+from scripts.aws_target.ledger_test_support import CostFixture, text_setting
 from scripts.lib import atomic_file, conf
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.notify import push_texts
@@ -851,6 +851,48 @@ gate_wait_usd_per_minute=0
         self.assertEqual({row[column] for row in gpu.rows}, {spot_table.NOT_SOLD})
         self.assertEqual(gpu.not_sold, frozenset((row, column) for row in range(len(gpu.rows))))
 
+
+
+class HanaBilledHoursTests(CostFixture):
+    def test_hana_billed_hours_reads_only_the_day_and_configured_spot_types(self) -> None:
+        configuration = self.root / 'hana_aws.conf'
+        text_setting(configuration, 'instance_type', 'm7a.4xlarge')
+        text_setting(configuration, 'fallback_instance_types', 'c7a.4xlarge')
+        text_setting(configuration, 'region', 'us-east-2')
+        day = date(2026, 1, 15)
+        start = int(datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp())
+        directory = self.state / 'charges'
+        directory.mkdir()
+        path = directory / (day.isoformat() + '.json')
+        self.assertIsNone(run_cost.hana_billed_hours(self.state, day))
+
+        ignored = (
+            ledger.UsageTypeCost('USE1-SpotUsage:m7a.4xlarge', Decimal(0), Decimal(4), 'Hrs'),
+            ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal(0), Decimal(2), 'Hrs'),
+            ledger.UsageTypeCost('USE2-BoxUsage:m7a.4xlarge', Decimal(0), Decimal(3), 'Hrs'),
+        )
+        primary = ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal(0), Decimal('0.490279'), 'Hrs')
+        fallback = ledger.UsageTypeCost('USE2-SpotUsage:c7a.4xlarge', Decimal(0), Decimal('0.25'), 'Hrs')
+        bill = ledger.ChargeRead(day.isoformat(), start + 86400, start, start + 86400,
+                                 Decimal(0), Decimal(0), Decimal(0))
+        for usage, expected in (
+            ((*ignored, primary), Decimal('0.490279')),
+            ((*ignored, primary, fallback), Decimal('0.740279')),
+            (ignored, Decimal('0.0')),
+        ):
+            with self.subTest(hours=expected):
+                _ = path.write_text(json.dumps(ledger.charge_record(replace(bill, usage_types=usage))))
+                self.assertEqual(run_cost.hana_billed_hours(self.state, day), expected)
+
+        next_day = replace(bill, at=start + 2 * 86400, period_start=start + 86400,
+                           period_end=start + 2 * 86400, usage_types=(primary,))
+        _ = path.write_text(json.dumps(ledger.charge_record(next_day)))
+        self.assertIsNone(run_cost.hana_billed_hours(self.state, day))
+
+        damaged = ledger.charge_record(bill)
+        damaged['at'] = 'invalid'
+        _ = path.write_text(json.dumps(damaged))
+        self.assertIsNone(run_cost.hana_billed_hours(self.state, day))
 
 
 class HoursCheckTests(CostFixture):

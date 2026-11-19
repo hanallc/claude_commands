@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from contextlib import redirect_stderr
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import date
 from decimal import Decimal
 import fcntl
 import io
@@ -850,6 +851,106 @@ class LedgerTests(CostFixture):
         assert isinstance(costs, ledger.CostEstimate)
         self.assertEqual(costs.monthly.usd, Decimal('5.03'))
         self.assertEqual(costs.daily.usd, Decimal(0))
+
+    def test_accrued_cost_uses_each_day_source_and_the_guard_limit_count(self) -> None:
+        self.costs({'bill_complete_after_seconds': '86400', 'monthly_limit_usd': '10.03',
+                    'cost_explorer_read_usd': '.01'})
+        first = instant('2026-01-01T00:00:00+00:00')
+        second = first + 86400
+        third = second + 86400
+        now = third + 3600
+        self.running(first)
+        self.observe(first + 4 * 3600, 'stopped')
+        self.observe(second, 'running')
+        self.observe(second + 3 * 3600, 'stopped')
+        self.observe(third, 'running')
+        with self.book.transaction() as state:
+            state.gate_reservations.append(ledger.GateReservation(
+                'future', now + 3600, now + 7200, Decimal(1), Decimal(0), region='us-east-2'))
+        counted_bill = ledger.ChargeRead('2026-01-01', now, first, second, Decimal(2), Decimal(0), Decimal(0))
+        self.write_complete_bill_fixture(counted_bill)
+        self.write_complete_bill_fixture(ledger.ChargeRead(
+            '2026-01-02', now, second, third, Decimal(5), Decimal(0), Decimal(0), provisional=False))
+
+        accrued = self.book.accrued_cost(self.settings, now, window='month')
+        fee = Decimal('.01')
+        self.assertEqual(accrued.days, (
+            ledger.AccruedDay(date(2026, 1, 1), Decimal('2.01'), 'billed_not_final', None, fee),
+            ledger.AccruedDay(date(2026, 1, 2), Decimal('3.01'), 'estimate', Decimal(5), fee),
+            ledger.AccruedDay(date(2026, 1, 3), Decimal('1.01'), 'estimate', None, fee),
+        ))
+        self.assertEqual(accrued.cost, Decimal('6.03'))
+        self.assertEqual(sum((day.cost for day in accrued.days), Decimal(0)), accrued.cost)
+        self.assertEqual(accrued.reserves, Decimal(1))
+        self.assertEqual(accrued.limit_count, accrued.cost + accrued.reserves + accrued.headroom)
+        self.write_complete_bill_fixture(replace(counted_bill, provisional=False))
+        finalized = self.book.accrued_cost(self.settings, now, window='month')
+        self.assertEqual(finalized, replace(accrued, days=(
+            replace(accrued.days[0], state='billed_final'), *accrued.days[1:],
+        )))
+        legacy_bill = ledger.charge_record(counted_bill)
+        del legacy_bill['provisional']
+        path = self.state / 'charges' / (counted_bill.day + '.json')
+        _ = path.write_text(json.dumps(legacy_bill))
+        self.assertEqual(self.book.accrued_cost(self.settings, now, window='month'), accrued)
+        legacy_bill['provisional'] = None
+        _ = path.write_text(json.dumps(legacy_bill))
+        self.assertFalse(ledger.read_charge(path).provisional)
+        self.assertEqual(self.book.accrued_cost(self.settings, now, window='month'), accrued)
+        daily = self.book.accrued_cost(self.settings, now, window='day')
+        self.assertEqual(daily, ledger.AccruedCost(
+            Decimal('1.01'), Decimal('5.01'), Decimal(1), Decimal(3), accrued.days[-1:]))
+        decision = self.guard(now)
+        self.assertIsInstance(decision, ledger.SpendingRefused)
+        assert isinstance(decision, ledger.SpendingRefused)
+        self.assertEqual(decision.reason, 'monthly_limit')
+        notice, = self.notices
+        self.assertEqual(notice.estimate_usd + config.read_settings(self.settings).limit_reserve_usd, accrued.limit_count)
+        self.assertEqual(accrued.limit_count, Decimal('10.03'))
+
+    def test_accrued_cost_estimates_a_day_with_a_damaged_charge_file(self) -> None:
+        start = self.start
+        now = start + 3600
+        self.running(start)
+        directory = self.state / 'charges'
+        directory.mkdir()
+        _ = (directory / '2026-01-15.json').write_text('{')
+
+        accrued = self.book.accrued_cost(self.settings, now, window='day')
+        self.assertEqual(accrued.cost, Decimal(1))
+        self.assertEqual(tuple(day.state for day in accrued.days), ('estimate',))
+        self.assertIsNone(accrued.days[0].aws_amount_so_far)
+        self.assertIsInstance(accrued.limit_count, ledger.CostEvidenceUnavailable)
+        self.assertIsInstance(self.guard(now), ledger.SpendingUnavailable)
+
+    def test_accrued_cost_keeps_the_estimate_with_a_partial_bill(self) -> None:
+        start = self.start
+        now = start + 10 * 3600
+        self.running(start)
+        self.write_complete_bill_fixture(ledger.ChargeRead(
+            '2026-01-15', now, start, start + 3600, Decimal(2), Decimal(0), Decimal(0)))
+
+        accrued = self.book.accrued_cost(self.settings, now, window='day')
+        self.assertEqual(accrued.cost, Decimal(10))
+        self.assertEqual(accrued.limit_count, Decimal(13))
+        self.assertEqual(accrued.days, (
+            ledger.AccruedDay(date(2026, 1, 15), Decimal(10), 'estimate', None, Decimal(0)),
+        ))
+
+    def test_accrued_cost_includes_the_minimum_charge_at_now(self) -> None:
+        now = self.start
+        self.inventory(now)
+        self.observe(now, 'stopped')
+        with self.book.transaction() as state:
+            state.gate_reservations.append(ledger.GateReservation(
+                'ended', now, now + 60, Decimal('.60'), Decimal(0),
+                ledger.GateTerminated(now, 'fixture'), region='us-east-2'))
+
+        accrued = self.book.accrued_cost(self.settings, now, window='day')
+        self.assertEqual(accrued.cost, Decimal('.01'))
+        self.assertEqual(accrued.days, (
+            ledger.AccruedDay(date(2026, 1, 15), Decimal('.01'), 'estimate', None, Decimal(0)),
+        ))
 
     def test_complete_bill_qualifies_at_utc_midnight(self) -> None:
         self.replace('observation_max_age_seconds', '345600')

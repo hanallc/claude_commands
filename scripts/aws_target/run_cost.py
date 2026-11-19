@@ -4,14 +4,15 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import Enum
 import json
+from pathlib import Path
 from statistics import median
 from typing import cast
 
-from scripts.aws_target import ledger
+from scripts.aws_target import hana_spend, ledger
 from scripts.aws_target.ledger import gate_vcpus as gate_vcpus
 from scripts.aws_target.measurement import number
 from scripts.lib import conf
@@ -116,16 +117,36 @@ def spot_bills(book: ledger.CostLedger, start: datetime, end: datetime) -> dict[
     return bills_from_readings(billed_readings(book, start, end))
 
 
+def _spot_usage_key(usage_type: str) -> tuple[str, str] | None:
+    size = usage_type.partition('SpotUsage:')[2]
+    region = ledger.usage_region(usage_type, 'SpotUsage:')
+    return (size, region) if size and region is not None else None
+
+
 def bills_from_readings(readings: Sequence[ledger.ChargeRead]) -> dict[tuple[str, str, str], tuple[Decimal, Decimal]]:
     bills: dict[tuple[str, str, str], tuple[Decimal, Decimal]] = {}
     for reading in readings:
         for usage in reading.usage_types:
-            size = usage.usage_type.partition('SpotUsage:')[2]
-            region = ledger.usage_region(usage.usage_type, 'SpotUsage:')
-            if size and region is not None:
+            key = _spot_usage_key(usage.usage_type)
+            if key is not None:
+                size, region = key
                 usd, hours = bills.get((size, region, reading.day), (Decimal(0), Decimal(0)))
                 bills[size, region, reading.day] = usd + usage.usd, hours + usage.quantity
     return bills
+
+
+def hana_billed_hours(directory: Path, day: date) -> Decimal | None:
+    """Read Hana's billed Spot hours for a UTC day, or return None when the bill is unavailable."""
+    path = directory / 'charges' / (day.isoformat() + '.json')
+    try:
+        bill = ledger.read_strict_charge(path)
+        if not ledger.matches_utc_charge_day(path.name, bill, day):
+            return None
+    except (OSError, ValueError, ArithmeticError):
+        return None
+    settings = hana_spend.read_settings(conf.read_or_repository('hana_aws'))
+    keys = {(size, settings.region) for size in (settings.instance_type, *settings.fallback_instance_types)}
+    return sum((row.quantity for row in bill.usage_types if _spot_usage_key(row.usage_type) in keys), Decimal('0.0'))
 
 
 def paid_per_hour(bills: dict[tuple[str, str, str], tuple[Decimal, Decimal]]) -> dict[tuple[str, str], Decimal]:

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
-from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, time as day_time, timedelta
@@ -588,6 +588,25 @@ class CostEvidenceUnavailable:
 
 
 @dataclass(frozen=True)
+class AccruedDay:
+    day: date
+    cost: Decimal
+    state: Literal['estimate', 'billed_not_final', 'billed_final']
+    aws_amount_so_far: Decimal | None
+    query_fees: Decimal
+    rounding_adjustment: Decimal = Decimal(0)
+
+
+@dataclass(frozen=True)
+class AccruedCost:
+    cost: Decimal
+    limit_count: Decimal | CostEvidenceUnavailable
+    reserves: Decimal
+    headroom: Decimal
+    days: tuple[AccruedDay, ...]
+
+
+@dataclass(frozen=True)
 class SpendingPolicyUnavailable:
     reason: str
 
@@ -1147,45 +1166,32 @@ def period_cost(intervals: Sequence[ChargedInterval] | Iterator[ChargedInterval]
     return sum((_overlap(charge, start, end) for charge in intervals), Decimal(0))
 
 
-def complete_day_adjustment(complete_days: Sequence[CompleteDayAmount], intervals: Sequence[ChargedInterval],
-                            gate_reservations: Sequence[GateReservation], start: int, end: int) -> Decimal:
-    """Replace old usage with the AWS amount for each complete UTC day in the window."""
+def _complete_day_adjustments(complete_days: Sequence[CompleteDayAmount], intervals: Sequence[ChargedInterval],
+                              gate_reservations: Sequence[GateReservation], start: int,
+                              end: int) -> tuple[tuple[int, Decimal], ...]:
     covered = tuple(day for day in complete_days if start <= day.start and day.end <= end)
     if not covered:
-        return Decimal(0)
+        return ()
     open_gates = tuple(row for row in gate_reservations if gate_is_open(row))
     preserved = {'gate storage and transfer:' + row.attempt + ' (' + gate_allowance(row).source + ')'
                  for row in open_gates}
     preserved.update('gate:' + row.attempt for row in open_gates)
     usage = tuple(row for row in intervals if row.kind != 'explorer' and row.source not in preserved)
-    return sum((day.usd - period_cost(usage, day.start, day.end) for day in covered), Decimal(0))
+    return tuple((day.start, day.usd - period_cost(usage, day.start, day.end)) for day in covered)
+
+
+def complete_day_adjustment(complete_days: Sequence[CompleteDayAmount], intervals: Sequence[ChargedInterval],
+                            gate_reservations: Sequence[GateReservation], start: int, end: int) -> Decimal:
+    """Replace old usage with the AWS amount for each complete UTC day in the window."""
+    adjustments = _complete_day_adjustments(complete_days, intervals, gate_reservations, start, end)
+    return sum((usd for _, usd in adjustments), Decimal(0))
 
 
 def read_charge(path: Path) -> ChargeRead:
-    row = mapping(cast(object, json.loads(path.read_text())))
-    reading = ChargeRead(text(row, 'day'), instant(row, 'at'), instant(row, 'period_start'),
-                         instant(row, 'period_end'), conf.decimal(text(row, 'actual_usd')),
-                         money(text(row, 'estimated_usd')), money(text(row, 'query_usd')),
-                         tuple(UsageTypeCost(text(item, 'usage_type'), conf.decimal(text(item, 'usd')),
-                                             conf.decimal(str(item.get('quantity', '0'))), str(item.get('unit', '')))
-                               for item in rows(row, 'usage_types')) if 'usage_types' in row else (),
-                         row.get('provisional', True) is True, row.get('excludes_credits') is True)
-    if reading.period_end <= reading.period_start or reading.period_end > reading.at:
-        raise LedgerUnavailable('invalid charge reconciliation')
-    return reading
+    return _decode_charge(cast(object, json.loads(path.read_text())))
 
 
-def unique_charge_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    fields: dict[str, object] = {}
-    for key, value in pairs:
-        if key in fields:
-            raise LedgerUnavailable('duplicate charge field')
-        fields[key] = value
-    return fields
-
-
-def read_strict_charge(path: Path) -> ChargeRead:
-    record = cast(object, json.loads(path.read_text(), object_pairs_hook=unique_charge_fields))
+def _decode_charge(record: object) -> ChargeRead:
     row = mapping(record)
     reading = ChargeRead(text(row, 'day'), instant(row, 'at'), instant(row, 'period_start'),
                          instant(row, 'period_end'), conf.decimal(text(row, 'actual_usd')),
@@ -1197,6 +1203,49 @@ def read_strict_charge(path: Path) -> ChargeRead:
     if reading.period_end <= reading.period_start or reading.period_end > reading.at:
         raise LedgerUnavailable('invalid charge reconciliation')
     return reading
+
+
+class _DuplicateChargeField(LedgerUnavailable):
+    pass
+
+
+def unique_charge_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    fields: dict[str, object] = {}
+    for key, value in pairs:
+        if key in fields:
+            raise _DuplicateChargeField('duplicate charge field')
+        fields[key] = value
+    return fields
+
+
+def read_strict_charge(path: Path) -> ChargeRead:
+    return _decode_charge(_strict_charge_record(path.read_text()))
+
+
+def _strict_charge_record(document: str) -> dict[str, object]:
+    return mapping(cast(object, json.loads(document, object_pairs_hook=unique_charge_fields)))
+
+
+def matches_utc_charge_day(name: str, reading: ChargeRead, day: date) -> bool:
+    """Check that the file name, label and bounds match the full UTC day."""
+    label = day.isoformat()
+    return (name == label + '.json' and reading.day == label
+            and (reading.period_start, reading.period_end) == period_bounds(day, ZoneInfo('UTC')))
+
+
+def _bill_day_reads(readings: Iterable[tuple[str, ChargeRead]], now: int) -> Iterator[ChargeRead]:
+    for name, reading in readings:
+        try:
+            matches = matches_utc_charge_day(name, reading, date.fromisoformat(reading.day))
+        except (OSError, ValueError, ArithmeticError):
+            continue
+        if (matches and reading.at <= now
+                and reading.account_bill and reading.actual_usd >= Decimal('.01')):
+            yield reading
+
+
+def _bill_has_aged(reading: ChargeRead, settings: SpendingSettings) -> bool:
+    return reading.period_end + settings.bill_complete_after_seconds <= reading.at
 
 
 def charge_record(reading: ChargeRead) -> dict[str, object]:
@@ -1683,6 +1732,99 @@ def gate_future_costs(state: LedgerEvidence, settings: SpendingSettings, now: in
     return daily.get(day, Decimal(0)), monthly.get(day[:7], Decimal(0))
 
 
+@dataclass(frozen=True)
+class _LimitAmount:
+    adjusted_usage: Decimal
+    adjustment: Decimal
+    reserves: Decimal
+    headroom: Decimal
+
+    @property
+    def before_headroom(self) -> Decimal:
+        return self.adjusted_usage + self.reserves
+
+    @property
+    def limit_count(self) -> Decimal:
+        return self.before_headroom + self.headroom
+
+
+def _limit_amount(old_usage: Decimal, adjustment: Decimal, reserves: Decimal, headroom: Decimal) -> _LimitAmount:
+    return _LimitAmount(old_usage + adjustment, adjustment, reserves, headroom)
+
+
+@dataclass(frozen=True)
+class _GuardAccrual:
+    amount: _LimitAmount
+    bounds: tuple[int, int]
+    day_adjustments: tuple[tuple[int, Decimal], ...]
+
+
+def _require_instance_observation(state: LedgerEvidence) -> None:
+    if not any(row.state != 'unknown' for row in state.observations):
+        raise LedgerUnavailable('instance state evidence is missing')
+
+
+def _guard_limit_amounts(state: LedgerEvidence, settings: SpendingSettings, costs: CostEstimate,
+                         complete_days: Sequence[CompleteDayAmount]) -> tuple[_GuardAccrual, _GuardAccrual]:
+    now = costs.at
+    daily_fixed, monthly_fixed = _reserved_fixed_costs(state, settings, costs)
+    gate_daily, gate_monthly = gate_future_costs(state, settings, now)
+    reserved, reserved_months = spending_periods(
+        hana_intervals(state, now, settings.box_minimum_seconds, reserve=True), settings.accounting_zone)
+    accrued, accrued_months = spending_periods(
+        hana_intervals(state, now, settings.box_minimum_seconds), settings.accounting_zone)
+    daily_fixed += gate_daily + max(Decimal(0), reserved.get(costs.daily.day, Decimal(0))
+                                   - accrued.get(costs.daily.day, Decimal(0)))
+    monthly_fixed += gate_monthly + max(Decimal(0), reserved_months.get(costs.monthly.month, Decimal(0))
+                                       - accrued_months.get(costs.monthly.month, Decimal(0)))
+    zone = settings.accounting_zone
+    day = datetime.fromtimestamp(now, zone).date()
+
+    def for_window(old_usage: Decimal, reserves: Decimal, bounds: tuple[int, int]) -> _GuardAccrual:
+        adjustments = _complete_day_adjustments(complete_days, costs.intervals, state.gate_reservations, *bounds)
+        adjustment = sum((usd for _, usd in adjustments), Decimal(0))
+        amount = _limit_amount(old_usage, adjustment, reserves, settings.limit_reserve_usd)
+        return _GuardAccrual(amount, bounds, adjustments)
+
+    return (for_window(costs.daily.usd, daily_fixed, period_bounds(day, zone)),
+            for_window(costs.monthly.usd, monthly_fixed, _month_bounds(day, zone)))
+
+
+def _accrued_days(cost: Decimal, accrual: _GuardAccrual, estimates: CostEstimate,
+                  aws_amounts_so_far: Mapping[date, Decimal], final_days: set[date]) -> tuple[AccruedDay, ...]:
+    utc = ZoneInfo('UTC')
+    start, end = accrual.bounds
+    amounts = {datetime.fromtimestamp(left, utc).date(): Decimal(0)
+               for left, _ in _days(start, min(end, estimates.at + 1), utc)}
+    fees: dict[date, Decimal] = {}
+    for row in estimates.intervals:
+        if not start <= row.start < end:
+            continue
+        spans = ((row.start, row.end),) if row.start == row.end else _days(row.start, row.end, utc)
+        for left, right in spans:
+            day = datetime.fromtimestamp(left, utc).date()
+            usd = row.usd if (left, right) == (row.start, row.end) else _overlap(row, left, right)
+            amounts[day] = amounts.get(day, Decimal(0)) + usd
+            if row.kind == 'explorer':
+                fees[day] = fees.get(day, Decimal(0)) + usd
+
+    billed_days = {datetime.fromtimestamp(at, utc).date(): usd for at, usd in accrual.day_adjustments}
+    for day, adjustment in billed_days.items():
+        amounts[day] = amounts.get(day, Decimal(0)) + adjustment
+    days: list[AccruedDay] = []
+    for day, usd in sorted(amounts.items()):
+        state: Literal['estimate', 'billed_not_final', 'billed_final'] = 'estimate'
+        if day in billed_days:
+            state = 'billed_final' if day in final_days else 'billed_not_final'
+        days.append(AccruedDay(day, usd, state, aws_amounts_so_far.get(day), fees.get(day, Decimal(0))))
+    if days:
+        # Assign the Decimal rounding difference from grouping to the last day.
+        last = days[-1]
+        last_cost = cost - sum((day.cost for day in days[:-1]), Decimal(0))
+        days[-1] = replace(last, cost=last_cost, rounding_adjustment=last_cost - last.cost)
+    return tuple(days)
+
+
 def send_limit_event(event: LimitEvent) -> bool:
     """Use the existing message interface after persisting the event identity."""
     # Keep the key active across every date that the message interface can represent.
@@ -1777,24 +1919,18 @@ class CostLedger:
     def read_bills(self) -> tuple[ChargeRead, ...]:
         return tuple(read_charge(path) for path in self.bill_paths())
 
-    def read_complete_day_amounts(self, settings: SpendingSettings, now: int) -> tuple[CompleteDayAmount, ...]:
-        """Read amounts that qualify to replace a full UTC day."""
-        complete: list[CompleteDayAmount] = []
-        utc = ZoneInfo('UTC')
+    def _strict_charge_reads(self) -> Iterator[tuple[str, ChargeRead]]:
         for path in self.bill_paths():
             try:
                 reading = read_strict_charge(path)
-                day = date.fromisoformat(reading.day)
-                start, end = period_bounds(day, utc)
             except (OSError, ValueError, ArithmeticError):
                 continue
-            key = day.isoformat()
-            if (reading.day == key and path.name == key + '.json'
-                    and (reading.period_start, reading.period_end) == (start, end)
-                    and end + settings.bill_complete_after_seconds <= reading.at <= now
-                    and reading.account_bill and reading.actual_usd >= Decimal('.01')):
-                complete.append(CompleteDayAmount(start, end, reading.actual_usd))
-        return tuple(complete)
+            yield path.name, reading
+
+    def read_complete_day_amounts(self, settings: SpendingSettings, now: int) -> tuple[CompleteDayAmount, ...]:
+        """Read amounts that qualify to replace a full UTC day."""
+        return tuple(CompleteDayAmount(read.period_start, read.period_end, read.actual_usd)
+                     for read in _bill_day_reads(self._strict_charge_reads(), now) if _bill_has_aged(read, settings))
 
     def launches(self) -> tuple[dict[str, object], ...]:
         path = self.launch_history_path
@@ -1855,6 +1991,60 @@ class CostLedger:
             for row in launches) + sum(r.attempt not in logged_attempts and isinstance(r.state, (GateRunning, GateTerminated))
                 and datetime.fromtimestamp(r.at, ZoneInfo('UTC')).date().isoformat() == day.day
                 for r in state.gate_reservations)) for day in days)
+
+    def accrued_cost(self, settings_path: Path, now: int, *,
+                     window: Literal['day', 'month']) -> AccruedCost:
+        """Return the admission guard's limit_count, equal to cost plus reserves and headroom."""
+        state = self.read_snapshot()
+        settings = read_settings(settings_path)
+        pricing_reads: list[ChargeRead] = []
+        strict_reads: list[tuple[str, ChargeRead]] = []
+        final_bill_names: set[str] = set()
+        unavailable: CostEvidenceUnavailable | None = None
+        for path in self.bill_paths():
+            try:
+                document = path.read_text()
+                try:
+                    record = _strict_charge_record(document)
+                    read = _decode_charge(record)
+                except _DuplicateChargeField:
+                    read = _decode_charge(cast(object, json.loads(document)))
+                else:
+                    strict_reads.append((path.name, read))
+                    if record.get('provisional') is False:
+                        final_bill_names.add(path.name)
+                pricing_reads.append(read)
+            except (OSError, ValueError, ArithmeticError) as error:
+                unavailable = unavailable or CostEvidenceUnavailable(str(error))
+
+        complete_days: list[CompleteDayAmount] = []
+        aws_amounts_so_far: dict[date, Decimal] = {}
+        final_days: set[date] = set()
+        for read in _bill_day_reads(strict_reads, now):
+            day = date.fromisoformat(read.day)
+            if _bill_has_aged(read, settings):
+                complete_days.append(CompleteDayAmount(read.period_start, read.period_end, read.actual_usd))
+                if read.day + '.json' in final_bill_names:
+                    final_days.add(day)
+            else:
+                aws_amounts_so_far[day] = read.actual_usd
+
+        try:
+            estimates = self._guard_estimate(state, settings, now, pricing_reads)
+        except (OSError, ValueError, ArithmeticError) as error:
+            unavailable = unavailable or CostEvidenceUnavailable(str(error))
+            estimates = costs_from_evidence(state, settings, now)
+        try:
+            _require_instance_observation(state)
+        except LedgerUnavailable as error:
+            unavailable = unavailable or CostEvidenceUnavailable(str(error))
+        daily, monthly = _guard_limit_amounts(state, settings, estimates, complete_days)
+        accrual = daily if window == 'day' else monthly
+        amount = accrual.amount
+        cost = amount.adjusted_usage
+        limit_count = amount.limit_count if unavailable is None else unavailable
+        days = _accrued_days(cost, accrual, estimates, aws_amounts_so_far, final_days)
+        return AccruedCost(cost, limit_count, amount.reserves, amount.headroom, days)
 
     def reserve_gate(self, settings_path: Path, request: GateReservation) -> GateReserved | GateCapReached | GateAttemptEnded:
         """Reserve gate costs under the shared Rust accounting lock."""
@@ -1942,12 +2132,13 @@ class CostLedger:
             if day >= today:
                 bounds = period_bounds(date.fromisoformat(day), zone)
                 adjustment = complete_day_adjustment(complete_days, intervals, state.gate_reservations, *bounds)
-                if amount + adjustment + fixed_daily + settings.limit_reserve_usd >= settings.daily_limit_usd:
+                count = _limit_amount(amount, adjustment, fixed_daily, settings.limit_reserve_usd).limit_count
+                if count >= settings.daily_limit_usd:
                     reason = 'daily_limit'
-        if not reason and any(amount + complete_day_adjustment(
-                complete_days, intervals, state.gate_reservations,
-                *_month_bounds(date.fromisoformat(month + '-01'), zone))
-                + fixed_monthly + settings.limit_reserve_usd >= settings.monthly_limit_usd
+        if not reason and any(_limit_amount(
+                amount, complete_day_adjustment(complete_days, intervals, state.gate_reservations,
+                                                *_month_bounds(date.fromisoformat(month + '-01'), zone)),
+                fixed_monthly, settings.limit_reserve_usd).limit_count >= settings.monthly_limit_usd
                 for month, amount in monthly.items() if month >= today[:7]):
             reason = 'monthly_limit'
         return reason
@@ -2162,6 +2353,11 @@ class CostLedger:
             return PermissionUnavailable(decision.at, 'current decision has no durable publication')
         return decode_permission(decision_record(decision))
 
+    def _guard_estimate(self, state: LedgerEvidence, settings: SpendingSettings, now: int,
+                        readings: Sequence[ChargeRead]) -> CostEstimate:
+        self._price_gates(state, readings, now)
+        return _charges(state, settings, now, current_window=True)
+
     def _decide(self, state: LedgerEvidence, settings_path: Path,
                 purpose: SpendingPurpose, now: int, *, placement_preview: bool = False) -> SpendingDecision:
         evidence = GuardEvidence(purpose, (), CostEvidenceUnavailable("costs have not been validated"))
@@ -2169,43 +2365,28 @@ class CostLedger:
             settings = read_settings(settings_path)
             evidence = GuardEvidence(purpose, settings.limits, evidence.costs, settings)
             readings = self.read_bills()
-            self._price_gates(state, readings, now)
-            costs = _charges(state, settings, now, current_window=True)
+            costs = self._guard_estimate(state, settings, now, readings)
             evidence = GuardEvidence(purpose, settings.limits, costs, settings)
-            if purpose != "deployment" and not any(r.state != "unknown" for r in state.observations):
-                raise LedgerUnavailable("instance state evidence is missing")
-            daily_fixed, monthly_fixed = _reserved_fixed_costs(state, settings, costs)
-            gate_daily, gate_monthly = gate_future_costs(state, settings, now)
-            reserved, reserved_months = spending_periods(
-                hana_intervals(state, now, settings.box_minimum_seconds, reserve=True), settings.accounting_zone)
-            accrued, accrued_months = spending_periods(
-                hana_intervals(state, now, settings.box_minimum_seconds), settings.accounting_zone)
-            daily_fixed += gate_daily + max(Decimal(0), reserved.get(costs.daily.day, Decimal(0))
-                                           - accrued.get(costs.daily.day, Decimal(0)))
-            monthly_fixed += gate_monthly + max(Decimal(0), reserved_months.get(costs.monthly.month, Decimal(0))
-                                               - accrued_months.get(costs.monthly.month, Decimal(0)))
+            if purpose != "deployment":
+                _require_instance_observation(state)
             complete_days = self.read_complete_day_amounts(settings, now)
-            zone = settings.accounting_zone
-            day = datetime.fromtimestamp(now, zone).date()
-            daily_adjustment = complete_day_adjustment(
-                complete_days, costs.intervals, state.gate_reservations, *period_bounds(day, zone))
-            monthly_adjustment = complete_day_adjustment(
-                complete_days, costs.intervals, state.gate_reservations, *_month_bounds(day, zone))
-            if daily_adjustment or monthly_adjustment:
-                costs = replace(costs, daily=replace(costs.daily, usd=costs.daily.usd + daily_adjustment),
-                                monthly=replace(costs.monthly, usd=costs.monthly.usd + monthly_adjustment))
-            evidence = GuardEvidence(purpose, settings.limits, costs, settings, daily_fixed, monthly_fixed)
+            daily_accrual, monthly_accrual = _guard_limit_amounts(state, settings, costs, complete_days)
+            daily, monthly = daily_accrual.amount, monthly_accrual.amount
+            if daily.adjustment or monthly.adjustment:
+                costs = replace(costs, daily=replace(costs.daily, usd=daily.adjusted_usage),
+                                monthly=replace(costs.monthly, usd=monthly.adjusted_usage))
+            evidence = GuardEvidence(purpose, settings.limits, costs, settings, daily.reserves, monthly.reserves)
             reason = ""
-            for period, key, total, limit in (
-                ("daily", costs.daily.day, costs.daily.usd + daily_fixed, settings.daily_limit_usd),
-                ("monthly", costs.monthly.month, costs.monthly.usd + monthly_fixed, settings.monthly_limit_usd),
+            for period, key, amount, limit in (
+                ("daily", costs.daily.day, daily, settings.daily_limit_usd),
+                ("monthly", costs.monthly.month, monthly, settings.monthly_limit_usd),
             ):
-                if total + settings.limit_reserve_usd < limit:
+                if amount.limit_count < limit:
                     continue
                 reason = reason or f"{period}_limit"
                 event_id = f"{period}:{key}"
                 if not any(event.event_id == event_id for event in state.events):
-                    state.events.append(LimitEvent(event_id, now, period, total, limit,
+                    state.events.append(LimitEvent(event_id, now, period, amount.before_headroom, limit,
                                                    settings.notification_recipient, settings.notification_timeout_s))
             if not reason and placement_preview:
                 reason = self._reservation_cap(state, settings, now, costs, readings, complete_days)
