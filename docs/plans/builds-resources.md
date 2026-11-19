@@ -3045,22 +3045,13 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 - lint.conf: `sweep_build_floor_gib.natedev=733.29` after `sweep_free_floor_percent`; 3.2 MiB above the old 20 percent byte floor (accepted in review). The 300 GiB change is `/tune lint sweep_build_floor_gib.natedev 300`, only on the user's go.
 - Row 116e24ea0 on main 764582979 (same tree as 96a8d6a67, which had no Change-Review line). Tests in both layouts, 0 failures: 11 suites; types 0.
 
-### Phase 169 — The disk floor sweep sends one notice for each holder, not one for each target  · status: in review
-**Source:** builds, 2026-11-19 04:2x EST: from 04:08 to 04:30 EST the sweep sent more than 150 messages to devtools (session 33c5eac0), about one each 10 s. Each one named the same pid 3179104 and one target.
-**Cause:** one `disk-floor.service` pass (pid 1787514, started 03:50:33) found 273 protected targets. `floor_holders` gives one `FloorHolder` for each busy target, and the pass sends `holder_message_text` once for each holder, one after the other (`sweep.py` near the `told = frozenset(...)` line). Each send takes about 9 s. The pass reads the process table once, so it still names the pid after the pid ends. The message says "removed all idle build output" when the pass removed nothing.
+### Phase 169 — The disk floor sweep sends one notice for each holder, not one for each target  · status: done
+**Source:** builds, 2026-11-19 04:2x EST: one disk-floor.service pass (started 03:50:33) sent more than 200 session messages, one for each held target, about 9 s apart, and named pids 3179104 and 2149035 after they had ended. Other sweeps waited on its lock.
 
-#### Work Order
-
-**Goal:** a session gets one floor notice for each holder process, and the next pass does not repeat it while nothing changes.
-
-**Spec:**
-1. Group the busy targets by holder (session and pid). Send one message for each group. It gives the target count, the total size and the largest paths that fit `sweep_message_limit`.
-2. Give each send a delivery key built from the holder pid, its start time and its target set, with a repeat window, so a later pass with the same holder and targets sends nothing.
-3. Before each send, check that the holder pid is still the same live process. Send nothing for a process that ended.
-4. Say "removed all idle build output" only when the pass removed output. Else say that no idle build output was found.
-
-**Base:** main `764582979`, a row separate from the 167 and 168 rows.
-
-**Files:** `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py` (rows in the existing holder-message tests).
-
-**Acceptance gate:** new rows pass for one holder with many targets, a repeat pass with no change, and a holder that ended before the send; test_sweep and test_tmp_sweep pass; types 0.
+#### As-built
+- The floor pass groups the holders that have a session by (session, pid) and sends one message per group: the target count, the total size and the largest paths that fit `sweep_message_limit`.
+- Each group send carries a delivery key from the pid, its start time (read from `/proc/<pid>/stat` with the holder) and the sorted target set, through `crossing_send_argv`. send.py keeps a delivered key, so the same holder with the same targets gets one notice; a new pid, start time or target set sends again.
+- Just before each send, the pass checks that the pid is the same live process; an ended holder gets no message.
+- The first line says the sweep removed idle build output only when the pass removed some; else it says it found none to remove.
+- Accepted (review): no hourly repeat for an unchanged holder (the asked rule); a repeat skip counts as told; path fit order in a long message; hard-link bytes shared across holders; one extra `/proc/<pid>/stat` read per pid on a recheck.
+- Row e9b059d52 on main 764582979. Tests in both layouts, 0 failures: 11 suites; types 0.
