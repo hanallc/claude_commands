@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import TextIO, cast, final, override
 from unittest.mock import patch
 
-from scripts.lib import land_main, live_settings, main_push_lock, models_registry, waiting_rows
+from scripts.lib import land_main, live_settings, main_push_lock, models_registry, registry_rows, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.checkout_test_support import write_python_tool
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
@@ -405,6 +405,23 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
             with self.subTest(child=tool):
                 self.assertIn(tool + " held", lease_log.read_text().splitlines())
         self.assertTrue((self.repo / ".git" / main_push_lock.RECORD_NAME).is_file())
+
+
+class RegistryRowReplayTests(unittest.TestCase):
+    def test_new_rows_follow_the_last_key_or_empty_section_header(self) -> None:
+        edit = registry_rows.RowChange("producers", "bob", "bob=claude:fable:high")
+        for case, keys, tail in (
+            ("before another section",
+             "morty=claude:fable:high\ndwight=claude:fable:high\n", "\n# Directors\n[production.claude]\n"),
+            ("without keys",
+             "", "# No producers\n\n[production.claude]\n"),
+            ("at the end",
+             "dwight=claude:fable:high\n", "\n# End of registry\n"),
+        ):
+            with self.subTest(case=case):
+                prefix = f"[producers]\n{keys}"
+                self.assertEqual(registry_rows.replay(prefix + tail, [edit], False),
+                                 f"{prefix}{edit.replacement}\n{tail}")
 
 
 class LaunchSettingsTests(unittest.TestCase):

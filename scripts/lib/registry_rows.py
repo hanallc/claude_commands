@@ -100,28 +100,32 @@ def replay(text: str, edits: list[RowChange], additive_catalog: bool) -> str:
                     for change in edits}
     lines: list[str] = []
     section = ""
+    insert_at = 0
 
-    def append_new_rows() -> None:
+    def insert_new_rows() -> None:
+        new_rows: list[str] = []
         for address in list(replacements):
             if address[0] == section:
                 line = replacements.pop(address)
                 if line:
-                    lines.append(line)
+                    new_rows.append(line)
+        lines[insert_at:insert_at] = new_rows
 
     for line in text.splitlines():
         content = line.partition("#")[0].strip()
         if content.startswith("[") and content.endswith("]"):
-            append_new_rows()
+            insert_new_rows()
             section = content[1:-1]
+            insert_at = len(lines) + 1
         elif "=" in content:
-            address = section, content.split("=", 1)[0].strip()
-            if address in replacements:
-                replacement = replacements.pop(address)
-                if replacement:
-                    lines.append(replacement)
+            key = content.split("=", 1)[0].strip()
+            line = replacements.pop((section, key), line)
+            if not line:
                 continue
+            if key:
+                insert_at = len(lines) + 1
         lines.append(line)
-    append_new_rows()
+    insert_new_rows()
     for address, line in replacements.items():
         new_section = address[0]
         if not line:
