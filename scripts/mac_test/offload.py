@@ -2716,9 +2716,9 @@ def claimed_run(
                     buildlog_sync.sync_target(request.target)
 
 
-def hana_source_key(request: OffloadRequest) -> execution_identity.SourceIdentity:
+def hana_source_key(source_root: Path) -> execution_identity.SourceIdentity:
     """Read the caller's current source without installing a remote snapshot."""
-    key = read_tree_key(request.source_root)
+    key = read_tree_key(source_root)
     return (execution_identity.SourceKeyKnown(key.value) if isinstance(key, KnownTreeKey)
             else execution_identity.SourceKeyUnavailable('The caller source key is unavailable'))
 
@@ -2908,7 +2908,7 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
             lifecycle.directory / 'hana' / 'source', configuration)
         prepared = execution.prepare_execution(claim, sender, request.source_root, command,
             hana_result.LogicalStepLink(request.call_id, assignment.episode),
-            current_source_key=lambda: hana_source_key(request), environment=dict(request.environment),
+            current_source_key=lambda: hana_source_key(request.source_root), environment=dict(request.environment),
             staging=staging, features=tuple(dict.fromkeys(features)))
     except copies.SourceChangedDuringCapture as error:
         return close_prelaunch(str(error))
@@ -2965,7 +2965,7 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
         try:
             state = execution.dispatch_execution(lifecycle.directory, prepared, claim, objects,
                 upload_source=upload_source, consume=admission_client.consume_permission,
-                current_permission=permission, current_source_key=lambda: hana_source_key(request))
+                current_permission=permission, current_source_key=lambda: hana_source_key(request.source_root))
         finally:
             staging.close()
         if isinstance(state, execution_identity.HanaCommandAdmissionRefused):
@@ -2982,7 +2982,7 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
                 'The Hana command was not authorized for publication')
         if isinstance(state, execution.DispatchSettled):
             accepted = execution.replay_accepted_result(lifecycle.directory, prepared, transport.host,
-                                                        lambda: hana_source_key(request))
+                                                        lambda: hana_source_key(request.source_root))
         while (not isinstance(state, (execution.DispatchFenced, execution.DispatchSettled,
                                      execution_identity.HanaCommandAdmissionRefused))
                 and execution.dispatch_publication_attempted(lifecycle.directory, prepared)):
@@ -3045,7 +3045,7 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
                     break
                 try:
                     decision = execution.accept_result(lifecycle.directory, prepared, objects.execution_result(prepared.key),
-                        transport.host, lambda: hana_source_key(request))
+                        transport.host, lambda: hana_source_key(request.source_root))
                     accepted = decision
                     reason = decision.reason if isinstance(decision, hana_result.RejectedHanaResult) else 'The Hana command completed'
                 except hana_result.HanaResultDownloadTimedOut as error:
@@ -3094,8 +3094,8 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
                                     remote_started_at, time.time())
     context = record.HanaStepContext(request.target, request.verb, repository.key, str(request.repo_root), '')
     if isinstance(accepted, hana_result.AcceptedHanaResult):
-        if hana_source_key(request) != prepared.source_key:
-            reason = 'The caller source changed before result publication'
+        if hana_source_key(request.source_root) != prepared.source_key:
+            reason = execution.SOURCE_CHANGED_BEFORE_RESULT_PUBLICATION
         else:
             evidence.completion = 'confirmed'
             result = accepted.result
