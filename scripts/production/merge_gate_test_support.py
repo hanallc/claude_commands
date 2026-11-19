@@ -315,16 +315,21 @@ class MergeGateFixture(unittest.TestCase):
     fixture_seeds: ClassVar[dict[tuple[str, ...], GateFixtureSeed]]
 
     @classmethod
+    def fixture_configuration(cls, directory: Path) -> dict[str, str]:
+        return config_environment(directory)
+
+    @classmethod
     @override
     def setUpClass(cls) -> None:
         # A leased folder: a run that ends by a signal leaves it free, and the next allocation removes it.
         configuration = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="gate-config-", dir="/tmp")))
-        _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, config_environment(configuration))))
+        _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, cls.fixture_configuration(configuration))))
         parent = merge_gate.gate_test_parent(build_folders.tmpfs_temporary_parent())
         parent.mkdir(mode=0o700, exist_ok=True)
         build_folders.sweep_temporary_build_folders(parent, wait=False)
         directory = cls.enterClassContext(build_folders.temporary_build_folder(
-            build_folders.UniqueBuildFolder("merge-gate-test-", build_folders.ExplicitBuildParent(parent))))
+            build_folders.BuildFolderSpec(kind="legacy-unique", parent=parent,
+                                          purpose="merge-gate-test-", suffix_length=8)))
         cls.fixture_root = directory / "case"
         cls.fixture_snapshot = directory / "snapshot"
         cls.fixture_snapshot.mkdir()
@@ -548,6 +553,9 @@ class MergeGateFixture(unittest.TestCase):
         finally:
             server.reply_filter = previous
 
+    def install_fixture_runner(self) -> None:
+        _ = install_test_runner(self.checkout)
+
     def build_fixture(self, root: Path) -> None:
         self.bind_fixture(root)
         copy_runtime(self.bin.parent)
@@ -581,7 +589,7 @@ class MergeGateFixture(unittest.TestCase):
         self.write(self.checkout / "subject.txt", "base\n")
         self.write(self.checkout / "Cargo.toml", "[workspace]\n")
         self.write(self.checkout / "scripts" / "production" / "README.md", "Type-check fixture.\n")
-        _ = install_test_runner(self.checkout)
+        self.install_fixture_runner()
         shim = self.checkout / "scripts/lib/py"
         shim.parent.mkdir(parents=True, exist_ok=True)
         _ = shutil.copy2(SCRIPT.parents[1] / "lib/py", shim)
