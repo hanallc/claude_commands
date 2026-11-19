@@ -1347,6 +1347,18 @@ for descriptor in descriptors:
                     self.assert_retry_keeps_metadata(path, link)
                     self.assertEqual(os.readlink(link), "refs/heads/loose")
 
+    def test_retry_keeps_a_symbolic_ref_with_the_removal_marks_timestamp(self) -> None:
+        path = self.checkout_with_removal_intent("current", "coarse-symbolic-ref")
+        link = path / ".git/refs/heads/alias"
+        link.symlink_to("refs/heads/loose")
+        mark = scratch.removal_mark(path)
+        stamp = link.lstat().st_ctime_ns
+        fields = cast(dict[str, object], json.loads(mark.read_text()))
+        fields["removal_intent_ns"] = stamp + 1
+        _ = mark.write_text(json.dumps(fields))
+        os.utime(mark, ns=(stamp, stamp))
+        self.assert_retry_keeps_metadata(path, link)
+
     def test_final_removal_scan_checks_metadata_added_after_the_first_scan(self) -> None:
         scan_metadata = git_files.check_internal_removal_entries
         for version in ("current", "legacy"):

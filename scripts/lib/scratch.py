@@ -1463,9 +1463,12 @@ def repository_removal_evidence(path: Path, *, scratch_settings: conf.ConfigRead
 def recovery_state(path: Path, pending: copy_record.Registered, scope: BusyMarkScope, *,
                    scratch_settings: conf.ConfigRead, descendant_checkouts: tuple[Path, ...] = ()) -> RemovalRetry | KeptFolder:
     """Resume unchanged sources and check changed sources before another deletion attempt."""
-    intent = pending.fields.get("removal_intent_ns", removal_mark(path).stat().st_mtime_ns)
+    mark_mtime = removal_mark(path).stat().st_mtime_ns
+    intent = pending.fields.get("removal_intent_ns", mark_mtime)
     if type(intent) is not int:
         return KeptFolder(path, "invalid removal intent time")
+    # A new link can share the mark's filesystem timestamp, which can precede the recorded intent.
+    link_intent = min(intent, mark_mtime)
     saved_files = pending.fields.get("removal_files")
     previous = (git_files.RecordedRemovalFiles(frozenset(name for name in cast(list[object], saved_files)
                                                          if isinstance(name, str)))
@@ -1489,8 +1492,8 @@ def recovery_state(path: Path, pending: copy_record.Registered, scope: BusyMarkS
 
     # Exempt only the busy mark that the retry created and still holds.
     changed = min((entry.path for entry in entries.values()
-                   if (stat.S_ISREG(entry.status.st_mode) or stat.S_ISLNK(entry.status.st_mode))
-                   and entry.status.st_ctime_ns > intent
+                   if ((stat.S_ISREG(entry.status.st_mode) and entry.status.st_ctime_ns > intent)
+                       or (stat.S_ISLNK(entry.status.st_mode) and entry.status.st_ctime_ns >= link_intent))
                    and (entry.path not in busy_marks or not os.path.samestat(entry.status, busy_marks[entry.path]))),
                   default=RemovalRetry.UNCHANGED)
     if changed is RemovalRetry.UNCHANGED:
