@@ -43,7 +43,7 @@ from scripts.build_queue import memory_files
 from scripts.lib import conf, scratch
 from scripts.production import change_routing, change_review, staff, the_list
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
-from scripts.review_links import new_item_dialog, page_frame, question_record, review_actions, review_submissions
+from scripts.review_links import new_item_dialog, page_frame, question_record, review_actions, review_submissions, staff_names
 from scripts.review_links.review_link import private_name
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
@@ -515,14 +515,22 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.review_response(owned, 'text/html; charset=utf-8', prepared if owned is content else b'')
             return None
         if route.path == list_page.PAGE_PATH:
+            if route.query in (list_page.COUNTS_QUERY, list_page.COUNTS_AND_LINKS_QUERY):
+                self.list_counts(include_linked_reviews=route.query == list_page.COUNTS_AND_LINKS_QUERY)
+                return None
             fields = parse_qs(route.query)
             if "item-state" in fields:
                 self.list_action_state(fields)
                 return None
             try:
                 with server.list_store_access():
-                    content = list_page.render(root, include_counts=server.mode is ServerMode.LIVE,
-                                               status=server.delivery_status)
+                    live = server.mode is ServerMode.LIVE
+                    reviews = server.list_review_records()
+                    content = list_page.render(root, include_counts=live, defer_counts=True,
+                                               status=server.delivery_status,
+                                               review_records=(list_page.LinkedReviewRead.AFTER_RENDER
+                                                               if live and reviews is list_page.LinkedReviewRead.FROM_DISK
+                                                               else reviews))
                     content = owned_document(content, "list")
             except (OSError, ValueError) as error:
                 print(f"review-links list: {error}", file=sys.stderr)
@@ -1165,6 +1173,27 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             cast(ReviewLinksServer, self.server).accounts_cache = AccountsPageCache()
             self.json_response(200, {"state": "saved"})
 
+    def list_counts(self, *, include_linked_reviews: bool) -> None:
+        """Serve the counts and any pending links after the List rows."""
+        server = cast(ReviewLinksServer, self.server)
+        if server.mode is not ServerMode.LIVE:
+            self.send_error(404)
+            return
+        try:
+            members = staff.snapshot()
+            content = list_page.counts_strip(members, staff_names.StaffNames(members))
+        except (OSError, ValueError) as error:
+            print(f"review-links List counts: {error}", file=sys.stderr)
+            self.html_response(503, b"")
+            return
+        if include_linked_reviews:
+            try:
+                content += list_page.render_review_updates(server.root, members, server.list_review_records())
+            except (OSError, ValueError, change_review.ChangeReviewError) as error:
+                print(f"review-links List links: {error}", file=sys.stderr)
+                content += '<template data-list-review-read-error></template>'
+        self.html_response(200, content.encode())
+
     def list_action_state(self, fields: dict[str, list[str]]) -> None:
         """Read the current item after an action response is lost."""
         server = cast(ReviewLinksServer, self.server)
@@ -1174,7 +1203,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             (park_request,) = fields.get("park-request", [""])
             with server.list_store_access():
                 current = list_page.saved_action_state(keeper, identity, status=server.delivery_status,
-                                                       park_request=park_request)
+                                                       park_request=park_request,
+                                                       review_records=server.list_review_records())
         except ValueError as error:
             self.browser_failure(400, "The List item is unavailable.", error)
         except OSError as error:
@@ -1210,7 +1240,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         try:
             action = fields["action"][0]
             state = "saved" if action.startswith("resend-") else {"read": "read", "question": "saved"}.get(action, "sent")
-            current = list_page.saved_action_state(fields["keeper"][0], fields["id"][0], status=server.delivery_status)
+            current = list_page.saved_action_state(fields["keeper"][0], fields["id"][0],
+                                                   status=server.delivery_status,
+                                                   review_records=server.list_review_records())
             reply = {"state": state, **current}
             if isinstance(submission, list_page.ListUnparkSubmission):
                 reply["unpark_outcome"] = submission.response_outcome(current).value
@@ -1389,6 +1421,14 @@ def release_park_for_change(root: Path, members: staff.StaffSnapshot, entry: lis
 
 
 class ConsoleReviewSnapshotCache(review_page.ReviewSnapshotCache):
+    def linked_records(self) -> list_page.ImmediateReviewRecords:
+        """Return the published records without waiting for a build."""
+        with self._condition:
+            snapshot = self._snapshot
+        if isinstance(snapshot, review_page.SnapshotUnavailable):
+            return list_page.LinkedReviewRead.FROM_DISK
+        return snapshot.records
+
     @override
     def _after_snapshot_update(self, snapshot: review_page.ReviewSnapshot, /) -> None:
         try:
@@ -1438,6 +1478,12 @@ class ReviewLinksServer(ThreadingHTTPServer):
             recover_list()
         threading.Thread(target=recover_pending, daemon=True).start()
         self.review_cache.start()
+
+    def list_review_records(self) -> list_page.ImmediateReviewRecords:
+        cache = self.review_cache
+        if isinstance(cache, ConsoleReviewSnapshotCache) and cache.root == self.root:
+            return cache.linked_records()
+        return list_page.LinkedReviewRead.FROM_DISK
 
     def capture_page(self, key: str, firefox: str, url: str, capture: new_item_dialog.PageCaptureRequest) -> None:
         image = None

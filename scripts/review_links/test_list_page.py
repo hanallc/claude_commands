@@ -83,6 +83,17 @@ class ListPageTests(unittest.TestCase):
                 self.assertEqual(parse_qs(place.query), {"show": ["all"]})
                 self.assertEqual(parse_qs(place.fragment), {"key": list(item.reviews)})
 
+    def test_review_summary_reports_a_missing_link_as_unavailable(self) -> None:
+        item = replace(self.add("Linked work"), reviews=("sdlc/C1", "sdlc/C2"))
+        done = review_items.ReviewItem("sdlc/C1", "sdlc/C1", review_items.ReviewType.CHANGE,
+            OWNER.id, OWNER.id, "Completed work", review_items.ReviewState.DONE,
+            review_items.ReviewTimes(NOW, NOW), (), (), review_items.ProposalLedgerSource(self.root / "review.md"))
+        for reviews in ({}, {done.key: done}):
+            with self.subTest(reviews=tuple(reviews)):
+                summary = list_page.review_summary(item, reviews, NOW)
+                self.assertIn(list_page.REVIEW_UNAVAILABLE, summary)
+                self.assertNotIn("Reviews done", summary)
+
     def test_list_ids_use_the_shared_no_wrap_cell(self) -> None:
         _ = self.add("Readable item number")
         body = list_page.render(self.root / "reviews").decode()
@@ -1255,7 +1266,8 @@ document.body.append(result);
             + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config),
             "SHOWRUNNER_STATE_DIR": str(self.root / "state"), "STAFF_FILE": str(self.root / "staff.json"),
-            "USER_ZONE": "America/New_York", "REVIEW_LINKS_ROOT": str(self.root / "reviews")})))
+            "USER_ZONE": "America/New_York", "REVIEW_LINKS_ROOT": str(self.root / "reviews"),
+            "CHANGE_REVIEW_DIR": str(self.root / "change-reviews")})))
         _ = (self.root / "staff.json").write_text(json.dumps({"schema": 1, "rows": [
             row.to_json() for row in (MORTY, DWIGHT, OWNER, OTHER)]}))
         _ = self.enterContext(patch.object(the_list, "now", return_value=NOW))
@@ -1360,7 +1372,7 @@ document.body.append(result);
             ((waiting.key, later.key), "2 reviews waiting on others"),
             ((answer.key,), "1 review for you"),
             ((done.key,), "Reviews done — decide: close, keep or park"),
-            (("missing/C9",), "Reviews done — decide: close, keep or park"),
+            (("missing/C9",), list_page.REVIEW_UNAVAILABLE),
             ((), ""),
             ((later.key,), "1 review waiting on others"),
             ((ready[0].key, waiting.key, done.key), "1 change for you"),
@@ -1416,6 +1428,12 @@ document.body.append(result);
         first = refreshed.split(f'data-key="{MORTY.id}/{items[0].id}"', 1)[1].split('</tbody>', 1)[0]
         self.assertIn("Reviews done — decide: close, keep or park", first)
         self.assertNotIn("2 changes for you", first)
+        with (patch.object(list_page, "read_linked_reviews", return_value=reviews) as read,
+              patch.object(list_page, "counts_strip", return_value="")):
+            partial = list_page.render(root, review_records={}).decode()
+        read.assert_called_once_with(root, members=staff.snapshot())
+        first = partial.split(f'data-key="{MORTY.id}/{items[0].id}"', 1)[1].split('</tbody>', 1)[0]
+        self.assertIn("2 changes for you", first)
         self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
 
     def test_live_change_and_delivered_state_return_parked_items_to_needs_me(self) -> None:
@@ -1827,6 +1845,175 @@ document.body.append(result);
         colors.assert_called_once()
         chip = body.split('<span class="list-count-chip">', 1)[1].split('<a ', 1)[0]
         self.assertRegex(chip, r'data-color-text="role.showrunner"[^>]*>sdlc</span> · ')
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_loads_deferred_counts_after_the_list(self) -> None:
+        item = self.add("Show this row first")
+        item = the_list.link(MORTY.id, item.id, ("sdlc/C1",), source="morty")
+        entry = f"{MORTY.id}/{item.id}"
+        template = (f'<template data-list-review-key="{entry}" data-list-review-version="{list_page.review_version(item)}">'
+                    '<span data-list-review-summary>1 change for you</span>'
+                    '<div data-list-review-links><a href="/console/?page=review">sdlc/C1</a></div></template>')
+        counts = '<aside class="list-counts"><a href="/console/?page=changes">2 changes</a></aside>'
+        change = review_items.ReviewItem("sdlc/C1", "sdlc/C1", review_items.ReviewType.CHANGE,
+            OWNER.id, OWNER.id, "Check the change", review_items.ReviewState.OPEN,
+            review_items.ReviewTimes(NOW, NOW), (), (), review_items.ProposalLedgerSource(self.root / "review.md"))
+        published: list_page.ReviewRecords = {change.key: change}
+        partial: list_page.ReviewRecords = {}
+        for lookup, query, response, expected in (
+            (published, list_page.COUNTS_QUERY, counts, ""),
+            (partial, list_page.COUNTS_AND_LINKS_QUERY, counts + template, "1 change for you"),
+            (list_page.LinkedReviewRead.AFTER_RENDER, list_page.COUNTS_AND_LINKS_QUERY,
+             counts + '<template data-list-review-read-error></template>', list_page.REVIEW_UNAVAILABLE),
+        ):
+            with self.subTest(query=query, expected=expected), patch.object(list_page, "counts_strip",
+                    side_effect=AssertionError("The List read the counts.")):
+                markup = list_page.render(self.root / "reviews", defer_counts=True, review_records=lookup).decode()
+                self.assertIn("Show this row first", markup)
+                self.assertEqual("Checking linked reviews…" in markup, bool(expected))
+                setup = """<script>
+let countRequests=[];
+window.fetch=async (url,options)=>{
+ countRequests.push([url,options.cache]);
+ return {ok:true,text:async()=>MARKUP};
+};
+</script>""".replace("MARKUP", json.dumps(response))
+                probe = """
+<script>
+(async()=>{
+ const footer=document.querySelector('[data-list-counts-url]');
+ if(!footer.firstChild) await new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{observer.disconnect();resolve();});
+  observer.observe(footer,{childList:true});
+ });
+ const failures=[];
+ if(countRequests.length!==1 || countRequests[0].join()!==REQUEST)
+  failures.push('The footer uses one independent request.');
+ if(!document.querySelector('[data-list-item]') || footer.querySelector('a')?.textContent!=='2 changes')
+  failures.push('The counts appear without replacing the List rows.');
+ if(EXPECTED && document.querySelector('[data-list-review-summary]')?.textContent!==EXPECTED)
+  failures.push('The same request settles the linked review status.');
+ if(EXPECTED==='1 change for you' && document.querySelector('[data-list-review-links] a')?.textContent!=='sdlc/C1')
+  failures.push('The same request fills the linked review fields.');
+ const result=document.createElement('p');
+ result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
+})();
+</script>""".replace("REQUEST", json.dumps(f"{list_page.PAGE_PATH}?{query},no-store")).replace(
+                    "EXPECTED", json.dumps(expected))
+                self.browser_actions(markup, setup, probe)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_refresh_keeps_the_follow_up_request_and_retries_after_timeout(self) -> None:
+        _ = write_config_fixture(conf.path("review_links"), "page_request_timeout_seconds=4\n")
+        root = self.root / "reviews"
+        changed = self.add("Keep the changed row usable")
+        counts_only = list_page.render(root, defer_counts=True, review_records={}).decode()
+        stable = self.add("Keep the unchanged row usable")
+        changed = the_list.link(MORTY.id, changed.id, ("sdlc/C1",), source="morty")
+        stable = the_list.link(MORTY.id, stable.id, ("sdlc/C1",), source="morty")
+        markup = list_page.render(root, defer_counts=True,
+                                  review_records=list_page.LinkedReviewRead.AFTER_RENDER).decode()
+        renewed = the_list.update(MORTY.id, changed.id, {"title": "Show the new title"}, source="morty")
+        refreshed = list_page.render(root, defer_counts=True,
+                                     review_records=list_page.LinkedReviewRead.AFTER_RENDER).decode()
+
+        def update(item: the_list.ListItem, label: str) -> str:
+            return (f'<template data-list-review-key="{MORTY.id}/{item.id}"'
+                    + f' data-list-review-version="{list_page.review_version(item)}">'
+                    + f'<span data-list-review-summary>{label}</span></template>')
+
+        first_updates = update(changed, "Old review status") + update(stable, "Unchanged review status")
+        current_updates = update(renewed, "Current review status") + update(stable, "Unchanged review status")
+        setup = """<script>
+const requests=[],deadlines=[];
+let page=INITIAL_PAGE;
+AbortSignal.timeout=milliseconds=>{
+ const timer=new AbortController();
+ deadlines.push({milliseconds,timer});
+ return timer.signal;
+};
+window.fetch=(url,options)=>{
+ if(!String(url).includes('?counts=')) return Promise.resolve(new Response(page));
+ return new Promise((resolve,reject)=>{
+  const request={url,signal:options.signal,finish:markup=>resolve({ok:true,text:()=>Promise.resolve(markup)})};
+  requests.push(request);
+  request.signal.addEventListener('abort',()=>reject(request.signal.reason));
+ });
+};
+</script>""".replace("INITIAL_PAGE", json.dumps(markup).replace("</", "<\\/"))
+        probe = """<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ const summary=number=>document.querySelector('[data-number="'+number+'"] [data-list-review-summary]');
+ const footer=()=>document.querySelector('[data-list-counts-url]');
+ const refresh=()=>{
+  const list=document.querySelector('[data-list]');
+  const replaced=changed(list.parentElement);
+  document.dispatchEvent(new Event('visibilitychange'));
+  return replaced;
+ };
+ const changed=node=>new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{observer.disconnect();resolve();});
+  observer.observe(node,{childList:true});
+ });
+ const first=requests[0];
+ await refresh();
+ page=UPDATED_PAGE;
+ await refresh();
+ check(requests.length===1 && !first.signal.aborted,'Refreshes keep the healthy request active.');
+ const firstLoaded=changed(footer());
+ first.finish('<aside>First counts</aside>'+FIRST_UPDATES);
+ await firstLoaded;
+ check(footer().textContent==='First counts' && summary(2).textContent==='Unchanged review status',
+  'The first response fills the current footer and unchanged row.');
+ check(summary(1).textContent==='Checking linked reviews…',
+  'The response skips a changed row with the same review links.');
+ check(requests.length===2,'The changed row starts one follow-up without another refresh.');
+ const timedOut=changed(summary(1));
+ deadlines[1].timer.abort();
+ await timedOut;
+ check(summary(1).textContent===UNAVAILABLE && document.querySelector('.list-toggle').matches(':enabled'),
+  'A timeout leaves the row usable and identifies the unavailable status.');
+ check(requests.length===2,'A timeout does not repeat the same request.');
+ await refresh();
+ check(footer().textContent==='First counts','The refresh keeps the last counts during the active request.');
+ const loaded=changed(footer());
+ requests[2].finish('<aside>New counts</aside>'+CURRENT_UPDATES);
+ await loaded;
+ check(footer().textContent==='New counts' && summary(1).textContent==='Current review status',
+  'The next refresh loads counts and status after a timeout.');
+ page=COUNTS_ONLY_PAGE;
+ await refresh();
+ const counts=requests[3];
+ check(counts.url.endsWith('?counts=1') && !summary(2),'The counts-only request starts before the new row appears.');
+ page=UPDATED_PAGE;
+ await refresh();
+ check(requests.length===4 && !counts.signal.aborted && summary(2).textContent==='Checking linked reviews…',
+  'A refresh adds the waiting row and keeps the counts-only request active.');
+ const countsLoaded=changed(footer());
+ counts.finish('<aside>Counts before linked status</aside>');
+ await countsLoaded;
+ check(requests.length===5 && requests[4].url.endsWith('?counts=1&linked-reviews=1'),
+  'The completed counts request starts one follow-up for the linked status.');
+ const links=requests[4];
+ if(links){
+  const statusLoaded=changed(summary(2));
+  links.finish('<aside>Final counts</aside>'+CURRENT_UPDATES);
+  await statusLoaded;
+  check(summary(2).textContent==='Unchanged review status',
+   'The follow-up fills the new row without another refresh.');
+ }
+ check(requests.length===5 && deadlines.every(deadline=>deadline.milliseconds===4000),
+  'Each request uses the configured time limit.');
+ const result=document.createElement('p');
+ result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
+})();
+</script>""".replace("UPDATED_PAGE", json.dumps(refreshed).replace("</", "<\\/")).replace(
+            "COUNTS_ONLY_PAGE", json.dumps(counts_only).replace("</", "<\\/")).replace(
+            "FIRST_UPDATES", json.dumps(first_updates).replace("</", "<\\/")).replace(
+            "CURRENT_UPDATES", json.dumps(current_updates).replace("</", "<\\/")).replace(
+            "UNAVAILABLE", json.dumps(list_page.REVIEW_UNAVAILABLE))
+        self.browser_actions(markup, setup, probe)
 
     def test_counts_use_status_line_readers(self) -> None:
         owners: list[staff.StaffRow] = []
@@ -5584,8 +5771,16 @@ try{
  }
  check(new Set(requestIds).size===4,'each new action uses a fresh request');
  realFeedback=true;failRefresh=false;
+ const beforeRefresh=document.querySelector('[data-list]');
+ const replaced=new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{
+   if(beforeRefresh.isConnected) return;
+   observer.disconnect();resolve();
+  });
+  observer.observe(beforeRefresh.parentElement,{childList:true});
+ });
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
- await flush();await flush();await flush();await flush();
+ await replaced;
  realFeedback=false;failRefresh=true;
  location.hash=new URLSearchParams({show:'closed',sort:'#',dir:'desc'});await flush();
  check(visible().map(row=>row.dataset.number).join(',')==='106,105,63,58' && selectedShow()==='all','An old Closed address opens All in the requested sort order.');
