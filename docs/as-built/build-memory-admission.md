@@ -950,7 +950,7 @@ Exit 3 still means the caller is not a registered worker; only that exit permits
 `queue_place` uses the client in process. Its public call retains `before_check`.
 The build queue has one way in. `queue_place.request_place` is the one requester, and `queue_place.release_place` is the one releaser.
 `request_place` takes a `RefreshedRequest` (a step or program request, local or cloud), a `RefreshedLaunch` or a `ServiceEstimateRequest` (a CI cargo call).
-`release_place` defers cleanup signals while it releases.
+`release_place` uses the caller's signal handling while it releases.
 `queue_place.held_reservation` uses both. It waits for the grant, then releases it with the holder's status when the holder exits, also after an exception.
 `queue_place`, the cloud route's `cloud_reservation` and `ci_cargo_front.py` use `held_reservation`.
 `memory_gate.sh` runs `queue_place.py admit`, `launch` and `release` (`BUILDLOG_QUEUE_PLACE_SCRIPT`) for verify steps and BRP launches. These shell actions use the same two calls.
@@ -965,12 +965,13 @@ The hook runs before each attempt and after a grant. An exception after a grant 
 `popen` starts the program in its own scope, nested when the holder already runs in `builds.slice`.
 Without a scope, it raises `QueuePlaceRefused` before the fork.
 Only `BUILDLOG_SCOPE=0` enables process-tree sampling for tests.
-`finish()` rereads `cgroup.procs` until empty before release. It sends TERM, then uses `cgroup.kill` after `program_stop_seconds`.
+`finish()` gives the program and sampler `program_stop_seconds` to stop.
+It sends TERM during the first half of that time.
+It uses `cgroup.kill` or sends KILL during the second half.
+If it cannot confirm that the program and sampler stopped, it reports `UNRESOLVED` and keeps the recovery record.
 The scoped wrapper requires a published sidecar and a live holder before program execution.
-`QueuePlace.popen` installs no signal handler.
-It masks TERM, INT, and HUP until program publication and the `on_started` callback finish.
-It then restores the caller's previous signal mask.
-The program wrapper unblocks these signals before exec.
+`QueuePlace.popen` uses the caller's signal handling during program publication and the `on_started` callback.
+The program wrapper unblocks TERM, INT, and HUP before exec.
 The program wrapper atomically publishes a `ProgramStart` record before execution.
 The record contains the holder identity, program identity, and memory scope.
 The wrapper checks the holder's PID and start time before and after publication.
@@ -981,11 +982,10 @@ It removes their records after their scopes or process trees become empty.
 Normal cleanup removes the record after the program and its descendants stop.
 Temporary queue-place folder names contain the holder's PID and start time.
 The next start removes this account's folders after those exact holders end.
-Folder allocation and removal use a signal mask and install no handler.
+Folder allocation and removal use the caller's signal handling.
 SIGTERM uses its default action and can leave cleanup for the next start or service read.
 Python's default SIGINT raises `KeyboardInterrupt` and runs the existing cleanup blocks.
-`defer_cleanup_signals` retains its signal mask during normal cleanup.
-It uses `pthread_sigmask` and installs no handler.
+Cleanup uses the caller's signal handling.
 
 ### Startup, cut-over, and rollback
 

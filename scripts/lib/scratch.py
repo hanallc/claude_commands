@@ -303,8 +303,25 @@ def busy_path(path: Path) -> Path:
     return path / BUSY
 
 
+def lock_copy_descriptor(descriptor: int, operation: int, *, wait: bool = True,
+                         deadline: float | None = None) -> None:
+    """Acquire a copy lock within the given deadline when it has one."""
+    if not wait or deadline is not None:
+        operation |= fcntl.LOCK_NB
+    while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise CopyLockTimeout("the scratch copy lock is still held")
+        try:
+            fcntl.flock(descriptor, operation)
+            return
+        except BlockingIOError:
+            if deadline is None:
+                raise
+            time.sleep(max(0, min(0.05, deadline - time.monotonic())))
+
+
 @contextmanager
-def copy_lock(path: Path, *,
+def copy_lock(path: Path, *, deadline: float | None = None,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Generator[None]:
     if isinstance(scratch_settings, UseConfiguredValue):
@@ -319,8 +336,8 @@ def copy_lock(path: Path, *,
     mark = busy_path(folder)
     lock = open_busy_mark(mark, create=True)
     try:
-        fcntl.flock(lock, fcntl.LOCK_SH)
-        with copy_record_lock(folder, scratch_settings=scratch_settings):
+        lock_copy_descriptor(lock, fcntl.LOCK_SH, deadline=deadline)
+        with copy_record_lock(folder, deadline=deadline, scratch_settings=scratch_settings):
             # A remover can unlink the mark while this holder waits on its old inode.
             # Recheck after the record lock too: deletion can finish while it waits.
             held = os.fstat(lock)
@@ -343,16 +360,16 @@ def copy_lock(path: Path, *,
 
 
 @contextmanager
-def copy_record_lock(path: Path, *,
+def copy_record_lock(path: Path, *, deadline: float | None = None,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Generator[None]:
     """Serialize record changes and deletion on the existing directory, without creating a file."""
-    with directory_record_lock(path, wait=True, scratch_settings=scratch_settings):
+    with directory_record_lock(path, wait=True, deadline=deadline, scratch_settings=scratch_settings):
         yield
 
 
 @contextmanager
-def directory_record_lock(path: Path, *, wait: bool,
+def directory_record_lock(path: Path, *, wait: bool, deadline: float | None = None,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Generator[bool]:
     """Lock the directory still at path; readers can decline to wait on another copy."""
@@ -370,7 +387,7 @@ def directory_record_lock(path: Path, *, wait: bool,
             reentered = identity in RECORD_LOCKS.get()
             if not reentered:
                 try:
-                    fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+                    lock_copy_descriptor(descriptor, fcntl.LOCK_EX, wait=wait, deadline=deadline)
                 except BlockingIOError:
                     if wait:
                         raise
@@ -572,6 +589,10 @@ def update_record(path: Path, change: Callable[[copy_record.Registered | copy_re
 
 
 class ScratchError(Exception):
+    pass
+
+
+class CopyLockTimeout(ScratchError):
     pass
 
 

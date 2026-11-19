@@ -862,8 +862,12 @@ class GateRecovery:
                 except BlockingIOError:
                     print(f"Recovered gate {self.pid}: rollback waits for the live gate in {repo}", flush=True)
                     return
-                _ = cleanup.enter_context(scratch.copy_lock(repo))
-                self.rollback_deadline = time.monotonic() + stop_seconds
+                deadline = time.monotonic() + stop_seconds
+                try:
+                    _ = cleanup.enter_context(scratch.copy_lock(repo, deadline=deadline))
+                except scratch.CopyLockTimeout as error:
+                    raise GateRefused(f"UNRESOLVED: {error} in {repo}") from error
+                self.rollback_deadline = deadline
                 try:
                     head = checked_git(repo, "rev-parse", "HEAD")
                     if head not in (self.rollback, self.rollback_head):

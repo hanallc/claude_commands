@@ -72,6 +72,10 @@ class CheckerFailure(ValueError):
     pass
 
 
+class ReleaseDeadlineExceeded(RuntimeError):
+    """The service did not confirm release before the deadline."""
+
+
 class _QueueUnreachable(Exception):
     pass
 
@@ -477,6 +481,7 @@ def nested_reservation_reason() -> str:
 def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
           refresh: Callable[[], wire.AdmitRequest | wire.LaunchRequest] | None = None,
           *, attempt: Callable[[], None] = _no_attempt_hook, channel: EstimateConnection | None = None,
+          deadline: float = math.inf,
           configuration: records.MemoryConfig | wire.AcquisitionTiming | wire.CleanupTiming | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE
           ) -> wire.Admitted | wire.LaunchAdmitted | wire.Refused | wire.Ok | wire.BuildHistoryReply | LeftQueue | wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus | wire.FirstAuthorization | wire.RepositorySlotReady | wire.RepositorySlotExpired | status_wire.PlacementStatusReply:
     if isinstance(request, (wire.AdmitRequest, wire.ServiceEstimateRequest, wire.LaunchRequest, wire.PlacementRequest)):
@@ -490,9 +495,10 @@ def _call(request: wire.Request, on_wait: Callable[[wire.Wait], None],
     if retry is None:
         limit = _whole_seconds("BUILDLOG_MEM_WAIT_LIMIT_S", 900)
         launch = isinstance(request, wire.LaunchRequest)
-        deadline = (CLOCK.monotonic() + max(0.0, request.deadline - CLOCK.now())
-                    if isinstance(request, wire.RepositorySlotRequest) else
-                    CLOCK.monotonic() + limit if launch and limit > 0 else float("inf"))
+        if isinstance(request, wire.RepositorySlotRequest):
+            deadline = CLOCK.monotonic() + max(0.0, request.deadline - CLOCK.now())
+        elif launch and limit > 0:
+            deadline = CLOCK.monotonic() + limit
         retry = AcquisitionRetry(deadline, launch_without_wait=launch and limit == 0)
     token = _ACQUISITION_RETRY.set(retry)
     was_refreshing = retry.estimate_refresh_pending
@@ -557,6 +563,8 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                     if isinstance(first, wire.RepositorySlotRequest) else None)
 
     def deadline_reply() -> wire.Refused | wire.RepositorySlotExpired:
+        if isinstance(first, wire.ReleaseRequest):
+            raise ReleaseDeadlineExceeded(f"the service did not confirm release of reservation {first.reservation}")
         if slot_waiting is not None:
             return wire.RepositorySlotExpired(slot_waiting.expired_text)
         return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
@@ -707,7 +715,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                     if retry.left_queue():
                         return LeftQueue()
                     if CLOCK.monotonic() >= retry.deadline:
-                        return _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
+                        return deadline_reply()
                     if isinstance(cause, records.EstimateExpired):
                         if isinstance(first, wire.ServiceEstimateRequest):
                             refreshed = first
@@ -751,7 +759,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                 if retry.left_queue():
                     return LeftQueue()
                 if CLOCK.monotonic() >= retry.deadline:
-                    return _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
+                    return deadline_reply()
                 check_unreachable()
                 print(f"memory admission check failed ({reason}); trying again, the step keeps its place", file=sys.stderr)
                 if not retry_estimator or refresh is None or not isinstance(first, (wire.AdmitRequest, wire.LaunchRequest)):
@@ -848,8 +856,9 @@ def _silence_notice(last_valid: float) -> None:
 
 
 def _mutation(request: wire.ReleaseRequest | wire.WidthRequest | wire.PrioritySetRequest | wire.PriorityClearRequest | wire.TokenWaitRequest,
-              configuration: records.MemoryConfig | wire.CleanupTiming | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE) -> wire.Ok | wire.Refused:
-    return cast(wire.Ok | wire.Refused, _call(request, lambda waiting: None, configuration=configuration))
+              configuration: records.MemoryConfig | wire.CleanupTiming | ReadConfigurationAtUse = READ_CONFIGURATION_AT_USE,
+              *, deadline: float = math.inf) -> wire.Ok | wire.Refused:
+    return cast(wire.Ok | wire.Refused, _call(request, lambda waiting: None, configuration=configuration, deadline=deadline))
 
 
 def request_id() -> str:
@@ -874,8 +883,9 @@ def service_admit(request: wire.ServiceEstimateRequest, on_wait: Callable[[wire.
     return wire.Refused("invalid service estimate answer")
 
 
-def release(reservation: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming) -> wire.Ok | wire.Refused:
-    return _mutation(wire.ReleaseRequest(request_id(), reservation, status), configuration)
+def release(reservation: str, status: int, configuration: records.MemoryConfig | wire.CleanupTiming,
+            *, deadline: float = math.inf) -> wire.Ok | wire.Refused:
+    return _mutation(wire.ReleaseRequest(request_id(), reservation, status), configuration, deadline=deadline)
 
 
 def width(reservation: str, width: int) -> wire.Ok | wire.Refused:
