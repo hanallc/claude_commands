@@ -3415,6 +3415,12 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
             request_id, kind, owner, 'Which layout should the page use?', review_submissions.NoEvidence()))
         return f'question/{owner}/{filed.path.name}'
 
+    def file_response(self, owner: staff.StaffId) -> str:
+        request = self.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner)
+        saved = review_submissions.submit(request)
+        self.assertTrue(review_submissions.answer(saved.key, 'Use the wide layout.', saved.reply_token))
+        return f'question/{owner}/{saved.path.name}'
+
     def test_sent_question_feedback_recovers_when_the_saved_mark_write_fails(self) -> None:
         key = self.file_sent_question()
         words = 'Use the wide layout for the next review.'
@@ -3517,10 +3523,14 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         open_record = investigation.file(producer.id, "Why did the gate stop?", "Read the gate log.",
                                          waiting_why="The producer checks the gate.")
         record = investigation.answer(producer.id, open_record.id, "The repair is ready.")
-        for key in (question, f'investigation/{record.owner}/{record.id}'):
+        cases = ((question, 'feedback'), (f'investigation/{record.owner}/{record.id}', 'feedback'),
+                 (self.file_response(producer.id), 'question'))
+        for key, action in cases:
             with self.subTest(key=key):
                 words = f'Keep the feedback for {key}.'
-                delivery, _ = review_page.submit(self.root, self.body(key, 'feedback', words), self.status)
+                snapshot = review_page.build_snapshot(self.root)
+                body = self.card_body(snapshot, key, action, words)
+                delivery, _ = review_page.submit(self.root, body, self.status, snapshot=snapshot)
                 assert isinstance(delivery, change_page.MessageDelivery)
                 path = self.status.path(delivery.page, delivery.row)
                 original_message = delivery.message
@@ -3558,16 +3568,20 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
 
     def test_recovery_reuses_the_send_key_when_the_result_write_fails(self) -> None:
         sent: dict[str, str] = {}
-        for case in ("investigation", "change"):
+        for case in ("investigation", "change", "response"):
             with self.subTest(case=case):
                 if case == "investigation":
                     record = self.investigation()
                     key = f'investigation/{record.owner}/{record.id}'
                     action = "feedback"
-                else:
+                elif case == "change":
                     key, action = "page-owner/C1", "works"
+                else:
+                    key, action = self.file_response(self.ready_submission_recipient().id), "question"
                 words = "Keep the saved layout."
-                delivery, _ = review_page.submit(self.root, self.body(key, action, words), self.status)
+                snapshot = review_page.build_snapshot(self.root) if case == "response" else None
+                body = self.card_body(snapshot, key, action, words) if snapshot else self.body(key, action, words)
+                delivery, _ = review_page.submit(self.root, body, self.status, snapshot=snapshot)
                 assert isinstance(delivery, change_page.MessageDelivery)
                 file = self.status.closeout_path(delivery.page, delivery.row)
                 write = atomic_file.write_bytes_atomic
@@ -3587,17 +3601,26 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 with patch.object(change_page, "send_message", new=relay):
                     with patch.object(atomic_file, "write_bytes_atomic", new=stop):
                         change_page.recover_pending(change_page.DeliveryStatus(self.root))
-                    if case == "investigation":
+                    if case in ("investigation", "response"):
                         verdict = self.status.slots(delivery.page, delivery.row).verdict
                         assert isinstance(verdict, change_page.DeliveryIntent)
                         self.assertEqual(verdict.attempt, delivery.attempt)
+                    if case == "response":
+                        current = review_page.build_snapshot(self.root)
+                        self.assertEqual(current.records[key].state, review_items.ReviewState.WAITING)
+                        for source in (current, None):
+                            with self.assertRaises(review_items.ReviewRecordChanged):
+                                _ = review_page.submit(self.root, body, self.status, snapshot=source)
+                            replayed = self.status.slots(delivery.page, delivery.row).verdict
+                            assert isinstance(replayed, change_page.DeliveryIntent)
+                            self.assertEqual(replayed.attempt, delivery.attempt)
                     change_page.recover_pending(change_page.DeliveryStatus(self.root))
                 send_key = change_page.review_delivery_key(delivery.page.review_list, delivery.row, delivery.attempt)
                 self.assertEqual(seen, [send_key] * 2)
                 if case == "investigation":
                     self.assertEqual(sum(words in message for message in sent.values()), 1)
                 self.assertIsInstance(self.status.slots(delivery.page, delivery.row).verdict, change_page.NoDelivery)
-        self.assertEqual(len(sent), 2)
+        self.assertEqual(len(sent), 3)
 
     def test_validating_question_recovers_after_receipt_and_result_write_failures(self) -> None:
         words = 'Keep the saved layout.'

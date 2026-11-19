@@ -908,6 +908,24 @@ def review_fields(body: str) -> dict[str, list[str]]:
     return fields
 
 
+def repeats_response_followup(item: ReviewItem, outcome: str, words: str, status: change_page.DeliveryStatus) -> bool:
+    """Keep the saved delivery when the form repeats the current follow-up."""
+    source = item.source
+    if outcome != 'question' or 'question' not in item.actions or not isinstance(source, review_items.QuestionSource):
+        return False
+    fields = source.record.item
+    pending = fields.get('followup')
+    if not fields.get('followups') or pending is None or pending['text'] != words.strip():
+        return False
+    if 'review_submission' not in fields:
+        return False
+    reply = new_item_dialog.read_submission(fields['review_submission'])
+    path = source.record.path
+    page = status.metadata_page(change_page.ReviewPage(path, path.parent, (path.stem,), ''))
+    return (isinstance(page, change_page.UserQuestionPage) and page.saved.get('kind') == 'question'
+            and page.saved.get('question_id') == reply.reply_token and page.saved.get('question_text') == pending['text'])
+
+
 def submit_response(item: ReviewItem, outcome: str, words: str, status: change_page.DeliveryStatus,
                     verify_revision: Callable[[], ReviewItem]
                     ) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
@@ -1009,6 +1027,8 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
     if key.startswith('question/'):
         question_item = next((item for item in review_items.read(root, kinds=review_items.QUESTION_TYPES)
                               if item.key == key), None)
+        if question_item is not None and repeats_response_followup(question_item, outcome, words, status):
+            raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
         if question_item is not None and question_item.type == ReviewType.RESPONSE:
             def validate_response() -> ReviewItem:
                 current = review_items.read_current(root, question_item, staff.snapshot())

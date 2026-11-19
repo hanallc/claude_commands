@@ -29,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from http.client import HTTPConnection, RemoteDisconnected
 from io import StringIO
 from pathlib import Path
-from unittest.mock import ANY, call, patch
+from unittest.mock import ANY, Mock, call, patch
 
 
 from typing import TextIO, cast, override
@@ -91,6 +91,18 @@ def setUpModule() -> None:
     _ = (configuration / "statusline.conf").write_text(ROLE_COLOR_CONFIG, encoding="utf-8")
     _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {
         "CONF_DIR": str(configuration), "USER_ZONE": "America/New_York"})))
+
+
+@contextmanager
+def capture_sender(name: str) -> Generator[Mock]:
+    """Capture the recipient, sender, and message of a keyed send."""
+    send = Mock()
+
+    def capture(recipient: str, sender: str, message: str, **_options: str) -> None:
+        _ = cast(object, send(recipient, sender, message))
+
+    with patch.object(change_page, name, new=capture):
+        yield send
 
 
 class ReviewLinksServerTests(unittest.TestCase):
@@ -279,7 +291,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         with (patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
-              patch.object(change_page, "send_message") as send):
+              capture_sender("send_message") as send):
             cases = (
                 (new_item_dialog.SubmissionKind.QUESTION, review_items.ReviewType.QUESTION),
                 (new_item_dialog.SubmissionKind.INVESTIGATION, review_items.ReviewType.INVESTIGATION),
@@ -801,7 +813,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 raise OSError("The case write failed.\nFixture detail.")
             return create_text(path, text)
 
-        def delivered(_owner: staff.StaffId, _sender: str, _message: str) -> None:
+        def delivered(_owner: staff.StaffId, _sender: str, _message: str, **_options: str) -> None:
             events.append("delivery")
 
         errors = StringIO()
@@ -830,7 +842,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 raise OSError("The fixture did not release Firefox.")
             return base64.b64decode(PNG)
 
-        def note_delivery(_owner: staff.StaffId, _sender: str, _message: str) -> None:
+        def note_delivery(_owner: staff.StaffId, _sender: str, _message: str, **_options: str) -> None:
             delivered.set()
 
         with (patch.object(shutil, "which", side_effect=fake_firefox),
@@ -977,7 +989,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             attach(saved, png)
             attached.set()
 
-        def message_sent(_recipient: staff.StaffId, _sender: str, _message: str) -> None:
+        def message_sent(_recipient: staff.StaffId, _sender: str, _message: str, **_options: str) -> None:
             delivered.set()
 
         with (patch.object(server, "review_cache", cache), patch.object(server, "delivery_status", case.status),
@@ -1102,7 +1114,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertEqual(fields["page_owner"], morty.id if page == "list" else owner.id)
         with (patch.object(self.server, "review_cache", cache),
               patch.object(self.server, "delivery_status", case.status),
-              patch.object(change_page, "send_message") as send):
+              capture_sender("send_message") as send):
             for page, kind in (("", new_item_dialog.SubmissionKind.QUESTION),
                                ("review", new_item_dialog.SubmissionKind.INVESTIGATION),
                                ("images", new_item_dialog.SubmissionKind.BUG)):
@@ -1753,7 +1765,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         request = case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id)
         with (patch.object(self.server, 'review_cache', cache),
               patch.object(self.server, 'delivery_status', case.status),
-              patch.object(change_page, 'send_to_staff') as send):
+              capture_sender('send_to_staff') as send):
             created = self.new_item_http(self.new_item_body(request), finished=True)
             self.assertEqual(created.status, 200, created.body)
             sent = cast(dict[str, str], json.loads(created.body))
