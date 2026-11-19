@@ -6,8 +6,7 @@ try:
 except FileNotFoundError:
     pass
 
-from collections.abc import Sequence
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager
 import ctypes
 from dataclasses import dataclass
@@ -103,7 +102,7 @@ def end_with_front(front_pid: int) -> None:
         os._exit(1)
 
 
-def remove_abandoned_folders(shared_folder: Path) -> None:
+def remove_abandoned_folders(shared_folder: Path, kept_sidecars: set[Path]) -> None:
     """Remove this user's shared admission folders when their owners are not live."""
     uid = os.getuid()
     prefix = f"build-admission-ci-{uid}-"
@@ -118,26 +117,26 @@ def remove_abandoned_folders(shared_folder: Path) -> None:
                 if (len(owner) == 3 and owner[0].isdecimal() and owner[1].isdecimal()
                         and records.process_start_time(int(owner[0])) == owner[1]):
                     continue
+                if Path(entry.path) / "cargo.cgroup" in kept_sidecars:
+                    continue
                 shutil.rmtree(entry.path)
             except FileNotFoundError:
                 pass
 
 
 @contextmanager
-def cargo_folder(prefix: str, parent: Path | None) -> Generator[str]:
+def cargo_folder(prefix: str, parent: Path | None, keep: Callable[[], bool]) -> Generator[str]:
     folder = tempfile.mkdtemp(prefix=prefix, dir=parent)
-    keep = False
     try:
         yield folder
-    except queue_place.CleanupUnresolved:
-        keep = True
-        raise
     finally:
-        if not keep:
+        if not keep():
             queue_place.remove_program_folder(Path(folder))
 
 
 def stop_progress_reader(reader: threading.Thread, timeout: float) -> None:
+    if reader.ident is None:
+        return
     reader.join(timeout=timeout)
     if reader.is_alive():
         raise queue_place.CleanupUnresolved("the Cargo progress reader did not stop")
@@ -155,7 +154,9 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
     prefix = f"build-admission-ci-{os.getuid()}-"
     if isinstance(shared_folder, Path):
         prefix += f"{pid}-{start}-"
-    with cargo_folder(prefix, shared_folder if isinstance(shared_folder, Path) else None) as folder:
+    held: queue_place.HeldReservation | None = None
+    with cargo_folder(prefix, shared_folder if isinstance(shared_folder, Path) else None,
+                      keep=lambda: held is not None and not held.released) as folder:
         directory = Path(folder)
         directory.chmod(0o755)
         sidecar = directory / "cargo.cgroup"
@@ -176,13 +177,13 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
                 print("the service estimate grant has no runner timing", file=sys.stderr)
                 return 1
             if isinstance(shared_folder, Path):
-                queue_place.cleanup_program_starts(grant.execution)
-                remove_abandoned_folders(shared_folder)
+                remove_abandoned_folders(shared_folder, queue_place.cleanup_program_starts(grant.execution))
             place = queue_place.QueuePlace(sidecar, sidecar, configuration=grant.execution,
                 purpose=queue_place.ProgramPurpose.RUNNER, arguments=tuple(argv))
             environment = dict(os.environ, PATH=child_path, CARGO_TERM_PROGRESS_WHEN="always", CARGO_TERM_PROGRESS_WIDTH="80")
             status = 1
             cleanup = ExitStack()
+            held.keep = True
             try:
                 _ = adopt_descendants()
                 # The main thread forks because the death signal follows the thread that forks.
@@ -192,15 +193,14 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
                 if stream is None:
                     raise RuntimeError("cargo progress pipe is unavailable")
                 reader = threading.Thread(target=capture_progress, args=(stream.fileno(), sidecar), daemon=True)
-                reader.start()
                 _ = cleanup.callback(stream.close)
                 _ = cleanup.callback(stop_progress_reader, reader, grant.execution.program_stop_seconds)
+                reader.start()
                 status = process.wait()
             except SystemExit as error:
                 status = error.code if isinstance(error.code, int) else 1
                 raise
             finally:
-                held.keep = True
                 try:
                     place.finish(failed=status != 0)
                 finally:

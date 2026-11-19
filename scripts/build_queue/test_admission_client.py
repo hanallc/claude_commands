@@ -1533,13 +1533,18 @@ else:
 """
         checkout = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, config_environment(Path(directory))):
-            for terminate in (False, True):
-                with self.subTest(terminate=terminate), short_socket_directory() as socket_directory, \
+            shell = ("from scripts.build_queue import queue_place; "
+                     + "raise SystemExit(queue_place.main(['release', 'fixture', '0']))")
+            for source, code in ((program, 0), (shell, 2)):
+                with self.subTest(shell=source == shell), short_socket_directory() as socket_directory, \
                         socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
-                    self.assert_release_stops(program, checkout, Path(socket_directory) / "s", listener, terminate)
+                    self.assert_release_stops(source, checkout, Path(socket_directory) / "s", listener,
+                                              terminate=False, deadline_status=code)
+            with short_socket_directory() as socket_directory, socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                self.assert_release_stops(program, checkout, Path(socket_directory) / "s", listener, terminate=True)
 
     def assert_release_stops(self, program: str, checkout: Path, path: Path, listener: socket.socket,
-                             terminate: bool) -> None:
+                             *, terminate: bool, deadline_status: int = 0) -> None:
         directory = os.environ["CONF_DIR"]
         root = Path(directory)
         write_memory_config(root / "build_admission.conf", program_stop_seconds="60" if terminate else "1")
@@ -1559,9 +1564,9 @@ else:
                     if terminate:
                         child.terminate()
                     output, errors = child.communicate(timeout=5)
-                    self.assertEqual(child.returncode, -signal.SIGTERM if terminate else 0, output + errors)
+                    self.assertEqual(child.returncode, -signal.SIGTERM if terminate else deadline_status, output + errors)
                     if not terminate:
-                        self.assertIn("did not confirm release of reservation fixture", output)
+                        self.assertIn("did not confirm release of reservation fixture", output + errors)
             finally:
                 if child.poll() is None:
                     child.kill()

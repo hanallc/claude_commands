@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from enum import Enum, auto
 import os
 from pathlib import Path
+import select
 import signal
 import shutil
 import subprocess
@@ -200,20 +201,41 @@ class ProgramStart:
     holder: wire.Owner
     program: wire.Owner
     scope: str
+    ready: bool = True
+    sidecar: str = ""
 
 
 def program_starts() -> Path:
     return store.root() / "program-starts"
 
 
-def program_start(record: Path, holder: wire.Owner, argv: Sequence[str], *, scope: str = "") -> None:
+def read_program_start(record: Path) -> ProgramStart | None:
+    try:
+        return wire.parse_record(record.read_text(), ProgramStart)
+    except FileNotFoundError:
+        return None
+
+
+def wait_for_start(descriptor: int, stop_seconds: float) -> None:
+    with os.fdopen(descriptor, "rb") as permission:
+        if not select.select([permission], [], [], stop_seconds)[0] or permission.read(1) != b"1":
+            raise QueuePlaceRefused("the queue place holder did not authorize startup")
+
+
+def program_start(record: Path, holder: wire.Owner, argv: Sequence[str], *,
+                  sidecar: Path, scope: str = "") -> None:
     """Publish ownership before execution and reject a dead holder."""
     if admission_records.process_start_time(holder.pid) != holder.start_time:
         raise QueuePlaceRefused("the queue place holder exited before program startup")
     start = admission_records.process_start_time(os.getpid())
     if start is None:
         raise QueuePlaceRefused("the program has no live process identity")
-    atomic_file.write_text_atomic(record, wire.encode_record(ProgramStart(holder, wire.Owner(os.getpid(), start), scope)))
+    owner = wire.Owner(os.getpid(), start)
+    if scope:
+        atomic_file.write_text_atomic(record, wire.encode_record(
+            ProgramStart(holder, owner, scope, ready=False, sidecar=str(sidecar))))
+        atomic_file.atomic_sample(sidecar, scope + "\n")
+    atomic_file.write_text_atomic(record, wire.encode_record(ProgramStart(holder, owner, scope, sidecar=str(sidecar))))
     if admission_records.process_start_time(holder.pid) != holder.start_time:
         raise QueuePlaceRefused("the queue place holder exited during program publication")
     _ = signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGINT, signal.SIGHUP})
@@ -250,7 +272,7 @@ def remove_program_folder(path: Path) -> None:
         raise CleanupUnresolved(f"could not remove {path}")
 
 
-def cleanup_queue_place_folders() -> None:
+def cleanup_queue_place_folders(kept_sidecars: set[Path]) -> None:
     """Remove this account's temporary folders after their exact holders end."""
     prefix = build_folders.FOLDER_PREFIXES["queue-place"]
     for path in build_folders.inherited_temporary_parent().glob(prefix + "*"):
@@ -259,6 +281,8 @@ def cleanup_queue_place_folders() -> None:
             continue
         if admission_records.process_start_time(int(fields[0])) == fields[1]:
             continue
+        if path / "program.cgroup" in kept_sidecars:
+            continue
         try:
             if not path.is_symlink() and path.is_dir() and path.stat().st_uid == os.getuid():
                 remove_program_folder(path)
@@ -266,46 +290,58 @@ def cleanup_queue_place_folders() -> None:
             pass
 
 
-def cleanup_program_starts(configuration: admission_records.MemoryConfig | wire.RunnerExecutionTiming) -> None:
+def cleanup_program_starts(configuration: admission_records.MemoryConfig | wire.RunnerExecutionTiming) -> set[Path]:
     """Stop recorded programs whose exact holders have ended."""
     directory = program_starts()
+    kept: set[Path] = set()
     if not directory.exists():
-        return
+        return kept
     for path in directory.iterdir():
         target = atomic_file.temporary_target(path.name)
         if target is not None:
             atomic_file.remove_dead_temporary_files(directory / target)
     for path in directory.glob("*.json"):
-        try:
-            record = wire.parse_record(path.read_text(), ProgramStart)
-        except FileNotFoundError:
-            continue
-        if admission_records.process_start_time(record.holder.pid) == record.holder.start_time:
+        record = read_program_start(path)
+        if record is None or admission_records.process_start_time(record.holder.pid) == record.holder.start_time:
             continue
         deadline = time.monotonic() + configuration.program_stop_seconds
-        if record.scope:
-            stop_scope(Path(record.scope), deadline, configuration.program_sample_seconds)
-        else:
-            start = admission_records.process_start_time(record.program.pid)
-            if start is None or start == record.program.start_time:
-                tree = ProgramTree(record.program.pid)
-                tree.observed[record.program.pid] = record.program.start_time
-                stop_members(lambda: tree.live_members(set()), deadline, configuration.program_sample_seconds)
-        path.unlink(missing_ok=True)
+        try:
+            if record.scope:
+                stop_scope(Path(record.scope), deadline, configuration.program_sample_seconds)
+            else:
+                start = admission_records.process_start_time(record.program.pid)
+                if start is None or start == record.program.start_time:
+                    tree = ProgramTree(record.program.pid)
+                    tree.observed[record.program.pid] = record.program.start_time
+                    stop_members(lambda: tree.live_members(set()), deadline, configuration.program_sample_seconds)
+                published = read_program_start(path)
+                if published is not None and published.scope:
+                    stop_scope(Path(published.scope), deadline, configuration.program_sample_seconds)
+            path.unlink(missing_ok=True)
+        except (CleanupUnresolved, OSError) as error:
+            if record.sidecar:
+                kept.add(Path(record.sidecar))
+            print(f"UNRESOLVED: recovery kept {path}: {error}", file=sys.stderr)
+    return kept
 
 
-def scope_start(sidecar: Path, holder_pid: int, holder_start: str, argv: Sequence[str], *, record: Path) -> None:
-    """Publish the scope and confirm its holder before the program starts."""
-    if admission_records.process_start_time(holder_pid) != holder_start:
-        raise QueuePlaceRefused("the queue place holder exited before scope startup")
+def program_scope() -> Path | None:
     for line in Path("/proc/self/cgroup").read_text().splitlines():
         if line.startswith("0::") and "/builds.slice/" in line:
-            scope = Path("/sys/fs/cgroup") / line[3:].lstrip("/")
-            atomic_file.atomic_sample(sidecar, str(scope) + "\n")
-            if admission_records.process_start_time(holder_pid) != holder_start:
-                raise QueuePlaceRefused("the queue place holder exited during scope publication")
-            program_start(record, wire.Owner(holder_pid, holder_start), argv, scope=sidecar.read_text().strip())
-    raise QueuePlaceRefused("the program did not enter its memory scope")
+            return Path("/sys/fs/cgroup") / line[3:].lstrip("/")
+    return None
+
+
+def scope_start(sidecar: Path, holder_pid: int, holder_start: str, argv: Sequence[str], *,
+                record: Path, permission: int, stop_seconds: float) -> None:
+    """Publish the scope and confirm its holder before the program starts."""
+    wait_for_start(permission, stop_seconds)
+    if admission_records.process_start_time(holder_pid) != holder_start:
+        raise QueuePlaceRefused("the queue place holder exited before scope startup")
+    scope = program_scope()
+    if scope is None:
+        raise QueuePlaceRefused("the program did not enter its memory scope")
+    program_start(record, wire.Owner(holder_pid, holder_start), argv, sidecar=sidecar, scope=str(scope))
 
 
 def stop_scope(scope: Path, deadline: float, sample_seconds: float) -> None:
@@ -414,31 +450,42 @@ class QueuePlace:
         holder_start = admission_records.process_start_time(holder_pid)
         if holder_start is None:
             raise QueuePlaceRefused("the queue place holder has no live process identity")
-        cleanup_program_starts(self.configuration)
+        _ = cleanup_program_starts(self.configuration)
         directory = program_starts()
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         record = directory / (uuid.uuid4().hex + ".json")
         wrapper = [sys.executable, str(Path(__file__).resolve())]
-        command = ([*prefix, *wrapper, "--scope-start", str(self.sidecar), str(holder_pid), holder_start, str(record), *argv]
-                   if prefix else [*wrapper, "--program-start", str(record), str(holder_pid), holder_start, *argv])
-        process = subprocess.Popen(command, **popen_arguments)
-        stopped = threading.Event()
-        tracking: ScopedProgram | ProgramTree = ScopedProgram()
-        if not prefix:
-            tracking = ProgramTree(process.pid)
-            if self.purpose == ProgramPurpose.RUNNER:
-                tracking.adopter = wire.Owner(holder_pid, holder_start)
+        holder = wire.Owner(holder_pid, holder_start)
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, "rb") as reader, os.fdopen(write_fd, "wb", buffering=0) as permission:
+            action = "--scope-start" if prefix else "--program-start"
+            command = [*prefix, *wrapper, action, str(self.sidecar), str(holder_pid), holder_start,
+                       str(record), str(read_fd), str(self.configuration.program_stop_seconds), *argv]
+            popen_arguments["pass_fds"] = (*popen_arguments.get("pass_fds", ()), reader.fileno())
+            process = subprocess.Popen(command, **popen_arguments)
+            stopped = threading.Event()
+            tracking = (ScopedProgram() if prefix else ProgramTree(process.pid))
+            sampler = (UnmeasuredProbe() if self.purpose == ProgramPurpose.PROBE else
+                       threading.Thread(target=self._sample, args=(tracking, stopped), daemon=True))
+            self.program = StartedProgram(process, stopped, sampler, tracking, record)
             start = admission_records.process_start_time(process.pid)
-            if start is not None:
+            if start is None:
+                raise QueuePlaceRefused("the program has no live process identity")
+            if isinstance(tracking, ProgramTree):
+                if self.purpose == ProgramPurpose.RUNNER:
+                    tracking.adopter = holder
                 tracking.observed[process.pid] = start
-        sampler = (UnmeasuredProbe() if self.purpose == ProgramPurpose.PROBE else
-                   threading.Thread(target=self._sample, args=(tracking, stopped), daemon=True))
-        self.program = StartedProgram(process, stopped, sampler, tracking, record)
-        if isinstance(sampler, threading.Thread):
-            sampler.start()
+            atomic_file.write_text_atomic(record, wire.encode_record(
+                ProgramStart(holder, wire.Owner(process.pid, start), "", ready=False, sidecar=str(self.sidecar))))
+            if isinstance(sampler, threading.Thread):
+                sampler.start()
+            _ = permission.write(b"1")
         deadline = time.monotonic() + self.configuration.program_stop_seconds
-        while not record.exists():
-            if process.poll() is not None and not record.exists():
+        while (published := read_program_start(record)) is None or not published.ready:
+            if process.poll() is not None:
+                published = read_program_start(record)
+                if published is not None and published.ready:
+                    break
                 raise QueuePlaceRefused("the program exited before it published its ownership")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -484,13 +531,15 @@ class QueuePlace:
         process = program.process
         config = self.configuration
         deadline = time.monotonic() + config.program_stop_seconds
+        scope = ""
         try:
             completed = process.poll()
             if isinstance(program.tracking, ScopedProgram):
-                scope = self.sidecar.read_text().strip()
+                published = read_program_start(program.record)
+                scope = published.scope if published is not None else ""
                 if scope:
                     stop_scope(Path(scope), deadline, config.program_sample_seconds)
-                else:
+                elif completed is None:
                     process.kill()
             else:
                 def live_members() -> dict[int, str]:
@@ -503,6 +552,10 @@ class QueuePlace:
                 _ = process.wait(timeout=max(0, deadline - time.monotonic()))
             except subprocess.TimeoutExpired as error:
                 raise CleanupUnresolved(f"program {process.pid} did not exit") from error
+            if isinstance(program.tracking, ScopedProgram):
+                published = read_program_start(program.record)
+                if published is not None and published.scope and published.scope != scope:
+                    stop_scope(Path(published.scope), deadline, config.program_sample_seconds)
             if completed is not None and not failed:
                 self.status = completed
         finally:
@@ -557,11 +610,19 @@ def release_place(reservation: str, status: int, timing: wire.CleanupTiming, *,
         raise CleanupUnresolved(str(error)) from error
 
 
+def shell_stop_seconds() -> float:
+    try:
+        return conf.read("build_admission").number("program_stop_seconds")
+    except conf.Unusable:
+        return wire.PROTOCOL_CLEANUP_TIMING.silence_seconds
+
+
 @dataclass
 class HeldReservation:
     grant: wire.Admitted
     status: int = 1
     keep: bool = False
+    released: bool = field(default=False, init=False)
 
 
 @contextmanager
@@ -576,13 +637,18 @@ def held_reservation(request: QueueRequest, *,
         raise QueuePlaceRefused(reply.reason)
     if not isinstance(reply, wire.Admitted):
         raise QueuePlaceRefused("left the admission queue")
-    output.finished()
     held = HeldReservation(reply)
+    if stop_seconds is None and isinstance(reply, wire.RunnerAdmitted):
+        stop_seconds = reply.execution.program_stop_seconds
     try:
+        output.finished()
         yield held
     finally:
         if not held.keep:
-            _ = release_place(reply.reservation, held.status, reply.cleanup_timing, stop_seconds=stop_seconds)
+            answer = release_place(reply.reservation, held.status, reply.cleanup_timing, stop_seconds=stop_seconds)
+            if isinstance(answer, wire.Refused):
+                raise CleanupUnresolved(f"the service refused release of reservation {reply.reservation}: {answer.reason}")
+            held.released = True
 
 
 @contextmanager
@@ -613,18 +679,19 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
         if first is None:
             raise QueuePlaceRefused(f"no first peak for {name} in build_admission.conf [memory]; {conf.path('build_admission')}: program_first_peak_gib.{name} is missing or invalid")
         estimate = admission_records.HistoryPeakSizing(first, admission_records.FirstProgramPeak(first), 0.0)
-    cleanup_program_starts(config)
-    cleanup_queue_place_folders()
+    cleanup_queue_place_folders(cleanup_program_starts(config))
     pid = os.getpid()
     start = admission_records.process_start_time(pid)
     if start is None:
         raise QueuePlaceRefused("owner no longer exists")
     # The reservation ends before its folder: the service can read the sidecar until release.
     keep_folder = False
-    with recoverable_tool_folder("queue-place", keep=lambda: keep_folder) as temporary, ExitStack() as reservation:
+    grant: HeldReservation | UnreservedProgram = UnreservedProgram()
+    with recoverable_tool_folder("queue-place", keep=lambda: keep_folder or
+                                 isinstance(grant, HeldReservation) and not grant.released) as temporary, \
+            ExitStack() as reservation:
         sidecar = temporary / "program.cgroup"
         atomic_file.atomic_sample(sidecar, "")
-        grant: HeldReservation | UnreservedProgram = UnreservedProgram()
         if purpose == ProgramPurpose.BATCH:
             assert not isinstance(estimate, ConfiguredFirstPeak)
             profile = (estimate if isinstance(estimate, admission_records.InferFromArgv) else
@@ -640,6 +707,9 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
         sample_path = (Path(grant.grant.max_path).with_suffix("") if isinstance(grant, HeldReservation)
                        else temporary / "program")
         place = QueuePlace(sample_path, sidecar, configuration=config, purpose=purpose, arguments=arguments)
+        keep_folder = True
+        if isinstance(grant, HeldReservation):
+            grant.keep = True
         failed = False
         try:
             yield place
@@ -649,9 +719,6 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
                             error.code if isinstance(error, SystemExit) and isinstance(error.code, int) else 1)
             raise
         finally:
-            keep_folder = True
-            if isinstance(grant, HeldReservation):
-                grant.keep = True
             place.finish(failed=failed)
             keep_folder = place.keep_reservation
             if isinstance(grant, HeldReservation):
@@ -734,7 +801,7 @@ def shell_wait(args: ShellArguments) -> int:
                 admission_client.write_shell_grant(args.shell_state, grant, output.elapsed_seconds())
             except BaseException:
                 if isinstance(grant, wire.Admitted):
-                    _ = release_place(grant.reservation, 1, grant.cleanup_timing)
+                    _ = release_place(grant.reservation, 1, grant.cleanup_timing, stop_seconds=shell_stop_seconds())
                 raise
         outcome = "Granted"
         output.finished()
@@ -762,16 +829,25 @@ def shell_wait(args: ShellArguments) -> int:
 def main(argv: list[str] | None = None) -> int:
     """Run a program in its queue place, or serve a shell step's admit, launch or release."""
     argv = sys.argv[1:] if argv is None else argv
-    if len(argv) >= 5 and argv[0] == "--scope-start":
-        scope_start(Path(argv[1]), int(argv[2]), argv[3], argv[5:], record=Path(argv[4]))
-        return 0
-    if len(argv) >= 5 and argv[0] == "--program-start":
-        program_start(Path(argv[1]), wire.Owner(int(argv[2]), argv[3]), argv[4:])
+    if len(argv) >= 8 and argv[0] in ("--scope-start", "--program-start"):
+        sidecar, holder, record = Path(argv[1]), wire.Owner(int(argv[2]), argv[3]), Path(argv[4])
+        permission, stop_seconds = int(argv[5]), float(argv[6])
+        if argv[0] == "--scope-start":
+            scope_start(sidecar, holder.pid, holder.start_time, argv[7:], record=record,
+                        permission=permission, stop_seconds=stop_seconds)
+        else:
+            wait_for_start(permission, stop_seconds)
+            program_start(record, holder, argv[7:], sidecar=sidecar)
         return 0
     if argv[:1] and argv[0] in SHELL_ACTIONS:
         args = shell_arguments(argv)
         if args.command == "release":
-            reply = release_place(args.reservation, args.status, admission_client.saved_cleanup_timing())
+            try:
+                reply = release_place(args.reservation, args.status, admission_client.saved_cleanup_timing(),
+                                      stop_seconds=shell_stop_seconds())
+            except CleanupUnresolved as error:
+                print(error, file=sys.stderr)
+                return 2
             if isinstance(reply, wire.Refused):
                 return 2
             print(wire.encode_record(reply))

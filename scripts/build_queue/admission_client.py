@@ -569,6 +569,8 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
             return wire.RepositorySlotExpired(slot_waiting.expired_text)
         return wire.Refused(LAUNCH_WAIT_LIMIT_REASON) if generation_query else _refused(LAUNCH_WAIT_LIMIT_REASON, checker=True)
 
+    bounded_release = isinstance(first, wire.ReleaseRequest) and math.isfinite(retry.deadline)
+
     def check_unreachable() -> None:
         if (not isinstance(configuration, wire.CleanupTiming)
                 and CLOCK.monotonic() >= retry.unreachable_deadline):
@@ -624,7 +626,8 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                             reply = wire.parse_reply(line, request)
                     except ValueError as error:
                         raise CheckerFailure(str(error)) from error
-                    if CLOCK.monotonic() > retry.deadline:
+                    replied_at = CLOCK.monotonic()
+                    if replied_at > retry.deadline or (bounded_release and replied_at == retry.deadline):
                         return deadline_reply()
                     cause = reply.reason if isinstance(reply, wire.Wait) else None
                     if isinstance(cause, records.HeadAdmissionStatus):
@@ -791,7 +794,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                 if not restarted:
                     print("admission service restarted; waiting again", file=sys.stderr)
                     restarted = True
-                if not retry.estimate_refresh_pending:
+                if not retry.estimate_refresh_pending and not bounded_release:
                     continue
             elif CLOCK.monotonic() - retry.last_outage_line >= (configuration.outage_notice_seconds if not isinstance(configuration, (wire.AcquisitionTiming, wire.CleanupTiming)) else configuration.silence_seconds):
                 reason = "no socket" if isinstance(error, FileNotFoundError) else "connect refused" if isinstance(error, ConnectionRefusedError) else str(error)
