@@ -69,12 +69,17 @@ class ChangedValueTests(unittest.TestCase):
         for name in ("PYTHONUNBUFFERED", "REFUSAL_WATCH_INVENTORY", "STAFF_OPERATION_FD"):
             self.assertNotIn(name, os.environ)
         self.assertIn("BUILDLOG_DIR", os.environ)
+        cwd = Path.cwd()
+        row = {"kind": "test", "module": __name__.rsplit(".", 1)[-1], "package_module": __name__,
+               "cwd": str(cwd), "slot_git": (cwd / ".git").is_file()}
+        if os.environ.get("FAST_TRACK_TEST_RECORD_GIT"):
+            row["branch"] = subprocess.check_output(
+                ["git", "branch", "--show-current"], text=True, timeout=__HANG_GUARD__).strip()
+            row["common"] = subprocess.check_output(
+                ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                text=True, timeout=__HANG_GUARD__).strip()
         with Path(os.environ["FAST_TRACK_TEST_EVENTS"]).open("a") as output:
-            output.write(json.dumps({"kind": "test", "module": __name__.rsplit(".", 1)[-1],
-                                     "package_module": __name__,
-                                     "cwd": str(Path.cwd()), "slot_git": (Path.cwd() / ".git").is_file(),
-                                     "branch": subprocess.check_output(["git", "branch", "--show-current"], text=True, timeout=__HANG_GUARD__).strip(),
-                                     "common": subprocess.check_output(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], text=True, timeout=__HANG_GUARD__).strip()}) + "\\n")
+            output.write(json.dumps(row) + "\\n")
 '''.replace("__HANG_GUARD__", str(TEST_HANG_GUARD_SECS))
 
 TYPE_TOOL = '''#!/usr/bin/env python3
@@ -298,10 +303,12 @@ class FastTrackTests(MergeCheckpointFixture):
         bounded_git = self.bin / "bounded-git"
         self.env["FAST_TRACK_BOUND_GIT"] = str(bounded_git)
         self.env.update({
+            "MERGE_GATE_BASEDPYRIGHT": "basedpyright",
             "FAST_TRACK_STATE_DIR": str(self.records_dir),
             "FAST_TRACK_TEST_EVENTS": str(self.events_path), "FAST_TRACK_TEST_CONTROL": str(self.control),
             "FAST_TRACK_TEST_LOCK": str(self.common_directory / "main-push.lock"),
         })
+        _ = self.env.pop("FAST_TRACK_TEST_RECORD_GIT", None)
         self.settings = {
             "max_changed_lines": 100, "max_files": 10, "check_time_limit_seconds": 30,
             "max_push_attempts": 2, "fetch_lock_attempts": 3, "fetch_lock_wait_seconds": 0,
@@ -798,6 +805,7 @@ owner.verify=verify
                          {tip, self.git("rev-parse", "main", cwd=self.origin)})
 
     def test_unrelated_stuck_restore_does_not_block_a_new_fix(self) -> None:
+        self.enable_promotion()
         self.assert_unrelated_attempt_does_not_block(missing_production=False)
 
     def test_unrelated_missing_production_does_not_block_a_new_fix(self) -> None:
@@ -1123,6 +1131,7 @@ owner.verify=verify
         self.enable_promotion()
         self.change_module()
         self.env.update(PYTHONUNBUFFERED="1", REFUSAL_WATCH_INVENTORY="fixture", STAFF_OPERATION_FD="-1")
+        self.env["FAST_TRACK_TEST_RECORD_GIT"] = "1"
         self.write(self.unit, "unrelated.txt", "keep this edit\n")
         result = self.fast_track()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -1249,10 +1258,14 @@ owner.verify=verify
     def test_red_direct_test_or_type_warning_prevents_the_push(self) -> None:
         self.change_module()
         _ = (self.control / "bad-types").touch()
-        self.assert_refused(self.fast_track())
+        warning = self.fast_track()
+        self.assert_refused(warning, "fast check failed: basedpyright scripts/sample/item.py")
+        self.assertIn("0 errors, 1 warning, 0 notes", warning.stdout)
         (self.control / "bad-types").unlink()
         self.write(self.unit, "scripts/sample/item.py", MODULE.replace('VALUE = "before"', 'VALUE = "incorrect"'))
-        self.assert_refused(self.fast_track())
+        red_test = self.fast_track()
+        self.assert_refused(red_test, "-m unittest scripts.sample.test_item")
+        self.assertIn("AssertionError: 'incorrect' != 'after'", red_test.stdout)
 
     def test_origin_main_move_reapplies_and_rechecks_outside_the_push_lock(self) -> None:
         self.change_module()
