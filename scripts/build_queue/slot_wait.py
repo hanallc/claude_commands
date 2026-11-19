@@ -10,7 +10,9 @@ from functools import cache, cached_property, lru_cache
 import os
 from pathlib import Path
 import re
+import select
 import subprocess
+from threading import Thread
 
 from scripts.lib import build_folders, conf
 from scripts.lib.build_steps import (INTERPRETER, LONG_VALUE_OPTIONS, RAW_ID, RECORDED_STEP_NAMES, RECORDED_VERBS,
@@ -276,14 +278,16 @@ def read_pool(repository: str, machine: str, root: Path) -> wire.RepositorySlotW
 
 def wait_for_slot(repository: str, machine: str, root: Path, maximum: int, *, episode: str,
                   since: float, showrunner: str, unit: str, work: str, purpose: str,
-                  expires_at: float | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> None:
+                  expires_at: float | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+                  owner_pid: int = 0) -> None:
     """Block on one queue connection; retain episode and since after a lost race."""
     from scripts.build_queue import admission_client as client, admission_records as records
     from scripts.build_queue import admission_protocol as wire
 
     seconds = conf.read_or_repository("build_folders").number("slots.wait_seconds")
     deadline = since + seconds if isinstance(expires_at, conf.UseConfiguredValue) else expires_at
-    start = records.process_start_time(os.getpid())
+    pid = owner_pid or os.getpid()
+    start = records.process_start_time(pid)
     if start is None:
         raise RuntimeError("the slot waiter has no process identity")
     caller = SLOT_CALLER.get()
@@ -295,10 +299,28 @@ def wait_for_slot(repository: str, machine: str, root: Path, maximum: int, *, ep
         identity = wire.Identity(caller.staff_id, caller.showrunner,
                                  step if isinstance(step, QueueRowName) else "", str(caller.source))
     del unit, purpose
-    request = wire.RepositorySlotRequest(episode, wire.Owner(os.getpid(), start), since,
+    request = wire.RepositorySlotRequest(episode, wire.Owner(pid, start), since,
         repository, machine, str(root), maximum, deadline, identity)
+    if owner_pid:
+        watch_parent(owner_pid)
     reply = client.repository_slot(request)
     if isinstance(reply, wire.RepositorySlotExpired):
         raise SlotWaitExpired(reply.reason)
     if isinstance(reply, wire.Refused):
         raise RuntimeError(reply.reason)
+
+
+def watch_parent(pid: int) -> None:
+    """End a standalone waiter when its parent ends."""
+    if os.getppid() != pid:
+        raise SlotWaitExpired("slots: the step ended before its folder wait")
+    descriptor = os.pidfd_open(pid)
+    if os.getppid() != pid:
+        os.close(descriptor)
+        raise SlotWaitExpired("slots: the step ended before its folder wait")
+
+    def stop() -> None:
+        _ = select.select([descriptor], [], [])
+        os._exit(75)
+
+    Thread(target=stop, daemon=True, name="slot-wait-owner").start()

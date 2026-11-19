@@ -7,8 +7,9 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import json
 import os
-from pathlib import Path
 import select
+import signal
+from pathlib import Path
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -17,7 +18,8 @@ from typing import cast
 import unittest
 from unittest import mock
 
-from scripts.build_queue import admission_protocol as wire, admission_records, admission_service as service, execution_identity
+from scripts.agents.remote import local_machine
+from scripts.build_queue import admission_protocol as wire, admission_records, admission_service as service, execution_identity, memory_feed
 from scripts.buildlog import treekey
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.direct.verify_doc_test_support import CARGO_STUB, VERIFY, VerifyDocFixture
@@ -25,10 +27,12 @@ from scripts.direct.verify_mac_offload_test_support import processes_carrying, r
 from scripts.direct.verify_scope_test_support import use_fixture_scope_readings, write_real_scope_launcher
 from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
 from scripts.lib import build_folders, build_slots
+from scripts.lib.build_steps import RECORDED_STEP_NAMES
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_admit import scope_members
 from scripts.lint.memory_test_support import write_config_fixture, write_pressure_reading
+from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 
@@ -39,26 +43,19 @@ class VerifyDocPipeTests(unittest.TestCase):
     def run_checkout_pipe_probe(self, limit: int, probe: str) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "checkout").mkdir()
-            (root / "lib").mkdir()
-            (root / "copies").mkdir()
-            _ = (root / "copies/copies.py").write_text(r'''
+            owner = root / "copy-owner.sh"
+            _ = owner.write_text(r'''
 if [[ "$TEST_COPY_LIMIT" == 0 ]]; then
-    printf '%s\n' tree "$PWD/checkout"
+    printf '%s\n' "$PWD"
 fi
 if IFS= read -r request; then
     exit 99
 fi
 : > owner-received-eof
 ''')
-            script = shell_functions(VERIFY, "doc_checkout", "doc_close_checkout") + r'''
+            script = shell_functions(VERIFY, "step_checkout", "step_close_checkout") + r'''
 export TEST_COPY_LIMIT=$1
-DOC_CALLER_DIR=$PWD
-DOC_REPO_TOP=$PWD/checkout
-DOC_TREE=tree
-PY=$BASH
-BUILD_FOLDERS_SCRIPT=$PWD/lib/build_folders.py
-doc_tree() { printf '%s\n' tree; }
+checkout() { step_checkout "$BASH" ./copy-owner.sh; }
 ''' + probe
             try:
                 result = subprocess.run(["bash", "-euc", script, "doc-pipes", str(limit)], cwd=root,
@@ -74,8 +71,8 @@ doc_tree() { printf '%s\n' tree; }
                 self.run_checkout_pipe_probe(limit, r'''
 ulimit -Sn "$TEST_COPY_LIMIT"
 status=0
-doc_checkout || status=$?
-[[ "$status" == 1 && "$PWD" == "$DOC_CALLER_DIR" ]]
+checkout || status=$?
+[[ "$status" == 2 ]]
 ''')
 
     def test_doc_preserves_files_that_reuse_the_original_pipe_numbers(self) -> None:
@@ -87,12 +84,12 @@ trap '
         original_reply=${DOC_COPY[0]}
     fi
 ' DEBUG
-doc_checkout
+checkout
 trap - DEBUG
 [[ ! -e "/dev/fd/$original_request" && ! -e "/dev/fd/$original_reply" ]]
-file=$DOC_CALLER_DIR/reused
+file=$PWD/reused
 eval 'exec '"$original_request"'>"$file" '"$original_reply"'<"$file"'
-doc_close_checkout
+step_close_checkout
 [[ "/dev/fd/$original_request" -ef "$file" && "/dev/fd/$original_reply" -ef "$file" ]]
 ''')
 
@@ -251,7 +248,7 @@ with {patches}:
     def test_doc_scope_stop_failure_retains_checkout_and_reservation_after_sidecar_sweep(self) -> None:
         self.assert_doc_retains_checkout_until_scope_empties(interrupt=False, sweep_scope_sidecar=True)
 
-    def test_copies_run_binds_the_prepared_doc_checkout_before_cargo(self) -> None:
+    def test_copies_run_binds_the_doc_checkout_before_cargo(self) -> None:
         with isolated_staff_file(self.root / "staff.json", self.environment):
             caller = fixture_member("showrunner", name="doc-copy")
             self.environment["CLAUDE_CODE_SESSION_ID"] = caller.current_session
@@ -480,6 +477,87 @@ os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
             self.assertTrue(pipe.startswith("pipe:["))
             self.assertNotIn(pipe, cargo_pipes.read_text().splitlines())
 
+    def test_doc_slot_wait_names_the_unit_without_a_session(self) -> None:
+        _ = self.enterContext(isolated_staff_file(self.root / "doc-staff.json", self.environment))
+        showrunner = fixture_member("showrunner", name="builds")
+        unit = fixture_member("unit", name="doc-proof", parent=showrunner.id,
+                              worktree=staff.PresentWorktree(local_machine(), self.repo))
+        _ = self.environment.pop("CLAUDE_CODE_SESSION_ID", None)
+        _ = self.environment.pop("CODEX_THREAD_ID", None)
+        self.assert_doc_slot_wait_identity(showrunner, unit, session=str(unit.id), folder=str(self.repo))
+
+    def test_doc_slot_wait_names_the_unit_from_an_unregistered_clone(self) -> None:
+        registered = self.root / "registered" / self.repo.name
+        registered.parent.mkdir()
+        _ = self.repo.rename(registered)
+        _ = subprocess.run(["git", "clone", "-q", "--", str(registered), str(self.repo)],
+                           env=self.environment, check=True, timeout=TEST_HANG_GUARD_SECS)
+        _ = self.enterContext(isolated_staff_file(self.root / "doc-staff.json", self.environment))
+        showrunner = fixture_member("showrunner", name="builds")
+        unit = fixture_member("unit", name="doc-proof", parent=showrunner.id,
+                              worktree=staff.PresentWorktree(local_machine(), registered))
+        self.environment["CLAUDE_CODE_SESSION_ID"] = unit.current_session
+        _ = self.environment.pop("CODEX_THREAD_ID", None)
+        self.assert_doc_slot_wait_identity(showrunner, unit, session=unit.current_session, folder="")
+
+    def assert_doc_slot_wait_identity(self, showrunner: staff.StaffRow, unit: staff.StaffRow, *,
+                                      session: str, folder: str) -> None:
+        admission = caller_admission(self, self.root, self.environment)
+        waiting = Event()
+
+        def observe_wait(reply: wire.Reply) -> wire.Reply:
+            if isinstance(reply, wire.RepositorySlotWaiting):
+                waiting.set()
+            return reply
+
+        with (self.occupy_doc_slot(), mock.patch.object(admission.server, "reply_filter", side_effect=observe_wait)):
+            process, log, _ = self.start_doc()
+            self.assertTrue(waiting.wait(TEST_HANG_GUARD_SECS), log.read_text())
+            with admission.loop_turn():
+                waiter, = admission.server.repository_slot_waiters.values()
+                request, reply = waiter.request, waiter.reply
+                assert isinstance(reply, wire.RepositorySlotWaiting)
+            labels = memory_feed.FeedStaff(staff.StaffSnapshot((showrunner, unit)))
+            slot = wire.RepositorySlotRow(request.owner, request.identity, request.since, request.machine, reply)
+            row = memory_feed.repository_slot_row(slot, RECORDED_STEP_NAMES, labels)
+            assert isinstance(row, dict)
+            self.assertEqual(row["unit"], unit.name)
+            self.assertEqual(request.identity.session_id, session)
+            self.assertEqual(request.identity.folder, folder)
+        self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), 0, log.read_text())
+
+    def test_remote_doc_refuses_a_tree_staged_during_checkout_preparation(self) -> None:
+        self.enable_held_mac_doc()
+        wrapper = self.root / "checkout-interpreter"
+        staged = self.repo / "alpha/src/lib.rs"
+        original_tree = self.git("write-tree")
+        self.executable(wrapper, f'''import os
+from pathlib import Path
+import subprocess
+import sys
+
+command = [sys.executable, *sys.argv[1:]]
+arguments = sys.argv[1:]
+if not (len(arguments) >= 2 and arguments[0].endswith("/copies.py")
+        and arguments[1] == "hold" and "--scratch" in arguments and "--" not in arguments):
+    os.execv(sys.executable, command)
+with subprocess.Popen(command, stdout=subprocess.PIPE, text=True) as copy:
+    checkout = copy.stdout.readline()
+    if not checkout:
+        raise SystemExit(copy.wait() or 1)
+    Path({str(staged)!r}).write_text("pub fn staged_during_checkout() {{}}\\n")
+    subprocess.run(["git", "-C", {str(self.repo)!r}, "add", "--", {str(staged)!r}], check=True)
+    print(checkout, end="", flush=True)
+    raise SystemExit(copy.wait())
+''')
+        self.environment["CLAUDE_PYTHON"] = str(wrapper)
+        result = self.verify()
+        self.assertNotEqual(self.git("write-tree"), original_tree, result.stdout + result.stderr)
+        self.assertFalse(self.events.exists(), "the remote runner dispatched the old tree")
+        self.assertEqual(result.returncode, 77, result.stdout + result.stderr)
+        self.assertIn("the staged tree changed", result.stderr)
+        self.assertEqual(self.pass_records(), [])
+
     def test_doc_refuses_a_tree_staged_during_the_copy_slot_wait(self) -> None:
         admission = caller_admission(self, self.root, self.environment)
         waiting = Event()
@@ -493,8 +571,10 @@ os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
               mock.patch.object(admission.server, "reply_filter", side_effect=observe_wait)):
             process, log, _ = self.start_doc()
             self.assertTrue(waiting.wait(TEST_HANG_GUARD_SECS), log.read_text())
-            reservation, = admission.caller_reservations().values()
-            self.assertEqual(reservation.owner.pid, process.pid)
+            with admission.loop_turn():
+                waiter, = admission.server.repository_slot_waiters.values()
+                self.assertEqual(waiter.request.owner.pid, process.pid)
+                self.assertNotIn(waiter.request.episode, admission.caller_reservations())
             self.assertFalse(self.events.exists())
             _ = (self.repo / "alpha/src/lib.rs").write_text("pub fn staged_while_waiting() {}\n")
             _ = self.git("add", "alpha/src/lib.rs")
@@ -504,7 +584,7 @@ os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
         self.assertEqual(self.pass_records(), [])
         self.assertFalse(admission.caller_reservations())
 
-    def test_sigterm_reaps_the_copy_holder_during_the_slot_wait(self) -> None:
+    def test_verify_exit_releases_the_slot_wait(self) -> None:
         admission = caller_admission(self, self.root, self.environment)
         waiting = Event()
 
@@ -513,22 +593,46 @@ os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
                 waiting.set()
             return reply
 
-        with (self.occupy_doc_slot(),
-              mock.patch.object(admission.server, "reply_filter", side_effect=observe_wait)):
-            process, log, marker = self.start_doc()
-            self.assertTrue(waiting.wait(TEST_HANG_GUARD_SECS), log.read_text())
-            with admission.loop_turn():
-                waiter, = admission.server.repository_slot_waiters.values()
-                self.assertIn(waiter.request.owner.pid, processes_carrying(marker))
-            process.terminate()
-            self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), 143, log.read_text())
-            self.assertEqual(processes_carrying(marker), set())
-            with admission.loop_turn():
-                _ = admission.server.run_pass()
-                self.assertFalse(admission.server.repository_slot_waiters)
-            self.assertFalse(admission.caller_reservations())
-        self.assertFalse(self.events.exists())
-        self.assertEqual(self.pass_records(), [])
+        for stop in (signal.SIGTERM, signal.SIGKILL):
+            with self.subTest(stop=stop):
+                waiting.clear()
+                with (self.occupy_doc_slot(),
+                      mock.patch.object(admission.server, "reply_filter", side_effect=observe_wait)):
+                    if stop == signal.SIGKILL:
+                        config = Path(self.environment["CONF_DIR"]) / "build_folders.conf"
+                        _ = write_config_fixture(config, "# range: 5e-324..\nslots.wait_seconds=300\n")
+                    process, log, marker = self.start_doc()
+                    self.assertTrue(waiting.wait(TEST_HANG_GUARD_SECS), log.read_text())
+                    with admission.loop_turn():
+                        waiter, = admission.server.repository_slot_waiters.values()
+                        owner = waiter.request.owner.pid
+                        children = processes_carrying(marker)
+                        self.assertIn(owner, children)
+                        exited = -1
+                        if stop == signal.SIGKILL:
+                            if owner != process.pid:
+                                helper = owner
+                            else:
+                                helper, = (child for child in children
+                                    if b"wait-slot" in (Path("/proc") / str(child) / "cmdline").read_bytes().split(b"\0"))
+                            exited = os.pidfd_open(helper)
+                            self.addCleanup(os.close, exited)
+                    process.send_signal(stop)
+                    expected = 143 if stop == signal.SIGTERM else -signal.SIGKILL
+                    self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), expected, log.read_text())
+                    if stop == signal.SIGTERM:
+                        self.assertEqual(processes_carrying(marker), set())
+                    else:
+                        self.assertTrue(select.select([exited], [], [], 30)[0],
+                                        "the folder waiter survived verify")
+                    with admission.loop_turn():
+                        _ = admission.server.run_pass()
+                        self.assertFalse(admission.server.repository_slot_waiters)
+                    self.assertFalse(admission.caller_reservations())
+                self.assertFalse(self.events.exists())
+                self.assertEqual(self.pass_records(), [])
+                self.assertTrue(all(build_folders.build_folder_state(path) == "free"
+                                    for path in Path(waiter.request.root).glob("*-slot*") if path.is_dir()))
 
     @contextmanager
     def hold_background_sweep(self, probe: str = "") -> Generator[Path]:
@@ -621,7 +725,7 @@ for descriptor in (8, 74):
         self.assertIs(row["tree_changed"], False)
         self.assertEqual(len(self.pass_records()), 1)
 
-    def test_hold_after_grant_releases_doc_checkout_without_waiting(self) -> None:
+    def test_hold_after_grant_refuses_doc_without_taking_a_checkout(self) -> None:
         admission = caller_admission(self, self.root, self.environment)
         holders = Path(self.environment["BUILD_HOLD_DIR"])
         holders.mkdir()
@@ -655,8 +759,7 @@ for descriptor in (8, 74):
         self.assertFalse(self.events.exists())
         self.assertEqual(self.pass_records(), [])
         self.assertFalse(admission.caller_reservations())
-        checkout, = (self.root / "slots").glob("workspace-slot*/")
-        self.assertEqual(build_folders.build_folder_state(checkout), "free")
+        self.assertEqual(list((self.root / "slots").glob("workspace-slot*/")), [])
 
     def test_doc_refuses_a_tree_staged_during_admission(self) -> None:
         admission = caller_admission(self, self.root, self.environment)

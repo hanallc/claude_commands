@@ -1328,7 +1328,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "placement_once", "placement_failed", "local_cargo_build_folder", "start_routing_wait", "wait_for_placement", "buildlog_memory_event",
             "route_compiling_step", "take_local_placement",
             "pinned_target_refuse",
-            "try_reserved_target", "mac_only_refuse",
+            "try_reserved_target", "step_close_checkout", "mac_only_refuse",
             "route_test", "check_routing_hold")
         functions += shell_functions(VERIFY.parent.parent / "lint/invoke.sh", "buildlog_now")
         functions += shell_functions(VERIFY.parent.parent / "lint/memory_gate.sh",

@@ -37,16 +37,16 @@ class PreparedDocCheckout:
 
 
 @dataclass(frozen=True)
-class PrivateDocCheckout:
+class PrivateStepCheckout:
     lease_owner: int
     request_fd: int
     reply_fd: int
 
 
-OwnedDocCheckout = PreparedDocCheckout | PrivateDocCheckout
+OwnedCheckout = PreparedDocCheckout | PrivateStepCheckout
 
 
-class NoOwnedDocCheckout(Enum):
+class NoOwnedCheckout(Enum):
     NOT_REQUIRED = auto()
 
 
@@ -198,11 +198,11 @@ def wait_for_checkout_confirmation(owners: select.poll, reply: int, deadline: fl
         owners.unregister(reply)
 
 
-def bind_checkout_scope(checkout: OwnedDocCheckout, scope: Path, owners: select.poll, deadline: float) -> None:
+def bind_checkout_scope(checkout: OwnedCheckout, scope: Path, owners: select.poll, deadline: float) -> None:
     owner_start = process_start_time(checkout.lease_owner)
     if owner_start is None:
         raise ValueError("the checkout lease owner exited before scope publication")
-    if isinstance(checkout, PrivateDocCheckout):
+    if isinstance(checkout, PrivateStepCheckout):
         # The copy owner publishes while it holds the checkout lock.
         _ = os.write(checkout.request_fd, os.fsencode(scope) + b"\n")
         wait_for_checkout_confirmation(owners, checkout.reply_fd, deadline)
@@ -238,19 +238,19 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
             owners.register(open_pidfd(leader, cleanup), select.POLLIN)
             if owners.poll(0):
                 raise ValueError("a scope owner exited before launch")
-            owner_pid = os.environ.pop("VERIFY_DOC_CHECKOUT_OWNER", "")
+            owner_pid = os.environ.pop("VERIFY_CHECKOUT_OWNER", "")
             lock_fd = os.environ.pop("BUILDLOG_PREPARED_COPY_LOCK_FD", "")
             request_fd = os.environ.pop("DOC_COPY_LEASE_FD", "")
             reply_fd = os.environ.pop("DOC_COPY_REPLY_FD", "")
-            checkout: OwnedDocCheckout | NoOwnedDocCheckout = NoOwnedDocCheckout.NOT_REQUIRED
+            checkout: OwnedCheckout | NoOwnedCheckout = NoOwnedCheckout.NOT_REQUIRED
             if owner_pid:
                 if request_fd:
-                    checkout = PrivateDocCheckout(int(owner_pid), int(request_fd), int(reply_fd))
+                    checkout = PrivateStepCheckout(int(owner_pid), int(request_fd), int(reply_fd))
                 else:
                     checkout = PreparedDocCheckout(Path.cwd(), int(owner_pid), int(lock_fd))
             watch = None
             deadline = 0.0
-            if isinstance(checkout, OwnedDocCheckout):
+            if isinstance(checkout, OwnedCheckout):
                 seconds = conf.read_or_repository("direct").number("VERIFY_SCOPE_PUBLICATION_SECONDS")
                 deadline = time.monotonic() + seconds
                 watch = inotify.open_watch()
@@ -264,14 +264,14 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
                  "/bin/sh", "-c", 'exec 3>&1; ' + scope_shell, peak, "/bin/sh", "-c", CHECK_SCOPE_OWNER,
                  "verify-scope-owner", str(sidecar), unit, str(caller), caller_start, str(leader), leader_start,
                  str(supervisor), supervisor_start,
-                 "bind-checkout" if isinstance(checkout, OwnedDocCheckout) else "no-checkout",
+                 "bind-checkout" if isinstance(checkout, OwnedCheckout) else "no-checkout",
                  *command],
-                stdin=subprocess.PIPE if isinstance(checkout, OwnedDocCheckout) else None,
+                stdin=subprocess.PIPE if isinstance(checkout, OwnedCheckout) else None,
                 stderr=subprocess.DEVNULL, process_group=0,
             )
             try:
                 owners.register(open_pidfd(process.pid, cleanup), select.POLLIN)
-                if isinstance(checkout, OwnedDocCheckout) and watch is not None:
+                if isinstance(checkout, OwnedCheckout) and watch is not None:
                     scope = wait_for_checkout_scope(owners, watch, sidecar, unit, deadline)
                     bind_checkout_scope(checkout, scope, owners, deadline)
                     if owners.poll(0):
