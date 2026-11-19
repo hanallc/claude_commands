@@ -31,6 +31,8 @@ from scripts.buildlog import record, treekey
 from scripts.copies import copies
 from scripts.direct import runner_result
 from scripts.lib import conf, process_start
+from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.shell_test_support import refusing_bash_startup
 from scripts.lint.memory_test_support import config_environment
 from scripts.mac_test import eligibility, offload
 
@@ -320,7 +322,7 @@ route_test
         command = 'VERIFY_FIXTURE=("$@")\n' + ''.join(functions) + stubs
         return subprocess.run(['bash', '-c', command, 'verify.sh', sys.executable,
             str(scripts / 'direct' / 'runner_result.py'), str(result), str(status)],
-            cwd=self.root, check=False, capture_output=True, text=True, timeout=5)
+            cwd=self.root, env=verify_test_environment(), check=False, capture_output=True, text=True, timeout=5)
 
     def establish_pinned_hana_assignment(self) -> None:
         install_hana_spending_settings(self.transport.settings)
@@ -339,10 +341,15 @@ route_test
 
     def test_pinned_verify_refuses_the_same_way_during_setup(self) -> None:
         self.establish_pinned_hana_assignment()
+        startup = refusing_bash_startup(self.root)
         with hana_command_lock(self.lifecycle.directory) as access:
             self.assertIs(access, HanaCommandAccess.ACQUIRED)
-            result = self.pinned_verify()
-        self.assertEqual((result.returncode, result.stderr), (2, 'verify.sh: target hana-aws refused: Hana is busy\n'))
+            for bash_env in ('', str(startup)):
+                with (self.subTest(caller_startup=bool(bash_env)),
+                      mock.patch.dict(os.environ, {'BASH_ENV': bash_env})):
+                    result = self.pinned_verify()
+                    self.assertEqual((result.returncode, result.stderr),
+                                     (2, 'verify.sh: target hana-aws refused: Hana is busy\n'))
 
     def test_setup_hold_refuses_without_a_provider_claim(self) -> None:
         with self.context(), mock.patch.object(hana, 'claim_assigned', return_value=hana.HanaClaimResourcesHeld()), \
