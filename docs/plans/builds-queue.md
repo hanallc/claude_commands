@@ -3078,6 +3078,28 @@ Work:
 2. Also fix three reds with the same cause (caller GIT_INDEX_FILE, COPIES_ first-step settings, BASH_ENV): test_slot_order tree-key mismatch, buildlog/test_mac_idle, style/test_style_sync.
 3. A failing-first row for each of the six tests with the caller variable set; all pass with and without the variables.
 
+### Phase 44cy — Landing merge tests go first in the natedev line  · status: todo
+**From nate via bob and builds, 2026-11-19 08:36:** a permanent queue rule, "mergetests first on natedev". Build after 44cx. The merge waits for nate's approval of the key names and values.
+
+Rules from nate:
+1. Only the natemerge landing merge test gets first place. A unit trial gate does not, and a unit cannot claim it.
+2. Place only. The memory check stays; nothing is admitted that memory cannot hold.
+3. A waiting unit step cannot be passed without end: `landing_merge_max_passes` limits it.
+4. A failed merge test gets no automatic second run with first place.
+5. One config key turns the rule on and off, read live.
+6. Measure the memory wait of landing tests and unit steps, before and after, from the queue record. Before data starts at nate's first natemerge order.
+7. A unit step that a landing test passed does not fire the 44ct stall alert.
+
+Caller path (fix4 read): merge_checkpoint.py writes `lands/<pid>.json` (pid and start time) for each land and runs the gate as its child. The gate request carries the gate pid, its start time and the session id.
+
+Work:
+1. The admission service marks a request as a landing test when an ancestor of its pid matches a live land record by pid and start time, and the session's staff chain leads to natemerge. No caller flag; no change to merge_gate.py or land_queue.py.
+2. Each land record gives first place one time. A rerun in the same land waits in the normal line.
+3. `waiter_order` puts a marked landing test first. A waiter passed `landing_merge_max_passes` times is not passed again.
+4. Config in build_admission.conf: `landing_merge_first=on|off` and `landing_merge_max_passes=2`. Both names live in one place.
+5. A pass restarts the 44ct quiet clock of the passed head. The as-built ties this to the pass limit: a larger limit needs a new alert check.
+6. queue_times.jsonl records a landing mark. One report command prints the memory wait of landing tests and unit steps over a time span.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
