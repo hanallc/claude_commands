@@ -280,6 +280,16 @@ class BuildHoldGuardTest(TemporaryGuardTest):
                                       env={**os.environ, "CLAUDE_PYTHON": sys.executable})
                 self.assertEqual(done.stdout, invoke_hook(payload))
 
+    def assert_shell_front_denies_raw_test(self, payload: str) -> None:
+        done = subprocess.run(["bash", str(FRONT)], input=payload, capture_output=True,
+                              text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
+                              env={**os.environ, "CLAUDE_PYTHON": sys.executable})
+        response = cast(dict[str, dict[str, str]], json.loads(done.stdout))
+        self.assertEqual(response["hookSpecificOutput"], {
+            "hookEventName": "PreToolUse", "permissionDecision": "deny",
+            "permissionDecisionReason": "Start tests through scripts/lib/py or scripts/lib/walled_tests.py.",
+        })
+
     def test_shell_front_denies_raw_tests_without_a_hold(self) -> None:
         self.holders.mkdir()
         for command in ("python3 -m unittest x", "python3 -m unittest.__main__ x", "pytest",
@@ -290,14 +300,12 @@ class BuildHoldGuardTest(TemporaryGuardTest):
             with self.subTest(command=command):
                 payload = json.dumps({"tool_name": "Bash", "cwd": str(self.root),
                                       "tool_input": {"command": command}})
-                done = subprocess.run(["bash", str(FRONT)], input=payload, capture_output=True,
-                                      text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
-                                      env={**os.environ, "CLAUDE_PYTHON": sys.executable})
-                response = cast(dict[str, dict[str, str]], json.loads(done.stdout))
-                self.assertEqual(response["hookSpecificOutput"], {
-                    "hookEventName": "PreToolUse", "permissionDecision": "deny",
-                    "permissionDecisionReason": "Start tests through scripts/lib/py or scripts/lib/walled_tests.py.",
-                })
+                self.assert_shell_front_denies_raw_test(payload)
+
+    def test_shell_front_denies_raw_unittest_with_a_unicode_escape(self) -> None:
+        payload = json.dumps({"tool_name": "Bash", "cwd": str(self.root),
+                              "tool_input": {"command": "python3 -m unittest x"}})
+        self.assert_shell_front_denies_raw_test(payload.replace("unittest x", r"uni\u0074test x"))
 
     def test_fast_paths_do_not_import_hold_code(self) -> None:
         for has_hold, command in ((False, "cargo build"), (True, "cargo metadata"), (True, "pwd"),
@@ -388,18 +396,19 @@ exit "$GUARD_STATUS"
                     }}, indent=indent)
                     self.assert_no_python(raw)
 
-    def test_ambiguous_command_fields_send_the_full_payload_to_python(self) -> None:
+    def test_python_receives_the_full_payload_on_fallback(self) -> None:
         for tool_input in (
             {"command": 'printf "%s" ready; scripts/agents/test_agent_exec.sh'},
             {"command": ["scripts/agents/test_agent_exec.sh"]},
             {"command": "", "cmd": "scripts/agents/test_agent_exec.sh"},
+            {"command": "pwd", "description": "Read café files"},
         ):
             with self.subTest(tool_input=tool_input):
                 raw = json.dumps({"tool_name": "Bash", "tool_input": tool_input})
                 done = self.run_front(raw)
                 self.assertEqual((done.returncode, done.stdout, done.stderr), (0, "", ""))
                 self.assertEqual(self.stdin_copy.read_text(), raw)
-        self.assertEqual(self.calls.read_text().splitlines(), ["called"] * 3)
+        self.assertEqual(self.calls.read_text().splitlines(), ["called"] * 4)
 
     def test_same_stdin_output_and_status_are_relayed(self) -> None:
         self.hold()

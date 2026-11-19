@@ -8,7 +8,7 @@ command_text=$hook_input
 select_command() {
     local value command
     case "$hook_input" in
-        *'\u'*|*'"cmd"'*'"command"'*|*'"command"'*'"cmd"'*) return ;;
+        *'"cmd"'*'"command"'*|*'"command"'*'"cmd"'*) return ;;
         *'"command"'*) value=${hook_input#*'"command"'} ;;
         *'"cmd"'*) value=${hook_input#*'"cmd"'} ;;
         *) return ;;
@@ -27,38 +27,39 @@ select_command() {
     command_text="\"$command\""
 }
 
-select_command
-continuation='\\\n'
-command_text="${command_text//"$continuation"/}"
-test_start=0
-case "$command_text" in
-    *unittest*|*pytest*|*py.test*|*module_run*|*coverage_overlap*|*merge_gate*|*/gate.py*|*' gate.py'*|*'"gate.py'*|*targeted_test*|*walled_tests*)
-        test_start=1
-        ;;
-    *python*|*/py*|*node*|*bash*|*zsh*|*dash*|*'"sh '*|*'"sh"'*|*'/sh '*|*'/sh"'*|*' sh '*)
-        case "$command_text" in
-            *test_*|*proof*) test_start=1 ;;
-        esac
-        ;;
-    *test_*.sh*|*test_*.py*|*proof*.mjs*)
-        case "$hook_input" in
-            *'"Bash"'*|*'\u'*) test_start=1 ;;
-        esac
-        ;;
-esac
+needs_decision() {
+    # The Python hook decodes JSON Unicode escapes.
+    [[ $hook_input == *'\u'* ]] && return 0
 
-if (( ! test_start )); then
+    select_command
+    local continuation='\\\n'
+    command_text="${command_text//"$continuation"/}"
+    case "$command_text" in
+        *unittest*|*pytest*|*py.test*|*module_run*|*coverage_overlap*|*merge_gate*|*/gate.py*|*' gate.py'*|*'"gate.py'*|*targeted_test*|*walled_tests*)
+            return 0
+            ;;
+        *python*|*/py*|*node*|*bash*|*zsh*|*dash*|*'"sh '*|*'"sh"'*|*'/sh '*|*'/sh"'*|*' sh '*)
+            case "$command_text" in
+                *test_*|*proof*) return 0 ;;
+            esac
+            ;;
+        *test_*.sh*|*test_*.py*|*proof*.mjs*)
+            [[ $hook_input == *'"Bash"'* ]] && return 0
+            ;;
+    esac
     case "$command_text" in
         *cargo*) ;;
-        *) exit 0 ;;
+        *) return 1 ;;
     esac
-    hold_dir="${BUILD_HOLD_DIR:-$HOME/.local/state/build-hold}"
+    local hold_dir="${BUILD_HOLD_DIR:-$HOME/.local/state/build-hold}"
     shopt -s nullglob dotglob
     if [[ ! -e "$hold_dir" || ( -d "$hold_dir" && -r "$hold_dir" && -x "$hold_dir" ) ]]; then
-        hold_entries=("$hold_dir"/*)
-        (( ${#hold_entries[@]} )) || exit 0
+        local -a hold_entries=("$hold_dir"/*)
+        (( ${#hold_entries[@]} )) || return 1
     fi
-fi
+    return 0
+}
 
+needs_decision || exit 0
 hook_dir="${BASH_SOURCE[0]%/*}"
 printf '%s' "$hook_input" | "$hook_dir/../lib/py" "$hook_dir/pre-tool-use-build-hold-guard.py"
