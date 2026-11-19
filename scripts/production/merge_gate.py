@@ -1073,7 +1073,7 @@ def stop_at_time_limit(running: Sequence[RunningGateJob], failed: Sequence[GateJ
 
 
 def one_minute_load() -> float:
-    return float(Path("/proc/loadavg").read_text().split()[0])
+    return os.getloadavg()[0]
 
 
 def module_order(modules: Sequence[tuple[str, Path]], timings: dict[str, float],
