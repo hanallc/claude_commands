@@ -1208,59 +1208,50 @@ def retirement_find_unit(production_name: str, given: str, *,
 def retirement_last_session(unit: RetiringUnit) -> str:
     return unit.staff_member.current_session
 
-@dataclass(frozen=True)
-class RetirementBranchTips:
-    local: dict[str, str]
-    origin: dict[str, str]
-
-    def commits(self, ref: str) -> tuple[str, ...]:
-        return tuple(dict.fromkeys(tips[ref] for tips in (self.local, self.origin) if ref in tips))
-
-
-@dataclass(frozen=True)
-class RetirementReady:
-    tips: RetirementBranchTips
-
-
-@dataclass(frozen=True)
-class RetirementBlocked:
-    reasons: list[str]
-
-
-def retirement_branch_tips(unit: RetiringUnit, refs: tuple[str, ...], *,
-                           settings: conf.ConfigRead) -> RetirementBranchTips:
-    """Read the local and advertised tips without updating remote-tracking refs."""
-    requested = set(refs)
-    observed = retirement_git(unit, "for-each-ref", "--format=%(objectname)%00%(refname)%00",
+def retirement_branch_refs(unit: RetiringUnit, refs: tuple[str, ...], *,
+                           settings: conf.ConfigRead) -> dict[str, list[str]]:
+    """Find local refs and fetch the advertised branch refs without updating tracking refs."""
+    observed = retirement_git(unit, "for-each-ref", "--format=%(refname)%00%(symref)%00",
                               "--", *refs, settings=settings)
     if observed.returncode or observed.stderr.strip():
         raise OSError(retirement_failure(observed))
     # Git adds a newline after each NUL-delimited record.
     fields = observed.stdout.split("\0")
-    local = {ref: commit.removeprefix("\n") for commit, ref in zip(fields[::2], fields[1::2]) if ref in requested}
-    remote = retirement_git(unit, "ls-remote", "--exit-code", "--heads", "origin", *refs, settings=settings)
-    if remote.returncode not in (0, 2):
-        raise OSError(retirement_failure(remote))
+    local = {ref.removeprefix("\n"): target for ref, target in zip(fields[::2], fields[1::2])}
+    unit_ref = f"refs/heads/{unit.branch}"
+    if local.get(unit_ref):
+        raise OSError(f"refused: branch {unit.branch} is symbolic")
+
+    sources = {ref: [ref] if ref in local else [] for ref in refs}
     advertised: dict[str, str] = {}
-    for line in remote.stdout.split("\n"):
-        commit, _, ref = line.partition("\t")
-        if ref in requested:
-            advertised[ref] = commit
-    refs_to_fetch = [ref for ref, commit in advertised.items() if commit != local.get(ref)]
-    if refs_to_fetch:
+    for ref in refs:
+        remote = retirement_git(unit, "ls-remote", "--exit-code", "--heads", "origin", ref, settings=settings)
+        if remote.returncode not in (0, 2):
+            raise OSError(retirement_failure(remote))
+        if remote.returncode == 0:
+            # A suffix-only match still requires the full ref to exist at fetch.
+            advertised[ref] = ""
+            for line in remote.stdout.split("\n"):
+                commit, _, name = line.partition("\t")
+                if name == ref:
+                    advertised[ref] = commit
+                    break
+    if advertised:
         fetched = retirement_git(unit, "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "-q",
-                                 "origin", *refs_to_fetch, settings=settings)
+                                 "origin", *advertised, settings=settings)
         if fetched.returncode:
             raise OSError(retirement_failure(fetched))
-    return RetirementBranchTips(local, advertised)
+        for ref, commit in advertised.items():
+            if not commit:
+                raise OSError(f"origin did not advertise the exact branch {ref}")
+            sources[ref].append(commit)
+    return sources
 
-
-def retirement_check(unit: RetiringUnit, *, settings: conf.ConfigRead,
-                     check_absent_branch: bool = False) -> RetirementReady | RetirementBlocked:
-    """Check for unsaved work and retain the exact tips that can be removed."""
+def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead, check_absent_branch: bool = False) -> list[str]:
+    """Keep uncommitted work and commits outside the merge branch."""
     present = unit.worktree.is_dir()
     if not present and (not check_absent_branch or not unit.branch):
-        return RetirementReady(RetirementBranchTips({}, {}))
+        return []
     found: list[str] = []
     if present:
         status = retirement_run(["git", "-C", str(unit.worktree), "status", "--short"], settings=settings)
@@ -1270,15 +1261,14 @@ def retirement_check(unit: RetiringUnit, *, settings: conf.ConfigRead,
                  if not (line[:2] == " M" and retirement_recorder_line_only(unit.worktree, line[3:], settings=settings))]
         if paths:
             found.append(f"uncommitted work in {unit.worktree}: {', '.join(paths)}")
-    merge_branch = unit.production.merge_branch
-    merge_ref = f"refs/heads/{merge_branch}"
+    merge_ref = f"refs/heads/{unit.production.merge_branch}"
     branch_ref = f"refs/heads/{unit.branch}"
-    named_refs = tuple(dict.fromkeys((branch_ref, merge_ref))) if unit.branch else (merge_ref,)
-    tips = retirement_branch_tips(unit, named_refs, settings=settings)
-    refs = tips.commits(branch_ref) if unit.branch else ("HEAD",)
-    merge_refs = tips.commits(merge_ref)
+    branches = tuple(dict.fromkeys((branch_ref, merge_ref))) if unit.branch else (merge_ref,)
+    sources = retirement_branch_refs(unit, branches, settings=settings)
+    refs = sources[branch_ref] if unit.branch else ["HEAD"]
+    merge_refs = sources[merge_ref]
     if not merge_refs:
-        raise OSError(f"merge branch {merge_branch} is absent from origin and this clone")
+        raise OSError(f"merge branch {unit.production.merge_branch} is absent from origin and this clone")
     for ref in refs:
         commits = retirement_git(unit, "rev-list", "--no-merges", ref, "--not", *merge_refs, settings=settings)
         if commits.returncode:
@@ -1286,34 +1276,30 @@ def retirement_check(unit: RetiringUnit, *, settings: conf.ConfigRead,
         if commits.stdout.strip():
             found.append(f"unmerged commits on {unit.branch or ref}: {commits.stdout.splitlines()[0]}")
             break
-    return RetirementBlocked(found) if found else RetirementReady(tips)
+    return found
 
 def retirement_members(unit: RetiringUnit, record: staff.StaffSnapshot) -> list[staff.StaffRow]:
     return [unit.staff_member, *record.find(kind="worker", parent=unit.staff_member.id)]
 
-def retirement_remove(unit: RetiringUnit, ready: RetirementReady, *, settings: conf.ConfigRead) -> list[str]:
+def retirement_remove(unit: RetiringUnit, *, settings: conf.ConfigRead) -> list[str]:
     if unit.worktree.exists():
         result = retirement_git(unit, "worktree", "remove", "--force", str(unit.worktree), settings=settings)
         if result.returncode:
             return [retirement_failure(result)]
         release_worktree_pair(unit.worktree)
         print(f"removed: worktree {unit.worktree}")
-    ref = f"refs/heads/{unit.branch}"
-    if ref in ready.tips.local:
-        worktrees = retirement_git(unit, "worktree", "list", "--porcelain", "-z", settings=settings)
-        if worktrees.returncode:
-            return [retirement_failure(worktrees)]
-        if f"branch {ref}" in worktrees.stdout.split("\0"):
-            return [f"branch {unit.branch} is checked out"]
-        result = retirement_git(unit, "update-ref", "-d", ref, ready.tips.local[ref], settings=settings)
-        if result.returncode:
-            return [retirement_failure(result)]
-        _ = retirement_git(unit, "config", "--remove-section", f"branch.{unit.branch}", settings=settings)
-    if ref in ready.tips.origin:
-        lease = f"--force-with-lease={ref}:{ready.tips.origin[ref]}"
-        result = retirement_git(unit, "push", "-q", "origin", lease, f":{ref}", settings=settings)
-        if result.returncode:
-            return [retirement_failure(result)]
+    if unit.branch:
+        if retirement_git(unit, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}", settings=settings).returncode == 0:
+            result = retirement_git(unit, "branch", "-D", unit.branch, settings=settings)
+            if result.returncode:
+                return [retirement_failure(result)]
+        observed = retirement_git(unit, "ls-remote", "--exit-code", "--heads", "origin", unit.branch, settings=settings)
+        if observed.returncode not in (0, 2):
+            return [retirement_failure(observed)]
+        if observed.returncode == 0:
+            result = retirement_git(unit, "push", "-q", "origin", "--delete", unit.branch, settings=settings)
+            if result.returncode:
+                return [retirement_failure(result)]
     return []
 
 def retirement_release_reservations(unit: RetiringUnit, *, settings: conf.ConfigRead) -> None:
@@ -1459,9 +1445,9 @@ def unit_local_command() -> int:
                 production = Production(Path(), "", retained.get("merge_branch", str(fields["merge_branch"])),
                                         Path(retained["checkout"]), Path(), ZoneInfo("UTC"), row)
                 unit = RetiringUnit(production, row.name, location.path, retained["branch"], row)
-                checked = retirement_check(unit, settings=settings, check_absent_branch=True)
-                if isinstance(checked, RetirementBlocked):
-                    print("\n".join(f"refused: {reason}" for reason in checked.reasons))
+                refused = retirement_refusals(unit, settings=settings, check_absent_branch=True)
+                if refused:
+                    print("\n".join(f"refused: {reason}" for reason in refused))
                 else:
                     panes, reasons = retirement_stop_members(row, record)
                     for reason in reasons:
@@ -1623,9 +1609,9 @@ def retirement_clear_worktree(unit: RetiringUnit, *, settings: conf.ConfigRead, 
         print(f"refused: live holds or processes remain in {unit.worktree}")
         return 1
     # Check the work again after the sessions stop.
-    checked = retirement_check(unit, settings=settings, check_absent_branch=require_cleanup)
-    if isinstance(checked, RetirementBlocked):
-        print("\n".join(f"refused: {reason}" for reason in checked.reasons))
+    refused = retirement_refusals(unit, settings=settings, check_absent_branch=require_cleanup)
+    if refused:
+        print("\n".join(f"refused: {reason}" for reason in refused))
         return 1
     remaining = worker_panes.observe(row.id, record) if pane_workers else []
     if any(isinstance(item, (worker_panes.OpenWorker, worker_panes.UncertainWorker, worker_panes.ProcessUnknownWorker)) for item in remaining):
@@ -1644,7 +1630,7 @@ def retirement_clear_worktree(unit: RetiringUnit, *, settings: conf.ConfigRead, 
         retained = staff.set_worktree(row.id, staff.RemovedWorktree(row.worktree.machine, unit.worktree,
                                                                   staff.ParkedBranch(unit.branch)), expected=row.worktree)
         unit = replace(unit, staff_member=retained)
-    failed = retirement_remove(unit, checked, settings=settings)
+    failed = retirement_remove(unit, settings=settings)
     if failed:
         if (isinstance(row.worktree, staff.PresentWorktree) and unit.worktree.is_dir()
                 and isinstance(unit.staff_member.worktree, staff.RemovedWorktree)):
@@ -1678,11 +1664,11 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
     pane = retirement_pane(row, record)
     if isinstance(row.worktree, staff.RemovedWorktree) and not unit.worktree.exists():
         if unit.branch:
-            checked = retirement_check(unit, settings=settings, check_absent_branch=True)
-            if isinstance(checked, RetirementBlocked):
-                print("\n".join(f"refused: {reason}" for reason in checked.reasons))
+            refused = retirement_refusals(unit, settings=settings, check_absent_branch=True)
+            if refused:
+                print("\n".join(f"refused: {reason}" for reason in refused))
                 return 1
-            failed = retirement_remove(unit, checked, settings=settings)
+            failed = retirement_remove(unit, settings=settings)
             if failed:
                 print("\n".join(f"anomaly: {reason}" for reason in failed))
                 return 1
@@ -1693,9 +1679,9 @@ def retirement_retire(unit: RetiringUnit, *, settings: conf.ConfigRead,
         print("unchanged")
         retirement_close_idle_shell(pane, row, record)
         return 0
-    checked = retirement_check(unit, settings=settings)
-    if isinstance(checked, RetirementBlocked):
-        print("\n".join(f"refused: {reason}" for reason in checked.reasons))
+    refused = retirement_refusals(unit, settings=settings)
+    if refused:
+        print("\n".join(f"refused: {reason}" for reason in refused))
         return 1
     config = unit_config.read(unit.worktree, cleanup=False)
     if isinstance(config, unit_config.UnitConfig):
