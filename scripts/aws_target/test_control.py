@@ -22,6 +22,7 @@ from scripts.aws_target import admin_secrets, aws_page, aws_target, deploy, ledg
 from scripts.aws_target import config as aws_config
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture
+from scripts.buildlog import aws_report
 from scripts.lib import atomic_file, conf
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.notify import push_texts
@@ -373,6 +374,41 @@ gate_wait_usd_per_minute=0
         # Refused requests and launched boxes have their own tables: one row per type, one column per region.
         self.assertEqual(merge_gates.refused.rows[0], (fast, '1', '0'))
         self.assertEqual(merge_gates.launched.rows[0], (fast, '1', '0'))
+
+    def test_launch_history_readers_accept_missing_and_unreadable_gate_jobs(self) -> None:
+        self.assertEqual(self.snapshot(), 0)
+        now = int(self.clock.now)
+        end = datetime.fromtimestamp(now, UTC)
+        start = end - timedelta(hours=1)
+        region = self.regions[0]
+        size = self.standard[0]
+        attempt: dict[str, object] = {
+            'attempt': 'fixture', 'instance_type': size, 'mode': 'merge-gate', 'region': region}
+        launched = {**attempt, 'result': 'launched', 'time': now - 600}
+        finished = {**attempt, 'result': 'finished', 'time': now - 240, 'gate_s': 300}
+        book = ledger.CostLedger(self.state)
+        book.record_inventory(ledger.ResourceInventory(now - 900,
+            (ledger.PricedResource('fixture-fixed', Decimal(0)),), 'fixture'))
+        gate_job = {'kind': 'StepJob', 'step': 'test-all', 'unit': '', 'branch': '', 'modules': 0}
+        job_fields: tuple[dict[str, object], ...] = ({}, {'gate_job': gate_job},
+            {'gate_job': {'kind': 'GateJobNotRecorded'}}, {'gate_job': {'kind': 'FutureGateJob'}},
+            {'gate_job': {**gate_job, 'modules': []}})
+        for job_field in job_fields:
+            with self.subTest(job_field=job_field):
+                rows = ({**launched, **job_field}, {**finished, **job_field})
+                _ = book.launch_history_path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                self.assertEqual(book.launches(), rows)
+                self.assertEqual(ledger.recent_gate_launches(self.state, start.timestamp()), rows[::-1])
+                runs = run_cost.gate_runs(book, start, end, region).runs
+                self.assertEqual([(run.instance_type, run.box_s) for run in runs], [(size, Decimal(360))])
+                self.assertEqual(sum(day.runs for day in book.spend_days(aws_config.read_settings(self.settings), now)), 1)
+                report = aws_report.gate_type_report(self.state, end.date().isoformat(), 1)
+                self.assertTrue(any(line.startswith(f'| {size} |') for line in report.tables))
+                page = aws_page.publish(self.state, now, self.root / 'page', settings_path=self.settings)
+                payload = page.read_text().split('<script id="aws-prices-data" type="application/json">', 1)[1]
+                data = cast(aws_page.PageData, json.loads(payload.split('</script>', 1)[0]))
+                table = next(table for table in data['runs'][0]['tables'] if table.get('title') == size)
+                self.assertEqual(table['rows'][0][:3], [region, '6.0', '1'])
 
     def test_paid_run_cell_counts_the_runs_whose_bill_is_still_due(self) -> None:
         self.assertEqual(self.snapshot(), 0)

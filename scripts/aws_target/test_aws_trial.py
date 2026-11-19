@@ -460,7 +460,10 @@ class Sample(unittest.TestCase):
             folder = next((self.state / 'paired-trials').iterdir())
             expires = 1700000000 + cloud_gate.settings().whole('lifetime_minutes') * 60
             request_path = next(folder.glob('*/request.json'))
-            self.assertEqual(cloud_gate.read(request_path)['expires'], expires)
+            saved = cloud_gate.read(request_path)
+            self.assertEqual(saved['expires'], expires)
+            self.assertEqual(saved['gate_job'], {'kind': 'StepJob', 'step': 'test-modules',
+                                                'unit': '', 'branch': '', 'modules': 1})
             self.assertEqual(self.remote_branches(), {**branches,
                 f'refs/heads/gate-trial-{expires}-{folder.name}-base': self.base,
                 f'refs/heads/gate-trial-{expires}-{folder.name}-changed': self.changed})
@@ -1056,7 +1059,8 @@ print('200', end='')
     def test_paired_worker_leaves_launch_progress_to_the_box_request(self) -> None:
         folder = self.root / 'trial' / 'module'
         folder.mkdir(parents=True)
-        request: dict[str, object] = {'attempt': 'module'}
+        request: dict[str, object] = {'attempt': 'module', 'gate_job': {
+            'kind': 'StepJob', 'step': 'test-modules', 'unit': 'saved-unit', 'branch': '', 'modules': 1}}
         cloud_gate.save(folder / 'request.json', request)
         cloud_gate.save(folder / 'deployment.json', {})
         sidecar = folder / 'reservation.cgroup'

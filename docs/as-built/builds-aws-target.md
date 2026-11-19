@@ -1127,6 +1127,13 @@ Failed or slow regions retain their hourly rows.
 The live read never writes `spot-prices.json`.
 `launch.json` saves `spot_price_reads`, with `region`, `seconds`, and `used` for each regional call.
 Launch and refusal rows copy this evidence into `cloud-gate-launches.jsonl`.
+Every launch, refusal, fallback, and finish row in this file includes `gate_job`.
+It uses the queue's tagged `StepJob` record with `step`, `unit`, `branch`, and `modules`.
+When the job is unknown, the field contains `{"kind":"GateJobNotRecorded"}`.
+Readers accept rows with missing or unreadable `gate_job` values.
+The controller saves the job with the attempt ID in `current.json`.
+The request and every launch history row for the attempt use that saved job.
+An attempt uses `GateJobNotRecorded` if its saved job is missing or unreadable.
 Resumed launches keep the saved ranking and evidence without another live read.
 Placement does not try a type and region whose median box time, boot included, is above `max_gate_minutes=12`.
 The user, 2026-11-14: a slow type costs more gate time than its lower price saves.
