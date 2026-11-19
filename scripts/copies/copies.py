@@ -45,7 +45,10 @@ from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.lib.build_slots import SlotQueuePosition, NewSlotQueuePosition, NEW_SLOT_QUEUE_POSITION
 from scripts.build_queue import first_step, slot_wait
-from scripts.copies.scope_bindings import CopyOwnerLaunch, OwnedCheckoutLease, VerifyLaunch, checkout_scope_channel
+from scripts.copies.scope_bindings import (
+    CheckoutProcess, CopyScopeRegistration, LaunchedSupervisors, OwnedCheckoutLease, checkout_binding_registration,
+    checkout_scope_channel, checkout_scope_listener,
+)
 from scripts.lib.build_steps import StepJob, VerifyCommand, command_job, command_program, read_step_names, verify_command
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
@@ -1462,8 +1465,8 @@ def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Se
                 if sys.platform == "linux":
                     descriptor = build_folders.build_folder_lock_fd(tree)
                     lease = OwnedCheckoutLease(tree, descriptor, build_folders.CheckoutLeaseKind.READY_SLOT)
-                    address = scope.enter_context(checkout_scope_channel(lease, CopyOwnerLaunch(os.getpid())))
-                    scope.enter_context(copy_binding_environment(address, descriptor, command))
+                    registration = scope.enter_context(checkout_binding_registration(lease))
+                    scope.enter_context(copy_binding_environment(registration, descriptor, command))
             else:
                 # OtherCommand has no first queue step to admit.
                 tree = scope.enter_context(standing(owner, repo, policy, merge=merge, step=label, command=command))
@@ -2226,18 +2229,20 @@ def command_tail(command: list[str]) -> list[str]:
 
 
 @contextmanager
-def copy_binding_environment(address: str, descriptor: int, command: Sequence[str]) -> Generator[None]:
-    key = "BUILDLOG_PREPARED_COPY_BIND_ADDRESS"
+def copy_binding_environment(registration: CopyScopeRegistration, descriptor: int, command: Sequence[str]) -> Generator[None]:
+    key = "BUILDLOG_SCOPE_REGISTRATION"
     inherited = "BUILDLOG_PREPARED_COPY_LOCK_FD"
     previous = {name: os.environ.get(name) for name in (key, inherited)}
-    os.environ[key] = address
+    os.environ[key] = registration.handoff()
     with ExitStack() as cleanup:
+        locks = COMMAND_LOCKS.get()
         if isinstance(verify_command(command), VerifyCommand):
-            token = COMMAND_LOCKS.set(tuple(fd for fd in COMMAND_LOCKS.get() if fd != descriptor))
-            _ = cleanup.callback(COMMAND_LOCKS.reset, token)
+            locks = tuple(fd for fd in locks if fd != descriptor)
             _ = os.environ.pop(inherited, None)
         else:
             os.environ[inherited] = str(descriptor)
+        token = COMMAND_LOCKS.set((*locks, *registration.descriptors()))
+        _ = cleanup.callback(COMMAND_LOCKS.reset, token)
         try:
             yield
         finally:
@@ -2269,8 +2274,9 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
             locks = COMMAND_LOCKS.get()
             if sys.platform == "linux":
                 lease = OwnedCheckoutLease(tree.parent, source_lock, build_folders.CheckoutLeaseKind.SOURCE_COPY)
-                environment["COPIES_CHECKOUT_BIND_ADDRESS"] = scope.enter_context(
-                    checkout_scope_channel(lease, CopyOwnerLaunch(os.getpid())))
+                registration = scope.enter_context(checkout_binding_registration(lease))
+                environment["COPIES_SCOPE_REGISTRATION"] = registration.handoff()
+                locks = (*locks, *registration.descriptors())
             if sys.platform != "linux" or not isinstance(verify_command(command), VerifyCommand):
                 # Other commands can use the source copy without a Verify scope.
                 environment["COPIES_RUN_LOCK_FD"] = str(source_lock)
@@ -2440,21 +2446,30 @@ def step_owner(source: Path) -> str:
 class CheckoutOwnerPipes:
     request: BinaryIO
     reply: BinaryIO
-    verify_pid: int
     owner_fds: tuple[int, ...]
 
-    def wait_for_publish(self) -> bool:
+    def read_command(self) -> bytes:
         if not self.owner_fds:
-            return self.request.readline() == b"publish\n"
+            return self.request.readline(64)
         request = self.request.fileno()
         ready = select.poll()
         ready.register(request, select.POLLIN)
         for descriptor in self.owner_fds:
             ready.register(descriptor, select.POLLIN)
-        return all(descriptor == request for descriptor, _ in ready.poll()) and os.read(request, 8) == b"publish\n"
+        if any(descriptor != request for descriptor, _ in ready.poll()):
+            return b""
+        return os.read(request, 64)
+
+    def wait_for_publish(self) -> bool:
+        return self.read_command() == b"publish\n"
 
     def publish_path(self, checkout: Path) -> None:
         _ = self.reply.write(os.fsencode(checkout) + b"\n")
+        self.reply.flush()
+
+    def publish_step(self, checkout: Path, endpoint: bytes, words: Sequence[str]) -> None:
+        _ = self.reply.write(os.fsencode(checkout) + b"\n" + endpoint + f"{len(words)}\n".encode("ascii"))
+        _ = self.reply.write(b"\0".join(map(os.fsencode, words)) + b"\0")
         self.reply.flush()
 
 
@@ -2475,7 +2490,7 @@ def checkout_owner_pipes() -> Generator[CheckoutOwnerPipes]:
         try:
             _ = os.dup2(command_stream.fileno(), 0)
             _ = os.dup2(command_stream.fileno(), 1)
-            yield CheckoutOwnerPipes(request, reply, verify_pid, tuple(owner_fds))
+            yield CheckoutOwnerPipes(request, reply, tuple(owner_fds))
         finally:
             _ = sys.stdout.flush()
             _ = os.dup2(request.fileno(), 0)
@@ -2519,11 +2534,19 @@ def run_slot_step(source: Path, args: CopyArguments, launch: CheckoutOwnerPipes 
                 words = ["env", *(f"{key}={value}" for key, value in slot.slot_environment.items()), *command]
                 lease = OwnedCheckoutLease(checkout, build_folders.build_folder_lock_fd(checkout),
                                            build_folders.CheckoutLeaseKind.READY_SLOT)
-                bindings = checkout_scope_channel(lease, VerifyLaunch(launch.verify_pid)) if sys.platform == "linux" else nullcontext("")
-                with bindings as address:
-                    _ = launch.reply.write(os.fsencode(f"{checkout}\n{address}\n{len(words)}\n"))
-                    _ = launch.reply.write(b"\0".join(map(os.fsencode, words)) + b"\0")
-                    launch.reply.flush()
+                if sys.platform == "linux":
+                    with checkout_scope_listener() as (listener, endpoint):
+                        launch.publish_step(checkout, endpoint.encode(), words)
+                        registration = launch.read_command()
+                        if not registration:
+                            return 0
+                        supervisors = LaunchedSupervisors()
+                        supervisors.record(CheckoutProcess.parse(registration.decode("ascii").rstrip("\n")))
+                        with checkout_scope_channel(listener, lease, supervisors):
+                            if launch.wait_for_publish():
+                                capture_step_files(output, paths, before)
+                else:
+                    launch.publish_step(checkout, b"\n", words)
                     if launch.wait_for_publish():
                         capture_step_files(output, paths, before)
                 return 0

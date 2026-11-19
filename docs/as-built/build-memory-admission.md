@@ -267,12 +267,20 @@ If shutdown fails, verify reports the error and keeps the reservation for the se
 Before local Cargo starts, the copy owner writes the scope path to each checkout lease record.
 The same owner protocol binds private slots, prepared slots, and source copies.
 The owner keeps the checkout lock and sends only a confirmation.
-The owner checks `SO_PEERCRED` and the peer's process ancestry before it binds the scope.
-Only the scope supervisor that Verify launched can request the binding.
+Verify registers the supervisor's PID and start time before it permits the supervisor to connect.
+For private slots, Verify registers on the checkout owner's command pipe.
+For prepared slots and source copies, Verify registers on a private socket from the owner.
+The owner puts the endpoint in a sealed file descriptor that each Verify invocation can read.
+Bash marks the registration sockets close-on-exec with its `fdflags` builtin.
+Verify carries the sockets through its Nix re-exec and supplies the owner identities and addresses as arguments.
+The Nix helper gives direnv no registration socket.
+The owner checks the supervisor's PID and start time with `SO_PEERCRED` and the process table.
+The supervisor checks the owner's PID and start time before it requests the lease.
 The private checkout owner watches Verify and the launch shell by pidfd.
 A child with an open protocol pipe cannot keep the lease after either process exits.
 The copy owner keeps the protocol apart from the streams that its commands inherit.
-The Python shim closes inherited descriptors for its interpreter probe.
+The Python shim isolates the interpreter probe and cache helpers from caller descriptors.
+The final interpreter receives the caller descriptors.
 `VERIFY_SCOPE_PUBLICATION_SECONDS` sets the deadline in `config/direct.conf`.
 The deadline covers scope publication, the scope request, and lease confirmation.
 The supervisor checks for owner exit and channel capacity before the request.

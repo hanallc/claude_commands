@@ -228,6 +228,53 @@ if [[ -n "${COPIES_RUN_LOCK_FD:-}${COPIES_RUN_BIND_FD:-}${BUILDLOG_PREPARED_COPY
     close_checkout_handoffs
 fi
 
+# Take the channels before Nix can change the command environment.
+unset SOURCE_SCOPE_FD SOURCE_SCOPE_BINDING PREPARED_SCOPE_FD PREPARED_SCOPE_BINDING PREPARED_SCOPE_PATH
+SOURCE_SCOPE_FD=""
+SOURCE_SCOPE_BINDING=""
+PREPARED_SCOPE_FD=""
+PREPARED_SCOPE_BINDING=""
+PREPARED_SCOPE_PATH=""
+CHECKOUT_BINDINGS_REEXEC=0
+source_endpoint=""
+prepared_endpoint=""
+if [[ "${1:-}" == --checkout-bindings ]]; then
+    CHECKOUT_BINDINGS_REEXEC=1
+    SOURCE_SCOPE_FD=$2 SOURCE_SCOPE_BINDING=$3 PREPARED_SCOPE_FD=$4 PREPARED_SCOPE_BINDING=$5 PREPARED_SCOPE_PATH=$6
+    shift 6
+else
+    IFS=: read -r SOURCE_SCOPE_FD source_endpoint <<< "${COPIES_SCOPE_REGISTRATION:-}"
+    IFS=: read -r PREPARED_SCOPE_FD prepared_endpoint <<< "${BUILDLOG_SCOPE_REGISTRATION:-}"
+    PREPARED_SCOPE_PATH=${BUILDLOG_PREPARED_COPY:-}
+fi
+unset COPIES_SCOPE_REGISTRATION BUILDLOG_SCOPE_REGISTRATION
+
+if [[ -n "$SOURCE_SCOPE_FD$PREPARED_SCOPE_FD" ]]; then
+    # The Bash builtin changes the descriptor flags in this shell.
+    if ! enable -f "${BASH%/*}/../lib/bash/fdflags" fdflags 2>/dev/null &&
+       ! enable -f /run/current-system/sw/lib/bash/fdflags fdflags; then
+        printf 'verify.sh: cannot isolate the checkout registration descriptors\n' >&2
+        exit 125
+    fi
+    for scope_fd in "$SOURCE_SCOPE_FD" "$PREPARED_SCOPE_FD"; do
+        [[ -n "$scope_fd" ]] || continue
+        [[ "$scope_fd" =~ ^[1-9][0-9]*$ && "$scope_fd" -gt 2 && -S "/dev/fd/$scope_fd" ]] || exit 125
+        fdflags -s +cloexec,+nonblock "$scope_fd" || exit 125
+    done
+    # Reopen the sealed record so successive launches have separate read offsets.
+    take_checkout_endpoint() {
+        local endpoint=$1 binding=$2
+        [[ "$endpoint" =~ ^[1-9][0-9]*$ && "$endpoint" -gt 2 && -f "/proc/self/fd/$endpoint" ]] || return 125
+        IFS= read -r "$binding" < "/proc/self/fd/$endpoint" || return 125
+        exec {endpoint}<&-
+    }
+    if [[ "$CHECKOUT_BINDINGS_REEXEC" == 0 ]]; then
+        [[ -z "$SOURCE_SCOPE_FD" ]] || take_checkout_endpoint "$source_endpoint" SOURCE_SCOPE_BINDING || exit 125
+        [[ -z "$PREPARED_SCOPE_FD" ]] || take_checkout_endpoint "$prepared_endpoint" PREPARED_SCOPE_BINDING || exit 125
+    fi
+fi
+readonly SOURCE_SCOPE_FD SOURCE_SCOPE_BINDING PREPARED_SCOPE_FD PREPARED_SCOPE_BINDING PREPARED_SCOPE_PATH
+
 usage() {
     sed -n '/^# Usage:$/,/^# End usage\./{
         /^# End usage\./d
@@ -537,7 +584,7 @@ VERIFY_INVOKE_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$VERIFY_INVOKE_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_INVOKE_DIR=.
 source "$VERIFY_INVOKE_DIR/../lint/invoke.sh" --prepare-temp || exit 2
 # Load the environment once through the shared helper, before tool setup or records.
-if [[ -n "${VERIFY_NIX_ENV_REEXEC:-}" ]]; then
+if [[ -n "${VERIFY_NIX_ENV_REEXEC:-}" || "$CHECKOUT_BINDINGS_REEXEC" == 1 ]]; then
     if [[ -n "${IN_NIX_SHELL:-}" ]]; then
         printf '%s\n' 'verify.sh: not in the nix shell; re-running under nix_env.py exec' >&2
     elif [[ -n "${NIX_ENV_ENVRC:-}" ]]; then
@@ -549,10 +596,22 @@ elif [[ -z "${IN_NIX_SHELL:-}" ]]; then
     [[ "$VERIFY_NIX_SCRIPT_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_NIX_SCRIPT_DIR=.
     VERIFY_NIX_SCRIPT_DIR="$(cd -- "$VERIFY_NIX_SCRIPT_DIR" && pwd -P)"
     export VERIFY_NIX_ENV_REEXEC=1
-    exec "$PY" -S "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/nix_env.py" \
-        exec "$VERIFY_NIX_SCRIPT_DIR/${BASH_SOURCE[0]##*/}" "$@"
+    if [[ -n "$SOURCE_SCOPE_FD$PREPARED_SCOPE_FD" ]]; then
+        set -- "$BASH" -p "$VERIFY_NIX_SCRIPT_DIR/${BASH_SOURCE[0]##*/}" \
+            --checkout-bindings "$SOURCE_SCOPE_FD" "$SOURCE_SCOPE_BINDING" \
+            "$PREPARED_SCOPE_FD" "$PREPARED_SCOPE_BINDING" "$PREPARED_SCOPE_PATH" "$@"
+        for scope_fd in "$SOURCE_SCOPE_FD" "$PREPARED_SCOPE_FD"; do
+            [[ -z "$scope_fd" ]] || fdflags -s -cloexec "$scope_fd" || exit 125
+        done
+    else
+        set -- "$VERIFY_NIX_SCRIPT_DIR/${BASH_SOURCE[0]##*/}" "$@"
+    fi
+    exec "$PY" -S "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/nix_env.py" exec "$@"
 fi
 unset VERIFY_NIX_ENV_REEXEC
+if [[ -n "$PREPARED_SCOPE_FD" ]]; then
+    export BUILDLOG_PREPARED_COPY="$PREPARED_SCOPE_PATH"
+fi
 
 BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$BUILD_OVERRIDE_GUARD_DIR" != "${BASH_SOURCE[0]}" ]] || BUILD_OVERRIDE_GUARD_DIR=.
@@ -2841,7 +2900,8 @@ step_uses_build_scope() {
     verify_uses_build_scope || return 1
     [[ -n "${BUILDLOG_SELECTED_LOCAL_GRANT:-}" ]] && return 0
     [[ "${1:-}" == cargo ]] || return 1
-    [[ ( -n "${COPIES_RUN_PID:-}" && -n "${COPIES_STEP_SOURCE:-}" ) ||
+    [[ -n "$SOURCE_SCOPE_BINDING" ||
+       ( -n "${COPIES_RUN_PID:-}" && -n "${COPIES_STEP_SOURCE:-}" ) ||
        ( -n "${BUILDLOG_PREPARED_COPY:-}" && "$BUILDLOG_PREPARED_COPY" == "${VERIFY_REPO_ROOT:-}" ) ]]
 }
 
@@ -2853,10 +2913,10 @@ run_checkout_step() (
         return $?
     fi
     local DOC_COPY_OWNER_PID="" DOC_COPY_LEASE_FD="" DOC_COPY_REPLY_FD="" MAC_SOURCE_ROOT=""
-    local command=() argument_count DOC_COPY_BIND_ADDRESS
+    local command=() argument_count DOC_COPY_BINDING
     step_checkout "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$VERIFY_SLOT_SOURCE" --tree "$VERIFY_SLOT_TREE" \
         --step "$CMD" --capacity-file "$VERIFY_SLOT_CAPACITY_FILE" --bind-scope -- "$@" || return $?
-    if ! IFS= read -r DOC_COPY_BIND_ADDRESS <&"$DOC_COPY_REPLY_FD" ||
+    if ! IFS= read -r DOC_COPY_BINDING <&"$DOC_COPY_REPLY_FD" ||
        ! IFS= read -r argument_count <&"$DOC_COPY_REPLY_FD" ||
        [[ ! "$argument_count" =~ ^[1-9][0-9]*$ ]] ||
        ! mapfile -d '' -n "$argument_count" command <&"$DOC_COPY_REPLY_FD" ||
@@ -2885,31 +2945,60 @@ run_placed_scope() {
         export BUILDLOG_RESERVED_STEP
     fi
     local output="$PLACEMENT_SCOPE_STATE.output" supervisor reader status=0
-    local checkout_owner="" checkout_address="" peak=${BUILDLOG_PEAK:-$PLACEMENT_SCOPE_STATE.peak}
+    local checkout_fd="" checkout_binding="" peak=${BUILDLOG_PEAK:-$PLACEMENT_SCOPE_STATE.peak}
+    local -a bindings=()
+    if [[ -n "$SOURCE_SCOPE_BINDING" ]]; then
+        bindings+=(--checkout-binding "$SOURCE_SCOPE_BINDING")
+    elif [[ -n "${COPIES_RUN_PID:-}" && -n "${COPIES_STEP_SOURCE:-}" ]]; then
+        printf 'the source copy has no scope binding channel\n' > "$PLACEMENT_SCOPE_STATE"
+        return 125
+    fi
     if [[ -n "${DOC_COPY_LEASE_FD:-}" ]]; then
-        checkout_owner=$DOC_COPY_OWNER_PID
-        checkout_address=$DOC_COPY_BIND_ADDRESS
+        checkout_fd=$DOC_COPY_LEASE_FD
+        checkout_binding=$DOC_COPY_BINDING
     elif [[ -n "${BUILDLOG_PREPARED_COPY:-}" &&
             "$BUILDLOG_PREPARED_COPY" == "${DOC_REPO_TOP:-${VERIFY_REPO_ROOT:-}}" ]]; then
-        checkout_owner=${BUILDLOG_RUN:-}
-        checkout_owner=${checkout_owner%%:*}
-        checkout_address=${BUILDLOG_PREPARED_COPY_BIND_ADDRESS:-}
-        if [[ -z "$checkout_address" || ! "$checkout_owner" =~ ^[1-9][0-9]*$ ]]; then
-            printf 'the prepared checkout has no scope binding channel\n' > "$PLACEMENT_SCOPE_STATE"
-            return 125
-        fi
+        checkout_fd=$PREPARED_SCOPE_FD
+        checkout_binding=$PREPARED_SCOPE_BINDING
+    fi
+    if [[ -n "$checkout_binding" ]]; then
+        bindings+=(--checkout-binding "$checkout_binding")
+    elif [[ -n "$checkout_fd" ||
+            ( -n "${BUILDLOG_PREPARED_COPY:-}" &&
+              "$BUILDLOG_PREPARED_COPY" == "${DOC_REPO_TOP:-${VERIFY_REPO_ROOT:-}}" ) ]]; then
+        printf 'the checkout has no scope binding channel\n' > "$PLACEMENT_SCOPE_STATE"
+        return 125
     fi
     # The scope writes to a file. Only the reader can write to the log pipeline.
     if ! : > "$output"; then
         printf 'cannot create the scope output file\n' > "$PLACEMENT_SCOPE_STATE"
         return 125
     fi
-    (
-        export VERIFY_CHECKOUT_OWNER="$checkout_owner" VERIFY_CHECKOUT_BIND_ADDRESS="$checkout_address"
-        exec "$PY" "$VERIFY_START_DIR/verify_scoped_step.py" "$$" "$leader" "$PLACEMENT_SCOPE_STATE" \
-            "$peak" "$BUILDLOG_SCOPE_SH" "$@"
-    ) > "$output" 2>&1 &
-    supervisor=$!
+    local -a launch=("$PY" "$VERIFY_START_DIR/verify_scoped_step.py" "$$" "$leader" "$PLACEMENT_SCOPE_STATE"
+                     "$peak" "$BUILDLOG_SCOPE_SH" ${bindings[@]+"${bindings[@]}"} "$@")
+    if (( ${#bindings[@]} )); then
+        # Keep the supervisor behind a pipe until Verify registers its identity.
+        coproc SCOPE_START {
+            local permission
+            IFS= read -r permission && [[ "$permission" == launch ]] || exit 125
+            exec "${launch[@]}" </dev/null > "$output" 2>&1
+        }
+        supervisor=$!
+        local start_fd=${SCOPE_START[1]} stat
+        local -a fields
+        if read -r stat < "/proc/$supervisor/stat" && read -r -a fields <<< "${stat##*) }" &&
+           [[ -n "${fields[19]:-}" ]] &&
+           { [[ -z "$SOURCE_SCOPE_FD" ]] || printf '%s:%s\n' "$supervisor" "${fields[19]}" >&"$SOURCE_SCOPE_FD"; } &&
+           { [[ -z "$checkout_fd" ]] || printf '%s:%s\n' "$supervisor" "${fields[19]}" >&"$checkout_fd"; }; then
+            printf 'launch\n' >&"$start_fd" || true
+        else
+            printf 'cannot register the scope supervisor\n' > "$PLACEMENT_SCOPE_STATE"
+        fi
+        exec {start_fd}>&-
+    else
+        (exec "${launch[@]}") > "$output" 2>&1 &
+        supervisor=$!
+    fi
     (
         close_checkout_handoffs
         exec tail -n +1 --follow --pid="$supervisor" --sleep-interval=0.1 "$output"

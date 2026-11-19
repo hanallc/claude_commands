@@ -182,44 +182,54 @@ class VerifyCopyPythonStartsTests(VerifyDocFixture):
 
 
 class VerifyPythonShimProbeTests(unittest.TestCase):
-    def test_interpreter_probe_does_not_inherit_caller_pipes(self) -> None:
+    def test_interpreter_selection_helpers_do_not_inherit_caller_pipes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            probe_log = root / "probe.json"
-            interpreter = root / "interpreter"
-            _ = interpreter.write_text(f"""#!{sys.executable}
+            reader, writer = os.pipe()
+            self.addCleanup(os.close, reader)
+            self.addCleanup(os.close, writer)
+            mkdir = shutil.which("mkdir")
+            assert mkdir is not None
+            for name in ("python3", "mkdir"):
+                helper = root / name
+                _ = helper.write_text(f"""#!{sys.executable}
 import json
 import os
 from pathlib import Path
 import sys
-if sys.argv[1:3] == ["-I", "-c"]:
+
+name = Path(sys.argv[0]).name
+if name == "mkdir" or sys.argv[1:3] == ["-I", "-c"]:
     descriptors = {{}}
-    for entry in Path("/proc/self/fd").iterdir():
+    for fd in (0, 1, 2, {reader}, {writer}):
         try:
-            descriptors[entry.name] = os.readlink(entry)
-        except FileNotFoundError:
-            pass
-    Path({str(probe_log)!r}).write_text(json.dumps(descriptors))
-os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+            state = os.fstat(fd)
+        except OSError:
+            continue
+        descriptors[str(fd)] = [state.st_dev, state.st_ino]
+    Path({str(root)!r}, name + ".json").write_text(json.dumps(descriptors))
+executable = {mkdir!r} if name == "mkdir" else sys.executable
+os.execv(executable, [executable, *sys.argv[1:]])
 """)
-            interpreter.chmod(0o755)
-            reader, writer = os.pipe()
-            try:
-                expected = os.readlink(f"/proc/self/fd/{reader}")
-                result = subprocess.run(
-                    [str(VERIFY.parents[1] / "lib/py"), "-c",
-                     "import os,sys; print(sys.stdin.read().strip(), os.readlink(sys.argv[1]))",
-                     f"/proc/self/fd/{reader}"],
-                    input="caller input\n", cwd=root, capture_output=True, text=True,
-                    env={**os.environ, "CLAUDE_PYTHON": str(interpreter)}, pass_fds=(reader, writer),
-                    timeout=TEST_HANG_GUARD_SECS)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(result.stdout, f"caller input {expected}\n")
-                self.assertEqual(json.loads(probe_log.read_text()), {"0": "/dev/null", "1": "/dev/null", "2": "/dev/null"},
-                                 "The interpreter probe inherited the caller's streams or descriptors")
-            finally:
-                os.close(reader)
-                os.close(writer)
+                helper.chmod(0o755)
+            environment = {**os.environ, "XDG_CACHE_HOME": str(root / "cache"),
+                           "PATH": os.pathsep.join((str(root), os.environ["PATH"]))}
+            _ = environment.pop("CLAUDE_PYTHON", None)
+            pipe = os.fstat(reader)
+            result = subprocess.run(
+                [str(VERIFY.parents[1] / "lib/py"), "-c",
+                 "import os,sys; s=os.fstat(int(sys.argv[1])); print(sys.stdin.read().strip(), s.st_dev, s.st_ino)",
+                 str(reader)],
+                input="caller input\n", cwd=root, capture_output=True, text=True,
+                env=environment, pass_fds=(reader, writer), timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout, f"caller input {pipe.st_dev} {pipe.st_ino}\n")
+            null = Path(os.devnull).stat()
+            expected = {str(fd): [null.st_dev, null.st_ino] for fd in range(3)}
+            for name in ("python3", "mkdir"):
+                with self.subTest(helper=name):
+                    self.assertEqual(json.loads((root / f"{name}.json").read_text()), expected,
+                                     f"{name} inherited a caller stream or descriptor")
 
 
 class VerifyOutputRootsTests(unittest.TestCase):

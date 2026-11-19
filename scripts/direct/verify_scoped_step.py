@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
-from dataclasses import dataclass
 from enum import Enum, auto
 import errno
 import fcntl
@@ -22,35 +21,13 @@ except FileNotFoundError:
     pass
 
 from scripts.build_queue.admission_records import process_start_time
+from scripts.copies.scope_bindings import CheckoutBindingChannel, checkout_peer
 from scripts.lib import conf, inotify
 
 
 SCOPE_STOP_TIMEOUT_SECONDS = 10
 # poll() takes a signed 32-bit timeout in milliseconds.
 POLL_MAX_MILLISECONDS = (1 << 31) - 1
-
-
-@dataclass(frozen=True)
-class CheckoutBindingChannel:
-    lease_owner: int
-    address: str
-
-
-def checkout_scope_leases() -> tuple[CheckoutBindingChannel, ...]:
-    """Collect the copy owners that must bind the scope."""
-    leases: list[CheckoutBindingChannel] = []
-    source = os.environ.pop("COPIES_CHECKOUT_BIND_ADDRESS", "")
-    if os.environ.get("COPIES_RUN_PID") and os.environ.get("COPIES_STEP_SOURCE"):
-        if not source:
-            raise ValueError("the source copy has no scope binding channel")
-        leases.append(CheckoutBindingChannel(int(os.environ["COPIES_RUN_PID"]), source))
-    owner = os.environ.pop("VERIFY_CHECKOUT_OWNER", "")
-    address = os.environ.pop("VERIFY_CHECKOUT_BIND_ADDRESS", "")
-    if owner:
-        if not address:
-            raise ValueError("the checkout has no scope binding channel")
-        leases.append(CheckoutBindingChannel(int(owner), address))
-    return tuple(leases)
 
 
 # The scope shell publishes its path before this check. A dead owner permits no start.
@@ -222,12 +199,14 @@ def bind_checkout_scope(checkout: CheckoutBindingChannel, scope: Path, owners: s
     with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as channel:
         channel.setblocking(False)
         channel.connect("\0" + checkout.address)
+        if checkout_peer(channel) != checkout.owner:
+            raise ValueError("the checkout scope peer is not the registered copy owner")
         send_checkout_scope(channel, os.fsencode(scope) + b"\n", owners, deadline)
         wait_for_checkout_confirmation(owners, channel.fileno(), deadline)
 
 
 def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
-                    scope_shell: str, command: list[str]) -> int:
+                    scope_shell: str, command: list[str], leases: tuple[CheckoutBindingChannel, ...]) -> int:
     # The supervisor and the scope survive the exit of the step shell.
     supervisor = os.getpid()
     unit = f"verify-step-{supervisor}.scope"
@@ -253,11 +232,12 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
                 raise ValueError("a scope owner exited before launch")
             watch = None
             deadline = 0.0
-            leases = checkout_scope_leases()
             if leases:
                 seconds = conf.read_or_repository("direct").number("VERIFY_SCOPE_PUBLICATION_SECONDS")
                 deadline = time.monotonic() + seconds
-            lease_owners = {lease.lease_owner for lease in leases} - {caller, leader, supervisor}
+            if any(not lease.owner.live_now() for lease in leases):
+                raise ValueError("a checkout owner exited before launch")
+            lease_owners = {lease.owner.pid for lease in leases} - {caller, leader, supervisor}
             lease_owner_fds = tuple(open_pidfd(owner, cleanup) for owner in lease_owners)
             if leases:
                 for descriptor in lease_owner_fds:
@@ -337,7 +317,11 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
 def main(argv: list[str]) -> int:
     caller, leader, release_state, peak, scope_shell, *command = argv
     try:
-        return run_scoped_step(int(caller), int(leader), Path(release_state), peak, scope_shell, command)
+        leases: list[CheckoutBindingChannel] = []
+        while command[:1] == ["--checkout-binding"]:
+            leases.append(CheckoutBindingChannel.parse(command[1]))
+            del command[:2]
+        return run_scoped_step(int(caller), int(leader), Path(release_state), peak, scope_shell, command, tuple(leases))
     except (OSError, ValueError) as error:
         print(f"verify.sh: cannot finish the local build scope ({error})", file=sys.stderr)
         return 125

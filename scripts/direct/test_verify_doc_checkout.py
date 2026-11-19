@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 import json
 import os
+import secrets
 import select
 import signal
 from pathlib import Path
@@ -22,7 +23,7 @@ from scripts.agents.remote import local_machine
 from scripts.build_queue import admission_protocol as wire, admission_records, admission_service as service, execution_identity, memory_feed, placement
 from scripts.buildlog import treekey
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
-from scripts.copies.scope_bindings import CopyOwnerLaunch, OwnedCheckoutLease, checkout_scope_channel
+from scripts.copies.scope_bindings import OwnedCheckoutLease, checkout_binding_registration
 from scripts.direct.verify_doc_test_support import CARGO_STUB, VERIFY, VerifyDocFixture
 from scripts.direct.verify_mac_offload_test_support import processes_carrying, reap, wait_for_marker_exit
 from scripts.direct.verify_scope_test_support import use_fixture_scope_readings, write_real_scope_launcher
@@ -100,6 +101,9 @@ class VerifyDocCheckoutTests(VerifyDocFixture):
                   pass_fds: tuple[int, ...] = ()) -> tuple[subprocess.Popen[bytes], Path, str]:
         log = self.root / "verify.log"
         marker = f"TEST_DOC_CHECKOUT={self.root}"
+        registration = self.environment.get("BUILDLOG_SCOPE_REGISTRATION")
+        if registration:
+            pass_fds = (*pass_fds, *(int(fd) for fd in registration.split(":")))
         with log.open("wb") as output:
             process = subprocess.Popen(
                 command, cwd=self.repo, stdout=output, stderr=output,
@@ -385,6 +389,7 @@ from scripts.test_times import task_cpu
 original = task_cpu.command_arguments
 observations = []
 source_locks = set()
+source_registration = set()
 slot_pipes = set()
 verify_pid = 0
 
@@ -399,10 +404,11 @@ def inspect(pid):
         for fd in (proc / "fd").iterdir():
             with suppress(FileNotFoundError):
                 descriptors[os.fsencode(fd.name)] = os.readlink(fd)
-        if "verify.sh" in names and b"COPIES_CHECKOUT_BIND_ADDRESS" in environment and not verify_pid:
+        if "verify.sh" in names and b"COPIES_STEP_SOURCE" in environment and not verify_pid:
             verify_pid = pid
             source = Path(os.fsdecode(environment[b"COPIES_STEP_SOURCE"])).parent
             source_locks.add(str(source.with_name(source.name + ".lock")))
+            source_registration.update(descriptors[fd] for fd in environment[b"COPIES_SCOPE_REGISTRATION"].split(b":"))
         if verify_pid and "copies.py" in names and "hold" in arguments:
             slot_pipes.update(descriptors[fd] for fd in (b"0", b"1") if descriptors[fd].startswith("pipe:"))
         if verify_pid:
@@ -414,14 +420,16 @@ with patch.object(task_cpu, "command_arguments", inspect):
                            timeout_s=TEST_HANG_GUARD_SECS, output_fd=1)
 if run.status != 0:
     sys.exit(run.status)
-assert source_locks and slot_pipes, "the fixture did not see the source lease and checkout pipes"
+assert source_locks and source_registration and slot_pipes, "the fixture did not see the source lease and checkout pipes"
 assert any("taplo" in names for _, _, names, _ in observations)
 assert any("tee" in names for _, _, names, _ in observations)
 assert any("verify_scoped_step.py" in names for _, _, names, _ in observations)
 assert any("dev_features.py" in names for _, _, names, _ in observations), "the helper fallback did not run"
 leaks = set()
-for _, arguments, names, descriptors in observations:
+for pid, arguments, names, descriptors in observations:
     unexpected = descriptors & source_locks
+    if pid != verify_pid:
+        unexpected |= descriptors & source_registration
     if not ("copies.py" in names and "hold" in arguments):
         unexpected |= descriptors & slot_pipes
     if unexpected:
@@ -1136,9 +1144,14 @@ for descriptor in (8, 74):
             self.environment["BUILDLOG_RUN"] = f"{os.getpid()}:{admission_records.process_start_time(os.getpid())}"
             self.environment["TEST_METADATA"] = self.environment["TEST_METADATA"].replace(str(original), str(slot.path))
             lease = OwnedCheckoutLease(slot.path, descriptor, build_folders.CheckoutLeaseKind.READY_SLOT)
-            with checkout_scope_channel(lease, CopyOwnerLaunch(os.getpid())) as address:
-                self.environment["BUILDLOG_PREPARED_COPY_BIND_ADDRESS"] = address
-                yield slot.path
+            with checkout_binding_registration(lease) as registration:
+                self.environment["BUILDLOG_SCOPE_REGISTRATION"] = registration.handoff()
+                endpoint = Path(f"/proc/self/fd/{registration.endpoint}").read_text().strip()
+                self.environment["BUILDLOG_PREPARED_COPY_BIND_ADDRESS"] = endpoint.rsplit(":", 1)[1]
+                try:
+                    yield slot.path
+                finally:
+                    _ = self.environment.pop("BUILDLOG_SCOPE_REGISTRATION")
 
     def assert_doc_uses_the_prepared_copy(self, command: tuple[str, ...]) -> None:
         with self.prepared_doc_slot() as checkout:
@@ -1183,6 +1196,96 @@ if sys.argv[1:] == ["export", "json"]:
             self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), 0, log.read_text())
             self.assertEqual(observed.read_bytes(), b"", "direnv received a checkout lease response")
             self.assertEqual(len(self.cargo_calls()), 1)
+
+    def test_unregistered_scope_peer_cannot_bind_a_prepared_checkout(self) -> None:
+        verify = self.root / "verify.sh"
+        supervisor = verify.with_name("verify_scoped_step.py")
+        self.executable(verify, '#!/bin/bash\n"$1" "$2" "$$"\nexit $?\n')
+        self.executable(supervisor, f"""
+import os
+from pathlib import Path
+import socket
+
+address = os.environ["BUILDLOG_PREPARED_COPY_BIND_ADDRESS"]
+with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as channel:
+    channel.settimeout({TEST_HANG_GUARD_SECS!r})
+    channel.connect("\\0" + address)
+    scope = Path({str(self.root)!r}) / f"verify-step-{{os.getpid()}}.scope"
+    try:
+        channel.sendall(os.fsencode(scope) + b"\\n")
+        confirmation = channel.recv(64)
+    except (BrokenPipeError, ConnectionResetError):
+        confirmation = b""
+print(confirmation.decode(), end="")
+""")
+        with self.prepared_doc_slot() as checkout:
+            result = subprocess.run(
+                ["bash", str(verify), sys.executable, str(supervisor)], env=self.environment, cwd=self.repo,
+                capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.stdout, "", "The unregistered scope peer received confirmation")
+            record = cast(dict[str, object], json.loads(build_slots.lease_path(checkout).read_text()))
+            self.assertNotIn("scope", record)
+
+    @contextmanager
+    def scope_confirmation_stub(self) -> Generator[str]:
+        address = "copies-scope-" + secrets.token_hex(16)
+        stub = self.root / "unverified-scope-owner"
+        self.executable(stub, f"""
+from contextlib import suppress
+import socket
+
+with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener:
+    listener.bind("\\0" + {address!r})
+    listener.listen()
+    print("ready", flush=True)
+    with listener.accept()[0] as channel, suppress(BrokenPipeError, ConnectionResetError):
+        if channel.recv(4096):
+            channel.sendall(b"bound\\n")
+""")
+        with subprocess.Popen([str(stub)], stdout=subprocess.PIPE) as peer:
+            try:
+                assert peer.stdout is not None
+                readable, _, _ = select.select([peer.stdout], [], [], TEST_HANG_GUARD_SECS)
+                self.assertTrue(readable, "The test peer did not open its socket")
+                self.assertEqual(peer.stdout.readline(), b"ready\n")
+                yield address
+            finally:
+                peer.kill()
+
+    def test_nix_setup_cannot_replace_the_prepared_checkout_binding(self) -> None:
+        _ = self.environment.pop("IN_NIX_SHELL", None)
+        with self.scope_confirmation_stub() as address, self.prepared_doc_slot() as checkout:
+            self.executable(self.root / "bin/direnv", f"""
+import json
+import sys
+
+if sys.argv[1:] == ["export", "json"]:
+    print(json.dumps({{"IN_NIX_SHELL": "impure", "BUILDLOG_PREPARED_COPY_BIND_ADDRESS": {address!r},
+                      "BUILDLOG_SCOPE_REGISTRATION": "98:99", "VERIFY_NIX_ENV_REEXEC": None}}))
+""")
+            _ = (checkout / ".envrc").write_text("# Use the fixture direnv.\n")
+            process, log, _ = self.start_doc()
+            self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), 0, log.read_text())
+            self.assertEqual(len(self.cargo_calls()), 1)
+            record = cast(dict[str, object], json.loads(build_slots.lease_path(checkout).read_text()))
+            self.assertIsInstance(record.get("scope"), str, "Cargo started without a durable checkout lease")
+
+    def test_doc_refuses_a_confirmation_from_the_wrong_copy_owner(self) -> None:
+        with self.scope_confirmation_stub() as address, self.prepared_doc_slot() as checkout:
+            self.instrument_scope_supervisor(f"""
+from dataclasses import replace
+
+bind = verify_scoped_step.bind_checkout_scope
+
+def redirect(checkout, scope, owners, deadline):
+    bind(replace(checkout, address={address!r}), scope, owners, deadline)
+""", 'patch.object(verify_scoped_step, "bind_checkout_scope", redirect)')
+            process, log, _ = self.start_doc()
+            self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), 125, log.read_text())
+            self.assertIn("the checkout scope peer is not the registered copy owner", log.read_text())
+            self.assertFalse(self.events.exists())
+            record = cast(dict[str, object], json.loads(build_slots.lease_path(checkout).read_text()))
+            self.assertNotIn("scope", record)
 
     def test_doc_uses_the_prepared_copy_without_taking_a_second_slot(self) -> None:
         self.assert_doc_uses_the_prepared_copy(DOC_COMMAND)
