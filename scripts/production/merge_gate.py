@@ -748,7 +748,7 @@ class GateRecovery:
                         os.close(descriptor)
         for folder in self.folders:
             path = Path(folder)
-            if not build_folders.remove_free_build_folder(path, wait=False):
+            if not build_folders.remove_free_build_folder(path):
                 raise GateRefused(f"gate recovery kept held folder {path}")
         self.folders.clear()
         self.save()
