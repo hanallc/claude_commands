@@ -2963,6 +2963,13 @@ Work:
 2. Fix it at its cause. A run that mixes an old verify.sh with a new copies.py must fail with a clear message or work, never with an argparse error.
 3. The test replays the user's case (`verify.sh doc <repo>`).
 
+### Phase 44cn — The head-stall line counts sccache compile memory for each holder  · status: todo
+**From builds, 2026-11-18 ~23:35 EST:** the head-stall watch said two nextest holders "use 0.2-0.3 GiB" of 12.5-13.9 GiB promises (pids 4094003, 1090772). Both were compiling through sccache, so the compile memory sits in the sccache server, not in the step cgroup. The "uses" number undercounts every sccache build and sends readers after holders that are fine.
+1. Find where `holder.used` comes from (`scripts/build_queue/head_stall.py` `_used`, the step's `StepMemory`) and why it leaves out the step's compiler jobs. `CompilerJob` (`admission_records.py:524`) already names the jobs that sccache runs for one step scope.
+2. Fix it at its cause: the "uses" number includes the step's sccache compiler jobs. If a job reading is not available, the line says that sccache memory is not counted. Never a silent undercount.
+3. Check if the step memory records and estimates have the same undercount. Fix it in this phase if the cause is the same; otherwise route it.
+4. The test replays the case: two compiling holders under sccache, with low cgroup memory and high compiler job memory.
+
 ### Phase 44cg — A memory wait fixture gives the same result under load  · status: todo
 **From builds, 2026-11-18 18:3x:** queue's next item after 44cf.
 
