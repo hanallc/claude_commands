@@ -48,6 +48,14 @@ def transcript_paths(root: Path, pattern: str = "**/*.jsonl") -> list[Path]:
     return sorted(found.values(), key=str)
 
 
+def claude_transcript_candidates(config_dir: Path, session_id: str) -> Generator[Path]:
+    """Yield one logical path per project. Report directory read errors to the caller."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", session_id):
+        raise ValueError("invalid Claude session ID")
+    for project in (config_dir / "projects").iterdir():
+        yield project / f"{session_id}.jsonl"
+
+
 def transcript_stems(root: Path) -> list[str]:
     """Name each plain or compressed transcript under root once, without a path for each file."""
     stems: dict[str, None] = {}
