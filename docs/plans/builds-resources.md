@@ -2921,7 +2921,7 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 
 **Files:** `scripts/aws_target/aws_trial.py`, `scripts/aws_target/cloud_gate.py`, `scripts/aws_target/test_cloud_gate.py`, `scripts/aws_target/test_aws_trial.py`, `scripts/build_queue/admission_service.py`.
 
-### Phase 159 — The floor pass deletes build output whose workspace is gone before it cuts a live worktree  · status: todo
+### Phase 159 — The floor pass deletes build output whose workspace is gone before it cuts a live worktree  · status: in review
 **Source:** item 88, bob (producer) go 2026-11-18 19:40 EST, through builds. Order: after the Hana AWS work and the Nov 19 cleanup.
 **Cause:** on 11-18, 18 build folders under `/build/cargo` had no workspace (89.2 GiB; largest `scratch/p37w-de072c` 33.9 GiB and `hana_catalyst-inspectors-prefs` 29.1 GiB). The floor take orders by last use only, so it cut live worktree output while these folders stayed. A workspace removed by hand or by `folder_audit.py` leaves its build folder; `worktree_delete` cleans it.
 
