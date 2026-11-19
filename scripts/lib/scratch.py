@@ -46,7 +46,7 @@ ender can fail. A row's folder waits for its verdict, and VISIBLE_ROOT is never 
 worktree goes through `git worktree remove`, so its source repo keeps no stale entry.
 Removal writes versioned deletion intent to `.scratch-removing-<folder>.json` beside the source.
 The intent preserves the task and source evidence across interruptions.
-A retry checks regular file and symbolic link ctime against the intent.
+A retry compares ref file metadata with the intent and checks other file timestamps.
 The retry validates the structure of Git metadata before it can resume removal.
 A retry checks changed, intact sources for unsaved work.
 A retry keeps changed, partly deleted sources and names the changed file.
@@ -83,7 +83,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Collection, Generator, Iterable, Iterator
+from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -1425,12 +1425,64 @@ class RepositoryRemovalEvidence(TypedDict):
 def removal_source_files(path: Path) -> dict[str, int]:
     """Read every regular file's ctime, including files inside Git directories."""
     root = path.resolve()
+    return removal_regular_files(root, removal_entries(root))
+
+
+def removal_entries(root: Path) -> dict[Path, git_files.RemovalEntry]:
     try:
-        entries = git_files.scan_removal_tree(root)
+        return git_files.scan_removal_tree(root)
     except git_files.UnreadableGitFiles as error:
         raise OSError(str(error)) from error
+
+
+def removal_regular_files(root: Path, entries: Mapping[Path, git_files.RemovalEntry]) -> dict[str, int]:
     return {str(entry.path.relative_to(root)): entry.status.st_ctime_ns
             for entry in entries.values() if stat.S_ISREG(entry.status.st_mode)}
+
+
+def removal_checkouts(path: Path, descendants: tuple[Path, ...]) -> tuple[git_files.Checkout, ...]:
+    checkouts: list[git_files.Checkout] = []
+    for folder in (path, *descendants):
+        git = git_directory(folder)
+        if isinstance(git, UnreadableGitDirectory):
+            raise OSError(git.reason)
+        if isinstance(git, GitDirectory):
+            checkouts.append(git.checkout)
+    return tuple(checkouts)
+
+
+def removal_ref_entries(entries: Mapping[Path, git_files.RemovalEntry],
+                        checkouts: tuple[git_files.Checkout, ...]) -> Iterator[git_files.RemovalEntry]:
+    directories = {directory for checkout in checkouts for directory in (checkout.git_dir, checkout.common_dir)}
+    directories.update(path for path, entry in entries.items()
+                       if path.name == ".git" and stat.S_ISDIR(entry.status.st_mode))
+    if not directories:
+        return
+    files = {directory / name for directory in directories for name in ("HEAD", "packed-refs")}
+    prefixes = tuple(str(directory / name) + os.sep for directory in directories for name in ("refs", "reftable"))
+    for path, entry in entries.items():
+        if not stat.S_ISDIR(entry.status.st_mode) and (path in files or str(path).startswith(prefixes)):
+            yield entry
+
+
+def removal_ref_stat(entry: git_files.RemovalEntry) -> tuple[int, int, int]:
+    """Identify Git's replacement of a ref file without reading the file."""
+    status = entry.status
+    return status.st_ino, status.st_size, status.st_mtime_ns
+
+
+def changed_removal_ref(root: Path, refs: Iterable[git_files.RemovalEntry], recorded: object,
+                        legacy_mtime: int | None) -> Path | None:
+    if recorded is None:
+        # A legacy mark and its refs use filesystem timestamps.
+        # An old versioned mark cannot compare its wall time with ref ctime.
+        return min((entry.path for entry in refs
+                    if legacy_mtime is None or entry.status.st_ctime_ns >= legacy_mtime), default=None)
+    if not isinstance(recorded, dict):
+        raise OSError(f"{root}: invalid removal ref evidence")
+    previous = cast(dict[str, object], recorded)
+    return min((entry.path for entry in refs
+                if previous.get(str(entry.path.relative_to(root))) != list(removal_ref_stat(entry))), default=None)
 
 
 def empty_lost_worktree(path: Path, git: GitDirectoryState) -> bool:
@@ -1463,25 +1515,31 @@ def repository_removal_evidence(path: Path, *, scratch_settings: conf.ConfigRead
 def recovery_state(path: Path, pending: copy_record.Registered, scope: BusyMarkScope, *,
                    scratch_settings: conf.ConfigRead, descendant_checkouts: tuple[Path, ...] = ()) -> RemovalRetry | KeptFolder:
     """Resume unchanged sources and check changed sources before another deletion attempt."""
-    intent = pending.fields.get("removal_intent_ns", removal_mark(path).stat().st_mtime_ns)
+    mark_mtime = removal_mark(path).stat().st_mtime_ns
+    intent = pending.fields.get("removal_intent_ns", mark_mtime)
     if type(intent) is not int:
         return KeptFolder(path, "invalid removal intent time")
+    # A changed file can share the mark's timestamp and still come after the intent.
+    source_cutoff = min(intent, mark_mtime)
+    versioned = "removal_version" in pending.fields
+    regular_cutoff = source_cutoff if versioned else source_cutoff + 1
     saved_files = pending.fields.get("removal_files")
     previous = (git_files.RecordedRemovalFiles(frozenset(name for name in cast(list[object], saved_files)
                                                          if isinstance(name, str)))
                 if pending.fields.get("removal_version") == REMOVAL_VERSION and isinstance(saved_files, list)
                 else git_files.LegacyRemovalFiles())
     removal_root = path.resolve()
-    checkouts: list[git_files.Checkout] = []
-    for checkout in (path, *descendant_checkouts):
-        git = git_directory(checkout)
-        if isinstance(git, UnreadableGitDirectory):
-            return KeptFolder(path, git.reason)
-        if isinstance(git, GitDirectory):
-            checkouts.append(git.checkout)
     try:
-        git_files.check_internal_removal_entries(tuple(checkouts), previous, removal_root=removal_root)
-        entries = git_files.scan_removal_tree(removal_root, checkouts=tuple(checkouts), previous=previous)
+        checkouts = removal_checkouts(path, descendant_checkouts)
+        git_files.check_internal_removal_entries(checkouts, previous, removal_root=removal_root)
+        entries = git_files.scan_removal_tree(removal_root, checkouts=checkouts, previous=previous)
+        refs = {entry.path: entry for entry in removal_ref_entries(entries, checkouts)}
+        legacy_mtime = None if versioned else mark_mtime
+        recorded_refs = pending.fields.get("removal_ref_files")
+        ref_change = changed_removal_ref(removal_root, refs.values(), recorded_refs, legacy_mtime)
+        if ref_change is not None:
+            change = "may have changed" if recorded_refs is None else "changed"
+            return ChangedRemovalRef(path, f"ambiguous source: {ref_change} {change} after removal intent")
         busy_marks = {removal_root / mark.relative_to(path): os.fstat(scope.held[mark])
                       for mark in scope.created if mark.is_relative_to(path)}
     except (OSError, git_files.UnreadableGitFiles) as error:
@@ -1489,8 +1547,9 @@ def recovery_state(path: Path, pending: copy_record.Registered, scope: BusyMarkS
 
     # Exempt only the busy mark that the retry created and still holds.
     changed = min((entry.path for entry in entries.values()
-                   if (stat.S_ISREG(entry.status.st_mode) or stat.S_ISLNK(entry.status.st_mode))
-                   and entry.status.st_ctime_ns > intent
+                   if entry.path not in refs
+                   and ((stat.S_ISREG(entry.status.st_mode) and entry.status.st_ctime_ns >= regular_cutoff)
+                        or (stat.S_ISLNK(entry.status.st_mode) and entry.status.st_ctime_ns >= source_cutoff))
                    and (entry.path not in busy_marks or not os.path.samestat(entry.status, busy_marks[entry.path]))),
                   default=RemovalRetry.UNCHANGED)
     if changed is RemovalRetry.UNCHANGED:
@@ -1538,6 +1597,11 @@ class KeptFolder:
 
     path: Path
     reason: str
+
+
+@dataclass(frozen=True)
+class ChangedRemovalRef(KeptFolder):
+    """The retry must keep a folder whose Git ref changed."""
 
 
 @dataclass(frozen=True)
@@ -1682,7 +1746,7 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
             if isinstance(pending, copy_record.Registered):
                 recovery = recovery_state(path, pending, scope, scratch_settings=scratch_settings,
                                           descendant_checkouts=descendant_checkouts)
-                if isinstance(recovery, KeptFolder):
+                if isinstance(recovery, KeptFolder) and not isinstance(recovery, ChangedRemovalRef):
                     return recovery
             git = git_directory(path)
             if isinstance(git, UnreadableGitDirectory):
@@ -1706,9 +1770,12 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                 elif not isinstance(state, Ended):
                     return KeptFolder(path, state.why if isinstance(state, Live) else state.reason)
             if (check is RemovalWorkCheck.LANDED or
-                    (recovery is RemovalRetry.RECHECK and not empty_run_worktree
+                    ((recovery is RemovalRetry.RECHECK or isinstance(recovery, ChangedRemovalRef)) and not empty_run_worktree
                      and (not is_throwaway(path) or isinstance(pending, copy_record.Registered)))):
                 work = check_removal_work(path, request, scratch_settings, publication=publication, check=check)
+                if isinstance(recovery, ChangedRemovalRef):
+                    # Keep the ref even when Git finds that its commit is published.
+                    return work if isinstance(work, KeptFolder) else recovery
                 if isinstance(work, LocalRemoteKeptFolder) or (check is RemovalWorkCheck.LANDED and isinstance(work, KeptFolder)):
                     return work
                 rescue = (isinstance(pending, copy_record.NotRegistered)
@@ -1719,6 +1786,8 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                     copies.rescue_workspace(path, record)
                 if isinstance(work, KeptFolder) and not (rescue and not selected):
                     return work
+            if isinstance(recovery, ChangedRemovalRef):
+                return recovery
             if dry_run:
                 return RemovedCopy()
             if isinstance(record, copy_record.Registered):
@@ -1739,26 +1808,38 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                      and record.fields.get("test_hana_clone") is True and held is not None
                      and isinstance(held.lease, HeldFolderRemovalLease) and held.lease.folder == path else None)
             sidecars = lease.sidecar_identities() if lease is not None else {}
+            has_cargo_manifest = isinstance(pending, copy_record.Registered) and any(
+                (folder / "Cargo.toml").is_file() for folder in (path, *descendant_checkouts))
             saved = save_cargo_outputs(path)
             clean_cargo_outputs(path, saved)
-            cargo_checked = bool(saved) or any((folder / "Cargo.toml").is_file() for folder in (path, *descendant_checkouts))
-            if cargo_checked and isinstance(pending, copy_record.Registered):
+            if isinstance(pending, copy_record.Registered) and (has_cargo_manifest or saved):
+                # Cargo preparation can change the source without finding any Cargo outputs.
                 recovery = recovery_state(path, pending, scope, scratch_settings=scratch_settings,
                                           descendant_checkouts=descendant_checkouts)
-                if isinstance(recovery, KeptFolder):
-                    return recovery
-                if recovery is RemovalRetry.RECHECK and not empty_run_worktree:
+                if (recovery is RemovalRetry.RECHECK or isinstance(recovery, ChangedRemovalRef)) and not empty_run_worktree:
                     work = check_removal_work(path, request, scratch_settings, publication=publication, check=check)
                     if isinstance(work, KeptFolder):
                         return work
+                    if recovery is RemovalRetry.RECHECK:
+                        recovery = recovery_state(path, pending, scope, scratch_settings=scratch_settings,
+                                                  descendant_checkouts=descendant_checkouts)
+                if isinstance(recovery, KeptFolder):
+                    return recovery
             if isinstance(pending, copy_record.NotRegistered):
                 directory = path.stat()
                 fields: dict[str, object] = dict(record.fields) if isinstance(record, copy_record.Registered) else {
                     "task": task_request.task if isinstance(task_request, TaskRemoval) else "gate:folder-removal"}
+                repositories = [] if empty_run_worktree else repository_removal_evidence(path, scratch_settings=scratch_settings)
+                root = path.resolve()
+                entries = removal_entries(root)
+                checkouts = removal_checkouts(path, descendant_checkouts)
+                references = {str(entry.path.relative_to(root)): removal_ref_stat(entry)
+                              for entry in removal_ref_entries(entries, checkouts)}
                 fields.update(removal_version=REMOVAL_VERSION, copy_path=str(path.resolve()),
                               copy_device=directory.st_dev, copy_inode=directory.st_ino,
-                              removal_repositories=[] if empty_run_worktree else repository_removal_evidence(path, scratch_settings=scratch_settings),
-                              removal_files=sorted(removal_source_files(path)), removal_intent_ns=time.time_ns())
+                              removal_repositories=repositories,
+                              removal_files=sorted(removal_regular_files(root, entries)), removal_ref_files=references,
+                              removal_intent_ns=time.time_ns())
                 atomic_record(removal_mark(path), fields)
             if source_deletion is SourceDeletion.SWEEP:
                 cast(_SweepRemoval, cast(object, import_module("scripts.lint.tmp_sweep"))).delete_tree(str(path))

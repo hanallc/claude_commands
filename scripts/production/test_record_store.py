@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,85 @@ from scripts.production import record_store, staff
 
 
 class NumberedRecordsTests(unittest.TestCase):
+    def git_history_fixture(self) -> Path:
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}))
+        _ = self.git(directory, "init", "-b", "main")
+        return directory / "production.md"
+
+    def git(self, directory: Path, *arguments: str) -> str:
+        return subprocess.run(["git", "-C", str(directory), "-c", "user.name=Fixture",
+                               "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", *arguments],
+                              capture_output=True, check=True, text=True).stdout.strip()
+
+    def commit_folder(self, doc: Path, folder: Path) -> str:
+        _ = doc.write_text(f"- **Proposals:** {folder}\n")
+        _ = self.git(doc.parent, "add", doc.name)
+        _ = self.git(doc.parent, "commit", "-m", "Set the proposals folder.")
+        return self.git(doc.parent, "rev-parse", "HEAD")
+
+    def test_history_reuses_one_git_read_until_a_commit_changes(self) -> None:
+        doc = self.git_history_fixture()
+        old, new = (doc.parent / name for name in ("old", "new"))
+        _ = self.commit_folder(doc, old)
+        with patch.object(subprocess, "run", wraps=subprocess.run) as git:
+            self.assertEqual(tuple(record_store.historical_issue_folders(doc)), (old,))
+            self.assertEqual(tuple(record_store.historical_issue_folders(doc)), (old,))
+            git.assert_called_once()
+        _ = self.commit_folder(doc, new)
+        self.assertEqual(set(record_store.historical_issue_folders(doc)), {old, new})
+
+    def test_history_follows_branches_and_detached_worktree_heads(self) -> None:
+        doc = self.git_history_fixture()
+        current, former = (doc.parent / name for name in ("current", "former"))
+        first = self.commit_folder(doc, current)
+        linked = doc.parent / "linked"
+        _ = self.git(doc.parent, "worktree", "add", "--detach", str(linked))
+        self.assertEqual(set(record_store.historical_issue_folders(doc)), {current})
+        alternate = self.commit_folder(linked / doc.name, former)
+        self.assertEqual(set(record_store.historical_issue_folders(doc)), {current, former})
+        _ = self.git(linked, "switch", "--detach", first)
+        self.assertEqual(set(record_store.historical_issue_folders(doc)), {current})
+
+        _ = self.git(doc.parent, "branch", "review/former", alternate)
+        self.assertEqual(set(record_store.historical_issue_folders(doc)), {current, former})
+        _ = self.git(doc.parent, "pack-refs", "--all")
+        self.assertEqual(set(record_store.historical_issue_folders(doc)), {current, former})
+        _ = self.git(doc.parent, "branch", "-D", "review/former")
+        self.assertEqual(set(record_store.historical_issue_folders(doc)), {current})
+
+    def test_history_tracks_included_git_config(self) -> None:
+        doc = self.git_history_fixture()
+        folder = doc.parent / "proposals"
+        _ = self.commit_folder(doc, folder)
+        included = doc.parent / "work settings"
+        _ = included.write_text("[diff]\n\trenameLimit = 20\n")
+        _ = self.git(doc.parent, "config", "include.path", str(included))
+        sources: list[Path] = []
+        self.assertEqual(tuple(record_store.historical_issue_folders(doc, sources=sources)), (folder,))
+        self.assertIn(included, sources)
+        _ = included.write_text("[diff]\n\trenameLimit = 30\n")
+        with patch.object(subprocess, "run", wraps=subprocess.run) as git:
+            self.assertEqual(tuple(record_store.historical_issue_folders(doc)), (folder,))
+            self.assertEqual(tuple(record_store.historical_issue_folders(doc)), (folder,))
+            git.assert_called_once()
+
+    def test_history_retries_a_failed_git_read(self) -> None:
+        doc = self.git_history_fixture()
+        folder = doc.parent / "proposals"
+        _ = self.commit_folder(doc, folder)
+        failed = subprocess.CompletedProcess(["git"], 1, stdout="", stderr="Git could not read a ref.")
+        with patch.object(subprocess, "run", return_value=failed):
+            with self.assertRaisesRegex(OSError, "Git could not read a ref"):
+                _ = tuple(record_store.historical_issue_folders(doc))
+        with patch.object(subprocess, "run", side_effect=OSError("Git could not start.")):
+            with self.assertRaisesRegex(OSError, "Git could not start"):
+                _ = tuple(record_store.historical_issue_folders(doc))
+        with patch.object(subprocess, "run", wraps=subprocess.run) as git:
+            self.assertEqual(tuple(record_store.historical_issue_folders(doc)), (folder,))
+            self.assertEqual(tuple(record_store.historical_issue_folders(doc)), (folder,))
+            git.assert_called_once()
+
     def test_producer_question_folders_do_not_read_the_producer_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": directory}):
             root = Path(directory)

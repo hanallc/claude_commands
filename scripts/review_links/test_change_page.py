@@ -615,6 +615,8 @@ class ChangePageTests(unittest.TestCase):
                     self.assertTrue(status.answer_question(self.page, row_id, question.question_id, answer))
                     selected = change_page.render(replace(self.page, rows=(row_id,)), status).decode()
                     browser = self.browser()[2]
+                    for page in (selected, browser):
+                        self.assertEqual(page.count(page_frame.BUTTON_STATES), 1)
                     section = re.search(r'<section\b[^>]*data-key="page-owner/' + row_id
                                         + r'"[^>]*>(.*?)</section>', browser, re.DOTALL)
                     assert section is not None
@@ -2077,6 +2079,7 @@ class ChangePageTests(unittest.TestCase):
         _ = self.file_other_change()
         _ = self.file_user_question()
         _, _, body = self.browser("questions")
+        self.assertEqual(body.count(page_frame.BUTTON_STATES), 1)
         self.assertIn('</h1><p class="page-status"', body)
         self.assertIn(page_frame.STYLE, body)
         self.assertLess(body.index('data-page-status '), body.index('<div data-review-content'))
@@ -2936,6 +2939,18 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.http_request(path, self.browser_fields(refreshed, "page-owner/C1", "works")).status, 200)
         self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
         self.assertEqual(next(row["Verdict"] for row in change_review.review_rows(self.review_list) if row["#"] == "C1"), "works")
+
+    def test_answer_preserves_the_time_of_the_change_handoff(self) -> None:
+        status = change_page.DeliveryStatus(self.root)
+        path = status.path(self.page, 'C1')
+        handed_at = '2026-11-16T12:49:08-05:00'
+        with patch.object(time, 'time', return_value=datetime.fromisoformat(handed_at).timestamp()):
+            request = status.ask(self.page, 'C1', 'Which groups?')
+        assert isinstance(request, change_page.QuestionDelivery)
+        self.assertEqual(cast(dict[str, object], json.loads(path.read_text())).get('handed_at'), handed_at)
+
+        self.assertTrue(status.answer_question(self.page, 'C1', request.question_id, 'The numbered groups.'))
+        self.assertEqual(cast(dict[str, object], json.loads(path.read_text())).get('handed_at'), handed_at)
 
     def test_an_open_question_leaves_waiting_rows_counts_and_next_after_a_fresh_prepare(self) -> None:
         path, forms, body = self.browser()

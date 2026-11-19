@@ -5,12 +5,15 @@ import hashlib
 import io
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import time
 import unittest
 from collections.abc import Callable
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
+from functools import cache
 from pathlib import Path
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from typing import Literal, cast, override
@@ -23,10 +26,58 @@ from scripts.message import sessions
 ENTRY_ID = "0123456789abcdef0123456789abcdef"
 TEXT = "Sender: Question\nSender native id: unavailable\nTag: 01234567\n\nQuestion"
 EPOCH = 1_800_000_000.0
+MOD_FIXTURE_VERSION = "0.2.0"
+
+# The cloud gate has Node.js. The loader suppresses test registration and runs
+# the same fixture function that the Claude mod test calls.
+CAPTURE_RECEIPT = """
+import { writeFileSync } from "node:fs";
+import { registerHooks } from "node:module";
+import { pathToFileURL } from "node:url";
+
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (specifier === "claude-code/testing") {
+      const kit = "export function describe() {} export function expect() {} export function test() {}";
+      return nextResolve("data:text/javascript," + kit, context);
+    }
+    const path = specifier.startsWith("./") || specifier.startsWith("../");
+    return nextResolve(path && !specifier.endsWith(".ts") ? specifier + ".ts" : specifier, context);
+  },
+});
+const { captureReceiptFixture } = await import(pathToFileURL(process.argv[1]).href);
+writeFileSync(process.argv[2], await captureReceiptFixture());
+"""
+
+
+@cache
+def mod_receipt_fixture() -> postmaster.OutboxResult:
+    node = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
+    test = Path(__file__).resolve().parents[2] / "mods/postmaster/tests/outbox.test.ts"
+    with tempfile.TemporaryDirectory() as directory:
+        receipt = Path(directory) / "receipt.json"
+        _ = subprocess.run([node, "--input-type=module", "-e", CAPTURE_RECEIPT, str(test), str(receipt)],
+                           check=True, timeout=20)
+        value = cast(object, json.loads(receipt.read_text(encoding="utf-8")))
+    if not postmaster.is_outbox_result(value) or not postmaster.receipt_matches_recipient(
+        value, "recipient", 321, "recipient-process"
+    ):
+        raise AssertionError(f"The mod wrote an invalid recipient receipt: {value!r}")
+    return value
+
+
+def fake_receipt(entry: postmaster.OutboxEntry, outcome: postmaster.ModOutcome, at_ms: int, *,
+                 matching: bool = True) -> postmaster.OutboxResult:
+    result = mod_receipt_fixture().copy()
+    result.update(id=entry["id"], outcome=outcome, session_id=entry["session_id"],
+                  recipient_pid=entry["recipient_pid"], recipient_start=entry["recipient_start"],
+                  sha256=hashlib.sha256(entry["text"].encode()).hexdigest() if matching else "0" * 64,
+                  claimed_ms=at_ms, finished_ms=at_ms)
+    return result
 
 
 def session(identity: str, name: str) -> sessions.SessionRecord:
-    return sessions.SessionRecord(pid=123, sessionId=identity, name=name,
+    return sessions.SessionRecord(pid=123, sessionId=identity, name=name, procStart="fixture-start",
         messagingSocketPath=f"/test-sockets/{identity}.sock", updatedAt=1, tmux="", formerNames=[])
 
 
@@ -49,6 +100,12 @@ class FakeClock:
 
 
 class PostmasterTests(unittest.TestCase):
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        _ = mod_receipt_fixture()
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
@@ -90,14 +147,14 @@ class PostmasterTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(json.dumps(value))
 
-    def heartbeat(self, *, age: float = 0, identity: str = "worker") -> None:
+    def heartbeat(self, *, age: float = 0, identity: str = "worker", version: str = MOD_FIXTURE_VERSION) -> None:
         self.write(self.directory / "heartbeat.json", postmaster.Heartbeat(
-            session_id=identity, at_ms=int((self.clock.time() - age) * 1000), version="0.1.0", run="1800000000000-test-worker"))
+            session_id=identity, at_ms=int((self.clock.time() - age) * 1000), version=version, run="1800000000000-test-worker"))
 
-    def result(self, outcome: Literal["delivered", "failed", "expired", "withdrawn", "abandoned"], *, matching: bool = True) -> None:
-        self.write(self.path("results"), postmaster.OutboxResult(id=ENTRY_ID, outcome=outcome,
-            detail="fake mod result", sha256=hashlib.sha256(TEXT.encode()).hexdigest() if matching else "0" * 64,
-            claimed_ms=int(self.clock.time() * 1000), finished_ms=int(self.clock.time() * 1000)))
+    def result(self, outcome: postmaster.ModOutcome, *, matching: bool = True, entry_id: str = ENTRY_ID) -> None:
+        at_ms = int(self.clock.time() * 1000)
+        entry = postmaster.wire_entry(entry_id, self.recipient, "Sender", postmaster.ReplyUnroutable(), TEXT, at_ms)
+        self.write(self.directory / "results" / f"{entry_id}.json", fake_receipt(entry, outcome, at_ms, matching=matching))
 
     def claim(self) -> None:
         self.write(self.path("claimed"), {"id": ENTRY_ID, "claimed_ms": int(self.clock.time() * 1000), "run": "fake-worker"})
@@ -181,13 +238,18 @@ class PostmasterTests(unittest.TestCase):
             with self.subTest(run_fields=run_fields):
                 self.write(self.directory / "heartbeat.json", {
                     "session_id": "worker", "at_ms": int(self.clock.time() * 1000),
-                    "version": "0.1.0", **run_fields,
+                    "version": MOD_FIXTURE_VERSION, **run_fields,
                 })
                 self.assertEqual(self.attempt(), postmaster.RelayRequired("stale", 0.0))
                 self.no_id_files()
                 with patch.object(sessions, "live_sessions", return_value=self.live), redirect_stdout(io.StringIO()) as output:
                     self.assertEqual(postmaster.status(self.state), 1)
                 self.assertIn("postmaster: not running;", output.getvalue())
+
+    def test_receipt_from_the_mod_matches_the_claimed_recipient(self) -> None:
+        receipt = mod_receipt_fixture()
+        self.assertEqual(receipt["outcome"], "delivered")
+        self.assertTrue(postmaster.receipt_matches_recipient(receipt, "recipient", 321, "recipient-process"))
 
     def test_status_prints_the_current_worker_identity(self) -> None:
         self.heartbeat()
@@ -248,6 +310,43 @@ class PostmasterTests(unittest.TestCase):
                     assert isinstance(answer, postmaster.RelayRequired)
                     self.assertEqual(answer.reason, expected)
                 if outcome != "abandoned":
+                    self.no_id_files()
+
+    def test_fieldless_results_keep_main_outcomes_and_wrong_recipients_stay_unconfirmed(self) -> None:
+        cases: list[tuple[postmaster.ModOutcome, str, dict[str, object], str]] = [
+            ("withdrawn", "sender withdrew entry", {}, "unclaimed"),
+            ("failed", "unreadable entry", {}, "failed"),
+            ("expired", "entry deadline passed", {}, "expired"),
+            ("delivered", "", {}, "delivered"),
+            ("abandoned", "lost delivery answer", {}, "unconfirmed"),
+            ("delivered", "", {"session_id": "different", "recipient_pid": 456, "recipient_start": "other"}, "unconfirmed"),
+            ("delivered", "", {"session_id": self.recipient["sessionId"]}, "unconfirmed"),
+        ]
+        for outcome, detail, fields, expected in cases:
+            with self.subTest(outcome=outcome, fields=fields):
+                shutil.rmtree(self.directory, ignore_errors=True)
+                self.heartbeat(version="0.1.0")
+                receipt_text = "" if outcome in ("withdrawn", "failed") else TEXT
+                def respond() -> None:
+                    self.claim()
+                    self.write(self.path("results"), {
+                        "id": ENTRY_ID, "outcome": outcome, "detail": detail,
+                        "sha256": hashlib.sha256(receipt_text.encode()).hexdigest(), "claimed_ms": 1, "finished_ms": 2,
+                        **fields,
+                    })
+                self.clock.after_sleep = respond
+                answer = self.attempt()
+                if expected == "unconfirmed":
+                    self.assertIsInstance(answer, postmaster.DeliveryUnconfirmed)
+                    self.assertTrue(self.path("results").exists())
+                else:
+                    if expected == "delivered":
+                        self.assertIsInstance(answer, postmaster.Delivered)
+                        assert isinstance(answer, postmaster.Delivered)
+                        self.assertTrue(answer.verbatim)
+                    else:
+                        assert isinstance(answer, postmaster.RelayRequired)
+                        self.assertEqual(answer.reason, expected)
                     self.no_id_files()
 
     def test_unclaimed_deadline_withdraws_entry_before_check_and_cleans_files(self) -> None:
@@ -363,7 +462,9 @@ class PostmasterTests(unittest.TestCase):
                 deadline = int(self.clock.time() * 1000) + int(postmaster.wait_seconds() * 1000)
                 def mod() -> None:
                     value = cast(dict[str, object], json.loads(self.path("outbox").read_text()))
-                    self.assertEqual(set(value), {"id", "session_id", "socket", "text", "sha256", "deadline_ms", "sender", "reply_to_session_id"})
+                    self.assertEqual(set(value), {"id", "session_id", "socket", "text", "sha256", "deadline_ms", "sender", "reply_to_session_id",
+                                                  "recipient_pid", "recipient_start"})
+                    self.assertEqual((value["recipient_pid"], value["recipient_start"]), (123, "fixture-start"))
                     self.assertRegex(str(value["id"]), r"^[a-fA-F0-9]{32}$")
                     self.assertRegex(str(value["sha256"]), r"^[a-f0-9]{64}$")
                     self.assertIs(type(value["deadline_ms"]), int)
@@ -487,7 +588,20 @@ class PostmasterTests(unittest.TestCase):
                 self.assertEqual(len(delivered), 1)
                 self.no_id_files()
 
-    def test_entry_validator_matches_mod_rules_and_integer_bounds(self) -> None:
+    def test_receipt_for_another_process_does_not_confirm_delivery(self) -> None:
+        self.heartbeat()
+
+        def mod() -> None:
+            self.result("delivered")
+            value = cast(dict[str, object], json.loads(self.path("results").read_text()))
+            value["recipient_start"] = "replacement"
+            self.write(self.path("results"), value)
+
+        self.clock.after_sleep = mod
+        self.assertIsInstance(self.attempt(), postmaster.DeliveryUnconfirmed)
+        self.assertTrue(self.path("results").exists())
+
+    def test_entry_validator_requires_recipient_generation_and_integer_bounds(self) -> None:
         entry = postmaster.wire_entry(ENTRY_ID, self.recipient, "Sender", postmaster.ReplyToSession("sender"), TEXT, 0)
         self.assertTrue(postmaster.is_outbox_entry(entry))
         self.assertTrue(postmaster.is_outbox_entry({**entry, "deadline_ms": 9007199254740991}))
@@ -496,6 +610,7 @@ class PostmasterTests(unittest.TestCase):
         invalid: list[tuple[str, object]] = [
             ("deadline_ms", 9007199254740992), ("deadline_ms", True), ("deadline_ms", 1.0), ("deadline_ms", -1),
             ("id", "a" * 31), ("id", "g" * 32), ("session_id", ""), ("sender", ""),
+            ("recipient_pid", True), ("recipient_pid", 0), ("recipient_start", ""),
             ("socket", 17), ("text", 17), ("sha256", "A" * 64), ("sha256", "a" * 63), ("reply_to_session_id", 17)]
         for field, value in invalid:
             with self.subTest(field=field, value=value):
@@ -601,10 +716,7 @@ class PostmasterTests(unittest.TestCase):
                 self.heartbeat()
                 new_id = "f" * 32
                 def mod(receipt_outcome: postmaster.ModOutcome = outcome) -> None:
-                    value: postmaster.OutboxResult = {"id": new_id, "outcome": receipt_outcome, "detail": "",
-                        "sha256": hashlib.sha256(TEXT.encode()).hexdigest(),
-                        "claimed_ms": int(self.clock.time() * 1000), "finished_ms": int(self.clock.time() * 1000)}
-                    self.write(self.directory / "results" / f"{new_id}.json", value)
+                    self.result(receipt_outcome, entry_id=new_id)
                 self.clock.after_sleep = mod
                 answer = postmaster.attempt(self.state, self.recipient, "Sender", new_id, TEXT, self.live)
                 self.assertIsInstance(answer, postmaster.Delivered if outcome == "delivered" else postmaster.DeliveryUnconfirmed)
@@ -621,9 +733,7 @@ class PostmasterTests(unittest.TestCase):
                     self.heartbeat()
                     next_id = "e" * 32
                     def abandoned() -> None:
-                        self.write(self.directory / "results" / f"{next_id}.json", postmaster.OutboxResult(
-                            id=next_id, outcome="abandoned", detail="", sha256=hashlib.sha256(TEXT.encode()).hexdigest(),
-                            claimed_ms=int(self.clock.time() * 1000), finished_ms=int(self.clock.time() * 1000)))
+                        self.result("abandoned", entry_id=next_id)
                     self.clock.after_sleep = abandoned
                     self.assertIsInstance(postmaster.attempt(self.state, self.recipient, "Sender", next_id, TEXT, self.live),
                                           postmaster.DeliveryUnconfirmed)

@@ -293,7 +293,7 @@ with hana_command_lock(directory) as access:
         pending = self.claim()
         assert isinstance(pending, hana.HanaClaimPending)
         self.clock.advance(121)
-        self.assertFalse(self.controller.release(pending.reference.claim_id))
+        self.assertIsInstance(self.controller.release(pending.reference.claim_id), hana.HanaClaimReleaseRefused)
         self.assertEqual(self.claim(), pending)
 
     def test_placement_releases_only_a_dead_claim_after_lifecycle_abandonment(self) -> None:
@@ -358,7 +358,7 @@ with hana_command_lock(directory) as access:
         observation = replace(objects.observe_execution(key), evidence=execution_identity.ExecutionEvidenceUnavailable(reason, self.clock.now))
         with mock.patch.object(objects, 'observe_execution', return_value=observation):
             _ = execution.observe_execution(self.state, request, objects)
-        with mock.patch.object(hana, 'release_assigned', return_value=False) as release:
+        with mock.patch.object(hana, 'release_assigned', return_value=hana.HanaClaimReleaseRefused('The Hana claim is busy')) as release:
             settled = execution.settle_execution(self.state, request, objects,
                 release_claim=lambda: hana.release_assigned(self.assignment, self.holder, self.controller), reason='lost',
                 fence_window=execution.FenceAcknowledgementWindow(0, 1))
@@ -391,7 +391,7 @@ with hana_command_lock(directory) as access:
         from scripts.aws_target import hana_execution
         before = self.controller.path.read_bytes()
         with mock.patch.object(hana_execution, 'execution_command_settled', return_value=True):
-            self.assertTrue(hana.release_assigned(second, self.holder, self.controller))
+            self.assertEqual(hana.release_assigned(second, self.holder, self.controller), hana.HanaClaimReleased())
         self.assertEqual(self.controller.path.read_bytes(), before)
         self.assertEqual(len(claim_state.read_claims(claim_state.state_paths('fixture'))), 1)
 
@@ -562,12 +562,26 @@ with hana_command_lock(directory) as access:
 
     def test_release_requires_durable_fence_and_exact_holder(self) -> None:
         adopted = self.ready()
-        self.assertFalse(hana.release_assigned(self.assignment, self.holder, self.controller))
+        self.assertEqual(hana.release_assigned(self.assignment, self.holder, self.controller),
+                         hana.HanaClaimReleaseRefused('The Hana command settlement is unconfirmed'))
         from scripts.aws_target import hana_execution
         with mock.patch.object(hana_execution, 'execution_command_settled', return_value=True):
-            self.assertFalse(hana.release_assigned(self.assignment, replace(self.holder, start_time='wrong'), self.controller))
-            self.assertTrue(hana.release_assigned(self.assignment, self.holder, self.controller))
-            self.assertTrue(hana.release_assigned(self.assignment, self.holder, self.controller))
+            self.assertEqual(hana.release_assigned(self.assignment, replace(self.holder, start_time='wrong'), self.controller),
+                             hana.HanaClaimReleaseRefused('The local Hana claim differs from the assignment or holder'))
+            step = self.provider.step
+
+            def during_observe(identity: box.DeploymentIdentity, start: box.DemandStart | box.NoDemandStart,
+                               operation: box.PendingOperation) -> box.ProviderReply:
+                self.assertEqual(operation.action, box.Action.OBSERVE)
+                self.assertEqual(hana.release_assigned(self.assignment, self.holder, self.controller),
+                                 hana.HanaClaimReleaseRefused('The Hana lifecycle operation observe is pending'))
+                return step(identity, start, operation)
+
+            with mock.patch.object(self.provider, 'step', side_effect=during_observe) as observed:
+                _ = self.controller.tick()
+            observed.assert_called_once()
+            self.assertEqual(hana.release_assigned(self.assignment, self.holder, self.controller), hana.HanaClaimReleased())
+            self.assertEqual(hana.release_assigned(self.assignment, self.holder, self.controller), hana.HanaClaimReleased())
         self.assertEqual(claim_state.read_claims(claim_state.state_paths('fixture')), ())
         self.assertEqual(adopted.reserved.claim.reference.claim_id, execution_identity.assigned_claim_id('fixture-episode', 'fixture-attempt'))
 

@@ -243,6 +243,24 @@ class AccountsPageTests(unittest.TestCase):
             _ = accounts_page.page()
         cleared.assert_called_once_with(accounts_page.quota_state(self.review_root))
 
+    def test_quota_clear_survives_reset_time_drift_until_the_next_week(self) -> None:
+        reset = AT + timedelta(days=1, microseconds=299911)
+        path = accounts_page.quota_state(self.review_root)
+        path.parent.mkdir(parents=True)
+        _ = path.write_text(json.dumps({"claude1": {"level": "urgent", "reset": reset.isoformat()}}), encoding="utf-8")
+        cases = ((reset - timedelta(microseconds=526917), 4, False),
+                 (reset + timedelta(seconds=3599), 4, False),
+                 (reset + timedelta(hours=1), 4, True),
+                 (reset + timedelta(days=7), 100, False),
+                 (reset + timedelta(days=7), 4, True))
+        for observed_reset, left, shows_icon in cases:
+            with self.subTest(reset=observed_reset, left=left):
+                row = replace(status_row("claude1"), resets_at=observed_reset, weekly_left_percent=left)
+                reading = accounts.StatusReading((row,), (), (), timezone.utc, AT)
+                with patch.object(accounts, "read_status", return_value=reading):
+                    content = accounts_page.page().decode()
+                self.assertEqual('data-quota-account="claude1"' in content, shows_icon)
+
     def test_page_keeps_account_values_when_quota_settings_or_state_are_invalid(self) -> None:
         reading = accounts.StatusReading((replace(status_row("claude1"), weekly_left_percent=4),),
                                          (), (), timezone.utc, AT)
@@ -1117,6 +1135,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                     self.assertIn("<div data-accounts>", page)
                     self.assertIn(console_theme.CSS, page)
                     self.assertIn(page_frame.STYLE, page)
+                    self.assertEqual(page.count(page_frame.BUTTON_STATES), 1)
                     self.assertIn('<h1 class="page-title">Accounts</h1>', page)
                     self.assertIn("'console-shown'", page)
                     self.assertIn(f'data-refresh-seconds="{float(seconds)}"', page)

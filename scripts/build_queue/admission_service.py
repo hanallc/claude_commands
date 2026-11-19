@@ -844,14 +844,14 @@ class DispatchEvidenceProbe:
     """The probe reads dispatch ownership for one saved assignment outside the service loop."""
     key: placement.HostEvidenceKey
     saved: records.SavedPlacementAssignment
-    read: Callable[[], bool]
+    read: Callable[[], placement.DispatchPathState | wire.ExecutionReport]
 
 
 @dataclass(frozen=True)
 class DispatchEvidence:
     """The reading applies only to the saved assignment that requested it."""
     saved: records.SavedPlacementAssignment
-    pending: bool
+    result: placement.DispatchPathState | wire.ExecutionReport
     observed_at: float
 
 
@@ -897,7 +897,18 @@ class HostEvidenceWorker:
                 self.requested.set()
             observed = self.dispatch_observations.get(attempt)
             return (observed is None or observed.saved != probe.saved
-                    or time.monotonic() - observed.observed_at > self.interval or observed.pending)
+                    or time.monotonic() - observed.observed_at > self.interval
+                    or not isinstance(observed.result, placement.DispatchPathSettled))
+
+    def recovered_dispatch(self, saved: records.SavedPlacementAssignment) -> wire.ExecutionReport | placement.NoTerminalReport:
+        """Read the settled report for the same saved assignment."""
+        assignment = saved.assignment
+        attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+        with self.lock:
+            observed = self.dispatch_observations.get(attempt)
+            if observed is not None and observed.saved == saved and isinstance(observed.result, wire.ExecutionReport):
+                return observed.result
+        return placement.NoTerminalReport()
 
     def request(self, key: placement.HostEvidenceKey) -> None:
         with self.lock:
@@ -965,10 +976,10 @@ class HostEvidenceWorker:
         dispatches_read: list[tuple[str, DispatchEvidenceProbe, DispatchEvidence]] = []
         for attempt, probe in dispatches:
             try:
-                pending = probe.read()
+                result = probe.read()
             except Exception:
-                pending = True
-            dispatches_read.append((attempt, probe, DispatchEvidence(probe.saved, pending, time.monotonic())))
+                result = placement.DispatchPathPending('The dispatch evidence is unavailable')
+            dispatches_read.append((attempt, probe, DispatchEvidence(probe.saved, result, time.monotonic())))
         with self.lock:
             if self.subscriptions.get(key) is not subscription:
                 return True
@@ -2896,6 +2907,13 @@ class AdmissionServer:
             except conf.Unusable as error:
                 return placement.HostEvidenceUnavailable(key, self.clock.now(), str(error))
 
+    @staticmethod
+    def _hana_memory_eligibility(request: wire.PlacementRequest, settings: conf.ConfigRead
+                                 ) -> placement.AllowedHost | placement.TemporaryExclusion:
+        if request.profile.peak.bytes > settings.value('step_memory_gib', conf.positive_whole) * 1024 ** 3:
+            return placement.TemporaryExclusion('memory')
+        return placement.AllowedHost()
+
     def _request_target_evidence(self, request: wire.PlacementRequest,
                                  key: placement.HostEvidenceKey) -> placement.HostEvidence:
         destination = key.destination
@@ -2907,11 +2925,10 @@ class AdmissionServer:
             target = configuration.target(destination.target, key.settings)
             if isinstance(target, target_config.SshTarget):
                 transport = configuration.transport(target)
-                if (isinstance(transport, hana_placement.HanaControlTransport)
-                        and request.profile.peak.bytes >
-                        configuration.read(transport.settings).value('step_memory_gib', conf.positive_whole) * 1024 ** 3):
-                    # Memory belongs to this request, not the shared host evidence.
-                    return placement.FreshHostEvidence(key, self.clock.now(), '', placement.TemporaryExclusion('memory'))
+                if isinstance(transport, hana_placement.HanaControlTransport):
+                    memory = self._hana_memory_eligibility(request, configuration.read(transport.settings))
+                    if isinstance(memory, placement.TemporaryExclusion):
+                        return placement.FreshHostEvidence(key, self.clock.now(), '', memory)
         if destination.provider == "local" and not self.background_local_evidence:
             try:
                 return self.host_probe(key)
@@ -3243,15 +3260,36 @@ done
                         return True
                     transport = configuration.transport(target)
                 if isinstance(transport, hana_placement.HanaControlTransport):
-                    from scripts.aws_target.hana_execution import claim_dispatch_pending
-                    reference = placement.assigned_claim_reference(saved.assignment)
-                    def read_dispatch() -> bool:
-                        controller = hana_placement.controller_for(transport, read_only=True)
-                        return (controller.execution_bound(reference.claim_id)
-                                and claim_dispatch_pending(controller.directory, reference))
-
                     if submitted is None or not isinstance(self.last_usable_configuration, records.MemoryConfig):
                         return True
+                    reference = placement.assigned_claim_reference(saved.assignment)
+
+                    def read_dispatch() -> placement.DispatchPathState | wire.ExecutionReport:
+                        from scripts.aws_target.hana_execution import HanaSettled, claim_dispatch_pending
+                        from scripts.aws_target.hana_placement_adapter import recover_assigned_execution
+
+                        controller = hana_placement.controller_for(transport, read_only=True)
+                        report = saved.terminal_report
+                        if (isinstance(saved.permission, placement.PermissionConsumed)
+                                and isinstance(saved.holder, placement.ClaimHolderIdentity)
+                                and (isinstance(report, placement.NoTerminalReport)
+                                     or isinstance(report.path, placement.DispatchPathPending))):
+                            if saved.provider != reference or destination.host != transport.host:
+                                return placement.DispatchPathPending('The Hana claim differs from the assignment')
+                            recovered = recover_assigned_execution(saved.assignment, saved.holder, controller)
+                            if isinstance(recovered, HanaSettled):
+                                outcome = report.outcome if isinstance(report, placement.TerminalAttemptReport) else recovered.outcome
+                                evidence = (execution_identity.ExecutionNotStarted()
+                                    if isinstance(outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
+                                    else recovered.evidence)
+                                return wire.ExecutionReport('hana-recovery:' + reference.claim_id, saved.assignment,
+                                    reference, evidence, outcome, placement.DispatchPathSettled())
+                            return placement.DispatchPathPending(recovered.reason)
+                        if (controller.execution_bound(reference.claim_id)
+                                and claim_dispatch_pending(controller.directory, reference)):
+                            return placement.DispatchPathPending('The Hana dispatch remains pending')
+                        return placement.DispatchPathSettled()
+
                     key = self.host_evidence_key(submitted, destination)
                     self.host_requests[key] = submitted
                     self.placement_host_keys[(submitted.episode, destination)] = key
@@ -3267,6 +3305,15 @@ done
                 return offload.pending_start_path(saved.assignment.destination.target, identity).exists()
             except conf.Unusable:
                 return True
+
+    def _recovered_hana_dispatch(self, saved: records.SavedPlacementAssignment) -> wire.ExecutionReport | placement.NoTerminalReport:
+        if self._ended_claim_holder(saved):
+            _ = self._start_pending(saved)
+            assignment = saved.assignment
+            key = self.placement_host_keys.get((assignment.episode, assignment.destination))
+            if key is not None and (reader := self.host_readers.get(key)) is not None:
+                return reader.worker.recovered_dispatch(saved)
+        return placement.NoTerminalReport()
 
     def _claim_holders(self) -> set[wire.Owner]:
         """The local holders of current provider claims, which the service watches."""
@@ -3855,11 +3902,16 @@ done
         assignment = request.assignment
         key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         saved = self.assignments.get(key)
-        if (saved is None or saved.assignment != assignment
-                or self.current_assignments.get(assignment.episode) != key
-                or not isinstance(saved.state, placement.CurrentAssignment)
-                or isinstance(saved.permission, placement.PermissionConsumed)):
-            return self._placement_status(assignment)
+        if saved is None:
+            return self._placement_status(assignment, "unknown attempt")
+        if saved.assignment != assignment:
+            return self._placement_status(assignment, "the request differs from the saved assignment")
+        if isinstance(saved.state, placement.ClosedAssignment):
+            return self._placement_status(assignment, f"the attempt is closed: {saved.state.reason}")
+        if self.current_assignments.get(assignment.episode) != key:
+            return self._placement_status(assignment, "the attempt is no longer current")
+        if isinstance(saved.permission, placement.PermissionConsumed):
+            return self._placement_status(assignment, "launch permission was already consumed")
         if not isinstance(saved.terminal_report, placement.NoTerminalReport):
             return self._placement_status(assignment, 'the attempt has a terminal report')
         submitted = self.placement_requests.get(assignment.episode)
@@ -3872,20 +3924,43 @@ done
                 or reference.provider != destination.provider or reference.target != destination.target
                 or reference.scope != destination.scope):
             return self._placement_status(assignment, "claim does not match the assignment")
-        evidence = self._request_host_evidence(submitted, destination)
-        if not isinstance(evidence, placement.FreshHostEvidence):
-            return self._placement_status(assignment, "adoption evidence is unavailable or stale")
         if not isinstance(request.holder, placement.ClaimHolderIdentity) or not self._holder_matches(assignment.owner, request.holder):
             return self._placement_status(assignment, "claim holder is not a live coordinator descendant")
+        from scripts.aws_target import hana_placement
         from scripts.mac_test.claim_state import RepositoryScope
         if isinstance(destination.scope, RepositoryScope) and destination.scope.slot != destination.slot and destination.provider == "ssh":
             return self._placement_status(assignment, "assigned scope and slot disagree")
-        adopted = next((claim for claim in evidence.claims
-                        if claim.reference == reference and claim.holder == request.holder
-                        and claim.session == assignment.session and claim.host == destination.host
-                        and claim.generation == evidence.generation), None)
-        if adopted is None:
-            return self._placement_status(assignment, "the exact claim is not adopted")
+        transport: ExecutionTransport | None = None
+        if destination.provider == "ssh":
+            with conf.report_key_changes():
+                try:
+                    configuration = _provider_configuration()
+                    target = configuration.target(destination.target, self._placement_settings(submitted, destination))
+                    if isinstance(target, target_config.SshTarget):
+                        transport = configuration.transport(target)
+                        if isinstance(transport, hana_placement.HanaControlTransport):
+                            memory = self._hana_memory_eligibility(submitted, configuration.read(transport.settings))
+                            if isinstance(memory, placement.TemporaryExclusion):
+                                return self._placement_status(assignment, f'Hana admission refused: {memory.reason}')
+                except (OSError, ValueError) as error:
+                    return self._placement_status(assignment, f"adoption evidence is unavailable: {error}")
+        if isinstance(transport, hana_placement.HanaControlTransport):
+            from scripts.aws_target.hana_placement_adapter import read_assigned_adoption
+
+            adopted = read_assigned_adoption(assignment, request.holder, transport)
+            if isinstance(adopted, hana_placement.HanaClaimRefused):
+                return self._placement_status(assignment, adopted.reason)
+            if adopted.reference != reference:
+                return self._placement_status(assignment, "the exact claim is not adopted")
+        else:
+            evidence = self._request_host_evidence(submitted, destination)
+            if not isinstance(evidence, placement.FreshHostEvidence):
+                state = "stale" if isinstance(evidence, placement.StaleHostEvidence) else "unavailable"
+                return self._placement_status(assignment, f"adoption evidence is {state}: {evidence.reason}")
+            if not any(claim.reference == reference and claim.holder == request.holder
+                       and claim.session == assignment.session and claim.host == destination.host
+                       and claim.generation == evidence.generation for claim in evidence.claims):
+                return self._placement_status(assignment, "the exact claim is not adopted")
         saved = replace(saved, permission=placement.PermissionConsumed(self.clock.now()), provider=reference, holder=request.holder)
         self.assignments[key] = saved
         self._watch_owner(wire.Owner(request.holder.pid, request.holder.start_time))
@@ -3980,6 +4055,17 @@ done
                 continue
             submitted = self.placement_requests.get(assignment.episode)
             if submitted is None:
+                continue
+            if isinstance(recovered := self._recovered_hana_dispatch(saved), wire.ExecutionReport):
+                _ = self._handle_placement(recovered)
+                if self.current_assignments.get(assignment.episode) == key:
+                    # The worker already confirmed release for the exact settled decline.
+                    updated = self.assignments[key]
+                    terminal = updated.terminal_report
+                    if (isinstance(terminal, placement.TerminalAttemptReport)
+                            and isinstance(terminal.path, placement.DispatchPathSettled)
+                            and terminal.outcome == recovered.outcome):
+                        self._close_for_report(updated, terminal)
                 continue
             if not self._claim_holder_ended(saved):
                 _ = self._request_host_evidence(submitted, assignment.destination, keys)

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Literal, cast, override
 from unittest.mock import patch
 
-from scripts.agents import pane_record, producer_lifecycle, remote, restart, restart_support, shutdown, shutdown_record, stop_resume
+from scripts.agents import pane_record, producer_creation, producer_lifecycle, remote, restart, restart_support, shutdown, shutdown_record, stop_resume
 from scripts.agents.test_stop_resume import ProducerAdmissionWorld, producer_first_fixture
 from scripts.herdr import herdr, pane_launch
 from scripts.lib import models_registry
@@ -30,11 +30,12 @@ OPENING_TEXT = script_prompt("Read ~/rust/hanadocs/dwight/README.md, then run /p
 ZERO_PANE_PROCESS_IDS: dict[str, object] = {
     "process_info": {"shell_pid": 0, "foreground_process_group_id": 0, "foreground_processes": []},
 }
+type Rollout = Literal["clean", "malformed", "malformed-only", "no-timestamp", "partial"]
 
 
 @contextmanager
 def opening_transcript(world: ProducerAdmissionWorld, sent: list[str], *,
-                       rollout: Literal["clean", "malformed", "partial"] = "clean") -> Generator[Path]:
+                       rollout: Rollout = "clean") -> Generator[Path]:
     client = world.case.client
     path = (world.home / f"projects/producer/{world.identity}.jsonl" if world.kind == "claude"
             else world.home / f"sessions/2026/11/18/rollout-2026-11-18T00-00-00-{world.identity}.jsonl")
@@ -42,29 +43,34 @@ def opening_transcript(world: ProducerAdmissionWorld, sent: list[str], *,
     def write_turn(pane: str, text: str) -> None:
         if pane != world.pane:
             raise AssertionError("unexpected opening prompt pane")
-        if rollout == "partial" and sent:
+        if rollout in ("partial", "no-timestamp") and sent or rollout == "malformed-only" and len(sent) > 1:
             raise AssertionError("the opening prompt was already sent")
         sent.append(text)
         stamp = datetime.now(timezone.utc).isoformat()
+        turn: dict[str, object]
         if world.kind == "claude":
             turn = {"type": "user", "timestamp": stamp, "message": {"content": text}}
         else:
             turn = {"type": "response_item", "timestamp": stamp, "payload": {
                 "type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}}
+        if rollout == "no-timestamp":
+            _ = turn.pop("timestamp")
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as stream:
-            if rollout == "malformed":
+            if rollout == "malformed" or rollout == "malformed-only" and len(sent) == 1:
                 _ = stream.write('{"type":broken}\n{"timestamp":"invalid"}\n')
-            _ = stream.write(json.dumps(turn) + ("" if rollout == "partial" else "\n"))
+            if rollout != "malformed-only" or len(sent) == 2:
+                _ = stream.write(json.dumps(turn) + ("" if rollout == "partial" else "\n"))
 
     def submit(pane: str, opening: herdr.OpeningPrompt, since: datetime, timeout_ms: int) -> herdr.PromptSubmitOutcome:
-        if rollout == "partial" and not sent:
+        if rollout in ("partial", "malformed-only", "no-timestamp") and not sent:
             write_turn(pane, script_prompt(opening.text))
             return herdr.PromptNotSubmitted("fixture interrupted prompt verification")
         return SUBMIT_OPENING(client, pane, opening, since, timeout_ms)
 
     with (patch.object(client, "submit_opening_prompt", side_effect=submit),
           patch.object(client, "wait_for_prompt_input", return_value=herdr.PromptInputReady(idle=True)),
+          patch.object(client, "composer", return_value=herdr.ComposerInput("")),
           patch.object(herdr, "prompt_recipient_process", return_value=herdr.PromptRecipientUnavailable("fixture")),
           patch.object(herdr, "check_target", return_value=True),
           patch.object(client, "_prompt", side_effect=write_turn)):
@@ -87,12 +93,13 @@ def retain_producer_pane(row: staff.StaffRow) -> None:
 class CreateProducerTests(unittest.TestCase):
     def test_create_uses_default_or_override_and_passes_only_its_opening_prompt(self) -> None:
         codex_arguments = ("--model", "codex:gpt-test")
-        cases: tuple[tuple[Literal["claude", "codex"], tuple[str, ...], str, str,
-                           Literal["clean", "malformed", "partial"]], ...] = (
+        cases: tuple[tuple[Literal["claude", "codex"], tuple[str, ...], str, str, Rollout], ...] = (
             ("claude", (), "claude:fable:high", "claude3", "clean"),
             ("claude", ("--model", "opus", "--effort", "max"), "claude:opus:max", "claude3", "clean"),
             ("codex", codex_arguments, "codex:gpt-test:high", "~/.codex3", "clean"),
             ("codex", codex_arguments, "codex:gpt-test:high", "~/.codex3", "malformed"),
+            ("codex", codex_arguments, "codex:gpt-test:high", "~/.codex3", "malformed-only"),
+            ("codex", codex_arguments, "codex:gpt-test:high", "~/.codex3", "no-timestamp"),
             ("codex", codex_arguments, "codex:gpt-test:high", "~/.codex3", "partial"),
         )
         for kind, arguments, expected, account, rollout in cases:
@@ -109,16 +116,31 @@ class CreateProducerTests(unittest.TestCase):
                       patch.object(roster, "roster", return_value=roster.Roster([], [])),
                       opening_transcript(world, sent, rollout=rollout) as transcript):
                     add = ("add-producer", "dwight", *arguments, "--job", "Plan the next work")
-                    if rollout == "partial":
+                    if rollout in ("partial", "malformed-only", "no-timestamp"):
                         self.assertIn("fixture interrupted prompt verification", command(*add)[2])
+                    if rollout == "partial":
                         code, output, errors = command(*add)
                         self.assertEqual((code, output), (2, ""))
                         self.assertEqual([line for line in errors.splitlines() if line != "unchanged"],
                                          ["shutdown: the first turn is still being written"])
+                        self.assertEqual(command("resume", "dwight", "--resend-opening-prompt")[0], 1)
                         self.assertEqual(staff.initial_snapshot().rows, ())
                         self.assertEqual(sent, [OPENING_TEXT])
                         with transcript.open("a", encoding="utf-8") as stream:
                             _ = stream.write("\n")
+                    if rollout == "malformed-only":
+                        code, _, errors = command("resume", "dwight")
+                        self.assertEqual(code, 1, errors)
+                        self.assertIn("Check the pane, then run agents resume dwight --resend-opening-prompt", errors)
+                        self.assertEqual(sent, [OPENING_TEXT])
+                        with patch.object(world.case.client, "composer", return_value=herdr.ComposerInput("draft")):
+                            code, _, errors = command("resume", "dwight", "--resend-opening-prompt")
+                        self.assertEqual(code, 1, errors)
+                        self.assertIn("check that the destination pane is idle and its input is empty", errors)
+                        self.assertEqual(sent, [OPENING_TEXT])
+                        code, _, errors = command("resume", "dwight", "--resend-opening-prompt")
+                        self.assertEqual(code, 0, errors)
+                        self.assertEqual(command("resume", "dwight", "--resend-opening-prompt")[0], 1)
                     code, output, errors = command(*add)
                     self.assertEqual(code, 0, errors)
                     self.assertEqual(command(*add), (0, output, ""))
@@ -127,7 +149,7 @@ class CreateProducerTests(unittest.TestCase):
                 self.assertIn(f"staff {row.id}, account {account}, tab {world.pane}", output)
                 self.assertEqual(models_registry.parse_registry(registry.read_text())["producers"]["dwight"], expected)
                 self.assertEqual(readme.read_text(), "# dwight\n\nPlan the next work\n")
-                self.assertEqual(sent, [OPENING_TEXT])
+                self.assertEqual(sent, [OPENING_TEXT] * (2 if rollout == "malformed-only" else 1))
 
     def test_create_retry_reuses_the_profile_readme_and_reserved_tab(self) -> None:
         with producer_first_fixture("claude") as world:
@@ -142,16 +164,62 @@ class CreateProducerTests(unittest.TestCase):
             with (patch.object(producer_lifecycle, "TEMPLATE", template),
                   patch.object(roster, "roster", return_value=roster.Roster([], [])),
                   opening_transcript(world, sent)):
+                path = producer_creation.record_path("dwight")
+                legacy = {"profile": "claude:sonnet:high", "job": "", "readme": "# dwight", "folder": str(world.folder)}
+                producer_creation.write_record(path, legacy)
+                before = registry.read_bytes()
+                code, _, errors = command("add-producer", "dwight")
+                self.assertEqual(code, 2, errors)
+                self.assertIn("the creation record has no creation ID", errors)
+                self.assertEqual(registry.read_bytes(), before)
+                self.assertEqual(producer_creation.read_record(path), legacy)
+                path.unlink()
                 with patch.object(herdr, "start_agent", return_value=herdr.AgentNotStarted("fixture start failed")):
                     code, _, errors = command("add-producer", "dwight")
                 self.assertNotEqual(code, 0)
                 self.assertIn("fixture start failed", errors)
                 self.assertEqual(staff.initial_snapshot().rows, ())
-                written = registry.read_bytes(), registry.stat().st_mtime_ns
+                source = remote.this_machine()
+                profiles = models_registry.parse_registry(registry.read_text())
+                saved = producer_creation.read_record(path)
+                marker = producer_creation.marker_for(saved)
+                self.assertEqual(profiles["producer_creations"], {"dwight": marker.value()})
+                with self.assertRaisesRegex(staff.StaffRefused, "already has a creation marker"):
+                    _ = staff.producer_creation_registry("claim", "dwight", marker.value(), profiles["producers"]["dwight"])
+                for rival in (producer_creation.Marker(source, "1" * 32), producer_creation.Marker("other", marker.creation_id)):
+                    with self.subTest(rival=rival):
+                        for action in ("claim", "finish"):
+                            with self.assertRaisesRegex(staff.StaffRefused, f"the creation record is on {source}"):
+                                _ = staff.producer_creation_registry(action, "dwight", rival.value(), profiles["producers"]["dwight"])
+                        self.assertEqual(models_registry.parse_registry(registry.read_text()), profiles)
+                other_panes = world.case.root / "other-panes"
+                with (patch.object(remote, "this_machine", return_value="fixture-other-machine"),
+                      patch.object(pane_record, "RECORD_DIR", other_panes),
+                      patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(other_panes)})):
+                    self.assertFalse(producer_creation.record_path("dwight").exists())
+                    code, output, errors = command("resume", "dwight")
+                    self.assertEqual((code, output), (1, ""))
+                    self.assertEqual(errors.splitlines(), [f"dwight: the creation record is on {source}. Run agents add-producer dwight there."])
+                    self.assertEqual(staff.initial_snapshot().rows, ())
+                    self.assertEqual(len(world.case.client.opened), 1)
+                    self.assertEqual(sent, [])
+                readme_copy = readme.rename(readme.with_suffix(".saved"))
+                code, _, errors = command("resume", "dwight")
+                self.assertEqual(code, 1, errors)
+                self.assertIn("producer README is unavailable. Run agents add-producer dwight.", errors)
+                self.assertEqual(len(world.case.client.opened), 1)
+                _ = readme_copy.rename(readme)
                 template.unlink()
                 code, _, errors = command("resume", "dwight")
                 self.assertEqual(code, 0, errors)
                 self.assertEqual(sent, [OPENING_TEXT])
+                completed = models_registry.parse_registry(registry.read_text())
+                self.assertEqual(completed["producers"], profiles["producers"])
+                self.assertNotIn("dwight", completed.get("producer_creations", {}))
+                written = registry.read_bytes(), registry.stat().st_mtime_ns
+                for name in ("dwight", "Dwight"):
+                    with self.subTest(delayed_claim=name), self.assertRaisesRegex(staff.StaffRefused, "a staff row already has this name"):
+                        _ = staff.producer_creation_registry("claim", name, f"other:{'2' * 32}", profiles["producers"]["dwight"])
                 code, output, errors = command("add-producer", "dwight")
                 self.assertEqual(code, 0, errors)
                 self.assertIn(world.identity, output)
@@ -225,7 +293,7 @@ class CreateProducerTests(unittest.TestCase):
                 admitted = stop_resume.adopt_named_producer(
                     stop_resume.ProducerFirstStart("dwight", world.folder), world.identity, world.pane, world.case.client)
                 self.assertEqual(sent, [])
-                path = stop_resume.producer_creation_path("dwight")
+                path = producer_creation.record_path("dwight")
                 receipt = cast(dict[str, object], json.loads(path.read_text()))
                 _ = path.write_text(json.dumps({**receipt, "staff": admitted.session_id,
                                                 "account": admitted.account, "tab": admitted.pane_id}))
@@ -274,7 +342,7 @@ class ProducerLifecycleTests(unittest.TestCase):
         before = self.registry.read_bytes()
         for name in ("morty", "Morty"):
             self.assertIn("reserved producer name", command("add-producer", name)[2])
-            self.assertFalse(stop_resume.producer_creation_path(name).exists())
+            self.assertFalse(producer_creation.record_path(name).exists())
         self.assertIn("staff row", command("add-producer", taken.name)[2])
         self.assertIn("producer key", command("add-producer", "dwight")[2])
         live = roster.RosterEntry("natedev", "claude", "freestanding", "live", "running",
