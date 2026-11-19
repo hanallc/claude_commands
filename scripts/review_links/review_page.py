@@ -374,6 +374,7 @@ class ReviewSnapshotCache:
     root: Path
     interval: float = 0.5
     start_worker: bool = True
+    initialize_on_start: bool = False
     _snapshot: ReviewSnapshot | SnapshotUnavailable = field(default_factory=SnapshotUnavailable,init=False)
     _condition: threading.Condition = field(default_factory=threading.Condition,init=False)
     _save_lock: threading.Lock = field(default_factory=threading.Lock,init=False)
@@ -385,7 +386,7 @@ class ReviewSnapshotCache:
     _thread: threading.Thread = field(init=False)
 
     def __post_init__(self) -> None:
-        if (self.root/change_page.CONSOLE_FOLDER/change_browser.MANIFEST).exists():
+        if not self.initialize_on_start and (self.root/change_page.CONSOLE_FOLDER/change_browser.MANIFEST).exists():
             try:
                 self._snapshot = build_snapshot(self.root)
             except Exception as error:
@@ -395,7 +396,12 @@ class ReviewSnapshotCache:
             self.start()
 
     def start(self) -> None:
+        if self.initialize_on_start:
+            self._wake.set()
         self._thread.start()
+
+    def _after_snapshot_update(self, _snapshot: ReviewSnapshot, /) -> None:
+        """Run background work after the worker publishes a snapshot."""
 
     def get(self) -> ReviewSnapshot:
         with self._condition:
@@ -559,7 +565,8 @@ class ReviewSnapshotCache:
                 unchanged = (isinstance(snapshot, ReviewSnapshot) and time.monotonic()-checked<30
                              and all(source_stamp(path)==stamp for path, stamp in snapshot.source_stamps.items()))
                 with self._condition:
-                    if (isinstance(snapshot, SnapshotUnavailable) and not self._initialize
+                    if (isinstance(snapshot, SnapshotUnavailable)
+                            and not self.initialize_on_start and not self._initialize
                             and not (self.root/change_page.CONSOLE_FOLDER/change_browser.MANIFEST).exists()):
                         self._wake.clear()
                         continue
@@ -572,12 +579,14 @@ class ReviewSnapshotCache:
                     _ = change_page.console_folder(self.root)
                 fresh = build_snapshot(self.root)
                 with self._save_lock, self._condition:
-                    if self._snapshot is snapshot and self._generation == generation:
-                        self._snapshot = fresh
-                    else:
+                    if self._snapshot is not snapshot or self._generation != generation:
                         self._wake.set()
+                        continue
+                    self._snapshot = fresh
+                    self._condition.notify_all()
                 checked = time.monotonic()
                 last_failure = None
+                self._after_snapshot_update(fresh)
             except Exception as error:
                 failure = ' '.join(str(error).splitlines())
                 if failure != last_failure:

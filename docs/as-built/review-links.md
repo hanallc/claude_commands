@@ -466,7 +466,7 @@ It also checks all stores every thirty seconds.
 A complete update replaces the current snapshot.
 Requests retain the current snapshot during an update.
 The server starts recovery before the snapshot worker.
-The first Review GET on a fresh root starts the worker's first build.
+The worker initializes the live Review cache at server startup.
 The native Question writer assigns stable IDs to legacy Questions under the owner lock.
 The same guard tracks and skips each source or record that fails during a build.
 A notice names each skipped source or record.
@@ -736,14 +736,17 @@ Owner and Producer list staff in name order after All and omit the `-unit` suffi
 The address keeps the original staff IDs, including `all` when it identifies a staff member.
 The words box sits beside the Producer chips and wraps below them when space is limited.
 The chip order is All, Needs me, Morty answering, Working, Blocked, Parked, and Closed.
-Morty answering includes all items with an open question, including parked items and items that need Resend.
-The other status chips contain items with no open question.
-Needs me includes unparked items in Waiting for nate or Delivered.
+Morty answering includes items with an open question, including items that need Resend.
+An open item parked until delivery belongs to Parked even if it has an open question.
+An unread delivery release belongs to Needs me even if the question remains open.
+Needs me also includes unparked items in Waiting for nate or Delivered when they have no open question.
 Working includes unparked items in New or Working.
 Blocked includes unparked items in Blocked or Paused.
 Parked includes items with a future parking time in states other than Done and Closed.
 Closed includes items in Done or Closed, even when they have a future parking time.
-Each item belongs to one status category. The six counts add up to All.
+Each item belongs to one status category.
+All excludes open items parked until delivery.
+The six status counts include those items under Parked.
 The Unread only switch limits the visible items and chip counts to unread items.
 Each chip count reflects the words box and the filters in the other rows.
 The “need you” total uses the Needs me chip count.
@@ -867,7 +870,7 @@ The Answer event includes the question ID.
 Link and Unlink events include the review keys.
 Evidence cleanup events name the copy that was removed.
 Request receipts stay in the record and are hidden from the log display.
-Each expanded row has Remove, Park with a date, and a text box for Ask question and Tell morty.
+Each expanded row with actions has Remove, Park until, and a text box for Ask question and Tell morty.
 The text box shows “Your words for morty about this item” as its placeholder and accessible name.
 Ask question and Tell morty sit below the box at its right edge, beside the send status.
 Both buttons stay disabled until the box contains words.
@@ -928,8 +931,10 @@ After a successful Ask keeps the row visible, the row toggle receives lost focus
 Focus stays on the user's selection if they move it during the request, including to the parent console.
 On refresh, the List restores focus to an available action button with the same item key and action.
 Column sort buttons keep focus through refresh.
-A waiting row shows “The producer will answer” and has no action buttons.
-The panel shows each open question with its asked time.
+A waiting row shows “The producer will answer.”
+The panel shows each open question with its asked time and the linked review cards.
+An actively parked waiting row shows the parking condition and Unpark.
+A waiting row with an unread delivery release shows Mark read.
 The waiting row keeps its log after Ask saves.
 A link opens a filtered-out question or read item in a separate section and preserves the current filters.
 The section does not change the results count.
@@ -937,7 +942,7 @@ An open question adds a Morty answering note below the saved state.
 Morty runs `the_list.py answer L<N> --question <id> --text "<answer>"` to save an answer.
 The answer adds one record event and marks the item unread, including when the item is Closed.
 After the last answer, the next refresh returns the row to its status chip.
-Parked shows the item after the last answer if its parking time is still active.
+A dated park uses Parked after the last answer if its time is still in the future.
 A signed Unpark request from an earlier page can clear parking while the item waits for an answer.
 That request keeps the item in Morty answering and shows its confirmation next to Show.
 An unread answer appears in the panel with the question, both times, and an Unread mark.
@@ -968,21 +973,22 @@ An older pending attempt with no live sender appears as uncertain.
 Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURCE`.
 Remove sits at the left edge of the row above the four-line text box.
 **Unpark** and **Park until** sit at the right edge of the row.
-An expanded parked item shows its parking time above the buttons.
-**Unpark** appears in the form when the parking time is in the future and the item is in a state other than Closed.
-**Park until** opens the shared calendar and 24-hour time field directly.
+An expanded parked item shows its parking condition above the buttons.
+**Unpark** appears in the form when the item has active parking and its state is outside Closed.
+**Park until** opens the picker.
+**Until delivered** sits above the shared calendar and 24-hour time field.
+One click saves this choice and shows “Parked until delivered” in the row.
 The picker aligns with the right edge of the text box.
 The page refresh waits while the picker is open.
 **Save** sends the chosen time in UTC.
-Park writes the time through `the_list.park` with the same source.
-The server still accepts a date as midnight in the user zone.
+Park writes a date, a time, or `delivered` through `the_list.park` with the List page source.
+The server reads a date as midnight in the user zone.
 The writer checks a new parking time against the current time under the List lock.
-The writer compares the saved instant when it checks a Park retry.
-The writer requires the instant in the receipt or in a parking change with the same request ID.
+The writer checks a Park retry against the parking condition in the receipt or the event with the same request ID.
 The picker can resend the original request and instant after the parking time passes.
 When the saved date has passed, the picker gives focus to an enabled day.
 The page keeps the words for Tell morty.
-**Unpark** clears the parking time through `the_list.unpark` and keeps the item state.
+**Unpark** clears parking through `the_list.unpark` and keeps the item state.
 It records one Unparked event and saves one notice for morty.
 If the item has no active parking time, the writer saves only a hidden request receipt.
 The receipt records whether the time expired or was absent.
@@ -998,6 +1004,26 @@ It keeps one confirmation per hidden row after overlapping Unpark requests.
 Focus moves from **Unpark** to the Parked filter and brings the filter and confirmation into view.
 In All, the row stays expanded and focus moves from **Unpark** to its item number.
 After Unpark, the item's saved state sets its status chip.
+
+Parked is the only Show filter that includes open items parked until delivery.
+A direct item link selects Parked for these items.
+Morty can set this parking condition with `the_list.py park --id L<N> --until delivered --source morty`.
+When morty records Delivered, the List writer clears this parking condition in the same write.
+The Review snapshot worker checks each snapshot after it publishes it.
+It checks linked change rows that the snapshot shows as ready for the user.
+Requests can use the published snapshot while the worker checks the parked items.
+The worker tries the List lock, the Review delivery lock, and the change list lock in that order.
+List Ask takes the List lock before the Review delivery lock.
+The worker skips a busy lock or unreadable change row and can retry after a later snapshot.
+List GET reads saved items and published question delivery records without the release locks.
+Console news reads the saved List records.
+The worker holds all three locks while it checks the current Review row and saves a release.
+The same parking event and link must still be current.
+The writer clears parking, sets Delivered, and marks the item unread.
+Both delivery signals save an Unparked event with the reason.
+The unread delivery release returns to Needs me with its review links.
+After Mark read, an open question returns the item to Morty answering.
+A dated park remains active until its time or an explicit Unpark.
 The shared item writer saves the action and its pending notice in one locked write.
 The notice tells morty which action nate completed.
 The existing sender delivers the notice with its retry and alert rules.
@@ -1012,7 +1038,7 @@ The request starts without waiting for the animation.
 The page disables all row buttons while the request runs.
 A second press sends no request.
 The page applies the saved state and parking status from the response.
-The page uses the saved time to update the parking labels for the expanded and collapsed row.
+The page uses the saved parking condition to update the labels for the expanded and collapsed row.
 A refusal restores the last confirmed item state, parking status, and unread state together.
 The unread state includes the Update sort key.
 If Mark read, Ask question, or Tell morty loses its response, the page restores the unread flag from before the request.

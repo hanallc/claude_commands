@@ -27,11 +27,11 @@ from xml.etree import ElementTree
 
 from scripts.accounts import accounts
 from scripts.agents.remote import local_machine
-from scripts.lib import conf, process_start
+from scripts.lib import atomic_file, conf, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message import send_result
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
-from scripts.production import change_review, change_routing, delivery_state, investigation, session_staff, showrunners, staff, the_list
+from scripts.production import change_review, change_routing, delivery_state, investigation, record_store, session_staff, showrunners, staff, the_list
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, list_page, serve, staff_names
 from scripts.review_links import change_browser, change_page, page_question, question_record
@@ -1148,6 +1148,7 @@ document.body.append(result);
         _ = self.enterContext(patch.object(the_list, "now", return_value=NOW))
         _ = self.enterContext(patch.object(time, "time", return_value=NOW.timestamp()))
         _ = self.enterContext(patch.object(rebuild_row, "read", return_value=rebuild_row.RebuildAnswer((), False)))
+        _ = change_page.console_folder(self.root / "reviews")
 
     def add(self, title: str, state: the_list.ItemState = the_list.ItemState.WORKING, *,
             owner: the_list.ItemOwner = OWNER.id, number: int | the_list.NextNumber = the_list.NextNumber.AVAILABLE,
@@ -1258,7 +1259,7 @@ document.body.append(result);
         paths = [the_list.folder(MORTY.id) / f"{item.id}.md" for item in items]
         before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
         root = self.root / "reviews"
-        with patch.object(review_items, "read", return_value=reviews) as read, patch.object(list_page, "counts_strip", return_value=""):
+        with patch.object(list_page, "read_linked_reviews", return_value=reviews) as read, patch.object(list_page, "counts_strip", return_value=""):
             body = list_page.render(root).decode()
         read.assert_called_once_with(root, members=staff.snapshot())
         for item, (identities, expected) in zip(items, cases):
@@ -1303,6 +1304,165 @@ document.body.append(result);
         self.assertIn("Reviews done — decide: close, keep or park", first)
         self.assertNotIn("2 changes for you", first)
         self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
+
+    def test_live_change_and_delivered_state_return_parked_items_to_needs_me(self) -> None:
+        root = self.root / "reviews"
+        doc = self.root / "sdlc.md"
+        listing = self.root / f"{change_review.PREFIX}sdlc.md"
+        _ = doc.write_text(f'# Production\n- **Change review:** `{listing}`\n')
+        _ = listing.write_text(change_review.BODY)
+        members = staff.StaffSnapshot((MORTY, replace(OWNER, doc=staff.LiveDoc(local_machine(), doc))))
+        parking = the_list.ParkUntilDelivered.DELIVERED
+        first, second = self.add("Publish this change"), self.add("Record this delivery")
+        first_key, second_key = "sdlc/C1", "sdlc/C2"
+        _ = the_list.link(MORTY.id, first.id, (first_key,), source="morty")
+        _ = the_list.link(MORTY.id, second.id, (second_key,), source="morty")
+        first = the_list.park(MORTY.id, first.id, parking, source="nate")
+        second = the_list.park(MORTY.id, second.id, parking, source="nate")
+        with (patch.object(staff, "snapshot", return_value=members),
+              patch.object(change_review, "lists_directory", return_value=self.root)):
+            before = list_page.render(root, include_counts=False).decode()
+            self.assertEqual(before.count('data-parked="delivered"'), 2)
+            self.assertEqual(before.count('>Parked until delivered<'), 4)
+            self.assertEqual(list_page.waiting_updates(console.NewsRequest(root)), frozenset())
+            self.assertEqual(the_list.load(MORTY.id, first.id), first)
+            self.assertEqual(the_list.load(MORTY.id, second.id), second)
+            second = the_list.update(MORTY.id, second.id, {"state": the_list.ItemState.DELIVERED}, source="morty")
+            self.assertIs(second.parked_until, the_list.NoTimestamp.UNSET)
+            self.assertEqual(second.log[-1].what, the_list.UnparkedForDelivery(the_list.ItemDelivered.RECORDED))
+            self.assertEqual(the_list.load(MORTY.id, first.id), first)
+            rows = "| C1 | Publish this change | | Read C1 |\n| C2 | Record this delivery | | Read C2 |\n"
+            _ = listing.write_text(change_review.BODY.replace("\n## Reviewed", rows + "\n## Reviewed"))
+            manifest = root / change_page.CONSOLE_FOLDER / change_browser.MANIFEST
+            manifest.unlink()
+            with (patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending"),
+                  patch.object(record_store, "write_text_atomic", wraps=atomic_file.write_text_atomic) as save,
+                  serve.ReviewLinksServer(("127.0.0.1", 0), root) as server):
+                server.review_cache.synchronize()
+                self.assertTrue(manifest.is_file())
+                self.assertEqual(the_list.load(MORTY.id, first.id).log[-1].what,
+                                 the_list.UnparkedForDelivery(the_list.LinkedChangeDelivered(first_key)))
+                server.review_cache.invalidate()
+                server.review_cache.synchronize()
+                save.assert_called_once()
+            after = list_page.render(root, include_counts=False).decode()
+            first = the_list.load(MORTY.id, first.id)
+            self.assertEqual(first.state, the_list.ItemState.DELIVERED)
+            self.assertIs(first.parked_until, the_list.NoTimestamp.UNSET)
+            self.assertEqual(first.log[-1].what, the_list.UnparkedForDelivery(the_list.LinkedChangeDelivered(first_key)))
+            chip = 'data-filter-value="needs-me"'
+            self.assertRegex(after, chip + r'[^>]*data-filter-count="2"')
+            for item, key in ((first, first_key), (second, second_key)):
+                self.assertEqual(item.unread_since, NOW)
+                self.assertEqual(item.reviews, (key,))
+                row = after.split(f'data-key="{MORTY.id}/{item.id}"', 1)[1].split('</tbody>', 1)[0]
+                self.assertIn('data-state="Delivered" data-unread="true" data-parked="false"', row)
+                place = review_page.PAGE_PATH + '?show=all#' + urlencode({"show": "open", "jump": key})
+                link = html.escape('/console/' + console.place_query('review', place), quote=True)
+                self.assertIn(f'href="{link}"', row)
+            self.assertEqual(len(list_page.waiting_updates(console.NewsRequest(root))), 2)
+            self.assertEqual(the_list.load(MORTY.id, first.id), first)
+            self.assertEqual(the_list.load(MORTY.id, second.id), second)
+
+    def test_stale_ready_change_keeps_a_newer_park_and_a_change_that_is_no_longer_ready(self) -> None:
+        root = self.root / "reviews"
+        doc = self.root / "sdlc.md"
+        listing = self.root / f"{change_review.PREFIX}sdlc.md"
+        _ = doc.write_text(f'# Production\n- **Change review:** `{listing}`\n')
+        rows = "| C1 | Publish this change | | Read C1 |\n"
+        _ = listing.write_text(change_review.BODY.replace("\n## Reviewed", rows + "\n## Reviewed"))
+        members = staff.StaffSnapshot((MORTY, replace(OWNER, doc=staff.LiveDoc(local_machine(), doc))))
+        item = self.add("Keep the new park")
+        key = "sdlc/C1"
+        parking = the_list.ParkUntilDelivered.DELIVERED
+        _ = the_list.link(MORTY.id, item.id, (key,), source="morty")
+        first = the_list.park(MORTY.id, item.id, parking, source="nate")
+        with (patch.object(staff, "snapshot", return_value=members),
+              patch.object(change_review, "lists_directory", return_value=self.root)):
+            snapshot = review_page.build_snapshot(root)
+            self.assertTrue(snapshot.records[key].for_you(NOW))
+            _ = the_list.unpark(MORTY.id, first.id, source="nate")
+            second = the_list.park(MORTY.id, first.id, parking, source="nate")
+            with patch.object(list_page, "records", return_value=[list_page.ListRecord(MORTY.id, first)]):
+                serve.release_delivery_parks(root, snapshot)
+            self.assertEqual(the_list.load(MORTY.id, first.id), second)
+            _ = listing.write_text(change_review.BODY)
+            serve.release_delivery_parks(root, snapshot)
+            self.assertEqual(the_list.load(MORTY.id, first.id), second)
+
+    def test_list_readers_leave_a_ready_park_and_a_fresh_root_unchanged(self) -> None:
+        root = self.root / "fresh"
+        item = self.add("Keep the park until the owner releases it")
+        source = review_items.ChangeSource(self.root / "changes.md", {"#": "C1"},
+            change_routing.ChangeAssignment(change_routing.ShowrunnerOwnChange(OWNER.id, OWNER.name), self.root / "sdlc.md"),
+            delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery()))
+        ready = review_items.ReviewItem("sdlc/C1", "C1", review_items.ReviewType.CHANGE,
+            OWNER.id, OWNER.id, "Read the change", review_items.ReviewState.OPEN,
+            review_items.ReviewTimes(NOW, NOW), (), (), source)
+        _ = the_list.link(MORTY.id, item.id, (ready.key,), source="morty")
+        parked = the_list.park(MORTY.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
+        with (patch.object(review_items, "read", return_value=[ready]) as read,
+              patch.object(the_list, "_save", side_effect=OSError("The store is read-only.")) as save):
+            before = list_page.render(root, include_counts=False).decode()
+            self.assertIn("Parked until delivered", before)
+            self.assertFalse(root.exists())
+            self.assertEqual(list_page.waiting_updates(console.NewsRequest(root)), frozenset())
+            read.assert_called_once()
+            save.assert_not_called()
+        self.assertEqual(the_list.load(MORTY.id, item.id), parked)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_waiting_item_shows_the_park_actions_and_unread_delivery_uses_needs_me(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Wait for an answer during delivery", number=1)
+        source = review_items.ChangeSource(self.root / "changes.md", {"#": "C1"},
+            change_routing.ChangeAssignment(change_routing.ShowrunnerOwnChange(OWNER.id, OWNER.name), self.root / "sdlc.md"),
+            delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery()))
+        review = review_items.ReviewItem("sdlc/C1", "C1", review_items.ReviewType.CHANGE,
+            OWNER.id, OWNER.id, "Read the change", review_items.ReviewState.OPEN,
+            review_items.ReviewTimes(NOW, NOW), (), (), source)
+        _ = the_list.link(MORTY.id, item.id, (review.key,), source="morty")
+        with patch.object(change_page, "send_question", return_value=question_outcome()):
+            delivery = list_page.submit(root, urlencode(self.fields(item, "question", words="What changed?")), status)
+            list_page.deliver(delivery)
+        parking = the_list.ParkUntilDelivered.DELIVERED
+        _ = the_list.park(MORTY.id, item.id, parking, source="morty")
+        with patch.object(review_items, "read", return_value=[review]):
+            before = list_page.render(root, include_counts=False, status=status).decode()
+            pending = list_page.saved_action_state(MORTY.id, item.id, status=status).get("waiting_details_html", "")
+            self.assertIn("Parked until delivered", pending)
+            self.assertIn('value="unpark"', pending)
+            self.assertNotIn(' hidden>Unpark', pending)
+            self.assertIn('data-list-review-link="">C1</a>', pending)
+            _ = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.DELIVERED}, source="morty")
+            after = list_page.render(root, include_counts=False, status=status).decode()
+            self.assertRegex(after, r'data-filter-value="needs-me"[^>]*data-filter-count="1"')
+        setup = "<script>window.fetch=()=>Promise.reject(new Error('Fixture does not send requests'));</script>"
+        self.browser_actions(before, setup, r"""<script>
+const failures=[];
+const row=document.querySelector('[data-number="1"]');
+document.getElementById('filter-show-parked').click();
+row.querySelector('.list-toggle').click();
+const unpark=row.querySelector('[value="unpark"]');
+if(row.hidden || !unpark?.getClientRects().length) failures.push('The waiting row shows Unpark in Parked');
+if(!row.querySelector('[data-list-review-link]')) failures.push('The waiting row shows its change link');
+const result=document.createElement('p');result.id='probe-results';
+result.textContent=JSON.stringify(failures);document.body.append(result);
+</script>""", reduced_motion=True)
+        self.browser_actions(after, setup, r"""<script>
+const failures=[];
+const row=document.querySelector('[data-number="1"]');
+document.getElementById('filter-show-needs-me').click();
+if(row.hidden || !row.querySelector('.list-dot')) failures.push('Needs me shows the unread delivery');
+row.querySelector('.list-toggle').click();
+if(!row.querySelector('[value="read"]') || !row.querySelector('[data-list-review-link]'))
+ failures.push('The waiting row shows Mark read and its change link');
+document.getElementById('filter-show-morty-answering').click();
+if(!row.hidden) failures.push('Morty answering excludes the unread delivery');
+const result=document.createElement('p');result.id='probe-results';
+result.textContent=JSON.stringify(failures);document.body.append(result);
+</script>""", reduced_motion=True)
 
     def test_unlinked_rows_do_not_read_the_review_stores(self) -> None:
         _ = self.add("Work without reviews")
@@ -1698,6 +1858,21 @@ document.body.append(result);
             send.assert_called_once()
             self.assertEqual(the_list.load(MORTY.id, item.id), saved)
 
+    def test_park_until_delivered_reuses_the_receipt_after_delivery(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Keep this work parked until delivery")
+        fields = self.fields(item, "park", until="delivered")
+        _ = list_page.submit(root, urlencode(fields))
+        parked = the_list.load(MORTY.id, item.id)
+        self.assertIs(parked.parked_until, the_list.ParkUntilDelivered.DELIVERED)
+        self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["parked_until"], "delivered")
+        self.assertEqual(the_list.feedback_requests(parked)[fields["request"]].parked_until, parked.parked_until)
+        with self.assertRaisesRegex(the_list.ListError, "different parking"):
+            _ = list_page.submit(root, urlencode({**fields, "until": "2026-12-03"}))
+        delivered = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.DELIVERED}, source="morty")
+        _ = list_page.submit(root, urlencode(fields))
+        self.assertEqual(the_list.load(MORTY.id, item.id), delivered)
+
     def test_refused_remove_and_notice_write_failure_keep_the_item(self) -> None:
         item = self.add("Keep this item when Remove fails")
         root = self.root / "reviews"
@@ -1932,6 +2107,57 @@ window.fetch=async(_path,options={})=>{
  await flush();
  check(row.querySelector('[data-parked-note]').textContent==='Parked until 2026-12-03 19:30 EST',
   'The row shows the saved time');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_parks_until_delivered_with_one_post(self) -> None:
+        self.browser_action_sequence(r"""
+ const toggle=form.querySelector('[data-later-toggle]');
+ const menu=form.querySelector('[data-later-menu]');
+ const preset=menu.querySelector('[data-later-preset]');
+ toggle.click();
+ check(menu.firstElementChild===preset && preset.textContent==='Until delivered','The preset comes first');
+ check(!menu.querySelector('[data-later-custom]').hidden,'The date controls stay open below the preset');
+ preset.click();
+ check(menu.hidden && requests.length===1,'One click closes the menu and posts once');
+ check(requests[0]?.get('action')==='park' && requests[0].get('until')==='delivered','The POST uses the delivery value');
+ finishPost({item_state:'Working',parked:'true',parked_until:'delivered'});
+ await flush();
+ check(row.hidden,'All hides the item until delivery');
+ check(document.querySelector('#filter-show-all b').textContent==='0' &&
+  document.querySelector('#filter-show-parked b').textContent==='1','The counts include the item only in Parked');
+ check(document.querySelector('[data-hidden-action-status]').textContent==='Item #1 parked until delivered.',
+  'The page confirms the parking action beside Show');
+ show('working');
+ check(row.hidden,'Working hides the item until delivery');
+ show('parked');
+ check(!row.hidden && !form.querySelector('[value="unpark"]').hidden,'Parked shows the item and Unpark');
+ check(form.querySelector('[data-parked-detail]').textContent==='Parked until delivered','The panel shows the condition');
+ check(row.querySelector('[data-parked-note]').textContent==='Parked until delivered','The state cell has the condition');
+ submit('unpark');
+ finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'});
+ await flush();
+ check(row.hidden,'Unpark removes the item from Parked');
+ show('working');
+ check(!row.hidden,'Unpark returns the item to Working');
+""", reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_park_preset_skips_menu_navigation(self) -> None:
+        self.browser_action_sequence(r"""
+ const errors=[];
+ addEventListener('error',event=>errors.push(event.message));
+ const toggle=form.querySelector('[data-later-toggle]');
+ toggle.click();
+ const preset=form.querySelector('[data-later-preset]');
+ preset.focus();
+ for(const key of ['ArrowUp','ArrowDown','Home','End']){
+  const event=new KeyboardEvent('keydown',{key,bubbles:true,cancelable:true});
+  preset.dispatchEvent(event);
+  check(!event.defaultPrevented && document.activeElement===preset,'The dialog skips menu navigation for '+key);
+ }
+ check(errors.length===0,'The keys cause no JavaScript errors');
+ check(requests.length===0,'Navigation sends no POST');
 """)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")

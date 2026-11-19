@@ -408,6 +408,10 @@ function readPlace(params,followingItemLink=false){
   if(keys.size) keys.add(item);
   if(!['owner','showrunner','show','q','sort','dir','type','source-owner',...filterNames].some(key=>params.has(key))){
    owner='';show='all';query='';type='';for(const name of filterNames) filters[name]='';}
+  if(options.onlyShow && !history.state?.recordTable){
+   const row=[...content.querySelectorAll('[data-list-item]')].find(row=>row.dataset.key===item);
+   if(row) show=options.onlyShow(row.dataset) ?? show;
+  }
   if(options.single) opened.clear();opened.add(item);revealKey=item;
  }
  const saved=followingItemLink ? null : history.state?.recordTable;
@@ -531,13 +535,18 @@ function matches(item,selection,counts){
  const values=options.filterValues(item.dataset,selection.query,selection);
  if(!values) return false;
  const selected={show:selection.show,owner:selection.owner,...selection.filters};
- const excluded=Object.entries(values).filter(([name,choices])=>
-  filterChipValue(name,selected[name])!=='all' && !choices.includes(selected[name]));
+ const onlyShow=options.onlyShow?.(item.dataset);
+ const excluded=Object.entries(values).filter(([name,choices])=>{
+  if(name==='show' && onlyShow) return selected.show!==onlyShow;
+  return filterChipValue(name,selected[name])!=='all' && !choices.includes(selected[name]);
+ });
  // A record counts for a row when it matches every other row.
  if(counts && excluded.length<2){
   for(const [name,choices] of Object.entries(values)){
    if(excluded.length && excluded[0][0]!==name) continue;
-   for(const value of ['all',...choices.map(choice=>filterChipValue(name,choice))])
+   const values=choices.map(choice=>filterChipValue(name,choice));
+   if(name!=='show' || !onlyShow) values.unshift('all');
+   for(const value of values)
     counts[name][value]=(counts[name][value] ?? 0)+1;
   }
  }
@@ -706,10 +715,11 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false}={}
   opened.add(key);
   const selection=currentSelection();
   if(!canRevealLinked(target,selection) && !matches(target,selection)){
-   const unfiltered=currentSelection({owner:'',show:'all',query:'',type:'',sourceOwner:'',filters:{}});
+   const accessibleShow=options.onlyShow?.(target.dataset) ?? 'all';
+   const unfiltered=currentSelection({owner:'',show:accessibleShow,query:'',type:'',sourceOwner:'',filters:{}});
    if(!keepMatchingFilters || owner && !matches(target,{...unfiltered,owner})) owner='';
    if(!keepMatchingFilters || sourceOwner && !matches(target,{...unfiltered,sourceOwner})) sourceOwner='';
-   if(!keepMatchingFilters || show!=='all' && !matches(target,{...unfiltered,show})) show='all';
+   if(!keepMatchingFilters || show!==accessibleShow && !matches(target,{...unfiltered,show})) show=accessibleShow;
    if(query && !matches(target,{...unfiltered,query:query.trim().toLowerCase()})) query='';
    if(type && !matches(target,{...unfiltered,type})) type='';
    for(const name of filterNames)
@@ -986,7 +996,9 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,prepareMenu=
    }
    return;
   }
-  const list=items(),index=list.indexOf(document.activeElement);
+  const list=items();
+ if(!list.length) return;
+ const index=list.indexOf(document.activeElement);
   const next={ArrowDown:index+1,ArrowUp:index-1+list.length,Home:0,End:list.length-1}[event.key];
   if(next===undefined) return;
   event.preventDefault();list[next%list.length].focus();
