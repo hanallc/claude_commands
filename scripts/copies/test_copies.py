@@ -1021,6 +1021,24 @@ with patch.object(subprocess, 'run', pause_clone):
             self.assertIn("/other", projects)
             self.assertIn(str(self.source.resolve()), projects)
 
+    def test_mirror_receiver_names_the_check_that_refused_it(self) -> None:
+        tree = self.base / "mirrors" / "hana"
+        tree.mkdir(parents=True)
+        _ = (tree / floor_claims.MIRROR_SESSION).write_text("reader\n")
+        receive = ("mirror-receive", "--path", str(tree), "--owner", "verify",
+                   "--repository", "hana", "--session", "writer", "--", sys.executable, "-c", "pass")
+        with floor_claims.mirror_lock_path(tree).open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            refused = self.cli(*receive)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("busy; held by session reader (mirror lease)", refused.stderr)
+
+        processes = copies.MirrorProcessScan(tmp_sweep.ProcessUsesUnavailable(), frozenset())
+        with mock.patch.object(copies, "scan_mirror_processes", return_value=processes):
+            refused = self.cli(*receive)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("busy; held by session reader (mirror process check)", refused.stderr)
+
     def test_copies_removal_clears_clone_trust_before_deleting_the_folder(self) -> None:
         paths = self.clone_trust_files()
         checkout = copies.clone(self.source, "gate:remove-trust")
