@@ -97,7 +97,7 @@ message text as one JSON line in STATE/log.jsonl:
   FAILED: why    not delivered and not kept: a Codex recipient,   exit 3
                  the user, or ssh to HOST
   REPLACED: why  a newer version replaced this push; not sent     exit 0
-  KEPT: why      the user's silence is on; posted when it ends    exit 0
+  KEPT: why      saved until silence or a review ends            exit 0
   REFUSED: why   rejected before delivery; not kept              exit 2
   HELD: not sent, failed review; revise and resend, no fallback     exit 4
         also a free-text push that reports an auto-mode refusal or paid credit use, or asks
@@ -155,7 +155,9 @@ from scripts.lib.atomic_file import write_bytes_atomic
 from scripts.lib.atomic_file import write_text_atomic as write_atomic
 from scripts.notify import decision_priority
 from scripts.message import review_hold, send_budget
-from scripts.message.review_hold import sent_line as sent_line
+from scripts.message.review_hold import (
+    MESSAGE_LINE_BREAK, quote_sender_lines as quote_sender_lines, sent_line as sent_line,
+)
 from scripts.message.send_result import (
     Outcome as Outcome, EXIT as EXIT, OUTCOME_HEADERS as OUTCOME_HEADERS,
     OutcomeHeader as OutcomeHeader, NoOutcomeHeader as NoOutcomeHeader, parse_outcome as parse_outcome,
@@ -348,6 +350,7 @@ KeyedMessage = TypedDict(
         "reason": str,
         "shown_sender": NotRequired[str],
         "sender_native_id": NotRequired[str],
+        "review_batch": NotRequired[bool],
         "socket_recovery": NotRequired[str],
         "stable_recipient": NotRequired[str],
         "claude_recipient": NotRequired[QueuedClaudeMailbox],
@@ -366,6 +369,7 @@ UnkeyedMessage = TypedDict(
         "reason": str,
         "shown_sender": NotRequired[str],
         "sender_native_id": NotRequired[str],
+        "review_batch": NotRequired[bool],
         "socket_recovery": NotRequired[str],
         "stable_recipient": NotRequired[str],
         "claude_recipient": NotRequired[QueuedClaudeMailbox],
@@ -637,6 +641,7 @@ class Message:
         default=NoClaudeDeliveryAttempt(), compare=False, repr=False)
     review_delivery: bool = False
     sent_header: str = field(default_factory=lambda: sent_line(now()), compare=False, repr=False)
+    review_batch: bool = False
 
     def __post_init__(self) -> None:
         if not self.shown_sender:
@@ -750,10 +755,6 @@ class Result(NamedTuple):
     detail: str
     failure: FailureText = NO_FAILED_PUSH
     receiver: str = ""
-
-
-class ReviewMessageKept(Result):
-    """A review has a durable copy of the message."""
 
 
 class PaneTextDelivered(Result):
@@ -1172,6 +1173,8 @@ def _queued_message(value: object) -> QueuedMessage | None:
     order = values.get("send_order")
     if "send_order" in values and (not isinstance(order, int) or isinstance(order, bool) or order < 0):
         return None
+    if "review_batch" in values and not isinstance(values["review_batch"], bool):
+        return None
     if "sender_native_id" in values:
         try:
             _ = read_sender_stamp(values["sender_native_id"])
@@ -1290,6 +1293,8 @@ def enqueue(message: Message, reason: str, at: datetime, *,
         entry["claude_recipient"] = saved
     if isinstance(order, QueueOrder):
         entry["send_order"] = order.value
+    if message.review_batch:
+        entry["review_batch"] = True
     with locked():
         path.parent.mkdir(parents=True, exist_ok=True)
         queues = [(path, _read_queue_rows(path))]
@@ -2788,7 +2793,8 @@ def pending(to: str | CodexQueueOwner | None, *, emit: bool = False,
             f"Queued message {index} of {len(entries)}, from {entry['from']} at {entry['time']}:"
             + shown_sender_line(entry["from"], entry.get("shown_sender", entry["from"]))
             + queued_sent_line(entry["time"]),
-            "\n" + entry["text"].rstrip(), read_sender_stamp(entry.get("sender_native_id", "unavailable")))
+            "\n" + entry["text"].rstrip(), read_sender_stamp(entry.get("sender_native_id", "unavailable")),
+            review_batch=entry.get("review_batch", False))
             for index, entry in enumerate(entries, 1))
         if emit and text:
             rendered = (json.dumps({"hookSpecificOutput": {"hookEventName": output.event, "additionalContext": text}})
@@ -4883,27 +4889,19 @@ def queued_sent_line(stored_time: str) -> str:
         return ""
 
 
-MESSAGE_LINE_BREAK = re.compile(r"\r\n|[\n\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
-
-
-def quote_sender_lines(text: str) -> str:
-    """Separate caller text from generated sender metadata."""
-    normalized = MESSAGE_LINE_BREAK.sub("\n", text)
-    return re.sub(r"(?m)^([^\S\n]*Sender native id:)", r"> \1", normalized)
-
-
-def stamped_text(first: str, rest: str, stamp: SenderStamp) -> str:
+def stamped_text(first: str, rest: str, stamp: SenderStamp, *, review_batch: bool = False) -> str:
     preview, separator, remainder = quote_sender_lines(first).partition("\n")
     return (preview + f"\nSender native id: {sender_native_id(stamp)}" + separator + remainder
-            + quote_sender_lines(rest))
+            + (rest if review_batch else quote_sender_lines(rest)))
 
 
 def agent_text(message: Message, *, via_relay: bool = False) -> str:
     """Format caller text and add the sending machine's display and native stamp."""
-    first, separator, rest = quote_sender_lines(message.text).partition("\n")
+    text = message.text if message.review_batch else quote_sender_lines(message.text)
+    first, separator, rest = text.partition("\n")
     sender = relay_session_name(message.sender) if via_relay else message.sender
     return stamped_text(first + shown_sender_line(sender, message.shown_sender) + message.sent_header,
-                        separator + rest, message.stamp)
+                        separator + rest, message.stamp, review_batch=message.review_batch)
 
 
 def delivered_text(message: Message, entry_id: str) -> str:
@@ -4913,7 +4911,7 @@ def delivered_text(message: Message, entry_id: str) -> str:
     if shown:
         shown = "\n" + MESSAGE_LINE_BREAK.sub(" ", shown.removeprefix("\n"))
     return stamped_text(f"{name}: {summary}{shown}{message.sent_header}\nTag: {entry_id[:8]}",
-                        "\n\n" + message.text, message.stamp)
+                        "\n\n" + message.text, message.stamp, review_batch=message.review_batch)
 
 
 def send(options: Options) -> Result:
@@ -5231,16 +5229,12 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
             emergency=emergency,
             posted_on=options.scope.host if isinstance(options.scope, NamedMachine) else machine())
     log_route: Route = NO_CLAUDE_ROUTE
-    guarded = repeat_guard.Decision()
-    if not refused and held is None and isinstance(claim_result, ClaimGranted) and not isinstance(route, (RecipientLookupFailed, RemoteDelivery)):
-        guarded = repeat_guard.check(STATE / "repeats", repeat_guard.Attempt(
-            sender, attempt_recipient.value,
-            text, machine(), started.timestamp(), options.human or sender.casefold() == USER or options.to == USER))
     review_session = ""
-    review_route: review_hold.HeldForReview | review_hold.ReleasedMessages = review_hold.ReleasedMessages(())
+    review_route: review_hold.OpenReview | review_hold.AlreadyKeptForReview | review_hold.ReleasedMessages
+    review_route = review_hold.ReleasedMessages(())
     review_error = ""
-    if (isinstance(claim_result, ClaimGranted) and not guarded.held
-            and not isinstance(options.sender_origin, ForwardedSender)):
+    review_message = review_hold.ReviewMessage(display, started.timestamp(), text, sender_native_id(stamp), key or "")
+    if (isinstance(claim_result, ClaimGranted) and not isinstance(options.sender_origin, ForwardedSender)):
         if isinstance(route, (ClaudeRecipient, QueuedStaffRecipient)):
             if not isinstance(recipient, (NoRelayReplyMailbox, RelayProcessRecipient)):
                 review_session = conversation_recipient(recipient).conversation
@@ -5251,15 +5245,23 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         if review_session:
             try:
                 review_route = review_access.enter_context(review_hold.route(
-                    review_session, review_hold.ReviewMessage(display, started.timestamp(), text), urgent=options.urgent))
+                    review_session, review_message, urgent=options.urgent))
             except (OSError, ValueError) as error:
                 review_error = f"review hold for {destination}: {error}"
+
+    guarded = repeat_guard.Decision()
+    if (not refused and held is None and not review_error and isinstance(claim_result, ClaimGranted)
+            and not isinstance(review_route, review_hold.AlreadyKeptForReview)
+            and not isinstance(route, (RecipientLookupFailed, RemoteDelivery))):
+        guarded = repeat_guard.check(STATE / "repeats", repeat_guard.Attempt(
+            sender, attempt_recipient.value,
+            text, machine(), started.timestamp(), options.human or sender.casefold() == USER or options.to == USER))
 
     transport_message = message
     review_text = ""
     if isinstance(review_route, review_hold.ReleasedMessages) and review_route.messages:
         review_text = review_hold.render(review_route.messages)
-        transport_message = replace(message, summary="Messages from the review", text=review_text)
+        transport_message = replace(message, summary="Messages from the review", text=review_text, review_batch=True)
 
     if refused:
         result = Result("refused", NO_CLEAR_STEP)
@@ -5275,8 +5277,15 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         result = Result("held", f"repeat guard: copy {guarded.copies} held; owner notice queued")
     elif review_error:
         result = Result("failed", review_error)
-    elif isinstance(review_route, review_hold.HeldForReview):
-        result = ReviewMessageKept("kept", f"{options.to} is in a review; delivered at its end")
+    elif isinstance(review_route, review_hold.AlreadyKeptForReview):
+        result = Result("skipped", f"key {key!r} is already held for {options.to}")
+    elif isinstance(review_route, review_hold.OpenReview):
+        try:
+            review_route.keep(review_message)
+        except OSError as error:
+            result = Result("failed", f"review hold for {destination}: {error}")
+        else:
+            result = Result("kept", f"{options.to} is in a review; delivered at its end")
     elif isinstance(route, RecipientLookupFailed):
         from scripts.message import failed_lookup
 
@@ -5360,7 +5369,7 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         else:
             assert isinstance(plan, RelayAttempt)
             live = records
-            relay_message = (replace(plan.message, summary=transport_message.summary, text=review_text)
+            relay_message = (replace(plan.message, summary=transport_message.summary, text=review_text, review_batch=True)
                              if review_text else plan.message)
             postmaster_recipient = _postmaster_recipient(plan, live, membership)
             entry_id = postmaster.new_entry_id()
@@ -5582,11 +5591,7 @@ def main(argv: list[str]) -> int:
             result = send(options)
             outcome = ("pending" if options.review_delivery and isinstance(result, UncertainRelayDelivery)
                        else result.outcome)
-            if isinstance(result, ReviewMessageKept):
-                print("KEPT: review hold")
-                print(f"HELD: {result.detail}")
-            else:
-                print(f"{outcome.upper()}: {result.detail}")
+            print(f"{outcome.upper()}: {result.detail}")
             if outcome == "failed" and options.to.startswith("uds:"):
                 print(f"send.py: {result.detail}", file=sys.stderr)
             if isinstance(result.failure, FailedPush):

@@ -16,6 +16,7 @@ from scripts.production import session_pane
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 from scripts.herdr import herdr
+from scripts.message import review_hold
 from scripts.message.relay_identity import relay_session_name
 from scripts.production.unit_lookup import Place
 from scripts.hooks import hook_dispatch
@@ -414,6 +415,33 @@ class ConversationPauseTests(ConversationPauseFixture):
             f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
         )
         self.assertTrue((instance / "state").read_text().startswith("ENABLED=0\n"))
+
+    def test_idle_review_messages_use_the_same_hook_reply_as_the_pause(self) -> None:
+        _ = self.create_instance(self.showrunner_timer("demo"))
+        config = self.root / "review-config"
+        config.mkdir()
+        _ = (config / "send.conf").write_text("# range: 0.001..\nreview_hold_idle_minutes=1\n", encoding="utf-8")
+        env = {"HOME": str(self.root), "CONF_DIR": str(config), "USER_ZONE": "UTC"}
+        with patch.dict(os.environ, env):
+            review_hold.set_count(SESSION, 2, 100, self.fail)
+            message = review_hold.ReviewMessage("Review peer", 101, "The checks passed.", "session:peer")
+            with review_hold.route(SESSION, message, urgent=False) as result:
+                assert isinstance(result, review_hold.OpenReview)
+                result.keep(message)
+            reply = self.parsed_reply(self.run_prompt("Continue review.", now=161, extra_env=env))
+            self.assertEqual(reply, {
+                "systemMessage": f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": PAUSE_CONTEXT + "\n\nMessages from the review\n\n"
+                    + "1. Review peer\n   Sent: 00:01 UTC\n   Sender native id: session:peer\n   The checks passed.",
+                },
+            })
+            review_hold.set_count(SESSION, 1, 162, self.fail)
+            self.assertEqual(review_hold.item_count(SESSION), 1)
+            follow_up = self.run_prompt("Next item.", now=162, extra_env=env)
+            self.assertEqual((follow_up.returncode, follow_up.stdout, follow_up.stderr), (0, "", ""))
+            review_hold.set_count(SESSION, 0, 162, self.fail)
 
     def test_typed_showrunner_prompt_pauses_reports_once(self) -> None:
         instance = self.create_instance(self.showrunner_timer("demo"))

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import re
 import sys
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
@@ -22,6 +23,8 @@ class ReviewMessage:
     sender: str
     sent: float
     text: str
+    native_id: str = "unavailable"
+    key: str = ""
 
 
 class EndedReview(Enum):
@@ -40,8 +43,19 @@ class ReleasedMessages:
     accepted: bool = False
 
 
-class HeldForReview:
-    """The review accepted the message for later delivery."""
+@dataclass(frozen=True)
+class OpenReview:
+    """The caller can add a message while it holds the review lock."""
+
+    path: Path
+    state: ReviewState
+
+    def keep(self, message: ReviewMessage) -> None:
+        _write_state(self.path, ReviewState(self.state.last_activity, (*self.state.messages, message)))
+
+
+class AlreadyKeptForReview:
+    """A held message already owns this key."""
 
 
 def _count_file(session: str) -> Path:
@@ -87,7 +101,9 @@ def _read_state(count: Path, path: Path) -> ReviewState:
     activity = EndedReview.HOLD_ENDED if at is None else float(cast(float, at))
     messages = cast(list[dict[str, str | float]], value["messages"])
     return ReviewState(activity, tuple(
-        ReviewMessage(str(item["sender"]), float(item["sent"]), str(item["text"])) for item in messages))
+        ReviewMessage(str(item["sender"]), float(item["sent"]), str(item["text"]),
+                      str(item.get("native_id", "unavailable")), str(item.get("key", "")))
+        for item in messages))
 
 
 def _write_state(path: Path, state: ReviewState) -> None:
@@ -111,13 +127,23 @@ def sent_line(at: datetime) -> str:
     return f"\nSent: {local:%H:%M} {local.tzname() or zone.key}"
 
 
+MESSAGE_LINE_BREAK = re.compile(r"\r\n|[\n\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
+
+
+def quote_sender_lines(text: str) -> str:
+    """Separate caller text from generated sender metadata."""
+    normalized = MESSAGE_LINE_BREAK.sub("\n", text)
+    return re.sub(r"(?m)^([^\S\n]*Sender native id:)", r"> \1", normalized)
+
+
 def render(messages: tuple[ReviewMessage, ...]) -> str:
     entries: list[str] = []
     for item in sorted(messages, key=lambda item: item.sent):
         stamp = sent_line(datetime.fromtimestamp(item.sent, timezone.utc)).replace("\n", "\n   ")
         sender = " ".join(item.sender.splitlines())
-        body = "\n".join("   " + line for line in item.text.splitlines())
-        entries.append(f"{len(entries) + 1}. {sender}{stamp}\n{body}")
+        body = "\n".join("   " + line for line in quote_sender_lines(item.text).splitlines())
+        native_id = " ".join(item.native_id.splitlines())
+        entries.append(f"{len(entries) + 1}. {sender}{stamp}\n   Sender native id: {native_id}\n{body}")
     return "Messages from the review\n\n" + "\n\n".join(entries)
 
 
@@ -139,17 +165,25 @@ def set_count(session: str, remaining: int, at: float, emit: Callable[[str], Non
         path.unlink(missing_ok=True)
 
 
-def record_user_prompt(session: str, at: float) -> None:
+def _emit_saved(path: Path, state: ReviewState, emit: Callable[[str], None]) -> None:
+    if state.messages:
+        emit(render(state.messages))
+        _write_state(path, ReviewState(state.last_activity))
+
+
+def record_user_prompt(session: str, at: float, emit: Callable[[str], None]) -> None:
     count = _count_file(session)
     path = _state_file(count)
     with _locked(path):
-        if item_count(session):
-            state = _read_state(count, path)
-            previous = state.last_activity
-            if not isinstance(previous, EndedReview):
-                activity = EndedReview.HOLD_ENDED if _idle(previous, at) else max(previous, at)
-                _write_state(path, ReviewState(activity, state.messages))
+        state = _read_state(count, path)
+        previous = state.last_activity
+        if not isinstance(previous, EndedReview):
+            activity = EndedReview.HOLD_ENDED if not item_count(session) or _idle(previous, at) else max(previous, at)
+            state = ReviewState(activity, state.messages)
+            _write_state(path, state)
         write_text_atomic(path.with_suffix(".prompt"), repr(at), new_file_mode=0o600)
+        if isinstance(state.last_activity, EndedReview):
+            _emit_saved(path, state, emit)
 
 
 def deliver_at_session_start(session: str, emit: Callable[[str], None]) -> None:
@@ -158,14 +192,11 @@ def deliver_at_session_start(session: str, emit: Callable[[str], None]) -> None:
     if not path.exists():
         return
     with _locked(path):
-        state = _read_state(count, path)
-        if state.messages:
-            emit(render(state.messages))
-            _write_state(path, ReviewState(state.last_activity))
+        _emit_saved(path, _read_state(count, path), emit)
 
 
 @contextmanager
-def route(session: str, message: ReviewMessage, *, urgent: bool) -> Generator[HeldForReview | ReleasedMessages]:
+def route(session: str, message: ReviewMessage, *, urgent: bool) -> Generator[OpenReview | AlreadyKeptForReview | ReleasedMessages]:
     count = _count_file(session)
     path = _state_file(count)
     if count.exists() or path.exists():
@@ -174,13 +205,16 @@ def route(session: str, message: ReviewMessage, *, urgent: bool) -> Generator[He
             activity = state.last_activity
             if not isinstance(activity, EndedReview) and item_count(session) and not _idle(activity, message.sent):
                 if not urgent:
-                    _write_state(path, ReviewState(state.last_activity, (*state.messages, message)))
-                    yield HeldForReview()
+                    if message.key and any(item.key == message.key for item in state.messages):
+                        yield AlreadyKeptForReview()
+                    else:
+                        yield OpenReview(path, state)
                     return
             elif state.messages or not isinstance(activity, EndedReview):
                 _write_state(path, ReviewState(EndedReview.HOLD_ENDED, state.messages))
                 if state.messages:
-                    batch = ReleasedMessages((*state.messages, message))
+                    repeated = message.key and any(item.key == message.key for item in state.messages)
+                    batch = ReleasedMessages(state.messages if repeated and not urgent else (*state.messages, message))
                     yield batch
                     if batch.accepted:
                         try:

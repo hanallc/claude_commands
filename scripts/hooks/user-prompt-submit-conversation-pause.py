@@ -13,7 +13,6 @@ import os
 import signal
 import subprocess
 import sys
-import time
 from pathlib import Path
 from types import FrameType
 from typing import TYPE_CHECKING, NoReturn, TypedDict, cast
@@ -116,12 +115,6 @@ def main() -> None:
             finish_turn_wait(run, session_id, source=source.name, prompt=prompt)
         if source is conversation_pause.PromptSource.TYPED:
             _record_typed_prompt()
-            from scripts.message import review_hold
-
-            try:
-                review_hold.record_user_prompt(session_id, time.time())
-            except (OSError, ValueError) as error:
-                print(f"review hold: {error}", file=sys.stderr)
         activity_source = {conversation_pause.PromptSource.TYPED: "UserTypedPrompt",
                            conversation_pause.PromptSource.PEER: "PeerPrompt",
                            conversation_pause.PromptSource.SCHEDULED: "ScriptPrompt",
@@ -129,19 +122,36 @@ def main() -> None:
         if not prompt.strip():
             activity_source = "UnknownPrompt"
         _record_activity(session_id, activity_source, prompt, record)
-        reply = conversation_pause.message_arrived(
-            session_id, source, prompt, conversation_pause.now_epoch(), record=record)
-        if reply is conversation_pause.NoReply.NOTHING:
-            return
-        result: dict[str, object] = {
-            "hookSpecificOutput": {
-                "hookEventName": "UserPromptSubmit",
-                "additionalContext": reply.context,
-            },
-        }
-        if isinstance(reply, conversation_pause.ShownToUser):
-            result["systemMessage"] = reply.system_message
-        print(json.dumps(result))
+        now = conversation_pause.now_epoch()
+        reply = conversation_pause.message_arrived(session_id, source, prompt, now, record=record)
+        emitted = False
+
+        def emit(held_messages: str = "") -> None:
+            nonlocal emitted
+            pause_context = "" if reply is conversation_pause.NoReply.NOTHING else reply.context
+            context = "\n\n".join(filter(None, (pause_context, held_messages)))
+            if not context:
+                return
+            result: dict[str, object] = {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": context,
+                },
+            }
+            if isinstance(reply, conversation_pause.ShownToUser):
+                result["systemMessage"] = reply.system_message
+            print(json.dumps(result), flush=True)
+            emitted = True
+
+        if source is conversation_pause.PromptSource.TYPED:
+            from scripts.message import review_hold
+
+            try:
+                review_hold.record_user_prompt(session_id, now, emit)
+            except (OSError, ValueError) as error:
+                print(f"review hold: {error}", file=sys.stderr)
+        if not emitted:
+            emit()
     finally:
         _ = signal.alarm(0)
 

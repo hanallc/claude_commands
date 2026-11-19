@@ -575,15 +575,16 @@ class AdhocItemsTests(unittest.TestCase):
             first = datetime(2026, 11, 19, 17, 5, tzinfo=timezone.utc).timestamp()
             with patch.dict(os.environ, env):
                 review_hold.set_count("review-session", 3, first, self.fail)
-                for item in (review_hold.ReviewMessage("Pat · build", first + 60, "Second report."),
-                             review_hold.ReviewMessage("Lee · test", first, "First report.\nMore detail.")):
+                for item in (review_hold.ReviewMessage("Pat · build", first + 60, "Second report.", "codex:pat"),
+                             review_hold.ReviewMessage("Lee · test", first, "First report.\nMore detail.", "session:lee")):
                     with review_hold.route("review-session", item, urgent=False) as result:
-                        self.assertIsInstance(result, review_hold.HeldForReview)
+                        assert isinstance(result, review_hold.OpenReview)
+                        result.keep(item)
                 command = [sys.executable, str(Path(adhoc_items.__file__)), "0"]
                 result = subprocess.run(command, text=True, capture_output=True, check=True)
                 self.assertEqual(result.stdout, "Messages from the review\n\n"
-                    + "1. Lee · test\n   Sent: 12:05 EST\n   First report.\n   More detail.\n\n"
-                    + "2. Pat · build\n   Sent: 12:06 EST\n   Second report.\n")
+                    + "1. Lee · test\n   Sent: 12:05 EST\n   Sender native id: session:lee\n   First report.\n   More detail.\n\n"
+                    + "2. Pat · build\n   Sent: 12:06 EST\n   Sender native id: codex:pat\n   Second report.\n")
                 self.assertEqual(result.stderr, "")
                 again = subprocess.run(command, text=True, capture_output=True, check=True)
                 self.assertEqual(again.stdout + again.stderr, "")
@@ -605,14 +606,16 @@ class AdhocItemsTests(unittest.TestCase):
                 review_hold.set_count("review-session", 3, at, self.fail)
                 message = review_hold.ReviewMessage("Drew", at, "A saved report.")
                 with review_hold.route("review-session", message, urgent=False) as result:
-                    self.assertIsInstance(result, review_hold.HeldForReview)
+                    assert isinstance(result, review_hold.OpenReview)
+                    result.keep(message)
                 command = [sys.executable, str(repo / "scripts/hooks/session-start-review-hold.py")]
                 payload = json.dumps({"session_id": "review-session", "source": "resume",
                                       "hook_event_name": "SessionStart"})
                 reply = subprocess.run(command, input=payload, text=True, capture_output=True, check=True)
                 self.assertEqual(cast(object, json.loads(reply.stdout)), {"hookSpecificOutput": {
                     "hookEventName": "SessionStart",
-                    "additionalContext": "Messages from the review\n\n1. Drew\n   Sent: 16:20 UTC\n   A saved report.",
+                    "additionalContext": ("Messages from the review\n\n1. Drew\n   Sent: 16:20 UTC\n"
+                                          + "   Sender native id: unavailable\n   A saved report."),
                 }})
                 self.assertEqual(reply.stderr, "")
                 again = subprocess.run(command, input=payload, text=True, capture_output=True, check=True)

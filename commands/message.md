@@ -8,11 +8,14 @@ description: Read agent message rules and delivery.
 
 - **Use `send.py` for peer messages.** Run `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py`.
   A `Remote Control` row is on another machine.
-  If native `SendMessage` reports a permission hold or refusal, use `send.py` and read its result.
+  Native `SendMessage` bypasses the review hold.
+  A `[Cross-session delivery notice]` means the message was held for approval or refused.
+  Count that notice as undelivered. Use `send.py` and read its result.
   `send.py pending` prints and clears messages in your mailbox. The mailbox follows your session ID across a rename.
   A `session:`, `codex:`, or staff address finds its machine without `--machine`.
+  `send.py` reaches a Codex worker by its `worker:` address or worker name.
   A name resolves on this machine first, then on the other machine.
-  Staff names take precedence over registry names.
+  Staff names take precedence over registry names without regard to case.
   Without a staff match, a unique registry name selects a live freestanding Claude session.
   For Claude recipients, `send.py` tries the running postmaster session first and relays otherwise.
 - A local Claude session in a review receives its held messages when the review ends. Do not resend a review hold.
@@ -50,7 +53,7 @@ Filing a question alone never sends a push.
 ### Outcomes and recovery
 
 - `SENT: <how>` (exit 0) means delivered; `SKIPPED: <why>` (exit 0) means acknowledged or inside the repeat window. `QUEUED: <why>` (exit 1) keeps a Claude message for later delivery; it has not arrived.
-- `KEPT: review hold` and `HELD: <target> is in a review; delivered at its end` (exit 0) confirm storage.
+- `KEPT: <target> is in a review; delivered at its end` (exit 0) confirms storage.
 - `SENT: to the user, rewritten:` (exit 0) shows exactly what the user received on the following lines.
 - `HELD: not sent, failed review: <rules>` (exit 4): revise and resend. No other phone path is allowed; this push never goes out on expiry. Emergency blocked pushes and registered script pushes are sent despite review failure, named in `SENT` and the review log.
 - `REPLACED: <why>` (exit 0): a newer version replaced this push, and that version carries the message; nothing was sent. Use no other phone path.

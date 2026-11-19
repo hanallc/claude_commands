@@ -22,7 +22,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from scripts.message import send_budget, session_send
+from scripts.message import send_budget, send_result, session_send
 from scripts.lib.script_envelope import SCRIPT_ENVELOPE_END, SCRIPT_ENVELOPE_START
 from scripts.production import staff
 
@@ -989,7 +989,7 @@ def _send_question(delivery: QuestionDelivery) -> bool:
         print(f"conversation-pause: send for {delivery.session_id}: {error}", file=sys.stderr)
         return False
     first_output = first_error_line(result.stdout)
-    if result.returncode == 0 and first_output.startswith("SENT:"):
+    if send_result.delivered_or_kept(result.returncode, result.stdout):
         return True
     message = first_error_line(result.stderr) or first_output or str(result.returncode)
     print(f"conversation-pause: send for {delivery.session_id}: {message}", file=sys.stderr)
