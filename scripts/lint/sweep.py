@@ -2620,9 +2620,14 @@ def scan_floor_roots(roots: list[str], trees: dict[str, list[str]], *,
     return combined
 
 
+class WorkspaceSweepSkip(Enum):
+    BUSY_TRIM = "a saved trim has active output"
+
+
 def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run: bool,
           recent_minutes: float, *, lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
-          trim_recovery: TrimRecovery = TrimRecovery.EVERY_SAVED_TRIM, proc: str = PROC_DIR) -> int:
+          trim_recovery: TrimRecovery = TrimRecovery.EVERY_SAVED_TRIM,
+          proc: str = PROC_DIR) -> int | WorkspaceSweepSkip:
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     if trim_recovery is TrimRecovery.INSIDE_SWEPT_ROOTS:
@@ -2646,7 +2651,7 @@ def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run:
                                                        lint_settings=lint_settings, proc=proc))
             if uses:
                 print(f"lint sweep: saved trim for {root} has active output; skipped")
-                return 0
+                return WorkspaceSweepSkip.BUSY_TRIM
         left, failures = shrink(
             scan, total, budget, dry_run,
             lambda group: (float(group.last_used > now - recent_minutes * 60), *unit_age(group, now)),
@@ -5307,9 +5312,11 @@ def _sweep_workspace(roots: list[str], budget_config: conf.ConfigRead, dry_run: 
         return tmp_sweep.SkippedSweepAssessment()
     try:
         doc_status = prune_doc_index(roots, doc_budget, dry_run, lint_settings=lint_settings)
-        return tmp_sweep.CompletedSweepAssessment(
-            sweep(roots, trees, budget, source, dry_run, recent_minutes, lint_settings=lint_settings,
-                  trim_recovery=trim_recovery, proc=proc) or doc_status)
+        status = sweep(roots, trees, budget, source, dry_run, recent_minutes,
+                       lint_settings=lint_settings, trim_recovery=trim_recovery, proc=proc)
+        if status is WorkspaceSweepSkip.BUSY_TRIM:
+            return tmp_sweep.SkippedSweepAssessment()
+        return tmp_sweep.CompletedSweepAssessment(status or doc_status)
     finally:
         release(locks.held)
 

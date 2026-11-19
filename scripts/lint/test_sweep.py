@@ -245,6 +245,7 @@ def run_sweep(target: Target, budget: int, dry_run: bool) -> tuple[int, str]:
     output = io.StringIO()
     with redirect_stdout(output):
         status = sweep.sweep([str(target.root)], sweep.build_trees(str(target.root)), budget, "test", dry_run, recent_minutes=60)
+    assert isinstance(status, int)
     return status, output.getvalue()
 
 
@@ -1997,6 +1998,12 @@ class FloorTests(SweepCase):
         intent = sweep.trim_intent_path(take.target)
         pending = intent.read_bytes()
         roots = [str(mapping.build_directory), str(mapping.target_directory)]
+        scope = sweep.WorkspaceFailureScope(tuple(sorted(roots)))
+        settings = conf.read("lint")
+        with mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT):
+            sweep.notify_floor_problem(tmp_sweep.CompletedSweepAssessment(1), lint_settings=settings, scope=scope)
+        record = base / scope.record_name
+        reported = record.read_bytes()
         proc = base / "proc"
         proc.mkdir()
         scans = 0
@@ -2015,13 +2022,14 @@ class FloorTests(SweepCase):
               mock.patch.object(sweep, "remove_entry", wraps=sweep.remove_entry) as remove,
               mock.patch.dict(os.environ, {sweep.BUDGET_ENV: "0"}),
               redirect_stdout(output)):
-            self.assertEqual(sweep.sweep_workspace(None, conf.read("lint"), False, 60, proc=str(proc)), 0)
+            self.assertEqual(sweep.sweep_workspace(None, settings, False, 60, proc=str(proc)), 0)
         self.assertEqual(scans, 3)
         self.assertIn("has active output; skipped", output.getvalue())
         remove.assert_not_called()
         self.assertTrue(own.exists())
         self.assertTrue(artifact.exists())
         self.assertEqual(intent.read_bytes(), pending)
+        self.assertEqual(record.read_bytes(), reported)
         self.assertEqual(self.trim_rows(), [])
 
     def test_changed_pair_entries_clear_the_old_intent_and_allow_a_new_take(self) -> None:
