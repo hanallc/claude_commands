@@ -72,6 +72,7 @@ def install_cost_settings(path: Path, overrides: str = "") -> None:
         "price_refresh_seconds": "3600", "price_max_age_seconds": "7200",
         "observation_max_age_seconds": "86400", "cost_explorer_interval_seconds": "86400",
         "notification_timeout_s": "5", "notification_retry_s": "60", "cost_explorer_lookback_days": "1",
+        "bill_complete_after_seconds": "172800",
     })
     text_setting(path, "cost_explorer_tag_key", "Project")
     text_setting(path, "cost_explorer_tag_value", "fixture-build")
