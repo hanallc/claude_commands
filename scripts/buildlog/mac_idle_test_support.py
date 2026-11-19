@@ -85,7 +85,7 @@ class NotificationGuardedTestCase(unittest.TestCase):
 
 from scripts.message import send, sessions
 from scripts.lib import process_start
-from scripts.production import staff
+from scripts.production import session_staff, staff, unit_lookup
 
 
 def no_checkpoint() -> None:
@@ -125,6 +125,26 @@ def private_sender_acceptance(state: Path, *, before_accept: Callable[[], None] 
     fixture = PrivateSenderAcceptance(state, state / "acceptances.jsonl")
     owner_pid = os.getpid()
     real_process_start = process_start.process_start
+    registry = sessions.RegistryRead(tuple(
+        sessions.RegistryObservation(sessions.SessionRecord(
+            pid=pid, sessionId=f"fixture-{name}", name=name, procStart=f"fixture-start-{pid}",
+            messagingSocketPath=f"/fixture/{name}.sock", updatedAt=1, tmux="", formerNames=[]), {})
+        for pid, name in enumerate(("builds", "restarted"), start=101)), ())
+
+    def running_records(reading: sessions.RegistryRead) -> list[sessions.SessionRecord]:
+        return [entry.record for entry in reading.entries]
+
+    def checked_conversation(conversation: str, *, registry: sessions.RegistryRead,
+                             probe_address: bool) -> unit_lookup.UnitOwner:
+        if probe_address:
+            raise AssertionError("the fixture does not probe sockets")
+        row = sessions.addressed(f"session:{conversation}", running_records(registry))
+        if row is None:
+            return unit_lookup.ProvedAbsentUnit()
+        return unit_lookup.ProvedLiveUnit(
+            unit_lookup.LiveClaude(row["name"], conversation, row["messagingSocketPath"], row["pid"]),
+            session_staff.ProvedProcessGeneration(row["pid"], row.get("procStart", "")),
+        )
 
     def sender_process_start(pid: int) -> process_start.ProcessStart:
         if pid == owner_pid:
@@ -148,7 +168,10 @@ def private_sender_acceptance(state: Path, *, before_accept: Callable[[], None] 
 
     with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())), \
          mock.patch.object(process_start, "process_start", side_effect=sender_process_start), \
+         mock.patch.object(sessions, "read_registry", return_value=registry), \
+         mock.patch.object(sessions, "running_records", side_effect=running_records), \
          mock.patch.object(sessions, "running_sessions", return_value=[]), \
+         mock.patch.object(unit_lookup, "checked_conversation", side_effect=checked_conversation), \
          mock.patch.object(send, "STATE", state), mock.patch.object(send, "wrong_template", return_value=None), mock.patch.object(send, "run", side_effect=transport), \
          mock.patch.object(send, "resolve_recipient", side_effect=discover), \
          mock.patch.object(send, "relay", side_effect=relay):
