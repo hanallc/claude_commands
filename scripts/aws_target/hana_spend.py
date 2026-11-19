@@ -1,6 +1,7 @@
 """Reserve Hana spending before a controller delivers a guest permit."""
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
@@ -14,7 +15,7 @@ from scripts.lib import conf
 
 
 @dataclass(frozen=True)
-class PermitSettings:
+class StartPermitSettings:
     enabled: bool
     region: str
     instance_type: str
@@ -25,30 +26,49 @@ class PermitSettings:
     daily_budget_usd: Decimal
     gp3_usd_per_gib_month: Decimal
     permit_max_seconds: int
-    guard_grace_seconds: int
 
     @property
     def storage_usd_per_month(self) -> Decimal:
         return (self.root_gib + self.data_gib) * self.gp3_usd_per_gib_month
 
 
-def read_settings(configuration: conf.ConfigRead) -> PermitSettings:
-    """Read workload limits without reading AWS credentials or deployment state."""
-    safety = hana_guest.read_settings(configuration)
+@dataclass(frozen=True)
+class PermitSettings(StartPermitSettings):
+    guard_grace_seconds: int
+
+
+def _positive_amount(value: str) -> Decimal:
+    amount = conf.decimal(value)
+    if amount <= 0:
+        raise ValueError('expected a positive amount')
+    return amount
+
+
+def _read_start_settings(configuration: conf.ConfigRead, *, enabled: bool, permit_max_seconds: int
+                         ) -> StartPermitSettings:
     instance_type = configuration.text('instance_type')
-    fallback = tuple(item.strip() for item in configuration.text('fallback_instance_types').split(','))
-    if not all(fallback) or len(set((instance_type, *fallback))) != 1 + len(fallback):
-        raise ValueError('fallback_instance_types must contain distinct types and no empty items')
-    values = PermitSettings(safety.enabled, configuration.text('region'), instance_type, fallback,
-        conf.decimal(configuration.text('spot_max_usd_per_hour')),
-        configuration.whole('root_gib'), configuration.whole('data_gib'),
-        conf.decimal(configuration.text('daily_budget_usd')), conf.decimal(configuration.text('gp3_usd_per_gib_month')),
-        safety.permit_max_seconds, safety.guard_grace_seconds)
-    if (not values.region or not values.instance_type or min(values.root_gib, values.data_gib) <= 0
-            or any(not value.is_finite() or value <= 0 for value in
-                   (values.spot_max_usd_per_hour, values.daily_budget_usd, values.gp3_usd_per_gib_month))):
-        raise ValueError('Hana spending settings must have positive limits and complete identity')
-    return values
+
+    def fallback_types(value: str) -> tuple[str, ...]:
+        types = tuple(item.strip() for item in value.split(','))
+        if not all(types) or len(set((instance_type, *types))) != 1 + len(types):
+            raise ValueError('expected distinct types and no empty items')
+        return types
+
+    return StartPermitSettings(enabled, configuration.text('region'), instance_type,
+        configuration.value('fallback_instance_types', fallback_types),
+        configuration.value('spot_max_usd_per_hour', _positive_amount),
+        configuration.value('root_gib', conf.positive_whole), configuration.value('data_gib', conf.positive_whole),
+        configuration.value('daily_budget_usd', _positive_amount),
+        configuration.value('gp3_usd_per_gib_month', _positive_amount), permit_max_seconds)
+
+
+def read_settings(configuration: conf.ConfigRead) -> PermitSettings:
+    """Read spending and guest safety limits before execution."""
+    safety = hana_guest.read_settings(configuration)
+    start = _read_start_settings(configuration, enabled=safety.enabled, permit_max_seconds=safety.permit_max_seconds)
+    return PermitSettings(start.enabled, start.region, start.instance_type, start.fallback_instance_types,
+        start.spot_max_usd_per_hour, start.root_gib, start.data_gib, start.daily_budget_usd,
+        start.gp3_usd_per_gib_month, start.permit_max_seconds, safety.guard_grace_seconds)
 
 
 @dataclass(frozen=True)
@@ -80,35 +100,34 @@ class StorageReserved:
 
 @dataclass(frozen=True)
 class _PreviewFileVersion:
-    path: Path
-    device: int
-    inode: int
+    stamp: conf.ConfigurationStamp
     size: int
-    modified_ns: int
-    changed_ns: int
 
 
 @dataclass(frozen=True)
 class _PreviewFileAbsent:
-    path: Path
+    """The file does not exist when the preview checks its inputs."""
 
 
-type _PreviewInputs = tuple[_PreviewFileVersion | _PreviewFileAbsent, ...]
+type _PreviewInputs = dict[Path, _PreviewFileVersion | _PreviewFileAbsent]
 _REPOSITORY_GATE_CONFIG = Path(__file__).resolve().parents[2] / 'config/cloud_gate.conf'
 
 
+def _setup_record_path(book: ledger.CostLedger) -> Path:
+    return book.directory / 'hana' / 'setup.json'
+
+
 def _preview_inputs(book: ledger.CostLedger, account: Path, workload: Path, lifecycle: Path) -> _PreviewInputs:
-    versions: list[_PreviewFileVersion | _PreviewFileAbsent] = []
-    for path in (book.path, book.launch_history_path, account, workload, lifecycle,
+    versions: _PreviewInputs = {}
+    for path in (book.path, book.launch_history_path, account, workload, lifecycle, _setup_record_path(book),
                  conf.path('cloud_gate'), _REPOSITORY_GATE_CONFIG, *book.bill_paths()):
         try:
             stat = path.stat()
         except FileNotFoundError:
-            versions.append(_PreviewFileAbsent(path))
+            versions[path] = _PreviewFileAbsent()
         else:
-            versions.append(_PreviewFileVersion(path, stat.st_dev, stat.st_ino, stat.st_size,
-                                                stat.st_mtime_ns, stat.st_ctime_ns))
-    return tuple(versions)
+            versions[path] = _PreviewFileVersion(conf.ConfigurationStamp.from_stat(stat), stat.st_size)
+    return versions
 
 
 @dataclass(frozen=True)
@@ -132,26 +151,31 @@ class _PlacementPreview:
         self.lock: Lock = Lock()
         self.cached: _SharedPlacementPreview | _NoPlacementPreview = _NoPlacementPreview()
 
-    def read(self, book: ledger.CostLedger, account: Path, workload: Path, lifecycle: Path
+    def read(self, book: ledger.CostLedger, account: Path, configuration: conf.ConfigRead, lifecycle: Path
              ) -> StartAffordable | PermitRefused:
         with self.lock:
+            workload = configuration.source
             inputs = _preview_inputs(book, account, workload, lifecycle)
+            version = inputs[workload]
+            current_workload = isinstance(version, _PreviewFileVersion) and version.stamp == configuration.stamp
             now, started = time.time(), time.monotonic()
             saved = self.cached
-            if (isinstance(saved, _SharedPlacementPreview) and saved.inputs == inputs
+            if (current_workload and isinstance(saved, _SharedPlacementPreview) and saved.inputs == inputs
                     and saved.checked_at <= now < saved.deadline and started < saved.monotonic_deadline):
                 return saved.result
             self.cached = _NoPlacementPreview()
             with conf.diagnostics() as configuration_warnings:
-                configuration = conf.read(workload)
-                settings = read_settings(configuration)
+                permit = hana_guest.read_permit_window(configuration)
+                settings = _read_start_settings(configuration, enabled=permit.enabled,
+                                                permit_max_seconds=permit.permit_max_seconds)
                 try:
                     max_age = configuration.whole('preview_max_age_s')
                 except conf.Unusable:
                     max_age = 0
                 result = HanaSpending(book, account, settings).preview_start(int(now), int(now) + settings.permit_max_seconds)
             # Git recovery emits a warning and can change without a live file change.
-            if max_age > 0 and not configuration_warnings and inputs == _preview_inputs(book, account, workload, lifecycle):
+            if (current_workload and max_age > 0 and not configuration_warnings
+                    and inputs == _preview_inputs(book, account, workload, lifecycle)):
                 self.cached = _SharedPlacementPreview(inputs, result, now, now + max_age, started + max_age)
             return result
 
@@ -159,19 +183,19 @@ class _PlacementPreview:
 _placement_preview = _PlacementPreview()
 
 
-def preview_placement_start(book: ledger.CostLedger, account: Path, workload: Path, lifecycle: Path
+def preview_placement_start(book: ledger.CostLedger, account: Path, configuration: conf.ConfigRead, lifecycle: Path
                             ) -> StartAffordable | PermitRefused:
     """Project eligibility for a stopped Hana box."""
-    return _placement_preview.read(book, account, workload, lifecycle)
+    return _placement_preview.read(book, account, configuration, lifecycle)
 
 
-class HanaSpending:
+class HanaSpending[Settings: StartPermitSettings]:
     """Serialize permits and lifecycle evidence with the account ledger."""
 
-    def __init__(self, book: ledger.CostLedger, account_settings: Path, settings: PermitSettings):
+    def __init__(self, book: ledger.CostLedger, account_settings: Path, settings: Settings):
         self.book: ledger.CostLedger = book
         self.account_settings: Path = account_settings
-        self.settings: PermitSettings = settings
+        self.settings: Settings = settings
 
     def _check(self, state: ledger.LedgerEvidence, now: int, *, placement_preview: bool = False
                ) -> PermitRefused | ledger.SpendingAllowed:
@@ -206,9 +230,12 @@ class HanaSpending:
             state.hana_storage = candidate.hana_storage
             return StorageReserved(proposed)
 
-    def reserve_setup(self, now: int, expires: int) -> StartReserved | PermitRefused:
-        """Reserve approved setup without enabling placement or command permission."""
-        return self._reserve_compute(now, expires, expected_generation=0, approved_setup=True)
+    def reserve_setup(self, now: int, expires: int, *, expected_generation: int = 0,
+                      before_commit: Callable[[ledger.HanaComputeExposure], None] | None = None
+                      ) -> StartReserved | PermitRefused:
+        """Reserve or extend setup without a permit."""
+        return self._reserve_compute(now, expires, expected_generation=expected_generation, approved_setup=True,
+                                     before_commit=before_commit)
 
     def record_setup_instance_type(self, generation: int, instance_type: str) -> None:
         """Set the machine type on the exposure for the launched instance."""
@@ -216,15 +243,15 @@ class HanaSpending:
             state.hana_compute = [replace(row, instance_type=instance_type)
                                   if row.generation == generation else row for row in state.hana_compute]
 
-    def close_unlaunched_setup(self, now: int, generation: int) -> None:
-        """Release compute when every request in this setup failed before launch."""
+    def close_setup(self, now: int, generation: int) -> None:
+        """Close the compute reservation for this approved setup."""
         with self.book.transaction() as state:
             state.hana_compute = [replace(row, state=ledger.HanaExposureClosed(now))
                                   if row.generation == generation and isinstance(row.state, ledger.HanaExposureOpen)
                                   else row for row in state.hana_compute]
 
     def _provisioned_instance_type(self) -> str:
-        path = self.book.directory / 'hana' / 'setup.json'
+        path = _setup_record_path(self.book)
         try:
             saved = remote.read_record(path)
         except FileNotFoundError:
@@ -297,7 +324,9 @@ class HanaSpending:
             return result
         return PermitIssued(hana_guest.WorkPermit(float(expires), str(result.exposure.generation), boot_id), result.exposure)
 
-    def _reserve_compute(self, now: int, expires: int, *, expected_generation: int, approved_setup: bool = False) -> StartReserved | PermitRefused:
+    def _reserve_compute(self, now: int, expires: int, *, expected_generation: int, approved_setup: bool = False,
+                         before_commit: Callable[[ledger.HanaComputeExposure], None] | None = None
+                         ) -> StartReserved | PermitRefused:
         if not self.settings.enabled and not approved_setup:
             return PermitRefused('Hana is disabled')
         if type(now) is not int or type(expires) is not int or now < 0 or not 0 < expires - now <= self.settings.permit_max_seconds:
@@ -307,7 +336,11 @@ class HanaSpending:
             if isinstance(fence, ledger.HanaLifecycleFence) and now < fence.at:
                 return PermitRefused('The permit time precedes the current lifecycle fence')
             active = [row for row in state.hana_compute if isinstance(row.state, ledger.HanaExposureOpen)]
-            if expected_generation:
+            if expected_generation and active and approved_setup:
+                if active[0].generation != expected_generation:
+                    return PermitRefused('The setup reservation generation is old')
+                expires = max(active[0].expires, expires)
+            elif expected_generation and not approved_setup:
                 if not active or active[0].generation != expected_generation:
                     return PermitRefused('The permit generation is old')
                 if now >= active[0].expires or expires <= active[0].expires:
@@ -315,14 +348,19 @@ class HanaSpending:
             elif active:
                 return PermitRefused('Confirm the previous stop before another start')
             candidate, proposed = self._project_compute(state, now, expires)
+            if active and approved_setup:
+                proposed = replace(proposed, generation=active[0].generation)
+                candidate.hana_compute[-1] = proposed
             decision = self._check(candidate, now)
             if isinstance(decision, PermitRefused):
                 return decision
+            if before_commit is not None and proposed.generation != expected_generation:
+                before_commit(proposed)
             state.hana_compute, state.hana_storage = candidate.hana_compute, candidate.hana_storage
             state.hana_lifecycle_fence = ledger.HanaLifecycleFence(now, proposed.generation)
             return StartReserved(proposed)
 
-    def reconcile(self, now: int, observed: ledger.InstanceState, *, generation: int) -> None:
+    def reconcile(self: HanaSpending[PermitSettings], now: int, observed: ledger.InstanceState, *, generation: int) -> None:
         """Apply an observation only to its generation and after the saved lifecycle time."""
         if type(now) is not int or now < 0:
             raise ValueError('The observation time must use nonnegative integer seconds')

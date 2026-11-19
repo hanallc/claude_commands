@@ -298,6 +298,27 @@ The first conversation receives a prompt to read the README and run `/producer:p
 The producer admission record keeps the time for prompt recovery after a failed start.
 The command reports the staff id, account and tab.
 
+### Rename or retire a producer
+
+`agents rename OLD NEW` moves the registry key and retains the staff id.
+If the old name no longer belongs to the saved staff id, the retry keeps the old key.
+It updates the session label and tab title.
+The staff document path still names the original folder.
+Rename and retire refuse while the producer has a pending admission.
+
+`agents retire NAME [--to PRODUCER]` requires a handoff file and no open questions.
+Without `handoff.md`, it asks the producer for the file and returns.
+The command stops the conversation and closes its tab before it reads the open List items.
+It moves those items with log source `agents retire` and tells each item's showrunner.
+The retirement receipt keeps the profile, session id, and notices.
+The command records notice delivery after the send succeeds.
+A retry refuses if the producer has a different session id.
+The command removes the producer key after a final read confirms that no open List items remain assigned to the producer.
+The staff row keeps the profile in `retired_producer`.
+Active staff lookups omit retired producers.
+The fixed-id lookup supplies their names for closed List items.
+`agents resume NAME --retired` restores the profile, clears the mark and resumes the same conversation.
+
 ### First start
 
 `ProducerFirstStart(name, folder)` represents a configured producer before staff admission.
@@ -573,12 +594,46 @@ The director counts as started and leaves the restart record.
 Restart checks each unit director and showrunner that it starts with a continuation message.
 The check uses the launched account home and native session identity.
 It reads only turns after that director's start.
-The opening prompt and the Claude resume check share a cursor positioned before launch.
+Herdr keeps one cursor for each native transcript and preserves the requested cursor's launch offsets.
+The Claude resume check uses the requested cursor when the pane reports the same ID.
+The check creates its own cursor when the pane reports a different ID.
 Herdr waits for the native session identity and uses that identity to check the opening prompt's target.
 A starting agent can lack its registry record, its process start time or its argv.
 Herdr retries the identity read and the target check until the launch deadline.
 The pause between tries starts at `PANE_POLL_SECONDS` and doubles up to `START_RETRY_MAX_SECONDS`.
 Only a failure at the deadline prints the native session error.
+Herdr checks the requested and discovered transcripts before typing, sending Enter or reporting a failure.
+If the send gate finds a different native ID, the failure check includes that ID's transcript.
+The receipt check reports a matching turn, a readable search with no match, or unknown evidence.
+An inaccessible transcript directory gives unknown evidence.
+Unknown evidence blocks a send.
+A matching turn gives the submission state `confirmed`.
+A new launch with no transport process gives `not_sent` when Herdr finds no matching turn.
+All other results without a matching turn have the state `unknown`.
+Add-unit closes a session for an opening prompt failure only when the state is `not_sent`.
+Herdr uses the last native ID reported by the pane to publish the staff relationship.
+When a transcript confirms the prompt during startup, Herdr publishes the staff relationship before it returns success.
+Staff publication uses the remaining launch time.
+The result reports a staff publication error in a separate field.
+A change in the recipient does not cancel a matching turn.
+Herdr requires one registered foreground agent and a recorded recipient for the same process.
+Herdr limits the slash-command record lock to the remaining launch time.
+Herdr prepares the slash-command record before it reads the transcript.
+After the gate accepts the send, Herdr writes the record.
+Herdr can evict an old record after the transport starts.
+If startup fails, Herdr removes the new record and keeps the older records.
+Each attempt reads the transcript for a matching turn before it checks the pane.
+The gate reads the composer first, then checks the terminal and registered foreground recipient.
+The gate checks that the agent is idle before record publication and transport.
+Typing requires an empty composer. Herdr types at most once per launch.
+An empty composer ends Enter retries for that launch.
+Add-unit, add-showrunner, and promote-showrunner reruns check the transcript before they send Enter for a matching draft.
+A rerun in the retained pane never types the prompt.
+If the composer is empty at the deadline and the transcript has no matching turn, Herdr reports "sent once, not confirmed".
+The terminal, process, or composer can still change between the last check and the terminal's receipt of input.
+The launch deadline limits the pane queries and both transport calls.
+The prompt transport uses the remaining time after its process starts.
+If Herdr declines to send a resume prompt, the anomaly tells the operator to check the retained pane and send the prompt by hand.
 For a Claude launch with an opening prompt, restart uses the greater of `START_SECONDS` and `OPENING_PROMPT_SECONDS`.
 `config/shutdown.conf` sets these limits to 20 seconds and 90 seconds.
 The operation deadline can reduce either limit.

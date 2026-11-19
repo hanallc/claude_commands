@@ -4,8 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
-import uuid
 
+from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.mac_test.claim_state import ClaimScope
 
@@ -101,6 +101,9 @@ class AttemptDeclined:
     reason: str
 
 
+HANA_IMAGE_STALE = "The Hana image is stale. Run deploy.py hana-setup --plan to review replacement."
+
+
 @dataclass(frozen=True)
 class AttemptCancelled:
     """The reason explains why the attempt was cancelled."""
@@ -113,8 +116,8 @@ class AttemptOutcomeUnavailable:
     reason: str
 
 
-AttemptOutcome = AttemptRunning | AttemptCompleted | PrelaunchRefused | AttemptDeclined | AttemptCancelled | AttemptOutcomeUnavailable
-TerminalAttemptOutcome = AttemptCompleted | PrelaunchRefused | AttemptDeclined | AttemptCancelled
+TerminalAttemptOutcome = AttemptCompleted | PrelaunchRefused | AttemptDeclined | execution_identity.HanaCommandAdmissionRefused | AttemptCancelled
+AttemptOutcome = AttemptRunning | TerminalAttemptOutcome | AttemptOutcomeUnavailable
 
 
 @dataclass(frozen=True)
@@ -255,21 +258,6 @@ class PlacementCandidate:
     settings: ProviderSettings = ConfiguredProviderSettings()
 
 
-@dataclass(frozen=True)
-class SourceKeyKnown:
-    """The key identifies the source tree for placement."""
-    key: str
-
-
-@dataclass(frozen=True)
-class SourceKeyUnavailable:
-    """The reason explains why the source tree key is unavailable."""
-    reason: str
-
-
-SourceIdentity = SourceKeyKnown | SourceKeyUnavailable
-
-
 StepCommandKind = Literal["check", "lint", "doc", "test", "build", "example", "final"]
 MacRunKind = Literal["shot", "install", "probe", "run"]
 CommandKind = StepCommandKind | MacRunKind
@@ -313,7 +301,7 @@ class CargoFolderFree:
 @dataclass(frozen=True)
 class PlacementConstraints:
     """The constraints hold source identity, command, caller, candidates, and selection rules."""
-    source_key: SourceIdentity
+    source_key: execution_identity.SourceIdentity
     command: tuple[str, ...]
     repository: str
     package: str
@@ -330,7 +318,7 @@ class PlacementAssignment:
     episode: str
     attempt: str
     destination: PlacementDestination
-    source_key: SourceIdentity
+    source_key: execution_identity.SourceIdentity
     owner: SubmittingOwner
     session: SubmittingSession
     since: float
@@ -402,48 +390,6 @@ class ReservedHost:
     """The reserved host holds its placement assignment and adopted claim."""
     assignment: PlacementAssignment
     claim: AdoptedProviderClaim
-
-
-@dataclass(frozen=True)
-class ProcessExecution:
-    """The execution identity holds a host, generation, process identifier, and start time."""
-    host: str
-    generation: str
-    pid: int
-    start_time: str
-
-
-@dataclass(frozen=True)
-class CloudExecution:
-    """The cloud execution identity holds a target, generation, instance, and attempt."""
-    target: str
-    generation: str
-    instance: str
-    attempt: str
-
-
-ExecutionIdentity = ProcessExecution | CloudExecution
-
-
-@dataclass(frozen=True)
-class ExecutionNotStarted:
-    """Execution has not started."""
-
-
-@dataclass(frozen=True)
-class ObservedExecution:
-    """The evidence identifies an observed execution."""
-    identity: ExecutionIdentity
-
-
-@dataclass(frozen=True)
-class ExecutionEvidenceUnavailable:
-    """The reason and time describe unavailable execution evidence."""
-    reason: str
-    observed_at: float
-
-
-ExecutionEvidence = ExecutionNotStarted | ObservedExecution | ExecutionEvidenceUnavailable
 
 
 @dataclass(frozen=True)
@@ -519,7 +465,7 @@ class FreshHostEvidence:
     eligibility: HostEligibility
     claims: tuple[AdoptedProviderClaim, ...] = ()
     cleanup_claims: tuple[RetainedCleanupClaim, ...] = ()
-    executions: tuple[tuple[ProviderClaimReference, ExecutionEvidence], ...] = ()
+    executions: tuple[tuple[ProviderClaimReference, execution_identity.ExecutionEvidence], ...] = ()
     holder: ResourceHolder = ResourceHolderUnknown()
     provider_diagnostic: BusyProviderDiagnostic | NoProviderDiagnostic = NO_PROVIDER_DIAGNOSTIC
 
@@ -563,25 +509,17 @@ class NoLaunchPermission:
     reason: str
 
 
-def attempt_key(episode: str, attempt: str) -> str:
-    """Length framing keeps different episode and attempt pairs distinct."""
-    return f"{len(episode)}:{episode}{attempt}"
-
-
-def assigned_claim_id(episode: str, attempt: str) -> str:
-    """The provider claim id of one assigned attempt."""
-    return uuid.uuid5(uuid.NAMESPACE_URL, attempt_key(episode, attempt)).hex
-
-
 def assigned_claim_reference(assignment: PlacementAssignment) -> ProviderClaimReference:
     """Identify the provider claim whose key derives from the assignment."""
     destination = assignment.destination
     return ProviderClaimReference(destination.provider, destination.target, destination.scope,
-        assigned_claim_id(assignment.episode, assignment.attempt), assignment.episode, assignment.attempt)
+        execution_identity.assigned_claim_id(assignment.episode, assignment.attempt), assignment.episode, assignment.attempt)
 
 
-def retry_decision(destination: PlacementDestination, reason: str, now: float) -> RetryDecision:
+def retry_decision(destination: PlacementDestination, reason: str | execution_identity.HanaCommandAdmissionRefused, now: float) -> RetryDecision:
     """Keep the existing remote decline delays separate from evidence age."""
+    if isinstance(reason, execution_identity.HanaCommandAdmissionRefused):
+        return DoNotRetry(reason.reason)
     if reason in SETTINGS_REFUSAL_REASONS or reason in ("no_tests", "linux_only", "local_flag", "command"):
         return DoNotRetry(reason)
     delay = 180 if destination.provider == "mac" and reason not in ("busy", "blocked", "disk") else 0

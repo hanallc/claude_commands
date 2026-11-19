@@ -1,6 +1,7 @@
 """The wire transports admission's domain records without another representation."""
 from __future__ import annotations
 
+from scripts.build_queue import execution_identity
 from scripts.lib import test_phase
 
 from scripts.build_queue import snapshot_codec as codec
@@ -25,6 +26,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint import memory_admit as gate
 from scripts.build_queue import admission_client as client, admission_protocol as wire
 from scripts.build_queue import admission_code, admission_records as records
+from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue import placement
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply, only_admitted
 from scripts.build_queue.admission_test_support import AdmissionFixture, Exchange, ScriptedTransport, GIB, NOW
@@ -76,8 +78,8 @@ class ProtocolTests(unittest.TestCase):
                     self.assertIsInstance(parsed.run, wire.NoRun)
                     self.assertIsInstance(parsed.prerequisite, placement.TokenNotRequired)
                     self.assertIsInstance(parsed.purpose, placement.NormalStep)
-                    self.assertEqual(parsed.constraints.source_key, placement.SourceKeyKnown(old_source) if old_source
-                        else placement.SourceKeyUnavailable("older request has no source key"))
+                    self.assertEqual(parsed.constraints.source_key, execution_identity.SourceKeyKnown(old_source) if old_source
+                        else execution_identity.SourceKeyUnavailable("older request has no source key"))
             assignment = placement.PlacementAssignment(current.episode, "older-attempt",
                 current.constraints.candidates[0].destination, current.constraints.source_key,
                 current.owner, current.constraints.session, current.since)
@@ -96,19 +98,20 @@ class ProtocolTests(unittest.TestCase):
             assert isinstance(parsed_consume, wire.ConsumePermission)
             self.assertIsInstance(parsed_consume.holder, placement.ClaimHolderUnconfirmed)
             report = cast(dict[str, object], json.loads(wire.encode_request(wire.ExecutionReport(
-                "older-report", assignment, claim, placement.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now())))))
+                "older-report", assignment, claim, execution_identity.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now())))))
             report_data = cast(dict[str, object], report["data"])
             report_data["outcome"] = ""
             del report_data["path"]
             parsed_report = wire.parse_request(json.dumps(report))
             assert isinstance(parsed_report, wire.ExecutionReport)
-            self.assertIsInstance(parsed_report.evidence, placement.ExecutionEvidenceUnavailable)
+            self.assertIsInstance(parsed_report.evidence, execution_identity.ExecutionEvidenceUnavailable)
             self.assertIsInstance(parsed_report.outcome, placement.AttemptOutcomeUnavailable)
             self.assertIsInstance(parsed_report.path, placement.DispatchPathPending)
 
 
     def test_client_startup_imports_only_the_wire_without_record_readers(self) -> None:
-        for operation in ("import", "release reply"):
+        identity = wire.Identity("session", "caller", "test-modules", "/fixture", job=StepJob("test-modules", modules=3))
+        for operation in ("import", "release reply", "recorded job"):
             with self.subTest(operation=operation):
                 source = "import json, sys; from scripts.build_queue import admission_client; "
                 if operation == "release reply":
@@ -116,8 +119,15 @@ class ProtocolTests(unittest.TestCase):
                         "wire = admission_client.wire; "
                         "reply = wire.parse_reply(wire.encode_reply(wire.Ok()), wire.ReleaseRequest('request', 'reservation', 0)); "
                         "assert isinstance(reply, wire.Ok); ")
+                arguments: list[str] = []
+                if operation == "recorded job":
+                    source += (
+                        "wire = admission_client.wire; "
+                        "identity = wire.parse_record(sys.argv[1], wire.Identity); "
+                        "assert identity.job.modules == 3; ")
+                    arguments.append(wire.encode_record(identity))
                 source += "print(json.dumps(sorted(sys.modules)))"
-                result = subprocess.run([sys.executable, "-c", source],
+                result = subprocess.run([sys.executable, "-c", source, *arguments],
                     cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True,
                     timeout=TEST_HANG_GUARD_SECS, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -162,11 +172,11 @@ class ProtocolTests(unittest.TestCase):
                 wire.ClaimFailure("foreign-claim", assignment, "busy",
                     replace(claim, episode="previous-episode", attempt="previous-attempt")),
                 wire.ConsumePermission("consume", assignment, claim),
-                wire.ExecutionReport("report", assignment, claim, placement.ExecutionNotStarted()),
-                wire.ExecutionReport("report-observed", assignment, claim, placement.ObservedExecution(
-                    placement.ProcessExecution("fixture-mac", "generation-a", 42, "remote-start"))),
+                wire.ExecutionReport("report", assignment, claim, execution_identity.ExecutionNotStarted()),
+                wire.ExecutionReport("report-observed", assignment, claim, execution_identity.ObservedExecution(
+                    execution_identity.ProcessExecution("fixture-mac", "generation-a", 42, "remote-start"))),
                 wire.ExecutionReport("report-unavailable", assignment, claim,
-                    placement.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now())),
+                    execution_identity.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now())),
                 wire.ConsumePermission("consume-child", assignment, claim, holder=coordinator_holder(assignment)),
                 wire.PrerequisiteReport("token-held", request.episode, request.owner, placement.TokenHeld()),
                 wire.CancelPlacement("cancel", request.episode, request.owner, "caller ended"),
@@ -176,14 +186,14 @@ class ProtocolTests(unittest.TestCase):
             requests.append(replace(request, local=wire.LocalAdmissionUnavailable("old caller")))
             requests.append(replace(request, purpose=placement.SpeculativeCopy("local-parent", fixture.clock.now())))
             for outcome, evidence, path in (
-                (placement.AttemptRunning(), placement.ObservedExecution(
-                    placement.ProcessExecution("fixture-mac", "generation-a", 42, "remote-start")),
+                (placement.AttemptRunning(), execution_identity.ObservedExecution(
+                    execution_identity.ProcessExecution("fixture-mac", "generation-a", 42, "remote-start")),
                     placement.DispatchPathPending("start child runs")),
-                (placement.AttemptCompleted(17), placement.ExecutionNotStarted(), placement.DispatchPathSettled()),
-                (placement.PrelaunchRefused("disk"), placement.ExecutionNotStarted(), placement.DispatchPathSettled()),
-                (placement.AttemptCancelled("caller ended"), placement.ExecutionNotStarted(), placement.DispatchPathSettled()),
+                (placement.AttemptCompleted(17), execution_identity.ExecutionNotStarted(), placement.DispatchPathSettled()),
+                (placement.PrelaunchRefused("disk"), execution_identity.ExecutionNotStarted(), placement.DispatchPathSettled()),
+                (placement.AttemptCancelled("caller ended"), execution_identity.ExecutionNotStarted(), placement.DispatchPathSettled()),
                 (placement.AttemptOutcomeUnavailable("unreachable"),
-                    placement.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now()),
+                    execution_identity.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now()),
                     placement.DispatchPathPending("start child has no result")),
             ):
                 requests.append(wire.ExecutionReport("typed-outcome", assignment, claim, evidence, outcome, path))
@@ -395,8 +405,13 @@ class ProtocolTests(unittest.TestCase):
                     self.assertEqual(wire.parse_record(wire.encode_record(current), type(current)), current)
 
     def test_shell_and_protocol_share_a_version_that_includes_the_version_module(self) -> None:
+        source = Path(__file__).resolve().parents[1]
+        test_modules = {"admission_protocol_v1_fixture.py", "admission_test_support.py"}
+        admission_modules = {str(path.relative_to(source))
+                             for path in (source / "build_queue").glob("admission_*.py")
+                             if path.name not in test_modules}
+        self.assertEqual(sorted(admission_modules.difference(admission_code.ADMISSION_CODE_PATHS)), [])
         with AdmissionFixture() as fixture:
-            source = Path(__file__).resolve().parents[1]
             scripts = fixture.root / "scripts"
             for relative in (*admission_code.ADMISSION_CODE_PATHS, "build_hold/override_guard.sh", "lib/py"):
                 target = scripts / relative

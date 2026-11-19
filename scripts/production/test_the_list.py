@@ -13,11 +13,12 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast, final, override
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
+from scripts.agents.remote import local_machine
 from scripts.lib import atomic_file
-from scripts.production import investigation, record_store, staff, the_list, update_registration
+from scripts.production import change_review, investigation, record_store, staff, the_list, update_registration
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
 from scripts.review_links import change_page, list_page, question_record, review_items
 
@@ -124,6 +125,44 @@ class TheListTests(unittest.TestCase):
         table = self.command("list")[1]
         self.assertIn("| 1 | show | dwight | Plan the year |", table)
         self.assertIn("| 2 | show | morty | Ship it |", table)
+
+    def test_open_saves_refuse_a_retired_producer_even_with_a_supplied_snapshot(self) -> None:
+        open_item = self.add("Update this")
+        old_item = self.add("Close this", changes={"producer": OTHER.id})
+        closed_item = self.add("Keep closed", changes={"producer": OTHER.id})
+        closed_item = the_list.close(MORTY.id, closed_item.id, "Done", source="fixture")
+        with staff.supplied_snapshot(staff.snapshot()):
+            _ = staff.set_producer_retirement(OTHER.id, staff.RetiredProducer("claude:sonnet:high"))
+            self.assertEqual(staff.snapshot().by_id(OTHER.id), OTHER)
+            for arguments in (
+                ("add", "--title", "Add this", "--owner", RUNNER.id, "--producer", OTHER.id),
+                ("update", "--id", open_item.id, "--producer", OTHER.id),
+                ("reopen", "--id", closed_item.id),
+            ):
+                with self.subTest(command=arguments[0]):
+                    code, _, errors = self.command(*arguments, "--source", "fixture")
+                    self.assertEqual(code, 1)
+                    self.assertIn(f"{OTHER.name}: retired producer. Choose an active producer.", errors)
+            self.assertEqual(the_list.records(MORTY.id, include_closed=True), [open_item, old_item, closed_item])
+            closed = the_list.close(MORTY.id, old_item.id, "Done", source="fixture")
+            self.assertEqual((closed.state, closed.producer), (the_list.ItemState.CLOSED, OTHER.id))
+            self.assertEqual(the_list.load(MORTY.id, old_item.id), closed)
+
+    def test_move_open_producer_preserves_closed_items_and_retries_without_a_log_entry(self) -> None:
+        current = self.add("Move this", changes={"producer": OTHER.id})
+        closed = self.add("Keep this", changes={"producer": OTHER.id})
+        closed = the_list.close(MORTY.id, closed.id, "Closed for this test", source="fixture")
+        for _ in range(2):
+            moved = the_list.move_open_producer(MORTY.id, current.id, OTHER.id, MORTY.id, source="agents retire")
+            self.assertEqual(moved.producer, MORTY.id)
+            self.assertEqual(len(moved.log), len(current.log) + 1)
+            self.assertEqual(moved.log[-1].source, "agents retire")
+            self.assertEqual(the_list.move_open_producer(MORTY.id, closed.id, OTHER.id, MORTY.id,
+                                                        source="agents retire"), closed)
+        notes = the_list.folder(MORTY.id) / "L-notes.md"
+        _ = notes.write_text("# Notes\n")
+        with the_list.require_no_open_producer_items(MORTY.id, OTHER.id):
+            self.assertEqual(notes.read_text(), "# Notes\n")
 
     def test_assignment_sends_both_notices_after_save(self) -> None:
         item = self.add("Old title", changes={"latest_status": "The build is complete."})
@@ -549,6 +588,38 @@ class TheListTests(unittest.TestCase):
                 self.assertEqual(self.command(command, item.id, "--review", identities[0], "--source", "morty"),
                     (1, "", f"the_list: {item.id}: reopen the Closed item before changing it\n"))
                 self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_review_link_ignores_a_producer_directory(self) -> None:
+        folder = self.root / "producer"
+        folder.mkdir()
+        _ = (folder / "README.md").write_text("# Producer\n")
+        members = staff.snapshot()
+        rows = tuple(replace(row, doc=staff.LiveDoc(local_machine(), folder)) if row.id == MORTY.id
+                     else row for row in members.rows)
+        _ = staff.record_path().write_text(replace(members, rows=rows).encode())
+        report = investigation.file(OWNER.id, "Read the result", "Check the result.", waiting_why="Check the result.")
+        item = self.add()
+        with (patch.object(change_review, "lists_directory", return_value=self.root),
+              self.assertNoLogs(review_items.__name__, level="WARNING")):
+            self.assertEqual(self.command("link", item.id, "--review", f"{OWNER.name}/{report.id}",
+                                          "--source", "morty"), (0, "", ""))
+        self.assertEqual(the_list.load(MORTY.id, item.id).reviews, (f"investigation/{OWNER.id}/{report.id}",))
+
+    def test_review_link_warns_and_skips_an_unreadable_change_list(self) -> None:
+        unreadable = self.root / f"{change_review.PREFIX}broken.md"
+        _ = unreadable.write_bytes(b"\xff")
+        listing = self.root / f"{change_review.PREFIX}{RUNNER.name}.md"
+        _ = listing.write_text(
+            "## To review\n\n| # | Change | How to check | Producer |\n| --- | --- | --- | --- |\n"
+            + f"| C1 | Review the result | Open the result | {RUNNER.id} |\n", encoding="utf-8")
+        item = self.add()
+        key = f"{RUNNER.name}/C1"
+        with (patch.object(change_review, "lists_directory", return_value=self.root),
+              self.assertLogs(review_items.__name__, level="WARNING") as warnings):
+            self.assertEqual(self.command("link", item.id, "--review", key, "--source", "morty"), (0, "", ""))
+        warning, = warnings.output
+        self.assertIn(f"Review source {unreadable}:", warning)
+        self.assertEqual(the_list.load(MORTY.id, item.id).reviews, (key,))
 
     def test_old_records_without_reviews_load_without_writes(self) -> None:
         item = self.add()
@@ -982,8 +1053,14 @@ class TheListTests(unittest.TestCase):
         saved = the_list.load(MORTY.id, item.id)
         self.assertEqual(the_list.feedback_requests(saved)["request"], feedback)
         self.assertEqual(the_list.unread_update(saved), target)
-        the_list.deliver_feedback(MORTY.id, item.id, "request", lambda _item, pending: replace(pending, state="sent"))
+        send = Mock(return_value=replace(feedback, state="sent"))
+        with patch.object(staff, "authority_snapshot", side_effect=staff.StaffUnreadable("fixture staff read failed")) as read:
+            the_list.deliver_feedback(MORTY.id, item.id, "request", send)
+            read.assert_not_called()
+        the_list.deliver_feedback(MORTY.id, item.id, "request", send)
+        send.assert_called_once_with(saved, feedback)
         sent = the_list.load(MORTY.id, item.id)
+        self.assertEqual(the_list.feedback_requests(sent)["request"].state, "sent")
         self.assertEqual(the_list.feedback_requests(sent)["request"].read_update, target)
         self.assertEqual(the_list.unread_update(sent), target)
 
@@ -1287,6 +1364,12 @@ class TheListTests(unittest.TestCase):
         with self.assertRaises(the_list.ListError):
             the_list.create_records(OWNER.id, [typed, typed])
         self.assertEqual(list(the_list.folder(OWNER.id).glob("*.md")), [])
+        _ = staff.set_producer_retirement(OTHER.id, staff.RetiredProducer("claude:sonnet:high"))
+        with self.assertRaisesRegex(the_list.ListError, f"{OTHER.name}: retired producer"):
+            the_list.create_records(OWNER.id, [typed, replace(dependent, producer=OTHER.id)])
+        self.assertEqual(list(the_list.folder(OWNER.id).glob("*.md")), [])
+        the_list.create_records(OWNER.id, [typed, dependent])
+        self.assertEqual(the_list.records(OWNER.id), [typed, dependent])
         for text_eta in ("2026-11-20/2026-11-19", "2026-11-99/2026-11-19", "Paused"):
             with self.subTest(text_eta=text_eta):
                 changed = the_list.update(OTHER.id, "L50", {"eta": the_list.EtaDescription(text_eta)}, source="morty")

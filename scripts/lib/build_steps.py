@@ -2,11 +2,13 @@
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import PurePath
+from pathlib import Path, PurePath
 from types import MappingProxyType
 
+from scripts.build_queue.admission_jobs import StepJob as StepJob
 from scripts.buildlog.parse import CARGO_BUILD_VERBS
 from scripts.lib import conf
+from scripts.lib.proc_text import read_proc_text
 from scripts.message.owner_role import OwnerRole
 
 
@@ -43,30 +45,23 @@ class StepNames:
         return template.format(unit=unit, step=step_name or self.shown(step)) if template is not None else fallback
 
 
-    def about(self, job: "StepJob", unit: str) -> str:
-        """The job's description sentence; empty when the configuration has none or it names an unknown unit."""
-        template = self.settings.get(f"about.{job.step}", "")
+    def about_template(self, job: StepJob, unit: str) -> tuple[str, str]:
+        """Return the description template and the unit it names."""
         owner = job.unit or (unit if unit != "—" else "")
-        if not template or ("{unit}" in template and not owner):
-            return ""
+        template = self.settings.get(f"about.{job.step}", "")
+        if "{unit}" in template and not owner:
+            template = self.settings.get(f"about.{job.step}-without-unit", "")
+        return template, owner
+
+    def about(self, job: StepJob, unit: str) -> str:
+        """Describe the job when a template applies."""
+        template, owner = self.about_template(job, unit)
         return template.format(unit=owner, branch=job.branch, modules=job.modules)
 
-    def changes(self, job: "StepJob") -> str:
+    def changes(self, job: StepJob) -> str:
         """What the job changes: a branch name, or the default text."""
         template = self.settings.get(f"changes.{job.step}", self.settings.get("changes.default", ""))
         return template.format(branch=job.branch)
-
-
-@dataclass(frozen=True)
-class StepJob:
-    """The job a command runs, read from its arguments.
-
-    unit is the checkpoint's unit for integrate; the other jobs test the caller's unit.
-    """
-    step: str
-    unit: str = ""
-    branch: str = ""
-    modules: int = 0
 
 
 @dataclass(frozen=True)
@@ -75,6 +70,21 @@ class OtherCommand:
 
 
 OTHER_COMMAND = OtherCommand()
+
+
+@dataclass(frozen=True)
+class CopiesRunCommand:
+    """The source and command of a copies.py run."""
+
+    source: str
+    arguments: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CommandUnreadable:
+    """The process command is unavailable for this lifetime."""
+
+    error: str
 
 
 @dataclass(frozen=True)
@@ -107,6 +117,7 @@ RECORDED_VERBS = VERIFY_VERBS | CARGO_BUILD_VERBS | {"cargo", "fmt", "sweep", "t
     "test-affected", "test-nightly", "fast-track", "toolchain-trial", "promote"}
 QUEUE_STEP_DISPLAY = {"run": "cargo run", "test-modules": "test named"}
 SHORT_OWNER_STEPS = {"merge-gate": "merge", "targeted-test": "targeted"}
+GATE_PROGRAMS = {"merge-gate": "merge_gate.py", "targeted-test": "targeted_test.py"}
 RAW_ID = re.compile(r"(?<![0-9a-f])(?:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{32})(?![0-9a-f])",
                     re.IGNORECASE)
 IDENTIFIER = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
@@ -193,6 +204,50 @@ def _verify_step(arguments: Sequence[str]) -> StepJob | OtherCommand:
     while index < len(arguments) and arguments[index].startswith("-"):
         index += 1 if "=" in arguments[index] else 2
     return StepJob(arguments[index]) if index < len(arguments) else OTHER_COMMAND
+
+
+def copies_run_command(argv: Sequence[str]) -> CopiesRunCommand | OtherCommand:
+    """Find the command after the copies.py run options."""
+    program = _program(argv)
+    if isinstance(program, OtherCommand) or program[0] != "copies.py" or not program[1] or program[1][0] != "run":
+        return OTHER_COMMAND
+    arguments = program[1]
+    if "--" not in arguments:
+        return OTHER_COMMAND
+    separator = arguments.index("--")
+    source = _option(arguments[:separator], "--repo")
+    return CopiesRunCommand(source, tuple(arguments[separator + 1:])) if source else OTHER_COMMAND
+
+
+def process_arguments(process: Path) -> list[str]:
+    """Read the arguments of a process from procfs."""
+    return [word for word in read_proc_text(process / "cmdline").split("\0") if word]
+
+
+def live_process_arguments(process: Path, start_time: str) -> list[str] | CommandUnreadable:
+    """Read arguments from the recorded process lifetime."""
+    try:
+        argv = process_arguments(process)
+        fields = read_proc_text(process / "stat").rsplit(") ", 1)[1].split()
+        if fields[19] == start_time and fields[0] not in ("Z", "X"):
+            return argv
+    except (OSError, ValueError, IndexError) as error:
+        return CommandUnreadable(str(error))
+    return CommandUnreadable("the process lifetime ended")
+
+
+def gate_job_from_process(step: str, process: Path, *, start_time: str = "") -> StepJob | OtherCommand | CommandUnreadable:
+    """Read the gate job from its process or the copies.py caller."""
+    try:
+        argv = live_process_arguments(process, start_time) if start_time else process_arguments(process)
+    except OSError as error:
+        return CommandUnreadable(str(error))
+    if isinstance(argv, CommandUnreadable):
+        return argv
+    copied = copies_run_command(argv)
+    command = copied.arguments if isinstance(copied, CopiesRunCommand) else argv
+    expected = GATE_PROGRAMS.get(step)
+    return command_job(command) if expected and command_program(command) == expected else OTHER_COMMAND
 
 
 def _test_job(arguments: Sequence[str], *, affected: bool) -> StepJob:
