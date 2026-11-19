@@ -79,6 +79,22 @@ def install_cost_settings(path: Path, overrides: str = "") -> None:
     text_setting(path, "notification_recipient", "fixture-showrunner")
 
 
+HANA_GUEST_RUNTIME_SETTINGS = """\
+# whole: 1..
+control_poll_seconds=2
+execution_shell=default
+# whole: 1..
+free_floor_gib=30
+# whole: 1..
+source_max_bytes=1048576
+# whole: 1..
+source_download_timeout_s=60
+# whole: 1..
+source_git_timeout_s=60
+source_allowed_environment=RUST_BACKTRACE
+"""
+
+
 def write_hana_config(path: Path | None = None) -> Path:
     """Write fixed setup settings to the test configuration directory."""
     if path is None:
@@ -120,6 +136,8 @@ mount_timeout_seconds=15
 # whole: 1..
 aws_timeout_s=10
 # whole: 1..
+result_transfer_timeout_s=83
+# whole: 1..
 idle_stop_seconds=600
 # whole: 1..
 start_timeout_seconds=120
@@ -134,13 +152,17 @@ stop_wait_timeout_s=600
 # whole: 1..
 stop_poll_seconds=10
 # whole: 1..
+setup_idle_wait_timeout_s=1500
+# whole: 1..
+setup_idle_heartbeat_s=15
+# whole: 1..
 intent_lookup_timeout_s=120
 image_upload_tool=fixture-nixos#coldsnap
 # whole: 60..
 image_upload_timeout_s=3600
 # whole: 1..60
 image_wait_interval_s=10
-""")
+""" + HANA_GUEST_RUNTIME_SETTINGS)
     return path
 
 

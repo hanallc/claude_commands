@@ -784,6 +784,7 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
                   else str(producer) if isinstance(producer, str) else row_production(owner, record)
                   for change, owner, producer in zip(changes, row_owners, row_producers)]
     unregistered: set[str] = set()
+    pending_rows: list[str] = []
 
     def write(lines: list[str]) -> list[str]:
         existing = _changes("".join(lines)) if any(isinstance(change, PublicationChange) for change in changes) else []
@@ -833,6 +834,7 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
                                      IMAGE: row_images[index]})
                 for offset, index in enumerate(selected)]
         _insert(lines, end, rows)
+        pending_rows.extend(rows)
         unregistered.update(change.unit_name for index in selected
                             if isinstance(change := changes[index], PublicationChange)
                             and isinstance(change.producer, UnknownProducer) and change.unit_name)
@@ -847,7 +849,14 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
             return f"add {named}"
         return f"{'row' if len(ids) == 1 else 'rows'} {named} from {merged}"
 
-    rows = _edit(path, production, day, write, what)
+    def publish(path: Path, text: str) -> None:
+        try:
+            write_text_atomic(path, text)
+        except AtomicDurabilityUnconfirmed as error:
+            visible = [WrittenReviewRow(path, row) for row in pending_rows]
+            raise ReviewListDurabilityUnconfirmed(path, visible, error) from error
+
+    rows = _edit(path, production, day, write, what, publish=publish)
     for name in sorted(unregistered):
         print(f"change review: no staff row for unit {name}; Producer stays empty")
     return rows
@@ -1527,18 +1536,24 @@ _held_review_locks: ContextVar[frozenset[Path]] = ContextVar("held_review_locks"
 
 
 @contextmanager
-def _list_lock(path: Path) -> Generator[None]:
+def _list_lock(path: Path, *, wait: bool = True) -> Generator[file_lock.LockResult]:
     folder = path.parent.resolve()
     held = _held_review_locks.get()
     if folder in held:
-        yield
+        yield file_lock.LockResult.ACQUIRED
         return
     descriptor = os.open(folder, os.O_RDONLY)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            if wait:
+                raise
+            yield file_lock.LockResult.BUSY
+            return
         token = _held_review_locks.set(held | {folder})
         try:
-            yield
+            yield file_lock.LockResult.ACQUIRED
         finally:
             _held_review_locks.reset(token)
     finally:
@@ -1546,16 +1561,19 @@ def _list_lock(path: Path) -> Generator[None]:
 
 
 @contextmanager
-def review_delivery_lock(root: Path) -> Generator[None]:
+def review_delivery_lock(root: Path, *, wait: bool = True) -> Generator[file_lock.LockResult]:
     lock = root.resolve() / ".review-link-delivery.lock"
     held = _held_review_locks.get()
     if lock in held:
-        yield
+        yield file_lock.LockResult.ACQUIRED
         return
-    with file_lock.exclusive(lock):
+    with file_lock.exclusive(lock, wait=wait) as result:
+        if result is file_lock.LockResult.BUSY:
+            yield result
+            return
         token = _held_review_locks.set(held | {lock})
         try:
-            yield
+            yield result
         finally:
             _held_review_locks.reset(token)
 
@@ -1565,6 +1583,17 @@ def checked_review_write(path: Path, root: Path, check: Callable[[], Result]) ->
     """Check a Review card while holding its list and delivery locks."""
     with review_delivery_lock(root), _list_lock(path):
         yield check()
+
+
+@contextmanager
+def try_review_write(path: Path, root: Path) -> Generator[file_lock.LockResult]:
+    """Try the Review delivery lock, then the change list lock."""
+    with review_delivery_lock(root, wait=False) as result:
+        if result is file_lock.LockResult.BUSY:
+            yield result
+            return
+        with _list_lock(path, wait=False) as result:
+            yield result
 
 
 @contextmanager
@@ -2206,7 +2235,6 @@ def _cleared_validation(delivery: Path) -> str:
     fields = cast(dict[str, object], json.loads(delivery.read_text()))
     # A null slot prevents older fields from restoring the completed validation.
     fields["validation"] = None
-    _ = fields.pop("handed_at", None)
     return json.dumps(fields)+"\n"
 
 
@@ -2423,10 +2451,38 @@ def _foreign_merges(repo: Path, refs: Mapping[Path, str], production: Path,
     return frozenset(foreign)
 
 
+@dataclass(frozen=True)
+class WrittenReviewRow:
+    list_path: Path
+    markdown: str
+
+
+class ReviewListWriteFailed(ChangeReviewError):
+    """A list write failed after zero or more rows were saved."""
+
+    def __init__(self, list_path: Path, rows: list[WrittenReviewRow], error: Exception) -> None:
+        super().__init__(str(error))
+        self.list_path: Path = list_path
+        self.written_rows: tuple[WrittenReviewRow, ...] = tuple(rows)
+
+
+class ReviewListDurabilityUnconfirmed(ReviewListWriteFailed):
+    """The new rows are visible after the write, but the directory sync failed."""
+
+
 def list_ready(repo: Path, production: Path, merge_branch: str, *,
                review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
                selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
                known_producer: KnownMergeProducer | UnknownProducer = UNKNOWN_PRODUCER) -> list[str]:
+    """Return the Markdown for the rows written to the review lists."""
+    return [row.markdown for row in list_ready_rows(repo, production, merge_branch, review_list=review_list,
+                                                   record=record, selection=selection, known_producer=known_producer)]
+
+
+def list_ready_rows(repo: Path, production: Path, merge_branch: str, *,
+                    review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
+                    selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
+                    known_producer: KnownMergeProducer | UnknownProducer = UNKNOWN_PRODUCER) -> list[WrittenReviewRow]:
     """Add live changes on origin/main, or release one completed step of one merge."""
     repo = repo.expanduser().resolve()
     try:
@@ -2461,7 +2517,7 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
     outside = _reviewed_merge_refs_by_doc(repo, lambda: outside_docs, record=record)
     outside_refs = set(outside.values())
     foreign = _foreign_merges(repo, outside, production, merge_branch, record)
-    rows: list[str] = []
+    rows: list[WrittenReviewRow] = []
     matched_step = False
     recorded = checkpoint_producers(record)
     for entry in merges:
@@ -2546,9 +2602,15 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
                 selected = [change for change in changes if isinstance(change.item.readiness, AfterStep)
                             and change.item.readiness.step == selection.step]
             stamp = now()
-            rows.extend(append_rows(path, selected, stamp.date(), short, owner_doc, record=record, repo=repo,
-                                    on_hold=note if isinstance(selection, ReadinessScan) else None,
-                                    merge_changes=merge_changes[path], added_at=stamp, on_image_problem=image_problem))
+            try:
+                written = append_rows(path, selected, stamp.date(), short, owner_doc, record=record, repo=repo,
+                                      on_hold=note if isinstance(selection, ReadinessScan) else None,
+                                      merge_changes=merge_changes[path], added_at=stamp, on_image_problem=image_problem)
+            except ReviewListDurabilityUnconfirmed as error:
+                raise ReviewListDurabilityUnconfirmed(path, [*rows, *error.written_rows], error) from error
+            except (ChangeReviewError, OSError, UnicodeError) as error:
+                raise ReviewListWriteFailed(path, rows, error) from error
+            rows.extend(WrittenReviewRow(path, row) for row in written)
     if isinstance(selection, CompletedStep) and not matched_step:
         raise ChangeReviewError(f"{selection.merged}: no change waits for step {selection.step!r}; no row added")
     return rows

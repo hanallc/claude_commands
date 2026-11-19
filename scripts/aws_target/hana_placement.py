@@ -8,12 +8,17 @@ from scripts.build_targets.execution_transport import (
     HanaControlTransport as HanaControlTransport,
 )
 from typing import TYPE_CHECKING, Protocol, cast
+from scripts.aws_target.hana_claim_release import (
+    HanaClaimRelease as HanaClaimRelease, HanaClaimReleased as HanaClaimReleased,
+    HanaClaimReleaseRefused as HanaClaimReleaseRefused,
+)
 from scripts.aws_target.hana_generation import HanaHostGeneration as HanaHostGeneration
 
 if TYPE_CHECKING:
     from scripts.aws_target import hana_box as box
     from scripts.aws_target.hana_box import (HanaLifecycleEvidence as HanaLifecycleEvidence,
-        HanaUnprovisioned as HanaUnprovisioned, HanaLifecycleUnavailable as HanaLifecycleUnavailable)
+        HanaUnprovisioned as HanaUnprovisioned, HanaLifecycleUnavailable as HanaLifecycleUnavailable,
+        HanaResourcesHeld as HanaResourcesHeld)
     from scripts.build_queue import admission_records as records, placement
     from scripts.build_targets.target_config import SshTarget
     from scripts.lib import conf
@@ -79,7 +84,12 @@ class HanaClaimRetained:
     reason: str
 
 
-HanaClaimResult = HanaClaimPending | HanaClaimAdopted | HanaClaimRefused | HanaClaimRetained
+@dataclass(frozen=True)
+class HanaClaimResourcesHeld:
+    """A resource command holds the box, so the claim has no binding."""
+
+
+HanaClaimResult = HanaClaimPending | HanaClaimAdopted | HanaClaimRefused | HanaClaimRetained | HanaClaimResourcesHeld
 
 
 @dataclass(frozen=True)
@@ -126,13 +136,14 @@ class _PlacementAdapter(Protocol):
     def claim_assigned(self, assignment: placement.PlacementAssignment, holder: placement.ClaimHolderIdentity, controller: box.HanaController, *, worktree: str='') -> HanaClaimResult:
         ...
 
-    def release_assigned(self, assignment: placement.PlacementAssignment, holder: placement.ClaimHolderIdentity, controller: box.HanaController) -> bool:
+    def release_assigned(self, assignment: placement.PlacementAssignment, holder: placement.ClaimHolderIdentity, controller: box.HanaController) -> HanaClaimRelease:
         ...
 
     def fixed_policy(self, transport: HanaControlTransport, repository: str, kind: str) -> HanaStepRefused | EnabledHanaRoute:
         ...
 
-    def read_evidence(self, key: placement.HostEvidenceKey, request: HanaEvidenceRequest) -> placement.HostEvidence:
+    def read_evidence(self, key: placement.HostEvidenceKey, request: HanaEvidenceRequest, *,
+                      transport: HanaControlTransport, workload: conf.ConfigRead) -> placement.HostEvidence:
         ...
 
 
@@ -184,7 +195,7 @@ def generation_text(generation: HanaHostGeneration) -> str:
     return digest.hexdigest()
 
 
-def release_assigned(assignment: placement.PlacementAssignment, holder: placement.ClaimHolderIdentity, controller: box.HanaController) -> bool:
+def release_assigned(assignment: placement.PlacementAssignment, holder: placement.ClaimHolderIdentity, controller: box.HanaController) -> HanaClaimRelease:
     """Release the exact target claim after durable execution and lifecycle settlement."""
     return _adapter().release_assigned(assignment, holder, controller)
 
@@ -194,14 +205,15 @@ def fixed_policy(transport: HanaControlTransport, repository: str, kind: str) ->
     return _adapter().fixed_policy(transport, repository, kind)
 
 
-def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest) -> placement.HostEvidence:
-    """Project existing lifecycle and execution records without provider mutations."""
-    return _adapter().read_evidence(key, request)
+def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, *,
+                  transport: HanaControlTransport, workload: conf.ConfigRead) -> placement.HostEvidence:
+    """Use the workload that selected the Hana transport to read evidence."""
+    return _adapter().read_evidence(key, request, transport=transport, workload=workload)
 
 
 def __getattr__(name: str) -> object:
     """Load lifecycle projection types only when a backend requests them."""
-    if name in ('HanaLifecycleEvidence', 'HanaUnprovisioned', 'HanaLifecycleUnavailable'):
+    if name in ('HanaLifecycleEvidence', 'HanaUnprovisioned', 'HanaLifecycleUnavailable', 'HanaResourcesHeld'):
         from importlib import import_module
         return cast(object, getattr(import_module('scripts.aws_target.hana_box'), name))
     raise AttributeError(name)

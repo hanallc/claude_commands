@@ -17,6 +17,7 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -37,14 +38,16 @@ STARTED_NS = time.time_ns()
 
 from scripts.disks import disks_page, sessions, slots
 from scripts.lib import conf, scratch
-from scripts.production import change_routing, change_review
+from scripts.production import change_routing, change_review, staff, the_list
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
-from scripts.review_links import question_record
+from scripts.review_links import new_item_dialog, question_record, review_actions, review_submissions
 from scripts.review_links.review_link import private_name
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
 # A restart passes the listening socket to the new process in this variable.
 LISTEN_FD = "REVIEW_LINKS_LISTEN_FD"
+MAX_NEW_ITEM_BODY = 4 * ((new_item_dialog.MAX_TOTAL_IMAGE_BYTES + 2) // 3) + 256 * 1024
+ATTACHMENT_MEDIA = {f"image.{extension}": media for media, extension in new_item_dialog.IMAGE_FORMATS.items()}
 
 
 @dataclass
@@ -312,16 +315,23 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.end_headers()
             return BytesIO(content)
         if route.path == "/console/for-you.json":
+            extra: dict[str, object] = {}
+            if route.query == "view=console":
+                extra["accounts_quota"] = {"level": accounts_page.QuotaLevel.NONE, "name": ""}
+                try:
+                    extra["accounts_quota"] = accounts_page.nav_quota(root)
+                except (accounts_page.UnreadableQuotaState, accounts_page.InvalidQuotaThresholds) as error:
+                    print(f"review-links accounts: {error}", file=sys.stderr)
+                except (OSError, ValueError):
+                    print("review-links accounts: could not read the quota alerts", file=sys.stderr)
             try:
-                if route.query == "view=count":
-                    payload = console.for_you_count(for_you.read())
-                else:
-                    payload = console.for_you_payload()
+                payload = (console.for_you_count(for_you.read()) if route.query == "view=count"
+                           else console.for_you_payload())
             except (OSError, ValueError) as error:
                 print(f"review-links actions: {error}", file=sys.stderr)
-                self.json_response(503, {"available": False})
+                self.json_response(503, {"available": False, **extra})
             else:
-                self.json_response(200, payload)
+                self.json_response(200, {**payload, **extra})
             return None
         if route.path == accounts_page.PAGE_PATH:
             try:
@@ -335,6 +345,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path in (investigations_page.PAGE_PATH, "/console/questions.html", "/console/changes.html"):
             self.redirect(review_page.legacy_url(route.path, route.query))
             return None
+        if route.path == review_page.NEW_ITEM_PATH:
+            self.new_item_options()
+            return None
+        if route.path == review_page.ATTACHMENT_PATH:
+            return self.review_attachment(route.query)
         if route.path == review_page.PAGE_PATH:
             try:
                 snapshot = cast(ReviewLinksServer,self.server).review_cache.get()
@@ -365,6 +380,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.review_response(content, 'text/html; charset=utf-8',prepared)
             return None
         if route.path == list_page.PAGE_PATH:
+            fields = parse_qs(route.query)
+            if "item-state" in fields:
+                self.list_action_state(fields)
+                return None
             try:
                 with server.list_store_access():
                     content = list_page.render(root, include_counts=server.mode is ServerMode.LIVE,
@@ -538,18 +557,24 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         server = cast(ReviewLinksServer, self.server)
-        if server.mode is ServerMode.LIST_FIXTURE and urlsplit(self.path).path != list_page.PAGE_PATH:
+        route = urlsplit(self.path)
+        if server.mode is ServerMode.LIST_FIXTURE and route.path != list_page.PAGE_PATH:
             self.send_error(404)
             return
-        try:
-            if server.bound_address != tailscale_ip():
-                self.html_response(403, change_page.document("<p>Open this page through this machine's Tailscale address.</p>"))
-                return
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
-            print(f"review-links address: {error}", file=sys.stderr)
-            self.html_response(403, change_page.document("<p>The Tailscale address is not available.</p>"))
+        refusal = self.tailscale_refusal()
+        if refusal:
+            if route.path == review_page.NEW_ITEM_PATH:
+                self.json_response(403, {"error": refusal})
+            else:
+                self.html_response(403, change_page.document(f"<p>{html.escape(refusal)}</p>"))
             return
-        if urlsplit(self.path).query or self.headers.get_content_type() != "application/x-www-form-urlencoded":
+        if route.path == review_page.NEW_ITEM_PATH:
+            self.new_item_post()
+            return
+        if route.path == review_page.ATTACHMENT_PATH:
+            self.send_error(405)
+            return
+        if route.query or self.headers.get_content_type() != "application/x-www-form-urlencoded":
             self.html_response(400, change_page.document("<p>Use the answer form on the review page.</p>"))
             return
         if urlsplit(self.path).path == review_page.PAGE_PATH:
@@ -711,6 +736,134 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             except OSError as error:
                 print(f"review-links delivery status: {error}", file=sys.stderr)
 
+    def tailscale_refusal(self) -> str:
+        server = cast(ReviewLinksServer, self.server)
+        try:
+            if server.bound_address != server.request_tailscale_address():
+                return "Open this page through this machine's Tailscale address."
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            print(f"review-links address: {error}", file=sys.stderr)
+            return "The Tailscale address is not available."
+        return ""
+
+    def same_origin(self) -> bool:
+        origins = self.headers.get_all("Origin", [])
+        host = self.headers.get("Host", "")
+        return not origins or bool(host and origins == [f"http://{host}"])
+
+    def new_item_options(self) -> None:
+        """Return a New item token and current recipients."""
+        server = cast(ReviewLinksServer, self.server)
+        if self.command != "GET":
+            self.send_error(405)
+            return
+        if self.path != review_page.NEW_ITEM_PATH:
+            self.json_response(400, {"error": "Open the New item dialog from Review."})
+            return
+        refusal = self.tailscale_refusal()
+        if refusal or not self.same_origin():
+            self.json_response(403, {"error": refusal or "Open the New item dialog from Review."})
+            return
+        try:
+            recipients = review_submissions.recipient_options(staff.snapshot())
+        except (OSError, ValueError) as error:
+            print(f"review-links New item recipients: {error}", file=sys.stderr)
+            self.json_response(503, {"error": "The recipients are unavailable."})
+            return
+        self.json_response(200, {"token": server.new_item_token, "recipients": recipients})
+
+    def new_item_post(self) -> None:
+        """File and publish a native record before sending its message."""
+        server = cast(ReviewLinksServer, self.server)
+        if self.path != review_page.NEW_ITEM_PATH or self.headers.get_content_type() != "application/json":
+            self.json_response(400, {"error": "Use the New item dialog on Review."})
+            return
+        if not self.same_origin():
+            self.json_response(403, {"error": "Use the New item dialog on Review."})
+            return
+        try:
+            lengths = self.headers.get_all("Content-Length", [])
+            if len(lengths) != 1 or self.headers.get("Transfer-Encoding") or not re.fullmatch(r"[0-9]{1,10}", lengths[0]):
+                raise new_item_dialog.SubmissionError("Invalid New item request size.")
+            size = int(lengths[0])
+            if not 0 < size <= MAX_NEW_ITEM_BODY:
+                raise new_item_dialog.SubmissionError("Invalid New item request size.")
+            body = self.rfile.read(size)
+            if len(body) != size:
+                raise new_item_dialog.SubmissionError("Incomplete New item request.")
+            payload = cast(object, json.loads(body.decode("utf-8")))
+            if not isinstance(payload, dict):
+                raise new_item_dialog.SubmissionError("Invalid New item request.")
+            fields = cast(dict[str, object], payload)
+            token = fields.get("token")
+            if not isinstance(token, str) or not token.isascii() or not secrets.compare_digest(token, server.new_item_token):
+                self.json_response(403, {"code": "stale_token", "error": "The New item token expired. Try Send again."})
+                return
+            request = new_item_dialog.read_request(fields)
+        except (ValueError, RecursionError) as error:
+            reason = str(error) if isinstance(error, new_item_dialog.SubmissionError) else "Invalid New item JSON."
+            self.json_response(400, {"error": reason})
+            return
+        except OSError:
+            self.json_response(400, {"error": "Could not read the New item request."})
+            return
+        try:
+            created = server.review_cache.create_submission(request)
+            delivery = review_actions.prepare_submission_delivery(created.saved, request.words, server.delivery_status)
+        except new_item_dialog.SubmissionConflict as error:
+            self.json_response(409, {"error": str(error)})
+            return
+        except new_item_dialog.SubmissionError as error:
+            self.json_response(400, {"error": str(error)})
+            return
+        except (OSError, ValueError, RuntimeError, TypeError) as error:
+            print(f"review-links New item Send: {error}", file=sys.stderr)
+            self.json_response(503, {"error": "Could not publish the item. Try Send again."})
+            return
+        try:
+            self.json_response(200, {"id": created.saved.id, "key": created.key, "version": created.version})
+        finally:
+            self.deliver_review(server, delivery)
+
+    def review_attachment(self, query: str) -> BinaryIO | None:
+        """Serve an image named by a retained Review record."""
+        server = cast(ReviewLinksServer, self.server)
+        if self.tailscale_refusal() or not self.same_origin():
+            self.send_error(403)
+            return None
+        fields = parse_qs(query, keep_blank_values=True)
+        if set(fields) != {"key", "id"} or any(len(values) != 1 for values in fields.values()):
+            self.send_error(404)
+            return None
+        try:
+            item = server.review_cache.get().records[fields["key"][0]]
+            origin = review_items.submission_origin(item)
+            if not isinstance(origin, new_item_dialog.ReviewSubmission):
+                raise FileNotFoundError()
+            image = next((image for image in origin.images if image.id == fields["id"][0]), None)
+            if image is None:
+                raise FileNotFoundError()
+            folder = review_submissions.image_folder(origin)
+            path = folder / image.id / image.file
+            media = ATTACHMENT_MEDIA[image.file]
+            if path.resolve() != path:
+                raise FileNotFoundError()
+            with path.open("rb") as stream:
+                content = stream.read(new_item_dialog.MAX_IMAGE_BYTES + 1)
+            if not 0 < len(content) <= new_item_dialog.MAX_IMAGE_BYTES:
+                raise FileNotFoundError()
+        except (KeyError, OSError, ValueError):
+            self.send_error(404)
+            return None
+        self.send_response(200)
+        self.send_header("Content-Type", media)
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.end_headers()
+        return BytesIO(content)
+
     def review_post(self) -> None:
         """Save the review answer before its shared message delivery."""
         server = cast(ReviewLinksServer, self.server)
@@ -768,20 +921,24 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 server.review_cache.invalidate()
 
     def accounts_post(self) -> None:
-        """Validate and save one account color or one next move from the Accounts page."""
+        """Apply one Accounts page action."""
+        quota_fields = {"quota_account", "quota_level", "quota_reset"}
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= 4096:
                 raise ValueError("Invalid accounts request size.")
             fields = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
-            if (set(fields) not in ({"key", "value"}, {"group", "to"}, {"group", "clear"})
+            if (set(fields) not in ({"key", "value"}, {"group", "to"}, {"group", "clear"}, quota_fields)
                     or any(len(values) != 1 for values in fields.values())
                     or ("clear" in fields and fields["clear"] != ["first"])):
-                raise ValueError("Use one color key and one color value, one group and one account, or one group and clear=first.")
+                raise ValueError("Send one Accounts action with its required fields.")
         except (ValueError, UnicodeError) as error:
             self.json_response(400, {"reason": str(error)})
             return
-        result = (accounts_page.save_color(fields["key"][0], fields["value"][0]) if "key" in fields
+        server = cast(ReviewLinksServer, self.server)
+        result = (accounts_page.clear_quota(server.root, fields["quota_account"][0], fields["quota_level"][0],
+                                            fields["quota_reset"][0]) if set(fields) == quota_fields
+                  else accounts_page.save_color(fields["key"][0], fields["value"][0]) if "key" in fields
                   else accounts_page.clear_next_move(fields["group"][0]) if "clear" in fields
                   else accounts_page.save_next_move(fields["group"][0], fields["to"][0]))
         if isinstance(result, accounts_page.Refused):
@@ -791,6 +948,23 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         else:
             cast(ReviewLinksServer, self.server).accounts_cache = AccountsPageCache()
             self.json_response(200, {"state": "saved"})
+
+    def list_action_state(self, fields: dict[str, list[str]]) -> None:
+        """Read the current item after an action response is lost."""
+        server = cast(ReviewLinksServer, self.server)
+        try:
+            (identity,) = fields["item-state"]
+            (keeper,) = fields.get("keeper", [])
+            (park_request,) = fields.get("park-request", [""])
+            with server.list_store_access():
+                current = list_page.saved_action_state(keeper, identity, status=server.delivery_status,
+                                                       park_request=park_request)
+        except ValueError as error:
+            self.browser_failure(400, "The List item is unavailable.", error)
+        except OSError as error:
+            self.browser_failure(503, "The List item cannot be read. Try again.", error)
+        else:
+            self.json_response(200, current)
 
     def list_post(self) -> None:
         """Save List feedback before the shared sender starts."""
@@ -960,19 +1134,71 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         return "text/plain; charset=utf-8"
 
 
+def release_delivery_parks(root: Path, snapshot: review_page.ReviewSnapshot) -> None:
+    """Use published changes to find parks that can be checked and released."""
+    now = the_list.now()
+    ready = {key: change for key, change in snapshot.records.items()
+             if isinstance(change.source, review_items.ChangeSource)
+             and key not in snapshot.unavailable_cards and change.for_you(now)}
+    if not ready:
+        return
+    for entry in list_page.records():
+        park = the_list.delivery_park_event(entry.item)
+        if not isinstance(park, the_list.DeliveryParkEvent):
+            continue
+        for key in entry.item.reviews:
+            change = ready.get(key)
+            if change is None or not isinstance(change.source, review_items.ChangeSource):
+                continue
+            try:
+                result = release_park_for_change(root, snapshot.members, entry, park, change, change.source)
+            except (OSError, ValueError, change_review.ChangeReviewError) as error:
+                print(f"review-links List delivery park {entry.key}: {error}", file=sys.stderr)
+                continue
+            if result is the_list.DeliveryParkRelease.RELEASED:
+                break
+
+
+def release_park_for_change(root: Path, members: staff.StaffSnapshot, entry: list_page.ListRecord,
+                            park: the_list.DeliveryParkEvent, change: review_items.ReviewItem,
+                            source: review_items.ChangeSource) -> the_list.DeliveryParkRelease:
+    def change_ready() -> bool:
+        try:
+            return review_items.read_current(root, change, members).for_you(the_list.now())
+        except review_items.ReviewRecordMissing:
+            return False
+
+    return the_list.unpark_for_delivered_change(entry.keeper, entry.item.id, park, change.key,
+                                               review_root=root, review_list=source.path, change_ready=change_ready)
+
+
+class ConsoleReviewSnapshotCache(review_page.ReviewSnapshotCache):
+    @override
+    def _after_snapshot_update(self, snapshot: review_page.ReviewSnapshot, /) -> None:
+        try:
+            release_delivery_parks(self.root, snapshot)
+        except (OSError, ValueError) as error:
+            print(f"review-links List delivery parks: {error}", file=sys.stderr)
+
+
 class ReviewLinksServer(ThreadingHTTPServer):
-    def __init__(self, address: tuple[str, int], root: Path, *, mode: ServerMode = ServerMode.LIVE) -> None:
+    def __init__(self, address: tuple[str, int], root: Path, *, mode: ServerMode = ServerMode.LIVE,
+                 initialize_review: bool = False) -> None:
         settings = conf.read("review_links")
         self.mode: ServerMode = mode
         self.store_folder: Path = root.resolve()
         # Use relative paths in the fixture process so a request cannot recreate the store after removal.
         self.root: Path = Path(".") if mode is ServerMode.LIST_FIXTURE else self.store_folder
         self.bound_address: str = address[0]
+        self.verified_tailscale_address: str = ""
+        self._tailscale_address_lock: threading.Lock = threading.Lock()
         self.delivery_status: change_page.DeliveryStatus = change_page.DeliveryStatus(self.root)
         self.branch_deletions: set[Path] = set()
         self.branch_deletions_lock: threading.Lock = threading.Lock()
         self.accounts_cache: AccountsPageCache = AccountsPageCache()
-        self.review_cache: review_page.ReviewSnapshotCache = review_page.ReviewSnapshotCache(self.root,start_worker=False)
+        self.review_cache: review_page.ReviewSnapshotCache = ConsoleReviewSnapshotCache(
+            self.root, start_worker=False, initialize_on_start=initialize_review and mode is ServerMode.LIVE)
+        self.new_item_token: str = secrets.token_urlsafe()
         self.next_tailscale_check: float = time.monotonic() + settings.number("tailscale_check_seconds")
         self.next_sweep: float = time.monotonic() + settings.number("snapshot_sweep_seconds")
         self.next_code_check: float = time.monotonic() + settings.number("code_check_seconds")
@@ -994,6 +1220,16 @@ class ReviewLinksServer(ThreadingHTTPServer):
             recover_list()
         threading.Thread(target=recover_pending, daemon=True).start()
         self.review_cache.start()
+
+    def request_tailscale_address(self) -> str:
+        """Reuse the startup address for the request guard."""
+        with self._tailscale_address_lock:
+            if self.verified_tailscale_address:
+                return self.verified_tailscale_address
+            address = tailscale_ip()
+            if address == self.bound_address:
+                self.verified_tailscale_address = address
+            return address
 
     @override
     def server_close(self) -> None:
@@ -1087,7 +1323,7 @@ def main(arguments: list[str]) -> int:
         if fixture is None:
             root = change_routing.review_root()
             root.mkdir(parents=True, exist_ok=True)
-            service = ReviewLinksServer(address, root)
+            service = ReviewLinksServer(address, root, initialize_review=True)
         else:
             root = fixture
             os.chdir(root)
@@ -1095,6 +1331,7 @@ def main(arguments: list[str]) -> int:
                               CHANGE_REVIEW_DIR="reviews", REBUILD_NEEDS_DIR="rebuild-needs")
             service = ReviewLinksServer(address, root, mode=ServerMode.LIST_FIXTURE)
         with service as server:
+            server.verified_tailscale_address = address[0]
             print(f"review-links: serving {root} on {address[0]}:{server.server_port}", flush=True)
             try:
                 server.serve_forever()

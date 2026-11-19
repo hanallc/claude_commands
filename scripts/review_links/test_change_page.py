@@ -31,6 +31,7 @@ from typing import Literal, TextIO, cast, override
 from collections.abc import Callable, Generator
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
+from uuid import uuid4
 
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_staff_names import without_role_colors
@@ -43,7 +44,7 @@ from scripts.production.cli_fixture import invoke_cli, process_boundary, process
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, production_staff_record
 from scripts.feature_log import feature_log
 from scripts.review_links import change_browser, change_page, serve, image_store, page_frame, review_events, review_link
-from scripts.review_links import question_record, review_items
+from scripts.review_links import new_item_dialog, question_record, review_actions, review_items, review_submissions
 from scripts.rebuild import need
 from scripts.statusline import rebuild_row
 from scripts.agents.remote import local_machine
@@ -614,6 +615,8 @@ class ChangePageTests(unittest.TestCase):
                     self.assertTrue(status.answer_question(self.page, row_id, question.question_id, answer))
                     selected = change_page.render(replace(self.page, rows=(row_id,)), status).decode()
                     browser = self.browser()[2]
+                    for page in (selected, browser):
+                        self.assertEqual(page.count(page_frame.BUTTON_STATES), 1)
                     section = re.search(r'<section\b[^>]*data-key="page-owner/' + row_id
                                         + r'"[^>]*>(.*?)</section>', browser, re.DOTALL)
                     assert section is not None
@@ -1280,6 +1283,36 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(forms.counts["page-owner"], 2)
         self.assertEqual(footer_counts.changes(self.production), forms.counts["page-owner"])
         self.assert_no_delivery_controls(content)
+
+    def test_submission_message_recovery_reuses_the_claim_and_receipt(self) -> None:
+        recipient = fixture_member('producer', name='producer')
+        kind = new_item_dialog.SubmissionKind.BUG
+        request = new_item_dialog.NewItemRequest(f'r1-{uuid4().hex}-{kind}-{recipient.id}', kind,
+                                                recipient.id, 'Check the build.', new_item_dialog.NoEvidence())
+        native = review_submissions.submit(request)
+        status = change_page.DeliveryStatus(self.root)
+        first = review_actions.prepare_submission_delivery(native, request.words, status)
+        assert isinstance(first, change_page.MessageDelivery)
+        self.assertIsInstance(review_actions.prepare_submission_delivery(native, request.words, status),
+                              change_page.NoMessageDelivery)
+        self.assertIn(change_page.reply_command(native.key, native.reply_token), first.message)
+        with patch.object(change_page, 'send_with_retries', return_value=[
+            change_page.DeliveryFailure(recipient.id, 'The fixture sender is unavailable.')
+        ]), patch.object(change_page, 'send_to_staff') as alert:
+            change_page.deliver(first, status)
+        alert.assert_called_once()
+        self.assertIn('The fixture sender is unavailable.', cast(str, alert.call_args.args[2]))
+        retried = review_actions.prepare_submission_delivery(native, request.words, status)
+        assert isinstance(retried, change_page.MessageDelivery)
+        self.assertEqual(retried.attempt, first.attempt)
+        restarted = change_page.DeliveryStatus(self.root)
+        with patch.object(change_page, 'send_to_staff') as send:
+            with patch.object(restarted, 'write_slots', side_effect=OSError('Cannot write the delivery receipt.')):
+                change_page.recover_review_messages(restarted)
+            change_page.recover_review_messages(change_page.DeliveryStatus(self.root))
+            send.assert_called_once_with(recipient.id, change_page.SENDER, first.message)
+        self.assertIsInstance(review_actions.prepare_submission_delivery(native, request.words, restarted),
+                              change_page.NoMessageDelivery)
 
     def test_delivery_failure_survives_restart_until_the_same_row_succeeds(self) -> None:
         status = change_page.DeliveryStatus(self.root)
@@ -2046,6 +2079,7 @@ class ChangePageTests(unittest.TestCase):
         _ = self.file_other_change()
         _ = self.file_user_question()
         _, _, body = self.browser("questions")
+        self.assertEqual(body.count(page_frame.BUTTON_STATES), 1)
         self.assertIn('</h1><p class="page-status"', body)
         self.assertIn(page_frame.STYLE, body)
         self.assertLess(body.index('data-page-status '), body.index('<div data-review-content'))
@@ -2905,6 +2939,18 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(self.http_request(path, self.browser_fields(refreshed, "page-owner/C1", "works")).status, 200)
         self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
         self.assertEqual(next(row["Verdict"] for row in change_review.review_rows(self.review_list) if row["#"] == "C1"), "works")
+
+    def test_answer_preserves_the_time_of_the_change_handoff(self) -> None:
+        status = change_page.DeliveryStatus(self.root)
+        path = status.path(self.page, 'C1')
+        handed_at = '2026-11-16T12:49:08-05:00'
+        with patch.object(time, 'time', return_value=datetime.fromisoformat(handed_at).timestamp()):
+            request = status.ask(self.page, 'C1', 'Which groups?')
+        assert isinstance(request, change_page.QuestionDelivery)
+        self.assertEqual(cast(dict[str, object], json.loads(path.read_text())).get('handed_at'), handed_at)
+
+        self.assertTrue(status.answer_question(self.page, 'C1', request.question_id, 'The numbered groups.'))
+        self.assertEqual(cast(dict[str, object], json.loads(path.read_text())).get('handed_at'), handed_at)
 
     def test_an_open_question_leaves_waiting_rows_counts_and_next_after_a_fresh_prepare(self) -> None:
         path, forms, body = self.browser()
