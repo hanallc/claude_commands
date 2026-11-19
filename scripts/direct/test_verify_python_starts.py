@@ -12,6 +12,7 @@ import subprocess
 import sys
 from typing import override
 import unittest
+from unittest import mock
 
 from scripts.lib.shell_test_support import shell_function
 from scripts.direct.tree_watch_test_support import TreeWatchFixture
@@ -22,6 +23,12 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyPythonStartsTests(VerifyLintCacheFixture):
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        with mock.patch.dict(os.environ, {"COPIES_RUN_PID": str(os.getpid())}):
+            super().setUpClass()
+
     def test_lint_trace_has_one_start_per_key_pair_and_no_unnamed_helper(self) -> None:
         _ = self.enable_cache()
         trace = self.root / "python-starts.tsv"
