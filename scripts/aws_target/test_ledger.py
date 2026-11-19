@@ -804,6 +804,37 @@ class LedgerTests(CostFixture):
                 self.assertEqual(costs.monthly.usd, Decimal(amount))
                 self.assertEqual(costs.daily.usd, Decimal(0))
 
+    def test_complete_bill_rejects_a_duplicate_timestamp(self) -> None:
+        start = self.start
+        end = start + 86400
+        now = end + 2 * 86400
+        day = '2026-01-15'
+        bill = ledger.ChargeRead(day, now, start, end, Decimal('.50'), Decimal(0), Decimal(0))
+        self.write_complete_bill_fixture(bill)
+        settings = config.read_settings(self.settings)
+        self.assertEqual(self.book.read_complete_day_amounts(settings, now),
+                         (ledger.CompleteDayAmount(start, end, Decimal('.50')),))
+        path = self.state / 'charges' / (day + '.json')
+        _ = path.write_text(path.read_text().replace('{', '{"at": "invalid", ', 1))
+        self.assertEqual(self.book.read_bills(), (bill,))
+        self.assertEqual(self.book.read_complete_day_amounts(settings, now), ())
+
+    def test_complete_bill_keeps_pending_gate_compute(self) -> None:
+        self.replace('observation_max_age_seconds', '345600')
+        start = self.start
+        end = start + 86400
+        now = end + 2 * 86400
+        self.inventory(start)
+        self.observe(start, 'stopped')
+        pending = ledger.GateReservation('pending', end - 2 * 3600, now, Decimal('.02'), Decimal(0),
+                                         region='us-east-2')
+        self.assertIsInstance(self.book.reserve_gate(self.settings, pending), ledger.GateReserved)
+        self.write_complete_bill_fixture(ledger.ChargeRead(
+            '2026-01-15', now, start, end, Decimal('.50'), Decimal(0), Decimal(0)))
+        costs = self.guard(now).evidence.costs
+        assert isinstance(costs, ledger.CostEstimate)
+        self.assertEqual(costs.monthly.usd, Decimal('1.50'))
+
     def test_complete_bill_keeps_open_allowance_and_query_fees(self) -> None:
         self.costs({'observation_max_age_seconds': '345600', 'limit_reserve_usd': '0', 'cost_explorer_read_usd': '.01'})
         start = self.start

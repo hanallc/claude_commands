@@ -1148,8 +1148,7 @@ def period_cost(intervals: Sequence[ChargedInterval] | Iterator[ChargedInterval]
 
 
 def complete_day_adjustment(complete_days: Sequence[CompleteDayAmount], intervals: Sequence[ChargedInterval],
-                            gate_reservations: Sequence[GateReservation], start: int, end: int, *,
-                            reserve: bool = False) -> Decimal:
+                            gate_reservations: Sequence[GateReservation], start: int, end: int) -> Decimal:
     """Replace old usage with the AWS amount for each complete UTC day in the window."""
     covered = tuple(day for day in complete_days if start <= day.start and day.end <= end)
     if not covered:
@@ -1157,14 +1156,25 @@ def complete_day_adjustment(complete_days: Sequence[CompleteDayAmount], interval
     open_gates = tuple(row for row in gate_reservations if gate_is_open(row))
     preserved = {'gate storage and transfer:' + row.attempt + ' (' + gate_allowance(row).source + ')'
                  for row in open_gates}
-    if reserve:
-        preserved.update('gate:' + row.attempt for row in open_gates)
+    preserved.update('gate:' + row.attempt for row in open_gates)
     usage = tuple(row for row in intervals if row.kind != 'explorer' and row.source not in preserved)
     return sum((day.usd - period_cost(usage, day.start, day.end) for day in covered), Decimal(0))
 
 
 def read_charge(path: Path) -> ChargeRead:
-    row = mapping(cast(object, json.loads(path.read_text())))
+    return charge_from_record(mapping(cast(object, json.loads(path.read_text()))))
+
+
+def unique_charge_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    fields: dict[str, object] = {}
+    for key, value in pairs:
+        if key in fields:
+            raise LedgerUnavailable('duplicate charge field')
+        fields[key] = value
+    return fields
+
+
+def charge_from_record(row: dict[str, object]) -> ChargeRead:
     reading = ChargeRead(text(row, 'day'), instant(row, 'at'), instant(row, 'period_start'),
                          instant(row, 'period_end'), conf.decimal(text(row, 'actual_usd')),
                          money(text(row, 'estimated_usd')), money(text(row, 'query_usd')),
@@ -1761,7 +1771,8 @@ class CostLedger:
         utc = ZoneInfo('UTC')
         for path in self.bill_paths():
             try:
-                reading = read_charge(path)
+                record = cast(object, json.loads(path.read_text(), object_pairs_hook=unique_charge_fields))
+                reading = charge_from_record(mapping(record))
                 day = date.fromisoformat(reading.day)
                 start, end = period_bounds(day, utc)
             except (OSError, ValueError, ArithmeticError):
@@ -1919,12 +1930,12 @@ class CostLedger:
         for day, amount in daily.items():
             if day >= today:
                 bounds = period_bounds(date.fromisoformat(day), zone)
-                adjustment = complete_day_adjustment(complete_days, intervals, state.gate_reservations, *bounds, reserve=True)
+                adjustment = complete_day_adjustment(complete_days, intervals, state.gate_reservations, *bounds)
                 if amount + adjustment + fixed_daily + settings.limit_reserve_usd >= settings.daily_limit_usd:
                     reason = 'daily_limit'
         if not reason and any(amount + complete_day_adjustment(
                 complete_days, intervals, state.gate_reservations,
-                *_month_bounds(date.fromisoformat(month + '-01'), zone), reserve=True)
+                *_month_bounds(date.fromisoformat(month + '-01'), zone))
                 + fixed_monthly + settings.limit_reserve_usd >= settings.monthly_limit_usd
                 for month, amount in monthly.items() if month >= today[:7]):
             reason = 'monthly_limit'
