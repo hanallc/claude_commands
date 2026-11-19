@@ -3068,7 +3068,7 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 3. Before each send, check that the holder pid is still the same live process. Send nothing for a process that ended.
 4. Say "removed all idle build output" only when the pass removed output. Else say that no idle build output was found.
 
-**Base:** main after Phases 167 and 168.
+**Base:** main `764582979`, a row separate from the 167 and 168 rows.
 
 **Files:** `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py` (rows in the existing holder-message tests).
 
