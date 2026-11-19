@@ -6956,12 +6956,14 @@ raise SystemExit(int(os.environ[variable]))
         base = self.base()
         tree, _ = cargo_target(base, "docs", APP, time.time() - DAY)
         doc = tree.parent / "doc"
+        renamed = tree.parent / sweep.DOC_PRUNE_DIR
         _ = write(doc / "search.index" / "index")
         original = shutil.rmtree
         observed: list[str] = []
 
         def remove(path: str) -> None:
-            self.assertTrue(doc.exists())
+            self.assertFalse(doc.exists())
+            self.assertTrue(renamed.exists())
             records = cast(dict[str, object], json.loads(sweep.target_deletes_path().read_text()))
             self.assertIn(str(tree.parent), records)
             observed.append(path)
@@ -6970,7 +6972,7 @@ raise SystemExit(int(os.environ[variable]))
         with mock.patch.object(shutil, "rmtree", side_effect=remove), redirect_stdout(io.StringIO()):
             status = sweep.prune_doc_index([str(tree.parent)], 0, False)
         self.assertEqual(status, 0)
-        self.assertEqual(observed, [str(doc)])
+        self.assertEqual(observed, [str(renamed)])
         self.assertFalse(doc.exists())
 
     def test_doc_index_removal_records_the_target_delete(self) -> None:
@@ -7709,6 +7711,181 @@ class RunnerTargetDirTests(SweepCase):
             status = sweep.main([sweep.TARGET_DIR_FLAG, str(target.root), sweep.FLOOR_ONLY_FLAG])
         self.assertEqual(status, 2)
         self.assertIn("does not go with", errors.getvalue())
+
+
+class DocIndexPruneTests(SweepCase):
+    def doc_tree(self, name: str = sweep.DOC_DIR) -> Path:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve() / "target"
+        tree = root / name
+        _ = write(tree / "search.index" / "index")
+        return tree
+
+    @contextmanager
+    def doc_process(self, tree: Path, *, fd_only: bool) -> Generator[int]:
+        from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+        code = (
+            "import sys\n"
+            "from contextlib import nullcontext\n"
+            "with open(sys.argv[1], 'rb') if len(sys.argv) > 1 else nullcontext():\n"
+            "    sys.stdout.buffer.write(b'R')\n"
+            "    sys.stdout.buffer.flush()\n"
+            "    sys.stdin.buffer.read(1)\n"
+        )
+        args = [sys.executable, "-c", code]
+        if fd_only:
+            args.append(str(tree / "search.index" / "index"))
+        ready, child = socket.socketpair()
+        with ready, child, subprocess.Popen(args, stdin=child.fileno(), stdout=child.fileno(), stderr=subprocess.PIPE,
+                                            cwd=tree.parent if fd_only else tree) as process:
+            child.close()
+            ready.settimeout(TEST_HANG_GUARD_SECS)
+            try:
+                self.assertEqual(ready.recv(1), b"R")
+                yield process.pid
+            finally:
+                ready.close()
+                try:
+                    _, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    raise
+                self.assertEqual(process.returncode, 0, errors)
+
+    def assert_keeps_doc_opened_after_scan(self, *, fd_only: bool, new_doc: bool = False) -> None:
+        if not Path(sweep.PROC_DIR, "self", "fd").is_dir():
+            self.skipTest("requires /proc")
+        doc = self.doc_tree()
+        root = doc.parent
+        renamed = root / sweep.DOC_PRUNE_DIR
+        readers: list[int] = []
+        record = sweep.record_before_delete
+        check = sweep.doc_tree_use
+
+        def start_reader(paths: Sequence[str], *, known_targets: Sequence[str],
+                         lint_settings: conf.ConfigRead) -> bool:
+            readers.append(self.enterContext(self.doc_process(doc, fd_only=fd_only)))
+            return record(paths, known_targets=known_targets, lint_settings=lint_settings)
+
+        def create_new_doc(tree: str, lock_fd: int | None) -> sweep.TargetUse | sweep.NoDocTreeUse:
+            self.assertFalse(doc.exists())
+            if new_doc:
+                doc.mkdir()
+            return check(tree, lock_fd)
+
+        output = io.StringIO()
+        with (mock.patch.dict(os.environ, {sweep.DOC_INDEX_ENV: "0", sweep.BUDGET_ENV: "1024"}),
+              mock.patch.object(sweep, "workspace_targets", return_value=[]),
+              mock.patch.object(sweep, "record_before_delete", side_effect=start_reader),
+              mock.patch.object(sweep, "doc_tree_use", side_effect=create_new_doc), redirect_stdout(output)):
+            self.assertEqual(sweep.sweep_workspace(str(root), conf.read("lint"), False, recent_minutes=0), 0)
+        pid, = readers
+        self.assertIn(f"pid {pid} {'holds' if fd_only else 'works in'} {renamed}", output.getvalue())
+        if new_doc:
+            self.assertIn("could not restore", output.getvalue())
+            self.assertEqual(list(doc.iterdir()), [])
+            self.assertTrue((renamed / "search.index" / "index").is_file())
+        else:
+            self.assertTrue((doc / "search.index" / "index").is_file())
+            self.assertFalse(renamed.exists())
+
+    def test_prune_restores_doc_used_as_cwd_after_workspace_scan(self) -> None:
+        self.assert_keeps_doc_opened_after_scan(fd_only=False)
+
+    def test_prune_restores_doc_opened_after_workspace_scan(self) -> None:
+        self.assert_keeps_doc_opened_after_scan(fd_only=True)
+
+    def test_prune_keeps_both_trees_if_rustdoc_recreates_doc(self) -> None:
+        self.assert_keeps_doc_opened_after_scan(fd_only=True, new_doc=True)
+
+    def test_prune_removes_idle_doc(self) -> None:
+        doc = self.doc_tree()
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(sweep.prune_doc_index([str(doc.parent)], 0, False), 0)
+        self.assertFalse(doc.exists())
+        self.assertFalse((doc.parent / sweep.DOC_PRUNE_DIR).exists())
+
+    def test_doc_tree_use_ignores_workspace_inference(self) -> None:
+        tree = self.doc_tree(sweep.DOC_PRUNE_DIR)
+        proc = tree.parent / "proc"
+        process = proc / "42"
+        process.mkdir(parents=True)
+        (process / "cwd").symlink_to(tree.parent, target_is_directory=True)
+        (process / "exe").symlink_to(sys.executable)
+        _ = (process / "maps").write_bytes(b"")
+        _ = (process / "cmdline").write_bytes(b"verify.sh\0")
+        with mock.patch.object(sweep, "workspace_targets", return_value=[str(tree)]) as workspaces:
+            self.assertIsInstance(sweep.doc_tree_use(str(tree), None, str(proc)), sweep.NoDocTreeUse)
+        workspaces.assert_not_called()
+
+    def test_next_prune_removes_leftover_below_budget(self) -> None:
+        renamed = self.doc_tree(sweep.DOC_PRUNE_DIR)
+        doc = renamed.parent / sweep.DOC_DIR
+        current = write(doc / "search.index" / "new-index")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(sweep.prune_doc_index([str(doc.parent)], GIB, False), 0)
+        self.assertTrue(current.is_file())
+        self.assertFalse(renamed.exists())
+
+    def test_failed_removal_leaves_renamed_tree_for_retry(self) -> None:
+        doc = self.doc_tree()
+        renamed = doc.parent / sweep.DOC_PRUNE_DIR
+        output = io.StringIO()
+        with mock.patch.object(shutil, "rmtree", side_effect=OSError("fixture removal failure")), redirect_stderr(output):
+            self.assertEqual(sweep.prune_doc_index([str(doc.parent)], 0, False), 1)
+        self.assertFalse(doc.exists())
+        self.assertTrue(renamed.is_dir())
+        self.assertIn("fixture removal failure", output.getvalue())
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(sweep.prune_doc_index([str(doc.parent)], GIB, False), 0)
+        self.assertFalse(renamed.exists())
+
+    @unittest.skipUnless(Path(sweep.PROC_DIR, "self", "fd").is_dir(), "requires /proc")
+    def test_next_prune_keeps_leftover_with_an_open_file(self) -> None:
+        renamed = self.doc_tree(sweep.DOC_PRUNE_DIR)
+        root = str(renamed.parent)
+        doc = renamed.parent / sweep.DOC_DIR
+        doc.mkdir()
+        output = io.StringIO()
+        with self.doc_process(renamed, fd_only=True) as pid, redirect_stdout(output):
+            self.assertEqual(sweep.prune_doc_index([root], GIB, False), 0)
+        self.assertTrue((renamed / "search.index" / "index").is_file())
+        self.assertEqual(list(doc.iterdir()), [])
+        self.assertIn(f"pid {pid} holds {renamed}", output.getvalue())
+        self.assertIn(f"could not restore {doc}", output.getvalue())
+        scan = sweep.scan_floor_roots([root], {root: []})
+        whole, = scan.whole_targets
+        self.assertIn(str(renamed), whole.retained)
+        self.assertFalse(any(Path(path).is_relative_to(renamed) for path in whole.entries))
+
+    @unittest.skipUnless(Path(sweep.PROC_DIR, "self", "fd").is_dir(), "requires /proc")
+    def test_next_prune_restores_used_leftover_when_doc_is_absent(self) -> None:
+        renamed = self.doc_tree(sweep.DOC_PRUNE_DIR)
+        doc = renamed.parent / sweep.DOC_DIR
+        output = io.StringIO()
+        with self.doc_process(renamed, fd_only=True) as pid, redirect_stdout(output):
+            self.assertEqual(sweep.prune_doc_index([str(doc.parent)], 0, True), 0)
+            self.assertFalse(doc.exists())
+            self.assertTrue(renamed.is_dir())
+            self.assertEqual(sweep.prune_doc_index([str(doc.parent)], 0, False), 0)
+        self.assertTrue((doc / "search.index" / "index").is_file())
+        self.assertFalse(renamed.exists())
+        self.assertIn(f"pid {pid} holds {renamed}", output.getvalue())
+        self.assertIn(f"{doc} kept", output.getvalue())
+
+    def test_dry_prune_changes_neither_tree(self) -> None:
+        doc = self.doc_tree()
+        renamed = doc.parent / sweep.DOC_PRUNE_DIR
+        _ = write(renamed / "search.index" / "index")
+        before = sorted(doc.parent.rglob("*"))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(sweep.prune_doc_index([str(doc.parent)], 0, True), 0)
+        self.assertEqual(sorted(doc.parent.rglob("*")), before)
+        self.assertIn(f"would remove leftover {renamed}", output.getvalue())
+        self.assertIn(f"would remove {doc}", output.getvalue())
+        self.assertFalse(sweep.target_deletes_path().exists())
 
 
 if __name__ == "__main__":

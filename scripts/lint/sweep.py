@@ -157,6 +157,7 @@ try:
 except FileNotFoundError:
     pass
 
+import ctypes
 import fcntl
 import hashlib
 import io
@@ -229,6 +230,7 @@ BUDGET_ENV = "LINT_SWEEP_BUDGET_GIB"
 BUDGET_KEY = "sweep_budget_gib"
 DOC_INDEX_ENV = "LINT_SWEEP_DOC_INDEX_MIB"
 DOC_DIR = "doc"
+DOC_PRUNE_DIR = ".doc-prune"
 DOC_LOCK_NAME = ".lock"
 # The cross-crate stores every rustdoc run reads and rewrites at its end.
 MERGE_DIRS = ("search.index", "trait.impl", "type.impl")
@@ -1308,10 +1310,11 @@ class OutsideTargets:
 class TargetOwnerIndex(Sequence[str]):
     """One pass's resolved targets and memo of the deepest owner of each path."""
 
-    def __init__(self, targets: Sequence[str]) -> None:
+    def __init__(self, targets: Sequence[str], *, include_workspace: bool = True) -> None:
         self.targets: tuple[str, ...] = tuple(targets)
         self.checked_targets: tuple[str, ...] = self.targets
         self.rechecking: bool = False
+        self.include_workspace: bool = include_workspace
         self.by_path: dict[str, TargetOwner] = {
             os.path.realpath(target): TargetOwner(target) for target in targets
         }
@@ -1371,7 +1374,7 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
     """Find one live process that uses each target, with one scan of /proc.
 
     A process uses a target when its executable, working directory, or a mapped file lies under it.
-    A cargo-nextest or verify.sh process also uses the targets of its workspace.
+    With workspace matching enabled, a cargo-nextest or verify.sh process uses its workspace targets.
     This keeps targets busy between test binaries and while verify.sh waits in the build queue.
     Without /proc, as on the Mac, the scan finds no use.
 
@@ -1401,8 +1404,11 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
             cwd = os.readlink(os.path.join(base, "cwd"))
             with open(os.path.join(base, "maps"), "rb") as handle:
                 maps = handle.read()
-            with open(os.path.join(base, "cmdline"), "rb") as handle:
-                argv = [arg.decode(errors="replace") for arg in handle.read().split(b"\0") if arg]
+            if owners.include_workspace:
+                with open(os.path.join(base, "cmdline"), "rb") as handle:
+                    argv = [arg.decode(errors="replace") for arg in handle.read().split(b"\0") if arg]
+            else:
+                argv = []
         except OSError:
             continue
         pid = int(name)
@@ -1890,6 +1896,11 @@ def walk(directory: str, owner: FloorTake | None, roots: dict[str, Group], scan:
             if entry.path in nested_targets:
                 if isinstance(owner, WholeTargetTake):
                     owner.retained.add(entry.path)
+                continue
+            if isinstance(owner, WholeTargetTake) and entry.path == os.path.join(owner.target, DOC_PRUNE_DIR):
+                owner.retained.add(entry.path)
+                if entry.is_dir(follow_symlinks=False):
+                    visit(entry.path, None)
                 continue
             if isinstance(owner, WholeTargetTake) and (
                     entry.name == ".claude-busy" or entry.name in LOCK_NAMES
@@ -2467,11 +2478,10 @@ def measure_directory(directory: str, walk: CacheFolderWalk,
     return DirectoryMeasurement(total, folder_total)
 
 
-def try_lock(path: str) -> int | None:
-    """An exclusive lock on path, created if missing, without waiting; None when
-    another process holds it."""
+def try_lock(path: str, *, create: bool = True) -> int | None:
+    """Take an exclusive lock without waiting. Return None if the lock is unavailable."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_CREAT, 0o600)
+        fd = os.open(path, os.O_RDONLY | (os.O_CREAT if create else 0), 0o600)
     except OSError:
         return None
     try:
@@ -2482,47 +2492,176 @@ def try_lock(path: str) -> int | None:
     return fd
 
 
+def rename_doc_tree(source: str, destination: str) -> None:
+    """Rename the tree atomically and refuse to replace even an empty destination."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        if sys.platform == "linux":
+            rename = cast(Callable[[int, bytes, int, bytes, int], int], libc.renameat2)
+            # Linux AT_FDCWD and RENAME_NOREPLACE.
+            result = rename(-100, os.fsencode(source), -100, os.fsencode(destination), 1)
+        elif sys.platform == "darwin":
+            rename_mac = cast(Callable[[bytes, bytes, int], int], libc.renamex_np)
+            # macOS RENAME_EXCL.
+            result = rename_mac(os.fsencode(source), os.fsencode(destination), 4)
+        else:
+            raise OSError("exclusive rename is unavailable")
+    except AttributeError as error:
+        raise OSError("exclusive rename is unavailable") from error
+    if result:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number), source, None, destination)
+
+
+@dataclass(frozen=True)
+class NoDocTreeUse:
+    """The process scan found no use of the doc tree."""
+
+
+def doc_tree_use(tree: str, lock_fd: int | None, proc: str = PROC_DIR) -> TargetUse | NoDocTreeUse:
+    """Check the renamed tree for process paths and open files."""
+    uses = process_use(tree, TargetOwnerIndex([tree], include_workspace=False), proc)
+    if tree in uses:
+        return uses[tree]
+    resolved = os.path.realpath(tree)
+    prefix = resolved + os.sep
+    own_pid = str(os.getpid())
+    own_lock = str(lock_fd)
+    for process in listing(proc):
+        if not process.name.isdigit():
+            continue
+        for fd in listing(os.path.join(process.path, "fd")):
+            if process.name == own_pid and fd.name == own_lock:
+                continue
+            try:
+                target = os.readlink(fd.path)
+            except OSError:
+                continue
+            if target == resolved or target.startswith(prefix):
+                return TargetUse(int(process.name), f"holds {target} open")
+    return NoDocTreeUse()
+
+
+class DocPruneOutcome(Enum):
+    REMOVED = "removed"
+    KEPT = "kept"
+    FAILED = "failed"
+    WOULD_REMOVE = "would remove"
+
+
+def finish_doc_prune(tree: str, doc: str, lock_fd: int | None, *,
+                     dry_run: bool = False) -> DocPruneOutcome:
+    """Remove an idle tree or try to restore a tree that a process uses."""
+    use = doc_tree_use(tree, lock_fd)
+    if isinstance(use, TargetUse):
+        kept = tree
+        reason = ""
+        if not dry_run:
+            try:
+                rename_doc_tree(tree, doc)
+            except OSError as error:
+                reason = f"; could not restore {doc}: {error}"
+            else:
+                kept = doc
+        print(f"lint sweep: pid {use.pid} {use.how}; {kept} kept{reason}")
+        return DocPruneOutcome.KEPT
+    if dry_run:
+        return DocPruneOutcome.WOULD_REMOVE
+    try:
+        shutil.rmtree(tree)
+    except OSError as error:
+        print(f"lint sweep: could not remove {tree}: {error}", file=sys.stderr)
+        return DocPruneOutcome.FAILED
+    return DocPruneOutcome.REMOVED
+
+
+def recover_doc_prune(tree: str, doc: str, dry_run: bool) -> DocPruneOutcome:
+    """Check a leftover tree under its rustdoc lock before removal or restoration."""
+    if not os.path.isdir(tree) or os.path.islink(tree):
+        print(f"lint sweep: could not remove {tree}: expected a directory", file=sys.stderr)
+        return DocPruneOutcome.FAILED
+    lock = os.path.join(tree, DOC_LOCK_NAME)
+    held = try_lock(lock, create=not dry_run)
+    if held is None and (not dry_run or os.path.lexists(lock)):
+        print(f"lint sweep: a rustdoc run holds {lock}; {tree} kept")
+        return DocPruneOutcome.KEPT
+    try:
+        result = finish_doc_prune(tree, doc, held, dry_run=dry_run)
+        if result in (DocPruneOutcome.REMOVED, DocPruneOutcome.WOULD_REMOVE):
+            print(f"lint sweep: {result.value} leftover {tree}")
+        return result
+    finally:
+        if held is not None:
+            os.close(held)
+
+
+def prune_doc_root(root: str, doc: str, tree: str, budget: int, dry_run: bool,
+                   lint_settings: conf.ConfigRead) -> int:
+    """Recover a leftover tree and prune the current tree if its index exceeds the budget."""
+    if os.path.lexists(tree):
+        recovered = recover_doc_prune(tree, doc, dry_run)
+        if recovered is DocPruneOutcome.FAILED:
+            return 1
+        if recovered is DocPruneOutcome.KEPT:
+            return 0
+    if not os.path.isdir(doc) or os.path.islink(doc):
+        return 0
+    index = sum(directory_blocks(os.path.join(doc, name)) for name in MERGE_DIRS)
+    if index <= budget:
+        if dry_run:
+            print(f"lint sweep: {doc} index is {mib(index)}, within the {mib(budget)} budget")
+        return 0
+    lock = os.path.join(doc, DOC_LOCK_NAME)
+    held = try_lock(lock, create=not dry_run)
+    if held is None and (not dry_run or os.path.lexists(lock)):
+        print(f"lint sweep: a rustdoc run holds {lock}; doc kept")
+        return 0
+    try:
+        size = directory_blocks(doc)
+        if not dry_run:
+            if not record_before_delete([root], known_targets=[root], lint_settings=lint_settings):
+                return 1
+            try:
+                rename_doc_tree(doc, tree)
+            except OSError as error:
+                print(f"lint sweep: could not rename {doc} to {tree}: {error}", file=sys.stderr)
+                return 1
+            outcome = finish_doc_prune(tree, doc, held)
+            if outcome is not DocPruneOutcome.REMOVED:
+                return int(outcome is DocPruneOutcome.FAILED)
+        verb = "would remove" if dry_run else "removed"
+        print(
+            f"lint sweep: {doc} index is {mib(index)}, over the {mib(budget)} budget;"
+            + f" {verb} {doc} ({mib(size)}), rebuilt by the next doc run"
+        )
+        return 0
+    finally:
+        if held is not None:
+            os.close(held)
+
+
 def prune_doc_index(roots: list[str], budget: int, dry_run: bool, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> int:
-    """Remove a doc tree whose cross-crate index has grown past the budget."""
+    """Remove idle doc trees with an index above the budget and clean up prior removals."""
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     failures = 0
     for root in roots:
         doc = os.path.join(root, DOC_DIR)
-        if not os.path.isdir(doc):
+        tree = os.path.join(root, DOC_PRUNE_DIR)
+        if not os.path.lexists(tree) and not os.path.isdir(doc):
             continue
-        index = sum(directory_blocks(os.path.join(doc, name)) for name in MERGE_DIRS)
-        if index <= budget:
-            if dry_run:
-                print(f"lint sweep: {doc} index is {mib(index)}, within the {mib(budget)} budget")
-            continue
-        # rustdoc's own lock.
-        held = try_lock(os.path.join(doc, DOC_LOCK_NAME))
+        # Keep the root locked even while removal unlinks the rustdoc lock.
+        held = try_lock(root, create=False)
         if held is None:
-            print(f"lint sweep: a rustdoc run holds {doc}/{DOC_LOCK_NAME}; doc kept")
+            print(f"lint sweep: could not lock {root}; doc kept")
             continue
         try:
-            size = directory_blocks(doc)
-            if not dry_run:
-                if not record_before_delete([root], known_targets=[root], lint_settings=lint_settings):
-                    failures += 1
-                    continue
-                try:
-                    shutil.rmtree(doc)
-                except OSError as error:
-                    print(f"lint sweep: could not remove {doc}: {error}", file=sys.stderr)
-                    failures += 1
-                    continue
-            verb = "would remove" if dry_run else "removed"
-            print(
-                f"lint sweep: {doc} index is {mib(index)}, over the {mib(budget)} budget;"
-                + f" {verb} {doc} ({mib(size)}), rebuilt by the next doc run"
-            )
+            failures += prune_doc_root(root, doc, tree, budget, dry_run, lint_settings)
         finally:
             os.close(held)
-    return 1 if failures else 0
+    return int(bool(failures))
 
 
 def gib(size: int) -> str:
