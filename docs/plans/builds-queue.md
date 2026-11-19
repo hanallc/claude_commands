@@ -3047,6 +3047,17 @@ Work:
 1. Replay the miss with a test: a held slot lock that `/proc/locks` does not list in one read.
 2. Name the cause: a kernel read race, or a gap in how the service reads `/proc/locks`.
 3. Fix the slot check so a held lock never reads as free. No retry loop; the check reads a source that cannot miss a held lock.
+
+### Phase 44cv — A Mac step keeps its package name after a slow parse  · status: todo
+**From builds (from report), 2026-11-19 03:2x:** goes after 44cr.
+
+Case: `verify_package` (`scripts/build_queue/slot_wait.py:230`) has `lru_cache`. It returns "" when its bash parse times out after 2 s. The cache keeps the empty result, so a waiter label stays `test` and not `test hana` until a service restart. Under load this fails `test_memory_feed` `test_wrapped_copies_waiters_name_the_first_verify_step_and_unit` (2 cases). report reproduced it with injected timeouts.
+
+Work:
+1. Replay the case: an injected timeout, then a good parse. The second request must give the package name.
+2. Cache only a good result. A timeout or an error is not kept, so the next request parses again.
+3. Stub bash in the feed test, so the test does not depend on load.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
