@@ -398,22 +398,31 @@ def merged_checkpoints(production: Production, *, record: staff.StaffSnapshot | 
     return tuple(found[commit] for commit in commits if commit in found)
 
 
+def fetch_origin_unit_branch(checkout: Path, branch: str, *flags: str) -> bool:
+    """Fetch the unit branch if it exists on origin."""
+    fetched = git(checkout, "fetch", "--no-prune", *flags, "origin", branch)
+    if fetched.returncode and git(checkout, "ls-remote", "--exit-code", "origin",
+                                  f"refs/heads/{branch}").returncode == 2:
+        return False
+    _ = good(fetched, "ancestry")
+    return True
+
+
+def fetch_origin_heads(checkout: Path, *flags: str) -> str:
+    """Fetch the origin heads and keep tracking refs that other worktrees use."""
+    fetched = git(checkout, "fetch", "--no-prune", *flags, "origin", "+refs/heads/*:refs/remotes/origin/*")
+    _ = good(fetched, "ancestry")
+    return fetched.stdout
+
+
 def on_origin(request: MergeRequest) -> str | None:
     """Find an origin branch holding the checkpoint, trying the unit branch first."""
     checkout = request.production.checkout
-    fetched = git(checkout, "fetch", "--no-prune", "origin", request.unit.branch)
-    # A missing unit branch is not a failure: another head may hold this phase.
-    missing = fetched.returncode and git(checkout, "ls-remote", "--exit-code", "origin",
-                                        f"refs/heads/{request.unit.branch}").returncode == 2
-    if not missing:
-        _ = good(fetched, "ancestry")
-        if git(checkout, "merge-base", "--is-ancestor", request.commit, "FETCH_HEAD").returncode == 0:
-            return f"origin/{request.unit.branch}"
-    # Fetch every head without deleting refs shared with other worktrees.
-    fetched = git(checkout, "fetch", "--no-prune", "--porcelain", "--verbose", "origin",
-                  "+refs/heads/*:refs/remotes/origin/*")
-    _ = good(fetched, "ancestry")
-    advertised = {fields[2]: fields[1] for line in fetched.stdout.splitlines()
+    if (fetch_origin_unit_branch(checkout, request.unit.branch)
+            and git(checkout, "merge-base", "--is-ancestor", request.commit, "FETCH_HEAD").returncode == 0):
+        return f"origin/{request.unit.branch}"
+    fetched = fetch_origin_heads(checkout, "--porcelain", "--verbose")
+    advertised = {fields[2]: fields[1] for line in fetched.splitlines()
                   if line[:1] in (" ", "+", "*", "=") and len(fields := line[1:].split()) == 3
                   and fields[2].startswith("refs/remotes/origin/")}
     refs = good(git(checkout, "for-each-ref", "--contains", request.commit,
@@ -714,11 +723,15 @@ def into(path: PurePath, branch: str, why: str, unblocks: str) -> None:
     print(f"into: {path} ({branch}) — {why}; unblocks: {unblocks}", flush=True)
 
 
+def checkpoint_merge_target(commit: str, branch: str) -> str:
+    return f" ({commit[:7]}) into {branch}"
+
+
 def merge_subject(request: MergeRequest) -> str:
     kind = (" shrink" if isinstance(request.kind, ShrinkCommit) else " as-built" if isinstance(request.kind, AsBuiltCommit)
             else "")
-    return (f"Merge {request.unit.name} phase {request.phase}{kind} "
-            f"({request.commit[:7]}) into {request.production.merge_branch}")
+    return (f"Merge {request.unit.name} phase {request.phase}{kind}"
+            + checkpoint_merge_target(request.commit, request.production.merge_branch))
 
 
 def merged_checkpoint(request: MergeRequest) -> str:
@@ -1809,9 +1822,52 @@ def resume_merged_items(requests: tuple[MergeRequest, ...]) -> tuple[tuple[Merge
     return tuple(remaining), status
 
 
-def unpushed_merge_sources(checkout: Path, published: str) -> set[str]:
-    parents = good(git(checkout, "log", "--first-parent", "--merges", "--format=%P", f"{published}..HEAD"), "batch")
-    return {line.split()[1] for line in parents.splitlines()}
+def unpushed_checkpoint_sources(production: ProductionDocument, published: str) -> set[str]:
+    merges = good(git(production.checkout, "log", "--first-parent", "--merges", "--format=%P%x09%s",
+                      f"{published}..HEAD"), "batch")
+    sources: set[str] = set()
+    for line in merges.splitlines():
+        parents, _, subject = line.partition("\t")
+        source = parents.split()[1]
+        target = checkpoint_merge_target(source, production.merge_branch)
+        if subject.endswith(target) and re.fullmatch(rf"Merge {unit_names.NAME.pattern} phase .+",
+                                                      subject.removesuffix(target)):
+            sources.add(source)
+    return sources
+
+
+def needs_tracking_ref_refresh(checkout: Path, revision: str, refreshed: set[str]) -> bool:
+    """Check whether the revision uses a tracking ref that the batch has not fetched."""
+    if not revision.startswith(("origin/", "remotes/origin/", "refs/remotes/origin/")):
+        return False
+    base = re.split(r"[~^:]|@\{", revision, maxsplit=1)[0]
+    symbolic = git(checkout, "rev-parse", "--verify", "--quiet", "--symbolic-full-name", base)
+    ref = symbolic.stdout.rstrip("\n")
+    return symbolic.returncode == 0 and ref.startswith("refs/remotes/origin/") and ref not in refreshed
+
+
+def resolve_batch_checkpoints(requests: tuple[MergeRequest, ...]) -> tuple[MergeRequest, ...]:
+    checkout = requests[0].production.checkout
+    refreshed = {f"refs/remotes/origin/{branch}" for branch in dict.fromkeys(request.unit.branch for request in requests)
+                 if fetch_origin_unit_branch(checkout, branch, "--no-write-fetch-head")}
+    resolved: dict[int, MergeRequest] = {}
+    for index, request in enumerate(requests):
+        if needs_tracking_ref_refresh(checkout, request.commit, refreshed):
+            continue
+        try:
+            resolved[index] = resolved_checkpoint(request)
+        except checkpoint_gate.Stop:
+            continue
+    if len(resolved) < len(requests):
+        _ = fetch_origin_heads(checkout, "--no-write-fetch-head")
+        for index, request in enumerate(requests):
+            if index in resolved:
+                continue
+            try:
+                resolved[index] = resolved_checkpoint(request)
+            except checkpoint_gate.Stop as error:
+                raise Refusal(f"{request.unit.name} phase {request.phase}: {error}") from error
+    return tuple(resolved[index] for index in range(len(requests)))
 
 
 @contextmanager
@@ -1822,17 +1878,12 @@ def batch_resume_record(requests: tuple[MergeRequest, ...]) -> Generator[BatchRe
     filename = f"checkpoint-batches/{production.merge_branch}"
     path = Path(good(git(checkout, "rev-parse", "--path-format=absolute", "--git-path", filename), "batch"))
     upstream = f"refs/remotes/origin/{production.merge_branch}"
-    _ = good(git(checkout, "fetch", "--no-prune", "--no-write-fetch-head", "origin", f"+refs/heads/{production.merge_branch}:{upstream}",
-                 "+refs/heads/*:refs/remotes/origin/*"), "batch")
-    checkpoints: list[MergeRequest] = []
-    for request in requests:
-        try:
-            checkpoints.append(resolved_checkpoint(request))
-        except checkpoint_gate.Stop as error:
-            raise Refusal(f"{request.unit.name} phase {request.phase}: {error}") from error
-    record = BatchResumeRecord(path, tuple(checkpoints))
+    _ = good(git(checkout, "fetch", "--no-prune", "--no-write-fetch-head", "origin",
+                 f"+refs/heads/{production.merge_branch}:{upstream}"), "batch")
+    checkpoints = resolve_batch_checkpoints(requests)
+    record = BatchResumeRecord(path, checkpoints)
     contents = record.contents()
-    sources = unpushed_merge_sources(checkout, upstream)
+    sources = unpushed_checkpoint_sources(production, upstream)
     if sources:
         try:
             saved = path.read_bytes()
@@ -1847,7 +1898,7 @@ def batch_resume_record(requests: tuple[MergeRequest, ...]) -> Generator[BatchRe
     try:
         yield record
     finally:
-        if not record.retirement_attempted and not unpushed_merge_sources(checkout, upstream):
+        if not record.retirement_attempted and not unpushed_checkpoint_sources(production, upstream):
             record.retire()
 
 

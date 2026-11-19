@@ -67,7 +67,8 @@ with Path(''' + repr(str(self.state / "pushed-refs")) + ''').open("a") as output
         return merges
 
     def test_two_code_items_share_tests_push_and_promotion(self) -> None:
-        for outcome in ("shared list", "push failure", "separate lists", "second list fails", "second directory sync fails"):
+        for outcome in ("shared list", "push failure", "separate lists", "second list fails",
+                        "second directory sync fails", "unrelated branch renamed", "unpublished main integration"):
             with self.subTest(outcome=outcome):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
@@ -95,6 +96,19 @@ with Path(''' + repr(str(self.state / "pushed-refs")) + ''').open("a") as output
                         beta_review.parent.mkdir(parents=True, exist_ok=True)
                         _ = beta_review.write_text("# Incomplete list\n")
                 start = self.git("rev-parse", "HEAD")
+                if outcome == "unrelated branch renamed":
+                    _ = self.git("update-ref", "refs/remotes/origin/topic", start)
+                    _ = self.git("update-ref", "refs/heads/topic/rework", start, cwd=self.origin)
+                if outcome == "unpublished main integration":
+                    published = start
+                    main = self.push_main_change("docs/main-fix.md", "Main fix\n")
+                    _ = self.git("fetch", "--no-write-fetch-head", "--refmap=", "origin", "refs/heads/main")
+                    _ = self.git("merge", "--no-ff", "-m", "Merge origin/main into production", main)
+                    start = self.git("rev-parse", "HEAD")
+                    self.assertEqual(self.git("rev-parse", "HEAD^2"), main)
+                    self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), published)
+                    record = self.checkout / self.git("rev-parse", "--git-path", "checkpoint-batches/production")
+                    self.assertFalse(record.exists())
                 first = self.checkpoint(subject="checkpoint(alpha): batch change\n\n"
                                         + "Change-Review: Alpha changes | Open alpha | The alpha change appears | image 012345abcdef")
                 second = self.beta_checkpoint("src/beta.txt", "beta batch change\n", visible=True)
