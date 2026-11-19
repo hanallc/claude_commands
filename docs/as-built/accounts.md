@@ -534,8 +534,10 @@ Each pull holds the journal lock from the ancestry check through restore.
 The Mac accepts an SSH live write only when its order is greater than the accepted order.
 The journal retains the accepted order after the tree includes that order and the pending value clears.
 Restore changes only the keys with pending values in the live files.
-The move marker records the planned writes before Git changes the checkout.
-Recovery reverses the move at the source commit or completes each write at the target commit.
+The move marker records the plan before Git changes the checkout and records each completed Git step.
+At the source commit, recovery reverses the recorded changes and keeps separate staged edits.
+At the target commit, recovery completes the planned writes if the files still match their recorded versions.
+If recovery cannot account for a change, it keeps the marker and gives the command to inspect the file.
 When you remove a key by hand in Git, keep its entry in `config/settings-orders.json`.
 A peer commit with the saved value and no order still needs a commit that records the order.
 A host added later whose name matches a model ID suffix makes that model's color key a host override.

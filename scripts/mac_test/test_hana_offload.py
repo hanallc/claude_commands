@@ -30,7 +30,7 @@ from scripts.build_targets import target_config
 from scripts.buildlog import record, treekey
 from scripts.copies import copies
 from scripts.direct import runner_result
-from scripts.lib import process_start
+from scripts.lib import conf, process_start
 from scripts.lint.memory_test_support import config_environment
 from scripts.mac_test import eligibility, offload
 
@@ -89,6 +89,8 @@ source_url_seconds=3600
 # whole: 1..
 source_max_bytes=1073741824
 source_allowed_environment=RUSTFLAGS
+source_allowed_ignored=target/
+source_forbidden_paths=*.key
 """)
         self.request = replace(self.request, repo_root=self.root)
         self.lifecycle = box.HanaController(self.root, self.root / 'account.conf', self.transport.settings,
@@ -96,7 +98,7 @@ source_allowed_environment=RUSTFLAGS
         self.fixture.objects.terminated = True
         self.fixture.objects.lease_free = True
 
-    def context(self) -> ExitStack:
+    def context(self, *, real_source: bool = False) -> ExitStack:
         stack = ExitStack()
         _ = stack.enter_context(mock.patch.object(hana, 'validate_assignment', return_value=self.transport))
         _ = stack.enter_context(mock.patch.object(hana, 'controller_for', return_value=self.lifecycle))
@@ -109,8 +111,10 @@ source_allowed_environment=RUSTFLAGS
         _ = stack.enter_context(mock.patch.object(self.lifecycle, 'inspect', return_value=snapshot))
         _ = stack.enter_context(mock.patch.object(self.lifecycle, 'permission', return_value=self.fixture.permission))
         _ = stack.enter_context(mock.patch.object(process_start, 'process_start', return_value=process_start.Started('holder-start')))
-        _ = stack.enter_context(mock.patch.object(hana_transport.SourceSender, 'prepare',
-                                                 return_value=(self.fixture.manifest, lambda: None)))
+        if not real_source:
+            _ = stack.enter_context(mock.patch.object(hana_transport, 'check_inputs'))
+            _ = stack.enter_context(mock.patch.object(hana_transport.SourceSender, 'prepare',
+                                                     return_value=(self.fixture.manifest, lambda: None)))
         _ = stack.enter_context(mock.patch.object(offload, 'hana_source_key', return_value=self.fixture.source_key))
         _ = stack.enter_context(mock.patch('scripts.build_queue.admission_client.consume_permission',
             return_value=wire.FirstAuthorization(self.fixture.assignment, self.fixture.reference)))
@@ -619,6 +623,111 @@ route_test
                 result = runner_result.read_result(self.root / 'result', status, False)
                 assert isinstance(result, runner_result.UsableRunnerResult)
                 self.assertEqual((result.word, result.reason), ('hana_command_admission_refused', reason))
+
+    def checkout_with_ignored_path(self) -> Path:
+        checkout = self.root / 'checkout'
+        checkout.mkdir()
+        _ = copies.git(checkout, 'init', '--quiet')
+        _ = (checkout / '.gitignore').write_text('refused.rs\n')
+        return checkout
+
+    def test_source_refusal_reports_fallback_without_requesting_a_claim(self) -> None:
+        checkout = self.checkout_with_ignored_path()
+        _ = (checkout / 'refused.rs').write_text('ignored build input\n')
+        with self.assertRaisesRegex(hana_protocol.SourceRefused, 'IgnoredInput') as refusal:
+            hana_transport.check_inputs(checkout, conf.read(self.transport.settings))
+        reason = 'The Hana payload could not be prepared: ' + str(refusal.exception)
+        assigned = replace(self.request, repo_root=checkout, result=offload.ResultFile(self.root / 'result'))
+        repository = eligibility.KnownRepository('hana', 'github.com/natepiano/hana')
+
+        def run(runner: offload.ProcessController, transport: hana.HanaControlTransport,
+                placed: offload.OffloadRequest, started: float) -> offload.MacOffloadResult:
+            return offload.claimed_run(runner, transport, placed, repository, started)
+
+        for request in (assigned, replace(assigned, placement=offload.DirectOffloadRequest())):
+            with self.subTest(request=request.placement):
+                output = StringIO()
+                controller = offload.ProcessController()
+                directory = Path(self.enterContext(tempfile.TemporaryDirectory(dir=self.root)))
+                with self.context(real_source=True), ExitStack() as patches:
+                    _ = patches.enter_context(mock.patch.object(self.lifecycle, 'directory', directory))
+                    _ = patches.enter_context(mock.patch.object(sys, 'stdout', output))
+                    _ = patches.enter_context(mock.patch.object(sys, 'argv',
+                        ['offload', 'run', '--repo-root', str(self.root), '--call-id', 'call']))
+                    _ = patches.enter_context(mock.patch.object(override_guard, 'refuse_overrides'))
+                    _ = patches.enter_context(mock.patch.object(offload, 'request_from_arguments', return_value=request))
+                    _ = patches.enter_context(mock.patch.object(offload, 'ProcessController', return_value=controller))
+                    _ = patches.enter_context(mock.patch.object(hana, 'read_execution_transport', return_value=self.transport))
+                    _ = patches.enter_context(mock.patch.object(offload, 'run_offload', side_effect=run))
+                    submit = patches.enter_context(mock.patch.object(offload, 'submit_direct_placement', side_effect=[assigned]))
+                    claim = patches.enter_context(mock.patch.object(hana, 'claim_assigned', return_value=self.fixture.adopted))
+                    capture = patches.enter_context(mock.patch.object(hana_transport.SourceSender, 'prepare'))
+                    release = patches.enter_context(mock.patch.object(hana, 'release_assigned', return_value=hana.HanaClaimReleased()))
+                    start_box = patches.enter_context(mock.patch.object(self.lifecycle, 'request'))
+                    upload = patches.enter_context(mock.patch.object(hana_transport.AwsSourceObjects, 'put_if_absent'))
+                    report = patches.enter_context(mock.patch.object(admission_client, 'report_execution'))
+                    _ = patches.enter_context(mock.patch.object(admission_client, 'cancel_placement'))
+                    _ = patches.enter_context(mock.patch.object(offload, 'persist_attempt'))
+                    status = offload.main()
+                self.assertEqual(status, 75)
+                self.assertEqual(submit.call_count, int(isinstance(request.placement, offload.DirectOffloadRequest)))
+                claim.assert_not_called()
+                capture.assert_not_called()
+                release.assert_not_called()
+                start_box.assert_not_called()
+                upload.assert_not_called()
+                report.assert_called_once()
+                sent = cast(wire.ExecutionReport, report.call_args.args[0])
+                self.assertEqual(sent.outcome, execution_identity.HanaCommandAdmissionRefused(reason))
+                self.assertIsInstance(sent.path, placement.DispatchPathSettled)
+                self.assertIsInstance(sent.evidence, execution_identity.ExecutionNotStarted)
+                self.assertFalse(self.lifecycle.execution_bound(self.fixture.key.claim_id))
+                self.assertFalse(execution.execution_path(directory, self.fixture.key.claim_id).exists())
+                self.assertEqual(self.fixture.objects.envelopes, [])
+                self.assertEqual(output.getvalue().splitlines(), [
+                    f'mac_test: The Hana command did not start on configured-target. {reason}'])
+                result = runner_result.read_result(self.root / 'result', status, False)
+                assert isinstance(result, runner_result.UsableRunnerResult)
+                self.assertEqual((result.word, result.reason), ('hana_command_admission_refused', reason))
+
+    def test_ignored_file_added_during_claim_is_refused_after_adoption(self) -> None:
+        checkout = self.checkout_with_ignored_path()
+        self.request = replace(self.request, repo_root=checkout)
+
+        def adopt(*_args: object, **_options: object) -> hana.HanaClaimAdopted:
+            _ = (checkout / 'refused.rs').write_text('ignored build input\n')
+            return self.fixture.adopted
+
+        with (self.context(real_source=True),
+              mock.patch.object(hana, 'claim_assigned', side_effect=adopt) as claim,
+              mock.patch.object(hana, 'release_assigned', return_value=hana.HanaClaimReleased()) as release,
+              mock.patch.object(hana_transport.AwsSourceObjects, 'put_if_absent') as upload):
+            outcome = self.run_claimed()
+
+        assert isinstance(outcome, offload.HanaCommandAdmissionRefused)
+        self.assertTrue(outcome.reason.startswith('The Hana payload could not be prepared: IgnoredInput:'))
+        claim.assert_called_once()
+        release.assert_called_once()
+        upload.assert_not_called()
+        self.assertEqual(self.fixture.objects.envelopes, [])
+
+    def test_unreadable_lifecycle_preserves_claim_refusal(self) -> None:
+        checkout = self.checkout_with_ignored_path()
+        _ = (checkout / 'refused.rs').write_text('ignored build input\n')
+        self.request = replace(self.request, repo_root=checkout)
+        self.lifecycle.path.parent.mkdir()
+        _ = self.lifecycle.path.write_text('{')
+
+        with (self.context(real_source=True),
+              mock.patch.object(hana, 'claim_assigned', return_value=hana.HanaClaimResourcesHeld()) as claim,
+              mock.patch.object(hana, 'release_assigned') as release):
+            outcome = self.run_claimed()
+
+        assert isinstance(outcome, offload.HanaCommandAdmissionRefused)
+        self.assertEqual(outcome.reason, box.HANA_CLAIM_BUSY)
+        claim.assert_called_once()
+        release.assert_not_called()
+        self.assertFalse(execution.execution_path(self.root, self.fixture.key.claim_id).exists())
 
     def test_source_change_inside_capture_returns_a_usable_refusal(self) -> None:
         def changed_capture(*_args: object, **_options: object) -> str:
