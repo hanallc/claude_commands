@@ -193,3 +193,26 @@
   2. 20 repeated runs of the two test modules pass, TMPDIR=/tmp, 2 GB scope.
   3. basedpyright zero errors and warnings on changed files.
   4. Full natedev gate passes (reds that also occur on base do not count).
+
+### Phase 391 — the gate wakes on child exit and reads job memory from its cgroup  · status: todo
+**Depends on:** Phase 388 (merge_gate.py job environment); builds orders the start (merge_gate.py is busy)
+
+#### Work Order
+- **Goal:** merge_gate.py stops timed polls of its jobs: it wakes on child exit (pidfd) and reads each job's memory from the job cgroup, so the gate supervisor uses less CPU on every gate run (proposal from 385: child runners were 45.3% of the base trace CPU; builds accepted 11-19).
+- **Spec:**
+  1. Step 1, design only: measure nothing; read merge_gate.py and name each timed poll, each per-process memory sample, and the exact lines and files to change. Send builds the file list before any code (builds orders merge_gate.py work).
+  2. Wake on child exit: one select.poll (or selectors) loop over the job pidfds plus the deadline; no fixed sleep.
+  3. Memory: read memory.current / memory.peak of the job scope cgroup; no walk over /proc per process.
+  4. Keep the gate's stop, timeout and memory-stop order unchanged; keep 383 recovery records.
+  5. Failing first: a test row shows the gate makes no wake while jobs run and nothing exits (count wakes), and one shows memory comes from the cgroup file.
+  6. Tests read no /tune value; no signal handlers.
+- **Files:** `scripts/production/merge_gate.py` (or gate.py if 355 has landed); one gate test module for the rows.
+- **Workers:** 1 writer.
+  - impl: design note, then the code and rows.
+- **Constraints from prior phases:** 383 recovery and 388 allow list change merge_gate.py; 355 renames it to gate.py. User test hold: no test runs until natemerge ends it.
+- **Acceptance gate:**
+  1. Gate supervisor CPU on a paired local gate run drops, with the number.
+  2. The new rows fail on the base and pass on the fix.
+  3. 20 repeated runs of the gate test modules pass, TMPDIR=/tmp, 2 GB scope.
+  4. basedpyright zero errors and warnings on changed files.
+  5. Full natedev gate passes (reds that also occur on base do not count).
