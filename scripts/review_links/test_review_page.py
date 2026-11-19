@@ -1880,6 +1880,8 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
         self.assertIn('Question for page-owner', pending_card)
         self.assertIn(question, pending_card)
         self.assertNotIn('Answer from page-owner', pending_card)
+        self.assertEqual([event.words for event in pending.records[key].log][-2:],
+                         ['Asked page-owner to validate', 'Asked a question about validation'])
         retry = cache.save(self.card_body(pending, key, 'question', question), self.status)
         self.assertIsInstance(retry.delivery, change_page.NoMessageDelivery)
         with self.assertRaisesRegex(question_record.AnswerRefused, 'already has an open question'):
@@ -1896,8 +1898,12 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
             with self.subTest(version=snapshot.version):
                 self.assertEqual(snapshot.records[key].state, review_items.ReviewState.VALIDATING)
                 card = snapshot.body(key).decode()
-                for text in ('Question for page-owner', 'Answer from page-owner', question, words, 'Answer: '+words):
+                for text in ('Question for page-owner', 'Answer from page-owner', question, words):
                     self.assertIn(text, card)
+                    self.assertEqual(card.count(text), 1)
+                self.assertEqual([event.words for event in snapshot.records[key].log][-3:],
+                                 ['Asked page-owner to validate', 'Asked a question about validation',
+                                  'Answered the question'])
         result = change_review.save_verdict(check.page.review_list, check.row, 'works', self.fixture.production,
                                             validation_id=check.attempt)
         self.assertIsInstance(result, change_review.VerdictSaved)

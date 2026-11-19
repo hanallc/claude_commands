@@ -442,6 +442,8 @@ When the record has no handoff time, the page shows **With <validator>**.
 The card shows the item, steps to check it, proof and the log.
 **Ask a question** sends **Your words** to the validator named above the button.
 The card shows **Question for <validator>** and **Answer from <validator>** when the answer arrives.
+The active validation log shows **Asked <validator> to validate**, **Asked a question about validation**, and **Answered the question**.
+The question and answer sections show the full text.
 The question and answer preserve the active validation and its handoff time.
 The Validating and All chips count the change.
 The Validating chip is dim at zero.

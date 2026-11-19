@@ -411,6 +411,19 @@ def change_delivery(root: Path, path: Path, row: str) -> delivery_state.Delivery
         return delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery())
 
 
+def validation_log_label(words: str, validator: str) -> str:
+    """Use plain labels for the active validation and its exchange."""
+    match words.partition(':')[0].casefold():
+        case 'validate':
+            return f'Asked {validator or "the showrunner"} to validate'
+        case 'question':
+            return 'Asked a question about validation'
+        case 'answer':
+            return 'Answered the question'
+        case _:
+            return words
+
+
 def change_item(path: Path, row: dict[str, str], assignment: change_routing.ChangeAssignment,
                 members: staff.StaffSnapshot, queue: str, current: Path,
                 slots: delivery_state.DeliverySlots, *, handed_at: datetime | None = None,
@@ -428,22 +441,35 @@ def change_item(path: Path, row: dict[str, str], assignment: change_routing.Chan
     logs = [ReviewLog(filed, name(source, members), 'Filed for your check')]
     saved_log = review_events.decode(row.get('Review log', ''))
     words = {entry.words.casefold() for entry in saved_log}
+    validating = state == ReviewState.VALIDATING
+    validator_name = name(identity, members) if validating else ''
+    validation_at = next((index for index in range(len(saved_log)-1, -1, -1)
+                          if saved_log[index].words.partition(':')[0] == 'validate'), None)
+    if slots.validation_requested and validation_at is None:
+        logs.append(ReviewLog(filed, 'nate', validation_log_label('validate', validator_name)))
     request = slots.question
+    exchange: set[str] = set()
     if isinstance(request, (delivery_state.OpenQuestion, delivery_state.AnsweredQuestion)) and not isinstance(
             request, (OpenFeedback, CompletedFeedback)):
         event = 'Question: ' + request.text
+        exchange.add(event.casefold())
         if event.casefold() not in words:
-            logs.append(ReviewLog(filed, 'nate', event))
+            logs.append(ReviewLog(filed, 'nate', validation_log_label(event, validator_name) if validating else event))
     if isinstance(request, delivery_state.AnsweredQuestion):
         answer = 'Answer: ' + request.answer
+        validation_answer = validating and not isinstance(request, CompletedFeedback)
+        if validation_answer:
+            exchange.add(answer.casefold())
         if answer.casefold() not in words:
-            logs.append(ReviewLog(filed, name(identity, members), answer))
-    if slots.validation_requested and not any(entry.words.startswith('validate') for entry in saved_log):
-        logs.append(ReviewLog(filed, 'nate', 'Asked the showrunner to check'))
+            logs.append(ReviewLog(filed, name(identity, members),
+                                  validation_log_label(answer, validator_name) if validation_answer else answer))
     if row.get('Verdict') and row['Verdict'].casefold() not in words and not any(
             entry.words.startswith('feedback sent:') for entry in saved_log):
         logs.append(ReviewLog(filed, 'nate', row['Verdict']))
-    logs.extend(saved_log)
+    for index, event in enumerate(saved_log):
+        during_validation = index >= validation_at if validation_at is not None else event.words.casefold() in exchange
+        logs.append(replace(event, words=validation_log_label(event.words, validator_name))
+                    if validating and during_validation else event)
     shown = change_review.display_id(row, routed.tab)
     after = entry.after if '/' in entry.after else prefix+'/'+entry.after if entry.after else ''
     local = path.absolute() == current.absolute()
