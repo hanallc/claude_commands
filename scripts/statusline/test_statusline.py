@@ -947,7 +947,7 @@ class RoleTests(ConfiguredShellTests):
         (self.home / ".git").mkdir()
         _ = (self.home / ".git/HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
         for session_id, label in ((OWNER.id, "show showrunner"), (WORKER.id, "worker"),
-                                  (PRODUCER.current_session, "morty producer"), ("unknown", "unassigned")):
+                                  (PRODUCER.current_session, "morty the producer"), ("unknown", "unassigned")):
             for shell in SHELLS:
                 with self.subTest(session_id=session_id, shell=shell):
                     self.assertEqual(self.first_line(session_id, shell=shell), f"{label} | ~")

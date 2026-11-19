@@ -129,9 +129,11 @@ class ProducerQuestionTests(RegistrationFixture):
                 _ = staff.update_current_session(current.current_session, replacement)
                 self.env["CLAUDE_CODE_SESSION_ID"] = replacement
                 calls: list[tuple[str, str]] = []
+                delivery_key = change_page.review_delivery_key(delivery.page.review_list, delivery.row, delivery.attempt)
 
-                def sender(recipient: str, name: str, message: str) -> None:
+                def sender(recipient: str, name: str, message: str, *, key: str, recipient_key: str) -> None:
                     del name
+                    self.assertEqual((key, recipient_key), (delivery_key, self.producer.id))
                     calls.append((recipient, message))
                     if len(calls) == 1:
                         raise RuntimeError("fixture sender unavailable")
@@ -147,24 +149,34 @@ class ProducerQuestionTests(RegistrationFixture):
                 self.assertEqual(registration.question_records_for_document(self.producer, registration.QuestionStaff.read())[-1].status,
                                  "closed")
 
-    def test_producer_delivery_exhaustion_uses_the_existing_alert(self) -> None:
+    def test_producer_delivery_exhaustion_alerts_the_configured_showrunner(self) -> None:
+        runner = staff.snapshot().by_id(self.owner_id)
+        assert runner is not None
+        settings = self.root / "config" / "review_links.conf"
+        _ = write_config_fixture(settings, f"unrouted_alert_recipient={runner.name}\n")
         self.file_question()
         status = change_page.DeliveryStatus(self.root / "links")
         browser = change_page.ReviewBrowser("producer-test", kind="questions")
         question = change_browser.prepare(browser, status).questions[0]
         delivery, _ = change_browser.submit_question(question, "answer", "Choose the first project.", status)
         calls: list[str] = []
+        keys: list[str] = []
 
-        def sender(recipient: str, name: str, message: str) -> None:
+        def sender(recipient: str, name: str, message: str, *, key: str, recipient_key: str) -> None:
             del name
-            self.assertEqual(recipient, f"session:{self.producer.current_session}")
+            alert = "delivery needs attention" in message
+            target = runner if alert else self.producer
+            self.assertEqual((recipient, recipient_key), (f"session:{target.current_session}", target.id))
             calls.append(message)
-            if "delivery needs attention" not in message:
+            keys.append(key)
+            if not alert:
                 raise RuntimeError("fixture sender unavailable")
 
         with mock.patch.object(change_page, "send_message", side_effect=sender):
             change_page.deliver(delivery, status)
         self.assertEqual(len(calls), 4)
+        self.assertEqual(len(set(keys[:3])), 1)
+        self.assertNotEqual(keys[0], keys[-1])
         self.assertIn("Tries: 3", calls[-1])
         self.assertIn("Choose the first project.", calls[-1])
 
