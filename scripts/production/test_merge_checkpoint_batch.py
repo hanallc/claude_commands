@@ -511,8 +511,8 @@ raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
         self.assertFalse(self.batch_record().exists())
 
     def test_a_stopped_batch_resumes_after_fetching_a_later_checkpoint(self) -> None:
-        for submit_ref in (False, True):
-            with self.subTest(submit_ref=submit_ref):
+        for case in ("unit branch hash", "unit branch ref", "phase branch only", "unit branch missing"):
+            with self.subTest(case=case):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
                 self.bind_fixture(self.root)
@@ -527,13 +527,24 @@ raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
                 _ = self.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m",
                              "beta work\n\nChange-Review: none — fixture code only", cwd=writer)
                 second = self.git("rev-parse", "HEAD", cwd=writer)
-                _ = self.git("push", "origin", "beta-branch", cwd=writer)
+                phase_branch = case in ("phase branch only", "unit branch missing")
+                target = "HEAD:refs/heads/beta-phase" if phase_branch else "beta-branch"
+                _ = self.git("push", "origin", target, cwd=writer)
+                if case == "unit branch missing":
+                    _ = self.git("update-ref", "-d", "refs/heads/beta-branch", cwd=self.origin)
                 absent = subprocess.run(["git", "cat-file", "-e", f"{second}^{{commit}}"], cwd=self.checkout,
                                         env=self.env, capture_output=True, text=True, check=False,
                                         timeout=TEST_HANG_GUARD_SECS)
                 self.assertNotEqual(absent.returncode, 0)
-                checkpoint = "refs/remotes/origin/beta-branch" if submit_ref else second
+                checkpoint = "refs/remotes/origin/beta-branch" if case == "unit branch ref" else second
                 lines = [self.batch_line("alpha", "2", first), self.batch_line("beta", "2", checkpoint)]
+
+                if phase_branch:
+                    result = self.land_batch(lines)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(self.git("rev-parse", "production^2", cwd=self.origin), second)
+                    self.assertEqual(self.git("rev-parse", "production^1^2", cwd=self.origin), first)
+                    continue
 
                 unpublished = self.interrupt_batch(*lines)
                 self.assertEqual(self.git("rev-parse", "HEAD^2"), second)
