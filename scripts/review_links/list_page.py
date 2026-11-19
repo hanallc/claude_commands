@@ -938,16 +938,17 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                                        defer_missing=include_counts and defer_counts))
     zone = user_zone()
     today = datetime.fromtimestamp(read_at, zone)
+    ordered_items = [(entry, the_list.parking_active(entry.item.parked_until, today)) for entry in items]
+    ordered_items.sort(key=lambda pair: pair[1])
     secret = form_secret(root)
     owners: Counter[the_list.ItemOwner] = Counter()
     producers: Counter[the_list.ItemOwner] = Counter()
     rows: list[str] = []
     deferred_links = False
     chip_counts: Counter[ListChip] = Counter()
-    for index, entry in enumerate(items):
+    for index, (entry, parked) in enumerate(ordered_items):
         owners[entry.item.owner] += 1
         producers[entry.item.producer] += 1
-        parked = the_list.parking_active(entry.item.parked_until, today)
         open_question = has_open_question(entry.item)
         visibility = the_list.question_visibility(entry.keeper, entry.item, status)
         chip_counts[list_chip(entry.item.state, parked=parked, open_question=open_question,
@@ -960,9 +961,10 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
         ):
             row_reviews = LinkedReviewRead.AFTER_RENDER
             deferred_links = True
-        rows.append(item_rows(entry, names, today, index, secret, row_reviews, parked=parked,
-                              open_question=open_question, visibility=visibility))
-    shows = [record_table.Chip("all", "All", chip_counts.total() - chip_counts[ListChip.PARKED]),
+        rows.append(
+            item_rows(entry, names, today, index, secret, row_reviews, parked=parked,
+                      open_question=open_question, visibility=visibility))
+    shows = [record_table.Chip("all", "All", len(items)),
              *(record_table.Chip(chip.value, chip.value.replace("-", " ").capitalize(), chip_counts[chip])
                for chip in ListChip if chip != ListChip.ALL)]
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" id="list-sort-{index}" data-sort="{index}">{label}'
@@ -1122,24 +1124,25 @@ const chipsByQuestion=''' + json.dumps({
 const shows=''' + json.dumps(list(ListChip)) + r''';
 const chipsByState=chipsByQuestion.false.false;
 const deliveryParking=''' + json.dumps(the_list.ParkUntilDelivered.DELIVERED) + r''';
+const isParked=data=>data.parked==='true' || data.parked===deliveryParking;
 const chipFor=data=>{
  if(data.state==='Closed') return;
- const parked=data.parked==='true' || data.parked===deliveryParking;
+ const parked=isParked(data);
  if(!parked && data.unreadDelivery==='true') return 'needs-me';
  return chipsByQuestion[data.openQuestion][String(parked)][data.state];
 };
 let content=document.querySelector('[data-list]');
 let closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
-let saving=0,listSaveVersion=0,refreshDeferred=false;
+let saving=0,listSaveVersion=0,refreshNeeded=false;
 let createdItem='';
 function startListSave(){
  saving++;listSaveVersion++;pageRefresh.abandon();
 }
 function refreshAfterListSave(needed){
- refreshDeferred ||= needed;
+ refreshNeeded ||= needed;
  if(saving) return;
  if(savedReview) void refreshSavedReview();
- else if(refreshDeferred || createdItem) void pageRefresh.refresh(true);
+ else if(refreshNeeded || createdItem) void pageRefresh.refresh(true);
 }
 const drafts=new Map();
 const unparkMessages={
@@ -1310,7 +1313,6 @@ const tableView=createRecordTable({content:()=>content,
  itemOpened:watchOpenedAnswer,
  expandedSelection:(data,selection)=>selection.filters.unread && selection.show===unreadShow &&
   keepOpenAfterRead.has(data.key) ? {...selection,filters:{...selection.filters,unread:''}} : undefined,
- requiredShow:data=>data && chipFor(data)==='parked' ? 'parked' : undefined,
  hasKey:key=>!closedKeys.has(key) && !!content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]'),
  revealLinked:(data,{filters})=>data.openQuestion==='true' || (filters.unread && data.unread!=='true'),
  missingItem:key=>{
@@ -1368,7 +1370,7 @@ function bindFeedbackForm(form){
    unpark.hidden=confirmed.parked==='false' || confirmed.state==='Closed';
    syncUnread(item,form,confirmed.unread,confirmed.unreadSort);
   };
-  const applySavedState=result=>{
+  const applySavedState=(result,keepDetailFocus=false)=>{
    delete item.dataset.listReviewVersion;
    if(typeof result.review_summary_html==='string'){
     const summary=item.querySelector('[data-list-review-summary]');
@@ -1415,7 +1417,12 @@ function bindFeedbackForm(form){
     item.dataset.waitingForAnswer='true';
     const detail=item.querySelector('[data-detail] td');
     if(typeof result.waiting_details_html==='string'){
+     const field=keepDetailFocus && listOwnsFocus() && detail.contains(document.activeElement)
+      ? document.activeElement : null;
+     const reviewLink=field?.matches('[data-list-review-card]') ? reviewLinkPlace(field) : null;
      detail.innerHTML=result.waiting_details_html;
+     if(reviewLink) restoreReviewLink(reviewLink);
+     else if(field?.id && field!==unpark) document.getElementById(field.id)?.focus({preventScroll:true});
      return detail.querySelector('[data-feedback-form]');
     }
     const note=detail.querySelector('[data-waiting-note]');
@@ -1457,6 +1464,7 @@ function bindFeedbackForm(form){
    event.preventDefault();if(cardSubmitBlocked(form,tableView.rowFading(key))) return;
    const submitter=event.submitter,action=submitter?.value || 'tell';
    const parkForDelivery=action==='park-until-delivered',parks=action==='park' || parkForDelivery;
+   const changesParking=parks || action==='unpark';
    const focusUnpark=action==='unpark' && document.activeElement===unpark;
    const usesWords=action==='tell' || action==='question';
    const asksQuestion=action==='question' || action.startsWith('resend-');
@@ -1470,7 +1478,7 @@ function bindFeedbackForm(form){
      parkingTime=new Date(at).toISOString();
     }
    }
-   if(!waitingForm && (parks || action==='unpark')) closeDateTimePicker(form.querySelector('[data-later-menu]'),false);
+   if(!waitingForm && changesParking) closeDateTimePicker(form.querySelector('[data-later-menu]'),false);
    const attempt=retry ?? {...fresh,action,words:words.value,until:until.value,parkingTime};
    identity(attempt);
    const data=new URLSearchParams(new FormData(form));data.set('action',parks ? 'park' : action);
@@ -1507,7 +1515,7 @@ function bindFeedbackForm(form){
     const result=await response.json();
     if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
     saved=true;
-    nextForm=applySavedState(result);
+    nextForm=applySavedState(result,changesParking);
     const unread=result.unread==='true';
     const unparked=action==='unpark' && result.unpark_outcome==='cleared';
     const message=action==='remove' ? 'Removed' : parks ? (parkForDelivery ? 'Parked until delivered' : 'Parked') :
@@ -1600,7 +1608,7 @@ function bindFeedbackForm(form){
       }
      }
     }
-    refreshAfterListSave((saved && item.dataset.waitingForAnswer!=='true') ||
+    refreshAfterListSave((saved && (changesParking || item.dataset.waitingForAnswer!=='true')) ||
       (!saved && !refused && (parks || action==='remove')));
    }
   });
@@ -1650,9 +1658,7 @@ async function readListCounts(source){
  }
 }
 async function refresh(_supersede=false,current=()=>true){
- if(saving){refreshDeferred=true;return;}
- if(dateTimePickerOpen(content)) return;
- refreshDeferred=false;
+ if(saving || dateTimePickerOpen(content)) return;
  const signal=AbortSignal.timeout(Number(content.dataset.requestTimeoutSeconds)*1000);
  const response=await fetch(location.pathname,{cache:'no-store',signal});
  if(!response.ok) throw new Error('HTTP '+response.status);
@@ -1660,10 +1666,11 @@ async function refresh(_supersede=false,current=()=>true){
  const fresh=page.querySelector('[data-list]');
  if(!fresh) throw new Error('The page has no list.');
  await tableView.settled();
- if(saving){refreshDeferred=true;return;}
- if(dateTimePickerOpen(content) || !current()) return;
+ if(saving || dateTimePickerOpen(content) || !current()) return;
+ refreshNeeded=false;
  const top=scrollY,field=listOwnsFocus() ? document.activeElement : null;
  const focus=field?.id,start=field?.selectionStart,end=field?.selectionEnd;
+ const direction=field?.selectionDirection;
  const reviewLink=field?.matches('[data-list-review-card]') ? reviewLinkPlace(field) : null;
  const action=field?.matches('button[name="action"]') ? field.value : '';
  const focusedRow=action || field?.matches('.list-toggle') ? field.closest('[data-list-item]')?.dataset.key : '';
@@ -1683,7 +1690,8 @@ async function refresh(_supersede=false,current=()=>true){
   if(watch) watchOpenedAnswer(item,watch.seen);
  }
  if(focus){const field=document.getElementById(focus);field?.focus({preventScroll:true});
-  if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number') field.setSelectionRange(start,end);}
+  if(typeof field?.setSelectionRange==='function' && typeof start==='number' && typeof end==='number')
+   field.setSelectionRange(start,end,direction);}
  if(reviewLink) restoreReviewLink(reviewLink);
  if(focusedRow){
   const row=[...content.querySelectorAll('[data-list-item]')].find(item=>item.dataset.key===focusedRow && !item.hidden);

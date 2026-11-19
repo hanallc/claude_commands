@@ -782,9 +782,12 @@ On desktop, the ETA cell stays on one line and shows an ellipsis if the text is 
 Hover or focus on the ETA to see the full text.
 On a phone, the ETA wraps to show the full text in the row.
 Past times and past range end times use the same warning color as Check overdue.
-The default order uses `the_list.order`, which the CLI also uses.
+The server puts parked items after other items in the default order.
+Within each group, the List uses `the_list.order`.
 User decisions come first, then unread updates, then the earliest next check.
-A column button sorts its values; a second click reverses that order.
+The page uses the order from the latest server response.
+A column button sorts all matching items by its values.
+A second click reverses that order.
 
 The List starts with All selected in the Owner, Producer, and Show rows.
 Owner and Producer list staff in name order after All and omit every trailing `-unit` from names.
@@ -799,9 +802,11 @@ Morty answering includes other unparked items with an open question, including i
 Needs me also includes unparked items in Waiting for nate or Delivered with no open question.
 Working includes other unparked items in New or Working.
 Blocked includes other unparked items in Blocked or Paused.
-All excludes parked items and includes unparked Done items.
-The Unread only switch limits the visible items and chip counts to unread items.
+All includes every open item, including parked items and Done items.
+The State cell shows the parking end time or delivery condition under the saved state.
+The Unread only switch shows and counts unread items and rows that stay open after an answer is read.
 Each chip count reflects the words box and the filters in the other rows.
+In All, each Owner and Producer chip counts matching parked items.
 The “need you” total uses the Needs me chip count.
 A zero-count chip stays visible and dimmed.
 The chip rows wrap when the available width decreases.
@@ -814,7 +819,7 @@ Hidden items keep their open or closed state.
 
 A link under Links opens the target item in the console.
 The table can change Show to All to reveal the target.
-A link to an item in Parked selects Parked.
+A direct link with no filters opens a parked item in All.
 The table clears each filter that excludes the target and keeps each filter that matches it.
 The table scrolls to the target and highlights it briefly.
 The table leaves a gap below the sticky status banner when it shows.
@@ -887,7 +892,9 @@ A revision replacement fades the old card out and slides the new card in.
 Both transitions use the configured card durations and respect reduced motion.
 If the List request fails or times out, the next periodic refresh can update the row.
 List and Review refresh, counts, and linked record requests use `page_request_timeout_seconds`.
-If a List action is pending, the refresh starts after that action ends.
+Periodic and console visibility refreshes skip a pending List action.
+A refused List action restores the confirmed row and shows the reason.
+A refresh for a saved Review change or a new item waits until pending List actions end.
 An explicit item target joins the linked selection and opens its card.
 The shared table names each linked key that the page cannot find.
 It keeps the found cards when another linked key is missing.
@@ -1037,7 +1044,9 @@ This rule also applies to direct links and to answers that appear in linked deta
 The tab and console frame must also be visible.
 Expand all leaves answers unread.
 A newer update stays unread if it arrives before the read saves.
-With Unread only on, an item can stay visible after this read until the user closes its row or changes Show.
+With Unread only on, the row can stay visible after this read.
+The row counts toward its matching Owner and Producer chips and the selected Show chip.
+Closing the row or changing Show ends this exception.
 Changing the Unread only switch ends this exception.
 After the item is read, the log shows “Question Q<n> — nate” and “Answer — <producer>” at their recorded times.
 The panel clears the question when the log shows it.
@@ -1089,8 +1098,8 @@ It keeps one confirmation per hidden row after overlapping Unpark requests.
 Focus moves from **Unpark** to the Parked filter and brings the filter and confirmation into view.
 If All is active when Unpark saves, the row stays expanded and its item number can receive focus.
 After Unpark, the item's saved state sets its status chip.
+After Park or Unpark saves, the List refreshes the server order even while the item waits for an answer.
 
-A direct link to a parked item selects Parked.
 Morty can set this parking condition with `the_list.py park --id L<N> --until delivered --source morty`.
 When morty records Delivered, the List writer clears this parking condition in the same write.
 The Review snapshot worker checks each snapshot after it publishes it.
@@ -1114,7 +1123,8 @@ The existing sender delivers the notice with its retry and alert rules.
 A delivery failure does not reverse the completed item action.
 Tell morty sends the user's words without changing the item's state or parking time.
 Remove hides the item at once and closes it when the save succeeds.
-Park moves an item to Parked at once.
+Park moves an item to the parked group at once.
+The item stays visible in All if it matches the other filters.
 With Unread only on, the row leaves the view when the user presses Mark read, Ask question, or Tell morty.
 The row returns when the server reports an unread update and the row matches the current filters.
 The shared table fades and collapses the row and its open details when an action hides them.
