@@ -329,6 +329,9 @@ class ListPageTests(unittest.TestCase):
         config = cls.browser_root / "config"
         config.mkdir()
         _ = (config / "production.conf").write_text("# whole: 20..\nquestion_title_max_chars=100\n")
+        _ = (config / "statusline.conf").write_text(
+            "role.showrunner=#a379fd\nrole.unit-director=#ffaf02\n"
+            + "role.producer=#90fe42\nrole.worker=#ff0404\n")
         _ = (config / "review_links.conf").write_text(
             "# whole: 1..20\ndelivery_tries=3\n# range: 0..300\ndelivery_pause_seconds=0\n"
             + "# whole: 1..20\nfeedback_rows=5\n# whole: 1..20\nreview_words_rows=4\n"
