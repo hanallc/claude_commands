@@ -77,9 +77,9 @@ def observe_process_placement(pid: int, marker: bytes) -> PlacementObservation |
     if isinstance(observed, ProcessArgumentStrings):
         if marker in observed.arguments or marker in observed.environment_and_metadata:
             return PlacementObservation.FOUND
-        if observed.environment_fields():
+        if any(observed.environment_and_metadata):
             return PlacementObservation.NOT_FOUND
-        observed = ProcessInspectionUnavailable("the response contains no readable environment fields")
+        observed = ProcessInspectionUnavailable("the response contains no content after argv")
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

@@ -335,6 +335,7 @@ class QueueRunTests(unittest.TestCase):
             "malformed": header + b"HOME=/fixture",
             "omitted environment": header,
             "empty environment": header + b"\0",
+            "empty environment with metadata": header + b"\0\0" + metadata,
             "complete without padding": unmarked,
             "complete with padding": header + environment + b"\0\0" + metadata,
             "marker in environment": header + marker + b"\0" + metadata,
@@ -371,7 +372,7 @@ class QueueRunTests(unittest.TestCase):
                 matching = outcome in ("marker in environment", "marker in argv", "marker after padding",
                                        "fake pfz before marker")
                 if matching or outcome in ("exited", "complete without padding", "complete with padding",
-                                           "marker prefix only"):
+                                           "empty environment with metadata", "marker prefix only"):
                     self.assertEqual(status.exception.code, 0)
                     self.assertEqual(output.getvalue(), "4567\n4568\n" if matching else "")
                     self.assertEqual(errors.getvalue(), "")
