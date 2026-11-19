@@ -2954,21 +2954,14 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 
 **Files:** `scripts/aws_target/aws_prices.html`, `scripts/aws_target/test_aws_page.py`.
 
-### Phase 161 — The Gate column shows the same price as the break-even card  · status: todo
-**Source:** builds, 2026-11-19 00:4x EST, from the Phase 160 open note. Order: after the 06:01 cutover step; before Phase 159.
-**Cause:** `spot_table.run_costs` prices the Gate column with `RunEvidence.expected_usd` (box time and refusal wait). Placement and the break-even card use `GateRunPricing.expected_usd`, which also adds the region transfer charge and the region extra wait. So the Gate column shows a lower price than the price placement uses (us-west-2 m7a.4xlarge: 0.0396 against 0.0397).
+### Phase 161 — The Gate column shows the same price as the break-even card  · status: done
+**Source:** builds, 2026-11-19, from the Phase 160 open note.
 
-#### Work Order
+#### As-built
+- `spot_table.run_costs` makes one `GateRunPricing` for each scope and prices each Gate cell with its `expected_usd`. The Gate column and the cheapest-gate line now add the transfer charge outside the home region and the region extra wait, as placement and the break-even card do. The scope text names both.
+- `test_aws_page` checks that the Gate cell equals the break-even price for a home and a remote region. `test_control` expects the remote price with the transfer charge (0.0250 to 0.0252, 0.0500 to 0.0502).
+- Tests on the row in both layouts, 0 failures: 8 suites, 279 tests; types 0.
+- Open note (blind review): the Gate column takes the lowest Spot price of any zone. Placement and the card take only zones with gate boxes. A cheap zone with no gate boxes can show a lower price than placement gets. The base has the same zone choice; offered to builds as a separate phase.
+- Checkpoint `9b022b16b`; row `2604acf72` on the Phase 160 row `46539f832`, branch `builds-resources-p161`.
 
-**Goal:** the Gate column, the cheapest-gate line and the break-even card use one price for each region and type.
-
-**Spec:**
-1. `run_costs` prices each grid cell with `GateRunPricing.from_config(values, evidence, home, scope.modes).expected_usd(price, size, region)`. Keep one pricing object per scope.
-2. The scope explanation text names the transfer charge and the region extra wait.
-3. No change to `run_cost.py`, to placement or to any config key.
-
-**Base:** row `46539f832` (Phase 160), because `GateRunPricing` comes with it. The row ships after it.
-
-**Files:** `scripts/aws_target/spot_table.py`, `scripts/aws_target/test_aws_page.py`.
-
-**Acceptance gate:** a test with a home region and a remote region with a transfer charge shows the Gate cell equal to the break-even card price for the same type and region; the home region has no transfer charge. Types 0; the aws page and aws_target suites pass on the row.
+**Files:** `scripts/aws_target/spot_table.py`, `scripts/aws_target/test_aws_page.py`, `scripts/aws_target/test_control.py`.
