@@ -3068,6 +3068,16 @@ Work:
 2. Replay the cause with a small test that hangs before the fix.
 3. Fix the cause where it lives; no longer timeout and no retry.
 
+### Phase 44cx — My tests ignore the caller's build and run variables  · status: todo
+**From builds (from sdlc admin-console), 2026-11-19 06:2x:** three queue test modules failed on main 764582979 in admin-console's gate run and pass alone in a clean environment.
+
+Case: admin-console ran its gate inside `copies run`, which exports COPIES_STEP_SOURCE, VERIFY_SLOT_SOURCE and CARGO_TARGET_DIR. test_slot_order (pid '' != '4242') and test_memory_admit (NoRun() for check and clippy) lose BUILDLOG_RUN or the run identity; test_copies touched-slot-file reports "target/debug/x not built". impl4 replayed each failure with one variable set.
+
+Work:
+1. One test helper drops the caller's step variables; all three fixtures use it.
+2. A failing-first row for each test with the caller variable set.
+3. The three modules pass with and without the variables.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
