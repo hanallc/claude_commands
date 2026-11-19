@@ -28,6 +28,7 @@ from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, largest_gate_v
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.build_hold import build_hold
 from scripts.build_targets import build_targets
+from scripts.direct.verify_shell_test_support import verify_cancellation_functions
 from scripts.lib import conf
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -2114,8 +2115,9 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
         self.assertTrue(all(state == 'terminated' for state in self.fake.instances.values()))
         self.assertEqual(trial.read_json(trial.cleanup_receipt(self.folder)), {'trial': claim})
 
-        cancel = shell_functions(trial.ROOT / 'scripts/direct/verify.sh',
-                                 'stop_assigned_gpu_unit', 'cancel_tree_run', 'forward_mac_runner_signal')
+        verify = trial.ROOT / 'scripts/direct/verify.sh'
+        cancel = shell_functions(verify, 'stop_assigned_gpu_unit', 'forward_mac_runner_signal')
+        cancel += verify_cancellation_functions(verify, 'cancel_tree_run')
         cancel += """
 after_tree_change() { return 0; }
 find_mac_runner_pid() { runner_pid=42; }
@@ -2136,6 +2138,7 @@ CMD=test
                 result = subprocess.run(['bash', '-c', cancel + command, 'verify.sh', str(self.root)],
                                         capture_output=True, text=True, timeout=5)
                 self.assertEqual(result.returncode, status, result.stderr)
+                self.assertNotIn('command not found', result.stderr)
                 self.assertEqual(result.stdout.splitlines(),
                     ['42 TERM', 'build_targets.py stop-hana-gpu --assignment-file assignment.json'])
 
