@@ -46,6 +46,7 @@ from scripts.build_queue import cloud_progress
 from scripts.build_queue import queue_snapshot, slot_wait
 from scripts.build_targets import target_config
 from scripts.build_targets.execution_transport import ExecutionTransport, HanaGpuNextestTransport
+from scripts.mac_test import mac_ci
 from scripts.mac_test.claim_state import MacCiActivity
 from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHolder, reason_phrase
 from scripts.build_queue.system_clock import SystemClock as SystemClock
@@ -140,6 +141,34 @@ _PASS_PROVIDER_CONFIGURATION: ContextVar[ProviderConfiguration] = ContextVar("pa
 def _provider_configuration() -> ProviderConfiguration:
     current = _PASS_PROVIDER_CONFIGURATION.get(None)
     return ProviderConfiguration() if current is None else current
+
+
+@dataclass(frozen=True)
+class MacCiObservation:
+    """A CI reading and the time its probe started."""
+
+    activity: MacCiActivity
+    observed_at: float
+
+
+class MacCiEvidencePass:
+    """Share CI observations by SSH host during one evidence pass."""
+
+    def __init__(self) -> None:
+        self.by_host: dict[str, MacCiObservation] = {}
+
+    def read(self, configuration: conf.ConfigRead, clock: Clock) -> MacCiObservation:
+        try:
+            host = configuration.text("host")
+        except conf.Unusable:
+            return MacCiObservation(MacCiActivity.UNKNOWN, clock.now())
+        if host not in self.by_host:
+            observed_at = clock.now()
+            self.by_host[host] = MacCiObservation(mac_ci.read_mac_ci_activity(configuration), observed_at)
+        return self.by_host[host]
+
+
+_MAC_CI_EVIDENCE_PASS: ContextVar[MacCiEvidencePass] = ContextVar("mac_ci_evidence_pass")
 
 
 CARGO_CAPTURE_ROOT = Path("/tmp/cargo-tile")
@@ -717,7 +746,7 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
             members[reading.cgroup] = frozenset()
         if not isinstance(records.recorded_service_state(reading), NotServiceSlice):
             programs = gate.member_programs(members[reading.cgroup].intersection(processes), proc.path)
-            workers[reading.cgroup] = frozenset(pid for pid, name in programs.items() if name == "Runner.Worker")
+            workers[reading.cgroup] = frozenset(pid for pid, name in programs.items() if mac_ci.is_runner_worker(name))
     scope_process_memory = {pid: gate.process_memory({pid}, proc.path)
                             for pid in {member for group in members.values() for member in group}}
     between: list[records.RunningStep] = []
@@ -941,7 +970,7 @@ class HostEvidenceWorker:
     def _next_ready(self, now: float) -> tuple[placement.HostEvidenceKey, object] | float | None:
         """Return the earliest due key and its subscription, or the delay until a key is due.
 
-        Each turn probes one key, so an expedited key waits for one probe at most.
+        Select the next key after each probe so an expedited key can run next.
         """
         ready = min(((due, order, key) for order, (key, due) in enumerate(self.due.items()) if due <= now),
                     default=None)
@@ -958,8 +987,27 @@ class HostEvidenceWorker:
                 ready = self._next_ready(time.monotonic())
             if not isinstance(ready, tuple):
                 _ = self.requested.wait(ready)
-            elif not self._probe(*ready):
+            elif not self._probe_pass(*ready):
                 return
+
+    def _probe_pass(self, key: placement.HostEvidenceKey, subscription: object) -> bool:
+        """Share CI readings until no key is due or a probed key is due again."""
+        token = _MAC_CI_EVIDENCE_PASS.set(MacCiEvidencePass())
+        probed: set[placement.HostEvidenceKey] = set()
+        try:
+            while True:
+                if not self._probe(key, subscription):
+                    return False
+                probed.add(key)
+                with self.lock:
+                    if self.stopped.is_set():
+                        return False
+                    ready = self._next_ready(time.monotonic())
+                if not isinstance(ready, tuple) or ready[0] in probed:
+                    return True
+                key, subscription = ready
+        finally:
+            _MAC_CI_EVIDENCE_PASS.reset(token)
 
     def _probe(self, key: placement.HostEvidenceKey, subscription: object) -> bool:
         """Probe one key and publish its evidence. Return False when the worker stops."""
@@ -3049,9 +3097,14 @@ class AdmissionServer:
             if isinstance(transport, hana_placement.HanaControlTransport):
                 return hana_placement.read_evidence(key, request, transport=transport, workload=configuration)
         paths = claim_state.state_paths(destination.target)
-        mac_ci = MacCiActivity.UNCHECKED
+        ci = MacCiActivity.UNCHECKED
+        observed_at = self.clock.now()
         if isinstance(target, target_config.SshTarget) and target.platform == "macos":
-            mac_ci = mac_test.settle_retained_mac_claims(paths, target.settings, configuration=configuration)
+            mac_test.settle_retained_mac_claims(paths, target.settings)
+            evidence_pass = _MAC_CI_EVIDENCE_PASS.get(None) or MacCiEvidencePass()
+            observation = evidence_pass.read(configuration, self.clock)
+            ci = observation.activity
+            observed_at = min(observed_at, observation.observed_at)
         sent = request.constraints.command_kind
         kind = recorded_step_kind(request.profile.step) if isinstance(sent, placement.CommandKindNotSent) else sent
         eligibility: placement.HostEligibility
@@ -3078,7 +3131,7 @@ class AdmissionServer:
                 and target.platform == "macos"
                 and (mac_test.free_now(paths, target.settings, Path(request.constraints.repository),
                                        session=key.session, configuration=configuration) == "busy"
-                     or mac_test.mac_build_capacity(conf.read("mac_test"), (), mac_ci).at_limit())):
+                     or mac_test.mac_build_capacity(conf.read("mac_test"), (), ci).at_limit())):
             eligibility = placement.TemporaryExclusion("busy")
         adopted: list[placement.AdoptedProviderClaim] = []
         cleanup: list[placement.RetainedCleanupClaim] = []
@@ -3116,8 +3169,8 @@ class AdmissionServer:
                 session, record["remote_host"], record.get("instance_generation", "")))
             executions.append((reference, self._observe_provider_execution(request, destination, reference,
                 record["remote_host"], record.get("instance_generation", ""), configuration)))
-        return placement.FreshHostEvidence(key, self.clock.now(), generation, eligibility, tuple(adopted),
-            tuple(cleanup), tuple(executions), holder, diagnostic, mac_ci=mac_ci)
+        return placement.FreshHostEvidence(key, observed_at, generation, eligibility, tuple(adopted),
+            tuple(cleanup), tuple(executions), holder, diagnostic, mac_ci=ci)
 
     def _observe_provider_execution(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
                                     reference: placement.ProviderClaimReference, host: str, generation: str,

@@ -40,6 +40,7 @@ from scripts.build_hold.shared_state_defaults import (
 )
 from scripts.build_targets.target_config import ConfigError, SshTarget, command_target_name, read_targets
 
+from scripts.mac_test.mac_ci import is_runner_worker
 from scripts.message import session_send
 
 
@@ -930,7 +931,7 @@ def ci_process(pid: int, start_time: str, proc_root: Path) -> bool:
     for identity in lineage:
         directory = proc_root / str(identity.pid)
         try:
-            if (directory / "comm").read_text().strip() == "Runner.Worker":
+            if is_runner_worker((directory / "comm").read_text().strip()):
                 return True
         except OSError:
             pass

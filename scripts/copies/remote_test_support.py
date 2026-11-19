@@ -21,6 +21,7 @@ from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 from scripts.copies.copies_test_support import copies_environment
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.mac_test import floor_claims
+from scripts.mac_test.mac_ci_test_support import idle_ci_python_reply
 
 
 @final
@@ -111,7 +112,7 @@ def local_remote_transport(root: Path) -> Generator[None]:
     tools.mkdir(exist_ok=True)
     _ = copy_helpers(root, *COPY_HELPERS)
     ssh = tools / "ssh"
-    _ = ssh.write_text(f"#!{sys.executable}\n" + '''import os, sys
+    _ = ssh.write_text(f"#!{sys.executable}\n" + idle_ci_python_reply() + '''import os
 environment = dict(os.environ)
 if sys.argv[-2] == 'natedev':
     environment['MAC_TEST_STATE_DIR'] = environment['REMOTE_CLAIM_STATE']

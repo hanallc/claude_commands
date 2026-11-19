@@ -629,6 +629,56 @@ class MacBuildLimitTests(unittest.TestCase):
                             self.assert_mac_busy(fixture, request)
                         self.assertEqual(len(mac_test.read_claims(paths)), int(allowed))
 
+    def test_host_evidence_pass_reads_ci_once_per_mac_host(self) -> None:
+        with self.mac_fixture(1) as (fixture, _paths):
+            requests = [self.request(fixture, repository, kind="run")
+                        for repository in ("hana", "cargo-liner", "other")]
+            for index, host in enumerate(("fixture-mac", "other-mac"), start=1):
+                settings = fixture.root / f"mac-{index}.conf"
+                _ = write_config_fixture(settings, f"host={host}\n", template="mac_test")
+                request = requests[index]
+                candidate, = request.constraints.candidates
+                candidate = replace(candidate, destination=replace(candidate.destination, host=host),
+                                    settings=placement.ExplicitProviderSettings(settings))
+                requests[index] = replace(request, constraints=replace(request.constraints, candidates=(candidate,)))
+            keys = [fixture.server.host_evidence_key(request, request.constraints.candidates[0].destination)
+                    for request in requests]
+            fixture.server.host_requests.update(zip(keys, requests, strict=True))
+
+            def probe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+                evidence = fixture.read_host_evidence(key)
+                fixture.clock.advance(1)
+                return evidence
+
+            worker = ManualEvidenceWorker(keys[0], probe, fixture.clock, fixture.server.reading_events,
+                                          records.read_memory_config().waiting_pass_seconds)
+            self.addCleanup(worker.close)
+            for key in keys[1:]:
+                worker.request(key)
+
+            for primary_output, primary_activity in ((BUSY_PROCESS_LIST, claim_state.MacCiActivity.RUNNING),
+                                                      (IDLE_PROCESS_LIST, claim_state.MacCiActivity.IDLE)):
+                with self.subTest(primary_activity=primary_activity):
+                    for key in keys:
+                        worker.expedite(key)
+                    started = fixture.clock.now()
+                    replies = [subprocess.CompletedProcess(["ssh"], 0, output, "")
+                               for output in (primary_output, IDLE_PROCESS_LIST)]
+                    with mock.patch.object(mac_ci, "run", side_effect=replies) as read:
+                        worker.probe_due_pass()
+                    self.assertEqual([call.args[0][-2:] for call in read.call_args_list],
+                                     [["fixture-mac", mac_ci.PROCESS_LIST_COMMAND],
+                                      ["other-mac", mac_ci.PROCESS_LIST_COMMAND]])
+                    for key in keys[:2]:
+                        evidence = worker.evidence(key)
+                        assert isinstance(evidence, placement.FreshHostEvidence), evidence
+                        self.assertIs(evidence.mac_ci, primary_activity)
+                        self.assertEqual(evidence.observed_at, started)
+                    independent = worker.evidence(keys[-1])
+                    assert isinstance(independent, placement.FreshHostEvidence), independent
+                    self.assertIs(independent.mac_ci, claim_state.MacCiActivity.IDLE)
+                    self.assertGreater(independent.observed_at, started)
+
     def test_mac_grant_reserves_capacity_from_a_standalone_claim(self) -> None:
         with self.mac_fixture(1) as (fixture, paths):
             request = self.request(fixture, "hana", kind="run")
@@ -2800,6 +2850,12 @@ class ManualEvidenceWorker(service.HostEvidenceWorker):
             raise AssertionError("the worker has no key to probe")
         _ = self._probe(*ready)
         return ready[0]
+
+    def probe_due_pass(self) -> None:
+        with self.lock:
+            ready = self._next_ready(time.monotonic())
+        assert isinstance(ready, tuple), "the worker has no due key"
+        assert self._probe_pass(*ready)
 
 
 @dataclass(frozen=True)

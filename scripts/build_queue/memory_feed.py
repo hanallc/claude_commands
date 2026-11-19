@@ -64,6 +64,7 @@ from scripts.build_queue import admission_records, target_availability
 from scripts.build_queue.memory_files import DATA_NAME, PAGE_NAME, PAGE_SOURCE, configured_output_folder
 from scripts.build_targets import target_config
 from scripts.lint import memory_admit as gate
+from scripts.mac_test.mac_ci import is_runner_worker
 from scripts.message import unit_labels
 from scripts.message.owner_role import OwnerRole
 from scripts.production import staff
@@ -1106,7 +1107,7 @@ def read_ci_runner(unit: Path, proc: Path) -> CIRunner:
                                                stat.split("(", 1)[1].rsplit(") ", 1)[0], command)
             except FileNotFoundError:
                 continue
-        workers = sorted((p for p in processes.values() if p.program == "Runner.Worker"),
+        workers = sorted((p for p in processes.values() if is_runner_worker(p.program)),
                          key=lambda p: (p.started_at, p.pid))
         if workers:
             worker = workers[0]

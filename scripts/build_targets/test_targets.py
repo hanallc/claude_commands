@@ -110,6 +110,7 @@ class IsolatedTargetTest(unittest.TestCase):
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         })))
         _ = self.enterContext(mock.patch.object(build_hold, "record_hold_event"))
+        _ = self.enterContext(mock.patch.object(mac_ci, "run", side_effect=idle_ci_reply))
         _ = os.environ.pop("BUILD_TARGETS_CONFIG", None)
         home_config = self.root / ".claude/config"
         home_config.mkdir(parents=True)
@@ -422,7 +423,6 @@ class TargetStateTests(IsolatedTargetTest):
         args.worktree = str(self.root)
         output = io.StringIO()
         with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("test-run-start")), \
-             mock.patch.object(mac_ci, "run", side_effect=idle_ci_reply), \
              mock.patch.object(mac_test, "start_claim_watcher") as watcher:
             with redirect_stdout(output):
                 code = mac_test.command_claim(args, mac_test.StatePaths(self.mac_state))

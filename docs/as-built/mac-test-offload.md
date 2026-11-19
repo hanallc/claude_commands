@@ -22,7 +22,9 @@ The `buildlog` CLI retains coordination state, hold intervals, and detailed Mac 
 `max_active_builds` in `config/mac_test.conf` sets the capacity for each managed Mac target.
 The initial limit is one build across repositories.
 A live `Runner.Worker` on the Mac counts as one Hana CI build.
-The shared settlement step reads CI activity before a new claim takes the state lock.
+The admission service reads CI activity once per SSH host in each evidence pass.
+The service keeps the observation time when it shares a reading across placement requests.
+A standalone claim reads CI activity before it takes the state lock.
 An unreadable CI result keeps new agent builds waiting.
 A queue grant reserves a claim under the same lock that a standalone claim uses.
 The runner adopts that claim in place.

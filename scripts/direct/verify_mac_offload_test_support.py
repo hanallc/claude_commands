@@ -7,6 +7,7 @@ from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_provider_evidence
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.mac_test import claim_state, eligibility
+from scripts.mac_test.mac_ci_test_support import idle_ci_shell_reply
 from scripts.lib.berth_test_support import write_unconfigured_berth
 from scripts.lib.checkout_test_support import python_tool_source, write_python_tool
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
@@ -1129,7 +1130,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_executable(self.bin_directory / name, blocker)
         write_unconfigured_berth(self.bin_directory)
-        self.write_executable(self.bin_directory / "ssh", '#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n')
+        self.write_ssh('printf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n')
         reader = self.root / "lint-config.sh"
         _ = reader.write_text(
             "lint_config_enabled() { return 1; }\n"
@@ -1267,6 +1268,11 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         self.environment.update({key: value for key, value in private.items() if key not in ("HOME", "CONF_DIR")})
         seed_interpreter_cache(self.root / "cache")
         _ = self.environment.pop("CLAUDE_PYTHON", None)
+
+    def write_ssh(self, reply: str) -> None:
+        """Write a private SSH stub with a shared reply for the CI read."""
+        source = '#!/bin/sh\nfor remote_command do :; done\n' + idle_ci_shell_reply("$remote_command") + reply
+        self.write_executable(self.bin_directory / "ssh", source)
 
     def write_executable(self, path: Path, source: str) -> None:
         # Private tools may start as links; replacing one must never edit its target.

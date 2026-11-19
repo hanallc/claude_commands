@@ -38,6 +38,7 @@ from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
 from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, MacOnly, PinnedTarget
 from scripts.build_hold.override_guard import require_shared_state_write
 from scripts.lib import conf
+from scripts.mac_test.mac_ci import is_runner_worker
 from scripts.lib.proc_text import read_proc_text as _read_proc_text
 
 from scripts.lib.test_phase import (
@@ -2942,7 +2943,7 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
                 job_state = IdleService()
                 current_state = IdleService()
                 programs = member_programs(members.intersection(processes), proc)
-                workers = [pid for pid, program in programs.items() if program == "Runner.Worker"]
+                workers = [pid for pid, program in programs.items() if is_runner_worker(program)]
                 listeners = [pid for pid, program in programs.items() if program == "Runner.Listener"]
                 candidates = workers or listeners
                 if candidates:

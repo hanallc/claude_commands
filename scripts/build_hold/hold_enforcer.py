@@ -31,6 +31,7 @@ from scripts.build_queue import admission_service, placement
 from scripts.aws_target import hana_placement
 from scripts.build_targets import target_config
 from scripts.mac_test import claim_state
+from scripts.mac_test.mac_ci import is_runner_worker
 from scripts.build_hold import override_guard
 from scripts.build_hold.shared_state_defaults import DEFAULT_ENFORCER_DIRECTORY as DEFAULT_STATE_DIRECTORY
 from scripts.buildlog.parse import CARGO_BUILD_VERBS, cargo_subcommand
@@ -300,9 +301,9 @@ def drain_identities(
                   if isinstance(decision, WouldStopBuild)}
     candidates.update(working_gates(processes, claims))
     candidates.update(process.identity for process in processes.values()
-                      if process.command == "Runner.Worker"
-                      or process.executable == "Runner.Worker"
-                      or process.argv and Path(process.argv[0]).name == "Runner.Worker")
+                      if is_runner_worker(process.command)
+                      or is_runner_worker(process.executable)
+                      or process.argv and is_runner_worker(process.argv[0]))
     return tuple(process.identity for process in processes.values()
                  if process.identity in candidates and not any(
                      parent.identity in candidates for parent in build_hold.audit_ancestors(process, processes)))

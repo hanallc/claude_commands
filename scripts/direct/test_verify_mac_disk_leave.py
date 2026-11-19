@@ -62,8 +62,7 @@ runpy.run_path(os.environ["TEST_REAL_TARGETS"], run_name="__main__")
         _ = self.hold_memory()
         available = self.runner_state / "available-gib"
         _ = available.write_text("0\n")
-        self.write_executable(self.bin_directory / "ssh", f'''#!/bin/sh
-printf 'free_gib=%s\\nhost=test-mac\\nrc=0\\n' "$(cat '{available}')"
+        self.write_ssh(f'''printf 'free_gib=%s\\nhost=test-mac\\nrc=0\\n' "$(cat '{available}')"
 ''')
         process = self.start_verify("test", "sample", "--no-cache", extra={
             "TEST_RUNNER_BUSY_UNTIL": str(self.runner_state / "mac-free"),

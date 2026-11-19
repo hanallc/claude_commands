@@ -19,15 +19,21 @@ def idle_ci_reply(arguments: list[str], **_options: object) -> subprocess.Comple
 
 def write_idle_ci_ssh(path: Path) -> None:
     """Install a private SSH program that answers only the CI process read."""
-    _ = path.write_text(
-        f"#!{sys.executable}\nimport sys\n"
-        + f"assert sys.argv[-1] == {PROCESS_LIST_COMMAND!r}, sys.argv\n"
-        + f"sys.stdout.write({IDLE_PROCESS_LIST!r})\n")
+    _ = path.write_text(f"#!{sys.executable}\n" + idle_ci_python_reply()
+                        + 'raise SystemExit("Unexpected SSH command: " + sys.argv[-1])\n')
     path.chmod(0o755)
 
 
+def idle_ci_python_reply() -> str:
+    """Answer only the CI read in a Python SSH stub."""
+    return ("import sys\n"
+            f"if sys.argv[-1] == {PROCESS_LIST_COMMAND!r}:\n"
+            f"    sys.stdout.write({IDLE_PROCESS_LIST!r})\n"
+            "    raise SystemExit(0)\n")
+
+
 def idle_ci_shell_reply(last_argument: str) -> str:
-    """Answer the CI read before the fixture records requests to other commands."""
-    return (f'\nif [[ $command == ssh && {last_argument} == {shlex.quote(PROCESS_LIST_COMMAND)} ]]; then\n'
+    """Answer the CI read before the fixture records other commands."""
+    return (f'\nif [ "${{0##*/}}" = ssh ] && [ "{last_argument}" = {shlex.quote(PROCESS_LIST_COMMAND)} ]; then\n'
             f'    printf "%s" {shlex.quote(IDLE_PROCESS_LIST)}\n'
             '    exit 0\nfi\n')
