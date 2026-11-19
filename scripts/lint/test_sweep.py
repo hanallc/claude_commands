@@ -1075,6 +1075,22 @@ class ProcessUseTests(SweepCase):
                 self.assertEqual(self.uses(), {str(self.other): f"runs cargo-nextest in {self.workspace}"})
                 shutil.rmtree(self.proc)
 
+    def test_verify_outside_cargo_keeps_only_its_own_output_when_a_template_needs_a_manifest(self) -> None:
+        cargo_home = self.base / "cargo-home"
+        cargo_home.mkdir()
+        _ = (cargo_home / "config.toml").write_text('[build]\nbuild-dir = "{workspace-root}/build"\n')
+        argv = ("bash", "/x/verify.sh", "test")
+        environment = (f"CARGO_HOME={cargo_home}",)
+        reason = f"runs verify.sh in {self.workspace}"
+
+        fake_process(self.proc, 10, cwd=str(self.workspace), argv=argv, environ=environment)
+        self.assertEqual(self.uses(), {str(self.hana): reason})
+
+        shutil.rmtree(self.proc)
+        fake_process(self.proc, 10, cwd=str(self.workspace), argv=argv,
+                     environ=(*environment, f"CARGO_TARGET_DIR={self.other}"))
+        self.assertEqual(self.uses(), {str(self.other): reason})
+
     def test_nextest_shared_reader_keeps_legacy_override_and_invalid_config_behavior(self) -> None:
         config = self.workspace / ".cargo"
         config.mkdir()
@@ -1917,14 +1933,15 @@ class FloorTests(SweepCase):
         proc = base / "proc"
         (proc / "4242").mkdir(parents=True)
         (proc / "4242" / "cwd").symlink_to(mapping.workspace_root, target_is_directory=True)
-        with (mock.patch.object(sessions, "live_sessions", return_value=[record]),
-              mock.patch.object(sweep, "PROC_DIR", str(proc))):
-            held = sweep.build_hold_targets([str(mapping.target_directory), str(mapping.build_directory)], {})
+        with mock.patch.object(sessions, "live_sessions", return_value=[record]):
+            held = sweep.build_hold_targets([str(mapping.target_directory), str(mapping.build_directory)], {},
+                                            proc=str(proc))
         self.assertEqual(set(held), {str(mapping.target_directory), str(mapping.build_directory)})
         self.assertTrue(own.exists())
         self.assertTrue(copy.exists())
 
     def test_interrupted_pair_keeps_pending_artifact_paths(self) -> None:
+        process_uses = sweep.process_uses
         base = self.base()
         mapping, own, copy = self.paired_output(base)
         roots = [str(mapping.build_directory), str(mapping.target_directory)]
@@ -1949,9 +1966,14 @@ class FloorTests(SweepCase):
         self.assertTrue(copy.exists())
         intent = sweep.read_trim_intent(sweep.trim_intent_path(str(mapping.build_directory)))
         self.assertIn(str(copy), intent.group_paths)
-        with mock.patch.object(sweep, "process_uses", return_value={}):
-            sweep.recover_pending_trims()
-            sweep.recover_pending_trims()
+        proc = base / "proc"
+        fake_process(proc, 10, cwd=str(mapping.target_directory))
+        with mock.patch.object(sweep, "process_uses", wraps=process_uses):
+            sweep.recover_pending_trims(proc=str(proc))
+            self.assertTrue(copy.exists())
+            shutil.rmtree(proc / "10")
+            sweep.recover_pending_trims(proc=str(proc))
+            sweep.recover_pending_trims(proc=str(proc))
         self.assertFalse(copy.exists())
         row, = self.trim_rows()
         self.assertEqual(row["cause"], "floor take")
@@ -2659,7 +2681,7 @@ class FloorTests(SweepCase):
         proc = base / "proc"
         fake_process(proc, 42, exe="/usr/bin/cargo-nextest", cwd=str(workspace),
                      argv=("cargo-nextest", "nextest", "run"), environ=environment)
-        def private_uses(targets: list[str]) -> dict[str, sweep.TargetUse]:
+        def private_uses(targets: Sequence[str], _proc: str = sweep.PROC_DIR) -> dict[str, sweep.TargetUse]:
             return process_uses(targets, str(proc))
 
         _ = self.enterContext(mock.patch.object(sweep, "process_uses", side_effect=private_uses))
@@ -6652,7 +6674,7 @@ raise SystemExit(int(os.environ[variable]))
         proc.mkdir()
         (proc / str(test.pid)).symlink_to(Path("/proc") / str(test.pid), target_is_directory=True)
 
-        def own_process_uses(targets: list[str]) -> dict[str, sweep.TargetUse]:
+        def own_process_uses(targets: Sequence[str], _proc: str = sweep.PROC_DIR) -> dict[str, sweep.TargetUse]:
             return process_uses(targets, str(proc))
 
         with mock.patch.object(sweep, "process_uses", side_effect=own_process_uses):
@@ -7447,13 +7469,12 @@ class HolderSessionTests(unittest.TestCase):
         with (mock.patch.dict(os.environ, {"BUILD_HOLD_DIR": str(holders),
                                           tmp_sweep.STATE_ENV: str(base / "state")}),
               mock.patch.object(sessions, "live_sessions", return_value=[record]),
-              mock.patch.object(process_table, "snapshot", return_value=table),
-              mock.patch.object(sweep, "PROC_DIR", str(proc))):
+              mock.patch.object(process_table, "snapshot", return_value=table)):
             original_path = list(sys.path)
             for attempt in range(2):
                 with (self.subTest(query="build_hold_targets", attempt=attempt),
                       mock.patch.object(sys, "path", list(original_path))):
-                    self.assertEqual(sweep.build_hold_targets([str(tree.parent)], {}),
+                    self.assertEqual(sweep.build_hold_targets([str(tree.parent)], {}, proc=str(proc)),
                                      {str(tree.parent): sweep.BuildHoldTarget("hana-unit")})
                     self.assertEqual(sys.path, original_path)
                 with (self.subTest(query="holder_sessions", attempt=attempt),

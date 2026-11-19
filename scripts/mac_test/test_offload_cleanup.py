@@ -18,7 +18,7 @@ from typing import cast, override
 from unittest import mock
 from scripts.mac_test import eligibility, offload, mac_test, nextest_log
 from scripts.mac_test.offload_test_commands import (
-    ACTIVITY_SELECTOR_STUB, configure_nextest_trim, install_nextest_log_writer, write_shell,
+    ACTIVITY_SELECTOR_STUB, WorkspaceSweepFixture, configure_nextest_trim, install_nextest_log_writer, write_shell,
 )
 from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
 from scripts.lib import conf, test_hang_guard
@@ -142,6 +142,11 @@ class MacTargetCleanupShellTests(unittest.TestCase):
         self.bin_directory = self.root / "bin"
         self.bin_directory.mkdir()
         self.configuration_environment = config_environment(self.root / "configuration")
+        _ = write_config_fixture(self.root / "configuration/lint.conf", "recent_minutes=60\n")
+        self.configuration_environment.update({
+            "LINT_SWEEP_STATE_DIR": str(self.root / "sweep-state"),
+            "BUILDLOG_DIR": str(self.root / "buildlog"),
+        })
         # Use the real log writer and stub the trim unless the test needs it.
         self.python = install_nextest_log_writer(self.home_directory)
         disk_space = self.bin_directory / "df"
@@ -384,7 +389,10 @@ exit 1
                         self.assertEqual(existing.read_text(), "keep\n")
                         self.assertEqual((target / "nextest-output").read_text(), "built\n")
 
-        configure_nextest_trim(self.python, "run")
+        proc = self.root / "proc"
+        proc.mkdir()
+        workspace_sweep = WorkspaceSweepFixture(proc)
+        configure_nextest_trim(self.python, workspace_sweep)
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             for status in (0, 42):
                 for default_kib, repository_kib, trim in ((96, 0, True), (256, 96, True), (96, 256, False)):
@@ -421,7 +429,7 @@ exit 1
                     target.mkdir()
                     retained = target / "unmatched-output"
                     _ = retained.write_bytes(os.urandom(128 * 1024))
-                    configure_nextest_trim(self.python, 9 if trim_fails else "run")
+                    configure_nextest_trim(self.python, 9 if trim_fails else workspace_sweep)
                     answer = self.run_remote(
                         shell, 42, budget_gib=str(96 / 1024 ** 2),
                         disk_output=("Filesystem GiB Used Available Capacity Mounted\n"

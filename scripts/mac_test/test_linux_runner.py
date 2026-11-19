@@ -20,12 +20,13 @@ from typing import Literal, NamedTuple, TypedDict, cast, override
 import unittest
 from unittest import mock
 
-from scripts.lib import process_stat
+from scripts.lib import process_stat, test_hang_guard
 from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.copies.copies_test_support import copies_environment
 from scripts.mac_test import eligibility, claim_state, linux_runner, mac_test, offload, test_target_slots
+from scripts.mac_test.offload_test_commands import WorkspaceSweepFixture
 from scripts.mac_test.offload_test_support import mirror_use_payload
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -139,6 +140,7 @@ rustup)
     ;;
 cargo|cargo-nextest|cargo-mend)
     if [[ $tool == cargo && "$*" == "metadata --format-version 1 --no-deps" && $# == 4 ]]; then
+        [[ -f Cargo.toml ]] || exit 101
         if [[ -n ${FAKE_CARGO_NEEDS_TOOLCHAIN-} && -z ${RUSTUP_TOOLCHAIN-} \
               && ! -f rust-toolchain && ! -f rust-toolchain.toml ]]; then
             echo "error: rustup could not choose a version of cargo to run" >&2
@@ -203,7 +205,8 @@ class LinuxShellTests(unittest.TestCase):
             + "free_floor_gib=10\nbuild_budget_gib=32\ntarget_budget_gib=24\n"
             + "target_budget_gib.hana=31\ntarget_budget_gib.phase-copy=2\n"
             + "devshell.hana=ci\ndevshell.phase-copy=wrong\nskip.hana=test(gpu)\n"
-            + "devshell=default\nshell_cache=.local/state/build-target/shells\nshell_timeout_s=2\n",
+            + "devshell=default\nshell_cache=.local/state/build-target/shells\n"
+            + f"shell_timeout_s={test_hang_guard.TEST_HANG_GUARD_SECS}\n",
             template="mac_test",
         )
         registry = self.root / "build_targets.conf"
@@ -228,7 +231,7 @@ class LinuxShellTests(unittest.TestCase):
         self.event_path = self.root / "events.jsonl"
         tools = self.root / "bin"
         tools.mkdir()
-        for tool in ("nix", "df", "rm", "rustup", "cargo-nextest", "cargo-mend"):
+        for tool in ("nix", "df", "rm", "rustup", "cargo", "cargo-nextest", "cargo-mend"):
             self.write_tool(tools / tool)
         self.write_tool(self.root / ".claude/scripts/lint/lint")
         _ = copy_helpers(self.root, *COPY_HELPERS)
@@ -289,11 +292,16 @@ class LinuxShellTests(unittest.TestCase):
         free = int(self.environment.get("FAKE_FREE_GIB", "100")) * 1024 ** 3
         real_run = subprocess.run
         def child(argv: list[str], *, cwd: Path | str = "", check: bool = False,
-                  capture_output: bool = False, text: bool = False, timeout: float = 5,
+                  capture_output: bool = False, text: bool = False,
+                  timeout: float = test_hang_guard.TEST_HANG_GUARD_SECS,
                   env: dict[str, str] | None = None, pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
             _ = text
-            if len(argv) > 2 and argv[1] == "-c" and "sweep.sweep_workspace" in argv[2] and not self.use_real_sweep:
-                return subprocess.CompletedProcess(argv, 0, "", "")
+            if len(argv) > 2 and argv[1] == "-c" and "sweep.sweep_workspace" in argv[2]:
+                if not self.use_real_sweep:
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                proc = self.root / "proc"
+                proc.mkdir(exist_ok=True)
+                argv = [*argv[:2], WorkspaceSweepFixture(proc).python_prefix() + argv[2], *argv[3:]]
             completed = real_run(argv, cwd=cwd or self.root, check=check, capture_output=True,
                                  text=True, timeout=timeout, env=env, pass_fds=pass_fds)
             if not capture_output:

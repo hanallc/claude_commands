@@ -1,8 +1,8 @@
 """Shell stand-ins keep argument records without starting Python per command."""
 
+from dataclasses import dataclass
 import shlex
 from pathlib import Path
-from typing import Literal
 
 from scripts.lib.checkout_test_support import fixture_shim_source, python_tool_source
 
@@ -44,11 +44,23 @@ def write_shell(path: Path, source: str) -> None:
     path.chmod(0o755)
 
 
-def configure_nextest_trim(shim: Path, trim: int | Literal["run"]) -> None:
-    """Keep the log writer active for each trim outcome."""
+@dataclass(frozen=True)
+class WorkspaceSweepFixture:
+    proc: Path
+
+    def python_prefix(self) -> str:
+        """Use the fixture process table in the child sweep."""
+        return ('from functools import partial; from scripts.lint import sweep; '
+                + f'sweep.sweep_workspace = partial(sweep.sweep_workspace, proc={str(self.proc)!r}); ')
+
+
+def configure_nextest_trim(shim: Path, trim: int | WorkspaceSweepFixture) -> None:
+    """Keep the log writer active while the fixture controls the trim."""
     original = Path(__file__).resolve().with_name("nextest_log.py")
     interpreter, _, body = fixture_shim_source().partition("\n")
-    trim_command = f"exit {trim}" if isinstance(trim, int) else ":"
+    trim_command = (f"exit {trim}" if isinstance(trim, int) else
+                    '[ "$#" -eq 4 ] && [ "$1" = -B ] && [ "$2" = -c ] || exit 99\n'
+                    + f'set -- "$1" "$2" {shlex.quote(trim.python_prefix())}"$3" "$4"')
     source = (interpreter + '\nif [ "${2##*/}" = nextest_log.py ]; then\n'
               + f'    shift 2\n    set -- -B {shlex.quote(str(original))} "$@"\n'
               + f'else\n    {trim_command}\nfi\n' + body)
