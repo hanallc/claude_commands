@@ -1523,6 +1523,32 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. No merge path runs basedpyright. The nightly run still type checks `scripts`. basedpyright: 0 errors, 0 warnings. Full gate green.
 
+### Phase 89 — A session in a review gets its messages at the review end; an urgent message goes through at once  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the user approved this at 17:27 EST Nov 19 in the dwight session: "okay build it". His one requirement: a simple way for a sender to send an urgent message through the hold. Name: reviewhold. During an adhoc review, each peer report starts a turn that is not about the item.
+
+**Spec:**
+1. While a session has an open review (its `adhoc_items.py` count is above 0), `send.py` holds each message to it. It does not deliver the message.
+2. When the review ends (`adhoc_items.py 0`), the session gets all held messages as one list, oldest first. Each entry shows its sender and Sent time.
+3. `send.py --urgent` delivers at once through the hold. It is for a point that needs nate before a merge, a loss of data, or a stall. `commands/message.md` names the flag.
+4. The send result says the message is held, for example `HELD: <target> is in a review; delivered at its end`. A held message counts as kept, so a sender never resends it.
+5. Timer prompts that go through `send.py` (stall-watch, update timers) are held the same way. In-process subagent reports are harness task notices; the hold cannot reach them.
+6. A crash or a missed end loses no held message. The next `adhoc_items.py 0` delivers them, and so does session start.
+7. The hold also ends when the session had no user prompt for N minutes (sdlc, 17:29 EST). N is one new `send.conf` key, default 30. At that end the held list is delivered as at count 0. A later user prompt does not start the hold again; only a new review does (the count rises from 0).
+8. No signal handlers or traps. Tests write their own fixtures and run on no live unit. Add rows to existing tests.
+
+**Files:** `scripts/message/send.py`, `config/send.conf`, `scripts/statusline/adhoc_items.py`, one session-start hook, the user-prompt hook if the idle end needs it, `commands/message.md`, `commands/adhoc_review.md`, the producer skills that name message rules, their existing tests.
+
+**Workers:** 1 writer.
+
+**Order:** the message-rule text goes to sdlc and morty before the hash; the hash waits for morty. Tests run only when natemerge allows them.
+
+**Acceptance gate:**
+1. A fixture review session gets no delivery while its count is above 0, gets one oldest-first list at 0, and gets an urgent message at once. basedpyright: 0 errors, 0 warnings. Full gate green.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
