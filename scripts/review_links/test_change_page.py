@@ -616,6 +616,8 @@ class ChangePageTests(unittest.TestCase):
                     self.assertTrue(status.answer_question(self.page, row_id, question.question_id, answer))
                     selected = change_page.render(replace(self.page, rows=(row_id,)), status).decode()
                     browser = self.browser()[2]
+                    for page in (selected, browser):
+                        self.assertEqual(page.count(page_frame.BUTTON_STATES), 1)
                     section = re.search(r'<section\b[^>]*data-key="page-owner/' + row_id
                                         + r'"[^>]*>(.*?)</section>', browser, re.DOTALL)
                     assert section is not None
@@ -2079,6 +2081,7 @@ class ChangePageTests(unittest.TestCase):
         _ = self.file_other_change()
         _ = self.file_user_question()
         _, _, body = self.browser("questions")
+        self.assertEqual(body.count(page_frame.BUTTON_STATES), 1)
         self.assertIn('</h1><p class="page-status"', body)
         self.assertIn(page_frame.STYLE, body)
         self.assertLess(body.index('data-page-status '), body.index('<div data-review-content'))

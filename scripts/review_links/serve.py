@@ -22,6 +22,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import threading
 from collections.abc import Generator, Mapping
@@ -31,23 +32,155 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO, cast, override
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlencode, urlsplit, urlunsplit
 
 # Detect file changes before the first stamp, including changes during imports.
 STARTED_NS = time.time_ns()
 
 from scripts.disks import disks_page, sessions, slots
+from scripts.aws_target import aws_page
+from scripts.build_queue import memory_files
 from scripts.lib import conf, scratch
 from scripts.production import change_routing, change_review, staff
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
-from scripts.review_links import new_item_dialog, question_record, review_actions, review_submissions
+from scripts.review_links import new_item_dialog, page_frame, question_record, review_actions, review_submissions
 from scripts.review_links.review_link import private_name
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
 # A restart passes the listening socket to the new process in this variable.
 LISTEN_FD = "REVIEW_LINKS_LISTEN_FD"
-MAX_NEW_ITEM_BODY = 4 * ((new_item_dialog.MAX_TOTAL_IMAGE_BYTES + 2) // 3) + 256 * 1024
+# Allow page state and rows in addition to the existing words and image budget.
+MAX_NEW_ITEM_BODY = (4 * ((new_item_dialog.MAX_TOTAL_IMAGE_BYTES + 2) // 3) + 256 * 1024
+                     + new_item_dialog.MAX_PAGE_DATA_BYTES + new_item_dialog.MAX_BUG_PAGE_STATE_BYTES)
 ATTACHMENT_MEDIA = {f"image.{extension}": media for media, extension in new_item_dialog.IMAGE_FORMATS.items()}
+
+
+def published_console_page(root: Path, path: str) -> str:
+    """Recognize the decoded path of a published console page."""
+    leaf = path.rsplit("/", 1)[-1]
+    try:
+        match leaf:
+            case aws_page.PAGE_NAME:
+                page, folder = "aws", aws_page.output_folder()
+            case disks_page.PAGE_NAME:
+                page, folder = "disks", disks_page.output_folder()
+            case memory_files.PAGE_NAME:
+                page, folder = "builds", memory_files.configured_output_folder(conf.read("memory_feed"))
+            case _:
+                return ""
+        relative = (folder.resolve() / leaf).relative_to(root.resolve())
+    except (OSError, ValueError):
+        return ""
+    return page if path == f"/{relative.as_posix()}" else ""
+
+
+CONSOLE_DOCUMENTS = {
+    accounts_page.PAGE_PATH: "accounts", images.PAGE_PATH: "images", list_page.PAGE_PATH: "list",
+    review_page.PAGE_PATH: "review", f"/console/{change_page.REBUILDS_NAME}": "rebuilds",
+}
+
+
+def capture_page_key(root: Path, place: str) -> str:
+    """Identify a console document that Firefox can open."""
+    route = urlsplit(place)
+    if route.netloc or route.scheme:
+        return ""
+    key = CONSOLE_DOCUMENTS.get(route.path) or published_console_page(root, unquote(route.path))
+    if key == "review" and {"body", "version", "index"} & parse_qs(route.query, keep_blank_values=True).keys():
+        return ""
+    return key
+
+
+def owned_document(content: bytes, page: str) -> bytes:
+    """Read the current owner when serving a console document."""
+    try:
+        members = staff.local_snapshot()
+        owner = review_submissions.page_owner(page, conf.read_or_repository("console"), members)
+        if isinstance(owner, staff.StaffRow):
+            return page_frame.with_owner(content, page, owner, members, new_item_dialog.render)
+    except (OSError, ValueError):
+        pass
+    return content
+
+
+def page_screenshot(firefox: str, url: str, request: new_item_dialog.PageCaptureRequest) -> bytes:
+    """Capture the console page in a clean Firefox profile."""
+    with tempfile.TemporaryDirectory(prefix="console-capture-") as folder:
+        profile = Path(folder)
+        output = profile / "page.png"
+        theme = int(request.dark)
+        _ = (profile / "user.js").write_text(
+            f'user_pref("ui.systemUsesDarkTheme", {theme});\n'
+            + 'user_pref("layout.css.devPixelsPerPx", "1.0");\n'
+            + 'user_pref("ui.prefersReducedMotion", 1);\n'
+            + 'user_pref("network.proxy.type", 0);\n', encoding="utf-8")
+        _ = subprocess.run([firefox, "--headless", "--no-remote", "--profile", folder,
+                            "--window-size", f"{request.width},{request.height}", "--screenshot", str(output), url],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=15)
+        with output.open("rb") as stream:
+            image = stream.read(new_item_dialog.MAX_IMAGE_BYTES + 1)
+    if not image.startswith(b"\x89PNG\r\n\x1a\n") or len(image) > new_item_dialog.MAX_IMAGE_BYTES:
+        raise OSError("Firefox did not return a PNG within the attachment limit.")
+    return image
+
+
+@dataclass
+class PageCapture:
+    """Hold an image or its destination until both are available."""
+
+    expires: float
+    image: bytes | None = None
+    saved: review_submissions.SavedSubmission | None = None
+
+
+class PageCaptures:
+    def __init__(self) -> None:
+        self._lock: threading.Lock = threading.Lock()
+        self._sessions: dict[str, PageCapture] = {}
+
+    def start(self) -> str:
+        """Reserve space for a dialog capture."""
+        with self._lock:
+            now = time.monotonic()
+            self._sessions = {key: capture for key, capture in self._sessions.items() if capture.expires > now}
+            if len(self._sessions) >= 8:
+                return ""
+            key = secrets.token_hex(16)
+            self._sessions[key] = PageCapture(now + 600)
+            return key
+
+    def discard(self, key: str) -> None:
+        with self._lock:
+            capture = self._sessions.get(key)
+            if capture is not None and capture.saved is None:
+                del self._sessions[key]
+
+    def file(self, key: str, saved: review_submissions.SavedSubmission) -> bytes | None:
+        """Claim a finished image or reserve the pending image for this item."""
+        with self._lock:
+            capture = self._sessions.get(key)
+            if capture is None or capture.saved is not None:
+                return None
+            if capture.expires <= time.monotonic():
+                del self._sessions[key]
+                return None
+            if capture.image is not None:
+                del self._sessions[key]
+                return capture.image
+            capture.saved = saved
+            return None
+
+    def complete(self, key: str, image: bytes | None) -> review_submissions.SavedSubmission | None:
+        """Keep an unused image in memory or return the item that needs it."""
+        with self._lock:
+            capture = self._sessions.get(key)
+            if capture is None:
+                return None
+            if image is not None and capture.saved is None:
+                capture.image = image
+                return None
+            del self._sessions[key]
+            return capture.saved
 
 
 @dataclass
@@ -340,7 +473,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 print(f"review-links accounts: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The Accounts page is not available.</p>"))
                 return None
-            self.html_response(200, content)
+            self.html_response(200, owned_document(content, "accounts"))
             return None
         if route.path in (investigations_page.PAGE_PATH, "/console/questions.html", "/console/changes.html"):
             self.redirect(review_page.legacy_url(route.path, route.query))
@@ -377,9 +510,14 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 self.html_response(503, change_page.document("<p>The Review page is not available.</p>"))
                 return None
             prepared = snapshot.page_gzip if fields.get('show',['open'])[0]=='open' else b''
-            self.review_response(content, 'text/html; charset=utf-8',prepared)
+            owned = owned_document(content, "review")
+            self.review_response(owned, 'text/html; charset=utf-8', prepared if owned is content else b'')
             return None
         if route.path == list_page.PAGE_PATH:
+            fields = parse_qs(route.query)
+            if "item-state" in fields:
+                self.list_action_state(fields)
+                return None
             try:
                 with server.list_store_access():
                     content = list_page.render(root, include_counts=server.mode is ServerMode.LIVE,
@@ -388,7 +526,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 print(f"review-links list: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The List page is not available.</p>"))
                 return None
-            self.html_response(200, content)
+            self.html_response(200, owned_document(content, "list"))
             return None
         if route.path == images.PAGE_PATH:
             try:
@@ -397,7 +535,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 print(f"review-links images: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The Images page is not available.</p>"))
                 return None
-            self.html_response(200, content)
+            self.html_response(200, owned_document(content, "images"))
             return None
         try:
             location = old_console_link(root, self.path)
@@ -435,7 +573,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.html_response(503, change_page.document("<p>The rebuild list is not available.</p>"))
             return None
         else:
-            self.html_response(200, content)
+            self.html_response(200, owned_document(content, "rebuilds"))
             return None
         try:
             browser = change_browser.page_at(root, self.path)
@@ -490,6 +628,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             stream = file.open("rb")
         except (OSError, ValueError, RuntimeError):
             self.html_response(404, change_page.document("<p>This review page is not available.</p>"))
+            return None
+        identity = published_console_page(root, decoded)
+        if identity:
+            with stream:
+                content = owned_document(stream.read(), identity)
+            self.html_response(200, content)
             return None
         try:
             stat = os.fstat(stream.fileno())
@@ -753,7 +897,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if self.command != "GET":
             self.send_error(405)
             return
-        if self.path != review_page.NEW_ITEM_PATH:
+        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        selected = query.get("page", [])
+        if query and (set(query) != {"page"} or len(selected) != 1 or selected[0] not in page_frame.OWNER_PAGES):
             self.json_response(400, {"error": "Open the New item dialog from Review."})
             return
         refusal = self.tailscale_refusal()
@@ -761,7 +907,13 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(403, {"error": refusal or "Open the New item dialog from Review."})
             return
         try:
-            recipients = review_submissions.recipient_options(staff.snapshot())
+            if selected:
+                owner = review_submissions.page_owner(selected[0], conf.read_or_repository("console"), staff.local_snapshot())
+                recipients: list[review_submissions.RecipientOption] = []
+                if isinstance(owner, staff.StaffRow):
+                    recipients.append({"id": owner.id, "name": owner.name, "proposal": False})
+            else:
+                recipients = review_submissions.recipient_options(staff.snapshot())
         except (OSError, ValueError) as error:
             print(f"review-links New item recipients: {error}", file=sys.stderr)
             self.json_response(503, {"error": "The recipients are unavailable."})
@@ -795,7 +947,18 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if not isinstance(token, str) or not token.isascii() or not secrets.compare_digest(token, server.new_item_token):
                 self.json_response(403, {"code": "stale_token", "error": "The New item token expired. Try Send again."})
                 return
-            request = new_item_dialog.read_request(fields)
+            if "page_capture" in fields:
+                self.new_item_capture(new_item_dialog.read_page_capture(fields["page_capture"]))
+                return
+            if "discard_capture" in fields:
+                server.page_captures.discard(new_item_dialog.read_capture_key(fields["discard_capture"]))
+                self.json_response(200, {})
+                return
+            key = new_item_dialog.read_capture_key(fields["capture_key"]) if "capture_key" in fields else ""
+            request = new_item_dialog.read_request(fields, has_capture=bool(key))
+            if key and (not request.page or not isinstance(
+                    request.evidence, (new_item_dialog.PageDataEvidence, new_item_dialog.NoEvidence))):
+                raise new_item_dialog.SubmissionError("Open the New item dialog from a page owner.")
         except (ValueError, RecursionError) as error:
             reason = str(error) if isinstance(error, new_item_dialog.SubmissionError) else "Invalid New item JSON."
             self.json_response(400, {"error": reason})
@@ -805,7 +968,16 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         try:
             created = server.review_cache.create_submission(request)
-            delivery = review_actions.prepare_submission_delivery(created.saved, request.words, server.delivery_status)
+            details = created.saved.details
+            evidence_url = ""
+            if key or details.images or request.page_state is not None or isinstance(
+                    details.evidence, new_item_dialog.PageDataEvidence):
+                site = f"http://{server.bound_address}:{server.server_port}"
+                fragment = urlencode({"item": created.key})
+                evidence_url = site + review_page.PAGE_PATH + "#" + fragment
+            delivery = review_actions.prepare_submission_delivery(
+                created.saved, created.saved.words if created.saved.reused else request.words,
+                server.delivery_status, evidence_url=evidence_url)
         except new_item_dialog.SubmissionConflict as error:
             self.json_response(409, {"error": str(error)})
             return
@@ -820,6 +992,38 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(200, {"id": created.saved.id, "key": created.key, "version": created.version})
         finally:
             self.deliver_review(server, delivery)
+            if key:
+                if created.saved.reused:
+                    server.page_captures.discard(key)
+                elif (image := server.page_captures.file(key, created.saved)) is not None:
+                    server.attach_page_screenshot(created.saved, image)
+            if created.saved.kind == new_item_dialog.SubmissionKind.BUG and (
+                    request.page_state is not None or details.page_state is not None):
+                server.finish_bug_evidence(created, request, self.headers.get("Host", ""))
+
+    def new_item_capture(self, capture: new_item_dialog.PageCaptureRequest) -> None:
+        """Start a screenshot only for a known page on this server."""
+        server = cast(ReviewLinksServer, self.server)
+        if not capture_page_key(server.root, capture.place):
+            self.json_response(400, {"error": "Select a console document."})
+            return
+        firefox = shutil.which("firefox")
+        if not firefox or not server.capture_slot.acquire(blocking=False):
+            self.json_response(503, {"error": "The page screenshot is unavailable."})
+            return
+        key = server.page_captures.start()
+        if not key:
+            server.capture_slot.release()
+            self.json_response(503, {"error": "The page screenshot is unavailable."})
+            return
+        url = f"http://{server.bound_address}:{server.server_port}{capture.place}"
+        try:
+            threading.Thread(target=server.capture_page, args=(key, firefox, url, capture), daemon=True).start()
+        except RuntimeError:
+            server.page_captures.discard(key)
+            server.capture_slot.release()
+            raise
+        self.json_response(202, {"capture_key": key})
 
     def review_attachment(self, query: str) -> BinaryIO | None:
         """Serve an image named by a retained Review record."""
@@ -944,6 +1148,23 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         else:
             cast(ReviewLinksServer, self.server).accounts_cache = AccountsPageCache()
             self.json_response(200, {"state": "saved"})
+
+    def list_action_state(self, fields: dict[str, list[str]]) -> None:
+        """Read the current item after an action response is lost."""
+        server = cast(ReviewLinksServer, self.server)
+        try:
+            (identity,) = fields["item-state"]
+            (keeper,) = fields.get("keeper", [])
+            (park_request,) = fields.get("park-request", [""])
+            with server.list_store_access():
+                current = list_page.saved_action_state(keeper, identity, status=server.delivery_status,
+                                                       park_request=park_request)
+        except ValueError as error:
+            self.browser_failure(400, "The List item is unavailable.", error)
+        except OSError as error:
+            self.browser_failure(503, "The List item cannot be read. Try again.", error)
+        else:
+            self.json_response(200, current)
 
     def list_post(self) -> None:
         """Save List feedback before the shared sender starts."""
@@ -1129,6 +1350,8 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.accounts_cache: AccountsPageCache = AccountsPageCache()
         self.review_cache: review_page.ReviewSnapshotCache = review_page.ReviewSnapshotCache(self.root,start_worker=False)
         self.new_item_token: str = secrets.token_urlsafe()
+        self.capture_slot: threading.BoundedSemaphore = threading.BoundedSemaphore()
+        self.page_captures: PageCaptures = PageCaptures()
         self.next_tailscale_check: float = time.monotonic() + settings.number("tailscale_check_seconds")
         self.next_sweep: float = time.monotonic() + settings.number("snapshot_sweep_seconds")
         self.next_code_check: float = time.monotonic() + settings.number("code_check_seconds")
@@ -1150,6 +1373,65 @@ class ReviewLinksServer(ThreadingHTTPServer):
             recover_list()
         threading.Thread(target=recover_pending, daemon=True).start()
         self.review_cache.start()
+
+    def capture_page(self, key: str, firefox: str, url: str, capture: new_item_dialog.PageCaptureRequest) -> None:
+        image = None
+        try:
+            image = page_screenshot(firefox, url, capture)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        finally:
+            saved = self.page_captures.complete(key, image)
+            self.capture_slot.release()
+        if saved is not None and image is not None:
+            self.attach_page_screenshot(saved, image)
+
+    def finish_bug_evidence(self, created: review_page.PublishedSubmission, request: new_item_dialog.NewItemRequest,
+                            host: str) -> None:
+        """Save the evidence after the response and delivery."""
+        saved = created.saved
+        try:
+            if review_submissions.save_bug_page_state(
+                    saved, created.key, request, lambda page, state: self.capture_bug_screenshot(saved, page, state, host)):
+                self.review_cache.publish_submission_evidence(saved.request_id)
+        except Exception as error:
+            self.review_cache.invalidate()
+            print(f"review-links Bug evidence for {saved.id}: {' '.join(str(error).splitlines())}", file=sys.stderr)
+
+    def capture_bug_screenshot(self, saved: review_submissions.SavedSubmission, page: str,
+                               state: new_item_dialog.BugPageState, host: str) -> bool:
+        """Capture the reported viewport before the case record becomes visible."""
+        try:
+            address = urlsplit(state.url)
+            if (address.scheme not in ("http", "https") or not address.hostname or address.username is not None
+                    or address.netloc.casefold() != host.casefold() or re.search(r"[\\\x00-\x20\x7f]", state.url)):
+                return False
+            place = urlunsplit(("", "", address.path, address.query, address.fragment))
+            capture = new_item_dialog.read_page_capture({
+                "place": place, "width": state.viewport.width, "height": state.viewport.height,
+                "dark": state.viewport.dark,
+            })
+        except ValueError:
+            return False
+        if capture_page_key(self.root, capture.place) != page:
+            return False
+        firefox = shutil.which("firefox")
+        if not firefox or not self.capture_slot.acquire(blocking=False):
+            return False
+        try:
+            url = f"http://{self.bound_address}:{self.server_port}{capture.place}"
+            image = page_screenshot(firefox, url, capture)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        finally:
+            self.capture_slot.release()
+        return self.review_cache.attach_page_screenshot(saved, image)
+
+    def attach_page_screenshot(self, saved: review_submissions.SavedSubmission, image: bytes) -> None:
+        try:
+            _ = self.review_cache.attach_page_screenshot(saved, image)
+        except (OSError, ValueError, RuntimeError) as error:
+            print(f"review-links screenshot for {saved.id}: {error}", file=sys.stderr)
 
     def request_tailscale_address(self) -> str:
         """Reuse the startup address for the request guard."""

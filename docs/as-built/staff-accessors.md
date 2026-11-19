@@ -312,6 +312,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/review_links/for_you.py` | read | snapshot names each For you action owner and finds the open run of a waiting worker's unit |
 | `scripts/review_links/images.py` | read | snapshot().by_id checks each image owner at register and names the owner on the Images page |
 | `scripts/review_links/new_item_dialog.py` | read | StaffId (type) identifies the selected recipient and the recipient in the scoped reply key. |
+| `scripts/review_links/page_frame.py` | read | StaffRow and StaffSnapshot (types) carry the page owner and the staff rows that name it in the owner control. |
 | `scripts/review_links/page_question.py` | read | StaffId (type) identifies the question recipient. |
 | `scripts/review_links/review_items.py` | read | snapshot, by_id and parent_of resolve the Review owner and source unit |
 | `scripts/review_links/review_actions.py` | read | snapshot names the owner showrunner in a proposal or efficiency Approve outcome |

@@ -31,6 +31,7 @@ from typing import IO, Literal, NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, urlsplit
 from weakref import WeakSet, finalize
 
+from scripts.agents import remote
 from scripts.lib import build_folders, process_start
 from scripts.lib.boot_identity import boot_identity
 from scripts.message import send_result
@@ -51,7 +52,8 @@ from scripts.production.production_doc import (
     Refusal as Refusal, production_field, read_production,
 )
 from scripts.feature_log import feature_log
-from scripts.review_links import console_theme, image_store, page_frame, question_record, review_events, review_link
+from scripts.review_links import (console_theme, image_store, new_item_dialog, page_frame, question_record, review_events,
+                                  review_link)
 from scripts.review_links.question_record import AnswerRefused as AnswerRefused
 from scripts.review_links.review_items import (
     CompletedFeedback as CompletedFeedback, OpenFeedback as OpenFeedback,
@@ -676,6 +678,55 @@ def _send_result(delivery: VerifiedQuestionAttempt) -> QuestionAttempt:
     return replace(result, state=QuestionSendState.UNKNOWN, error=error)
 
 
+def _list_question_store(record: QuestionAttempt) -> record_store.NumberedRecords:
+    return record_store.NumberedRecords(record.recipient_id, "list", "L", "list item", ValueError)
+
+
+def _open_list_question(listing: record_store.NumberedRecords,
+                        record: QuestionAttempt) -> dict[str, str]:
+    source = record.source
+    try:
+        path = listing.path(source.item_id)
+    except ValueError as error:
+        raise StaleQuestionAttempt("The List question source is unavailable.") from error
+    if path.resolve() != Path(source.path):
+        raise StaleQuestionAttempt("The List question source has moved.")
+    try:
+        fields = listing.read(source.item_id, path=path).fields
+    except ValueError as error:
+        raise OSError(f"Cannot read the List question source: {error}") from error
+    if (fields.get("id") != source.item_id or
+            fields.get("producer", record.recipient_id) != record.recipient_id or
+            fields.get("state", "Closed") == "Closed"):
+        raise StaleQuestionAttempt("The List question source is no longer open.")
+    return fields
+
+
+@contextmanager
+def _lock_open_question_source(record: QuestionAttempt) -> Generator[None, None, None]:
+    """Check the List question under the lock that Close uses."""
+    if not record.source.row.startswith("List item "):
+        yield
+        return
+    listing = _list_question_store(record)
+    with listing.locked():
+        fields = _open_list_question(listing, record)
+        questions = delivery_state.read_list_questions(fields.get("questions", "[]"))
+        if not any(question.question_id == record.source.question_id and question.answer is None
+                   and question.words == record.source.words for question in questions):
+            raise StaleQuestionAttempt("The List question is no longer open.")
+        yield
+
+
+def _authorize_question_send(status: DeliveryStatus, path: Path, record: QuestionAttempt,
+                             sending: QuestionAttempt) -> None:
+    with _lock_open_question_source(record), status.locked():
+        if record.state is QuestionSendState.CLAIMED:
+            advance_question_attempt(path, record, sending)
+        else:
+            _require_current_question_attempt(path, record)
+
+
 def deliver_page_question(delivery: PageQuestionSend, status: DeliveryStatus) -> None:
     """Publish the send marker before calling the transport."""
     job = delivery.job
@@ -686,26 +737,42 @@ def deliver_page_question(delivery: PageQuestionSend, status: DeliveryStatus) ->
         settings = conf.read("review_links")
         tries = settings.whole("delivery_tries")
         pause = settings.number("delivery_pause_seconds")
-        with status.locked():
-            sending = replace(job.record, revision=job.record.revision + 1, state=QuestionSendState.SENDING)
-            advance_question_attempt(path, job.record, sending)
+        sending = replace(job.record, revision=job.record.revision + 1, state=QuestionSendState.SENDING)
+        _authorize_question_send(status, path, job.record, sending)
         verified = replace(job.delivery, record=sending)
         result = _send_result(verified)
+        attempts = 1
+        retry_error: OSError | ValueError | None = None
         for _ in range(1, tries):
             if result.state is not QuestionSendState.FAILED:
                 break
             if pause:
                 time.sleep(pause)
-            with status.locked():
-                _require_current_question_attempt(path, sending)
+            try:
+                _authorize_question_send(status, path, sending, sending)
+            except StaleQuestionAttempt:
+                break
+            except (OSError, ValueError) as error:
+                retry_error = error
+                break
             result = _send_result(verified)
+            attempts += 1
         failed = result.state is QuestionSendState.FAILED
         if failed and result.earlier_unconfirmed:
             result = replace(result, state=QuestionSendState.UNKNOWN)
         with status.locked():
             advance_question_attempt(path, sending, result)
-        if failed:
-            _ = alert_delivery_failures([DeliveryFailure(result.recipient_id, result.error)], tries,
+        if retry_error is not None:
+            print(f"review-links question retry {delivery.row}: {retry_error}", file=sys.stderr)
+        elif failed:
+            try:
+                with _lock_open_question_source(result):
+                    pass
+            except (OSError, ValueError) as error:
+                if not isinstance(error, StaleQuestionAttempt):
+                    print(f"review-links question alert {delivery.row}: {error}", file=sys.stderr)
+                return
+            _ = alert_delivery_failures([DeliveryFailure(result.recipient_id, result.error)], attempts,
                                         source=delivery.page.review_list, row=delivery.row,
                                         message=delivery.message, recipients=delivery.alert_recipients)
     except StaleQuestionAttempt:
@@ -737,12 +804,11 @@ def recover_page_question(status: DeliveryStatus, path: Path, record: QuestionAt
             target = image_question_target(source_path, image)
             delivery = _recover_saved_question(status, target, record, questions)
     elif source.row == f"List item {source.item_id.removeprefix('L')}/{source.question_id}":
-        listing = record_store.NumberedRecords(record.recipient_id, "list", "L", "list item", ValueError)
-        if listing.path(source.item_id).resolve() != source_path:
-            return
+        listing = _list_question_store(record)
         with listing.locked(), status.locked():
-            fields = listing.read(source.item_id).fields
-            if fields["id"] != source.item_id or fields.get("producer", record.recipient_id) != record.recipient_id:
+            try:
+                fields = _open_list_question(listing, record)
+            except StaleQuestionAttempt:
                 return
             questions = delivery_state.read_list_questions(fields.get("questions", "[]"))
             target = list_question_target(source_path, fields["id"], int(fields["number"]), fields["title"], record.recipient_id)
@@ -2403,8 +2469,9 @@ def rebuilds_url() -> str:
 
 
 def reply_command(key: str, question: str = '') -> str:
+    machine = ' --machine '+shlex.quote(remote.local_machine()) if key.startswith(new_item_dialog.KEY_PREFIX) else ''
     return ('~/.claude/scripts/lib/py ~/.claude/scripts/review_links/change_page.py answer-question '
-            + '--item '+shlex.quote(key)+(' --question '+shlex.quote(question) if question else '')
+            + '--item '+shlex.quote(key)+(' --question '+shlex.quote(question) if question else '')+machine
             + " --text '<your answer>'")
 
 
@@ -2466,6 +2533,18 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
     raise question_record.AnswerRefused('this item cannot receive an answer')
 
 
+def _forward_reply(machine: str, key: str, words: str, token: str) -> int:
+    arguments = shlex.join(["answer-question", "--item=" + key, "--question=" + token, "--text=" + words])
+    command = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" ' + arguments
+    result = subprocess.run(["ssh", "-o", "BatchMode=yes", machine, command], stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True, timeout=30, check=False)
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    return result.returncode
+
+
 def main(arguments: list[str]) -> int:
     if arguments and arguments[0] == "answer-question":
         parser = argparse.ArgumentParser(description="Answer an Ask question action on a Review item.")
@@ -2474,13 +2553,27 @@ def main(arguments: list[str]) -> int:
         _ = parser.add_argument("--list", type=Path)
         _ = parser.add_argument("--row")
         _ = parser.add_argument("--question", default="")
+        _ = parser.add_argument("--machine", default="")
         _ = parser.add_argument("--text", required=True)
         args = parser.parse_args(arguments[1:])
         try:
-            if cast(str,args.item):
-                changed = answer_item(cast(str,args.item),cast(str,args.text),cast(str,args.question),
-                                                     DeliveryStatus(review_link.review_root()))
-                print(f'Answered {cast(str,args.item)}' if changed else f'{cast(str,args.item)} already has this answer')
+            key, words, token = cast(str, args.item), cast(str, args.text), cast(str, args.question)
+            machine = cast(str, args.machine)
+            scoped = key.startswith(new_item_dialog.KEY_PREFIX)
+            if machine:
+                if not scoped:
+                    raise ValueError("Use --machine with a sent item's full key.")
+                if machine != remote.local_machine():
+                    host = remote.machine_alias(machine)
+                    if isinstance(host, remote.MachineNameRefused):
+                        raise ValueError(host.reason)
+                    if host.alias != remote.this_machine():
+                        return _forward_reply(host.alias, key, words, token)
+            if key:
+                retained = scoped and not staff.is_owner()
+                with staff.supplied_snapshot(staff.local_snapshot()) if retained else nullcontext():
+                    changed = answer_item(key, words, token, DeliveryStatus(review_link.review_root()))
+                print(f'Answered {key}' if changed else f'{key} already has this answer')
                 return 0
             if not all((cast(str | None,args.production),cast(Path | None,args.list),cast(str | None,args.row),cast(str,args.question))):
                 parser.error('pass --item, or --production, --list, --row and --question')

@@ -15,7 +15,8 @@ import subprocess
 import tempfile
 import time
 import threading
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, tzinfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Self, TextIO, cast
@@ -38,7 +39,7 @@ from scripts.production.issues import Issue
 from scripts.production import issues as issue_store
 from scripts.production.staff_test_support import fixture_member
 from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, proposal_issue, staff, update_registration
-from scripts.review_links import change_browser, change_page, console, record_table, review_items, review_page
+from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_items, review_page
 from scripts.review_links import question_record
 from scripts.review_links import list_page, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, new_item_dialog, review_actions, review_events, review_later, review_submissions
@@ -118,6 +119,7 @@ class ReviewPageTests(unittest.TestCase):
     def test_review_ids_use_the_shared_no_wrap_cell(self) -> None:
         _ = self.question()
         body = review_page.render(self.root).decode()
+        self.assertEqual(body.count(page_frame.BUTTON_STATES), 1)
         self.assertIn('class="record-id"', body)
         self.assertIn('.list-table .record-id{white-space:nowrap;overflow-wrap:normal;width:1%}', body)
         self.assertIn('.list-toggle{white-space:nowrap}', body)
@@ -235,6 +237,46 @@ class ReviewPageTests(unittest.TestCase):
         open_keys = {item.key for item in review_items.read_open(self.root)}
         self.assertTrue({item.key for item in published} <= open_keys)
         self.assertEqual(review_items.investigations(self.fixture.production, staff.snapshot()), 2)
+
+    def test_page_feedback_uses_the_native_review_reply_and_keeps_its_data(self) -> None:
+        owner = self.ready_submission_recipient()
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        request = self.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id)
+        evidence = new_item_dialog.PageDataEvidence("The List", (("Item", "State"), ("The console", "Open <1>")))
+        created = cache.create_submission(replace(request, evidence=evidence))
+        self.assertEqual(created.saved.details.evidence, evidence)
+        card = cache.get().body(created.key)
+        self.assertIn(b'Page data', card)
+        self.assertIn(b'Open &lt;1&gt;', card)
+        answered = change_page.answer_item(created.saved.key, 'The display is correct.', created.saved.reply_token, self.status)
+        self.assertTrue(answered)
+        self.assertIn(created.key, {item.key for item in review_items.read_open(self.root)})
+
+    def test_bug_card_shows_captured_page_state_and_screenshot(self) -> None:
+        import base64
+
+        from scripts.review_links.test_review_submissions import PNG
+
+        owner = self.ready_submission_recipient()
+        _ = write_config_fixture(conf.path("console"), f"page.review.owner={owner.id}\n")
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        evidence = new_item_dialog.PageDataEvidence("Review", (("Page", "Console"),))
+        state = new_item_dialog.BugPageState(
+            "http://127.0.0.1/console/review.html#owner=builds", new_item_dialog.PageViewport(1280, 800, True),
+            2.4, ("Could not load brain.",), (), "Type All · State Open · Owner <builds>", True)
+        request = self.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id)
+        created = cache.create_submission(replace(request, page="review", evidence=evidence, page_state=state))
+        self.assertNotIn(b"Screenshot of Review", cache.get().body(created.key))
+        self.assertTrue(cache.attach_page_screenshot(created.saved, base64.b64decode(PNG)))
+        snapshot = review_page.build_snapshot(self.root)
+        self.assertEqual(snapshot.records[created.key].state, review_items.ReviewState.WAITING)
+        card = snapshot.body(created.key).decode()
+        self.assertIn('<h4>Page state</h4>', card)
+        self.assertIn('<dt>Page</dt><dd>Review</dd>', card)
+        self.assertIn('<dt>Filters</dt><dd>Type All · State Open · Owner &lt;builds&gt;</dd>', card)
+        self.assertIn('<dt>Render time</dt><dd>2.40 s</dd><dt>Errors</dt><dd>1 error line</dd>', card)
+        self.assertIn(f'id={review_submissions.PAGE_SCREENSHOT.id}" loading="lazy" alt="Screenshot of Review"', card)
+        self.assertIn('<figcaption>Screenshot of Review</figcaption>', card)
 
     def test_moved_reports_display_the_original_source_unit(self) -> None:
         owner = self.ready_submission_recipient()
@@ -1534,18 +1576,106 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
         with patch.object(review_items, 'read', return_value=records):
             page = self.fixture.temporary / 'tab-review.html'
             _ = page.write_bytes(review_page.build_snapshot(self.root).render())
-        profile = self.fixture.temporary / 'tab-profile'
+        with self.firefox_commands(page) as command:
+            for initial, expected, modifier in ((1, 2, ''), (2, 1, '\ue008')):
+                with self.subTest(initial=initial, expected=expected):
+                    _ = command('WebDriver:ExecuteAsyncScript', args=[initial], script=r"""
+const [number, done] = arguments;
+const row = id => document.querySelector('[data-key="page-owner/C'+id+'"]');
+scrollTo(0,0);
+function focusRow(){
+ if(!row(number)){requestAnimationFrame(focusRow);return;}
+ row(number).querySelector('.list-toggle').focus();
+ scrollTo(0,document.documentElement.scrollHeight);
+ requestAnimationFrame(waitForBottom);
+}
+function waitForBottom(){
+ if(row(400)) done();
+ else requestAnimationFrame(waitForBottom);
+}
+requestAnimationFrame(focusRow);
+""")
+                    keys = ([('keyDown', modifier)] if modifier else []) + [
+                        ('keyDown', '\ue004'), ('keyUp', '\ue004')] + ([('keyUp', modifier)] if modifier else [])
+                    _ = command('WebDriver:PerformActions', actions=[{'type':'key', 'id':'keyboard',
+                        'actions':[{'type':kind, 'value':key} for kind,key in keys]}])
+                    focused = command('WebDriver:ExecuteScript', args=[], script=
+                        'return document.activeElement.closest("[data-list-item]")?.dataset.key;')
+                    self.assertEqual(focused, {'value': f'page-owner/C{expected}'})
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_selected_chips_keep_text_contrast_on_hover_and_press(self) -> None:
+        review = review_page.build_snapshot(self.root).render().decode()
+        list_chip = record_table.chip_row('Show', [record_table.Chip('open', 'Open', 3)], 'open')
+        page = self.fixture.temporary / 'chip-contrast.html'
+        _ = page.write_text(review.replace('<div data-review ', list_chip + '<div data-review ', 1))
+        with self.firefox_commands(page) as command:
+            for theme in ('dark', 'light'):
+                for selector in ('#review-show-open', '#filter-show-open'):
+                    position = cast(dict[str, list[int]], command('WebDriver:ExecuteScript',
+                        args=[theme, selector], script=r"""
+const [theme, selector] = arguments;
+document.documentElement.dataset.theme = theme;
+const {x, y, width, height} = document.querySelector(selector).getBoundingClientRect();
+return [Math.floor(x + width / 2), Math.floor(y + height / 2)];
+"""))
+                    x, y = position['value']
+                    for state in ('hover', 'active'):
+                        with self.subTest(theme=theme, selector=selector, state=state):
+                            actions: list[dict[str, int | str]] = [
+                                {'type': 'pointerMove', 'origin': 'viewport', 'x': x, 'y': y, 'duration': 0}]
+                            if state == 'active':
+                                actions.append({'type': 'pointerDown', 'button': 0})
+                            _ = command('WebDriver:PerformActions', actions=[{
+                                'type': 'pointer', 'id': 'mouse', 'parameters': {'pointerType': 'mouse'}, 'actions': actions}])
+                            result = cast(dict[str, float | None], command('WebDriver:ExecuteScript',
+                                args=[selector, state], script=r"""
+const [selector, state] = arguments;
+const chip = document.querySelector(selector);
+if (!chip.matches('[aria-pressed=true]:' + state)) throw new Error('The chip state is missing.');
+const {color, backgroundColor, boxShadow} = getComputedStyle(chip);
+const tint = boxShadow.match(/(?:rgba?|color)\([^)]*\)/g)?.at(-1);
+if (!tint) throw new Error('The chip tint is missing.');
+const canvas = document.createElement('canvas').getContext('2d');
+function luminance(...layers) {
+ canvas.clearRect(0, 0, 1, 1);
+ for (const layer of layers) {
+  canvas.fillStyle = layer;
+  canvas.fillRect(0, 0, 1, 1);
+ }
+ const rgb = Array.from(canvas.getImageData(0, 0, 1, 1).data).slice(0, 3).map(value => {
+  const c = value / 255;
+  return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+ });
+ return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+}
+const ink = luminance(color), fill = luminance(backgroundColor, tint);
+return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
+"""))
+                            ratio = result['value']
+                            assert ratio is not None
+                            self.assertGreaterEqual(ratio, 4.5)
+                    _ = command('WebDriver:PerformActions', actions=[{
+                        'type': 'pointer', 'id': 'mouse', 'parameters': {'pointerType': 'mouse'},
+                        'actions': [{'type': 'pointerMove', 'origin': 'viewport', 'x': 2, 'y': 2, 'duration': 0}]}])
+                    _ = command('WebDriver:ReleaseActions')
+
+    @contextmanager
+    def firefox_commands(self, page: Path) -> Generator[Callable[..., object]]:
+        profile = self.fixture.temporary / 'marionette-profile'
         profile.mkdir()
         _ = (profile/'user.js').write_text('user_pref("marionette.port", 0);\n')
         with subprocess.Popen(['firefox', '--headless', '--no-remote', '--profile', str(profile), '--marionette',
                                'about:blank'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as browser:
             try:
-                self.check_firefox_tab_order(browser, page)
+                with self.marionette_commands(browser) as command:
+                    _ = command('WebDriver:Navigate', url=page.as_uri())
+                    yield command
             finally:
                 browser.kill()
 
-    def check_firefox_tab_order(self, browser: subprocess.Popen[bytes], page: Path) -> None:
-        """Send real Tab keys through Firefox's Marionette connection."""
+    @contextmanager
+    def marionette_commands(self, browser: subprocess.Popen[bytes]) -> Generator[Callable[..., object]]:
         output = browser.stdout
         assert output is not None
         log = b''
@@ -1584,32 +1714,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
 
             _ = receive()
             _ = command('WebDriver:NewSession', capabilities={})
-            _ = command('WebDriver:Navigate', url=page.as_uri())
-            for initial, expected, modifier in ((1, 2, ''), (2, 1, '\ue008')):
-                with self.subTest(initial=initial, expected=expected):
-                    _ = command('WebDriver:ExecuteAsyncScript', args=[initial], script=r"""
-const [number, done] = arguments;
-const row = id => document.querySelector('[data-key="page-owner/C'+id+'"]');
-scrollTo(0,0);
-function focusRow(){
- if(!row(number)){requestAnimationFrame(focusRow);return;}
- row(number).querySelector('.list-toggle').focus();
- scrollTo(0,document.documentElement.scrollHeight);
- requestAnimationFrame(waitForBottom);
-}
-function waitForBottom(){
- if(row(400)) done();
- else requestAnimationFrame(waitForBottom);
-}
-requestAnimationFrame(focusRow);
-""")
-                    keys = ([('keyDown', modifier)] if modifier else []) + [
-                        ('keyDown', '\ue004'), ('keyUp', '\ue004')] + ([('keyUp', modifier)] if modifier else [])
-                    _ = command('WebDriver:PerformActions', actions=[{'type':'key', 'id':'keyboard',
-                        'actions':[{'type':kind, 'value':key} for kind,key in keys]}])
-                    focused = command('WebDriver:ExecuteScript', args=[], script=
-                        'return document.activeElement.closest("[data-list-item]")?.dataset.key;')
-                    self.assertEqual(focused, {'value': f'page-owner/C{expected}'})
+            yield command
 
     def test_reader_projects_states_without_copying_the_records(self) -> None:
         key = self.question()
@@ -3836,6 +3941,37 @@ window.fetch=async(url)=>{
 </script>'''
         markup = markup.replace('</body>', probe + '</body>')
         self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_review_owner_and_new_share_the_title_line(self) -> None:
+        owner = replace(self.ready_submission_recipient(), name='Review and console delivery')
+        markup = page_frame.with_owner(review_page.build_snapshot(self.root).page, 'review', owner,
+                                       staff.StaffSnapshot((owner,)), new_item_dialog.render)
+        probe = b'''<script>
+(async()=>{
+ const failures=[];
+ try{
+  const title=document.querySelector('h1.page-title'), row=title.closest('.page-heading');
+  const name=document.querySelector('.page-owner-name'), owner=document.querySelector('[data-owner-new]');
+  const button=document.querySelector('[data-review-new]');
+  const bounds=element=>element.getBoundingClientRect(), center=box=>(box.top+box.bottom)/2;
+  await document.fonts.ready;
+  for(const width of [1280,390]){
+   frameElement.style.width=width+'px';
+   const t=bounds(title), n=bounds(name), o=bounds(owner), b=bounds(button), r=bounds(row);
+   const beside=Math.abs(center(t)-center(b))<=1;
+   if(innerWidth!==width || !row.contains(owner) || !row.contains(button) ||
+      Math.abs(center(o)-center(b))>1 || Math.abs(center(n)-center(b))>1 ||
+      Math.abs((o.left-n.right)-(b.left-o.right))>1 || o.left<n.right+4 ||
+      n.left<r.left-1 || Math.abs(b.right-r.right)>1 ||
+      (beside ? n.left<t.right+4 : width===1280 || b.top<t.bottom+4)){
+    failures.push('The title and both controls must fit at '+width+' px.');
+   }
+  }
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        self.assertEqual(firefox_probe_results(markup.replace(b'</body>', probe + b'</body>')), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_clears_the_review_save_notice(self) -> None:

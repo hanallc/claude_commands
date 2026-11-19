@@ -6,6 +6,7 @@ import hashlib
 import gzip
 import threading
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 import json
 import re
@@ -208,6 +209,7 @@ def submission_assets(key: str, origin: new_item_dialog.ReviewSubmission) -> str
     """Render the saved evidence and references for one lazy card."""
     evidence = origin.evidence
     body = ''
+    images = origin.images
     if isinstance(evidence, new_item_dialog.BuildStepEvidence):
         cells = ''.join('<div><dt>'+html.escape(cell.label)+'</dt><dd>'+html.escape(cell.value)+'</dd></div>'
                         for cell in evidence.cells)
@@ -223,14 +225,47 @@ def submission_assets(key: str, origin: new_item_dialog.ReviewSubmission) -> str
                 +f'Queue cap {memory.queue_cap_gib:g} GiB</p><p>'+html.escape(segments)
                 +'</p><strong>'+html.escape(evidence.tip_title)+'</strong><p>'+html.escape(evidence.tip_status)
                 +'</p><dl>'+tip+'</dl></section>')
-    if origin.images:
+    if origin.page_state is not None and (page_data := origin.bug_page_data) is not None:
+        screenshot = review_submissions.PAGE_SCREENSHOT
+        body += bug_page_state_box(key, origin.page_state, page_data.title, screenshot in images)
+        images = tuple(image for image in images if image != screenshot)
+    elif isinstance(evidence, new_item_dialog.PageDataEvidence):
+        data = json.dumps({'title': evidence.title, 'rows': evidence.rows}, ensure_ascii=False, indent=2)
+        body = '<section data-submission-evidence><h3>Page data</h3><pre>'+html.escape(data)+'</pre></section>'
+    if images:
         links: list[str] = []
-        for at, image in enumerate(origin.images, 1):
-            url = html.escape(ATTACHMENT_PATH+'?'+urlencode({'key': key, 'id': image.id}), quote=True)
+        for at, image in enumerate(images, 1):
+            url = attachment_url(key, image)
             links.append(f'<a href="{url}" target="_blank" rel="noopener"><img loading="lazy" '
                          + f'src="{url}" alt="Attachment {at}"></a>')
         body += '<section class="review-attachments"><h3>Attachments</h3>'+''.join(links)+'</section>'
     return body
+
+
+def attachment_url(key: str, image: new_item_dialog.ImageReference) -> str:
+    return html.escape(ATTACHMENT_PATH+'?'+urlencode({'key': key, 'id': image.id}), quote=True)
+
+
+def bug_page_state_box(key: str, state: new_item_dialog.BugPageState, title: str, captured: bool) -> str:
+    """Show the state from the Bug and its screenshot thumbnail."""
+    errors: list[str] = []
+    for count, label in ((len(state.notices), 'error line'), (len(state.script_errors), 'script error')):
+        if count:
+            errors.append(f'{count} {label}'+('' if count == 1 else 's'))
+    rows = (
+        ('Page', title), ('Filters', state.filters or 'None'),
+        ('Render time', 'Unavailable' if state.render_seconds is None else f'{state.render_seconds:.2f} s'),
+        ('Errors', ' · '.join(errors) or 'None'),
+    )
+    fields = ''.join(f'<dt>{label}</dt><dd>{html.escape(value)}</dd>' for label, value in rows)
+    figure = ''
+    if captured:
+        url = attachment_url(key, review_submissions.PAGE_SCREENSHOT)
+        caption = html.escape('Screenshot of '+title, quote=True)
+        figure = (f'<figure><a href="{url}" target="_blank" rel="noopener">'
+                  f'<img src="{url}" loading="lazy" alt="{caption}"></a><figcaption>{caption}</figcaption></figure>')
+    return ('<section class="page-state-box" data-submission-page-state><h4>Page state</h4>'
+            f'<dl class="page-state">{fields}</dl>{figure}</section>')
 
 
 def card_entry(item: ReviewItem, members: staff.StaffSnapshot, names: staff_names.StaffNames) -> ReviewIndexEntry:
@@ -443,9 +478,11 @@ class ReviewSnapshotCache:
             finally:
                 self.invalidate()
 
-    def publish_record(self, current: ReviewSnapshot, key: str) -> ReviewSnapshot:
+    def publish_record(self, current: ReviewSnapshot, key: str, *,
+                       members: staff.StaffSnapshot | None = None) -> ReviewSnapshot:
         """Replace or remove one record while serving the previous version to readers."""
-        members = staff.snapshot()
+        if members is None:
+            members = staff.snapshot()
         try:
             item = review_items.read_current(self.root, current.records[key], members)
             return self.publish_item(current, key, item, members)
@@ -457,8 +494,12 @@ class ReviewSnapshotCache:
         _ = self.get()
         with self._save_lock:
             current = self.get()
-            saved = review_submissions.submit(request, members=staff.snapshot())
+            remote_staff = not staff.is_owner()
             members = staff.snapshot()
+            with staff.supplied_snapshot(members) if remote_staff else nullcontext():
+                saved = review_submissions.submit(request, members=members)
+            if not remote_staff:
+                members = staff.snapshot()
             path = saved.path
             stamps = {source: source_stamp(source) for source in (path, path.parent)}
             try:
@@ -476,6 +517,28 @@ class ReviewSnapshotCache:
             finally:
                 self.invalidate()
             return PublishedSubmission(saved, item.key, fresh.version)
+
+    def attach_page_screenshot(self, saved: review_submissions.SavedSubmission, image: bytes) -> bool:
+        """Add the screenshot to the native record and refresh its Review card."""
+        with self._save_lock:
+            if review_submissions.attach_page_screenshot(saved.key, image):
+                self._publish_submission_evidence(saved.request_id)
+                return True
+            return False
+
+    def publish_submission_evidence(self, request_id: str) -> None:
+        """Publish evidence added to an existing submission."""
+        with self._save_lock:
+            self._publish_submission_evidence(request_id)
+
+    def _publish_submission_evidence(self, request_id: str) -> None:
+        try:
+            current = self.get()
+            key = current.submission_keys.get(request_id)
+            if key is not None:
+                _ = self.publish_record(current, key, members=current.members)
+        finally:
+            self.invalidate()
 
     def publish_item(self, current: ReviewSnapshot, key: str, item: ReviewItem | ReviewRecordNotPublished,
                      members: staff.StaffSnapshot, *, stamps: Mapping[Path, tuple[int, int]] | None = None,
@@ -843,14 +906,15 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
         if not words.strip():
             raise question_record.AnswerRefused('enter an answer')
         members = staff.snapshot()
-        scope = update_registration.question_scope(item.owner, members)
-        question = change_browser.WaitingQuestion(key, review_items.name(item.owner, members), source.record,
-            update_registration.question_source(scope), item.owner, review_items.name(source.record.asker, members))
         if 'review_submission' in source.record.item:
+            scope = review_submissions.sent_question_scope(item.owner, members)
             delivery, answer = review_actions.sent_question_action(
                 item, source.record, scope, cast(change_page.QuestionOutcome, outcome), words, status,
                 verify_revision=validate)
         else:
+            scope = update_registration.question_scope(item.owner, members)
+            question = change_browser.WaitingQuestion(key, review_items.name(item.owner, members), source.record,
+                update_registration.question_source(scope), item.owner, review_items.name(source.record.asker, members))
             delivery, answer = change_browser.submit_question(
                 question, cast(change_page.QuestionOutcome, outcome), words, status, exact_record=True,
                 verify_revision=validate)
@@ -930,9 +994,7 @@ STYLE = '''<style>
 .review-types button{max-width:100%;overflow-wrap:anywhere}
 :is(.review-types button,[data-clear-linked-reviews],.review-new){display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;min-height:36px;
 background:var(--card);border:1px solid var(--line);border-radius:999px;color:var(--ink-2);padding:5px 14px;margin:0}
-.page-heading:has(>.review-new)>.page-title{padding-inline-end:6rem}
-.page-heading>.review-new{position:absolute;inset-inline-end:0;inset-block-start:50%;transform:translateY(-50%);
-color:var(--accent);white-space:nowrap}
+.page-heading-actions>.review-new{flex:none;color:var(--accent);white-space:nowrap}
 :is(.review-types button,[data-clear-linked-reviews])[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
 #review-show-validating[data-empty-count]{opacity:.55}
 .review-icon{display:inline-flex;vertical-align:middle;margin-right:5px}.review-icon svg{width:18px;height:18px}
@@ -948,9 +1010,9 @@ color:var(--ink);border:1px solid var(--line);border-radius:8px;resize:vertical}
 .list-log span{white-space:pre-wrap}
 .review-actions [data-later-menu] [role=menuitem]{display:flex;justify-content:space-between;align-items:center;gap:24px;width:100%;
 min-height:32px;padding:5px 10px;border:0;border-radius:6px;background:none;color:var(--ink);text-align:left}
-.review-actions [data-later-menu] [role=menuitem]:is(:hover,:focus){background:var(--accent);color:#fff;outline:none}
+.review-actions [data-later-menu] [role=menuitem]:focus{background:var(--accent);color:#fff;outline:none}
 [data-later-menu] small{font-size:12px;color:var(--ink-3)}
-[data-later-menu] [role=menuitem]:is(:hover,:focus) small{color:inherit;opacity:.85}
+[data-later-menu] [role=menuitem]:focus small{color:inherit;opacity:.85}
 [data-later-menu] hr{border:0;border-top:1px solid var(--line);margin:5px 4px}
 [data-later-menu][data-choosing]>:is([role=menuitem],hr){display:none}
 .review-actions button{margin:0;font:inherit;min-height:40px;padding:6px 14px;border:1px solid var(--ink-3);border-radius:8px;
