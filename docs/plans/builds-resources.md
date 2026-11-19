@@ -3066,16 +3066,10 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 Comments only: what the value controls, its unit, and its default or fallback, from each key's reader. No key name, value or order changes. Prompt: the unit folder `phases/171/prompt.txt`. Workers: impl writes, review2 reviews blind. Tests wait for natemerge's word (user test hold).
 
 ### Phase 172 — The sweep floor tests set their own floor values  · status: done
-**Source:** builds, 2026-11-19 16:49 EST (base red on main; bob's priority): `test_sweep.py` `test_secondary_floor_uses_configured_floor_and_groups_each_device`, natedev subcase, read the live `sweep_build_floor_gib.natedev`; the user's 300 GiB value made it red. Base main a2d0e6eb6.
-**Scope:** `scripts/lint/test_sweep.py` only. No config change; the key stays at 300.
+**Source:** builds, 2026-11-19 16:49 EST: base red on main a2d0e6eb6. The natedev subcase of `test_secondary_floor_uses_configured_floor_and_groups_each_device` read the live `sweep_build_floor_gib.natedev`; the user's 300 GiB value made it red.
 
-#### Work Order
-The natedev subcase writes its own `sweep_build_floor_gib.natedev` fixture value and expects that value. Director fix (two lines, test only). Module test alone on the row (natemerge allows the fix test). Blind review on review2. Fast track first; the row is the fallback.
-
-#### As built
-- Row `7208538bb` on main `a2d0e6eb6`, branch `builds-resources-p172b`; `scripts/lint/test_sweep.py` only.
-- The natedev subcase writes `sweep_build_floor_gib.natedev=733.29` and expects it.
-- The two Mac floor tests set `free_floor_gib=100`. The phone rearm test sets `sweep_phone_rearm_gib=5`.
-- Fast track could not apply: this branch does not carry the failing test.
+#### As-built
+- Row `7208538bb` on main `a2d0e6eb6`, branch `builds-resources-p172b`; `scripts/lint/test_sweep.py` only. No config change.
+- The natedev subcase writes `sweep_build_floor_gib.natedev=733.29` and expects it. The two Mac floor tests set `free_floor_gib=100`. The phone rearm test sets `sweep_phone_rearm_gib=5`.
 - Module test: 368 tests pass with both layouts.
-- Blind review (review2): 6 findings. 2 fixed in the row. 4 go to the next phase: growth alert keys, message limits, `sweep_proc_locks_reads`, `sweep_dep_info_head_bytes`.
+- Blind review: 6 findings; 2 fixed in the row; 4 go to the next phase (growth alert keys, message limits, `sweep_proc_locks_reads`, `sweep_dep_info_head_bytes`).
