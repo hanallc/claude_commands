@@ -15,14 +15,14 @@ import os
 from pathlib import Path
 import re
 import select
-import signal
 import subprocess
 import tempfile
+import time
 from typing import cast, final, override
 from contextlib import AbstractContextManager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
-from scripts.lib import process_group, scratch, walled_tests
+from scripts.lib import scratch, walled_tests
 from scripts.production import change_review, merge_gate, staff
 from scripts.production.gate_modules import GateRefused
 from scripts.production.test_change_review import ProducerFixture
@@ -47,35 +47,49 @@ class ModuleScopeStopTests(unittest.TestCase):
 
             poll = mock.Mock(side_effect=empty)
             with mock.patch.object(select, "poll", return_value=mock.Mock(poll=poll)):
-                self.assertTrue(merge_gate.stop_module_scope(scope))
+                result = merge_gate.stop_module_scope(scope, time.monotonic() + 5)
+            self.assertIs(result, merge_gate.ScopeStop.STOPPED)
             poll.assert_called_once()
 
-    def test_scope_that_appears_during_a_stop_is_checked_after_reap(self) -> None:
+    def test_scope_that_appears_during_a_stop_is_checked_after_the_group_stops(self) -> None:
         scope = Path("/scopes/module.scope")
-        process = cast(subprocess.Popen[str], mock.Mock(spec=subprocess.Popen, pid=123, returncode=None))
-        job = merge_gate.RunningGateJob("lib", Path("test_one.py"), process, 0, 0,
-                                      io.StringIO(), Path("output.log"), "test_one.py", scope=scope)
-        actions: list[str] = []
+        deadline = 10.0
+        for result in (merge_gate.ScopeStop.STOPPED, merge_gate.ScopeStop.UNRESOLVED):
+            with self.subTest(result=result):
+                process = cast(subprocess.Popen[str], mock.Mock(spec=subprocess.Popen, pid=123, returncode=None))
+                job = merge_gate.RunningGateJob("lib", Path("test_one.py"), process, 0, 0,
+                                              io.StringIO(), Path("output.log"), "test_one.py", scope=scope)
+                actions: list[str] = []
 
-        def stop(path: Path) -> bool:
-            self.assertEqual(path, scope)
-            actions.append("scope")
-            return "reap" in actions
+                def stop(path: Path, until: float) -> merge_gate.ScopeStop:
+                    self.assertEqual((path, until), (scope, deadline))
+                    actions.append("scope")
+                    return result if "group" in actions else merge_gate.ScopeStop.ABSENT
 
-        def stop_group(pid: int, number: int) -> None:
-            self.assertEqual((pid, number), (123, signal.SIGKILL))
-            actions.append("group")
+                def stop_group(pid: int, until: float) -> bool:
+                    self.assertEqual((pid, until), (process.pid, deadline))
+                    actions.append("group")
+                    return True
 
-        def reap(current: merge_gate.RunningGateJob, *, block: bool = False) -> None:
-            self.assertIs(current, job)
-            self.assertTrue(block)
-            actions.append("reap")
+                exited = mock.Mock(side_effect=[False, True])
+                reap = mock.Mock()
+                with (mock.patch.object(merge_gate, "module_stop_deadline", return_value=deadline),
+                      mock.patch.object(merge_gate, "stop_module_scope", side_effect=stop),
+                      mock.patch.object(merge_gate, "stop_module_group", side_effect=stop_group),
+                      mock.patch.object(merge_gate, "process_exited", exited),
+                      mock.patch.object(merge_gate, "reap_gate_job", reap), redirect_stdout(io.StringIO())):
+                    stopped = merge_gate.kill_job_group(job)
 
-        with (mock.patch.object(merge_gate, "stop_module_scope", side_effect=stop),
-              mock.patch.object(process_group, "send_process_group", side_effect=stop_group),
-              mock.patch.object(merge_gate, "reap_gate_job", side_effect=reap)):
-            merge_gate.kill_job_group(job)
-        self.assertEqual(actions, ["scope", "group", "reap", "scope"])
+                self.assertEqual(actions, ["scope", "group", "scope"])
+                if result is merge_gate.ScopeStop.STOPPED:
+                    self.assertTrue(stopped)
+                    self.assertEqual(exited.call_args, mock.call(process.pid, deadline))
+                    reap.assert_called_once_with(job, block=True)
+                else:
+                    self.assertFalse(stopped)
+                    self.assertIn(str(scope), job.stop_error)
+                    reap.assert_not_called()
+
 
     def test_nested_job_clears_the_caller_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
