@@ -24,7 +24,6 @@ None.
 
 from __future__ import annotations
 
-from enum import Enum, auto
 import hashlib
 import os
 import subprocess
@@ -68,18 +67,13 @@ def finish(processes: list[subprocess.Popen[bytes]]) -> list[bytes] | None:
     return outputs
 
 
-class GitlinkScope(Enum):
-    ALL_CHECKOUTS = auto()
-    TRACKED_SUBMODULES = auto()
-
-
-def content(path: bytes, *, gitlinks: GitlinkScope = GitlinkScope.ALL_CHECKOUTS) -> bytes:
+def content(path: bytes) -> bytes:
     if os.path.islink(path):
         return b"link " + os.readlink(path)
     if os.path.isfile(path):
         with open(path, "rb") as handle:
             return hashlib.file_digest(handle, "sha256").digest()
-    return gitlink_content(path, gitlinks=gitlinks) or b"absent"
+    return gitlink_content(path) or b"absent"
 
 
 def tracked_gitlink(path: bytes) -> bool:
@@ -95,13 +89,13 @@ def tracked_gitlink(path: bytes) -> bool:
                for entry in outputs[0].split(b"\0"))
 
 
-def gitlink_content(path: bytes, *, gitlinks: GitlinkScope = GitlinkScope.ALL_CHECKOUTS) -> bytes:
-    """Return the checked-out commit and content key for a Git worktree."""
+def gitlink_content(path: bytes) -> bytes:
+    """Return the checked-out commit and content key for a tracked submodule."""
     if not os.path.isdir(path) or not os.path.lexists(os.path.join(path, b".git")):
         return b""
-    if gitlinks is GitlinkScope.TRACKED_SUBMODULES and not tracked_gitlink(path):
+    if not tracked_gitlink(path):
         return b""
-    submodule_key = _tree_key(os.fsdecode(path), submodule=True, gitlinks=gitlinks)
+    submodule_key = _tree_key(os.fsdecode(path), submodule=True)
     if submodule_key is None:
         raise OSError(f"no tree key for {os.fsdecode(path)}")
     return b"gitlink " + submodule_key.encode("ascii")
@@ -128,13 +122,11 @@ def committed_tree_key(tree_id: bytes) -> str:
     return hashlib.sha256(tree_id + b"\n").hexdigest()
 
 
-def tree_key(directory: str, *, exclude_session_dirs: bool = False,
-             gitlinks: GitlinkScope = GitlinkScope.ALL_CHECKOUTS) -> str | None:
-    return _tree_key(directory, submodule=False, exclude_session_dirs=exclude_session_dirs, gitlinks=gitlinks)
+def tree_key(directory: str, *, exclude_session_dirs: bool = False) -> str | None:
+    return _tree_key(directory, submodule=False, exclude_session_dirs=exclude_session_dirs)
 
 
-def _tree_key(directory: str, *, submodule: bool, exclude_session_dirs: bool = False,
-              gitlinks: GitlinkScope = GitlinkScope.ALL_CHECKOUTS) -> str | None:
+def _tree_key(directory: str, *, submodule: bool, exclude_session_dirs: bool = False) -> str | None:
     revision = ("HEAD^{tree}", "HEAD") if submodule else ("HEAD^{tree}",)
     try:
         processes = [
@@ -162,7 +154,7 @@ def _tree_key(directory: str, *, submodule: bool, exclude_session_dirs: bool = F
     excluded = session_directory_prefixes(top) if exclude_session_dirs else ()
     try:
         for path in changed_paths(status, exclude=excluded):
-            key.update(path + b"\0" + content(os.path.join(top, path), gitlinks=gitlinks))
+            key.update(path + b"\0" + content(os.path.join(top, path)))
     except OSError:
         return None
     return key.hexdigest()
@@ -186,9 +178,7 @@ def worktree(directory: str) -> str | None:
 
 
 if __name__ == "__main__":
-    options = sys.argv[2:]
-    gitlinks = GitlinkScope.TRACKED_SUBMODULES if "--tracked-submodules" in options else GitlinkScope.ALL_CHECKOUTS
-    key = tree_key(sys.argv[1], exclude_session_dirs="--exclude-session-dirs" in options, gitlinks=gitlinks)
+    key = tree_key(sys.argv[1], exclude_session_dirs="--exclude-session-dirs" in sys.argv[2:])
     if key is None:
         raise SystemExit(1)
     print(key)

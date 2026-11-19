@@ -90,7 +90,7 @@ def lint_tool_versions() -> bytes:
 
 
 def blob(path: bytes) -> bytes:
-    """Identify a file or a checked-out Git worktree."""
+    """Identify a file or a tracked submodule."""
     if os.path.islink(path):
         data, mode = os.readlink(path), b"120000"
     elif os.path.isfile(path):
@@ -98,7 +98,7 @@ def blob(path: bytes) -> bytes:
             data = handle.read()
         mode = b"100755" if os.access(path, os.X_OK) else b"100644"
     else:
-        return treekey.gitlink_content(path, gitlinks=treekey.GitlinkScope.TRACKED_SUBMODULES)
+        return treekey.gitlink_content(path)
     return mode + b" blob " + git_blob_id(data).encode()
 
 
@@ -221,8 +221,7 @@ class TreeInputs:
         if not self.package:
             key.update(run("git", "--no-optional-locks", "-C", self.top, "rev-parse", "HEAD^{tree}"))
             for path in changed:
-                key.update(path + b"\0" + treekey.content(os.path.join(self.top, path),
-                                                          gitlinks=treekey.GitlinkScope.TRACKED_SUBMODULES))
+                key.update(path + b"\0" + treekey.content(os.path.join(self.top, path)))
         key.update(run("rustc", "-vV"))
         if lint_versions and self.words[:1] == ["lint"]:
             try:
@@ -233,7 +232,7 @@ class TreeInputs:
             key.update(versions)
         tree_content = key.copy()
         for name in self.files:
-            key.update(treekey.content(os.fsencode(name), gitlinks=treekey.GitlinkScope.TRACKED_SUBMODULES))
+            key.update(treekey.content(os.fsencode(name)))
         build_key = key.copy()
         words = iter(self.words)
         for word in words:

@@ -121,6 +121,12 @@ class TreeKeyTests(unittest.TestCase):
         self.assertNotEqual(key(self.repo), dirty)
         self.assertNotEqual(dirty, original)
 
+    def test_key_is_available_with_an_untracked_repository_without_a_commit(self) -> None:
+        nested = self.repo / "nested"
+        nested.mkdir()
+        _ = git("init", "-q", cwd=nested)
+        self.assertRegex(key(self.repo), r"^[0-9a-f]{64}$")
+
     def test_file_read_error_leaves_tree_key_unavailable(self) -> None:
         source = self.repo / "src" / "new.rs"
         _ = source.write_text("pub fn two() {}\n")
