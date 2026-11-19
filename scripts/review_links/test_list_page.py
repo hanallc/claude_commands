@@ -191,6 +191,11 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         item = self.add("Check the linked reviews", number=111)
         _ = the_list.link(MORTY.id, item.id, ("sdlc/C1", "sdlc/C2"), source="morty")
         _ = self.add("An unrelated List row", number=112)
+        waiting = investigation.file(OWNER.id, "Check the waiting review", "What caused the error?",
+                                     waiting_why="The owner checks the error.")
+        waiting_key = f"investigation/{waiting.owner}/{waiting.id}"
+        waiting_item = self.add("Check the linked reviews that are waiting", number=113)
+        _ = the_list.link(MORTY.id, waiting_item.id, (waiting_key,), source="morty")
         _ = write_config_fixture(self.root / "config/review_links.conf",
                                  "page_request_timeout_seconds=7\ncard_fade_out_ms=180\ncard_fade_in_ms=260\n")
         pages = (console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage(list_page.PAGE_PATH)),
@@ -202,6 +207,7 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         probe = r'''<script>
 const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
 const shot=new URLSearchParams(location.search).has('shot');
+const waitingKey=WAITING_KEY;
 const report=async()=>{await fetch('/results',{method:'POST',body:JSON.stringify(failures)});};
 const listFrame=document.querySelector('iframe:not([hidden])');
 const direct=!listFrame;
@@ -245,6 +251,11 @@ async function inspect(){
  let savedReviewPlace=reviewPlace();
  const search=doc.querySelector('#list-search');
  search.value='linked reviews';search.dispatchEvent(new win.Event('input',{bubbles:true}));
+ const waitingLink=doc.querySelector('[data-number="113"] [data-label="State"] a[data-list-review-card]');
+ const waitingCard=await readCard(waitingLink);
+ check(dialog.open && waitingCard.querySelector('[data-key="'+waitingKey+'"][data-state="Waiting"]'),
+  'The summary opens the linked Waiting card.');
+ dialog.querySelector('button').click();
  const doneLink=link('sdlc/C2'),done=await readCard(doneLink);
  check(dialog.open && done.querySelector('[data-state="Done"]'),'Done opens in the dialog.');
  check(!done.querySelector('[data-review-form] textarea'),'The Done card has no action.');
@@ -293,6 +304,9 @@ async function inspect(){
   const reviewFrame=document.querySelector('iframe[data-console-page="review"]');
   await new Promise(resolve=>reviewFrame.addEventListener('load',resolve,{once:true}));
   await animationFrames(window);
+  const entries=JSON.parse(reviewFrame.contentDocument.querySelector('[data-review-index]').textContent).r;
+  check(entries.some(entry=>entry[0]===waitingKey) && entries.every(entry=>entry[0]!=='sdlc/C2'),
+   'The Review index includes the Waiting card and excludes the Done card.');
   check(listFrame.hidden && !dialog.open,'Changing the console page closes an idle card.');
   const oldRow=row();
   document.querySelector('.nav-entry[data-page="list"]').click();
@@ -468,7 +482,7 @@ async function inspect(){
 }
 (listFrame || window).addEventListener('load',()=>{void inspect().catch(error=>{failures.push(String(error));void report();});},{once:true});
 if(shot){const image=new Image();image.hidden=true;image.src='/complete';document.body.append(image);}
-</script>'''
+</script>'''.replace('WAITING_KEY', json.dumps(waiting_key))
         shell = shell.replace('</body>', probe + '</body>')
         proof = os.environ.get("LIST_OVERLAY_SCREENSHOT")
         _ = write_config_fixture(self.root / "config/scratch.conf", f"visible_root={self.root / 'scratch'}\n")
@@ -4277,7 +4291,6 @@ window.fetch=async(_url,options)=>{
         fragment = urlencode({"item": f"{MORTY.id}/{item.id}"})
         setup = """<script>
 const fragment='#FRAGMENT',reads=[];
-if(LINK_ON_LOAD) history.replaceState(null,'',fragment);
 const seenEntries=[],NativeIntersectionObserver=window.IntersectionObserver;
 window.IntersectionObserver=class extends NativeIntersectionObserver{
  constructor(callback,options){
@@ -4289,8 +4302,14 @@ window.IntersectionObserver=class extends NativeIntersectionObserver{
   },options);
  }
 };
-let receivedRead;
+let receivedRead,receivedFirstAnswer;
 const postedRead=new Promise(resolve=>{receivedRead=resolve;});
+const firstAnswerSeen=new Promise(resolve=>{receivedFirstAnswer=resolve;});
+const unobserveAnswer=IntersectionObserver.prototype.unobserve;
+IntersectionObserver.prototype.unobserve=function(answer){
+ unobserveAnswer.call(this,answer);
+ if(answer.matches('[data-question="Q1"] > p:last-child')) receivedFirstAnswer();
+};
 window.fetch=async(_url,options)=>{
  if(options?.method!=='POST') return new Response('',{status:503});
  reads.push(new URLSearchParams(options.body));
@@ -4322,11 +4341,19 @@ window.fetch=async(_url,options)=>{
    scrollTo({top:scrollY+answer.getBoundingClientRect().top-16,behavior:'instant'});
    await paint();
   };
+  const requireEvent=(event,message)=>{
+   let timer;
+   const deadline=new Promise((_,reject)=>{
+    timer=setTimeout(()=>reject(new Error(message+' '+JSON.stringify({count:reads.length,seenEntries}))),20000);
+   });
+   return Promise.race([event,deadline]).finally(()=>clearTimeout(timer));
+  };
   check(!row.hidden && !detail.hidden,'The item link opens the row');
   document.body.style.paddingBottom='100vh';
   await paint();
   await showAnswer(first);
   check((await sample(first)).intersectionRect.height>0,'The first answer enters the viewport');
+  await requireEvent(firstAnswerSeen,'The List did not record the first visible answer within 20 seconds.');
   check(!(await sample(second)).isIntersecting && second.getBoundingClientRect().top>innerHeight,
    'The second answer starts below the viewport');
   check(!reads.length && panel.querySelectorAll('.question-unread').length===2,
@@ -4334,7 +4361,7 @@ window.fetch=async(_url,options)=>{
   await showAnswer(second);
   check((await sample(second)).intersectionRect.height>0 && first.getBoundingClientRect().bottom<0,
    'The second answer enters the viewport after the first leaves it');
-  await Promise.race([postedRead,new Promise(resolve=>setTimeout(resolve,2000))]);
+  await requireEvent(postedRead,'The List did not send the signed read within 20 seconds.');
   check(reads.length===1 && reads[0].get('action')==='read' &&
    reads[0].get('request')===panel.dataset.openReadRequest && reads[0].get('token')===panel.dataset.openReadToken,
    'The last answer to enter the viewport sends one signed read. '+JSON.stringify({count:reads.length,seenEntries}));
@@ -4345,12 +4372,13 @@ window.fetch=async(_url,options)=>{
         for link_on_load in (True, False):
             with self.subTest(link_on_load=link_on_load):
                 enabled = str(link_on_load).lower()
-                self.browser_answer_visibility(markup, setup.replace('LINK_ON_LOAD', enabled),
-                                               probe.replace('LINK_ON_LOAD', enabled), viewport_height=1120)
+                self.browser_answer_visibility(markup, setup, probe.replace('LINK_ON_LOAD', enabled),
+                                               viewport_height=1120,
+                                               console_fragment="#" + fragment if link_on_load else "")
 
     def browser_answer_visibility(self, markup: str, setup: str, probe: str, *,
                                   viewport_height: int | None = None, reload_markup: str = "",
-                                  reload_console: bool = False) -> None:
+                                  reload_console: bool = False, console_fragment: str = "") -> None:
         page = markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>').encode()
         reloaded = reload_markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>').encode()
         loaded = threading.Event()
@@ -4358,11 +4386,14 @@ window.fetch=async(_url,options)=>{
         frame_path = "/page"
         frame_url = frame_path
         console_shell = b""
-        if reload_console:
+        if reload_console or console_fragment:
             frame_path = list_page.PAGE_PATH
             listing = console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage(frame_path))
             console_shell = console.render((listing,), console.UnavailablePage())
-            frame_url = "/console/?" + urlencode({"page": "list", "at.list": frame_path + "#show=working"})
+            place = frame_path + (console_fragment or "#show=working")
+            frame_url = "/console/?" + urlencode({"page": "list", "at.list": place})
+            if console_fragment:
+                console_shell = console_shell.replace(b"</body>", b'<img hidden src="/complete"></body>')
         host_page = (f'<!doctype html><style>iframe{{border:0;width:100%;height:{height}}}'
                      + 'iframe[hidden]{display:block;visibility:hidden}</style>'
                      + f'<iframe src="{html.escape(frame_url)}"></iframe><img hidden src="/complete">').encode()
@@ -4410,9 +4441,10 @@ window.fetch=async(_url,options)=>{
                 profile = self.root / "answer-profile"
                 profile.mkdir(exist_ok=True)
                 window_height = max(900, (viewport_height or 0) + 32)
+                destination = frame_url if console_fragment else "/"
                 browser = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
                     '--window-size', f'1280,{window_height}', '--screenshot', str(self.root / 'answer.png'),
-                    f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=45)
+                    f'http://127.0.0.1:{server.server_port}{destination}'], capture_output=True, text=True, timeout=45)
                 self.assertEqual(browser.returncode, 0, browser.stderr)
                 self.assertEqual(results, [[]])
             finally:
