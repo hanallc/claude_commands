@@ -39,6 +39,7 @@ NonBusyMacDeclineReason = Literal[
     "disk",
     "copy",
     "source_changed",
+    "runner",
 ]
 
 

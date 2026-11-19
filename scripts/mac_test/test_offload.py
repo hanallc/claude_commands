@@ -22,6 +22,7 @@ import io
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
+from scripts.build_queue import execution_identity
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
 from scripts.mac_test import eligibility, nextest_log, offload, claim_state
@@ -717,7 +718,7 @@ class OffloadSettingsTests(unittest.TestCase):
         assert start is not None
         local = fixture.request(owner=wire.Owner(os.getpid(), start))
         target = placement.PlacementDestination("mac", "mac", "mac", claim_state.RepositoryScope("hana"))
-        constraints = placement.PlacementConstraints(placement.SourceKeyUnavailable("the fixture has no tree key"),
+        constraints = placement.PlacementConstraints(execution_identity.SourceKeyUnavailable("the fixture has no tree key"),
             ("cargo", "nextest", "run"), str(self.root), "hana", NoOwningSession(),
             (placement.PlacementCandidate(target),), placement.PinnedHost("mac"))
         request = wire.PlacementRequest(local.episode,
@@ -1196,7 +1197,7 @@ class OffloadCommandTests(OffloadCommandFixture):
                 admission.server.publish_host_evidence(admission.server.host_probe(key))
         _ = admission.run_pass()
         with admission.loop_turn():
-            self.assertTrue(all(isinstance(admission.server.assignments[placement.attempt_key(
+            self.assertTrue(all(isinstance(admission.server.assignments[execution_identity.attempt_key(
                 saved.assignment.episode, saved.assignment.attempt)].state, placement.ClosedAssignment)
                 for saved in assigned), assigned)
 
