@@ -18,7 +18,7 @@ import shlex
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePath
-from typing import BinaryIO, TypedDict, cast
+from typing import BinaryIO, NotRequired, TypedDict
 
 from scripts.lib import conf
 
@@ -42,7 +42,7 @@ LOCATION = re.compile(r"^\s*--> (\S.*)$")
 # progress counter ("(───)" on a retried attempt) and binary then test.
 TEST_LINE = re.compile(
     r"^\s*(?:TRY (\d+) )?([A-Z][A-Z0-9-]*) \[\s*>?\s*(\d+(?:\.\d+)?)s\]\s+"
-    + r"(?:\((?:\s*\d+/\d+|[─-]+)\)\s+)?(\S+)\s+(\S.*?)\s*$"
+    + r"(?:\((\s*\d+/\d+|[─-]+)\)\s+)?(\S+)\s+(\S.*?)\s*$"
 )
 SUMMARY = re.compile(r"^\s*Summary \[\s*[\d.]+s\]\s+(\d+)(?:/\d+)? tests? run:(.*)$")
 NOT_RESULT = frozenset({"START", "DELAY", "RETRY", "CANCEL", "SKIP", "FLAKY", "SETUP"})
@@ -67,77 +67,9 @@ class TestRow(TypedDict):
     slow: bool
 
 
-@dataclass(frozen=True)
-class SelectedTests:
-    """Every test that nextest selected, grouped by binary ID."""
-
+class ObservedNextestTests(TypedDict):
     by_binary: dict[str, list[str]]
-
-
-@dataclass(frozen=True)
-class NoTestSelection:
-    """The step has no saved selection."""
-
-
-NO_TEST_SELECTION = NoTestSelection()
-
-
-def saved_test_selection(value: object) -> SelectedTests | NoTestSelection:
-    """Read a complete selection from a build log field."""
-    if not isinstance(value, dict):
-        return NO_TEST_SELECTION
-    by_binary: dict[str, list[str]] = {}
-    for binary, tests in cast(dict[object, object], value).items():
-        if not isinstance(binary, str) or not isinstance(tests, list):
-            return NO_TEST_SELECTION
-        names: list[str] = []
-        for name in cast(list[object], tests):
-            if not isinstance(name, str):
-                return NO_TEST_SELECTION
-            names.append(name)
-        by_binary[binary] = names
-    return SelectedTests(by_binary)
-
-
-@dataclass(frozen=True)
-class NextestListing:
-    """The selected names and binary metadata from one nextest build."""
-
-    selection: SelectedTests
-    binaries_metadata: dict[str, object]
-
-
-def nextest_listing(document: dict[str, object]) -> NextestListing:
-    """Read the selected names and convert the suites to binary metadata."""
-    build = document["rust-build-meta"]
-    suites = document["rust-suites"]
-    if not isinstance(build, dict) or not isinstance(suites, dict):
-        raise ValueError("Invalid nextest build or suites")
-    selected: dict[str, list[str]] = {}
-    binaries: dict[str, object] = {}
-    for binary, suite in cast(dict[object, object], suites).items():
-        if not isinstance(binary, str) or not isinstance(suite, dict):
-            raise ValueError("Invalid nextest suite")
-        fields = cast(dict[str, object], suite)
-        cases = fields.get("testcases", {})
-        binary_fields = {key: value for key, value in fields.items()
-                         if key not in ("testcases", "package-name", "cwd", "status")}
-        binaries[binary] = binary_fields
-        if not isinstance(cases, dict):
-            raise ValueError("Invalid nextest test cases")
-        names: list[str] = []
-        for name, case in cast(dict[object, object], cases).items():
-            if not isinstance(name, str) or not isinstance(case, dict):
-                raise ValueError("Invalid nextest test case")
-            match = cast(dict[str, object], case).get("filter-match")
-            status = cast(dict[str, object], match).get("status") if isinstance(match, dict) else None
-            if status not in ("matches", "mismatch"):
-                raise ValueError("Invalid nextest filter match")
-            if status == "matches":
-                names.append(name)
-        if names:
-            selected[binary] = names
-    return NextestListing(SelectedTests(selected), {"rust-build-meta": build, "rust-binaries": binaries})
+    complete: bool
 
 
 class LogFacts(TypedDict):
@@ -153,6 +85,7 @@ class LogFacts(TypedDict):
     tests_flaky: int | None
     tests_retried: int | None
     tests: list[TestRow] | None
+    observed_tests: NotRequired[ObservedNextestTests]
     mend_fixes: int | None
     mend_check_s: float | None
     mend_s: float | None
@@ -426,14 +359,21 @@ def nextest_slow_test_s() -> float:
     return conf.read("test_times").number("NEXTEST_SLOW_TEST_S")
 
 
-def test_results(lines: list[str]) -> tuple[list[TestRow], list[Summary]]:
-    """Per-test rows worth keeping, and the Summary counts.
+@dataclass(frozen=True)
+class NextestResults:
+    timing_rows: list[TestRow]
+    summaries: list[Summary]
+    observed: ObservedNextestTests
 
-    Only lines before the Summary count: nextest reprints the failed and flaky
-    ones after it. A row is kept for a test that failed, was retried, ran past
-    NEXTEST_SLOW_TEST_S or was reported SLOW; the counts cover every test.
+
+def test_results(lines: list[str]) -> NextestResults:
+    """Read result names and keep timing rows for failures, retries and slow tests.
+
+    Nextest can repeat failures and retries after the summary. Read only the
+    statuses before the summary.
     """
     tests: dict[tuple[str, str], TestRow] = {}
+    unfinished: set[tuple[str, str]] = set()
     summaries: list[Summary] = []
     for line in lines:
         found = SUMMARY.match(line)
@@ -445,33 +385,42 @@ def test_results(lines: list[str]) -> tuple[list[TestRow], list[Summary]]:
         match = TEST_LINE.match(line)
         if not match:
             continue
-        attempt_text, word, duration, binary, test = match.groups()
+        attempt_text, word, duration, progress, binary, test = match.groups()
         if word in NOT_RESULT:
             continue
+        name = (binary, test)
         row = tests.setdefault(
-            (binary, test),
+            name,
             {"binary": binary, "test": test, "status": "passed", "attempts": 0, "duration_s": None, "slow": False},
         )
         if word == "SLOW":
             row["slow"] = True
+            unfinished.add(name)
             continue
+        if progress and "/" not in progress:
+            unfinished.add(name)
+        else:
+            unfinished.discard(name)
         attempt = int(attempt_text) if attempt_text else 1
         if attempt >= row["attempts"]:
             row["attempts"] = attempt
             row["status"] = result_status(word)
             row["duration_s"] = float(duration)
     if not tests:
-        return [], summaries
+        return NextestResults([], summaries, {"by_binary": {}, "complete": False})
     slow_test_s = nextest_slow_test_s()
     rows: list[TestRow] = []
+    names: dict[str, list[str]] = {}
     for row in tests.values():
+        names.setdefault(row["binary"], []).append(row["test"])
         if row["attempts"] == 0:
             row["attempts"] = 1
         if row["status"] == "passed" and row["attempts"] > 1:
             row["status"] = "flaky"
         if row["status"] != "passed" or row["attempts"] > 1 or row["slow"] or (row["duration_s"] or 0) > slow_test_s:
             rows.append(row)
-    return rows, summaries
+    complete = bool(summaries and not unfinished and len(tests) == summaries[0]["run"])
+    return NextestResults(rows, summaries, {"by_binary": names, "complete": complete})
 
 
 def mend_fixes(lines: list[str]) -> int | None:
@@ -508,7 +457,10 @@ def log_facts(step: str, text: str) -> LogFacts:
     facts["compiled_crate_names"] = names
     facts["crates_compiled"] = len(names)
     facts["warnings"], facts["errors"] = diagnostics(lines)
-    rows, summaries = test_results(lines)
+    results = test_results(lines)
+    rows, summaries = results.timing_rows, results.summaries
+    if step == "nextest" and results.observed["by_binary"]:
+        facts["observed_tests"] = results.observed
     if summaries or step == "nextest":
         facts["tests"] = rows
         facts["tests_retried"] = sum(1 for row in rows if row["attempts"] > 1)

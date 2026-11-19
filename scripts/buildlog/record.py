@@ -12,7 +12,6 @@ port_lint.py writes its own call records through write_call() here.
       the original row and sources for collect() to finish after a failed
       save. BUILDLOG_TEST_PHASE_FILE names the step's sampled test-phase
       sidecar, retained with those sources; missing observations are unknown.
-      BUILDLOG_TEST_SELECTION_FILE names the selection saved before nextest ran.
       BUILDLOG_TREE_START is the tree key step_context.py printed
       before the step; the key taken here, after it, decides tree_key and
       tree_changed.
@@ -285,7 +284,6 @@ class PendingStep:
     month_row_end: int
     test_phase_file: Path | NoTestPhaseRecord = NO_TEST_PHASE_RECORD
     test_phase: TestPhaseRecord | NoTestPhaseRecord | UnreadableTestPhaseRecord = NO_TEST_PHASE_RECORD
-    test_selection_file: Path | parse.NoTestSelection = parse.NO_TEST_SELECTION
 
 
 @dataclass(frozen=True)
@@ -529,8 +527,6 @@ def new_id(host: str, epoch: float) -> str:
 
 
 def rustc_version(argv: list[str], cwd: str) -> str | None:
-    from scripts.buildlog import parse
-
     words = ["rustc"]
     chosen = parse.toolchain(argv)
     if chosen:
@@ -702,8 +698,6 @@ def completed_test_phase_charge(reservation_id: str) -> TestPhaseChargeUse | NoT
 
 def test_phase_context(sampling_context: str, argv: list[str]) -> dict[str, object]:
     """Copy admission's selection, using the argv that actually runs for its width."""
-    from scripts.buildlog import parse
-
     loaded = cast(object, json.loads(sampling_context))
     if not isinstance(loaded, dict):
         raise ValueError("test-phase sampling context is not an object")
@@ -811,7 +805,6 @@ def _save_pending_step(pending: PendingStep, *, replace_existing: bool = False) 
         "held_log": str(pending.held_log) if isinstance(pending.held_log, Path) else None,
         "peak_file": str(pending.peak_file) if isinstance(pending.peak_file, Path) else None,
         "test_phase_file": str(pending.test_phase_file) if isinstance(pending.test_phase_file, Path) else None,
-        "test_selection_file": str(pending.test_selection_file) if isinstance(pending.test_selection_file, Path) else None,
         "test_phase_read_error": (pending.test_phase.reason
                                   if isinstance(pending.test_phase, UnreadableTestPhaseRecord) else None),
         "month_row_end": pending.month_row_end,
@@ -831,8 +824,9 @@ def _read_pending_step(path: Path) -> PendingStep:
             or not all(isinstance(row.get(key), str) for key in ("host", "id", "started_at"))):
         raise ValueError("pending record is not a build step")
     held, peak, phase = fields.get("held_log"), fields.get("peak_file"), fields.get("test_phase_file")
-    selection = fields.get("test_selection_file")
-    if any(source is not None and not isinstance(source, str) for source in (held, peak, phase, selection)):
+    if ((held is not None and not isinstance(held, str))
+            or (peak is not None and not isinstance(peak, str))
+            or (phase is not None and not isinstance(phase, str))):
         raise ValueError("pending step has invalid source paths")
     boundary_key = "month_row_end" if "month_row_end" in fields else "month_offset"
     saved_boundary = fields.get(boundary_key)
@@ -846,8 +840,7 @@ def _read_pending_step(path: Path) -> PendingStep:
                   else _test_phase_record(row) if isinstance(phase, str) else NO_TEST_PHASE_RECORD)
     return PendingStep(row_key, row, Path(held) if isinstance(held, str) else NoHeldLog(),
                        Path(peak) if isinstance(peak, str) else NoPeakFile(), month_row_end,
-                       Path(phase) if isinstance(phase, str) else NO_TEST_PHASE_RECORD, test_phase,
-                       Path(selection) if isinstance(selection, str) else parse.NO_TEST_SELECTION)
+                       Path(phase) if isinstance(phase, str) else NO_TEST_PHASE_RECORD, test_phase)
 
 
 def _step_month_file(row: Mapping[str, object]) -> Path:
@@ -886,10 +879,9 @@ def _resume_step_line(pending: PendingStep) -> bool:
 
 
 def _delete_step_sources(held: Path | NoHeldLog, peak: Path | NoPeakFile,
-                         phase: Path | NoTestPhaseRecord = NO_TEST_PHASE_RECORD,
-                         selection: Path | parse.NoTestSelection = parse.NO_TEST_SELECTION) -> None:
+                         phase: Path | NoTestPhaseRecord = NO_TEST_PHASE_RECORD) -> None:
     sidecars = [Path(str(peak) + suffix) for suffix in (CPU_SIDECAR, IO_SIDECAR)] if isinstance(peak, Path) else []
-    for path in (held, peak, phase, selection, *sidecars):
+    for path in (held, peak, phase, *sidecars):
         if isinstance(path, Path):
             path.unlink(missing_ok=True)
             if path.parent.is_dir():
@@ -911,7 +903,7 @@ def _finish_step(path: Path, pending: PendingStep, publish: Callable[[PendingSte
             raise OSError("failed step log was not saved")
         _sync_directory((store.root() / saved_log).parent)
     added = publish(pending)
-    _delete_step_sources(pending.held_log, pending.peak_file, pending.test_phase_file, pending.test_selection_file)
+    _delete_step_sources(pending.held_log, pending.peak_file, pending.test_phase_file)
     os.utime(path, None)
     with path.open("rb") as handle:
         os.fsync(handle.fileno())
@@ -1030,6 +1022,14 @@ def _hana_step_row(key: hana_result.HanaAttemptKey, link: hana_result.LogicalSte
             'call_id': link.call_id, **hana_result.linked_step_fields(key, link, 'remote', final)}
 
 
+def captured_log_facts(step: str, output: bytes, source: str) -> parse.LogFacts:
+    try:
+        return parse.log_facts(step, output.decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 -- a parser failure must preserve the step result
+        store.note_error(f"parse {step} {source}")
+        return parse.no_facts()
+
+
 def publish_hana_result(accepted: hana_result.AcceptedHanaResult, link: hana_result.LogicalStepLink,
                         context: HanaStepContext) -> PublishedStep:
     """Publish only a result accepted under the execution journal lock."""
@@ -1037,13 +1037,16 @@ def publish_hana_result(accepted: hana_result.AcceptedHanaResult, link: hana_res
 
     result = accepted.result
     output = result.stdout + result.stderr
+    parse_input = output
+    if result.stdout and result.stderr and not result.stdout.endswith(b"\n"):
+        parse_input = b"\n".join((result.stdout, result.stderr))
     row = _hana_step_row(result.key, link, context, result.host, result.started_at, result.finished_at,
                          result.status, True)
     row.update({'argv': list(result.argv), 'source_key': result.source_key, 'source_commit': result.commit,
                 'sha': result.commit[:12], 'toolchain_identity': result.toolchain,
                 'duration_s': result.execution_seconds,
                 'peak_mem_bytes': result.memory.bytes if isinstance(result.memory, hana_result.MeasuredPeak) else None,
-                **parse.log_facts(context.step, output.decode('utf-8', 'replace'))})
+                **captured_log_facts(context.step, parse_input, str(row['id']))})
     return _publish_hana_step(row, output)
 
 
@@ -1073,24 +1076,6 @@ def scope_resources(peak: str) -> cgroup_capture.StepScopeCounters:
             "io": cgroup_capture.parse_io(sidecar(IO_SIDECAR))}
 
 
-def selection_fields(source: Path | parse.NoTestSelection) -> dict[str, object]:
-    if isinstance(source, parse.NoTestSelection):
-        return {}
-    try:
-        content = source.read_text(encoding="utf-8")
-        if not content:
-            return {}
-        selection = parse.saved_test_selection(cast(object, json.loads(content)))
-        if isinstance(selection, parse.SelectedTests):
-            return {"selected_tests": selection.by_binary}
-    except FileNotFoundError:
-        return {}
-    except ValueError:
-        pass
-    store.note_error(f"invalid nextest selection {source}")
-    return {}
-
-
 def step(args: list[str]) -> None:
     import hashlib
     from scripts.buildlog import treekey
@@ -1100,19 +1085,15 @@ def step(args: list[str]) -> None:
     host = store.host_name()
     cwd = os.getcwd()
     phase_path = os.environ.get("BUILDLOG_TEST_PHASE_FILE", "")
-    selection_path = os.environ.get("BUILDLOG_TEST_SELECTION_FILE", "")
     identity: list[object] = [host, cwd, args]
     if phase_path:
         identity.append(str(Path(phase_path).absolute()))
-    if selection_path:
-        identity.append({"test_selection_file": str(Path(selection_path).absolute())})
     row_key = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
     pending_path = pending_steps_root() / f"{row_key}.json"
     done_path = pending_path.with_suffix(".done")
     held_log = Path(held).absolute() if held else NoHeldLog()
     peak_file = Path(peak).absolute() if peak else NoPeakFile()
     phase_file = Path(phase_path).absolute() if phase_path else NO_TEST_PHASE_RECORD
-    selection_file = Path(selection_path).absolute() if selection_path else parse.NO_TEST_SELECTION
     store.root().mkdir(parents=True, exist_ok=True)
     try:
         with (store.root() / LAUNCH_LOCK_NAME).open("a+b") as lock:
@@ -1120,7 +1101,7 @@ def step(args: list[str]) -> None:
             if pending_path.exists():
                 _ = finish_pending_step(pending_path)
                 return
-            if (held or peak or phase_path or selection_path) and done_path.exists():
+            if (held or peak or phase_path) and done_path.exists():
                 return
         try:
             start = float(start_text)
@@ -1129,7 +1110,7 @@ def step(args: list[str]) -> None:
             started_at, ended_at = store.utc_iso(start), store.utc_iso(end)
         except (ValueError, OverflowError, OSError):
             store.note_error(f"record.py step {' '.join(args)[:500]}")
-            _delete_step_sources(held_log, peak_file, phase_file, selection_file)
+            _delete_step_sources(held_log, peak_file, phase_file)
             return
         tty = tty_text == "1"
         directory = git_directory(argv, cwd)
@@ -1150,10 +1131,7 @@ def step(args: list[str]) -> None:
         log: str | None = None
         if not tty and held and os.path.isfile(held):
             data = Path(held).read_bytes()
-            try:
-                facts = parse.log_facts(name, data.decode("utf-8", "replace"))
-            except Exception:  # noqa: BLE001 -- a parser bug loses the facts, never the record
-                store.note_error(f"parse {name} {held}")
+            facts = captured_log_facts(name, data, held)
             if status != 0:
                 log = _log_relative_path(host, start, record_id)
         output_roots = step_context.step_output_roots(argv, cwd) if name != "sweep" else CargoOutputUnavailable("sweep step")
@@ -1208,7 +1186,6 @@ def step(args: list[str]) -> None:
             "mem_stall_some_s": memory.stall_some_s if isinstance(memory.stall_some_s, float) else None,
             "mem_stall_full_s": memory.stall_full_s if isinstance(memory.stall_full_s, float) else None,
             **facts,
-            **selection_fields(selection_file),
             "log": log,
             **(test_phase_fields(phase) if not isinstance(phase, UnreadableTestPhaseRecord) else {}),
             **placement_step_fields(),
@@ -1218,11 +1195,11 @@ def step(args: list[str]) -> None:
             if pending_path.exists():
                 _ = finish_pending_step(pending_path)
                 return
-            if (held or peak or phase_path or selection_path) and done_path.exists():
+            if (held or peak or phase_path) and done_path.exists():
                 return
             month_file = store.host_file(host, start)
             month_row_end = store.read_last_whole_row_end(month_file)
-            pending = PendingStep(row_key, record, held_log, peak_file, month_row_end, phase_file, phase, selection_file)
+            pending = PendingStep(row_key, record, held_log, peak_file, month_row_end, phase_file, phase)
             _ = _finish_step(_save_pending_step(pending), pending, write_step_line)
     except Exception:  # noqa: BLE001 -- retain every source needed for a retry
         if pending_path.is_file():

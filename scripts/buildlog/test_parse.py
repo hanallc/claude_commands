@@ -135,31 +135,6 @@ class CleaningTests(unittest.TestCase):
 
 
 class FixtureTests(unittest.TestCase):
-    def test_nextest_listing_preserves_binary_metadata_and_only_selected_names(self) -> None:
-        build = {"target-directory": "/work/target"}
-        binary = {"binary-id": "hana::test_target", "binary-path": "/work/target/test"}
-        skipped = {"binary-id": "hana::skipped", "binary-path": "/work/target/skipped"}
-        listing = parse.nextest_listing({
-            "rust-build-meta": build,
-            "rust-suites": {
-                "hana::test_target": {
-                    **binary, "cwd": "/work", "status": "listed", "package-name": "hana",
-                    "testcases": {
-                        "tests::fast": {"ignored": False, "filter-match": {"status": "matches"}},
-                        "tests::ignored": {"ignored": True, "filter-match": {"status": "matches"}},
-                        "tests::excluded": {"ignored": False, "filter-match": {"status": "mismatch", "reason": "expression"}},
-                    },
-                },
-                "hana::skipped": {**skipped, "status": "skipped", "package-name": "hana"},
-            },
-        })
-        self.assertEqual(listing.selection.by_binary, {"hana::test_target": ["tests::fast", "tests::ignored"]})
-        self.assertEqual(listing.binaries_metadata, {
-            "rust-build-meta": build, "rust-binaries": {"hana::test_target": binary, "hana::skipped": skipped},
-        })
-        self.assertEqual(parse.saved_test_selection(listing.selection.by_binary), listing.selection)
-        self.assertIsInstance(parse.saved_test_selection({"hana": ["valid", 7]}), parse.NoTestSelection)
-
     def test_compiled_names_keep_every_counted_line_in_log_order(self) -> None:
         text = (
             "\x1b[32m   Compiling hana v0.1.0 (/r/hana)\x1b[0m\n"
@@ -227,6 +202,13 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(result["tests_skipped"], 0)
         self.assertEqual(result["tests_flaky"], 1)
         self.assertEqual(result["tests_retried"], 2)
+        self.assertEqual(result.get("observed_tests"), {
+            "by_binary": {
+                "alpha": ["tests::fails", "tests::adds", "tests::flaky", "tests::slow"],
+                "beta": ["tests::doubles"],
+            },
+            "complete": True,
+        })
         # The warning cargo repeats for the lib test target counts once.
         self.assertEqual(result["warnings"], 1)
         rows = {row["test"]: row for row in result["tests"] or []}
@@ -243,6 +225,7 @@ class FixtureTests(unittest.TestCase):
         tests = {row["test"] for row in result["tests"] or []}
         self.assertEqual(tests, {"tests::fails", "tests::flaky", "tests::slow"})
         self.assertEqual(result["tests_run"], 5)
+        self.assertEqual(result.get("observed_tests"), facts("nextest", "nextest").get("observed_tests"))
 
     def test_mend_times_and_fixes(self) -> None:
         result = facts("mend", "mend")
@@ -409,8 +392,9 @@ class NextestFormTests(unittest.TestCase):
             _ = write_config_fixture(config / "test_times.conf")
             _ = write_config_fault(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=unusable")
             with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
-                rows, summaries = parse.test_results(["    Checking hana v0.1.0", "    Finished in 0.10s"])
-                self.assertEqual((rows, summaries), ([], []))
+                result = parse.test_results(["    Checking hana v0.1.0", "    Finished in 0.10s"])
+                self.assertEqual((result.timing_rows, result.summaries), ([], []))
+                self.assertEqual(result.observed, {"by_binary": {}, "complete": False})
                 with self.assertRaises(ValueError):
                     _ = parse.test_results(["        PASS [ 2.000s] hana tests::slow"])
 
@@ -443,6 +427,7 @@ class NextestFormTests(unittest.TestCase):
         result = parse.log_facts("nextest", "  TRY 1 FAIL [   0.003s] (───) alpha tests::fails\n")
         self.assertIsNone(result["tests_run"])
         self.assertEqual([row["test"] for row in result["tests"] or []], ["tests::fails"])
+        self.assertEqual(result.get("observed_tests"), {"by_binary": {"alpha": ["tests::fails"]}, "complete": False})
 
 
 class CargoSubcommandTests(unittest.TestCase):

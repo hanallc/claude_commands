@@ -185,7 +185,6 @@ buildlog_exec() {
 
 buildlog_write_step() {
     BUILDLOG_TARGET_FOLDER="${BUILDLOG_TARGET_FOLDER:-}" BUILDLOG_TEST_PHASE_FILE="${BUILDLOG_TEST_PHASE_FILE:-}" \
-        BUILDLOG_TEST_SELECTION_FILE="${BUILDLOG_TEST_SELECTION_FILE:-}" \
         BUILDLOG_TREE_START="${BUILDLOG_TREE:-}" BUILDLOG_MEM_WAIT_S="${BUILDLOG_MEM_WAIT_S:-0}" \
         "$BUILD_HELPER_ROOT/lib/py" "$BUILDLOG_RECORD" step "$@" </dev/null >/dev/null 2>&1
 }
@@ -476,27 +475,17 @@ run_step_attempt() {
         done
         BUILDLOG_MEM_WAIT_S=$memory_wait
     fi
-    local holder=() holder_options=() LINT_NEXTEST_WIDTH_FILE="" BUILDLOG_TEST_SELECTION_FILE=""
-    local LINT_PREBUILD_PREFIX=()
-    if [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then
-        if [[ -n "${LINT_NEXTEST_POOL:-}" && "${4:-}" == --test-threads ]]; then
-            LINT_NEXTEST_WIDTH_FILE="${TMPDIR:-/tmp}/nextest_tokens.$$.$RANDOM.width"
-            holder_options=(--pool "$LINT_NEXTEST_POOL" --width-file "$LINT_NEXTEST_WIDTH_FILE"
-                            --reservation "${BUILDLOG_MEM_RESERVATION:-}")
-        else
-            nextest_thread_report "$@"
-        fi
-        if [[ -n "${BUILDLOG_START:-}" ]]; then
-            BUILDLOG_TEST_SELECTION_FILE="$(mktemp "${TMPDIR:-/tmp}/nextest-selection.XXXXXXXX")" || BUILDLOG_TEST_SELECTION_FILE=""
-            if [[ -n "$BUILDLOG_TEST_SELECTION_FILE" ]]; then
-                holder_options+=(--selection-file "$BUILDLOG_TEST_SELECTION_FILE")
-            fi
-        fi
-        if [[ "${holder_options[0]:-}" != "" ]]; then
-            holder=("$BUILDLOG_MEM_PY" "$LINT_TEST_TOKENS_SCRIPT" "${holder_options[@]}" --)
-        fi
-        lint_prebuild_prefix
+    local holder=() LINT_NEXTEST_WIDTH_FILE=""
+    if [[ -n "${LINT_NEXTEST_POOL:-}" && "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run
+          && "${4:-}" == --test-threads ]]; then
+        LINT_NEXTEST_WIDTH_FILE="${TMPDIR:-/tmp}/nextest_tokens.$$.$RANDOM.width"
+        holder=("$BUILDLOG_MEM_PY" "$LINT_TEST_TOKENS_SCRIPT" --pool "$LINT_NEXTEST_POOL"
+                --width-file "$LINT_NEXTEST_WIDTH_FILE" --reservation "${BUILDLOG_MEM_RESERVATION:-}" --)
+    elif [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then
+        nextest_thread_report "$@"
     fi
+    local LINT_PREBUILD_PREFIX=()
+    if [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then lint_prebuild_prefix; fi
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" && -n "${BUILDLOG_PEAK:-}" ]]; then
         BUILDLOG_TEST_PHASE_FILE="$BUILDLOG_PEAK.test-phase.json"
         buildlog_sample_anon "$BUILDLOG_PEAK.cgroup" "$BUILDLOG_MEM_MAX_PATH" "$parent_pid" \
@@ -544,13 +533,11 @@ run_step_attempt() {
     buildlog_retry_unstarted_step "$@" || {
         status=$?
         [[ -z "$log" ]] || rm -f "$log"
-        [[ -z "$BUILDLOG_TEST_SELECTION_FILE" ]] || rm -f -- "$BUILDLOG_TEST_SELECTION_FILE"
         return "$status"
     }
     if [[ "$BUILDLOG_RETRY_STEP" == 1 ]]; then
         [[ -z "${BUILDLOG_PEAK:-}" ]] || rm -f "$BUILDLOG_PEAK"
         [[ -z "$log" ]] || rm -f "$log"
-        [[ -z "$BUILDLOG_TEST_SELECTION_FILE" ]] || rm -f -- "$BUILDLOG_TEST_SELECTION_FILE"
         return 0
     fi
     if [[ -n "$log" && $status -ne 0 ]] && grep -q "$SANDBOX_SIGNATURE" "$log"; then

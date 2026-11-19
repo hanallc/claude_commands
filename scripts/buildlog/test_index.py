@@ -824,31 +824,40 @@ class IndexTests(unittest.TestCase):
         ):
             with self.subTest(threshold=threshold):
                 _ = write_config_fixture(config / "test_times.conf", f"NEXTEST_SLOW_TEST_S={threshold}")
-                tests = parse.test_results(lines)[0]
+                tests = parse.test_results(lines).timing_rows
                 self.assertEqual({test["test"] for test in tests}, expected)
                 self.write(self.host_file, step("threshold", step="nextest", tests=tests))
                 _ = index.update()
                 self.assertEqual({row[0] for row in self.rows("SELECT test FROM tests")}, expected)
 
-    def test_only_fast_passes_get_a_gpu_class_from_the_saved_selection(self) -> None:
+    def test_fast_passes_get_a_gpu_class_only_with_proof(self) -> None:
         config = configure_cleanup(self, self.root)
         _ = write_config_fixture(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
-        facts = parse.log_facts("nextest", "PASS [ 0.010s] hana tests::fast\n"
-                                + "Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n")
+        passed = "PASS [ 0.010s] hana tests::fast\n"
+        summary = "Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n"
+        partial = "Summary [ 0.020s] 2 tests run: 2 passed, 0 skipped\n"
+        retry = "TRY 1 FAIL [ 0.008s] (───) hana tests::fast\n"
         self.write(self.host_file,
-                   step("saved", step="nextest", **facts, selected_tests={"hana": ["tests::fast"]}),
-                   step("legacy", step="nextest", **facts),
-                   step("partial", step="nextest", **facts, selected_tests={"hana": ["tests::fast", "tests::other"]}))
+                   step("complete", step="nextest", **parse.log_facts("nextest", passed + summary)),
+                   step("hidden", step="nextest", **parse.log_facts("nextest", summary)),
+                   step("partial", step="nextest", **parse.log_facts("nextest", passed + partial)),
+                   step("retry", step="nextest", **parse.log_facts("nextest", retry + summary)),
+                   step("missing-proof", step="nextest", **parse.log_facts(
+                       "nextest", passed + "PASS [ 0.010s] hana tests::other\n" + partial)),
+                   step("legacy", step="nextest", tests_run=1,
+                        tests=[{"binary": "hana", "test": "tests::fast", "status": "passed"}]))
         _ = index.update()
-        self.assertEqual(self.rows("SELECT test FROM tests"), [])
+        self.assertEqual(self.rows("SELECT step_id FROM tests ORDER BY step_id"), [("legacy",), ("retry",)])
         classes = index.NextestGpuClass
         with closing(index.read_only()) as database:
             proof = {("hana", "tests::fast"): classes.NO_GPU}
-            self.assertEqual(index.nextest_gpu_class(database, "saved", proof), classes.NO_GPU)
-            self.assertEqual(index.nextest_gpu_class(database, "legacy", proof), classes.UNKNOWN)
-            self.assertEqual(index.nextest_gpu_class(database, "partial", proof), classes.UNKNOWN)
+            for step_id, expected in (("complete", classes.NO_GPU), ("legacy", classes.NO_GPU),
+                                      ("hidden", classes.UNKNOWN), ("partial", classes.UNKNOWN),
+                                      ("retry", classes.UNKNOWN), ("missing-proof", classes.UNKNOWN)):
+                with self.subTest(step_id=step_id):
+                    self.assertEqual(index.nextest_gpu_class(database, step_id, proof), expected)
             proof["hana", "tests::fast"] = classes.GPU
-            self.assertEqual(index.nextest_gpu_class(database, "saved", proof), classes.GPU)
+            self.assertEqual(index.nextest_gpu_class(database, "complete", proof), classes.GPU)
             self.assertEqual(index.nextest_gpu_class(database, "partial", proof), classes.GPU)
 
     def cargo_build_rows(self, *commands: list[str]) -> list[tuple[object, ...]]:

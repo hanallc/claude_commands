@@ -31,16 +31,6 @@ PY = Path(__file__).resolve().parents[1] / "lib/py"
 FAKE_CARGO = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$CARGO_CALLS"
 [[ -z "${FAKE_QUIET:-}" ]] || exec >/dev/null
-if [[ "$2" == list ]]; then
-    [[ -z "${FAKE_BUILD_STATUS:-}" ]] || exit "$FAKE_BUILD_STATUS"
-    printf '%s\\n' '{"rust-build-meta":{},"rust-suites":{"hana":{"binary-id":"hana","testcases":{"tests::fast":{"filter-match":{"status":"matches"}}}}}}'
-    exit 0
-fi
-if [[ " $* " == *" --binaries-metadata "* ]]; then
-    for folder in "$TMPDIR"/nextest-selection.*; do
-        [[ "$(cat "$folder")" == '{"hana":["tests::fast"]}' ]] || exit 2
-    done
-fi
 if [[ " $* " == *" --no-run "* ]]; then
     # nextest 0.9.143 refuses these with --no-run.
     for flag in --fail-fast --no-fail-fast --max-fail --debugger --tracer; do
@@ -156,8 +146,8 @@ class BuildOnlyTests(unittest.TestCase):
         self.assertEqual(run.with_threads(8)[3:6], ["--test-threads", "8", "--no-fail-fast"])
 
     def test_each_run_only_form_is_dropped_with_its_value(self) -> None:
-        for given in (["--fail-fast"], ["--ff"], ["--no-fail-fast"], ["--nff"], ["--max-fail", "3"], ["--max-fail=3"],
-                      ["--retries", "2"], ["--retries=2"], ["-j", "4"], ["-j4"], ["--jobs", "4"], ["--test-threads", "4"],
+        for given in (["--fail-fast"], ["--no-fail-fast"], ["--max-fail", "3"], ["--max-fail=3"],
+                      ["--retries", "2"], ["--retries=2"], ["-j", "4"], ["-j4"], ["--test-threads", "4"],
                       ["--status-level", "all"], ["--final-status-level=fail"], ["--success-output", "never"],
                       ["--failure-output", "final"], ["--no-capture"], ["--nocapture"], ["--debugger", "gdb"],
                       ["--tracer", "strace"], ["--no-tests", "pass"], ["--stress-count", "2"],
@@ -286,7 +276,7 @@ class ReservationTests(PoolCase):
 class InvokeTests(PoolCase):
     """run_nextest through the real run_once, with the memory gate and build log stubbed."""
 
-    def run_nextest(self, makeflags: str, *arguments: str, capture_selection: bool = False) -> str:
+    def run_nextest(self, makeflags: str, *arguments: str) -> str:
         config_reader = self.root / "lint_config.sh"
         _ = config_reader.write_text("lint_config_enabled() { return 0; }\nlint_config_skip_notice() { :; }\n")
         script = """
@@ -296,17 +286,7 @@ shift
 require_nextest() { :; }
 buildlog_step_compiles() { return 1; }
 buildlog_finish_memory() { :; }
-buildlog_end() {
-    shift 3
-    printf 'recorded:%s\\n' "$*"
-    if [[ -n "${BUILDLOG_TEST_SELECTION_FILE:-}" ]]; then
-        cat "$BUILDLOG_TEST_SELECTION_FILE"
-        rm -- "$BUILDLOG_TEST_SELECTION_FILE"
-    fi
-}
-if [[ "$CAPTURE_SELECTION" == 1 ]]; then
-    buildlog_begin() { BUILDLOG_START=1; }
-fi
+buildlog_end() { shift 3; printf 'recorded:%s\\n' "$*"; }
 nextest_logical_cores() { LINT_LOGICAL_CORES=8; }
 LINT_TEST_WIDTH=logical
 run_nextest "$@"
@@ -316,7 +296,6 @@ run_nextest "$@"
             "CARGO_MAKEFLAGS": makeflags,
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_OFF": "1", "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "", "BUILDLOG_SCOPE": "0",
-            "CAPTURE_SELECTION": "1" if capture_selection else "0",
             "LINT_SKIP_SWEEP": "1", "TMPDIR": str(self.root),
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
@@ -327,24 +306,6 @@ run_nextest "$@"
                                 stdin=subprocess.DEVNULL, timeout=60)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout
-
-    def test_step_saves_its_selection_and_reuses_the_build_with_or_without_a_pool(self) -> None:
-        self.fill(5)
-        for pool, width in ((f"--jobserver-auth=fifo:{self.root / 'missing'}", 8),
-                            (f"--jobserver-auth=fifo:{self.pool}", 5)):
-            with self.subTest(pool=pool):
-                self.calls.unlink(missing_ok=True)
-                output = self.run_nextest(pool, "--workspace", "--no-fail-fast", "-P", "ci",
-                                          "-E", "test(fast)", "--", "--exact", "tests::fast",
-                                          capture_selection=True)
-                build, run = self.cargo_calls()
-                self.assertEqual(build, "nextest list --message-format=json --workspace -P ci -E test(fast)"
-                                        + " -- --exact tests::fast")
-                self.assertRegex(run, fr"^nextest run --test-threads {width} --no-fail-fast -P ci -E test\(fast\)"
-                                      + r" --binaries-metadata .+ -- --exact tests::fast$")
-                self.assertIn(f"recorded:cargo nextest run --test-threads {width} --workspace", output)
-                self.assertIn('{"hana":["tests::fast"]}', output)
-                self.assertEqual(self.free_tokens(), 5)
 
     def test_pool_run_builds_first_and_records_the_width_it_ran_at(self) -> None:
         self.fill(5)
