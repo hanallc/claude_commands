@@ -10,7 +10,7 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import urlencode
 
@@ -161,6 +161,17 @@ class WaitingWhyTests(unittest.TestCase):
         self.assertIsInstance(delivery, change_page.MessageDelivery)
         self.assertEqual(status.slots(self.fixture.page, 'C1').waiting_why,
                          'The user asked the showrunner to validate this change.')
+
+    def test_delivery_rewrite_keeps_unknown_handoff_time(self) -> None:
+        status = change_page.DeliveryStatus(self.root)
+        page = self.fixture.page
+        path = status.path(page, 'C1')
+        _ = path.write_text('{"validation":{"attempt":"check","state":"sent"}}\n')
+        with status.locked():
+            slots = replace(status.slots(page, 'C1'), waiting_why=WHY)
+            status.write_slots(page, 'C1', slots)
+        self.assertEqual(status.slots(page, 'C1').waiting_why, WHY)
+        self.assertNotIn('handed_at', cast(dict[str, object], json.loads(path.read_text())))
 
     def test_set_updates_unowned_question_under_canonical_lock(self) -> None:
         item = self.enter_waiting(review_items.ReviewType.QUESTION, WHY)

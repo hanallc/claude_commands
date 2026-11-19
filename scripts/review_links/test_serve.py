@@ -403,6 +403,31 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(reply.status, 200)
         self.assertIn(b'data-review-index', reply.body)
 
+    def test_review_index_omits_an_unknown_handoff_time(self) -> None:
+        case = self.review_fixture(changes=2)
+        saved = '2026-11-16T12:49:08-05:00'
+        for row, time_fields in (('C1', {}), ('C2', {'handed_at': saved})):
+            path = change_routing.delivery_path(case.root, case.fixture.review_list, row)
+            _ = path.write_text(json.dumps({'validation': {'attempt': row, 'state': 'sent'}, **time_fields}))
+            os.utime(path, (1795123200, 1795123200))
+        snapshot = review_page.build_snapshot(case.root)
+        with patch.object(review_page.ReviewSnapshotCache, 'get', return_value=snapshot):
+            reply = self.request(review_page.PAGE_PATH + '?index=1')
+        self.assertEqual(reply.status, 200)
+        entries = {entry['key']: entry for entry in
+                   test_review_page.unpack_index(json.dumps(json.loads(reply.body)['index']))}
+        unknown = entries['page-owner/C1']
+        self.assertEqual(unknown['state'], review_items.ReviewState.VALIDATING)
+        self.assertNotIn('handoff', unknown)
+        self.assertEqual(entries['page-owner/C2'].get('handoff'), (saved, 'Nov 16 12:49 EST'))
+
+    def test_review_get_initializes_a_fresh_root(self) -> None:
+        _ = self.review_fixture()
+        self.assertFalse((self.root / change_page.CONSOLE_FOLDER / change_page.BROWSER_MANIFEST).exists())
+        reply = self.request(review_page.PAGE_PATH)
+        self.assertEqual(reply.status, 200)
+        self.assertIn(b'data-review-index', reply.body)
+
     def test_review_body_reports_its_version_and_gzip_uses_quality(self) -> None:
         case = self.review_fixture()
         key = case.question()
@@ -2278,6 +2303,43 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertEqual(code, 503)
                     self.assertEqual(json.loads(body), {"reason": f"Invalid quota clear state in {state}."})
                     self.assertEqual(state.read_bytes(), contents)
+
+    def test_quota_clear_accepts_a_submitted_reset_from_the_same_week(self) -> None:
+        from scripts.accounts import accounts
+
+        reset = datetime.now(timezone.utc) + timedelta(days=1)
+        state = accounts_page.quota_state(self.root)
+        quotas = {"claude1": accounts.WeeklyQuota(4, reset)}
+        cases = ((reset - timedelta(days=7), 400),
+                 (reset + timedelta(microseconds=526917), 200))
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(accounts, "stored_weekly_quotas", return_value=quotas)):
+            for submitted, status in cases:
+                with self.subTest(submitted=submitted):
+                    form = urlencode({"quota_account": "claude1", "quota_level": "urgent",
+                                      "quota_reset": submitted.isoformat()})
+                    self.assertEqual(self.post(accounts_page.PAGE_PATH, form)[0], status)
+                    if status == 400:
+                        self.assertFalse(state.exists())
+                    else:
+                        self.assertEqual(json.loads(state.read_text()), {
+                            "claude1": {"level": "urgent", "reset": reset.isoformat()},
+                        })
+
+    def test_warning_clear_keeps_an_urgent_record_for_the_same_week(self) -> None:
+        from scripts.accounts import accounts
+
+        reset = datetime.now(timezone.utc) + timedelta(days=1)
+        quotas = {"claude1": accounts.WeeklyQuota(9, reset)}
+        state = accounts_page.quota_state(self.root)
+        state.parent.mkdir(parents=True, exist_ok=True)
+        receipt = {"claude1": {"level": "urgent", "reset": (reset - timedelta(microseconds=526917)).isoformat()}}
+        _ = state.write_text(json.dumps(receipt), encoding="utf-8")
+        form = urlencode({"quota_account": "claude1", "quota_level": "warning", "quota_reset": reset.isoformat()})
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(accounts, "stored_weekly_quotas", return_value=quotas)):
+            self.assertEqual(self.post(accounts_page.PAGE_PATH, form)[0], 200)
+        self.assertEqual(json.loads(state.read_text()), receipt)
 
     def test_accounts_post_saves_and_clears_a_producers_next_move(self) -> None:
         from scripts.accounts import accounts, next_moves

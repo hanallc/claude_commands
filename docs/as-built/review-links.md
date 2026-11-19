@@ -380,6 +380,9 @@ One row can open its card in place.
 `record_table.py` supplies the table styles, filters, sorting and open-row controls for Review and The List.
 When a Review action removes a card, the shared table keeps a copy of the row and its open details in place.
 The copy fades and collapses in 200 ms, and the rows below slide up during that time.
+The Review page can restore a pending card after the user scrolls one viewport.
+The redraw that restores this card waits for all row animations to end.
+When Later hides the last card for an owner, the Owner filter resets after the fade ends.
 A save can change the card's sort values. The copy keeps its previous values until the fade ends.
 If the request fails, the row slides back into view and the current card stays selected.
 If the fade is still in progress, the return starts at the copy's current height and opacity.

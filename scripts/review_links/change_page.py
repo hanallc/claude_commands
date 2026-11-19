@@ -137,19 +137,26 @@ WITH_SHOWRUNNER = "This change is already with the showrunner."
 CHANGE_HANDOFFS = frozenset(("validate", "question", "feedback"))
 
 
-def handoff_time(path: Path, fallback: datetime) -> datetime:
-    """Read the request time, or use the file time for an older request."""
+def read_handed_at(path: Path) -> str | None:
+    """Read the saved hand-off field without changing its value."""
     try:
-        with path.open(encoding="utf-8") as stream:
-            fields = cast(object, json.load(stream))
-            if isinstance(fields, dict):
-                saved = cast(dict[str, object], fields).get("handed_at")
-                if isinstance(saved, str):
-                    parsed = datetime.fromisoformat(saved)
-                    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=user_zone())
-            return datetime.fromtimestamp(os.fstat(stream.fileno()).st_mtime, user_zone())
+        fields = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except (FileNotFoundError, ValueError):
+        return None
+    saved = cast(dict[str, object], fields).get("handed_at") if isinstance(fields, dict) else None
+    return saved if isinstance(saved, str) else None
+
+
+def handoff_time(path: Path) -> datetime | None:
+    """Read the saved hand-off time."""
+    try:
+        saved = read_handed_at(path)
+        if saved is None:
+            return None
+        parsed = datetime.fromisoformat(saved)
     except (OSError, ValueError):
-        return fallback
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=user_zone())
 
 
 def require_user_turn(slots: DeliverySlots) -> None:
@@ -1081,9 +1088,11 @@ class DeliveryStatus:
         if saved_question is not None and isinstance(question, (OpenFeedback, CompletedFeedback)):
             saved_question["kind"] = "feedback"
         path = self.path(page, row)
-        if re.fullmatch(r"C\d+", row) and not slots.waits_for_user(False):
-            now = datetime.fromtimestamp(time.time(), user_zone())
-            fields["handed_at"] = (now if new_handoff else handoff_time(path, now)).isoformat()
+        if fields and re.fullmatch(r"C\d+", row):
+            if new_handoff:
+                fields["handed_at"] = datetime.fromtimestamp(time.time(), user_zone()).isoformat()
+            elif (saved := read_handed_at(path)) is not None:
+                fields["handed_at"] = saved
         published = False
         try:
             if fields:
