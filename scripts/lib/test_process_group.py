@@ -23,9 +23,9 @@ import unittest
 from typing import cast, override
 from unittest.mock import MagicMock, patch
 
-from scripts.lib.py_floor_test_support import interpreter_cache_environment
+from scripts.direct.verify_shell_test_support import verify_cancellation_functions
 from scripts.lib import process_group
-from scripts.lib.shell_test_support import shell_functions
+from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment
 
@@ -269,7 +269,7 @@ class ShellProcessGroupTests(PrivateGroupFixture):
             + f"raise SystemExit({status})\n")
 
     def cancel_step(self, function: str, child: subprocess.Popen[str]) -> subprocess.CompletedProcess[str]:
-        functions = shell_functions(self.root / "scripts/direct/verify.sh", "stop_run_step", function)
+        functions = verify_cancellation_functions(self.root / "scripts/direct/verify.sh", function)
         watch = self.root / "watch"
         watch.mkdir(exist_ok=True)
         driver = """
@@ -303,6 +303,7 @@ final_pass_finish() { :; }
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                 self.assertEqual((self.root / "helper-arguments").read_text(), f"{child.pid} {signum}")
                 self.assertNotIn("process group helper failed", result.stderr)
+                self.assertNotIn("close_mac_log: command not found", result.stderr)
 
     def test_verify_cancellation_reports_missing_or_refused_local_helpers(self) -> None:
         child = self.private_child()

@@ -42,6 +42,7 @@ from unittest import mock
 
 from scripts.build_hold import build_hold
 from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
+from scripts.direct.verify_shell_test_support import verify_cancellation_functions
 from scripts.lib import inotify
 from scripts.production.cli_fixture import invoke_cli
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -1321,8 +1322,8 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "collect_child", "verify_helper",
             "try_mac_test", "find_mac_runner_pid", "forward_mac_runner_signal", "target_for_settings", "target_platform",
             "step_state", "publish_step_state", "lint_code_files", "tree_key", "set_verdict_keys", "after_tree_change",
-            "start_tree_watch", "finish_tree_watch", "stop_tree_watch", "stop_run_step", "cancel_tree_run",
-            "record_mac_pass", "close_mac_log", "cache_record", "user_clock", "finish_mac_pass", "note_event",
+            "start_tree_watch", "finish_tree_watch", "stop_tree_watch",
+            "record_mac_pass", "cache_record", "user_clock", "finish_mac_pass", "note_event",
             "collect_hold_wait", "collect_routing_wait", "phase_wait_start", "phase_wait_holder_flags", "phase_wait_finish", "phase_wait_finish_all",
             "finish_hold_wait", "release_wait_claim", "step_can_retry", "remote_step_kind",
             "placement_once", "placement_failed", "local_cargo_build_folder", "start_routing_wait", "wait_for_placement", "buildlog_memory_event",
@@ -1330,6 +1331,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "pinned_target_refuse",
             "try_reserved_target", "step_close_checkout", "mac_only_refuse",
             "route_test", "check_routing_hold")
+        functions += verify_cancellation_functions(VERIFY, "cancel_tree_run")
         functions += shell_functions(VERIFY.parent.parent / "lint/invoke.sh", "buildlog_now")
         functions += shell_functions(VERIFY.parent.parent / "lint/memory_gate.sh",
                                      "build_hold_nothing_held", "build_hold_check_result",
