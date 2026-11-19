@@ -1208,23 +1208,38 @@ def retirement_find_unit(production_name: str, given: str, *,
 def retirement_last_session(unit: RetiringUnit) -> str:
     return unit.staff_member.current_session
 
-def retirement_branch_commits(unit: RetiringUnit, branch: str, *, settings: conf.ConfigRead) -> list[str]:
-    commits: list[str] = []
-    branch_ref = f"refs/heads/{branch}"
-    observed = retirement_git(unit, "show-ref", "--verify", "--quiet", branch_ref, settings=settings)
-    if observed.returncode == 0:
-        commits.append(branch_ref)
-    elif observed.returncode != 1:
+def retirement_branch_tips(unit: RetiringUnit, branches: tuple[str, ...], *,
+                           settings: conf.ConfigRead) -> dict[str, tuple[str, ...]]:
+    """Read the local and advertised tips without updating remote-tracking refs."""
+    refs = {branch: f"refs/heads/{branch}" for branch in branches}
+    requested = set(refs.values())
+
+    def selected_tips(output: str) -> dict[str, str]:
+        tips: dict[str, str] = {}
+        for line in output.splitlines():
+            commit, _, ref = line.partition("\t")
+            if ref in requested:
+                tips[ref] = commit
+        return tips
+
+    observed = retirement_git(unit, "for-each-ref", "--format=%(objectname)%09%(refname)",
+                              "--", *refs.values(), settings=settings)
+    if observed.returncode or observed.stderr.strip():
         raise OSError(retirement_failure(observed))
-    remote = retirement_git(unit, "ls-remote", "--exit-code", "--heads", "origin", branch_ref, settings=settings)
+    local = selected_tips(observed.stdout)
+    remote = retirement_git(unit, "ls-remote", "--exit-code", "--heads", "origin",
+                            *refs.values(), settings=settings)
     if remote.returncode not in (0, 2):
         raise OSError(retirement_failure(remote))
-    if remote.returncode == 0:
-        fetched = retirement_git(unit, "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "-q", "origin", branch_ref, settings=settings)
+    advertised = selected_tips(remote.stdout)
+    tips_to_fetch = dict.fromkeys(commit for ref, commit in advertised.items() if commit != local.get(ref))
+    if tips_to_fetch:
+        fetched = retirement_git(unit, "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "-q",
+                                 "origin", *tips_to_fetch, settings=settings)
         if fetched.returncode:
             raise OSError(retirement_failure(fetched))
-        commits.append(remote.stdout.split()[0])
-    return commits
+    return {branch: tuple(dict.fromkeys(tips[ref] for tips in (local, advertised) if ref in tips))
+            for branch, ref in refs.items()}
 
 def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead, check_absent_branch: bool = False) -> list[str]:
     """Keep uncommitted work and commits outside the merge branch."""
@@ -1240,9 +1255,11 @@ def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead, check_
                  if not (line[:2] == " M" and retirement_recorder_line_only(unit.worktree, line[3:], settings=settings))]
         if paths:
             found.append(f"uncommitted work in {unit.worktree}: {', '.join(paths)}")
-    refs = (retirement_branch_commits(unit, unit.branch, settings=settings) if unit.branch else
-            ["HEAD"] if present else [])
-    merge_refs = retirement_branch_commits(unit, unit.production.merge_branch, settings=settings)
+    merge_branch = unit.production.merge_branch
+    branches = (unit.branch, merge_branch) if unit.branch else (merge_branch,)
+    tips = retirement_branch_tips(unit, branches, settings=settings)
+    refs = tips[unit.branch] if unit.branch else ("HEAD",)
+    merge_refs = tips[merge_branch]
     if not merge_refs:
         raise OSError(f"merge branch {unit.production.merge_branch} is absent from origin and this clone")
     for ref in refs:
