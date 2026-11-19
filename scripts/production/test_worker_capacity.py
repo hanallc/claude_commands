@@ -88,7 +88,7 @@ class WorkerCapacityTests(StaffTestCase):
         _ = self.enterContext(mock.patch.object(herdr, "shared_session", return_value="fixture-session"))
         _ = self.enterContext(mock.patch.object(herdr, "Herdr"))
         _ = self.enterContext(mock.patch.object(showrunners, "load_settings_from", return_value=showrunners.ShowrunnerSettings(
-            threshold_percent=1, repeat_minutes=30, stall_minutes=5, faults_to=FAULTS_TO, always=[])))
+            threshold_percent=1, stall_minutes=5, faults_to=FAULTS_TO, always=[])))
 
     def stop(self, first: Sequence[worker_panes.WorkerPane], *later: worker_panes.WorkerPane) -> int:
         self.first = list(first)
