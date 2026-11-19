@@ -2024,6 +2024,8 @@ CI and ownerless scopes do not count as admitted runs for this exception.
 Each new start sets the next start time through `start_spacing_after`.
 The interval is `recovery_start_seconds`, currently 5 seconds, for launches and build steps alike.
 A completed step leaves its run a slot for `slot_gap_seconds`, currently 10 seconds.
+The slot keeps the caller name from the reservation, including when a continuation claims the slot.
+A snapshot that includes the matching reservation can restore a missing caller name.
 A continuation within the slot bypasses order, spacing, and pressure.
 A larger continuation holds the slot and requests only its extra memory before new runs.
 A closed connection frees its claim. An idle slot expires or ends with its verified run owner.

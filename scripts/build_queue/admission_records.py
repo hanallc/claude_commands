@@ -773,7 +773,7 @@ class EndedStepFactNotRecorded:
 
 @dataclass(frozen=True)
 class EndedStepFacts:
-    """The reservation's work and staff facts survive until the hold ends."""
+    """The reservation's caller, work, and staff facts survive until the hold ends."""
 
     step: str | EndedStepFactNotRecorded
     package: str | PackageNotRecorded
@@ -781,6 +781,7 @@ class EndedStepFacts:
     folder: str | EndedStepFactNotRecorded
     staff_id: StaffId | NoEndedStepStaff
     job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
+    caller_name: str | EndedStepFactNotRecorded = field(default_factory=EndedStepFactNotRecorded, kw_only=True)
 
 
 @dataclass(frozen=True)

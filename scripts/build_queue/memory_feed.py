@@ -603,11 +603,10 @@ def build_row_step(step: str, package: str | admission_records.PackageNotRecorde
     return program_name if isinstance(program_name, QueueRowName) else QueueRowName.recorded_step_text(step)
 
 
-def ended_step_name(facts: admission_records.EndedStepFacts, names: StepNames,
-                    owner: unit_labels.UnitLabels) -> QueueRowName | NoNamedStep:
+def ended_step_name(facts: admission_records.EndedStepFacts, names: StepNames) -> QueueRowName | NoNamedStep:
     step = facts.step if isinstance(facts.step, str) else ""
     if step in GATE_STEPS:
-        return QueueRowName.owner_only(public_queue_text(owner.unit) or owner.owner_text)
+        return QueueRowName.owner_only(facts.caller_name if isinstance(facts.caller_name, str) else "")
     return build_row_step(step, facts.package,
         facts.project if isinstance(facts.project, str) else "", facts.folder if isinstance(facts.folder, str) else "", names)
 
@@ -2328,10 +2327,12 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             if isinstance(slot.identity.job, StepJob):
                 job = slot.identity.job
             labels_for_slot = members.ended_step_labels(slot.identity)
-            title_step = ended_step_name(slot.identity, names, labels_for_slot)
+            title_step = ended_step_name(slot.identity, names)
             if isinstance(title_step, NoNamedStep):
                 continue
-            owner = StepPageOwner(labels_for_slot, unit=staff_unit(labels_for_slot))
+            caller = slot.identity.caller_name
+            owner = StepPageOwner(labels_for_slot, caller if isinstance(caller, str) else "",
+                                  unit=staff_unit(labels_for_slot))
             display_name = title_step
             parts: list[staff_names.NamePart] = []
         else:

@@ -12,7 +12,7 @@ import os
 import re
 from collections import Counter
 from collections.abc import Iterable, Mapping
-from contextlib import nullcontext, redirect_stdout
+from contextlib import redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPConnection
@@ -1510,6 +1510,34 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(row["unit"], "startup")
         self.assertEqual(row.get("detail"), "between steps")
 
+    def test_released_holds_keep_the_recorded_caller(self) -> None:
+        members = staff.StaffSnapshot(())
+        for continuation in (False, True):
+            with (self.subTest(continuation=continuation), AdmissionFixture() as fixture,
+                  mock.patch.object(staff, "local_snapshot", return_value=members),
+                  mock.patch.object(staff, "snapshot", return_value=members)):
+                run = fixture.run_owner()
+                first = fixture.request(run=run, step="merge-gate", need=6 * admission_records.GIB)
+                first = replace(first, identity=replace(first.identity, name="caller with no staff record"))
+                grant = only_admitted(fixture.server.handle_request(first))
+                if continuation:
+                    fixture.free(0)
+                    _ = fixture.server.handle_request(fixture.request(run=run, need=8 * admission_records.GIB))
+                fixture.release(grant)
+                reply, = fixture.server.handle_request(wire.ViewRequest())
+                assert isinstance(reply, wire.ViewReply)
+                slot, = reply.reading.explanation.decided_from.slots
+                self.assertIsInstance(slot, admission_records.ContinuationSlot if continuation
+                                      else admission_records.BetweenStepsSlot)
+                for stage, current in (("released", reply), ("snapshot", wire.parse_reply(wire.encode_reply(reply)))):
+                    with self.subTest(stage=stage):
+                        assert isinstance(current, wire.ViewReply)
+                        with mock.patch.object(admission_client, "view", return_value=current.reading):
+                            page = memory_feed.reading()
+                        row, = [row for row in page["walk"] if row.get("between_steps")]
+                        self.assertEqual(row["name"], first.identity.name)
+                        self.assertEqual(row.get("caller"), first.identity.name)
+
     def test_between_steps_holds_name_their_distinct_owners(self) -> None:
         inputs = captured_reading().explanation.decided_from
         policy = admission_policy_fixture()
@@ -2541,7 +2569,8 @@ process.stdout.write(JSON.stringify({
             with self.subTest(ended_step=step):
                 run = LiveBuildRun(101, "101", inputs.now - 15)
                 reservation = memory_tests.ProgressKeepAsideTests.reservation(step, need=admission_records.GIB)
-                reservation.update(run_origin=admission_records.CallerRun(run), slot_staff=owner.id)
+                reservation.update(run_origin=admission_records.CallerRun(run), slot_staff=owner.id,
+                                   session_name=owner.name)
                 hold = gate.ended_step_slot(reservation, inputs.now, policy)
                 assert isinstance(hold, admission_records.BetweenStepsSlot)
                 reading = gate.queue_read_from(replace(inputs, slots=(hold,)), policy)
@@ -2711,6 +2740,7 @@ process.stdout.write(JSON.stringify({
         unknown = unit_labels.UnitLabels("unknown")
         for step, owner, expected in (
             ("targeted-test", director, "panes"),
+            ("build", director, "panes build"),
             ("merge-gate", runner, "builds"),
             ("merge-gate", director, "panes"),
             ("merge-gate", merge_staff, "sdlc-merge-gate"),
@@ -2729,6 +2759,17 @@ process.stdout.write(JSON.stringify({
                 waiting = [row for row in page["waiters"] if row.get("kind") == "cloud"]
                 self.assertEqual([row["name"] for row in running], [expected])
                 self.assertEqual([row["name"] for row in waiting], [expected])
+
+    def test_cloud_page_shows_the_recorded_staff_role(self) -> None:
+        for name, role, worker in (("impl", unit_labels.Runner.WORKER, "impl"),
+                                   ("panes", unit_labels.Runner.UNIT_DIRECTOR, "")):
+            with self.subTest(role=role):
+                owner = unit_labels.UnitLabels(name, "sdlc", "panes", unit_labels.OwnerRole.UNIT, role)
+                page = self.cloud_owner_page("targeted-test", owner)
+                rows = [cast(memory_feed.CloudWorkRow, row) for row in (*page["walk"], *page["waiters"])
+                        if row.get("kind") == "cloud"]
+                self.assertEqual([(row["showrunner"], row["unit"], row.get("runner"), row.get("worker")) for row in rows],
+                                 [("sdlc", "panes", role, worker)] * 2)
 
     def test_queue_views_keep_recorded_names_when_registry_labels_are_empty(self) -> None:
         base = cloud_reading(with_wait_reason(captured_reading(), admission_records.NeedsMemory()))
@@ -3324,16 +3365,12 @@ def write_browser_fixture(folder: Path) -> None:
         director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
                                           unit_labels.DirectsUnit("panes"))
         runner = unit_labels.make_labels("builds", unit_labels.RunsProduction("builds"), unit_labels.NoDirector())
-        for version in ("before", "after"):
-            def recorded_name(row: wire.CloudRow, model: queue_view.QueueModel) -> str:
-                return model.names.shown(row.identity.step)
-            naming = mock.patch.object(queue_view, "cloud_step_name", side_effect=recorded_name)
-            with (naming if version == "before" else nullcontext()):
-                targeted = fixture.cloud_owner_page("targeted-test", director)
-                merge = fixture.cloud_owner_page("merge-gate", runner)
-            targeted["walk"] = [row for page in (targeted, merge) for row in page["walk"] if row.get("kind") == "cloud"]
-            targeted["waiters"] = [row for page in (targeted, merge) for row in page["waiters"] if row.get("kind") == "cloud"]
-            pages[f"owner_names_{version}"] = json.loads(memory_feed.page_json(targeted))
+        targeted = fixture.cloud_owner_page("targeted-test", director)
+        merge = fixture.cloud_owner_page("merge-gate", runner)
+        targeted["walk"] = [row for page in (targeted, merge) for row in page["walk"] if row.get("kind") == "cloud"]
+        targeted["waiters"] = [row for page in (targeted, merge) for row in page["waiters"] if row.get("kind") == "cloud"]
+        owner_names = cast(object, json.loads(memory_feed.page_json(targeted)))
+        pages["owner_names_before"] = pages["owner_names_after"] = owner_names
         owner = unit_labels.make_labels("impl", unit_labels.UnderShowrunner("hana", "hana", ""),
                                         unit_labels.UnderDirector("research", "research", ""))
         pages["step_owners"] = json.loads(memory_feed.page_json(fixture.owner_machine_page(owner)))

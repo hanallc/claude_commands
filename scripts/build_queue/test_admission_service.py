@@ -3922,7 +3922,8 @@ class RoomAndSlotTests(unittest.TestCase):
             slot, = fixture.server.slots.values()
             self.assertEqual(cast(dict[str, object], codec.snapshot_value(slot)).get("identity"),
                              {"kind": "EndedStepFacts", "step": "nextest", "package": "hana",
-                              "project": "fixture", "folder": str(fixture.root), "staff_id": "fixed-director"})
+                              "project": "fixture", "folder": str(fixture.root), "staff_id": "fixed-director",
+                              "caller_name": "fixture"})
             _ = fixture.run_pass()
             saved = queue_snapshot.read_queue_snapshot(fixture.state_dir)
             assert isinstance(saved, queue_snapshot.QueueSnapshot)

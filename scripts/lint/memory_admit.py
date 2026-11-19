@@ -1792,7 +1792,8 @@ def ended_step_slot(row: Reservation, ended_at: float,
     facts = records.EndedStepFacts(job.step if isinstance(job, StepJob) else identity["step"] or absent,
         row.get("package") or waiter.get("package") or PackageNotRecorded(),
         step_project(waiter.get("repository_name", ""), row["repo"]) or absent,
-        identity["folder"] or absent, row.get("slot_staff", records.NoEndedStepStaff()), job=job)
+        identity["folder"] or absent, row.get("slot_staff", records.NoEndedStepStaff()), job=job,
+        caller_name=identity["session_name"] or absent)
     return BetweenStepsSlot(origin.run, row.get("reservation_id", ""), row["need"],
                             ended_at + policy.timing.slot_gap_seconds, facts)
 

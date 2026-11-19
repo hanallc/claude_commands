@@ -1512,8 +1512,9 @@ class AdmissionServer:
             self.run_places = state.run_places
             self.lifecycle_outbox = state.lifecycle_outbox
             self.caller_versions = state.caller_versions
-            self.placement_requests = {key: self._named_placement(request, members=members)
-                                       for key, request in state.placement_requests.items()}
+            self.placement_requests = {
+                key: replace(request, identity=self._named_identity(self._placement_identity(request), members=members))
+                for key, request in state.placement_requests.items()}
             self.assignments = state.assignments
             self.current_assignments = state.current_assignments
         self.persist()
@@ -4124,22 +4125,18 @@ done
         caller = records.queue_caller(session, "", name, "", folder, members=members, unit=unit)
         return replace(caller, name=name.strip() or caller.name)
 
-    def _named_identity(self, identity: wire.Identity, *, folder: str = "",
-                        members: records.QueueStaff | None = None) -> wire.Identity:
-        if members is None:
-            members = records.queue_staff() if identity.session_id else records.NO_STAFF_LOOKUP
+    def _named_identity(self, identity: wire.Identity, *, members: records.QueueStaff, folder: str = "") -> wire.Identity:
         caller = self._stored_caller(identity.session_id, identity.name, identity.folder or folder, identity.unit,
                                      members=members)
         return replace(identity, name=caller.name, unit=caller.unit)
 
-    def _named_placement(self, request: wire.PlacementRequest, *,
-                         members: records.QueueStaff | None = None) -> wire.PlacementRequest:
+    @staticmethod
+    def _placement_identity(request: wire.PlacementRequest) -> wire.Identity:
         identity = request.identity
         session = request.constraints.session
-        identity = replace(identity, session_id=identity.session_id or (
+        return replace(identity, session_id=identity.session_id or (
             session.session_id if isinstance(session, OwningSession) else ""),
             step=identity.step or request.profile.step, folder=identity.folder or request.profile.worktree)
-        return replace(request, identity=self._named_identity(identity, members=members))
 
     def handle_request(self, request: wire.Request, connection: Connection | NoConnection = NO_CONNECTION
                        ) -> list[wire.Reply]:
@@ -4173,11 +4170,15 @@ done
                 status_wire.KnownPlacementStatus(saved.assignment, self._assignment_state(saved), saved.provider))
             return [status_wire.PlacementStatusReply(status)]
         if isinstance(request, wire.RepositorySlotRequest):
-            return self._repository_slot(replace(request, identity=self._named_identity(request.identity)), connection)
+            members = records.queue_staff() if request.identity.session_id else records.NO_STAFF_LOOKUP
+            identity = self._named_identity(request.identity, members=members)
+            return self._repository_slot(replace(request, identity=identity), connection)
         if isinstance(connection, Connection):
             self._record_caller_version(request, connection, persist_change=not isinstance(request, wire.ConsumePermission))
         if isinstance(request, wire.PlacementRequest):
-            request = self._named_placement(request)
+            identity = self._placement_identity(request)
+            members = records.queue_staff() if identity.session_id else records.NO_STAFF_LOOKUP
+            request = replace(request, identity=self._named_identity(identity, members=members))
         if isinstance(request, (wire.PlacementRequest, wire.ConsumePermission, wire.ClaimFailure, wire.ExecutionReport,
                                 wire.PrerequisiteReport, wire.CancelPlacement)):
             replies = self._handle_placement(request, connection)
@@ -4238,7 +4239,8 @@ done
                    for episode, waiting in self.waiters.items()):
                 return self._mutation_reply(key, wire.Refused("owner already has an admission episode"))
             folder = request.cwd if isinstance(request, wire.AdmitRequest) else request.profile.worktree
-            request = replace(request, identity=self._named_identity(request.identity, folder=folder))
+            members = records.queue_staff() if request.identity.session_id else records.NO_STAFF_LOOKUP
+            request = replace(request, identity=self._named_identity(request.identity, members=members, folder=folder))
             self._pending_replies[key] = []
             place_key = _place_key(request.owner, request.since)
             row = self._row(request, self.places.get(place_key, records.NoWaiter()))

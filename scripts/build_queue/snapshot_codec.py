@@ -75,6 +75,8 @@ def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> di
         if writing and schema.__name__ == "QueueInputs":
             # Pinned clients require this inactive field in the wire record.
             record = {**record, "override": {"kind": "NoHeadAdmissionOverride"}}
+        elif not writing and schema.__name__ == "QueueInputs":
+            record = recover_slot_callers(record)
         elif not writing and schema.__name__ == "BetweenStepsSlot":
             record = {**record, "identity": ended_step_facts(record.get("identity", {"kind": "HoldPredatesStepFacts"}))}
     if schema.__module__ == "scripts.build_queue.admission_records" and "running" in record:
@@ -101,7 +103,43 @@ def ended_step_facts(value: object) -> object:
     absent = {"kind": "EndedStepFactNotRecorded"}
     return {"kind": "EndedStepFacts", "step": name if source in ("step", "script") else absent,
             "package": {"kind": "PackageNotRecorded"}, "project": name if source == "repository" else absent,
-            "folder": absent, "staff_id": identity["staff_id"]}
+            "folder": absent, "staff_id": identity["staff_id"],
+            **({"caller_name": identity["caller_name"]} if "caller_name" in identity else {})}
+
+
+def recover_slot_callers(record: dict[str, object]) -> dict[str, object]:
+    """Use matching reservation evidence to name older holds."""
+    slots, reservations = record.get("slots"), record.get("reservations")
+    if not isinstance(slots, list) or not slots or not isinstance(reservations, list) or not reservations:
+        return record
+    callers: dict[str, str] = {}
+    for value in cast(list[object], reservations):
+        if not isinstance(value, dict):
+            continue
+        reservation = cast(dict[str, object], value)
+        key = reservation.get("reservation_id")
+        identity = reservation.get("queue_waiter", reservation)
+        if isinstance(key, str) and isinstance(identity, dict):
+            name = cast(dict[str, object], identity).get("session_name")
+            if isinstance(name, str) and name.strip():
+                callers[key] = name
+    if not callers:
+        return record
+
+    def recover(value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        slot = cast(dict[str, object], value)
+        if slot.get("kind") == "ContinuationSlot":
+            return {**slot, "slot": recover(slot["slot"])}
+        key, identity = slot.get("reservation"), slot.get("identity")
+        if slot.get("kind") == "BetweenStepsSlot" and isinstance(key, str) and key in callers and isinstance(identity, dict):
+            facts = cast(dict[str, object], identity)
+            if "caller_name" not in facts:
+                return {**slot, "identity": {**facts, "caller_name": callers[key]}}
+        return slot
+
+    return {**record, "slots": [recover(slot) for slot in cast(list[object], slots)]}
 
 
 def remote_memory_row(value: object) -> bool:
