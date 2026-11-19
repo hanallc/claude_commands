@@ -104,6 +104,7 @@ class VerifyDocFixture(unittest.TestCase):
         builder = cls()
         builder.root = cls.fixture_root
         builder.build_fixture()
+        builder.environment["PYTHONPYCACHEPREFIX"] = str(cls.fixture_root.parent / "bytecode")
         cls.fixture_environment = builder.environment.copy()
         _ = shutil.copytree(cls.fixture_root, cls.fixture_seed, symlinks=True)
         shutil.rmtree(cls.fixture_root)
@@ -145,8 +146,6 @@ class VerifyDocFixture(unittest.TestCase):
         tools.mkdir()
         self.executable(tools / "cargo", CARGO_STUB)
         self.executable(tools / "rustc", '#!/bin/sh\nprintf "rustc fixture\\n"\n')
-        targets = tools / "build-targets.py"
-        self.executable(targets, f'import runpy\nrunpy.run_path({str(SCRIPTS / "build_targets/build_targets.py")!r}, run_name="__main__")\n')
         _ = (self.root / "build_targets.conf").write_text(
             "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
@@ -174,12 +173,13 @@ class VerifyDocFixture(unittest.TestCase):
                                           "src_path": str(source), "required-features": []}]})
         self.environment = {
             name: value for name, value in os.environ.items()
-            if not name.startswith(("BUILD", "UNIT_", "LINT_", "MAC_TEST_", "CARGO_", "RUST",
+            if name != "PYTHONDONTWRITEBYTECODE"
+            and not name.startswith(("BUILD", "UNIT_", "LINT_", "MAC_TEST_", "CARGO_", "RUST",
                                     "NEXTEST_", "CLAUDE_CODE_", "CODEX_", "GIT_"))
         }
         self.environment.update({
             "HOME": str(home), "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
-            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPYCACHEPREFIX": str(self.root / "bytecode"),
             "LINT_SKIP_SWEEP": "1",
             "TEST_CARGO_EVENTS": str(self.events),
             "TEST_ORIGINAL_REPO": str(self.repo),
@@ -192,7 +192,7 @@ class VerifyDocFixture(unittest.TestCase):
             "VERIFY_STEPS_DIR": str(self.root / "verify-steps"),
             "BUILDLOG_DIR": str(self.root / "buildlog"), "BUILDLOG_OFF": "1", "BUILDLOG_SCOPE": "0",
             **memory_environment,
-            "BUILD_HOLD_DIR": str(self.root / "build-hold"), "BUILD_TARGETS_SCRIPT": str(targets),
+            "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "LINT_CONFIG_READER": str(SCRIPTS / "lint/lint_config.sh"),
             "LINT_SKIP_SWEEP": "1",
             "LINT_CONFIG_FILE": str(self.config), **config_environment(self.root),
