@@ -17,15 +17,9 @@ folder the ending director holds. In each one this removes:
 With --tracked it also ends tracked scratch for these runs, preserving live
 command directories and the scratch registry's existing unsaved-work holds.
 
-A checkout whose .git is a file is a linked worktree. It goes through its
-source repo (git worktree remove), so the source keeps no stale entry; a stale
-entry keeps the branch "already checked out" and the next git worktree add of
-it refuses. When that fails, the folder is deleted and the source pruned.
-
-It never descends into a folder it removes. A symbolic link is never followed:
-it is not a folder to this walk, and shutil.rmtree unlinks a link it finds, so
-nothing outside the run folder is reached. The run folder itself stays, with
-its ledgers, logs, diffs and json.
+For a linked worktree, cleanup also removes its registration in the source repository.
+The coordinator checks mount IDs before it descends into each directory.
+The run folder stays with its records and logs.
 """
 
 from __future__ import annotations
@@ -36,7 +30,6 @@ except FileNotFoundError:
 
 import argparse
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -83,24 +76,33 @@ def scratch_folders(run: Path) -> list[Path]:
     return found
 
 
-def worktree_source(folder: Path) -> Path | None:
-    """The common git folder of the repo folder is a linked worktree of, or None when folder is no
-    linked worktree: its .git is a file, not a link."""
+def worktree_checkout(folder: Path) -> git_files.Checkout | None:
+    """Read a linked worktree's checkout and registration."""
     if (folder / ".git").is_symlink() or not (folder / ".git").is_file():
         return None
     try:
-        return git_files.at(folder).common_dir
+        return git_files.at(folder)
     except git_files.GitFilesError:
         return None
 
 
-def git(common: Path, *arguments: str) -> bool:
-    try:
-        result = subprocess.run(["git", "--git-dir", str(common), "worktree", *arguments],
-                                check=False, capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return result.returncode == 0
+def worktree_source(folder: Path) -> Path | None:
+    checkout = worktree_checkout(folder)
+    return checkout.common_dir if checkout is not None else None
+
+
+def git(common: Path, operation: str, registration: scratch.WorktreeRegistration | None = None) -> bool:
+    """Remove a Git registration or prune stale registrations through the coordinator."""
+    with scratch.coordinate_removals() as removal:
+        if operation == "remove" and registration is not None:
+            return removal.remove_worktree_registration(registration)
+        if operation == "prune":
+            try:
+                removal.prune_worktrees(common)
+            except subprocess.SubprocessError:
+                return False
+            return True
+        raise ValueError(f"unsupported worktree operation: {operation}")
 
 
 def remove(folder: Path) -> None:
@@ -108,14 +110,11 @@ def remove(folder: Path) -> None:
 
 
 def remove_tree(folder: Path) -> None:
-    """Remove one scratch folder; a linked worktree through its source repo, so no entry stays."""
-    source = worktree_source(folder)
-    # Twice --force also removes a locked worktree: the run that locked it has ended.
-    if source is not None and git(source, "remove", "--force", "--force", str(folder)):
-        return
-    shutil.rmtree(folder)
-    if source is not None:
-        _ = git(source, "prune")
+    """Delete the checkout before removing its Git registration."""
+    def cleanup(registration: scratch.WorktreeRegistration) -> bool:
+        return git(registration.common, "remove", registration) or git(registration.common, "prune")
+
+    scratch.remove_journaled_tree(folder, worktree_checkout(folder), cleanup=cleanup)
 
 
 def end_tracked_scratch(run: Path) -> int:
@@ -142,6 +141,12 @@ def main() -> int:
     failed = 0
     for run in runs:
         removed = 0
+        try:
+            _ = scratch.recover_folder_operations((run,))
+        except (OSError, scratch.ScratchError) as error:
+            failed += 1
+            print(f"remove_run_scratch: could not recover {run}: {error}", file=sys.stderr)
+            continue
         for folder in scratch_folders(run):
             try:
                 remove(folder)
