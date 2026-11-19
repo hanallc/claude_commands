@@ -3045,7 +3045,7 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 - lint.conf: `sweep_build_floor_gib.natedev=733.29` after `sweep_free_floor_percent`; 3.2 MiB above the old 20 percent byte floor (accepted in review). The 300 GiB change is `/tune lint sweep_build_floor_gib.natedev 300`, only on the user's go.
 - Row 116e24ea0 on main 764582979 (same tree as 96a8d6a67, which had no Change-Review line). Tests in both layouts, 0 failures: 11 suites; types 0.
 
-### Phase 169 — The disk floor sweep sends one notice for each holder, not one for each target  · status: todo
+### Phase 169 — The disk floor sweep sends one notice for each holder, not one for each target  · status: in review
 **Source:** builds, 2026-11-19 04:2x EST: from 04:08 to 04:30 EST the sweep sent more than 150 messages to devtools (session 33c5eac0), about one each 10 s. Each one named the same pid 3179104 and one target.
 **Cause:** one `disk-floor.service` pass (pid 1787514, started 03:50:33) found 273 protected targets. `floor_holders` gives one `FloorHolder` for each busy target, and the pass sends `holder_message_text` once for each holder, one after the other (`sweep.py` near the `told = frozenset(...)` line). Each send takes about 9 s. The pass reads the process table once, so it still names the pid after the pid ends. The message says "removed all idle build output" when the pass removed nothing.
 
