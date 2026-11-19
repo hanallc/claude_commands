@@ -257,6 +257,80 @@ with {patches}:
                 sys.executable, str(copies), "run", "--repo", str(self.repo), "--commit", "HEAD", "--", *DOC_COMMAND,
             ))
 
+    def test_in_place_lint_keeps_the_source_copy_after_the_owner_dies(self) -> None:
+        admission = self.use_real_scope()
+        _ = write_config_fixture(self.config, "mend=on\nfmt=off\nclippy=off\nsweep=off\n")
+        started = self.root / "repair-pid"
+        release = self.root / "end-repair"
+        self.executable(self.root / "bin/cargo", CARGO_STUB.replace(
+            'elif arguments[:1] == ["doc"]:', f'''
+elif arguments[:1] == ["mend"] and "--fix" in arguments:
+    sys.path.insert(0, {str(VERIFY.parents[2])!r})
+    from scripts.direct.wait_for_test_state import wait_for_file
+
+    ready = Path({str(started)!r})
+    pending = ready.with_suffix(".new")
+    pending.write_text(str(os.getpid()))
+    pending.replace(ready)
+    wait_for_file(Path({str(release)!r}))
+    raise SystemExit(0)
+elif arguments[:1] == ["doc"]:
+'''))
+        with isolated_staff_file(self.root / "staff.json", self.environment):
+            caller = fixture_member("showrunner", name="lint-copy")
+            self.environment["CLAUDE_CODE_SESSION_ID"] = caller.current_session
+            copies = VERIFY.parents[1] / "copies/copies.py"
+            process, log, marker = self.start_doc(command=(
+                sys.executable, str(copies), "run", "--repo", str(self.repo), "--commit", "HEAD", "--",
+                "bash", str(VERIFY), "lint",
+            ))
+            wait_until(lambda: started.is_file() or process.poll() is not None, self.root, processes=(process,))
+            self.assertTrue(started.is_file(), log.read_text())
+            cargo_pid = int(started.read_text())
+            checkout = (Path("/proc") / str(cargo_pid) / "cwd").resolve(strict=True)
+            source_folder = checkout.parent
+            sidecar, = (self.root / "tmp").glob("buildlog.*.peak.cgroup")
+            scope = Path(sidecar.read_text().strip())
+            kill_file = scope / "cgroup.kill"
+            self.assertIn(cargo_pid, scope_members(scope))
+            _ = admission.run_pass()
+            kill_file.chmod(0)
+            try:
+                process.kill()
+                self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), -signal.SIGKILL)
+                self.assertIn(cargo_pid, scope_members(scope))
+                self.assertEqual(build_folders.build_folder_state(source_folder, wait=False), "held")
+                record = source_folder.with_name(source_folder.name + ".lease.json")
+                lease = cast(dict[str, object], json.loads(record.read_text()))
+                self.assertEqual(lease.get("scope"), str(scope))
+            finally:
+                release.touch()
+                if kill_file.exists():
+                    kill_file.chmod(0o200)
+                self.assertEqual(wait_for_marker_exit(marker, TEST_HANG_GUARD_SECS), set())
+                _ = admission.run_pass()
+            self.assertEqual(build_folders.build_folder_state(source_folder, wait=False), "free")
+
+    def test_doc_uses_the_build_directory_of_the_slot_it_holds(self) -> None:
+        build_directory = self.root / "cargo-build-directory"
+        self.executable(self.root / "bin/cargo", CARGO_STUB.replace(
+            'elif arguments[:1] == ["doc"]:', f'''
+elif arguments[:1] == ["doc"]:
+    Path({str(build_directory)!r}).write_text(os.environ["CARGO_BUILD_BUILD_DIR"])
+'''))
+        with mock.patch.dict(os.environ, self.environment), build_slots.take_slot(
+                self.repo, "HEAD", showrunner="builds", unit="doc-test", work="another build", purpose="doc",
+                wait_policy=build_slots.SlotWaitPolicy.REFUSE) as first:
+            self.environment.update(first.env)
+            metadata = cast(dict[str, object], json.loads(self.environment["TEST_METADATA"]))
+            metadata["build_directory"] = str(first.cargo_dir)
+            self.environment["TEST_METADATA"] = json.dumps(metadata)
+            result = self.verify()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        checkout = Path(self.cargo_calls()[0]["cwd"])
+        self.assertNotEqual(checkout, first.path)
+        self.assertEqual(Path(build_directory.read_text()), first.cargo_dir.with_name(checkout.name))
+
     def test_doc_refuses_launch_when_the_scope_publication_is_lost(self) -> None:
         config = Path(self.environment["CONF_DIR"]) / "direct.conf"
         _ = write_config_fixture(config, "# range: 5e-324..\nVERIFY_SCOPE_PUBLICATION_SECONDS=1\n")

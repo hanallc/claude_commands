@@ -30,10 +30,11 @@ POLL_MAX_MILLISECONDS = (1 << 31) - 1
 
 
 @dataclass(frozen=True)
-class PreparedDocCheckout:
+class InheritedCheckoutLease:
     path: Path
     lease_owner: int
     lock_fd: int
+    kind: build_folders.CheckoutLeaseKind
 
 
 @dataclass(frozen=True)
@@ -43,7 +44,7 @@ class PrivateStepCheckout:
     reply_fd: int
 
 
-OwnedCheckout = PreparedDocCheckout | PrivateStepCheckout
+OwnedCheckout = InheritedCheckoutLease | PrivateStepCheckout
 
 
 class NoOwnedCheckout(Enum):
@@ -207,8 +208,9 @@ def bind_checkout_scope(checkout: OwnedCheckout, scope: Path, owners: select.pol
         _ = os.write(checkout.request_fd, os.fsencode(scope) + b"\n")
         wait_for_checkout_confirmation(owners, checkout.reply_fd, deadline)
     else:
-        build_folders.write_checkout_lease(checkout.path, build_folders.CheckoutScopeBinding(scope, checkout.lease_owner),
-                                           checkout.lock_fd)
+        build_folders.write_checkout_lease(
+            checkout.path, build_folders.CheckoutScopeBinding(scope, checkout.lease_owner, checkout.kind),
+            checkout.lock_fd)
     if process_start_time(checkout.lease_owner) != owner_start:
         raise ValueError("the checkout lease owner exited during scope publication")
 
@@ -240,6 +242,7 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
                 raise ValueError("a scope owner exited before launch")
             owner_pid = os.environ.pop("VERIFY_CHECKOUT_OWNER", "")
             lock_fd = os.environ.pop("BUILDLOG_PREPARED_COPY_LOCK_FD", "")
+            source_copy = os.environ.pop("VERIFY_SOURCE_COPY_FOLDER", "")
             request_fd = os.environ.pop("DOC_COPY_LEASE_FD", "")
             reply_fd = os.environ.pop("DOC_COPY_REPLY_FD", "")
             checkout: OwnedCheckout | NoOwnedCheckout = NoOwnedCheckout.NOT_REQUIRED
@@ -247,7 +250,10 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
                 if request_fd:
                     checkout = PrivateStepCheckout(int(owner_pid), int(request_fd), int(reply_fd))
                 else:
-                    checkout = PreparedDocCheckout(Path.cwd(), int(owner_pid), int(lock_fd))
+                    kind = (build_folders.CheckoutLeaseKind.SOURCE_COPY if source_copy
+                            else build_folders.CheckoutLeaseKind.READY_SLOT)
+                    checkout = InheritedCheckoutLease(Path(source_copy) if source_copy else Path.cwd(),
+                                                       int(owner_pid), int(lock_fd), kind)
             watch = None
             deadline = 0.0
             if isinstance(checkout, OwnedCheckout):

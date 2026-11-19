@@ -546,10 +546,23 @@ elif [[ -z "${IN_NIX_SHELL:-}" ]]; then
 fi
 unset VERIFY_NIX_ENV_REEXEC
 
+# In-place lint can compile in the source copy. Keep its lock for scope binding.
 if [[ "${COPIES_RUN_LOCK_FD:-}" =~ ^[0-9]+$ ]]; then
-    exec {COPIES_RUN_LOCK_FD}>&-
+    if [[ "${VERIFY_QUERY_ARGS[0]:-}" == lint && "$VERIFY_REPO_ROOT" == "${COPIES_STEP_SOURCE:-}" &&
+          -z "${BUILDLOG_PREPARED_COPY_LOCK_FD:-}" ]]; then
+        BUILDLOG_PREPARED_COPY_LOCK_FD=$COPIES_RUN_LOCK_FD
+    else
+        exec {COPIES_RUN_LOCK_FD}>&-
+    fi
     unset COPIES_RUN_LOCK_FD
 fi
+
+close_inherited_checkout_lock() {
+    if [[ -n "${BUILDLOG_PREPARED_COPY_LOCK_FD:-}" ]]; then
+        exec {BUILDLOG_PREPARED_COPY_LOCK_FD}>&-
+        unset BUILDLOG_PREPARED_COPY_LOCK_FD
+    fi
+}
 
 # Move the caller's checkout lock before Verify starts its helpers.
 if [[ -n "${BUILDLOG_PREPARED_COPY_LOCK_FD:-}" ]]; then
@@ -601,10 +614,7 @@ verify_helper() {
         [[ -f "$script" ]] || return 0
         VERIFY_HELPER_LOCK="$(mktemp 2>/dev/null)" || return 0
         coproc VERIFY_CALLS {
-            if [[ -n "${BUILDLOG_PREPARED_COPY_LOCK_FD:-}" ]]; then
-                exec {BUILDLOG_PREPARED_COPY_LOCK_FD}>&-
-                unset BUILDLOG_PREPARED_COPY_LOCK_FD
-            fi
+            close_inherited_checkout_lock
             exec "$VERIFY_START_DIR/../lib/py" "$script" "$VERIFY_HELPER_LOCK"
         } 2>/dev/null
         VERIFY_HELPER_PID=${VERIFY_CALLS_PID:-}
@@ -2850,11 +2860,13 @@ run_checkout_step() (
         return $?
     fi
     local DOC_COPY_OWNER_PID="" DOC_COPY_LEASE_FD="" DOC_COPY_REPLY_FD="" MAC_SOURCE_ROOT=""
-    local command=()
+    local command=() argument_count
     step_checkout "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$VERIFY_SLOT_SOURCE" --tree "$VERIFY_SLOT_TREE" \
         --step "$CMD" --capacity-file "$VERIFY_SLOT_CAPACITY_FILE" --bind-scope -- "$@" || return $?
-    if ! mapfile -d '' -n "$#" command <&"$DOC_COPY_REPLY_FD" ||
-       (( ${#command[@]} != $# )) || ! cd -- "$MAC_SOURCE_ROOT"; then
+    if ! IFS= read -r argument_count <&"$DOC_COPY_REPLY_FD" ||
+       [[ ! "$argument_count" =~ ^[1-9][0-9]*$ ]] ||
+       ! mapfile -d '' -n "$argument_count" command <&"$DOC_COPY_REPLY_FD" ||
+       (( ${#command[@]} != argument_count )) || ! cd -- "$MAC_SOURCE_ROOT"; then
         step_close_checkout || true
         return 2
     fi
@@ -2880,15 +2892,23 @@ run_placed_scope() {
     printf -v BUILDLOG_RESERVED_STEP '%s\t%s\t%s' "$BUILDLOG_MEM_RESERVATION" \
         "${BUILDLOG_MEM_RESERVATION%%-*}" "${BUILDLOG_MEM_MAX_PATH%/*}"
     export BUILDLOG_RESERVED_STEP
-    local output="$PLACEMENT_SCOPE_STATE.output" supervisor reader status=0 checkout_owner=""
+    local output="$PLACEMENT_SCOPE_STATE.output" supervisor reader status=0
+    local checkout_owner="" inherited_checkout=0 source_copy=""
     # Keep the checkout lease while the supervisor binds the scope.
     if [[ -n "${DOC_COPY_LEASE_FD:-}" ]]; then
         checkout_owner=$DOC_COPY_OWNER_PID
     elif [[ "$CMD" == doc && -n "${DOC_REPO_TOP:-}" && "${BUILDLOG_PREPARED_COPY:-}" == "$DOC_REPO_TOP" ]]; then
-        local checkout_fd=${BUILDLOG_PREPARED_COPY_LOCK_FD:-}
         checkout_owner=${BUILDLOG_RUN:-}
         checkout_owner=${checkout_owner%%:*}
-        if [[ ! "$checkout_fd" =~ ^[0-9]+$ || ! -e "/dev/fd/$checkout_fd" || -z "$checkout_owner" ]]; then
+        inherited_checkout=1
+    elif [[ "$CMD" == lint && -n "${COPIES_STEP_SOURCE:-}" && "$VERIFY_REPO_ROOT" == "$COPIES_STEP_SOURCE" ]]; then
+        source_copy=${COPIES_STEP_SOURCE%/*}
+        checkout_owner=${COPIES_RUN_PID:-}
+        inherited_checkout=1
+    fi
+    if (( inherited_checkout )); then
+        local checkout_fd=${BUILDLOG_PREPARED_COPY_LOCK_FD:-}
+        if [[ ! "$checkout_fd" =~ ^[0-9]+$ || ! -e "/dev/fd/$checkout_fd" || ! "$checkout_owner" =~ ^[1-9][0-9]*$ ]]; then
             printf 'the prepared checkout has no inherited lease\n' > "$PLACEMENT_SCOPE_STATE"
             return 125
         fi
@@ -2905,7 +2925,7 @@ run_placed_scope() {
                 {DOC_COPY_REPLY_FD}<"/dev/fd/$DOC_COPY_REPLY_FD" || exit 125
             export DOC_COPY_LEASE_FD DOC_COPY_REPLY_FD
         fi
-        export VERIFY_CHECKOUT_OWNER="$checkout_owner"
+        export VERIFY_CHECKOUT_OWNER="$checkout_owner" VERIFY_SOURCE_COPY_FOLDER="$source_copy"
         exec "$PY" "$VERIFY_START_DIR/verify_scoped_step.py" "$$" "$leader" "$PLACEMENT_SCOPE_STATE" \
             "$BUILDLOG_PEAK" "$BUILDLOG_SCOPE_SH" "$@"
     ) > "$output" 2>&1 &
@@ -3899,7 +3919,10 @@ trap 'verify_interrupted 2' INT
 trap 'verify_interrupted 15' TERM
 trap 'verify_interrupted 1' HUP
 if [[ -n "${COPIES_RUN_PID:-}" ]]; then
-    "$PY" "$STEP_COPIES_SCRIPT" watch-owner --pid "$COPIES_RUN_PID" --verify-pid "$$" &
+    (
+        close_inherited_checkout_lock
+        exec "$PY" "$STEP_COPIES_SCRIPT" watch-owner --pid "$COPIES_RUN_PID" --verify-pid "$$"
+    ) &
     COPY_RUN_WATCH_PID=$!
 fi
 

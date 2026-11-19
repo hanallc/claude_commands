@@ -70,6 +70,7 @@ class ActiveGate:
     tree: Path
     source: Path
     owner: str
+    slot_environment: Mapping[str, str]
 
 
 ACTIVE_GATES: ContextVar[tuple[ActiveGate, ...]] = ContextVar("active_gate_checkouts", default=())
@@ -1342,6 +1343,17 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
 
     step is the build_steps key of the work, such as integrate or lint; the lease shows its configured name.
     """
+    with standing_checkout(owner, repo, policy, merge=merge, step=step, command=command,
+                           queue_position=queue_position, wait_policy=wait_policy) as checkout:
+        yield checkout.tree
+
+
+@contextmanager
+def standing_checkout(owner: str, repo: str | Path, policy: SourcePolicy, *,
+                      merge: MergePolicy = NO_MERGE, step: str = "", command: Sequence[str] = (),
+                      queue_position: SlotQueuePosition | NewSlotQueuePosition = NEW_SLOT_QUEUE_POSITION,
+                      wait_policy: build_slots.SlotWaitPolicy = build_slots.SlotWaitPolicy.QUEUE) -> Generator[ActiveGate]:
+    """Hold a slot and expose its environment for a separate launcher."""
     from scripts.production import staff
 
     owner = checked_owner(owner)
@@ -1350,7 +1362,7 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
     for active in reversed(ACTIVE_GATES.get()):
         if (source == active.tree and active.owner == owner and commit_at(source, "HEAD") == base
                 and isinstance(policy, CommittedSource) and isinstance(merge, NoMerge)):
-            yield source
+            yield active
             return
     with _slot_preparation():
         canonical = slot_source(source)
@@ -1382,7 +1394,8 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
         # A value under the slot cache root is another slot's lease, inherited from an outer gate or slot command.
         defaults = {key: value for key, value in slot.env.items()
                     if key not in os.environ or Path(os.environ[key]).resolve().parent == slot.cargo_dir.parent}
-        active_token = ACTIVE_GATES.set((*ACTIVE_GATES.get(), ActiveGate(tree, canonical, owner)))
+        checkout = ActiveGate(tree, canonical, owner, slot.env)
+        active_token = ACTIVE_GATES.set((*ACTIVE_GATES.get(), checkout))
         previous = {key: os.environ.get(key) for key in defaults}
         os.environ.update(defaults)
         try:
@@ -1393,7 +1406,7 @@ def standing(owner: str, repo: str | Path, policy: SourcePolicy, *,
                 if isinstance(merge, MergeRevision):
                     _ = merge_changes(tree, source, merge.revision)
             try:
-                yield tree
+                yield checkout
             finally:
                 caller_error = sys.exception()
                 try:
@@ -2402,8 +2415,9 @@ def run_slot_step(source: Path, args: CopyArguments) -> int:
     policy = (CommittedSource(head) if git(source, "rev-parse", f"{head}^{{tree}}").decode().strip() == args.tree
               else StagedSource(args.tree))
     try:
-        with standing(step_owner(source), source, policy, step=args.step,
-                      wait_policy=build_slots.SlotWaitPolicy.REFUSE) as checkout:
+        with standing_checkout(step_owner(source), source, policy, step=args.step,
+                               wait_policy=build_slots.SlotWaitPolicy.REFUSE) as slot:
+            checkout = slot.tree
             if args.step == "doc" and staged_tree(source) != args.tree:
                 print("verify.sh: the staged tree changed before doc ran; no doc pass record was written.", file=sys.stderr)
                 return 77
@@ -2422,8 +2436,9 @@ def run_slot_step(source: Path, args: CopyArguments) -> int:
             target = checkout / os.environ.get("CARGO_TARGET_DIR", "target")
             before = publication_candidates(checkout, target, command, paths)
             if args.bind_scope:
-                print(checkout, flush=True)
-                _ = sys.stdout.buffer.write(b"\0".join(map(os.fsencode, command)) + b"\0")
+                launch = ["env", *(f"{key}={value}" for key, value in slot.slot_environment.items()), *command]
+                print(checkout, len(launch), sep="\n", flush=True)
+                _ = sys.stdout.buffer.write(b"\0".join(map(os.fsencode, launch)) + b"\0")
                 _ = sys.stdout.buffer.flush()
                 request = sys.stdin.readline()
                 if request and request != "publish\n":

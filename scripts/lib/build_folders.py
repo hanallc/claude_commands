@@ -392,10 +392,16 @@ def _release_build_folder(path: Path, *, descriptor: int | None = None) -> None:
         os.close(descriptor)
 
 
+class CheckoutLeaseKind(Enum):
+    READY_SLOT = "ready-slot"
+    SOURCE_COPY = "source-copy"
+
+
 @dataclass(frozen=True)
 class CheckoutScopeBinding:
     scope: Path
     lease_owner: int
+    kind: CheckoutLeaseKind = CheckoutLeaseKind.READY_SLOT
 
 
 class MissingFolderLock(Enum):
@@ -469,8 +475,12 @@ def _write_lease(path: Path, directory: int, spec: BuildFolderSpec | CheckoutSco
     record: dict[str, object]
     if isinstance(spec, CheckoutScopeBinding):
         record = _read_lease(path, directory)
-        if record.get("pid") != spec.lease_owner or record.get("ready") is not True:
-            raise ValueError(f"{path}: the checkout lease owner changed before scope publication")
+        if spec.kind is CheckoutLeaseKind.READY_SLOT:
+            matches = record.get("ready") is True
+        else:
+            matches = "ready" not in record and record.get("purpose") == "copies-source"
+        if record.get("pid") != spec.lease_owner or not matches:
+            raise ValueError(f"{path}: the checkout lease changed before scope publication")
         _require_empty_checkout_scope(path, record)
         record["scope"] = str(spec.scope)
     else:
