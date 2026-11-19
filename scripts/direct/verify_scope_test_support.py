@@ -48,6 +48,14 @@ exec {shlex.quote(launcher)} "$@"
     manager.chmod(0o755)
 
 
+def use_fixture_cgroup_roots(test: TestCase) -> None:
+    """Keep cgroup discovery private while a test restores the environment."""
+    builds = Path(os.environ["BUILDLOG_BUILDS_CGROUP"])
+    ci = Path(os.environ["BUILDLOG_CI_CGROUP"])
+    _ = test.enterContext(mock.patch.object(gate, "builds_slice_cgroup", return_value=builds))
+    _ = test.enterContext(mock.patch.object(gate, "systemd_slice_group", return_value=ci))
+
+
 def use_fixture_scope_readings(test: TestCase, root: Path, admission: AdmissionFixture) -> None:
     """Permit membership reads from test scopes and supply private memory values."""
     guard = gate.check_memory_reading

@@ -34,7 +34,9 @@ from scripts.build_queue import step_estimator
 from scripts.mac_test import eligibility
 from scripts.disks import slots
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, reap
-from scripts.direct.verify_scope_test_support import use_fixture_scope_readings, write_real_scope_launcher
+from scripts.direct.verify_scope_test_support import (
+    use_fixture_cgroup_roots, use_fixture_scope_readings, write_real_scope_launcher,
+)
 from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
 from scripts.lib import build_folders, build_slots, conf
 from scripts.build_queue.admission_jobs import StepJob
@@ -88,6 +90,7 @@ class SlotOrderTests(unittest.TestCase):
         environment = copies_environment(self.root, repository="origin")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
         self.queue = self.enterContext(AdmissionFixture(root=Path(environment["CONF_DIR"])))
+        use_fixture_cgroup_roots(self)
         self.queue.clock.epoch = time.time()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {**environment,
             "PYTHONPATH": str(CHECKOUT), "SLOT_ORDER_CHECKOUT": str(CHECKOUT),
