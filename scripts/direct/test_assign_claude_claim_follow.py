@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import signal
-from typing import cast
+from typing import ClassVar, cast
 
 from scripts.direct.assign_claude_test_support import AssignClaudeLauncherFixture
 from scripts.direct import worker_state
@@ -12,6 +12,8 @@ from scripts.direct.test_assign_claude import GROUP_STOP_READY, stop_assignment
 
 
 class AssignClaudeLauncherFollowTests(AssignClaudeLauncherFixture):
+    direct_cli_calls: ClassVar[bool] = True
+
     def test_new_launch_and_delivery_retry_preserve_a_live_claim(self) -> None:
         session = self.start_phase("held-publication")
         _ = self.claude_worker(session)
@@ -24,9 +26,9 @@ class AssignClaudeLauncherFollowTests(AssignClaudeLauncherFixture):
         for kind in ("new", "retry"):
             with self.subTest(kind=kind):
                 if kind == "retry":
-                    _ = entry.write_text(source.replace("code = assign_claude.run(",
-                        "assign_claude._switch = lambda launch, name: assign_claude.ClaudeDeliveryRetry()\n"
-                        + "code = assign_claude.run(", 1))
+                    _ = entry.write_text(source.replace("    code = assign_claude.run(",
+                        "    assign_claude._switch = lambda launch, name: assign_claude.ClaudeDeliveryRetry()\n"
+                        + "    code = assign_claude.run(", 1))
                     result = self.worker_launch(session, to="fixture-impl")
                 else:
                     result = self.worker_launch(session, slot="fixture-impl")

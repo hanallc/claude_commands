@@ -3,34 +3,31 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import cast
+from typing import cast, override
 import unittest
 
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture
 
 
 class VerifyLintLocalWritesTests(VerifyStepRoutesFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.fixture.environment["PYTHONPYCACHEPREFIX"] = str(self.fixture.root.parent / "bytecode")
+        _ = self.fixture.environment.pop("PYTHONDONTWRITEBYTECODE", None)
+
     def hold_before_repair(self, tool: str) -> Path:
         self.fixture.environment["TEST_REQUIRE_CLIPPY_FIX"] = "1" if tool == "clippy" else "0"
         self.fixture.environment["TEST_REQUIRE_MEND_FIX"] = "1" if tool == "mend" else "0"
         (Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "other").unlink(missing_ok=True)
-        shell = self.fixture.root / "hold-before-repair.sh"
-        _ = shell.write_text('''
-hold_before_repair() {
-    if [[ "$TEST_REQUIRE_MEND_FIX" != 1 && "$BASH_COMMAND" != *'invoke_clippy_fix --workspace '* ]]; then
-        return 0
-    fi
-    case "$BASH_COMMAND" in
-        'invoke_mend --workspace --fix '*|'invoke_clippy_fix --workspace '*\
-            |'lint_rewrite invoke_mend --workspace --fix '*|'lint_rewrite invoke_clippy_fix --workspace '*)
-            printf held > "$BUILD_HOLD_DIR/other"
-            ;;
-    esac
-}
-set -o functrace
-trap hold_before_repair DEBUG
-''')
-        self.fixture.environment["BASH_ENV"] = str(shell)
+        invoke = self.fixture.verify_script.parent.parent / "lint/invoke.sh"
+        function = "invoke_mend() {" if tool == "mend" else "invoke_clippy_fix() {"
+        hold = 'printf held > "$BUILD_HOLD_DIR/other"'
+        if tool == "mend":
+            hold = f'if [[ " $* " == *" --fix "* ]]; then {hold}; fi'
+        original = invoke.read_text()
+        self.assertIn(function, original)
+        _ = invoke.write_text(original.replace(function, f"{function}\n    {hold}", 1))
         cargo = self.fixture.bin_directory / "cargo"
         source = cargo.read_text().replace('arguments = sys.argv[1:]', '''arguments = sys.argv[1:]
 repair = Path(os.environ["PACKAGE_ROOT"]) / "local-repair"
