@@ -646,24 +646,16 @@ class MergeGateFixture(unittest.TestCase):
         self.write(self.checkout / "scripts/hooks/test_first.py", "from scripts.hooks import affected_subject\n" + SUITE_MODULE)
         return subject, self.commit(self.checkout, "dependency fixture")
 
-    def run_gate(self, *extra: str, checkpoint: str = "", previous: str = "",
-                 ignored_signals: bool = False, callers_production: bool = False,
+    def run_gate(self, *extra: str, ignored_signals: bool = False,
                  own_process: bool = False, preamble: str = "",
                  type_dirs: Sequence[str] = ("scripts/production",)) -> subprocess.CompletedProcess[str]:
         arguments = ["--repo", str(self.checkout),
-             "--merge-branch", "integration", "--unit-branch", "unit-phase",
-             "--checkpoint", checkpoint or self.checkpoint,
-             "--previous-checkpoint", previous or self.base,
-             "--unit", "fixture", "--phase", "phase-2",
-             "--body", "Fixture checkpoint gate.",
-             *(["--type-dirs", *type_dirs] if type_dirs else []),
-             "--main-repo", str(self.main),
-             "--ssh", str(self.bin / "ssh"),
-             *([] if callers_production or "--production" in extra else ["--production", "quiet"]),
-             *extra]
-        if self.suite_mode is merge_gate.SuiteMode.TARGETED_TEST:
-            arguments = ["--repo", str(self.checkout),
-                         *(["--type-dirs", *type_dirs] if type_dirs else []), *extra]
+                     *(["--type-dirs", *type_dirs] if type_dirs else []), *extra]
+        if self.suite_mode is merge_gate.SuiteMode.MERGE_GATE:
+            if "--nightly" in extra:
+                arguments.extend(("--merge-branch", "integration"))
+            elif "--tests-only" not in extra:
+                arguments.append("--tests-only")
         if own_process or ignored_signals:
             return subprocess.run(
                 [*self.gate_command(ignored_signals=ignored_signals, preamble=preamble), *arguments], cwd=self.root,
