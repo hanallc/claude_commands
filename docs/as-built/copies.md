@@ -53,6 +53,14 @@ Removal verifies the exported rescue before it deletes the workspace.
 Python callers pass slot lease descriptors to their build and test children.
 `clone()` keeps its task-owned return-a-path API and uses the maker outside the gate root.
 Its Git children inherit the destination lease and busy lock.
+New shared copies follow Git alternates to object stores that have no alternates of their own.
+Git fetches objects from the source that those root stores lack.
+Removing an intermediate copy leaves those objects available in the new copy.
+A clone of an active gate uses `--no-local` without sharing its object store.
+Worktree snapshots use a temporary object store while they read staged and working files.
+The new copy's alternates list does not include the worktree's intermediate store.
+Existing copies keep their alternates.
+Removal still checks for borrowers before it deletes a copy.
 The saved-work check trusts cached remote-tracking refs when they cover all local commits.
 Otherwise, removal runs `git ls-remote` in the clone once per named remote.
 Git uses the named remote's configured transport.

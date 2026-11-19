@@ -1456,6 +1456,57 @@ with patch.object(subprocess, 'run', pause_clone):
         assert isinstance(record, copy_record.Registered)
         self.assertEqual(record.fields["source_commit"], commit)
 
+    def test_unshared_object_store_is_its_own_root(self) -> None:
+        objects = self.source / ".git/objects"
+        self.assertFalse((objects / "info/alternates").exists())
+        self.assertEqual(copies.root_object_stores(objects), (objects,))
+
+    def test_clone_chain_borrows_only_roots_and_keeps_intermediate_commits(self) -> None:
+        source = self.source
+        commits = [self.head]
+        for name in ("first", "middle"):
+            checkout = self.base / name
+            _ = self.git(self.base, "clone", "--shared", "-q", str(source), str(checkout))
+            objects = checkout / ".git/objects"
+            relative = os.path.relpath(source / ".git/objects", objects)
+            _ = (objects / "info/alternates").write_text(relative + "\n")
+            _ = (checkout / f"{name}.txt").write_text(f"{name} commit\n")
+            _ = self.git(checkout, "add", f"{name}.txt")
+            _ = self.git(checkout, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                         "commit", "-qm", f"{name} commit")
+            commits.append(self.git(checkout, "rev-parse", "HEAD"))
+            source = checkout
+
+        child = copies.clone(source, task="gate:child")
+        later = copies.clone(child, task="gate:later")
+        for checkout in (child, later):
+            alternate = checkout / ".git/objects/info/alternates"
+            self.assertEqual(alternate.read_text().splitlines(), [str(self.source / ".git/objects")])
+            self.assertEqual(self.git(checkout, "show", f"{commits[-1]}:middle.txt"), "middle commit")
+
+        shutil.rmtree(self.base / "middle")
+        shutil.rmtree(self.base / "first")
+        for checkout in (child, later):
+            self.assertEqual(self.git(checkout, "rev-list", "--objects", "--all", "--quiet"), "")
+            for commit in commits:
+                self.assertEqual(self.git(checkout, "cat-file", "-t", commit), "commit")
+            self.assertEqual(self.git(checkout, "show", "HEAD:first.txt"), "first commit")
+            self.assertEqual(self.git(checkout, "show", "HEAD:middle.txt"), "middle commit")
+
+    def test_worktree_snapshot_keeps_staged_blobs_without_an_intermediate_alternate(self) -> None:
+        source, commit = self.shared_source_commit()
+        _ = (source / "tracked.txt").write_text("staged only in the source\n")
+        _ = self.git(source, "add", "tracked.txt")
+        index = (source / ".git/index").read_bytes()
+        with copies.requested_source(source, copies.WorktreeSource(commit, source), copies.NO_MERGE) as tree:
+            self.assertEqual((source / ".git/index").read_bytes(), index)
+            self.assertEqual(self.git(source, "rev-parse", "HEAD"), commit)
+            self.assertEqual((tree / ".git/objects/info/alternates").read_text().splitlines(),
+                             [str(self.source / ".git/objects")])
+            shutil.rmtree(source)
+            self.assertEqual(self.git(tree, "show", "HEAD:tracked.txt"), "staged only in the source")
+            self.assertEqual(self.git(tree, "show", f"{commit}:tracked.txt"), "shared source commit")
+
     def test_workspace_selects_a_detached_commit_that_exists_only_in_its_shared_source(self) -> None:
         source, commit = self.shared_source_commit()
         with copies.workspace(self.owner_id, source, commit, name="detached", branch="worker") as tree:

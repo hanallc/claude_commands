@@ -7,6 +7,7 @@ except FileNotFoundError:
     pass
 
 import argparse
+from codecs import escape_decode
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
@@ -651,19 +652,85 @@ def refresh_remotes(tree: Path, source: Path, *, new_checkout: bool = False) -> 
         _ = git(tree, "fetch", "-q", "--prune", "--", str(source), *mappings)
 
 
+def git_object_store(source: Path) -> Path:
+    """Find the object directory for a checkout, including a linked worktree."""
+    path = git(source, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+    return Path(os.fsdecode(path.removesuffix(b"\n"))).resolve()
+
+
+def root_object_stores(source_objects: Path) -> tuple[Path, ...]:
+    """Find the stores that supply objects without borrowing from other stores."""
+    roots: list[Path] = []
+    visited: set[Path] = set()
+    visiting: set[Path] = set()
+
+    def visit(objects: Path) -> None:
+        objects = objects.resolve()
+        if objects in visited:
+            return
+        if objects in visiting:
+            raise CopyError(f"{objects}: alternate object stores form a cycle")
+        if not objects.is_dir():
+            raise CopyError(f"{objects}: missing Git object store")
+        visiting.add(objects)
+        alternates = objects / "info/alternates"
+        try:
+            descriptor = os.open(alternates, os.O_RDONLY | os.O_NONBLOCK)
+        except FileNotFoundError:
+            entries = []
+        else:
+            with os.fdopen(descriptor, "rb") as source:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise CopyError(f"{alternates}: expected a regular file")
+                entries = source.read().split(b"\n")
+        uses_alternate = False
+        for entry in entries:
+            if not entry or entry.startswith(b"#"):
+                continue
+            if entry.startswith(b'"') and entry.endswith(b'"'):
+                entry, _ = escape_decode(entry[1:-1])
+            uses_alternate = True
+            visit(objects / os.fsdecode(entry))
+        if not uses_alternate:
+            roots.append(objects)
+        visiting.remove(objects)
+        visited.add(objects)
+
+    visit(source_objects)
+    return tuple(roots)
+
+
+def write_object_alternates(objects: Path, stores: Sequence[Path]) -> None:
+    """Write an alternate list in a private object directory."""
+    paths = [os.fsencode(store) for store in stores]
+    if any(b"\n" in path for path in paths):
+        raise CopyError("an alternate object directory contains a newline")
+    info = objects / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    _ = (info / "alternates").write_bytes(b"\n".join(paths) + b"\n")
+
+
 def initialize_git(tree: Path, source: Path) -> None:
     """Create private Git metadata while the caller holds the busy mark."""
     new_checkout = not (tree / ".git").exists()
     if new_checkout:
         # clone needs an empty destination; the tree already holds scratch's busy mark.
         # Stage only Git metadata, so first creation never has an unlocked checkout.
-        clone_source = source
-        clone_mode = "--shared"
-        if any(active.tree == source for active in ACTIVE_GATES.get()):
-            clone_mode = "--no-local"
         with tempfile.TemporaryDirectory(dir=tree, prefix=CLONE_STAGE + "-") as directory:
             stage = Path(directory)
-            _ = git(source, "clone", clone_mode, "--no-checkout", "--quiet", "--", str(clone_source), str(stage))
+            clone_options = ["--no-local"]
+            if not any(active.tree == source for active in ACTIVE_GATES.get()):
+                source_objects = git_object_store(source)
+                roots = root_object_stores(source_objects)
+                if roots == (source_objects,):
+                    clone_options = ["--shared"]
+                else:
+                    # Give Git the root stores before it fetches the source refs.
+                    template = stage / "template"
+                    write_object_alternates(template / "objects", roots)
+                    clone_options.append(f"--template={template}")
+                    stage = stage / "checkout"
+            _ = git(source, "clone", *clone_options, "--no-checkout", "--quiet", "--", str(source), str(stage))
             _ = (stage / ".git").rename(tree / ".git")
     if (tree / ".git").is_symlink() or not (tree / ".git").is_dir():
         raise CopyError(f"{tree}: standing checkout must own its .git directory")
@@ -775,20 +842,21 @@ class MergedEnvrcReference:
     committed_merge: str
 
 
-def apply_changes(tree: Path, worktree: Path, base: str) -> EnvrcReference:
+def apply_changes(tree: Path, worktree: Path, base: str, *, private_snapshot: bool = False) -> EnvrcReference:
     changed: list[str] = []
     try:
-        changed = [os.fsdecode(name) for name in git(worktree, "diff", "--name-only", "-z", "HEAD").split(b"\0")
-                   if name]
-        for name in git(worktree, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0"):
-            if not name:
-                continue
-            changed.append(os.fsdecode(name))
-            if Path(os.fsdecode(name)).parts[0] in (scratch.BUSY, ".git", CLONE_STAGE):
-                raise CopyError(f"{os.fsdecode(name)}: path conflicts with gate metadata")
-        snapshot = staged_tree(worktree, include_worktree=True)
-        envrc_changed = git(worktree, "diff", "--name-only", "-z", "HEAD", snapshot, "--", ".envrc")
-        diff = git(worktree, "diff", "--binary", "HEAD", snapshot, "--")
+        with worktree_objects(tree, worktree, base) if private_snapshot else nullcontext():
+            changed = [os.fsdecode(name) for name in git(worktree, "diff", "--name-only", "-z", "HEAD").split(b"\0")
+                       if name]
+            for name in git(worktree, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0"):
+                if not name:
+                    continue
+                changed.append(os.fsdecode(name))
+                if Path(os.fsdecode(name)).parts[0] in (scratch.BUSY, ".git", CLONE_STAGE):
+                    raise CopyError(f"{os.fsdecode(name)}: path conflicts with gate metadata")
+            snapshot = staged_tree(worktree, include_worktree=True)
+            envrc_changed = git(worktree, "diff", "--name-only", "-z", "HEAD", snapshot, "--", ".envrc")
+            diff = git(worktree, "diff", "--binary", "HEAD", snapshot, "--")
         if diff:
             _ = git(tree, "apply", "--index", "--3way", "--binary", "-", data=diff)
         short = git(tree, "rev-parse", "--short", base).decode().strip()
@@ -1128,22 +1196,27 @@ def _slot_preparation() -> Generator[None]:
 
 
 @contextmanager
-def worktree_objects(tree: Path, worktree: Path) -> Generator[None]:
-    """Write working file objects into the copy while it borrows the source objects."""
-    objects = tree / ".git/objects"
-    source_objects = git(worktree, "rev-parse", "--path-format=absolute", "--git-path", "objects").decode().strip()
-    alternates = objects / "info/alternates"
-    with alternates.open("a") as output:
-        _ = output.write(source_objects + "\n")
-    previous = os.environ.get("GIT_OBJECT_DIRECTORY")
-    os.environ["GIT_OBJECT_DIRECTORY"] = str(objects)
-    try:
-        yield
-    finally:
-        if previous is None:
-            _ = os.environ.pop("GIT_OBJECT_DIRECTORY", None)
-        else:
-            os.environ["GIT_OBJECT_DIRECTORY"] = previous
+def worktree_objects(tree: Path, worktree: Path, base: str) -> Generator[None]:
+    """Read the worktree index and write its temporary objects outside both checkouts."""
+    head = commit_at(worktree, "HEAD")
+    if head != base:
+        # The three-way apply can need objects from the worktree's HEAD.
+        _ = git(tree, "fetch", "-q", "--no-tags", "--", str(worktree), head)
+    source_objects = git_object_store(worktree)
+    roots = root_object_stores(source_objects)
+    with build_folders.tool_folder("copies-objects") as folder:
+        objects = folder / "objects"
+        # The temporary index can need staged blobs that no ref can supply.
+        write_object_alternates(objects, tuple(dict.fromkeys((*roots, source_objects))))
+        previous = os.environ.get("GIT_OBJECT_DIRECTORY")
+        os.environ["GIT_OBJECT_DIRECTORY"] = str(objects)
+        try:
+            yield
+        finally:
+            if previous is None:
+                _ = os.environ.pop("GIT_OBJECT_DIRECTORY", None)
+            else:
+                os.environ["GIT_OBJECT_DIRECTORY"] = previous
 
 
 @dataclass(frozen=True)
@@ -1169,8 +1242,7 @@ def prepare_requested_source(tree: Path, source: Path, policy: SourcePolicy, mer
     envrc: EnvrcReference | MergedEnvrcReference = EnvrcReference.CALLER_ANCHOR
     if isinstance(policy, WorktreeSource):
         worktree = Path(policy.worktree).expanduser().resolve()
-        with worktree_objects(tree, worktree):
-            envrc = apply_changes(tree, worktree, base)
+        envrc = apply_changes(tree, worktree, base, private_snapshot=True)
     if isinstance(merge, MergeRevision):
         if envrc is EnvrcReference.CALLER_ANCHOR:
             envrc = merge_changes(tree, source, merge.revision, committed_base=committed_base)
