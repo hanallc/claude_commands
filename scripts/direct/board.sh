@@ -289,17 +289,19 @@ write_lock_meta() {
 cleanup_owned_group() {
   local dir="$1"
   [[ -f "$dir/owned" ]] || return 0
-  "$BOARD_DIR/../lib/py" - "$dir/owned" "$BOARD_DIR/../lib" <<'PY'
+  "$BOARD_DIR/../lib/py" - "$dir/owned" <<'PY'
 from __future__ import annotations
 
 import json
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
 
 record = Path(sys.argv[1])
 
+from scripts.direct.cleanup_lease import stop_group
 from scripts.lib.process_start import Started, Zombie, process_start
 
 def identity(pid: int) -> str | None:
@@ -331,9 +333,10 @@ if identity(group) != start:
     sys.exit(0)
 
 try:
-    if (sent := subprocess.run([str(Path(sys.argv[2]).resolve() / "py"), str(Path(sys.argv[2]).resolve() / "process_group.py"), str(group), "KILL"], capture_output=True, text=True)).returncode: raise ProcessLookupError if sent.returncode == 3 else SystemExit("board.sh: process group helper failed: " + " ".join(sent.stderr.splitlines()))
-except ProcessLookupError:
-    pass
+    stop_group(group, signal.SIGKILL)
+except (OSError, ValueError) as error:
+    print(f"board.sh: could not stop process group {group}: {error}", file=sys.stderr)
+    sys.exit(1)
 
 deadline = time.monotonic() + 2
 while live_group(group) and time.monotonic() < deadline:

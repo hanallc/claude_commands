@@ -20,6 +20,7 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.copies.copies_test_support import copies_environment
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.process_group import send_process_group
+from scripts.lib.shell_test_support import shell_function
 from scripts.lib.socket_test_support import ShortUnixSocket
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
@@ -413,29 +414,116 @@ raise SystemExit(BatchCommands(Path("unused"), ()).run(
         parent, child = result.stdout.splitlines()
         self.assertEqual(parent, child)
 
-    def test_term_during_the_final_tree_check_stops_the_batch(self) -> None:
+    def test_term_during_the_final_tree_check_stops_both_git_children(self) -> None:
         scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        result = self.run_python("""
-import os, signal, sys
+        git = scratch / "git"
+        _ = git.write_text(f"""#!{sys.executable}
+import os
+from pathlib import Path
+import signal
+import sys
+
+if not Path("final").exists():
+    if "rev-parse" in sys.argv:
+        print(os.getcwd(), "fixture-tree", sep=chr(10))
+    sys.exit(0)
+name = "head" if "rev-parse" in sys.argv else "status"
+pending = Path(name + ".tmp")
+pending.write_text(str(os.getpid()))
+pending.rename(name)
+signal.pause()
+""")
+        git.chmod(0o755)
+        program = """
+import fcntl
 from pathlib import Path
 from unittest.mock import patch
 from scripts.direct import verify_batch as batch
 
-checks = iter(("tree", "tree", "final"))
+def verify_step(step, *_args, **_kwargs):
+    if step == "lint":
+        Path("final").touch()
+    return batch.BatchStepResult(0, False)
 
-def tree_key(_directory):
-    if next(checks) == "final":
-        os.kill(os.getpid(), signal.SIGTERM)
-    return "tree"
-
-commands = batch.BatchCommands(Path("unused"), ())
-with patch.object(commands, "verify_step", return_value=batch.BatchStepResult(0, False)):
-    with patch.object(batch.treekey, "tree_key", side_effect=tree_key):
+with open("cleanup.lock", "w+b") as lease:
+    fcntl.flock(lease, fcntl.LOCK_EX)
+    commands = batch.BatchCommands(Path("unused"), (), cleanup=batch.ForegroundCleanupLease(lease.fileno()))
+    with patch.object(commands, "verify_step", side_effect=verify_step):
         raise SystemExit(batch.run_batch(commands, Path.cwd(), ("sample",), batch.LintScope.WORKSPACE,
-                                        batch.NoBaselineProof.SKIP, Path(sys.argv[1])))
-""", str(scratch))
-        self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
-        self.assertNotIn("verify.sh batch result green", result.stdout)
+                                        batch.NoBaselineProof.SKIP, Path.cwd()))
+"""
+        environment = {**os.environ, "PATH": f"{scratch}:{os.environ['PATH']}",
+                       "PYTHONPATH": str(support.VERIFY.parents[2])}
+        with subprocess.Popen([sys.executable, "-c", program], cwd=scratch, env=environment,
+                              start_new_session=True, stdout=subprocess.DEVNULL) as process:
+            children: list[int] = []
+            try:
+                for name in ("head", "status"):
+                    ready = scratch / name
+                    wait_until(lambda: ready.exists() or process.poll() is not None, scratch, 10,
+                               processes=(process,))
+                    self.assertTrue(ready.is_file(), f"the tree-key Git {name} command did not start")
+                    children.append(os.pidfd_open(int(ready.read_text())))
+                process.terminate()
+                self.assertEqual(process.wait(timeout=5), -signal.SIGTERM)
+                for descriptor in children:
+                    self.assertTrue(select.select([descriptor], [], [], 5)[0],
+                                    "a tree-key Git process survived its coordinator")
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                for descriptor in children:
+                    try:
+                        signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    finally:
+                        os.close(descriptor)
+
+    def test_marker_write_failure_prevents_a_foreground_launch(self) -> None:
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        started = scratch / "started"
+        result = self.run_python("""
+import os, sys
+from pathlib import Path
+from scripts.direct.cleanup_lease import CleanupLeaseUse, run_command
+
+started = Path(sys.argv[1])
+lock = started.with_name("cleanup.lock")
+lock.touch()
+with lock.open("rb") as lease:
+    raise SystemExit(run_command(["touch", str(started)], os.getppid(), os.getpgrp(), lease.fileno(),
+                                 CleanupLeaseUse.KEEP_IN_SUPERVISOR))
+""", str(started))
+        self.assertFalse(started.exists(), "the command launched without a cleanup marker")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("could not record foreground cleanup", result.stderr)
+
+    def test_interruption_stops_a_stopped_placement_group(self) -> None:
+        source = support.VERIFY.read_text()
+        stop = shell_function(source, "stop_verify_group") if "\nstop_verify_group() {" in source else ""
+        script = stop + "\n" + shell_function(source, "interrupt_hold_wait") + """
+PY=$1 VERIFY_START_DIR=$2 STEP_RECORD_SCRIPT=$2/step_record.py
+HOLD_WAITER_PID=$3 PLACEMENT_CLIENT_ACTIVE=1
+interrupt_hold_wait
+"""
+        with subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
+                              start_new_session=True) as placement:
+            try:
+                os.kill(placement.pid, signal.SIGSTOP)
+                _, status = os.waitpid(placement.pid, os.WUNTRACED)
+                self.assertTrue(os.WIFSTOPPED(status))
+                result = subprocess.run(["bash", "-c", script, "test", sys.executable,
+                                         str(support.VERIFY.parent), str(placement.pid)],
+                                        capture_output=True, text=True, check=False, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                try:
+                    self.assertEqual(placement.wait(timeout=5), -signal.SIGTERM)
+                except subprocess.TimeoutExpired:
+                    self.fail("the stopped placement group survived TERM")
+            finally:
+                if placement.poll() is None:
+                    placement.kill()
 
     def test_a_failed_copy_cleanup_names_the_baseline_step(self) -> None:
         scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))

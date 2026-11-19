@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+import sys
 import time
 
 GIT_TIMEOUT_S = 10
@@ -147,3 +148,10 @@ def worktree(directory: str) -> str | None:
         return None
     top = result.stdout.strip()
     return top if result.returncode == 0 and top else None
+
+
+if __name__ == "__main__":
+    key = tree_key(sys.argv[1])
+    if key is None:
+        raise SystemExit(1)
+    print(key)

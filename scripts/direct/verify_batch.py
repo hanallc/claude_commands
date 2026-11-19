@@ -18,7 +18,8 @@ from typing import final
 
 from scripts.buildlog import treekey
 from scripts.direct import recorder_state
-from scripts.direct.cleanup_lease import CleanupLeaseUse, ForegroundCleanupLease, NoCleanupLease
+from scripts.direct.cleanup_lease import CommandLifetime, CleanupLeaseUse, ForegroundCleanupLease, NoCleanupLease
+from scripts.lib.build_folders import ForegroundMarker
 
 
 class LintScope(Enum):
@@ -69,15 +70,26 @@ class BatchCommands:
         self.environment = {**os.environ, "UNIT_DETACHED_RUN": "1"}
         _ = self.environment.pop("UNIT_DETACHED_RECORD", None)
 
-    def run(self, command: Sequence[str], changes: dict[str, str], *,
-            use: CleanupLeaseUse = CleanupLeaseUse.KEEP_IN_SUPERVISOR) -> int:
+    def invoke(self, command: Sequence[str], changes: dict[str, str], *,
+               use: CleanupLeaseUse = CleanupLeaseUse.KEEP_IN_SUPERVISOR,
+               lifetime: CommandLifetime = CommandLifetime.FOREGROUND,
+               stdout: int | None = None) -> subprocess.CompletedProcess[bytes]:
         environment = {**self.environment, **changes}
         if isinstance(self.cleanup, ForegroundCleanupLease):
-            result = self.cleanup.run(command, cwd=Path.cwd(), environment=environment,
-                                      stdin=subprocess.DEVNULL, use=use)
-        else:
-            result = subprocess.run(command, env=environment, stdin=subprocess.DEVNULL, check=False)
+            return self.cleanup.run(command, cwd=Path.cwd(), environment=environment,
+                                    stdin=subprocess.DEVNULL, stdout=stdout, use=use, lifetime=lifetime)
+        return subprocess.run(command, env=environment, stdin=subprocess.DEVNULL, stdout=stdout, check=False)
+
+    def run(self, command: Sequence[str], changes: dict[str, str], *,
+            use: CleanupLeaseUse = CleanupLeaseUse.KEEP_IN_SUPERVISOR,
+            lifetime: CommandLifetime = CommandLifetime.FOREGROUND) -> int:
+        result = self.invoke(command, changes, use=use, lifetime=lifetime)
         return result.returncode if result.returncode >= 0 else 128 - result.returncode
+
+    def tree_key(self, repo: Path) -> str:
+        result = self.invoke([sys.executable, str(Path(treekey.__file__).resolve()), str(repo)], {},
+                             lifetime=CommandLifetime.GROUP, stdout=subprocess.PIPE)
+        return result.stdout.decode("ascii").strip() if result.returncode == 0 else ""
 
     def verify_step(self, step: str, args: Sequence[str], cache_hit: Path,
                     *, format_packages: str = "") -> BatchStepResult:
@@ -186,15 +198,15 @@ def run_batch(commands: BatchCommands, repo: Path, packages: tuple[str, ...],
     if not commands.verify_step("format", lint_args, hit, format_packages=format_packages).show("format", scope):
         passed = False
 
-    before_tests = treekey.tree_key(str(repo))
-    stale = before_tests is None
+    before_tests = commands.tree_key(repo)
+    stale = not before_tests
     for package in packages:
         test = commands.verify_step("test", ("test", package), hit)
         if not test.show("test", package):
             passed = False
-        stale |= treekey.tree_key(str(repo)) != before_tests
+        stale |= commands.tree_key(repo) != before_tests
     finish = commands.verify_step("lint", lint_args, hit, format_packages=format_packages)
-    stale |= treekey.tree_key(str(repo)) != before_tests
+    stale |= commands.tree_key(repo) != before_tests
     if not finish.show("lint", scope, "tests stale" if stale else ""):
         passed = False
     print("verify.sh batch result " + ("green" if passed else "red"), flush=True)
@@ -214,9 +226,10 @@ def main(argv: list[str]) -> int:
         _, verify, marker, patch, *cases = args
         done = Path(marker)
         lease = os.environ.pop("COPIES_STEP_LOCK_FD", "")
-        cleanup = ForegroundCleanupLease(int(lease)) if lease else NoCleanupLease.NONE
+        cleanup = (ForegroundCleanupLease(int(lease), ForegroundMarker.COORDINATED_COMMAND)
+                   if lease else NoCleanupLease.NONE)
         commands = BatchCommands(Path(verify), route, cleanup=cleanup)
-        if commands.run(["git", "apply", "--index", "--", patch], {}) != 0:
+        if commands.run(["git", "apply", "--index", "--", patch], {}, lifetime=CommandLifetime.GROUP) != 0:
             return 2
         result = run_baseline_tests(commands, [RegressionCase(*case.split("=", 1)) for case in cases],
                                     done.with_name("baseline-cache-hit"))

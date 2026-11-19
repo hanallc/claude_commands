@@ -1026,6 +1026,22 @@ print('signals')
         with folders.folder_removal_lease(path, children=True) as lease:
             self.assertIsInstance(lease, folders.HeldFolderRemovalLease)
 
+    def test_recursive_removal_keeps_a_marked_or_held_child(self) -> None:
+        for state in ("marked", "held"):
+            with self.subTest(state=state):
+                parent = self.root / state
+                child = parent / "inner" / "copy"
+                child.mkdir(parents=True)
+                cleanup = mock.Mock()
+                with child.with_suffix(".lock").open("w+b") as lease:
+                    if state == "marked":
+                        folders.mark_cleanup_incomplete(lease.fileno())
+                    else:
+                        fcntl.flock(lease, fcntl.LOCK_EX)
+                    self.assertFalse(folders.remove_build_folder(parent, cleanup, wait=False))
+                cleanup.assert_not_called()
+                self.assertTrue(child.is_dir())
+
     def test_removal_calls_cleanup_without_creating_an_absent_parent(self) -> None:
         path = self.root / "absent-parent" / "tree"
         for result in (True, False, None):

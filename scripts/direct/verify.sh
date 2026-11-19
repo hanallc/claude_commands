@@ -589,6 +589,10 @@ collect_child() {
     wait "$1" 2>/dev/null || true
 }
 
+stop_verify_group() {
+    "$PY" "$VERIFY_START_DIR/cleanup_lease.py" cancel-group "$@" || true
+}
+
 # One parent-owned helper serves command substitutions and cleanup traps.
 verify_helper() {
     if [[ "${1:-}" == --start ]]; then
@@ -1536,25 +1540,23 @@ if [[ "$CMD" == batch ]]; then
         local status=$?
         if [[ "$batch_launching" == 1 && "${!:-}" != "$batch_previous_job" ]]; then
             # The batch job has its own process group, as a single verify step does.
-            "$PY" "$VERIFY_START_DIR/cleanup_lease.py" cancel-group "$!" 74>&- || true
+            stop_verify_group "$!" 74>&-
         fi
         if [[ -n "$batch_scratch" ]]; then
             # Foreground guards retain fd 74 through their own cleanup.
             exec 74>&-
-            exec 74<>"$batch_scratch/cleanup.lock"
-            if ! "$PY" "$VERIFY_START_DIR/cleanup_lease.py" acquire 74; then
+            if ! "$PY" "$VERIFY_START_DIR/cleanup_lease.py" remove "$batch_scratch"; then
                 printf 'verify.sh: batch cleanup could not remove %s\n' "$batch_scratch" >&2
                 finish_verify_run 2
                 exit 2
             fi
-            rm -rf -- "$batch_scratch"
         fi
         if [[ "$batch_launching" == 0 ]]; then finish_verify_run "$status"; fi
         [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
     }
     trap finish_batch EXIT
     batch_scratch="$(mktemp -d "${TMPDIR:-/tmp}/verify-batch.XXXXXX")" || exit 2
-    exec 74<>"$batch_scratch/cleanup.lock"
+    exec 74<>"$batch_scratch.lock"
     lock_file_descriptor 74 || exit 2
     if [[ -n "${VERIFY_HELPER_INPUT:-}" ]]; then
         exec 70>&- 71<&-
@@ -1862,7 +1864,7 @@ collect_hold_wait() {
 interrupt_hold_wait() {
     if [[ -n "$HOLD_WAITER_PID" ]]; then
         if [[ "${PLACEMENT_CLIENT_ACTIVE:-0}" == 1 ]]; then
-            "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$HOLD_WAITER_PID" TERM 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$HOLD_WAITER_PID" >&2; }
+            stop_verify_group "$HOLD_WAITER_PID"
             if [[ -n "${VERIFY_HELPER_PID:-}" ]]; then
                 kill -TERM "$VERIFY_HELPER_PID" 2>/dev/null || true
                 VERIFY_HELPER_PID=""
@@ -2039,7 +2041,7 @@ cancel_tree_run() {
     # Board release also stops a step's separately owned process group.
     if declare -F release_token >/dev/null; then release_token || true; fi
     if [[ -n "${RUN_STEP_PID:-}" ]]; then
-        "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$RUN_STEP_PID" KILL 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$RUN_STEP_PID" >&2; }
+        stop_verify_group "$RUN_STEP_PID" 9
         wait "$RUN_STEP_PID" 2>/dev/null || true
         RUN_STEP_PID=""
     fi
@@ -3947,6 +3949,7 @@ def shell_status(status: int) -> int:
     return status if status >= 0 else 128 - status
 
 with open(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]) / "package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
+from scripts.direct.cleanup_lease import signal_and_resume, stop_group
 from scripts.lib.process_start import Started, process_start, process_start_format
 
 def identity(pid):
@@ -3958,14 +3961,9 @@ def identity(pid):
 child = os.fork()
 if child:
     def forward(signum, _frame):
-        try:
-            if (sent := subprocess.run([str(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]) / "py"), str(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]) / "process_group.py"), str(child), str(signum)], capture_output=True, text=True)).returncode: raise ProcessLookupError if sent.returncode == 3 else SystemExit("verify.sh: process group helper failed: " + " ".join(sent.stderr.splitlines()))
-        except ProcessLookupError:
-            # The child has not created its new group yet, or has exited.
-            try:
-                os.kill(child, signum)
-            except ProcessLookupError:
-                pass
+        if not stop_group(child, signum):
+            # The child has not created its group yet, or has exited.
+            signal_and_resume(lambda number: os.kill(child, number), signum)
 
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, forward)
@@ -4375,7 +4373,7 @@ verify_interrupted() {
     EXIT_STATUS=$((128 + $1))
     interrupt_hold_wait
     if [[ -n "$RUN_STEP_PID" ]]; then
-        "$PY" "$VERIFY_START_DIR/cleanup_lease.py" cancel-group "$RUN_STEP_PID" "$1" || printf 'verify.sh: could not stop step group %s\n' "$RUN_STEP_PID" >&2
+        stop_verify_group "$RUN_STEP_PID" "$1"
         release_token || true
         wait "$RUN_STEP_PID" 2>/dev/null || true
         RUN_STEP_PID=""
@@ -4447,7 +4445,7 @@ lint_copy_return() {
 
 lint_copy_drop() {
     [[ -n "${LINT_COPY_DIR:-}" ]] || return 0
-    rm -rf -- "$LINT_COPY_DIR"
+    verify_helper "$BUILD_FOLDERS_SCRIPT" remove "$LINT_COPY_DIR" || return $?
     LINT_COPY_DIR="" LINT_COPY_TREE=""
     LINT_COPY_ARGS=()
 }

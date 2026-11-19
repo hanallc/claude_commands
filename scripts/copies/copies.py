@@ -46,7 +46,7 @@ from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.lib.build_slots import SlotQueuePosition, NewSlotQueuePosition, NEW_SLOT_QUEUE_POSITION
 from scripts.build_queue import first_step, slot_wait
 from scripts.direct.cleanup_lease import (
-    CleanupLeaseUse, ForegroundCleanupLease, NoCleanupLease, acquire_cleanup, mark_cleanup_incomplete,
+    CleanupLeaseUse, ForegroundCleanupLease, NoCleanupLease, acquire_cleanup,
 )
 from scripts.lib.build_steps import StepJob, VerifyCommand, command_job, command_program, read_step_names, verify_command
 from scripts.lib.conf import UseConfiguredValue
@@ -2708,7 +2708,6 @@ shift 4
 parent=""
 cleanup() {
     [[ -n "$parent" ]] || return 0
-    rmdir -- "$parent" 2>/dev/null && return 0
     "$python" "$copies" --clean-run-scope "$parent" "$batch_lease" || exit 2
 }
 trap cleanup EXIT
@@ -2732,8 +2731,8 @@ def release_run_scope(parent: Path) -> int:
                     raise ValueError(f"foreground cleanup is incomplete; kept {parent}")
         except FileNotFoundError:
             pass
-        build_folders.sweep_temporary_build_folders(parent, wait=False)
-        parent.rmdir()
+        if not build_folders.remove_build_folder(parent, wait=False):
+            return 2
     except (OSError, ValueError) as error:
         print(f"copies: release private copy: {error}", file=sys.stderr)
         return 2
@@ -2744,9 +2743,12 @@ def run_copy_in_scope(argv: list[str]) -> int:
     """Keep snapshot cleanup in the command group after its Python owner exits."""
     environment = dict(os.environ)
     cleanup_lease = environment.pop("COPIES_RUN_SCOPE_LOCK_FD", "")
+    pass_fds = (int(cleanup_lease),) if cleanup_lease else ()
+    for descriptor in pass_fds:
+        build_folders.ForegroundMarker.COORDINATED_COMMAND.begin(descriptor)
     result = subprocess.run(["bash", "-c", COPY_RUN_SCOPE_SH, "copies-run",
                              sys.executable, str(Path(__file__).resolve()), str(os.getpid()), cleanup_lease, *argv],
-                            pass_fds=(int(cleanup_lease),) if cleanup_lease else (), env=environment, check=False)
+                            pass_fds=pass_fds, env=environment, check=False)
     return result.returncode if result.returncode >= 0 else 128 - result.returncode
 
 
@@ -2761,8 +2763,8 @@ def copy_cli(argv: list[str]) -> int:
     if argv[:1] == ["--clean-run-scope"]:
         _, parent, batch_lease = argv
         status = release_run_scope(Path(parent))
-        if status and batch_lease:
-            mark_cleanup_incomplete(int(batch_lease))
+        if status == 0 and batch_lease:
+            build_folders.ForegroundMarker.COORDINATED_COMMAND.finish(int(batch_lease))
         return status
     return main(argv, invocation=CopyCommandLine(argv))
 

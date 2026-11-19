@@ -603,7 +603,8 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                 except BaseException:
                     _ = _locks.pop(descriptor, None)
                     if (made_inode is not None or (new_folder and not stable)) and _take_lock(descriptor, fcntl.LOCK_EX):
-                        _remove_failed_allocation(path, directory, made_inode)
+                        cleanup = None if made_inode is not None else lambda: None
+                        _ = _remove_leased_folder(path, directory, cleanup, temporary=True, allocated=made_inode)
                         if isinstance(original, LinkedEditableRepository):
                             import subprocess
 
@@ -629,13 +630,6 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
         if descriptor >= 0:
             _release_build_folder(_locks[descriptor], descriptor=descriptor)
         raise
-
-
-def _remove_failed_allocation(path: Path, directory: int, allocated: os.stat_result | None) -> None:
-    if allocated is not None:
-        _remove_folder(path, directory, allocated)
-    if not _folder_exists(path, directory):
-        _unlink_metadata(path, directory)
 
 
 def _remove_folder(path: Path, directory: int, allocated: os.stat_result) -> None:
@@ -775,14 +769,43 @@ def mark_cleanup_incomplete(descriptor: int) -> None:
     _ = os.pwrite(descriptor, _INCOMPLETE_CLEANUP_MARKER, 0)
 
 
-def cleanup_incomplete(descriptor: int) -> bool:
+class ForegroundMarker(Enum):
+    """Reserve a byte for each level of foreground supervision."""
+
+    COMMAND = len(_INCOMPLETE_CLEANUP_MARKER)
+    COORDINATED_COMMAND = len(_INCOMPLETE_CLEANUP_MARKER) + 1
+
+    def begin(self, descriptor: int) -> None:
+        if cleanup_incomplete(descriptor, active=self):
+            raise BlockingIOError(errno.EBUSY, "foreground cleanup is incomplete")
+        self._write(descriptor, b"1")
+
+    def finish(self, descriptor: int) -> None:
+        self._write(descriptor, b"\0")
+
+    def _write(self, descriptor: int, value: bytes) -> None:
+        if os.pwrite(descriptor, value, self.value) != len(value):
+            raise OSError(errno.EIO, "could not write foreground cleanup state")
+        os.fsync(descriptor)
+
+
+def cleanup_incomplete(descriptor: int, *, active: ForegroundMarker = ForegroundMarker.COMMAND) -> bool:
     """Read the marker while the caller holds the cleanup lock."""
     marker = os.pread(descriptor, len(_INCOMPLETE_CLEANUP_MARKER), 0)
-    return bool(marker) and _INCOMPLETE_CLEANUP_MARKER.startswith(marker)
+    if marker and _INCOMPLETE_CLEANUP_MARKER.startswith(marker):
+        return True
+    for slot in ForegroundMarker:
+        if slot is ForegroundMarker.COMMAND and active is ForegroundMarker.COORDINATED_COMMAND:
+            continue
+        if os.pread(descriptor, 1, slot.value) == b"1":
+            return True
+    return False
 
 
-def _take_removal_lock(path: Path, directory: int, descriptor: int, *, wait: bool) -> bool:
-    return (_take_lock(descriptor, fcntl.LOCK_EX, wait=wait)
+def _take_removal_lock(path: Path, directory: int, descriptor: int, *,
+                       wait: bool | build_folder_lock.ProbeTiming) -> bool:
+    timing = _probe_timing(wait=wait) if isinstance(wait, bool) else wait
+    return (build_folder_lock.take_lock(descriptor, fcntl.LOCK_EX, timing)
             and build_folder_lock.lock_current(path, directory, descriptor)
             and not cleanup_incomplete(descriptor))
 
@@ -802,19 +825,59 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
     return HeldFolderRemovalLease(path, directory, descriptor)
 
 
-def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True) -> bool:
-    """Hold every lease lock below path without following links. False when an owner holds one."""
+def _hold_child_leases(path: Path, stack: ExitStack, *, dir_fd: int | None = None,
+                       wait: bool = True, repair_permissions: bool = False) -> bool:
+    """Hold the child leases without following links."""
     def unreadable(error: OSError) -> None:
         if not isinstance(error, FileNotFoundError):
             raise error
 
-    for top, folders, files, directory in os.fwalk(path, follow_symlinks=False, onerror=unreadable):
+    root = path.name if dir_fd is not None else str(path)
+    try:
+        info = os.stat(root, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    if repair_permissions:
+        _make_directory_readable(root, dir_fd, info)
+    for top, folders, files, directory in os.fwalk(root, follow_symlinks=False, onerror=unreadable, dir_fd=dir_fd):
+        if repair_permissions:
+            for folder in folders:
+                try:
+                    info = os.stat(folder, dir_fd=directory, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                _make_directory_readable(folder, directory, info)
+        names = set(folders) | set(files)
         for name in files:
             stem = name.removesuffix(".lock")
-            if stem != name and (stem in folders or stem + ".lease.json" in files):
-                if isinstance(_hold_free_lease(Path(top) / stem, directory, stack, wait=wait), RefusedRemovalLease):
-                    return False
+            if stem == name:
+                continue
+            child = (path.parent / top if dir_fd is not None else Path(top)) / stem
+            if stem not in folders and stem + ".lease.json" not in names:
+                # An interrupted removal can leave a marker beside an absent folder.
+                try:
+                    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    if error.errno == errno.ELOOP:
+                        continue
+                    raise
+                try:
+                    if stat.S_ISREG(os.fstat(descriptor).st_mode) and cleanup_incomplete(descriptor):
+                        return False
+                finally:
+                    os.close(descriptor)
+                continue
+            if isinstance(_hold_free_lease(child, directory, stack, wait=wait), RefusedRemovalLease):
+                return False
     return True
+
+
+def _make_directory_readable(name: str, directory: int | None, info: os.stat_result) -> None:
+    required = stat.S_IRUSR | stat.S_IXUSR
+    if stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and info.st_mode & required != required:
+        os.chmod(name, stat.S_IMODE(info.st_mode) | required, dir_fd=directory, follow_symlinks=False)
 
 
 @contextmanager
@@ -877,29 +940,56 @@ def slot_build_folder(spec: BuildFolderSpec) -> Generator[Path]:
             _release_build_folder(path)
 
 
-def remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary: bool = True,
-                        dir_fd: int | None = None, wait: bool = True) -> bool:
-    """Run cleanup under the free folder's lock, then remove temporary metadata."""
-    with ExitStack() as parents:
+def remove_build_folder(path: Path, cleanup: Callable[[], object] | None = None, *, temporary: bool = True,
+                        dir_fd: int | None = None, wait: bool | build_folder_lock.ProbeTiming = True,
+                        allocated: os.stat_result | None = None) -> bool:
+    """Remove a folder only while its lease and all child leases are free."""
+    with ExitStack() as locks:
         try:
-            directory = dir_fd if dir_fd is not None else parents.enter_context(
+            directory = dir_fd if dir_fd is not None else locks.enter_context(
                 build_folder_lock.folder_parent(path, path.parent, create=False))
         except FileNotFoundError:
-            # An absent parent has no folder or metadata to lock.
-            return cleanup() is not False
-        descriptor = build_folder_lock.open_lock(path, directory, create=True)
+            return cleanup is None or cleanup() is not False
         try:
-            if not _take_removal_lock(path, directory, descriptor, wait=wait):
+            descriptor = build_folder_lock.open_lock(path, directory, create=True)
+            _ = locks.callback(os.close, descriptor)
+            free = _take_removal_lock(path, directory, descriptor, wait=wait)
+        except (OSError, ValueError):
+            free = False
+        if not free:
+            print(f"build folders: kept {path}; its lease is held or incomplete", file=sys.stderr)
+            return False
+        return _remove_leased_folder(path, directory, cleanup, temporary=temporary, allocated=allocated)
+
+
+def _remove_leased_folder(path: Path, directory: int, cleanup: Callable[[], object] | None, *,
+                          temporary: bool, allocated: os.stat_result | None = None) -> bool:
+    with ExitStack() as children:
+        current = None
+        try:
+            try:
+                current = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                current = None
+            if allocated is not None and current is not None and not os.path.samestat(allocated, current):
                 return False
-            if cleanup() is False:
-                return False
-            if _folder_exists(path, directory):
-                return False
-            if temporary:
-                _unlink_metadata(path, directory)
-            return True
-        finally:
-            os.close(descriptor)
+            free = _hold_child_leases(path, children, dir_fd=directory, wait=False,
+                                      repair_permissions=allocated is not None)
+        except (OSError, ValueError):
+            free = False
+        if not free:
+            print(f"build folders: kept {path}; a child lease is held or incomplete", file=sys.stderr)
+            return False
+        if cleanup is None:
+            if current is not None:
+                _remove_folder(path, directory, current)
+        elif cleanup() is False:
+            return False
+        if _folder_exists(path, directory):
+            return False
+        if temporary:
+            _unlink_metadata(path, directory)
+        return True
 
 
 class FolderPairRelease(Enum):
@@ -948,28 +1038,12 @@ def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
     if _locks.get(descriptor) != path:
         return
     _release_build_folder(path, descriptor=descriptor)
-    _ = remove_build_folder(path, lambda: _remove_folder(path, directory, allocated),
-                            temporary=temporary, dir_fd=directory)
+    _ = remove_build_folder(path, temporary=temporary, dir_fd=directory, allocated=allocated)
 
 
 def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
-    """Remove a folder and its records when no process holds its lock or a lease below it."""
-    def cleanup() -> bool:
-        try:
-            allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
-        except FileNotFoundError:
-            return True
-        with ExitStack() as children:
-            # A held lease below a free folder, or an unreadable folder below it, keeps the folder.
-            try:
-                if not _hold_child_leases(path, children, wait=wait):
-                    return False
-            except OSError:
-                return False
-            _remove_folder(path, directory, allocated)
-        return True
-
-    return remove_build_folder(path, cleanup, dir_fd=directory, wait=wait)
+    """Remove a temporary allocation under its leases."""
+    return remove_build_folder(path, dir_fd=directory, wait=wait)
 
 
 def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
@@ -1223,12 +1297,7 @@ def main(argv: Sequence[str]) -> int:
         if command == "remove":
             path = cast(Path, args.path)
             _release_build_folder(path)
-            def cleanup() -> None:
-                try:
-                    shutil.rmtree(path)
-                except FileNotFoundError:
-                    pass
-            return 0 if remove_build_folder(path, cleanup) else 1
+            return 0 if remove_build_folder(path) else 1
         if command == "run-temp-path":
             from scripts.lib import unit_runs
 
