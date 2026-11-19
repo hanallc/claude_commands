@@ -293,7 +293,7 @@ with hana_command_lock(directory) as access:
         pending = self.claim()
         assert isinstance(pending, hana.HanaClaimPending)
         self.clock.advance(121)
-        self.assertFalse(self.controller.release(pending.reference.claim_id))
+        self.assertIsInstance(self.controller.release(pending.reference.claim_id), hana.HanaClaimReleaseRefused)
         self.assertEqual(self.claim(), pending)
 
     def test_placement_releases_only_a_dead_claim_after_lifecycle_abandonment(self) -> None:
@@ -358,7 +358,7 @@ with hana_command_lock(directory) as access:
         observation = replace(objects.observe_execution(key), evidence=execution_identity.ExecutionEvidenceUnavailable(reason, self.clock.now))
         with mock.patch.object(objects, 'observe_execution', return_value=observation):
             _ = execution.observe_execution(self.state, request, objects)
-        with mock.patch.object(hana, 'release_assigned', return_value=False) as release:
+        with mock.patch.object(hana, 'release_assigned', return_value=hana.HanaClaimReleaseRefused('The Hana claim is busy')) as release:
             settled = execution.settle_execution(self.state, request, objects,
                 release_claim=lambda: hana.release_assigned(self.assignment, self.holder, self.controller), reason='lost',
                 fence_window=execution.FenceAcknowledgementWindow(0, 1))
@@ -391,7 +391,7 @@ with hana_command_lock(directory) as access:
         from scripts.aws_target import hana_execution
         before = self.controller.path.read_bytes()
         with mock.patch.object(hana_execution, 'execution_command_settled', return_value=True):
-            self.assertTrue(hana.release_assigned(second, self.holder, self.controller))
+            self.assertEqual(hana.release_assigned(second, self.holder, self.controller), hana.HanaClaimReleased())
         self.assertEqual(self.controller.path.read_bytes(), before)
         self.assertEqual(len(claim_state.read_claims(claim_state.state_paths('fixture'))), 1)
 
@@ -562,12 +562,26 @@ with hana_command_lock(directory) as access:
 
     def test_release_requires_durable_fence_and_exact_holder(self) -> None:
         adopted = self.ready()
-        self.assertFalse(hana.release_assigned(self.assignment, self.holder, self.controller))
+        self.assertEqual(hana.release_assigned(self.assignment, self.holder, self.controller),
+                         hana.HanaClaimReleaseRefused('The Hana command settlement is unconfirmed'))
         from scripts.aws_target import hana_execution
         with mock.patch.object(hana_execution, 'execution_command_settled', return_value=True):
-            self.assertFalse(hana.release_assigned(self.assignment, replace(self.holder, start_time='wrong'), self.controller))
-            self.assertTrue(hana.release_assigned(self.assignment, self.holder, self.controller))
-            self.assertTrue(hana.release_assigned(self.assignment, self.holder, self.controller))
+            self.assertEqual(hana.release_assigned(self.assignment, replace(self.holder, start_time='wrong'), self.controller),
+                             hana.HanaClaimReleaseRefused('The local Hana claim differs from the assignment or holder'))
+            step = self.provider.step
+
+            def during_observe(identity: box.DeploymentIdentity, start: box.DemandStart | box.NoDemandStart,
+                               operation: box.PendingOperation) -> box.ProviderReply:
+                self.assertEqual(operation.action, box.Action.OBSERVE)
+                self.assertEqual(hana.release_assigned(self.assignment, self.holder, self.controller),
+                                 hana.HanaClaimReleaseRefused('The Hana lifecycle operation observe is pending'))
+                return step(identity, start, operation)
+
+            with mock.patch.object(self.provider, 'step', side_effect=during_observe) as observed:
+                _ = self.controller.tick()
+            observed.assert_called_once()
+            self.assertEqual(hana.release_assigned(self.assignment, self.holder, self.controller), hana.HanaClaimReleased())
+            self.assertEqual(hana.release_assigned(self.assignment, self.holder, self.controller), hana.HanaClaimReleased())
         self.assertEqual(claim_state.read_claims(claim_state.state_paths('fixture')), ())
         self.assertEqual(adopted.reserved.claim.reference.claim_id, execution_identity.assigned_claim_id('fixture-episode', 'fixture-attempt'))
 
@@ -732,7 +746,9 @@ class HanaGpuPlacementTests(CostFixture):
                 self.assertEqual(stdout.getvalue(), 'output\n')
                 self.assertEqual(stderr.getvalue(), 'diagnostics\n')
                 raise wire.AdmissionUnavailable('fixture queue outage')
-            state = (placement.ClosedAssignment('completed') if isinstance(request.outcome, placement.AttemptCompleted)
+            state = (placement.ClosedAssignment('completed')
+                     if isinstance(request.outcome, placement.AttemptCompleted)
+                     and isinstance(request.path, placement.DispatchPathSettled)
                      else placement.CurrentAssignment())
             return wire.DispatchStatus(self.assignment, state, placement.PermissionConsumed(0))
 
@@ -841,6 +857,12 @@ class HanaGpuPlacementTests(CostFixture):
                 result = read_result(self.root / 'gpu-result', status, False)
                 assert isinstance(result, UsableRunnerResult)
                 self.assertEqual((result.word, result.reason), ('hana_command_admission_refused', reason))
+
+    def test_pending_claim_release_preserves_the_test_verdict_and_output(self) -> None:
+        status, stdout, stderr, report = self.run_fake_gpu(100, refuse_release=True)
+        self.assertEqual((status, stdout, stderr), (100, 'output\n', 'diagnostics\n'))
+        self.assertEqual(report.outcome, placement.AttemptCompleted(100))
+        self.assertEqual(report.path, placement.DispatchPathPending('The Hana GPU claim release remains pending'))
 
     def test_queue_outage_preserves_the_test_verdict_and_output(self) -> None:
         status, stdout, stderr, report = self.run_fake_gpu(100, report_unavailable=True)

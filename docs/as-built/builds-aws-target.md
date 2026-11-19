@@ -1560,6 +1560,7 @@ If the queue refuses authorization, the sender uses the queue's reason.
 The queue reports whether adoption evidence is stale or unavailable and includes the reason.
 If release fails, the sender reports pending settlement and the queue keeps the assignment.
 The runner returns the confirmed guest refusal with its original reason and records that cleanup remains unconfirmed.
+The runner also returns an accepted command result with its output and exit status while claim release remains pending.
 `release_assigned()` requires F1's durable command settlement before lifecycle and target claim release.
 An exact guest observation can settle an accepted execution that ended without a compiler result.
 The observation must confirm termination and lease release, and the sender must have issued no source update.
@@ -1579,8 +1580,9 @@ For a dead local holder, the Hana evidence worker can replay exact terminal proo
 The journal, guest observation, and retained claim must identify the same boot.
 The worker uses the normal settlement path to release the claim and record settlement.
 Recovery preserves a saved pending report's outcome and sends that report as settled after claim release.
-The sender checks the current source on the normal completion path and sends a settled report. The pending report path sends no completion.
-For a recovered completion, the worker uses the sender's current source check and reports a decline if the source changed.
+The sender checks the current source when it accepts a result.
+If fencing or claim release remains pending, the sender reports the accepted completion with `DispatchPathPending`.
+Recovery uses the result decision from the journal.
 The queue consumes the settled execution report on its loop thread and closes the assignment.
 If the service restarts after claim release, it can read the settled journal and finish the report.
 If the journal confirms command settlement and the claim is gone, recovery completes any unfinished journal write and sends the report.
@@ -1603,8 +1605,10 @@ Phase E adds no stored shape or queue wire field.
 Run the gate setup command on natedev.
 
 ```sh
-python3 scripts/aws_target/deploy.py up --workload merge-gates --approve-resources --hana-gpu-nextest
+python3 scripts/aws_target/deploy.py up --workload merge-gates --approve-resources
 ```
+
+The GPU probe prints its verdict. The verdict is available only in the command output.
 
 After the GPU setup probe passes, set `hana_gpu_route_enabled=on` in `config/cloud_gate.conf`.
 The route checks the deployment record for every type in `hana_gpu_instance_types`.

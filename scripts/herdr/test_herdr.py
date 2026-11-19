@@ -2321,6 +2321,36 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertIsInstance(herdr.submitted_prompt(self.transcript, "resume the saved work", self.launched_at),
                               herdr.PromptSubmitted)
 
+        with self.subTest(transcript="malformed Codex line"):
+            from scripts.agents.stop_resume import CodexProducerPromptCursor
+
+            self.typed.clear()
+            self.turn_delay = 0
+            self.path = self.transcript.config_dir / "sessions" / f"rollout-{self.transcript.session_id}.jsonl"
+            self.path.parent.mkdir()
+            cursor = CodexProducerPromptCursor(self.transcript, self.launched_at)
+
+            def type_with_malformed_record(pane: str, text: str) -> None:
+                self.type_prompt(pane, text)
+                _ = self.path.write_text('{"type":broken}\n')
+                self.screen = "────────\n❯ \n────────"
+
+            opening = herdr.OpeningPrompt("resume the saved work", self.transcript, cursor=cursor)
+            with patch.object(self.client, "_prompt", side_effect=type_with_malformed_record):
+                outcome = self.client.submit_opening_prompt("destination:p1", opening, self.launched_at, 16_000)
+            self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+            self.assertEqual(len(self.typed), 1)
+            self.assertEqual(self.enters, [])
+            self.assertIsInstance(cursor.readability, herdr.TranscriptUnreadable)
+            retry = herdr.OpeningPrompt(opening.text, self.transcript, cursor=cursor, resend_once=True)
+            with patch.object(self.client, "_prompt", side_effect=type_with_malformed_record):
+                outcome = self.client.submit_opening_prompt("destination:p1", retry, self.launched_at, 16_000)
+            self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+            self.assertEqual(len(self.typed), 2)
+            self.assertEqual(self.enters, [])
+            self.write_turn(opening.text)
+            self.assertIsInstance(cursor.submitted_prompt(script_prompt(opening.text)), herdr.PromptSubmitted)
+
     def test_unreadable_accepted_turn_is_found_after_reads_recover_without_retyping(self) -> None:
         self.turn_delay = 8
         with self.unreadable_transcript(8, 13) as failures:

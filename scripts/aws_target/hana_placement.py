@@ -9,6 +9,10 @@ from scripts.build_targets.execution_transport import (
     HanaControlTransport as HanaControlTransport, HanaGpuNextestTransport,
 )
 from typing import TYPE_CHECKING, Protocol, cast
+from scripts.aws_target.hana_claim_release import (
+    HanaClaimRelease as HanaClaimRelease, HanaClaimReleased as HanaClaimReleased,
+    HanaClaimReleaseRefused as HanaClaimReleaseRefused,
+)
 from scripts.aws_target.hana_generation import HanaHostGeneration as HanaHostGeneration
 
 if TYPE_CHECKING:
@@ -133,7 +137,7 @@ class _PlacementAdapter(Protocol):
     def claim_assigned(self, assignment: placement.PlacementAssignment, holder: placement.ClaimHolderIdentity, controller: box.HanaController, *, worktree: str='') -> HanaClaimResult:
         ...
 
-    def release_assigned(self, assignment: placement.PlacementAssignment, holder: placement.ClaimHolderIdentity, controller: box.HanaController) -> bool:
+    def release_assigned(self, assignment: placement.PlacementAssignment, holder: placement.ClaimHolderIdentity, controller: box.HanaController) -> HanaClaimRelease:
         ...
 
     def fixed_policy(self, transport: HanaControlTransport, repository: str, kind: str) -> HanaStepRefused | EnabledHanaRoute:
@@ -204,7 +208,7 @@ def generation_text(generation: HanaHostGeneration) -> str:
     return digest.hexdigest()
 
 
-def release_assigned(assignment: placement.PlacementAssignment, holder: placement.ClaimHolderIdentity, controller: box.HanaController) -> bool:
+def release_assigned(assignment: placement.PlacementAssignment, holder: placement.ClaimHolderIdentity, controller: box.HanaController) -> HanaClaimRelease:
     """Release the exact target claim after durable execution and lifecycle settlement."""
     return _adapter().release_assigned(assignment, holder, controller)
 

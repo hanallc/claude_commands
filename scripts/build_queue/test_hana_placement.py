@@ -108,7 +108,7 @@ class HanaQueueTests(unittest.TestCase):
         if warm:
             self.assertIsInstance(controller.request('warm-up'), hana_box.ClaimCommitted)
             tick((1, 1, 1, 1))
-            self.assertTrue(controller.release('warm-up'))
+            self.assertIsInstance(controller.release('warm-up'), hana_placement.HanaClaimReleased)
 
         # Keep the first worker reading in the cache until after launch permission.
         fixture.configure(waiting_pass_seconds=60)
@@ -323,7 +323,7 @@ class HanaQueueTests(unittest.TestCase):
         for proof in ('legacy refusal', 'no reply', 'other boot', 'claim from other boot',
                       'restart after release reports once', 'sender settled without a saved observation',
                       'sender final write failed without a saved observation',
-                      'pending conflicting report', 'stale completion', 'failed release', 'interrupted journal write'):
+                      'pending conflicting report', 'accepted completion with changed source', 'failed release', 'interrupted journal write'):
             with self.subTest(proof=proof):
                 self.check_dead_holder_replay(proof)
 
@@ -377,18 +377,18 @@ class HanaQueueTests(unittest.TestCase):
             observed_attempt = (replace(attempt, generation=replace(attempt.generation, boot_id='other-boot'))
                                 if proof == 'other boot' else attempt)
             reason = 'The data mount and a fresh permit are required'
-            stale_completion = proof == 'stale completion'
+            accepted_completion = proof == 'accepted completion with changed source'
             evidence = execution_identity.ExecutionEvidenceUnavailable(
-                'The command ended' if stale_completion else reason, fixture.clock.now())
+                'The command ended' if accepted_completion else reason, fixture.clock.now())
             observation = hana_protocol.HanaCommandObservation(observed_attempt, dispatch.slot, True,
-                stale_completion, True, True, fixture.clock.now(), evidence, False)
+                accepted_completion, True, True, fixture.clock.now(), evidence, False)
             journal: dict[str, object] = {'version': 1, 'request': hana_protocol.request_fields(dispatch), 'phase': 'fenced',
                 'publication_attempted': True, 'command_settled': False, 'evidence': hana_protocol.encode_evidence(evidence)}
             sender_write_failed = proof == 'sender final write failed without a saved observation'
             sender_fenced = proof == 'sender settled without a saved observation' or sender_write_failed
             if proof != 'no reply' and not sender_fenced:
                 journal['observation'] = cast(object, json.loads(hana_protocol.encode_observation(observation)))
-            if stale_completion:
+            if accepted_completion:
                 result = replace(execution_fixture.command_result(), key=attempt, source_key=source.key, host=destination.host)
                 journal['accepted_result'] = base64.b64encode(hana_result.encode_result(result)).decode('ascii')
             journal_path = hana_execution.execution_path(controller.directory, reference.claim_id)
@@ -439,7 +439,7 @@ class HanaQueueTests(unittest.TestCase):
                     self.assertFalse(path.exists())
                 fixture.end_owner(wire.Owner(holder.pid, holder.start_time))
                 if proof == 'failed release':
-                    release.return_value = False
+                    release.return_value = hana_placement.HanaClaimReleaseRefused('The Hana lifecycle operation observe is pending')
                     self.probe_dead_holder(fixture, target.name)
                     _ = fixture.run_pass()
                     self.assertIsInstance(fixture.server.assignments[key].state, placement.CurrentAssignment)
@@ -492,11 +492,10 @@ class HanaQueueTests(unittest.TestCase):
                     assert isinstance(pending, placement.TerminalAttemptReport)
                     self.assertEqual(saved.state, placement.ClosedAssignment('lost'))
                     self.assertEqual(report, replace(pending, path=placement.DispatchPathSettled()))
-                elif stale_completion:
-                    changed = hana_execution.SOURCE_CHANGED_BEFORE_RESULT_PUBLICATION
-                    self.assertEqual(saved.state, placement.ClosedAssignment(changed))
-                    self.assertEqual(report.outcome, placement.AttemptDeclined(changed))
-                    source_read.assert_called_once_with(fixture.root)
+                elif accepted_completion:
+                    self.assertIsInstance(saved.state, placement.ClosedAssignment)
+                    self.assertEqual(report.outcome, placement.AttemptCompleted(0))
+                    source_read.assert_not_called()
                 elif sender_fenced:
                     self.assertEqual(saved.state, placement.ClosedAssignment(sender_reason))
                     self.assertEqual(report.outcome, placement.AttemptDeclined(sender_reason))
@@ -670,7 +669,7 @@ class HanaQueueTests(unittest.TestCase):
             self.assertIsInstance(hana_placement.claim_assigned(assignment, holder, controller), hana_placement.HanaClaimAdopted)
             paths = claim_state.state_paths(target.name)
 
-            with mock.patch.object(controller, 'release', return_value=False):
+            with mock.patch.object(controller, 'release', return_value=hana_placement.HanaClaimReleaseRefused('The Hana claim is busy')):
                 pending = hana_execution.settle_unpublished_claim(controller.directory, reference,
                     release_claim=lambda: hana_placement.release_assigned(assignment, holder, controller),
                     reason=outcome if isinstance(outcome, execution_identity.HanaCommandAdmissionRefused) else outcome.reason)
@@ -920,12 +919,14 @@ class HanaGpuQueueTests(unittest.TestCase):
                 self.assertEqual(assignment.destination.target, 'hana-gpu')
                 key = fixture.server.host_evidence_key(request, assignment.destination)
 
-                def refresh_evidence() -> None:
-                    evidence = fixture.read_host_evidence(key)
-                    self.assertIsInstance(evidence, placement.FreshHostEvidence)
-                    assert isinstance(evidence, placement.FreshHostEvidence)
+                def publish_evidence(evidence: placement.HostEvidence) -> None:
                     fixture.provider_evidence[key] = evidence
                     fixture.server.publish_host_evidence(evidence)
+
+                def fresh_evidence() -> placement.FreshHostEvidence:
+                    evidence = fixture.read_host_evidence(key)
+                    assert isinstance(evidence, placement.FreshHostEvidence)
+                    return evidence
 
                 evidence_expired = False
 
@@ -933,15 +934,24 @@ class HanaGpuQueueTests(unittest.TestCase):
                     nonlocal evidence_expired
                     if not evidence_expired:
                         evidence_expired = True
+                        assert isinstance(message.holder, placement.ClaimHolderIdentity)
+                        ineligible = replace(fresh_evidence(), eligibility=placement.FixedExclusion('fixture policy'))
+                        self.assertIn(placement.AdoptedProviderClaim(message.claim, message.holder,
+                            assignment.session, assignment.destination.host, ineligible.generation), ineligible.claims)
+                        publish_evidence(ineligible)
+                        denied = fixture.connect(replace(message, request_id='gpu-ineligible')).replies()[-1]
+                        assert isinstance(denied, wire.DispatchStatus)
+                        self.assertIsInstance(denied.permission, placement.PermissionAvailable)
+                        self.assertEqual(denied.reason, 'The Hana GPU step is no longer eligible')
+
                         stale = placement.StaleHostEvidence(key, fixture.clock.now(), 'provider evidence expired')
-                        fixture.provider_evidence[key] = stale
-                        fixture.server.publish_host_evidence(stale)
+                        publish_evidence(stale)
                         refused = fixture.connect(message).replies()[-1]
                         assert isinstance(refused, wire.DispatchStatus)
                         self.assertIsInstance(refused.permission, placement.PermissionAvailable)
                         self.assertEqual(refused.reason, 'adoption evidence is unavailable or stale')
                         return refused
-                    refresh_evidence()
+                    publish_evidence(fresh_evidence())
                     answer = fixture.connect(message).replies()[-1]
                     self.assertIsInstance(answer, wire.FirstAuthorization)
                     assert isinstance(answer, wire.FirstAuthorization)
@@ -962,7 +972,7 @@ class HanaGpuQueueTests(unittest.TestCase):
                     self.assertEqual(message.path, placement.DispatchPathSettled())
                     self.assertFalse(hana_placement_adapter.gpu_claim_pending('hana-gpu', message.claim.claim_id)
                                      if isinstance(message.claim, placement.ProviderClaimReference) else True)
-                    refresh_evidence()
+                    publish_evidence(fresh_evidence())
                     answer = fixture.connect(message).replies()[-1]
                     assert isinstance(answer, wire.DispatchStatus)
                     return answer
