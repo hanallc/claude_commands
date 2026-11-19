@@ -1413,7 +1413,11 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
              'vcpus': 32, 'result': 'finished', 'gate_s': 1.0, 'mode': 'merge-gate', 'region': 'fixture-region'}])
         data = ledger.text(self.fake.launches[0], 'UserData')
         self.assertTrue(data.startswith('#!/bin/sh\n'))
-        links = ledger.mapping(cast(object, json.loads(data.split("<<'GATE_LINKS'\n", 1)[1].split('\nGATE_LINKS', 1)[0])))
+        link_rows = data.split("<<'GATE_LINKS'\n", 1)[1].split('\nGATE_LINKS', 1)[0]
+        links: dict[str, object] = {}
+        for line in link_rows.splitlines():
+            name, _, _, value = line.split('\t', 3)
+            links[cast(str, json.loads(name))] = cast(object, json.loads(value))
         for key in ('guest', 'request', 'source', 'log', 'result', 'boot_error'):
             parsed = urlsplit(ledger.text(links, key))
             query = parse_qs(parsed.query)
