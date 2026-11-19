@@ -2,21 +2,20 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
-from typing import BinaryIO, cast
+from typing import BinaryIO, IO, Protocol, cast
 import re
 import json
 import os
 import select
 import signal
 import subprocess
-import sys
 import time
 
-from scripts.lib import cancellation, process_group
+from scripts.lib import cancellation, process_supervisor
 
 SETTLE_SECONDS = 0.25
 
@@ -139,32 +138,15 @@ class PageResult:
 
 @contextmanager
 def managed_process(command: Sequence[str], *, cwd: Path, env: Mapping[str, str],
-                    stderr: BinaryIO) -> Generator[subprocess.Popen[bytes]]:
-    """Keep the process group alive only while the checker owns it."""
-    supervisor = Path(__file__).with_name("console_supervisor.py").resolve()
-    with cancellation.defer_cleanup_signals(), ExitStack() as descriptors:
-        checker_read, checker_write = os.pipe()
-        _ = descriptors.callback(os.close, checker_write)
+                    stderr: BinaryIO) -> Generator[process_supervisor.ManagedProcess[bytes]]:
+    """Keep the workload session alive only while the checker owns it."""
+    with cancellation.defer_cleanup_signals(), process_supervisor.launch(
+            command, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr) as child:
+        previous = signal.pthread_sigmask(signal.SIG_UNBLOCK, cancellation.CANCELLATION_SIGNALS)
         try:
-            child = subprocess.Popen(
-                [sys.executable, "-I", "-S", str(supervisor), str(checker_read), *command],
-                cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
-                pass_fds=(checker_read,), start_new_session=True,
-            )
+            yield child
         finally:
-            os.close(checker_read)
-        try:
-            # Restore the caller's signal mask while it uses the process.
-            previous = signal.pthread_sigmask(signal.SIG_UNBLOCK, cancellation.CANCELLATION_SIGNALS)
-            try:
-                yield child
-            finally:
-                _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous)
-        finally:
-            with suppress(ProcessLookupError):
-                process_group.send_process_group(child.pid, signal.SIGKILL)
-            with child:
-                _ = child.wait(timeout=30)
+            _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 class Pipe:
@@ -203,10 +185,18 @@ def message_object(data: bytes) -> dict[str, object]:
     return json_object(cast(object, json.loads(data)))
 
 
+class DebuggerPipes(Protocol):
+    @property
+    def stdin(self) -> IO[bytes] | None: ...
+
+    @property
+    def stdout(self) -> IO[bytes] | None: ...
+
+
 class Browser:
     """Inspect each navigation in a new Chrome tab."""
 
-    def __init__(self, child: subprocess.Popen[bytes], origin: str) -> None:
+    def __init__(self, child: DebuggerPipes, origin: str) -> None:
         if child.stdin is None or child.stdout is None:
             raise ValueError("Chrome needs a debugger pipe.")
         self.output: BinaryIO = cast(BinaryIO, child.stdin)

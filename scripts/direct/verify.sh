@@ -907,6 +907,7 @@ run_step() {
         started="$(date '+%Y-%m-%d %H:%M:%S %z')"
         monitor=0
         [[ $- != *m* ]] || monitor=1
+        # The step group stays in the caller's session for guardian cleanup.
         set -m
         (
             set +m
@@ -2972,15 +2973,19 @@ wait_for_placement() {
     "$PY" "$LOCAL_RELEASE_WAIT_SCRIPT" "${BUILD_TARGETS_POLL_S:-15}" "$BUILDLOG_CALL_ID" \
         "$PLACEMENT_EPISODE" "$wait_kind" "$wait_target" &
     HOLD_WAITER_PID=$!
-    wait "$HOLD_WAITER_PID" || true
+    local status=0
+    wait "$HOLD_WAITER_PID" || status=$?
     HOLD_WAITER_PID=""
+    return "$status"
 }
 
 wait_for_claim_recovery() {
+    local status=0
     sleep "${BUILD_TARGETS_POLL_S:-15}" &
     HOLD_WAITER_PID=$!
-    wait "$HOLD_WAITER_PID" || true
+    wait "$HOLD_WAITER_PID" || status=$?
     HOLD_WAITER_PID=""
+    return "$status"
 }
 
 take_local_placement() {
@@ -3090,7 +3095,7 @@ route_test() {
                 PLACEMENT_TOKEN_CHECK_EPISODE=$PLACEMENT_EPISODE
                 continue
             fi
-            wait_for_placement
+            wait_for_placement || return $?
             continue
         fi
         (( placement_status == 0 )) || return "$placement_status"
@@ -3152,7 +3157,7 @@ route_test() {
                 while (( recovered == 78 )); do
                     recovered=0
                     verify_helper "$BUILD_TARGETS_SCRIPT" recover-reservation "${reservation_words[@]}" || recovered=$?
-                    if (( recovered == 78 )); then wait_for_claim_recovery; fi
+                    if (( recovered == 78 )); then wait_for_claim_recovery || return $?; fi
                 done
                 if (( recovered == 0 || recovered == 13 )); then
                     claim_status=$recovered
@@ -3847,7 +3852,15 @@ acquire_token() {
             token_wait_note still "$waited"
             noted=$waited
         fi
-        (( TOKEN_SUPERSEDED )) || sleep "$pause"
+        if (( ! TOKEN_SUPERSEDED )); then
+            sleep "$pause" || {
+                status=$?
+                if (( ! TOKEN_SUPERSEDED )); then
+                    token_wait_left
+                    return "$status"
+                fi
+            }
+        fi
     done
     phase_wait_finish token
     TOKEN_WAITER_PID=""
@@ -3886,15 +3899,17 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import threading
 
-lock = Path(sys.argv[1])
-holder = sys.argv[2]
-command = sys.argv[3:]
+forwarded_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+if sys.argv[1] != "--workload":
+    signal.pthread_sigmask(signal.SIG_BLOCK, forwarded_signals)
 
 def shell_status(status: int) -> int:
     return status if status >= 0 else 128 - status
 
 with open(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]) / "package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
+from scripts.lib import process_supervisor
 from scripts.lib.process_start import Started, process_start, process_start_format
 
 def identity(pid):
@@ -3903,44 +3918,77 @@ def identity(pid):
         raise RuntimeError("cannot read the step owner start")
     return result.start
 
-child = os.fork()
-if child:
-    def forward(signum, _frame):
+def forward(signum: int) -> None:
+    library = Path(os.environ["VERIFY_PROCESS_GROUP_LIB"])
+    sent = subprocess.run(
+        [str(library / "py"), str(library / "process_group.py"), str(child), str(signum)],
+        capture_output=True, text=True,
+    )
+    if sent.returncode == 3:
         try:
-            if (sent := subprocess.run([str(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]) / "py"), str(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]) / "process_group.py"), str(child), str(signum)], capture_output=True, text=True)).returncode: raise ProcessLookupError if sent.returncode == 3 else SystemExit("verify.sh: process group helper failed: " + " ".join(sent.stderr.splitlines()))
+            os.kill(child, signum)
         except ProcessLookupError:
-            # The child has not created its new group yet, or has exited.
+            pass
+    elif sent.returncode:
+        raise SystemExit("verify.sh: process group helper failed: " + " ".join(sent.stderr.splitlines()))
+
+if sys.argv[1] == "--workload":
+    lock = Path(sys.argv[2])
+    holder = sys.argv[3]
+    command = sys.argv[4:]
+    with (lock.parent / "cargo.guard").open("a+") as guard:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        try:
+            recorded = (lock / "holder_pid").read_text()
+        except OSError:
+            recorded = ""
+        if recorded != holder:
+            lost_file = os.environ.get("VERIFY_TOKEN_LOST_FILE")
+            if lost_file:
+                Path(lost_file).write_text("lost")
+            print("verify.sh: lost the cargo token before its step started", file=sys.stderr)
+            sys.exit(125)
+        record = lock / f"owned.{os.getpid()}.tmp"
+        record.write_text(json.dumps({"group": os.getpid(), "start": identity(os.getpid()), "start_format": process_start_format()}))
+        os.replace(record, lock / "owned")
+        fcntl.flock(guard, fcntl.LOCK_UN)
+    sys.exit(shell_status(subprocess.call(command)))
+
+forwarding = threading.Lock()
+finished = False
+forward_error: OSError | SystemExit | None = None
+
+def receive_signals() -> None:
+    global forward_error
+    while True:
+        signum = signal.sigwait(forwarded_signals)
+        with forwarding:
+            if finished:
+                return
             try:
-                os.kill(child, signum)
-            except ProcessLookupError:
-                pass
+                forward(signum)
+            except (OSError, SystemExit) as error:
+                forward_error = error
+                return
 
-    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        signal.signal(signum, forward)
-    _, status = os.waitpid(child, 0)
-    sys.exit(shell_status(os.waitstatus_to_exitcode(status)))
-
-os.setsid()
-with (lock.parent / "cargo.guard").open("a+") as guard:
-    fcntl.flock(guard, fcntl.LOCK_EX)
-    # A token released or reclaimed after the grant leaves no holder_pid,
-    # or a holder that recorded none: either way this run no longer holds it.
+with process_supervisor.launch([sys.executable, "-I", "-S", "-c", os.environ["VERIFY_STEP_OWNER_SOURCE"],
+                                "--workload", *sys.argv[1:]]) as workload:
+    child = workload.pid
+    threading.Thread(target=receive_signals, daemon=True).start()
     try:
-        recorded = (lock / "holder_pid").read_text()
-    except OSError:
-        recorded = ""
-    if recorded != holder:
-        lost_file = os.environ.get("VERIFY_TOKEN_LOST_FILE")
-        if lost_file:
-            Path(lost_file).write_text("lost")
-        print("verify.sh: lost the cargo token before its step started", file=sys.stderr)
-        sys.exit(125)
-    record = lock / f"owned.{os.getpid()}.tmp"
-    record.write_text(json.dumps({"group": os.getpid(), "start": identity(os.getpid()), "start_format": process_start_format()}))
-    os.replace(record, lock / "owned")
-    fcntl.flock(guard, fcntl.LOCK_UN)
-
-sys.exit(shell_status(subprocess.call(command)))
+        # A bounded wait lets the main thread report a forwarding error.
+        while forward_error is None:
+            try:
+                status = workload.wait(timeout=1)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    finally:
+        with forwarding:
+            finished = True
+    if forward_error is not None:
+        raise forward_error
+    sys.exit(shell_status(status))
 '
 
 # Preserve the shared invocation policy (including systemd scopes and its
@@ -4034,7 +4082,8 @@ buildlog_exec() {
             return 125
         fi
         VERIFY_TOKEN_LOST_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/token-lost}" \
-            VERIFY_PY_HELPER=STEP_OWNER_PY buildlog_exec_unowned env VERIFY_PROCESS_GROUP_LIB="$(dirname -- "${STEP_RECORD_SCRIPT:-$BOARD_HELPER}")/../lib" "$PY" -c "$STEP_OWNER_PY" \
+            VERIFY_PY_HELPER=STEP_OWNER_PY buildlog_exec_unowned env VERIFY_PROCESS_GROUP_LIB="$(dirname -- "${STEP_RECORD_SCRIPT:-$BOARD_HELPER}")/../lib" \
+                VERIFY_STEP_OWNER_SOURCE="$STEP_OWNER_PY" "$PY" -c "$STEP_OWNER_PY" \
                 "${BOARD_DIR}/locks/cargo.d" "$$" "$@" || step_status=$?
         stop_token_renewer
         return "$step_status"

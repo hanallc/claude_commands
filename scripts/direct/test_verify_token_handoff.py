@@ -1,6 +1,8 @@
 """Real verify.sh token handoff behavior."""
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import ManagedProcess, launch
+
 import subprocess
 import unittest
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY
@@ -15,19 +17,17 @@ class VerifyTokenHandoffTests(VerifyTokenWaitFixture):
         environment = self.hold_environment(board, 0)
         output = self.root / "held.out"
         held = self.start_hold_waiter(environment, output)
-        peer: subprocess.Popen[bytes] | None = None
+        peer: ManagedProcess[bytes] | None = None
         try:
             self.assertFalse(lock.exists(), "the hold wait kept the token")
             peer_holds = self.root / "peer-holds"
             peer_holds.mkdir()
-            peer = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"],
+            peer = self.enterContext(launch(["bash", str(VERIFY), "check", "sample", "--no-cache"],
                                     cwd=self.root,
                                     env={**environment, "BUILD_HOLD_DIR": str(peer_holds), "TEST_BLOCK": "1",
                                          "CLAUDE_CODE_SESSION_ID": fixture_runtime_id("fixture-hold-owner"),
                                          "CODEX_THREAD_ID": fixture_runtime_id("fixture-hold-owner")},
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                    start_new_session=True)
-            self.started_groups.add(peer.pid)
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
             self.wait_for_running(self.root / "running", peer)
             self.assertEqual((lock / "holder_pid").read_text(), str(peer.pid))
 

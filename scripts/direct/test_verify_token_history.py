@@ -6,6 +6,7 @@ import unittest
 from typing import cast
 from pathlib import Path
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY
+from scripts.lib.process_supervisor import launch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import fixture_runtime_id
 
@@ -33,37 +34,27 @@ exit 0
                               "UNIT_TEAM_ROLE": "second", "CODEX_THREAD_ID": fixture_runtime_id("thread-second"), "TEST_WAITING": str(waiting),
                               "TEST_WAIT_GATE": str(resume),
                               "UNIT_TOKEN_CLOCK_FILE": str(second_clock)}
-        first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
-                                 env=first_environment, stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
-        self.started_groups.add(first.pid)
-        try:
-            self.wait_for_running(self.root / "running", first)
-            second = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
-                                      env=second_environment, stdout=subprocess.PIPE,
-                                      stderr=subprocess.PIPE, text=True, start_new_session=True)
-            self.started_groups.add(second.pid)
+        with launch(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
+                    env=first_environment, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True) as first:
             try:
-                self.wait_for_running(waiting, second)
-                self.assertIsNone(second.poll(), "second verify exited before the token was released")
-                self.assertEqual(len(self.records()), 0)
-                _ = second_clock.write_text("1020\n")
-                _ = (self.root / "release").touch()
-                first_output = first.communicate(timeout=TEST_HANG_GUARD_SECS)
-                self.assertEqual(first.returncode, 0, first_output)
-                resume.touch()
-                second_output = second.communicate(timeout=TEST_HANG_GUARD_SECS)
-                self.assertEqual(first.returncode, 0, first_output)
-                self.assertEqual(second.returncode, 0, second_output)
+                self.wait_for_running(self.root / "running", first)
+                with launch(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
+                            env=second_environment, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True) as second:
+                    self.wait_for_running(waiting, second)
+                    self.assertIsNone(second.poll(), "second verify exited before the token was released")
+                    self.assertEqual(len(self.records()), 0)
+                    _ = second_clock.write_text("1020\n")
+                    _ = (self.root / "release").touch()
+                    first_output = first.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(first.returncode, 0, first_output)
+                    resume.touch()
+                    second_output = second.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(first.returncode, 0, first_output)
+                    self.assertEqual(second.returncode, 0, second_output)
             finally:
-                if second.poll() is None:
-                    self.end_group(second.pid)
-                    _ = second.communicate()
-        finally:
-            _ = (self.root / "release").touch()
-            if first.poll() is None:
-                self.end_group(first.pid)
-                _ = first.communicate()
+                _ = (self.root / "release").touch()
         records = self.records()
         self.assertEqual(len(records), 2)
         first_record = next((record for record in records

@@ -40,6 +40,7 @@ from unittest import mock
 from scripts.build_hold import build_hold
 from scripts.direct.local_release_wait import RELEASE_CHANGES, LocalReleaseEvents, local_release_waiter
 from scripts.lib import inotify
+from scripts.lib.process_supervisor import ManagedProcess
 from scripts.production.cli_fixture import invoke_cli
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
@@ -1390,7 +1391,7 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
     ) -> subprocess.CompletedProcess[str]:
         return self.finish_verify(self.start_verify(*arguments, extra=extra))
 
-    def finish_verify(self, process: subprocess.Popen[str]) -> subprocess.CompletedProcess[str]:
+    def finish_verify(self, process: subprocess.Popen[str] | ManagedProcess[str]) -> subprocess.CompletedProcess[str]:
         """Stop owned processes before an exceptional exit reaches the next case."""
         try:
             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
@@ -1414,11 +1415,8 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
     def start_verify(
         self, *arguments: str, extra: dict[str, str] | None = None
     ) -> subprocess.Popen[str]:
-        self.placement_policy = {**self.environment, **(extra or {})}
-
-        install_fixed_cargo(self.bin_directory / "cargo")
         return subprocess.Popen(
-            ["bash", str(self.verify_script), *arguments],
+            self.prepare_verify(*arguments, extra=extra),
             cwd=self.root,
             env={**self.environment, **(extra or {})},
             stdout=subprocess.PIPE,
@@ -1427,6 +1425,11 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
             start_new_session=True,
             preexec_fn=restore_sigint,
         )
+
+    def prepare_verify(self, *arguments: str, extra: dict[str, str] | None = None) -> list[str]:
+        self.placement_policy = {**self.environment, **(extra or {})}
+        install_fixed_cargo(self.bin_directory / "cargo")
+        return ["bash", str(self.verify_script), *arguments]
 
     def cargo_events(self) -> list[CargoEvent]:
         if not self.cargo_events_path.exists():
@@ -1476,7 +1479,8 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         for name in ("runner-events.jsonl", "runner-started", "runner-signal", "runner-signals-ready", "placement-refusal.json"):
             (self.runner_state / name).unlink(missing_ok=True)
 
-    def wait_for_path(self, path: Path, processes: Sequence[subprocess.Popen[str]] = ()) -> None:
+    def wait_for_path(self, path: Path,
+                      processes: Sequence[subprocess.Popen[str] | ManagedProcess[str]] = ()) -> None:
         self.wait_until(path.exists, str(path), processes)
 
     def route_waits_through_sleep(self, script: str = SLEEP_STUB) -> None:
@@ -1556,8 +1560,11 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         """The environment entry every process this test starts inherits."""
         return f"TEST_RUNNER_STATE={self.runner_state}"
 
-    def stop_verify(self, process: subprocess.Popen[str]) -> None:
+    def stop_verify(self, process: subprocess.Popen[str] | ManagedProcess[str]) -> None:
         """Kill the call and every process under it, its steps' own groups and sessions too."""
+        if isinstance(process, ManagedProcess):
+            process.close()
+            return
         _ = reap(self.child_marker())
         _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
@@ -1605,7 +1612,8 @@ trap 'finish_tree_watch; finish_hold_wait; release_token' EXIT
         self.wait_for_path(self.runner_state / f"routing-sleep-{step + 1}")
 
     def wait_until(self, condition: Callable[[], bool], what: str,
-                   processes: Sequence[subprocess.Popen[str]] = (), *, directory: Path | None = None) -> None:
+                   processes: Sequence[subprocess.Popen[str] | ManagedProcess[str]] = (),
+                   *, directory: Path | None = None) -> None:
         deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         descriptors: list[int] = []
         try:

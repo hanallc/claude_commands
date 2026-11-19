@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import subprocess
 import unittest
+from scripts.lib.process_supervisor import launch
 from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
 
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY, BOARD
@@ -17,19 +18,16 @@ class VerifyTokenFifoTests(VerifyTokenWaitFixture):
         board = self.root / "board"
         waiters = board / "token_waiters"
         waiters.mkdir(parents=True)
-        older = subprocess.Popen(["bash", "-c", 'read -r -t "$1" _; :', "verify.sh",
-                                  str(TEST_HANG_GUARD_SECS)], stdin=subprocess.PIPE,
-                                 start_new_session=True)
-        self.started_groups.add(older.pid)
+        older = self.enterContext(launch(["bash", "-c", 'read -r -t "$1" _; :', "verify.sh",
+                                  str(TEST_HANG_GUARD_SECS)], stdin=subprocess.PIPE))
         older_entry = waiters / f"peer.0123456789abcdef.1000000.{older.pid}.again"
         older_entry.touch()
         output = self.root / "queued.out"
         with output.open("wb") as stream:
-            call = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
+            call = self.enterContext(launch(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                     env={**self.environment, "UNIT_RUN_DIR": str(board),
                                          "UNIT_TEAM_ROLE": "impl"},
-                                    stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
-        self.started_groups.add(call.pid)
+                                    stdout=stream, stderr=subprocess.STDOUT))
         try:
             self.wait_for_output(output, "calls ahead of this one: 1", call)
             self.assertIn("it is free and goes to an earlier call", output.read_text())

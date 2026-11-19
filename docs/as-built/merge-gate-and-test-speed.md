@@ -258,6 +258,12 @@ On success, the gate pushes the merge branch.
 With `--promote`, it also advances `~/.claude` main and the Mac.
 On failure, it undoes the merge and prints the failed suites' output.
 
+**Managed test processes.** `scripts/lib/process_supervisor.py` gives each managed test process a guardian. It starts cleanup when the owner's pipe closes, including after SIGKILL.
+Linux guardians adopt orphaned descendants, including descendants in new sessions. A guardian signals its own children and waits on its SIGCHLD descriptor. It reaps until no children remain.
+macOS guardians rescan their session for a bounded time. A detached session needs a registered guardian to take part in cleanup.
+Each registered macOS guardian reports its result through a private pipe. A launch that fails before the guardian starts reports cancellation.
+One deadline covers all cleanup steps. The guardian reports failure if it reaches the deadline.
+
 **Build-hold guard tests.** `scripts/hooks/test_build_hold_guard.py` calls the real Python hook entry point in-process for command parsing and hold decisions, restoring stdin, environment and import paths for each call. `build_hold_guard_test_support.py` copies the existing hold fixture's class seed into a private case directory at the same path for each test. Real subprocess tests retain the shell front's no-Python fast paths, byte-for-byte stdin/output/status relay, lazy imports, malformed input, and shell-to-reader integration. No production hook or hold decision is replaced, and no clock or wait budget is shortened.
 
 **Build-hold tests.** `scripts/build_hold/test_build_hold.py` uses a class fixture seed copied into the same private path for each test. `build_hold_test_support.py` invokes the real argument parser and command handlers in-process for holder-state checks, while shell wait status, detached recording, lock ownership and child reaping retain real processes. Record assertions wait for recorder threads and the child-lifetime FIFO to finish instead of polling log files. Real recorder output and every original assertion remain covered.

@@ -1,6 +1,8 @@
 """Independent tools, state and process cleanup for verify token tests."""
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import ManagedProcess, launch
+
 from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
 
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls, private_caller_provider
@@ -43,11 +45,6 @@ BOARD = VERIFY.with_name("board.sh")
 
 
 Record = dict[str, object]
-
-
-def restore_sigint() -> None:
-    _ = signal.signal(signal.SIGINT, signal.SIG_DFL)
-
 
 
 class VerifyTokenWaitFixture(unittest.TestCase):
@@ -299,6 +296,9 @@ esac
                 found.append(pid)
         return found
 
+    def live_owned_processes(self, process: ManagedProcess[str] | ManagedProcess[bytes]) -> list[int]:
+        return [pid for pid in self.live_group_processes(process.session_id) if pid != process.session_id]
+
     @staticmethod
     def session_of(pid: int) -> int | None:
         try:
@@ -375,14 +375,17 @@ esac
     def verify(self, environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
         script = (Path(environment["HOME"]) / ".claude/scripts/direct/verify.sh"
                   if environment["HOME"] != self.environment["HOME"] else VERIFY)
-        return subprocess.run(["bash", str(script), "check", "sample"], cwd=self.root,
-                              env=environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        command = ["bash", str(script), "check", "sample"]
+        with launch(command, cwd=self.root, env=environment, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True) as process:
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            return subprocess.CompletedProcess(command, process.wait(), output, errors)
 
-    def wait_for_running(self, path: Path, process: subprocess.Popen[str] | subprocess.Popen[bytes]) -> None:
+    def wait_for_running(self, path: Path, process: ManagedProcess[str] | ManagedProcess[bytes]) -> None:
         wait_until(lambda: path.exists() or process.poll() is not None, path.parent, processes=(process,))
         self.assertTrue(path.exists(), "verify never reached its expected state")
 
-    def start_memory_waiter(self, environment: dict[str, str], errors: Path) -> subprocess.Popen[bytes]:
+    def start_memory_waiter(self, environment: dict[str, str], errors: Path) -> ManagedProcess[bytes]:
         """Start a verify that waits on the held meminfo without the token.
 
         verify.sh tees its step output to stdout, so both streams go to `errors`.
@@ -392,15 +395,14 @@ esac
             if not admission.server.reservations and not admission.server.slots:
                 _ = admission.occupy_host()
         with errors.open("wb") as stream:
-            process = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"],
+            process = self.enterContext(launch(["bash", str(VERIFY), "check", "sample", "--no-cache"],
                                        cwd=self.root, env=environment, stdout=stream,
-                                       stderr=subprocess.STDOUT, start_new_session=True)
-        self.started_groups.add(process.pid)
+                                       stderr=subprocess.STDOUT))
         self.wait_for_output(errors, "waiting for memory", process)
         self.assertIsNone(process.poll(), errors.read_text(errors="replace"))
         return process
 
-    def wait_for_output(self, path: Path, text: str, process: subprocess.Popen[bytes]) -> None:
+    def wait_for_output(self, path: Path, text: str, process: ManagedProcess[bytes]) -> None:
         wait_until(lambda: text in path.read_text(errors="replace") or process.poll() is not None,
                    path.parent, processes=(process,), watch_writes=True)
         self.assertIn(text, path.read_text(errors="replace"))
@@ -485,16 +487,15 @@ esac
         return {**self.environment, "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "impl",
                 "BUILD_TARGETS_POLL_S": "0.5"}
 
-    def start_hold_waiter(self, environment: dict[str, str], output: Path) -> subprocess.Popen[bytes]:
+    def start_hold_waiter(self, environment: dict[str, str], output: Path) -> ManagedProcess[bytes]:
         with output.open("wb") as stream:
-            process = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"],
+            process = self.enterContext(launch(["bash", str(VERIFY), "check", "sample", "--no-cache"],
                                        cwd=self.root, env=environment, stdout=stream,
-                                       stderr=subprocess.STDOUT, start_new_session=True)
-        self.started_groups.add(process.pid)
+                                       stderr=subprocess.STDOUT))
         self.wait_for_running(self.root / "hold-waiting", process)
         return process
 
-    def start_owned_step(self, environment: dict[str, str]) -> subprocess.Popen[str]:
+    def start_owned_step(self, environment: dict[str, str]) -> ManagedProcess[str]:
         """Run the real command guard and renewer with a real board lease."""
         source = VERIFY.read_text()
         start = source.index("STEP_OWNER_PY='\n")
@@ -519,22 +520,19 @@ buildlog_exec cargo check > "$HOLD_WAIT_DIR/command-output" 2>&1 || status=$?
 cat -- "$HOLD_WAIT_DIR/command-output"
 exit "$status"
 ''')
-        process = subprocess.Popen(["bash", str(script), str(VERIFY.parent.parent / "lint/invoke.sh")],
+        process = self.enterContext(launch(["bash", str(script), str(VERIFY.parent.parent / "lint/invoke.sh")],
             cwd=self.root, env={**environment, "TEST_BOARD_HELPER": str(BOARD),
                 "TEST_STEP_RECORD_SCRIPT": str(VERIFY.with_name("step_record.py")),
                 "TEST_REAL_PYTHON": sys.executable, "TEST_HOLD_DIRECTORY": str(self.root / "owned-step-hold")},
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-        self.started_groups.add(process.pid)
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
         return process
 
-    def start_check(self, environment: dict[str, str]) -> subprocess.Popen[str]:
-        process = subprocess.Popen(["bash", str(Path(environment["HOME"]) / ".claude/scripts/direct/verify.sh"), "check", "sample"], cwd=self.root, env=environment,
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                   start_new_session=True)
-        self.started_groups.add(process.pid)
+    def start_check(self, environment: dict[str, str]) -> ManagedProcess[str]:
+        process = self.enterContext(launch(["bash", str(Path(environment["HOME"]) / ".claude/scripts/direct/verify.sh"), "check", "sample"], cwd=self.root, env=environment,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
         return process
 
-    def wait_for_waiter(self, board: Path, process: subprocess.Popen[str]) -> None:
+    def wait_for_waiter(self, board: Path, process: ManagedProcess[str]) -> None:
         """Waits until the call's own file is in the board's token waiter list."""
         waiters = board / "token_waiters"
         waiters.mkdir(parents=True, exist_ok=True)
@@ -550,11 +548,9 @@ exit "$status"
                              "UNIT_TEAM_ROLE": "first", "TEST_BLOCK": "1"}
         second_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
                               "UNIT_TEAM_ROLE": "second", "TEST_RECLAIM_CHECK": "1"}
-        first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
+        first = self.enterContext(launch(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                  env=first_environment, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, start_new_session=True,
-                                 preexec_fn=restore_sigint)
-        self.started_groups.add(first.pid)
+                                 stderr=subprocess.DEVNULL))
         try:
             self.wait_for_running((self.root / "running"), first)
             self.assertTrue((self.root / "running").exists())

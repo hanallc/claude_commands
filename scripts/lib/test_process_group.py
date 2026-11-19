@@ -247,18 +247,18 @@ class ShellProcessGroupTests(PrivateGroupFixture):
             env=self.environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
         )
 
-    def forward(self) -> Callable[[int, object], None]:
-        """Load the real embedded handler without executing its fork or signals."""
+    def forward(self) -> Callable[[int], None]:
+        """Load only the embedded function that forwards signals."""
         source = (self.root / "scripts/direct/verify.sh").read_text()
         embedded = source.split("STEP_OWNER_PY='", 1)[1].split("\n'\n", 1)[0]
         tree = ast.parse(embedded)
         statements = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
-        handlers = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "forward"]
-        self.assertEqual(len(handlers), 1)
-        module = ast.Module(body=[*statements, handlers[0]], type_ignores=[])
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "forward"]
+        self.assertEqual(len(functions), 1)
+        module = ast.Module(body=[*statements, functions[0]], type_ignores=[])
         namespace: dict[str, object] = {"child": self.private_child().pid}
         exec(compile(module, str(self.root / "scripts/direct/verify.sh"), "exec"), namespace)
-        return cast(Callable[[int, object], None], namespace["forward"])
+        return cast(Callable[[int], None], namespace["forward"])
 
     def fake_helper(self, status: int) -> None:
         _ = (self.root / "scripts/lib/process_group.py").write_text(
@@ -344,7 +344,7 @@ final_pass_finish() { :; }
         self.fake_helper(0)
         forward = self.forward()
         with patch.dict(os.environ, self.environment), patch.object(os, "kill") as individual:
-            forward(signal.SIGTERM, None)
+            forward(signal.SIGTERM)
         individual.assert_not_called()
         self.assertTrue((self.root / "helper-arguments").read_text().endswith(f" {signal.SIGTERM}"))
 
@@ -357,7 +357,7 @@ final_pass_finish() { :; }
                     (self.root / "scripts/lib/process_group.py").unlink()
                 with patch.dict(os.environ, self.environment), patch.object(os, "kill") as individual:
                     with self.assertRaises(SystemExit) as refused:
-                        forward(signal.SIGTERM, None)
+                        forward(signal.SIGTERM)
                 individual.assert_not_called()
                 self.assertIn("process group helper failed", str(refused.exception))
                 self.assertIn("process_group.py" if failure == "missing" else "fixture helper diagnostic", str(refused.exception))
@@ -366,7 +366,7 @@ final_pass_finish() { :; }
         self.fake_helper(3)
         forward = self.forward()
         with patch.dict(os.environ, self.environment), patch.object(os, "kill") as individual:
-            forward(signal.SIGTERM, None)
+            forward(signal.SIGTERM)
         arguments = (self.root / "helper-arguments").read_text().split()
         individual.assert_called_once_with(int(arguments[0]), signal.SIGTERM)
 

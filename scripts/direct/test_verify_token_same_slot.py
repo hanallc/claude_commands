@@ -1,6 +1,8 @@
 """Real verify.sh token same slot behavior."""
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import ManagedProcess, launch
+
 import json
 import subprocess
 from typing import cast
@@ -25,19 +27,17 @@ class VerifyTokenSameSlotTests(VerifyTokenOwnershipFixture):
         second_environment = {**first_environment, "TEST_RELEASE": str(second_release),
                               "TEST_RUNNING": str(second_running),
                               "TEST_CARGO_PID": str(self.root / "second-cargo-pid")}
-        first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
+        first = self.enterContext(launch(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                  env=first_environment, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
-        self.started_groups.add(first.pid)
-        second: subprocess.Popen[str] | None = None
+                                 stderr=subprocess.PIPE, text=True))
+        second: ManagedProcess[str] | None = None
         try:
             self.wait_for_running(first_running, first)
             self.assertTrue(first_running.exists(), "first cargo did not start")
             _ = (lock / "expires").write_text("0")
-            second = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
+            second = self.enterContext(launch(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                       env=second_environment, stdout=subprocess.DEVNULL,
-                                      stderr=subprocess.PIPE, text=True, start_new_session=True)
-            self.started_groups.add(second.pid)
+                                      stderr=subprocess.PIPE, text=True))
             self.wait_for_waiter(board, second)
             self.assertEqual((lock / "holder_pid").read_text(), str(first.pid))
             self.assertFalse(second_running.exists(), "the expired live step was reclaimed")

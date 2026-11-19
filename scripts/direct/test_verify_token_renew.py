@@ -1,6 +1,8 @@
 """Check lease renewal, admission retry, and loaded lint input identity."""
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import ManagedProcess, launch
+
 import fcntl
 import os
 from pathlib import Path
@@ -59,7 +61,7 @@ class LongStepOwnershipTests(VerifyTokenWaitFixture):
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertFalse(lock.exists())
         # There must be no heartbeat left in the call's session after release.
-        self.assertEqual(self.live_group_processes(process.pid), [])
+        self.assertEqual(self.live_owned_processes(process), [])
 
     def test_expired_matching_live_step_keeps_ownership_but_dead_holder_is_freed(self) -> None:
         board = self.root / "board"
@@ -112,7 +114,7 @@ bash "$BOARD_HELPER" release "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$
         self.assertEqual(result.stdout.count("command started after renewal"), 2)
 
     def memory_wait_process(self, *, lose_at_launch: bool = False, scoped_attempt: bool = False,
-                            board_helper: Path = BOARD, noncompiling: bool = False) -> subprocess.Popen[str]:
+                            board_helper: Path = BOARD, noncompiling: bool = False) -> ManagedProcess[str]:
         # Use the real board and ownership guard with controlled admission replies.
         _ = write_config_fixture(self.root / "direct.conf", "VERIFY_TOKEN_HOLD_SECONDS=2\nVERIFY_TOKEN_RENEW_SECONDS=1")
         source = VERIFY.read_text()
@@ -202,15 +204,13 @@ release_token
                        "TEST_SCOPED_ATTEMPT": "1" if scoped_attempt else "0",
                        "TEST_REAL_BOARD": str(BOARD), "TEST_NONCOMPILING": "1" if noncompiling else "0",
                        "TEST_BLOCK": "1", "TEST_RUNNING": str(self.root / "command-ran")}
-        process = subprocess.Popen(["bash", str(harness), str(board_helper), str(self.root / "board"), sys.executable,
+        process = self.enterContext(launch(["bash", str(harness), str(board_helper), str(self.root / "board"), sys.executable,
                                     str(SCRIPTS / "lint" / "invoke.sh")],
-                                   cwd=self.root, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                   start_new_session=True)
-        self.started_groups.add(process.pid)
+                                   cwd=self.root, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
         self.addCleanup(self.finish_memory_wait, process)
         return process
 
-    def finish_memory_wait(self, process: subprocess.Popen[str]) -> None:
+    def finish_memory_wait(self, process: ManagedProcess[str]) -> None:
         (self.root / "release").touch()
         if process.poll() is None:
             self.end_group(process.pid)
@@ -228,7 +228,7 @@ release_token
         self.assertEqual((self.root / "admission-holders").read_text().splitlines(), ["0"])
         self.assertEqual((self.root / "acquisitions").read_text().splitlines(), ["acquired"])
         self.assertFalse(lock.exists())
-        self.assertEqual(self.live_group_processes(process.pid), [])
+        self.assertEqual(self.live_owned_processes(process), [])
 
     def test_a_grant_keeps_its_reservation_while_a_peer_holds_the_token(self) -> None:
         process = self.memory_wait_process()
@@ -250,7 +250,7 @@ release_token
         self.assertEqual((self.root / "recorded-statuses").read_text().splitlines(), ["0"])
         self.assertFalse((self.root / "reservation").exists())
         self.assertFalse((self.root / "hold").exists())
-        self.assertEqual(self.live_group_processes(process.pid), [])
+        self.assertEqual(self.live_owned_processes(process), [])
 
     def test_ownership_guard_refusal_readmits_before_running_and_records_only_the_step(self) -> None:
         process = self.memory_wait_process(lose_at_launch=True, scoped_attempt=True)
@@ -270,7 +270,7 @@ release_token
         self.assertEqual(len((self.root / "scoped-attempts").read_text().splitlines()), 2)
         self.assertEqual(list(self.root.glob("attempt.*.peak")), [], "discarded scope kept its peak file")
         self.assertEqual(list(self.root.glob("attempt.*.peak.cgroup")), [])
-        self.assertEqual(self.live_group_processes(process.pid), [])
+        self.assertEqual(self.live_owned_processes(process), [])
 
     def test_unstarted_noncompiling_step_reacquires_before_its_command(self) -> None:
         process = self.memory_wait_process(lose_at_launch=True, noncompiling=True)

@@ -6,6 +6,7 @@ import subprocess
 from typing import cast
 from scripts.direct.verify_token_wait_test_support import VERIFY, BOARD
 from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
+from scripts.lib.process_supervisor import launch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -14,10 +15,9 @@ class VerifyTokenOwnershipTests(VerifyTokenOwnershipFixture):
         board = self.root / "board"
         environment = {**self.environment, "UNIT_RUN_DIR": str(board),
                        "UNIT_TEAM_ROLE": "first", "TEST_BLOCK": "1"}
-        first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
+        first = self.enterContext(launch(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                  env=environment, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
-        self.started_groups.add(first.pid)
+                                 stderr=subprocess.PIPE, text=True))
         try:
             self.wait_for_running((self.root / "running"), first)
             self.assertTrue((self.root / "running").exists())

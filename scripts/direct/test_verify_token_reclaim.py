@@ -6,6 +6,7 @@ import subprocess
 from typing import cast
 from scripts.direct.verify_token_wait_test_support import BOARD, VERIFY
 from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
+from scripts.lib.process_supervisor import launch
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -35,18 +36,17 @@ wait "$TOKEN_RENEWER_PID"
 bash "$BOARD_HELPER" release "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$
 ''')
         stopped = self.root / "stopped-renewer"
-        process = subprocess.Popen(
+        process = self.enterContext(launch(
             ["bash", str(harness), str(BOARD), str(self.root / "board")],
             cwd=self.root,
             env={**self.environment, "BASH_ENV": str(gate), "TEST_STOPPED_RENEWER": str(stopped)},
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-        )
-        self.started_groups.add(process.pid)
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ))
         try:
             self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0)
             self.assertNotEqual(int(stopped.read_text()), process.pid)
-            self.wait_for_group_exit(process.pid, timeout=5)
-            self.assertEqual(self.live_group_processes(process.pid), [])
+            self.wait_for_group_exit(process.session_id, timeout=5, guardian=process.session_id)
+            self.assertEqual(self.live_owned_processes(process), [])
         finally:
             self.end_group(process.pid)
             _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
@@ -63,10 +63,9 @@ exit 0
                              "UNIT_TEAM_ROLE": "first", "TEST_BLOCK": "1"}
         second_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
                               "UNIT_TEAM_ROLE": "second", "TEST_RECLAIM_POLLS": str(polls)}
-        first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
+        first = self.enterContext(launch(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                  env=first_environment, stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
-        self.started_groups.add(first.pid)
+                                 stderr=subprocess.PIPE, text=True))
         try:
             self.wait_for_running((self.root / "running"), first)
             self.assertTrue((self.root / "running").exists(),
@@ -102,10 +101,9 @@ exit 0
                              "UNIT_TEAM_ROLE": "first", "TEST_BLOCK": "1"}
         second_environment = {**self.environment, "UNIT_RUN_DIR": str(board),
                               "UNIT_TEAM_ROLE": "second", "TEST_RECLAIM_CHECK": "1"}
-        first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
+        first = self.enterContext(launch(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
                                  env=first_environment, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, start_new_session=True)
-        self.started_groups.add(first.pid)
+                                 stderr=subprocess.DEVNULL))
         try:
             self.wait_for_running((self.root / "running"), first)
             self.assertTrue((self.root / "running").exists())
@@ -118,7 +116,7 @@ exit 0
             _ = first.wait(timeout=TEST_HANG_GUARD_SECS)
             second = self.verify(second_environment)
             self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
-            self.assertEqual(self.live_group_processes(first.pid), [])
+            self.assertEqual(self.live_owned_processes(first), [])
             self.assertEqual(self.live_group_processes(step_group), [])
         finally:
             self.end_group(first.pid)

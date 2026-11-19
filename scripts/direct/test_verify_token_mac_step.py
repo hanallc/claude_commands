@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import subprocess
+from typing import override
 import unittest
 
 from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
@@ -13,12 +14,23 @@ from scripts.build_queue import admission_client, admission_protocol as wire, pl
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.build_folders_test_support import tool_folders
+from scripts.lib.process_supervisor import ManagedProcess, launch
 
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, RUNNER_STUB, VERIFY
 from scripts.direct.verify_step_routes_test_support import TARGETS
 
 
 class VerifyTokenMacStepTests(VerifyMacOffloadFixture):
+
+    def start_owned_verify(self, *arguments: str, extra: dict[str, str] | None = None) -> ManagedProcess[str]:
+        return self.enterContext(launch(self.prepare_verify(*arguments, extra=extra), cwd=self.root,
+            env={**self.environment, **(extra or {})}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+
+    @override
+    def verify(self, *arguments: str, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        with self.start_owned_verify(*arguments, extra=extra) as process:
+            return self.finish_verify(process)
+
     def prepare_claim_boundary(self) -> None:
         Path(self.environment["BUILD_HOLD_DIR"]).mkdir()
         targets = self.root / "claim-targets.py"
@@ -99,7 +111,7 @@ exec bash "$TEST_REAL_BOARD" "$@"
         arguments = ("lint", *(("sample",) if not after_mac else ()), "--no-cache")
         if after_mac:
             arguments += ("--check",)
-        process = self.start_verify(*arguments)
+        process = self.start_owned_verify(*arguments)
         self.addCleanup(self.stop_verify, process)
         self.wait_for_path(self.runner_state / "local-token-wait", (process,))
         self.assertIsNone(process.poll())
@@ -158,7 +170,7 @@ exec bash "$TEST_REAL_BOARD" "$@"
 
     def test_local_fmt_takes_the_token_after_a_memory_wait_leaves_for_the_mac(self) -> None:
         _ = self.prepare_memory_lint()
-        process = self.start_verify("lint", "--check", "--no-cache")
+        process = self.start_owned_verify("lint", "--check", "--no-cache")
         self.addCleanup(self.stop_verify, process)
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
@@ -199,7 +211,7 @@ exec bash "$TEST_REAL_BOARD" "$@"
             return evidence
 
         admission.server.host_probe = observe
-        process = self.start_verify("lint", "--check", "--no-cache")
+        process = self.start_owned_verify("lint", "--check", "--no-cache")
         self.addCleanup(self.stop_verify, process)
         self.wait_for_path(observed, (process,))
         self.assertEqual(observed.read_text(), "1")

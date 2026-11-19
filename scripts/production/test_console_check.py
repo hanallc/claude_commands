@@ -34,6 +34,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment
 from scripts.production import change_routing, console_browser, console_check, console_server, console_settings
 from scripts.production.console_browser import Browser, FaultKind, PageFault, PageResult, Pipe, Viewport, VisitCompletion, managed_process, message_object
+from scripts.lib.process_supervisor import ManagedProcess
 from scripts.review_links import accounts_page, change_browser, change_page, console, review_page, serve
 from scripts.production.test_console_fixtures import failed_status, first_page
 
@@ -298,11 +299,11 @@ if (location.search === '?view=saved' && location.hash === '#saved-row' &&
     @unittest.skipUnless(browser_available(), "Headless Chrome is unavailable.")
     def test_failure_reaps_both_processes(self) -> None:
         self.write_page("first", "<p role=alert>Could not load fixture data.</p>")
-        children: list[subprocess.Popen[bytes]] = []
+        children: list[ManagedProcess[bytes]] = []
 
         @contextmanager
         def capture(command: Sequence[str], *, cwd: Path, env: Mapping[str, str],
-                    stderr: BinaryIO) -> Generator[subprocess.Popen[bytes]]:
+                    stderr: BinaryIO) -> Generator[ManagedProcess[bytes]]:
             with managed_process(command, cwd=cwd, env=env, stderr=stderr) as child:
                 children.append(child)
                 yield child
@@ -311,8 +312,9 @@ if (location.search === '?view=saved' && location.hash === '#saved-row' &&
             self.assertIn("Could not load fixture data.", console_check.run_check(self.candidate), output.getvalue())
         server, browser = children
         for child in (server, browser):
-            with self.subTest(command=child.args), self.assertRaises(ProcessLookupError):
-                os.kill(child.pid, 0)
+            for pid in (child.pid, child.session_id):
+                with self.subTest(pid=pid), self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
 
     @unittest.skipUnless(browser_available(), "Headless Chrome is unavailable.")
     def test_checker_sigkill_stops_server_accounts_and_chrome_groups(self) -> None:
@@ -356,7 +358,7 @@ with patch.object(signal, "signal", side_effect=AssertionError("The checker inst
         for stage in ("startup", "accounts", "chrome"):
             with self.subTest(stage=stage), socket.socket() as listener, tempfile.TemporaryFile() as log:
                 if stage == "chrome":
-                    self.write_page("first", "<script>console.log('Fixture Chrome is busy'); for (;;) {}</script>")
+                    self.write_page("first", "<script>console.log('Fixture Chrome is busy');</script>")
                 listener.bind(("127.0.0.1", 0))
                 listener.listen()
                 listener.settimeout(45)
@@ -371,16 +373,18 @@ with patch.object(signal, "signal", side_effect=AssertionError("The checker inst
                             connection.settimeout(5)
                             active = int(ready.readline())
                             rows = processes()
-                            groups = {pid for pid, parent, group, _, _ in rows
-                                      if parent == str(checker.pid) and pid == group}
-                            self.assertEqual(len(groups), 1 if stage == "startup" else 2)
-                            server, = (row for row in rows if row[2] in groups and row[1] == row[2]
+                            guardians = {pid for pid, parent, group, _, _ in rows
+                                         if parent == str(checker.pid) and pid == group}
+                            self.assertEqual(len(guardians), 1 if stage == "startup" else 2)
+                            groups = {pid for pid, parent, group, _, _ in rows if parent in guardians and pid == group}
+                            self.assertEqual(len(groups), len(guardians))
+                            server, = (row for row in rows if row[0] in groups and row[1] in guardians
                                        and "console_server.py" in row[4])
                             if stage == "startup":
                                 self.assertEqual(int(server[0]), active)
                             else:
-                                browser, = (row for row in rows if row[2] in groups - {server[2]}
-                                            and row[1] == row[2] and "--headless" in row[4])
+                                browser, = (row for row in rows if row[0] in groups - {server[2]}
+                                            and row[1] in guardians and "--headless" in row[4])
                                 self.assertTrue(any(row[2] == browser[2] and "--type=" in row[4] for row in rows))
                                 if stage == "accounts":
                                     self.assertTrue(any(row[0] == str(active) and row[1] == server[0]
@@ -390,7 +394,7 @@ with patch.object(signal, "signal", side_effect=AssertionError("The checker inst
                             checker.kill()
                             deadline = time.monotonic() + 5
                             self.assertEqual(checker.wait(timeout=5), -signal.SIGKILL)
-                            while remaining := [row for row in processes() if row[2] in groups]:
+                            while remaining := [row for row in processes() if row[2] in groups | guardians]:
                                 self.assertLess(time.monotonic(), deadline, remaining)
                                 time.sleep(0.05)
                     except TimeoutError as error:

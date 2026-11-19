@@ -10,6 +10,7 @@ from typing import cast, override
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct import test_verify_step_routes as routes
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, Record, VERIFY
+from scripts.lib.process_supervisor import launch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -75,17 +76,15 @@ trap observe_admission DEBUG
     def test_token_wait_names_a_holder_without_a_final_newline(self) -> None:
         board = self.root / "board"
         environment = {**self.environment, "UNIT_RUN_DIR": str(board)}
-        first = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
+        first = self.enterContext(launch(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
             env={**environment, "UNIT_TEAM_ROLE": "first", "TEST_BLOCK": "1"},
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-        self.started_groups.add(first.pid)
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         self.wait_for_running(self.root / "running", first)
         output = self.root / "token-note.err"
         with output.open("wb") as stream:
-            second = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
+            second = self.enterContext(launch(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
                 env={**environment, "UNIT_TEAM_ROLE": "second"}, stdout=stream,
-                stderr=subprocess.STDOUT, start_new_session=True)
-        self.started_groups.add(second.pid)
+                stderr=subprocess.STDOUT))
         self.wait_for_output(output, "waiting for the cargo token since", second)
         self.assertIn(f"first (pid {first.pid}) holds it", output.read_text())
         _ = (self.root / "release").touch()

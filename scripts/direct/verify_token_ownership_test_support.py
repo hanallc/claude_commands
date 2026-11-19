@@ -49,10 +49,11 @@ class VerifyTokenOwnershipFixture(VerifyTokenWaitFixture):
                 found.append(pid)
         return found
 
-    def wait_for_group_exit(self, group: int, timeout: float = TEST_HANG_GUARD_SECS) -> None:
+    def wait_for_group_exit(self, group: int, timeout: float = TEST_HANG_GUARD_SECS,
+                            *, guardian: int = 0) -> None:
         """Observe exits without killing anything: the verifier must clean up."""
         deadline = time.monotonic() + timeout
-        while members := self.live_group_processes(group):
+        while members := [pid for pid in self.live_group_processes(group) if pid != guardian]:
             descriptors: list[int] = []
             try:
                 for pid in members:

@@ -11,17 +11,22 @@ from pathlib import Path
 import errno
 import os
 import select
-import subprocess
 import sys
 import time
+from typing import Protocol
 
 from scripts.direct.local_release_wait import RELEASE_CHANGES, IntervalReleasePolling, local_release_waiter
 from scripts.lib import inotify
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
+class ObservedProcess(Protocol):
+    @property
+    def pid(self) -> int: ...
+
+
 def wait_until(ready: Callable[[], bool], directory: Path, timeout: float = TEST_HANG_GUARD_SECS,
-               *, processes: Sequence[subprocess.Popen[str] | subprocess.Popen[bytes]] = (),
+               *, processes: Sequence[ObservedProcess] = (),
                watch_writes: bool = False) -> None:
     deadline = time.monotonic() + timeout
     descriptors: list[int] = []
@@ -74,7 +79,7 @@ def wait_for_file(path: Path) -> None:
 
 
 def wait_for_pid(path: Path, *,
-                 processes: Sequence[subprocess.Popen[str] | subprocess.Popen[bytes]] = ()) -> int:
+                 processes: Sequence[ObservedProcess] = ()) -> int:
     """Read a pid file once it holds a pid: a writer that does not publish by
     rename leaves the file created and still empty for a moment."""
     wait_until(lambda: path.exists() and path.read_text() != "", path.parent, processes=processes)

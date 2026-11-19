@@ -12,6 +12,7 @@ from scripts.build_queue import admission_protocol as wire, admission_service as
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY, BOARD
+from scripts.lib.process_supervisor import launch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -49,7 +50,7 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
 
         wait_until(admission.callers_released, admission.state_dir)
         self.assertFalse((board / "locks/cargo.d").exists())
-        self.assertEqual(self.live_group_processes(process.pid), [])
+        self.assertEqual(self.live_owned_processes(process), [])
         self.assertFalse((self.root / "cargo-calls").exists())
 
     def test_connection_wait_holds_no_token_before_the_first_reply(self) -> None:
@@ -74,10 +75,9 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
         _ = self.enterContext(mock.patch.object(admission.server, "handle_request", side_effect=interrupt_first_placement))
         errors = self.root / "connection.err"
         with errors.open("wb") as stream:
-            process = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--local", "connection wait fixture", "--no-cache"], cwd=self.root,
+            process = self.enterContext(launch(["bash", str(VERIFY), "check", "sample", "--local", "connection wait fixture", "--no-cache"], cwd=self.root,
                 env={**self.environment, "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "impl"},
-                stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
-        self.started_groups.add(process.pid)
+                stdout=stream, stderr=subprocess.STDOUT))
         try:
             self.wait_for_output(errors, "build queue not reachable; trying for", process)
             with admission.loop_turn():
@@ -101,10 +101,9 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
         errors = self.root / "unreachable.err"
         try:
             with errors.open("wb") as stream:
-                process = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
+                process = self.enterContext(launch(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
                     env={**self.environment, "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "impl"},
-                    stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
-            self.started_groups.add(process.pid)
+                    stdout=stream, stderr=subprocess.STDOUT))
             self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 2, errors.read_text())
             lines = errors.read_text().splitlines()
             self.assertEqual(lines.count("build queue not reachable; trying for 0.2 s"), 1)
@@ -146,9 +145,8 @@ class VerifyTokenMemoryHistoryTests(VerifyTokenWaitFixture):
         try:
             with mock.patch.object(admission.server, "handle_request", side_effect=disconnect_refresh), \
                     errors.open("wb") as stream:
-                process = subprocess.Popen(["bash", str(VERIFY), "build", "sample"], cwd=self.root,
-                    env=environment, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
-                self.started_groups.add(process.pid)
+                process = self.enterContext(launch(["bash", str(VERIFY), "build", "sample"], cwd=self.root,
+                    env=environment, stdout=stream, stderr=subprocess.STDOUT))
                 self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 2, errors.read_text())
             self.assertEqual(generations, 2)
             lines = errors.read_text().splitlines()
@@ -183,12 +181,11 @@ observe_attempt_status() {
 trap observe_attempt_status DEBUG
 ''')
         with errors.open("wb") as stream:
-            process = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
+            process = self.enterContext(launch(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
                 env={**self.environment, "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "impl",
                      "BASH_ENV": str(shell), "TEST_ATTEMPT_STATUSES": str(attempts),
                      "TEST_TOKEN_RELEASED": str(released), "TEST_BOARD": str(BOARD)},
-                stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
-        self.started_groups.add(process.pid)
+                stdout=stream, stderr=subprocess.STDOUT))
         self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0, errors.read_text())
         self.assertTrue(released.exists())
         self.assertEqual(attempts.read_text().splitlines()[0], "125")
@@ -204,10 +201,9 @@ trap observe_attempt_status DEBUG
         second_board = self.root / "second-board"
         errors = self.root / "first.err"
         with errors.open("wb") as stream:
-            first = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
+            first = self.enterContext(launch(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
                 env={**self.environment, "UNIT_RUN_DIR": str(first_board), "UNIT_TEAM_ROLE": "impl", "TEST_BLOCK": "1"},
-                stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
-        self.started_groups.add(first.pid)
+                stdout=stream, stderr=subprocess.STDOUT))
         self.wait_for_running(self.root / "running", first)
         second_errors = self.root / "second.err"
         second = self.start_memory_waiter({**self.environment, "UNIT_RUN_DIR": str(second_board),

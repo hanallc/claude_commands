@@ -13,6 +13,7 @@ import unittest
 
 from scripts.direct.test_verify_mac_offload import stub_build_tool_path
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.process_supervisor import ManagedProcess, launch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_function
 
@@ -123,12 +124,13 @@ wait_for_file(root / (name + ".release"))
         self.environment["TEST_REPO"] = str(VERIFY.parent.parent.parent)
 
     def wrapper(self, *command: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["bash", "-c", self.shell + '\nbuildlog_exec "$@"', "step-owner-test", *command],
-            cwd=self.root, env=self.environment, capture_output=True, text=True,
-            check=False, timeout=TEST_HANG_GUARD_SECS, start_new_session=True)
+        arguments = ["bash", "-c", self.shell + '\nbuildlog_exec "$@"', "step-owner-test", *command]
+        with launch(arguments, cwd=self.root, env=self.environment,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            return subprocess.CompletedProcess(arguments, process.wait(), output, errors)
 
-    def background_sweep(self) -> subprocess.Popen[str]:
+    def background_sweep(self) -> ManagedProcess[str]:
         script = self.shell + '''
 buildlog_exec "$TEST_PYTHON" "$TEST_COMMAND" "$TEST_REPO" real &
 real_step=$!
@@ -151,13 +153,13 @@ bash "$BOARD_HELPER" release "$BOARD_DIR" fixture cargo --pid "$$"
 : > "$TEST_ROOT/cleanup-done"
 "$TEST_PYTHON" "$TEST_WAIT" "$TEST_ROOT/sweep.status"
 '''
-        process = subprocess.Popen(
+        process = self.enterContext(launch(
             ["bash", "-c", script], cwd=self.root, env=self.environment,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
         self.addCleanup(self.finish_background_sweep, process)
         return process
 
-    def finish_background_sweep(self, process: subprocess.Popen[str]) -> None:
+    def finish_background_sweep(self, process: ManagedProcess[str]) -> None:
         for name in ("real.release", "cleanup.release", "sweep.release"):
             (self.root / name).touch()
         try:
@@ -168,7 +170,7 @@ bash "$BOARD_HELPER" release "$BOARD_DIR" fixture cargo --pid "$$"
             raise
         self.assertEqual(process.returncode, 0, output + errors)
 
-    def wait_for(self, name: str, process: subprocess.Popen[str]) -> None:
+    def wait_for(self, name: str, process: ManagedProcess[str]) -> None:
         path = self.root / name
         wait_until(lambda: path.exists() or process.poll() is not None,
                    self.root, processes=(process,))
@@ -216,6 +218,18 @@ bash "$BOARD_HELPER" release "$BOARD_DIR" fixture cargo --pid "$$"
             with self.subTest(status=status):
                 result = self.wrapper(sys.executable, "-c", f"raise SystemExit({status})")
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+
+    def test_signal_before_workload_launch_reaches_its_group(self) -> None:
+        launch = "with process_supervisor.launch("
+        forward = "def forward(signum: int) -> None:\n"
+        self.assertIn(launch, self.shell)
+        self.assertIn(forward, self.shell)
+        self.shell = self.shell.replace(
+            forward, forward + '    Path(os.environ["TEST_ROOT"], "forwarded").write_text(str(signum))\n', 1)
+        self.shell = self.shell.replace(launch, "os.kill(os.getpid(), signal.SIGTERM)\n" + launch, 1)
+        result = self.wrapper(sys.executable, "-c", "import signal; signal.pause()")
+        self.assertEqual(result.returncode, 143, result.stdout + result.stderr)
+        self.assertEqual((self.root / "forwarded").read_text(), str(int(signal.SIGTERM)))
 
 
 if __name__ == "__main__":

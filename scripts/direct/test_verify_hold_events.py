@@ -23,6 +23,7 @@ from scripts.direct.verify_hold_wait_test_support import (
     release_registered_call,
 )
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib import process_supervisor
 from scripts.lib.shell_test_support import shell_function
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -159,6 +160,81 @@ class PlacementWaitModeTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(calls.read_text().splitlines(), [
                 "one evidence", "one resource", "one resource", "two evidence", "three resource"])
+
+    def assert_missing_fixture_ends_wait(self, script: str) -> str:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = root / "fixture"
+            fixture.touch()
+            ready = root / "ready"
+            calls = root / "calls"
+            environment = {**os.environ, "FIXTURE": str(fixture),
+                           "READY": str(ready), "CALLS": str(calls)}
+            command = r"""
+set -euo pipefail
+exec 3<&0
+wait_fixture() {
+    if [[ -s "$CALLS" ]]; then
+        printf 'repeat\n' >> "$CALLS"
+        exit 74
+    fi
+    printf 'attempt\n' >> "$CALLS"
+    : > "$READY"
+    read -r -u 3
+    [[ -e "$FIXTURE" ]] || return 73
+}
+"""
+            with process_supervisor.launch(["bash", "-c", command + script], env=environment,
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+                wait_until(ready.exists, root, processes=(process,))
+                fixture.unlink()
+                assert process.stdin is not None
+                _ = process.stdin.write("\n")
+                process.stdin.flush()
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(process.returncode, 73, output + errors)
+                self.assertEqual(calls.read_text().splitlines(), ["attempt"])
+                return output
+
+    def test_placement_wait_propagates_a_deleted_fixture_failure(self) -> None:
+        source = Path(__file__).with_name("verify.sh").read_text()
+        script = "\n".join((
+            "PY=wait_fixture LOCAL_RELEASE_WAIT_SCRIPT=wait BUILDLOG_CALL_ID=call",
+            "PHASE_RESOURCE_WAIT='' PLACEMENT_WAIT_MEMORY=0 PLACEMENT_EVIDENCE_EPISODE=''",
+            "HOLD_WAITER_PID='' PLACEMENT_EPISODE=one STEP_TARGET_TABLE='' PINNED_TARGET=''",
+            "release_token() { :; }",
+            "check_routing_hold() { :; }",
+            "placement_attempts=0",
+            "placement_once() { (( ++placement_attempts == 1 )) && return 78; return 74; }",
+            "start_routing_wait() { :; }",
+            "build_hold_nothing_held() { return 0; }",
+            shell_function(source, "wait_for_placement"),
+            shell_function(source, "route_test"),
+            "status=0; route_test || status=$?",
+            'printf "waiter=%s\n" "$HOLD_WAITER_PID"; exit "$status"',
+        ))
+        self.assertEqual(self.assert_missing_fixture_ends_wait(script), "waiter=\n")
+
+    def test_token_wait_propagates_a_deleted_pause_fixture_failure(self) -> None:
+        source = Path(__file__).with_name("verify.sh").read_text()
+        script = "\n".join((
+            "TOKEN_USED=1 TOKEN_HELD=0 TOKEN_SUPERSEDED=0 TOKEN_WAIT_NOTE_MIN=5",
+            "TOKEN_FIRST_WAIT_DONE=0 TOKEN_WAIT_HOLD_CHECK='' TOKEN_WAITER_FILE=$FIXTURE.waiter",
+            "buildlog_check_nested_step() { :; }",
+            "sync_token_state() { :; }",
+            "token_wait_clock() { TOKEN_CLOCK_NOW=0; }",
+            "count_token_waiters_ahead() { TOKEN_WAITERS_AHEAD=1; }",
+            "phase_wait_start() { :; }",
+            "phase_wait_finish() { :; }",
+            "token_wait_note() { :; }",
+            "sleep() { wait_fixture; }",
+            shell_function(source, "token_wait_left"),
+            shell_function(source, "acquire_token"),
+            "status=0; acquire_token || status=$?",
+            '[[ ! -e "$TOKEN_WAITER_FILE" ]] || exit 75',
+            'exit "$status"',
+        ))
+        self.assertEqual(self.assert_missing_fixture_ends_wait(script), "")
 
 
 class ReleaseDeadlineTests(unittest.TestCase):

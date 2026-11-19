@@ -1,6 +1,8 @@
 """Real verify.sh token reservation behavior."""
 from __future__ import annotations
 
+from scripts.lib.process_supervisor import ManagedProcess, launch
+
 from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
 
 from scripts.build_queue import admission_records
@@ -35,20 +37,17 @@ class VerifyTokenReservationTests(VerifyTokenWaitFixture):
         board = self.root / "board"
         environment = {**self.environment, "UNIT_RUN_DIR": str(board), "UNIT_TEAM_ROLE": "impl"}
         output = self.root / "waiter.out"
-        holder = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
+        holder = self.enterContext(launch(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
                                   env={**environment, "TEST_BLOCK": "1"},
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-        self.started_groups.add(holder.pid)
-        waiter: subprocess.Popen[bytes] | None = None
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        waiter: ManagedProcess[bytes] | None = None
         try:
             self.wait_for_running(self.root / "running", holder)
             held = set(self.admission.server.reservations)
             self.assertEqual(len(held), 1, "the running step holds one reservation")
             with output.open("wb") as stream:
-                waiter = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
-                                          env=environment, stdout=stream, stderr=subprocess.STDOUT,
-                                          start_new_session=True)
-            self.started_groups.add(waiter.pid)
+                waiter = self.enterContext(launch(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
+                                          env=environment, stdout=stream, stderr=subprocess.STDOUT))
             self.wait_for_output(output, "waiting for the cargo token since", waiter)
             with self.admission.loop_turn():
                 self.assertEqual(self.admission.server.waiters, {})
@@ -98,19 +97,17 @@ class VerifyTokenReservationTests(VerifyTokenWaitFixture):
 
         self.admission.server.host_probe = blocked_while_held
         output = self.root / "waiter.out"
-        holder = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
+        holder = self.enterContext(launch(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
                                   env={**environment, "TEST_BLOCK": "1"},
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-        self.started_groups.add(holder.pid)
-        waiter: subprocess.Popen[bytes] | None = None
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        waiter: ManagedProcess[bytes] | None = None
         try:
             self.wait_for_running(self.root / "running", holder)
             held = set(self.admission.server.reservations)
             with output.open("wb") as stream:
-                waiter = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
+                waiter = self.enterContext(launch(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
                                           env={**environment, "UNIT_TOKEN_CLOCK_FILE": str(clock)},
-                                          stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
-            self.started_groups.add(waiter.pid)
+                                          stdout=stream, stderr=subprocess.STDOUT))
             self.wait_for_output(output, "waiting for the cargo token since", waiter)
             _ = clock.write_text("1020\n")
             publish_local(placement.TemporaryExclusion("blocked"))
@@ -147,9 +144,7 @@ class VerifyTokenReservationTests(VerifyTokenWaitFixture):
         real_sleep = shutil.which("sleep")
         if real_sleep is None:
             self.fail("the token wait test needs sleep on PATH")
-        peer = subprocess.Popen([real_sleep, "600"], start_new_session=True)
-        self.started_groups.add(peer.pid)
-        self.addCleanup(peer.wait, TEST_HANG_GUARD_SECS)
+        peer = self.enterContext(launch([real_sleep, "600"]))
         taken = subprocess.run(["bash", str(BOARD), "acquire", str(board), "peer", "cargo", "--pid", str(peer.pid),
                                 "--hold", "3600", "--wait", "0"],
                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
@@ -165,14 +160,13 @@ trap probe_local_attempt DEBUG
                        "BASH_ENV": str(shell), "TEST_WAITING": str(waiting)}
         output = self.root / "waiter.out"
         with output.open("wb") as stream:
-            call = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
-                                    env=environment, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
-        self.started_groups.add(call.pid)
+            call = self.enterContext(launch(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
+                                    env=environment, stdout=stream, stderr=subprocess.STDOUT))
         self.wait_for_running(waiting, call)
         os.kill(call.pid, signal.SIGKILL)
         _ = call.wait(timeout=TEST_HANG_GUARD_SECS)
         deadline = time.monotonic() + TEST_HANG_GUARD_SECS
-        while (left := self.live_group_processes(call.pid)) and time.monotonic() < deadline:
+        while (left := self.live_owned_processes(call)) and time.monotonic() < deadline:
             time.sleep(0.1)
         self.assertEqual(left, [], output.read_text(errors="replace"))
         self.assertFalse((self.root / "cargo-calls").exists())
@@ -244,12 +238,11 @@ buildlog_release_memory 0
         release = self.root / "old-release"
         old_errors = self.root / "old.err"
         with old_errors.open("wb") as stream:
-            old = subprocess.Popen(["bash", str(old_shell)], cwd=self.root, env={**self.environment,
+            old = self.enterContext(launch(["bash", str(old_shell)], cwd=self.root, env={**self.environment,
                 "TEST_MEMORY_GATE": str(VERIFY.parents[1] / "lint/memory_gate.sh"),
                 "TEST_BOARD": str(BOARD), "TEST_BOARD_DIR": str(board),
                 "TEST_OLD_READY": str(ready), "TEST_OLD_GAP": str(gap), "TEST_OLD_RELEASE": str(release)},
-                stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
-        self.started_groups.add(old.pid)
+                stdout=stream, stderr=subprocess.STDOUT))
         self.wait_for_running(ready, old)
         with self.admission.loop_turn():
             self.assertEqual(len(self.admission.server.reservations), 1)
