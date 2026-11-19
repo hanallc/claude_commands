@@ -5061,8 +5061,9 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - impl: the test module and verify.sh.
 
 **Acceptance gate:** the module passes 20 times under host load in a 2 GB scope; the full suite is green.
-### Phase 362 — scratch removal moves the checkout before it checks refs  · status: todo
+### Phase 362 — scratch removal moves the checkout before it checks refs  · status: parked
 **Depends on:** Phase 360
+**Parked:** 2026-11-19. Four closure reviews each found a new High crash window in the two-folder move (the last: a crash during restore lets `git worktree prune` remove the admin folder). Phases 359 and 360 stay as the landed fix. Branch natest-tombstone362 at af6723929 keeps the work.
 
 #### Work Order
 
