@@ -1822,8 +1822,9 @@ def batch_resume_record(requests: tuple[MergeRequest, ...]) -> Generator[BatchRe
     filename = f"checkpoint-batches/{production.merge_branch}"
     path = Path(good(git(checkout, "rev-parse", "--path-format=absolute", "--git-path", filename), "batch"))
     upstream = f"refs/remotes/origin/{production.merge_branch}"
-    _ = good(git(checkout, "fetch", "--no-prune", "origin", f"+refs/heads/{production.merge_branch}:{upstream}",
-                 "+refs/heads/*:refs/remotes/origin/*"), "batch")
+    branches = dict.fromkeys([production.merge_branch, *(request.unit.branch for request in requests)])
+    refspecs = [f"+refs/heads/{branch}:refs/remotes/origin/{branch}" for branch in branches]
+    _ = good(git(checkout, "fetch", "--no-prune", "--refmap=", "origin", *refspecs), "batch")
     checkpoints: list[MergeRequest] = []
     for request in requests:
         try:

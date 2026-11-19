@@ -67,7 +67,8 @@ with Path(''' + repr(str(self.state / "pushed-refs")) + ''').open("a") as output
         return merges
 
     def test_two_code_items_share_tests_push_and_promotion(self) -> None:
-        for outcome in ("shared list", "push failure", "separate lists", "second list fails", "second directory sync fails"):
+        for outcome in ("shared list", "push failure", "separate lists", "second list fails",
+                        "second directory sync fails", "unrelated branch renamed"):
             with self.subTest(outcome=outcome):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
@@ -95,6 +96,9 @@ with Path(''' + repr(str(self.state / "pushed-refs")) + ''').open("a") as output
                         beta_review.parent.mkdir(parents=True, exist_ok=True)
                         _ = beta_review.write_text("# Incomplete list\n")
                 start = self.git("rev-parse", "HEAD")
+                if outcome == "unrelated branch renamed":
+                    _ = self.git("update-ref", "refs/remotes/origin/topic", start)
+                    _ = self.git("update-ref", "refs/heads/topic/rework", start, cwd=self.origin)
                 first = self.checkpoint(subject="checkpoint(alpha): batch change\n\n"
                                         + "Change-Review: Alpha changes | Open alpha | The alpha change appears | image 012345abcdef")
                 second = self.beta_checkpoint("src/beta.txt", "beta batch change\n", visible=True)
@@ -141,6 +145,10 @@ raise SystemExit(1)
                     self.assertIn("push: failed", result.stdout)
                 else:
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    if outcome == "unrelated branch renamed":
+                        self.assertEqual(self.git("for-each-ref", "--format=%(refname) %(objectname)",
+                                                  "refs/remotes/origin/topic"),
+                                         f"refs/remotes/origin/topic {start}")
                     merges = self.assert_landed(start, [first, second])
                     self.assertEqual(self.events("checkpoint-test"), [[]])
                     for unit, merge in zip(("alpha", "beta"), merges):
@@ -451,10 +459,9 @@ raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
     def test_a_stopped_batch_refuses_a_moved_ref_for_an_item_that_has_not_merged(self) -> None:
         published = self.git("rev-parse", "HEAD")
         first = self.checkpoint(content="alpha batch change\n")
-        second = self.beta_checkpoint("src/beta.txt", "beta batch change\n")
-        remote_ref = "refs/heads/beta-checkpoint"
-        ref = "refs/remotes/origin/beta-checkpoint"
-        _ = self.git("update-ref", remote_ref, second, cwd=self.origin)
+        _ = self.beta_checkpoint("src/beta.txt", "beta batch change\n")
+        ref = "refs/remotes/origin/beta-branch"
+        _ = self.git("update-ref", "-d", ref)
         lines = [self.batch_line("alpha", "2", first), self.batch_line("beta", "2", ref)]
         merge = merge_checkpoint.merge
 
@@ -469,9 +476,7 @@ raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
         unpublished = self.git("rev-parse", "HEAD")
         self.assertEqual(self.git("rev-parse", "HEAD^2"), first)
 
-        moved = self.beta_checkpoint("src/beta.txt", "later beta change\n")
-        _ = self.git("update-ref", remote_ref, moved, second, cwd=self.origin)
-        _ = self.git("fetch", "origin", f"{remote_ref}:{ref}")
+        _ = self.beta_checkpoint("src/beta.txt", "later beta change\n")
         result = self.land_batch(lines)
         self.assert_batch_requires_reset(result, published, unpublished)
         self.assertIn("input: failed", result.stdout)
@@ -522,12 +527,12 @@ raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
                 _ = self.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m",
                              "beta work\n\nChange-Review: none — fixture code only", cwd=writer)
                 second = self.git("rev-parse", "HEAD", cwd=writer)
-                _ = self.git("push", "origin", "beta-branch", "HEAD:refs/heads/beta-checkpoint", cwd=writer)
+                _ = self.git("push", "origin", "beta-branch", cwd=writer)
                 absent = subprocess.run(["git", "cat-file", "-e", f"{second}^{{commit}}"], cwd=self.checkout,
                                         env=self.env, capture_output=True, text=True, check=False,
                                         timeout=TEST_HANG_GUARD_SECS)
                 self.assertNotEqual(absent.returncode, 0)
-                checkpoint = "refs/remotes/origin/beta-checkpoint" if submit_ref else second
+                checkpoint = "refs/remotes/origin/beta-branch" if submit_ref else second
                 lines = [self.batch_line("alpha", "2", first), self.batch_line("beta", "2", checkpoint)]
 
                 unpublished = self.interrupt_batch(*lines)
