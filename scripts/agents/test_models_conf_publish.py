@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import ClassVar, Literal, final, override
 from unittest import mock
 
+from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import models_registry, atomic_file, registry_rows  # noqa: E402
 from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry  # noqa: E402
@@ -85,17 +86,29 @@ class RegistryFixture(unittest.TestCase):
         self.registry = self.root / relative_path
         self.registry.parent.mkdir(parents=True, exist_ok=True)
         _ = write_registry(self.registry, base_text=DEFAULTS)
+        configuration = self.registry.parent
+        _ = (configuration / "main_push_lock.conf").write_text("# whole: 1..\nrecord_days=14\n")
+        _ = (configuration / "build_folders.conf").write_text(
+            "patterns.tool={purpose}{suffix}\n"
+            + "# range: 0.001..60\nlocks.probe_wait_seconds=0.25\n"
+            + "# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n")
         self.environment = {**os.environ, **interpreter_cache_environment(self.root / "cache"), "HOME": str(self.home),
+                            "CONF_DIR": str(configuration), "XDG_STATE_HOME": str(self.root / "state"),
+                            "CLAUDE_CONFIG_DIR": str(self.home / ".claude"),
+                            "CODEX_PACER_TIER_FILE": str(self.root / "pacer-tier"),
                             "MODELS_CONFIG_FILE": str(self.registry),
                             "MODELS_CONFIG_PUBLISH": "1" if publishing else "0",
                             "MODELS_CONFIG_TIER_ONLY": "1", "CODEX_CONFIG_FILE": str(self.root / "codex.toml"),
                             "CODEX_MODELS_CACHE_FILE": str(self.root / "models.json"),
                             "CODEX_CATALOG_SYNC_STATE_FILE": str(self.root / "catalog-state"),
-                            "PYTHONPATH": str(REPO / "scripts/lib/python_startup"), "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                            "PYTHONPATH": str(REPO / "scripts/lib/python_startup"),
+                            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(self.root)),
                             "GIT_TERMINAL_PROMPT": "0", "GIT_AUTHOR_NAME": "Registry Test",
                             "GIT_AUTHOR_EMAIL": "registry@example.invalid", "GIT_COMMITTER_NAME": "Registry Test",
                             "GIT_COMMITTER_EMAIL": "registry@example.invalid"}
-        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG", "GIT_CONFIG_COUNT"):
+        for key in ("GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG",
+                    "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_OBJECT_DIRECTORY",
+                    "GIT_ALTERNATE_OBJECT_DIRECTORIES", *models_registry.OPERATION_ENVIRONMENT):
             _ = self.environment.pop(key, None)
 
     def command(self, *arguments: str, cwd: Path | None = None,
@@ -783,7 +796,14 @@ models_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
         binaries.mkdir()
         count = self.root / "push-count"
         wrapper = binaries / "git"
-        _ = wrapper.write_text('''#!/usr/bin/env python3
+        _ = wrapper.write_text('''#!/bin/bash
+if [[ "${1:-}" == -C && "${3:-}" == push ]]; then
+    exec "$TEST_PYTHON" "$TEST_PUSH_HANDLER" "$@"
+fi
+exec "$TEST_REAL_GIT" "$@"
+''')
+        handler = binaries / "push.py"
+        _ = handler.write_text('''
 import os
 import pathlib
 import shutil
@@ -824,36 +844,36 @@ def advance_peer(accepted=False):
     subject = "config(models): later peer edit" if accepted else "concurrent row edits"
     for command in (["add", *paths], ["commit", "-m", subject], ["push", "origin", "main"]):
         subprocess.run([real, *command], cwd=peer, check=True, capture_output=True)
-if "push" in arguments:
-    counter = pathlib.Path(os.environ["TEST_PUSH_COUNT"])
-    attempt = int(counter.read_text()) + 1 if counter.exists() else 1
-    counter.write_text(str(attempt))
-    if attempt == 1:
-        git_dir = pathlib.Path(subprocess.check_output([real, "rev-parse", "--absolute-git-dir"], text=True).strip())
-        accepted_merge = os.environ["TEST_ACCEPTED_MERGE"]
-        if accepted_merge != "none":
-            subprocess.run([real, *arguments], check=True)
-            start_merge(git_dir, unmerged=accepted_merge == "unmerged_index")
-            snapshot_state("after-push", git_dir, counter)
-            sys.exit(0)
-        if os.environ["TEST_UNFINISHED_MERGE"] == "1":
-            start_merge(git_dir)
-        snapshot_state("before-retry", git_dir, counter)
-    if os.environ.get("TEST_LOSE_ACK") == "1":
-        result = subprocess.run([real, *arguments], check=False)
-        if result.returncode == 0 and os.environ.get("TEST_ADVANCE_ACCEPTED") == "1":
-            advance_peer(accepted=True)
-        sys.exit(result.returncode or 1)
-    if os.environ["TEST_REJECT_ALL"] == "1":
-        print("! [rejected] main -> main (test remote refused push)", file=sys.stderr)
-        sys.exit(1)
-    if attempt == 1:
-        advance_peer()
+counter = pathlib.Path(os.environ["TEST_PUSH_COUNT"])
+attempt = int(counter.read_text()) + 1 if counter.exists() else 1
+counter.write_text(str(attempt))
+if attempt == 1:
+    git_dir = pathlib.Path(subprocess.check_output([real, "rev-parse", "--absolute-git-dir"], text=True).strip())
+    accepted_merge = os.environ["TEST_ACCEPTED_MERGE"]
+    if accepted_merge != "none":
+        subprocess.run([real, *arguments], check=True)
+        start_merge(git_dir, unmerged=accepted_merge == "unmerged_index")
+        snapshot_state("after-push", git_dir, counter)
+        sys.exit(0)
+    if os.environ["TEST_UNFINISHED_MERGE"] == "1":
+        start_merge(git_dir)
+    snapshot_state("before-retry", git_dir, counter)
+if os.environ.get("TEST_LOSE_ACK") == "1":
+    result = subprocess.run([real, *arguments], check=False)
+    if result.returncode == 0 and os.environ.get("TEST_ADVANCE_ACCEPTED") == "1":
+        advance_peer(accepted=True)
+    sys.exit(result.returncode or 1)
+if os.environ["TEST_REJECT_ALL"] == "1":
+    print("! [rejected] main -> main (test remote refused push)", file=sys.stderr)
+    sys.exit(1)
+if attempt == 1:
+    advance_peer()
 os.execv(real, [real, *arguments])
 ''')
         wrapper.chmod(0o755)
         self.environment.update(PATH=str(binaries) + os.pathsep + self.environment["PATH"],
-                                TEST_REAL_GIT=GIT, TEST_PUSH_COUNT=str(count),
+                                TEST_REAL_GIT=GIT, TEST_PYTHON=sys.executable,
+                                TEST_PUSH_HANDLER=str(handler), TEST_PUSH_COUNT=str(count),
                                 TEST_COMPETITOR=str(self.competitor), TEST_REJECT_ALL="1" if always_refuse else "0",
                                 TEST_OBSTRUCTION=obstruction, TEST_UNFINISHED_MERGE="1" if unfinished_merge else "0",
                                 TEST_ACCEPTED_MERGE=accepted_merge)
