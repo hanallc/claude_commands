@@ -186,8 +186,8 @@ class TheListTests(unittest.TestCase):
                 producer, showrunner = self.notices[(number - 1) * 2:number * 2]
                 self.assertEqual(producer, (OTHER.id, f"You are the producer of item {number}: Build plan. "
                     + f"Its showrunner is show.\nRun `{launcher} list --all --latest-status` to read it. "
-                    + f"Run `{launcher} update --id L{number}` with `--latest-status`, `--next-step`, "
-                    + "or `--eta` to update it."))
+                    + f"Run `{launcher} update --id L{number}` to update it. "
+                    + "Use any of `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`."))
                 self.assertEqual(showrunner, (RUNNER.id, f"dwight is the producer of item {number}: Build plan. "
                     + "Send design questions on this item to dwight."))
         self.assertEqual(len(self.notices), 4)
@@ -351,24 +351,53 @@ class TheListTests(unittest.TestCase):
             "latest_status": "The plan is ready.", "next_step": "Review the plan.", "eta": the_list.EtaStatus.PENDING}))
         self.assertEqual(self.notices, [])
 
+    def test_producer_can_set_working_but_cannot_set_closed(self) -> None:
+        item = self.add(changes={"producer": OTHER.id})
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+            with self.assertRaises(SystemExit) as refused:
+                _ = self.command("update", "--id", item.id, "--state", "Closed")
+            self.assertEqual(refused.exception.code, 2)
+            self.assertEqual(the_list.load(MORTY.id, item.id), item)
+            self.assertEqual(self.command("update", "--id", item.id, "--state", "Working"), (0, "", ""))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(saved.state, the_list.ItemState.WORKING)
+        with self.assertRaisesRegex(the_list.ListError, "use close"):
+            _ = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.CLOSED}, source=OTHER.name)
+        self.assertEqual(the_list.load(MORTY.id, item.id), saved)
+
+    def test_producer_sets_next_check_with_its_name_as_source(self) -> None:
+        item = self.add(changes={"producer": OTHER.id})
+        check = START + timedelta(days=1)
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+            self.assertEqual(self.command("update", "--id", item.id, "--next-check", check.isoformat(),
+                                          "--source", "morty"), (0, "", ""))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(saved.next_check, check)
+        self.assertEqual(saved.log[-1].what, the_list.FieldChange("Updated", {"next_check": check}))
+        self.assertEqual(saved.log[-1].source, OTHER.name)
+
     def test_producer_cannot_update_another_producers_item(self) -> None:
         item = self.add(changes={"producer": BOB.id})
         with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
-            self.assertEqual(self.command("update", "--id", item.id, "--eta", "Pending"),
-                             (1, "", f"the_list: {item.id} is assigned to another producer\n"))
-        self.assertEqual(the_list.load(MORTY.id, item.id), item)
+            for option, value in (("--eta", "Pending"), ("--state", "Working"), ("--next-check", START.isoformat())):
+                with self.subTest(option=option):
+                    self.assertEqual(self.command("update", "--id", item.id, option, value),
+                                     (1, "", f"the_list: {item.id} is assigned to another producer\n"))
+                    self.assertEqual(the_list.load(MORTY.id, item.id), item)
 
     def test_producer_cannot_update_other_fields(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
         fields = (("--title", "New title"), ("--owner", "invalid owner"), ("--producer", "invalid producer"),
-                  ("--unit", "unit-board"), ("--next-check", "Pending"), ("--evidence", "evidence"),
-                  ("--done-when", "Done"), ("--state", "Working"), ("--requested-by", "nate"),
+                  ("--unit", "unit-board"), ("--evidence", "evidence"),
+                  ("--done-when", "Done"), ("--requested-by", "nate"),
                   ("--blocked-by",), ("--related-to",))
         with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
             for field, *values in fields:
                 with self.subTest(field=field):
                     result, output, error = self.command("update", "--id", item.id, "--eta", "Pending", field, *values)
                     self.assertEqual((result, output), (1, ""))
+                    self.assertIn("producers can update only --latest-status, --next-step, --eta, --state, --next-check.",
+                                  error)
                     self.assertIn(f"Refused options: {field}", error)
                     self.assertEqual(the_list.load(MORTY.id, item.id), item)
         self.assertEqual(self.notices, [])

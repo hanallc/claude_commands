@@ -1693,6 +1693,10 @@ def _send_assignment_notice(recipient: staff.StaffRow, text: str) -> None:
     raise ListError((result.stderr or result.stdout).strip() or "message delivery failed")
 
 
+_PRODUCER_UPDATE_FIELDS = ("latest_status", "next_step", "eta", "state", "next_check")
+_PRODUCER_UPDATE_OPTIONS = tuple("--" + field.replace("_", "-") for field in _PRODUCER_UPDATE_FIELDS)
+
+
 def _notify_producer_assignment(item: ListItem, previous_producer: staff.StaffId, keeper: staff.StaffId) -> int:
     if item.producer in (keeper, previous_producer):
         return 0
@@ -1705,10 +1709,11 @@ def _notify_producer_assignment(item: ListItem, previous_producer: staff.StaffId
     showrunner = f"Its showrunner is {owner.name}." if owner is not None else "The item has no assigned showrunner."
     item_text = f"item {item.number}: {item.title}"
     launcher = "~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py"
+    update_options = ", ".join(f"`{option}`" for option in _PRODUCER_UPDATE_OPTIONS)
     notices = (
         ("producer", item.producer, producer, f"You are the producer of {item_text}. {showrunner}\n"
          + f"Run `{launcher} list --all --latest-status` to read it. "
-         + f"Run `{launcher} update --id {item.id}` with `--latest-status`, `--next-step`, or `--eta` to update it."),
+         + f"Run `{launcher} update --id {item.id}` to update it. Use any of {update_options}."),
         ("showrunner", item.owner, owner, f"The saved assignment for {item_text} needs a new producer."
          if producer is None else f"{producer.name} is the producer of {item_text}. "
          + f"Send design questions on this item to {producer.name}."),
@@ -1800,11 +1805,11 @@ def main(argv: list[str] | None = None) -> int:
                 identity = f"L{identity}"
             if assigned_to is not AllItems.INCLUDED:
                 options = cast(dict[str, object], vars(args))
-                allowed = {"command", "id", "source", "latest_status", "next_step", "eta"}
+                allowed = {"command", "id", "source", *_PRODUCER_UPDATE_FIELDS}
                 refused = sorted(f"--{key.replace('_', '-')}" for key, value in options.items()
                                  if value is not None and key not in allowed)
                 if refused:
-                    raise ListError("producers can update only --latest-status, --next-step, and --eta. "
+                    raise ListError(f"producers can update only {', '.join(_PRODUCER_UPDATE_OPTIONS)}. "
                                     + f"Refused options: {', '.join(refused)}")
                 _ = _update(keeper, identity, _cli_changes(args, record), source=caller.name, assigned_to=assigned_to)
                 return 0

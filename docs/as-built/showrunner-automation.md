@@ -579,7 +579,8 @@ Morty can use every command.
 Other producers can list only their own items, including with `--all`.
 If the directory or a record is unreadable, the producer's list reports an incomplete result and exits nonzero.
 The command shows any readable items in scope and omits details of the read error.
-They can update only `--latest-status`, `--next-step`, and `--eta` on those items.
+They can update only `--latest-status`, `--next-step`, `--eta`, `--state`, and `--next-check` on those items.
+Only morty can close an item.
 Their updates use the caller's staff name as the log source.
 
 Morty uses `--producer <name or staff id>` on add or update to assign an item.
