@@ -55,7 +55,6 @@ class FailedLaunchRunTests(HookAssignmentFixture):
             "SCRATCH_VISIBLE_ROOT": str(self.session_dir.parent / "visible-scratch"),
             "SCRATCH_HOLDS": str(self.session_dir.parent / "scratch-holds.json"),
         })))
-        _ = shutil.copy2(ROOT / "config/scratch.conf", Path(os.environ["CONF_DIR"]) / "scratch.conf")
         for key in ("CLAUDE_CODE_SESSION_ID", "UNIT_RUN_DIR", "PLAN_DELEGATE_RUN_DIR"):
             _ = os.environ.pop(key, None)
         _ = staff.set_run(self.native.fixture.parent.id, staff.OpenRun(self.session_dir))
@@ -91,15 +90,7 @@ class FailedLaunchRunTests(HookAssignmentFixture):
             f"os.execv({assign.PYTHON!r}, [{assign.PYTHON!r}, *arguments])",
         )) + "\n")
         command.chmod(0o755)
-        self.instrument_launcher("\n".join((
-            "from scripts.direct import assign",
-            f"assign.PYTHON = {str(command)!r}",
-            "prepare_run = assign.prepare_run",
-            "def prepare(*arguments):",
-            "    run, phase = prepare_run(*arguments)",
-            "    return run, phase",
-            "assign.prepare_run = prepare",
-        )))
+        _ = self.enterContext(patch.object(assign, "PYTHON", str(command)))
         return calls
 
     def assert_run_ended(self, result: subprocess.CompletedProcess[str]) -> None:
@@ -130,14 +121,14 @@ class FailedLaunchRunTests(HookAssignmentFixture):
             self.assert_run_ended(self.launch())
 
     def assert_prepared_marker_is_removed(self) -> None:
-        prepared = self.run_launcher(["bash", str(ROOT / "scripts/direct/prepare_session.sh")])
+        prepared = self.run_command(["bash", str(ROOT / "scripts/direct/prepare_session.sh")])
         self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
         run = Path(prepared.stdout.split("Session ready at ")[-1].strip())
         _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({
             unit_runs.OWNER_FIELD: self.native.fixture.parent.id,
         }))
         self.assertEqual(self.open_run(), run, prepared.stdout + prepared.stderr)
-        ended = self.run_launcher(["bash", str(ROOT / "scripts/direct/end_session.sh")])
+        ended = self.run_command(["bash", str(ROOT / "scripts/direct/end_session.sh")])
         self.assertEqual(ended.returncode, 0, ended.stdout + ended.stderr)
         self.assertIsNone(self.open_run(), ended.stdout + ended.stderr)
         self.assertIn("run pointer cleared", ended.stdout)
@@ -161,7 +152,7 @@ class FailedLaunchRunTests(HookAssignmentFixture):
                 before = staff_file.read_bytes()
                 try:
                     with patch.dict(os.environ, environment):
-                        result = self.run_launcher(["bash", str(ROOT / "scripts/direct/prepare_session.sh")])
+                        result = self.run_command(["bash", str(ROOT / "scripts/direct/prepare_session.sh")])
                     self.assertEqual(result.returncode, expected_code, result.stdout + result.stderr)
                     self.assertEqual(staff_file.read_bytes(), before)
                     if state == "missing":
@@ -323,11 +314,12 @@ class PaneReviewLauncherTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        bytecode_setting = os.environ.get("PYTHONDONTWRITEBYTECODE", "")
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
         _ = self.enterContext(patch.object(unit_runs, "ASTRA_RUN_ROOT", self.fixture.fixture.root))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"ASTRA_REVIEW_DIR": str(self.fixture.fixture.root)})))
-        _ = self.enterContext(assignment_helpers())
+        _ = self.enterContext(assignment_helpers(bytecode_setting))
         self.ready = self.fixture.run_dir / "final.ready"
         self.phase = self.fixture.run_dir / "phases/8"
         write_text_atomic(self.fixture.prompt, "Phase 8 — Workers\nReview Stage 1, then review the final diff in Stage 2.\n")
