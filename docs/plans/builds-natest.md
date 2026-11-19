@@ -67,3 +67,24 @@
   2. 20 loaded runs pass, TMPDIR=/tmp, 2 GB scope.
   3. basedpyright zero errors and warnings on changed files.
   4. Full natedev gate passes (review_links reds that also occur on base do not count).
+
+### Phase 385 — the gate ledger test halves its AWS CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** production/test_merge_gate_ledger.py (AWS name test_gate_ledger.py, rank 22: 28.4 CPU s, 19 tests) uses half its AWS gate CPU with every assertion kept.
+- **Spec:**
+  1. Measure like the gate with module_cost.py (`--tests 20 --commands 20`), fresh TMPDIR on /tmp, bytecode on.
+  2. Cut the cost at its cause: repeated repository builds, Git calls and process starts become one shared fixture where tests only read it; fixed waits become events the test drives.
+  3. Change test files only. merge_gate.py is under phase 383; report a production cause as an architecture proposal.
+  4. Tests read no /tune-changeable value; pin each config value the fixture reads. Fixture Git commands use `git_test_support.fixture_git_environment`.
+  5. If the floor is above half, report the floor and an architecture proposal.
+- **Files:** `scripts/production/test_merge_gate_ledger.py`; `scripts/production/merge_gate_test_support.py` when its callers keep passing.
+- **Workers:** 1 writer. One test module and its support file.
+  - impl: both files.
+- **Constraints from prior phases:** AWS account blocked: measure locally until builds says AWS works. Every module that imports merge_gate_test_support.py must pass.
+- **Acceptance gate:**
+  1. Local module_cost.py CPU at most half of the base.
+  2. 20 loaded runs of the module and the support callers pass, TMPDIR=/tmp, 2 GB scope.
+  3. basedpyright zero errors and warnings on changed files.
+  4. Full natedev gate passes (reds that also occur on base do not count).
