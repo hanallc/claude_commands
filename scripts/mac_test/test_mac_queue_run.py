@@ -32,6 +32,9 @@ def option(name):
 with (root / "events").open("a") as stream:
     stream.write(json.dumps(args)+"\n")
 if args[0] == "place-step":
+    if os.environ.get("FAKE_QUEUE_BUSY") == "1":
+        print("waiting for the Mac")
+        raise SystemExit(78)
     if os.environ.get("FAKE_QUEUE_WAIT") == "1":
         (root / "waiting").write_text("waiting")
         time.sleep(60)
@@ -164,6 +167,18 @@ class QueueRunTests(unittest.TestCase):
             self.assertEqual(work[3], "MAC_PLACEMENT=" + placed[placed.index("--episode") + 1] + "/attempt")
             self.assertEqual(work[4:], self.command(root)[-3:])
             self.assertEqual(result.stdout.splitlines()[-1], f"mac_exit={status}")
+
+    def test_no_wait_returns_the_busy_status_after_one_queue_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = {**self.fixture(root), "FAKE_QUEUE_BUSY": "1"}
+            command = self.command(root, "run")
+            command.insert(command.index("--"), "--no-wait")
+            result = subprocess.run(command, capture_output=True, text=True, env=environment,
+                                    timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, mac_queue_run.MAC_BUSY_STATUS, result.stdout + result.stderr)
+            self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
+            self.assertFalse((root / "remote").exists())
 
     def test_a_signal_ends_the_run_with_its_default_action(self) -> None:
         for waiting, signum in ((False, signal.SIGTERM), (False, signal.SIGHUP), (True, signal.SIGTERM),

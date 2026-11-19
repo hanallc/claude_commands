@@ -184,6 +184,7 @@ def run_callback(script: str, phase: str, argv_file: Path, arguments: list[str],
             stop_command(process)
 
 
+MAC_BUSY_STATUS = 78
 RUNS = ".local/state/mac-queue/runs"
 RECEIPTS = ".local/state/mac-queue/receipts"
 
@@ -250,6 +251,7 @@ class Arguments(argparse.Namespace):
     worktree: Path = Path()
     cwd: str = ""
     lifecycle_script: str = ""
+    no_wait: bool = False
     argv: list[str] = []
 
 
@@ -279,7 +281,7 @@ def run(args: Arguments) -> int:
             while True:
                 code, output = capture_command(admission_command() + placement_arguments(episode, since, pid,
                     args.worktree, args.package, args.kind, source_key, session, assignment_file, command))
-                if code != 78:
+                if code != MAC_BUSY_STATUS or args.no_wait:
                     break
                 print(output, end="", flush=True)
                 time.sleep(conf.read("build_admission").number("waiting_pass_seconds"))
@@ -361,6 +363,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = parser.add_argument("--worktree", type=Path, default=Path.cwd())
     _ = parser.add_argument("--cwd", default="")
     _ = parser.add_argument("--lifecycle-script", default="")
+    _ = parser.add_argument("--no-wait", action="store_true", help="exit with status 78 when the Mac is busy")
     _ = parser.add_argument("argv", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv, namespace=Arguments())
     if not args.argv or args.argv == ["--"]:

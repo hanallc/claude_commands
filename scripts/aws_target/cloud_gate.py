@@ -994,20 +994,26 @@ def _outcome_imported(folder: Path) -> bool:
         return False
 
 
-def validate_result(row: dict[str, object], request: dict[str, object], *, instance: str = '') -> None:
-    if request.get('task') == 'paired':
-        gate_box.validate_paired_result(row, request, instance)
-        return
+def validate_run_identity(row: dict[str, object], request: dict[str, object]) -> gate.GateRun:
+    """Decode a result for the requested attempt, source tree, and modules."""
     for key in ('attempt', 'commit', 'tree'):
         if row.get(key) != request[key]:
             raise ValueError('The result differs from the current ' + key)
     run = gate_box.decode_run(row['gate'])
-    if row.get('log_error') or row.get('verdict') != ('pass' if run.passed else 'fail'):
-        raise ValueError('The result has no complete verdict and log')
     modules = ['scripts/' + job.suite + '/' + job.module for job in run.jobs]
     if (any(job.kind is not gate.GateJobKind.TEST_MODULE for job in run.jobs)
             or len(modules) != len(set(modules)) or set(modules) != set(cast(list[str], request['modules']))):
         raise ValueError('The result has a different module list')
+    return run
+
+
+def validate_result(row: dict[str, object], request: dict[str, object], *, instance: str = '') -> None:
+    if request.get('task') == 'paired':
+        gate_box.validate_paired_result(row, request, instance)
+        return
+    run = validate_run_identity(row, request)
+    if row.get('log_error') or row.get('verdict') != ('pass' if run.passed else 'fail'):
+        raise ValueError('The result has no complete verdict and log')
     host = ledger.text(row, 'host')
     if not host or Path(host).name != host or host in ('.', '..'):
         raise ValueError('Invalid remote host')
