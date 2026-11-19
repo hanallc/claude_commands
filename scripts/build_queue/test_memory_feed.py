@@ -15,7 +15,8 @@ from collections import Counter
 from collections.abc import Iterable, Mapping
 from contextlib import redirect_stdout
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from http.client import HTTPConnection
 from pathlib import Path
 import shutil
@@ -25,10 +26,13 @@ import textwrap
 import tempfile
 import time
 import unittest
+from zoneinfo import ZoneInfo
 from typing import Literal, cast, override
 from unittest import mock
 
-from scripts.buildlog import charts, cost_actions, costs, parse
+from scripts.aws_target import ledger
+from scripts.aws_target.ledger_test_support import install_cost_settings, text_setting
+from scripts.buildlog import aws_costs, charts, cost_actions, costs, parse
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, queue_snapshot, target_availability
 from scripts.build_queue.admission_wire import ReservedCloudSlot
@@ -69,6 +73,47 @@ def needs_all_page_proof_views(repo: Path) -> bool:
 
 class FeedStopped(Exception):
     """The fixture stops the feed after its recorded cycles."""
+
+
+AWS_COST_TIME = int(datetime(2026, 1, 2, 12, tzinfo=UTC).timestamp())
+PRIVATE_AWS_FIELDS = {
+    "account_id": "111122223333", "instance_id": "i-0123abcdef", "subnet": "subnet-0123abcdef",
+    "volume": "vol-0123abcdef", "snapshot": "snap-0123abcdef",
+    "arn": "arn:aws:ec2:us-east-1:111122223333:snapshot/snap-0123abcdef",
+    "recipient": "recipient@example.invalid", "email": "notification@example.invalid",
+}
+
+
+def write_aws_cost_fixture(root: Path, *, unknown_unit: str = "", instant: int = AWS_COST_TIME) -> ledger.CostLedger:
+    """Save a bill, three finished runs, and the latest fixed costs."""
+    settings = root / "aws_target.conf"
+    install_cost_settings(settings)
+    text_setting(settings, "notification_recipient", PRIVATE_AWS_FIELDS["recipient"])
+    book = ledger.CostLedger(root / "target-state" / "aws")
+    midnight, _ = ledger.period_bounds(datetime.fromtimestamp(instant, UTC).date(), ZoneInfo("UTC"))
+    start = midnight - 86400
+    book.record_inventory(ledger.ResourceInventory(start,
+        (ledger.PricedResource("gate-image", Decimal("6.20")),
+         ledger.PricedResource(PRIVATE_AWS_FIELDS["volume"], Decimal("24.80"))),
+         PRIVATE_AWS_FIELDS["snapshot"], builder_removed=True))
+    charges = book.directory / "charges"
+    charges.mkdir(exist_ok=True)
+    bill_day = datetime.fromtimestamp(start, UTC).date().isoformat()
+    bill = ledger.ChargeRead(bill_day, midnight, start, midnight, Decimal(12), Decimal(0), Decimal(0),
+        (ledger.UsageTypeCost("USE1-SpotUsage:m7a.8xlarge", Decimal(8), Decimal(1), "Hrs"),
+         ledger.UsageTypeCost("USE1-EBS:SnapshotUsage", Decimal(4))), provisional=False)
+    _ = (charges / (bill.day + ".json")).write_text(json.dumps(ledger.charge_record(bill)))
+    rows: list[dict[str, object]] = []
+    for index, (unit, mode, seconds) in enumerate((("research", "merge-gate", 120),
+                                                   (unknown_unit, "merge-gate", 60),
+                                                   ("report", "targeted-test", 60))):
+        launch: dict[str, object] = {**PRIVATE_AWS_FIELDS, "attempt": f"fixture-{index}", "instance_type": "m7a.8xlarge",
+            "region": "us-east-1", "time": start + 60, "mode": mode, "result": "launched"}
+        if unit:
+            launch["unit"] = unit
+        rows.extend((launch, {**launch, "time": start + 60 + seconds, "result": "finished", "gate_s": 20}))
+    _ = book.launch_history_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    return book
 
 
 def captured_reading(*, running: tuple[admission_records.RunningStep, ...] = (),
@@ -411,6 +456,8 @@ class MemoryFeedTests(unittest.TestCase):
             "USER_ZONE": "UTC",
             "MAC_IDLE_STATE_DIR": str(self.root / "mac-idle"),
             "BUILDLOG_USER_CGROUP": str(self.root / "user"),
+            "BUILD_TARGETS_STATE_DIR": str(self.root / "target-state"),
+            "AWS_TARGET_CONFIG": str(self.root / "aws_target.conf"),
         })))
         _ = self.enterContext(mock.patch.object(admission_client, "view",
             side_effect=AssertionError("The test must supply a private queue reading")))
@@ -3442,6 +3489,120 @@ process.stdout.write(JSON.stringify({
         self.assertIn("2026-11-05", text)
         self.assertIn("2026-11-08", text)
 
+    def test_aws_cost_feed_uses_saved_bills_and_box_time(self) -> None:
+        _ = write_aws_cost_fixture(self.root)
+        with (mock.patch.object(subprocess, "run", side_effect=AssertionError("AWS costs only read saved records")),
+              mock.patch.object(subprocess, "Popen", side_effect=AssertionError("AWS costs only read saved records"))):
+            report = memory_feed.report_file(charts.IndexUnavailable("no index"), aws_costs.read_saved_costs(AWS_COST_TIME))
+        costs = cast(dict[str, object], json.loads(report.text))["aws_costs"]
+        self.assertEqual(costs, {
+            "accounting_zone": "UTC",
+            "yesterday": {"amount": "$12.00", "provisional": False},
+            "today": {"amount": "$4.00", "limit": "$20.00"},
+            "month": {"amount": "$16.00", "limit": "$400.00"},
+            "gates": {"merge_gates": "$6.00", "targeted_tests": "$2.00", "per_merge_gate": "$3.00",
+                      "units": [{"unit": "research", "merge_gates": "$4.00", "targeted_tests": None},
+                                {"unit": "Unit not recorded", "merge_gates": "$2.00", "targeted_tests": None},
+                                {"unit": "report", "merge_gates": None, "targeted_tests": "$2.00"}]},
+            "fixed": {"gate_image": "$6.20", "other": "$24.80", "total": "$31.00"},
+        })
+
+    def test_aws_cost_feed_does_not_copy_private_fields_or_unit_identifiers(self) -> None:
+        joined = "research" + PRIVATE_AWS_FIELDS["instance_id"] + "report"
+        book = write_aws_cost_fixture(self.root, unknown_unit=joined)
+        report = memory_feed.report_file(charts.IndexUnavailable("no index"), aws_costs.read_saved_costs(AWS_COST_TIME))
+        for field, value in {**PRIVATE_AWS_FIELDS, "joined unit": joined}.items():
+            with self.subTest(field=field):
+                self.assertIn(value, book.launch_history_path.read_text())
+                self.assertNotIn(value, report.text)
+                self.assertNotIn(json.dumps(field), report.text)
+                self.assertEqual(aws_costs.recorded_unit(value), "")
+        self.assertIn("Unit not recorded", report.text)
+
+    def test_aws_cost_feed_keeps_the_caps_when_evidence_is_missing(self) -> None:
+        install_cost_settings(self.root / "aws_target.conf")
+        actual = aws_costs.read_saved_costs(AWS_COST_TIME)
+        self.assertEqual(actual, {**aws_costs.NO_COSTS, "accounting_zone": "UTC",
+            "today": {"amount": None, "limit": "$20.00"}, "month": {"amount": None, "limit": "$400.00"}})
+
+        book = write_aws_cost_fixture(self.root)
+        bill, = book.read_bills()
+        book.path.unlink()
+        bill_path, = book.bill_paths()
+        for value, amount in ((Decimal(12), "$12.00"), (Decimal(0), "$0.00")):
+            with self.subTest(amount=amount):
+                saved_bill = replace(bill, actual_usd=value, usage_types=())
+                _ = bill_path.write_text(json.dumps(ledger.charge_record(saved_bill)))
+                actual = aws_costs.read_saved_costs(AWS_COST_TIME)
+                self.assertEqual(actual["yesterday"], {"amount": amount, "provisional": False})
+                self.assertEqual(actual["month"], {"amount": amount, "limit": "$400.00"})
+                self.assertEqual(actual["today"], {"amount": None, "limit": "$20.00"})
+                self.assertIsNone(actual["fixed"])
+
+    def test_aws_cost_feed_keeps_estimates_for_bill_gaps_and_provisional_zero(self) -> None:
+        instant = int(datetime(2026, 1, 4, 12, tzinfo=UTC).timestamp())
+        book = write_aws_cost_fixture(self.root, instant=instant)
+        bill, = book.read_bills()
+        for day, value, provisional, expected in (
+            ("2026-01-01", Decimal(12), False, "$32.00"),
+            ("2026-01-02", Decimal(0), True, "$24.00"),
+        ):
+            with self.subTest(day=day):
+                start, end = ledger.period_bounds(date.fromisoformat(day), ZoneInfo("UTC"))
+                earlier = replace(bill, day=day, at=end, period_start=start, period_end=end, actual_usd=value,
+                                  usage_types=() if provisional else bill.usage_types, provisional=provisional)
+                path = book.directory / "charges" / (day + ".json")
+                _ = path.write_text(json.dumps(ledger.charge_record(earlier)))
+                try:
+                    actual = aws_costs.read_saved_costs(instant)
+                    self.assertEqual(actual["today"], {"amount": "$4.00", "limit": "$20.00"})
+                    self.assertEqual(actual["month"], {"amount": expected, "limit": "$400.00"})
+                finally:
+                    path.unlink()
+
+    def test_aws_cost_feed_counts_open_gate_spend_through_now(self) -> None:
+        midnight = int(datetime(2026, 1, 5, tzinfo=UTC).timestamp())
+        instant = midnight - 1800
+        book = write_aws_cost_fixture(self.root, instant=instant)
+        with book.transaction() as state:
+            state.gate_reservations.append(ledger.GateReservation(
+                "crossing-midnight", midnight - 3600, midnight + 3600, Decimal(8), Decimal(0),
+                state=ledger.GateRunning("i-fixture"), instance_type="m7a.8xlarge", region="us-east-1"))
+
+        actual = aws_costs.read_saved_costs(instant)
+        self.assertEqual(actual["month"], {"amount": "$28.00", "limit": "$400.00"})
+        self.assertEqual(actual["today"], {"amount": "$8.00", "limit": "$20.00"})
+
+    def test_aws_cost_feed_excludes_the_next_accounting_day(self) -> None:
+        zone = ZoneInfo("America/New_York")
+        instant = int(datetime(2026, 1, 4, 21, tzinfo=zone).timestamp())
+        _ = write_aws_cost_fixture(self.root, instant=instant)
+        text_setting(self.root / "aws_target.conf", "accounting_zone", zone.key)
+
+        actual = aws_costs.read_saved_costs(instant)
+        self.assertEqual(actual["month"], {"amount": "$24.00", "limit": "$400.00"})
+        self.assertEqual(actual["today"], {"amount": "$10.33", "limit": "$20.00"})
+        self.assertEqual(actual["yesterday"], {"amount": "$12.00", "provisional": False})
+
+    def test_aws_cost_feed_groups_cap_totals_in_the_accounting_zone(self) -> None:
+        instant = int(datetime(2026, 2, 1, 2, tzinfo=UTC).timestamp())
+        _ = write_aws_cost_fixture(self.root, instant=instant)
+        text_setting(self.root / "aws_target.conf", "accounting_zone", "America/New_York")
+        actual = aws_costs.read_saved_costs(instant)
+        self.assertEqual(actual["accounting_zone"], "America/New_York")
+        self.assertEqual(actual["yesterday"], {"amount": "$12.00", "provisional": False})
+        self.assertEqual(actual["today"], {"amount": "$10.33", "limit": "$20.00"})
+        self.assertEqual(actual["month"], {"amount": "$132.00", "limit": "$400.00"})
+        gates = actual["gates"]
+        assert gates is not None
+        self.assertEqual(gates["merge_gates"], "$6.00")
+
+        actual = aws_costs.read_saved_costs(instant + 4 * 3600)
+        self.assertEqual(actual["yesterday"], {"amount": "$12.00", "provisional": False})
+        self.assertEqual(actual["today"], {"amount": "$3.17", "limit": "$20.00"})
+        self.assertEqual(actual["month"], {"amount": "$3.17", "limit": "$400.00"})
+        self.assertIsNone(actual["gates"])
+
     def test_the_json_boundary_preserves_named_missing_states(self) -> None:
         with mock.patch.object(admission_client, "view", return_value=captured_reading()):
             payload = memory_feed.reading()
@@ -3697,6 +3858,11 @@ def write_browser_fixture(folder: Path) -> None:
         for name, page in pages.items():
             report = reports.get(name, default_report)
             cast(dict[str, object], page).update(report_version=report.version, report=cast(object, json.loads(report.text)))
+        _ = write_aws_cost_fixture(fixture.root)
+        costs_report = memory_feed.report_file(memory_feed.report_reading(configuration.history_days),
+                                               aws_costs.read_saved_costs(AWS_COST_TIME))
+        pages["aws_costs"] = {**cast(dict[str, object], pages["good"]), "report_version": costs_report.version,
+                               "report": cast(object, json.loads(costs_report.text))}
         _ = (folder / "fixtures.json").write_text(json.dumps(pages))
     finally:
         _ = fixture.doCleanups()

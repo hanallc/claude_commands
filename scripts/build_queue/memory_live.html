@@ -383,6 +383,19 @@ body.queue-unavailable .card { display: none; }
 .report-top-row { margin: 0; padding: 10px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
 .report-top-row:last-child { border-bottom: 0; }
 .report-top-row .action { display: block; margin-top: 3px; color: var(--ink-2); }
+.aws-totals, .aws-breakdown { display: grid; gap: 12px; margin-top: 12px; }
+.aws-totals { grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr)); }
+.aws-total { padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; cursor: help; }
+.aws-total span, .aws-total strong { display: block; overflow-wrap: anywhere; }
+.aws-total span { color: var(--ink-2); font-size: 0.85rem; }
+.aws-total strong { font-size: 1.1rem; }
+.aws-breakdown { grid-template-columns: repeat(auto-fit, minmax(min(100%, 21rem), 1fr)); gap: 12px 28px; }
+.aws-breakdown h3 { margin: 0; font-size: 1rem; cursor: help; }
+.aws-values { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; margin: 6px 0 0; }
+.aws-values dd { margin: 0; text-align: right; }
+.aws-units { width: 100%; margin: 10px 0 0; border-collapse: collapse; font-size: 0.87rem; }
+.aws-units th, .aws-units td { padding: 4px 0 4px 8px; text-align: right; border-top: 1px solid var(--line); }
+.aws-units th:first-child { padding-left: 0; text-align: left; overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
@@ -497,6 +510,10 @@ body.queue-unavailable .card { display: none; }
     <p class="swap-reserve" id="swap-reserve" data-tip="swap"></p>
     <h3>Swap by group</h3>
     <div class="swaprows" id="swaprows"></div>
+  </section>
+  <section class="card" id="aws-costs" aria-label="AWS costs">
+    <div class="section-head">AWS costs</div>
+    <div id="aws-cost-content">no record</div>
   </section>
   <section class="card" id="report-charts">
     <div class="section-head">Top 3 costs</div>
@@ -638,6 +655,49 @@ function renderReserveStatus(d, macAlert) {
 function legendTip(name, bytes, caption, parts = [], text = ramAmount(bytes)) {
   const title = field(name, text, 'title');
   return recorded(bytes) ? [title,field('',caption,'caption'),...groupRows(parts)] : [title];
+}
+let awsCosts;
+function costAmount(value) { return value ?? "no record"; }
+function awsCostSummary() {
+  return [
+    ["yesterday", "Yesterday", costAmount(awsCosts?.yesterday?.amount)],
+    ["today", "Today (estimated)", budgetCost(awsCosts?.today)],
+    ["month", "Month to date", budgetCost(awsCosts?.month)]
+  ];
+}
+function budgetCost(cost) {
+  return cost?.limit ? `${costAmount(cost.amount)} of ${cost.limit}` : costAmount(cost?.amount);
+}
+function awsGateValues() {
+  return [["Full merge gates", awsCosts?.gates?.merge_gates],
+    ["Targeted tests", awsCosts?.gates?.targeted_tests],
+    ["Merge gate average", awsCosts?.gates?.per_merge_gate]];
+}
+function awsFixedValues() {
+  const monthly = value => value == null ? undefined : `${value}/month`;
+  return [["Gate image storage", monthly(awsCosts?.fixed?.gate_image)],
+    ["Other resources", monthly(awsCosts?.fixed?.other)],
+    ["Total fixed cost", monthly(awsCosts?.fixed?.total)]];
+}
+function awsCostTip(section) {
+  if (section === "gates" || section === "fixed") {
+    const gates = section === "gates";
+    const title = gates ? "Billed gate spend" : "Fixed costs";
+    const values = gates ? awsGateValues() : awsFixedValues();
+    const rows = groupRows(values.map(([label,value]) => field(label,value)));
+    if (!rows.length) return [field(title,"unavailable","title")];
+    return [field(title,"","title"), ...(gates ? [field("Period","Month to date")] : []),
+      field("Basis",gates ? "Recorded box time" : "Latest saved inventory"), ...rows];
+  }
+  const [,label,value] = awsCostSummary().find(([key]) => key === section);
+  const cost = awsCosts?.[section];
+  if (cost?.amount == null) return [field(label,"unavailable","title")];
+  const yesterday = section === "yesterday";
+  const source = yesterday ? (cost.provisional ? "Provisional AWS bill" : "AWS bill") : "Saved ledger and bills";
+  const zone = yesterday ? "UTC" : awsCosts.accounting_zone;
+  return [field(label,value,"title"), field("Source",source),
+    ...(zone ? [field("Day boundary",zone)] : []),
+    ...(section === "today" ? [field("Non-compute costs","full day if billed")] : [])];
 }
 const TIPS = {
   'g-builds': d => legendTip('Builds', queueCapMemory(d).builds, 'RAM that builds use now', memoryRows([
@@ -962,6 +1022,7 @@ function tooltipRows(key, rawData) {
   if (kind === 'row' || kind === 'wait') return stepTooltip(key, data, rawData.ram.room_bytes);
   if (kind === 'swap' && index !== undefined) return swapTip(data.swap_by[+index]);
   if (kind === 'swap-pool') return poolTip(index, data);
+  if (kind === 'aws-cost') return awsCostTip(index);
   const rows = TIPS[key](data);
   if (key === 'walkhead' && data.unmatched_priority_entries?.length)
     rows.push(staffField('Priority', data.unmatched_priority_entries.map(entry => entry.unit)));
@@ -1450,11 +1511,26 @@ let reportStamp = "";
 function reportDate(value, zone) {
   return new Date(value).toLocaleDateString("en-US", {timeZone: zone, month: "short", day: "numeric", year: "numeric"});
 }
+function renderAwsCosts(costs) {
+  awsCosts = costs;
+  const summary = awsCostSummary().map(([key,label,value]) =>
+    `<div class="aws-total" data-tip="aws-cost:${key}" tabindex="0"><span>${esc(label)}</span><strong class="num">${esc(value)}</strong></div>`).join("");
+  const values = rows => `<dl class="aws-values">${rows.map(([label,value]) =>
+    `<dt>${esc(label)}</dt><dd class="num">${esc(costAmount(value))}</dd>`).join("")}</dl>`;
+  const units = (costs?.gates?.units || []).map(row =>
+    `<tr><th scope="row">${esc(row.unit)}</th><td>${esc(costAmount(row.merge_gates))}</td><td>${esc(costAmount(row.targeted_tests))}</td></tr>`).join("");
+  $("aws-cost-content").innerHTML = `<div class="aws-totals">${summary}</div><div class="aws-breakdown">
+    <div><h3 tabindex="0" data-tip="aws-cost:gates">Billed gate spend · Month to date</h3>${values(awsGateValues())}
+    ${units ? `<table class="aws-units num"><thead><tr><th scope="col">Unit</th><th scope="col">Merge gates</th><th scope="col">Targeted tests</th></tr></thead><tbody>${units}</tbody></table>` : ""}</div>
+    <div><h3 tabindex="0" data-tip="aws-cost:fixed">Fixed costs</h3>${values(awsFixedValues())}</div>
+  </div>`;
+}
 function renderReport(report) {
   const stamp = JSON.stringify(report);
   if (stamp === reportStamp) return;
   const view = captureReportView();
   reportStamp = stamp;
+  renderAwsCosts(report?.aws_costs);
   if (!report || report.kind === "IndexUnavailable") {
     const reason = report?.reason || "Report data unavailable";
     $("top-costs").textContent = reason;

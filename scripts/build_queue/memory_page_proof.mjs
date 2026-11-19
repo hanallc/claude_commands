@@ -12,6 +12,7 @@
 // Add --macroute as the fourth argument for the Mac route and width images.
 // Use --verify-call as the third argument for the Verify column proof.
 // Use --headcount to compare the Running and Queued headers.
+// Add --awscosts as the fourth argument to save the AWS costs pane.
 // Use --rowask to capture the rows and the New item dialog.
 // Use <output-folder> --tip-design for the six dark tooltip captures.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
@@ -83,6 +84,7 @@ try {
   const macrouteComparison = comparison === '--macroute';
   const headcountComparison = comparison === '--headcount';
   const rowAskComparison = comparison === '--rowask';
+  const awsCostsComparison = comparison === '--awscosts';
   const comparisonImages = Boolean(comparison || beforePage || swapBeforePage || requestedShot);
   const readings = JSON.parse(await readFile(join(folder, 'fixtures.json'), 'utf8'));
   const fixtureTime = readings.good.read_at;
@@ -641,7 +643,83 @@ try {
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:theme}]});
           for (const width of widths) {
             await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
+            await show(readings.aws_costs);
+            const awsPane = await evaluate(`(() => {
+              const pane = document.querySelector('#aws-costs');
+              const totals = [...pane.querySelectorAll('.aws-total')].map(card => [...card.children].map(cell => cell.textContent));
+              const units = [...pane.querySelectorAll('tbody tr')].map(row => row.cells[0].textContent);
+              const fields = [...pane.querySelectorAll('.aws-values dd')].map(cell => cell.textContent);
+              return {totals, units, fields, fits:pane.scrollWidth <= pane.clientWidth};
+            })()`);
+            assert.deepEqual(awsPane, {
+              totals:[['Yesterday','$12.00'],['Today (estimated)','$4.00 of $20.00'],['Month to date','$16.00 of $400.00']],
+              units:['research','Unit not recorded','report'],
+              fields:['$6.00','$2.00','$3.00','$6.20/month','$24.80/month','$31.00/month'], fits:true
+            });
+            if (theme === 'dark' && width === 1400) {
+              const awsTips = await evaluate(`(async () => {
+                const section = document.querySelector('#aws-costs');
+                section.scrollIntoView({block:'center'});
+                const tip = document.querySelector('#tip');
+                const showCost = trigger => {
+                  const bounds = trigger.getBoundingClientRect();
+                  showTip(trigger.dataset.tip, bounds.left + bounds.width / 2, bounds.bottom);
+                };
+                const views = Object.fromEntries([...section.querySelectorAll('[data-tip^="aws-cost:"]')].map(trigger => {
+                  showCost(trigger);
+                  const grid = tip.querySelector(':scope > dl.tip');
+                  const labels = [...grid.querySelectorAll(':scope > dt')];
+                  const pairs = labels.map(label => [label.textContent, label.nextElementSibling.textContent]);
+                  const aligned = labels.every(label => label.nextElementSibling.tagName === 'DD' &&
+                    getComputedStyle(label).textAlign === 'left' &&
+                    getComputedStyle(label.nextElementSibling).textAlign === 'right');
+                  const unwrapped = [...grid.children].every(cell => {
+                    const range = document.createRange();
+                    range.selectNodeContents(cell);
+                    return range.getClientRects().length <= 1;
+                  });
+                  return [trigger.dataset.tip, {pairs, aligned, unwrapped, columns:getComputedStyle(grid).gridTemplateColumns.split(' ').length}];
+                }));
+                let clip;
+                if (${awsCostsComparison}) {
+                  showCost(section.querySelector('[data-tip="aws-cost:today"]'));
+                  const r = tip.getBoundingClientRect();
+                  await Promise.all(tip.getAnimations().map(animation => animation.finished));
+                  const pane = section.getBoundingClientRect();
+                  const left = Math.min(pane.left, r.left), top = Math.min(pane.top, r.top);
+                  clip = {x:left+scrollX, y:top+scrollY, width:Math.max(pane.right, r.right)-left,
+                    height:Math.max(pane.bottom, r.bottom)-top, scale:1};
+                }
+                return {views, clip};
+              })()`);
+              assert.equal(Object.keys(awsTips.views).length, 5);
+              for (const [key, view] of Object.entries(awsTips.views)) {
+                assert.equal(view.columns, 2, key);
+                assert.ok(view.aligned, key);
+                for (const [label] of view.pairs)
+                  assert.ok([...label].length <= 18, `${key} label exceeds 18 characters: ${label}`);
+                assert.ok(view.pairs.every(([label,value]) => !label.endsWith(':') && !/[.!?]$/.test(value)), key);
+              }
+              assert.deepEqual(awsTips.views['aws-cost:gates'].pairs, [['Billed gate spend',''],['Period','Month to date'],
+                ['Basis','Recorded box time'],['Full merge gates','$6.00'],['Targeted tests','$2.00'],
+                ['Merge gate average','$3.00']]);
+              assert.deepEqual(awsTips.views['aws-cost:today'].pairs, [
+                ['Today (estimated)','$4.00 of $20.00'],['Source','Saved ledger and bills'],
+                ['Day boundary','UTC'],['Non-compute costs','full day if billed']]);
+              assert.ok(awsTips.views['aws-cost:today'].unwrapped, 'A Today tooltip row wraps on desktop.');
+              if (awsCostsComparison)
+                await saveScreenshot('aws-cost-tip-dark',{captureBeyondViewport:true,clip:awsTips.clip});
+              await evaluate('hideTip()');
+              if (awsCostsComparison) {
+                const clip = await evaluate(`(() => {
+                  const r = document.querySelector('#aws-costs').getBoundingClientRect();
+                  return {x:r.left+scrollX, y:r.top+scrollY, width:r.width, height:r.height, scale:1};
+                })()`);
+                await saveScreenshot('after-awscosts-dark',{captureBeyondViewport:true,clip});
+              }
+            }
             await show(base);
+            assert.equal(await evaluate(`document.querySelector('[data-tip="aws-cost:yesterday"] strong').textContent`), 'no record');
             // A render keeps the viewed row in place, so the scroll of the last width stays; the pixel checks read from the top.
             await evaluate('scrollTo(0,0)');
             const timeCells = await evaluate(`({

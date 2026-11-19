@@ -1610,6 +1610,37 @@ process.stdout.write(JSON.stringify(steps));
             ["ignored", 2, False], ["foreign", 2, False], ["resumed", 4, True],
             ["input, textarea, select, button, summary, [contenteditable]"]])
 
+    def test_aws_cost_hover_uses_the_label_and_value_grid(self) -> None:
+        cases: list[tuple[str, object, list[tuple[str, str]]]] = [
+            ("today", {"today": {"amount": "$4.00", "limit": "$20.00"}, "accounting_zone": "America/New_York"},
+             [("Today (estimated)", "$4.00 of $20.00"), ("Source", "Saved ledger and bills"),
+              ("Day boundary", "America/New_York"), ("Non-compute costs", "full day if billed")]),
+            ("yesterday", None, [("Yesterday", "unavailable")]),
+            ("today", {"today": {"amount": None, "limit": "$20.00"}, "accounting_zone": "UTC"},
+             [("Today (estimated)", "unavailable")]),
+            ("month", {}, [("Month to date", "unavailable")]),
+            ("gates", {"gates": {"units": []}}, [("Billed gate spend", "unavailable")]),
+            ("fixed", {"fixed": None}, [("Fixed costs", "unavailable")]),
+            ("month", {"month": {"amount": "$0.00", "limit": None}, "accounting_zone": None},
+             [("Month to date", "$0.00"), ("Source", "Saved ledger and bills")]),
+            ("gates", {"gates": {"targeted_tests": "$2.00"}},
+             [("Billed gate spend", ""), ("Period", "Month to date"), ("Basis", "Recorded box time"),
+              ("Targeted tests", "$2.00")]),
+            ("fixed", {"fixed": {"total": "$0.00"}},
+             [("Fixed costs", ""), ("Basis", "Latest saved inventory"), ("Total fixed cost", "$0.00/month")]),
+        ]
+        for section, costs, expected in cases:
+            with self.subTest(section=section, costs=costs):
+                markup = str(self.page_expression(
+                    "(awsCosts = data.costs, tooltipHtml('aws-cost:' + data.section, data))",
+                    {"costs": costs, "section": section}, walk=True))
+                grid = ElementTree.fromstring(markup)
+                self.assertEqual((grid.tag, grid.get("class")), ("dl", "tip"))
+                labels, values = grid.findall("dt"), grid.findall("dd")
+                self.assertEqual((labels[0].get("class"), values[0].get("class")), ("title", "title"))
+                fields = [(label.text or "", value.text or "") for label, value in zip(labels, values, strict=True)]
+                self.assertEqual(fields, expected)
+
     def page_expression(self, expression: str, data: object, *, walk: bool = False, swap: bool = False) -> object:
         html = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         functions = html[html.index("function field("):html.index("const tip =")]

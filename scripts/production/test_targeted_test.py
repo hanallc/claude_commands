@@ -7,7 +7,10 @@ from pathlib import Path
 from typing import ClassVar, override
 from unittest import mock
 
-from scripts.production import merge_gate, targeted_test
+from scripts.aws_target import ledger
+from scripts.build_queue import admission_records
+from scripts.message import unit_labels
+from scripts.production import merge_gate, staff, targeted_test
 from scripts.lib import build_folders
 from scripts.production.affected_modules import NoCertifiedBase
 from scripts.production.merge_gate_test_support import MergeGateFixture, SUITE_MODULE, gate_suites
@@ -43,6 +46,26 @@ class TargetedTestTests(MergeGateFixture):
         self.assertFalse(path.exists())
         self.assertFalse(path.with_name(path.name + ".lease.json").exists())
         self.assertFalse(path.with_name(path.name + ".lock").exists())
+
+    def test_targeted_entry_records_its_callers_unit_in_the_cloud_launch_log(self) -> None:
+        runner = staff.StaffRow(staff.StaffId("fixture-runner"), "showrunner", "fixture", staff.StaffRoot(),
+                                current_session=staff.StaffId("fixture-showrunner"))
+        director = staff.StaffRow(staff.StaffId("fixture-director"), "unit", "targeting", staff.ReportsTo(runner.id),
+                                  current_session=staff.StaffId("fixture-unit-session"))
+        worker = staff.StaffRow(staff.StaffId("fixture-worker"), "worker", "test", staff.ReportsTo(director.id),
+                                current_session=staff.StaffId("fixture-caller"))
+        state = self.root / "target-state"
+        self.environment["BUILD_TARGETS_STATE_DIR"] = str(state)
+        self.environment["CLAUDE_CODE_SESSION_ID"] = worker.current_session
+        _ = self.environment.pop("CODEX_THREAD_ID", None)
+        _ = self.environment.pop(admission_records.BUILDLOG_UNIT, None)
+        with (staff.supplied_snapshot(staff.StaffSnapshot((runner, director, worker))),
+              mock.patch.object(unit_labels, "newest_sessions", return_value=[]),
+              mock.patch.object(merge_gate, "run_suites", return_value=merge_gate.GateRun((), 0, 0, tests_reused=True))):
+            result = self.run_gate("--full", type_dirs=())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row, = ledger.CostLedger(state / "aws").launches()
+        self.assertEqual((row["mode"], row["result"], row.get("unit")), ("targeted-test", "fallback", director.name))
 
     def test_a_changed_suite_set_cannot_reuse_or_certify_an_old_full_pass(self) -> None:
         first = self.run_gate()
