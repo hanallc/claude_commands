@@ -11,6 +11,7 @@ import time
 from typing import cast
 from unittest import mock
 
+from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import OwningSession
 from scripts.build_queue import placement
 from scripts.mac_test import eligibility, nextest_log, offload
@@ -131,7 +132,7 @@ class OffloadForwardTests(OffloadCommandFixture):
     def test_placed_mac_command_sends_the_assignment_placement_to_the_cargo_gate(self) -> None:
         request = offload.OffloadRequest(self.repository, "hana", "call-forward", offload.NO_RESULT_FILE, ("--workspace",), owner="verify", holder_session="fixture-session")
         destination = placement.PlacementDestination("mac", "mac", "fixture-mac", RepositoryScope("hana"))
-        assignment = placement.PlacementAssignment("episode-a", "attempt-b", destination, placement.SourceKeyKnown("source-a"),
+        assignment = placement.PlacementAssignment("episode-a", "attempt-b", destination, execution_identity.SourceKeyKnown("source-a"),
             placement.SubmittingOwner("natedev", 42, "start"), OwningSession("submitting-session"), 1.0)
         config = eligibility.read_config(self.config_path)
         with self.subTest(placement="assigned"), mock.patch.dict(os.environ, {"MAC_PLACEMENT": "environment/value"}):
