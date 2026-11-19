@@ -109,6 +109,18 @@ class TreeKeyTests(unittest.TestCase):
         self.assertNotEqual(key(self.repo), self.clean)
         self.assertEqual(key(self.repo / "src"), key(self.repo))
 
+    def test_key_follows_edits_inside_an_already_dirty_submodule(self) -> None:
+        _ = git("-c", "protocol.file.allow=always", "submodule", "add", str(self.clone), "sub", cwd=self.repo)
+        _ = git("commit", "-qm", "Add submodule", cwd=self.repo)
+        _ = git("config", "submodule.sub.ignore", "all", cwd=self.repo)
+        original = key(self.repo)
+        source = self.repo / "sub" / "src" / "lib.rs"
+        _ = source.write_text("pub fn two() {}\n")
+        dirty = key(self.repo)
+        _ = source.write_text("pub fn three() {}\n")
+        self.assertNotEqual(key(self.repo), dirty)
+        self.assertNotEqual(dirty, original)
+
     def test_file_read_error_leaves_tree_key_unavailable(self) -> None:
         source = self.repo / "src" / "new.rs"
         _ = source.write_text("pub fn two() {}\n")

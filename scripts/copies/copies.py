@@ -60,6 +60,7 @@ RSYNC_RECEIVER_WRITE_TIME_FLAGS = "-rlpc"
 LEGACY_WORKER_HOLD_REASON = "legacy crate worker"
 OWNER = re.compile(r"[a-z0-9][a-z0-9_-]*")
 CLONE_STAGE = ".gate-clone"
+PRIVATE_SOURCE_TOOL = "copies-source"
 COMMAND_LOCKS: ContextVar[tuple[int, ...]] = ContextVar("gate_command_locks", default=())
 
 
@@ -1215,9 +1216,10 @@ def read_snapshot_origin(tree: Path, caller: Path) -> SnapshotOrigin | CloneSour
 
 
 @contextmanager
-def requested_source(source: Path, policy: SourcePolicy, merge: MergePolicy) -> Generator[Path]:
+def requested_source(source: Path, policy: SourcePolicy, merge: MergePolicy, *,
+                     parent: Path | None = None) -> Generator[Path]:
     """Freeze the requested files for admission without taking a build slot."""
-    with build_folders.tool_folder("copies-source") as folder:
+    with build_folders.tool_folder(PRIVATE_SOURCE_TOOL, parent=parent) as folder:
         tree = folder / "source"
         tree.mkdir()
         origin = prepare_requested_source(tree, source, policy, merge)
@@ -2206,24 +2208,46 @@ def command_tail(command: list[str]) -> list[str]:
     return command[1:] if command[:1] == ["--"] else command
 
 
-def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy) -> int:
+@dataclass(frozen=True)
+class CopyRunScope:
+    parent: Path
+    owner_pid: int
+
+
+@dataclass(frozen=True)
+class CopyCommandLine:
+    argv: list[str]
+
+
+class InProcessCopy(Enum):
+    USE_CALLER = auto()
+
+
+def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy,
+             invocation: CopyCommandLine | CopyRunScope | InProcessCopy) -> int:
     """Give commands a private source snapshot and retain the merge gate's slot."""
+    standing_slot = command_program(command) == "merge_gate.py"
+    if not standing_slot and isinstance(invocation, CopyCommandLine):
+        return run_copy_in_scope(invocation.argv)
     owner = caller_owner()
     source = Path(args.repo or "").expanduser().resolve()
     with ExitStack() as scope:
         captured = ""
-        if command_program(command) == "merge_gate.py":
+        if standing_slot:
             tree = scope.enter_context(command_tree(owner, source, policy, command, merge=merge))
             environment = dict(os.environ)
             target = tree / "target"
             locks = COMMAND_LOCKS.get()
         else:
-            tree = scope.enter_context(requested_source(source, policy, merge))
+            parent = invocation.parent if isinstance(invocation, CopyRunScope) else None
+            owner_pid = invocation.owner_pid if isinstance(invocation, CopyRunScope) else os.getpid()
+            tree = scope.enter_context(requested_source(source, policy, merge, parent=parent))
+            lease = build_folders.build_folder_lock_fd(tree.parent)
             environment = {**os.environ, "COPIES_STEP_SOURCE": str(tree), "COPIES_STEP_POOL": str(slot_source(tree)),
-                           "COPIES_STEP_REPOSITORY": str(source),
-                           "COPIES_STEP_OWNER": owner, "COPIES_RUN_PID": str(os.getpid()), "UNIT_DETACHED_RUN": "1"}
+                           "COPIES_STEP_REPOSITORY": str(source), "COPIES_STEP_LOCK_FD": str(lease),
+                           "COPIES_STEP_OWNER": owner, "COPIES_RUN_PID": str(owner_pid), "UNIT_DETACHED_RUN": "1"}
             target = tree / environment.setdefault("CARGO_TARGET_DIR", str(tree / "target"))
-            locks = (*COMMAND_LOCKS.get(), build_folders.build_folder_lock_fd(tree.parent))
+            locks = (*COMMAND_LOCKS.get(), lease)
             if args.publish:
                 output = tree.parent / "step-output"
                 output.mkdir()
@@ -2514,7 +2538,8 @@ class CopyArguments(argparse.Namespace):
     scratch: bool = False
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *,
+         invocation: CopyCommandLine | CopyRunScope | InProcessCopy = InProcessCopy.USE_CALLER) -> int:
     from scripts.build_queue.slot_wait import SlotWaitExpired
     from scripts.lib.build_slots import SlotsNotConfigured
 
@@ -2642,7 +2667,7 @@ def main(argv: list[str] | None = None) -> int:
             policy: SourcePolicy = (WorktreeSource(args.commit, args.apply_uncommitted) if args.apply_uncommitted else
                                     CommittedSource(args.commit))
             merge: MergePolicy = MergeRevision(args.merge) if args.merge else NoMerge()
-            return run_copy(args, command, policy, merge)
+            return run_copy(args, command, policy, merge, invocation)
         if args.action == "list":
             list_trees()
         else:
@@ -2658,5 +2683,61 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+COPY_RUN_SCOPE_SH = r'''
+python=$1 copies=$2 owner=$3
+shift 3
+parent=""
+cleanup() {
+    [[ -n "$parent" ]] || return 0
+    rmdir -- "$parent" 2>/dev/null && return 0
+    "$python" "$copies" --clean-run-scope "$parent" || exit 2
+}
+trap cleanup EXIT
+parent="$(mktemp -d "${TMPDIR:-/tmp}/copies-run.XXXXXX")" || exit 2
+"$python" "$copies" --in-run-scope "$parent" "$owner" "$@"
+exit "$?"
+'''
+
+
+def release_run_scope(parent: Path) -> int:
+    """Wait for the command's lease before removing its private copy."""
+    try:
+        if (not re.fullmatch(r"copies-run\.[A-Za-z0-9]{6}", parent.name)
+                or parent.parent.resolve() != build_folders.inherited_temporary_parent().resolve()
+                or not stat.S_ISDIR(parent.lstat().st_mode)):
+            raise ValueError("invalid private copy directory")
+        lease = parent / (PRIVATE_SOURCE_TOOL + ".lock")
+        try:
+            with os.fdopen(os.open(lease, os.O_RDONLY | os.O_NOFOLLOW), "rb") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+        except FileNotFoundError:
+            pass
+        build_folders.sweep_temporary_build_folders(parent)
+        parent.rmdir()
+    except (OSError, ValueError) as error:
+        print(f"copies: release private copy: {error}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def run_copy_in_scope(argv: list[str]) -> int:
+    """Keep snapshot cleanup in the command group after its Python owner exits."""
+    environment = dict(os.environ)
+    cleanup_lease = environment.pop("COPIES_RUN_SCOPE_LOCK_FD", "")
+    result = subprocess.run(["bash", "-c", COPY_RUN_SCOPE_SH, "copies-run",
+                             sys.executable, str(Path(__file__).resolve()), str(os.getpid()), *argv],
+                            pass_fds=(int(cleanup_lease),) if cleanup_lease else (), env=environment, check=False)
+    return result.returncode if result.returncode >= 0 else 128 - result.returncode
+
+
+def copy_cli(argv: list[str]) -> int:
+    if argv[:1] == ["--in-run-scope"]:
+        _, parent, owner, *command = argv
+        return main(command, invocation=CopyRunScope(Path(parent), int(owner)))
+    if argv[:1] == ["--clean-run-scope"]:
+        return release_run_scope(Path(argv[1]))
+    return main(argv, invocation=CopyCommandLine(argv))
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(copy_cli(sys.argv[1:]))

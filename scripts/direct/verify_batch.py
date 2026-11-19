@@ -12,17 +12,12 @@ from enum import Enum
 import os
 from pathlib import Path
 import re
-import signal
 import subprocess
 import sys
-import tempfile
-from types import FrameType
 from typing import final
 
 from scripts.buildlog import treekey
 from scripts.direct import recorder_state
-from scripts.lib.cancellation import CANCELLATION_SIGNALS
-from scripts.lib.process_group import send_process_group
 
 
 class LintScope(Enum):
@@ -62,52 +57,20 @@ class BatchStepResult:
 
 
 @final
-class BatchInterrupted(Exception):
-    def __init__(self, status: int) -> None:
-        super().__init__(status)
-        self.status = status
-
-
-@final
 class BatchCommands:
-    """Run one child at a time and let it close its grants on cancellation."""
+    """Run one command at a time in the caller's process group."""
 
-    def __init__(self, verify: Path, route: Sequence[str]) -> None:
+    def __init__(self, verify: Path, route: Sequence[str], *, cleanup_leases: tuple[int, ...] = ()) -> None:
         self.verify = verify
         self.route = route
+        self.cleanup_leases = cleanup_leases
         self.environment = {**os.environ, "UNIT_DETACHED_RUN": "1"}
         _ = self.environment.pop("UNIT_DETACHED_RECORD", None)
-        self.interrupted = 0
-        for sig in CANCELLATION_SIGNALS:
-            _ = signal.signal(sig, self.interrupt)
-
-    def interrupt(self, signum: int, _frame: FrameType | None) -> None:
-        self.interrupted = signum
 
     def run(self, command: Sequence[str], changes: dict[str, str]) -> int:
-        if self.interrupted:
-            raise BatchInterrupted(128 + self.interrupted)
-        with subprocess.Popen(command, env={**self.environment, **changes}, stdin=subprocess.DEVNULL,
-                              start_new_session=True) as child:
-            def forward(signum: int, frame: FrameType | None) -> None:
-                self.interrupt(signum, frame)
-                try:
-                    send_process_group(child.pid, signum)
-                except ProcessLookupError:
-                    pass
-
-            for sig in CANCELLATION_SIGNALS:
-                _ = signal.signal(sig, forward)
-            try:
-                if self.interrupted:
-                    forward(self.interrupted, None)
-                status = child.wait()
-            finally:
-                for sig in CANCELLATION_SIGNALS:
-                    _ = signal.signal(sig, self.interrupt)
-        if self.interrupted:
-            raise BatchInterrupted(128 + self.interrupted)
-        return status if status >= 0 else 128 - status
+        result = subprocess.run(command, env={**self.environment, **changes}, stdin=subprocess.DEVNULL,
+                                pass_fds=self.cleanup_leases, check=False)
+        return result.returncode if result.returncode >= 0 else 128 - result.returncode
 
     def verify_step(self, step: str, args: Sequence[str], cache_hit: Path,
                     *, format_packages: str = "") -> BatchStepResult:
@@ -190,8 +153,11 @@ def run_baseline_copy(commands: BatchCommands, repo: Path, plan: BaselineProof, 
                "--", "bash", "-c", apply_patch, "regression-patch", str(plan.patch),
                sys.executable, str(script), "--baseline", str(commands.verify), str(done), *cases,
                "--", *commands.route]
-    status = commands.run(command, {})
-    if not done.is_file():
+    cleanup = commands.cleanup_leases
+    environment = {"COPIES_RUN_SCOPE_LOCK_FD": str(cleanup[0])} if cleanup else {}
+    status = commands.run(command, environment)
+    baseline_status = done.read_text() if done.is_file() else ""
+    if baseline_status != str(status):
         scope = ",".join(dict.fromkeys(case.package for case in plan.cases))
         return BatchStepResult(status, False).show("fail-first", scope, f"baseline copy exit {status}")
     return status == 0
@@ -234,17 +200,15 @@ def main(argv: list[str]) -> int:
     split = len(argv) - 1 - argv[::-1].index("--")
     args, route = argv[:split], argv[split + 1:]
     if args[0] == "--baseline":
-        try:
-            _, verify, marker, *cases = args
-            done = Path(marker)
-            result = run_baseline_tests(BatchCommands(Path(verify), route),
-                                        [RegressionCase(*case.split("=", 1)) for case in cases],
-                                        done.with_name("baseline-cache-hit"))
-            done.touch()
-            return result
-        except BatchInterrupted as error:
-            return error.status
-    repo, verify, recorder, *words = args
+        _, verify, marker, *cases = args
+        done = Path(marker)
+        lease = os.environ.get("COPIES_STEP_LOCK_FD")
+        commands = BatchCommands(Path(verify), route, cleanup_leases=(int(lease),) if lease else ())
+        result = run_baseline_tests(commands, [RegressionCase(*case.split("=", 1)) for case in cases],
+                                    done.with_name("baseline-cache-hit"))
+        _ = done.write_text(str(result))
+        return result
+    repo, verify, scratch, lease, *words = args
     try:
         parser = argparse.ArgumentParser(prog="verify.sh batch", allow_abbrev=False)
         _ = parser.add_argument("--packages", required=True)
@@ -255,18 +219,11 @@ def main(argv: list[str]) -> int:
         if len(set(packages)) != len(packages) or not all(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]*", p) for p in packages):
             raise ValueError("--packages needs distinct package names separated by commas")
         baseline = baseline_proof(packages, options.fail_first)
-        with tempfile.TemporaryDirectory(prefix="verify-batch-") as directory:
-            status = run_batch(BatchCommands(Path(verify), route), Path(repo), packages, LintScope(options.lint),
-                               baseline, Path(directory))
+        commands = BatchCommands(Path(verify), route, cleanup_leases=(int(lease),))
+        return run_batch(commands, Path(repo), packages, LintScope(options.lint), baseline, Path(scratch))
     except (OSError, ValueError) as error:
         print(f"verify.sh batch: {error}", file=sys.stderr)
-        status = 2
-    except BatchInterrupted as error:
-        status = error.status
-    if record := os.environ.get("UNIT_DETACHED_RECORD"):
-        _ = subprocess.run([sys.executable, recorder, "record-exit", record, str(status), "--pid", str(os.getpid())],
-                           check=False)
-    return status
+        return 2
 
 
 if __name__ == "__main__":

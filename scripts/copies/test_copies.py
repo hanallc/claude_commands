@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import select
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -26,6 +27,7 @@ from scripts.buildlog.store import host_name
 from scripts.copies import copies
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue import admission_protocol as wire, slot_wait
+from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
@@ -200,6 +202,33 @@ class StandingTests(unittest.TestCase):
     def run_cli(self, *options: str, command: tuple[str, ...] = ()) -> subprocess.CompletedProcess[str]:
         return self.cli("run", "--repo", str(self.source),
                         "--commit", "HEAD", *options, "--", *(command or (sys.executable, "-c", "pass")))
+
+    def test_term_cleans_a_running_commands_private_snapshot(self) -> None:
+        command = "import os, sys; print(os.getcwd(), flush=True); sys.stdin.buffer.read(1)"
+        with subprocess.Popen(
+            [sys.executable, str(Path(copies.__file__).resolve()), "run", "--repo", str(self.source),
+             "--commit", "HEAD", "--", sys.executable, "-c", command],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
+        ) as process:
+            assert process.stdout is not None
+            try:
+                self.assertTrue(select.select([process.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
+                location = cast(str, process.stdout.readline()).strip()
+                if not location:
+                    output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    self.fail("the copy command did not start: " + output + errors)
+                snapshot = Path(location)
+                self.assertTrue(snapshot.is_relative_to(self.base / "temporary"))
+                self.assertTrue(snapshot.is_dir())
+                send_process_group(process.pid, signal.SIGTERM)
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            finally:
+                if process.poll() is None:
+                    send_process_group(process.pid, signal.SIGKILL)
+            self.assertEqual(process.returncode, -signal.SIGTERM, output + errors)
+            self.assertFalse(snapshot.exists())
+            self.assertEqual(list((self.base / "temporary").iterdir()), [])
 
     def test_claude_and_codex_workers_use_their_unit_owner(self) -> None:
         unit = next(row for row in staff.local_snapshot().rows if row.kind == "unit")

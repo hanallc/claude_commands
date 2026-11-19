@@ -3,7 +3,8 @@
 The key covers HEAD's tree, then every path that differs from it -- staged,
 unstaged, deleted, or new and not ignored -- sorted, each as its path, a NUL
 and its content: the sha256 of its bytes, `link <target>` for a symlink,
-`absent` when deleted. Those are the content rules of verify.sh's pass-record
+`absent` when deleted. A changed submodule includes its checked-out commit and
+tree key. Regular files use the content rules of verify.sh's pass-record
 key (TREE_KEY_PY), without its worktree path, rustc, script hashes, command
 words or environment: this key names the tree alone, and the build log matches
 the worktree and the argv on columns of their own. Two clones holding the same
@@ -68,6 +69,11 @@ def content(path: bytes) -> bytes:
     if os.path.isfile(path):
         with open(path, "rb") as handle:
             return hashlib.file_digest(handle, "sha256").digest()
+    if os.path.isdir(path) and os.path.lexists(os.path.join(path, b".git")):
+        submodule_key = _tree_key(os.fsdecode(path), submodule=True)
+        if submodule_key is None:
+            raise OSError(f"no tree key for {os.fsdecode(path)}")
+        return b"gitlink " + submodule_key.encode("ascii")
     return b"absent"
 
 
@@ -77,12 +83,18 @@ def committed_tree_key(tree_id: bytes) -> str:
 
 
 def tree_key(directory: str) -> str | None:
+    return _tree_key(directory, submodule=False)
+
+
+def _tree_key(directory: str, *, submodule: bool) -> str | None:
+    revision = ("HEAD^{tree}", "HEAD") if submodule else ("HEAD^{tree}",)
     try:
         processes = [
-            git(directory, "rev-parse", "--show-toplevel", "HEAD^{tree}"),
+            git(directory, "rev-parse", "--show-toplevel", *revision),
             # Staged, unstaged, deleted and untracked alike, every untracked file
             # by name; porcelain names paths from the top in any folder.
-            git(directory, "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames"),
+            git(directory, "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames",
+                "--ignore-submodules=none"),
         ]
     except OSError:
         return None
@@ -91,9 +103,12 @@ def tree_key(directory: str) -> str | None:
         return None
     heads, status = outputs
     lines = heads.splitlines()
-    if len(lines) != 2:
+    if len(lines) != 1 + len(revision):
         return None
-    top, tree = lines
+    top, *identity = lines
+    if submodule and os.path.realpath(os.fsencode(directory)) != top:
+        return None
+    tree = b"\0".join(identity)
     if not status:
         return committed_tree_key(tree)
     key = hashlib.sha256(tree + b"\n")

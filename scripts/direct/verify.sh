@@ -1529,10 +1529,30 @@ if [[ "$CMD" == batch ]]; then
     if [[ -n "$PINNED_TARGET" ]]; then batch_route+=(--target "$PINNED_TARGET"); fi
     if [[ "$MAC_ONLY" == 1 ]]; then batch_route+=(--mac "$MAC_REASON"); fi
     if [[ "$LOCAL_ONLY" == 1 ]]; then batch_route+=(--local "$LOCAL_REASON"); fi
-    if [[ -n "${VERIFY_HELPER_INPUT:-}" ]]; then exec 70>&- 71<&-; fi
-    exec "$PY" "$VERIFY_START_DIR/verify_batch.py" "$VERIFY_REPO_ROOT" \
-        "$VERIFY_START_DIR/verify.sh" "$DETACHED_RUNS_SCRIPT" "${ARGS[@]}" \
-        -- ${batch_route[@]+"${batch_route[@]}"}
+    batch_scratch=""
+    # Copy and step cleanup keep fd 74 open until they release their leases.
+    trap '
+        if [[ -n "$batch_scratch" ]]; then
+            exec 74>&-
+            exec 74<>"$batch_scratch/cleanup.lock"
+            lock_file_descriptor 74 || exit 2
+            rm -rf -- "$batch_scratch"
+        fi
+        [[ -z "${VERIFY_HELPER_LOCK:-}" ]] || rm -f -- "$VERIFY_HELPER_LOCK"
+    ' EXIT
+    batch_scratch="$(mktemp -d "${TMPDIR:-/tmp}/verify-batch.XXXXXX")" || exit 2
+    exec 74<>"$batch_scratch/cleanup.lock"
+    lock_file_descriptor 74 || exit 2
+    if [[ -n "${VERIFY_HELPER_INPUT:-}" ]]; then
+        exec 70>&- 71<&-
+        unset VERIFY_HELPER_INPUT VERIFY_HELPER_OUTPUT
+    fi
+    batch_status=0
+    "$PY" "$VERIFY_START_DIR/verify_batch.py" "$VERIFY_REPO_ROOT" \
+        "$VERIFY_START_DIR/verify.sh" "$batch_scratch" 74 "${ARGS[@]}" \
+        -- ${batch_route[@]+"${batch_route[@]}"} || batch_status=$?
+    finish_verify_run "$batch_status"
+    exit "$batch_status"
 fi
 parse_command_arguments "${ARGS[@]}"
 set -- ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}

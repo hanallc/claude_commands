@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import select
+import signal
+import socket
 import subprocess
+import sys
+import tempfile
 from typing import cast, override
 import unittest
 from unittest.mock import patch
@@ -12,6 +18,8 @@ from unittest.mock import patch
 from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.copies.copies_test_support import copies_environment
+from scripts.lib.git_test_support import commit_repository
+from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
@@ -100,6 +108,12 @@ BATCH_CARGO_STUB = CARGO_STUB.replace(
         assert expression == "package(sample) & test(=regression)", expression
         assert Path("src/regression.rs").is_file(), Path.cwd()
         assert " { 1 }" in Path("src/lib.rs").read_text()
+        if ready := os.environ.get("TEST_BASELINE_READY"):
+            from socket import AF_UNIX, SOCK_STREAM, socket
+            with socket(AF_UNIX, SOCK_STREAM) as started:
+                started.connect(ready)
+                started.sendall(os.environ["COPIES_STEP_SOURCE"].encode() + b"\n")
+                started.recv(1)
         raise SystemExit(int(os.environ["TEST_BASELINE_STATUS"]))
     assert any("--check" not in args for args in taplo_calls), taplo_calls
     raise SystemExit(int(os.environ.get("TEST_SAMPLE_STATUS", "0")) if expression == "package(sample)" else 0)
@@ -203,6 +217,22 @@ class VerifyBatchTests(support.VerifyLintScopeFixture):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("verify.sh batch lint sample,other red cached=no (tests stale)", result.stdout)
 
+    def test_batch_rejects_a_lint_edit_in_a_dirty_submodule(self) -> None:
+        module = self.root / "nested"
+        module.mkdir()
+        self.run_git("-C", str(module), "init", "--quiet")
+        source = module / "lib.rs"
+        _ = source.write_text("pub fn value() -> u8 { 1 }\n")
+        _ = commit_repository(module, "Add submodule source", env=self.environment)
+        self.run_git("add", "--force", module.name)
+        _ = commit_repository(self.root, "Add submodule", module.name, env=self.environment)
+        _ = source.write_text("pub fn value() -> u8 { 2 }\n")
+        self.environment.update(TEST_EDIT_DURING="mend", TEST_EDIT_FILE="nested/lib.rs")
+
+        result = self.batch()
+        self.assertIn("verify.sh batch lint sample,other red cached=no (tests stale)", result.stdout)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
     def test_batch_reports_the_cache_result_of_each_package_and_lint(self) -> None:
         first = self.batch()
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
@@ -240,6 +270,112 @@ class VerifyBatchTests(support.VerifyLintScopeFixture):
         self.assertIsInstance(first_requests[0].run, wire.RunIdentity)
         self.assertEqual({request.run for request in placements}, {first_requests[0].run})
         self.assertNotEqual(first_requests[0].constraints.source_key, first_requests[1].constraints.source_key)
+
+
+    def test_batch_stop_releases_the_baseline_grant_and_copy(self) -> None:
+        self.fail_first(status=100)
+        admission = caller_admission(self, self.root, self.environment)
+        ready = self.root / "baseline-ready"
+        environment = {**self.environment, "TEST_BASELINE_READY": str(ready)}
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(str(ready))
+            listener.listen(1)
+            listener.settimeout(TEST_HANG_GUARD_SECS)
+            with subprocess.Popen(
+                ["bash", str(support.VERIFY), "batch", "--packages", "sample,other", "--lint", "packages",
+                 "--fail-first"], cwd=self.root, env=environment, start_new_session=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            ) as process:
+                try:
+                    with os.fdopen(os.pidfd_open(process.pid), "rb") as stopped:
+                        ready_fds = select.select([listener, stopped], [], [], TEST_HANG_GUARD_SECS)[0]
+                    if listener not in ready_fds:
+                        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                        self.fail("the baseline test did not start: " + output + errors)
+                    with listener.accept()[0] as connection:
+                        connection.settimeout(TEST_HANG_GUARD_SECS)
+                        with connection.makefile("r") as data:
+                            snapshot = Path(data.readline().strip())
+                        self.assertTrue(snapshot.is_dir())
+                        self.assertTrue(admission.caller_reservations())
+                        send_process_group(process.pid, signal.SIGTERM)
+                        self.assertEqual(connection.recv(1), b"")
+                    _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+                    self.assertTrue(admission.callers_released(), "the batch exited before it released the grant")
+                    self.assertFalse(snapshot.parent.exists(), "the batch exited before it removed the private copy")
+                    output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                finally:
+                    if process.poll() is None:
+                        send_process_group(process.pid, signal.SIGKILL)
+                self.assertEqual(process.returncode, -signal.SIGTERM, output + errors)
+                self.assertNotIn("verify.sh batch result green", output)
+
+
+class BatchCancellationTests(unittest.TestCase):
+    def run_python(self, program: str, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([sys.executable, "-c", program, *arguments], capture_output=True, text=True,
+                              check=False, timeout=TEST_HANG_GUARD_SECS)
+
+    def test_a_batch_command_uses_the_callers_process_group(self) -> None:
+        result = self.run_python("""
+import os, sys
+from pathlib import Path
+from scripts.direct.verify_batch import BatchCommands
+print(os.getpgrp(), flush=True)
+raise SystemExit(BatchCommands(Path("unused"), ()).run(
+    [sys.executable, "-c", "import os; print(os.getpgrp())"], {}))
+""")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        parent, child = result.stdout.splitlines()
+        self.assertEqual(parent, child)
+
+    def test_term_during_the_final_tree_check_stops_the_batch(self) -> None:
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        result = self.run_python("""
+import os, signal, sys
+from pathlib import Path
+from unittest.mock import patch
+from scripts.direct import verify_batch as batch
+
+checks = iter(("tree", "tree", "final"))
+
+def tree_key(_directory):
+    if next(checks) == "final":
+        os.kill(os.getpid(), signal.SIGTERM)
+    return "tree"
+
+commands = batch.BatchCommands(Path("unused"), ())
+with patch.object(commands, "verify_step", return_value=batch.BatchStepResult(0, False)):
+    with patch.object(batch.treekey, "tree_key", side_effect=tree_key):
+        raise SystemExit(batch.run_batch(commands, Path.cwd(), ("sample",), batch.LintScope.WORKSPACE,
+                                        batch.NoBaselineProof.SKIP, Path(sys.argv[1])))
+""", str(scratch))
+        self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
+        self.assertNotIn("verify.sh batch result green", result.stdout)
+
+    def test_a_failed_copy_cleanup_names_the_baseline_step(self) -> None:
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        result = self.run_python("""
+import sys
+from pathlib import Path
+from unittest.mock import patch
+from scripts.direct import verify_batch as batch
+
+scratch = Path(sys.argv[1])
+plan = batch.BaselineProof("commit", scratch / "patch", (batch.RegressionCase("sample", "regression"),))
+
+def run_after_proof(_command, _environment):
+    marker = scratch / "baseline-done"
+    with patch.object(batch, "run_baseline_tests", return_value=0):
+        assert batch.main(["--baseline", "verify", str(marker), "sample=regression", "--"]) == 0
+    return 2
+
+commands = batch.BatchCommands(Path("verify"), ())
+with patch.object(commands, "run", side_effect=run_after_proof):
+    assert not batch.run_baseline_copy(commands, scratch, plan, scratch)
+""", str(scratch))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("verify.sh batch fail-first sample red cached=no (baseline copy exit 2)", result.stdout)
 
 
 if __name__ == "__main__":

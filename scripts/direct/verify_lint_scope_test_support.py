@@ -92,7 +92,7 @@ elif arguments[:1] not in (["mend"], ["clippy"], ["doc"], ["+nightly"]):
 if arguments[:1] == [os.environ.get("TEST_EDIT_DURING", "")] and (
     arguments[0] != "clippy" or "--fix" not in arguments
 ):
-    with Path(os.environ["PACKAGE_ROOT"], "src", "lib.rs").open("a", encoding="utf-8") as source:
+    with Path(os.environ["PACKAGE_ROOT"], os.environ.get("TEST_EDIT_FILE", "src/lib.rs")).open("a", encoding="utf-8") as source:
         source.write("// changed during " + arguments[0] + "\n")
 if arguments[:1] == ["clippy"]:
     source = Path(os.environ["PACKAGE_ROOT"], os.environ.get("TEST_FIX_FILE", "src/lib.rs"))
