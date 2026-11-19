@@ -7567,33 +7567,111 @@ class PaneWorkerMessageTests(unittest.TestCase):
 
     def test_worker_message_requires_one_prompt_to_start_a_turn(self) -> None:
         message = "Detached run: private-run\nResult: PASS"
-        result = send.deliver_worker_text(self.row, staff.snapshot(), message, sender="detached-runs", timeout=60)
-        self.assertIsInstance(result, send.PaneTextDelivered)
-        self.assertEqual(result.outcome, "sent", result.detail)
-        prompts = [command for command in self.fixture.world.commands if command[:2] == ("agent", "prompt")]
-        self.assertEqual(prompts, [("agent", "prompt", "w1:p1", script_prompt(message),
-                                    "--wait", "--until", "working", "--until", "blocked", "--timeout", "60000")])
-        self.assertEqual(send.pending(f"staff:{self.fixture.parent.id}"), "")
+        for status in ("idle", "working"):
+            with self.subTest(status=status):
+                self.fixture.world.commands.clear()
+                self.fixture.world.locations["w1:p1"]["agent_status"] = status
+                result = send.deliver_worker_text(self.row, staff.snapshot(), message, sender="detached-runs", timeout=60)
+                self.assertIsInstance(result, send.PaneTextDelivered)
+                self.assertEqual(result.outcome, "sent", result.detail)
+                prompts = [command for command in self.fixture.world.commands if command[:2] == ("agent", "prompt")]
+                self.assertEqual(prompts, [("agent", "prompt", "w1:p1", script_prompt(message),
+                                            "--wait", "--until", "working", "--until", "blocked", "--timeout", "60000")])
+                self.assertFalse(any(command[:2] == ("agent", "wait") for command in self.fixture.world.commands))
+                self.assertEqual(send.pending(f"staff:{self.fixture.parent.id}"), "")
 
-    def test_stalled_prompt_routes_the_message_and_reason_to_the_holder(self) -> None:
-        message = "Detached run: stalled-run\nResult: PASS"
-        pane_run = self.fixture.world.run
+    def test_prompt_failure_routes_to_the_holder_only_when_input_was_not_submitted(self) -> None:
+        from scripts.herdr import herdr
+        from scripts.lib import script_prompts
 
-        def run(*arguments: str, deadline: float = math.inf) -> str:
-            output = pane_run(*arguments, deadline=deadline)
-            if arguments[:2] == ("agent", "prompt"):
-                raise herdr_types.HerdrFailure("agent_prompt_stalled: no working or blocked state", code="agent_prompt_stalled")
-            return output
+        world = self.fixture.world
+        pane_run, pane_composer = world.run, world.composer
+        pane_result, record_prompt = world.result, script_prompts.record
+        read_shared_session = herdr.shared_session
+        pane = "w1:p1"
+        stall = "agent_prompt_stalled: no working or blocked state"
+        for case, reason, submitted in (
+                ("launch refused", "prompt command did not start", False),
+                ("Popen failed", f"{world.binary}: [Errno {errno.EMFILE}] too many open files", False),
+                ("pane became blocked", "worker is blocked", False),
+                ("slash record denied", "slash record denied", False),
+                ("invalid readiness bytes", "the Herdr reply cannot be decoded", False),
+                ("client setup denied", "shared-session read denied", False),
+                ("prompt stalled", stall, True),
+                ("invalid reply bytes", "the Herdr prompt reply cannot be decoded", True)):
+            message = "/resume" if case == "slash record denied" else "Detached run: stalled-run\nResult: PASS"
+            world.commands.clear()
+            world.locations[pane]["agent_status"] = "working"
+            session_reads = 0
 
-        with mock.patch.object(self.fixture.world, "run", side_effect=run):
-            result = send.deliver_worker_text(self.row, staff.snapshot(), message, sender="detached-runs", timeout=60)
-        self.assertEqual(result.outcome, "queued", result.detail)
-        retained = send.pending(f"staff:{self.fixture.parent.id}")
-        self.assertIn("Worker impl: agent_prompt_stalled: no working or blocked state", retained)
-        self.assertIn(message, retained)
-        prompts = [command for command in self.fixture.world.commands if command[:2] == ("agent", "prompt")]
-        self.assertEqual(prompts, [("agent", "prompt", "w1:p1", script_prompt(message),
-                                    "--wait", "--until", "working", "--until", "blocked", "--timeout", "60000")])
+            def shared_session(*, dependencies: Callable[[Path], None] | None = None) -> str:
+                nonlocal session_reads
+                session_reads += 1
+                if case == "client setup denied" and session_reads == 2:
+                    raise PermissionError("shared-session read denied")
+                return read_shared_session(dependencies=dependencies)
+
+            def composer(target: str) -> herdr.ComposerInput | herdr.NoComposer:
+                if case == "pane became blocked":
+                    world.locations[target]["agent_status"] = "blocked"
+                return pane_composer(target)
+
+            def record(target: str, text: str) -> None:
+                if case == "slash record denied":
+                    self.assertEqual(text, "/resume")
+                    raise PermissionError("slash record denied")
+                record_prompt(target, text)
+
+            def read(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+                if case == "invalid readiness bytes" and arguments == ("agent", "get", pane):
+                    decode_error = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid byte")
+                    with mock.patch.object(subprocess, "run", side_effect=decode_error):
+                        _ = herdr.run_program(world.argv(*arguments))
+                return pane_result(*arguments, deadline=deadline)
+
+            def run(*arguments: str, deadline: float = math.inf) -> str:
+                if arguments[:2] != ("agent", "prompt"):
+                    return pane_run(*arguments, deadline=deadline)
+                if case == "launch refused":
+                    raise herdr.HerdrLaunchRefused("prompt command did not start")
+                if case == "prompt stalled":
+                    _ = pane_run(*arguments, deadline=deadline)
+                    raise herdr_types.HerdrFailure(stall, code="agent_prompt_stalled")
+
+                def spawn(*_args: object, **_kwargs: object) -> object:
+                    if case == "Popen failed":
+                        raise OSError(errno.EMFILE, "too many open files")
+                    _ = pane_run(*arguments, deadline=deadline)
+                    decode_error = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid byte")
+                    return mock.MagicMock(communicate=mock.Mock(side_effect=decode_error))
+
+                with mock.patch.object(subprocess, "Popen", side_effect=spawn):
+                    reply = herdr.run_program(world.argv(*arguments))
+                    herdr.require_success(reply, "herdr agent prompt")
+                    return reply.stdout
+
+            with (self.subTest(case=case), mock.patch.object(world, "run", side_effect=run),
+                  mock.patch.object(herdr, "shared_session", side_effect=shared_session),
+                  mock.patch.object(world, "composer", side_effect=composer),
+                  mock.patch.object(world, "result", side_effect=read),
+                  mock.patch.object(script_prompts, "record", side_effect=record)):
+                result = send.deliver_worker_text(self.row, staff.snapshot(), message, sender="detached-runs", timeout=60)
+                retained = send.pending(f"staff:{self.fixture.parent.id}")
+                prompts = [command for command in world.commands if command[:2] == ("agent", "prompt")]
+                if submitted:
+                    self.assertIsInstance(result, send.WorkerMessageUnconfirmed)
+                    self.assertEqual(result.outcome, "failed", result.detail)
+                    self.assertEqual(result.detail,
+                                     f"worker message delivery unconfirmed: {reason}. "
+                                     + "The message may already have arrived. Do not resend it.")
+                    self.assertEqual(retained, "")
+                    self.assertEqual(prompts, [("agent", "prompt", "w1:p1", script_prompt(message),
+                                                "--wait", "--until", "working", "--until", "blocked", "--timeout", "60000")])
+                else:
+                    self.assertEqual(result.outcome, "queued", result.detail)
+                    self.assertIn(f"Worker impl: {reason}", retained)
+                    self.assertIn(message, retained)
+                    self.assertEqual(prompts, [])
 
     def test_short_worker_path_prefers_the_sender_showrunner_over_an_absolute_collision(self) -> None:
         collision = fixture_member("showrunner", name="unit")
@@ -7738,6 +7816,21 @@ class PaneWorkerMessageTests(unittest.TestCase):
 
         pane = "w1:p1"
         row = self.row
+        receipt = send.WorkerResultReceipt("Detached run: fixture", wait_for_idle=True)
+        selection = send.FixedStaffLookup(row.id, "worker")
+        self.fixture.world.locations[pane]["agent_status"] = "working"
+        with (self.subTest(session="same"),
+              mock.patch.object(send.WorkerResultReceipt, "received", return_value=True) as received):
+            membership = staff.snapshot()
+            result = send.deliver_worker_text(row, membership, "Detached run: fixture",
+                sender="fixture", timeout=send.delivery_timeout(), receipt=receipt, selection=selection)
+            self.assertIsInstance(result, send.PaneTextDelivered)
+            self.assertEqual([command[:3] for command in self.fixture.world.commands
+                              if command[:2] in (("agent", "wait"), ("agent", "prompt"))],
+                             [("agent", "wait", pane), ("agent", "prompt", pane)])
+            received.assert_called_once_with(row, membership)
+
+        self.fixture.world.commands.clear()
         self.fixture.world.locations[pane]["agent_status"] = "working"
 
         def move_worker(target: str, _timeout: int) -> herdr.ObservedAgentState:
@@ -7749,8 +7842,7 @@ class PaneWorkerMessageTests(unittest.TestCase):
         with mock.patch.object(self.fixture.world, "wait_turn_end", side_effect=move_worker):
             result = send.deliver_worker_text(row, staff.snapshot(), "Detached run: fixture",
                 sender="fixture", timeout=send.delivery_timeout(),
-                receipt=send.WorkerResultReceipt("Detached run: fixture", wait_for_idle=True),
-                selection=send.FixedStaffLookup(row.id, "worker"))
+                receipt=receipt, selection=selection)
         self.assertEqual(result, send.Result("failed", f"the session changed for staff ID {row.id}"))
         self.assertFalse(any(command[:2] == ("agent", "prompt") for command in self.fixture.world.commands))
         self.assertEqual(send.pending(f"staff:{self.fixture.parent.id}"), "")
@@ -7796,14 +7888,16 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.assertEqual(self.fixture.world.commands, [])
 
     def test_unavailable_workers_route_the_original_message_and_one_reason_to_the_holder(self) -> None:
-        for state in ("blocked", "working", "stopped", "closed", "unknown", "uncertain"):
+        for state in ("blocked", "stopped", "closed", "unknown", "uncertain", "unknown-status"):
             with self.subTest(state=state):
                 row = self.fixture.worker(state)
                 pane = "w1:p" + str(10 + len(self.fixture.world.locations))
                 if state != "closed":
                     self.fixture.world.add(row, pane, live=state != "stopped")
-                if state in ("blocked", "working"):
+                if state == "blocked":
                     self.fixture.world.locations[pane]["agent_status"] = state
+                elif state == "unknown-status":
+                    self.fixture.world.locations[pane]["agent_status"] = "unknown"
                 elif state == "unknown":
                     self.fixture.world.unknown[pane] = "process read unavailable"
                 elif state == "uncertain":
@@ -7816,13 +7910,17 @@ class PaneWorkerMessageTests(unittest.TestCase):
                 self.assertIn(f"Worker {state}:", retained)
                 self.assertIn(f"Original {state} message.", retained)
                 self.assertEqual(self.fixture.world.commands, before)
-                if state == "unknown":
+                if state == "blocked":
+                    self.assertIn("Worker blocked: worker is blocked", retained)
+                elif state == "unknown":
                     notes = [line for line in errors.getvalue().splitlines() if "process read unavailable" in line]
                     self.assertEqual(len(notes), 1, errors.getvalue())
                     self.assertIn("process read unavailable", retained)
                     del self.fixture.world.unknown[pane]
                 elif state == "uncertain":
                     self.assertIn("terminal identity", retained)
+                elif state == "unknown-status":
+                    self.assertIn("Worker unknown-status: worker is unknown", retained)
 
 
 if __name__ == "__main__":

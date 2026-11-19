@@ -914,6 +914,9 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
     elif state is ReleasedWorkerPass.ENDED:
         passed = worker_pass(worker.row, directory)
         hook = progress_history.hook_completion(passed)
+        if (isinstance(hook, progress_history.HookCompletion) and hook.outcome == "stopped"
+                and isinstance(worker, OpenWorker) and not worker.status.idle):
+            return Kept(f"agent state is {worker.status.value}")
         delivery = progress_history.dispatch_delivery(passed)
         if delivery.line:
             completion = recorded_completion_close(worker.row, directory, passed)
