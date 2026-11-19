@@ -32,6 +32,7 @@ from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.production import footer_counts, investigation, session_labels, staff
 from scripts.production.issues import ALL_FIELDS, Issue
 from scripts.rebuild import need
+from scripts.message import review_hold
 from scripts.agents import remote
 from scripts.statusline import adhoc_items, assignment, counts_row, rebuild_row
 
@@ -563,6 +564,59 @@ class AdhocItemsTests(unittest.TestCase):
                         self.assertEqual(path.read_text(encoding="utf-8"), str(remaining))
                     else:
                         self.assertFalse(path.exists())
+
+    def test_zero_prints_one_list_in_sent_order_and_removes_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config"
+            config.mkdir()
+            _ = write_config_fixture(config / "send.conf", "review_hold_idle_minutes=30")
+            env = {"HOME": directory, "CONF_DIR": str(config), "USER_ZONE": "America/New_York",
+                   "CLAUDE_CODE_SESSION_ID": "review-session"}
+            first = datetime(2026, 11, 19, 17, 5, tzinfo=timezone.utc).timestamp()
+            with patch.dict(os.environ, env):
+                review_hold.set_count("review-session", 3, first, self.fail)
+                for item in (review_hold.ReviewMessage("Pat · build", first + 60, "Second report."),
+                             review_hold.ReviewMessage("Lee · test", first, "First report.\nMore detail.")):
+                    with review_hold.route("review-session", item, urgent=False) as result:
+                        self.assertIsInstance(result, review_hold.HeldForReview)
+                command = [sys.executable, str(Path(adhoc_items.__file__)), "0"]
+                result = subprocess.run(command, text=True, capture_output=True, check=True)
+                self.assertEqual(result.stdout, "Messages from the review\n\n"
+                    + "1. Lee · test\n   Sent: 12:05 EST\n   First report.\n   More detail.\n\n"
+                    + "2. Pat · build\n   Sent: 12:06 EST\n   Second report.\n")
+                self.assertEqual(result.stderr, "")
+                again = subprocess.run(command, text=True, capture_output=True, check=True)
+                self.assertEqual(again.stdout + again.stderr, "")
+
+    def test_session_start_recovers_the_saved_list_once_as_hook_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config"
+            config.mkdir()
+            _ = write_config_fixture(config / "send.conf", "review_hold_idle_minutes=30")
+            with patch.dict(os.environ, {"HOME": directory, "CONF_DIR": str(config), "USER_ZONE": "UTC"}):
+                repo = Path(adhoc_items.__file__).parents[2]
+                settings = cast(dict[str, object], json.loads((repo / "settings.json").read_text()))
+                hooks = cast(dict[str, list[dict[str, object]]], settings["hooks"])
+                group = next(item for item in hooks["SessionStart"] if item["matcher"] == "startup|resume|clear|compact")
+                registered = cast(list[dict[str, str]], group["hooks"])
+                self.assertTrue(any(command["command"].endswith('/session-start-review-hold.py"')
+                                    for command in registered))
+                at = datetime(2026, 11, 19, 16, 20, tzinfo=timezone.utc).timestamp()
+                review_hold.set_count("review-session", 3, at, self.fail)
+                message = review_hold.ReviewMessage("Drew", at, "A saved report.")
+                with review_hold.route("review-session", message, urgent=False) as result:
+                    self.assertIsInstance(result, review_hold.HeldForReview)
+                command = [sys.executable, str(repo / "scripts/hooks/session-start-review-hold.py")]
+                payload = json.dumps({"session_id": "review-session", "source": "resume",
+                                      "hook_event_name": "SessionStart"})
+                reply = subprocess.run(command, input=payload, text=True, capture_output=True, check=True)
+                self.assertEqual(cast(object, json.loads(reply.stdout)), {"hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": "Messages from the review\n\n1. Drew\n   Sent: 16:20 UTC\n   A saved report.",
+                }})
+                self.assertEqual(reply.stderr, "")
+                again = subprocess.run(command, input=payload, text=True, capture_output=True, check=True)
+                self.assertEqual(again.stdout + again.stderr, "")
 
     def test_row_omits_invalid_or_nonpositive_counts_and_an_empty_session(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"HOME": directory}):

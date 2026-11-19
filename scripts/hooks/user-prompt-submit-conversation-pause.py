@@ -13,6 +13,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import FrameType
 from typing import TYPE_CHECKING, NoReturn, TypedDict, cast
@@ -115,6 +116,12 @@ def main() -> None:
             finish_turn_wait(run, session_id, source=source.name, prompt=prompt)
         if source is conversation_pause.PromptSource.TYPED:
             _record_typed_prompt()
+            from scripts.message import review_hold
+
+            try:
+                review_hold.record_user_prompt(session_id, time.time())
+            except (OSError, ValueError) as error:
+                print(f"review hold: {error}", file=sys.stderr)
         activity_source = {conversation_pause.PromptSource.TYPED: "UserTypedPrompt",
                            conversation_pause.PromptSource.PEER: "PeerPrompt",
                            conversation_pause.PromptSource.SCHEDULED: "ScriptPrompt",

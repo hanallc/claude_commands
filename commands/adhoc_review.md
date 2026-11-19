@@ -110,7 +110,7 @@ For each item, in order:
 
 Do not ask "continue or add more?" between items — assume continue unless the user volunteers something.
 
-After each terminal choice, including a skip, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" <remaining>` with the open count.
+After each terminal choice, run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" <remaining>` if items remain.
 Run it again when the user returns to a closed item; include that item in the count.
 
 ### Decision frame
@@ -155,6 +155,7 @@ This is a scaffold, not a demand for headings when a very small item reads more 
 ## Step 5: Wrap up
 
 Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/statusline/adhoc_items.py" 0` when the review ends, including an early end.
+Read the held messages from the command output. The command lists them oldest first.
 
 When every item is done:
 

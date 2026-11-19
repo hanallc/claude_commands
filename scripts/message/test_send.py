@@ -46,14 +46,14 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once, stop_in_child
 from scripts.lib.socket_test_support import ShortUnixSocket, short_socket_directory
-from scripts.message import send
+from scripts.message import review_hold, send, send_later
 from scripts.message import failed_lookup
 from scripts.message.roster import roster as read_roster
 from scripts.message import repeat_guard
 from scripts.message.relay_identity import publish_relay_identity, relay_session_name
 from scripts.message.relay_test_support import write_relay_record
 from scripts.lib import conf, names, process_start, models_registry
-from scripts.production import fake_unit_host, session_staff, staff, unit_lookup
+from scripts.production import fake_unit_host, session_staff, staff, stall_watch, unit_lookup
 from scripts.message import send_result
 from scripts.message.unit_labels import StaffRowAnomaly
 from scripts.message.recipient_test_support import staff_child_command
@@ -182,7 +182,7 @@ class RelayAccountTests(unittest.TestCase):
             assert started
             program = """
 import os, re, signal, sys
-from scripts.message import send
+from scripts.message import review_hold, send, send_later
 
 def killed(_command, prompt, _timeout, _environment, _cwd):
     print(re.search(r'uds:(/tmp/claude-send-[^"]+/delivery.sock)', prompt)[1], flush=True)
@@ -1983,6 +1983,106 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         if "bogus" not in self.staff_rows:
             self.session("bogus", "bogus")
         return send.send(local_options(["--to", "bogus", "--from", "test", *args]))
+
+    def test_review_hold_keeps_the_send_and_its_repeat_window(self) -> None:
+        self.session("recipient", "Recipient")
+        review_hold.set_count("recipient", 5, send.now().timestamp(), self.fail)
+        args = ["--to", "session:recipient", "--from", "test", "--text", "Hold this update.",
+                "--key", "review-update", "--repeat-minutes", "30"]
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(send.main(args), 0)
+        self.assertEqual(output.getvalue().splitlines(), [
+            "KEPT: review hold",
+            "HELD: session:recipient is in a review; delivered at its end",
+        ])
+        parsed = send_result.send_outcome(0, output.getvalue())
+        self.assertIsInstance(parsed, send_result.ConfirmedSendOutcome)
+        self.assertEqual(self.log()[-1]["outcome"], "kept")
+        self.assertEqual(send.send(local_options(args)).outcome, "skipped")
+        self.assertEqual(self.relayed, [])
+        self.assertEqual(send.pending("session:recipient"), "")
+
+    def test_urgent_send_goes_through_an_open_review(self) -> None:
+        self.session("recipient", "Recipient")
+        review_hold.set_count("recipient", 5, send.now().timestamp(), self.fail)
+        args = ["--to", "session:recipient", "--from", "test"]
+        self.assertEqual(send.send(local_options([*args, "--text", "Later."])).outcome, "kept")
+        self.assertEqual(send.send(local_options([*args, "--urgent", "--text", "Now."])).outcome, "sent")
+        self.assertEqual([message.text for message in self.relayed], ["Now."])
+        held: list[str] = []
+        review_hold.set_count("recipient", 0, send.now().timestamp(), held.append)
+        self.assertEqual(len(held), 1)
+        self.assertIn("Later.", held[0])
+        self.assertNotIn("Now.", held[0])
+
+    def test_expired_review_releases_the_list_and_stays_ended_until_a_new_review(self) -> None:
+        self.session("recipient", "Recipient")
+        _ = write_send_config(self.root / "config/send.conf", "review_hold_idle_minutes=4")
+        at = send.now()
+        review_hold.set_count("recipient", 5, at.timestamp(), self.fail)
+        args = ["--to", "session:recipient", "--from", "test"]
+        with mock.patch.object(send, "now", return_value=at):
+            self.assertEqual(send.send(local_options([*args, "--text", "First update."])).outcome, "kept")
+        recent_prompt = at + timedelta(minutes=3)
+        review_hold.record_user_prompt("recipient", recent_prompt.timestamp())
+        with mock.patch.object(send, "now", return_value=at + timedelta(minutes=5)):
+            self.assertEqual(send.send(local_options([*args, "--text", "Second update."])).outcome, "kept")
+
+        after_idle = at + timedelta(minutes=8)
+        review_hold.record_user_prompt("recipient", after_idle.timestamp())
+        review_hold.set_count("recipient", 4, after_idle.timestamp(), self.fail)
+        with mock.patch.object(send, "now", return_value=after_idle):
+            self.assertEqual(send.send(local_options([*args, "--text", "Third update."])).outcome, "sent")
+            self.assertEqual(send.send(local_options([*args, "--text", "Fourth update."])).outcome, "sent")
+        self.assertEqual(len(self.relayed), 2)
+        updates = ("First update.", "Second update.", "Third update.")
+        positions = [self.relayed[0].text.index(update) for update in updates]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(self.relayed[1].text, "Fourth update.")
+        review_hold.set_count("recipient", 0, after_idle.timestamp(), self.fail)
+        review_hold.set_count("recipient", 5, after_idle.timestamp(), self.fail)
+        with mock.patch.object(send, "now", return_value=after_idle):
+            self.assertEqual(send.send(local_options([*args, "--text", "New review."])).outcome, "kept")
+
+    def test_the_first_send_after_idle_releases_the_list_without_a_prompt(self) -> None:
+        self.session("recipient", "Recipient")
+        _ = write_send_config(self.root / "config/send.conf", "review_hold_idle_minutes=1")
+        at = send.now()
+        review_hold.set_count("recipient", 3, at.timestamp(), self.fail)
+        args = ["--to", "session:recipient", "--from", "test"]
+        with mock.patch.object(send, "now", return_value=at):
+            self.assertEqual(send.send(local_options([*args, "--text", "Held earlier."])).outcome, "kept")
+        after_idle = at + timedelta(minutes=2)
+        with mock.patch.object(send, "now", return_value=after_idle):
+            self.outcome = send.Result("failed", "no delivery")
+            self.assertEqual(send.send(local_options([*args, "--text", "Failed to send."])).outcome, "failed")
+            self.outcome = send.Result("sent", "ok")
+            self.assertEqual(send.send(local_options([*args, "--text", "Send with the list."])).outcome, "sent")
+        self.assertIn("Held earlier.", self.relayed[-1].text)
+        self.assertIn("Send with the list.", self.relayed[-1].text)
+        self.assertNotIn("Failed to send.", self.relayed[-1].text)
+        review_hold.set_count("recipient", 0, after_idle.timestamp(), self.fail)
+
+    def test_review_holds_stall_watch_and_send_later_timer_prompts(self) -> None:
+        self.session("recipient", "Recipient")
+        at = send.now()
+        review_hold.set_count("recipient", 5, at.timestamp(), self.fail)
+        stall = stall_watch.delivery(self.root / "timer", "review", str(self.root / "recipient.sock"),
+                                     "stall-review", "Report the current status.")
+        delayed = send_later.timer_argv("5m", None,
+            ["--to", "session:recipient", "--from", "timer", "--text", "Read the phase report."], 1)
+        for command in (stall.command, delayed):
+            script = next(index for index, word in enumerate(command) if word.endswith("/send.py"))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(send.main(list(command[script + 1:])), 0)
+            self.assertIn("is in a review; delivered at its end", output.getvalue())
+        self.assertEqual(self.relayed, [])
+        held: list[str] = []
+        review_hold.set_count("recipient", 0, at.timestamp(), held.append)
+        self.assertIn("Report the current status.", held[0])
+        self.assertIn("Read the phase report.", held[0])
 
     def test_repeat_guard_holds_the_third_delivery_and_logs_each_held_copy(self) -> None:
         with mock.patch.object(repeat_guard, "check", wraps=repeat_guard.check) as guard:

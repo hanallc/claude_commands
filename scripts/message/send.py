@@ -136,7 +136,7 @@ import sys
 import time
 from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -154,7 +154,8 @@ from scripts.lib import conf, models_registry, process_start
 from scripts.lib.atomic_file import write_bytes_atomic
 from scripts.lib.atomic_file import write_text_atomic as write_atomic
 from scripts.notify import decision_priority
-from scripts.message import send_budget
+from scripts.message import review_hold, send_budget
+from scripts.message.review_hold import sent_line as sent_line
 from scripts.message.send_result import (
     Outcome as Outcome, EXIT as EXIT, OUTCOME_HEADERS as OUTCOME_HEADERS,
     OutcomeHeader as OutcomeHeader, NoOutcomeHeader as NoOutcomeHeader, parse_outcome as parse_outcome,
@@ -751,6 +752,10 @@ class Result(NamedTuple):
     receiver: str = ""
 
 
+class ReviewMessageKept(Result):
+    """A review has a durable copy of the message."""
+
+
 class PaneTextDelivered(Result):
     """The observed worker pane accepted the text input."""
 
@@ -1036,6 +1041,7 @@ class Options(NamedTuple):
     recipient_identity: TransportRecipientIdentity | LogicalRecipientIdentity = TransportRecipientIdentity()
     silence_policy: silence.SilencePolicy = silence.SilencePolicy.KEEP_DURING_SILENCE
     review_delivery: bool = False
+    urgent: bool = False
 
     @property
     def to(self) -> str:
@@ -2337,10 +2343,20 @@ def _fixed_staff_relay_plan(message: Message, selection: FixedStaffLookup) -> Re
 
 
 def relay_socket(message: Message, timeout: float, *,
-                 selection: RecipientSelection | NoFixedStaffLookup = NO_FIXED_STAFF_LOOKUP) -> tuple[Message, Result]:
+                 selection: RecipientSelection | NoFixedStaffLookup = NO_FIXED_STAFF_LOOKUP,
+                 review_session: str = "") -> tuple[Message, Result]:
     """Retry only a confirmed socket miss and preserve the selected mailbox."""
+    def fixed_plan(target: FixedStaffLookup) -> RelayAttempt | ClaudeRoutingFailed:
+        plan = _fixed_staff_relay_plan(message, target)
+        if review_session and isinstance(plan, RelayAttempt):
+            owner = plan.message.claude_attempt
+            assert isinstance(owner, ClaudeDeliveryAttempt) and isinstance(owner.recipient, StaffClaudeRecipient)
+            if owner.recipient.current.conversation != review_session:
+                return ClaudeRoutingFailed(unit_lookup.ClaudeOwnerMismatch("the review recipient changed before delivery"))
+        return plan
+
     if isinstance(selection, FixedStaffLookup):
-        plan = _fixed_staff_relay_plan(message, selection)
+        plan = fixed_plan(selection)
         if isinstance(plan, ClaudeRoutingFailed):
             return message, Result("failed", plan.failure.reason)
         message = plan.message
@@ -2352,7 +2368,7 @@ def relay_socket(message: Message, timeout: float, *,
     if not isinstance(result, ConfirmedSocketMiss):
         return message, result
     if isinstance(selection, FixedStaffLookup):
-        replacement = _fixed_staff_relay_plan(message, selection)
+        replacement = fixed_plan(selection)
         if isinstance(replacement, ClaudeRoutingFailed):
             return message, Result("failed", f"{result.detail}; {replacement.failure.reason}")
         if replacement.message.to == message.to:
@@ -2365,7 +2381,9 @@ def relay_socket(message: Message, timeout: float, *,
     if isinstance(mailbox, NoRelayReplyMailbox):
         return message, Result("failed", f"{result.detail}; {dead_socket_reason(message.to)}")
     registry = sessions.read_registry()
-    if isinstance(mailbox, StaffClaudeRecipient):
+    if review_session:
+        mailbox = ConversationRecipient(machine(), review_session)
+    elif isinstance(mailbox, StaffClaudeRecipient):
         member = staff.snapshot().by_id(mailbox.staff_id)
         if member is None or isinstance(member.retirement, staff.RetiredProducer):
             return message, Result("failed", "the staff recipient is unavailable")
@@ -4576,6 +4594,7 @@ def parse(argv: list[str]) -> Options:
     )
     _ = parser.add_argument("--recipient-kind", choices=get_args(staff.Kind),
                             help="require a current staff row of this kind at the fixed staff ID in --to")
+    _ = parser.add_argument("--urgent", action="store_true", help="send now through a Claude review hold")
     _ = parser.add_argument("--text-id", default="", help="registered script push")
     _ = parser.add_argument("--value", action="append", default=[], help="registry template key=value")
     _ = parser.add_argument("--answerable", action="store_true", help=argparse.SUPPRESS)
@@ -4749,7 +4768,7 @@ def parse(argv: list[str]) -> Options:
                       silence_policy=(silence.SilencePolicy.SEND_THROUGH_SILENCE if attr(args, "through_silence") is True
                                       else silence.SilencePolicy.KEEP_DURING_SILENCE),
                       recipient_identity=LogicalRecipientIdentity(recipient_key) if recipient_key else TransportRecipientIdentity(),
-                      review_delivery=get["review_delivery"] is True)
+                      review_delivery=get["review_delivery"] is True, urgent=get["urgent"] is True)
     if options.to == USER and options.summary is None:
         parser.error("--to user needs --summary, its title, and takes no --codex")
     if options.to != USER and options.need != "note":
@@ -4856,16 +4875,6 @@ def shown_sender_line(sender: str, display: str) -> str:
     return f"\nShown sender: {display}" if display != sender else ""
 
 
-def sent_line(at: datetime) -> str:
-    try:
-        zone = user_zone()
-    except (OSError, ValueError) as error:
-        print(f"send.py: Sent line omitted: {one_line(str(error))}", file=sys.stderr)
-        return ""
-    local = at.astimezone(zone)
-    return f"\nSent: {local:%H:%M} {local.tzname() or zone.key}"
-
-
 def queued_sent_line(stored_time: str) -> str:
     try:
         at = datetime.fromisoformat(stored_time)
@@ -4955,7 +4964,8 @@ class OrdinaryWorkerMessage(Enum):
 def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot, text: str, *,
                         sender: str, timeout: float, reason: str = "",
                         receipt: WorkerResultReceipt | OrdinaryWorkerMessage = OrdinaryWorkerMessage.SEND,
-                        selection: RecipientSelection | NoFixedStaffLookup = NO_FIXED_STAFF_LOOKUP) -> Result:
+                        selection: RecipientSelection | NoFixedStaffLookup = NO_FIXED_STAFF_LOOKUP,
+                        review_text: str = "") -> Result:
     """Deliver to a proved pane or retain the message through its holder."""
     from scripts.herdr import worker_panes
     from scripts.herdr import herdr
@@ -5006,7 +5016,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                         current = _current_staff_session(selection, ExpectedStaffSession(worker.current_session))
                         if isinstance(current, RecipientLookupFailed):
                             return Result("failed", current.reason)
-                    prompt_client.prompt(state.pane, text, target=str(worker.current_session),
+                    prompt_client.prompt(state.pane, review_text or text, target=str(worker.current_session),
                                          proof=herdr.SubmitStarts(int(timeout * 1000)), on_submission=on_submission)
                     if isinstance(receipt, OrdinaryWorkerMessage):
                         return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
@@ -5054,6 +5064,11 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
 
 
 def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
+    with ExitStack() as review_access:
+        return _send_with_review(options, membership, review_access)
+
+
+def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_access: ExitStack) -> Result:
     from scripts.message import roster
 
     if options.to == USER and not options.text_id:
@@ -5221,6 +5236,31 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
         guarded = repeat_guard.check(STATE / "repeats", repeat_guard.Attempt(
             sender, attempt_recipient.value,
             text, machine(), started.timestamp(), options.human or sender.casefold() == USER or options.to == USER))
+    review_session = ""
+    review_route: review_hold.HeldForReview | review_hold.ReleasedMessages = review_hold.ReleasedMessages(())
+    review_error = ""
+    if (isinstance(claim_result, ClaimGranted) and not guarded.held
+            and not isinstance(options.sender_origin, ForwardedSender)):
+        if isinstance(route, (ClaudeRecipient, QueuedStaffRecipient)):
+            if not isinstance(recipient, (NoRelayReplyMailbox, RelayProcessRecipient)):
+                review_session = conversation_recipient(recipient).conversation
+        elif isinstance(route, PaneWorkerRecipient):
+            worker_session = str(route.row.current_session)
+            if any(record["sessionId"] == worker_session for record in running):
+                review_session = worker_session
+        if review_session:
+            try:
+                review_route = review_access.enter_context(review_hold.route(
+                    review_session, review_hold.ReviewMessage(display, started.timestamp(), text), urgent=options.urgent))
+            except (OSError, ValueError) as error:
+                review_error = f"review hold for {destination}: {error}"
+
+    transport_message = message
+    review_text = ""
+    if isinstance(review_route, review_hold.ReleasedMessages) and review_route.messages:
+        review_text = review_hold.render(review_route.messages)
+        transport_message = replace(message, summary="Messages from the review", text=review_text)
+
     if refused:
         result = Result("refused", NO_CLEAR_STEP)
     elif held is not None:
@@ -5233,6 +5273,10 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
         result = Result("retry" if options.review_delivery else "pending", claim_result.reason)
     elif guarded.held:
         result = Result("held", f"repeat guard: copy {guarded.copies} held; owner notice queued")
+    elif review_error:
+        result = Result("failed", review_error)
+    elif isinstance(review_route, review_hold.HeldForReview):
+        result = ReviewMessageKept("kept", f"{options.to} is in a review; delivered at its end")
     elif isinstance(route, RecipientLookupFailed):
         from scripts.message import failed_lookup
 
@@ -5254,15 +5298,25 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
         result = Result("queued", f"no live Claude or Codex session answers to {route.name} ({route.session_id}),"
                         + " so it is kept for it")
         assert isinstance(plan, SessionIdWithoutLiveRecipient)
-        enqueue(replace(message, to=stable_mailbox_key(plan.recipient)), result.detail, started,
-                recipient=attempt_recipient, order=order, membership=membership, mailbox=plan.recipient)
+        queue_mailbox = conversation_recipient(plan.recipient) if review_text else plan.recipient
+        enqueue(replace(transport_message, key=None if review_text else message.key), result.detail, started,
+                recipient=attempt_recipient, order=order, membership=membership, mailbox=queue_mailbox)
     elif isinstance(route, PaneWorkerRecipient):
-        result = deliver_worker_text(route.row, membership, agent_text(message),
-                                     sender=message.sender, timeout=options.timeout, selection=options.selection)
+        if review_text:
+            result = deliver_worker_text(route.row, membership, agent_text(message),
+                                         sender=message.sender, timeout=options.timeout, selection=options.selection,
+                                         review_text=agent_text(transport_message))
+        else:
+            result = deliver_worker_text(route.row, membership, agent_text(message),
+                                         sender=message.sender, timeout=options.timeout, selection=options.selection)
     else:
         claude_started = time.monotonic()
         def relay_and_queue(relay_message: Message, timeout: float) -> Result:
-            delivery_message, relayed_result = relay_socket(relay_message, timeout, selection=options.selection)
+            if review_text:
+                delivery_message, relayed_result = relay_socket(relay_message, timeout, selection=options.selection,
+                                                                review_session=review_session)
+            else:
+                delivery_message, relayed_result = relay_socket(relay_message, timeout, selection=options.selection)
             if isinstance(options.selection, FixedStaffLookup):
                 if relayed_result.outcome == "queued":
                     return Result("failed", relayed_result.detail)
@@ -5277,9 +5331,10 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
             queue_recipient = attempt.recipient
             if isinstance(queue_recipient, RelayProcessRecipient):
                 return Result("failed", f"{relayed_result.detail}; {dead_socket_reason(message.to)}")
-            enqueue(replace(delivery_message, to=stable_mailbox_key(queue_recipient)), relayed_result.detail, started,
-                    recipient=StableRecipient(_claude_recipient_key(queue_recipient)), order=order,
-                    membership=membership, mailbox=queue_recipient)
+            if review_text:
+                queue_recipient = conversation_recipient(queue_recipient)
+            enqueue(replace(delivery_message, key=None if review_text else delivery_message.key),
+                    relayed_result.detail, started, order=order, membership=membership, mailbox=queue_recipient)
             return relayed_result
 
         def relay_with_claim(attempt: Message, timeout: float, delivery_identity: Message, entry_id: str) -> Result:
@@ -5296,14 +5351,17 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
                 "queued",
                 f"no live session answers to {plan.address}, so it is kept under that name",
             )
-            enqueue(replace(message, to=stable_mailbox_key(plan.recipient)), result.detail, started,
+            queue_mailbox = conversation_recipient(plan.recipient) if review_text else plan.recipient
+            enqueue(replace(transport_message, key=None if review_text else message.key), result.detail, started,
                     recipient=attempt_recipient, order=order,
-                    membership=membership, mailbox=plan.recipient, generation=plan.generation)
+                    membership=membership, mailbox=queue_mailbox, generation=plan.generation)
             if isinstance(plan.generation, session_staff.ProvedProcessGeneration):
                 log_route = ClaudeRoute("queue", "unresolved", time.monotonic() - claude_started)
         else:
             assert isinstance(plan, RelayAttempt)
             live = records
+            relay_message = (replace(plan.message, summary=transport_message.summary, text=review_text)
+                             if review_text else plan.message)
             postmaster_recipient = _postmaster_recipient(plan, live, membership)
             entry_id = postmaster.new_entry_id()
             try:
@@ -5326,7 +5384,7 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
             elif isinstance(postmaster_recipient, postmaster.RegisteredClaudeRecipient):
                 try:
                     delivery = postmaster.attempt(STATE, postmaster_recipient.session, message.sender, entry_id,
-                                                  delivered_text(message, entry_id), live,
+                                                  delivered_text(transport_message, entry_id), live,
                                                   reply_identity=sender_native_id(message.stamp), membership=membership,
                                                   deadline=claude_started + options.timeout,
                                                   publish=partial(publish_postmaster_entry, postmaster_identity, entry_id,
@@ -5347,7 +5405,7 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
                     log_route = ClaudeRoute("postmaster", "claimed-no-result", time.monotonic() - claude_started)
                 else:
                     if finish_postmaster_claim(postmaster_identity, entry_id, delivery, recipient=stable):
-                        result = relay_with_claim(plan.message, max(1.0, options.timeout - delivery.seconds),
+                        result = relay_with_claim(relay_message, max(1.0, options.timeout - delivery.seconds),
                                                   postmaster_identity, entry_id)
                         log_route = ClaudeRoute("relay", delivery.reason, time.monotonic() - claude_started)
                     else:
@@ -5355,8 +5413,11 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
                         claim_result = RepeatPending(reason)
                         result = Result("failed", reason)
             else:
-                result = relay_with_claim(plan.message, options.timeout, postmaster_identity, entry_id)
+                result = relay_with_claim(relay_message, options.timeout, postmaster_identity, entry_id)
                 log_route = ClaudeRoute("relay", "unresolved", time.monotonic() - claude_started)
+    if isinstance(review_route, review_hold.ReleasedMessages) and review_text:
+        review_route.accepted = (isinstance(result, PaneTextDelivered) if isinstance(route, PaneWorkerRecipient)
+                                 else result.outcome in ("sent", "queued"))
     if result.outcome == "sent" and message.key is not None:
         addresses = ((native_address,) if isinstance(plan, RelayAttempt) and native_address
                      else () if isinstance(plan, RelayAttempt)
@@ -5521,7 +5582,11 @@ def main(argv: list[str]) -> int:
             result = send(options)
             outcome = ("pending" if options.review_delivery and isinstance(result, UncertainRelayDelivery)
                        else result.outcome)
-            print(f"{outcome.upper()}: {result.detail}")
+            if isinstance(result, ReviewMessageKept):
+                print("KEPT: review hold")
+                print(f"HELD: {result.detail}")
+            else:
+                print(f"{outcome.upper()}: {result.detail}")
             if outcome == "failed" and options.to.startswith("uds:"):
                 print(f"send.py: {result.detail}", file=sys.stderr)
             if isinstance(result.failure, FailedPush):
