@@ -193,10 +193,10 @@ class MergeGateTestTimesTests(MergeGateFixture):
             self.assertEqual((row["restart"], row["tests_run"], row["tests_s"], row["tests"]), ("", 0, 0.0, []))
 
     def test_full_and_reused_runs_keep_the_type_job_without_missing_times(self) -> None:
-        first = self.run_gate("--full")
+        first = self.run_gate("--tests-only", "--full")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         full = self.only_record()
-        self.assertEqual((full["selection"], full["source"], full["status"]), ("full", "checkpoint", 0))
+        self.assertEqual((full["selection"], full["source"], full["status"]), ("full", "tests-only", 0))
         self.assertEqual(full["sha"], self.git(self.checkout, "rev-parse", "HEAD"))
         self.clear_gate_events()
         second = self.run_gate("--tests-only")

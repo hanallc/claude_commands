@@ -15,20 +15,21 @@ class GateJobTests(unittest.TestCase):
     def test_only_a_live_natemerge_land_names_gate_tests_integrate(self) -> None:
         caller_pid = 101
         land_pid = 100
-        natemerge = staff.StaffRow(NATEMERGE_STAFF_ID, "worker", "natemerge", staff.StaffRoot(),
-                                 current_session=staff.StaffId("landing-session"))
-        unit = staff.StaffRow(staff.StaffId("ordinary"), "worker", "unit", staff.StaffRoot(),
-                              current_session=staff.StaffId("ordinary-session"))
+        landing = staff.StaffId("00000000-0000-4000-8000-000000000101")
+        ordinary = staff.StaffId("00000000-0000-4000-8000-000000000102")
+        natemerge = staff.StaffRow(NATEMERGE_STAFF_ID, "producer", "natemerge", staff.StaffRoot(),
+                                 current_session=landing)
+        unit = staff.StaffRow(staff.StaffId("00000000-0000-4000-8000-000000000103"),
+                              "producer", "ordinary", staff.StaffRoot(), current_session=ordinary)
         cases = (
-            ("first full run", (), "1000", "landing-session", "integrate"),
-            ("base check", ("--module", "lib/example"), "1000", "landing-session", "integrate"),
-            ("batch retry", (), "1000", "landing-session", "integrate"),
-            ("unit run", (), "", "ordinary-session", "test-all"),
-            ("dead land", (), "900", "landing-session", "test-all"),
-            ("non-natemerge land", (), "1000", "ordinary-session", "test-all"),
+            ("first full run", (), "1000", landing, "integrate"),
+            ("base check", ("--module", "lib/example"), "1000", landing, "integrate"),
+            ("batch retry", (), "1000", landing, "integrate"),
+            ("unit run", (), "", ordinary, "test-all"),
+            ("dead land", (), "900", landing, "test-all"),
+            ("non-natemerge land", (), "1000", ordinary, "test-all"),
         )
-        with (tempfile.TemporaryDirectory() as temporary,
-              patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((natemerge, unit)))):
+        with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             proc = root / "proc"
             state = root / "state"
@@ -41,7 +42,9 @@ class GateJobTests(unittest.TestCase):
                 fields = ["S", str(parent), *["0"] * 17, start]
                 _ = (process / "stat").write_text(f"{pid} (fixture) " + " ".join(fields))
             caller = proc / str(caller_pid)
-            with patch.dict(os.environ, {"MERGE_GATE_STATE_DIR": str(state)}):
+            staff_file = root / "staff.json"
+            _ = staff_file.write_text(staff.StaffSnapshot((natemerge, unit)).encode())
+            with patch.dict(os.environ, {"MERGE_GATE_STATE_DIR": str(state), "STAFF_FILE": str(staff_file)}):
                 for name, args, recorded_start, session, expected in cases:
                     with self.subTest(name=name):
                         if recorded_start:

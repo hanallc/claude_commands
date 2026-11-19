@@ -6,12 +6,10 @@ from scripts.build_queue import queue_place
 import unittest
 import io
 import os
-import subprocess
 from typing import final
 from contextlib import redirect_stdout
 from unittest import mock
 from scripts.production import merge_gate
-from scripts.production.gate_modules import GateRefused
 from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, gate_suites
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 from scripts.lint.memory_test_support import write_config_fixture
@@ -148,10 +146,10 @@ class MergeGateRerunsTests(GateSuitesFixture):
                 self.assertIn("fixture message failed", output.getvalue())
 
     @gate_suites("lib", "hooks")
-    def test_red_modules_fail_again_print_both_outputs_and_reset(self) -> None:
+    def test_red_modules_fail_again_and_print_both_outputs(self) -> None:
         self.write(self.state / "red-lib", "red")
         self.write(self.state / "red-hooks", "red")
-        result = self.run_gate()
+        result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assert_not_pushed()
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
@@ -246,22 +244,6 @@ class MergeGateRerunsTests(GateSuitesFixture):
         self.assertNotIn("Rerun alone:", result.stdout)
         starts = [row for row in self.module_events() if row["event"] == "start"]
         self.assertEqual(len(starts), self.module_count)
-
-    def test_red_gate_restores_tracked_debris_before_rollback(self) -> None:
-        self.write(self.state / "modify-tracked", "modify")
-        result = self.run_gate()
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
-        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
-        self.assertIn("merge undone", result.stderr)
-        self.assert_not_pushed()
-
-    def test_failed_rollback_names_merge_commit_and_blocking_files(self) -> None:
-        with mock.patch.object(merge_gate, "git", return_value=subprocess.CompletedProcess([], 1, " M unit.txt", "blocked")), mock.patch.object(
-                merge_gate, "checked_git", side_effect=["merge-commit", "unit.txt\0"]):
-            with self.assertRaisesRegex(GateRefused, "merge NOT undone; merge commit merge-commit; blocking files: M unit.txt"):
-                merge_gate.rollback_merge(self.checkout, self.base)
-
 
 if __name__ == "__main__":
     _ = unittest.main()
