@@ -948,7 +948,15 @@ function closeDateTimePicker(menu,focus){
  const toggle=menu.parentElement.querySelector('[data-later-toggle]');toggle.setAttribute('aria-expanded','false');
  if(focus) toggle.focus();
 }
-function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,prepareMenu=()=>{},retryTime=()=>NaN}){
+function pickerSummary(zone){
+ const date=new Intl.DateTimeFormat('en-GB',{timeZone:zone,weekday:'short',day:'numeric',month:'short'});
+ return at=>{
+  const {hour,minute}=zoneParts(zone,at);
+  return date.format(at)+' '+dateTimeClock(hour*60+minute);
+ };
+}
+function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,formatSummary=pickerSummary(zone),
+ prepareMenu=()=>{},retryTime=()=>NaN}){
  const toggle=form.querySelector('[data-later-toggle]'),menu=form.querySelector('[data-later-menu]');
  const custom=menu.querySelector('[data-later-custom]'),chooseItem=menu.querySelector('[data-later-choose]');
  const items=()=>[...menu.querySelectorAll('[role=menuitem]:not([hidden])')];
@@ -967,7 +975,6 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,prepareMenu=
  const dayText=date=>date.toISOString().slice(0,10);
  const monthText=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',month:'long',year:'numeric'});
  const dayLabel=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',dateStyle:'full'});
- const summary=new Intl.DateTimeFormat('en-GB',{timeZone:zone,weekday:'short',day:'numeric',month:'short'});
  let selected=new Date(),display=new Date();
  const today=()=>{const now=zoneParts(zone,Date.now());return new Date(Date.UTC(now.year,now.month-1,now.day));};
  const update=(normalize=false)=>{
@@ -979,9 +986,8 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,prepareMenu=
   field.dispatchEvent(new Event('input',{bubbles:true}));
   const retry=retryTime();
   const at=Number.isFinite(retry) ? retry : valid ? dateTimeEpoch(zone,selected,minutes) : NaN;
-  const resolved=Number.isFinite(at) ? zoneParts(zone,at) : null;
-  custom.querySelector('[data-later-summary]').textContent=resolved ? summaryPrefix+summary.format(at)+' '+
-   dateTimeClock(resolved.hour*60+resolved.minute) : 'Choose a time';
+  custom.querySelector('[data-later-summary]').textContent=Number.isFinite(at)
+   ? summaryPrefix+formatSummary(at) : 'Choose a time';
   save.disabled=!Number.isFinite(retry) && !(at>Date.now());
  };
  const draw=()=>{

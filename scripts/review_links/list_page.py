@@ -153,10 +153,25 @@ def eta_text(eta: the_list.Eta, today: datetime) -> str:
     return the_list.eta_text(eta)
 
 
+def short_list_time(moment: datetime, zone: tzinfo | None) -> str:
+    local = moment.astimezone(zone)
+    return f"{local:%b} {local.day} {local:%H:%M %Z}"
+
+
+def check_row_html(check: the_list.NextCheck, today: datetime) -> str:
+    if isinstance(check, datetime):
+        value = html.escape(short_list_time(check, today.tzinfo))
+        if check < today:
+            return f'<small data-list-check><span class="warning">Check overdue {value}</span></small>'
+        return f'<small data-list-check>Check {value}</small>'
+    if isinstance(check, the_list.CheckCondition):
+        return f'<small data-list-check>Check: {html.escape(check.text)}</small>'
+    return ""
+
+
 def eta_cell_text(eta: the_list.Eta, today: datetime) -> str:
     if isinstance(eta, datetime):
-        local = eta.astimezone(today.tzinfo)
-        return f"{local:%b} {local.day} {local:%H:%M %Z}"
+        return short_list_time(eta, today.tzinfo)
     if isinstance(eta, date):
         return f"{eta:%b} {eta.day}"
     if isinstance(eta, the_list.EtaRange):
@@ -165,6 +180,10 @@ def eta_cell_text(eta: the_list.Eta, today: datetime) -> str:
 
 
 def parked_label(moment: datetime | the_list.ParkUntilDelivered, zone: tzinfo) -> str:
+    return moment.value if moment is the_list.ParkUntilDelivered.DELIVERED else short_list_time(moment, zone)
+
+
+def parking_notice_label(moment: datetime | the_list.ParkUntilDelivered, zone: tzinfo) -> str:
     if moment is the_list.ParkUntilDelivered.DELIVERED:
         return moment.value
     local = moment.astimezone(zone)
@@ -186,6 +205,8 @@ def field_html(field: str, value: object, today: datetime, names: staff_names.St
         assert zone is not None
         return parked_label(value, zone)
     if isinstance(value, datetime):
+        if field == "next_check":
+            return html.escape(short_list_time(value, today.tzinfo))
         return html.escape(list_time(value, today))
     if isinstance(value, the_list.CheckCondition):
         return html.escape(value.text)
@@ -598,14 +619,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     state = f'<span class="list-state {tone}">' + field_html("state", item.state, today, names) + '</span>'
     if open_question:
         state += '<small data-open-question-note>Morty answering</small>'
-    if isinstance(item.next_check, datetime):
-        check = field_html("next_check", item.next_check, today, names)
-        if item.next_check < today:
-            state += f'<small><span class="warning">Check overdue {check}</span></small>'
-        else:
-            state += f'<small>Check {check}</small>'
-    elif isinstance(item.next_check, the_list.CheckCondition):
-        state += '<small>Check: ' + field_html("next_check", item.next_check, today, names) + '</small>'
+    state += check_row_html(item.next_check, today)
     parking_label = field_html("parked_until", item.parked_until, today, names) if parked else ""
     if parking_label:
         state += '<small data-parked-note>Parked until ' + parking_label + '</small>'
@@ -683,6 +697,7 @@ class SavedActionState(TypedDict):
     item_state: str
     parked: str
     parked_until: str
+    check_html: str
     waiting_for_answer: str
     open_question: str
     unread_delivery: NotRequired[str]
@@ -698,6 +713,7 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
     item = the_list.load(owner, identity)
     zone = user_zone()
     today = the_list.now()
+    local_today = today.astimezone(zone)
     parking = item.parked_until
     parked_until = (parked_label(parking, zone)
                     if parking is not the_list.NoTimestamp.UNSET and the_list.parking_active(parking, today) else "")
@@ -709,6 +725,7 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
                                "unread_sort": unread.timestamp() if isinstance(unread, datetime) else 0,
                                "item_state": item.state.value,
                                "parked": str(bool(parked_until)).lower(), "parked_until": parked_until,
+                               "check_html": check_row_html(item.next_check, local_today),
                                "waiting_for_answer": str(waiting).lower(),
                                "open_question": str(open_question).lower(),
                                "unread_delivery": str(the_list.unread_delivery(item)).lower()}
@@ -727,7 +744,7 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
                     reviews = review_records
             saved["review_summary_html"] = review_summary(item, reviews, today)
         saved["waiting_details_html"] = waiting_details(
-            ListRecord(owner, item), today.astimezone(zone), names, the_list.unread_answer_ids(item),
+            ListRecord(owner, item), local_today, names, the_list.unread_answer_ids(item),
             form_secret(reading.root), reviews, parked_until)
     return saved
 
@@ -783,7 +800,7 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
             raise question_record.AnswerRefused("choose Until delivered, a parking date, or a time with a UTC offset")
         parked_until = the_list.parking_value(until)
         assert parked_until is not the_list.NoTimestamp.UNSET
-        label = parked_label(parked_until, user_zone())
+        label = parking_notice_label(parked_until, user_zone())
         notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} until {label}.", "park", words)
         changed = the_list.park(morty.id, identity, parked_until, source=the_list.PAGE_SOURCE, notice=notice)
     elif action == "unpark":
@@ -1075,6 +1092,7 @@ background:var(--ink-2);border-radius:50%}
 .list-actions{position:relative}
 .list-parking-actions{display:flex;gap:inherit;margin-inline-start:auto}
 .list-park [data-later-menu] [data-later-preset]{display:block;width:calc(100% - 12px);margin:6px 6px 4px}
+.list-table [data-parked]:not([data-parked="false"]) [data-list-check]{display:none}
 .list-table tbody:has([data-parked-detail]:not([hidden])) .list-row.open [data-parked-note]{display:none}
 .list-table:has(.list-park>[data-later-menu]:not([hidden]),.list-eta:focus-visible),
 .list-table tbody:has(.list-park>[data-later-menu]:not([hidden]),.list-eta:focus-visible){overflow:visible}
@@ -1354,6 +1372,14 @@ function bindListControls(){
  }));
  content.querySelectorAll('[data-feedback-form]').forEach(bindFeedbackForm);
 }
+function listPickerSummary(zone){
+ const format=new Intl.DateTimeFormat('en-US',{timeZone:zone,month:'short',day:'numeric',
+  hour:'2-digit',minute:'2-digit',hourCycle:'h23',timeZoneName:'short'});
+ return at=>{
+  const parts=Object.fromEntries(format.formatToParts(at).map(part=>[part.type,part.value]));
+  return parts.month+' '+parts.day+' '+parts.hour+':'+parts.minute+' '+parts.timeZoneName;
+ };
+}
 function bindFeedbackForm(form){
   const item=form.closest('[data-list-item]'),key=item.dataset.key;
   const notice=form.querySelector('[data-send-status]');
@@ -1412,6 +1438,12 @@ function bindFeedbackForm(form){
      state.after(note);
     }
    }else questionNote?.remove();
+   if(typeof result.check_html==='string'){
+    const check=item.querySelector('[data-list-check]');
+    if(check) check.outerHTML=result.check_html;
+    else if(result.check_html)
+     (item.querySelector('[data-open-question-note]') ?? state).insertAdjacentHTML('afterend',result.check_html);
+   }
    const waiting=result.waiting_for_answer==='true';
    if(waiting){
     item.dataset.waitingForAnswer='true';
@@ -1459,7 +1491,7 @@ function bindFeedbackForm(form){
   const zone=content.dataset.zone;
   const parkToggle=form.querySelector('[data-later-toggle]');
   if(!waitingForm) bindDateTimePicker(form,{zone,defaultMinutes:()=>Number(content.dataset.parkMorning),summaryPrefix:'Parks until ',
-   retryTime:()=>Date.parse(matching('park')?.parkingTime ?? '')});
+   formatSummary:listPickerSummary(zone),retryTime:()=>Date.parse(matching('park')?.parkingTime ?? '')});
   form.addEventListener('submit',async event=>{
    event.preventDefault();if(cardSubmitBlocked(form,tableView.rowFading(key))) return;
    const submitter=event.submitter,action=submitter?.value || 'tell';
