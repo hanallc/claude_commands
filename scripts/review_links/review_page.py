@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 from scripts.lib import conf
 from scripts.lib.user_zone import CONF as USER_ZONE_CONF, user_zone
 from scripts.production import change_review, change_routing, proposal_issue, staff, update_registration
-from scripts.production.record_store import state_root
+from scripts.production.record_store import FileStamp, state_root
 from scripts.lib import urgency
 from scripts.review_links import change_browser, change_page, console, page_frame, record_table, review_items, review_link
 from scripts.review_links import new_item_dialog, review_submissions
@@ -140,7 +140,7 @@ class ReviewSnapshot:
     refresh_seconds: float
     assets: dict[str,str]
     zone: ZoneInfo
-    source_stamps: dict[Path, tuple[int, int]]
+    source_stamps: dict[Path, FileStamp]
     later: Mapping[str, int]
     names: staff_names.StaffNames
     page: bytes = b''
@@ -480,7 +480,7 @@ class ReviewSnapshotCache:
             return PublishedSubmission(saved, item.key, fresh.version)
 
     def publish_item(self, current: ReviewSnapshot, key: str, item: ReviewItem | ReviewRecordNotPublished,
-                     members: staff.StaffSnapshot, *, stamps: Mapping[Path, tuple[int, int]] | None = None,
+                     members: staff.StaffSnapshot, *, stamps: Mapping[Path, FileStamp] | None = None,
                      replaced_key: str = '') -> ReviewSnapshot:
         """Insert, replace or remove one retained record."""
         started = time.perf_counter()
