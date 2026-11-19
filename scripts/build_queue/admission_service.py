@@ -2339,7 +2339,9 @@ class AdmissionServer:
         try:
             ordered, priority = self._queue_order()
             queue_snapshot.write_queue_snapshot(self.state_dir,
-                replace(inputs, ordered=ordered, spacing=self.spacing, priority=priority,
+                replace(inputs, ordered=[(path, row) for path, row in ordered
+                                         if records.waiter_owner(row) in inputs.waiter_orders],
+                        spacing=self.spacing, priority=priority, mac_waits=self._mac_slot_waits(),
                         slots=tuple(slot for slot in inputs.slots
                             if gate.between_steps(slot).reservation not in result.policy.returned_claims)), policy)
         except OSError:
@@ -2559,6 +2561,39 @@ class AdmissionServer:
             return [wire.Refused("slot waiter owner no longer exists")]
         return [waiting.reply]
 
+    def _mac_slot_waits(self) -> tuple[records.MacSlotWait, ...]:
+        """Capture active Mac waits and the attempts that the Mac refused as busy."""
+        waiting: dict[str, tuple[wire.PlacementRequest, str]] = {}
+        for request in self.placement_requests.values():
+            selection = request.constraints.selection
+            if isinstance(selection, placement.PinnedHost):
+                target = selection.target
+            elif isinstance(selection, placement.MacOnlyHost):
+                target = "mac"
+            else:
+                continue
+            if (any(candidate.destination.provider == "mac" and candidate.destination.target == target
+                    for candidate in request.constraints.candidates) and self._placement_waiting(request)):
+                waiting[request.episode] = (request, target)
+        if not waiting:
+            return ()
+        attempts: dict[str, list[records.MacBusyAttempt]] = {episode: [] for episode in waiting}
+        for saved in self.assignments.values():
+            assignment, report = saved.assignment, saved.terminal_report
+            current = waiting.get(assignment.episode)
+            if (current is not None and assignment.destination.provider == "mac"
+                    and assignment.destination.target == current[1]
+                    and saved.state == placement.ClosedAssignment("busy")
+                    and isinstance(report, placement.TerminalAttemptReport)):
+                attempts[assignment.episode].append(records.MacBusyAttempt(assignment.attempt, report.received_at))
+        waits: list[records.MacSlotWait] = []
+        for request, target in waiting.values():
+            row = self._placement_row(request)
+            row["route"] = target_config.PinnedTarget(target)
+            busy = sorted(attempts[request.episode], key=lambda attempt: (attempt.reported_at, attempt.attempt))
+            waits.append(records.MacSlotWait(request.episode, target, row, tuple(busy)))
+        return tuple(waits)
+
     def _placement_reading(self, reading: records.QueueRead) -> records.QueueRead:
         remote: list[records.RunningStep] = []
         for key, saved in self.assignments.items():
@@ -2590,11 +2625,10 @@ class AdmissionServer:
                 pid=pid, started_at=saved.permission.consumed_at if isinstance(saved.permission, placement.PermissionConsumed) else 0,
                 unit=identity.unit, project=gate.step_project(request.profile.repo), execution=evidence,
                 assignment_host=assignment.destination.host))
-        if not remote:
-            return reading
         explained = tuple(records.ExplainedRunningStep(step, records.AdmissionTimeNotRecorded(), 0, 0, 0,
             owner=records.execution_group(step, str(index))) for index, step in enumerate(remote))
-        return replace(reading, view=replace(reading.view, running=(*reading.view.running, *remote)),
+        return replace(reading, view=replace(reading.view, running=(*reading.view.running, *remote),
+                                             mac_waits=self._mac_slot_waits()),
             explanation=replace(reading.explanation, running=(*reading.explanation.running, *explained)))
 
     def _publish_replies(self) -> None:
@@ -3349,8 +3383,9 @@ done
                 "", request.profile.step, request.profile.worktree)
         owner = wire.Owner(request.owner.pid, request.owner.start_time)
         local = request.local
-        if isinstance(local, wire.LocalAdmissionUnavailable):
-            return wire.LaunchRequest(request.episode, owner, request.since, identity, request.profile)
+        if isinstance(local, wire.LocalAdmissionUnavailable) or not self._can_hold_local_place(request):
+            profile = replace(request.profile, peak=replace(request.profile.peak, bytes=0))
+            return wire.LaunchRequest(request.episode, owner, request.since, identity, profile)
         return wire.AdmitRequest(request.episode, owner, local.argv, local.cwd, request.since, local.sidecar,
             identity, local.call, local.test_width, request.profile, local.fresh_test, local.token_back_at, request.run)
 
@@ -3442,7 +3477,7 @@ done
         return tuple(result), local_holder
 
     def _local_placement_eligibility(self, request: wire.PlacementRequest) -> placement.HostEligibility:
-        if isinstance(request.local, wire.LocalAdmissionContext) and isinstance(request.purpose, placement.NormalStep):
+        if self._can_hold_local_place(request):
             return next((candidate.eligibility for candidate in self.placement_eligibility.get(request.episode, ())
                          if candidate.destination.provider == "local"),
                         placement.FixedExclusion("no local candidate"))
