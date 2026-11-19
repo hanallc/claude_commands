@@ -5062,7 +5062,7 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 
 **Acceptance gate:** the module passes 20 times under host load in a 2 GB scope; the full suite is green.
 ### Phase 362 — scratch removal moves the checkout before it checks refs  · status: todo
-**Depends on:** Phase 361
+**Depends on:** Phase 360
 
 #### Work Order
 
@@ -5168,3 +5168,66 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - impl: the merge.
 
 **Acceptance gate:** test_verify_mac_only.py and the modules that import the support file pass; the full suite is green.
+### Phase 367 — each nextest step records its selected test names before it runs  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** every Hana nextest step has a GPU or no-GPU class, because the recorder saves each selected test name before nextest runs.
+
+**Spec:**
+- Builds assigned this on 2026-11-18. Rank: behind verify 43h, queue 44bw and the aws GPU pilot; ahead of other new natest work.
+- Now 343 of 916 Hana nextest steps have no class. The recorder keeps only failures, retries, SLOW results and tests above `NEXTEST_SLOW_TEST_S`, so a step of fast passes has no names (aws page http://100.103.14.30:8765/24f398/page.html).
+1. Before nextest runs, save the selected test names for the step (for example from `cargo nextest list`, or the step's filter), in the build log record.
+2. The class reader uses the saved names. Fast-pass timing rows stay as they are now.
+3. Add the saved names at no extra Cargo build: reuse the build the step already does.
+- Tests read no /tune-changeable value. No lazy imports, no copies.
+
+**Files:** scripts/buildlog/parse.py; scripts/buildlog/index.py; the nextest step runner that writes the build log; their tests.
+
+**Workers:** 1 writer.
+- impl: the recorder, the class reader and their tests.
+
+**Acceptance gate:** a fast-pass-only nextest step gets a class; the changed modules pass; basedpyright clean; the full suite is green.
+### Phase 368 — the verify doc checkout test halves its AWS CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `direct/test_verify_doc_checkout.py` uses half its AWS gate CPU (59.2 s median on 2026-11-18), and the shared cost of the verify.sh test family is named.
+
+**Spec:**
+- AWS rank on 2026-11-18 21:30 EST: 3rd, after statusline and list_page (phase 365). 15 tests, 59.2 CPU s, 87.6 s wall. Slowest kept test: `test_doc_slot_wait_names_the_unit_without_a_session` 9.6 s.
+- Five verify.sh test modules sit in the top 13: doc_checkout 59.2, wait_holder 55.2, mac_only 46.6, ssh_targets_routing 42.3, lint_free_mac 37.1 CPU s.
+1. Measure with `module_cost.py --tests 15 --commands 20` like the gate: fresh TMPDIR, bytecode on. Name the top commands and fixtures.
+2. Cut the cost at its cause: repeated verify.sh starts, helper Python starts, Git setup or waits. Share setup per class where the tests stay independent.
+3. When the cause is shared by the other four verify.sh modules, report it as an architecture proposal with the measured share. Do not change those modules in this phase.
+- Every assertion remains. Tests read no /tune-changeable value. No lazy imports, no copies, no signal handlers.
+
+**Files:** scripts/direct/test_verify_doc_checkout.py; its test support module; scripts/direct/verify.sh only when the cost lives there.
+
+**Workers:** 1 writer. One module and its support.
+- impl: the test module, its support and any verify.sh cause.
+
+**Acceptance gate:** an AWS pair (3 rounds) shows the median CPU at half or less, or a floor result with its cause; the module passes 20 times under load in a 2 GB scope; the full suite is green.
+### Phase 369 — the copies test halves its AWS CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `copies/test_copies.py` uses half its AWS gate CPU (42.0 s median, 72.2 s wall, 141 tests on 2026-11-18).
+
+**Spec:**
+- AWS rank 11 on 2026-11-18 21:30 EST. Ranks 4-10 are verify.sh modules (phase 368 measures their shared cause), floor results, or modules phase 364 just worked. An aws pair in an earlier phase measured 24.75 CPU s; natedev runs swing 18 to 34 CPU s.
+- Three StandingTests wait about 5 s each for a release (wall time). Slowest kept test: `test_run_uses_tree_cwd_substitution_and_command_exit_status` 6.9 s.
+1. Measure with `module_cost.py --tests 20 --commands 20` like the gate: fresh TMPDIR, bytecode on. Name the top commands and fixtures and their CPU share. Count the Git calls and say which ones each test needs.
+2. Cut the cost at its cause: repeated Git repository setup, Python starts, or polling. Share setup per class where the tests stay independent. Replace fixed waits with an event the test drives.
+3. Name any cause in scripts/copies/copies.py itself; fix it there when it also costs production runs.
+- Every assertion remains. Tests read no /tune-changeable value. No lazy imports, no copies, no signal handlers.
+
+**Files:** scripts/copies/test_copies.py; its test support; scripts/copies/copies.py only when the cost lives there.
+
+**Workers:** 1 writer. One module and its subject.
+- impl: the test module, its support and any copies.py cause.
+
+**Acceptance gate:** an AWS pair (3 rounds) shows the median CPU at half or less, or a floor result with its cause; the module passes 20 times under load in a 2 GB scope; the full suite is green.
