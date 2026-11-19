@@ -45,6 +45,7 @@ from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role
 from scripts.accounts.nix_env_fake import FakeShellRefusal, fake_nix_loader, imports_with_nix_loader, installed_program
 from scripts.lib import atomic_file, conf, file_lock, unit_runs
 from scripts.lib.test_models_registry import write_registry
+from scripts.lib import models_registry
 from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker
 from scripts.agents import stop_resume
@@ -925,6 +926,94 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(rows[0].role_counts_by_machine[peer], {})
         self.assertEqual(rows[0].models_by_role, {})
         self.assertEqual(problems, (f"{peer}: Claude session registry unreadable. Claude session counts are unknown.",))
+
+    def test_model_cells_name_counted_sessions_from_the_existing_scan(self) -> None:
+        from scripts.herdr import pane_launch
+        from scripts.production import session_staff
+        from scripts.production.staff_test_support import fixture_worker
+
+        showrunner = fixture_member("showrunner", name="suite-runner")
+        unit = fixture_member("unit", name="suite-unit", parent=showrunner.id)
+        registry_named = replace(fixture_member("unit", name="registry-unit", parent=showrunner.id), name="")
+        unnamed = replace(fixture_member("unit", name="unnamed-unit", parent=showrunner.id), name="")
+        worker = fixture_worker("suite-worker", unit.id)
+        producer = fixture_member("producer", name="suite-producer")
+        members = (producer, showrunner, unit, registry_named, unnamed, worker)
+        lives = [sessions.SessionRecord(pid=900 + index, sessionId=member.current_session,
+            name=registry_name, messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], status="busy")
+            for index, (member, registry_name) in enumerate(zip(members,
+                ("old-producer", "old-runner", "old-unit", "A registry name", "", "old-worker"), strict=True))]
+        folder = self.home / ".claude1"
+        known = accounts.ObservedSessionModel("claude-opus-5-5", "high")
+        observe = cast(Callable[..., accounts.LocalRoleSessions], getattr(accounts, "_read_local_role_sessions"))
+        count = cast(Callable[..., tuple[tuple[accounts.StatusRow, ...], tuple[str, ...]]],
+                     getattr(accounts, "_count_role_sessions"))
+        configuration = models_registry.LaunchSettings("claude", known.model, known.effort, "")
+        with (patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(members)) as staff_read,
+              patch.object(sessions, "running_sessions", return_value=lives),
+              patch.object(sessions, "read_registry", wraps=sessions.read_registry) as registry_read,
+              patch.object(pane_launch, "record_directory", return_value=self.root / "no-launches"),
+              patch.object(session_staff, "pane_parents", return_value=()),
+              patch.object(session_state, "running_detached_work", return_value=session_state.NO_DETACHED_WORK),
+              patch.object(accounts, "producer_settings", return_value=configuration),
+              patch.object(accounts, "_session_config_dir", return_value=account.ConfiguredClaudeFolder(folder)),
+              patch.object(accounts.SessionModelReader, "claude", side_effect=[
+                  known, known, known, known, accounts.SessionModelUnknown(), known]) as model_read):
+            observed = observe({}, include_models=True)
+        staff_read.assert_called_once_with()
+        registry_read.assert_called_once_with(dependencies=ANY)
+        self.assertEqual(model_read.call_count, len(members))
+        row = replace(SharedStatusDocumentTests().row(), label="claude1", tool="claude", folder=str(folder))
+        rows, _ = count((row,), observed)
+        board = accounts.models_board(accounts.StatusReading(rows, (), (), timezone.utc, datetime.now(timezone.utc)), {})
+        short_id = unnamed.current_session[:8]
+        model, unknown, total = board.rows
+        self.assertEqual(model.get("session_names"), {
+            "producers": (producer.name,), "showrunners": (showrunner.name,), "units": ("A registry name", unit.name),
+            "workers": (worker.name,), "total": ("A registry name", producer.name, showrunner.name, unit.name, worker.name),
+        })
+        self.assertEqual(unknown.get("session_names"), {"units": (short_id,), "total": (short_id,)})
+        self.assertEqual(total.get("session_names", {}).get("units"),
+                         tuple(sorted((unit.name, "A registry name", short_id), key=str.casefold)))
+
+        with patch.object(accounts, "_local_session_counts", return_value=observed), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(accounts.main(["session-counts-read"]), 0)
+        machine = "mac" if remote.other_machine() == "natedev" else "natedev"
+        published = decode_session_counts(output.getvalue(), machine)
+        self.assertEqual(published.get("models", {}).get("claude1", {}).get("units"), [
+            {"model": known.model, "effort": known.effort, "count": 2, "names": [unit.name, "A registry name"]},
+        ])
+        self.assertEqual(published.get("unknown_model_names"), {"claude1": {"units": [short_id]}})
+
+    def test_peer_model_cells_name_remote_sessions_and_count_names_missing_from_older_documents(self) -> None:
+        now = datetime.now(timezone.utc)
+        row = replace(SharedStatusDocumentTests().row(), label="claude1", tool="claude", roles=("units",),
+                      role_counts=(accounts.RoleSessionCounts(0, 0, 0, 0),))
+        counts = {"busy": 3, "idle": 0, "paused": 0, "exited": 0, "total": 3}
+        model = {"model": "claude-opus-5-5", "effort": "high", "count": 2}
+        cases: tuple[tuple[dict[str, object], list[tuple[str, ...]]], ...] = (
+            ({"models": {"claude1": {"units": [{**model, "names": ["hana-unit"]}]}},
+              "unknown_model_names": {"claude1": {"units": ["other-unit"]}}},
+             [("hana-unit (mac)", "1 more on mac"), ("other-unit (mac)",),
+              ("hana-unit (mac)", "other-unit (mac)", "1 more on mac")]),
+            ({"models": {"claude1": {"units": [model]}}},
+             [("2 more on mac",), ("1 more on mac",), ("3 more on mac",)]),
+            ({}, [("3 more on mac",), ("3 more on mac",)]),
+            ({"models": {"claude1": {"units": [{**model, "names": ["hana-unit", "\ud800"]}]}},
+              "unknown_model_names": {"claude1": {"units": ["\udfff"]}}},
+             [("hana-unit (mac)", "1 more on mac"), ("1 more on mac",),
+              ("hana-unit (mac)", "2 more on mac")]),
+        )
+        with patch.object(remote, "other_machine", return_value="mac"):
+            for payload, names in cases:
+                with self.subTest(payload=payload):
+                    _ = session_counts_cache().parent.mkdir(parents=True, exist_ok=True)
+                    _ = session_counts_cache().write_text(json.dumps({"machine": "mac", "at": now.isoformat(),
+                        "accounts": {"claude1": {"units": counts}}, **payload}), encoding="utf-8")
+                    combined = machine_role_counts((row,), now)
+                    board = accounts.models_board(accounts.StatusReading(combined.rows, (), (), timezone.utc, now), {})
+                    self.assertEqual([line.get("session_names", {}).get("units") for line in board.rows], names)
+                    self.assertEqual([line.get("session_names", {}).get("total") for line in board.rows], names)
 
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_partial_move_counts_actual_accounts_and_stopped_members_once(self) -> None:

@@ -431,8 +431,13 @@ For a compressed file, it streams the records and caches the result in memory by
 The cache evicts the least recently used result when a new result exceeds the limit.
 A missing Claude transcript gives `unknown`.
 Live process options apply when the reader can establish that no turn was recorded.
-The peer count document carries known model counts by account and role.
+The peer count document carries model counts and session names by account and role.
 The Models table puts the remainder of each role count in the `unknown` row.
+Hover over a positive count or focus it to see the session names in order.
+The tooltip uses the staff name or the Claude registry name.
+If neither name is available, the tooltip uses the first eight characters of the session ID.
+The tooltip includes the machine for each peer session.
+An older peer count adds a line such as `2 more on mac` for sessions without names.
 `config/statusline.conf` holds each account color under `account.<label>`.
 `ROLE_COLOR_KEYS` maps each role group to its color key:
 
