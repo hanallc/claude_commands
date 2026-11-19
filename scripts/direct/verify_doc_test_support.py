@@ -8,6 +8,7 @@ from scripts.build_queue import placement
 from scripts.lib.berth_test_support import write_unconfigured_berth
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.copies import copies
+from scripts.lib import conf
 from scripts.lib.build_slots_test_support import private_slot_config
 from unittest import mock
 
@@ -199,6 +200,10 @@ class VerifyDocFixture(unittest.TestCase):
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
         })
         private = private_slot_config(self.root, repository=self.repo.name)
+        probe_line, _ = conf.editable_line(private.settings, "locks.probe_wait_seconds")
+        slot_settings = private.settings.read_text().splitlines(keepends=True)
+        slot_settings[probe_line] = "locks.probe_wait_seconds=0.25\n"
+        _ = private.settings.write_text("".join(slot_settings))
         _ = write_config_fixture(Path(private.environment["COPIES_CONFIG"]), "git_timeout_seconds=600\n")
         configuration = Path(self.environment["CONF_DIR"])
         _ = shutil.copy2(private.settings, configuration / "build_folders.conf")
