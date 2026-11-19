@@ -99,7 +99,8 @@ def network_git(repo: Path, *arguments: str) -> str:
                 send_process_group(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            _ = process.communicate()
+            # Cancellation can interrupt communicate before it initializes its state.
+            _ = process.wait()
             raise
         if process.returncode:
             raise subprocess.CalledProcessError(process.returncode, command, output=output, stderr=errors)
