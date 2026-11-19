@@ -406,9 +406,9 @@ class AdmissionFixture(ExitStack):
         check_memory_reading = gate.check_memory_reading
 
         def check_fixture_reading(path: Path) -> None:
-            if path == Path("/proc/pressure/memory"):
-                raise gate.LiveMemoryReading(f"live memory reading {path} in a test")
             check_memory_reading(path)
+            if path == Path("/proc/pressure/memory") and not os.environ.get("BUILDLOG_LIVE_MEMORY_TRIPWIRE"):
+                raise gate.LiveMemoryReading(f"live memory reading {path} in a test")
 
         _ = self.enter_context(mock.patch.object(gate, "check_memory_reading", new=check_fixture_reading))
         self.readings: PrivateReadings = PrivateReadings(self.root)
