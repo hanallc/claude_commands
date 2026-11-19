@@ -30,8 +30,12 @@ class LiveUnit(NamedTuple):
     @property
     def name(self) -> str:
         """The unit's session name now; empty when no Claude is known to run in it."""
-        claude = self.session.claude if self.session is not None else None
-        return claude.name if isinstance(claude, unit_lookup.LiveClaude) else ""
+        if isinstance(self.owner, session_staff.ProvedLiveUnit):
+            owner = self.owner.owner
+            claude = owner.claude if isinstance(owner, unit_lookup.LabeledSession) else owner
+            if isinstance(claude, unit_lookup.LiveClaude):
+                return claude.name
+        return ""
 
 
 class UnitListing(NamedTuple):
@@ -122,21 +126,39 @@ def listing_in(production_name: str, every: unit_lookup.LabeledProductions) -> U
                        every.unreadable_pane_lists, every.failures)
 
 
-def live_unit_ids(runner: showrunners.Showrunner) -> list[str]:
-    """The staff ids of the showrunner's units that have a live Claude, read through one staff snapshot.
+class LiveUnitIds(NamedTuple):
+    """Keep unknown units and observation failures with the proved Claude IDs."""
 
-    A herdr that cannot say which sessions exist leaves the list empty and says why.
-    """
-    record = staff.snapshot()
+    proved_ids: list[str]
+    unknown: dict[str, session_staff.UnknownUnit]
+    failures: tuple[str, ...]
+
+
+def live_unit_ids(runner: showrunners.Showrunner) -> LiveUnitIds:
+    """Return proved Claude directors and retain unknown units."""
+    name = runner["name"]
     try:
-        return [str(member.id) for unit in units_of(runner["name"])
-                if isinstance(unit.owner, session_staff.ProvedLiveUnit)
-                and isinstance(pane := unit.owner.owner, unit_lookup.LabeledSession)
-                and isinstance(pane.claude, unit_lookup.LiveClaude)
-                and (member := record.by_current_session(pane.claude.session_id)) is not None]
+        record = staff.snapshot()
+        listing = read_units(name, record=record)
     except OSError as error:
-        print(f"live_units: the units of {runner['name']} could not be listed: {error}", file=sys.stderr)
-        return []
+        reason = f"live_units: the units of {name} could not be listed: {error}"
+        print(reason, file=sys.stderr)
+        return LiveUnitIds([], {}, (reason,))
+    for line in listing.anomalies:
+        print(line, file=sys.stderr)
+    live: list[str] = []
+    unknown: dict[str, session_staff.UnknownUnit] = {}
+    for unit in listing.units:
+        if isinstance(unit.owner, session_staff.UnknownUnit):
+            unknown[unit.unit] = unit.owner
+        elif isinstance(unit.owner, session_staff.ProvedLiveUnit):
+            owner = unit.owner.owner
+            claude = owner.claude if isinstance(owner, unit_lookup.LabeledSession) else owner
+            if isinstance(claude, unit_lookup.LiveClaude):
+                member = record.by_current_session(claude.session_id)
+                if member is not None:
+                    live.append(str(member.id))
+    return LiveUnitIds(live, unknown, listing.failures)
 
 
 def main(arguments: list[str]) -> int:
