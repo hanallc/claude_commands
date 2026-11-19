@@ -425,10 +425,30 @@ The `board` is `accounts.status_board()`: the table the console Accounts page dr
 The reader finds the Claude transcript by session ID across project folders.
 Claude model and effort come from the latest real assistant message.
 Codex model and effort come from the latest `turn_context`.
-The model reader scans at most 128 KiB from the end of a plain file.
-For a compressed file, it streams the records and caches the result in memory by path, size, and modification time.
-`session_model_cache_entries` in `config/accounts.conf` sets the limit for each process.
-The cache evicts the least recently used result when a new result exceeds the limit.
+The model reader scans a plain file backward in 16 KiB blocks until it finds the newest model row.
+`session_model_scan_kib` in `config/accounts.conf` limits the scan.
+The default is 8192 KiB. The setting accepts 128 to 32768 KiB.
+The reader checks one byte before the range to detect a row that starts at the limit.
+A damaged complete model row gives `unknown`. The reader skips damaged output rows.
+An unfinished last row can leave an earlier model in effect.
+A scan that reaches the limit without a model row gives `unknown`.
+
+A status scan loads the plain transcript cache once and saves changes atomically.
+The cache file is `$XDG_CACHE_HOME/claude/session-models.json`.
+If `XDG_CACHE_HOME` is unset, the reader uses `~/.cache`.
+The cache retains the largest transcripts up to `session_model_cache_entries`.
+The cache drops entries whose encoded fields exceed 32 KiB.
+A missing or damaged cache starts a fresh scan.
+Unchanged transcripts need no reads. On growth, the reader checks hashes at both ends of the old content.
+The reader also checks the cached model row before it reuses that row.
+A rewrite that preserves the sampled edges and the cached model row can escape detection.
+If the hashes match, the reader checks new bytes and any unfinished row within the scan range.
+If the file grows during the scan, the next scan reads the bytes from that append.
+If an unfinished row starts before the range, the reader checks only the new bytes.
+The reader uses a cached model row only while the row remains in range.
+The reader scans again after replacement or truncation.
+For a compressed file, the reader streams the records and caches the result in the process.
+The compressed cache evicts the least recently used result at `session_model_cache_entries`.
 A missing Claude transcript gives `unknown`.
 Live process options apply when the reader can establish that no turn was recorded.
 The peer count document carries known model counts by account and role.
