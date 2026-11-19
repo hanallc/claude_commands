@@ -25,10 +25,7 @@ from typing import NamedTuple, TypedDict, cast
 
 from scripts.lib import file_lock
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.production import land_runs, waits_on
-
-HASH = re.compile(r"[0-9a-f]{7,40}")
-
+from scripts.production import land_runs, merge_input, waits_on
 
 class LineItem(TypedDict):
     label: str
@@ -136,18 +133,27 @@ def edited() -> Generator[list[LineItem]]:
 
 
 def batch_commits(batch: str) -> tuple[BatchCommit, ...]:
-    """The unit, phase and commit of each batch line; a line whose third field is not a hash is not a commit."""
+    """Read commit identities from saved batches, including batches that predate input checks."""
     if not batch:
         return ()
+    parser = merge_input.checkpoint_parser(batch_item=True)
+    found: list[BatchCommit] = []
     try:
-        lines = Path(batch).read_text(encoding="utf-8").splitlines()
+        for _, line in merge_input.batch_lines(Path(batch)):
+            try:
+                args = merge_input.batch_arguments(parser, line)
+            except ValueError:
+                pass
+            else:
+                unit, phase, commit = cast(str | None, args.unit), cast(str | None, args.phase), cast(str | None, args.hash)
+                if unit and phase and commit and merge_input.COMMIT_HASH.fullmatch(commit):
+                    found.append(BatchCommit(unit, phase, commit))
+                    continue
+            fields = line.split(maxsplit=3)
+            if len(fields) >= 3 and merge_input.COMMIT_HASH.fullmatch(fields[2]):
+                found.append(BatchCommit(fields[0], fields[1], fields[2]))
     except OSError:
         return ()
-    found: list[BatchCommit] = []
-    for line in lines:
-        fields = line.split()
-        if len(fields) >= 3 and HASH.fullmatch(fields[2]):
-            found.append(BatchCommit(fields[0], fields[1], fields[2]))
     return tuple(found)
 
 
@@ -233,11 +239,11 @@ def add(label: str, *, batch: str, commits: list[str], first: bool, before: str 
     check_batch_path(batch)
     batch_path = str(Path(batch).resolve()) if batch else ""
     check_batch_path(batch_path)
-    if batch_path and not batch_commits(batch_path):
-        raise Refusal(f"batch file {batch} names no commit")
+    if batch_path:
+        _ = merge_input.read_batch(Path(batch_path))
     if not batch_path and not commits:
         raise Refusal("give --batch or --commit")
-    bad = [commit for commit in commits if not HASH.fullmatch(commit)]
+    bad = [commit for commit in commits if not merge_input.COMMIT_HASH.fullmatch(commit)]
     if bad:
         raise Refusal(f"not a commit hash: {', '.join(bad)}")
     item: LineItem = {"label": label, "batch": batch_path, "commits": commits,

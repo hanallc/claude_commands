@@ -11,6 +11,7 @@ import io
 import json
 import os
 import re
+import shlex
 import sqlite3
 import subprocess
 import tempfile
@@ -32,6 +33,7 @@ from scripts.lib import conf, unit_runs
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
 from scripts.production import showrunners
 from scripts.production import unit_lookup
+from scripts.production.merge_checkpoint_test_support import STARTED, TRIAL
 from scripts.production import session_staff, unit_config
 from scripts.production import waits_on
 from scripts.herdr.herdr import HerdrPlace
@@ -1892,7 +1894,12 @@ class UnitPhasesTests(unittest.TestCase):
                 for phase, commit in (("a", first), ("b", second))]
         _ = self.write_run(member, "merge", phases, tail)
         batch = self.root / "batch"
-        _ = batch.write_text(f"merge a {first}\nmerge b {second}\nmerge c {carrier}\n")
+        lines = [
+            shlex.join(["merge", phase, commit, "--started", STARTED,
+                        "--review-trial", TRIAL, "--delivers", "Show the merge group."])
+            for phase, commit in (("a", first), ("b", second), ("c", carrier))
+        ]
+        _ = batch.write_text("\n".join(lines) + "\n", encoding="utf-8")
         for name in ("carried line", "direct line", "carried running", "direct running", "single", "absent", "unused"):
             with self.subTest(merge=name):
                 with land_queue.edited() as items:

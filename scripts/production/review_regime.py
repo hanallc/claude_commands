@@ -130,13 +130,34 @@ def read_rows() -> list[Row]:
     return rows
 
 
+def review_time(label: str, moment: str) -> datetime:
+    """Read a review timestamp with a UTC offset."""
+    try:
+        parsed = datetime.fromisoformat(moment)
+    except ValueError as error:
+        raise ValueError(f"--{label} {moment!r} needs an ISO timestamp") from error
+    if parsed.tzinfo is None:
+        raise ValueError(f"--{label} {moment!r} needs a UTC offset")
+    return parsed
+
+
+def add_measurement_arguments(parser: argparse.ArgumentParser) -> None:
+    """Define the review counts and minutes for the parser."""
+    _ = parser.add_argument("--ux-findings", type=int)
+    _ = parser.add_argument("--code-findings", type=int)
+    _ = parser.add_argument("--review-minutes", type=float)
+    _ = parser.add_argument("--ux-check-minutes", type=float)
+    _ = parser.add_argument("--ux-repair-minutes", type=float)
+
+
 def add(arguments: argparse.Namespace) -> None:
     started = cast(str, arguments.started)
     merged = cast(str, arguments.merged)
-    for label, moment in (("started", started), ("merged", merged)):
-        parsed = datetime.fromisoformat(moment)
-        if parsed.tzinfo is None:
-            raise SystemExit(f"review_regime: --{label} {moment!r} needs a UTC offset")
+    try:
+        start_time = review_time("started", started)
+        merge_time = review_time("merged", merged)
+    except ValueError as error:
+        raise SystemExit(f"review_regime: {error}") from error
     checkpoint_ref = cast(str, arguments.checkpoint)
     resolved = subprocess.run(["git", "rev-parse", "--verify", "--end-of-options", f"{checkpoint_ref}^{{commit}}"],
                               capture_output=True, text=True, check=False)
@@ -165,7 +186,7 @@ def add(arguments: argparse.Namespace) -> None:
         excluded=excluded,
         checkpoint=checkpoint,
     )
-    if row.hours() < 0:
+    if merge_time < start_time:
         raise SystemExit("review_regime: --merged is before --started")
     identity = (row.unit, row.plan, row.phase, checkpoint)
     for existing in read_rows():
@@ -264,11 +285,7 @@ def main() -> int:
     _ = adding.add_argument("--merged", required=True)
     _ = adding.add_argument("--holds", type=int, required=True)
     _ = adding.add_argument("--merge-defects", type=int, required=True)
-    _ = adding.add_argument("--ux-findings", type=int)
-    _ = adding.add_argument("--code-findings", type=int)
-    _ = adding.add_argument("--review-minutes", type=float)
-    _ = adding.add_argument("--ux-check-minutes", type=float)
-    _ = adding.add_argument("--ux-repair-minutes", type=float)
+    add_measurement_arguments(adding)
     _ = adding.add_argument("--excluded", help=f"why the comparison cannot use this phase; --ux-check-minutes 0 records {NO_VISIBLE_CHANGE!r}")
     _ = adding.add_argument("--note")
     reporting = commands.add_parser("report")

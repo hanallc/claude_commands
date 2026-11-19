@@ -31,14 +31,16 @@ from pathlib import Path, PurePath, PurePosixPath
 from typing import NamedTuple, cast
 
 from scripts.lib import build_folders
-from scripts.production import change_review, checkpoint_gate, land_runs
+from scripts.production import change_review, checkpoint_gate, land_runs, merge_input
+from scripts.production.merge_input import AsBuiltCommit, CodeCheckpoint, NoReviewTrial as NoReviewTrial
+from scripts.production.merge_input import ReviewTrial, ShrinkCommit as ShrinkCommit
 from scripts.worktree import worktrees
 from scripts.lib import land_main, mac_wake, main_publish, main_push_lock, scratch, waiting_rows
 from scripts.production.showrunners import owner_for
 from scripts.production.production_doc import Production, ProductionDocument, Refusal, cell_value, production_field, read_production
 
 from scripts.direct import progress_history  # noqa: E402
-from scripts.production import merge_gate, production_doc, session_staff, staff, unit_config, unit_lookup, unit_names  # noqa: E402
+from scripts.production import merge_gate, production_doc, session_staff, staff, unit_config, unit_lookup  # noqa: E402
 from scripts.agents import remote  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.message import sessions  # noqa: E402
@@ -87,30 +89,6 @@ class PromotionOriginPushed(NamedTuple):
 class PromotionNotPushed(NamedTuple):
     tip: str
     already_at_tip: bool
-
-
-class CodeCheckpoint(NamedTuple):
-    pass
-
-
-class ShrinkCommit(NamedTuple):
-    pass
-
-
-class AsBuiltCommit(NamedTuple):
-    """A unit's closing documentation commit after its last phase merged."""
-
-
-class ReviewTrial(NamedTuple):
-    ux_findings: str
-    code_findings: str
-    review_minutes: str
-    ux_check_minutes: str
-    ux_repair_minutes: str
-
-
-class NoReviewTrial(NamedTuple):
-    pass
 
 
 class Unit(NamedTuple):
@@ -276,14 +254,6 @@ def parse_merge_tests(lines: list[str], checkout: Path) -> tuple[tuple[str, ...]
     return tuple(commands)
 
 
-def user_bump(args: argparse.Namespace) -> bool:
-    bump = cast(bool, getattr(args, "bump", False))
-    if bump and any((cast(bool, args.shrink), cast(bool, args.as_built),
-                     cast(str | None, getattr(args, "from_child", None)))):
-        raise Refusal("--bump applies only to a code checkpoint requested by the user")
-    return bump
-
-
 def worktree_in_repo(row: staff.StaffRow, main_checkout: Path) -> bool:
     location = row.worktree
     if not isinstance(location, staff.PresentWorktree) or location.machine != remote.local_machine():
@@ -318,13 +288,16 @@ def require_merge_branch(production: ProductionDocument) -> None:
 
 
 def request_from(args: argparse.Namespace) -> MergeRequest:
-    bump = user_bump(args)
+    return request_from_input(cast(str, args.production), merge_input.unit_checkpoint(args))
+
+
+def request_from_input(production_name: str, item: merge_input.UnitCheckpointInput) -> MergeRequest:
     record = staff.snapshot()
-    production = read_production(cast(str, args.production), record)
-    name = cast(str, args.unit)
+    production = read_production(production_name, record)
+    name = item.unit
     resolver = session_staff.RowResolver(record)
     rows = record.find(kind="unit", parent=production.owner.id)
-    selected = next((row for row in rows if row.name == unit_names.name(name)), None)
+    selected = next((row for row in rows if row.name == name), None)
     selected = selected if selected is not None else unit_lookup.unit_row(name, record)
     try:
         main_checkout = worktrees.main_checkout(production.checkout)
@@ -345,32 +318,14 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
     units = (unit, *(unit_from_row(row, resolver) for row in rows
                      if row.id != selected.id and worktree_in_repo(row, main_checkout)))
     policy = read_merge_policy(production)
-    if cast(bool, args.cancel_prior) and isinstance(policy.push, GitPush):
+    if item.cancel_prior and isinstance(policy.push, GitPush):
         raise Refusal("--cancel-prior applies only to Push: validate_and_push")
-    if cast(bool, args.shrink) and cast(bool, args.as_built):
-        raise Refusal("--shrink and --as-built are separate checkpoints")
-    kind: CodeCheckpoint | ShrinkCommit | AsBuiltCommit = (
-        ShrinkCommit() if cast(bool, args.shrink) else AsBuiltCommit() if cast(bool, args.as_built) else CodeCheckpoint())
-    trial = cast(str | None, args.review_trial)
-    if isinstance(kind, CodeCheckpoint) and not trial:
-        raise Refusal("code checkpoint requires --review-trial")
-    review_trial: ReviewTrial | NoReviewTrial = review_numbers(trial) if trial else NoReviewTrial()
-    delivers = cast(str | None, args.delivers)
-    if isinstance(kind, CodeCheckpoint) and (not delivers or not delivers.strip()):
-        raise Refusal("code checkpoint requires --delivers")
-    if delivers and ("\n" in delivers or "\r" in delivers):
-        raise Refusal("--delivers must be one line")
-    if not isinstance(kind, CodeCheckpoint) and delivers:
-        raise Refusal("--delivers applies only to a code checkpoint")
-    scratch = Path(cast(str | None, args.scratch) or os.environ.get("MERGE_CHECKPOINT_SCRATCH")
-                   or tempfile.gettempdir()).expanduser()
-    return MergeRequest(production, unit, cast(str, args.phase), cast(str, args.hash),
-                        kind, policy.push, policy.promotion,
+    scratch = Path(item.scratch or os.environ.get("MERGE_CHECKPOINT_SCRATCH") or tempfile.gettempdir()).expanduser()
+    return MergeRequest(production, unit, item.phase, item.commit, item.kind, policy.push, policy.promotion,
                         policy.merge_tests, policy.flakes, policy.flaky_tests, units, scratch,
-                        tuple(cast(list[str], args.trailer)), review_trial, delivers or "",
-                        cast(bool, args.cancel_prior), cast(str, args.started),
-                        cast(str, args.regime), cast(int, args.holds), cast(int, args.merge_defects),
-                        cast(str | None, args.excluded) or "", bump, record, parent_production)
+                        item.trailer, item.review_trial, item.delivers, item.cancel_prior,
+                        item.started, item.regime, item.holds, item.merge_defects, item.excluded,
+                        item.bump, record, parent_production)
 
 
 class MergedCheckpoint(NamedTuple):
@@ -1152,16 +1107,6 @@ def finish_promotion_targets(promotion: production_doc.NoPromotion | production_
              f"the live gate of {label}")
 
 
-def review_numbers(line: str) -> ReviewTrial:
-    pattern = (r"review trial: ux (\d+) findings, code (\d+) findings, review-worker minutes ([\d.]+), "
-               r"ux check minutes ([\d.]+), ux repair minutes ([\d.]+)")
-    match = re.fullmatch(pattern, line.strip())
-    if match is None:
-        raise Refusal("--review-trial must read: review trial: ux <N> findings, code <N> findings, "
-                      + "review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>")
-    return ReviewTrial(match[1], match[2], match[3], match[4], match[5])
-
-
 def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
     recorded = (f"{request.unit.name} phase {request.phase} ({request.commit}) merged as {merge_head}; ")
     parent = request.parent_production
@@ -1177,16 +1122,19 @@ def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
         merged = good(git(request.production.checkout, "show", "-s", "--format=%cI", merge_head), "record")
         script = checkpoint_gate.tool("review_regime.py", Path.home() / ".claude/scripts/production/review_regime.py",
                       "MERGE_CHECKPOINT_REVIEW_REGIME")
-        review_command = [PYTHON, script]
-        command = [*review_command, "add", "--unit", request.unit.name, "--plan", checkpoint_plan(request).as_posix(),
-                   "--phase", request.phase, "--checkpoint", request.commit,
-                   "--regime", request.regime, "--started", request.started, "--merged", merged,
-                   "--holds", str(request.holds), "--merge-defects", str(request.merge_defects),
-                   "--ux-findings", numbers.ux_findings, "--code-findings", numbers.code_findings,
-                   "--review-minutes", numbers.review_minutes, "--ux-check-minutes", numbers.ux_check_minutes,
-                   "--ux-repair-minutes", numbers.ux_repair_minutes]
+        options = [("--unit", request.unit.name), ("--plan", checkpoint_plan(request).as_posix()),
+                   ("--phase", request.phase), ("--checkpoint", request.commit),
+                   ("--regime", request.regime), ("--started", request.started), ("--merged", merged),
+                   ("--holds", str(request.holds)), ("--merge-defects", str(request.merge_defects)),
+                   *numbers.record_options()]
         if request.excluded:
-            command.extend(("--excluded", request.excluded))
+            options.append(("--excluded", request.excluded))
+        command = [PYTHON, script, "add"]
+        for option, value in options:
+            if value.startswith("-"):
+                command.append(f"{option}={value}")
+            else:
+                command.extend((option, value))
         result = subprocess.run(command, cwd=request.production.checkout, capture_output=True, text=True, check=False)
         if result.returncode:
             raise checkpoint_gate.Stop("record", "failed", failure_detail(result),
@@ -2093,65 +2041,16 @@ def run_handoff(request: ChildHandoffRequest) -> int:
     return 0
 
 
-def checkpoint_parser(*, batch_item: bool = False) -> argparse.ArgumentParser:
-    """Define each item flag once for single commands and batch lines."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    if not batch_item:
-        _ = parser.add_argument("--production", required=True)
-        _ = parser.add_argument("--batch", type=Path)
-    _ = parser.add_argument("unit", nargs="?")
-    _ = parser.add_argument("phase", nargs="?")
-    _ = parser.add_argument("hash", nargs="?")
-    _ = parser.add_argument("--from-child")
-    _ = parser.add_argument("--checkpoint")
-    _ = parser.add_argument("--root-self", action="store_true")
-    _ = parser.add_argument("--shrink", action="store_true")
-    _ = parser.add_argument("--as-built", action="store_true")
-    _ = parser.add_argument("--trailer", action="append", default=[])
-    _ = parser.add_argument("--review-trial")
-    _ = parser.add_argument("--delivers")
-    _ = parser.add_argument("--cancel-prior", action="store_true")
-    _ = parser.add_argument("--bump", action="store_true",
-                            help="only a user's bump: push a code checkpoint before its background gate")
-    _ = parser.add_argument("--started", required=batch_item)
-    _ = parser.add_argument("--regime", choices=("after", "trial"), default="after")
-    _ = parser.add_argument("--holds", type=int, default=0)
-    _ = parser.add_argument("--merge-defects", type=int, default=0)
-    _ = parser.add_argument("--excluded")
-    _ = parser.add_argument("--scratch")
-    return parser
-
-
-def require_unit_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    if cast(bool, args.root_self) or cast(str | None, args.checkpoint):
-        parser.error("--root-self and --checkpoint require --from-child")
-    if not all((cast(str | None, args.unit), cast(str | None, args.phase), cast(str | None, args.hash))):
-        parser.error("unit, phase and hash are required for a unit checkpoint")
-
-
 def batch_requests(path: Path, production: str) -> tuple[MergeRequest, ...]:
     """Read all item arguments before any batch merge starts."""
-    requests: list[MergeRequest] = []
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        if not line.strip():
-            continue
-        words = shlex.split(line)
-        parser = checkpoint_parser(batch_item=True)
-        args = parser.parse_args(words)
-        if cast(bool, args.bump) or cast(str | None, args.from_child) is not None or cast(str | None, args.checkpoint) is not None:
-            raise Refusal(f"{path}:{number}: --bump, --from-child and --checkpoint are not batch items")
-        args.production = production
-        require_unit_arguments(parser, args)
-        requests.append(request_from(args))
-    if not requests:
-        raise Refusal("the batch file has no items")
+    requests = tuple(request_from_input(production, item) for item in merge_input.read_batch(path))
     if any(request.production.checkout != requests[0].production.checkout for request in requests):
         raise Refusal("batch items use different merge checkouts; submit a batch for each checkout")
-    return tuple(requests)
+    return requests
 
 
 def main() -> int:
-    parser = checkpoint_parser()
+    parser = merge_input.checkpoint_parser(description=__doc__)
     args = parser.parse_args()
     batch = cast(Path | None, args.batch)
     if batch is not None:
@@ -2170,7 +2069,7 @@ def main() -> int:
         parser.error("the following arguments are required: --started")
     if cast(str | None, args.from_child):
         try:
-            _ = user_bump(args)
+            _ = merge_input.user_bump(args)
             if not cast(str | None, args.checkpoint):
                 raise Refusal("--from-child requires --checkpoint")
             if any((cast(str | None, args.unit), cast(str | None, args.phase), cast(str | None, args.hash),
@@ -2193,7 +2092,7 @@ def main() -> int:
         except (Refusal, staff.StaffRefused, OSError, ValueError, subprocess.TimeoutExpired) as error:
             print("merge_checkpoint: " + " ".join(str(error).splitlines()), flush=True)
             return 1
-    require_unit_arguments(parser, args)
+    merge_input.require_unit_arguments(parser, args)
     try:
         request = request_from(args)
         owners = [f"{request.unit.name} {request.phase}"]

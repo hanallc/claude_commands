@@ -8,10 +8,10 @@ import shlex
 import shutil
 import subprocess
 import unittest
-from typing import final
+from typing import cast, final
 from unittest.mock import patch
 
-from scripts.production import staff
+from scripts.production import merge_checkpoint, merge_input, staff
 from scripts.production.staff_test_support import recorded_showrunner, unit_membership
 from scripts.lib import atomic_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -65,6 +65,47 @@ with Path(''' + repr(str(self.state / "pushed-refs")) + ''').open("a") as output
                          list(zip(merges, checkpoints)))
         self.assertEqual(len(self.events("style_sync.py")), 1)
         return merges
+
+    def test_a_bad_batch_line_is_refused_before_reading_production_state(self) -> None:
+        batch = self.root / "bad-batch.txt"
+        first = self.batch_line("alpha", "1", "a" * 40)
+        second = self.batch_line("beta", "2", "b" * 40).replace("review trial: ", "", 1)
+        _ = batch.write_text(f"{first}\n\n{second}\n", encoding="utf-8")
+        with patch.object(staff, "snapshot", side_effect=AssertionError("read production state")), \
+             self.assertRaises(ValueError) as refused:
+            _ = merge_checkpoint.batch_requests(batch, "example")
+        self.assertEqual(str(refused.exception), f"{batch}:3: --review-trial must read: "
+                         + "review trial: ux <N> findings, code <N> findings, "
+                         + "review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>")
+
+    def test_invalid_review_record_values_are_refused_before_merge(self) -> None:
+        batch = self.root / "bad-batch.txt"
+        first = self.batch_line("alpha", "1", "a" * 40)
+        cases = (
+            (self.batch_line("beta", "2", "b" * 40, "--review-trial",
+                             TRIAL.replace("review-worker minutes 14", "review-worker minutes 1..2")),
+             "argument --review-minutes: invalid float value: '1..2'"),
+            (self.batch_line("beta", "2", "b" * 40, "--started", ""), "--started '' needs an ISO timestamp"),
+        )
+        for second, reason in cases:
+            with self.subTest(reason=reason):
+                _ = batch.write_text(f"{first}\n\n{second}\n", encoding="utf-8")
+                with patch.object(staff, "snapshot", side_effect=AssertionError("read production state")), \
+                     self.assertRaises(merge_input.MergeInputRefused) as refused:
+                    _ = merge_checkpoint.batch_requests(batch, "example")
+                self.assertEqual(str(refused.exception), f"{batch}:3: {reason}")
+
+    def test_a_batch_records_an_exclusion_that_looks_like_a_flag(self) -> None:
+        self.env["MERGE_CHECKPOINT_REVIEW_REGIME"] = str(Path(__file__).with_name("review_regime.py"))
+        ledger = Path(self.env["HOME"]) / ".claude/data/review_regime.jsonl"
+        first = self.checkpoint()
+        second = self.beta_checkpoint("src/beta.txt", "beta batch change\n")
+        result = self.land_batch([self.batch_line("alpha", "2", first, "--excluded=--note"),
+                                  self.batch_line("beta", "2", second)])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        recorded = [cast(dict[str, object], json.loads(line)) for line in ledger.read_text().splitlines()]
+        self.assertEqual([(row["checkpoint"], row["excluded"], row["note"]) for row in recorded],
+                         [(first, "--note", None), (second, None, None)])
 
     def test_two_code_items_share_tests_push_and_promotion(self) -> None:
         for outcome in ("shared list", "push failure", "separate lists", "second list fails", "second directory sync fails"):
