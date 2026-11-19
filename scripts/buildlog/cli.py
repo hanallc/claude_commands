@@ -19,7 +19,8 @@
   buildlog snapshot                 record slice and zram counters now
   buildlog memory START END         report memory between offset-bearing instants
   buildlog usage-hours [YYYY-MM-DD]  measured memory, CPU, disk and free pool tokens over 24 h
-  buildlog hourly                   sync, vault pull, ci, screenshot scan, Rust release check, then AWS snapshot
+  buildlog hourly                   sample sccache, sync, and run the hourly collectors
+  buildlog sccache [START END]       Rust cache hit rate for inclusive local dates, default today
   buildlog backfill-verify [LEDGER] copy verify.sh's old events.jsonl ledger in, once
 
 Records live in ~/.local/state/buildlog (BUILDLOG_DIR moves it); see store.py.
@@ -181,6 +182,28 @@ def day_report(args: list[str]) -> int:
     return 0
 
 
+def sccache_report(args: list[str]) -> int:
+    from scripts.buildlog import index
+    from scripts.buildlog import report
+
+    usage = "usage: buildlog sccache [YYYY-MM-DD YYYY-MM-DD]"
+    today = date.today().isoformat()
+    try:
+        first, last = map(date.fromisoformat, args or [today, today])
+        if not date(2000, 1, 1) <= first <= last < date.max:
+            raise ValueError("Invalid date range.")
+    except ValueError:
+        print(usage, file=sys.stderr)
+        return 2
+    _ = index.update()
+    connection = index.read_only()
+    try:
+        print(report.sccache_hit_rate(connection, first, last))
+    finally:
+        connection.close()
+    return 0
+
+
 def moments_report(args: list[str]) -> int:
     from scripts.buildlog import index
     from scripts.buildlog import report
@@ -228,12 +251,13 @@ def hourly() -> int:
     from scripts.buildlog import ci
     from scripts.buildlog import index
     from scripts.buildlog import rust_release
+    from scripts.buildlog import sample
     from scripts.buildlog import store
     from scripts.buildlog import sync
     from scripts.buildlog import vault_pull
 
     status = 0
-    for name, job in (("sync", sync.sync), ("vault", vault_pull.vault), ("ci", ci.ci),
+    for name, job in (("sccache", sample.sccache_sample), ("sync", sync.sync), ("vault", vault_pull.vault), ("ci", ci.ci),
                       ("screenshot", screenshot_hourly), ("rust release", rust_release.check_release),
                       ("AWS snapshot", aws_snapshot), ("AWS page", aws_page)):
         try:
@@ -267,6 +291,8 @@ def main(argv: list[str]) -> int:
         return schema()
     if command == "report":
         return day_report(rest)
+    if command == "sccache":
+        return sccache_report(rest)
     if command == "moments":
         return moments_report(rest)
     if command == "usage-hours":

@@ -98,7 +98,7 @@ def host_name() -> str:
 
 def utc_iso(epoch: float) -> str:
     """Milliseconds, UTC, with the Z suffix SQLite's date functions accept."""
-    return datetime.fromtimestamp(epoch, UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return datetime.fromtimestamp(epoch, UTC).isoformat(timespec="milliseconds").removesuffix("+00:00") + "Z"
 
 
 def month(epoch: float) -> str:

@@ -9,16 +9,17 @@ import subprocess
 import tempfile
 import time
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from io import StringIO
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 from scripts.buildlog.mac_natedev_test_support import mac_natedev_environment
 from scripts.buildlog.cli_probe_test_support import measure_cli_work
 
-from scripts.buildlog import disk, ci
+from scripts.buildlog import cli, disk, ci
 from scripts.buildlog import index
 from scripts.buildlog import mac_outcome
 from scripts.buildlog import moments, report, holds, health
@@ -231,6 +232,53 @@ class ReportTests(unittest.TestCase):
         _ = index.update()
         with closing(index.read_only()) as connection:
             return report.report(connection, day or local_day(STAMP))
+
+    def test_sccache_report_sums_deltas_within_the_date_range_and_server_life(self) -> None:
+        host = store.host_name()
+
+        def reading(at: str, boot: str, start: int, hits: int, misses: int) -> Record:
+            return {"kind": "sccache_sample", "host": host, "at": at, "boot_id": boot,
+                    "server_started_us": start, "rust_hits": hits, "rust_misses": misses}
+
+        self.write(self.root / host / "samples-2026-10.jsonl",
+                   reading("2026-10-02T06:59:00.000Z", "boot-a", 10, 1, 1),
+                   reading("2026-10-02T07:00:00.000Z", "boot-a", 10, 100, 60),
+                   reading("2026-10-02T08:00:00.000Z", "boot-a", 10, 115, 65),
+                   reading("2026-10-02T09:00:00.000Z", "boot-a", 20, 200, 100),
+                   reading("2026-10-02T10:00:00.000Z", "boot-a", 20, 205, 115),
+                   reading("2026-10-02T11:00:00.000Z", "boot-b", 20, 300, 200),
+                   reading("2026-10-02T12:00:00.000Z", "boot-b", 20, 310, 200),
+                   reading("2026-10-02T13:00:00.000Z", "boot-b", 20, 2, 3),
+                   reading("2026-10-03T06:59:00.000Z", "boot-b", 20, 2, 8),
+                   reading("2026-10-03T07:00:00.000Z", "boot-b", 20, 1000, 1000))
+        self.write(self.root / "fixture-remote" / "samples-2026-10.jsonl",
+                   {**reading("2026-10-02T08:00:00.000Z", "boot-a", 10, 0, 0), "host": "fixture-remote"},
+                   {**reading("2026-10-02T09:00:00.000Z", "boot-a", 10, 100, 0), "host": "fixture-remote"})
+        self.write(self.root / host / "samples-0999-01.jsonl",
+                   reading("0999-01-01T12:00:00.000Z", "boot-old", 10, 1, 1),
+                   reading("0999-01-01T13:00:00.000Z", "boot-old", 10, 2, 2))
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(cli.main(["sccache", "2026-10-02", "2026-10-02"]), 0)
+        self.assertEqual(output.getvalue(),
+                         "Rust sccache hit rate (2026-10-02 to 2026-10-02): 54.55% (30 hits, 25 misses)\n")
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(cli.main(["sccache", "2026-10-03", "2026-10-04"]), 0)
+        self.assertEqual(output.getvalue(),
+                         "Rust sccache hit rate (2026-10-03 to 2026-10-04): unavailable (no deltas with requests)\n")
+        with closing(index.read_only()) as connection:
+            self.assertEqual(report.sccache_hit_rate(connection, date(1, 1, 1), date(999, 1, 1)),
+                             "Rust sccache hit rate (0001-01-01 to 0999-01-01): 50.00% (1 hits, 1 misses)")
+
+    def test_sccache_report_rejects_invalid_date_ranges(self) -> None:
+        for dates in (["2026-10-02"], ["2026-10-02", "bad"], ["2026-10-03", "2026-10-02"],
+                      ["1999-12-31", "2000-01-01"]):
+            errors = StringIO()
+            with self.subTest(dates=dates), redirect_stderr(errors), mock.patch.object(index, "update") as update:
+                self.assertEqual(cli.main(["sccache", *dates]), 2)
+            update.assert_not_called()
+            self.assertEqual(errors.getvalue(), "usage: buildlog sccache [YYYY-MM-DD YYYY-MM-DD]\n")
 
     def test_report_uses_one_target_identity_for_all_sections(self) -> None:
         from scripts.buildlog import record
