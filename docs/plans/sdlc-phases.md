@@ -1401,9 +1401,12 @@ The test server joins its request handlers before fixture cleanup and gives each
 2. Any other `--eta` is refused. The error names the forms and says: put the reason in --latest-status.
 3. Old records stay as they are, with no conversion. The reader accepts every stored form it reads now (ranges, ISO times, text, `Not asked`, `Pending`).
 4. The List page gets no change from this phase. unit-board owns the page ETA column.
-5. Add rows to the existing tests in `test_the_list.py`: each accepted form, a refused `about Nov 19`, a refused range, a refused free text, and an old record that still reads.
+5. A producer may write `--evidence` on its own items, under the same check as `--latest-status`, `--next-step`, `--eta`, `--state` and `--next-check`. Other fields stay morty's (nate via morty, List 106).
+6. `--add-evidence "<text>"` adds one line to the end of the evidence text. `--evidence` still replaces the whole text. The same producer check covers both.
+7. `commands/producer/produce.md`: add `--evidence` and `--add-evidence` to the option line "Use `--latest-status`, `--next-step`, `--eta`, `--state`, or `--next-check`." This line ships with the tool, so the doc matches the tool.
+8. Add rows to the existing tests in `test_the_list.py`: each accepted form, a refused `about Nov 19`, a refused range, a refused free text, an old record that still reads, a producer `--evidence` and `--add-evidence` on its own item, and a refused one on another producer's item.
 
-**Files:** `scripts/production/the_list.py`, `scripts/production/test_the_list.py`, `docs/as-built/showrunner-automation.md` (where it lists the ETA forms).
+**Files:** `scripts/production/the_list.py`, `scripts/production/test_the_list.py`, `commands/producer/produce.md`, `docs/as-built/showrunner-automation.md` (where it lists the ETA forms and the producer options).
 
 **Workers:** 1 writer.
 
