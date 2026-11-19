@@ -36,7 +36,6 @@ from scripts.lib import atomic_file, conf, file_lock, process_start
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
-from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
 from scripts.production import change_review, change_routing, delivery_state, investigation, record_store, session_staff, showrunners, staff, the_list
@@ -330,13 +329,15 @@ class ListPageTests(unittest.TestCase):
         config = cls.browser_root / "config"
         config.mkdir()
         _ = (config / "production.conf").write_text("# whole: 20..\nquestion_title_max_chars=100\n")
-        _ = write_config_fixture(config / "review_links.conf",
+        _ = (config / "review_links.conf").write_text(
             "# whole: 1..20\ndelivery_tries=3\n# range: 0..300\ndelivery_pause_seconds=0\n"
             + "# whole: 1..20\nfeedback_rows=5\n# whole: 1..20\nreview_words_rows=4\n"
             + "# whole: 1..1440\nlater_soon_minutes=60\n"
             + "later_evening=18:00\nlater_evening_until=17:00\nlater_morning=09:00\n"
             + "later_week_day=Monday\nlater_week_time=09:00\n"
             + "# range: 5..300\npage_refresh_seconds=15\n# whole: 1..80\nlist_log_max_height_rem=16\n"
+            + "# whole: 1..300\npage_request_timeout_seconds=15\n"
+            + "# whole: 1..5000\ncard_fade_out_ms=450\n# whole: 1..5000\ncard_fade_in_ms=600\n"
             + "# range: 0.5..60\nframe_retry_seconds=2\n"
             + "# range: 0.001..\ntailscale_check_seconds=60\n"
             + "# range: 0.001..\nsnapshot_sweep_seconds=3600\n"
@@ -2242,7 +2243,9 @@ window.fetch=async (url,options)=>{
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_refresh_keeps_the_follow_up_request_and_retries_after_timeout(self) -> None:
-        _ = write_config_fixture(conf.path("review_links"), "page_request_timeout_seconds=4\n")
+        settings = conf.path("review_links")
+        _ = settings.write_text(settings.read_text().replace(
+            "page_request_timeout_seconds=15\n", "page_request_timeout_seconds=4\n"))
         root = self.root / "reviews"
         changed = self.add("Keep the changed row usable")
         counts_only = list_page.render(root, defer_counts=True, review_records={}).decode()
