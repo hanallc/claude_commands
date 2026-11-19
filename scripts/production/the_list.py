@@ -241,6 +241,13 @@ class ListItem:
     def id(self) -> str:
         return f"L{self.number}"
 
+    @property
+    def latest_status_time(self) -> Timestamp:
+        for entry in reversed(self.log):
+            if isinstance(entry.what, FieldChange) and "latest_status" in entry.what.fields:
+                return entry.time
+        return NoTimestamp.UNSET
+
 
 class AllItems(StrEnum):
     INCLUDED = "all items"
@@ -459,7 +466,8 @@ def _log_line(value: str, name: str) -> None:
         raise ListError(f"{name} must have one nonempty line")
 
 
-_SOURCE_CLOCK = re.compile(r"(?:^|(?<=[\s,]))(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?"
+_SOURCE_CLOCK = re.compile(r"(?:^|(?<=[\s,]))(?:\d{4}-\d{2}-\d{2}T)?"
+                           + r"(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:[.,]\d+)?)?"
                            + r"(?: [A-Z]{2,6}|Z| ?[+-]\d{2}(?::?\d{2})?)?$")
 
 
@@ -1666,8 +1674,9 @@ def _format_table(items: Sequence[ListItem], record: staff.StaffSnapshot, *, inc
                  item.next_step, eta_text(item.eta), "●" if isinstance(item.unread_since, datetime) else "—")
         if show_latest_status:
             status = item.latest_status
-            if status and isinstance(item.updated, datetime):
-                status += " · " + list_time(item.updated, today)
+            status_time = item.latest_status_time
+            if status and isinstance(status_time, datetime):
+                status += " · " + list_time(status_time, today)
             cells += (status,)
         lines.append("| " + " | ".join(" ".join(cell.split()).replace("|", "\\|") for cell in cells) + " |")
     return "\n".join(lines)

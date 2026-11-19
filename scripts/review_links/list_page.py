@@ -204,12 +204,12 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
 def item_log_html(item: the_list.ListItem, today: datetime, names: staff_names.StaffNames,
                   unread_answers: frozenset[str]) -> str:
     answers = {question.question_id for question in item.questions if question.answer is not None}
-    sources: dict[str, str] = {}
+    answer_entries: dict[str, the_list.ItemChange] = {}
     rows: list[tuple[datetime, str]] = []
     for index, change in enumerate(item.log):
         content = change.what
         if isinstance(content, the_list.QuestionAnswered) and content.question_id in answers:
-            sources[content.question_id] = change.source
+            answer_entries[content.question_id] = change
         elif not the_list.is_page_request_receipt(change):
             rows.append((change.time, log_entry_html(change, index, today, names)))
     for question in item.questions:
@@ -220,7 +220,11 @@ def item_log_html(item: the_list.ListItem, today: datetime, names: staff_names.S
         asked = datetime.fromisoformat(question.asked_at).astimezone(UTC)
         answered = datetime.fromisoformat(answer.answered_at).astimezone(UTC)
         question_body = "Question " + html.escape(identity) + log_source_html("nate", names)
-        answer_body = "Answer" + log_source_html(sources.get(identity, item.producer), names)
+        entry = answer_entries.get(identity)
+        source = the_list.source_without_clock(entry.source) if entry is not None else item.producer
+        logged_at = entry.time if entry is not None else answered
+        clock = logged_at.astimezone(today.tzinfo).strftime("%H:%M %Z")
+        answer_body = "Answer" + log_source_html(source, names, clock)
         rows.append((asked, log_row(f"{identity}-asked", asked,
                                    question_body + change_browser.question_paragraphs(question.words), today)))
         rows.append((answered, log_row(f"{identity}-answered", answered,
@@ -397,8 +401,9 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[st
     item = entry.item
     if isinstance(visibility, the_list.WaitingForAnswer):
         return waiting_details(entry, today, names, unread_answers, secret)
-    status_time = " · " + time_html(item.updated, today) if item.latest_status and isinstance(item.updated, datetime) else ""
-    sections = (f'<section><h3>{FIELD_LABELS["latest_status"]}{status_time}</h3>'
+    status_time = item.latest_status_time
+    status_stamp = " · " + time_html(status_time, today) if item.latest_status and isinstance(status_time, datetime) else ""
+    sections = (f'<section><h3>{FIELD_LABELS["latest_status"]}{status_stamp}</h3>'
                 + field_html("latest_status", item.latest_status, today, names) + '</section>'
                 + f'<section><h3>{FIELD_LABELS["done_when"]}</h3>'
                 + field_html("done_when", item.done_when, today, names) + '</section>')

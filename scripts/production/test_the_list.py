@@ -454,9 +454,16 @@ class TheListTests(unittest.TestCase):
             self.assertEqual((saved.updated, saved.log[-1].time), (updated, updated))
             self.assertIn("The report is ready. · 13:20 EST", self.command("list", "--latest-status")[1])
 
+        read_at = START + timedelta(hours=11, minutes=5)
+        with (patch.dict(os.environ, {"USER_ZONE": "America/New_York", "CODEX_THREAD_ID": OTHER.current_session}),
+              patch.object(the_list, "now", return_value=read_at)):
+            read = the_list.mark_read(MORTY.id, item.id, source="nate")
+            self.assertEqual(read.updated, read_at)
+            self.assertIn("The report is ready. · 2026-11-16 13:20 EST", self.command("list", "--latest-status")[1])
+
     def test_update_refuses_a_clock_time_at_the_end_of_source(self) -> None:
         item = self.add()
-        for clock in ("13:20", "13:20 EST", "13:20+01:00"):
+        for clock in ("13:20", "13:20 EST", "13:20+01:00", "2026-11-18T23:55:00-05:00"):
             with self.subTest(clock=clock):
                 result, output, error = self.command("update", "--id", item.id, "--state", "Working",
                                                      "--source", "morty: report, " + clock)

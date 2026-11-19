@@ -875,6 +875,14 @@ frame.addEventListener('load',async()=>{
                 body = list_page.render(self.root / "reviews", include_counts=False).decode()
                 self.assertIn(f'<h3>Latest status · <time datetime="{updated.isoformat()}">{expected}</time></h3>', body)
 
+        read_at = NOW + timedelta(hours=11, minutes=5)
+        with (patch.object(the_list, "now", return_value=read_at),
+              patch.object(time, "time", return_value=read_at.timestamp())):
+            read = the_list.mark_read(MORTY.id, item.id, source="nate")
+            self.assertEqual(read.updated, read_at)
+            body = list_page.render(self.root / "reviews", include_counts=False).decode()
+            self.assertIn(f'<h3>Latest status · <time datetime="{updated.isoformat()}">2026-11-16 13:20 EST</time></h3>', body)
+
     def test_log_source_shows_the_recorded_clock_time(self) -> None:
         log = self.legacy_log('- 2026-11-16 18:20:00+00:00 Updated state: "Working" — morty, 09:00 CST')
         self.assertIn("morty, 13:20 EST</small>", without_role_colors(log))
@@ -2539,6 +2547,7 @@ observer.observe(original.parentNode,{childList:true});
         fields = self.fields(item, "question", words="What changed in <List>?")
         asked_at = NOW - timedelta(days=1)
         answered_at = NOW - timedelta(minutes=25)
+        answer_logged_at = answered_at + timedelta(minutes=1)
         asked_time = f'<time datetime="{asked_at.isoformat()}">2026-11-15 13:00 EST</time>'
         answer_time = f'<time datetime="{answered_at.isoformat()}">12:35 EST</time>'
         question_clock = Mock(wraps=datetime)
@@ -2555,7 +2564,7 @@ observer.observe(original.parentNode,{childList:true});
             with patch.object(change_page, "send_question", return_value=question_outcome()):
                 list_page.deliver(delivery)
             with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": MORTY.current_session}),
-                  patch.object(the_list, "now", return_value=answered_at), redirect_stdout(io.StringIO())):
+                  patch.object(the_list, "now", return_value=answer_logged_at), redirect_stdout(io.StringIO())):
                 self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The <filter> changed."]), 0)
         _ = list_page.submit(root, urlencode(fields))
         answered = list_page.render(root).decode().split('<script>', 1)[0]
@@ -2582,7 +2591,7 @@ observer.observe(original.parentNode,{childList:true});
         self.assertNotIn('class="question-unread"', panel)
         log = re.sub(r'<span class="staff-name"[^>]*>(.*?)</span>', r'\1', log)
         question_row = '<li data-log-index="Q1-asked">' + asked_time + '<div>Question Q1 <small>— nate</small>'
-        answer_row = '<li data-log-index="Q1-answered">' + answer_time + '<div>Answer <small>— morty</small>'
+        answer_row = '<li data-log-index="Q1-answered">' + answer_time + '<div>Answer <small>— morty, 12:36 EST</small>'
         self.assertIn(question_row + '<p>What changed in &lt;List&gt;?</p></div></li>', log)
         self.assertIn(answer_row + '<p>The &lt;filter&gt; changed.</p></div></li>', log)
         self.assertLess(log.index(answer_row), log.index(question_row))
