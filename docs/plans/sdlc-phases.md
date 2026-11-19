@@ -1387,6 +1387,31 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
 
+### Phase 84 — The List refuses an ETA that is not one of the agreed forms  · status: todo
+**Depends on:** phase 83
+
+#### Work Order
+
+**Goal:** nate (00:49 EST Nov 19, List 106, via morty and the sdlc showrunner). An ETA is the time when the whole item is done. The producer docs that name the forms ship with phase 83 (336f042c4).
+
+**Spec:**
+1. `the_list.py add` and `update` accept `--eta` only in these forms:
+   - `Mon D` or `Mon D HH:MM ZONE` (for example `Nov 19` or `Nov 19 14:30 EST`). No "about", no "estimate", no text after it. ZONE is the user zone's label from `user_zone.py`. The year is the one that puts the date nearest to today.
+   - `No time yet`, `Waiting for nate`, `Paused`, `Delivered`.
+2. Any other `--eta` is refused. The error names the forms and says: put the reason in --latest-status.
+3. Old records stay as they are, with no conversion. The reader accepts every stored form it reads now (ranges, ISO times, text, `Not asked`, `Pending`).
+4. The List page gets no change from this phase. unit-board owns the page ETA column.
+5. Add rows to the existing tests in `test_the_list.py`: each accepted form, a refused `about Nov 19`, a refused range, a refused free text, and an old record that still reads.
+
+**Files:** `scripts/production/the_list.py`, `scripts/production/test_the_list.py`, `docs/as-built/showrunner-automation.md` (where it lists the ETA forms).
+
+**Workers:** 1 writer.
+
+**Order:** stacked on phase 83 (both change `the_list.py update`).
+
+**Acceptance gate:**
+1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
