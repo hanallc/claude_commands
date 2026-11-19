@@ -1725,6 +1725,19 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertTrue(delivered.wait(TEST_HANG_GUARD_SECS))
                 self.assertEqual(the_list.load(morty.id, item.id), newer)
 
+                park_request = uuid4().hex
+                delayed = new_time + timedelta(hours=2)
+                _ = the_list.park(morty.id, item.id, delayed, source=the_list.PAGE_SOURCE,
+                    notice=the_list.PageItemNotice(park_request, "Park from the List.", "park"))
+                for checked, saved in ((park_request, True), (fresh, False), (uuid4().hex, False)):
+                    with self.subTest(park_request=checked):
+                        query = urlencode({"item-state": item.id, "keeper": morty.id, "park-request": checked})
+                        reply = self.request(list_page.PAGE_PATH + "?" + query)
+                        self.assertEqual(reply.status, 200)
+                        payload = cast(list_page.SavedActionState, json.loads(reply.body))
+                        self.assertEqual(payload["parked"], "true")
+                        self.assertIs(payload.get("park_request_saved"), saved)
+
     def test_list_remove_reports_saved_when_directory_sync_fails_after_replace(self) -> None:
         morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
                                current_session=staff.StaffId("fixture-morty-session"))
@@ -1898,6 +1911,16 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
             self.assertEqual(len(deliveries), 2)
             self.assertEqual([question.question_id for question in the_list.load(morty.id, item.id).questions], ["Q1", "Q2"])
+            closed = the_list.close(morty.id, item.id, "This report is retired.", source="nate")
+            code, body = self.post(list_page.PAGE_PATH, urlencode(fields))
+            self.assertEqual((code, json.loads(body)["state"]), (200, "saved"))
+            self.assertEqual(self.post(list_page.PAGE_PATH, urlencode(
+                {**fields, "request": f"{request}.{uuid4().hex}"}))[0], 400)
+            current = self.request(list_page.PAGE_PATH + "?" + urlencode({"item-state": item.id, "keeper": morty.id}))
+            self.assertEqual(current.status, 200)
+            self.assertEqual(json.loads(current.body)["item_state"], "Closed")
+            self.assertEqual(the_list.load(morty.id, item.id), closed)
+            self.assertEqual(len(deliveries), 2)
 
     def test_list_ask_preserves_unicode_separators(self) -> None:
         morty = staff.StaffRow(staff.StaffId("fixture-morty"), "producer", "morty", staff.StaffRoot(),
