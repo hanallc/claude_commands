@@ -3139,7 +3139,8 @@ Work:
 6. Update the as-built docs for the session root.
 7. After the merge, measure the same p50 in a new session folder.
 
-### Phase 44df — A landing merge test gets more CPU than sibling gates  · status: todo
+### Phase 44df — A landing merge test gets more CPU than sibling gates  · status: superseded by 44dg (not landed)
+**Stopped (bob, 2026-11-19, via builds):** decision B. The cpu controller is off in builds.slice and builds-detached.slice, so no CPUWeight there applies, and turning it on changes every other share. Option A (nixos cpu controller) was rejected. The uncommitted work stays in /session/queue-impl6/landcpu for reference.
 **From builds (item 140, decision (b)), 2026-11-19:** natedev's CPU was full (3,156% of 3,200%) while 15 of 31 tokens were free, so a landing merge test lost CPU, not tokens. The read is phases/44de/review2_reply_1.txt in the run folder.
 
 Work:
@@ -3150,6 +3151,26 @@ Work:
 5. Update the as-built text for gate scopes.
 
 Out of scope: the Hana CI CPU cap (nixos; builds sends it to natedev) and a token priority (dropped).
+
+### Phase 44dg — Other claude_commands tests wait while natemerge merges  · status: todo
+**From builds (item 140, replaces 44df), 2026-11-19.** nate, 13:28 EST: "anytime natemerge needs to run - everyone else needs to wait" and "the tests that were running that i asked to have cancelled should get to go first after natemerge finishes its work". nate approved the rule, 15:22 EST: "yes that rule is fine but it only applies to natedev not to aws". The key name needs nate's go before merge (bob asks).
+
+Rule: while a claude_commands landing test runs or is about to start, the queue starts no other claude_commands test on natedev. Started runs continue. Held runs start in arrival order when the landing ends. A step placed on AWS is not held. Hana Rust steps are not held.
+
+Work:
+1. Runner lease (scripts/production/land_queue.py): `next` writes ~/.local/state/merge-gate/runner.json with the caller's runner pid and start time, and `taking` when it returns an item or `empty` when the line is empty.
+2. Landing signal (scripts/production/land_runs.py): `landing_active()` is on when a live land record exists (running_lands), or when the lease process is alive and its state is `taking`. A dead runner frees the queue at once. A line with items and no live runner does not hold.
+3. Queue (scripts/build_queue/admission_service.py): while the signal is on, the admission walk starts no natedev step whose repository and step are in the key, except the landing's own test (44cy LandingTest). Held waiters keep their places. An AWS placement is not held.
+4. A held waiter's wait reason reads "waits for natemerge's landing" in verify.sh and on the Builds page.
+5. One new key in config/build_admission.conf: `landing_hold_steps=claude_commands:merge-gate claude_commands:targeted-test` (name pending nate's go). Empty turns the rule off.
+6. Update the as-built text (build-memory-admission.md, the land line doc).
+7. After merge, natemerge removes hold_begin, hold_end and hold_off from its runner; the build_hold drain is no longer used for landings.
+
+Tests (each failing first): a landing holds an ordinary claude_commands test; the gap between two items keeps the hold; a dead runner frees it; an AWS placement starts; a Hana step starts; held runs start in arrival order; an empty key turns the rule off.
+
+Risk: a runner that hangs during a land holds all natedev claude_commands tests until it is stopped. That is the rule as given.
+
+Base: 44cy (the landing identity). Cost about 9 worker hours; two writers: land side (items 1-2) and queue side (items 3-6).
 
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
