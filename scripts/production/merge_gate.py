@@ -37,9 +37,8 @@ except FileNotFoundError:
 import argparse
 from collections import deque
 from collections.abc import Callable, Generator, Sequence
-from concurrent.futures import Future
 from contextlib import ExitStack, closing, contextmanager, nullcontext
-from contextvars import Context, ContextVar
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum, auto
@@ -62,7 +61,6 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from typing import Literal, TextIO, cast
 
@@ -77,9 +75,10 @@ from scripts.production.gate_modules import GateRefused, discover_test_modules, 
 from scripts.production.gate_routes import (
     ALL_MODULES as ALL_MODULES, AllModules as AllModules, AssignedModules, CloudGateRoute,
     GateJobKind as GateJobKind, GateJobResult as GateJobResult, GateRun as GateRun,
-    MacGateCancellation, MacGateRoute, ModuleCoverage, SelectedModules as SelectedModules,
+    ModuleCoverage, SelectedModules as SelectedModules,
     SuiteMode as SuiteMode, TreeSelection as TreeSelection,
 )
+from scripts.production import mac_gate_process
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
 )
@@ -2587,40 +2586,6 @@ def combine_gate_runs(first: GateRun, second: GateRun, *, seconds: float) -> Gat
                    time_limit_report=reports)
 
 
-@dataclass(frozen=True)
-class MacGateMiss:
-    """Keep the reason and elapsed time when the Mac returns no result."""
-    reason: str
-    seconds: float
-
-
-@contextmanager
-def start_mac_gate(mac: MacGateRoute, repo: Path, *, mode: SuiteMode, full: bool,
-                   module_time_limit_s: float, selected: TreeSelection) -> Generator[Future[GateRun | MacGateMiss]]:
-    """Keep the Mac cancellation pipe open while the split gate owns it."""
-    outcome: Future[GateRun | MacGateMiss] = Future()
-    reader, writer = os.pipe()
-    read_end = os.fdopen(reader, "rb")
-
-    def run() -> None:
-        try:
-            with read_end:
-                began = time.monotonic()
-                result = mac.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                                   selected=selected, cancellation=MacGateCancellation(read_end.fileno()))
-                observed = MacGateMiss(result, time.monotonic() - began) if isinstance(result, str) else result
-        except BaseException as error:
-            outcome.set_exception(error)
-        else:
-            outcome.set_result(observed)
-
-    with os.fdopen(writer, "wb"):
-        # The Linux caller owns gate recovery. The Mac route uses the cancellation pipe.
-        worker = threading.Thread(target=Context().run, args=(run,), daemon=True, name="mac-gate-route")
-        cancellation.start_masked_thread(worker)
-        yield outcome
-
-
 def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                     module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S, *,
                     source: Literal["tests-only", "checkpoint"] = "tests-only", full: bool = False,
@@ -2669,9 +2634,9 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         local = run_local_subset((), type_dirs)
         return combine_gate_runs(outcome, local, seconds=outcome.seconds + local.seconds)
 
-    mac_module = 'scripts.mac_test.mac_gate'
+    mac_module = mac_gate_process.MAC_GATE_MODULE
     try:
-        mac = cast(MacGateRoute, cast(object, import_module(mac_module)))
+        mac = mac_gate_process.load_mac_gate_route(mac_module)
     except ModuleNotFoundError as error:
         if error.name != mac_module:
             raise
@@ -2690,8 +2655,9 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         if not mac_paths:
             return run_cloud(selected)
         linux_paths = tuple(path for path in assignment.paths if path not in allowed)
-        with start_mac_gate(mac, repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
-                            selected=TreeSelection(mac_paths, assignment.tree)) as mac_result:
+        with mac_gate_process.start_mac_gate(
+                mac_module, repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
+                selected=TreeSelection(mac_paths, assignment.tree)) as mac_result:
             if linux_paths:
                 linux = run_cloud(AssignedModules(linux_paths, assignment.tree))
             elif type_dirs:
@@ -2700,7 +2666,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                 linux = GateRun((), 0.0, 0.0, selection_certified=True)
             outcome = mac_result.result()
 
-        if isinstance(outcome, MacGateMiss):
+        if isinstance(outcome, mac_gate_process.MacGateMiss):
             print("Mac gate uses natedev: " + outcome.reason, flush=True)
             outcome = GateRun((), outcome.seconds, 0.0, coverage=ModuleCoverage.SUBSET)
 
