@@ -1,6 +1,10 @@
 # Gate child exit and memory accounting
 
-Phase 391 design. The line ranges refer to `origin/main` at `673b10fa82d2664b468c2fef814d03522ee0b602`. Builds orders the implementation after phase 388.
+Phase 391 design. The base line ranges refer to `origin/main` at `673b10fa82d2664b468c2fef814d03522ee0b602`. Builds orders the implementation.
+
+1. Wait for bb1 (43w and 383) and 44df to land on main.
+2. Merge main into the phase 388 and phase 355 branches.
+3. Start phase 391 implementation after those merges.
 
 ## Current waits
 
@@ -33,7 +37,7 @@ Other bounded waits start a command once. They cover the memory stop notice (467
 
 `/proc/loadavg` at lines 1075–1076 reads host load. The pass at lines 725–740 reads group membership during recovery. Both reads serve separate purposes.
 
-The AWS paired trial also calls `process_memory_mib` in `scripts/aws_target/gate_box.py:123,308–316`. Retain its existing helper for that caller. The suite scheduler will stop using that helper.
+Keep `process_memory_mib` for the fallback sampler. The AWS paired trial also calls it in `scripts/aws_target/gate_box.py:123,308–316`.
 
 ## Design
 
@@ -47,19 +51,23 @@ The AWS paired trial also calls `process_memory_mib` in `scripts/aws_target/gate
 
 Keep the current idle CPU and hold waits. Recompute the gate deadline after a hold. Run pending work immediately when the scheduler can start it. When a retry is ready and no job runs, start it in the next pass without a wait. A blocked token check keeps the CPU descriptor registered until the gate can take a token.
 
-Shared mode keeps the 250 ms memory deadline while jobs run. It uses that deadline to detect memory growth and admit work. Whole-machine mode has no memory deadline. Neither mode needs a 50 ms liveness timer. Keep the current signal dispositions and cancellation deferral.
+Shared mode keeps the 250 ms memory deadline while jobs run. It uses that deadline to detect memory growth and admit work. Whole-machine mode has no memory deadline. Remove the 50 ms liveness timer when pidfds are available. Keep the current child wait where the platform has no pidfds. Keep the current signal dispositions and cancellation deferral.
 
 ### Read owned cgroups
 
-1. Use a distinct cgroup v2 leaf for each shared-mode test job and type check. Keep the job inside the outer admission and memory limits.
-2. Create the leaf inside a delegated parent. Record its unique path, device, inode, and boot identity. Attach the direct child through `cgroup.procs` before releasing the bootstrap to execute the job.
+Queue phase 44df creates one local gate scope under `builds.slice` with `Delegate=yes`. The scope has no separate memory limit. `builds.slice` sets `MemoryMax=44G` in `development.nix:261`. The slice currently enables `io`, `memory`, and `pids` in `cgroup.subtree_control`. The landing gate scope uses `CPUWeight` from `landing_cpu_weight`.
+
+The queue draft is `gate_scope` in [queue_place.py](/session/queue-impl6/landcpu/scripts/build_queue/queue_place.py:137). The draft starts the keeper in the scope and yields a command that attaches jobs before `exec`. Its attach command currently targets the scope root. Use the final 44df interface to place the keeper and jobs in leaves of the same scope.
+
+1. Move the keeper into a dedicated leaf before enabling the memory controller for child cgroups. Keep all inner nodes free of processes.
+2. Create one leaf per shared-mode test or type job under the same scope. Keep the 44df scope as the only gate scope. Record each leaf's unique path, device, inode, and boot identity. Confirm that the direct child joined the leaf before releasing the bootstrap to execute the job.
 3. Keep the leaf until the final read. Open its counters once and read them at offset zero on each sample. Read `memory.peak` again before removing the leaf.
 4. Use `memory.current` plus `memory.swap.current` for the live charge. Keep the largest sampled live charge and the kernel's `memory.peak` as the job peak.
 5. Compute the gate charge from simultaneous job charges and the gate's own resident and swap reading. Read the supervisor's `statm` and `status` directly.
 
 The final `memory.peak` captures a short peak between samples. The sum of independent job peaks cannot represent concurrent gate memory. Keep the current reservation padding, fallback sizes, and history format. Record successful job peaks in the existing history. Keep the current live-charge limit for stopping a running module. The cgroup charge includes memory such as page cache and kernel allocations, so compare admission and memory stops on the paired runs.
 
-Builds must confirm a delegated parent for each supported shared launch. The existing scope prefix skips jobs when the gate already runs in `builds.slice`. A sibling scope can move a job outside an outer memory limit. Use a delegated child of that limit in this case. Check the memory controller and counters before starting shared work. Report a refusal if the gate cannot obtain an owned leaf. Builds must approve this change to the current scope-probe fallback before implementation. A private gate fixture can supply the cgroup interface without a live systemd manager. Whole-machine mode keeps its existing scope and admission behavior.
+Use the current process-tree sampler when the scope is absent, delegation is unavailable, or a join fails. This includes Mac. Use the same fallback if the gate cannot read the required counters. Continue the job on every fallback path. Switch the rest of the shared run to the current sampler after a scope accounting failure. This keeps each admission snapshot on one memory source. Keep ownership of any leaves that the gate created until cleanup finishes. Whole-machine mode continues without shared admission samples.
 
 ### Keep stop and recovery order
 
@@ -80,7 +88,7 @@ Add both new rows to `test_merge_gate_suites_resources.py`. The current fixtures
 | --- | --- | --- |
 | `merge_gate.py` | 4–17, 118–132, 257–328 | Document the charge. Add launch and job ownership state. Keep the admission clock and reservation arithmetic. |
 | `merge_gate.py` | 652–787, 816–880, 989–1030, 1086–1105, 1137–1165 | Add scope ownership to 383 recovery. Attach and register each child. Wait for exits during stop and read the final peak before cleanup. |
-| `merge_gate.py` | 1501–1533, 1561–1573, 1590–1614, 1629–1692, 1693–1778, 1816–1820 | Prepare shared job cgroups. Replace suite samples and waits. Keep the limit and result order. Label the reported memory source. |
+| `merge_gate.py` | 1501–1533, 1561–1573, 1590–1614, 1629–1692, 1693–1778, 1816–1820 | Use the 44df scope. Select cgroup or fallback readings. Keep the limit and result order. Label the reported memory source. |
 | `test_merge_gate_suites_resources.py` | 15–29, 61–121, 384–399, 477–505, 547–592 | Add the wake and counter rows. Retain the existing scheduler and timeout assertions with private readings. |
 | `merge_gate_test_support.py` | 74–86, 383–419, 432–459, 674–698 | Supply private counter files to both fixture entry points. Keep deterministic job release and the existing scope tests. |
 | `test_merge_gate_suites_admission.py` | 76–105, 420–483, 541–630, 643–711 | Adapt startup observers, peak and swap fixtures, and the sample clock. Retain the admission and reservation assertions. |
@@ -89,6 +97,8 @@ Add both new rows to `test_merge_gate_suites_resources.py`. The current fixtures
 | `test_merge_gate_holds.py` | 125–155, 209–232 | Pass the launch ownership argument through existing observers. Keep the hold and restart assertions. |
 | `test_merge_gate_suites_types.py` | 142–161 | Pass the launch ownership argument through the type job observer. |
 | `test_merge_gate_test_times.py` | 83–105, 218–227, 256–275, 288–317 | Feed private peaks to the record fixtures. Keep exception, hold, and result assertions. |
+
+Confirm the scope interface after 44df lands. The draft attach command at `scripts/build_queue/queue_place.py:114–122` takes the scope root as its target. If the final interface still targets the root, update that command and the keeper setup at draft lines 137–177 to use leaves.
 
 Phase 383's local branch is `natest-gaterecover383`. Commit `5e578970a` changes token recovery near base lines 743–759. Keep its FIFO identity check and device token behavior. Preserve the shared stop order at 989–1030 and ownership publication at 1093–1101. Run its signal and recovery rows after implementation.
 
@@ -99,12 +109,12 @@ Phase 355's `natest-chainmerge` places the implementation in `gate.py`. Apply th
 ## Test rows and CPU estimate
 
 1. Hold a real fixture job on a pipe in whole-machine mode. Advance a controlled clock through multiple 50 ms ticks before the nearest deadline. Count zero scheduler wakes before releasing the job. Then expect one exit wake and one `wait4` result. Count the timed sleep and child checks when running the row against the base.
-2. Open private cgroup counter files with distinct live, swap, and peak readings. Run an admitted job while a second job waits. Assert the live charge drives admission, the module stop reads the live charge, and the final result records the retained peak. Make the process-tree sampler raise if the suite calls it. Exercise a missing counter and a leaf that remains populated during cleanup.
+2. Open private cgroup counter files with distinct live, swap, and peak readings. Run an admitted job while a second job waits. Assert that the live charge controls admission and the module stop. Check that the final result records the retained peak. Assert zero process-tree samples when the scope works. Use subcases for no scope, no delegation, a failed join, and a missing counter. Verify that each subcase runs the job with the current sampler. Exercise a leaf that remains populated during cleanup.
 
 Use private fixture configuration and controlled clocks. Run the rows on the base first after natemerge clears tests. Then check timeout ties, TERM order, late exits, hold restart, retry failure, and 383 recovery with the existing rows. Run basedpyright on the changed files. Repeat the gate modules 20 times with `TMPDIR=/tmp` and a 2 GiB scope. Run the complete natedev gate when authorized.
 
 Phase 385's saved reply attributes 45.3% of its baseline trace CPU to child runners. It reports a 30.495 s to 13.201 s median change for the ledger fixture. The linked detail report was absent at its stated path. The fixture result cannot quantify the production supervisor saving.
 
-Estimate 20 timer wakes per quiet second on the base, compared with zero in whole-machine mode and up to four sample wakes in shared mode. Exit, CPU token, and deadline events can add wakes. With 300 visible PIDs and 16 jobs, each sample replaces at least 300 process reads with at most 50 counter and supervisor reads. The counts are illustrative. Expect lower supervisor CPU if reduced reading and wake work exceed cgroup setup and cleanup cost.
+Estimate 20 timer wakes per quiet second on the base. With pidfds, estimate zero in whole-machine mode and up to four sample wakes in shared mode. Exit, CPU token, and deadline events can add wakes. With 300 visible PIDs and 16 jobs, each cgroup sample replaces at least 300 process reads with at most 50 counter and supervisor reads. The counts are illustrative. The process-tree fallback keeps its current read cost. Expect lower supervisor CPU if reduced reading and wake work exceed cgroup setup and cleanup cost.
 
 Measure the supervisor's user and system CPU separately from child CPU in a paired, full local run. Match the module set, job limit, admission setup, and cache state. Report the absolute CPU change, wake counts, and verdicts. Include scope setup cost in the result. No phase 391 measurement has run.
