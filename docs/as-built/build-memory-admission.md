@@ -269,11 +269,17 @@ For a private checkout, the supervisor asks the copy owner to write the scope an
 The copy owner writes the confirmation line in one pipe write.
 The supervisor reads to the end of the line.
 For a prepared checkout, the supervisor writes the scope while it holds the inherited slot lock.
-Verify moves the descriptor named by the caller to an unused descriptor before it starts its helpers.
-Tool launches that bind no checkout close the checkout handoffs.
+Verify transfers inherited checkout descriptors to a holder before it starts its helpers.
+The holder exits when Verify exits.
+The scope supervisor receives the descriptors through a local socket.
+The private checkout pipes close on exec.
+The shell duplicates those pipes only in the supervisor launch.
+The copy owner keeps the checkout protocol separate from the streams that its commands inherit.
 `VERIFY_SCOPE_PUBLICATION_SECONDS` sets the deadline in `config/direct.conf`.
 The deadline covers scope publication, the source copy request, and lease confirmation.
 The supervisor waits for channel capacity and checks for owner exit before it sends the request.
+The source copy request uses a nonblocking datagram send.
+Verify refuses launch if the channel fills after the readiness check.
 The supervisor divides long waits into intervals that fit the kernel's poll limit.
 The supervisor checks the deadline after its last check that the owners are alive.
 If the deadline expires, Verify refuses to launch Cargo and keeps the reservation.

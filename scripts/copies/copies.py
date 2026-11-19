@@ -30,7 +30,7 @@ import sys
 import tempfile
 from threading import Thread
 import time
-from typing import TYPE_CHECKING, NoReturn, TextIO, cast, override
+from typing import TYPE_CHECKING, BinaryIO, NoReturn, TextIO, cast, override
 from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
@@ -2457,7 +2457,37 @@ def step_owner(source: Path) -> str:
     return source_owner(source)
 
 
-def run_slot_step(source: Path, args: CopyArguments) -> int:
+@dataclass(frozen=True)
+class CheckoutOwnerPipes:
+    request: TextIO
+    reply: BinaryIO
+
+    def publish_path(self, checkout: Path) -> None:
+        _ = self.reply.write(os.fsencode(checkout) + b"\n")
+        self.reply.flush()
+
+
+@contextmanager
+def checkout_owner_pipes() -> Generator[CheckoutOwnerPipes]:
+    """Keep the checkout protocol out of the owner's command streams."""
+    _ = sys.stdout.flush()
+    with (os.fdopen(os.dup(0), "r") as request, os.fdopen(os.dup(1), "wb") as reply,
+          open(os.devnull, "r+b") as command_stream):
+        try:
+            _ = os.dup2(command_stream.fileno(), 0)
+            _ = os.dup2(command_stream.fileno(), 1)
+            yield CheckoutOwnerPipes(request, reply)
+        finally:
+            _ = sys.stdout.flush()
+            _ = os.dup2(request.fileno(), 0)
+            _ = os.dup2(reply.fileno(), 1)
+
+
+class SlotLaunch(Enum):
+    DIRECT = auto()
+
+
+def run_slot_step(source: Path, args: CopyArguments, launch: CheckoutOwnerPipes | SlotLaunch) -> int:
     """Try the slot once and pass its lease to the command tree."""
     command = command_tail(args.command)
     if not command or not args.tree or not args.capacity_file:
@@ -2486,17 +2516,17 @@ def run_slot_step(source: Path, args: CopyArguments) -> int:
                     print(f"copies: publish: {error}", file=sys.stderr)
             target = checkout / os.environ.get("CARGO_TARGET_DIR", "target")
             before = publication_candidates(checkout, target, command, paths)
-            if args.bind_scope:
-                launch = ["env", *(f"{key}={value}" for key, value in slot.slot_environment.items()), *command]
-                print(checkout, len(launch), sep="\n", flush=True)
-                _ = sys.stdout.buffer.write(b"\0".join(map(os.fsencode, launch)) + b"\0")
-                _ = sys.stdout.buffer.flush()
-                request = sys.stdin.readline()
+            if isinstance(launch, CheckoutOwnerPipes):
+                words = ["env", *(f"{key}={value}" for key, value in slot.slot_environment.items()), *command]
+                _ = launch.reply.write(os.fsencode(f"{checkout}\n{len(words)}\n"))
+                _ = launch.reply.write(b"\0".join(map(os.fsencode, words)) + b"\0")
+                launch.reply.flush()
+                request = launch.request.readline()
                 if request and request != "publish\n":
                     bind_copy_scope(checkout, build_folders.build_folder_lock_fd(checkout), request,
                                     build_folders.CheckoutLeaseKind.READY_SLOT)
-                    _ = os.write(sys.stdout.fileno(), b"bound\n")
-                    request = sys.stdin.readline()
+                    _ = os.write(launch.reply.fileno(), b"bound\n")
+                    request = launch.request.readline()
                 if request == "publish\n":
                     capture_step_files(output, paths, before)
                 return 0
@@ -2683,12 +2713,18 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "hold":
             source = Path(args.repo or "").expanduser().resolve()
             if not args.scratch:
-                return run_slot_step(source, args)
-            with requested_source(source, StagedSource(args.tree), NO_MERGE) as checkout:
-                if command := command_tail(args.command):
+                if args.bind_scope:
+                    with checkout_owner_pipes() as pipes:
+                        return run_slot_step(source, args, pipes)
+                return run_slot_step(source, args, SlotLaunch.DIRECT)
+            command = command_tail(args.command)
+            streams = nullcontext(SlotLaunch.DIRECT) if command else checkout_owner_pipes()
+            with streams as launch, requested_source(source, StagedSource(args.tree), NO_MERGE) as checkout:
+                if isinstance(launch, CheckoutOwnerPipes):
+                    launch.publish_path(checkout)
+                    _ = launch.request.read(1)
+                else:
                     return subprocess.run(command, cwd=checkout).returncode
-                print(checkout, flush=True)
-                _ = sys.stdin.read(1)
             return 0
         if args.action == "wait-slot":
             source = Path(args.repo or "").expanduser().resolve()

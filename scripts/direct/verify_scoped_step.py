@@ -22,6 +22,7 @@ except FileNotFoundError:
     pass
 
 from scripts.build_queue.admission_records import process_start_time
+from scripts.direct.verify_checkout_handoff import CheckoutHandoff, receive_checkout_handoffs, send_checkout_descriptors
 from scripts.lib import build_folders, conf, inotify
 
 
@@ -53,24 +54,38 @@ class SourceCopyLeaseChannel:
 CheckoutScopeLease = InheritedSlotLease | CheckoutOwnerChannel | SourceCopyLeaseChannel
 
 
-def checkout_scope_leases() -> tuple[CheckoutScopeLease, ...]:
+def checkout_scope_leases(owners: select.poll, deadline: float, cleanup: ExitStack) -> tuple[CheckoutScopeLease, ...]:
     """Collect each copy lease that the command can use."""
     leases: list[CheckoutScopeLease] = []
-    source_channel = os.environ.pop("COPIES_RUN_BIND_FD", "")
+    address = os.environ.pop("VERIFY_CHECKOUT_CHANNEL", "")
+    handoffs: dict[CheckoutHandoff, int] = {}
+    if address:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as channel:
+            channel.setblocking(False)
+            channel.connect("\0" + address)
+            descriptor = channel.fileno()
+            owners.register(descriptor, select.POLLIN)
+            try:
+                wait_for_checkout_channel(owners, descriptor, deadline, "the checkout descriptor holder did not reply")
+                handoffs = receive_checkout_handoffs(channel, cleanup)
+            finally:
+                owners.unregister(descriptor)
     if os.environ.get("COPIES_RUN_PID") and os.environ.get("COPIES_STEP_SOURCE"):
-        if not source_channel:
+        if CheckoutHandoff.SOURCE_CHANNEL not in handoffs:
             raise ValueError("the source copy has no scope binding channel")
-        leases.append(SourceCopyLeaseChannel(int(os.environ["COPIES_RUN_PID"]), int(source_channel)))
+        leases.append(SourceCopyLeaseChannel(int(os.environ["COPIES_RUN_PID"]), handoffs[CheckoutHandoff.SOURCE_CHANNEL]))
 
     owner_pid = os.environ.pop("VERIFY_CHECKOUT_OWNER", "")
-    lock_fd = os.environ.pop("BUILDLOG_PREPARED_COPY_LOCK_FD", "")
     request_fd = os.environ.pop("DOC_COPY_LEASE_FD", "")
     reply_fd = os.environ.pop("DOC_COPY_REPLY_FD", "")
     if owner_pid:
         if request_fd:
             leases.append(CheckoutOwnerChannel(int(owner_pid), int(request_fd), int(reply_fd)))
         else:
-            leases.append(InheritedSlotLease(Path(os.environ["BUILDLOG_PREPARED_COPY"]), int(owner_pid), int(lock_fd)))
+            if CheckoutHandoff.PREPARED_LOCK not in handoffs:
+                raise ValueError("the prepared checkout has no inherited lease")
+            leases.append(InheritedSlotLease(Path(os.environ["BUILDLOG_PREPARED_COPY"]), int(owner_pid),
+                                             handoffs[CheckoutHandoff.PREPARED_LOCK]))
     return tuple(leases)
 
 
@@ -237,8 +252,10 @@ def bind_source_copy_scope(checkout: SourceCopyLeaseChannel, request: bytes,
             try:
                 wait_for_checkout_channel(
                     owners, descriptor, deadline, "the source copy channel did not accept the checkout scope")
-                # Keep the shared socket flags and keep this send within the deadline.
-                _ = socket.send_fds(channel, [request], [writer.fileno()], flags=socket.MSG_DONTWAIT)
+                try:
+                    send_checkout_descriptors(channel, request, [writer.fileno()])
+                except BlockingIOError as error:
+                    raise ValueError("the source copy channel filled before the checkout scope was sent") from error
             finally:
                 owners.unregister(descriptor)
         writer.close()
@@ -287,16 +304,17 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
             owners.register(open_pidfd(leader, cleanup), select.POLLIN)
             if owners.poll(0):
                 raise ValueError("a scope owner exited before launch")
-            leases = checkout_scope_leases()
             watch = None
             deadline = 0.0
+            if os.environ.get("VERIFY_CHECKOUT_CHANNEL") or os.environ.get("VERIFY_CHECKOUT_OWNER"):
+                seconds = conf.read_or_repository("direct").number("VERIFY_SCOPE_PUBLICATION_SECONDS")
+                deadline = time.monotonic() + seconds
+            leases = checkout_scope_leases(owners, deadline, cleanup)
             lease_owners = {lease.lease_owner for lease in leases} - {caller, leader, supervisor}
             lease_owner_fds = tuple(open_pidfd(owner, cleanup) for owner in lease_owners)
             if leases:
                 for descriptor in lease_owner_fds:
                     owners.register(descriptor, select.POLLIN)
-                seconds = conf.read_or_repository("direct").number("VERIFY_SCOPE_PUBLICATION_SECONDS")
-                deadline = time.monotonic() + seconds
                 watch = inotify.open_watch()
                 _ = cleanup.callback(os.close, watch)
                 _ = inotify.add_watch(watch, sidecar.parent, inotify.IN_CLOSE_WRITE | inotify.IN_MOVED_TO

@@ -12,8 +12,6 @@
 # invoke_clippy_fix applies fixes; fmt_cargo formats them before invoke_clippy
 # judges the result. Worker verdict keys include this policy file.
 
-[[ -n "${LINT_INVOKE_SOURCED:-}" ]] && return 0
-
 # Only the scope supervisor receives checkout handoffs.
 close_checkout_handoffs() {
     local handoff descriptor
@@ -30,6 +28,9 @@ run_without_checkout_handoffs() (
     close_checkout_handoffs
     "$@"
 )
+
+[[ "${1:-}" == --checkout-handoffs ]] && return 0
+[[ -n "${LINT_INVOKE_SOURCED:-}" ]] && return 0
 
 BUILD_FOLDERS_SCRIPT="$(cd -- "${BASH_SOURCE[0]%/*}/../lib" && pwd)/build_folders.py"
 if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then

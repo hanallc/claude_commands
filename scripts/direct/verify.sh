@@ -220,6 +220,30 @@
 
 set -euo pipefail
 
+# The source copy owner keeps the lock and accepts scope requests.
+if [[ "${COPIES_RUN_LOCK_FD:-}" =~ ^[0-9]+$ ]]; then
+    exec {COPIES_RUN_LOCK_FD}>&-
+    unset COPIES_RUN_LOCK_FD
+fi
+if [[ "${OSTYPE:-}" == linux* && -n "${COPIES_RUN_BIND_FD:-}${BUILDLOG_PREPARED_COPY_LOCK_FD:-}" ]]; then
+    checkout_scripts=${BASH_SOURCE[0]%/*}
+    [[ "$checkout_scripts" != "${BASH_SOURCE[0]}" ]] || checkout_scripts=.
+    source "$checkout_scripts/../lint/invoke.sh" --checkout-handoffs
+    checkout_python="$(run_without_checkout_handoffs "$checkout_scripts/../lib/py" -S -c 'import sys; print(sys.executable)')"
+    coproc VERIFY_CHECKOUT {
+        exec "$checkout_python" "$checkout_scripts/verify_checkout_handoff.py" "$$"
+    }
+    checkout_reply=${VERIFY_CHECKOUT[0]:-}
+    checkout_input=${VERIFY_CHECKOUT[1]:-}
+    close_checkout_handoffs
+    if [[ -z "$checkout_reply" ]] || ! IFS= read -r VERIFY_CHECKOUT_CHANNEL <&"$checkout_reply"; then
+        printf '%s\n' 'verify.sh: cannot start the checkout descriptor holder' >&2
+        exit 2
+    fi
+    exec {checkout_reply}<&- {checkout_input}>&-
+fi
+export -n VERIFY_CHECKOUT_CHANNEL
+
 usage() {
     sed -n '/^# Usage:$/,/^# End usage\./{
         /^# End usage\./d
@@ -541,28 +565,10 @@ elif [[ -z "${IN_NIX_SHELL:-}" ]]; then
     [[ "$VERIFY_NIX_SCRIPT_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_NIX_SCRIPT_DIR=.
     VERIFY_NIX_SCRIPT_DIR="$(cd -- "$VERIFY_NIX_SCRIPT_DIR" && pwd -P)"
     export VERIFY_NIX_ENV_REEXEC=1
-    exec "$PY" -S "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/nix_env.py" \
+    VERIFY_CHECKOUT_CHANNEL="${VERIFY_CHECKOUT_CHANNEL:-}" exec "$PY" -S "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/nix_env.py" \
         exec "$VERIFY_NIX_SCRIPT_DIR/${BASH_SOURCE[0]##*/}" "$@"
 fi
 unset VERIFY_NIX_ENV_REEXEC
-
-# The source copy owner binds the scope through its request channel.
-if [[ "${COPIES_RUN_LOCK_FD:-}" =~ ^[0-9]+$ ]]; then
-    exec {COPIES_RUN_LOCK_FD}>&-
-    unset COPIES_RUN_LOCK_FD
-fi
-
-# Move the caller's checkout lock before Verify starts its helpers.
-if [[ -n "${BUILDLOG_PREPARED_COPY_LOCK_FD:-}" ]]; then
-    if [[ ! "$BUILDLOG_PREPARED_COPY_LOCK_FD" =~ ^[0-9]+$ ]]; then
-        unset BUILDLOG_PREPARED_COPY_LOCK_FD
-    elif ! { exec {BUILDLOG_PREPARED_COPY_LOCK_FD}>&"$BUILDLOG_PREPARED_COPY_LOCK_FD"-; } 2>/dev/null; then
-        exec {BUILDLOG_PREPARED_COPY_LOCK_FD}>&- || true
-        unset BUILDLOG_PREPARED_COPY_LOCK_FD
-    else
-        export BUILDLOG_PREPARED_COPY_LOCK_FD
-    fi
-fi
 
 BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$BUILD_OVERRIDE_GUARD_DIR" != "${BASH_SOURCE[0]}" ]] || BUILD_OVERRIDE_GUARD_DIR=.
@@ -2038,9 +2044,9 @@ from scripts.mac_test.offload import trusted_linux_source
 
 trust = copies.SshSourceTrust(trusted_caller=trusted_linux_source, trusted_root=nix_env.trusted_root,
                              registered_worktree=nix_env.registered_worktree)
-with copies.remote_step_source(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4]), trust) as checkout:
-    print(checkout, flush=True)
-    sys.stdin.read(1)
+with copies.checkout_owner_pipes() as pipes, copies.remote_step_source(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4]), trust) as checkout:
+    pipes.publish_path(checkout)
+    pipes.request.read(1)
 '
     if [[ -n "$ssh_caller" ]]; then
         VERIFY_PY_HELPER=SSH_SOURCE_PY step_checkout "$PY" -c "$ssh_source_py" "$STEP_COPIES_SCRIPT" "$top" "$tree" "$ssh_caller" || return 2
@@ -2896,10 +2902,9 @@ run_placed_scope() {
         checkout_owner=$DOC_COPY_OWNER_PID
     elif [[ -n "${BUILDLOG_PREPARED_COPY:-}" &&
             "$BUILDLOG_PREPARED_COPY" == "${DOC_REPO_TOP:-${VERIFY_REPO_ROOT:-}}" ]]; then
-        local checkout_fd=${BUILDLOG_PREPARED_COPY_LOCK_FD:-}
         checkout_owner=${BUILDLOG_RUN:-}
         checkout_owner=${checkout_owner%%:*}
-        if [[ ! "$checkout_fd" =~ ^[0-9]+$ || ! -e "/dev/fd/$checkout_fd" || ! "$checkout_owner" =~ ^[1-9][0-9]*$ ]]; then
+        if [[ -z "${VERIFY_CHECKOUT_CHANNEL:-}" || ! "$checkout_owner" =~ ^[1-9][0-9]*$ ]]; then
             printf 'the prepared checkout has no inherited lease\n' > "$PLACEMENT_SCOPE_STATE"
             return 125
         fi
@@ -2916,7 +2921,7 @@ run_placed_scope() {
                 {DOC_COPY_REPLY_FD}<"/dev/fd/$DOC_COPY_REPLY_FD" || exit 125
             export DOC_COPY_LEASE_FD DOC_COPY_REPLY_FD
         fi
-        export VERIFY_CHECKOUT_OWNER="$checkout_owner"
+        export VERIFY_CHECKOUT_OWNER="$checkout_owner" VERIFY_CHECKOUT_CHANNEL="${VERIFY_CHECKOUT_CHANNEL:-}"
         exec "$PY" "$VERIFY_START_DIR/verify_scoped_step.py" "$$" "$leader" "$PLACEMENT_SCOPE_STATE" \
             "$peak" "$BUILDLOG_SCOPE_SH" "$@"
     ) > "$output" 2>&1 &
