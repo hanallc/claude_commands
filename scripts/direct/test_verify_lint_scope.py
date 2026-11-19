@@ -238,6 +238,17 @@ class VerifyBatchTests(support.VerifyLintScopeFixture):
         self.assertIn("verify.sh batch lint workspace green cached=no", result.stdout)
         self.assertTrue(any((self.root / "session" / "verify_cache").rglob("*")))
 
+    def test_batch_accepts_an_untracked_repository_without_a_commit(self) -> None:
+        module = self.root / "unborn"
+        self.run_git("init", "--quiet", str(module))
+        exclude = self.root / ".git/info/exclude"
+        with exclude.open("a", encoding="utf-8") as rules:
+            _ = rules.write("!/unborn/\n")
+
+        result = self.batch(lint_scope="workspace")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("verify.sh batch result green", result.stdout)
+
     def test_batch_rejects_a_lint_edit_in_a_dirty_submodule(self) -> None:
         module = self.root / "nested"
         module.mkdir()

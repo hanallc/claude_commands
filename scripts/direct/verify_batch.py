@@ -88,7 +88,7 @@ class BatchCommands:
 
     def tree_key(self, repo: Path) -> str:
         result = self.invoke([sys.executable, str(Path(treekey.__file__).resolve()), str(repo),
-                              "--exclude-session-dirs"], {},
+                              "--exclude-session-dirs", "--tracked-submodules"], {},
                              lifetime=CommandLifetime.GROUP, stdout=subprocess.PIPE)
         return result.stdout.decode("ascii").strip() if result.returncode == 0 else ""
 

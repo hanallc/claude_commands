@@ -128,8 +128,9 @@ def committed_tree_key(tree_id: bytes) -> str:
     return hashlib.sha256(tree_id + b"\n").hexdigest()
 
 
-def tree_key(directory: str, *, exclude_session_dirs: bool = False) -> str | None:
-    return _tree_key(directory, submodule=False, exclude_session_dirs=exclude_session_dirs)
+def tree_key(directory: str, *, exclude_session_dirs: bool = False,
+             gitlinks: GitlinkScope = GitlinkScope.ALL_CHECKOUTS) -> str | None:
+    return _tree_key(directory, submodule=False, exclude_session_dirs=exclude_session_dirs, gitlinks=gitlinks)
 
 
 def _tree_key(directory: str, *, submodule: bool, exclude_session_dirs: bool = False,
@@ -185,7 +186,9 @@ def worktree(directory: str) -> str | None:
 
 
 if __name__ == "__main__":
-    key = tree_key(sys.argv[1], exclude_session_dirs="--exclude-session-dirs" in sys.argv[2:])
+    options = sys.argv[2:]
+    gitlinks = GitlinkScope.TRACKED_SUBMODULES if "--tracked-submodules" in options else GitlinkScope.ALL_CHECKOUTS
+    key = tree_key(sys.argv[1], exclude_session_dirs="--exclude-session-dirs" in options, gitlinks=gitlinks)
     if key is None:
         raise SystemExit(1)
     print(key)
