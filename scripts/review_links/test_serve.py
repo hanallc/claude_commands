@@ -258,6 +258,44 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertIn(b'data-page-owner="review"', review.body)
         self.assertEqual(review.body.count(b'<dialog id="review-new-item"'), 1)
 
+    def test_list_owner_control_and_sends_use_the_configured_producer(self) -> None:
+        case = self.review_fixture()
+        default = case.ready_submission_recipient()
+        morty = fixture_member("producer", name="morty")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\nowner.default={default.id}\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        listing = self.request(list_page.PAGE_PATH)
+        self.assertEqual(listing.status, 200)
+        self.assertIn(b'data-page-owner="list"', listing.body)
+        owner_control = listing.body.partition(b'data-page-owner="list">')[2].partition(b"</div>")[0]
+        self.assertRegex(owner_control, rb'data-color-text="role.producer"[^>]*>morty</span>')
+        self.assertIn(b'aria-label="New item for morty"', listing.body)
+        self.assertEqual(listing.body.count(b'<dialog id="review-new-item"'), 1)
+        options = self.new_item_http(query="?page=list")
+        self.assertEqual(options.status, 200)
+        fields = cast(dict[str, object], json.loads(options.body))
+        self.assertEqual(fields["recipients"], [{"id": morty.id, "name": "morty", "proposal": False}])
+
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(change_page, "send_message") as send):
+            cases = (
+                (new_item_dialog.SubmissionKind.QUESTION, review_items.ReviewType.QUESTION),
+                (new_item_dialog.SubmissionKind.INVESTIGATION, review_items.ReviewType.INVESTIGATION),
+                (new_item_dialog.SubmissionKind.BUG, review_items.ReviewType.BUG),
+            )
+            for kind, review_type in cases:
+                with self.subTest(kind=kind):
+                    send.reset_mock()
+                    request = replace(case.submission_request(kind, morty.id), page="list",
+                                      request_id="r2-" + uuid4().hex)
+                    response = self.new_item_http(self.new_item_body(request), finished=True)
+                    self.assertEqual(response.status, 200, response.body)
+                    saved = cast(dict[str, str], json.loads(response.body))
+                    item = cache.get().records[saved["key"]]
+                    self.assertEqual((item.owner, item.type), (morty.id, review_type))
+                    send.assert_called_once_with(f"session:{morty.current_session}", change_page.SENDER, ANY)
+
     def test_f014_standard_new_replays_the_item_filed_for_the_new_page_owner(self) -> None:
         case = self.review_fixture()
         owner = case.ready_submission_recipient()
