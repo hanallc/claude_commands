@@ -243,13 +243,11 @@ def card_entry(item: ReviewItem, members: staff.StaffSnapshot, names: staff_name
         hiddenUntil=item.times.later.timestamp()*1000 if isinstance(item.times.later, datetime) else 0,
         sourceName=source, urgency=item.urgency.level, ownerHtml=names.html(item.owner, owner),
         sourceHtml=names.html(item.source_unit, source))
-    if item.state == ReviewState.VALIDATING and isinstance(item.source, review_items.ChangeSource):
-        requested = item.times.updated
-        if root is not None:
-            path = change_routing.delivery_path(root, item.source.path, item.source.row['#'])
-            requested = change_page.handoff_time(path, requested)
-        requested = requested.astimezone(user_zone())
-        entry['handoff'] = (requested.isoformat(), requested.strftime('%b %d %H:%M %Z'))
+    if root is not None and item.state == ReviewState.VALIDATING and isinstance(item.source, review_items.ChangeSource):
+        path = change_routing.delivery_path(root, item.source.path, item.source.row['#'])
+        if (requested := change_page.handoff_time(path)) is not None:
+            requested = requested.astimezone(user_zone())
+            entry['handoff'] = (requested.isoformat(), requested.strftime('%b %d %H:%M %Z'))
     if (item.state == ReviewState.WAITING and item.waiting_why
             and isinstance(review_items.submission_origin(item), new_item_dialog.ReviewSubmission)):
         entry['waitingWhy'] = item.waiting_why
@@ -1057,7 +1055,7 @@ const view=createRecordTable({content:()=>content,single:true,
   const key=data.key,entry=index.get(key),departure=saved.get(key);
   if(!entry || pendingSaves.get(key)?.departing) return false;
   const reopened=departure?.closes && view.linkedItem===key && view.opened.has(key);
-  return (!departure || entry.handoff || reopened) && matches(entry,filters);
+  return (!departure || entry.state==='Validating' && entry.type==='change' || reopened) && matches(entry,filters);
  },
  sortValues:data=>{
   const entry=index.get(data.key);
