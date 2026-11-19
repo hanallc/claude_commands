@@ -524,20 +524,8 @@ def read_git_settings(repo: Path, *options: str) -> GitSettings:
     return settings
 
 
-def origin_url(source: Path, *, settings: GitSettings | UseConfiguredValue = UseConfiguredValue.CURRENT) -> str | None:
+def origin_url(source: Path) -> str | None:
     """Read the origin URL when the repository has one."""
-    if isinstance(settings, dict) and (urls := settings.get("remote.origin.url")):
-        url = urls[0]
-        length = -1
-        replacement = ""
-        for key, aliases in settings.items():
-            if key.startswith("url.") and key.endswith(".insteadof"):
-                for alias in aliases:
-                    if len(alias) > length and url.startswith(alias):
-                        length = len(alias)
-                        replacement = key.removeprefix("url.").removesuffix(".insteadof")
-        return (replacement + url[max(length, 0):]).strip()
-    # Git can also read an origin from its older remotes and branches files.
     try:
         return git(source, "remote", "get-url", "origin").decode().strip()
     except GitExit as error:
@@ -549,11 +537,11 @@ def origin_url(source: Path, *, settings: GitSettings | UseConfiguredValue = Use
 
 
 
-def repository_name(source: Path, *, settings: GitSettings | UseConfiguredValue = UseConfiguredValue.CURRENT) -> str:
+def repository_name(source: Path) -> str:
     """Follow local origins to the repository's upstream identity."""
     seen: set[Path] = set()
     while True:
-        origin = origin_url(source, settings=settings)
+        origin = origin_url(source)
         if (origin is not None and not origin.startswith("file://")
                 and not Path(resolved_remote_url(source, origin)).is_absolute()):
             return origin.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1].removesuffix(".git")
@@ -565,7 +553,6 @@ def repository_name(source: Path, *, settings: GitSettings | UseConfiguredValue 
             return checkout.name
         source = (Path(unquote(urlsplit(origin).path)) if origin.startswith("file://")
                   else Path(resolved_remote_url(checkout, origin)))
-        settings = UseConfiguredValue.CURRENT
 
 
 def main_checkout(source: Path) -> Path:
@@ -613,9 +600,9 @@ def claim_tree(tree: Path, *, create: bool, inherited_fds: list[int] | None = No
         yield ClaimState.ACQUIRED if idle and same else ClaimState.BUSY if same else ClaimState.REPLACED
 
 
-def source_origin(source: Path, *, settings: GitSettings | UseConfiguredValue = UseConfiguredValue.CURRENT) -> tuple[str, str]:
+def source_origin(source: Path) -> tuple[str, str]:
     """Return the upstream URL and the source refs that represent it."""
-    origin = origin_url(source, settings=settings)
+    origin = origin_url(source)
     if origin is not None:
         return origin, "refs/remotes/origin"
     return str(source), "refs/heads"
@@ -628,11 +615,9 @@ def resolved_remote_url(repo: Path, url: str) -> str:
     return str((repo / Path(url).expanduser()).resolve())
 
 
-def refresh_remotes(tree: Path, source: Path, *,
-                    source_settings: GitSettings | UseConfiguredValue = UseConfiguredValue.CURRENT,
-                    new_checkout: bool = False) -> None:
+def refresh_remotes(tree: Path, source: Path, *, new_checkout: bool = False) -> None:
     """Keep upstream refs and saved local branches in separate remotes."""
-    url, refs = source_origin(source, settings=source_settings)
+    url, refs = source_origin(source)
     settings = read_git_settings(tree, "--local")
 
     def references(repo: Path, *prefixes: str) -> dict[str, str]:
@@ -666,8 +651,7 @@ def refresh_remotes(tree: Path, source: Path, *,
         _ = git(tree, "fetch", "-q", "--prune", "--", str(source), *mappings)
 
 
-def initialize_git(tree: Path, source: Path, *,
-                   source_settings: GitSettings | UseConfiguredValue = UseConfiguredValue.CURRENT) -> None:
+def initialize_git(tree: Path, source: Path) -> None:
     """Create private Git metadata while the caller holds the busy mark."""
     new_checkout = not (tree / ".git").exists()
     if new_checkout:
@@ -693,7 +677,7 @@ def initialize_git(tree: Path, source: Path, *,
             _ = git(tree, "ls-files", "--stage")
         except CopyError:
             index.unlink(missing_ok=True)
-    refresh_remotes(tree, source, source_settings=source_settings, new_checkout=new_checkout)
+    refresh_remotes(tree, source, new_checkout=new_checkout)
     exclude = tree / ".git/info/exclude"
     text = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
     entries = [entry for entry in (f"/{scratch.BUSY}", "/target")
@@ -836,14 +820,13 @@ class MergeEnvrcProof(Enum):
 
 
 def merge_changes(tree: Path, source: Path, revision: str, *,
-                  committed_base: str | MergeEnvrcProof = MergeEnvrcProof.NOT_REQUIRED,
-                  source_settings: GitSettings | UseConfiguredValue = UseConfiguredValue.CURRENT,
+                  committed_base: str | MergeEnvrcProof = MergeEnvrcProof.NOT_REQUIRED
                   ) -> MergedEnvrcReference | EnvrcReference:
     try:
         before = commit_at(tree, "HEAD") if isinstance(committed_base, str) else ""
         if revision.startswith("origin/"):
             branch = revision.removeprefix("origin/")
-            origin, _ = source_origin(source, settings=source_settings)
+            origin, _ = source_origin(source)
             origin = resolved_remote_url(source, origin)
             _ = git(source, "check-ref-format", f"refs/heads/{branch}")
             _ = git(tree, "fetch", "-q", "--refmap=", "--", origin, f"refs/heads/{branch}")
@@ -897,8 +880,7 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
     owner = checked_owner(owner)
     if path is None:
         _check_workspace_name(name)
-    source_settings = read_git_settings(source)
-    identity = repository_name(source, settings=source_settings)
+    identity = repository_name(source)
     tree = copy_record.copies_root() / f"{identity}-{owner}" / name if path is None else path.resolve()
     legacy = copy_record.copy_folder(tree) != tree
     if legacy and not tree.is_dir():
@@ -949,7 +931,7 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
                     if not isinstance(record, copy_record.NotRegistered):
                         raise CopyError(f"{tree}: unreadable legacy workspace")
                     origin = git(tree, "remote", "get-url", "origin").decode().strip()
-                    upstream, _ = source_origin(source, settings=source_settings)
+                    upstream, _ = source_origin(source)
                     resolved_origin = resolved_remote_url(tree, origin)
                     if resolved_origin not in (resolved_remote_url(source, upstream), str(source)):
                         raise CopyError(f"{tree}: legacy workspace source differs")
@@ -976,10 +958,11 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
                         register(str(record.fields["copy_commit"]))
                     else:
                         scratch.renew(tree)
-                    refresh_remotes(tree, source, source_settings=source_settings)
+                    refresh_remotes(tree, source)
                 else:
-                    initialize_git(tree, source, source_settings=source_settings)
+                    initialize_git(tree, source)
                     _ = git(tree, "checkout", "-q", "-B", branch, base)
+                    source_settings = read_git_settings(source)
                     for key in ("user.name", "user.email"):
                         values = source_settings.get(key)
                         value = values[-1] if values else os.fsdecode(git(source, "config", key))
@@ -1098,7 +1081,7 @@ def end_workspaces(task: str, paths: list[Path], *,
         _ = scratch.release(tree)
 
 
-def slot_source(source: Path, *, settings: GitSettings | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Path:
+def slot_source(source: Path) -> Path:
     """Follow registered source copies to the repository that retains slot objects."""
     seen: set[Path] = set()
     while source not in seen:
@@ -1113,19 +1096,17 @@ def slot_source(source: Path, *, settings: GitSettings | UseConfiguredValue = Us
                 return active.source
         record = scratch.task_of(source)
         if not isinstance(record, copy_record.Registered):
-            origin = origin_url(source, settings=settings)
+            origin = origin_url(source)
             if origin is not None:
                 local = Path(resolved_remote_url(source, origin))
                 if (local / ".git").exists():
                     source = local.resolve()
-                    settings = UseConfiguredValue.CURRENT
                     continue
             return main_checkout(source)
         original = record.fields.get("source_path")
         if not isinstance(original, str) or not Path(original).exists():
             return main_checkout(source)
         source = Path(original).resolve()
-        settings = UseConfiguredValue.CURRENT
     raise CopyError(f"{source}: local origins form a cycle")
 
 
@@ -1173,17 +1154,14 @@ class SnapshotOrigin:
     envrc: EnvrcReference | MergedEnvrcReference
 
 
-def prepare_requested_source(tree: Path, source: Path, policy: SourcePolicy, merge: MergePolicy, *,
-                             source_settings: GitSettings | UseConfiguredValue = UseConfiguredValue.CURRENT) -> SnapshotOrigin:
+def prepare_requested_source(tree: Path, source: Path, policy: SourcePolicy, merge: MergePolicy) -> SnapshotOrigin:
     """Check out the requested files without changing the source refs."""
-    if isinstance(source_settings, UseConfiguredValue):
-        source_settings = read_git_settings(source)
-    initialize_git(tree, source, source_settings=source_settings)
-    origin = origin_url(source, settings=source_settings)
+    initialize_git(tree, source)
+    origin = origin_url(source)
     if origin is None:
         _ = git(tree, "remote", "remove", "origin")
-    elif (resolved := resolved_remote_url(source, origin)) != origin:
-        _ = git(tree, "config", "--replace-all", "remote.origin.url", resolved)
+    else:
+        _ = git(tree, "remote", "set-url", "origin", resolved_remote_url(source, origin))
     base = source_commit(source, policy)
     _ = git(tree, "fetch", "-q", "--", str(source), base)
     _ = git(tree, "checkout", "--quiet", "--detach", base)
@@ -1195,10 +1173,9 @@ def prepare_requested_source(tree: Path, source: Path, policy: SourcePolicy, mer
             envrc = apply_changes(tree, worktree, base)
     if isinstance(merge, MergeRevision):
         if envrc is EnvrcReference.CALLER_ANCHOR:
-            envrc = merge_changes(tree, source, merge.revision, committed_base=committed_base,
-                                  source_settings=source_settings)
+            envrc = merge_changes(tree, source, merge.revision, committed_base=committed_base)
         else:
-            _ = merge_changes(tree, source, merge.revision, source_settings=source_settings)
+            _ = merge_changes(tree, source, merge.revision)
     return SnapshotOrigin(CloneSourceCommit(str(source.resolve()), committed_base), envrc)
 
 
@@ -1269,11 +1246,10 @@ def requested_source(source: Path, policy: SourcePolicy, merge: MergePolicy) -> 
     with build_folders.tool_folder("copies-source") as folder:
         tree = folder / "source"
         tree.mkdir()
-        source_settings = read_git_settings(source)
-        origin = prepare_requested_source(tree, source, policy, merge, source_settings=source_settings)
+        origin = prepare_requested_source(tree, source, policy, merge)
         write_snapshot_origin(tree, origin, policy)
         token = ADMISSION_SOURCE_COPIES.set((*ADMISSION_SOURCE_COPIES.get(),
-            AdmissionSourceCopy(tree, slot_source(source, settings=source_settings))))
+            AdmissionSourceCopy(tree, slot_source(source))))
         try:
             yield tree
         finally:
@@ -2441,8 +2417,9 @@ def run_slot_step(source: Path, args: CopyArguments) -> int:
     command = command_tail(args.command)
     if not command or not args.tree or not args.capacity_file:
         raise CopyError("a slot step needs a tree, capacity file and command")
-    revisions = git(source, "rev-parse", "--revs-only", "--end-of-options",
-                    "HEAD^{commit}", "HEAD^{tree}").decode().splitlines()
+    # Print the tree from the same commit object that supplies the commit ID.
+    revisions = git(source, "log", "-1", "--format=%H%n%T", "--no-show-signature", "--no-notes",
+                    "--no-decorate", "--no-color", "HEAD", "--").decode().splitlines()
     if len(revisions) != 2:
         raise CopyError(f"{source}: cannot read the HEAD commit and tree")
     head, head_tree = revisions

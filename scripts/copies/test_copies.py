@@ -176,6 +176,7 @@ class StandingTests(unittest.TestCase):
     @contextmanager
     def queue_service(self) -> Generator[AdmissionFixture]:
         original = dict(os.environ)
+        _ = write_config_fixture(Path(original["CONF_DIR"]) / "build_admission.conf", "wait_reply_seconds=60\n")
         with AdmissionFixture() as fixture:
             fixture.clock.epoch = time.time()
             with mock.patch.dict(os.environ, {**original, "ADMISSION_SOCKET": str(fixture.socket_path)}), fixture.serving():
@@ -299,6 +300,35 @@ class StandingTests(unittest.TestCase):
             with copies.command_tree(self.owner_id, self.source, copies.CommittedSource(self.head), command) as tree:
                 self.assertTrue(tree.is_dir())
         resolve.assert_not_called()
+
+    def test_slot_uses_the_requested_tree_if_head_moves_after_lookup(self) -> None:
+        incoming = self.incoming()
+        requested_tree = self.git(self.source, "rev-parse", f"{incoming}^{{tree}}")
+        real_git = copies.git
+
+        def advance_head() -> None:
+            _ = self.git(self.source, "update-ref", "HEAD", incoming, self.head)
+
+        def git(repo: Path, *arguments: str, data: bytes | None = None) -> bytes:
+            if repo == self.source and arguments[-2:] == ("HEAD^{commit}", "HEAD^{tree}"):
+                # Move HEAD between Git's two revision arguments.
+                result = real_git(repo, *arguments[:-1], data=data)
+                advance_head()
+                return result + real_git(repo, *arguments[:-2], "HEAD^{tree}")
+            result = real_git(repo, *arguments, data=data)
+            if repo == self.source and arguments[:1] == ("log",):
+                advance_head()
+            return result
+
+        output = self.base / "slot-tree"
+        args = copies.CopyArguments()
+        args.tree = requested_tree
+        args.capacity_file = str(self.base / "capacity")
+        args.command = ["sh", "-eu", "-c", 'git rev-parse HEAD^{tree} > "$1"', "slot-command", str(output)]
+        with mock.patch.object(copies, "git", side_effect=git):
+            self.assertEqual(copies.run_slot_step(self.source, args), 0)
+        self.assertEqual(self.git(self.source, "rev-parse", "HEAD"), incoming)
+        self.assertEqual(output.read_text().strip(), requested_tree)
 
     def test_expired_slot_wait_stops_the_cli_before_it_starts_the_command(self) -> None:
         _ = write_config_fixture(self.base / "config/build_folders.conf",
@@ -1759,10 +1789,9 @@ with patch.object(subprocess, 'run', pause_clone):
         _ = self.git(self.source, "remote", "set-url", "--add", "origin", "ssh://backup.invalid/project.git")
         _ = self.git(self.source, "config", "url.ssh://fallback.invalid/.insteadOf", "work:")
         _ = self.git(self.source, "config", "url.ssh://preferred.invalid/team/.insteadOf", "work:team/")
-        settings = copies.read_git_settings(self.source)
         resolved = self.git(self.source, "remote", "get-url", "origin")
         self.assertEqual(resolved, "ssh://preferred.invalid/team/project.git")
-        self.assertEqual(copies.origin_url(self.source, settings=settings), resolved)
+        self.assertEqual(copies.origin_url(self.source), resolved)
 
     def test_repository_without_origin_uses_main_checkout_name(self) -> None:
         _ = self.git(self.source, "remote", "remove", "origin")
@@ -1953,6 +1982,21 @@ with patch.object(subprocess, 'run', pause_clone):
                     _ = (resumed / "tracked.txt").write_text("finished workspace edit\n")
                 with copies.workspace(self.owner_id, self.source, self.head, name=boundary, branch="worker") as resumed:
                     self.assertEqual((resumed / "tracked.txt").read_text(), "finished workspace edit\n")
+
+    def test_workspace_reads_identity_after_the_checkout(self) -> None:
+        real_git = copies.git
+
+        def git(repo: Path, *arguments: str, data: bytes | None = None) -> bytes:
+            result = real_git(repo, *arguments, data=data)
+            if arguments[:1] == ("checkout",):
+                _ = self.git(self.source, "config", "user.name", "Checkout Hook")
+                _ = self.git(self.source, "config", "user.email", "hook@example.invalid")
+            return result
+
+        with mock.patch.object(copies, "git", side_effect=git):
+            with copies.workspace(self.owner_id, self.source, self.head, name="identity", branch="worker") as tree:
+                self.assertEqual(self.git(tree, "config", "user.name"), "Checkout Hook")
+                self.assertEqual(self.git(tree, "config", "user.email"), "hook@example.invalid")
 
     def test_legacy_workspace_keeps_commits_index_and_journal_and_ends_through_holds(self) -> None:
         tree = self.base / "old-run/worker"
