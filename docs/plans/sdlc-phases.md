@@ -1420,13 +1420,14 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 #### Work Order
 
-**Goal:** the sdlc showrunner (06:30 EST Nov 19; phases-unit owns send.py). verify-unit sent two messages to builds at 06:27 and 06:28. Copy 1 printed `FAILED: SendMessage used a different target or payload`. Copy 2 printed `FAILED: 2 SendMessage calls; delivery unconfirmed`. builds got both. The resend rule then made copies, and the repeat guard held copy 3 as a flood.
+**Goal:** the sdlc showrunner (06:30 EST Nov 19; phases-unit owns send.py). verify-unit sent two messages to builds at 06:27 and 06:28. Copy 1 printed `FAILED: SendMessage used a different target or payload`. Copy 2 printed `FAILED: 2 SendMessage calls; delivery unconfirmed`. The resend rule then made copies, and the repeat guard held copy 3 as a flood.
 
 **Spec:**
-1. The proxy forward record is the proof of delivery. In `read_relay` (send.py), when the proxy completed one forward and its payload is the message text, the result is SENT. A relay tool-call count, target or payload that does not match is a note on the SENT line, not a failure.
-2. Keep FAILED or queued for each case where the proxy forwarded nothing, was refused, or was interrupted. Keep "delivery unconfirmed" only where the proxy state cannot show whether the bytes went.
-3. A forward whose payload is not the message text stays FAILED.
-4. Add rows to the existing relay tests in `test_send.py`: a different target or payload in the tool call with a matching forward prints SENT; two SendMessage calls with one matching forward prints SENT; no forward stays queued or FAILED; an interrupted forward stays unconfirmed.
+1. The blind review traced both sends. The 06:27 copy was not delivered: no proxy write, one receipt in builds. Its FAILED was correct. The 06:28 copy made two SendMessage calls; the proxy refused the first and wrote the second, which returned success. Only that FAILED was false.
+2. `read_relay` (send.py) selects the SendMessage call by the proxy forward's tool ID, not by a count of one. The other calls become a note on the SENT line.
+3. SENT still needs a completed proxy forward of the approved text and one success result for the forwarded tool ID. A completed `sendall()` alone does not prove the recipient read the message.
+4. A refusal result, a missing result, a timeout or a socket error after the write keep their old results (not SENT).
+5. Add rows to the existing relay tests in `test_send.py`: the 06:28 shape prints SENT; a refusal after the write and a timeout after the write stay not SENT; the no-forward and interrupted rows stay as controls.
 
 **Files:** `scripts/message/send.py`, `scripts/message/test_send.py`, `docs/as-built/` where it states the relay result rules.
 
