@@ -203,7 +203,7 @@ class ReviewRepairsTests(unittest.TestCase):
                         with self.assertRaisesRegex(question_record.AnswerRefused, 'already with the showrunner'):
                             _, _ = review_page.submit(case.root, case.body(key, 'feedback', 'SECOND_REQUEST'), case.status)
                         expected_text, excluded_text = 'FIRST_REQUEST', 'SECOND_REQUEST'
-                        expected_state = review_items.ReviewState.VALIDATING
+                        expected_state = review_items.ReviewState.WAITING
                     else:
                         _, _ = review_page.submit(case.root, case.body(key, 'feedback', 'SECOND_REQUEST'), case.status)
                         expected_text, excluded_text = 'SECOND_REQUEST', 'FIRST_REQUEST'

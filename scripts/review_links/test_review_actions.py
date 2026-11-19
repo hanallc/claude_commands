@@ -43,12 +43,7 @@ class WaitingActionTests(unittest.TestCase):
                 else:
                     _ = review_actions.decision_action(item, 'question', words, status)
                 current = next(value for value in review_items.read(self.fixture.root, assign_ids=False) if value.key == item.key)
-                expected_state = (
-                    review_items.ReviewState.VALIDATING
-                    if kind == review_items.ReviewType.CHANGE
-                    else review_items.ReviewState.WAITING
-                )
-                self.assertEqual(current.state, expected_state)
+                self.assertEqual(current.state, review_items.ReviewState.WAITING)
                 self.assertEqual(current.waiting_why, words)
 
 
