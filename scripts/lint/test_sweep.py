@@ -1049,6 +1049,21 @@ class ProcessUseTests(SweepCase):
                      argv=("/nix/store/x-cargo-nextest/bin/cargo-nextest", "nextest", "run"))
         self.assertEqual(self.uses(), {str(self.hana): f"runs cargo-nextest in {self.workspace / 'crates' / 'app'}"})
 
+        python_project = self.base / "python"
+        python_project.mkdir()
+        cargo_home = self.base / "cargo-home"
+        cargo_home.mkdir()
+        _ = (cargo_home / "config.toml").write_text('[build]\nbuild-dir = "{workspace-root}/target"\n')
+        environ_with_template = (f"CARGO_HOME={cargo_home}",)
+        broken_workspace = self.base / "broken"
+        broken_workspace.mkdir()
+        _ = (broken_workspace / "Cargo.toml").write_text("[workspace\n")
+        unreadable_workspace = self.base / "unreadable"
+        unreadable_workspace.mkdir()
+        (unreadable_workspace / "Cargo.toml").symlink_to(unreadable_workspace / "missing")
+        fifo_cwd = self.workspace / "fifo"
+        fifo_cwd.mkdir()
+
         cases = (
             (("bash", "/x/verify.sh", "build", "hana"), self.workspace / "crates" / "app", (), (self.hana,)),
             (("/x/verify.sh", "build", "hana"), self.workspace, (), (self.hana,)),
@@ -1059,12 +1074,26 @@ class ProcessUseTests(SweepCase):
             (("bash", "/x/other.sh"), self.workspace, (), ()),
             (("bash", "/x/verify.sh", "build"), self.workspace, (f"CARGO_TARGET_DIR={self.other}",), (self.other,)),
             (("bash", "/x/verify.sh", "build"), self.other.parent, (), (self.other,)),
+            (("bash", "/x/verify.sh", "build"), python_project, environ_with_template, ()),
+            (("bash", "/x/verify.sh", "build", "--manifest-path", "missing/Cargo.toml"),
+             python_project, environ_with_template, (self.hana, self.other)),
+            (("bash", "/x/verify.sh", "build"), broken_workspace, environ_with_template, (self.hana, self.other)),
+            (("bash", "/x/verify.sh", "build"), unreadable_workspace, environ_with_template, (self.hana, self.other)),
+            (("cargo-nextest", "nextest", "run"), python_project, environ_with_template, (self.hana, self.other)),
+            (("cargo-nextest", "nextest", "run"), python_project, (f"CARGO_TARGET_DIR={self.other}",), (self.other,)),
+            (("bash", "/x/verify.sh", "build"), fifo_cwd, environ_with_template, (self.hana,)),
         )
         for argv, cwd, environ, targets in cases:
             with self.subTest(argv=argv, cwd=cwd, environ=environ):
+                if cwd == fifo_cwd:
+                    if not hasattr(os, "mkfifo"):
+                        self.skipTest("A FIFO requires os.mkfifo")
+                    _ = (self.workspace / "Cargo.toml").write_text("[workspace]\n")
+                    os.mkfifo(cwd / "Cargo.toml")
                 shutil.rmtree(self.proc)
                 fake_process(self.proc, 10, cwd=str(cwd), argv=argv, environ=environ)
-                self.assertEqual(self.uses(), {str(target): f"runs verify.sh in {cwd}" for target in targets})
+                runner = "cargo-nextest" if argv[0] == "cargo-nextest" else "verify.sh"
+                self.assertEqual(self.uses(), {str(target): f"runs {runner} in {cwd}" for target in targets})
 
     def test_a_nextest_run_uses_the_target_its_flag_or_environment_names(self) -> None:
         for argv, environ in ((("cargo", "nextest", "run", "--target-dir", str(self.other)), ()),
