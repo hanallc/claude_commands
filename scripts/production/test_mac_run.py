@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import traceback
 import unittest
 from collections.abc import Callable
 from contextlib import suppress
@@ -122,6 +123,7 @@ import sys
 with socket.socket(socket.AF_UNIX) as connection:
     connection.settimeout(__HANG_GUARD__)
     connection.connect(os.environ["MAC_RUN_COPIES_SOCKET"])
+    socket.send_fds(connection, [b"-"], [sys.stdin.fileno()])
     with connection.makefile("rw", encoding="utf-8") as stream:
         stream.write(json.dumps({"arguments": sys.argv[1:], "cwd": os.getcwd(),
                                  "environment": dict(os.environ)}) + "\n")
@@ -138,16 +140,22 @@ def serve_copies_commands(listener: socket.socket) -> int:
     with listener:
         while True:
             connection = listener.accept()[0]
-            with connection, connection.makefile("r", encoding="utf-8") as stream:
-                line = stream.readline()
-                if not line:
+            with connection, suppress(BrokenPipeError, ConnectionResetError):
+                descriptors = socket.recv_fds(connection, 1, 1)[1]
+                if not descriptors:
                     continue
-                invocation = cast(CopiesInvocation, json.loads(line))
-                arguments = invocation["arguments"]
-                result = invoke_cli(copies, lambda: copies.main(arguments), arguments,
-                                    invocation["environment"], Path(invocation["cwd"]))
-                reply = json.dumps([result.returncode, result.stdout, result.stderr]) + "\n"
-                with suppress(BrokenPipeError, ConnectionResetError):
+                with os.fdopen(descriptors[0], encoding="utf-8", errors="surrogateescape") as stdin:
+                    with connection.makefile("r", encoding="utf-8") as stream:
+                        try:
+                            invocation = cast(CopiesInvocation, json.loads(stream.readline()))
+                            arguments = invocation["arguments"]
+                            with mock.patch.object(sys, "stdin", stdin):
+                                result = invoke_cli(copies, lambda: copies.main(arguments), arguments,
+                                                    invocation["environment"], Path(invocation["cwd"]))
+                            response = (result.returncode, result.stdout, result.stderr)
+                        except Exception:
+                            response = (1, "", traceback.format_exc())
+                    reply = json.dumps(response) + "\n"
                     connection.sendall(reply.encode("utf-8"))
 
 
@@ -159,11 +167,20 @@ run_real_copies() {
     local request=${remote%'; echo mac_exit=$?'}
     local -a words
     words=("${(@Q)${(z)request}}")
+    local interpreter=${words[1]}
+    if [[ $interpreter == '~/.claude/scripts/lib/py' ]]; then
+        interpreter=$MAC_RUN_TEST_SCRIPTS/lib/py
+    fi
+    if [[ ! -x $interpreter ]]; then
+        print -u2 -- "command not found: ${words[1]}"
+        print -r -- mac_exit=127
+        exit 0
+    fi
     case ${words[2]} in
         '~/.claude/scripts/copies/copies.py'|'~/.claude/scripts/lib/scratch.py') ;;
         *) exit 99 ;;
     esac
-    MAC_RUN_COPIES_SOCKET= "$MAC_RUN_TEST_SCRIPTS/lib/py" \
+    MAC_RUN_COPIES_SOCKET= PYTHONPYCACHEPREFIX=$MAC_RUN_REMOTE_BYTECODE "$interpreter" \
         "$MAC_RUN_TEST_SCRIPTS/${words[2]#\~/.claude/scripts/}" "${words[@]:2}"
     print -r -- "mac_exit=$?"
     exit 0
@@ -488,6 +505,8 @@ class MacRunTests(unittest.TestCase):
             "MAC_RUN_PYTHON": sys.executable,
             "MAC_RUN_COPIES_SOCKET": "" if boundary else str(self.copies_socket),
             "MAC_RUN_COPIES_CLIENT": str(self.copies_client),
+            "MAC_RUN_TEST_SCRIPTS": str(SCRIPTS),
+            "MAC_RUN_REMOTE_BYTECODE": str(self.root / "mac-bytecode"),
             "MAC_RUN_CHECKOUT": str(self.home / "scratch" / "gate-mac-run-private" / "checkout"),
             "HANA_TEST_PURPOSE": "Mac launch coordination",
             "TMPDIR": str(self.temp_directory),
@@ -971,6 +990,33 @@ cleanup_mac_run
             return [cast(dict[str, object], json.loads(copies.remote_record_path(mirror).read_text()))
                     for mirror in copies.remote_mirrors()]
 
+    def test_registry_worker_serves_the_next_command_after_an_exception(self) -> None:
+        command = [str(SCRIPTS / "lib/py"), str(SCRIPTS / "copies/copies.py"), "register-remote",
+                   "--repository", "hana", "--owner", "verify", "--session", "fixture", "--host", "localhost"]
+        bad = subprocess.run([*command, "--path", os.fsdecode(b"/fixture-\xff")], cwd=self.root,
+                             env=self.environment, capture_output=True, text=True, check=False,
+                             timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(bad.returncode, 1, bad.stdout + bad.stderr)
+        self.assertIn("UnicodeEncodeError", bad.stderr)
+
+        good = subprocess.run([*command, "--path", "/fixture"], cwd=self.root, env=self.environment,
+                              capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(good.returncode, 0, good.stdout + good.stderr)
+        record, = self.clone_registry_records(self.environment["COPIES_CONFIG"])
+        self.assertEqual(record["path"], "/fixture")
+
+    def test_missing_remote_interpreter_returns_127(self) -> None:
+        program = shell_functions(SCRIPT, "on_mac") + '\nhost=mac\non_mac "$1"\n'
+        command = shlex.quote(str(self.home / "missing-python"))
+        command += " ~/.claude/scripts/copies/copies.py unregister-remote --host localhost --path /fixture"
+        result = subprocess.run(
+            ["zsh", "-f", "-c", program, "missing-interpreter", command],
+            cwd=self.root, env={**self.environment, "MAC_RUN_REAL_COPIES": "1"},
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 127, result.stdout + result.stderr)
+        self.assertIn("missing-python", result.stderr)
+
     def assert_clone_records_after_cleanup(self, cleanup_status: int, *,
                                            prepare_cleanup: Callable[[Path], None] = lambda _: None) -> None:
         self.write_production_config(mac_run_source=str(self.clone_source))
@@ -981,7 +1027,6 @@ cleanup_mac_run
             "MAC_RUN_SHA": self.clone_head, "MAC_RUN_REAL_COPIES": "1", "MAC_RUN_REAL_PATH": os.environ["PATH"],
             "MAC_RUN_REMOTE_COPIES_CONFIG": str(remote_config),
             "MAC_RUN_REMOTE_CLAIMS": str(self.root / "remote-claims"),
-            "MAC_RUN_TEST_SCRIPTS": str(SCRIPTS),
             "GIT_CONFIG_GLOBAL": str(self.clone_git_config), "GIT_CONFIG_NOSYSTEM": "1",
         })
         process = self.start_mac_run(extra={"MAC_RUN_HOLD_BUILD": "1", "MAC_RUN_CLEANUP_STATUS": str(cleanup_status)})
