@@ -19,6 +19,9 @@ class RawStartTests(unittest.TestCase):
             ("/venv/bin/py.test", "tests"),
             ("python3", "/venv/bin/pytest", "tests"),
             ("./test_x.py",),
+            ("scripts/agents/test_agent_exec.sh",),
+            ("/work tree/test_x.sh", "case"),
+            ("./memory_page_proof.mjs",),
             ("/bin/bash", "-e", "test_x.sh"),
             ("bash", "-O", "extglob", "--", "test_x.sh"),
             ("bash", "/repo/scripts/lib/py", "-m", "unittest"),
@@ -50,6 +53,7 @@ class RawStartTests(unittest.TestCase):
             ("node", "--eval", "console.log(1)", "memory_page_proof.mjs"),
             ("node", "helper.mjs", "memory_page_proof.mjs"),
             ("grep", "test_"),
+            ("grep", "scripts/agents/test_agent_exec.sh"),
         )
         for argv in commands:
             with self.subTest(argv=argv):

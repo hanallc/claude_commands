@@ -284,7 +284,9 @@ class BuildHoldGuardTest(TemporaryGuardTest):
         self.holders.mkdir()
         for command in ("python3 -m unittest x", "python3 -m unittest.__main__ x", "pytest",
                         ["bash", "test_x.sh"], "node --require setup.cjs memory_page_proof.mjs",
-                        "python3 -m unit\\\ntest x", "node memory_page_proof.mjs"):
+                        "python3 -m unit\\\ntest x", "node memory_page_proof.mjs",
+                        "scripts/agents/test_agent_exec.sh", ["./test_x.sh", "case"],
+                        '"/work tree/test_x.sh"', "./test_x.py", "./memory_page_proof.mjs"):
             with self.subTest(command=command):
                 payload = json.dumps({"tool_name": "Bash", "cwd": str(self.root),
                                       "tool_input": {"command": command}})
@@ -375,6 +377,29 @@ exit "$GUARD_STATUS"
         for command in ("grep test_ notes.md", "grep proof notes.md", "python3 aggregate.py"):
             with self.subTest(command=command):
                 self.assert_no_python(json.dumps({"tool_name": "Bash", "tool_input": {"command": command}}))
+
+    def test_description_does_not_start_python(self) -> None:
+        self.hold()
+        for key in ("command", "cmd"):
+            for indent in (None, 2):
+                with self.subTest(key=key, indent=indent):
+                    raw = json.dumps({"tool_name": "Bash", "tool_input": {
+                        "description": "Read python test_results and cargo status", key: "pwd",
+                    }}, indent=indent)
+                    self.assert_no_python(raw)
+
+    def test_ambiguous_command_fields_send_the_full_payload_to_python(self) -> None:
+        for tool_input in (
+            {"command": 'printf "%s" ready; scripts/agents/test_agent_exec.sh'},
+            {"command": ["scripts/agents/test_agent_exec.sh"]},
+            {"command": "", "cmd": "scripts/agents/test_agent_exec.sh"},
+        ):
+            with self.subTest(tool_input=tool_input):
+                raw = json.dumps({"tool_name": "Bash", "tool_input": tool_input})
+                done = self.run_front(raw)
+                self.assertEqual((done.returncode, done.stdout, done.stderr), (0, "", ""))
+                self.assertEqual(self.stdin_copy.read_text(), raw)
+        self.assertEqual(self.calls.read_text().splitlines(), ["called"] * 3)
 
     def test_same_stdin_output_and_status_are_relayed(self) -> None:
         self.hold()
