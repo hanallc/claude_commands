@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import conf
+from scripts.agents import worker_lifecycle
 from scripts.aws_target import hana_result
 from scripts.message import session_send
 from scripts.aws_target.config import (
@@ -698,6 +699,10 @@ class ObservationRejected(ValueError):
 
 class LedgerUnavailable(ValueError):
     """Evidence cannot establish a safe spending decision."""
+
+
+class LedgerLockTimeout(LedgerUnavailable):
+    """The ledger lock stayed busy until the deadline."""
 
 
 def mapping(value: object) -> dict[str, object]:
@@ -1704,10 +1709,16 @@ class CostLedger:
             state.hana_attempts.append(charge)
 
     @contextmanager
-    def _locked(self) -> Generator[LedgerEvidence]:
+    def _locked(self, *, lock_deadline: float = inf) -> Generator[LedgerEvidence]:
         self.directory.mkdir(parents=True, exist_ok=True)
         with (self.directory / "cost-ledger.lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            if lock_deadline == inf:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            else:
+                try:
+                    worker_lifecycle.acquire_flock(lock, deadline=lock_deadline)
+                except worker_lifecycle.OperationDeadlineExpired as error:
+                    raise LedgerLockTimeout("UNRESOLVED: the cost ledger lock deadline passed") from error
             try:
                 state = self._read() if self.path.exists() else LedgerEvidence()
                 yield state
@@ -1873,9 +1884,9 @@ class CostLedger:
             reason = 'monthly_limit'
         return reason
 
-    def gate_region(self, attempt: str, region: str) -> None:
+    def gate_region(self, attempt: str, region: str, *, lock_deadline: float = inf) -> None:
         """Retain the region before AWS can accept a launch."""
-        with self._locked() as state:
+        with self._locked(lock_deadline=lock_deadline) as state:
             state.gate_reservations = [replace(row, region=region) if row.attempt == attempt else row
                                        for row in state.gate_reservations]
             self._save(state)
@@ -1894,9 +1905,10 @@ class CostLedger:
             state.gate_quota_refusals.append(GateQuotaRefusal(pool, state.live_gate_vcpus(now).get(pool, 0), int(now)))
             self._save(state)
 
-    def resolve_gate(self, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated, *, instance_type: str = '') -> None:
+    def resolve_gate(self, attempt: str, outcome: GateRunning | GateAbsent | GateTerminated, *,
+                     instance_type: str = '', lock_deadline: float = inf) -> None:
         """Preserve confirmed termination against every later outcome."""
-        with self._locked() as state:
+        with self._locked(lock_deadline=lock_deadline) as state:
             if any(row.attempt == attempt and isinstance(row.state, GateTerminated) for row in state.gate_reservations):
                 return
             now = int(time.time()) if isinstance(outcome, GateRunning) else outcome.at

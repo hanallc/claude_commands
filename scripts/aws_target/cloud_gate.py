@@ -274,6 +274,7 @@ def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker)
     deadline = worker.clock() + settings().number('termination_timeout_s')
     boxes: list[GateTermination] = []
     uncertain: list[UncertainGateLaunch] = []
+    absent: list[str] = []
     for item in attempts:
         reservation, launch = item.reservation, item.launch
         if isinstance(reservation.state, (ledger.GateAbsent, ledger.GateTerminated)):
@@ -290,7 +291,7 @@ def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker)
                 uncertain.append(UncertainGateLaunch(reservation.attempt, (region,),
                     'Name=client-token,Values=' + token, reservation.expires))
             elif item.launch_record_checked:
-                worker.book.resolve_gate(reservation.attempt, ledger.GateAbsent(int(worker.clock())))
+                absent.append(reservation.attempt)
             else:
                 regions = (reservation.region,) if reservation.region else tuple(settings().words('regions'))
                 uncertain.append(UncertainGateLaunch(reservation.attempt, regions,
@@ -311,21 +312,27 @@ def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker)
                 instances = [row for group in ledger.rows(reply, 'Reservations') for row in ledger.rows(group, 'Instances')]
                 if instances:
                     discovered = [GateTermination(launch.attempt, ledger.text(row, 'InstanceId'), region) for row in instances]
-                    try:
-                        worker.book.gate_region(launch.attempt, region)
-                    finally:
-                        boxes.extend(worker.request_terminations(discovered, deadline))
+                    boxes.extend(worker.request_terminations(discovered, deadline))
+                    worker.book.gate_region(launch.attempt, region, lock_deadline=worker.cleanup_lock_deadline(deadline))
                     found = True
                     break
             if not found:
                 if worker.clock() < launch.expires:
                     complete = False
                 else:
-                    worker.book.resolve_gate(launch.attempt, ledger.GateAbsent(int(worker.clock())))
+                    absent.append(launch.attempt)
         except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
             print('gate cleanup: ' + str(error), file=sys.stderr)
             complete = False
-    return worker.confirm_terminations(boxes, deadline) and complete
+    complete = worker.confirm_terminations(boxes, deadline) and complete
+    for attempt in absent:
+        try:
+            worker.book.resolve_gate(attempt, ledger.GateAbsent(int(worker.clock())),
+                                     lock_deadline=worker.cleanup_lock_deadline(deadline))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            print('gate cleanup: ' + str(error), file=sys.stderr)
+            complete = False
+    return complete
 
 
 @dataclass
@@ -354,7 +361,9 @@ def cloud_reservation(repo: Path, sidecar: Path, work: gate.SuiteMode | StepJob,
         return replace(request, place=wire.CloudPlace('aws', group), identity=replace(request.identity, job=job))
     with ExitStack() as held_slot:
         try:
-            held = held_slot.enter_context(queue_place.held_reservation(queue_place.RefreshedRequest(refresh)))
+            stop_seconds = conf.read('build_admission').number('program_stop_seconds')
+            held = held_slot.enter_context(queue_place.held_reservation(
+                queue_place.RefreshedRequest(refresh), stop_seconds=stop_seconds))
         except queue_place.QueuePlaceRefused as error:
             raise GateRefused(str(error)) from error
         reservation = CloudReservation(sidecar)
@@ -455,7 +464,12 @@ class GateWorker:
         else:
             raise AwsUnavailable('Termination is unconfirmed; the expiry function still owns cleanup')
         ended_at = int(self.clock()) if isinstance(result_seen_at, _ResultNotReceived) else result_seen_at
-        self.book.resolve_gate(attempt, ledger.GateTerminated(ended_at, instance))
+        self.book.resolve_gate(attempt, ledger.GateTerminated(ended_at, instance),
+                               lock_deadline=self.cleanup_lock_deadline(deadline))
+
+    def cleanup_lock_deadline(self, deadline: float) -> float:
+        """Convert the remaining cleanup time to a monotonic lock deadline."""
+        return time.monotonic() + (deadline - self.clock())
 
     def termination_call(self, region: str, operation: str, instances: Sequence[str], deadline: float) -> dict[str, object]:
         remaining = deadline - self.clock()
@@ -484,12 +498,14 @@ class GateWorker:
             print('paired cleanup: ' + str(error), file=sys.stderr)
         return set()
 
-    def record_ends(self, boxes: Sequence[GateTermination], region: str, ended: set[str]) -> list[GateTermination]:
+    def record_ends(self, boxes: Sequence[GateTermination], region: str, ended: set[str],
+                    deadline: float) -> list[GateTermination]:
         pending: list[GateTermination] = []
         for box in boxes:
             if box.region == region and box.instance in ended:
                 try:
-                    self.book.resolve_gate(box.attempt, ledger.GateTerminated(int(self.clock()), box.instance))
+                    self.book.resolve_gate(box.attempt, ledger.GateTerminated(int(self.clock()), box.instance),
+                                           lock_deadline=self.cleanup_lock_deadline(deadline))
                     continue
                 except (OSError, ValueError, KeyError, TypeError) as error:
                     print('paired cleanup: ' + str(error), file=sys.stderr)
@@ -503,7 +519,7 @@ class GateWorker:
             instances = [box.instance for box in boxes if box.region == region]
             ended = self.confirmed_ends(region, 'terminate-instances', instances, deadline)
             if ended:
-                pending = self.record_ends(pending, region, ended)
+                pending = self.record_ends(pending, region, ended, deadline)
         return pending
 
     def confirm_terminations(self, boxes: Sequence[GateTermination], deadline: float) -> bool:
@@ -517,7 +533,7 @@ class GateWorker:
                     continue
                 ended = self.confirmed_ends(region, 'describe-instances', instances, deadline)
                 if ended:
-                    pending = self.record_ends(pending, region, ended)
+                    pending = self.record_ends(pending, region, ended, deadline)
             if pending:
                 self.pause(max(0, min(settings().number('result_poll_s'), deadline - self.clock())))
         return not pending
@@ -1021,6 +1037,8 @@ class GateWorker:
                 self.terminate(attempt, instance, result_seen_at=result_seen_at)
                 interruption_confirmed = bool(interruption_code)
             return {'status': 'complete', 'instance': instance, 'result_file': RESULT_FILE}
+        except ledger.LedgerLockTimeout as error:
+            return {'status': 'fallback', 'reason': str(error)}
         except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
             launch = read(folder / 'launch.json') if (folder / 'launch.json').exists() else {}
             # Saved arguments mean AWS may have accepted the launch; a saved variant alone does not.
@@ -1222,7 +1240,7 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
         outcome = run_cloud(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
                             selected=selected, service=service, attempt=attempt)
     except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError,
-            GateRefused, affected_modules.GraphError) as error:
+            GateRefused, queue_place.CleanupUnresolved, affected_modules.GraphError) as error:
         outcome = LocalFallback(str(error))
     if isinstance(outcome, LocalFallback):
         if attempt.interruptions:

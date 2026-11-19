@@ -83,31 +83,34 @@ class PairedTrialRequest:
     clone_url: str
 
 
-def checked_git(repo: Path, *arguments: str) -> str:
+def checked_git(repo: Path, *arguments: str, start_new_session: bool = True) -> str:
     if arguments and arguments[0] in ('push', 'ls-remote'):
-        return network_git(repo, *arguments)
+        return network_git(repo, *arguments, start_new_session=start_new_session)
     return subprocess.check_output(['git', '-C', str(repo), *arguments], text=True, stderr=subprocess.PIPE).strip()
 
 
-def network_git(repo: Path, *arguments: str) -> str:
-    """Bound network Git calls and stop their process groups on cancellation."""
+def network_git(repo: Path, *arguments: str, start_new_session: bool = True) -> str:
+    """Limit Git's network wait and stop Git when the wait fails."""
     command = ['git', '-C', str(repo), *arguments]
     timeout = cloud_gate.settings().number('git_network_timeout_s')
     stop_timeout = conf.read('build_admission').number('program_stop_seconds')
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, start_new_session=True)
+                               text=True, start_new_session=start_new_session)
     try:
         try:
             output, errors = process.communicate(timeout=timeout)
         except BaseException:
             try:
-                send_process_group(process.pid, signal.SIGKILL)
+                if start_new_session:
+                    send_process_group(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
             except ProcessLookupError:
                 pass
             try:
                 _ = process.communicate(timeout=stop_timeout)
             except subprocess.TimeoutExpired:
-                print('paired trial: Git process group stop unresolved', file=sys.stderr)
+                print('paired trial: Git stop unresolved', file=sys.stderr)
             raise
         if process.returncode:
             raise subprocess.CalledProcessError(process.returncode, command, output=output, stderr=errors)
@@ -147,7 +150,7 @@ def delete_trial_branches(repo: Path, clone_url: str, prefix: str, expires: int,
     """Find and delete remote branches in this trial's unique namespace."""
     namespace = f'refs/heads/{prefix}-{expires}-{trial_id}-'
     try:
-        remote = checked_git(repo, 'ls-remote', '--heads', clone_url, namespace + '*')
+        remote = checked_git(repo, 'ls-remote', '--heads', clone_url, namespace + '*', start_new_session=False)
     except (OSError, ValueError, subprocess.SubprocessError):
         print(f'paired trial: could not list branches for trial {trial_id}', file=sys.stderr)
         return
@@ -157,7 +160,7 @@ def delete_trial_branches(repo: Path, clone_url: str, prefix: str, expires: int,
             continue
         branch = fields[1]
         try:
-            _ = checked_git(repo, 'push', clone_url, '--delete', branch)
+            _ = checked_git(repo, 'push', clone_url, '--delete', branch, start_new_session=False)
         except (OSError, ValueError, subprocess.SubprocessError):
             print(f'paired trial: could not delete branch {branch.removeprefix("refs/heads/")}', file=sys.stderr)
 
@@ -174,7 +177,7 @@ def sweep_trial_branches(repo: Path, clone_url: str, prefix: str, now: int) -> N
             name = fields[1].removeprefix(namespace)
             match = re.fullmatch(r'([0-9]{1,12})-([0-9a-f]{32})-(base|changed)', name)
             if match and int(match[1]) < now:
-                _ = checked_git(repo, 'push', clone_url, '--delete', fields[1])
+                _ = checked_git(repo, 'push', clone_url, '--delete', fields[1], start_new_session=False)
     except (OSError, ValueError, subprocess.SubprocessError):
         print(f'paired trial: could not sweep old branches for {prefix}', file=sys.stderr)
 

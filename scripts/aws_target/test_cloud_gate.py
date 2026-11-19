@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator, Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, closing, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict, replace
 from decimal import Decimal
 from hashlib import sha256
@@ -12,8 +12,10 @@ import base64
 import fcntl
 import gzip
 import json
+from math import inf
 import os
 import re
+import select
 import signal
 from pathlib import Path
 import subprocess
@@ -25,6 +27,7 @@ from typing import Never, cast, override
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
+from scripts.agents import worker_lifecycle
 from scripts.aws_target import aws_trial, cloud_gate, gate_box, ledger, s3_presign
 from scripts.aws_target.test_aws_trial import assert_term_during_cleanup
 from scripts.aws_target.aws_target import USAGE_ONLY, AwsCli, AwsUnavailable
@@ -33,7 +36,7 @@ from scripts.aws_target.ledger_test_support import CostFixture, account_reply, i
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue.admission_wire import CloudGroup, Owner, ReservedCloudSlot
-from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+from scripts.build_queue.admission_test_support import AdmissionFixture, Exchange, FakeClock, ScriptedTransport, caller_admission
 from scripts.buildlog import index, store
 from scripts.build_targets import target_config
 from scripts.production import affected_modules
@@ -1156,6 +1159,64 @@ class CloudGateTests(CostFixture):
         self.assertIn('Cloud gate termination waits on fixture-region:', output.getvalue())
         self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateTerminated)
 
+    def test_confirmed_termination_leaves_the_record_when_the_ledger_lock_deadline_passes(self) -> None:
+        _ = write_config_fixture(self.root / 'cloud_gate.conf', 'termination_timeout_s=2\n')
+        attempt = self.folder.name
+        instance = 'i-fixture'
+        _ = self.book.reserve_gate(self.settings, ledger.GateReservation(
+            attempt, int(self.now), int(self.now) + 1200, Decimal('.8'), Decimal('.02')))
+        running = ledger.GateRunning(instance)
+        self.book.resolve_gate(attempt, running)
+        launch = self.folder / 'launch.json'
+        cloud_gate.save(launch, {'instance': instance})
+        flock = fcntl.flock
+
+        def nonblocking_flock(handle: int | worker_lifecycle.LockFileDescriptor, operation: int) -> None:
+            self.assertNotEqual(operation, fcntl.LOCK_EX)
+            flock(handle, operation)
+
+        with (self.state / 'cost-ledger.lock').open('a') as held:
+            flock(held, fcntl.LOCK_EX)
+            for batch in (False, True):
+                with self.subTest(batch=batch):
+                    clock = FakeClock()
+                    clock.epoch = 0
+                    fake = FakeGateAws()
+
+                    def execute(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+                        if 'describe-instances' in arguments:
+                            clock.advance(1.75)
+                        return fake(arguments, **options)
+
+                    def wait_for_lock(_read: Sequence[int], _write: Sequence[int], _error: Sequence[int],
+                                      timeout: float) -> None:
+                        clock.advance(timeout)
+
+                    worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=execute),
+                        self.book, self.settings, self.folder / 'reservation', clock=clock.now, pause=clock.advance)
+                    time_fixture = SimpleNamespace(monotonic=clock.monotonic)
+                    errors = StringIO()
+                    with (mock.patch.object(cloud_gate, 'time', time_fixture),
+                          mock.patch.object(worker_lifecycle, 'time', time_fixture),
+                          mock.patch.object(select, 'select', side_effect=wait_for_lock),
+                          mock.patch.object(fcntl, 'flock', side_effect=nonblocking_flock),
+                          redirect_stderr(errors)):
+                        if batch:
+                            self.assertFalse(cloud_gate.cleanup_folder(self.folder, worker))
+                            self.assertIn('UNRESOLVED: the cost ledger lock deadline passed', errors.getvalue())
+                        else:
+                            with self.assertRaisesRegex(ledger.LedgerLockTimeout, 'UNRESOLVED: the cost ledger lock deadline passed'):
+                                worker.terminate(attempt, instance)
+                    self.assertIn(instance, fake.terminated_instances)
+                    self.assertEqual(clock.monotonic(), 2)
+                    self.assertEqual(self.book.read_snapshot().gate_reservations[0].state, running)
+                    self.assertEqual(cloud_gate.read(launch)['instance'], instance)
+
+        worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=self.fake),
+            self.book, self.settings, self.folder / 'reservation', clock=lambda: self.now, pause=self.advance)
+        self.assertTrue(cloud_gate.cleanup_folder(self.folder, worker))
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].state, ledger.GateTerminated(int(self.now), instance))
+
     def test_unreachable_region_moves_the_launch_to_the_next_region(self) -> None:
         self.deployment['regions'] = [{**ledger.rows(self.deployment, 'regions')[0], 'region': region}
                                       for region in ('us-east-2', 'us-west-2')]
@@ -2166,11 +2227,12 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                 worker = cloud_gate.GateWorker(api, self.book, self.settings, folder / 'reservation',
                                               clock=lambda: self.now, pause=self.advance)
                 resolve = self.book.resolve_gate
-                def cancel(attempt: str, state: ledger.GateRunning | ledger.GateAbsent | ledger.GateTerminated, *, instance_type: str = '') -> None:
+                def cancel(attempt: str, state: ledger.GateRunning | ledger.GateAbsent | ledger.GateTerminated, *,
+                           instance_type: str = '', lock_deadline: float = inf) -> None:
                     if isinstance(state, ledger.GateRunning):
                         self.assertEqual(cloud_gate.read(folder / 'launch.json')['instance'], 'i-fixture')
                         raise KeyboardInterrupt
-                    resolve(attempt, state, instance_type=instance_type)
+                    resolve(attempt, state, instance_type=instance_type, lock_deadline=lock_deadline)
                 trial_group = CloudGroup(folder.parent.name, 1, self.now, Owner(1, 'fixture'))
                 @contextmanager
                 def slot(_repo: Path, sidecar: Path, job: StepJob, *,
@@ -3619,6 +3681,29 @@ class CloudRouteTests(CostFixture):
                 if status_error:
                     self.assertEqual(outcome, cloud_gate.LocalFallback('fixture status error'))
                     service.assert_not_called()
+
+    def test_cloud_slot_release_deadline_preserves_the_reservation_and_sidecar(self) -> None:
+        _ = write_config_fixture(self.root / 'build_admission.conf', 'program_stop_seconds=0.2\n')
+        sidecar = self.root / 'reservation.cgroup'
+        sidecar.touch()
+        with ExitStack() as slot:
+            _ = slot.enter_context(cloud_gate.cloud_reservation(self.repo, sidecar, gate.SuiteMode.MERGE_GATE))
+            record, = self.admission.caller_reservations().values()
+            clock = FakeClock()
+            clock.advance(10)
+            transport = ScriptedTransport(clock, Exchange(TimeoutError()))
+            with (mock.patch.object(admission_client, 'CLOCK', clock),
+                  mock.patch.object(admission_client, '_connect', side_effect=transport.socket),
+                  self.assertRaisesRegex(queue_place.CleanupUnresolved, 'UNRESOLVED: the service did not confirm release')):
+                slot.close()
+
+        self.assertAlmostEqual(clock.monotonic(), 10.2)
+        request, = transport.requests
+        assert isinstance(request, wire.ReleaseRequest)
+        self.assertEqual(request.reservation, record.reservation_id)
+        self.assertTrue(sidecar.is_file())
+        remaining, = self.admission.caller_reservations().values()
+        self.assertEqual(remaining.reservation_id, request.reservation)
 
     def test_route_uses_installed_limit_and_handles_missing_results(self) -> None:
         cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
