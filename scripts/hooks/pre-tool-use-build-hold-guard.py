@@ -1,5 +1,5 @@
 #!/usr/bin/env -S ${HOME}/.claude/scripts/lib/py
-"""Refuse build calls from sessions subject to natedev's hold."""
+"""Refuse unguarded test starts and calls subject to the build hold."""
 
 from __future__ import annotations
 try:
@@ -12,6 +12,7 @@ import os
 import re
 import shlex
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TypedDict, cast
 
@@ -20,6 +21,15 @@ from scripts.hooks.tool_call_text import scan_text
 
 from scripts.lib.suite_runners import SUITE_RUNNERS, starts_suite_runner
 
+GUARD = Path("scripts/lib/test_guard.py")
+SHIM = Path("scripts/lib/py")
+RUNNER = Path("scripts/test_times/module_run.py")
+GUARDED_RUNNERS = SUITE_RUNNERS | {"gate.py", RUNNER.name, "coverage_overlap.py"}
+GUARD_CANDIDATE = re.compile(
+    r"unittest|pytest|py[.]test|test_|proof|module_run|coverage_overlap|merge_gate|gate[.]py|targeted_test"
+)
+PYTHON = re.compile(r"python(?:\d+(?:\.\d+)*)?")
+SHELLS = frozenset({"bash", "sh", "dash", "zsh"})
 CANDIDATE = re.compile(r"\b(?:" + "|".join(re.escape(name) for name in sorted({"cargo", *SUITE_RUNNERS})) + r")\b")
 PREFIXES = frozenset({"env", "sudo", "exec", "command", "nohup", "time", "timeout", "nice",
                       "!", "{", "then", "else", "do", "if", "while", "until"})
@@ -31,11 +41,13 @@ SHELL_HEREDOC = re.compile(r"\b(?:bash|sh|zsh)(?:[ \t]+[^<\n]*)?[ \t]*$")
 
 
 class BuildHoldCommandInput(TypedDict, total=False):
+    workdir: str
     command: str | list[str]
     cmd: str | list[str]
 
 
 class BuildHoldHookPayload(TypedDict, total=False):
+    cwd: str
     session_id: str
     tool_name: str
     tool_input: BuildHoldCommandInput
@@ -57,8 +69,7 @@ def without_literal_heredocs(command: str) -> str:
     return command
 
 
-def builds(words: list[str], *, suite_runner_only: bool = False) -> bool:
-    """Test one shell command after its environment and command prefixes."""
+def without_prefixes(words: list[str]) -> list[str]:
     while words:
         if ASSIGNMENT.match(words[0]):
             words = words[1:]
@@ -71,25 +82,51 @@ def builds(words: list[str], *, suite_runner_only: bool = False) -> bool:
             words = words[2:] if words[0] in PREFIX_ARGUMENTS else words[1:]
         if prefix == "timeout":
             words = words[1:]
+    return words
+
+
+def python_target(arguments: list[str]) -> list[str]:
+    """Read interpreter options up to the program or module name."""
+    while arguments and arguments[0].startswith("-"):
+        option = arguments[0]
+        if option == "--":
+            return arguments[1:]
+        if option.startswith("-m") and option != "-m":
+            return ["-m", option[2:], *arguments[1:]]
+        if option.startswith(("-c", "-m")):
+            return arguments
+        arguments = arguments[2:] if option in {"-W", "-X", "--check-hash-based-pycs"} else arguments[1:]
+    return arguments
+
+
+def shell_target(arguments: list[str]) -> tuple[bool, list[str]]:
+    """Read a shell command option or the script path."""
+    while arguments and arguments[0].startswith("-"):
+        option = arguments[0]
+        if option == "--":
+            return False, arguments[1:]
+        if "c" in option[1:] and not option.startswith("--"):
+            return True, arguments[1:]
+        arguments = arguments[2:] if option in {"-o", "-O"} else arguments[1:]
+    return False, arguments
+
+
+def builds(words: list[str], *, suite_runner_only: bool = False) -> bool:
+    """Check one command after its environment and command prefixes."""
+    words = without_prefixes(words)
     if not words:
         return False
     program = Path(words[0]).name
     arguments = words[1:]
-    if program in {"bash", "sh", "zsh"}:
-        return any("c" in option and building_command(script, suite_runner_only=suite_runner_only)
-                   for option, script in zip(arguments, arguments[1:]) if option.startswith("-"))
+    if program in SHELLS:
+        inline, child = shell_target(arguments)
+        if inline:
+            return bool(child) and building_command(child[0], suite_runner_only=suite_runner_only)
+        return False
     if starts_suite_runner(words):
         return True
-    if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", program) or (program == "py" and Path(words[0]).parent.name == "lib"):
-        while arguments and arguments[0].startswith("-"):
-            option = arguments[0]
-            if option == "--":
-                arguments = arguments[1:]
-                break
-            if option.startswith(("-c", "-m")):
-                return False
-            arguments = arguments[2:] if option in {"-W", "-X", "--check-hash-based-pycs"} else arguments[1:]
-        return starts_suite_runner(arguments)
+    if PYTHON.fullmatch(program) or Path(words[0]).parts[-3:] == SHIM.parts:
+        return starts_suite_runner(python_target(arguments))
     if suite_runner_only:
         return False
     if program != "cargo":
@@ -97,9 +134,7 @@ def builds(words: list[str], *, suite_runner_only: bool = False) -> bool:
     return cargo_subcommand(arguments) in CARGO_BUILD_VERBS
 
 
-def building_command(command: str, *, suite_runner_only: bool = False) -> bool:
-    if not CANDIDATE.search(command):
-        return False
+def shell_words(command: str) -> Iterator[list[str]]:
     command = scan_text("Bash", {"command": command}).replace("\\\n", "")
     lexer = shlex.shlex(without_literal_heredocs(command), posix=True, punctuation_chars=";&|()\n")
     lexer.whitespace = " \t\r"
@@ -107,12 +142,94 @@ def building_command(command: str, *, suite_runner_only: bool = False) -> bool:
     words: list[str] = []
     for word in lexer:
         if word and all(char in ";&|()\n" for char in word):
-            if builds(words, suite_runner_only=suite_runner_only):
-                return True
+            if words:
+                yield words
             words = []
         else:
             words.append(word)
-    return builds(words, suite_runner_only=suite_runner_only)
+    if words:
+        yield words
+
+
+def building_command(command: str, *, suite_runner_only: bool = False) -> bool:
+    return CANDIDATE.search(command) is not None and any(
+        builds(words, suite_runner_only=suite_runner_only) for words in shell_words(command)
+    )
+
+
+def checkout_refusal(directory: Path) -> str:
+    for root in (directory, *directory.parents):
+        if (root / GUARD).is_file():
+            break
+        if (root / SHIM).is_file() and (root / RUNNER).is_file():
+            return f"Test starts require {GUARD} in {root}."
+    return ""
+
+
+def test_refusal(words: list[str], directory: Path) -> str:
+    words = without_prefixes(words)
+    if not words:
+        return ""
+    program, *arguments = words
+    name = Path(program).name
+    shim = Path(program).parts[-3:] == SHIM.parts
+    python = shim or PYTHON.fullmatch(name) is not None
+    target = python_target(arguments) if python else words
+    if name in SHELLS:
+        inline, child = shell_target(arguments)
+        if inline:
+            return guard_refusal(shell_words(child[0]), directory) if child else ""
+        return test_refusal(child, directory)
+    elif name in {"node", "nodejs"}:
+        target = [argument for argument in arguments if not argument.startswith("-")]
+    if not target or target[0] == "-c":
+        return ""
+
+    module = target[0] == "-m"
+    if module and len(target) < 2:
+        return ""
+    entry = target[1] if module else target[0]
+    basename = Path(entry).name
+    if module and entry.startswith("scripts."):
+        basename = entry.rsplit(".", 1)[-1] + ".py"
+    launcher = Path(entry).parts[-3:] == GUARD.parts or entry == "scripts.lib.test_guard"
+    runner = basename in GUARDED_RUNNERS
+    direct_test = (basename in {"pytest", "py.test"} or module and entry == "unittest"
+                   or Path(basename).match("test_*.py") or Path(basename).match("test_*.sh")
+                   or Path(basename).match("*proof*.mjs"))
+    if not (launcher or runner or direct_test):
+        return ""
+    if direct_test and not shim:
+        return f"Start tests through {SHIM} or {GUARD}."
+
+    paths = [directory]
+    if not module and "/" in entry:
+        paths.append((directory / Path(entry).expanduser()).resolve().parent)
+    if shim:
+        paths.append((directory / Path(program).expanduser()).resolve().parent)
+    if basename in {RUNNER.name, "coverage_overlap.py"}:
+        first_argument = 2 if module else 1
+        if len(target) > first_argument:
+            paths.append((directory / Path(target[first_argument]).expanduser()).resolve())
+    if runner:
+        for index, option in enumerate(target):
+            if option.startswith("--repo="):
+                paths.append((directory / Path(option.split("=", 1)[1]).expanduser()).resolve())
+            elif option == "--repo" and index + 1 < len(target):
+                paths.append((directory / Path(target[index + 1]).expanduser()).resolve())
+    return next((reason for path in paths if (reason := checkout_refusal(path))), "")
+
+
+def guard_refusal(commands: Iterator[list[str]], directory: Path) -> str:
+    for words in commands:
+        call = without_prefixes(words)
+        if call[:1] == ["cd"] and len(call) == 2:
+            directory = (directory / Path(call[1]).expanduser()).resolve()
+            continue
+        reason = test_refusal(words, directory)
+        if reason:
+            return reason
+    return ""
 
 
 def decide(raw: str) -> str:
@@ -123,6 +240,13 @@ def decide(raw: str) -> str:
     command = tool_input.get("command") or tool_input.get("cmd") or ""
     if isinstance(command, list):
         command = shlex.join(command)
+    command = command.replace("\\\n", "")
+    if GUARD_CANDIDATE.search(command):
+        cwd = Path(payload.get("cwd") or os.getcwd())
+        directory = (cwd / tool_input.get("workdir", "")).resolve()
+        reason = guard_refusal(shell_words(command), directory)
+        if reason:
+            return reason
     if not building_command(command):
         return ""
     directory = Path(os.environ.get("BUILD_HOLD_DIR", str(Path.home() / ".local/state/build-hold")))
