@@ -14,4 +14,10 @@ class HanaControlTransport:
     host: str
 
 
-ExecutionTransport = SshCommandTransport | HanaControlTransport
+@dataclass(frozen=True)
+class HanaGpuNextestTransport:
+    settings: Path
+    host: str
+
+
+ExecutionTransport = SshCommandTransport | HanaControlTransport | HanaGpuNextestTransport

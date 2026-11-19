@@ -124,6 +124,7 @@ def producer_first_fixture(kind: Literal["claude", "codex"]) -> Generator[Produc
         configuration = case.root / "configuration/models.conf"
         _ = write_registry(configuration, {"producers": {"dwight": kind + (":opus:high" if kind == "claude" else ":gpt-test:high")}}, update=True)
         result = case.client.result
+        command = case.client.run
         program = herdr.run_program
 
         def pane_result(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
@@ -136,6 +137,11 @@ def producer_first_fixture(kind: Literal["claude", "codex"]) -> Generator[Produc
             if argv == case.client.argv("pane", "process-info", "--pane", world.pane) and world.active:
                 return subprocess.CompletedProcess(argv, 0, json.dumps({"result": world.process_info()}), "")
             return program(argv, timeout, environment=environment)
+
+        def pane_command(*arguments: str) -> str:
+            if arguments == ("pane", "read", world.pane, "--source", "visible", "--format", "ansi"):
+                return "────────\n❯ \n────────"
+            return command(*arguments)
 
         def native(pid: int, family: str, reported: str | herdr.PaneNotRead = herdr.PANE_NOT_READ) -> herdr.NativeAgentProcess:
             del reported
@@ -190,6 +196,7 @@ def producer_first_fixture(kind: Literal["claude", "codex"]) -> Generator[Produc
                     patch.object(case.client, "start_agent", side_effect=world.start_agent),
                     patch.object(case.client, "pane_activity", side_effect=activity),
                     patch.object(case.client, "result", side_effect=pane_result),
+                    patch.object(case.client, "run", side_effect=pane_command),
                     patch.object(herdr, "run_program", side_effect=run),
                     patch.object(herdr, "native_process", side_effect=native),
                     patch.object(accounts, "role_account", side_effect=role_account),
@@ -456,15 +463,23 @@ class StopResumeTests(unittest.TestCase):
                             _ = stop_resume.producer_adoption_launch(world.identity, world.pane, client)
 
     def test_producer_admission_refuses_an_incomplete_registry_before_reserving_a_pane(self) -> None:
-        with producer_first_fixture("claude") as world:
-            path = runtime_sessions.sessions_dir() / "unfinished.json"
-            _ = path.write_text("{")
-            result = stop_resume.resume("dwight")
-            self.assertIsInstance(result, stop_resume.ResumeFailed)
-            assert isinstance(result, stop_resume.ResumeFailed)
-            self.assertIn(f"session registry unreadable: {path}", result.reason)
-            self.assertEqual(world.case.client.opened, [])
-            self.assertEqual(world.arguments, [])
+        for missing in ("session registry", "creation record"):
+            with self.subTest(missing=missing), producer_first_fixture("claude") as world:
+                if missing == "session registry":
+                    path = runtime_sessions.sessions_dir() / "unfinished.json"
+                    _ = path.write_text("{")
+                    reason = f"session registry unreadable: {path}"
+                else:
+                    machine = remote.this_machine()
+                    registry = world.case.root / "configuration/models.conf"
+                    _ = write_registry(registry, {"producer_creations": {"dwight": f"{machine}:{'1' * 32}"}}, update=True)
+                    reason = f"the creation record is on {machine}"
+                result = stop_resume.resume("dwight")
+                self.assertIsInstance(result, stop_resume.ResumeFailed)
+                assert isinstance(result, stop_resume.ResumeFailed)
+                self.assertIn(reason, result.reason)
+                self.assertEqual(world.case.client.opened, [])
+                self.assertEqual(world.arguments, [])
 
     def test_configured_producer_first_start_and_live_resume_keep_one_native_conversation(self) -> None:
         for shown in (None, "old-producer-title"):
@@ -3869,6 +3884,96 @@ class StopResumeTests(unittest.TestCase):
         run.assert_not_called()
         popen.assert_not_called()
 
+    def test_batch_restarts_once_when_module_preload_fails(self) -> None:
+        for second_failure in (False, True):
+            with self.subTest(second_failure=second_failure):
+                log = self.root / "preload.log"
+                log.unlink(missing_ok=True)
+                args = ["batch", "--target", "claude4", "--log", str(log), "alpha", "beta"]
+                preload = [ImportError("mixed modules"), AttributeError("missing symbol") if second_failure else None]
+                results = [stop_resume.ClaudeUp("alpha", "w1:p2", "claude4"),
+                           stop_resume.ClaudeUp("beta", "w1:p4", "claude4")]
+
+                def restart_batch(executable: str, command: list[str]) -> Never:
+                    self.assertEqual(executable, sys.executable)
+                    self.assertEqual(command[:2], [sys.executable, stop_resume.__file__])
+                    self.assertEqual(log.read_text(),
+                                     "batch startup: module preload failed (ImportError); restarting in a new interpreter\n")
+                    raise SystemExit(stop_resume.main(command[2:]))
+
+                with (patch.object(stop_resume, "_load_batch_modules", side_effect=preload) as load_modules,
+                      patch.object(os, "execv", side_effect=restart_batch) as execv,
+                      patch.object(stop_resume, "move_sessions", return_value=results) as move_sessions):
+                    if second_failure:
+                        with self.assertRaisesRegex(AttributeError, "missing symbol"):
+                            _ = stop_resume.main(args)
+                        move_sessions.assert_not_called()
+                    else:
+                        with self.assertRaises(SystemExit) as exited:
+                            _ = stop_resume.main(args)
+                        self.assertEqual(exited.exception.code, 0)
+                        self.assertEqual(move_sessions.call_args.args, (["alpha", "beta"], "claude4"))
+                        entries = [cast(dict[str, object], json.loads(line)) for line in log.read_text().splitlines()[1:]]
+                        self.assertEqual([entry["session_id"] for entry in entries], ["alpha", "beta"])
+                    execv.assert_called_once()
+                    self.assertEqual(load_modules.call_count, 2)
+                self.assertEqual(log.read_text().count("restarting in a new interpreter"), 1)
+
+    def check_batch_moves_across_main_change(self) -> None:
+        """Run the batch in a fresh interpreter with fake sessions."""
+        from importlib import import_module
+
+        from scripts.production import session_staff, worker
+
+        production = import_module("scripts.production")
+        self.add_beta()
+        identity = self.entry["session_id"]
+        third = pane_record.launch("w1:p6", "sid-gamma", str(self.root),
+            {"CLAUDE_CONFIG_DIR": str(self.root / ".claude3")}, ["claude", "-n", "gamma"])
+        pane_record.write("agents", third)
+        self.client.rows.append({"pane_id": "w1:p6", "terminal_id": "gamma-terminal", "label": "gamma",
+                                 "workspace_id": "w1", "agent_session": {"kind": "id", "value": "sid-gamma"}})
+        expected = [(identity, "w1:p2"), ("sid-beta", "w1:p4"), ("sid-gamma", "w1:p6")]
+        members = [member for member, _pane in expected]
+        held = {member: ("verify",) for member in members}
+        checkout = self.root / "checkout/scripts/production"
+        checkout.mkdir(parents=True)
+        dependency = checkout / "session_staff.py"
+        dependent = checkout / "worker.py"
+        old_dependency = Path(session_staff.__file__).read_bytes()
+        old_dependent = Path(worker.__file__).read_bytes()
+        _ = dependency.write_bytes(old_dependency)
+        _ = dependent.write_bytes(old_dependent)
+
+        def publish_main(seconds: float) -> None:
+            self.assertFalse(self.launched)
+            _ = dependency.write_bytes(old_dependency + b"\nBatchRevision = 2\n")
+            _ = dependent.write_bytes(old_dependent + b"\nfrom scripts.production.session_staff import BatchRevision\n")
+            self.advance(seconds)
+
+        def stop_member(member: str) -> stop_resume.Stopped:
+            return stop_resume.Stopped(member, 123)
+
+        log = self.root / "batch.log"
+        with (patch.object(production, "__path__", [str(checkout), str(Path(session_staff.__file__).parent)]),
+              patch.object(stop_resume, "_build_holders", side_effect=[held, {}]),
+              patch.object(stop_resume, "_stop", side_effect=stop_member),
+              patch.object(time, "sleep", side_effect=publish_main) as published):
+            # The test fixtures import worker. Let the batch load it from the fixture checkout.
+            del sys.modules[worker.__name__]
+            delattr(production, "worker")
+            status = stop_resume.main(["batch", "--target", "claude4", "--cause", "auto",
+                                       "--log", str(log), *members])
+
+        rows = [cast(dict[str, object], json.loads(line)) for line in log.read_text().splitlines()
+                if line.startswith("{")]
+        self.assertEqual([(row["result"], row["session_id"], row.get("pane_id"), row.get("account")) for row in rows],
+                         [("ClaudeUp", member, pane, "claude4") for member, pane in expected])
+        self.assertEqual(status, 0)
+        self.assertEqual(self.launched, set(members))
+        self.assertEqual(sys.modules[worker.__name__].__file__, str(dependent))
+        published.assert_called_once()
+
 
     def test_reused_pid_generation_is_checked_before_each_signal(self) -> None:
         for changed_before_term in (True, False):
@@ -4946,6 +5051,66 @@ class BuildWaitTests(unittest.TestCase):
         self.assertEqual(results, [self.up["alpha"], self.up["beta"]])
         self.assertEqual(self.moved, [["beta"], ["alpha"]])
         self.assertEqual(shown.getvalue(), "build wait: alpha owns nextest in /w; the move waits for its steps to end\n")
+
+    def test_batch_retires_a_prompt_after_an_import_changes_on_disk(self) -> None:
+        module = self.root / "unit_lookup.py"
+        _ = module.write_bytes(Path(unit_lookup.__file__).read_bytes())
+        checkout = Path(__file__).resolve().parents[2]
+        code = r"""
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path.cwd()))
+from scripts import production
+
+root = Path(sys.argv[1])
+production.__path__ = [str(root), *production.__path__]
+from scripts.agents import stop_resume
+
+def replace_module(_seconds):
+    (root / "unit_lookup.py").write_text("# This revision lacks LiveSession.\n")
+
+def move_now(selected, target, **_options):
+    stop_resume._retire_prompt(selected[0])
+    return [stop_resume.ClaudeUp(selected[0], "w1:p1", target)]
+
+with (patch.object(stop_resume, "_build_holders", side_effect=[{"alpha": ("verify",)}, {}]),
+      patch.object(stop_resume.time, "sleep", side_effect=replace_module),
+      patch.object(stop_resume, "_move_now", side_effect=move_now)):
+    raise SystemExit(stop_resume.main(["batch", "--target", "claude3", "--cause", "auto",
+                                      "--log", str(root / "batch.log"), "alpha"]))
+"""
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", code, str(self.root)], cwd=checkout,
+            env={"HOME": str(self.root), "TMPDIR": str(self.root), "CONF_DIR": str(self.root / "config"),
+                 "STALL_WATCH_STATE_DIR": str(self.root)}, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("lacks LiveSession", module.read_text())
+        cancellations = list(self.root.glob("*.prompt.cancel.json"))
+        self.assertEqual(len(cancellations), 1, result.stderr)
+        cancellation = cast(dict[str, object], json.loads(cancellations[0].read_text()))
+        self.assertEqual(cancellation["session_id"], "alpha")
+
+    def test_batch_moves_every_member_when_main_changes_during_build_wait(self) -> None:
+        checkout = Path(__file__).resolve().parents[2]
+        code = """
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path.cwd()))
+from scripts.agents.test_stop_resume import StopResumeTests
+
+case = StopResumeTests()
+try:
+    case.setUp()
+    case.check_batch_moves_across_main_change()
+finally:
+    case.doCleanups()
+"""
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", code], cwd=checkout,
+            env={"HOME": str(self.root), "TMPDIR": str(self.root), "PATH": os.environ.get("PATH", "")},
+            capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_memory_wait_defers_at_the_move_deadline(self) -> None:
         self.batch()

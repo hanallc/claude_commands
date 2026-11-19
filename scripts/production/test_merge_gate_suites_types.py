@@ -169,7 +169,7 @@ class MergeGateTypesTests(GateSuitesFixture):
         self.assertEqual([call["args"] for call in self.calls() if call["tool"] == "uv"],
                          [["venv", "--clear", str(venv)],
                           ["pip", "install", "--python", str(venv / "bin" / "python"),
-                           *merge_gate.TYPECHECK_REQUIREMENTS]])
+                           "fake-bpy-module==20260822"]])
 
     def test_tests_only_runs_types_for_each_requested_directory(self) -> None:
         result = self.run_gate("--tests-only", "--type-dirs", "scripts/production", "scripts/hooks")

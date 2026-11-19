@@ -379,9 +379,15 @@ The table columns are Id, Type, Owner, Item, State and Age.
 One row can open its card in place.
 `record_table.py` supplies the table styles, filters, sorting and open-row controls for Review and The List.
 When a Review action removes a card, the shared table keeps a copy of the row and its open details in place.
-The copy fades and collapses in 200 ms, and the rows below slide up during that time.
+The copy fades and collapses while the rows below slide up.
+`card_fade_out_ms` in `config/review_links.conf` sets the duration. Its initial value is 450 ms.
+The Review page can restore a pending card after the user scrolls one viewport.
+The redraw that restores this card waits for all row animations to end.
+When Later hides the last card for an owner, the Owner filter stays selected with a zero count.
 A save can change the card's sort values. The copy keeps its previous values until the fade ends.
 If the request fails, the row slides back into view and the current card stays selected.
+`card_fade_in_ms` sets the duration of the return. Its initial value is 600 ms.
+Review and The List read both settings when they render.
 If the fade is still in progress, the return starts at the copy's current height and opacity.
 The animation updates when the user opens or closes a card during the transition.
 A successful save adds no notice above the table.
@@ -393,10 +399,10 @@ The reduced motion preference disables row animations.
 The shared `record-id` class keeps each ID and its expand arrow on one line.
 Each row becomes a card at phone width.
 The Type, Show and Owner rows use native buttons with a count and a pressed state.
-The Owner row shows owners with the selected type and words in any Show state.
+The Owner row shows the selected owner and owners with the selected type and words in any Show state.
 It hides the other Owner chips.
 Each Owner count uses the selected type, Show and words across all sources.
-An owner without that type and words returns to All.
+An explicit filter change can return the Owner filter to All when no items match the type and words.
 An owner with matching rows in another Show stays selected with a zero count.
 All stays first and counts every matching row.
 An unknown owner returns to All and clears both owner and source-owner constraints.
@@ -446,6 +452,10 @@ The browser keeps each pending save by key while the form leaves the window.
 Review and The List use Show chips.
 The shared table tracks the selected Show chip.
 The address and refresh retain the selected Show view.
+Review submissions retain the Type, Show and Owner chips and the search words.
+A new item opens when it matches the current filters.
+Review shows a save confirmation when the current filters hide the new item.
+A save conflict shows its reason and preserves the current filters.
 The Type, Show and Owner chip rows wrap at phone width.
 If a refresh hides the focused Owner chip, focus moves to the selected Owner chip.
 All types that wait on the user have the state Open.
@@ -466,7 +476,8 @@ It also checks all stores every thirty seconds.
 A complete update replaces the current snapshot.
 Requests retain the current snapshot during an update.
 The server starts recovery before the snapshot worker.
-The first Review GET on a fresh root starts the worker's first build.
+The live service requests the initial Review build at startup.
+Creating a console manifest after server construction does not start a Review build.
 The native Question writer assigns stable IDs to legacy Questions under the owner lock.
 The same guard tracks and skips each source or record that fails during a build.
 A notice names each skipped source or record.
@@ -731,20 +742,25 @@ The default order uses `the_list.order`, which the CLI also uses.
 User decisions come first, then unread updates, then the earliest next check.
 A column button sorts its values; a second click reverses that order.
 
-The List starts with All selected in its single row of status chips.
-The chip order is All, Needs me, Morty answering, Working, Blocked, Parked, and Closed.
-Morty answering includes all items with an open question, including parked items and items that need Resend.
-The other status chips contain items with no open question.
-Needs me includes unparked items in Waiting for nate or Delivered.
-Working includes unparked items in New or Working.
-Blocked includes unparked items in Blocked or Paused.
-Parked includes items with a future parking time in states other than Done and Closed.
-Closed includes items in Done or Closed, even when they have a future parking time.
-Each item belongs to one status category. The six counts add up to All.
+The List starts with All selected in the Owner, Producer, and Show rows.
+Owner and Producer list staff in name order after All and omit every trailing `-unit` from names.
+If the resulting name is empty, the chip shows the original staff ID.
+The address keeps the original staff IDs, including `all` when it identifies a staff member.
+The words box sits beside the Producer chips and wraps below them when space is limited.
+The chip order is All, Needs me, Morty answering, Working, Blocked, and Parked.
+The List excludes Closed records from rows, filters, and counts.
+Parked includes every non-Closed item with an active park.
+An unread delivery release belongs to Needs me even if the question remains open.
+Morty answering includes other unparked items with an open question, including items that need Resend.
+Needs me also includes unparked items in Waiting for nate or Delivered with no open question.
+Working includes other unparked items in New or Working.
+Blocked includes other unparked items in Blocked or Paused.
+All excludes parked items and includes unparked Done items.
 The Unread only switch limits the visible items and chip counts to unread items.
-The Owner and Producer menus and the words box also limit the chip counts.
+Each chip count reflects the words box and the filters in the other rows.
 The “need you” total uses the Needs me chip count.
 A zero-count chip stays visible and dimmed.
+The chip rows wrap when the available width decreases.
 
 The Expand all and Collapse all buttons sit above the number column at the left of the item count row.
 They use the vendored Lucide icons `chevrons-up-down` and `chevrons-down-up`.
@@ -753,7 +769,8 @@ Each button applies the current text in the words box before it selects the item
 Hidden items keep their open or closed state.
 
 A link under Links opens the target item in the console.
-The table changes Show to All if the target is outside the current view.
+The table can change Show to All to reveal the target.
+A link to an item in Parked selects Parked.
 The table clears each filter that excludes the target and keeps each filter that matches it.
 The table scrolls to the target and highlights it briefly.
 The table leaves a gap below the sticky status banner when it shows.
@@ -825,8 +842,9 @@ The Owner menu includes record owners without a current staff row.
 The Producer menu beside it lists each producer that a record names.
 An address with a producer that no record names shows all producers.
 The State column shows the saved state of each item.
-Closing an item clears its unread mark. A later answer can mark it unread again.
-An older address with `show=done` opens the Closed view.
+Closing an item clears its unread mark.
+An older address with `show=closed`, `show=done`, or `state=Closed` opens All.
+A link to a Closed item shows “Item #N is closed.”
 An older address with `show=unread` turns on Unread only.
 The search field matches the item number, owner name, title, or state words.
 Numbers can include `L` or `#`.
@@ -863,7 +881,7 @@ The Answer event includes the question ID.
 Link and Unlink events include the review keys.
 Evidence cleanup events name the copy that was removed.
 Request receipts stay in the record and are hidden from the log display.
-Each expanded row has Remove, Park with a date, and a text box for Ask question and Tell morty.
+Each expanded row with actions has Remove, Park until, and a text box for Ask question and Tell morty.
 The text box shows “Your words for morty about this item” as its placeholder and accessible name.
 Ask question and Tell morty sit below the box at its right edge, beside the send status.
 Both buttons stay disabled until the box contains words.
@@ -891,6 +909,8 @@ The POST response includes the current unread state.
 The form keeps its signed update until a page refresh shows a new snapshot.
 The page clears the dot and Mark read button when that state is false.
 It restores both controls when the response reports a new unread update.
+Mark read, Park until, and Remove release the link to the item.
+If the item stops matching the filters, it starts to fade as soon as the user submits the action.
 If the read write fails, the question or feedback remains saved and the sender can deliver it.
 The store keeps the unread update if the read write fails or a newer update exists.
 Tell morty shows “sent to morty; update remains unread” in both cases.
@@ -924,22 +944,40 @@ After a successful Ask keeps the row visible, the row toggle receives lost focus
 Focus stays on the user's selection if they move it during the request, including to the parent console.
 On refresh, the List restores focus to an available action button with the same item key and action.
 Column sort buttons keep focus through refresh.
-A waiting row shows “The producer will answer” and has no action buttons.
-The panel shows each open question with its asked time.
+A waiting row shows “The producer will answer.”
+The panel shows each open question with its asked time and the linked review cards.
+An actively parked waiting row shows the parking condition and Unpark.
+A waiting row with an unread delivery release shows Mark read.
 The waiting row keeps its log after Ask saves.
 A link opens a filtered-out question or read item in a separate section and preserves the current filters.
 The section does not change the results count.
+The List address preserves a linked item outside the filters when the console reloads.
+It counts in its current status chip.
+Close the linked item or change a filter to dismiss the section.
 An open question adds a Morty answering note below the saved state.
 Morty runs `the_list.py answer L<N> --question <id> --text "<answer>"` to save an answer.
-The answer adds one record event and marks the item unread, including when the item is Closed.
+The answer adds one record event and marks the item unread.
+Closing an item moves each open question to a “Question closed with item” log entry.
+The entry keeps the question ID, words, and time.
+The question no longer accepts answers or retries.
+Older Closed records stay in the store in their original format.
+Question delivery checks the current List record under the same lock that Close uses.
+The check runs before the first send and each retry.
+A close preserves the delivery result of a send already in progress.
+The sender checks the item again before it sends a failure alert.
+A read error during retry authorization preserves the confirmed failure and reports the read error separately.
+Startup recovery skips Closed items.
+A new Ask on a Closed item is refused.
+A retry of a saved Ask returns its saved result without sending again.
 After the last answer, the next refresh returns the row to its status chip.
-Parked shows the item after the last answer if its parking time is still active.
+The item stays in Parked while its park is active.
 A signed Unpark request from an earlier page can clear parking while the item waits for an answer.
-That request keeps the item in Morty answering and shows its confirmation next to Show.
+That request moves the item to Morty answering and shows its confirmation next to Show.
 An unread answer appears in the panel with the question, both times, and an Unread mark.
 Mark read clears the signed update shown by the form.
 Opening an individual row with an unread answer uses the same signed read operation.
 The List sends this request after the text of each unread answer enters the viewport while the row is open.
+This rule also applies to direct links and to answers that appear in linked details after refresh.
 The tab and console frame must also be visible.
 Expand all leaves answers unread.
 A newer update stays unread if it arrives before the read saves.
@@ -964,21 +1002,22 @@ An older pending attempt with no live sender appears as uncertain.
 Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURCE`.
 Remove sits at the left edge of the row above the four-line text box.
 **Unpark** and **Park until** sit at the right edge of the row.
-An expanded parked item shows its parking time above the buttons.
-**Unpark** appears in the form when the parking time is in the future and the item is in a state other than Closed.
-**Park until** opens the shared calendar and 24-hour time field directly.
+An expanded parked item shows its parking condition above the buttons.
+**Unpark** appears in the form when the item has active parking and its state is outside Closed.
+**Park until** opens the picker.
+**Until delivered** sits above the shared calendar and 24-hour time field.
+One click saves this choice and shows “Parked until delivered” in the row.
 The picker aligns with the right edge of the text box.
 The page refresh waits while the picker is open.
 **Save** sends the chosen time in UTC.
-Park writes the time through `the_list.park` with the same source.
-The server still accepts a date as midnight in the user zone.
+Park writes a date, a time, or `delivered` through `the_list.park` with the List page source.
+The server reads a date as midnight in the user zone.
 The writer checks a new parking time against the current time under the List lock.
-The writer compares the saved instant when it checks a Park retry.
-The writer requires the instant in the receipt or in a parking change with the same request ID.
+The writer checks a Park retry against the parking condition in the receipt or the event with the same request ID.
 The picker can resend the original request and instant after the parking time passes.
 When the saved date has passed, the picker gives focus to an enabled day.
 The page keeps the words for Tell morty.
-**Unpark** clears the parking time through `the_list.unpark` and keeps the item state.
+**Unpark** clears parking through `the_list.unpark` and keeps the item state.
 It records one Unparked event and saves one notice for morty.
 If the item has no active parking time, the writer saves only a hidden request receipt.
 The receipt records whether the time expired or was absent.
@@ -992,23 +1031,42 @@ When Unpark clears parking and removes the row from Parked, the page shows “It
 The page shows confirmations for hidden rows next to the Show filter.
 It keeps one confirmation per hidden row after overlapping Unpark requests.
 Focus moves from **Unpark** to the Parked filter and brings the filter and confirmation into view.
-In All, the row stays expanded and focus moves from **Unpark** to its item number.
+If All is active when Unpark saves, the row stays expanded and its item number can receive focus.
 After Unpark, the item's saved state sets its status chip.
+
+A direct link to a parked item selects Parked.
+Morty can set this parking condition with `the_list.py park --id L<N> --until delivered --source morty`.
+When morty records Delivered, the List writer clears this parking condition in the same write.
+The Review snapshot worker checks each snapshot after it publishes it.
+It checks linked change rows that the snapshot shows as ready for the user.
+Requests can use the published snapshot while the worker checks the parked items.
+The worker tries the List lock, the Review delivery lock, and the change list lock in that order.
+List Ask takes the List lock before the Review delivery lock.
+The worker skips a busy lock or unreadable change row and can retry after a later snapshot.
+List GET reads saved items and published question delivery records without the release locks.
+Console news reads the saved List records.
+The worker holds all three locks while it checks the current Review row and saves a release.
+The same parking event and link must still be current.
+The writer clears parking, sets Delivered, and marks the item unread.
+Both delivery signals save an Unparked event with the reason.
+The unread delivery release returns to Needs me with its review links.
+After Mark read, an open question returns the item to Morty answering.
+A dated park remains active until its time or an explicit Unpark.
 The shared item writer saves the action and its pending notice in one locked write.
 The notice tells morty which action nate completed.
 The existing sender delivers the notice with its retry and alert rules.
 A delivery failure does not reverse the completed item action.
 Tell morty sends the user's words without changing the item's state or parking time.
-Remove moves the item to Closed at once.
-Park moves an item to Parked at once when its state is outside Closed.
-With Unread only on, the row leaves the view when the user presses Mark read, Ask question, Tell morty, or Remove.
+Remove hides the item at once and closes it when the save succeeds.
+Park moves an item to Parked at once.
+With Unread only on, the row leaves the view when the user presses Mark read, Ask question, or Tell morty.
 The row returns when the server reports an unread update and the row matches the current filters.
 The shared table fades and collapses the row and its open details when an action hides them.
 The request starts without waiting for the animation.
 The page disables all row buttons while the request runs.
 A second press sends no request.
 The page applies the saved state and parking status from the response.
-The page uses the saved time to update the parking labels for the expanded and collapsed row.
+The page uses the saved parking condition to update the labels for the expanded and collapsed row.
 A refusal restores the last confirmed item state, parking status, and unread state together.
 The unread state includes the Update sort key.
 If Mark read, Ask question, or Tell morty loses its response, the page restores the unread flag from before the request.
@@ -1017,7 +1075,7 @@ The restored row slides back into view.
 After a Park refusal, the page returns focus to **Park until** only if the document body has focus and the control is visible and enabled.
 Each row keeps its own inline failure notice.
 The List uses the same rules as Review for notices above the table.
-If Remove or Park loses its response, the page keeps the row in its new view and reports that the save is unconfirmed.
+If Remove or Park loses its response, the page restores the confirmed row and reports that the save is unconfirmed.
 A new action uses a new request ID, even if the previous response did not arrive.
 The page keeps each unconfirmed request ID for an exact retry, even after another action.
 An HTTP 5xx response to Ask question leaves the request unconfirmed.
@@ -1052,6 +1110,8 @@ Delivery is at least once; a crash after a send but before its saved result can 
 The Update cell shows “sent to morty” with its time until the next log entry from morty.
 The page retains draft words, dates, actions, request IDs, and tokens during a refresh.
 An unchanged retry uses its saved request ID and token after a lost response.
+After a lost Park or Remove response, the List reads the current item before it restores the row.
+For Park, it checks the receipt for the exact request even when the item already has a parking time.
 Changed feedback uses the fresh signed request from the page.
 A successful send clears the saved request ID and only the text that the user sent.
 Each successful POST returns a fresh signed request ID for the next action.
@@ -1734,13 +1794,14 @@ The page, the footer and `/next` use these same folder readers.
 
 
 Legacy Changes and Questions forms and the Images page share one motion helper.
-A different Changes or Questions card fades out for 180ms, then fades in for 270ms with a 4px upward move.
+The page reads `card_fade_out_ms` and `card_fade_in_ms` when it renders.
+A different Changes or Questions card uses both durations, with a 4 px upward move during the fade in.
 A new switch completes the active switch first.
 The first load and an update that keeps the same card do not fade.
 A new card above the viewport scrolls into view smoothly.
-Image links scroll smoothly to their image, then reveal it over 270ms with a 4px upward move.
+Image links scroll smoothly to their image, then reveal it with a fade in and a 4 px upward move.
 Other image cards stay visible.
-An image fades before removal, and the cards below close the gap over 270ms.
+An image fades out before removal. The cards below close the gap over the fade in duration.
 Reduced motion disables fades and uses instant scrolling.
 
 Question items and change rows show a Lucide copy button inside the top right of each code block.

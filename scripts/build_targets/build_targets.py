@@ -28,10 +28,13 @@ from pathlib import Path
 from types import FrameType
 from typing import Literal, Protocol, TypedDict, cast, final, get_args
 
+from scripts.build_queue import execution_identity
 from scripts.build_hold import owning_session as session_owner
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state
+from scripts.build_targets.execution_transport import HanaGpuNextestTransport
+from scripts.lib import conf
 from scripts.build_queue.placement import CommandKind, ConfiguredProviderSettings, ExplicitProviderSettings, ProviderSettings
 
 CONFIGURED_PROVIDER_SETTINGS = ConfiguredProviderSettings()
@@ -79,6 +82,8 @@ class CliArguments(argparse.Namespace):
         self.episode: str = ""
         self.attempt: str = ""
         self.assignment_file: str = ""
+        self.result_file: str = ""
+        self.argv: list[str] = []
 
 
 def positive_pid(value: str) -> int:
@@ -102,6 +107,14 @@ def parser() -> argparse.ArgumentParser:
     _ = reserve.add_argument("--target", default="")
     _ = reserve.add_argument("--recover-only", action="store_true")
     _ = reserve.add_argument("--new-step", action="store_true")
+    gpu = commands.add_parser("run-hana-gpu")
+    _ = gpu.add_argument("--assignment-file", required=True)
+    _ = gpu.add_argument("--repo-root", required=True)
+    _ = gpu.add_argument("--package", required=True)
+    _ = gpu.add_argument("--result-file", required=True)
+    _ = gpu.add_argument("argv", nargs=argparse.REMAINDER)
+    stop_gpu = commands.add_parser("stop-hana-gpu")
+    _ = stop_gpu.add_argument("--assignment-file", required=True)
     info = commands.add_parser("assigned-info")
     _ = info.add_argument("--assignment-file", required=True)
     recovery = commands.add_parser("recover-probe", help=argparse.SUPPRESS)
@@ -163,6 +176,7 @@ from scripts.build_targets.target_config import (
     LocalTarget,
     LocalRequired,
     Routing,
+    RegistryRead,
     SshTarget,
     WRITES_TREE,
     read_targets,
@@ -183,14 +197,25 @@ def target_state(target: LocalTarget | SshTarget) -> TargetState:
     if isinstance(target, SshTarget):
         from scripts.aws_target import hana_placement
         transport = hana_placement.read_execution_transport(target)
+        if isinstance(transport, HanaGpuNextestTransport):
+            from scripts.build_targets.targets import Unreachable
+
+            setup = hana_placement.gpu_setup(transport)
+            if isinstance(setup, hana_placement.HanaStepRefused):
+                return Unreachable(setup.reason)
         if isinstance(transport, hana_placement.HanaControlTransport):
             from scripts.build_targets.targets import Free, StateUnreadable, Unreachable
             from scripts.aws_target import hana_box
-            snapshot = hana_placement.controller_for(transport, read_only=True).inspect()
+            controller = hana_placement.controller_for(transport, read_only=True)
+            snapshot = controller.inspect()
             if isinstance(snapshot, hana_placement.HanaLifecycleUnavailable):
                 return StateUnreadable(snapshot.reason)
             if isinstance(snapshot, hana_placement.HanaUnprovisioned):
                 return Unreachable('Hana is unprovisioned')
+            if isinstance(snapshot, hana_placement.HanaResourcesHeld):
+                return Unreachable('Hana is busy or recovering')
+            if not controller.image_is_current(snapshot.deployment):
+                return Unreachable(hana_box.HANA_IMAGE_STALE)
             if snapshot.claims or snapshot.state not in (hana_box.Lifecycle.READY, hana_box.Lifecycle.IDLE_STOPPED):
                 return Unreachable('Hana is busy or recovering')
             return Free()
@@ -264,7 +289,7 @@ def probe_target(target: SshTarget) -> TargetState:
     from scripts.mac_test import eligibility, offload
 
     from scripts.aws_target import hana_placement
-    if isinstance(hana_placement.read_execution_transport(target), hana_placement.HanaControlTransport):
+    if isinstance(hana_placement.read_execution_transport(target), (hana_placement.HanaControlTransport, HanaGpuNextestTransport)):
         return target_state(target)
     config = eligibility.read_config(target.settings)
     result = offload.probe_reachability(offload.ProcessController(), config)
@@ -366,7 +391,7 @@ def step_routing_rule(kind: CommandKind, routing: Routing = ANY_ELIGIBLE_TARGET,
 
 def fixed_placement_constraints(
     repo_root: Path, package: str, kind: CommandKind, command: tuple[str, ...],
-    session: SubmittingSession, source_key: str | placement.SourceIdentity, routing: Routing = ANY_ELIGIBLE_TARGET,
+    session: SubmittingSession, source_key: str | execution_identity.SourceIdentity, routing: Routing = ANY_ELIGIBLE_TARGET,
     selection: TargetSelection = ROUTED, *, writes_tree: bool = False,
     provider_settings: ProviderSettings = CONFIGURED_PROVIDER_SETTINGS,
 ) -> placement.PlacementConstraints:
@@ -374,69 +399,100 @@ def fixed_placement_constraints(
     from scripts.build_queue import placement
     from scripts.buildlog import store
     from scripts.mac_test import eligibility
-    from scripts.build_targets import target_config
 
     rule = step_routing_rule(kind, routing, selection, writes_tree=writes_tree)
     if writes_tree:
         selection = ROUTED
     repository = eligibility.repository_identity(repo_root)
     candidates: list[placement.PlacementCandidate] = []
-    for target in read_targets():
-        host_eligibility: placement.AllowedHost | placement.FixedExclusion = placement.AllowedHost()
-        if isinstance(target, LocalTarget):
-            destination = placement.PlacementDestination("local", target.name, store.host_name(), claim_state.WHOLE_MAC)
-            candidates.append(placement.PlacementCandidate(destination, host_eligibility))
-            continue
-        selected_settings: ProviderSettings = ConfiguredProviderSettings()
-        if isinstance(provider_settings, ExplicitProviderSettings) and isinstance(selection, Pinned) and target.name == selection.target:
-            target = replace(target, settings=provider_settings.path)
-            selected_settings = provider_settings
-        from scripts.aws_target import hana_placement
-        transport = target_config.read_execution_transport(target)
-        if isinstance(transport, hana_placement.HanaControlTransport):
-            scope = (claim_state.RepositoryScope(repository.name, repository.key, 1)
-                     if isinstance(repository, eligibility.KnownRepository) else claim_state.WHOLE_MAC)
-            policy = hana_placement.fixed_policy(transport, str(repo_root), kind)
-            if isinstance(rule, NatedevOnly):
-                host_eligibility = placement.FixedExclusion(rule.reason)
-            elif isinstance(policy, hana_placement.HanaStepRefused):
-                host_eligibility = placement.FixedExclusion(policy.reason)
-            elif command:
-                judgment = hana_placement.classify_command('check' if kind == 'check' else 'clippy', kind, command)
-                if isinstance(judgment, hana_placement.HanaStepRefused):
-                    host_eligibility = placement.FixedExclusion('command')
-            destination = placement.PlacementDestination('ssh', target.name, transport.host, scope, 1)
-            candidates.append(placement.PlacementCandidate(destination, host_eligibility, selected_settings))
-            continue
-        config = eligibility.read_config(target.settings)
-        scope = claim_state.target_claim_scope(claim_state.state_paths(target.name), str(repo_root))
-        if isinstance(rule, NatedevOnly):
-            host_eligibility = placement.FixedExclusion(rule.reason)
-        elif isinstance(repository, eligibility.UnknownRepository):
-            host_eligibility = placement.FixedExclusion("repo")
-        elif target_config.uses_legacy_mac_layout(target.platform):
-            key = f"linux_only.{repository.name}"
-            if key not in config.values:
-                host_eligibility = placement.FixedExclusion("repo")
-            else:
-                excluded = eligibility.comma_values(config.values[key])
-                if eligibility.linux_only_applies(kind) and eligibility.has_linux_only(repo_root, package, excluded):
-                    host_eligibility = placement.FixedExclusion("linux_only")
-        elif not eligibility.linux_kind_permitted(config.values, kind):
-            host_eligibility = placement.FixedExclusion("target does not permit this command")
-        slots = (target_config.slot_capacity(config.values, repository.name,
-                 missing=target_config.MissingSlotCapacity.SINGLE_SLOT)
-                 if target.platform == "linux" and isinstance(repository, eligibility.KnownRepository) else 1)
-        for slot in range(1, slots + 1):
-            selected_scope = (claim_state.RepositoryScope(scope.name, scope.key, slot)
-                              if target.platform == "linux" and isinstance(scope, claim_state.RepositoryScope) else scope)
-            destination = placement.PlacementDestination("mac" if target.platform == "macos" else "ssh",
-                target.name, config.host, selected_scope, slot if target.platform == "linux" else 0)
-            candidates.append(placement.PlacementCandidate(destination, host_eligibility, selected_settings))
-    source = placement.SourceKeyKnown(source_key) if isinstance(source_key, str) else source_key
+    selected = selection.target if isinstance(selection, Pinned) and isinstance(rule, AnyTarget) else ""
+    with conf.report_key_changes():
+        for target in read_targets(selected=selected, purpose=RegistryRead.PLACEMENT):
+            if isinstance(target, LocalTarget):
+                destination = placement.PlacementDestination("local", target.name, store.host_name(), claim_state.WHOLE_MAC)
+                candidates.append(placement.PlacementCandidate(destination))
+                continue
+            settings: ProviderSettings = CONFIGURED_PROVIDER_SETTINGS
+            if isinstance(provider_settings, ExplicitProviderSettings) and isinstance(selection, Pinned) and target.name == selection.target:
+                target = replace(target, settings=provider_settings.path)
+                settings = provider_settings
+            candidates.extend(fixed_remote_candidates(
+                target, settings, repository, repo_root, package, kind, command, rule, selection=selection))
+    source = execution_identity.SourceKeyKnown(source_key) if isinstance(source_key, str) else source_key
     return placement.PlacementConstraints(source, command, str(repo_root), package, session, tuple(candidates),
         placement.PinnedHost(selection.target) if isinstance(selection, Pinned) else placement.ConfiguredOrder(),
         command_kind=kind)
+
+
+def fixed_remote_candidates(
+    target: SshTarget, settings: ProviderSettings, repository: eligibility.RepositoryIdentity,
+    repo_root: Path, package: str, kind: CommandKind, command: tuple[str, ...], rule: AnyTarget | NatedevOnly,
+    *, selection: TargetSelection,
+) -> tuple[placement.PlacementCandidate, ...]:
+    """Read the remote keys that determine the fixed candidate set."""
+    from scripts.aws_target import hana_placement, hana_placement_adapter
+    from scripts.build_queue import placement
+    from scripts.build_targets import target_config
+    from scripts.mac_test import eligibility
+
+    provider: Literal["mac", "ssh"] = "mac" if target.platform == "macos" else "ssh"
+    policy: placement.AllowedHost | placement.FixedExclusion = placement.AllowedHost()
+    try:
+        configuration = conf.read(target.settings)
+        transport = target_config.read_execution_transport(target, configuration=configuration)
+        if isinstance(transport, HanaGpuNextestTransport):
+            scope = (claim_state.RepositoryScope(repository.name, repository.key, 1)
+                     if isinstance(repository, eligibility.KnownRepository) else claim_state.WHOLE_MAC)
+            if isinstance(rule, NatedevOnly):
+                policy = placement.FixedExclusion(rule.reason)
+            elif not isinstance(selection, Pinned) or selection.target != target.name:
+                policy = placement.FixedExclusion('This target requires --target hana-gpu')
+            else:
+                policy = hana_placement_adapter.gpu_step(transport,
+                    repository.key if isinstance(repository, eligibility.KnownRepository) else '',
+                    package, kind, command, configuration=configuration)
+            destination = placement.PlacementDestination('ssh', target.name, transport.host, scope, 1)
+            return (placement.PlacementCandidate(destination, policy, settings),)
+        if isinstance(transport, hana_placement.HanaControlTransport):
+            scope = (claim_state.RepositoryScope(repository.name, repository.key, 1)
+                     if isinstance(repository, eligibility.KnownRepository) else claim_state.WHOLE_MAC)
+            route = hana_placement_adapter.configured_route(configuration, str(repo_root), kind)
+            if isinstance(rule, NatedevOnly):
+                policy = placement.FixedExclusion(rule.reason)
+            elif isinstance(route, hana_placement.HanaStepRefused):
+                policy = placement.FixedExclusion(route.reason)
+            elif command:
+                judgment = hana_placement.classify_command('check' if kind == 'check' else 'clippy', kind, command)
+                if isinstance(judgment, hana_placement.HanaStepRefused):
+                    policy = placement.FixedExclusion('command')
+            destination = placement.PlacementDestination('ssh', target.name, transport.host, scope, 1)
+            return (placement.PlacementCandidate(destination, policy, settings),)
+
+        paths = claim_state.state_paths(target.name)
+        scope = claim_state.target_claim_scope(paths, str(repo_root))
+        host = eligibility.SshProbeSettings(configuration).host
+        if isinstance(rule, NatedevOnly):
+            policy = placement.FixedExclusion(rule.reason)
+        elif (selection == ROUTED and target_config.uses_legacy_mac_layout(target.platform)
+                and isinstance(repository, eligibility.KnownRepository)
+                and kind in configuration.value(f"offload_exclude.{repository.name}",
+                                                eligibility.comma_values, default=set(), allow_blank=True)):
+            policy = placement.FixedExclusion("offload_exclude")
+        else:
+            answer = eligibility.configured_step_policy(configuration, target.platform, repository, repo_root, package, kind)
+            if isinstance(answer, eligibility.IneligibleMacStep):
+                policy = placement.FixedExclusion(answer.reason)
+        slots = (target_config.slot_capacity(configuration, repository.name,
+                 missing=target_config.MissingSlotCapacity.SINGLE_SLOT)
+                 if target.platform == "linux" and isinstance(repository, eligibility.KnownRepository) else 1)
+    except conf.Unusable:
+        destination = placement.PlacementDestination(provider, target.name, target.name, claim_state.WHOLE_MAC)
+        return (placement.PlacementCandidate(destination, placement.FixedExclusion("state unreadable"), settings),)
+
+    return tuple(placement.PlacementCandidate(placement.PlacementDestination(provider, target.name, host,
+        claim_state.RepositoryScope(scope.name, scope.key, slot)
+            if target.platform == "linux" and isinstance(scope, claim_state.RepositoryScope) else scope,
+        slot if target.platform == "linux" else 0), policy, settings) for slot in range(1, slots + 1))
 
 
 def command_constraints(args: CliArguments) -> int:
@@ -448,7 +504,8 @@ def command_constraints(args: CliArguments) -> int:
 
     if args.target and args.target != "natedev":
         try:
-            _ = target_config.configured_ssh_target(args.target)
+            with conf.report_key_changes():
+                _ = target_config.configured_ssh_target(args.target)
         except ConfigError as error:
             print(f"build targets: {error}", file=sys.stderr)
             return 2
@@ -458,15 +515,21 @@ def command_constraints(args: CliArguments) -> int:
     selection = Pinned(args.target or "mac") if args.target or args.mac_only else ROUTED
     rule = step_routing_rule(cast(StepKind, args.kind), routing, selection)
     constraints = fixed_placement_constraints(Path(args.repo_root).resolve(), args.package,
-        cast(StepKind, args.kind), (), session, placement.SourceKeyUnavailable("source is not submitted yet"), routing, selection)
+        cast(StepKind, args.kind), (), session, execution_identity.SourceKeyUnavailable("source is not submitted yet"), routing, selection)
     print("any_target" if isinstance(rule, AnyTarget) else f"natedev_only {rule.reason}")
+    selected_name = selection.target if isinstance(selection, Pinned) and isinstance(rule, AnyTarget) else ""
     shown: set[str] = set()
+    with conf.report_key_changes():
+        targets = {target.name: target for target in read_targets(
+            selected=selected_name, purpose=RegistryRead.PLACEMENT)}
     for candidate in constraints.candidates:
         destination = candidate.destination
         if destination.target in shown:
             continue
         shown.add(destination.target)
-        target = next(target for target in read_targets() if target.name == destination.target)
+        target = targets.get(destination.target)
+        if target is None:
+            continue
         if args.mac_only and (not isinstance(target, SshTarget) or target.platform != "macos"):
             continue
         reason = (candidate.eligibility.reason if isinstance(candidate.eligibility, placement.FixedExclusion)
@@ -504,11 +567,13 @@ def recorded_step_kind(step: str) -> StepKind | KindNotOffloaded:
 
 def step_policy(target: LocalTarget | SshTarget, repo_root: Path, package: str, kind: StepKind, *,
                 backoff: eligibility.BackoffState | eligibility.ReadBackoff,
+                configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
                 ) -> eligibility.KnownRepository | ExcludedTarget:
     """Read the Mac policy for one step: repository, linux_only packages and backoff. Run no remote command."""
     from scripts.mac_test import eligibility
 
-    config = eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config()
+    config = (configuration if isinstance(configuration, conf.ConfigRead)
+              else eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config())
     name = target.name if isinstance(target, SshTarget) else "mac"
     first, *rest = eligibility.remote_step_kinds(kind)
     repository = eligibility.mac_step_eligibility(config, repo_root, package,
@@ -633,6 +698,7 @@ CAPACITY_NOT_READ = CapacityNotRead()
 def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
                            package: str, kind: StepKind, routing: Routing, *,
                            answer: mac_test.FreeNowAnswer | CapacityNotRead = CAPACITY_NOT_READ,
+                           configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
                            session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
                            ) -> EligibleTarget | ExcludedTarget:
 
@@ -642,14 +708,20 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
     if isinstance(routing, LocalRequired):
         return ExcludedTarget(target, routing.reason)
     try:
-        config = eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config()
+        config = (eligibility.SshProbeSettings(configuration) if isinstance(configuration, conf.ConfigRead)
+                  else eligibility.read_config(target.settings) if isinstance(target, SshTarget) else eligibility.read_config())
         name = target.name if isinstance(target, SshTarget) else "mac"
-        repository = step_policy(target, repo_root, package, kind, backoff=eligibility.READ_BACKOFF)
+        repository = step_policy(target, repo_root, package, kind, backoff=eligibility.READ_BACKOFF,
+                                 configuration=configuration)
         if isinstance(repository, ExcludedTarget):
             return repository
         if isinstance(answer, CapacityNotRead):
-            answer = mac_test.free_now(mac_test.state_paths(name), config.source, repo_root, session=session)
+            settings = config.source if isinstance(config, eligibility.OffloadConfig) else config.configuration.source
+            answer = mac_test.free_now(mac_test.state_paths(name), settings, repo_root, session=session,
+                                      configuration=configuration)
     except (OSError, UnicodeError, ValueError) as error:
+        if isinstance(error, conf.Unusable) and isinstance(configuration, conf.ConfigRead):
+            raise
         return ExcludedTarget(target, f"state unreadable: {error}")
     if answer in ("blocked", "backoff"):
         return ExcludedTarget(target, answer)
@@ -665,7 +737,9 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
             return ExcludedTarget(target, "busy")
         if isinstance(probe, offload.UnavailableProbe):
             with claim_state.locked(eligibility.state_directory(name) / "probe-result.lock"):
-                offload.write_backoff(time.time() + config.unreachable_backoff_s, name)
+                delay = (config.unreachable_backoff_s if isinstance(config, eligibility.OffloadConfig)
+                         else config.configuration.number("unreachable_backoff_s"))
+                offload.write_backoff(time.time() + delay, name)
             return ExcludedTarget(target, "unreachable")
         handlers = (offload.interrupt_handlers(controller)
                     if threading.current_thread() is threading.main_thread() else nullcontext())
@@ -678,12 +752,15 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
     except offload.OffloadInterrupted as interrupted:
         raise SystemExit(128 + interrupted.signal_number) from None
     except (OSError, UnicodeError, ValueError) as error:
+        if isinstance(error, conf.Unusable) and isinstance(configuration, conf.ConfigRead):
+            raise
         return ExcludedTarget(target, f"state unreadable: {error}")
     return EligibleTarget(target)
 
 
 def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
                            kind: StepKind, routing: Routing, *, selection: TargetSelection = ROUTED, new_step: bool = False,
+                           configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
                            session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
                            ) -> EligibleTarget | ExcludedTarget:
     """Read Linux policy and capacity without evaluating a development shell."""
@@ -691,33 +768,55 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
     from scripts.mac_test import eligibility, mac_test
 
     session = claim_state.submitting_session(session)
-    from scripts.aws_target import hana_placement
-    transport = hana_placement.read_execution_transport(target)
+    from scripts.aws_target import hana_placement, hana_placement_adapter
+    from scripts.build_targets import target_config
+
+    settings = conf.read(target.settings) if isinstance(configuration, conf.UseConfiguredValue) else configuration
+    transport = target_config.read_execution_transport(target, configuration=settings)
+    if isinstance(transport, HanaGpuNextestTransport):
+        from scripts.build_queue.placement import FixedExclusion
+
+        if isinstance(routing, LocalRequired):
+            return ExcludedTarget(target, routing.reason)
+        if not isinstance(selection, Pinned) or selection.target != target.name:
+            return ExcludedTarget(target, 'This target requires --target hana-gpu')
+        identity = eligibility.repository_identity(repo_root)
+        policy = hana_placement_adapter.gpu_step(transport,
+            identity.key if isinstance(identity, eligibility.KnownRepository) else '',
+            package, kind, (), configuration=settings)
+        return ExcludedTarget(target, policy.reason) if isinstance(policy, FixedExclusion) else EligibleTarget(target)
     if isinstance(transport, hana_placement.HanaControlTransport):
         if isinstance(routing, LocalRequired):
             return ExcludedTarget(target, routing.reason)
         policy = hana_placement.fixed_policy(transport, str(repo_root), kind)
         if isinstance(policy, hana_placement.HanaStepRefused):
             return ExcludedTarget(target, policy.reason)
-        snapshot = hana_placement.controller_for(transport, read_only=True).inspect()
+        controller = hana_placement.controller_for(transport, read_only=True)
+        snapshot = controller.inspect()
         if isinstance(snapshot, hana_placement.HanaUnprovisioned):
             return ExcludedTarget(target, 'unprovisioned')
         if isinstance(snapshot, hana_placement.HanaLifecycleUnavailable):
             return ExcludedTarget(target, 'state unreadable')
+        if isinstance(snapshot, hana_placement.HanaResourcesHeld):
+            return ExcludedTarget(target, 'busy')
         from scripts.aws_target import hana_box
+        if not controller.image_is_current(snapshot.deployment):
+            return ExcludedTarget(target, hana_box.HANA_IMAGE_STALE)
         if snapshot.claims:
             return ExcludedTarget(target, 'busy')
         if snapshot.state not in (hana_box.Lifecycle.READY, hana_box.Lifecycle.IDLE_STOPPED):
             return ExcludedTarget(target, 'starting' if snapshot.state == hana_box.Lifecycle.STARTING else 'recovery')
         return EligibleTarget(target)
     if target.platform == "macos" or isinstance(routing, LocalRequired):
-        answer = mac_test.free_now(mac_test.state_paths(target.name), target.settings, repo_root, session=session)
+        answer = mac_test.free_now(mac_test.state_paths(target.name), target.settings, repo_root, session=session,
+                                 configuration=configuration)
         if new_step and not isinstance(selection, Pinned) and answer == "bad":
             start_probe_recovery(target, repo_root, package, kind)
         if target.platform == "macos":
-            return mac_target_eligibility(target, repo_root, package, kind, routing, answer=answer, session=session)
+            return mac_target_eligibility(target, repo_root, package, kind, routing, answer=answer,
+                                          configuration=configuration, session=session)
         return ExcludedTarget(target, cast(LocalRequired, routing).reason)
-    config = ssh_target_config(target)
+    config = configuration if isinstance(configuration, conf.ConfigRead) else ssh_target_config(target)
     if isinstance(config, ExcludedTarget):
         return config
     for step in eligibility.remote_step_kinds(kind):
@@ -726,7 +825,8 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
         if isinstance(policy, eligibility.IneligibleMacStep):
             return ExcludedTarget(target, policy.reason)
     paths = mac_test.state_paths(target.name)
-    answer = mac_test.free_now(paths, target.settings, repo_root, session=session)
+    answer = mac_test.free_now(paths, target.settings, repo_root, session=session,
+                                 configuration=configuration)
     if new_step and not isinstance(selection, Pinned) and answer == "bad":
         start_probe_recovery(target, repo_root, package, kind)
     if answer not in ("free", "bad"):
@@ -735,7 +835,8 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
         return EligibleTarget(target)
     from scripts.mac_test import offload
 
-    if isinstance(offload.probe_reachability(offload.ProcessController(), config), offload.UnreachableHost):
+    probe_settings = eligibility.SshProbeSettings(config) if isinstance(config, conf.ConfigRead) else config
+    if isinstance(offload.probe_reachability(offload.ProcessController(), probe_settings), offload.UnreachableHost):
         return ExcludedTarget(target, "unreachable")
     return EligibleTarget(target)
 
@@ -745,7 +846,7 @@ def ssh_target_config(target: SshTarget) -> eligibility.OffloadConfig | Excluded
     from scripts.mac_test import eligibility
     from scripts.aws_target import hana_placement
 
-    if isinstance(hana_placement.read_execution_transport(target), hana_placement.HanaControlTransport):
+    if isinstance(hana_placement.read_execution_transport(target), (hana_placement.HanaControlTransport, HanaGpuNextestTransport)):
         return ExcludedTarget(target, 'Hana requires an exact queue assignment')
 
     return eligibility.read_config(target.settings)
@@ -889,7 +990,7 @@ def reserve_assigned(args: CliArguments) -> int:
         if isinstance(checked, hana_placement.HanaClaimRefused):
             return 1
         # F1 commits lifecycle demand after this process-bound reservation handoff.
-        identity = claim_state.ClaimIdentity(placement.assigned_claim_id(assignment.episode, assignment.attempt),
+        identity = claim_state.ClaimIdentity(execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
             assignment.episode, assignment.attempt)
         publish_wait_reservation(args, target, identity, assignment.session)
         return 0
@@ -899,7 +1000,7 @@ def reserve_assigned(args: CliArguments) -> int:
 
         try:
             with mac_test.locked(paths.lock):
-                expected = claim_state.ClaimIdentity(placement.assigned_claim_id(assignment.episode, assignment.attempt),
+                expected = claim_state.ClaimIdentity(execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
                                                      assignment.episode, assignment.attempt)
                 owner = process_start.process_start(args.pid)
                 if isinstance(owner, process_start.Unreadable):
@@ -1478,6 +1579,25 @@ def main() -> int:
         if args.command == "submitting-session":
             print(claim_state.session_id(claim_state.submitting_session(args.session)))
             return 0
+        if args.command == "stop-hana-gpu":
+            from importlib import import_module
+            from scripts.build_queue import admission_wire as wire
+
+            saved = wire.read_assignment(Path(args.assignment_file))
+            if not isinstance(saved, wire.Assignment) or saved.assignment.destination.target != "hana-gpu":
+                raise ValueError("A Hana GPU assignment is required to stop its service")
+            stop_service = cast(Callable[[str], int], getattr(
+                import_module("scripts.aws_target.gpu_size_trial"), "stop_assigned_gpu_service"))
+            return stop_service(execution_identity.assigned_claim_id(saved.assignment.episode, saved.assignment.attempt))
+        if args.command == "run-hana-gpu":
+            from scripts.aws_target import hana_placement
+            from scripts.build_queue import admission_wire as wire
+
+            saved = wire.read_assignment(Path(args.assignment_file))
+            if not isinstance(saved, wire.Assignment) or args.argv[:1] != ["--"]:
+                raise ValueError("The Hana GPU runner requires a remote assignment and a command")
+            return hana_placement.run_gpu_assignment(saved.assignment, Path(args.repo_root), args.package,
+                                      tuple(args.argv[1:]), Path(args.result_file))
         if args.command == "assigned-info":
             from scripts.build_queue import admission_protocol as wire
 

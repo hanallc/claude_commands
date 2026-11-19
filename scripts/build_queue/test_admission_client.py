@@ -8,6 +8,7 @@ import errno
 import io
 import json
 import os
+import re
 import shlex
 import socket
 import subprocess
@@ -18,6 +19,7 @@ import sys
 import unittest
 from unittest import mock
 
+from scripts.build_queue import execution_identity
 from scripts.accounts import outage_alerts
 from scripts.message import send_result
 from scripts.message import roster
@@ -110,7 +112,7 @@ class ClientTests(unittest.TestCase):
                 request.constraints.source_key, request.owner, request.constraints.session, request.since)
             claim = placement.ProviderClaimReference(destination.provider, destination.target, destination.scope,
                 "claim-a", assignment.episode, assignment.attempt)
-            key = placement.attempt_key(assignment.episode, assignment.attempt)
+            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
             cases = ((placement.CurrentAssignment(), claim, "current", 0, "claim-a", "-"),
                 (placement.CurrentAssignment(), placement.NoProviderClaim(), "current", 0, "-", "-"),
                 (placement.ClosedAssignment("source changed"), claim, "closed", 1, "claim-a", "source changed"))
@@ -149,7 +151,7 @@ class ClientTests(unittest.TestCase):
             local = fixture.request()
             owner = placement.SubmittingOwner(fixture.server.host, local.owner.pid, local.owner.start_time)
             destination = placement.PlacementDestination("local", "natedev", fixture.server.host, WHOLE_MAC)
-            constraints = placement.PlacementConstraints(placement.SourceKeyKnown("private-source"),
+            constraints = placement.PlacementConstraints(execution_identity.SourceKeyKnown("private-source"),
                 ("cargo", "check"), str(fixture.root), "sample", NoOwningSession(),
                 (placement.PlacementCandidate(destination),))
             request = wire.PlacementRequest(local.episode, owner, local.since, local.profile, constraints,
@@ -396,8 +398,13 @@ class ClientTests(unittest.TestCase):
             self.assertIsInstance(outcome, send_result.ConfirmedSendOutcome)
             assert isinstance(outcome, send_result.ConfirmedSendOutcome)
             self.assertEqual(outcome.header.outcome, "sent")
-            self.assertEqual([(item["threadId"], item["input"]) for item in received],
-                [(identity, [{"type": "text", "text": message + "\nSender native id: unavailable"}])])
+            delivery, = received
+            self.assertEqual(delivery["threadId"], identity)
+            payload, = cast(list[dict[str, str]], delivery["input"])
+            self.assertEqual(payload.keys(), {"type", "text"})
+            self.assertEqual(payload["type"], "text")
+            prefix = message + "\nSender native id: unavailable\nSent: "
+            self.assertRegex(payload["text"], r"\A" + re.escape(prefix) + r"\d{2}:\d{2} [^\n]+\Z")
 
     def test_runner_width_change_uses_its_account_and_changes_its_reservation(self) -> None:
         with AdmissionFixture() as fixture:
@@ -1999,7 +2006,7 @@ class ClientTests(unittest.TestCase):
                         query = lambda: client.consume_permission(permission)
                     elif operation == "execution":
                         execution = wire.ExecutionReport("finished-step", assigned, claim,
-                            placement.ExecutionNotStarted(), placement.AttemptCompleted(0), placement.DispatchPathSettled())
+                            execution_identity.ExecutionNotStarted(), placement.AttemptCompleted(0), placement.DispatchPathSettled())
                         request = execution
                         query = lambda: client.report_execution(execution)
                     else:

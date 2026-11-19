@@ -23,7 +23,7 @@ from scripts.lib import conf
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import investigation, staff
 from scripts.production.change_routing import UnavailableProduction
-from scripts.review_links import change_browser, change_page, console, for_you, investigations_page, review_link
+from scripts.review_links import change_browser, change_page, console, for_you, investigations_page, page_frame, review_link
 
 
 class ConsoleMarkup(HTMLParser):
@@ -113,6 +113,7 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn("open: current === rebuildLink ? '' : current.dataset.page", source)
         self.assertNotIn("<iframe", source)
         self.assertIn(".frame-area iframe[hidden]{display:block!important;visibility:hidden;pointer-events:none}", source)
+
         self.assertIn("const placeKey = identity => 'at.' + identity;", source)
         self.assertIn("target.pathname === new URL(base, location.href).pathname", source)
         self.assertIn("event.data !== 'console-place'", source)
@@ -139,6 +140,16 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn('.workspace{flex:1;width:100%}', source)
         self.assertIn("mobileToggle.setAttribute('aria-expanded', String(!value))", source)
 
+    def test_repository_config_names_staff_for_every_console_page(self) -> None:
+        path = Path(__file__).resolve().parents[2] / "config" / "console.conf"
+        settings = conf.read(path).values()
+        pages = {key.split(".")[1] for key in settings if key.startswith("page.") and key.endswith(".url")}
+        self.assertEqual(pages | {"rebuilds"}, page_frame.OWNER_PAGES)
+        for page in page_frame.OWNER_PAGES:
+            with self.subTest(page=page):
+                self.assertRegex(settings[f"page.{page}.owner"], r"^[a-f0-9-]{36}$")
+        self.assertEqual(settings["owner.default"], settings["page.review.owner"])
+
     def test_builds_url_resolves_from_its_public_function(self) -> None:
         folder = self.root / "snapshots/builds"
         folder.mkdir(parents=True)
@@ -161,6 +172,7 @@ class ConsoleTests(unittest.TestCase):
         self.assertIsInstance(pages[4].destination, console.UnavailablePage)
         markup = ConsoleMarkup()
         source = console.render(pages, console.UnavailablePage()).decode()
+        self.assertEqual(source.count(page_frame.BUTTON_STATES), 1)
         markup.feed(source)
         self.assertEqual(markup.pages, ["review", "list", "images", "disks", "builds", "aws", "accounts"])
         self.assertIn('data-page="rebuilds"\ndata-url="" data-title', source)
@@ -292,12 +304,14 @@ def assert_notifier_browser(case: unittest.TestCase, width: int) -> None:
     'Exercise the real shell with controlled reads, timers, and clipboard writes.'
     settings = Path(__file__).resolve().parents[2] / "config"
     pages = (console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage("/page")),
-             console.ConsolePage("review", "Review", "inbox", "Review", console.AvailablePage("/console/review.html")))
+             console.ConsolePage("review", "Review", "inbox", "Review", console.AvailablePage("/console/review.html")),
+             console.ConsolePage("accounts", "Accounts", "users", "Accounts", console.AvailablePage("/accounts")))
     with patch.dict(os.environ, {"CONF_DIR": str(settings)}):
         source = console.render(pages, console.UnavailablePage()).decode()
     setup = r'''<script>
 const nativeFetch=window.fetch.bind(window),timers=new Map();
 let mode='failed',reads=0,visibility='visible',copied='',finishRead;
+let accountsQuota={level:'urgent',name:'Urgent: 4% left'};
 Object.defineProperty(document,'visibilityState',{get:()=>visibility});
 window.setInterval=(run,ms)=>{const id=timers.size+1;timers.set(id,{run,ms});return id;};
 window.clearInterval=id=>timers.delete(id);
@@ -309,6 +323,7 @@ window.fetch=async(url,options)=>{
  if(String(url).includes('for-you.json')){reads++;if(mode==='failed') throw Error('Read failed.');
   const unavailable=mode==='unavailable' || mode==='http-unavailable';
   const payload=unavailable ? {available:false} : {available:true,count:mode==='zero'?0:2,entries:mode==='zero'?[]:entries};
+  payload.accounts_quota=accountsQuota;
   const status=mode==='http-unavailable' ? 503 : 200;
   const answer={status,ok:status===200,json:async()=>payload};
   if(mode==='delayed') return new Promise(resolve=>{finishRead=()=>resolve(answer);});
@@ -449,6 +464,17 @@ try{
   check(bounds.width>0 && bounds.left>=0 && bounds.right<=innerWidth,'the panel fits beside collapsed navigation');
   check(document.documentElement.scrollWidth===innerWidth,'collapsed navigation has no horizontal overflow');}
  if(innerWidth===1400){
+  const badge=document.querySelector('[data-page=accounts] #nav-quota');
+  check(!badge.hidden && badge.getBoundingClientRect().width>0 && badge.getAttribute('aria-label')==='Urgent: 4% left',
+   'the collapsed Accounts entry shows the urgent icon and its accessible name');
+  if(shell.classList.contains('collapsed')) document.getElementById('nav-toggle').click();
+  accountsQuota={level:'warning',name:'Warning: 9% left'};
+  dispatchEvent(new Event('focus'));await flush();
+  check(badge.getBoundingClientRect().width>0 && badge.querySelector('.lucide-triangle-alert')
+   && !badge.querySelector('.lucide-octagon-alert'),'the next count read changes the open entry to warning');
+  accountsQuota={level:'none',name:''};
+  dispatchEvent(new Event('focus'));await flush();
+  check(badge.hidden,'the next count read removes the last alert');
   const fixture=document.createElement('iframe');
   fixture.style.cssText='position:fixed;left:0;top:0;width:716px;height:800px;border:0';
   const bookmark='/console/?page=investigations&at.investigations='+

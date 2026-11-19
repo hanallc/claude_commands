@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlencode
 
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_staff_names import without_role_colors
-from scripts.lib import atomic_file, process_start
+from scripts.lib import atomic_file, conf, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result
@@ -237,12 +237,18 @@ class ImagesTests(ImagesFixture):
         older_folder = self.root / image_store.IMAGES_FOLDER / older["id"]
         older["registered_at"] = (datetime.now(UTC) - timedelta(days=9)).isoformat(timespec="seconds")
         image_store.write_record(older_folder, older)
-        source = images.render(self.status).decode()
+        settings = self.temporary / "config/review_links.conf"
+        _ = write_config_fixture(settings, "card_fade_out_ms=365\ncard_fade_in_ms=725\n")
+        with patch.object(conf, "read", wraps=conf.read) as read:
+            source = images.render(self.status).decode()
+        self.assertEqual(sum(call.args == ("review_links",) for call in read.call_args_list), 1)
+        self.assertEqual(source.count(page_frame.BUTTON_STATES), 1)
         self.assertEqual(source.count(page_frame.ZOOM_STYLE), 1)
         self.assertEqual(source.count(page_frame.ZOOM_SCRIPT), 1)
         self.assertEqual(source.count(page_frame.MOTION_SCRIPT), 1)
         self.assertEqual(source.count(page_frame.REFRESH_SCRIPT), 1)
         self.assertIn('data-refresh-seconds="0"', source)
+        self.assertIn('data-card-fade-out-ms="365" data-card-fade-in-ms="725"', source)
         self.assertIn("prefers-reduced-motion: reduce", source)
         self.assertLess(source.index(older["id"]), source.index(newer["id"]))
         self.assertIn('<nav data-image-groups aria-label="Image groups"></nav>', source)
@@ -377,13 +383,28 @@ class ImagesTests(ImagesFixture):
  for (let step = 0; step < 100 && !oldRefreshReady; step++) await wait(20);
  check(oldRefreshReady, 'the older refresh has a page with the card');
  const previous = list();
+ const departingForm = previous.querySelector('form');
+ const feedbackButton = departingForm.querySelector('button[value="feedback"]');
  submitFeedback('Routine feedback.');
+ const fade = departingForm.closest('article').getAnimations()[0];
+ if (!fade) throw new Error('The card must fade after feedback.');
+ fade.pause();
+ fade.currentTime = fade.effect.getTiming().duration / 2;
+ check([...departingForm.querySelectorAll('button')].every(button => button.disabled),
+       'The card disables all form buttons during the fade.');
+ feedbackButton.click();
+ departingForm.requestSubmit(feedbackButton);
+ fade.finish();
  for (let step = 0; step < 100 && list() === previous; step++) await wait(20);
  check(list() !== previous, 'routine feedback refreshes the list');
  check(!list().querySelector('article'), 'routine feedback leaves the card absent');
  releaseOldRefresh();
  for (let step = 0; step < 100 && !oldRefreshReleased; step++) await wait(20);
  check(oldRefreshReleased && !list().querySelector('article'), 'the older refresh cannot restore the card');
+ const updated = list();
+ document.dispatchEvent(new Event('visibilitychange'));
+ for (let step = 0; step < 100 && list() === updated; step++) await wait(20);
+ check(list() !== updated && !list().querySelector('article'), 'A later refresh still replaces the list.');
  check(list() !== null && location.pathname === '""" + images.PAGE_PATH + """', 'the page stays after Send Feedback');
  await report(failures);
 })().catch(error => fetch('/results', {method:'POST', body:JSON.stringify([String(error)])}));
@@ -476,7 +497,7 @@ class ImagesTests(ImagesFixture):
                 server.shutdown()
                 thread.join(TEST_HANG_GUARD_SECS)
         self.assertEqual(results, [[]], "The browser must complete every check without a failure.")
-        self.assertEqual(len(gets), 12, "load, update, reload, update, then one refresh per POST")
+        self.assertEqual(len(gets), 13, "Load, update, reload, update, one refresh per POST, and the later update.")
         self.assertEqual([(post["action"], post["feedback"]) for post in posts], [
             (["approved"], [""]), (["not approved"], [""]), (["feedback"], ["Too dark."]),
             (["question"], ["Which check passed?"]), (["feedback"], ["Please retry."]),
@@ -990,8 +1011,14 @@ async (find, whenPageShows, check) => {
     def test_browser_removes_the_card_and_recounts_until_the_owner_answers(self) -> None:
         _ = self.register('Another image')
         probe = r'''
-async (find, whenPageShows, check, controlRefresh) => {
- const tick = controlRefresh();
+async (find, whenPageShows, check) => {
+ const postFixture = path => fetch(path, {method:'POST', signal:AbortSignal.timeout(20000)});
+ const refresh = () => {
+  const list = document.querySelector('[data-images]');
+  const replaced = whenPageShows('the refreshed image list', () => !list.isConnected);
+  document.dispatchEvent(new Event('visibilitychange'));
+  return replaced;
+ };
  const card = () => find('Question fixture');
  const ask = () => card().querySelector('button[value="question"]');
  const count = () => document.querySelector('.group-count')?.textContent;
@@ -1005,11 +1032,11 @@ async (find, whenPageShows, check, controlRefresh) => {
  check(form.isConnected, 'The card stays until the request saves.');
  await whenPageShows('the card removed', () => !card());
  check(count() === '1', 'The owner count drops as soon as the card leaves.');
- check((await fetch('/fixture-delivery', {method:'POST'})).ok, 'The fixture completes delivery.');
- await tick();
+ check((await postFixture('/fixture-delivery')).ok, 'The fixture completes delivery.');
+ await refresh();
  check(!card() && count() === '1', 'Delivery alone leaves the card out of the count.');
- await fetch('/fixture-answer', {method:'POST'});
- await Promise.all([whenPageShows('the answered card', card), tick()]);
+ check((await postFixture('/fixture-answer')).ok, 'The fixture records the answer.');
+ await Promise.all([whenPageShows('the answered card', card), refresh()]);
  const question = card().querySelector('.page-question').textContent;
  check(question.includes('Which check passed?') && question.includes('The gate passed.'),
        'The returned card shows the question and answer.');
@@ -1022,8 +1049,8 @@ async (find, whenPageShows, check, controlRefresh) => {
  card().querySelector('form').elements.feedback.value = 'Which check failed?';
  card().querySelector('form').requestSubmit(ask());
  await whenPageShows('the card removed again', () => !card());
- check((await fetch('/fixture-failure', {method:'POST'})).ok, 'The fixture records the delivery failure.');
- document.dispatchEvent(new Event('visibilitychange'));
+ check((await postFixture('/fixture-failure')).ok, 'The fixture records the delivery failure.');
+ await refresh();
  await whenPageShows('the card with the failed question', card);
  check(count() === '2', 'The owner count includes the card after a delivery failure.');
  check(card().querySelector('[data-question="Q2"] [role="status"]').textContent ===
@@ -1031,8 +1058,8 @@ async (find, whenPageShows, check, controlRefresh) => {
  card().querySelector('form').elements.feedback.value = 'Which check failed?';
  card().querySelector('form').requestSubmit(ask());
  await whenPageShows('the card removed after resend', () => !card());
- check((await fetch('/fixture-resend', {method:'POST'})).ok, 'The fixture records the successful resend.');
- await tick();
+ check((await postFixture('/fixture-resend')).ok, 'The fixture records the successful resend.');
+ await refresh();
  check(!card() && count() === '1', 'The successful resend keeps the card out of the count.');
 }'''
         requests = self.run_question_browser(self.question_probe(probe))

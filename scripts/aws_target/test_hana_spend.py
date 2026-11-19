@@ -18,7 +18,7 @@ from scripts.lib import conf
 
 class HanaSpendTests(CostFixture):
     book: ledger.CostLedger  # pyright: ignore[reportUninitializedInstanceVariable]
-    controller: hana_spend.HanaSpending  # pyright: ignore[reportUninitializedInstanceVariable]
+    controller: hana_spend.HanaSpending[hana_spend.PermitSettings]  # pyright: ignore[reportUninitializedInstanceVariable]
     workload: hana_spend.PermitSettings  # pyright: ignore[reportUninitializedInstanceVariable]
     start: int = instant('2026-01-15T00:00:00+00:00')
 

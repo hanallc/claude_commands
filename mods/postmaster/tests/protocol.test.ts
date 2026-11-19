@@ -1,9 +1,10 @@
 import { describe, expect, test } from "claude-code/testing";
-import { isOutboxEntry as isEntry, isOutboxResult as isResult, isHeartbeat, isEntryId, isOutboxClaim, isDeliveryRouteFile, isForwardLog, isReplyLog, PATHS } from "../hooks/protocol";
+import { isOutboxEntry as isEntry, isOutboxResult as isResult, isHeartbeat, isEntryId, isOutboxClaim, isDeliveryRouteFile, isForwardLog, isReplyLog, PATHS, VERSION } from "../hooks/protocol";
 
+const recipient = { session_id: "recipient", recipient_pid: 321, recipient_start: "recipient-process" };
 const entry = {
   id: "0123456789abcdef0123456789abcdef",
-  session_id: "recipient",
+  ...recipient,
   socket: "uds:/test-sockets/recipient.sock",
   sender: "Original sender",
   reply_to_session_id: "original-session",
@@ -13,13 +14,14 @@ const entry = {
 };
 const result = {
   id: entry.id,
+  ...recipient,
   outcome: "delivered",
   detail: "",
   sha256: entry.sha256,
   claimed_ms: 9000,
   finished_ms: 9100,
 };
-const heartbeat = { session_id: "postmaster-session", at_ms: 9000, version: "0.1.0", run: "9000-test-worker" };
+const heartbeat = { session_id: "postmaster-session", at_ms: 9000, version: VERSION, run: "9000-test-worker" };
 
 describe("postmaster protocol validators", () => {
   test("entry requires a sender name and permits an unresolved reply destination on the wire", () => {
@@ -127,6 +129,22 @@ describe("postmaster protocol validators", () => {
     for (const outcome of ["delivered", "failed", "expired", "withdrawn", "abandoned"]) {
       expect(isResult({ ...result, outcome })).toBe(true);
     }
+  });
+
+  test("entry and result require nonempty recipient fields and a positive integer pid", () => {
+    for (const invalid of [{ session_id: "" }, { recipient_pid: 0 }, { recipient_pid: 1.5 }, { recipient_start: "" }]) {
+      expect(isEntry({ ...entry, ...invalid })).toBe(false);
+      expect(isResult({ ...result, ...invalid })).toBe(false);
+    }
+  });
+
+  test("results can omit all recipient fields for an unreadable or absent entry", () => {
+    const { session_id: _session, recipient_pid: _pid, recipient_start: _start, ...unbound } = result;
+    for (const outcome of ["withdrawn", "failed", "abandoned"]) {
+      expect(isResult({ ...unbound, outcome })).toBe(true);
+    }
+    expect(isResult(unbound)).toBe(false);
+    expect(isResult({ ...unbound, outcome: "expired" })).toBe(false);
   });
 
   test("result rejects missing fields and wrong field types", () => {

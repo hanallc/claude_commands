@@ -279,6 +279,22 @@
             {
               "Effect": "Allow",
               "Action": [
+                "ec2:DescribeImages",
+                "ec2:DescribeVolumes",
+                "ec2:DescribeReplaceRootVolumeTasks"
+              ],
+              "Resource": "*",
+              "Condition": {
+                "StringEquals": {
+                  "aws:RequestedRegion": {
+                    "Ref": "AWS::Region"
+                  }
+                }
+              }
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
                 "s3:GetObject",
                 "s3:PutObject"
               ],

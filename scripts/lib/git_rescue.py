@@ -14,6 +14,12 @@ import tempfile
 from scripts.lib import git_files, git_index
 
 RESCUE_DESCRIPTORS: ContextVar[tuple[int, ...]] = ContextVar('rescue_descriptors', default=())
+_RESCUE_IDENTITY = {
+    "GIT_AUTHOR_NAME": "git-rescue",
+    "GIT_AUTHOR_EMAIL": "git-rescue@localhost",
+    "GIT_COMMITTER_NAME": "git-rescue",
+    "GIT_COMMITTER_EMAIL": "git-rescue@localhost",
+}
 
 
 _OPERATION_HEAD_FILES = (
@@ -61,6 +67,8 @@ def _git(work_tree: Path, *arguments: str, data: bytes = b"", index: Path | None
          accepted: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess[bytes]:
     command = ["git", "--no-optional-locks", "-C", str(work_tree), *arguments]
     environment = dict(os.environ)
+    if arguments[:1] == ("commit-tree",):
+        environment.update(_RESCUE_IDENTITY)
     if index is not None:
         environment["GIT_INDEX_FILE"] = str(index)
     try:
