@@ -3110,6 +3110,21 @@ Work:
 2. Comments only: no key, value or order changes.
 3. Run each file's reader tests; the readers still parse the files.
 
+### Phase 44dc — A test run stops holding a full build's memory promise  · status: todo
+**From builds (item 78; nate yes 12:12 EST via bob), 2026-11-19:** a test run keeps a full build's memory promise for its whole life. At 09:07 a merge gate using 0.3 GiB still kept 4.6 GiB aside (the 44da read: designed behavior today). Repair it.
+
+Today the need falls only for a progress window or for a nextest step past its build (`reservation_need`, scripts/lint/memory_admit.py). Otherwise the full row need holds until the reservation ends (`step_promise`, `LifetimePromise`).
+
+Work:
+1. In `reservation_need`, for a test step (merge-gate, targeted-test, nextest, test): when the peak has decayed (no near-peak sample for `peak_hold`) and no compiler job runs in the step scope, charge the measured peak since the decay plus the test-phase margin, not the full need.
+2. A new near-peak sample, or a compiler job in the scope, returns the full need at once (a second run of a step).
+3. The rule needs no progress counter and no profile.
+4. Update the as-built text that says a scoped reservation keeps its accepted need (build-memory-admission.md).
+
+Tests (rows in the existing need tests, each failing first): the 09:07 case (4.6 GiB need, 0.3 GiB use, near-peak sample older than 180 s) drops the charge; the same case with a compiler job keeps the full need; a new near-peak sample returns the full need; a build step keeps the full need.
+
+Risk: between the decay and a second compile, the freed room can admit another step. MemAvailable and the PSI hold still guard that window.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
