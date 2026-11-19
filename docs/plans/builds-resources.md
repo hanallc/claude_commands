@@ -2362,7 +2362,7 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `memory_room` (`scripts/lint/memory_admit.py`) subtracts `agent_swap_demand` = ceil(max(0, SwapTotal − SwapFree − build_and_ci_swap) × `agent_swap_share_percent` / 100). `MemoryRoom.agent_swap_demand` carries the term; `room_text` shows it as "− N GiB swapped outside builds".
 - `read_meminfo` reads `build_and_ci_swap` (builds.slice plus the `ci_memory_slice` cgroup `memory.swap.current`) only when the host swaps. An inactive slice (empty systemd ControlGroup) or an absent cgroup folder reads as no swap. A missing counter or a failed systemctl call makes the room unavailable.
 - With no build running, the head still starts alone (the StartsAlone basis needs a readable room).
-- `config/build_admission.conf` key `agent_swap_share_percent=100` (0..100). builds.slice keeps its static MemoryMax 44G backstop; the room term is the dynamic control.
+- `config/build_admission.conf` key `agent_swap_share_percent=20` (0..100). builds.slice keeps its static MemoryMax 44G backstop; the room term is the dynamic control.
 
 **Files:**
 - `scripts/lint/memory_admit.py` — the term, `read_build_and_ci_swap`, `systemd_slice_group`, `slice_swap_current`.
@@ -2371,7 +2371,7 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 - `scripts/build_queue/memory_test_support.py` — the private CI slice writes `memory.swap.current` = 0.
 
 **Gotchas:**
-- Share 100 counts uncompressed swapped pages; zram holds them in less RAM, so the room is conservative. `agent_swap_share_percent` is the knob.
+- The config sets share 20. A share of 100 counts all uncompressed swapped pages; zram holds them in less RAM, so that room is conservative. `agent_swap_share_percent` is the knob.
 - Absent SwapTotal/SwapFree lines read as no swap; only fixtures omit them.
 
 **Ruled out:** a runtime MemoryMax change on builds.slice — the room term keeps builds dynamic.
@@ -2511,7 +2511,7 @@ Each Mac run without `--target-dir` trims the mirror target to `mac_budget_gib.<
 
 #### As-built
 
-- `config/build_admission.conf` `[memory]` has `gpu_test_slots=1` and `gpu_test_repositories=hana`. `read_memory_config` puts them in `AdmissionPolicy.gpu_tests` (`GpuTestSlots`); the default `NO_GPU_TESTS` names no repository.
+- `config/build_admission.conf` `[memory]` has `gpu_test_slots=2` (set by the user) and `gpu_test_repositories=hana`. `read_memory_config` puts them in `AdmissionPolicy.gpu_tests` (`GpuTestSlots`); the default `NO_GPU_TESTS` names no repository.
 - `GpuTestSlots.holds(repository, step)` is true for a listed repository and a step in `GPU_TEST_STEPS` (nextest, test, t, targeted-test, merge-gate).
 - `admission_walk` counts the admitted local reservations that hold a slot (`gpu_test_reservation`: the `queue_waiter` repository name, else `repo`). It adds each GPU test step it admits in the same pass. Cloud reservations, Mac placements and waiters do not count. The slot ends with the reservation; there is no file, lock or signal handler.
 - A held GPU test step gets `AdmissionDecision.gpu = GpuSlotWait(used, slots)` and cannot start. The head keeps its protected need, so no step passes it on memory. A head override does not lift the hold.
@@ -2559,36 +2559,38 @@ The cutover removal commit deletes the script after the run.
 
 **Gotchas:** a `.git` file does not prove that the Git store is outside the gate (`git init --separate-git-dir`); resolve the common directory first. Rescue refs stay in each source under `refs/rescue/`.
 
-### Phase 131 — The disk-floor sweep measures and alarms; it deletes nothing  · status: todo
+### Phase 131 — The temporary-folder sweep measures and alarms; it deletes nothing  · status: todo
 **Source:** build-folders Phase 8 (stall watch and alarm-only sweep), the resources part. builds showrunner 2026-11-15. Devtools owns the stall watch and `folder_audit.py`.
 **Depends on:** build-folders Phase 7 on main (planned Thu 11-19 morning), and devtools' stall watch on held lease owners on main first. Builds owns the order of `test_sweep.py` and `test_tmp_sweep.py` edits: claim them through berth and builds before an edit.
 
 #### Work Order
 
-**Goal:** the automatic disk-floor sweep measures and alarms and deletes nothing; explicit cleanup goes through the maker's lock and rescue path.
+**Goal:** the temporary-folder sweep measures and alarms and deletes nothing; explicit cleanup goes through the maker's lock and rescue path. The floor take on Cargo build output stays.
+
+**Decision (item 88, bob, producer, 2026-11-18 19:35 EST; the user can reverse it):** `tmp_sweep.py` becomes alarm only. The floor take on Cargo build output under `/build/cargo` and `/build/paths` stays. Removal of that floor take needs a bounding rule for each kind of Cargo output outside slots; that is a later decision for bob.
 
 **Spec:**
-1. Change `scripts/lint/tmp_sweep.py` and the floor callers in `scripts/lint/sweep.py` to measurement and alarms. They delete nothing.
+1. Change `scripts/lint/tmp_sweep.py` and its floor callers to measurement and alarms. They delete nothing. Keep the floor take in `scripts/lint/sweep.py` on Cargo build output under `/build/cargo` and `/build/paths`.
 2. Send each eligible one-off to the maker's lock and rescue path (`build_folders`). Keep explicit maker cleanup.
    `tmp_sweep.py --apply` (`apply_cleanup_plan()` at `scripts/lint/tmp_sweep.py:1456`, which deletes through `remove_entry()` at line 1162 and `remove_idle_entry()` at line 1185) is explicit cleanup of a saved plan: route each entry through the same maker path. Keep no direct delete in it.
 3. Retire each competing managed-folder delete path after its legacy users drain.
 4. Keep `~/.cache` out of every root. Add no cleanup tool.
-5. Unfinished trim records: `_hold_floor_pass()` runs `recover_pending_trims()` before it reads free space (`scripts/lint/sweep.py:4481`), and `TrimTake.recover()` deletes the remaining paired output (`sweep.py:2051`). At the cutover, a saved `deleting` or `publishing` intent deletes nothing more: keep the remaining files and keep the record of each completed deletion.
+5. Unfinished trim records: `_hold_floor_pass()` runs `recover_pending_trims()` before it reads free space (`scripts/lint/sweep.py:4481`), and `TrimTake.recover()` deletes the remaining paired output (`sweep.py:2051`). Both stay, because the floor take on Cargo build output stays.
 
 **Constraints from prior phases:**
 - Phase 8: only the installed copy writes the shared hold, release, enforcer and admission state. A checkout or test copy that tries gets exit 2. Tests use private directories.
 - `docs/as-built/build-memory-admission.md` has an "Installed writers and private test state" section. Put the alarm-only lines beside the `tmp_sweep` lines, not in that section.
 
 **Files:**
-- `scripts/lint/sweep.py`, `scripts/lint/tmp_sweep.py` — alarm-only floor callers and the explicit cleanup route.
+- `scripts/lint/sweep.py`, `scripts/lint/tmp_sweep.py` — alarm-only `tmp_sweep` callers, the kept Cargo floor take and the explicit cleanup route.
 - `scripts/lint/test_sweep.py`, `scripts/lint/test_tmp_sweep.py` — alarm, explicit cleanup and saved-plan rows (claim through berth and builds first).
-- `docs/as-built/build-memory-admission.md` — the alarm-only floor rule beside its `tmp_sweep` lines.
+- `docs/as-built/build-memory-admission.md` — the alarm-only `tmp_sweep` rule and the kept Cargo floor take, beside its `tmp_sweep` lines.
 
 **Workers:** `1 writer + 1 tester`
 - `impl` owns `scripts/lint/sweep.py`, `scripts/lint/tmp_sweep.py` and the documentation.
 - `test` owns both test modules and the alarm, cleanup and saved-plan fixtures.
 
-**Acceptance gate:** a low-disk check keeps every fixture folder; the floor alarm still sends once per crossing; explicit maker cleanup still rescues and removes an unlocked one-off; `tmp_sweep.py --apply` on a saved plan removes through the maker path and keeps a locked one; a saved `deleting` trim intent keeps its remaining files and the record of its completed deletions. Run the sweep, tmp sweep, folder audit and source enforcement tests. The full gate runs after the final migration.
+**Acceptance gate:** a low-disk check keeps every fixture folder and still takes Cargo build output under `/build/cargo` and `/build/paths`; the floor alarm still sends once per crossing; explicit maker cleanup still rescues and removes an unlocked one-off; `tmp_sweep.py --apply` on a saved plan removes through the maker path and keeps a locked one; a saved `deleting` trim intent on Cargo output still finishes. Run the sweep, tmp sweep, folder audit and source enforcement tests. The full gate runs after the final migration.
 
 ### Phase 132 — hana_shot launch refuses a new app at the local app cap  · status: done
 **Source:** builds showrunner 2026-11-15 23:1x, natedev decision after the 11-15 swap peak: 8 research `hana_shot.py launch` apps on ports 15820-15827 pushed swap to 36.6 GiB at 16:15 EST. An interim step; queue's memory gate for app launches (queue phase A) replaces it.
@@ -2915,5 +2917,43 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 - Tests on the row in both layouts, 0 failures: 8 suites, 763 tests.
 - Blind review: approved in 1 round.
 - Checkpoint `2eb06f046`; row `6160f865c` on main `f6c11ee64`, branch `builds-resources-p158`. It replaces `49dc19798`.
+- Main `cd9f5002b` moved the execution types to `execution_identity`, and `6160f865c` stopped merging clean. Row `aa966454c` on main `cd9f5002b`, branch `builds-resources-p158b`, replaces it. `test_queue_view.py` keeps only the `CloudGroup` import. Types 0; 8 suites, 767 tests, pass in both layouts.
 
 **Files:** `scripts/aws_target/aws_trial.py`, `scripts/aws_target/cloud_gate.py`, `scripts/aws_target/test_cloud_gate.py`, `scripts/aws_target/test_aws_trial.py`, `scripts/build_queue/admission_service.py`.
+
+### Phase 159 — The floor pass deletes build output whose workspace is gone before it cuts a live worktree  · status: todo
+**Source:** item 88, bob (producer) go 2026-11-18 19:40 EST, through builds. Order: after the Hana AWS work and the Nov 19 cleanup.
+**Cause:** on 11-18, 18 build folders under `/build/cargo` had no workspace (89.2 GiB; largest `scratch/p37w-de072c` 33.9 GiB and `hana_catalyst-inspectors-prefs` 29.1 GiB). The floor take orders by last use only, so it cut live worktree output while these folders stayed. A workspace removed by hand or by `folder_audit.py` leaves its build folder; `worktree_delete` cleans it.
+
+#### Work Order
+
+**Goal:** each floor pass first deletes, whole, every build folder whose workspace is gone, then takes from live targets as before.
+
+**Spec:**
+1. A build folder maps to its workspace through the mirror links under `roots.cargo_paths.<host>` (`/build/paths`). On 11-18: `home/natepiano/rust`, `home/natepiano/worktrees` and `build/slot` link to `/build/cargo`; `build/claude/scratch` links to `/build/cargo/scratch`. So `/build/cargo/<name>` serves `~/rust/<name>`, `~/worktrees/<name>` or `/build/slot/<name>`, and `/build/cargo/scratch/<name>` serves `/build/claude/scratch/<name>`; any other `/build/paths<path>` serves `<path>`. Read the links at run time, not from literals. A folder is an orphan only when no workspace it can serve exists.
+2. A folder is an orphan when no mapped workspace exists, no process uses it (`process_uses()`), and `lock_trees()` gets every Cargo lock in it without a wait.
+3. The floor pass takes orphans first, whole, under their Cargo locks, before any live target. Each one writes a `sweep_trim` row with cause `orphan take`.
+4. Slots (`roots.slots.<host>`) are never orphans: a slot's workspace is the slot folder.
+5. Add no new tool and no new config key unless a value must be tunable; a new key needs no user go.
+
+**Files:** `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py` (new tests at the end), `scripts/buildlog/record.py` (the cause value), `docs/as-built/build-memory-admission.md`.
+
+**Workers:** `1 writer + 1 tester`.
+
+**Acceptance gate:** under the floor, an orphan goes before a live target that is older; an orphan with a held Cargo lock or a process stays; a folder of a live `~/worktrees` workspace stays; a slot stays; above the floor, nothing goes. Run test_sweep, test_tmp_sweep and the buildlog record tests.
+
+### Phase 160 — The Phase 156 gate-time price card merges with main  · status: done
+
+**Source:** builds 11-18 20:1x EST. The Phase 156 row `039bb9706` conflicts with main `cd9f5002b` in `scripts/aws_target/aws_prices.html` and `scripts/aws_target/test_aws_page.py`. Main `366128688` puts prices and quotas in one table and moves the quota help into it.
+
+**Spec:**
+1. Keep main's page: the one Prices and quotas table, its filters and the quota help inside it.
+2. Keep the Phase 156 gate-time price card (`gate-time-price`), its data script (`aws-gate-time-data`) and its fill call. Remove the row's old Quotas section; main replaced it.
+3. Check the parts that merged without a conflict: the region chips, `readAwsPage`, the live refresh and `aws_page.py`.
+4. The new row has one parent, main, and goes on a new branch `builds-resources-p160`.
+
+**Files:** `scripts/aws_target/aws_prices.html`, `scripts/aws_target/test_aws_page.py`, `scripts/aws_target/aws_page.py` (if the clean merge is wrong).
+
+**Workers:** `1 writer`.
+
+**Acceptance gate:** test_aws_page and the AWS page suites pass on the row in both layouts; basedpyright 0; the rendered page shows the Prices and quotas table and the gate-time price card (one dark desktop shot, checked by me).
