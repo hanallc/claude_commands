@@ -2933,6 +2933,7 @@ Work:
 **From 44cb review pass 6 and Astra (/tmp/claude/astra/20261119T003304Z-2566773/review.md), 2026-11-18:** two cases are outside the 44cb guarantee. Starts after 44cb merges.
 1. F014: before an outage, the leave hook runs with no timeout and can pass the launch deadline. The base (47027a14c, admission_client.py:424 and :492) has the same gap. The hook gets only the time left to the active deadline.
 2. A replacement refusal can arrive while the original socket holds only part of a grant frame. The service saves the grant before delivery and does not release it on disconnect (admission_service.py:2645, :4323). Design the service coordination for this case and for cancellation, so a saved grant is never left unresolved.
+3. From 44cb pass 9 and Astra (/tmp/claude/astra/20261119T021252Z-2308046/review.md): control writes (the control writer and `_query()`) use one small nonblocking writer shared with acquisition. It keeps pending bytes across partial writes and checks the deadline before each `send()`. Cleanup keeps its own timing. Tests: encode near expiry, backpressure through expiry, partial write after expiry.
 
 ### Phase 44ck — Every queue row carries one stored name from admission to the page  · status: todo
 **From 44cf closure pass 3 and Astra (/tmp/claude/astra/20261119T010103Z-2553136/review.md), 2026-11-18:** the user's rule is that no row in the queue can be without a name. Earlier rounds fixed one path per round. This phase makes an empty name impossible by construction. Starts after 44cf merges.
