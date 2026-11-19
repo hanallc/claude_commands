@@ -2818,7 +2818,7 @@ A refused or failed release gives a nonzero exit, and the caller cancels the res
 ### Phase 44bs — Every queue row shows a real name  · status: done
 **From the user, 2026-11-18 00:1x:** "it should be IMPOSSIBLE for their to be someth8ing in our queue that cdoes not have a name". Two rows showed "bash" with a raw session id and the showrunner "hana": they were `copies.py run -- bash -c "… verify.sh test hana …"` calls from the startup and widget units that waited for a Hana build folder. A row names its step (the verify.sh verb and package, for example "test hana") and its unit (startup, widget). No row shows a shell or interpreter name or a raw session id. One dark shot.
 
-### Phase 44bt — A build folder is held only while its step runs  · status: todo
+### Phase 44bt — A build folder is held only while its step runs  · status: done
 **From the user, 2026-11-18 00:2x:** "i thought you said that those slots were only used in runnig build queue items - how can they possibly be in use?" At 00:20 EST all 7 Hana build folders on natedev were held by `copies.py run -- … verify.sh …` calls, and none ran Cargo: each took its folder first and then waited (for memory, for the natedev release, or for a Mac run). Two more Hana test runs waited for a folder. `copies.py run` takes its folder only when the step inside is admitted to run on natedev, and frees it when that step ends. Built on 44bg 4cbe61b59 (the doc verb), which is on the merge line.
 
 ### Phase 44bu — No natedev row leaves the line while it waits  · status: todo
