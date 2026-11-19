@@ -28,7 +28,8 @@ from urllib.parse import urlencode
 
 from scripts.agents import pane_record
 from scripts.agents.remote import local_machine
-from scripts.lib import atomic_file, urgency
+from scripts.lib import atomic_file, conf, urgency
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import change_review, investigation, next_item, production_lifecycle, proposal_issue, proposals_folder, record_store, session_staff, showrunners, staff, tidy_wrapped, update_registration
 from scripts.production.issues import Issue, frontmatter
 from scripts.production.production_doc import read_production
@@ -123,6 +124,25 @@ class ReviewSubmissionTests(unittest.TestCase):
         return [Issue(path, frontmatter(path)) for path in self.issues.glob("*.md")
                 if not path.name.startswith("question-")]
 
+    def test_answered_new_item_projects_one_response_from_the_same_question(self) -> None:
+        payload = request(submissions.SubmissionKind.QUESTION)
+        saved = submissions.submit(payload)
+        waiting = review_items.submission_item(saved, self.members)
+        self.assertEqual((waiting.type, waiting.state), (review_items.ReviewType.QUESTION, review_items.ReviewState.WAITING))
+
+        answer = 'Use the desktop layout.'
+        self.assertTrue(submissions.answer(saved.key, answer, saved.reply_token))
+        self.assertFalse(submissions.answer(saved.key, answer, saved.reply_token))
+        replay = submissions.submit(payload)
+        self.assertEqual((replay.key, replay.path, replay.owner), (saved.key, saved.path, OWNER))
+        native, = self.questions()
+        self.assertEqual(native.path, saved.path)
+        row = review_items.submission_item(replay, self.members)
+        self.assertEqual((row.key, row.type, row.state), (waiting.key, review_items.ReviewType.RESPONSE,
+                                                        review_items.ReviewState.OPEN))
+        self.assertEqual(row.log[-1].words, 'Answer: '+answer)
+        self.assertEqual(row.response, submissions.QuestionResponse(payload.words, answer, row.log[-1].time))
+
     def test_four_kinds_use_their_native_stores_and_ids(self) -> None:
         expected = ("Q1", "P1", "I1", "I2")
         for number, (kind, identity) in enumerate(zip(submissions.SubmissionKind, expected, strict=True), 1):
@@ -177,6 +197,13 @@ class ReviewSubmissionTests(unittest.TestCase):
         self.assertEqual(proposal.id, "P1")
         self.assertIsInstance(proposal_issue.find_review_proposal(vault, PRODUCER, new_item_dialog.ByItemId("P1")), Issue)
 
+    def test_proposal_folder_is_absent_for_a_producer_directory(self) -> None:
+        directory = self.root / "brain"
+        directory.mkdir()
+        producer = replace(self.members.rows[1], doc=staff.LiveDoc(local_machine(), directory))
+        self.assertEqual(submissions.proposal_folder(producer),
+                         submissions.NoNativeFolder(submissions.SubmissionKind.PROPOSAL))
+
     def test_concurrent_retries_reuse_the_id_for_the_same_request(self) -> None:
         with ThreadPoolExecutor(max_workers=4) as executor:
             saved = list(executor.map(submissions.submit, [request()] * 4))
@@ -187,6 +214,102 @@ class ReviewSubmissionTests(unittest.TestCase):
             with self.assertRaisesRegex(submissions.SubmissionConflict, "different item data"):
                 _ = submissions.submit(different)
         self.assertEqual([item.id for item in investigation.records(OWNER)], ["I1"])
+
+    def test_concurrent_draft_sends_reuse_each_recipient_item(self) -> None:
+        first = replace(request(), request_id="r2-" + "a" * 32)
+        second = replace(first, recipient_id=PRODUCER)
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            saved, other, replay, other_replay = executor.map(submissions.submit, (first, second, first, second))
+        self.assertEqual(saved.key, replay.key)
+        self.assertEqual(other.key, other_replay.key)
+        self.assertNotEqual(saved.key, other.key)
+        self.assertEqual([record.id for record in investigation.records(OWNER)], [saved.id])
+        self.assertEqual([record.id for record in investigation.records(PRODUCER)], [other.id])
+
+    def test_f021_page_send_reuses_standard_item_filed_with_parent(self) -> None:
+        _ = self.wrap_fixture()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.root / "config")})))
+        _ = write_config_fixture(conf.path("console"), f"page.review.owner={PRODUCER}\n")
+        standard = replace(request(), request_id="r2-" + "c" * 32)
+        saved = submissions.submit(standard)
+        self.assertEqual((saved.recipient_id, saved.owner), (OWNER, PRODUCER))
+
+        page = replace(standard, recipient_id=PRODUCER, page="review")
+        self.assertEqual(submissions.submit(page).key, saved.key)
+        self.assertEqual(submissions.submit(replace(page, page="")).key, saved.key)
+
+        # Remove the index to exercise receipts saved before it existed.
+        index = submissions.image_folder(saved).parent.with_name(f"r4-{saved.payload_hash}")
+        for marker in (".indexed", f"recipient-{PRODUCER}", "page-review"):
+            (index / marker).unlink()
+        self.assertEqual(submissions.submit(page).key, saved.key)
+        self.assertEqual([record.id for record in investigation.records(PRODUCER)], [saved.id])
+        self.assertEqual(investigation.records(OWNER), [])
+
+    def test_f022_page_retry_keeps_reused_standard_item_after_owner_retires(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.root / "config")})))
+        _ = write_config_fixture(conf.path("console"), f"page.review.owner={OWNER}\n")
+        standard = replace(request(), request_id="r2-" + "d" * 32)
+        saved = submissions.submit(standard)
+        page = replace(standard, page="review")
+        self.assertEqual(submissions.submit(page).key, saved.key)
+
+        _ = self.wrap_fixture()
+        retry = replace(page, recipient_id=PRODUCER)
+        self.assertEqual(submissions.submit(retry).key, saved.key)
+        self.assertEqual([record.id for record in investigation.records(OWNER)], [saved.id])
+        self.assertEqual(investigation.records(PRODUCER), [])
+
+    def test_list_producer_uses_native_stores_without_its_staff_document(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.root / "config")})))
+        _ = write_config_fixture(conf.path("console"),
+                                 f"page.review.owner={OWNER}\npage.list.owner={PRODUCER}\n")
+        morty = replace(self.members.rows[1], name="morty",
+                        doc=staff.LiveDoc(local_machine(), self.root / "unavailable.md"))
+        members = replace(self.members, rows=(self.members.rows[0], morty))
+        _ = self.enterContext(patch.object(staff, "snapshot", return_value=members))
+        for at, kind in enumerate((submissions.SubmissionKind.QUESTION, submissions.SubmissionKind.INVESTIGATION,
+                                   submissions.SubmissionKind.BUG)):
+            with self.subTest(kind=kind):
+                standard = replace(request(kind, recipient=PRODUCER), request_id=f"r2-{at:032x}")
+                selected = replace(standard, page="review", page_recipient=new_item_dialog.PageRecipient.LIST_OWNER)
+                saved = submissions.submit(selected)
+                folder = (record_store.default_question_folder(PRODUCER) if kind == submissions.SubmissionKind.QUESTION
+                          else investigation.folder(PRODUCER))
+                self.assertTrue(saved.path.is_relative_to(folder))
+                self.assertEqual(saved.owner, morty.id)
+                self.assertEqual(submissions.submit(selected).key, saved.key)
+                self.assertEqual(submissions.submit(standard).key, saved.key)
+                default = replace(selected, recipient_id=OWNER, page_recipient=new_item_dialog.PageRecipient.PAGE_OWNER)
+                self.assertNotEqual(submissions.submit(default).key, saved.key)
+        with self.assertRaisesRegex(submissions.SubmissionConflict, "List owner is unavailable"):
+            invalid = replace(request(recipient=OWNER), page="review",
+                              page_recipient=new_item_dialog.PageRecipient.LIST_OWNER)
+            _ = submissions.submit(invalid)
+
+    def test_draft_id_files_changed_content_before_and_after_native_write(self) -> None:
+        original = replace(request(), request_id="r2-" + "b" * 32, images=(IMAGE,))
+        changed_words = replace(original, words="A different report")
+        changes = (replace(original, kind=submissions.SubmissionKind.INVESTIGATION),
+                   replace(original, recipient_id=PRODUCER),
+                   replace(original, images=()))
+        with patch.object(record_store.NumberedRecords, "write", side_effect=OSError("interrupted")):
+            with self.assertRaisesRegex(OSError, "interrupted"):
+                _ = submissions.submit(original)
+        self.assertEqual(investigation.records(OWNER), [])
+        changed = submissions.submit(changed_words)
+        saved = submissions.submit(original)
+        self.assertNotEqual(changed.key, saved.key)
+        saved_keys = {changed.key, saved.key}
+        for change in changes:
+            with self.subTest(change=change):
+                item = submissions.submit(change)
+                self.assertNotIn(item.key, saved_keys)
+                saved_keys.add(item.key)
+                self.assertEqual(submissions.submit(change).key, item.key)
+        self.assertEqual(submissions.submit(original).key, saved.key)
+        self.assertEqual(len(investigation.records(OWNER)), 4)
+        self.assertEqual(len(investigation.records(PRODUCER)), 1)
 
     def test_evidence_and_image_survive_each_native_store_round_trip(self) -> None:
         for kind in submissions.SubmissionKind:
@@ -832,8 +955,9 @@ class ReviewSubmissionTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 self.assertTrue(submissions.answer(saved.key, 'Ready for review', saved.reply_token))
                 self.assertTrue(saved.path.exists())
-                found = review_items.read(self.root / 'review', members=self.members,
-                                          kinds=(review_items.ReviewType(kind.value),))
+                review_type = (review_items.ReviewType.RESPONSE if kind == submissions.SubmissionKind.QUESTION
+                               else review_items.ReviewType(kind.value))
+                found = review_items.read(self.root / 'review', members=self.members, kinds=(review_type,))
                 self.assertTrue(any(item.source_unit == OWNER and item.id == f'builds/{saved.id}'
                                     and item.state == review_items.ReviewState.OPEN for item in found))
         latest = self.root / 'third-issues'

@@ -67,6 +67,13 @@ class ResolveTests(unittest.TestCase):
         self.assertIn("no zone is named 'Seattle'; give the IANA zone of the place", str(refused.exception))
 
 
+    def test_notice_tells_agents_to_let_the_tools_add_the_present_time(self) -> None:
+        text = zone.notice("America/Curacao", INITIAL_ZONE)
+        self.assertIn("Write no present time. Write only future times, such as an ETA. The tools add the present time.",
+                      text)
+        self.assertNotIn("Read the clock", text)
+
+
 class StoredZoneTests(unittest.TestCase):
     def test_stored_uses_the_shared_reader_for_values_and_the_default(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))

@@ -570,6 +570,8 @@ def _host(
         clients = herdr.attached_clients(place.session)
         return {"kind": "herdr", "herdr_session": place.session, "pane_id": place.pane,
                 "presentation": "attached window" if isinstance(clients, herdr.ClientsAttached) else "detached"}
+    if isinstance(place, herdr.UnprovedHerdrPlacement):
+        return {"kind": "unknown"}
     desktop: Desktop = {"kind": "not in snapshot"}
     return _terminal_host(session.get("pid", 0), desktop)
 

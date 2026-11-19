@@ -4,6 +4,7 @@ from dataclasses import replace
 import os
 import unittest
 
+from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_client as client, admission_protocol as wire, first_step, placement
 from scripts.build_queue.test_placement import (
     PlacementFixture, adopt_assignment, assignment_for, consume_permission, placement_request, publish_candidate,
@@ -34,7 +35,7 @@ class FirstStepTests(unittest.TestCase):
                                   wire.FirstAuthorization)
             _ = publish_candidate(fixture, request)
             completed, = fixture.connect(wire.ExecutionReport("done", assignment, claim,
-                placement.ExecutionNotStarted(), placement.AttemptCompleted(0), placement.DispatchPathSettled())).replies()
+                execution_identity.ExecutionNotStarted(), placement.AttemptCompleted(0), placement.DispatchPathSettled())).replies()
             assert isinstance(completed, wire.DispatchStatus)
             self.assertEqual(completed.state, placement.ClosedAssignment("completed"))
 

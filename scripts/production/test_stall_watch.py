@@ -13,7 +13,6 @@ import runpy
 import select
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -353,8 +352,6 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         _ = self.config.write_text((f"""# range: 0..
 threshold_percent=1
 # range: 0..
-repeat_minutes=30
-# range: 0..
 stall_minutes={stall_minutes}
 faults_to=natedev
 always=natedev
@@ -413,18 +410,21 @@ always=natedev
         _ = (directory / "conf").write_text(f"TARGET=session:{owner.id}\nPROMPT_FILE={prompt}\n{check}")
 
     def unit(self, name: str) -> tuple[int, Path]:
-        child = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        socket_path = self.root / f"{unit_session(name)}.sock"
+        listener = ("import socket, sys, time; "
+                    "sock = socket.socket(socket.AF_UNIX); sock.bind(sys.argv[1]); sock.listen(128); "
+                    "print('listening', flush=True); time.sleep(float(sys.argv[2]))")
+        child = subprocess.Popen([sys.executable, "-c", listener, str(socket_path), str(TEST_HANG_GUARD_SECS)],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.children.append(child)
+        assert child.stdout is not None
+        with child.stdout:
+            self.assertEqual(child.stdout.readline(), b"listening\n")
         pane_pid = 10_000 + len(self.panes)
         self.process_rows += [f"{pane_pid} 1 herdr pane", f"{child.pid} {pane_pid} claude --remote-control other-name"]
         pane_id = len(self.panes) + 1
         self.panes[name] = {"pane": PANE, "id": pane_id, "pid": child.pid, "name": "showrunner", "label": f"label-of-{name}"}
-        socket_path = self.record_session(child.pid, unit_session(name), "different-remote-name")
-        # The lookup reads the record itself: it needs the pane the session runs in, and a real socket.
-        held = socket.socket(socket.AF_UNIX)
-        held.bind(str(socket_path))
-        held.listen(128)
-        self.addCleanup(held.close)
+        _ = self.record_session(child.pid, unit_session(name), "different-remote-name")
         record_path = self.sessions / f"{child.pid}.json"
         record = cast(dict[str, object], json.loads(record_path.read_text()))
         _ = record_path.write_text(json.dumps({**record, "tmux": ""}))

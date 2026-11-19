@@ -27,7 +27,7 @@ source "${BASH_SOURCE[0]%/*}/../lib/conf.sh"
 # the config that is not listed here is rejected as unknown.
 LINT_CONFIG_OPS=(
     "mend|cargo mend check pass and its --fix pass|invoke.sh mend (lint CLI, validate_ci mend steps, verify.sh lint)"
-    "style_review|style-guide walk and banned-words scan over the caller's diff|/unit:style_review · /unit:direct reviewer worker"
+    "style_review|Rust style checklist for the caller's diff|/unit:style_review · /unit:direct reviewer worker"
     "clippy|cargo clippy|invoke.sh clippy (lint CLI, verify.sh lint)"
     "doc|cargo doc with -D warnings|standalone lint doc only; verify.sh doc ignores this switch"
     "fmt|cargo +nightly fmt|invoke.sh fmt (lint fmt, verify.sh lint)"

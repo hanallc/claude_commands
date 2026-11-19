@@ -11,7 +11,7 @@ from typing import cast
 from urllib.parse import quote
 from uuid import uuid4
 
-from scripts.agents import pane_record, remote, restart, restart_support, shutdown_record, stop_resume
+from scripts.agents import pane_record, producer_creation, remote, restart, restart_support, shutdown_record, stop_resume
 from scripts.herdr import herdr
 from scripts.herdr.place import HerdrPlace
 from scripts.lib import atomic_file, models_registry
@@ -138,15 +138,15 @@ def add(name: str, *, model: str = "", effort: str = "", job: str = "") -> int:
     if len(job.splitlines()) > 1 or "\n" in job or "\r" in job:
         raise ValueError("--job must contain one line")
     folder = stop_resume.producer_folder(name)
-    path = stop_resume.producer_creation_path(name)
-    with (staff.slot_operation("producer-lifecycle", name),
-          staff.slot_operation("producer-first-" + name, name)):
+    path = producer_creation.record_path(name)
+    with producer_creation.operation(name):
         record = staff.initial_snapshot()
         matches = [row for row in record.find(kind="producer") if row.name == name]
         if len(matches) > 1:
             raise ValueError(f"{name}: several producer rows have this name")
         own = matches[0] if matches else None
-        saved = _read(path)
+        saved = producer_creation.read_record(path)
+        current_marker = producer_creation.require_record(name, saved)
         profiles = _profiles()
         if saved:
             folder = Path(_text(saved, "folder"))
@@ -177,9 +177,12 @@ def add(name: str, *, model: str = "", effort: str = "", job: str = "") -> int:
             values = {"name": name, "job": job}
             readme = re.sub(r"\{(name|job)\}", lambda match: values[match[1]], template)
             saved = {"profile": profile.value(), "job": job, "readme": readme, "folder": str(folder),
-                     "opening_since": datetime.now(timezone.utc).isoformat()}
-            _write(path, saved)
-        _ = models_registry.store_producer(name, *profile)
+                     "opening_since": datetime.now(timezone.utc).isoformat(), "creation_id": uuid4().hex}
+            producer_creation.write_record(path, saved)
+        if not isinstance(saved.get("opening_confirmed"), str):
+            if current_marker is None:
+                producer_creation.claim(name, producer_creation.marker_for(saved), profile)
+            producer_creation.sync_profile(name)
         _ = os.environ.pop(models_registry.OPERATION_ENVIRONMENT[0], None)
         _create_readme(folder / "README.md", _text(saved, "readme"))
         request = stop_resume.ProducerFirstStart(name, folder)
@@ -189,7 +192,8 @@ def add(name: str, *, model: str = "", effort: str = "", job: str = "") -> int:
         admitted = staff.initial_snapshot().by_current_session(result.session_id)
         if admitted is None or admitted.name != name or admitted.kind != "producer":
             raise ValueError(f"{name}: the first start did not record the producer")
-        _write(path, {**_read(path), "staff": admitted.id, "account": result.account, "tab": result.pane_id})
+        producer_creation.write_record(path, {**producer_creation.read_record(path), "staff": admitted.id,
+                                               "account": result.account, "tab": result.pane_id})
         _print_started(admitted, result.account, result.pane_id)
         return 0
 

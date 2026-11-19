@@ -4115,7 +4115,7 @@ class LiveMemoryTripwireTests(MemoryQueueFixture):
         for path in (Path("/proc/meminfo"), link):
             with self.subTest(path=path):
                 self.record.unlink(missing_ok=True)
-                with patch.object(Path, "read_text", side_effect=AssertionError("must refuse before reading memory")):
+                with patch.object(Path, "read_bytes", side_effect=AssertionError("must refuse before reading memory")):
                     with self.assertRaises(gate.LiveMemoryReading) as raised:
                         _ = gate.read_meminfo(path)
                 self.assertEqual(str(raised.exception), self.refusal("/proc/meminfo"))
@@ -4140,7 +4140,7 @@ class LiveMemoryTripwireTests(MemoryQueueFixture):
                 else:
                     os.environ["BUILDLOG_LIVE_MEMORY_TRIPWIRE"] = setting
                 # Keep the default-path contract without reading host memory.
-                with patch.object(Path, "read_text", return_value="full avg10=0 total=0\n"):
+                with patch.object(Path, "read_bytes", return_value=b"full avg10=0 total=0\n"):
                     self.assertIsInstance(gate.read_pressure(policy=admission_policy_fixture()), admission_records.Pressure)
 
     def test_shell_refuses_live_meminfo_or_pressure_and_records_one_reading(self) -> None:
@@ -4819,14 +4819,14 @@ class ProcessRunUseTests(unittest.TestCase):
     def test_a_denied_status_keeps_the_run_unavailable_and_names_its_file(self) -> None:
         _ = self.reservation("holder", 100)
         denied = self.fixture.proc.path / "101/status"
-        read_text = Path.read_text
+        read_bytes = Path.read_bytes
 
-        def read_private(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        def read_private(path: Path) -> bytes:
             if path == denied:
                 raise PermissionError(13, "Permission denied", str(path))
-            return read_text(path, encoding=encoding, errors=errors)
+            return read_bytes(path)
 
-        with patch.object(Path, "read_text", read_private):
+        with patch.object(Path, "read_bytes", read_private):
             room = self.room()
         self.assertIsInstance(room.cap, admission_records.CapUnavailable)
         hold, = room.runs
@@ -5548,8 +5548,14 @@ class QueueLeaveTests(unittest.TestCase):
                 + 'run_nextest --workspace')
 
     def test_a_waiting_run_takes_tokens_once_admitted_and_reserves_their_width(self) -> None:
+        with (self.root / "build_admission.conf").open("a", encoding="utf-8") as configuration:
+            _ = configuration.write("\n# whole: 0..\nnested_tokens=3\n")
         pool, calls = self.root / "pool", self.root / "cargo-calls"
         ran_args, reservation, waited = self.root / "args", self.root / "reservation", self.root / "waited"
+        listing = self.root / "test-list.json"
+        _ = listing.write_text(json.dumps({"rust-suites": {"suite": {"testcases": {
+            f"test_{index}": {"filter-match": {"status": "matches"}} for index in range(12)
+        }}}}), encoding="utf-8")
         os.mkfifo(pool)
         keeper = os.open(pool, os.O_RDWR | os.O_NONBLOCK)
         self.addCleanup(os.close, keeper)
@@ -5561,21 +5567,26 @@ class QueueLeaveTests(unittest.TestCase):
             + '[[ "$*" == "nextest --version" ]] && exit 0\n'
             + f'printf "%s\\n" "$*" >> "{calls}"\n'
             + '[[ " $* " == *" --no-run "* ]] && exit 0\n'
+            + f'if [[ "$1 $2" == "nextest list" ]]; then cat "{listing}"; exit $?; fi\n'
             + f'printf "%s\\n" "$*" > "{ran_args}"; "$TEST_PY" "$TEST_CAPTURE_WIDTH" > "{reservation}"\n')
         cargo.chmod(0o755)
         self.environment["PATH"] = f"{bin_dir}{os.pathsep}{self.environment['PATH']}"
         self.environment["CARGO_MAKEFLAGS"] = f"--jobserver-auth=fifo:{pool}"
+        self.environment["TMPDIR"] = str(self.root)
         free = (f'[[ -e "{calls}" ]] && echo built >> "{waited}"; echo waited >> "{waited}"; '
                 + 'printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO";')
         step = 'nextest_logical_cores() { LINT_LOGICAL_CORES=12; }; LINT_TEST_WIDTH=logical; run_nextest --workspace'
         result = self.run_step(None, free, step)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines()[-1].split("|")[:2], ["0", "Granted"])
-        # The memory wait comes before the build, and the build before the tokens.
+        # The memory wait ends before the build. The build ends before the launcher takes tokens.
         self.assertEqual(waited.read_text().splitlines(), ["waited"])
-        self.assertEqual(calls.read_text().splitlines(), ["nextest run --no-run --workspace",
-                                                          "nextest run --test-threads 6 --workspace"])
-        self.assertEqual(json.loads(reservation.read_text())["test_threads"], 6)
+        self.assertEqual(calls.read_text().splitlines(), [
+            "nextest run --no-run --workspace",
+            "nextest list --message-format json --workspace",
+            "nextest run --test-threads 3 --workspace",
+        ])
+        self.assertEqual(json.loads(reservation.read_text())["test_threads"], 3)
         self.assertEqual(len(os.read(keeper, 64)), 6)
 
     def test_full_width_nextest_run_reports_threads_and_load_after_admission(self) -> None:

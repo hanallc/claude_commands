@@ -43,9 +43,54 @@ These fields do not change the recipient, reply name, or message key.
 
 ### Replies to relay sockets
 
-The headless relay uses the session name `relay/<sender>`. Session lookups identify a relay only when its saved sender and process start identity match the live process; on Linux the boot ID must also match. A real session with the same name form, or a reused PID, stays visible. Its message body names the real sender in `Shown sender:`. The name rule and its readers are described in [session-roster.md](session-roster.md). Before the headless relay starts Claude, it atomically publishes the process lifetime and sender in `message/relay_senders/<pid>.identity`, then the plain sender name in `message/relay_senders/<pid>`. The plain sender remains available after the process exits for reply recovery. It then execs Claude with that same PID, which owns `cc-socks/<pid>.sock`. A reply to a missing socket, or one whose delivery connect returns `ENOENT` or `ECONNREFUSED`, checks the saved name through staff. A staff sender uses its current session. A non-staff sender uses the live registry. Send and drain share this rule; a live socket takes only its delivery connect. Without a saved name or a live session, `send.py` reports `FAILED` (exit 3), names the address and sender on stderr, and keeps no raw socket queue. A queued message uses the session ID found at the queue decision, even if that session then exits.
+The headless Claude relay uses the session name `relay/<sender>`. Before Claude starts, the launcher records the sender and process start in `message/relay_senders/<pid>.identity`.
+On Linux, it also records the boot ID. The launcher saves the sender name in `message/relay_senders/<pid>`.
+Claude runs with the same PID and owns `cc-socks/<pid>.sock`.
 
-`send.py drain-sockets` recovers old raw `uds__*.sock.jsonl` queues. It delivers each message in a file whose newest entry is under 24 hours old to the named live session, marked `Stuck message from <original time>:`. Recovery uses the relay record, then queued recipient metadata (`to_name`, `to-name`, `recipient_name`, or a named `to`). Each stable recovery ID gets a flushed and fsynced attempt in `message/socket-recovery-attempts.jsonl` before delivery, followed by its durable result in `message/log.jsonl`. The message log keeps one row per result; attempts do not count as messages. A rerun skips confirmed sends. An attempt without a result is archived without resending: `UNCONFIRMED: stuck reply from <time> to <name> may have arrived; archived, not resent` (exit 3); a later run has nothing to repeat. Known failed sends remain for retry, without another queued copy. Unresolved or unreadable files stay in place and are reported by path (exit 3); other files still run. Older files move intact to `message/socket-queue-archive/`; one line gives the file count and oldest and newest message times. Archive names never overwrite another item, and a retry reuses an identical uncertain entry's archive. `UNCONFIRMED` and `SENT` lines are printed and flushed before removing the queue entry; a rerun may repeat the report, without sending again. The old-file summary (`archiving <n> socket queue files: …`) is printed and flushed before any of its files move, so an interrupted move cannot hide the count; a rerun names only the files still to move.
+A native session or registered socket selects one conversation from the routing registry read.
+The sender uses the same owner check as the unit report.
+A staff name or `staff:<id>` selects a staff recipient.
+Only a staff recipient can select a successor when the sender prepares another attempt.
+A reply to an active relay selects its process generation.
+After confirmed absence, the relay's saved sender can supply a fallback conversation.
+A retry to a native conversation can use a new process generation for that conversation.
+
+The sender checks the owner before connecting.
+The private proxy checks the peer PID, process start, registry conversation, and socket immediately before forwarding on the same connection.
+A pre-tool hook permits one `SendMessage` call with the private address and expected message.
+The proxy buffers the request until the relay closes its write side.
+Before it writes any bytes, the proxy compares the decoded body with the exact encoding of the approved text.
+The encoder matches the two tag escape passes in Claude Code 2.1.319.
+The sender uses the tool ID from the completed proxy write to find the approved call and its result.
+The sender requires a complete forward of the approved text and one explicit success result for that tool ID.
+The `SENT` line reports how many SendMessage calls the relay made and that the proxy forwarded one.
+A possible write without confirmed acceptance leaves delivery unconfirmed and retains the claim.
+Claude's socket protocol has no expected conversation field.
+The race window extends from the final registry check until the receiver accepts the request.
+The sender closes its cleanup pipe on exit. The cleanup process removes the private directory.
+
+A queue entry stores the native conversation or staff ID and the process generation when available.
+The queue reader checks the current native owner before it prints the message.
+An explicit staff queue request reads the queue for that staff ID.
+The reader preserves the original bytes of entries with invalid, ambiguous, or conflicting recipient fields.
+An unknown owner or a peer mismatch fails the send.
+An offline staff queue requires proof of absence.
+SSH forwards native session addresses as conversations and staff addresses as staff IDs.
+
+Registered Claude delivery uses the checked relay. The Python postmaster records include the recipient PID and process start.
+New postmaster receipts must match that recipient. Postmaster stays disabled for registered sends until its mod validates the generation.
+Existing receipts without recipient evidence can settle earlier claims that also lack that evidence.
+A staff retry checks legacy reservations under its current or original conversation.
+The retry stays pending until a definite result resolves the legacy reservation.
+
+`send.py drain-sockets` can recover a raw socket queue when its entry proves the recipient.
+An entry with conflicting recipient fields stays in the file for inspection.
+A proved reply expires after 24 hours and moves to `message/socket-queue-archive/`.
+The drain moves the file intact when all of its replies qualify.
+The drain retains entries that need inspection in the original file.
+The drain records each attempt in `message/socket-recovery-attempts.jsonl` before delivery. It records the result in `message/log.jsonl` before removing the entry.
+An interrupted or unconfirmed attempt moves to the archive. A confirmed failure keeps the entry for retry.
+The drain prints and flushes each completed result before it removes the entry.
 
 ### The message guide
 

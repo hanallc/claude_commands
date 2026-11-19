@@ -109,6 +109,7 @@ class DispatchAgent:
         record = ({"type": "event_msg", "payload": {"type": "user_message" if role == "user" else "agent_message", "message": text}}
                   if isinstance(backend, staff.CodexBackend) else
                   {"type": role, "message": {"role": role, "content": [{"type": "text", "text": text}]}})
+        record["timestamp"] = datetime.now(timezone.utc).isoformat()
         with path.open("a", encoding="utf-8") as stream:
             _ = stream.write(json.dumps(record) + "\n")
         if role == "assistant":
@@ -1046,6 +1047,54 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(self.command("restore"), (0, f"{self.fixture.parent.name}: workers unchanged\n", ""))
         self.assertEqual(len(self.fixture.world.launches), before)
 
+    def test_restore_reports_each_worker_with_pending_completion(self) -> None:
+        impl = self.opened("impl")
+        cm = self.opened("cm")
+        dispatches: dict[str, str] = {}
+        for opened in (impl, cm):
+            name = opened.row.name
+            dispatch = progress_history.begin_dispatch(self.run_dir, slot=name, phase="8", role="impl",
+                worker_name=name, worker_id=opened.row.id, launcher_command=["assign.sh", name],
+                prompt=self.prompt, kind="impl", lens="")
+            dispatches[name] = dispatch
+            line = f"Complete the work. End your reply with DONE {dispatch}."
+            reply = self.run_dir / f"{name}_reply.md"
+            progress_history.save_dispatch_delivery(self.run_dir, dispatch,
+                progress_history.DispatchDelivery(line, dispatch, str(reply)))
+            self.agent.append(opened.pane, "user", line)
+
+        backend = staff.backend(impl.row)
+        assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
+        transcript = worker_admission.transcript_source(impl.row, backend)
+        with transcript.open("a", encoding="utf-8") as stream:
+            _ = stream.write('{"torn":')
+        result_path, result = self.detached_record(cm.row, "private-check")
+        result.update(delivery=f"sent: worker cm at {cm.pane}", pane_dispatch_id=dispatches["cm"])
+        atomic_file.write_text_atomic(result_path, json.dumps(result))
+        self.agent.append(cm.pane, "user", "Detached run: private-check\nRun finished: private verification")
+        self.agent.append(cm.pane, "assistant", "The check is on hold.")
+        self.fixture.world.locations[cm.pane]["agent_status"] = "done"
+
+        observe = worker_panes.observe
+
+        def observe_impl_first(parent: staff.StaffId, record: staff.StaffSnapshot) -> list[worker_panes.WorkerPane]:
+            return sorted(observe(parent, record), key=lambda state: state.row.name != "impl")
+
+        _ = self.enterContext(patch.object(worker_panes, "observe", side_effect=observe_impl_first))
+        code, _, errors = self.command("restore")
+        self.assertEqual(code, worker.ExitCode.UNCERTAIN)
+        self.assertEqual(errors.splitlines(), ["anomaly: impl: worker transcript has incomplete records",
+                                               "cm: a detached run result awaits a matching DONE"])
+        self.assertIn(impl.pane, self.fixture.world.locations)
+        self.assertIn(cm.pane, self.fixture.world.locations)
+
+        self.agent.append(cm.pane, "assistant", f"The check is complete.\nDONE {dispatches['cm']}")
+        code, _, errors = self.command("restore")
+        self.assertEqual(code, worker.ExitCode.UNCERTAIN)
+        self.assertEqual(errors.splitlines(), ["anomaly: impl: worker transcript has incomplete records"])
+        self.assertIn(impl.pane, self.fixture.world.locations)
+        self.assertNotIn(cm.pane, self.fixture.world.locations)
+
     def test_herdr_dispatch_records_the_worker_staff_id(self) -> None:
         for foreign_tab in (False, True):
             with self.subTest(foreign_tab=foreign_tab):
@@ -1329,9 +1378,9 @@ class WorkerCommandTests(unittest.TestCase):
                         failure_steps.append("error reply")
                         save_reply(path, text)
 
-                    def notify(thread_id: str) -> None:
+                    def notify(owner: staff.StaffId) -> detached_runs.CompletionReplay:
                         failure_steps.append("notice")
-                        run_finished(thread_id)
+                        return run_finished(owner)
 
                     with ExitStack() as failures:
                         if outcome == "first staff read":
@@ -1663,7 +1712,8 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(progress_history.active_dispatch(opened.row.id, self.run_dir), active)
             if closed:
                 _ = self.fixture.world.stop(opened.row, self.fixture.world)
-            record.update(status="finished", delivery=f"sent: worker {opened.row.name} at {opened.pane}")
+            delivery = "sent: holder received the result" if closed else f"sent: worker {opened.row.name} at {opened.pane}"
+            record.update(status="finished", delivery=delivery)
             atomic_file.write_text_atomic(path, json.dumps(record))
             if not closed:
                 self.agent.append(opened.pane, "user", "Detached run: verification\nRun finished: private verification")
@@ -1732,7 +1782,9 @@ class WorkerCommandTests(unittest.TestCase):
         row = self.agent.row(pane)
         path, record = self.detached_record(row, "private-check")
         record["delivery"] = f"sent: worker {row.name} at {pane}"
+        record["delivered_at"] = time.time()
         atomic_file.write_text_atomic(path, json.dumps(record))
+        self.agent.complete(pane)
         receipt = self.receipt()
         self.assertIsInstance(receipt, worker.DispatchComplete)
         assert isinstance(receipt, worker.DispatchComplete)
@@ -1796,10 +1848,73 @@ class WorkerCommandTests(unittest.TestCase):
         self.agent.append(pane, "user", "Detached run: stage-one-check\nRun finished: private verification")
         second_id = dispatch_id + "-2"
         second_line = "Stage 2: " + line.replace(dispatch_id, second_id)
+        run = self.run_dir
+        delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, run))
+        progress_history.save_dispatch_delivery(run, dispatch_id,
+            replace(delivery, line=second_line, completion_id=second_id))
         self.agent.append(pane, "user", second_line)
+        self.agent.append(pane, "assistant", f"DONE {dispatch_id}")
+        self.assertEqual(self.receipt(), worker.DispatchSubmitted(f"DONE {dispatch_id}"))
+        state = worker_panes.observe_worker(self.fixture.parent.id, row, staff.snapshot())
+        assert isinstance(state, worker_panes.OpenWorker)
+        self.assertIsInstance(worker_panes.can_close(state), worker_panes.Kept)
+        self.assertIsInstance(worker_panes.close(self.fixture.parent.id, staff.WorkerName.parse(row.name)), worker_panes.Kept)
+        self.assertIn(pane, self.fixture.world.locations)
         final = "The second review is complete.\nDONE " + second_id
         self.agent.append(pane, "assistant", final)
         self.assertEqual(worker.dispatch_receipt(row, second_line, second_id, run=self.run_dir), worker.DispatchComplete(final))
+        second_prompt = f"End your final reply with DONE {second_id}."
+        stale_done = f"DONE {dispatch_id}"
+        receipt = worker.transcript_receipt(
+            [f"assistant:\n{stale_done}", f"user:\n{second_prompt}", f"assistant:\n{stale_done}"],
+            worker.DispatchPrompt(dispatch_id, include_stage_two=True), worker.DoneReply(dispatch_id))
+        self.assertEqual(receipt.receipt, worker.DispatchSubmitted(stale_done))
+
+    def test_ended_pass_waits_for_the_saved_second_stage_reply_before_close(self) -> None:
+        for status in ("canceled", "interrupted"):
+            for stopped in (False, True):
+                with self.subTest(status=status, stopped=stopped):
+                    name = f"review-{status}-{int(stopped)}"
+                    self.reply = self.run_dir / f"{name}.md"
+                    self.assertIs(worker.dispatch(self.fixture.parent.id, staff.WorkerName.parse(name), "review",
+                        self.prompt, session_dir=self.run_dir, slot=name, phase="8", kind="review",
+                        launcher_command=["assign.sh"], reply=self.reply), worker.DispatchSubmission.SUBMITTED)
+                    pane, line = self.agent.submitted[-1]
+                    row = self.agent.row(pane)
+                    passed = worker_panes.worker_pass(row, self.run_dir)
+                    instance = str(passed["instance_id"])
+                    second_id = worker_panes.stage_two_completion_id(instance)
+                    second_line = "Stage 2: " + line.replace(instance, second_id)
+                    delivery = progress_history.dispatch_delivery(passed)
+                    progress_history.save_dispatch_delivery(self.run_dir, instance,
+                        replace(delivery, line=second_line, completion_id=second_id))
+                    state = self.run_dir / "progress_history_state.json"
+                    fields = cast(dict[str, object], json.loads(state.read_text()))
+                    cast(dict[str, dict[str, object]], fields["pass"])[name]["status"] = status
+                    atomic_file.write_text_atomic(state, json.dumps(fields))
+                    self.agent.append(pane, "user", second_line)
+                    self.agent.append(pane, "assistant", f"DONE {instance}")
+                    self.fixture.world.locations[pane]["agent_status"] = "idle"
+                    parent = self.fixture.parent.id
+                    worker_name = staff.WorkerName.parse(name)
+                    self.assertIsInstance(worker_panes.close(parent, worker_name), worker_panes.Kept)
+                    final = f"The second stage is complete.\nDONE {second_id}"
+                    self.agent.append(pane, "assistant", final)
+                    if stopped:
+                        worker.save_reply(self.reply, f"DONE {instance}")
+                        self.assertTrue(self.fixture.world.stop(row, self.fixture.world))
+                        self.assertIsInstance(worker_panes.observe_worker(parent, row, staff.snapshot()),
+                                              worker_panes.StoppedWorker)
+                        with redirect_stderr(io.StringIO()):
+                            self.assertIs(worker.end(parent, worker_name), worker.ExitCode.KEPT)
+                        self.assertEqual(staff.snapshot().by_id(row.id), row)
+                        self.assertIn(pane, self.fixture.world.locations)
+                    self.assertIsInstance(worker_panes.close(parent, worker_name), worker_panes.Kept)
+                    self.assertEqual(self.finish(name), turn_end.TurnOutcome.LATE_DONE)
+                    saved = progress_history.hook_completion(worker_panes.worker_pass(row, self.run_dir))
+                    assert isinstance(saved, progress_history.HookCompletion)
+                    self.assertEqual(Path(saved.reply_file).read_text(), final + "\n")
+                    self.assertNotIn(pane, self.fixture.world.locations)
 
     def test_only_a_live_run_or_a_result_sent_to_this_worker_can_hold_its_receipt(self) -> None:
         self.assertEqual(self.dispatch(), worker.ExitCode.OK)
@@ -1820,7 +1935,9 @@ class WorkerCommandTests(unittest.TestCase):
             with self.subTest(status=status, delivery=delivery):
                 record["status"] = cast(Literal["running", "finished"], status)
                 record["delivery"] = delivery
+                record["delivered_at"] = time.time()
                 atomic_file.write_text_atomic(path, json.dumps(record))
+                self.agent.complete(pane)
                 receipt = worker.dispatch_receipt(row, line, dispatch_id, run=self.run_dir)
                 self.assertIsInstance(receipt, worker.DispatchComplete)
                 assert isinstance(receipt, worker.DispatchComplete)
@@ -2935,6 +3052,72 @@ class WorkerCommandTests(unittest.TestCase):
                 self.assertEqual(arguments[arguments.index("--model") + 1], expected)
                 self.assertEqual(self.finish(name), turn_end.TurnOutcome.DONE)
 
+    def test_new_review_prompt_does_not_reuse_a_completed_predecessor(self) -> None:
+        for already_completed in (False, True):
+            with self.subTest(already_completed=already_completed):
+                name = f"review-{int(already_completed)}"
+                prompt = self.run_dir / f"{name}.md"
+                following = self.run_dir / f"{name}-next.md"
+                worker.save_reply(prompt, "Review the requested files.")
+                worker.save_reply(following, prompt.read_text())
+                command = ["assign.sh", "review"]
+                reply = self.run_dir / f"{name}-reply.md"
+                self.agent.finish_after = 1
+
+                def assign(path: Path) -> worker.DispatchSubmission | worker.ExitCode:
+                    return worker.dispatch(self.fixture.parent.id, staff.WorkerName.parse(name), "review", path,
+                        session_dir=self.run_dir, slot=name, phase="8", kind="assign",
+                        launcher_command=command, reply=reply)
+
+                self.assertIs(assign(prompt), worker.DispatchSubmission.SUBMITTED)
+                pane = self.agent.submitted[-1][0]
+                row = self.agent.row(pane)
+                old = str(worker_panes.worker_pass(row, self.run_dir)["instance_id"])
+                self.agent.complete(pane)
+                if already_completed:
+                    self.assertEqual(self.finish(name), turn_end.TurnOutcome.DONE)
+                before = len(self.agent.submitted)
+                self.assertIs(assign(following), worker.DispatchSubmission.SUBMITTED)
+                self.assertEqual(len(self.agent.submitted), before + 1)
+                new_pane, line = self.agent.submitted[-1]
+                current = worker_panes.worker_pass(self.agent.row(new_pane), self.run_dir)
+                instance = str(current["instance_id"])
+                self.assertNotEqual(instance, old)
+                self.assertEqual(current["prompt_file"], str(following))
+                self.assertIn(f"DONE {instance}", line)
+
+    def test_dispatch_refuses_to_replace_a_pass_that_took_the_selected_slot(self) -> None:
+        self.agent.finish_after = 1
+        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane = self.agent.submitted[-1][0]
+        row = self.agent.row(pane)
+        self.agent.complete(pane)
+        previous = worker_panes.worker_pass(row, self.run_dir)
+        competitor = self.run_dir / "competitor.md"
+        worker.save_reply(competitor, "Run a different assignment.")
+        self.prompt = self.run_dir / "requested.md"
+        worker.save_reply(self.prompt, "Run the requested assignment.")
+        launched_agent = worker.launched_agent
+        recorded: list[str] = []
+
+        def publish_competitor(current: staff.StaffRow) -> progress_history.CalledAgent:
+            recorded.append(progress_history.begin_dispatch(self.run_dir, slot="impl", phase="8", role="impl",
+                worker_name=row.name, worker_id=row.id, launcher_command=["different-launcher"], prompt=competitor,
+                kind="impl", lens=""))
+            return launched_agent(current)
+
+        with (patch.object(worker, "launched_agent", side_effect=publish_competitor),
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertIs(self.dispatch(), worker.ExitCode.BUSY)
+        self.assertIn("Slot impl or phase 8 changed during dispatch", errors.getvalue())
+        current = worker_panes.worker_pass(row, self.run_dir)
+        instance, = recorded
+        self.assertEqual(current["instance_id"], instance)
+        self.assertNotEqual(instance, previous["instance_id"])
+        self.assertEqual(current["status"], "active")
+        self.assertEqual(current["prompt_file"], str(competitor))
+        self.assertEqual(len(self.agent.submitted), 1)
+
     def test_early_review_uses_one_pass_and_two_transcript_receipts(self) -> None:
         ready = self.run_dir / "final.ready"
         atomic_file.write_text_atomic(self.reply, "The previous full report.\n")
@@ -2995,13 +3178,15 @@ class WorkerCommandTests(unittest.TestCase):
             with self.subTest(prompt="changed active content and launcher", changed_at=changed_at):
                 self.fixture.world.locations[submitted_pane]["agent_status"] = "idle"
                 changed_args = (*args[:-1], json.dumps(["assign.sh", "--prompt", str(self.prompt), "--reply-file", str(self.reply)]))
-                read_dispatch = progress_history.dispatch_worker
+                read_dispatch = progress_history.select_dispatch
 
                 def change_after_lookup(session_dir: Path, *, slot: str, phase: str, role: staff.WorkerRole,
                                         prompt: Path, launcher_command: list[str],
-                                        ) -> progress_history.MatchedDispatch | progress_history.NoMatchedDispatch | progress_history.ActiveDispatchPromptConflict:
+                                        work: progress_history.DispatchWork | progress_history.DispatchWorkAtUse,
+                                        target: staff.WorkerName | progress_history.DispatchTargetAtUse,
+                                        ) -> progress_history.DispatchSelection | progress_history.ActiveDispatchPromptConflict:
                     result = read_dispatch(session_dir, slot=slot, phase=phase, role=role,
-                                           prompt=prompt, launcher_command=launcher_command)
+                                           prompt=prompt, launcher_command=launcher_command, work=work, target=target)
                     atomic_file.write_text_atomic(self.prompt, original_prompt + "Read the changed work order.\n")
                     return result
 
@@ -3009,7 +3194,7 @@ class WorkerCommandTests(unittest.TestCase):
                     atomic_file.write_text_atomic(self.prompt, original_prompt + "Read the changed work order.\n")
                     code, output, errors = self.command(*changed_args)
                 else:
-                    with patch.object(progress_history, "dispatch_worker", side_effect=change_after_lookup):
+                    with patch.object(progress_history, "select_dispatch", side_effect=change_after_lookup):
                         code, output, errors = self.command(*args, "--name", self.agent.row(submitted_pane).name)
                 self.assertEqual((code, output), (worker.ExitCode.BUSY, ""))
                 self.assertIn(f"active pass {instance}", errors)

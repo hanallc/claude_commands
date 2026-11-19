@@ -33,6 +33,7 @@ if __name__ == "__main__":
 
 FEED_IMPORT_STARTED_AT_NS = time.time_ns()
 
+from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_code
 
 
@@ -47,6 +48,7 @@ from scripts.build_queue import cloud_progress, placement
 from scripts.build_targets import targets
 from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_text, service_activity_text, step_labels
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
+from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.queue_lines import age, plain, step_owner_name, step_text
 from scripts.build_queue.queue_view import reason_phrase
 from scripts.build_queue.admission_jobs import StepJob
@@ -67,6 +69,7 @@ from scripts.message.owner_role import OwnerRole
 from scripts.production import staff
 from scripts.lib import build_slots, conf
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.proc_text import read_proc_text
 from scripts.lib.user_zone import user_zone
 from scripts.review_links import console_theme, new_item_dialog, page_frame, review_link
 from scripts.review_links import staff_names
@@ -353,7 +356,26 @@ class HeadRoom(TypedDict):
     rows: list[RoomRow]
 
 
-class RowQueueNotes(TypedDict):
+class PageVerifyCall(TypedDict):
+    verb: admission_records.VerifyVerb
+    call: str
+    position: int
+    total: int
+    step: str
+
+
+class VerifyNotes(TypedDict, total=False):
+    verify: PageVerifyCall
+
+
+def verify_notes(call: admission_records.VerifyStep, step: str) -> VerifyNotes:
+    if isinstance(call, admission_records.VerifyCall):
+        return {"verify": {"verb": call.verb, "call": call.call, "position": call.position,
+                           "total": call.total, "step": step}}
+    return {}
+
+
+class RowQueueNotes(VerifyNotes):
     caller: NotRequired[str]
     name_parts: NotRequired[list[staff_names.NamePart]]
     detail_parts: NotRequired[list[staff_names.NamePart]]
@@ -837,6 +859,7 @@ def repository_slot_row(slot: wire.RepositorySlotRow, names: StepNames, members:
         return step
     return {"kind": "repository-slot", **queue_row_labels(step, step, unit=unit),
             **page_owner_labels(replace(label, showrunner=showrunner), unit=unit),
+            **verify_notes(identity.verify, identity.step),
             "pid": slot.owner.pid, "detail": slot.wait.repository, "need": 0.0, "since": slot.since,
             "reason": slot.wait.text, "fits": False, "why": "build slot", "runs_on": slot.machine}
 
@@ -1063,7 +1086,7 @@ def read_ci_runner(unit: Path, proc: Path) -> CIRunner:
     name = unit.name.removeprefix("github-runner-").removesuffix(".service")
     try:
         used = gib(gate.slice_working_set(unit).bytes)
-        boot = float(next(line.split()[1] for line in (proc / "stat").read_text().splitlines()
+        boot = float(next(line.split()[1] for line in read_proc_text(proc / "stat").splitlines()
                           if line.startswith("btime ")))
         ticks = int(os.sysconf("SC_CLK_TCK"))
         members: set[int] = set()
@@ -1075,12 +1098,11 @@ def read_ci_runner(unit: Path, proc: Path) -> CIRunner:
         processes: dict[int, RunnerProcess] = {}
         for pid in sorted(members):
             try:
-                stat = (proc / str(pid) / "stat").read_text()
+                stat = read_proc_text(proc / str(pid) / "stat")
                 fields = stat.rsplit(") ", 1)[1].split()
                 if fields[0] in ("Z", "X"):
                     continue
-                command = tuple(part for part in (proc / str(pid) / "cmdline").read_bytes()
-                                .decode(errors="replace").split("\0") if part)
+                command = tuple(part for part in read_proc_text(proc / str(pid) / "cmdline").split("\0") if part)
                 processes[pid] = RunnerProcess(pid, int(fields[1]), boot + int(fields[19]) / ticks,
                                                stat.split("(", 1)[1].rsplit(") ", 1)[0], command)
             except FileNotFoundError:
@@ -1245,7 +1267,7 @@ def local_step_name(step: admission_records.RunningStep | admission_records.Wait
 def has_controlling_terminal(pid: int, start: str) -> bool:
     """Use the terminal of the recorded process lifetime."""
     try:
-        fields = (PROC / str(pid) / "stat").read_text().rsplit(") ", 1)[1].split()
+        fields = read_proc_text(PROC / str(pid) / "stat").rsplit(") ", 1)[1].split()
         return fields[19] == start and fields[0] not in ("Z", "X") and int(fields[4]) != 0
     except (OSError, ValueError, IndexError):
         return False
@@ -1447,7 +1469,7 @@ def read_stalls() -> PressureValues:
     """Read the current ten-second memory stall averages."""
     path = PROC / "pressure/memory"
     try:
-        lines = path.read_text().splitlines()
+        lines = read_proc_text(path).splitlines()
     except OSError:
         missing = PressureNotRecorded(f"Pressure is unreadable: {path}")
         return {"some": missing, "full": missing}
@@ -1596,7 +1618,7 @@ def parent_pid(pid: int) -> int:
     """Read the parent of pid, or 0 when the process is gone."""
     try:
         # The command name can hold spaces and parentheses, so read the fields after its last ")".
-        return int((PROC / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[1])
+        return int(read_proc_text(PROC / str(pid) / "stat").rsplit(")", 1)[1].split()[1])
     except (OSError, IndexError, ValueError):
         return 0
 
@@ -1842,7 +1864,8 @@ def read_swap(steps: Sequence[admission_records.RunningStep], labels: Mapping[st
         path = PROC / "meminfo"
         try:
             values = {fields[0].removesuffix(":"): int(fields[1]) * 1024
-                      for line in path.read_text().splitlines() if (fields := line.split()) and fields[0] in ("SwapTotal:", "SwapFree:")}
+                      for line in read_proc_text(path).splitlines()
+                      if (fields := line.split()) and fields[0] in ("SwapTotal:", "SwapFree:")}
             capacity = values["SwapTotal"]
             used = capacity - values["SwapFree"]
         except (OSError, ValueError, KeyError, IndexError):
@@ -1952,7 +1975,8 @@ CACHE_FIELDS = ("Buffers", "Cached", "Shmem", "KReclaimable", "MemAvailable", "M
 def scope_program(path: Path) -> str:
     """Name a run scope by its program only when every member runs that program."""
     try:
-        programs = {(PROC / pid / "comm").read_text().strip() for pid in (path / "cgroup.procs").read_text().split()}
+        programs = {read_proc_text(PROC / pid / "comm").strip()
+                    for pid in (path / "cgroup.procs").read_text().split()}
     except OSError:
         programs = set[str]()
     if len(programs) != 1:
@@ -2003,7 +2027,7 @@ def meminfo_bytes() -> dict[str, int] | admission_records.ReadingUnavailable:
     path = PROC / "meminfo"
     try:
         return {fields[0].removesuffix(":"): int(fields[1]) * 1024
-                for line in path.read_text().splitlines() if (fields := line.split()) and len(fields) >= 2}
+                for line in read_proc_text(path).splitlines() if (fields := line.split()) and len(fields) >= 2}
     except (OSError, ValueError) as error:
         return admission_records.ReadingUnavailable(f"{path}: {error}")
 
@@ -2039,7 +2063,7 @@ def memmap_reading() -> RamReading:
     """Read the page descriptors allocated after boot, from /proc/vmstat nr_memmap_pages."""
     path = PROC / "vmstat"
     try:
-        pages = dict(line.split() for line in path.read_text().splitlines())["nr_memmap_pages"]
+        pages = dict(line.split() for line in read_proc_text(path).splitlines())["nr_memmap_pages"]
         return int(pages) * os.sysconf("SC_PAGE_SIZE")
     except (OSError, ValueError, KeyError) as error:
         return admission_records.ReadingUnavailable(f"{path}: {error!r}")
@@ -2363,6 +2387,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                      "need": gib(hold.memory.need), "need_part": need_in_next_part(steps_by_owner.get(hold.memory.owner, ())),
                      **(target_notes(step.route, routes, step.step, step.folder, step.package)
                         if step is not None and not ci_label else NO_TARGET_NOTES),
+                     **(verify_notes(step.verify, step.step) if step is not None else VerifyNotes()),
                      **job_notes(job, owner.labels.unit, names)})
     groups: dict[str, list[RunRow]] = {}
     remote_groups: set[str] = set()
@@ -2391,12 +2416,13 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             remote_row: RunRow = {**queue_row_labels(title_step, display_name, unit=owner.unit),
                 "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
                 **owner.fields(),
-                "state": "running" if isinstance(step.execution, placement.ObservedExecution) else "uncertain",
+                "state": "running" if isinstance(step.execution, execution_identity.ObservedExecution) else "uncertain",
                 "pid": step.pid, "detail": detail, "used": admission_records.RunUseUnavailable(memory.reason),
                 "counted": 0.0, "reserved": 0.0, "started_at": step.started_at,
                 "progress": row_progress((step,), progress.TOKEN_WAIT_REASON),
                 "queued": False, "keep_text": memory.reason, "group": "", "ci": False, "parts": [],
                 "machine": admission_records.execution_host(step, host_name()), "vcpus": queue_view.UnknownCpuCount(),
+                **verify_notes(step.verify, step.step),
                 **build_slot(step.folder, admission_records.execution_host(step, host_name()), slot_roots,
                     home=slot_homes.get(admission_records.execution_host(step, host_name()), ""))}
             walk.append(remote_row)
@@ -2511,6 +2537,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                         "free": gib(max(0, check.room)) if check is not None else
                                 gib(waiter.reason.free) if isinstance(waiter.reason, admission_records.NeedsMemory) else gib(ram["room_bytes"]),
                         "why": wait_why(waiter.reason),
+                        **verify_notes(waiter.verify, waiter.step),
                         **(NO_TARGET_NOTES if ci_label else target_notes(
                             waiter.route, routes, waiter.step, waiter.folder, waiter.package)),
                         # A waiting step names its slot, so the Disks page names the slot's work as this row does.
@@ -2528,10 +2555,17 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     else:
         with staff.supplied_snapshot(staff_display.members):
             mac_units = mac_build_units(mac_reading.builds, target_availability.mac_claims(snapshots))
+        mac_calls = {step.mac_placement: verify_notes(step.verify, step.step)
+                     for step in parsed.view.running if step.mac_placement}
         for build in mac_reading.builds:
             current = members.labels_for(build.session, mac_machine, Path(build.folder))
-            work_rows.append(mac_work_row(build, mac_reading, current or mac_units.get(build.pid, unit_labels.UnitLabels("")),
-                                          names=names, slot_roots=slot_roots, slot_machine=mac_machine))
+            mac_row = mac_work_row(build, mac_reading, current or mac_units.get(build.pid, unit_labels.UnitLabels("")),
+                                   names=names, slot_roots=slot_roots, slot_machine=mac_machine)
+            if build.gate_label is queue_view.MacGateLabel.PLACEMENT:
+                notes = mac_calls.get(build.gate_placement)
+                if notes is not None and "verify" in notes:
+                    mac_row["verify"] = notes["verify"]
+            work_rows.append(mac_row)
     work_rows.sort(key=lambda row: row["started_at"])
     waiting_rows: list[WaitRow | CloudWaitRow] = list(waiters.values())
     model = queue_view.QueueModel(parsed, labels, names=names)
@@ -2545,7 +2579,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         rows = queue_view.cloud_rows(model)
         with staff.supplied_snapshot(staff_display.members):
             cloud_labels = model.cloud_labels
-        cloud_slots_used = sum(isinstance(row.wait, admission_records.ReadyForAdmission) for row in rows)
+        cloud_slots_used = sum(isinstance(row.wait, admission_records.ReadyForAdmission)
+            or isinstance(row.wait.state, ReservedCloudSlot) for row in rows)
         interval = queue_view.cloud_push_interval()
         cloud_waiters: dict[wire.Owner, CloudWaitRow] = {}
         for cloud in rows:
@@ -2567,6 +2602,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             values: CloudWorkRow = {"kind": "cloud", **queue_row_labels(title_step, display_name, unit=unit),
                 "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
                 **page_owner_labels(identity, unit=unit), "pid": cloud.owner.pid,
+                **verify_notes(cloud.identity.verify, cloud.identity.step),
                 "detail": identity.unit, "machine": "" if isinstance(cloud.wait, wire.CloudSlotWait) else "aws",
                 "vcpus": information.vcpus,
                 "state": information.state, "status": plain([queue_view.cloud_page_status(cloud, information)]),
