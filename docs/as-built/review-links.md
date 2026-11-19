@@ -731,6 +731,10 @@ The navigation label is List, and the page title is The List.
 The page uses the shared status line in `page_frame.py`.
 The columns are #, Owner, Producer, Item, State, Next step, ETA, and Update.
 The Producer cell shows the name of the record's producer.
+On desktop, the ETA cell stays on one line and shows an ellipsis if the text is too long.
+Hover or focus on the ETA to see the full text.
+On a phone, the ETA wraps to show the full text in the row.
+Past times and past range end times use the same warning color as Check overdue.
 The default order uses `the_list.order`, which the CLI also uses.
 User decisions come first, then unread updates, then the earliest next check.
 A column button sorts its values; a second click reverses that order.

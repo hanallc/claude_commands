@@ -132,6 +132,15 @@ def eta_text(eta: the_list.Eta, today: datetime) -> str:
     return the_list.eta_text(eta)
 
 
+def eta_cell_text(eta: the_list.Eta, today: datetime) -> str:
+    if isinstance(eta, datetime):
+        local = eta.astimezone(today.tzinfo)
+        return f"{local:%b} {local.day} {local:%H:%M %Z}"
+    if isinstance(eta, the_list.EtaRange):
+        return eta_cell_text(eta.earliest, today) + " – " + eta_cell_text(eta.latest, today)
+    return the_list.eta_text(eta)
+
+
 def parked_label(moment: datetime | the_list.ParkUntilDelivered, zone: tzinfo) -> str:
     if moment is the_list.ParkUntilDelivered.DELIVERED:
         return moment.value
@@ -502,9 +511,9 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
                   "order": str(index), "sort-values": json.dumps(values, ensure_ascii=False)}
     attrs = ''.join(f' data-{key}="{html.escape(value, quote=True)}"' for key, value in attributes.items())
     panel = f'list-detail-{index}'
-    toggle_id = "list-toggle-" + html.escape(entry.key.replace("/", "-"), quote=True)
+    row_id = html.escape(entry.key.replace("/", "-"), quote=True)
     number = (f'<button type="button" class="list-toggle" aria-expanded="false" aria-controls="{panel}" '
-              + f'aria-label="Show item {item.number}" id="{toggle_id}">'
+              + f'aria-label="Show item {item.number}" id="list-toggle-{row_id}">'
               + f'<span class="list-chevron" aria-hidden="true">›</span>{item.number}</button>')
     title = '<strong>' + html.escape(item.title) + '</strong>'
     if item.unit:
@@ -516,8 +525,11 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     if open_question:
         state += '<small data-open-question-note>Morty answering</small>'
     if isinstance(item.next_check, datetime):
-        label = "Check overdue " if item.next_check < today else "Check "
-        state += '<small>' + label + field_html("next_check", item.next_check, today, names) + '</small>'
+        check = field_html("next_check", item.next_check, today, names)
+        if item.next_check < today:
+            state += f'<small><span class="warning">Check overdue {check}</span></small>'
+        else:
+            state += f'<small>Check {check}</small>'
     elif isinstance(item.next_check, the_list.CheckCondition):
         state += '<small>Check: ' + field_html("next_check", item.next_check, today, names) + '</small>'
     parking_label = field_html("parked_until", item.parked_until, today, names) if parked else ""
@@ -534,8 +546,17 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
             notice = ("not sent; " + names.html(feedback.alerted_to) + " told" if feedback.alerted_to
                       else "not sent; no showrunner for alert")
         update += '<small>' + notice + ", " + html.escape(local_time(sent, today)) + '</small>'
+    deadline = item.eta.latest if isinstance(item.eta, the_list.EtaRange) else item.eta
+    overdue = (isinstance(deadline, datetime) and deadline < today
+               and item.state != the_list.ItemState.CLOSED)
+    eta_class = "list-eta warning" if overdue else "list-eta"
+    full_eta = field_html("eta", item.eta, today, names)
+    short_eta = html.escape(eta_cell_text(item.eta, today))
+    eta_cell = (f'<span class="{eta_class}" id="list-eta-{row_id}" tabindex="0" title="{full_eta}">'
+                + f'<span class="list-eta-text">{short_eta}</span>'
+                + f'<span class="list-eta-full" aria-hidden="true">{full_eta}</span></span>')
     cells = (number, field_html("owner", item.owner, today, names), field_html("producer", item.producer, today, names),
-             title, state, field_html("next_step", item.next_step, today, names), field_html("eta", item.eta, today, names), update)
+             title, state, field_html("next_step", item.next_step, today, names), eta_cell, update)
     row = ''.join(f'<td' + (' class="record-id"' if label == '#' else '')
                   + f' data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     return (f'<tbody data-list-item{attrs}><tr class="list-row">' + row
@@ -937,8 +958,8 @@ background:var(--ink-2);border-radius:50%}
 .list-parking-actions{display:flex;gap:inherit;margin-inline-start:auto}
 .list-park [data-later-menu] [data-later-preset]{display:block;width:calc(100% - 12px);margin:6px 6px 4px}
 .list-table tbody:has([data-parked-detail]:not([hidden])) .list-row.open [data-parked-note]{display:none}
-.list-table:has(.list-park>[data-later-menu]:not([hidden])),
-.list-table tbody:has(.list-park>[data-later-menu]:not([hidden])){overflow:visible}
+.list-table:has(.list-park>[data-later-menu]:not([hidden]),.list-eta:focus-visible),
+.list-table tbody:has(.list-park>[data-later-menu]:not([hidden]),.list-eta:focus-visible){overflow:visible}
 .list-tell{display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap}
 .list-tell [value="tell"]{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
 .list-tell button:disabled{opacity:.45;cursor:default}.list-tell [data-send-status]{margin-left:0}
@@ -953,11 +974,20 @@ background:var(--ink-2);border-radius:50%}
 .list-panel [data-waiting-note]{margin-top:16px}
 .list-table td[data-label="State"]{color:var(--ink)}
 .list-table td[data-label="Producer"],.list-table td[data-label="ETA"]{color:var(--ink-2)}
+.list-eta{display:block;position:relative;min-width:0}
+.list-eta-text{display:block;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.list-eta:focus-visible{outline:2px solid currentColor;outline-offset:2px}
+.list-eta-full{display:none;position:absolute;inset-block-start:calc(100% + 4px);inset-inline-end:0;z-index:1;
+width:max-content;max-width:min(28rem,calc(100vw - 4rem));padding:6px 8px;background:var(--card);
+border:1px solid var(--line);border-radius:6px;overflow-wrap:anywhere}
+.list-eta:focus-visible .list-eta-full{display:block}
 @media(max-width:960px){
 .list-expansion button{width:34px;height:34px}
 .list-table .list-row td[data-label="Producer"]{font-size:inherit}.list-table .list-row td[data-label="Item"]{font-size:17px}
 .list-table .list-row td[data-label="State"]::before{content:none}
 .list-table [data-keeper-produces=true] .list-row td[data-label="Producer"]{display:none}
+.list-table .list-row td[data-label="ETA"]{display:flex;gap:4px}
+.list-eta-text{white-space:normal;overflow:visible}
 .list-table .list-row td[data-label="Producer"]::before,.list-table .list-row td[data-label="ETA"]::before{
 content:attr(data-label) ': ';color:var(--ink-3)}
 }
