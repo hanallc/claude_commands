@@ -197,6 +197,7 @@ from scripts.lib.cargo_target_config import (
 )
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.process_start import ProcessStart, Started, process_start
+from scripts.lib.process_stat import process_fields
 from scripts.lib.user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
     from scripts.lint import tmp_sweep
@@ -1378,6 +1379,18 @@ def mapped_files(maps: bytes) -> Iterator[str]:
             yield fields[5].decode(errors="replace")
 
 
+def read_holder_start(pid: int, proc: Path) -> Started | UnobservedHolderStart:
+    """Read the start identity from the process table used by the scan."""
+    try:
+        fields = process_fields(pid, proc)
+        start = fields[19]
+    except (OSError, IndexError, UnicodeError):
+        return UnobservedHolderStart()
+    if fields[0] in ("R", "S", "D", "T", "t", "X", "x", "K", "W", "P", "I") and start.isascii() and start.isdigit():
+        return Started(start)
+    return UnobservedHolderStart()
+
+
 def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, TargetUse]:
     """Find one live process that uses each target, with one scan of /proc.
 
@@ -1398,6 +1411,7 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
                      if owner.target in checked) if restricted else ()
     exact_roots = tuple(prefix[:-1] for prefix in prefixes)
     encoded_prefixes = tuple(os.fsencode(prefix) for prefix in prefixes)
+    proc_root = Path(proc)
 
     try:
         names = [name for name in os.listdir(proc) if name.isdigit()]
@@ -1408,7 +1422,7 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
         if len(found) == len(checked):
             break
         pid = int(name)
-        start = process_start(pid) if owners.identify_holders else UnobservedHolderStart()
+        start = read_holder_start(pid, proc_root) if owners.identify_holders else UnobservedHolderStart()
         base = os.path.join(proc, name)
         try:
             exe = os.readlink(os.path.join(base, "exe"))

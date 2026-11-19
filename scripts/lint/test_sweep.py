@@ -1110,7 +1110,7 @@ class ProcessUseTests(SweepCase):
         cargo_home = self.base / "cargo-home"
         cargo_home.mkdir()
         _ = (cargo_home / "config.toml").write_text('[build]\nbuild-dir = "{workspace-root}/build"\n')
-        argv = ("bash", "/x/verify.sh", "test")
+        argv = ("bash", "/x/verify.sh", "test", "--manifest-path", "missing/Cargo.toml")
         environment = (f"CARGO_HOME={cargo_home}",)
         reason = f"runs verify.sh in {self.workspace}"
 
@@ -6030,16 +6030,20 @@ raise SystemExit(int(os.environ[variable]))
         for after_scan in (Gone(), Started("456")):
             with self.subTest(after_scan=type(after_scan).__name__):
                 base = self.base()
-                _, payload = cargo_target(base, "busy", DEMO, time.time())
+                tree, payload = cargo_target(base, "busy", DEMO, time.time())
                 proc = base / "proc"
                 fake_process(proc, 46, exe=str(payload))
+                _ = (proc / "46" / "stat").write_text("46 (test process) S " + "0 " * 18 + "123 0\n")
 
                 def read_start(pid: int) -> ProcessStart:
                     self.assertEqual(pid, 46)
-                    return after_scan if cast(mock.Mock, sweep.scan_floor_roots).called else Started("123")
+                    self.assertTrue(cast(mock.Mock, sweep.scan_floor_roots).called)
+                    return after_scan
 
                 def fixture_uses(roots: Sequence[str]) -> dict[str, sweep.TargetUse]:
-                    return read_uses(roots, str(proc))
+                    uses = read_uses(roots, str(proc))
+                    self.assertEqual(uses[str(tree.parent)].start, Started("123"))
+                    return uses
 
                 with (mock.patch.object(sweep, "process_uses", side_effect=fixture_uses),
                       mock.patch.object(sweep, "process_start", side_effect=read_start) as starts,
@@ -6047,7 +6051,7 @@ raise SystemExit(int(os.environ[variable]))
                       mock.patch.object(sweep, "send_holder_message") as tell,
                       mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT) as summary):
                     self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB], recorded=True)[0], 0)
-                self.assertEqual(starts.call_args_list, [mock.call(46), mock.call(46)])
+                self.assertEqual(starts.call_args_list, [mock.call(46)])
                 tell.assert_not_called()
                 self.assertIn("the message to session hana-unit failed", cast(str, summary.call_args.args[0]))
 
