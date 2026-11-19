@@ -188,10 +188,15 @@ def hold_recorder_exits(timeout: float = TEST_HANG_GUARD_SECS) -> Generator[None
     launch = cast(Callable[..., subprocess.Popen[bytes]], subprocess.Popen)
     start = threading.Thread.start
 
-    def launch_owned(*arguments: object, **options: object) -> subprocess.Popen[bytes]:
-        process = launch(*arguments, **options)
-        children.append(process)
-        return process
+    def launch_owned(args: object, *arguments: object, **options: object) -> subprocess.Popen[bytes]:
+        if isinstance(args, list) and cast(Sequence[object], args)[2:3] == ["hold-event"]:
+            environment = verify_test_environment()
+            environment["BUILDLOG_DIR"] = os.environ["BUILDLOG_DIR"]
+            options["env"] = environment
+            process = launch(args, *arguments, **options)
+            children.append(process)
+            return process
+        return launch(args, *arguments, **options)
 
     def start_owned(thread: threading.Thread) -> None:
         if thread.name != "hold-event-recorder":

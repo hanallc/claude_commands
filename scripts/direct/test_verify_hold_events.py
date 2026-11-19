@@ -30,11 +30,18 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 class VerifyHoldWaitTests(VerifyHoldWaitFixture):
     def test_hold_release_records_before_the_fixture_restores_its_environment(self) -> None:
-        environments: tuple[tuple[str, dict[str, str]], ...] = (("ambient", {}), ("marked", self.fixture.environment))
-        for count, (name, environment) in enumerate(environments, 1):
+        startup = self.fixture.root / "caller-startup.sh"
+        _ = startup.write_text(': > "${BASH_SOURCE[0]}.ran"\nexit 97\n')
+        caller_environment = {"BASH_ENV": str(startup)}
+        environments: tuple[tuple[str, dict[str, str], dict[str, str]], ...] = (
+            ("ambient", {}, {}),
+            ("marked", self.fixture.environment, {}),
+            ("caller-startup", {}, caller_environment),
+        )
+        for count, (name, environment, caller) in enumerate(environments, 1):
             with self.subTest(environment=name):
                 self.hold()
-                with local_hold_environment(environment):
+                with mock.patch.dict(os.environ, caller), local_hold_environment(environment):
                     grant_call(self.cycle_file)
                 recorded: list[tuple[object, object]] = []
                 for path in (self.fixture.root / "buildlog").rglob("*.jsonl"):
@@ -43,6 +50,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
                         if row.get("kind") == "hold_event":
                             recorded.append((row.get("event"), row.get("holder")))
                 self.assertEqual(recorded, [("ended", "hana")] * count)
+                self.assertFalse(startup.with_suffix(".sh.ran").exists())
 
     def test_local_admission_waits_for_release_notifications_instead_of_sleeping(self) -> None:
         from scripts.build_targets import build_targets
