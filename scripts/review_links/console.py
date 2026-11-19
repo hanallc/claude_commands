@@ -15,7 +15,7 @@ from urllib.parse import unquote, urlencode, urlsplit, urlunsplit
 from scripts.lib import atomic_file, conf, file_lock
 from scripts.production.change_review import ChangeReviewError
 from scripts.production.production_doc import Refusal
-from scripts.review_links import change_page, for_you, page_frame, review_link, review_legacy
+from scripts.review_links import accounts_page, change_page, console_theme, for_you, page_frame, review_link, review_legacy
 
 PAGE_NAME = "console.html"
 # The console posts the open page here and reads which other pages hold new items.
@@ -252,16 +252,19 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
         available = isinstance(page.destination, AvailablePage)
         path = page.destination.path if isinstance(page.destination, AvailablePage) else ""
         label = html.escape(page.label)
+        quota = available and page.identity == "accounts"
         entries.append(f'<a class="nav-entry" href="?page={page.identity}" data-page="{page.identity}" '
                        + f'data-url="{html.escape(path, quote=True)}" data-title="{html.escape(page.title, quote=True)}" '
-                       + f'aria-label="{label}' + ('' if available else ' — Not available') + '">'
+                       + f'aria-label="{label}' + ('' if available else ' — Not available') + '"'
+                       + (' aria-describedby="nav-quota"' if quota else '') + '>'
                        + icon_svg(page.icon) + f'<span class="entry-label">{label}'
                        + ('' if available else '<small>Not available</small>') + '</span>'
                        + ('<span class="new-mark" hidden>' + new_mark + '</span>' if available
                           else '<span class="unavailable-dot" aria-hidden="true"></span>')
+                       + ('<span id="nav-quota" role="img" aria-label="" hidden></span>' if quota else '')
                        + f'<span class="tooltip" aria-hidden="true">{label}'
                        + ('<span class="new-text" hidden> · New</span>' if available else ' · Not available') + '</span></a>')
-    content = DOCUMENT.replace("<!-- ENTRIES -->", "\n".join(entries))
+    content = DOCUMENT.replace("<!-- ENTRIES -->", "\n".join(entries)).replace("/* Quota tokens. */", console_theme.QUOTA_TOKENS)
     rebuilds_path = rebuilds.path if isinstance(rebuilds, AvailablePage) else ""
     settings = conf.read("review_links")
     content = content.replace("<!-- REBUILDS -->", f'data-url="{html.escape(rebuilds_path, quote=True)}"')
@@ -275,7 +278,12 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
               + '<span class="for-you-state" data-for-you-state>Unavailable</span></button>')
     content = content.replace("<!-- FOR YOU BUTTON -->", button)
     content = content.replace("<!-- FOR YOU STYLE -->", page_frame.COPY_STYLE + FOR_YOU_STYLE)
-    content = content.replace("<!-- FOR YOU SCRIPT -->", page_frame.COPY_SCRIPT + FOR_YOU_SCRIPT)
+    notifier = FOR_YOU_SCRIPT
+    if any(page.identity == "accounts" and isinstance(page.destination, AvailablePage) for page in pages):
+        icons = {level: accounts_page.quota_icon(level)
+                 for level in (accounts_page.QuotaLevel.WARNING, accounts_page.QuotaLevel.URGENT)}
+        notifier = notifier.replace("/* Quota icons. */ {}", json.dumps(icons))
+    content = content.replace("<!-- FOR YOU SCRIPT -->", page_frame.COPY_SCRIPT + notifier)
     content = content.replace("<!-- FOR YOU COPY -->", page_frame.COPY_BUTTON)
     content = content.replace("<!-- FOR YOU REBUILD -->", icon_svg("refresh-cw"))
     content = content.replace("<!-- FOR YOU ACTION -->", icon_svg("list-checks"))
@@ -390,12 +398,22 @@ function createForYouNotifier(openCard){
   }
   drawPanel(count);
  }
+ const quota=document.getElementById('nav-quota'),quotaIcons=/* Quota icons. */ {};
+ function drawQuota(alert){
+  if(!quota || !alert || !['none','warning','urgent'].includes(alert.level) || typeof alert.name!=='string') return;
+  quota.hidden=alert.level==='none';
+  quota.setAttribute('aria-label',alert.name);
+  if(quota.dataset.quotaLevel===alert.level) return;
+  quota.dataset.quotaLevel=alert.level;
+  quota.innerHTML=quotaIcons[alert.level] || '';
+ }
  async function refresh(){
   if(reading || document.visibilityState!=='visible') return;
   reading=true;completionPending=false;
   try{
-   const response=await fetch('/console/for-you.json',{cache:'no-store'});
+   const response=await fetch('/console/for-you.json'+(quota ? '?view=console' : ''),{cache:'no-store'});
    const value=await response.json();
+   drawQuota(value?.accounts_quota);
    if(value?.available===false){last=null;stale=false;return;}
    if(!response.ok || value?.available!==true || !Number.isInteger(value.count) || value.count<0 || !Array.isArray(value.entries)) throw Error('Invalid action count.');
    last=value;stale=false;
@@ -430,7 +448,10 @@ function createForYouNotifier(openCard){
  entries.addEventListener('focusout',()=>queueMicrotask(release));
  document.addEventListener('selectionchange',release);
  addEventListener('message',event=>{
-  if(event.origin===location.origin && [...document.querySelectorAll('iframe')].some(frame=>frame.contentWindow===event.source) && event.data==='for-you-completed'){
+  if(event.origin!==location.origin) return;
+  const frame=[...document.querySelectorAll('iframe')].find(item=>item.contentWindow===event.source);
+  if(frame && (event.data==='for-you-completed' || (event.data==='accounts-quota-cleared'
+      && frame.dataset.consolePage==='accounts'))){
    completionPending=true;refresh();
   }
  });
@@ -445,6 +466,7 @@ DOCUMENT = """<!doctype html>
 <meta name="color-scheme" content="light dark">
 <title>Hana console</title>
 <style>
+/* Quota tokens. */
 :root{color-scheme:light dark;font:14px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
 --nav:#f8f9fc;--page:#fff;--text:#192339;--muted:#525c6e;--border:#e1e5ed;--active:#e8edfd;--accent:#2849a3;--hover:#edf0f6;
 --notice:#fdf1dc;--notice-text:#7a4300;--notice-hover:#fae6c3}
@@ -471,6 +493,10 @@ color:var(--muted);text-decoration:none;font-weight:550;white-space:nowrap}
 .unavailable-dot{width:6px;height:6px;border-radius:50%;background:var(--muted);margin:0 4px 0 auto}
 .new-mark{display:grid;place-items:center;margin-left:auto;color:var(--accent)}.new-mark svg{width:14px;height:14px;fill:currentColor}
 .collapsed .new-mark{position:absolute;top:7px;left:33px;margin:0}.collapsed .new-mark svg{width:11px;height:11px}
+#nav-quota{display:grid;place-items:center;margin-left:auto}
+#nav-quota svg{width:19px;height:19px;display:block}
+#nav-quota[data-quota-level=warning]{color:var(--warning)}#nav-quota[data-quota-level=urgent]{color:var(--error)}
+.collapsed #nav-quota{position:absolute;top:6px;left:31px;margin:0}.collapsed #nav-quota svg{width:13px;height:13px}
 .toggle{position:relative}#menu-new{position:absolute;top:4px;right:4px;left:auto;margin:0}#menu-new svg{width:11px;height:11px}
 .tooltip{display:none;position:absolute;left:calc(100% + 10px);top:50%;transform:translateY(-50%);padding:7px 11px;
 background:var(--text);color:var(--page);border-radius:6px;font-size:12px;font-weight:500;box-shadow:0 3px 12px #0002;z-index:5;pointer-events:none}
@@ -600,6 +626,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     let frame = frames.get(entry.dataset.page);
     if (frame) return frame;
     frame = document.createElement('iframe');
+    frame.dataset.consolePage = entry.dataset.page;
     frame.hidden = true;
     const target = placeOf(entry, new URL(location.href).searchParams.get(placeKey(entry.dataset.page)));
     const restored = history.state?.reviewPlace;

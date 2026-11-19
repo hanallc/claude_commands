@@ -25,6 +25,10 @@ class ImageRefused(ValueError):
     """The built image or its saved registration cannot be used."""
 
 
+class RegistrationDigestRefused(ImageRefused):
+    """The saved registration needs a verified guest digest."""
+
+
 @dataclass(frozen=True)
 class BuiltImage:
     """One NixOS Amazon image result and the name its registration uses."""
@@ -51,7 +55,7 @@ class RegisteredImage:
     owner: str
     vpc: str
     subnet: str
-    digest: hana_render.GuestDigest | hana_render.GuestDigestUnknown = hana_render.GuestDigestUnknown()
+    digest: hana_render.GuestDigest
 
 
 @dataclass(frozen=True)
@@ -107,14 +111,16 @@ def artifact_digest(store: Path, execute: AwsExecutor, timeout: float) -> hana_r
     raise ImageRefused('The Hana image has no verified guest digest. Build the Hana image from the current input.')
 
 
-def setup_image_is_current(setup: dict[str, object], configuration: Path | conf.ConfigRead) -> bool:
-    digest = hana_render.decode_guest_digest(setup.get('guest_digest'))
-    if not isinstance(digest, hana_render.GuestDigest):
-        return False
+def guest_digest_is_current(digest: hana_render.GuestDigest, configuration: Path | conf.ConfigRead) -> bool:
     try:
         return digest == hana_render.guest_digest(configuration)
     except (OSError, ValueError):
         return False
+
+
+def setup_image_is_current(setup: dict[str, object], configuration: Path | conf.ConfigRead) -> bool:
+    digest = hana_render.decode_guest_digest(setup.get('guest_digest'))
+    return isinstance(digest, hana_render.GuestDigest) and guest_digest_is_current(digest, configuration)
 
 
 def deployed_image_is_current(directory: Path, deployment: str, instance: str,
@@ -139,10 +145,13 @@ def saved(directory: Path) -> PendingImageRegistration | RegisteredImage | NoReg
             return PendingImageRegistration(ledger.text(record, 'name'), ledger.text(record, 'snapshot'))
         if state != 'registered':
             raise ValueError('unknown registration state')
-        return RegisteredImage(*(ledger.text(record, key) for key in ('name', 'image', 'owner', 'vpc', 'subnet')),
-            digest=hana_render.decode_guest_digest(record.get('guest_digest')))
+        fields = tuple(ledger.text(record, key) for key in ('name', 'image', 'owner', 'vpc', 'subnet'))
     except (KeyError, TypeError, ValueError) as error:
         raise ImageRefused(f'{path}: the saved Hana image record is incomplete') from error
+    digest = hana_render.decode_guest_digest(record.get('guest_digest'))
+    if isinstance(digest, hana_render.GuestDigestUnknown):
+        raise RegistrationDigestRefused('The Hana image registration has no valid guest digest. Register the image again.')
+    return RegisteredImage(*fields, digest=digest)
 
 
 def save(directory: Path, registration: PendingImageRegistration | RegisteredImage) -> Path:
@@ -153,8 +162,6 @@ def save(directory: Path, registration: PendingImageRegistration | RegisteredIma
         record.update(state='pending', snapshot=registration.snapshot)
     else:
         record.update(state='registered', image=registration.image, owner=registration.owner,
-                      vpc=registration.vpc, subnet=registration.subnet)
-        if isinstance(registration.digest, hana_render.GuestDigest):
-            record['guest_digest'] = registration.digest.value
+                      vpc=registration.vpc, subnet=registration.subnet, guest_digest=registration.digest.value)
     write_text_atomic(path, json.dumps(record, sort_keys=True) + '\n')
     return path
