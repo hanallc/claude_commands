@@ -1844,8 +1844,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
     def test_idle_hana_preview_uses_the_recovered_permit(self) -> None:
         from scripts.aws_target import hana_box, hana_spend
 
-        with (PlacementFixture() as fixture,
-              mock.patch.object(hana_box.HanaController, "image_is_current", return_value=True)):
+        with PlacementFixture() as fixture:
             settings, request = self.idle_hana(fixture)
             good = settings.read_text()
             self.commit_settings(settings)
@@ -1858,7 +1857,9 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 self.assertEqual(expires - now, spending.settings.permit_max_seconds)
                 return hana_spend.StartAffordable(expires)
 
-            with (redirect_stderr(warnings), mock.patch.object(hana_spend.HanaSpending, "preview_start",
+            with (redirect_stderr(warnings),
+                  mock.patch.object(hana_box.HanaController, "image_is_current", return_value=True),
+                  mock.patch.object(hana_spend.HanaSpending, "preview_start",
                                                                autospec=True, side_effect=preview) as start):
                 evidence = self.read_target(fixture, request)
                 assert isinstance(evidence, placement.FreshHostEvidence), evidence
@@ -2430,9 +2431,14 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                         assert isinstance(reply, wire.DispatchStatus)
                         self.assertEqual(reply.assignment, assignment)
                         self.assertIsInstance(reply.permission, placement.PermissionConsumed)
+                        self.assertEqual(reply.reason, "launch permission was already consumed")
 
     def test_closed_unknown_and_changed_assignments_never_receive_authorization(self) -> None:
-        for case in ("closed", "unknown", "source", "owner", "claim"):
+        for case, reason in (("closed", "the attempt is closed: busy"), ("unknown", "unknown attempt"),
+                             ("source", "the request differs from the saved assignment"),
+                             ("owner", "the request differs from the saved assignment"), ("claim", "the exact claim is not adopted"),
+                             ("stale", "adoption evidence is stale: provider evidence expired"),
+                             ("unavailable", "adoption evidence is unavailable: claim read failed")):
             with self.subTest(case=case), PlacementFixture() as fixture:
                 request = placement_request(fixture)
                 _ = publish_candidate(fixture, request)
@@ -2456,8 +2462,16 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 for restart in (False, True):
                     if restart:
                         fixture.restart()
+                    if case in ("stale", "unavailable"):
+                        key = fixture.server.host_evidence_key(request, assignment.destination)
+                        evidence = (placement.StaleHostEvidence(key, fixture.clock.now() - 20, "provider evidence expired")
+                            if case == "stale" else placement.HostEvidenceUnavailable(key, fixture.clock.now(), "claim read failed"))
+                        fixture.provider_evidence[key] = evidence
+                        fixture.server.publish_host_evidence(evidence)
                     reply, = fixture.server.handle_request(consume_permission(f"consume-{restart}", assignment, claim))
                     self.assertIsInstance(reply, wire.DispatchStatus)
+                    assert isinstance(reply, wire.DispatchStatus)
+                    self.assertEqual(reply.reason, reason)
                 if case in ("source", "owner", "claim") or case.startswith("generation-"):
                     claim = (replace(claim, claim_id="claim-a") if case.startswith("generation-")
                              else adopt_assignment(fixture, request, original))
