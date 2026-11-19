@@ -14,9 +14,6 @@ from scripts.lib import cargo_output
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 
 
-EMPTY_NEXTEST_LIST_JSON = '{"rust-build-meta":{},"rust-suites":{}}'
-
-
 def restore_environment(name: str, value: str | None) -> None:
     if value is None:
         _ = os.environ.pop(name, None)
