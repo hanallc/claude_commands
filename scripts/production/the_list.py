@@ -1201,13 +1201,16 @@ def _check_producer_update_fields(fields: Iterable[str]) -> None:
 
 
 def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source: str,
-            assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListEdit:
+            assigned_to: staff.StaffRow | AllItems = AllItems.INCLUDED) -> ListEdit:
+    scope: staff.StaffId | AllItems = AllItems.INCLUDED
     if assigned_to is not AllItems.INCLUDED:
         _check_producer_update_fields(changes)
-        producer = staff.by_id(assigned_to)
-        if producer is None or producer.kind != "producer":
+        if assigned_to.kind != "producer":
             raise ListError("the assigned producer has no producer staff row")
-        source = producer.name
+        if isinstance(assigned_to.retirement, staff.RetiredProducer):
+            raise ListError(f"{assigned_to.name}: retired producer. Choose an active producer.")
+        source = assigned_to.name
+        scope = assigned_to.id
 
     def edit(item: ListItem, _: datetime) -> ListItem:
         _open(item)
@@ -1217,7 +1220,7 @@ def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, sourc
         _validate(changed)
         _check_links(lambda number: load(keeper, f"L{number}"), changed.number, changes)
         return changed
-    return _change(keeper, identity, edit, FieldChange("Updated", {**changes}), source, assigned_to=assigned_to)
+    return _change(keeper, identity, edit, FieldChange("Updated", {**changes}), source, assigned_to=scope)
 
 
 def move_open_producer(keeper: staff.StaffId, identity: str, previous: staff.StaffId,
@@ -1822,7 +1825,7 @@ def main(argv: list[str] | None = None) -> int:
                 options = cast(dict[str, object], vars(args))
                 _check_producer_update_fields(key for key, value in options.items()
                                               if value is not None and key not in {"command", "id", "source"})
-                _ = _update(keeper, identity, _cli_changes(args, record), source=source or "", assigned_to=assigned_to)
+                _ = _update(keeper, identity, _cli_changes(args, record), source=source or "", assigned_to=caller)
                 return 0
             if source is None:
                 parser.error("update requires --source for morty")

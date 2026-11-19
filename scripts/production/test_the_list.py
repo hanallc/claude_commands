@@ -31,7 +31,7 @@ START = datetime(2026, 11, 16, 18, tzinfo=UTC)
 
 class ProducerScopedUpdate(Protocol):
     def __call__(self, keeper: staff.StaffId, identity: str, changes: the_list.ItemChanges, *,
-                 source: str, assigned_to: staff.StaffId) -> the_list.ListEdit: ...
+                 source: str, assigned_to: staff.StaffRow) -> the_list.ListEdit: ...
 
 
 scoped_update = cast(ProducerScopedUpdate, getattr(the_list, "_update"))
@@ -373,7 +373,7 @@ class TheListTests(unittest.TestCase):
             _ = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.CLOSED}, source=OTHER.name)
         with self.assertRaisesRegex(the_list.ListError, "use close"):
             _ = scoped_update(MORTY.id, item.id, {"state": the_list.ItemState.CLOSED},
-                              source=OTHER.name, assigned_to=OTHER.id)
+                              source=OTHER.name, assigned_to=OTHER)
         self.assertEqual(the_list.load(MORTY.id, item.id), saved)
 
     def test_producer_sets_next_check_with_its_name_as_source(self) -> None:
@@ -416,16 +416,33 @@ class TheListTests(unittest.TestCase):
     def test_producer_scoped_update_cannot_reassign_an_item(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
         with self.assertRaisesRegex(the_list.ListError, "Refused options: --producer"):
-            _ = scoped_update(MORTY.id, item.id, {"producer": BOB.id}, source=OTHER.name, assigned_to=OTHER.id)
+            _ = scoped_update(MORTY.id, item.id, {"producer": BOB.id}, source=OTHER.name, assigned_to=OTHER)
         self.assertEqual(the_list.load(MORTY.id, item.id), item)
 
     def test_producer_scoped_update_logs_its_own_name(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
         _ = scoped_update(MORTY.id, item.id, {"latest_status": "The plan is ready."},
-                          source=MORTY.name, assigned_to=OTHER.id)
+                          source=MORTY.name, assigned_to=OTHER)
         saved = the_list.load(MORTY.id, item.id)
         self.assertEqual(saved.latest_status, "The plan is ready.")
         self.assertEqual(saved.log[-1].source, OTHER.name)
+
+    def test_producer_scoped_update_refuses_a_retired_producer(self) -> None:
+        item = self.add(changes={"producer": OTHER.id})
+        retired = staff.set_producer_retirement(OTHER.id, staff.RetiredProducer("claude:sonnet:high"))
+        with self.assertRaisesRegex(the_list.ListError, "dwight: retired producer"):
+            _ = scoped_update(MORTY.id, item.id, {"state": the_list.ItemState.WORKING},
+                              source=retired.name, assigned_to=retired)
+        self.assertEqual(the_list.load(MORTY.id, item.id), item)
+
+    def test_producer_cli_update_reads_staff_once(self) -> None:
+        item = self.add(changes={"producer": OTHER.id})
+        record = staff.snapshot()
+        with (patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}),
+              patch.object(staff, "snapshot", side_effect=[record, OSError("staff read failed")]) as read_staff):
+            self.assertEqual(self.command("update", "--id", item.id, "--state", "Working"), (0, "", ""))
+        read_staff.assert_called_once_with()
+        self.assertEqual(the_list.load(MORTY.id, item.id).state, the_list.ItemState.WORKING)
 
     def test_producer_cannot_run_other_commands(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
