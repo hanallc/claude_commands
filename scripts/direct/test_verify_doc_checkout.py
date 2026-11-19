@@ -11,6 +11,7 @@ from pathlib import Path
 import select
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 from threading import Event
 from typing import cast
 import unittest
@@ -24,6 +25,7 @@ from scripts.direct.verify_mac_offload_test_support import processes_carrying, r
 from scripts.direct.verify_scope_test_support import use_fixture_scope_readings, write_real_scope_launcher
 from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
 from scripts.lib import build_folders, build_slots
+from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_admit import scope_members
 from scripts.lint.memory_test_support import write_config_fixture, write_pressure_reading
@@ -31,6 +33,68 @@ from scripts.production.staff_test_support import fixture_member, isolated_staff
 
 
 DOC_COMMAND = ("bash", str(VERIFY), "doc")
+
+
+class VerifyDocPipeTests(unittest.TestCase):
+    def run_checkout_pipe_probe(self, limit: int, probe: str) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "checkout").mkdir()
+            (root / "lib").mkdir()
+            (root / "copies").mkdir()
+            _ = (root / "copies/copies.py").write_text(r'''
+if [[ "$TEST_COPY_LIMIT" == 0 ]]; then
+    printf '%s\n' tree "$PWD/checkout"
+fi
+if IFS= read -r request; then
+    exit 99
+fi
+: > owner-received-eof
+''')
+            script = shell_functions(VERIFY, "doc_checkout", "doc_close_checkout") + r'''
+export TEST_COPY_LIMIT=$1
+DOC_CALLER_DIR=$PWD
+DOC_REPO_TOP=$PWD/checkout
+DOC_TREE=tree
+PY=$BASH
+BUILD_FOLDERS_SCRIPT=$PWD/lib/build_folders.py
+doc_tree() { printf '%s\n' tree; }
+''' + probe
+            try:
+                result = subprocess.run(["bash", "-euc", script, "doc-pipes", str(limit)], cwd=root,
+                                        capture_output=True, text=True, timeout=5)
+            except subprocess.TimeoutExpired as error:
+                self.fail(f"doc checkout cleanup timed out: {error.stderr!r}")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((root / "owner-received-eof").is_file())
+
+    def test_doc_closes_owned_pipes_when_a_move_fails(self) -> None:
+        for limit in (10, 11):
+            with self.subTest(limit=limit):
+                self.run_checkout_pipe_probe(limit, r'''
+ulimit -Sn "$TEST_COPY_LIMIT"
+status=0
+doc_checkout || status=$?
+[[ "$status" == 1 && "$PWD" == "$DOC_CALLER_DIR" ]]
+''')
+
+    def test_doc_preserves_files_that_reuse_the_original_pipe_numbers(self) -> None:
+        self.run_checkout_pipe_probe(0, r'''
+set -T
+trap '
+    if [[ "$BASH_COMMAND" == DOC_COPY_OWNER_PID=* && -n "${DOC_COPY[1]:-}" ]]; then
+        original_request=${DOC_COPY[1]}
+        original_reply=${DOC_COPY[0]}
+    fi
+' DEBUG
+doc_checkout
+trap - DEBUG
+[[ ! -e "/dev/fd/$original_request" && ! -e "/dev/fd/$original_reply" ]]
+file=$DOC_CALLER_DIR/reused
+eval 'exec '"$original_request"'>"$file" '"$original_reply"'<"$file"'
+doc_close_checkout
+[[ "/dev/fd/$original_request" -ef "$file" && "/dev/fd/$original_reply" -ef "$file" ]]
+''')
 
 
 class VerifyDocCheckoutTests(VerifyDocFixture):

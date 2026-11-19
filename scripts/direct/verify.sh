@@ -548,11 +548,13 @@ unset VERIFY_NIX_ENV_REEXEC
 
 # Move the caller's checkout lock before Verify starts its helpers.
 if [[ -n "${BUILDLOG_PREPARED_COPY_LOCK_FD:-}" ]]; then
-    if [[ "$BUILDLOG_PREPARED_COPY_LOCK_FD" =~ ^[0-9]+$ ]] &&
-            { exec {BUILDLOG_PREPARED_COPY_LOCK_FD}>&"$BUILDLOG_PREPARED_COPY_LOCK_FD"-; } 2>/dev/null; then
-        export BUILDLOG_PREPARED_COPY_LOCK_FD
-    else
+    if [[ ! "$BUILDLOG_PREPARED_COPY_LOCK_FD" =~ ^[0-9]+$ ]]; then
         unset BUILDLOG_PREPARED_COPY_LOCK_FD
+    elif ! { exec {BUILDLOG_PREPARED_COPY_LOCK_FD}>&"$BUILDLOG_PREPARED_COPY_LOCK_FD"-; } 2>/dev/null; then
+        exec {BUILDLOG_PREPARED_COPY_LOCK_FD}>&- || true
+        unset BUILDLOG_PREPARED_COPY_LOCK_FD
+    else
+        export BUILDLOG_PREPARED_COPY_LOCK_FD
     fi
 fi
 
@@ -603,13 +605,13 @@ verify_helper() {
         VERIFY_HELPER_PID=${VERIFY_CALLS_PID:-}
         input=${VERIFY_CALLS[1]:-}
         output=${VERIFY_CALLS[0]:-}
-        [[ -n "$input" && -n "$output" ]] || return 0
         # Move the coprocess pipes so Bash can use them in subshells.
-        if { exec {VERIFY_HELPER_INPUT}>&"$input"-; } 2>/dev/null; then
-            if ! { exec {VERIFY_HELPER_OUTPUT}<&"$output"-; } 2>/dev/null; then
-                exec {VERIFY_HELPER_INPUT}>&-
-                VERIFY_HELPER_INPUT=""
-            fi
+        if [[ -n "$input" && -n "$output" ]] &&
+                { exec {input}>&"$input"- && exec {output}<&"$output"-; } 2>/dev/null; then
+            VERIFY_HELPER_INPUT=$input VERIFY_HELPER_OUTPUT=$output
+        else
+            if [[ -n "$input" ]]; then exec {input}>&-; fi
+            if [[ -n "$output" ]]; then exec {output}<&-; fi
         fi
         return 0
     fi
@@ -1999,9 +2001,13 @@ doc_checkout() {
         local copy_script checkout_tree current_tree status
         copy_script="$(dirname "$BUILD_FOLDERS_SCRIPT")/../copies/copies.py"
         coproc DOC_COPY { exec "$PY" "$copy_script" hold --repo "$DOC_REPO_TOP" --bind-scope; }
-        DOC_COPY_OWNER_PID=$DOC_COPY_PID
-        if ! exec {DOC_COPY_LEASE_FD}>&"${DOC_COPY[1]}"- ||
-           ! exec {DOC_COPY_REPLY_FD}<&"${DOC_COPY[0]}"- ||
+        DOC_COPY_OWNER_PID=${DOC_COPY_PID:-}
+        # Each move updates the descriptor only if it succeeds.
+        DOC_COPY_LEASE_FD=${DOC_COPY[1]:-}
+        DOC_COPY_REPLY_FD=${DOC_COPY[0]:-}
+        if [[ -z "$DOC_COPY_LEASE_FD" || -z "$DOC_COPY_REPLY_FD" ]] ||
+           ! exec {DOC_COPY_LEASE_FD}>&"$DOC_COPY_LEASE_FD"- ||
+           ! exec {DOC_COPY_REPLY_FD}<&"$DOC_COPY_REPLY_FD"- ||
            ! IFS= read -r checkout_tree <&"$DOC_COPY_REPLY_FD" ||
            ! IFS= read -r checkout <&"$DOC_COPY_REPLY_FD"; then
             doc_close_checkout
@@ -2020,15 +2026,15 @@ doc_checkout() {
 
 doc_close_checkout() {
     local owner=${DOC_COPY_OWNER_PID:-${DOC_COPY_PID:-}}
+    if [[ -n "${DOC_COPY_LEASE_FD:-}" ]]; then
+        exec {DOC_COPY_LEASE_FD}>&-
+        DOC_COPY_LEASE_FD=""
+    fi
+    if [[ -n "${DOC_COPY_REPLY_FD:-}" ]]; then
+        exec {DOC_COPY_REPLY_FD}<&-
+        DOC_COPY_REPLY_FD=""
+    fi
     if [[ -n "$owner" ]]; then
-        if [[ -n "${DOC_COPY_LEASE_FD:-}" ]]; then
-            exec {DOC_COPY_LEASE_FD}>&-
-            DOC_COPY_LEASE_FD=""
-        fi
-        if [[ -n "${DOC_COPY_REPLY_FD:-}" ]]; then
-            exec {DOC_COPY_REPLY_FD}<&-
-            DOC_COPY_REPLY_FD=""
-        fi
         if [[ "${1:-}" == stop ]]; then
             collect_child "$owner" TERM
         else
