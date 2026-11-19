@@ -4237,7 +4237,7 @@ window.fetch=async(url)=>{
   const button=document.querySelector('[data-review-new]');
   const bounds=element=>element.getBoundingClientRect(), center=box=>(box.top+box.bottom)/2;
   await document.fonts.ready;
-  for(const width of [1280,390]){
+  for(const width of [1280,390,320]){
    frameElement.style.width=width+'px';
    const t=bounds(title), n=bounds(name), o=bounds(owner), b=bounds(button), r=bounds(row);
    const beside=Math.abs(center(t)-center(b))<=1;
@@ -4247,6 +4247,13 @@ window.fetch=async(url)=>{
       n.left<r.left-1 || Math.abs(b.right-r.right)>1 ||
       (beside ? n.left<t.right+4 : width===1280 || b.top<t.bottom+4)){
     failures.push('The title and both controls must fit at '+width+' px.');
+   }
+   if(width===320 && Math.abs(t.height-parseFloat(getComputedStyle(title).lineHeight))>1){
+    failures.push('The Review title fits on one line at 320 px.');
+   }
+   if(width===320 && (button.innerText.trim()!=='+' || button.getAttribute('aria-label')!=='New item' ||
+                     button.title!=='New item')){
+    failures.push('The narrow New item button shows only + and keeps its name.');
    }
   }
  }catch(error){failures.push(String(error));}
