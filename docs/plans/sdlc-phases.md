@@ -1361,7 +1361,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
 
-### Phase 83 — Tools add the present time; agents write only future times  · status: todo
+### Phase 83 — Tools add the present time; agents write only future times  · status: done
 **Depends on:** phase 82
 
 #### Work Order
@@ -1387,7 +1387,9 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
 
-### Phase 84 — The List refuses an ETA that is not one of the agreed forms  · status: todo
+**Result:** `the_list.py update` keeps the clock time of each update, and the List page shows it beside the latest status in the user zone. The tool adds the time to `--source` and refuses a source that ends in a clock time. `send.py` adds a `Sent:` header line. The agent rule is now "write no present time; write only future times". On main 69b0e7ae6 (hash d6d56f52f).
+
+### Phase 84 — The List refuses an ETA that is not one of the agreed forms  · status: done
 **Depends on:** phase 83
 
 #### Work Order
@@ -1414,6 +1416,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Acceptance gate:**
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
+
+**Result:** `the_list.py add` and `update` accept `--eta` only as `Mon D`, `Mon D HH:MM ZONE`, `No time yet`, `Waiting for nate`, `Paused` or `Delivered`. Old records read as before. A producer may set `--evidence` and `--add-evidence` on its own items. On main 31f454605 (hash fb52e3dc7).
 
 ### Phase 85 — send.py prints FAILED only when delivery failed  · status: todo
 **Depends on:** phase 84 (fb52e3dc7)
