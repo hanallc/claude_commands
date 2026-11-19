@@ -3100,6 +3100,16 @@ Work:
 5. A pass restarts the 44ct quiet clock of the passed head. The as-built ties this to the pass limit: a larger limit needs a new alert check.
 6. queue_times.jsonl records a landing mark. One report command prints the memory wait of landing tests and unit steps over a time span.
 
+### Phase 44cz — Each queue setting says what it means  · status: todo
+**From builds (user ask via natedev), 2026-11-19:** settings must be reasonably documented. The messaging unit's config audit names queue as owner of 67 settings whose comment lacks a meaning, a unit, or allowed values and a default. Low priority: run after current work.
+
+Source: /tmp/claude/unit/f0420563-917b-4724-a701-72eac3ca0f19/phases/config-doc-audit/config-doc-audit-report.md, rows with owner unit `queue`: 16 in config/build_admission.conf, 28 in config/build_folders.conf, 23 in config/build_targets.conf.
+
+Work:
+1. Give each listed setting a comment with its meaning, its unit, and its allowed values and default, read from the code that uses it.
+2. Comments only: no key, value or order changes.
+3. Run each file's reader tests; the readers still parse the files.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
