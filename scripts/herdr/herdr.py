@@ -172,8 +172,19 @@ class AgentBlocked(HerdrFailure):
     """An agent requires user input; nothing is sent in response."""
 
 
-class _CommandNotStarted(HerdrFailure):
+class HerdrCommandNotStarted(HerdrFailure):
     """The transport command did not start."""
+
+
+@dataclass
+class TrackedPromptSubmission:
+    """Check readiness and record whether the prompt may have sent input."""
+
+    check: Callable[[], None]
+    may_have_submitted: bool = field(default=False, init=False)
+
+    def __call__(self) -> None:
+        self.check()
 
 
 class _WrongNativeTarget(HerdrFailure):
@@ -359,6 +370,7 @@ class OpeningPrompt:
     cursor: TranscriptCursor | UnspecifiedPromptTranscript = UnspecifiedPromptTranscript()
     may_type: bool = True
     other_transcripts: tuple[TranscriptCursor, ...] = ()
+    resend_once: bool = False
 
     def prepare_for_launch(self, since: datetime) -> OpeningPrompt:
         """Keep a supplied cursor or position a new cursor before the agent starts."""
@@ -495,6 +507,10 @@ class TranscriptCursor:
             if row.get("type") == "user" and not row.get("isMeta", False) and _prompt_matches(text, _turn_text(row)):
                 return PromptSubmitted(at)
         return PromptNotSubmitted("no matching non-meta user turn after launch")
+
+    def allows_resend(self) -> bool:
+        """Allow a caller to authorize one send when the transcript has a known gap."""
+        return False
 
     def command_rejections(self, text: str) -> int:
         """How many times Claude answered this prompt's slash command with `Unknown command` since launch."""
@@ -795,6 +811,39 @@ class UnreadableCwd:
     detail: str
 
 
+class PaneShellAncestry(Enum):
+    DESCENDANT = "descendant"
+    OUTSIDE = "outside"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class ProcessAncestry:
+    """Use parent PIDs and terminals from the scan that supplied the placement."""
+
+    parents: Mapping[int, int] = field(default_factory=dict[int, int])
+    terminals: Mapping[int, int | str] = field(default_factory=dict[int, int | str])
+
+    def is_detached_from_shell(self, pid: int, shell_pid: int) -> bool:
+        terminal = self.terminals.get(pid)
+        shell_terminal = self.terminals.get(shell_pid)
+        return (terminal is not None and shell_terminal is not None
+                and (terminal == 0 or terminal != shell_terminal)
+                and self.relative_to_shell(pid, shell_pid) is PaneShellAncestry.OUTSIDE)
+
+    def relative_to_shell(self, pid: int, shell_pid: int) -> PaneShellAncestry:
+        seen: set[int] = set()
+        while pid > 1 and pid not in seen:
+            if pid == shell_pid:
+                return PaneShellAncestry.DESCENDANT
+            seen.add(pid)
+            parent = self.parents.get(pid)
+            if parent is None:
+                return PaneShellAncestry.UNKNOWN
+            pid = parent
+        return PaneShellAncestry.OUTSIDE if pid in (0, 1) else PaneShellAncestry.UNKNOWN
+
+
 @dataclass(frozen=True)
 class HerdrProcess:
     pid: int
@@ -802,6 +851,7 @@ class HerdrProcess:
     marks: dict[str, str]
     command: str
     working_directory: str | UnreadableCwd
+    ancestry: ProcessAncestry = field(default_factory=ProcessAncestry, compare=False, repr=False)
 
     @property
     def cwd(self) -> str:
@@ -1116,7 +1166,7 @@ def unmarked_environment() -> dict[str, str]:
     return child_environment(dict(os.environ))
 
 
-class HerdrLaunchRefused(_CommandNotStarted):
+class HerdrLaunchRefused(HerdrCommandNotStarted):
     """The deadline passed before Herdr started the command."""
 
 
@@ -1134,17 +1184,22 @@ def run_program(argv: list[str], timeout: float = PROGRAM_TIMEOUT_SECONDS, *,
     try:
         env = unmarked_environment() if environment is None else child_environment(environment)
         if not prompt_transport:
-            return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=remaining, env=env)
+            try:
+                return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=remaining, env=env)
+            except UnicodeDecodeError as error:
+                raise HerdrFailure("the Herdr reply cannot be decoded") from error
         process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     except Exception as error:
         if prompt_transport or isinstance(error, OSError):
-            raise _CommandNotStarted(f"{argv[0]}: {error}") from error
+            raise HerdrCommandNotStarted(f"{argv[0]}: {error}") from error
         raise
     with process:
         try:
             stdout, stderr = process.communicate(timeout=max(0.0, deadline - time.monotonic()))
-        except BaseException:
+        except BaseException as error:
             process.kill()
+            if isinstance(error, UnicodeDecodeError):
+                raise HerdrFailure("the Herdr prompt reply cannot be decoded") from error
             raise
         return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
@@ -2972,9 +3027,11 @@ class Herdr:
                 result = receipt()
                 if isinstance(result, PromptSubmitted):
                     return result
-                if isinstance(result, TranscriptUnreadable):
+                if isinstance(result, TranscriptUnreadable) and not opening.resend_once:
                     return False
                 composer = self.composer(pane)
+                if opening.resend_once and (isinstance(composer, NoComposer) or composer.text.strip()):
+                    raise HerdrFailure("check that the destination pane is idle and its input is empty", "wrong_target")
                 if isinstance(composer, NoComposer):
                     return False
                 if not composer.text.strip():
@@ -2993,6 +3050,12 @@ class Herdr:
                 if not check_target(session, action=action, place=place, terminal=terminal,
                                     recipient=recipient, pane_info=row, client=self):
                     return False
+                if opening.resend_once:
+                    result = receipt()
+                    if isinstance(result, PromptSubmitted):
+                        return result
+                    if cursor is None or not cursor.allows_resend():
+                        raise HerdrFailure("the transcript does not permit a resend", "wrong_target")
                 if action is _OpeningComposer.DRAFT:
                     self._send_keys(pane, "Enter")
                     return True
@@ -3001,7 +3064,7 @@ class Herdr:
                 typed = draft_pending = True
                 try:
                     self._prompt(pane, text)
-                except _CommandNotStarted:
+                except HerdrCommandNotStarted:
                     typed = False
                     if record is not None:
                         record.path.unlink(missing_ok=True)
@@ -3026,6 +3089,8 @@ class Herdr:
                 screen = ready.screen
                 if isinstance(ready, PromptInputTimedOut):
                     return failure("destination never became ready for input", check_readability=True)
+                if opening.resend_once and not ready.idle:
+                    return failure("check that the destination pane is idle and its input is empty")
             if cursor is None:
                 return failure("caller did not identify the transcript; submit is unproven")
             with operation_deadline.within(deadline):
@@ -3046,6 +3111,9 @@ class Herdr:
                 if remaining > 0:
                     time.sleep(min(pause, remaining))
                     pause = min(pause * 2, START_RETRY_MAX_SECONDS)
+
+            if opening.resend_once:
+                return self._wait_for_submit(receipt, deadline) or failure()
 
             enters = 0
             while True:
@@ -3092,7 +3160,16 @@ class Herdr:
                             pane_info=row, client=self):
             raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
         _ = on_submission()
-        self._prompt(pane, _prepare_prompt(pane, text), proof=proof)
+        prepared = _prepare_prompt(pane, text)
+        transport_started = True
+        try:
+            self._prompt(pane, prepared, proof=proof)
+        except HerdrCommandNotStarted:
+            transport_started = False
+            raise
+        finally:
+            if isinstance(on_submission, TrackedPromptSubmission):
+                on_submission.may_have_submitted = transport_started
 
     def prompt_terminal(self, pane: str, terminal: str, text: str) -> None:
         """Send input to the selected pane terminal."""
@@ -5795,8 +5872,36 @@ def _add_scope_owners(owners: dict[tuple[str, Path], set[str]], pids: Sequence[i
             owners.setdefault(scope, set()).add(sessions[pid])
 
 
+@dataclass
+class _LinuxProcessScan:
+    parents: dict[int, int] = field(default_factory=dict)
+    terminals: dict[int, int | str] = field(default_factory=dict)
+    starts: dict[int, str] = field(default_factory=dict)
+
+    def read_parent(self, pid: int) -> int:
+        fields = _linux_process_stat(pid)
+        parent = int(fields[1])
+        self.parents[pid] = parent
+        if len(fields) > 19 and fields[19].isdecimal():
+            self.starts[pid] = fields[19]
+        if len(fields) > 4 and re.fullmatch(r"-?[0-9]+", fields[4]):
+            self.terminals[pid] = int(fields[4])
+        return parent
+
+    def check_start(self, pid: int) -> None:
+        # Check again after the metadata reads: a reused PID or a new parent makes the evidence unknown.
+        try:
+            fields = _linux_process_stat(pid)
+            if pid in self.starts and fields[19] == self.starts[pid] and int(fields[1]) == self.parents.get(pid):
+                return
+        except (OSError, ValueError, IndexError):
+            pass
+        _ = self.parents.pop(pid, None)
+        _ = self.terminals.pop(pid, None)
+
+
 def _process_sessions(candidates: list[Path], servers: dict[int, str], *,
-                      failures: list[str] | None = None) -> dict[int, str]:
+                      failures: list[str] | None = None, scan: _LinuxProcessScan | None = None) -> dict[int, str]:
     """Associate descendants and handoff survivors with socket-owned sessions."""
     if not servers:
         return {}
@@ -5815,9 +5920,10 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str], *,
             else:
                 shared_groups.setdefault((hierarchy, path), set()).add(session)
     children: dict[int, list[Path]] = {}
+    read_parent = linux_process_parent if scan is None else scan.read_parent
     for process in candidates:
         try:
-            parent = linux_process_parent(int(process.name))
+            parent = read_parent(int(process.name))
             children.setdefault(parent, []).append(process)
         except FileNotFoundError:
             continue
@@ -5918,6 +6024,7 @@ class _UserProcess:
     parent: int
     executable: str
     argument_state: UnparsedProcessArguments | ReadProcessArguments | UnreadableProcessArguments
+    terminal: int | str | None = None
 
     @cached_property
     def arguments(self) -> ReadProcessArguments | UnreadableProcessArguments:
@@ -5932,9 +6039,10 @@ class _UserProcess:
         return UnreadableProcessArguments(f"process {self.pid}: arguments are unreadable or changed")
 
 
-def _darwin_processes(*, complete: bool = False, timeout: float | _ProcessReadDeadline = PROGRAM_TIMEOUT_SECONDS) -> list[_UserProcess]:
+def _darwin_processes(*, complete: bool = False, with_terminal: bool = False,
+                      timeout: float | _ProcessReadDeadline = PROGRAM_TIMEOUT_SECONDS) -> list[_UserProcess]:
     result = run_program([os.environ.get("HERDR_PS", "ps"), "-U", str(os.getuid()),
-                          "-o", "pid=,ppid=,uid=,comm="],
+                          "-o", "pid=,ppid=,uid=,tdev=,comm=" if with_terminal else "pid=,ppid=,uid=,comm="],
                          timeout=timeout.remaining() if isinstance(timeout, _ProcessReadDeadline) else timeout)
     require_success(result, "user processes")
     # Both fields can contain spaces. Separate batched columns retain an unambiguous
@@ -5951,16 +6059,23 @@ def _darwin_processes(*, complete: bool = False, timeout: float | _ProcessReadDe
         elif complete and line.strip():
             raise HerdrFailure("user process arguments are incomplete")
     processes: list[_UserProcess] = []
+    last = 4 if with_terminal else 3
     for line in result.stdout.splitlines():
-        fields = line.split(maxsplit=3)
-        if len(fields) != 4 or not all(field.isdecimal() for field in fields[:3]):
+        fields = line.split(maxsplit=last)
+        if len(fields) != last + 1 or not all(field.isdecimal() for field in fields[:3]):
             if complete and line.strip():
                 raise HerdrFailure("user process descendants are incomplete")
             continue
         pid, parent, uid = map(int, fields[:3])
         if uid != os.getuid() or pid <= 0:
             continue
-        executable = fields[3].rstrip()
+        executable = fields[last].rstrip()
+        terminal: int | str | None = None
+        if with_terminal:
+            if fields[3] == "??":
+                terminal = 0
+            elif re.fullmatch(r"[0-9]+/[0-9]+", fields[3]):
+                terminal = fields[3]
         if pid not in commands:
             try:
                 current = run_program([os.environ.get("HERDR_PS", "ps"), "-o", "command=", "-p", str(pid)],
@@ -5974,7 +6089,8 @@ def _darwin_processes(*, complete: bool = False, timeout: float | _ProcessReadDe
                 continue
             except HerdrFailure:
                 pass
-        processes.append(_UserProcess(pid, parent, executable, UnparsedProcessArguments(commands.get(pid, ""))))
+        processes.append(_UserProcess(pid, parent, executable, UnparsedProcessArguments(commands.get(pid, "")),
+                                      terminal))
     if complete and set(commands) != {process.pid for process in processes}:
         raise HerdrFailure("user process descendants changed or are incomplete")
     return processes
@@ -6073,11 +6189,14 @@ def _darwin_process_sessions(by_pid: dict[int, _UserProcess], listeners: list[_B
 
 def _darwin_herdr_processes(*, inherited_marks_only: bool = False) -> list[HerdrProcess]:
     try:
-        by_pid = {process.pid: process for process in _darwin_processes()}
+        by_pid = {process.pid: process for process in _darwin_processes(with_terminal=True)}
         listeners = _darwin_bound_sockets()
     except (HerdrFailure, subprocess.TimeoutExpired):
         return []
     sessions = _darwin_process_sessions(by_pid, listeners)
+    ancestry = ProcessAncestry({pid: process.parent for pid, process in by_pid.items()},
+                              {pid: process.terminal for pid, process in by_pid.items()
+                               if process.terminal is not None})
     processes: list[HerdrProcess] = []
     working_directories = _darwin_process_cwds(sorted(sessions))
     for pid, session in sessions.items():
@@ -6093,7 +6212,7 @@ def _darwin_herdr_processes(*, inherited_marks_only: bool = False) -> list[Herdr
             marks = (_inherited_process_marks(environment) if inherited_marks_only
                      else _process_marks(pid, environment, list(arguments.argv), place))
             processes.append(HerdrProcess(pid, place, marks,
-                                          Path(by_pid[pid].executable).name, working_directories[pid]))
+                                          Path(by_pid[pid].executable).name, working_directories[pid], ancestry))
         except (HerdrFailure, subprocess.TimeoutExpired):
             continue
     return processes
@@ -6159,7 +6278,9 @@ def _scan_herdr_processes(*, inherited_marks_only: bool = False) -> list[HerdrPr
         candidates = [path for path in proc_root().iterdir() if path.name.isdecimal()]
     except OSError:
         return processes
-    sessions = _process_sessions(candidates, _live_server_processes(candidates))
+    scan = _LinuxProcessScan()
+    sessions = _process_sessions(candidates, _live_server_processes(candidates), scan=scan)
+    ancestry = ProcessAncestry(scan.parents, scan.terminals)
     for pid, session in sessions.items():
         process = proc_root() / str(pid)
         try:
@@ -6181,7 +6302,8 @@ def _scan_herdr_processes(*, inherited_marks_only: bool = False) -> list[HerdrPr
                 cwd = UnreadableCwd(str(error))
             marks = (_inherited_process_marks(environment) if inherited_marks_only
                      else _process_marks(pid, environment, arguments, place))
-            processes.append(HerdrProcess(pid, place, marks, Path(arguments[0]).name, cwd))
+            scan.check_start(pid)
+            processes.append(HerdrProcess(pid, place, marks, Path(arguments[0]).name, cwd, ancestry))
         except (OSError, ValueError, RuntimeError):
             continue
     return processes
@@ -6279,9 +6401,7 @@ def herdr_processes(*, membership: StaffLabels | StaffLabelsRead = StaffLabelsRe
     if inherited_marks_only:
         return processes
     labels = RecordedLabels(membership)
-    return [HerdrProcess(row.pid, row.place, labels.resolve(row.pid, row.marks),
-                         row.command, row.working_directory)
-            for row in processes]
+    return [replace(row, marks=labels.resolve(row.pid, row.marks)) for row in processes]
 
 
 def _check_agent_arguments(kind: str, agent_arguments: list[str]) -> None:

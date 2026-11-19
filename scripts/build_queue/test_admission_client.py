@@ -10,6 +10,7 @@ from functools import partial
 import io
 import json
 import os
+import re
 import resource
 from selectors import DefaultSelector, EVENT_READ, EVENT_WRITE, SelectorKey
 import shlex
@@ -495,8 +496,13 @@ class ClientTests(unittest.TestCase):
             self.assertIsInstance(outcome, send_result.ConfirmedSendOutcome)
             assert isinstance(outcome, send_result.ConfirmedSendOutcome)
             self.assertEqual(outcome.header.outcome, "sent")
-            self.assertEqual([(item["threadId"], item["input"]) for item in received],
-                [(identity, [{"type": "text", "text": message + "\nSender native id: unavailable"}])])
+            delivery, = received
+            self.assertEqual(delivery["threadId"], identity)
+            payload, = cast(list[dict[str, str]], delivery["input"])
+            self.assertEqual(payload.keys(), {"type", "text"})
+            self.assertEqual(payload["type"], "text")
+            prefix = message + "\nSender native id: unavailable\nSent: "
+            self.assertRegex(payload["text"], r"\A" + re.escape(prefix) + r"\d{2}:\d{2} [^\n]+\Z")
 
     def test_runner_width_change_uses_its_account_and_changes_its_reservation(self) -> None:
         with AdmissionFixture() as fixture:

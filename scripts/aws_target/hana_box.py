@@ -13,6 +13,7 @@ from typing import Protocol, cast
 from uuid import uuid4
 
 from scripts.aws_target import hana_guest, hana_replacement_record, hana_spend, ledger, remote
+from scripts.aws_target.hana_claim_release import HanaClaimRelease, HanaClaimReleased, HanaClaimReleaseRefused
 from scripts.aws_target.controller_lock import control_lock, hana_work_lock
 from scripts.build_queue.placement import HANA_IMAGE_STALE as HANA_IMAGE_STALE
 from scripts.lib import conf, file_lock, process_start
@@ -36,6 +37,8 @@ class Lifecycle(StrEnum):
 class StopCause(StrEnum):
     IDLE = 'idle'
     INTERRUPTION = 'interruption'
+    UNCLAIMED = 'unclaimed'
+    UNCLAIMED_AFTER_INTERRUPTION = 'unclaimed-after-interruption'
     UNKNOWN = 'unknown'
 
 
@@ -183,6 +186,16 @@ class HanaLifecycleUnavailable:
 HanaInspection = HanaLifecycleEvidence | HanaUnprovisioned | HanaLifecycleUnavailable | HanaResourcesHeld
 
 
+@dataclass(frozen=True)
+class UnclaimedStopDecision:
+    generation: int
+
+
+@dataclass(frozen=True)
+class NoUnclaimedStopDecision:
+    """The journal has no generation for an unclaimed stop."""
+
+
 @dataclass
 class BoxRecord:
     identity: DeploymentIdentity
@@ -197,6 +210,7 @@ class BoxRecord:
     observed_at: int = 0
     stop_cause: StopCause = StopCause.UNKNOWN
     reason: str = ''
+    unclaimed_stop: UnclaimedStopDecision | NoUnclaimedStopDecision = NoUnclaimedStopDecision()
 
 
 @dataclass(frozen=True)
@@ -323,6 +337,8 @@ def _record(row: BoxRecord) -> dict[str, object]:
             permit=dict(expires_at=int(permit.expires_at), generation=permit.generation, boot_id=permit.boot_id)
                 if isinstance(permit, hana_guest.WorkPermit) else None) if isinstance(operation, PendingOperation) else None,
         'idle_since': row.idle_since, 'observed_at': row.observed_at, 'stop_cause': row.stop_cause.value, 'reason': row.reason,
+        'unclaimed_stop_generation': row.unclaimed_stop.generation
+            if isinstance(row.unclaimed_stop, UnclaimedStopDecision) else None,
     }
 
 
@@ -389,6 +405,8 @@ def _decode(document: dict[str, object]) -> BoxRecord:
         reason=_empty_text(document, 'reason'))
     if len(row.claims) > 1 or any(not c.execution or not c.token for c in row.claims):
         raise ValueError('The Hana claim record is invalid')
+    if document.get('unclaimed_stop_generation') is not None:
+        row.unclaimed_stop = UnclaimedStopDecision(ledger.instant(document, 'unclaimed_stop_generation'))
     if document['start'] is not None:
         item = ledger.mapping(document['start'])
         row.start = DemandStart(ledger.text(item, 'token'), ledger.instant(item, 'at'), ledger.instant(item, 'deadline'))
@@ -422,6 +440,14 @@ def require_idle_setup(path: Path, identity: DeploymentIdentity) -> None:
     if (row.state != Lifecycle.IDLE_STOPPED or row.claims or isinstance(row.start, DemandStart)
             or isinstance(row.operation, PendingOperation) and row.operation.action != Action.OBSERVE):
         raise ValueError('The Hana lifecycle is busy. Run hana-setup again when the box is idle.')
+
+
+def lifecycle_release_block(state: Lifecycle, operation: PendingOperation | NoOperation) -> HanaClaimRelease:
+    if isinstance(operation, PendingOperation):
+        return HanaClaimReleaseRefused(f'The Hana lifecycle operation {operation.action.value} is pending')
+    if state in (Lifecycle.STARTING, Lifecycle.STOPPING):
+        return HanaClaimReleaseRefused(f'The Hana lifecycle is {state.value}')
+    return HanaClaimReleased()
 
 
 def record_replacement_stop(path: Path, generation: int, now: int, *, stopped: bool) -> None:
@@ -587,7 +613,7 @@ class HanaController:
         except (OSError, ValueError, KeyError, TypeError):
             return True
 
-    def release(self, execution: str) -> bool:
+    def release(self, execution: str) -> HanaClaimRelease:
         """Keep unresolved starts owned until lifecycle recovery settles them."""
         with control_lock(self.directory):
             from importlib import import_module
@@ -598,19 +624,23 @@ class HanaController:
 
             guarded = execution_guard_path(self.directory, execution).exists()
             if guarded and not execution_command_settled(self.directory, execution):
-                return False
+                return HanaClaimReleaseRefused('The Hana command settlement is unconfirmed')
             row = self._read()
-            if isinstance(row, NoDeployment) or not row.claims or row.claims[0].execution != execution:
-                return (guarded and isinstance(row, BoxRecord) and not row.claims
-                        and row.state not in (Lifecycle.STARTING, Lifecycle.STOPPING)
-                        and not isinstance(row.operation, PendingOperation))
-            if row.state in (Lifecycle.STARTING, Lifecycle.STOPPING) or isinstance(row.operation, PendingOperation):
-                return False
-            row.claims = []
-            row.delivered = NoDeliveredPermit()
-            row.idle_since = int(self.clock())
-            self._save(row)
-            return True
+            if isinstance(row, NoDeployment):
+                return HanaClaimReleaseRefused('No Hana deployment is available for release')
+            if row.claims and row.claims[0].execution != execution:
+                return HanaClaimReleaseRefused('The Hana lifecycle claim belongs to another execution')
+            if not guarded and not row.claims:
+                return HanaClaimReleaseRefused('The Hana lifecycle claim is missing')
+            blocked = lifecycle_release_block(row.state, row.operation)
+            if isinstance(blocked, HanaClaimReleaseRefused):
+                return blocked
+            if row.claims:
+                row.claims = []
+                row.delivered = NoDeliveredPermit()
+                row.idle_since = int(self.clock())
+                self._save(row)
+            return HanaClaimReleased()
 
     def permission(self, execution: str, boot_id: str, generation: int) -> CommandPermission | ClaimRefused:
         with hana_work_lock(self.directory) as access:
@@ -790,6 +820,9 @@ class HanaController:
 
     def _stop(self, row: BoxRecord, now: int, cause: StopCause) -> None:
         row.state, row.stop_cause, row.delivered = Lifecycle.STOPPING, cause, NoDeliveredPermit()
+        row.unclaimed_stop = (UnclaimedStopDecision(row.generation)
+                              if cause in (StopCause.UNCLAIMED, StopCause.UNCLAIMED_AFTER_INTERRUPTION)
+                              else NoUnclaimedStopDecision())
         _ = self._intent(row, Action.STOP, now)
 
     def _observe(self, row: BoxRecord, observed: BoxObservation, settings: LifecycleSettings, now: int) -> None:
@@ -807,11 +840,16 @@ class HanaController:
             row.delivered, row.boot, row.start = NoDeliveredPermit(), BootUnverified(), NoDemandStart()
             if observed.state == 'terminated':
                 row.state = Lifecycle.REPLACEMENT_PENDING
-            elif observed.stop_cause == StopCause.INTERRUPTION:
+            elif (observed.stop_cause == StopCause.INTERRUPTION
+                  or row.state == Lifecycle.STOPPING and row.stop_cause == StopCause.INTERRUPTION):
                 row.state = Lifecycle.INTERRUPTED
             elif row.state == Lifecycle.STOPPING and row.stop_cause == StopCause.IDLE:
                 row.state = Lifecycle.IDLE_STOPPED
-            elif row.state != Lifecycle.IDLE_STOPPED:
+            elif row.state == Lifecycle.STOPPING and row.stop_cause == StopCause.UNCLAIMED_AFTER_INTERRUPTION:
+                decision = row.unclaimed_stop
+                row.state = (Lifecycle.IDLE_STOPPED if isinstance(decision, UnclaimedStopDecision)
+                             and decision.generation == row.generation else Lifecycle.INTERRUPTED)
+            elif row.state not in (Lifecycle.IDLE_STOPPED, Lifecycle.INTERRUPTED):
                 row.state = Lifecycle.STOPPED_UNKNOWN
             return
         if row.state == Lifecycle.STARTING:
@@ -833,7 +871,11 @@ class HanaController:
                 self._stop(row, now, StopCause.IDLE)
             elif (row.state != Lifecycle.STARTING or not isinstance(row.start, DemandStart)
                     or now >= row.start.deadline):
-                self._stop(row, now, StopCause.UNKNOWN)
+                if row.state == Lifecycle.INTERRUPTED:
+                    cause = StopCause.INTERRUPTION if row.claims else StopCause.UNCLAIMED_AFTER_INTERRUPTION
+                else:
+                    cause = StopCause.UNKNOWN if row.claims else StopCause.UNCLAIMED
+                self._stop(row, now, cause)
             return
         assert isinstance(observed.boot, VerifiedBoot)
         row.boot = observed.boot

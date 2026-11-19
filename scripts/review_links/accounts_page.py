@@ -408,13 +408,25 @@ def board(reading: accounts.StatusReading, alerts: Mapping[str, QuotaAlert] | No
             + (f'<h2>Problems</h2><ul class="problems">{problems}</ul>' if problems else "") + "</section>")
 
 
+def _model_cell(row: accounts.ModelsBoardRow, column: accounts.BoardColumn) -> str:
+    key = column["key"]
+    spans = row["cells"][key]
+    attributes = ""
+    if names := row["session_names"].get(key):
+        tooltip = html.escape("\n".join(names), quote=True)
+        label = html.escape(f'{spans[0]["text"]}: ' + ", ".join(names), quote=True)
+        cell_id = html.escape(f'model-count-{row["model_name"]}-{row["effort"]}-{key}', quote=True)
+        attributes = f' id="{cell_id}" tabindex="0" aria-label="{label}" data-model-sessions="{tooltip}"'
+    return f'<td class="{column["align"]}"{attributes}>{_spans(spans)}</td>'
+
+
 def models_board(reading: accounts.StatusReading) -> str:
     table = accounts.models_board(reading, accounts.role_colors())
     head = "".join(_sort_heading(column, "model", accounts.MODEL_COUNT_COLUMNS)
                    + ('<th class="left"></th>' if column["key"] == "model" else "")
                    for column in accounts.MODEL_COLUMNS)
     rows = "".join("<tr>" + "".join(
-        f'<td class="{column["align"]}">{_spans(row["cells"][column["key"]])}</td>'
+        _model_cell(row, column)
         + (f'<td class="left">{_swatch(row["cells"]["model"])}</td>' if column["key"] == "model" else "")
         for column in accounts.MODEL_COLUMNS) + "</tr>" for row in table.rows)
     orders = html.escape(json.dumps(table.orders), quote=True)
@@ -438,6 +450,7 @@ def page() -> bytes:
             + '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Accounts</title>'
             + f'{STYLE}</head><body><main data-refresh-seconds="{refresh_seconds}">' + page_frame.title("Accounts", "accounts")
             + f'<div data-accounts>{body}</div></main>' + POPUP + MENU + QUOTA_PANEL
+            + '<div class="model-tooltip" hidden aria-hidden="true"></div>'
             + f"<script>{SCRIPT}</script></body></html>").encode()
 
 
@@ -471,6 +484,13 @@ STYLE = "<style>\n" + console_theme.CSS + page_frame.STYLE + """
 h2{margin:16px 0 4px}
 .card{--column-gap:1.125rem;--table-font-size:.86rem;width:fit-content;max-width:100%;padding-right:var(--column-gap)}
 .models-card{margin-top:24px}
+.model-tooltip{position:fixed;width:max-content;padding:7px 11px;background:var(--model-tooltip-bg);
+color:var(--model-tooltip-ink);border-radius:6px;
+font-size:12px;font-weight:500;box-shadow:0 3px 12px #0002;z-index:5;white-space:pre;overflow:auto}
+:root{--model-tooltip-bg:#192339;--model-tooltip-ink:#fff}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){--model-tooltip-bg:#e4eaf4;--model-tooltip-ink:#10151e}}
+:root[data-theme="dark"]{--model-tooltip-bg:#e4eaf4;--model-tooltip-ink:#10151e}
+[data-model-sessions]:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
 table{border-collapse:collapse;font-size:var(--table-font-size);font-variant-numeric:tabular-nums}
 /* Let the last sort arrow use the right padding of the card. */
 .card .scroll{margin-right:calc(-1 * var(--column-gap));padding-right:var(--column-gap)}
@@ -510,7 +530,7 @@ border-radius:4px;background:var(--card)}
 .color-picker input[type=text]{box-sizing:border-box;width:100%;padding:8px;margin-bottom:12px;border-radius:6px;
 background:var(--bg);color:var(--ink);border:1px solid var(--line)}
 .color-actions{display:flex;gap:8px}.color-actions button{flex:1;padding:7px;border:1px solid var(--line);border-radius:6px;
-background:var(--bg);color:var(--ink);cursor:pointer}.color-actions button:hover{background:var(--hover)}
+background:var(--bg);color:var(--ink);cursor:pointer}
 .color-actions button:disabled{opacity:.5;cursor:default}
 .color-save-error{color:var(--error);overflow-wrap:anywhere}
 .color-swatch:focus-visible,.color-picker :focus-visible{outline:2px solid var(--accent);outline-offset:3px}
@@ -519,7 +539,7 @@ background:var(--bg);color:var(--ink);cursor:pointer}.color-actions button:hover
 .next-cell{white-space:nowrap}.next-muted{color:var(--ink-2)}
 .next-button{display:inline-flex;vertical-align:middle;margin-left:5px;padding:2px;border:0;border-radius:4px;
 background:transparent;color:var(--ink-2);cursor:pointer}
-.next-button:hover,.next-button:focus-visible{background:var(--hover)}
+.next-button:focus-visible{background:var(--hover)}
 .next-button svg,.next-minus svg{width:14px;height:14px;vertical-align:middle}
 .move-menu button[aria-checked=true]{background:var(--hover)}
 .move-menu{position:fixed;margin:0;padding:6px;width:max-content;min-width:220px;max-width:calc(100vw - 16px);box-sizing:border-box;
@@ -529,7 +549,7 @@ font-size:.86rem;font-variant-numeric:tabular-nums}
 .move-title{padding:6px 10px 8px;margin-bottom:4px;color:var(--ink-2);border-bottom:1px solid var(--line)}
 .move-menu button{display:flex;justify-content:space-between;gap:24px;width:100%;padding:6px 10px;border:0;border-radius:6px;
 background:none;color:inherit;font:inherit;text-align:left;cursor:pointer}
-.move-menu button:hover,.move-menu button:focus-visible{background:var(--hover);outline:none}
+.move-menu button:focus-visible{background:var(--hover);outline:none}
 .move-name{font-weight:600}.move-left{color:var(--ink-2)}.move-left.warning{color:var(--warning)}.move-left.error{color:var(--error)}
 .move-empty{padding:6px 10px;color:var(--ink-3)}
 .quota-icon{display:inline-grid;place-items:center;vertical-align:middle;width:22px;height:22px;margin:-3px 5px -3px 0;
@@ -574,6 +594,50 @@ QUOTA_PANEL = ('<div class="quota-panel" id="quota-panel" role="dialog" aria-lab
 SCRIPT = page_frame.REFRESH_SCRIPT + r"""(() => {
 let view = document.querySelector('[data-accounts]');
 let newestRequest = 0;
+const modelTooltip=document.querySelector('.model-tooltip');
+const modelCell=node=>node instanceof Element ? node.closest('[data-model-sessions]') : null;
+let hoveredModelCell=null, tooltipModelCell=null;
+function positionModelTooltip(){
+ const cell=tooltipModelCell;
+ modelTooltip.hidden=true;
+ if(!cell?.isConnected) return;
+ const box=cell.getBoundingClientRect(), table=cell.closest('table').getBoundingClientRect();
+ const scroll=cell.closest('.scroll').getBoundingClientRect();
+ const left=Math.max(table.left,scroll.left,0), right=Math.min(table.right,scroll.right,innerWidth);
+ const top=Math.max(table.top,scroll.top,0), bottom=Math.min(table.bottom,scroll.bottom,innerHeight);
+ if(box.bottom<=top || box.top>=bottom || box.right<=left || box.left>=right) return;
+ modelTooltip.textContent=cell.dataset.modelSessions;
+ modelTooltip.style.maxWidth=(right-left)+'px';modelTooltip.style.maxHeight=(bottom-top)+'px';
+ modelTooltip.hidden=false;
+ const size=modelTooltip.getBoundingClientRect();
+ const beside=box.right+size.width<=right ? box.right : box.left-size.width;
+ modelTooltip.style.left=Math.max(left,Math.min(beside,right-size.width))+'px';
+ modelTooltip.style.top=Math.max(top,Math.min(box.top,bottom-size.height))+'px';
+}
+function showModelTooltip(cell){tooltipModelCell=cell;positionModelTooltip();}
+document.addEventListener('pointerover',event=>{
+ const cell=modelCell(event.target);
+ if(cell && cell!==hoveredModelCell){hoveredModelCell=cell;showModelTooltip(cell);}
+});
+document.addEventListener('pointerout',event=>{
+ if(!hoveredModelCell || (modelCell(event.target)!==hoveredModelCell && !modelTooltip.contains(event.target))) return;
+ if(modelCell(event.relatedTarget)===hoveredModelCell || modelTooltip.contains(event.relatedTarget)) return;
+ const departed=hoveredModelCell;
+ hoveredModelCell=null;
+ if(tooltipModelCell===departed) showModelTooltip(modelCell(document.activeElement));
+});
+document.addEventListener('focusin',event=>{
+ const cell=modelCell(event.target);
+ if(cell) showModelTooltip(cell);
+});
+document.addEventListener('focusout',event=>{
+ if(tooltipModelCell && modelCell(event.target)===tooltipModelCell) showModelTooltip(hoveredModelCell);
+});
+addEventListener('scroll',event=>{if(event.target!==modelTooltip) positionModelTooltip();},{capture:true,passive:true});
+addEventListener('resize',positionModelTooltip);
+document.addEventListener('keydown',event=>{
+ if(event.key==='Escape' && !modelTooltip.hidden){hoveredModelCell=null;showModelTooltip(null);}
+});
 const popup=document.querySelector('[data-color-picker]'), picker=popup.querySelector('#account-color-value');
 const area=popup.querySelector('[data-color-area]'), hue=popup.querySelector('#account-color-hue');
 const cursor=popup.querySelector('[data-color-cursor]'), preview=popup.querySelector('[data-color-preview]');
@@ -729,9 +793,13 @@ async function refresh(supersede=false,current=()=>true) {
   if (request !== newestRequest || !current() || hold()) return;
   if (!fresh) throw new Error('The page has no accounts.');
   const top = scrollY;
+  const restoreFocus = modelCell(document.activeElement) ? restoreFocusAfterRefresh() : null;
   view.replaceWith(fresh);view = fresh;
   applySorts();
   scrollTo({top, behavior: 'instant'});
+  hoveredModelCell=null;
+  restoreFocus?.();
+  showModelTooltip(modelCell(document.activeElement));
   return pageRefreshFacts(page);
 }
 const updates=createPageRefresh(refresh, () => document.querySelector('main').dataset.refreshSeconds, hold);

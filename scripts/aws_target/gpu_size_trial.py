@@ -408,10 +408,19 @@ def remove_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def trial_lock_directory(folder: Path) -> Path:
+    key = hashlib.sha256(str(folder.resolve()).encode()).hexdigest()
+    return trial_root() / '.locks' / key
+
+
+def cleanup_receipt(folder: Path) -> Path:
+    """Keep cleanup evidence when the prepared trial is pruned."""
+    return trial_lock_directory(folder) / 'cleanup-confirmed.json'
+
+
 @contextmanager
 def trial_lock(folder: Path, *, exclusive: bool = False) -> Generator[None]:
-    key = hashlib.sha256(str(folder.resolve()).encode()).hexdigest()
-    directory = trial_root() / '.locks' / key
+    directory = trial_lock_directory(folder)
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / 'controller.lock').open('a') as lock:
         fcntl.flock(lock, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
@@ -993,14 +1002,80 @@ def validate_prepared(folder: Path) -> dict[str, object]:
     return manifest
 
 
+def gpu_service_name(trial: str) -> str:
+    return 'gpu-size-trial-' + hashlib.sha256(trial.encode()).hexdigest()[:24]
+
+
+def confirm_assigned_gpu_service(trial: str) -> None:
+    """Retain the exact live claim before the service can launch a box."""
+    from scripts.lib import process_start
+    from scripts.mac_test import claim_state
+
+    paths = claim_state.StatePaths(ssh_target_state_directory('hana-gpu'), 'hana-gpu', platform='linux')
+    with claim_state.locked(paths.lock):
+        for held in claim_state.read_claims(paths):
+            record = held.record
+            if record['claim_id'] != trial or 'remote_host' not in record:
+                continue
+            if (record.get('cleanup_pending')
+                    or process_start.process_start(record['pid']) != process_start.Started(record['proc_start'])):
+                break
+            cloud_gate.save(held.path, dict(record, cleanup_pending=True))
+            return
+    raise ValueError('The Hana GPU service has no live claim')
+
+
+def assigned_gpu_cleanup_pending(trial: str) -> bool:
+    from scripts.mac_test import claim_state
+
+    paths = claim_state.StatePaths(ssh_target_state_directory('hana-gpu'), 'hana-gpu', platform='linux')
+    with claim_state.locked(paths.lock):
+        return any(held.record['claim_id'] == trial and held.record.get('cleanup_pending')
+                   for held in claim_state.read_claims(paths))
+
+
+def assigned_gpu_cleanup_confirmed(trial: str) -> bool:
+    """Read the exact trial's cleanup evidence without waiting for the worker."""
+    if not re.fullmatch(r'[0-9a-f]{32}', trial):
+        return False
+    try:
+        if read_json(cleanup_receipt(trial_root() / trial)) == {'trial': trial}:
+            return True
+    except (OSError, ValueError):
+        pass
+
+    directory = ssh_target_state_directory('aws')
+    try:
+        with (directory / 'gpu-size-trial/controller.lock').open('rb') as lock:
+            # The worker holds this lock across regional retries.
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            rows = [row for row in ledger.CostLedger(directory).read_snapshot().gate_reservations
+                    if isinstance(row.trial, ledger.GateTrialBudget) and row.trial.trial_id == trial]
+            return bool(rows) and all(not ledger.gate_is_open(row) for row in rows)
+    except (OSError, ledger.LedgerUnavailable):
+        return False
+
+
+def stop_assigned_gpu_service(trial: str) -> int:
+    if not assigned_gpu_cleanup_pending(trial) or assigned_gpu_cleanup_confirmed(trial):
+        return 0
+    return subprocess.run(['systemctl', '--user', 'stop', gpu_service_name(trial)]).returncode
+
+
 def start_service(folder: Path, directory: Path, settings_path: Path,
-                  execute: Callable[[Sequence[str]], int]) -> int:
+                  execute: Callable[[Sequence[str]], int], *, assigned: bool = False) -> int:
     folder = host_trial_folder(folder)
     with held_trial(folder):
         manifest = validate_prepared(folder)
-        unit = 'gpu-size-trial-' + hashlib.sha256(str(manifest['trial']).encode()).hexdigest()[:24]
-        command = cloud_gate.service_command('scripts.aws_target.gpu_size_trial',
-            ['--worker', str(folder), '--directory', str(directory), '--settings', str(settings_path)], unit)
+        trial = ledger.text(manifest, 'trial')
+        arguments = ['--worker', str(folder), '--directory', str(directory), '--settings', str(settings_path)]
+        if assigned:
+            if trial != folder.name:
+                raise ValueError('The Hana GPU service does not match its assigned trial')
+            arguments.append('--assigned')
+        command = cloud_gate.service_command('scripts.aws_target.gpu_size_trial', arguments, gpu_service_name(trial))
+        if assigned and 'BUILD_TARGETS_STATE_DIR' in os.environ:
+            command.insert(1, '--setenv=BUILD_TARGETS_STATE_DIR=' + os.environ['BUILD_TARGETS_STATE_DIR'])
         if isinstance(nextest_request(manifest), HanaGpuNextestRequest):
             command = ['--working-directory=' + str(ROOT) if arg.startswith('--working-directory=') else arg
                        for arg in command]
@@ -1794,6 +1869,7 @@ def online_main(arguments: Sequence[str]) -> int:
     _ = modes.add_argument('--cleanup', type=Path)
     _ = parser.add_argument('--directory', type=Path, required=True)
     _ = parser.add_argument('--settings', type=Path, required=True)
+    _ = parser.add_argument('--assigned', action='store_true')
     args = parser.parse_args(arguments)
     directory, settings_path = cast(Path, args.directory), cast(Path, args.settings)
     cleanup = cast(Path | None, args.cleanup)
@@ -1813,13 +1889,19 @@ def online_main(arguments: Sequence[str]) -> int:
             if cleanup is not None:
                 with held_trial(folder):
                     try:
-                        return int(not worker.cleanup(folder))
+                        if not worker.cleanup(folder):
+                            return 1
+                        if isinstance(nextest_request(read_json(folder / 'manifest.json')), HanaGpuNextestRequest):
+                            cloud_gate.save(cleanup_receipt(folder), {'trial': folder.name})
+                        return 0
                     finally:
                         if not (folder / 'online-result.json').exists() and not (folder / 'run-error.json').exists():
                             cloud_gate.save(folder / 'run-error.json', {'status': 'failed',
                                 'reason': 'The online worker ended before it saved a final result'})
                         remove_run_inputs(folder, worker.gates.clock())
             deployment = gate_deployment(directory / 'gate-deployment.json', api.region)
+            if cast(bool, args.assigned):
+                confirm_assigned_gpu_service(folder.name)
             worker.execute(folder, deployment)
             return 0
         except (OSError, ValueError, KeyError, AwsUnavailable, subprocess.SubprocessError) as error:
@@ -1827,16 +1909,44 @@ def online_main(arguments: Sequence[str]) -> int:
             return 1
 
 
-def run_nextest(repo: Path, commit: str, request: HanaGpuNextestRequest) -> HanaGpuNextestResult:
-    folder = trial_root() / uuid4().hex
+@dataclass(frozen=True)
+class AssignedHanaGpuLaunch:
+    trial: str
+    before_service: Callable[[], None]
+
+
+@dataclass(frozen=True)
+class StandaloneHanaGpuLaunch:
+    pass
+
+
+STANDALONE_HANA_GPU_LAUNCH = StandaloneHanaGpuLaunch()
+
+
+def run_nextest(repo: Path, commit: str, request: HanaGpuNextestRequest, *,
+                launch: AssignedHanaGpuLaunch | StandaloneHanaGpuLaunch = STANDALONE_HANA_GPU_LAUNCH
+                ) -> HanaGpuNextestResult:
+    folder = trial_root() / (launch.trial if isinstance(launch, AssignedHanaGpuLaunch) else uuid4().hex)
     with new_trial(folder, prune_previous=False):
         with redirect_stdout(sys.stderr):
             prepare_locked(repo, commit, folder, request)
 
         def service(command: Sequence[str]) -> int:
+            if isinstance(launch, AssignedHanaGpuLaunch):
+                launch.before_service()
             return subprocess.run(command, stdout=sys.stderr).returncode
 
-        status = start_service(folder, ssh_target_state_directory('aws'), conf.path('aws_target'), service)
+        directory = ssh_target_state_directory('aws')
+        settings = conf.path('aws_target')
+        if isinstance(launch, AssignedHanaGpuLaunch):
+            status = start_service(folder, directory, settings, service, assigned=True)
+            if not assigned_gpu_cleanup_confirmed(launch.trial):
+                if assigned_gpu_cleanup_pending(launch.trial):
+                    raise ValueError('The Hana GPU service has no cleanup confirmation')
+                remove_run_inputs(folder, datetime.now(UTC).timestamp())
+                raise ValueError(f'The Hana GPU service did not start (status {status})')
+        else:
+            status = start_service(folder, directory, settings, service)
         receipt = folder / 'online-result.json'
         if receipt.is_file():
             outcome = read_json(receipt)

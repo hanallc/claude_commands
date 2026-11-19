@@ -13,7 +13,7 @@ import json
 import re
 import subprocess
 import sys
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from contextlib import AbstractContextManager, ExitStack, redirect_stderr
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -530,17 +530,13 @@ def _finalize_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path,
         if isinstance(result, assign.CompletionFailed):
             diagnostics.append(result.reason if outcome == TurnOutcome.DONE else f"{outcome}: {result.reason}")
             outcome = TurnOutcome.ERROR
-    digest = hashlib.sha256(instance.encode()).hexdigest()
-    diagnostic_path = run / f".{digest}.completion-diagnostics.json"
-    recorded = worker_lifecycle.read_json_object(diagnostic_path)
-    for message in diagnostics:
-        _ = recorded.setdefault(message, False)
-    if diagnostics:
-        atomic_file.write_text_atomic(diagnostic_path, json.dumps(recorded))
+    diagnostic_path = _completion_diagnostics_path(run, instance)
+    recorded = _record_completion_diagnostics(diagnostic_path, diagnostics)
     new_details = tuple(dict.fromkeys((*details, *diagnostics)))
     completion = replace(completion, details=new_details)
     progress_history.save_hook_completion(run, instance, completion)
-    _deliver_completion_diagnostics(row, parent, instance, completion, diagnostic_path, recorded)
+    _deliver_completion_diagnostics(row, parent, instance, diagnostic_path, recorded,
+                                    sender_native_id=completion.sender_native_id)
     if completion.pane_closed and completion.role_released:
         progress_history.save_hook_completion(run, instance, replace(completion, finished=True))
         if isinstance(pane, worker.CloseCompletedPane):
@@ -554,9 +550,23 @@ def _remove_completed_restart(row: staff.StaffRow, delivery: progress_history.Di
     shutdown_record.forget([str(row.id)])
 
 
+def _completion_diagnostics_path(run: Path, instance: str) -> Path:
+    digest = hashlib.sha256(instance.encode()).hexdigest()
+    return run / f".{digest}.completion-diagnostics.json"
+
+
+def _record_completion_diagnostics(path: Path, messages: Iterable[str]) -> dict[str, object]:
+    recorded = worker_lifecycle.read_json_object(path)
+    count = len(recorded)
+    for message in messages:
+        _ = recorded.setdefault(message, False)
+    if len(recorded) != count:
+        atomic_file.write_text_atomic(path, json.dumps(recorded))
+    return recorded
+
+
 def _deliver_completion_diagnostics(row: staff.StaffRow, parent: staff.StaffRow, instance: str,
-                                    completion: progress_history.HookCompletion, path: Path,
-                                    recorded: dict[str, object]) -> None:
+                                    path: Path, recorded: dict[str, object], *, sender_native_id: str = "") -> None:
     from scripts.message import send
 
     for message, delivered in recorded.items():
@@ -570,8 +580,13 @@ def _deliver_completion_diagnostics(row: staff.StaffRow, parent: staff.StaffRow,
         options = send.parse(["--to", address, "--from", row.name, "--text", message,
             "--key", f"worker-completion:{instance}:diagnostic:{digest}", "--recipient-key", f"staff:{parent.id}",
             "--repeat-minutes", str(COMPLETION_NOTICE_REPEAT_MINUTES)])
+        if sender_native_id:
+            sender = send.read_sender_stamp(sender_native_id)
+        else:
+            identity = str(row.current_session)
+            sender = send.ClaudeSender(identity) if isinstance(staff.backend(row), staff.ClaudeBackend) else send.CodexSender(identity)
         result = send.send(options._replace(
-            sender_origin=send.ForwardedSender(send.read_sender_stamp(completion.sender_native_id)),
+            sender_origin=send.ForwardedSender(sender),
             shown_sender=send.ShownSender(row.name)))
         if result.outcome not in ("sent", "skipped"):
             raise ValueError(result.detail)
@@ -591,8 +606,17 @@ def recover_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path,
     stopped = progress_history.hook_completion(passed)
     if isinstance(stopped, progress_history.HookCompletion) and stopped.outcome == TurnOutcome.STOPPED:
         if passed.get("status") == "canceled":
-            _ = _save_stopped_reply(row, run, _stopped_receipt(instance, progress_history.dispatch_delivery(passed)))
+            receipt = _stopped_receipt(instance, progress_history.dispatch_delivery(passed))
+            recovered = _record_stopped_reply(row, run, receipt, stopped)
             _ = _stopped_notice(row, parent, run, passed, stopped).send_notice()
+            if isinstance(pane, worker.ReuseCompletedPane):
+                return worker.CompletionRecovery.NO_PENDING_NOTICE
+            if isinstance(recovered, worker.DispatchEvidenceUnknown):
+                raise ValueError(recovered.reason)
+            if recovered == StoppedReplyRecovery.WAITING_ON_RUNS:
+                return worker.CompletionRecovery.WAITING_ON_RUNS
+            if recovered == StoppedReplyRecovery.WAITING_ON_REPLY:
+                return worker.CompletionRecovery.WAITING_ON_REPLY
         return worker.CompletionRecovery.NO_PENDING_NOTICE
     delivery = progress_history.dispatch_delivery(passed)
     event = WorkerEvent(str(row.current_session), EventKind.RUN_FINISHED)
@@ -630,14 +654,18 @@ def recover_completion(row: staff.StaffRow, parent: staff.StaffRow, run: Path,
     return worker.CompletionRecovery.PENDING_CLOSE
 
 
-def _ignored(event: WorkerEvent, reason: str, worker_name: str = "unknown") -> TurnOutcome:
-    """Save each ignored event for the director without sending a notice."""
+def _log_hook_event(event: WorkerEvent, reason: str, worker_name: str) -> None:
     path = herdr.layout_path(herdr.shared_session()).parent / "turn-end-ignored.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as stream:
         _ = stream.write(json.dumps({"timestamp": datetime.now(timezone.utc).isoformat(),
             "reason": reason, "thread_id": event.thread_id, "worker_name": worker_name,
             "event": event.kind}) + "\n")
+
+
+def _ignored(event: WorkerEvent, reason: str, worker_name: str = "unknown") -> TurnOutcome:
+    """Save each ignored event for the director without sending a notice."""
+    _log_hook_event(event, reason, worker_name)
     return TurnOutcome.IGNORED
 
 
@@ -646,7 +674,7 @@ class WorkerByThread(Enum):
 
 
 def handle(event: WorkerEvent, *, owner: staff.StaffId | WorkerByThread = WorkerByThread.LOOKUP) -> TurnOutcome:
-    """Send the decided notice after the worker lock is released."""
+    """Send the decided notice after releasing the worker lock."""
     decision = _handle_locked(event, owner)
     if isinstance(decision, TurnDecision):
         return decision.send_notice() or decision.outcome
@@ -669,31 +697,109 @@ def _stopped_receipt(instance: str, delivery: progress_history.DispatchDelivery)
 
 class StoppedReplyRecovery(Enum):
     SAVED = "saved the verified reply"
-    ALREADY_SAVED = "the late reply file exists"
+    ALREADY_SAVED = "the file contains the latest verified reply"
     UNVERIFIED = "no verified DONE for the stopped pass"
-    PENDING = "the stopped pass still needs completion evidence"
+    WAITING_ON_RUNS = worker.CompletionRecovery.WAITING_ON_RUNS.value
+    WAITING_ON_REPLY = worker.CompletionRecovery.WAITING_ON_REPLY.value
 
 
 def _save_stopped_reply(row: staff.StaffRow, run: Path,
-                        receipt: progress_history.StoppedPassReceipt) -> StoppedReplyRecovery:
+                        receipt: progress_history.StoppedPassReceipt,
+                        ) -> StoppedReplyRecovery | worker.DispatchEvidenceUnknown:
     if not receipt.line:
+        return StoppedReplyRecovery.UNVERIFIED
+    reply = worker.dispatch_receipt(row, receipt.line, receipt.completion_id, run=run,
+                                    require_transcript=True, pane_pass=receipt)
+    if isinstance(reply, worker.DispatchEvidenceUnknown):
+        return reply
+    if isinstance(reply, worker.DispatchWaitingForRuns):
+        return StoppedReplyRecovery.WAITING_ON_RUNS if reply.has_live_run else StoppedReplyRecovery.WAITING_ON_REPLY
+    if isinstance(reply, worker.DispatchAwaitingReply):
+        return StoppedReplyRecovery.WAITING_ON_REPLY
+    if not isinstance(reply, worker.DispatchComplete):
         return StoppedReplyRecovery.UNVERIFIED
     path = _late_reply_path(row, run, receipt.reply_file, receipt.instance_id)
     try:
-        saved = path.read_text()
+        if path.read_text(encoding="utf-8").rstrip() == reply.reply.rstrip():
+            return StoppedReplyRecovery.ALREADY_SAVED
     except FileNotFoundError:
         pass
-    else:
-        if worker_admission.reply_ends_dispatch(saved, receipt.completion_id):
-            return StoppedReplyRecovery.ALREADY_SAVED
-    reply = worker.dispatch_receipt(row, receipt.line, receipt.completion_id, run=run,
-                                    require_transcript=True, pane_pass=receipt)
-    if isinstance(reply, (worker.DispatchWaitingForRuns, worker.DispatchAwaitingReply, worker.DispatchEvidenceUnknown)):
-        return StoppedReplyRecovery.PENDING
-    if not isinstance(reply, worker.DispatchComplete):
-        return StoppedReplyRecovery.UNVERIFIED
     worker.save_reply(path, reply.reply)
     return StoppedReplyRecovery.SAVED
+
+
+def _record_stopped_reply(row: staff.StaffRow, run: Path, receipt: progress_history.StoppedPassReceipt,
+                          completion: progress_history.HookCompletion,
+                          ) -> progress_history.HookCompletion | StoppedReplyRecovery | worker.DispatchEvidenceUnknown:
+    recovered = _save_stopped_reply(row, run, receipt)
+    if recovered not in (StoppedReplyRecovery.SAVED, StoppedReplyRecovery.ALREADY_SAVED):
+        return recovered
+    path = _late_reply_path(row, run, receipt.reply_file, receipt.instance_id)
+    if completion.reply_file != str(path):
+        completion = replace(completion, reply_file=str(path))
+        progress_history.save_hook_completion(run, receipt.instance_id, completion)
+    return completion
+
+
+def _close_stopped_after_notice(row: staff.StaffRow, parent: staff.StaffRow, run: Path, instance: str,
+                                completion: progress_history.HookCompletion, decision: TurnDecision) -> TurnDecision:
+    def report(reason: str) -> None:
+        message = f"{row.name}: kept pane: {' '.join(reason.splitlines())}"
+        print(message, file=sys.stderr)
+        _send_stopped_diagnostics(row, parent, run, instance, (message,), sender_native_id=completion.sender_native_id)
+
+    def send_notice() -> None:
+        _ = decision.send_notice()
+        name = staff.WorkerName.parse(row.name)
+        with ExitStack() as after_unlock, worker_panes.worker_lock(parent.id, name, blocking=True) as hold:
+            if isinstance(hold, worker_panes.Kept):
+                _ = after_unlock.callback(report, hold.blocker)
+                return
+            record = staff.snapshot()
+            current = record.by_id(row.id)
+            if (current is None or current.name != row.name or current.current_session != row.current_session
+                    or not hold.owns(current) or worker_panes.worker_run(current, record=record) != run):
+                return
+            passed = worker_panes.worker_pass(current, run, record=record)
+            saved = progress_history.hook_completion(passed)
+            if (passed.get("instance_id") != instance or passed.get("status") != "canceled"
+                    or not isinstance(saved, progress_history.HookCompletion)
+                    or not _same_completion(saved, completion)
+                    or not progress_history.stopped_notice_delivered(run, instance)):
+                return
+            if saved.pane_closed:
+                return
+            receipt = _stopped_receipt(instance, progress_history.dispatch_delivery(passed))
+            recovered = _record_stopped_reply(current, run, receipt, saved)
+            if not isinstance(recovered, progress_history.HookCompletion):
+                reason = recovered.reason if isinstance(recovered, worker.DispatchEvidenceUnknown) else recovered.value
+                _ = after_unlock.callback(report, reason)
+                return
+            try:
+                with redirect_stderr(io.StringIO()):
+                    closed = worker_panes.close(parent.id, name, lock=hold)
+            except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
+                    staff.StaffRefused, staff.StaffUnreadable) as error:
+                _ = after_unlock.callback(report, str(error))
+                return
+            if isinstance(closed, worker_panes.Closed):
+                progress_history.save_hook_completion(run, instance, replace(recovered, pane_closed=True))
+            else:
+                _ = after_unlock.callback(report, closed.blocker if isinstance(closed, worker_panes.Kept) else closed.reason)
+
+    return replace(decision, send_notice=send_notice)
+
+
+def _send_stopped_diagnostics(row: staff.StaffRow, parent: staff.StaffRow, run: Path, instance: str,
+                              messages: tuple[str, ...] = (), *, sender_native_id: str = "") -> None:
+    path = _completion_diagnostics_path(run, instance)
+    if not messages and not path.exists():
+        return
+    digest = hashlib.sha256(instance.encode()).hexdigest()
+    with (run / f".{digest}.notice.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        recorded = _record_completion_diagnostics(path, messages)
+        _deliver_completion_diagnostics(row, parent, instance, path, recorded, sender_native_id=sender_native_id)
 
 
 def _stopped_pass_folders(parent: staff.StaffRow, record: staff.StaffSnapshot, run: Path) -> Generator[Path]:
@@ -706,22 +812,34 @@ def _stopped_pass_folders(parent: staff.StaffRow, record: staff.StaffSnapshot, r
             yield directory
 
 
-def _recover_replaced_stops(event: WorkerEvent, row: staff.StaffRow, parent: staff.StaffRow,
-                            record: staff.StaffSnapshot, run: Path, instance: str, marker: str
+def _recover_replaced_stops(event: WorkerEvent, row: staff.StaffRow, run: Path, instance: str, marker: str,
+                            archived_stops: Iterable[tuple[Path, progress_history.StoppedPassReceipt]],
                             ) -> TurnOutcome | NoLateDone:
     recovered = False
-    for directory in _stopped_pass_folders(parent, record, run):
-        for receipt in progress_history.stopped_pass_receipts(directory, row.id):
-            if directory == run and receipt.instance_id == instance:
-                continue
-            if marker and receipt.completion_id != marker:
-                continue
+    for directory, receipt in archived_stops:
+        if directory == run and receipt.instance_id == instance:
+            continue
+        if marker and receipt.completion_id != marker:
+            continue
+        path = _late_reply_path(row, directory, receipt.reply_file, receipt.instance_id)
+        try:
+            if not marker:
+                try:
+                    if worker_admission.reply_ends_dispatch(path.read_text(encoding="utf-8"), receipt.completion_id):
+                        continue
+                except FileNotFoundError:
+                    pass
             result = _save_stopped_reply(row, directory, receipt)
-            if marker:
-                if result in (StoppedReplyRecovery.UNVERIFIED, StoppedReplyRecovery.PENDING):
-                    return _ignored(event, "the stopped pass reply has no verified DONE receipt", row.name)
-                return TurnOutcome.STOPPED
-            recovered |= result == StoppedReplyRecovery.SAVED
+        except (OSError, UnicodeError) as error:
+            reason = " ".join(f"anomaly: unable to recover stopped pass reply {path}: {error}".splitlines())
+            unit_runs.report_anomaly(reason)
+            _log_hook_event(event, reason, row.name)
+            continue
+        if marker:
+            if result not in (StoppedReplyRecovery.SAVED, StoppedReplyRecovery.ALREADY_SAVED):
+                return _ignored(event, "the stopped pass reply has no verified DONE receipt", row.name)
+            return TurnOutcome.STOPPED
+        recovered |= result == StoppedReplyRecovery.SAVED
     return TurnOutcome.STOPPED if recovered else NoLateDone.UNRECORDED
 
 
@@ -858,7 +976,7 @@ def _stale_done_detail(reply: str, expected: str) -> str:
 
 def _handle_locked(event: WorkerEvent,
                    owner: staff.StaffId | WorkerByThread = WorkerByThread.LOOKUP) -> TurnOutcome | TurnDecision:
-    """Recover completion records while holding the worker lock."""
+    """Recover completion records under the worker lock."""
     record = staff.snapshot()
     row = (record.by_current_session(event.thread_id) if isinstance(owner, WorkerByThread)
            else record.by_id(owner))
@@ -871,7 +989,8 @@ def _handle_locked(event: WorkerEvent,
     parent = record.parent_of(row)
     if parent is None:
         return _ignored(event, "the worker has no parent", row.name)
-    with worker_panes.worker_lock(parent.id, staff.WorkerName.parse(row.name), blocking=True) as hold:
+    with ExitStack() as after_unlock, worker_panes.worker_lock(
+            parent.id, staff.WorkerName.parse(row.name), blocking=True) as hold:
         if isinstance(hold, worker_panes.Kept):
             if event.kind == EventKind.RUN_FINISHED:
                 return TurnOutcome.RETRY_EVIDENCE
@@ -891,10 +1010,23 @@ def _handle_locked(event: WorkerEvent,
 
         instance = str(passed.get("instance_id", ""))
         delivery = progress_history.dispatch_delivery(passed)
+        archived_stops = [(directory, receipt) for directory in _stopped_pass_folders(parent, record, run)
+                          for receipt in progress_history.stopped_pass_receipts(directory, row.id)]
+
+        def retry_stopped_diagnostics() -> None:
+            for directory, receipt in archived_stops:
+                try:
+                    _send_stopped_diagnostics(row, parent, directory, receipt.instance_id)
+                except (OSError, ValueError, staff.StaffUnreadable, staff.StaffRefused) as error:
+                    unit_runs.report_anomaly(
+                        " ".join(f"anomaly: {row.name}: close diagnostic retry failed: {error}".splitlines()))
+
+        if archived_stops:
+            _ = after_unlock.callback(retry_stopped_diagnostics)
         marker = _done_marker(event.reply) if event.kind == EventKind.TURN_END else ""
         late: TurnOutcome | NoLateDone = NoLateDone.UNRECORDED
         if event.kind == EventKind.TURN_END and (not marker or marker != (delivery.completion_id or instance)):
-            late = _recover_replaced_stops(event, row, parent, record, run, instance, marker)
+            late = _recover_replaced_stops(event, row, run, instance, marker, archived_stops)
             if marker and isinstance(late, TurnOutcome):
                 return late
 
@@ -933,9 +1065,13 @@ def _handle_locked(event: WorkerEvent,
                 decision = _stopped_notice(row, parent, run, passed, stopped)
                 if event.kind == EventKind.RUN_FINISHED or (
                         event.kind == EventKind.TURN_END and marker in ("", receipt.completion_id)):
-                    recovered = _save_stopped_reply(row, run, receipt)
-                    if recovered == StoppedReplyRecovery.PENDING and event.kind == EventKind.RUN_FINISHED:
+                    recovered = _record_stopped_reply(row, run, receipt, stopped)
+                    if event.kind == EventKind.RUN_FINISHED and (
+                            isinstance(recovered, worker.DispatchEvidenceUnknown) or recovered in (
+                                StoppedReplyRecovery.WAITING_ON_RUNS, StoppedReplyRecovery.WAITING_ON_REPLY)):
                         return replace(decision, outcome=TurnOutcome.WAITING_ON_REPLY)
+                    if isinstance(recovered, progress_history.HookCompletion):
+                        return _close_stopped_after_notice(row, parent, run, instance, recovered, decision)
                 return decision
             return _ignored(event, "the recorder has not ended the stopped pass", row.name)
         client = herdr.Herdr(herdr.shared_session())

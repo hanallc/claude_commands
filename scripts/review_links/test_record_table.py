@@ -18,8 +18,13 @@ def save_notice_failures(page: bytes, action: Literal['works', 'remove']) -> lis
 const realFetch=fetch;
 let finishPost;
 window.setInterval=()=>0;
-window.fetch=(_path,options={})=>{
- if(options.method!=='POST') return new Promise(()=>{});
+window.fetch=(path,options={})=>{
+ if(options.method!=='POST'){
+  if(new URL(path,location.href).searchParams.has('item-state')){
+   return Promise.resolve({ok:true,json:async()=>({item_state:'Working',parked:'false',unread:'true'})});
+  }
+  return new Promise(()=>{});
+ }
  return new Promise((resolve,reject)=>{
   finishPost=reason=>reason ? reject(new Error(reason)) : resolve({ok:true,json:async()=>({
    answer:'works',request:'a'.repeat(32),token:'b'.repeat(64),item_state:'Closed'
@@ -49,6 +54,9 @@ window.fetch=(_path,options={})=>{
    return row;
   };
   const startSave=async row=>{
+   const animations=[...document.querySelectorAll('[data-record-motion]')].flatMap(node=>node.getAnimations({subtree:true}));
+   for(const animation of animations) animation.finish();
+   await Promise.allSettled(animations.map(animation=>animation.finished));
    row=open(row);
    const form=action==='works' ? await readyReviewCard(row) : row.querySelector('form');
    const settled=new Promise(resolve=>{
@@ -68,15 +76,18 @@ window.fetch=(_path,options={})=>{
    const save=await startSave(row);
    row=save.row;
    if(!reason){
+    const duration=Number(document.querySelector('[data-review],[data-list]').dataset.cardFadeOutMs);
     const motion=row.nextElementSibling ?? [...document.querySelectorAll('[data-record-motion]')].find(
      node=>node.querySelector('.list-toggle').textContent===row.querySelector('.list-toggle').textContent);
     check(row.hidden && motion?.matches('[data-record-motion]') &&
-      motion.getAnimations({subtree:true}).some(animation=>animation.effect.getTiming().duration===200),
-      'a successful save starts the 200 ms row fade');
+      motion.getAnimations({subtree:true}).some(animation=>animation.effect.getTiming().duration===duration),
+      'a successful save starts the configured row fade');
    }else if(action==='works') open(anchor);
    await save.finish(reason);
   };
   const failure=(row,reason)=>{
+   // A lost Remove restores the row. Collapse it to check the table notice.
+   if(action==='remove' && !row.querySelector('[data-detail]').hidden) row.querySelector('.list-toggle').click();
    const label=action==='works' ? row.dataset.key : 'Item '+row.dataset.number;
    const prefix=action==='works' ? 'Not saved: ' : 'Save not confirmed: ';
    check(!status.hidden && status.textContent===label+': '+prefix+reason,

@@ -11,7 +11,9 @@ from pathlib import Path
 import os
 import re
 from typing import Literal
-from scripts.build_targets.execution_transport import ExecutionTransport, HanaControlTransport, SshCommandTransport
+from scripts.build_targets.execution_transport import (
+    ExecutionTransport, HanaControlTransport, HanaGpuNextestTransport, SshCommandTransport,
+)
 
 
 SCRIPTS = Path(__file__).resolve().parent.parent
@@ -114,7 +116,7 @@ class LiveConfiguration(Enum):
 class CommandConfiguration:
     """Configuration reads retained only during one short command."""
 
-    targets: dict[Path, tuple[Target, ...]] = field(default_factory=dict)
+    configurations: dict[Path, conf.ConfigRead] = field(default_factory=dict)
 
 
 COMMAND_CONFIGURATION: ContextVar[LiveConfiguration | CommandConfiguration] = ContextVar(
@@ -243,23 +245,27 @@ def _read_target(config: conf.ConfigRead, name: str, purpose: RegistryRead) -> T
     return SshTarget(name, platform, settings)
 
 
-def read_targets(path: Path | None = None, *, selected: str = "",
+def read_targets(path: Path | None = None, *, selected: str = "", target_name: str = "",
                  purpose: RegistryRead = RegistryRead.REQUIRE_SETTINGS_FILES,
                  configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
                  ) -> tuple[Target, ...]:
-    registry = conf.path("build_targets") if path is None else path
-    current = COMMAND_CONFIGURATION.get()
-    complete = purpose is RegistryRead.REQUIRE_SETTINGS_FILES and not selected
-    use_cache = isinstance(configuration, conf.UseConfiguredValue)
-    if use_cache and isinstance(current, CommandConfiguration) and registry in current.targets:
-        registered = current.targets[registry]
-        if selected:
-            return tuple(target for target in registered if target.name == selected)
-        if complete:
-            return registered
+    if selected and target_name and selected != target_name:
+        raise ConfigError("expected one selected target")
+    selected = selected or target_name
     if isinstance(configuration, conf.UseConfiguredValue):
-        configuration = conf.read(registry)
+        registry = conf.path("build_targets") if path is None else path
+        current = COMMAND_CONFIGURATION.get()
+        if isinstance(current, CommandConfiguration):
+            if registry not in current.configurations:
+                current.configurations[registry] = conf.read(registry)
+            configuration = current.configurations[registry]
+        else:
+            configuration = conf.read(registry)
     names = _registry_value(configuration, "targets", _target_names, purpose)
+    if selected and selected not in names:
+        pinned = configuration.value("pinned_targets", str, default="", allow_blank=True)
+        if any(name.strip() == selected for name in pinned.split(",")):
+            names = (selected,)
     targets: list[Target] = []
     for name in names:
         if selected and name != selected:
@@ -269,10 +275,7 @@ def read_targets(path: Path | None = None, *, selected: str = "",
         except ConfigError:
             if selected or purpose is RegistryRead.REQUIRE_SETTINGS_FILES:
                 raise
-    result = tuple(targets)
-    if complete and use_cache and isinstance(current, CommandConfiguration):
-        current.targets[registry] = result
-    return result
+    return tuple(targets)
 
 
 def configured_ssh_target(target: str) -> SshTarget:
@@ -280,6 +283,8 @@ def configured_ssh_target(target: str) -> SshTarget:
     for configured in read_targets(selected=target, purpose=RegistryRead.PLACEMENT):
         if configured.name == target and isinstance(configured, SshTarget):
             require_target_name(target)
+            if target == "hana-gpu" and not configured.settings.is_file():
+                raise ConfigError(f"settings.{target}: settings file does not exist: {configured.settings}")
             return configured
     raise ConfigError(f"unknown SSH target: {target}")
 
@@ -289,9 +294,11 @@ def read_execution_transport(target: SshTarget, *,
                              ) -> ExecutionTransport:
     """Select the transport before reading connection settings."""
     def transport_kind(value: str) -> str:
-        if value != "ssh" and (value != "hana-control" or target.platform != "linux"):
-            raise ValueError("expected ssh or Linux hana-control")
-        return value
+        if value == "ssh" or (target.platform == "linux" and value == "hana-control"):
+            return value
+        if value == "hana-gpu" and target.platform == "linux" and target.name == "hana-gpu":
+            return value
+        raise ValueError("expected ssh, Linux hana-control, or the Linux hana-gpu target")
 
     def reporting_host(value: str) -> str:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value):
@@ -299,7 +306,11 @@ def read_execution_transport(target: SshTarget, *,
         return value
 
     settings = conf.read(target.settings) if isinstance(configuration, conf.UseConfiguredValue) else configuration
-    if settings.value("execution_transport", transport_kind, default="ssh") == "ssh":
+    transport = settings.value("execution_transport", transport_kind, default="ssh",
+                               recover_invalid=target.name != "hana-gpu")
+    if transport == "hana-gpu":
+        return HanaGpuNextestTransport(target.settings, target.name)
+    if transport == "ssh":
         return SshCommandTransport(target.settings)
     return HanaControlTransport(target.settings, settings.value("host", reporting_host))
 
@@ -307,10 +318,10 @@ def read_execution_transport(target: SshTarget, *,
 def command_target_name(given: str | None) -> str:
     """Resolve a positional target for clear, drain, or release."""
     configuration = conf.read_or_repository("build_targets")
-    configured = read_targets(configuration.source)
     selected = given if given is not None else configuration.text("default_target")
+    configured = read_targets(selected="" if selected == "all" else selected, configuration=configuration)
     names = {target.name for target in configured}
     names.update(key.removeprefix("sync.hosts.") for key in configuration.values() if key.startswith("sync.hosts."))
     if selected != "all" and selected not in names:
-        raise ConfigError(f"unknown target {selected}; configured targets: {', '.join(target.name for target in configured)}")
+        raise ConfigError(f"unknown target {selected}")
     return selected

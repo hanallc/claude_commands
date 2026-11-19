@@ -452,7 +452,7 @@ class PlacementStatusTests(unittest.TestCase):
                         self.assertEqual(fixture.server.current_assignments[assignment.episode], key)
                         continue
                     if case == "fenced start refusal":
-                        def release() -> bool:
+                        def release() -> hana_placement.HanaClaimRelease:
                             return hana_placement.release_assigned(assignment, coordinator_holder(assignment), controller)
 
                         fenced = hana_execution.settle_unpublished_claim(controller.directory, claim,
@@ -471,7 +471,7 @@ class PlacementStatusTests(unittest.TestCase):
                             release_claim=release, reason=reason)
                     else:
                         settlement = hana_execution.settle_unpublished_claim(controller.directory, claim,
-                            release_claim=lambda: True, reason=reason)
+                            release_claim=hana_placement.HanaClaimReleased, reason=reason)
                     self.assertIsInstance(settlement, hana_execution.HanaSettled)
                     self.assertFalse(hana_execution.claim_dispatch_pending(controller.directory, claim))
                     if case == "fenced start refusal":
