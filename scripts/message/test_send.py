@@ -2762,6 +2762,53 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(send.pending("session:recipient"), "")
         self.assertEqual(self.log()[-1]["via"], "postmaster")
 
+    def test_review_key_keeps_one_unconfirmed_relay_across_sender_processes(self) -> None:
+        self.session("recipient", "Recipient")
+        self.outcome = send.UncertainRelayDelivery("failed", "The proxy forwarded the message.")
+        args = ["--here", "--to", "session:recipient", "--from", "Sender", "--text", "body",
+                "--key", "review:one", "--recipient-key", "stable-recipient", "--repeat-minutes", "60"]
+        with redirect_stdout(io.StringIO()) as first:
+            self.assertEqual(send.main([*args, "--review-delivery"]), 5)
+        self.assertEqual(first.getvalue(), "PENDING: The proxy forwarded the message.\n")
+        with redirect_stdout(io.StringIO()) as repeat:
+            self.assertEqual(send.main([*args, "--review-delivery"]), 5)
+        self.assertIn("PENDING: postmaster delivery is unconfirmed", repeat.getvalue())
+        with mock.patch.object(send, "_owner_released", return_value=True):
+            with redirect_stdout(io.StringIO()) as ordinary:
+                self.assertEqual(send.main(args), 3)
+            self.assertIn("FAILED: postmaster delivery is unconfirmed", ordinary.getvalue())
+        self.assertEqual(len(self.relayed), 1)
+
+    def test_review_key_keeps_an_abandoned_postmaster_send_on_repeat(self) -> None:
+        clock = self.postmaster_clock()
+        self.session("recipient", "Recipient")
+        self.session("worker", "Postmaster")
+        self.postmaster_heartbeat(clock)
+        texts: list[str] = []
+        self.postmaster_mod(clock, texts, receipt_delay=0, outcome="abandoned")
+        args = ["--here", "--to", "session:recipient", "--from", "Sender", "--text", "body",
+                "--key", "review:postmaster", "--recipient-key", "stable-recipient", "--review-delivery"]
+        for _ in range(2):
+            with redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(send.main(args), 5)
+            self.assertIn("PENDING: postmaster delivery is unconfirmed", output.getvalue())
+        self.assertEqual(len(texts), 1)
+        self.assertEqual(self.relayed, [])
+
+    def test_review_key_skips_an_accepted_repeat_and_retries_a_definite_failure(self) -> None:
+        self.session("recipient", "Recipient")
+        args = ["--here", "--to", "session:recipient", "--from", "Sender", "--text", "body",
+                "--key", "review:two", "--recipient-key", "stable-recipient", "--repeat-minutes", "60",
+                "--review-delivery"]
+        for result, code, header in ((send.Result("failed", "Rejected"), 3, "FAILED:"),
+                                     (send.Result("sent", "Accepted"), 0, "SENT:"),
+                                     (send.Result("sent", "Ignored"), 0, "SKIPPED:")):
+            self.outcome = result
+            with redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(send.main(args), code)
+            self.assertTrue(output.getvalue().startswith(header), output.getvalue())
+        self.assertEqual(len(self.relayed), 2)
+
     def test_unconfirmed_postmaster_delivery_keeps_claim_and_never_relays_or_queues(self) -> None:
         clock = self.postmaster_clock()
         self.session("recipient", "Recipient")
@@ -5646,6 +5693,87 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             self.assertEqual(output.getvalue(), f"FAILED: {detail}\n")
         self.assertEqual(send.pending("codex:thread-one"), "")
 
+    def test_keyed_review_can_retry_when_the_deadline_precedes_the_queue_write(self) -> None:
+        written: list[dict[str, object]] = []
+
+        def daemon(connection: socket.socket) -> None:
+            initialize = receive_frame(connection)
+            reply(connection, initialize, {})
+            self.assertEqual(receive_frame(connection)["method"], "initialized")
+            try:
+                request = receive_frame(connection)
+            except EOFError:
+                return
+            self.assertEqual(request["method"], "thread/queue/add")
+            written.append(request)
+            reply(connection, request, {})
+
+        recipient = self.daemon_owner()
+        recipient.socket.parent.mkdir(parents=True, exist_ok=True)
+        row = self.daemon_row("thread-one")
+        args = ["--here", "--to", "codex:thread-one", "--from", "test", "--text", "hello",
+                "--key", "review:before-write", "--recipient-key", "stable-staff",
+                "--review-delivery", "--repeat-minutes", "60"]
+        call = codex_daemon._DaemonClient.call  # pyright: ignore[reportPrivateUsage]
+
+        def expire(client: codex_daemon._DaemonClient, method: str, params: dict[str, object]  # pyright: ignore[reportPrivateUsage]
+                   ) -> dict[str, object]:
+            if method == "thread/queue/add":
+                with mock.patch("scripts.message.codex_daemon._WebSocket._prepare_operation", side_effect=TimeoutError):
+                    return call(client, method, params)
+            return call(client, method, params)
+
+        with (FakeDaemon(recipient.socket, daemon, repeat=True),
+              mock.patch.object(roster, "roster", return_value=self.recipient_roster([row], []))):
+            first = io.StringIO()
+            with (mock.patch("scripts.message.codex_daemon._DaemonClient.call", autospec=True, side_effect=expire),
+                  redirect_stdout(first)):
+                self.assertEqual(send.main(args), 3)
+            self.assertTrue(first.getvalue().startswith("FAILED: timed out after "))
+            self.assertEqual(written, [])
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(send.main(args), 0)
+                self.assertEqual(send.main(args), 0)
+        self.assertEqual(len(written), 1)
+
+    def test_keyed_review_reuses_the_daemon_message_id_after_a_queue_timeout(self) -> None:
+        requests: list[dict[str, object]] = []
+        accepted: set[str] = set()
+
+        def daemon(connection: socket.socket) -> None:
+            initialize = receive_frame(connection)
+            reply(connection, initialize, {})
+            self.assertEqual(receive_frame(connection)["method"], "initialized")
+            request = receive_frame(connection)
+            self.assertEqual(request["method"], "thread/queue/add")
+            params = cast(dict[str, object], request["params"])
+            requests.append(params)
+            identity = cast(str, params["clientUserMessageId"])
+            if identity in accepted:
+                reply(connection, request, {})
+            else:
+                accepted.add(identity)
+                self.assertEqual(connection.recv(1), b"")
+
+        recipient = self.daemon_owner()
+        row = self.daemon_row("thread-one")
+        args = ["--here", "--to", "codex:thread-one", "--from", "test", "--text", "hello",
+                "--timeout", "0.5", "--key", "review:codex", "--recipient-key", "stable-staff",
+                "--review-delivery", "--repeat-minutes", "60"]
+        recipient.socket.parent.mkdir(parents=True, exist_ok=True)
+        with (FakeDaemon(recipient.socket, daemon, repeat=True),
+              mock.patch.object(roster, "roster", return_value=self.recipient_roster([row], []))):
+            first = io.StringIO()
+            with redirect_stdout(first):
+                self.assertEqual(send.main(args), 5)
+            self.assertIn("PENDING: Codex queue acceptance is unconfirmed", first.getvalue())
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(send.main(args), 0)
+                self.assertEqual(send.main(args), 0)
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0], requests[1])
+        self.assertEqual(len(accepted), 1)
+
     def test_local_roster_is_read_once_for_every_roster_address_and_bare_name(self) -> None:
         self.staff_member("thread-one", "thread-one")
         self.session("claude-one", "claude")
@@ -7201,6 +7329,15 @@ class ReadRelayTests(ShutdownTestCase):
         refused = answer('{"success":false,"message":"No agent named bogus is reachable. Use ListAgents."}')
         result = self.read_relay(stream(INIT, call("hello"), refused), no_write)
         self.assertEqual(result, send.Result("queued", "No agent named bogus is reachable. Use ListAgents."))
+
+    def test_review_relay_preserves_an_explicit_rejection_after_forwarding(self) -> None:
+        refusal = answer('{"success":false,"message":"No agent named bogus is reachable."}')
+        events = stream(INIT, call("hello"), refusal)
+        observed = send.RelayTransportResponse(0, events, "", RELAY_FIXTURE_TARGET, self.FORWARDED)
+        ordinary = send.read_relay(observed, "hello")
+        self.assertIsInstance(ordinary, send.UncertainRelayDelivery)
+        result = send.read_relay(observed, "hello", review_delivery=True)
+        self.assertEqual(result, send.Result("failed", "No agent named bogus is reachable."))
 
     def test_multiple_calls_cannot_confirm_delivery(self) -> None:
         events = stream(INIT, call("hello"), answer("matched two sessions", error=True),

@@ -625,14 +625,7 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
 
 def alert_showrunners(item: the_list.ListItem, members: staff.StaffSnapshot) -> tuple[staff.StaffRow, ...]:
     """Find the first showrunner above the item owner without session or document reads."""
-    owner = members.by_id(item.owner) if not isinstance(item.owner, the_list.UnassignedOwner) else None
-    visited: set[staff.StaffId] = set()
-    while owner is not None and owner.id not in visited:
-        if owner.kind == "showrunner":
-            return (owner,)
-        visited.add(owner.id)
-        owner = members.parent_of(owner)
-    return ()
+    return () if isinstance(item.owner, the_list.UnassignedOwner) else change_page.staff_showrunner(item.owner, members)
 
 
 def deliver(submission: ListActionSubmission) -> None:
@@ -648,14 +641,15 @@ def deliver(submission: ListActionSubmission) -> None:
         tries = settings.whole("delivery_tries")
         message = (f"List page: nate's words for item {item.number}\n{feedback.words}"
                    if feedback.action == "tell" else feedback.words)
+        source = the_list.folder(delivery.keeper) / f"{item.id}.md"
+        key = change_page.review_delivery_key(source, item.id, feedback.request)
         failures = change_page.send_with_retries(change_page.SENDER, (delivery.keeper,), message,
-                                                 tries, settings.number("delivery_pause_seconds"))
+                                                 tries, settings.number("delivery_pause_seconds"), key=key)
         if not failures:
             return replace(feedback, state="sent")
-        owners = alert_showrunners(item, staff.snapshot())
-        source = the_list.folder(delivery.keeper) / f"{item.id}.md"
+        owners = tuple(owner for owner in alert_showrunners(item, staff.snapshot()) if owner.id != delivery.keeper)
         reached = change_page.alert_delivery_failures(failures, tries, source=source, row=item.id, message=message,
-            recipients=tuple(owner.id for owner in owners), title="List feedback needs attention")
+            recipients=tuple(owner.id for owner in owners), attempt=feedback.request, title="List feedback needs attention")
         return replace(feedback, state="alerted", alerted_to=", ".join(owner.name for owner in owners)) if reached else feedback
     the_list.deliver_feedback(delivery.keeper, delivery.identity, delivery.request, send)
 

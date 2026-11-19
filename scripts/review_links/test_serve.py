@@ -247,7 +247,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(snapshot.records[key].state, review_items.ReviewState.WAITING)
             respond(active, status, fields)
 
-        def message_sent(_recipient: staff.StaffId, _sender: str, _message: str) -> None:
+        def message_sent(_recipient: staff.StaffId, _sender: str, _message: str, **_options: str) -> None:
             delivered.set()
 
         with (patch.object(self.server, 'review_cache', cache),
@@ -825,7 +825,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         alerts: list[tuple[staff.StaffId, str]] = []
         refused_states: list[str] = []
 
-        def send(owner: staff.StaffId, _sender: str, message: str) -> None:
+        def send(owner: staff.StaffId, _sender: str, message: str, **_options: str) -> None:
             if 'feature log failed' in message:
                 alerts.append((owner, message))
                 if 'already dropped' in message:
@@ -939,7 +939,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             events.append('cleanup')
             return []
 
-        def send(_recipient: staff.StaffId, _sender: str, _message: str) -> None:
+        def send(_recipient: staff.StaffId, _sender: str, _message: str, **_options: str) -> None:
             events.append('deliver')
 
         for row, condition in (('C1', 'locks'), ('C2', 'unreadable'), ('C3', 'intent alone')):
@@ -987,7 +987,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             events.append('cleanup')
             return []
 
-        def send(_recipient: staff.StaffId, _sender: str, _message: str) -> None:
+        def send(_recipient: staff.StaffId, _sender: str, _message: str, **_options: str) -> None:
             events.append('deliver')
 
         with patch.object(change_review, 'end_row_scratch', side_effect=cleanup):
@@ -1134,7 +1134,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         deliver = change_page.deliver
         messages: list[str] = []
 
-        def send(_recipient: staff.StaffId, _sender: str, message: str) -> None:
+        def send(_recipient: staff.StaffId, _sender: str, message: str, **_options: str) -> None:
             messages.append(message)
 
         def deliver_then_signal(message: change_page.MessageDelivery | change_page.NoMessageDelivery,
@@ -1611,7 +1611,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         def complete_delivery(message: list_page.ListFeedbackDelivery | change_page.NoMessageDelivery) -> None:
             real_deliver(message)
             completed.set()
-        def send(_recipient: staff.StaffId, _sender: str, _message: str) -> None:
+        def send(_recipient: staff.StaffId, _sender: str, _message: str, **_options: str) -> None:
             sent.set()
         with (patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
