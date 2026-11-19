@@ -321,12 +321,19 @@ class ReviewRepairsTests(unittest.TestCase):
             def do_POST(self) -> None:
                 body = self.rfile.read(int(self.headers['Content-Length']))
                 if self.path == '/action':
-                    delivery,answer = review_page.submit(case.root,body.decode(),case.status)
-                    change_page.deliver(delivery,case.status)
+                    cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+                    saved = cache.save(body.decode(), case.status)
+                    result: dict[str, object] = {'answer': saved.answer, 'version': saved.version}
+                    if isinstance(saved.item, review_items.ReviewItem):
+                        later = saved.item.times.later
+                        result.update(state=saved.item.state, later=0 if isinstance(later, review_items.NoLaterTime)
+                                      else later.timestamp()*1000)
+                    delivery = change_page.finish_verdict_cleanup(saved.delivery, case.status)
+                    change_page.deliver(delivery, case.status)
                     self.send_response(200)
                     self.send_header('Content-Type','application/json')
                     self.end_headers()
-                    _ = self.wfile.write(json.dumps({'answer':answer}).encode())
+                    _ = self.wfile.write(json.dumps(result).encode())
                     return
                 results.append(cast(list[str],json.loads(body)))
                 complete.set()
@@ -602,7 +609,9 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
         ready = self.case.investigation()
         markup = review_page.render(self.case.root).decode()
         setup = '''<script>const nativeFetch=fetch;window.setInterval=()=>0;
-window.fetch=(url,options={})=>{
+let allowReviewRefresh=Promise.resolve();
+window.fetch=async(url,options={})=>{
+ if(options.method!=='POST') await allowReviewRefresh;
  return nativeFetch(options.method==='POST'?'/action':'/fresh'+new URL(url,location.href).search,options);
 };</script>'''
         markup = markup.replace('<head>','<head>'+setup,1)
@@ -656,8 +665,17 @@ window.fetch=(url,options={})=>{
   check(!row('C2') || row('C2').hidden,'A passed check stays out of All.');
   row('C3').querySelector('.list-toggle').click();await readyReviewCard(row('C3'));
   const [openBeforeWorks,validatingBeforeWorks,allBeforeWorks]=counts();
-  const third=row('C3').querySelector('form');await save(third,'works');
-  check(!row('C3') || row('C3').hidden,'F010: Works leaves All');
+  let resumeRefresh;
+  allowReviewRefresh=new Promise(resolve=>{resumeRefresh=resolve;});
+  try{
+   const third=row('C3').querySelector('form');await save(third,'works');
+   check(!row('C3') || row('C3').hidden,'F010: Works leaves All');
+   const [open,validating,all]=counts();
+   check(open===openBeforeWorks-1 && validating===validatingBeforeWorks && all===allBeforeWorks-1,
+    'F010: Save removes the completed item from the Open and All counts before refresh.');
+   await show('open');
+   check(!row('C3') || row('C3').hidden,'F010: Save removes the completed item from Open before refresh.');
+  }finally{resumeRefresh();}
   for(let pass=0;pass<2;pass++){
    await refresh();
    for(const choice of ['open','Validating','all']){
@@ -776,10 +794,14 @@ window.fetch=(url,options={})=>{
  const failures=[];
  try{
   const frame=[...document.querySelectorAll('iframe')].find(frame=>!frame.hidden);
-  if(!frame.contentDocument.querySelector('[data-review]')) await new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+  const count=value=>frame.contentDocument.querySelector('[data-show-chip="'+value+'"] b')?.textContent;
+  const deadline=performance.now()+8000;
+  while(!count('open') || !count('all')){
+   if(performance.now()>deadline) throw new Error('F012: Review did not populate the filtered counts.');
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
   const page=frame.contentDocument;
   const rows=[...page.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
-  const count=value=>page.querySelector('[data-show-chip="'+value+'"] b').textContent;
   if(page.querySelector('[data-show-chip][aria-pressed="true"]').dataset.showChip!=='open' ||
    page.querySelector('[data-owner-chip][aria-pressed="true"]').dataset.ownerChip!==INVESTIGATION_OWNER ||
    rows.length!==1 || rows[0].dataset.key!==READY_KEY || rows[0].dataset.sourceOwner!==INVESTIGATION_OWNER ||
