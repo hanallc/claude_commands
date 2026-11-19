@@ -151,3 +151,23 @@
   2. 20 repeated runs of the gate test modules pass, TMPDIR=/tmp, 2 GB scope.
   3. basedpyright zero errors and warnings on changed files.
   4. Full natedev gate passes (reds that also occur on base do not count).
+
+### Phase 389 — a plan so no test can write to live folders  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** a measured plan, reviewed by bob before any code, that makes every test run unable to write to live folders (user order 13:01 EST 11-19 via bob and builds, after a queue sweep test deleted 11 live /tmp/claude/unit entries at 12:46).
+- **Spec:**
+  1. Layer 1: the one place that starts a test step makes live roots read-only for that run and gives it its own temp folder; a wrong default fails with a write error. Candidate: a private mount view at step start (unshare); the scope at lint/invoke.sh:177 has no file rules today. Name a better form if one exists (for example systemd-run ReadOnlyPaths, Landlock).
+  2. Layer 2: no delete function has a live default root; the caller gives the root. List each delete function with a default root today.
+  3. Layer 3 (queue's sweep guard) is queue's; the plan names how it fits.
+  4. Measured, not estimated: (a) the list of live roots (/tmp/claude, /session, ~/session, /build, ~/.claude, ~/.local/state, ~/rust/hanadocs, others found); (b) the tests that write outside their own folders today, from a full suite run under the read-only view or a write trace; (c) the form for the Mac and for AWS boxes; (d) every path where a test runs outside the step start (worker shells, merge_gate module runs, nextest, direct python -m), each as a gap; (e) the cost in worker hours and an ETA.
+  5. Plan only. No production or test code until bob reviews the plan.
+- **Files:** `docs/plans/test-live-folder-guard.md` (new) in the phase worktree.
+- **Workers:** 1 writer (research and plan).
+  - impl: the plan doc and the measurement runs.
+- **Constraints from prior phases:** 388 (runner allow list) and 383 (gate recovery) change the same runner; the plan builds on them. Builds load hold: the full measured run (4b) starts only when builds says the hold ended. No run makes load on purpose.
+- **Acceptance gate:**
+  1. Each of 4a–4e has a measured answer with its evidence path.
+  2. The plan names one form for natedev, the Mac and AWS, and each gap with its fix.
+  3. bob reviews the plan before any code phase opens.
