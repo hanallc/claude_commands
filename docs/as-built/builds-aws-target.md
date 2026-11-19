@@ -379,7 +379,7 @@ A saved idle-stop intent refuses a later claim until stop confirmation.
 A confirmed interruption takes priority over a pending stop.
 The controller records `INTERRUPTED` and refuses a manual restart.
 A stopped observation with an unknown cause preserves `INTERRUPTED`.
-If EC2 restarts the box without a claim, the controller saves its stop decision before it calls the provider.
+If the controller stops an unclaimed restart, it saves its stop decision before it calls the provider.
 The decision records the generation and whether an interruption came before the restart.
 Another running observation keeps the stop in progress.
 If the running box enters a new generation, the controller saves a new stop decision for that generation.
@@ -388,6 +388,23 @@ The controller records `IDLE_STOPPED` if that decision followed an interruption.
 A stopped observation from a different generation preserves `INTERRUPTED` if the old decision followed an interruption.
 An unclaimed stop with no prior interruption ends at `STOPPED_UNKNOWN`.
 The decision applies whether the controller or the guest stops the box.
+
+The controller cannot use a saved `STOPPED_UNKNOWN` row to infer a Spot interruption from the next compute generation.
+The compute ledger records exposure times, but it lacks the last running observation and the reason for the stop.
+The exposure record does not identify a guard window or a reservation.
+The provider records lack the generation and the acceptance time of a start or stop.
+An EC2 restart and a start in the AWS console can produce the same saved records.
+
+After you confirm Hana is stopped, run `deploy.py hana-release-unknown-stop` to preview the release.
+With `--approve-release`, the command saves a stop decision and records the approval time.
+The command requires `STOPPED_UNKNOWN` and closed compute exposure in the newest ledger generation.
+A claim, pending operation, saved demand start, or replacement duty prevents approval.
+The command makes no AWS call and needs no AWS credentials.
+Hana remains in `STOPPING` and refuses claims until the controller confirms the stop.
+If the controller finds Hana running, it saves a stop decision for the running generation and stops Hana.
+The controller sets `IDLE_STOPPED` after a fresh stopped observation with closed compute exposure for the stop decision.
+Repeat the command to check whether the release waits for confirmation or is already complete.
+Later claims use the usual image, spending, and permit checks.
 
 Phase C reserves compute before the next boot identity exists through `reserve_start()`.
 `check_start()` rechecks current caps before bootstrap, start, and permit publication.
