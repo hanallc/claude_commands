@@ -29,6 +29,7 @@ import uuid
 from types import MappingProxyType
 from typing import Callable, Protocol, cast, override
 
+from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue import admission_wire as status_wire
@@ -876,7 +877,7 @@ class HostEvidenceWorker:
     def dispatch_pending(self, probe: DispatchEvidenceProbe) -> bool:
         """Request a worker reading and retain ownership until the exact reading arrives."""
         assignment = probe.saved.assignment
-        attempt = placement.attempt_key(assignment.episode, assignment.attempt)
+        attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         with self.lock:
             previous = self.dispatch_probes.get(attempt)
             if previous is None or previous.saved != probe.saved:
@@ -1370,7 +1371,7 @@ class AdmissionServer:
         self.pending_coordinators: dict[placement.SubmittingOwner, PendingCoordinatorEvidence] = {}
         self.assignments: dict[str, records.SavedPlacementAssignment] = {}
         self.current_assignments: dict[str, str] = {}
-        self.execution_evidence: dict[str, placement.ExecutionEvidence] = {}
+        self.execution_evidence: dict[str, execution_identity.ExecutionEvidence] = {}
         self.prerequisites: dict[str, placement.LocalExecutionPrerequisite] = {}
         self.placement_eligibility: dict[str, tuple[placement.CandidateEligibility, ...]] = {}
         self.local_hold_holders: dict[str, placement.ResourceHolder] = {}
@@ -2263,7 +2264,7 @@ class AdmissionServer:
                 candidate = next(candidate for candidate in self.placement_eligibility[episode]
                     if candidate.destination.provider == "local" and isinstance(candidate.eligibility, placement.AllowedHost))
                 assignment = self._new_assignment(placement_request, candidate.destination, remote_start_hold_seconds)
-                key = placement.attempt_key(episode, assignment.attempt)
+                key = execution_identity.attempt_key(episode, assignment.attempt)
                 self.assignments[key] = replace(self.assignments[key], permission=placement.PermissionConsumed(inputs.now))
                 if isinstance(cargo_folder, placement.CargoFolder):
                     for slot_key, slot in list(self.slots.items()):
@@ -2447,7 +2448,7 @@ class AdmissionServer:
             request = self.placement_requests.get(assignment.episode)
             if request is None:
                 continue
-            evidence = self.execution_evidence.get(key, placement.ExecutionEvidenceUnavailable(
+            evidence = self.execution_evidence.get(key, execution_identity.ExecutionEvidenceUnavailable(
                 "execution evidence is unavailable", self.clock.now()))
             policy_key = self.placement_host_keys.get((request.episode, assignment.destination))
             host_evidence = self.host_evidence(policy_key) if policy_key is not None else None
@@ -2455,14 +2456,14 @@ class AdmissionServer:
             if isinstance(host_evidence, placement.FreshHostEvidence):
                 retained = any(claim.reference.episode == assignment.episode and claim.reference.attempt == assignment.attempt
                     for claim in (*host_evidence.claims, *host_evidence.cleanup_claims))
-                if not isinstance(evidence, placement.ObservedExecution):
+                if not isinstance(evidence, execution_identity.ObservedExecution):
                     evidence = next((execution for reference, execution in host_evidence.executions
                         if reference == saved.provider), evidence)
             if not isinstance(saved.state, placement.CurrentAssignment) and not retained:
                 continue
             identity = request.identity
             pid: int | records.PidNotRecorded = records.PidNotRecorded()
-            if isinstance(evidence, placement.ObservedExecution) and isinstance(evidence.identity, placement.ProcessExecution):
+            if isinstance(evidence, execution_identity.ObservedExecution) and isinstance(evidence.identity, execution_identity.ProcessExecution):
                 pid = evidence.identity.pid
             remote.append(records.RunningStep(identity.session_id, identity.name, identity.step or request.profile.step,
                 identity.folder or request.profile.worktree, 0, records.RemoteMemoryUnavailable("remote memory is unavailable"),
@@ -2909,7 +2910,7 @@ class AdmissionServer:
             eligibility = placement.TemporaryExclusion("busy")
         adopted: list[placement.AdoptedProviderClaim] = []
         cleanup: list[placement.RetainedCleanupClaim] = []
-        executions: list[tuple[placement.ProviderClaimReference, placement.ExecutionEvidence]] = []
+        executions: list[tuple[placement.ProviderClaimReference, execution_identity.ExecutionEvidence]] = []
         with claim_state.locked(paths.lock):
             held = claim_state.read_claims(paths)
         holder = placement.ResourceHolderUnknown()
@@ -2934,7 +2935,7 @@ class AdmissionServer:
             session = OwningSession(session_id) if session_id else NoOwningSession()
             if record.get("cleanup_pending", False):
                 cleanup.append(placement.RetainedCleanupClaim(reference, "provider cleanup remains unresolved"))
-                executions.append((reference, placement.ExecutionEvidenceUnavailable("provider cleanup remains unresolved", self.clock.now())))
+                executions.append((reference, execution_identity.ExecutionEvidenceUnavailable("provider cleanup remains unresolved", self.clock.now())))
                 continue
             adopted.append(placement.AdoptedProviderClaim(reference,
                 placement.ClaimHolderIdentity(self.host, record["pid"], record["proc_start"]),
@@ -2945,15 +2946,15 @@ class AdmissionServer:
 
     def _observe_provider_execution(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
                                     reference: placement.ProviderClaimReference, host: str, generation: str,
-                                    config: conf.ConfigRead) -> placement.ExecutionEvidence:
+                                    config: conf.ConfigRead) -> execution_identity.ExecutionEvidence:
         """Read existing mirror process evidence without invoking provider cleanup."""
         from scripts.mac_test import eligibility, offload, claim_state
 
         if isinstance(eligibility.read_backoff(time.time(), destination.target), eligibility.ActiveBackoff):
-            return placement.ExecutionEvidenceUnavailable("provider retry backoff is active", self.clock.now())
+            return execution_identity.ExecutionEvidenceUnavailable("provider retry backoff is active", self.clock.now())
         repository = eligibility.repository_identity(Path(request.constraints.repository))
         if not isinstance(repository, eligibility.KnownRepository):
-            return placement.ExecutionEvidenceUnavailable("repository execution scope is unavailable", self.clock.now())
+            return execution_identity.ExecutionEvidenceUnavailable("repository execution scope is unavailable", self.clock.now())
         scope = reference.scope
         slot = scope.slot if isinstance(scope, claim_state.RepositoryScope) and scope.slot else destination.slot or 1
         script = offload.mirror_selector_script(repository, destination.target, slot) + r'''
@@ -2974,12 +2975,12 @@ done
                 for line in result.stdout.splitlines():
                     pid, separator, start = line.partition("\t")
                     if separator and pid.isdecimal() and int(pid) > 0 and start.strip():
-                        return placement.ObservedExecution(placement.ProcessExecution(host, generation, int(pid), start.strip()))
-                return placement.ExecutionEvidenceUnavailable("remote execution remains unresolved", self.clock.now())
+                        return execution_identity.ObservedExecution(execution_identity.ProcessExecution(host, generation, int(pid), start.strip()))
+                return execution_identity.ExecutionEvidenceUnavailable("remote execution remains unresolved", self.clock.now())
         except (OSError, ValueError, subprocess.TimeoutExpired):
             pass
         offload.write_backoff(time.time() + config.number("unreachable_backoff_s"), destination.target)
-        return placement.ExecutionEvidenceUnavailable("remote execution remains unresolved", self.clock.now())
+        return execution_identity.ExecutionEvidenceUnavailable("remote execution remains unresolved", self.clock.now())
 
     def _prune_ended_placements(self, cutoff: float) -> None:
         """Remove the request and closed attempts of an episode whose owner ended before the cutoff."""
@@ -3009,7 +3010,7 @@ done
 
     def _saved_assignment(self, episode: str, attempt: str
                           ) -> records.SavedPlacementAssignment | status_wire.UnknownPlacementStatus:
-        return self.assignments.get(placement.attempt_key(episode, attempt),
+        return self.assignments.get(execution_identity.attempt_key(episode, attempt),
             status_wire.UnknownPlacementStatus(episode, attempt))
 
     def _provider_release_evidence(self, saved: records.SavedPlacementAssignment, keys: PlacementEvidenceKeys | None = None
@@ -3046,7 +3047,7 @@ done
         """Confirm claim release under the same rules for status, replay, and settlement."""
         assignment = saved.assignment
         if (not isinstance(saved.state, placement.CurrentAssignment)
-                or self.current_assignments.get(assignment.episode) != placement.attempt_key(assignment.episode, assignment.attempt)
+                or self.current_assignments.get(assignment.episode) != execution_identity.attempt_key(assignment.episode, assignment.attempt)
                 or assignment.episode not in self.placement_requests):
             return False
         if self._claim_holder_ended(saved):
@@ -3247,7 +3248,7 @@ done
                         for report in (attempt.terminal_report,)
                         if isinstance(attempt.state, placement.ClosedAssignment)
                         and isinstance(report, placement.TerminalAttemptReport)
-                        and isinstance(report.outcome, (placement.PrelaunchRefused, placement.HanaCommandAdmissionRefused))
+                        and isinstance(report.outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
                         and isinstance(attempt.provider, placement.ProviderClaimReference)
                         and attempt.provider.provider == destination.provider and attempt.provider.target == destination.target
                         and scopes_overlap(attempt.provider.scope, destination.scope))
@@ -3311,9 +3312,9 @@ done
             evidence = self.execution_evidence.get(key)
             host_key = self.placement_host_keys.get((request.episode, saved.assignment.destination))
             host_evidence = self.host_evidence(host_key) if host_key is not None else None
-            if (isinstance(evidence, placement.ObservedExecution)
+            if (isinstance(evidence, execution_identity.ObservedExecution)
                     or isinstance(host_evidence, placement.FreshHostEvidence)
-                    and any(reference == saved.provider and isinstance(execution, placement.ObservedExecution)
+                    and any(reference == saved.provider and isinstance(execution, execution_identity.ObservedExecution)
                             for reference, execution in host_evidence.executions)):
                 self.assignments[key] = self._end_remote_start_hold(request, saved)
                 return False
@@ -3394,7 +3395,7 @@ done
                         ) -> placement.PlacementAssignment:
         assignment = placement.PlacementAssignment(request.episode, uuid.uuid4().hex, destination,
             request.constraints.source_key, request.owner, request.constraints.session, request.since)
-        key = placement.attempt_key(request.episode, assignment.attempt)
+        key = execution_identity.attempt_key(request.episode, assignment.attempt)
         evidence_key = self.placement_host_keys[(request.episode, destination)]
         hold = (records.RemoteStartHold(self.clock.now() + remote_start_hold_seconds)
                 if destination.provider != "local" and self._can_hold_local_place(request)
@@ -3637,7 +3638,7 @@ done
                 taken.append(destination)
                 if isinstance(request.purpose, placement.SpeculativeCopy):
                     held_copy_destinations.append(candidate.destination)
-                saved = self.assignments[placement.attempt_key(assignment.episode, assignment.attempt)]
+                saved = self.assignments[execution_identity.attempt_key(assignment.episode, assignment.attempt)]
                 if isinstance(saved.remote_start_hold, records.RemoteStartHold):
                     if self._local_placement_eligibility(request) != placement.TemporaryExclusion("blocked"):
                         pending_remote_starts.add(owner)
@@ -3722,7 +3723,7 @@ done
 
     def _consume_permission(self, request: wire.ConsumePermission) -> wire.FirstAuthorization | wire.DispatchStatus:
         assignment = request.assignment
-        key = placement.attempt_key(assignment.episode, assignment.attempt)
+        key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         saved = self.assignments.get(key)
         if (saved is None or saved.assignment != assignment
                 or self.current_assignments.get(assignment.episode) != key
@@ -3775,7 +3776,7 @@ done
     def _close_placement(self, saved: records.SavedPlacementAssignment, reason: str,
                          retry: placement.RetryDecision) -> None:
         assignment = saved.assignment
-        key = placement.attempt_key(assignment.episode, assignment.attempt)
+        key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         self._drop_waiter(assignment.episode)
         if self.current_assignments.get(assignment.episode) == key:
             request = self.placement_requests.get(assignment.episode)
@@ -3792,7 +3793,8 @@ done
         """Close a Hana attempt when its journal confirms release before launch."""
         assignment = saved.assignment
         if (assignment.destination.provider != "ssh"
-                or not isinstance(report.outcome, (placement.PrelaunchRefused, placement.AttemptCancelled))
+                or not isinstance(report.outcome, (placement.PrelaunchRefused, placement.AttemptCancelled,
+                                                     execution_identity.HanaCommandAdmissionRefused))
                 or not isinstance(saved.permission, placement.PermissionAvailable)):
             return False
         from scripts.aws_target import hana_placement
@@ -3809,7 +3811,7 @@ done
         reference = placement.assigned_claim_reference(assignment)
         # The atomic journal proves settlement without a controller lock or a provider probe.
         if (claim_dispatch_pending(directory, reference)
-                or not isinstance(read_claim_execution(directory, reference), placement.ExecutionNotStarted)):
+                or not isinstance(read_claim_execution(directory, reference), execution_identity.ExecutionNotStarted)):
             return False
         settled = replace(report, path=placement.DispatchPathSettled())
         reason = report.outcome.reason
@@ -3865,7 +3867,7 @@ done
             self._close_placement(saved, "completed", placement.DoNotRetry("command result is final"))
         elif isinstance(outcome, placement.AttemptCancelled):
             self._close_placement(saved, "cancelled", placement.DoNotRetry(outcome.reason))
-        elif isinstance(outcome, placement.HanaCommandAdmissionRefused):
+        elif isinstance(outcome, execution_identity.HanaCommandAdmissionRefused):
             self._close_placement(saved, outcome.reason,
                 placement.retry_decision(saved.assignment.destination, outcome, report.received_at))
         elif not self._settle_hana_prelaunch(saved, report):
@@ -3901,7 +3903,7 @@ done
                     report = saved.terminal_report
                     if (self._start_pending(saved) or (isinstance(report, placement.TerminalAttemptReport)
                             and isinstance(report.path, placement.DispatchPathPending))):
-                        key = placement.attempt_key(saved.assignment.episode, saved.assignment.attempt)
+                        key = execution_identity.attempt_key(saved.assignment.episode, saved.assignment.attempt)
                         self.assignments[key] = replace(saved, terminal_report=placement.TerminalAttemptReport(
                             placement.AttemptCancelled(request.reason), placement.DispatchPathPending('provider settlement remains pending'),
                             self.clock.now()))
@@ -3963,7 +3965,7 @@ done
             return [self._placement_reply(request,
                 self.local_hold_holders.get(request.episode, placement.ResourceHolderUnknown()))]
         assignment = request.assignment
-        key = placement.attempt_key(assignment.episode, assignment.attempt)
+        key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         saved = self.assignments.get(key)
         if saved is None or saved.assignment != assignment:
             return [self._placement_status(assignment, check_lifetime=False)]
@@ -3997,7 +3999,7 @@ done
                         self._close_placement(replace(refused, terminal_report=terminal), request.reason, retry)
         elif (isinstance(saved.permission, placement.PermissionConsumed) and saved.provider == request.claim
                 or isinstance(saved.permission, placement.PermissionAvailable)
-                and (isinstance(request.outcome, (placement.PrelaunchRefused, placement.HanaCommandAdmissionRefused))
+                and (isinstance(request.outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
                     or isinstance(request.outcome, placement.AttemptCancelled)
                     and isinstance(saved.terminal_report, placement.TerminalAttemptReport)
                     and saved.terminal_report.outcome == request.outcome)
@@ -4008,15 +4010,15 @@ done
             self.execution_evidence[key] = request.evidence
             outcome = request.outcome
             if (isinstance(outcome, (placement.AttemptCompleted, placement.AttemptDeclined, placement.AttemptCancelled))
-                    or isinstance(outcome, placement.PrelaunchRefused) and isinstance(request.evidence, placement.ExecutionNotStarted)
-                    or isinstance(outcome, placement.HanaCommandAdmissionRefused)
-                    and isinstance(request.evidence, placement.ExecutionNotStarted)
-                    and isinstance(request.path, placement.DispatchPathSettled)):
+                    or isinstance(outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
+                    and isinstance(request.evidence, execution_identity.ExecutionNotStarted)):
                 previous = saved.terminal_report
                 if isinstance(previous, placement.NoTerminalReport):
                     terminal = placement.TerminalAttemptReport(outcome, request.path, self.clock.now())
                     retry = saved.retry
-                    if isinstance(outcome, placement.PrelaunchRefused) and not isinstance(retry, placement.RetryAt):
+                    if isinstance(outcome, execution_identity.HanaCommandAdmissionRefused):
+                        retry = placement.DoNotRetry(outcome.reason)
+                    elif isinstance(outcome, placement.PrelaunchRefused) and not isinstance(retry, placement.RetryAt):
                         retry = placement.retry_decision(assignment.destination, outcome.reason, terminal.received_at)
                     self.assignments[key] = replace(saved, terminal_report=terminal, provider=request.claim, retry=retry)
                 elif previous.outcome == outcome:

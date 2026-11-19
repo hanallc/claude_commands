@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
+from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import OwningSession
 from scripts.direct import verify_ssh_targets_test_support as support
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
@@ -305,7 +306,7 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
                                 self.admission.server.publish_host_evidence(self.admission.server.host_probe(key))
                     _ = self.admission.run_pass()
                     with self.admission.loop_turn():
-                        self.assertTrue(all(isinstance(self.admission.server.assignments[placement.attempt_key(
+                        self.assertTrue(all(isinstance(self.admission.server.assignments[execution_identity.attempt_key(
                             attempt.assignment.episode, attempt.assignment.attempt)].state, placement.ClosedAssignment)
                             for attempt in saved), repr(saved) + result.stdout + result.stderr)
 
