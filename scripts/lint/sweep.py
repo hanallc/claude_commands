@@ -5315,6 +5315,8 @@ def _sweep_workspace(roots: list[str], budget_config: conf.ConfigRead, dry_run: 
         status = sweep(roots, trees, budget, source, dry_run, recent_minutes,
                        lint_settings=lint_settings, trim_recovery=trim_recovery, proc=proc)
         if status is WorkspaceSweepSkip.BUSY_TRIM:
+            if doc_status:
+                return tmp_sweep.CompletedSweepAssessment(doc_status)
             return tmp_sweep.SkippedSweepAssessment()
         return tmp_sweep.CompletedSweepAssessment(status or doc_status)
     finally:
