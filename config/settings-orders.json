@@ -5,6 +5,9 @@
   "cloud_gate": {
     "hana_gpu_route_enabled": 3
   },
+  "console": {
+    "page.accounts.owner": 7
+  },
   "hana_aws": {
     "source_allowed_ignored": 1
   },
