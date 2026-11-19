@@ -692,7 +692,7 @@ class NativePaneSessionTests(StaffTestCase):
             self.assertIsInstance(herdr.foreground_pane_owner(info, for_input=True), herdr.ProvedCodexForeground)
             self.assertEqual(read.call_args_list, [call(457), call(457)])
 
-    def test_known_codex_with_unreadable_live_node_descendant_is_unknown(self) -> None:
+    def test_foreground_evidence_when_argv_is_unavailable(self) -> None:
         node = {"pid": 457, "name": "node"}
         codex = {"pid": 456, "argv": ["codex"]}
         with (patch.object(herdr, "_PLATFORM", "linux"),
@@ -701,6 +701,26 @@ class NativePaneSessionTests(StaffTestCase):
                 with self.subTest(processes=processes):
                     owner = herdr.foreground_pane_owner({"foreground_processes": processes})
                     self.assertIsInstance(owner, herdr.UnprovedForegroundOwner)
+
+        place = herdr.HerdrPlace("fixture", "w1:p1")
+        reason = "agent argv is unavailable"
+        claude = {"pid": 458, "name": "claude"}
+        shell = {"pid": 459, "name": "sh", "argv": ["sh"]}
+        for processes, foreground, pane in (
+                ([claude], herdr.ClaudeForegroundWithoutArgv("claude", reason, 458),
+                 herdr.ClaudePaneWithoutArgv(place, reason, 458)),
+                ([shell, claude], herdr.ClaudeForegroundWithoutArgv("claude", reason, 458),
+                 herdr.ClaudePaneWithoutArgv(place, reason, 458)),
+                ([claude, {"pid": 460, "name": "claude"}], herdr.UnprovedForegroundOwner("claude", reason),
+                 herdr.UnknownPaneOwner(place, reason)),
+                ([claude, {**shell, "pid": 458}], herdr.UnprovedForegroundOwner("claude", reason),
+                 herdr.UnknownPaneOwner(place, reason)),
+                ([{"pid": True, "name": "claude"}], herdr.UnprovedForegroundOwner("claude", reason),
+                 herdr.UnknownPaneOwner(place, reason))):
+            with self.subTest(processes=processes):
+                info: dict[str, object] = {"foreground_processes": processes}
+                self.assertEqual(herdr.foreground_pane_owner(info), foreground)
+                self.assertEqual(herdr.pane_foreground(place, info), pane)
 
     def test_foreground_input_reads_each_ancestor_and_descendant_once(self) -> None:
         codex, ancestor, child = 456, 457, 458
