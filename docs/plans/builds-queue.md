@@ -3074,9 +3074,9 @@ Work:
 Case: admin-console ran its gate inside `copies run`, which exports COPIES_STEP_SOURCE, VERIFY_SLOT_SOURCE and CARGO_TARGET_DIR. test_slot_order (pid '' != '4242') and test_memory_admit (NoRun() for check and clippy) lose BUILDLOG_RUN or the run identity; test_copies touched-slot-file reports "target/debug/x not built". impl4 replayed each failure with one variable set.
 
 Work:
-1. One test helper drops the caller's step variables; all three fixtures use it.
-2. A failing-first row for each test with the caller variable set.
-3. The three modules pass with and without the variables.
+1. Use verify 43s's allow-list helper `verify_test_environment` (scripts/lib/helper_tree_test_support.py); add no second helper (builds call). Base 44cx on the final 43s hash; it merges after 43s.
+2. Also fix three reds with the same cause (caller GIT_INDEX_FILE, COPIES_ first-step settings, BASH_ENV): test_slot_order tree-key mismatch, buildlog/test_mac_idle, style/test_style_sync.
+3. A failing-first row for each of the six tests with the caller variable set; all pass with and without the variables.
 
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
