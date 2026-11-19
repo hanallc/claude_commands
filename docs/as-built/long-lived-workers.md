@@ -839,7 +839,10 @@ A missing pane record does not prove that a worker has ended.
 
 Staff worker addresses use `worker:<parent>/<worker>`.
 Message selection resolves the fixed staff id and current session.
-Pane delivery uses the observed pane and current holder.
+Ordinary messages can go to a verified worker pane with status `working`, `idle`, or `done`.
+For a worker address, the holder receives the message and cause if the pane is unavailable.
+The sender also uses the holder if it confirms that submission failed before input.
+If the pane may have received the message, the sender reports unconfirmed delivery and stops.
 Daemon sessions retain their `codex:<thread>` route.
 
 ## Retirement and resume

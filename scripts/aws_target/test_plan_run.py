@@ -12,7 +12,7 @@ from typing import Literal, cast, final, override
 from unittest import mock
 
 from scripts.aws_target.aws_cli import AwsUnavailable
-from scripts.aws_target import admin_secrets, aws_trial, deploy, hana_box, hana_image, hana_render, hana_replacement, ledger, plan_identity, plan_run, test_deploy
+from scripts.aws_target import admin_secrets, aws_trial, deploy, hana_box, hana_image, hana_placement, hana_render, hana_replacement, ledger, plan_identity, plan_run, test_deploy
 from scripts.aws_target.config import DeploymentSettings
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, control_lock, hana_command_lock
@@ -1074,7 +1074,7 @@ shared_usd_per_month=1
                 self.assertEqual(provider.published[-1].expected_generation, permit.generation)
                 settled.append('renewed')
             if operation == release_on:
-                self.assertTrue(controller.release(claim))
+                self.assertIsInstance(controller.release(claim), hana_placement.HanaClaimReleased)
                 self.assertIsInstance(controller.claim_status(claim), hana_box.ClaimRefused)
                 settled.append('released')
 
