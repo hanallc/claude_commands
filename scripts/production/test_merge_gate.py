@@ -108,12 +108,7 @@ def announce_wait(seconds):
     sleep(seconds)
 
 with mock.patch.object(scratch.time, "sleep", side_effect=announce_wait):
-    try:
-        merge_gate.recover_gate_directory(merge_gate.gate_run_directory(repo))
-    except merge_gate.GateRefused as error:
-        print(error)
-    else:
-        raise AssertionError("rollback ran while the lock was held")
+    merge_gate.recover_gate_directory(merge_gate.gate_run_directory(repo), str(repo))
 """
         checkout = Path(__file__).resolve().parents[2]
         copies = self.root / "copies"

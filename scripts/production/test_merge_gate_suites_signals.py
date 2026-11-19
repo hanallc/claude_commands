@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import select
 import signal
 import shutil
 import subprocess
@@ -16,6 +17,8 @@ import sys
 import tempfile
 from typing import Literal, cast, final
 from unittest import mock
+from scripts.build_queue import admission_records
+from scripts.build_queue.queue_place import QueuePlace
 from scripts.lib import build_folders
 from scripts.lib.process_group import send_process_group
 from scripts.production import merge_gate, merge_gate_suites_test_support
@@ -199,6 +202,80 @@ sys.stdin.read(1)
                             [token] = cast(list[dict[str, object]], record["tokens"])
                             self.assertEqual(token["operation"], operation)
                             recovery.path.unlink()
+
+    def test_gate_scope_sidecar_names_the_slice_before_the_child_starts(self) -> None:
+        sidecar = self.state / "gate.cgroup"
+        sidecar.touch()
+        record = self.state / "run.json"
+        recovery = merge_gate.GateRecovery(record, str(self.checkout), os.getpid(), "fixture")
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            configuration = admission_records.read_memory_config()
+            reservation = QueuePlace(self.state / "gate", sidecar, configuration=configuration)
+            prefix = merge_gate.publish_gate_scope(recovery, reservation, ["--slice=builds.slice", "--"])
+        scope = Path(sidecar.read_text().strip())
+        self.assertEqual(str(scope), recovery.scope)
+        self.assertEqual(scope.parent, Path(self.environment["BUILDLOG_BUILDS_CGROUP"]))
+        self.assertEqual(prefix, [f"--slice={scope.name}", "--"])
+        self.assertEqual(json.loads(record.read_text())["scope"], str(scope))
+        self.assertEqual(sidecar.with_name(build_folders.RECOVERY_MARKER).readlink(), record)
+
+    def test_cpu_wait_repairs_the_last_slot_after_one_bounded_slice(self) -> None:
+        self.supply_jobserver(b"Q")
+        with mock.patch.dict(os.environ, self.environment, clear=True), merge_gate.shared_cpu_pool() as pool:
+            assert isinstance(pool, merge_gate.SharedCPUPool)
+            path = merge_gate.gate_run_directory(self.checkout) / "dead-reader.json"
+            recovery = merge_gate.GateRecovery(path, str(self.checkout), os.getpid(), "ended-owner")
+            recovery.tokens.append(recovery.token(pool.descriptor, b"", "acquiring", available=1))
+            recovery.save()
+            self.assertEqual(os.read(pool.descriptor, 1), b"Q")
+            ready = select.select
+            stop_seconds = admission_records.read_memory_config().program_stop_seconds
+
+            def expire_slice(readers: list[int], writers: list[int], errors: list[int],
+                             timeout: float | None = None) -> tuple[list[int], list[int], list[int]]:
+                if pool.blocking in readers:
+                    assert timeout is not None
+                    self.assertGreater(timeout, 0)
+                    self.assertLessEqual(timeout, stop_seconds)
+                    return [], [], []
+                return ready(readers, writers, errors, timeout)
+
+            with mock.patch.object(select, "select", side_effect=expire_slice):
+                slot = pool.acquire()
+            self.assertEqual(slot.token, b"+")
+            self.assertFalse(path.exists())
+        self.assertEqual(self.jobserver_tokens(), b"+")
+
+    def test_held_nested_lease_keeps_folders_and_slot_without_stopping_the_scan(self) -> None:
+        self.supply_jobserver(b"Q")
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            directory = merge_gate.gate_run_directory(self.checkout)
+            first = merge_gate.GateRecovery(directory / "first.json", str(self.checkout),
+                                            os.getpid(), "ended-owner")
+            second = merge_gate.GateRecovery(directory / "second.json", str(self.checkout),
+                                             os.getpid(), "ended-owner")
+            descriptor = os.open(self.environment["BUILDLOG_JOBSERVER_FIFO"], os.O_RDWR | os.O_NONBLOCK)
+            self.addCleanup(os.close, descriptor)
+            parent = self.root / "recorded-work"
+            parent.mkdir()
+            first.folders.append(str(parent))
+            first.tokens.append(first.token(descriptor, os.read(descriptor, 1), "held"))
+            first.save()
+            second.save()
+            (parent / build_folders.RECOVERY_MARKER).symlink_to(first.path)
+            nested = build_folders.BuildFolderSpec(kind="tool", parent=parent, purpose="nested", suffix_length=0)
+            with build_folders.leased_build_folder(nested) as holder:
+                output = io.StringIO()
+                with redirect_stdout(output), merge_gate.gate_recovery(self.checkout):
+                    self.assertIn("UNRESOLVED", output.getvalue())
+                    self.assertTrue(holder.is_dir())
+                    self.assertTrue(first.path.is_file())
+                    self.assertFalse(second.path.exists())
+                    self.assertEqual(self.jobserver_tokens(), b"")
+            with merge_gate.gate_recovery(self.checkout):
+                self.assertFalse(parent.exists())
+                self.assertFalse(first.path.exists())
+                self.assertEqual(self.jobserver_tokens(), b"Q")
 
     @gate_suites("hooks")
     def test_both_gate_modes_recover_the_private_run_record(self) -> None:
@@ -419,38 +496,78 @@ merge_gate.start_gate_job = interrupt_after_start
     @gate_suites("hooks")
     def test_unresolved_module_cleanup_keeps_capacity_and_folders(self) -> None:
         self.supply_jobserver(b"Q")
+        self.write(self.state / "hold-module", "hold")
         sidecar = self.state / "sidecar-path"
+        proof = self.state / "live-group-proof"
         preamble = f"""from contextlib import contextmanager
+import json
+from scripts.direct.wait_for_test_state import wait_until
 
-kill = merge_gate.kill_job_group
 reservation = merge_gate.gate_reservation
+reap = merge_gate.reap_gate_job
+send = merge_gate.process_group.send_process_group
+state = Path(os.environ["MERGE_GATE_TEST_STATE"])
+attempts = []
+held = None
+
+def record_job(job):
+    global held
+    if job.suite == "hooks":
+        wait_until((state / "module-held").exists, state, timeout={TEST_HANG_GUARD_SECS})
+        held = job.process.pid
+        job.process.returncode = 0
+    else:
+        reap(job)
+
+def hold_fixture_group(pid, number):
+    if pid != held or number == 0:
+        send(pid, number)
 
 def unresolved_finish(job, *, deadline=None):
-    if deadline is None:
-        raise merge_gate.GateRefused("UNRESOLVED: fixture module did not stop")
-    kill(job, deadline=deadline)
+    assert job.process.pid == held and merge_gate.live_group(held)
+    attempts.append("finish" if deadline is None else "final")
+    raise merge_gate.GateRefused("UNRESOLVED: fixture module did not stop")
 
 @contextmanager
 def record_sidecar(*arguments, **options):
     with reservation(*arguments, **options) as place:
         Path({str(sidecar)!r}).write_text(str(place.sidecar))
-        yield place
+        try:
+            yield place
+        finally:
+            recovery = merge_gate.ACTIVE_GATE_RECOVERY.get()
+            record = json.loads(recovery.path.read_text())
+            assert record["groups"][str(held)]
+            assert merge_gate.live_group(held)
+            assert place.keep_reservation
+            assert all(Path(path).is_dir() for path in record["folders"])
+            assert [token["operation"] for token in record["tokens"]] == ["held"]
+            Path({str(proof)!r}).write_text(json.dumps(attempts))
 
+merge_gate.reap_gate_job = record_job
+merge_gate.process_group.send_process_group = hold_fixture_group
 merge_gate.kill_job_group = unresolved_finish
 merge_gate.gate_reservation = record_sidecar
 """
-        result = self.run_gate("--tests-only", own_process=True, preamble=preamble, type_dirs=())
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("UNRESOLVED: fixture module did not stop", result.stderr)
-        self.assertEqual(self.jobserver_tokens(), b"")
-        self.assertTrue(Path(sidecar.read_text()).is_file())
-        [path] = (self.state / "runner" / "active-runs").glob("*/*.json")
-        record = cast(dict[str, object], json.loads(path.read_text()))
-        [token] = cast(list[dict[str, object]], record["tokens"])
-        self.assertEqual(token["operation"], "held")
-        folders = [Path(folder) for folder in cast(list[str], record["folders"])]
-        self.assertTrue(folders)
-        self.assertTrue(all(folder.is_dir() for folder in folders))
+        try:
+            result = self.run_gate("--tests-only", own_process=True, preamble=preamble, type_dirs=())
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("UNRESOLVED: fixture module did not stop", result.stderr)
+            self.assertEqual(json.loads(proof.read_text()), ["finish", "final"])
+            self.assertEqual(self.jobserver_tokens(), b"")
+            self.assertTrue(Path(sidecar.read_text()).is_file())
+            [path] = (self.state / "runner" / "active-runs").glob("*/*.json")
+            record = cast(dict[str, object], json.loads(path.read_text()))
+            folders = [Path(folder) for folder in cast(list[str], record["folders"])]
+            self.assertTrue(folders)
+            self.assertTrue(all(folder.is_dir() for folder in folders))
+        finally:
+            module = self.state / "module-held"
+            if module.exists():
+                try:
+                    send_process_group(int(module.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     @gate_suites("hooks", "lib")
     def test_stop_with_pending_modules_returns_owned_slot_and_reservation(self) -> None:

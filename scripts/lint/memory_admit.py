@@ -1028,13 +1028,15 @@ def reservation_lifetime(row: Reservation, owner_live: bool) -> StepLifetime:
             scope_name = ""
         if scope_name:
             scope = Path(scope_name)
-            members = scope / "cgroup.procs"
-            check_memory_reading(members)
+            # cgroup.events includes descendants of an empty slice root.
+            events = scope / "cgroup.events"
+            check_memory_reading(events)
             try:
-                if members.read_text().split():
+                if "populated 1" in events.read_text().splitlines():
                     return PopulatedStepScope(scope)
             except FileNotFoundError:
-                pass
+                if scope_members(scope):
+                    return PopulatedStepScope(scope)
             except OSError as error:
                 if error.errno != errno.ENODEV:
                     raise

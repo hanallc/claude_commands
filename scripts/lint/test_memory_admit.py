@@ -3876,6 +3876,25 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
         self.assertEqual(result.explanation.totals.measured, 2 * GIB)
         self.assertEqual(result.explanation.totals.charged, 2 * GIB)
 
+    def test_nested_gate_scope_keeps_a_dead_owners_reservation(self) -> None:
+        path = self.running(100, 1)
+        row = gate.read_reservation(path)
+        sidecar = self.root / "gate.cgroup"
+        scope = self.builds / "builds-gatefixture.slice"
+        module = scope / "module.scope"
+        module.mkdir(parents=True)
+        _ = sidecar.write_text(str(scope) + "\n")
+        row["sidecar"] = str(sidecar)
+        _ = (scope / "cgroup.procs").write_text("")
+        _ = (module / "cgroup.procs").write_text("101\n")
+        events = scope / "cgroup.events"
+        _ = events.write_text("populated 1\nfrozen 0\n")
+        self.assertEqual(gate.reservation_lifetime(row, False), gate.PopulatedStepScope(scope))
+        events.unlink()
+        self.assertEqual(gate.reservation_lifetime(row, False), gate.PopulatedStepScope(scope))
+        _ = (module / "cgroup.procs").write_text("")
+        self.assertEqual(gate.reservation_lifetime(row, False), gate.EndedStep())
+
     def test_scope_counter_disappearing_uses_owner_lifetime(self) -> None:
         reservation = self.running(100, 12)
         scope = self.builds / "ending.scope"
