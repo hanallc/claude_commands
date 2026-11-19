@@ -15,14 +15,20 @@ from ipaddress import IPv4Address
 from typing import cast
 
 from scripts.lib import conf
-from scripts.review_links import for_you
-from scripts.statusline import assignment
+from scripts.statusline import assignment, rebuild_row
+
+try:
+    from scripts.review_links import for_you
+except Exception:
+    for_you = None
 
 
-def global_action_count() -> str:
+def global_action_count(rebuild: rebuild_row.RebuildAnswer | None = None) -> str:
     """Return a complete action count or an explicit unavailable result."""
+    if for_you is None:
+        return "unavailable"
     try:
-        count = for_you.read().open_count
+        count = for_you.read(rebuild_row.DEFAULT_CONFIG, rebuild=rebuild).open_count
     except (OSError, ValueError):
         return "unavailable"
     return str(count.value) if isinstance(count, for_you.KnownOpenCount) else "unavailable"
@@ -57,16 +63,24 @@ def console_action_count() -> str:
     return "unavailable"
 
 
+def action_count(source: str, rebuild: rebuild_row.RebuildAnswer | None = None) -> str:
+    """Read the action count from its selected source."""
+    return console_action_count() if source == "--for-you-console" else global_action_count(rebuild)
+
+
 def main() -> None:
     """Pass the action count and shell arguments to the status line renderer."""
-    read_count = console_action_count if sys.argv[1] == "--for-you-console" else global_action_count
+    if len(sys.argv) == 2:
+        print(action_count(sys.argv[1]))
+        return
+    rebuild = rebuild_row.read(rebuild_row.DEFAULT_CONFIG)
     try:
-        count = read_count()
+        count = action_count(sys.argv[1], rebuild)
     except Exception:
         traceback.print_exc()
         count = "unavailable"
     sys.argv[1:2] = ["--arg", "for_you", count]
-    assignment.main()
+    assignment.main(rebuild)
 
 
 if __name__ == "__main__":

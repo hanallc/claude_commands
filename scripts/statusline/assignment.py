@@ -138,7 +138,7 @@ def counts_rows(record: staff.StaffSnapshot, session_id: str) -> str:
     return "".join(lines)
 
 
-def main() -> None:
+def main(rebuild: rebuild_row.RebuildAnswer | None = None) -> None:
     payload = cast(dict[str, object], json.load(sys.stdin))
     try:
         record = staff_record(Path(os.environ["STAFF_FILE"]).read_text(encoding="utf-8"))
@@ -149,8 +149,9 @@ def main() -> None:
     pwd = next((value for option, name, value in zip(sys.argv, sys.argv[1:], sys.argv[2:])
                 if option == "--arg" and name == "pwd"), os.getcwd())
     branch = current_branch(payload, pwd) if role == "unit-director" else ""
-    rebuild_config = Path(__file__).resolve().parents[2] / "config/statusline.conf"
-    rebuild = rebuild_row.read(rebuild_config)
+    rebuild_config = rebuild_row.DEFAULT_CONFIG
+    if rebuild is None:
+        rebuild = rebuild_row.read(rebuild_config)
     if rebuild.refresh_due:
         try:
             _ = subprocess.Popen(

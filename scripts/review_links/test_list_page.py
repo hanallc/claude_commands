@@ -207,7 +207,7 @@ class _Chrome(_Browser):
                 "globalThis.fixtureDOM = new Promise(resolve => {"
                 "const observer = new MutationObserver(() => {"
                 f"const result = document.getElementById({marker_literal});"
-                "if (result) { observer.disconnect(); resolve(result.outerHTML); }"
+                "if (result) { observer.disconnect(); resolve(document.documentElement.outerHTML); }"
                 "});"
                 "observer.observe(document, {childList: true, subtree: true});"
                 "});"

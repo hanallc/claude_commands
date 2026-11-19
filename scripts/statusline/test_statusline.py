@@ -68,15 +68,17 @@ def fixture_account_label(label: str, configuration: Path) -> str:
 
 
 def fixture_colors(path: Path) -> Path:
-    """Copy the config and set the colors and thresholds that these tests assert."""
-    _ = write_config_fixture(path, "role.showrunner=purple\nrole.unit-director=yellow\nrole.worker=#ff04a3\n"
-                             + "account.claude1=#53d5fd\naccount.claude2=#cd54f2\naccount.claude3=#ffc800\n"
-                             + "account.claude4=#ff8700\naccount.claude5=#19d772\naccount.codex1=#ff1261\naccount.codex2=#4bf331\n"
-                             + "counts.questions=bright-red\ncounts.proposals=purple\ncounts.adhoc_items=pink\n"
-                             + "counts.changes=bright-cyan\ncounts.efficiency=bright-green\n"
-                             + "level.ok=bright-green\nlevel.warn=bright-yellow\nlevel.alarm=bright-red\n"
-                             + "tokens.warn=80\ntokens.alarm=90\nleft.warn=10\nleft.alarm=5\n",
-                             template="statusline")
+    """Write the colors and thresholds that these tests assert."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _ = path.write_text(
+        "role.showrunner=purple\nrole.unit-director=yellow\nrole.worker=#ff04a3\n"
+        + "role.producer=#90fe42\nrole.astra-designer=mauve\nrole.astra-reviewer=bright-green\n"
+        + "account.claude1=#53d5fd\naccount.claude2=#cd54f2\naccount.claude3=#ffc800\n"
+        + "account.claude4=#ff8700\naccount.claude5=#19d772\naccount.codex1=#ff1261\naccount.codex2=#4bf331\n"
+        + "counts.questions=bright-red\ncounts.proposals=purple\ncounts.adhoc_items=pink\n"
+        + "counts.changes=bright-cyan\ncounts.efficiency=bright-green\n"
+        + "level.ok=bright-green\nlevel.warn=bright-yellow\nlevel.alarm=bright-red\n"
+        + "tokens.warn=80\ntokens.alarm=90\nleft.warn=10\nleft.alarm=5\n", encoding="utf-8")
     return path
 
 
@@ -335,8 +337,8 @@ class ColorTests(unittest.TestCase):
                 field = status_lines({}, colors=f"account.claude1={color}\n")[1].split(" | ")[0]
                 self.assertRegex(field, r"^\x1b\[[0-9;]+mclaude1\x1b\[0m$")
 
-    def test_shipped_color_values_are_renderable(self) -> None:
-        for key, value in conf.read(SHIPPED_COLORS).values().items():
+    def test_fixture_color_values_are_renderable(self) -> None:
+        for key, value in conf.read(self.colors).values().items():
             if not key.startswith(("role.", "account.", "level.", "counts.")) or key == "counts.retry_seconds":
                 continue
             with self.subTest(key=key):
@@ -455,10 +457,10 @@ class ForYouStatusTests(unittest.TestCase):
         for rows, failures, expected in (((row,), (), "1"), ((), (), "0"),
                                           ((row,), (for_you.UnavailableSource("fixture", "Failed."),), "unavailable")):
             with self.subTest(expected=expected), patch.object(for_you, "read", return_value=for_you.ForYouSnapshot(rows, failures)) as read:
-                self.assertEqual(counts_row.global_action_count(), expected)
+                self.assertEqual(statusline_rows.global_action_count(), expected)
                 self.assertEqual(read.call_count, 1)
         with patch.object(for_you, "read", side_effect=OSError("Fixture read failed.")):
-            self.assertEqual(counts_row.global_action_count(), "unavailable")
+            self.assertEqual(statusline_rows.global_action_count(), "unavailable")
 
     def test_mac_default_uses_the_console_peers_tailscale_address(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -470,7 +472,7 @@ class ForYouStatusTests(unittest.TestCase):
             with (patch.dict(os.environ, {"CONF_DIR": directory}, clear=True),
                   patch.object(subprocess, "check_output", return_value="100.64.0.42\n") as address,
                   patch.object(statusline_rows, "HTTPConnection", return_value=connection) as connect):
-                self.assertEqual(counts_row.console_action_count(), "3")
+                self.assertEqual(statusline_rows.console_action_count(), "3")
                 connect.assert_called_once_with("100.64.0.42", 8765, timeout=2)
                 address.assert_called_once_with(
                     ["tailscale", "ip", "-4", "fixture-console"], text=True, stderr=subprocess.DEVNULL, timeout=2)

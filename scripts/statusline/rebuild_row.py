@@ -8,6 +8,7 @@ except FileNotFoundError:
 import argparse
 import fcntl
 import json
+import os
 import re
 import subprocess
 import sys
@@ -201,6 +202,7 @@ class RebuildAnswer:
     compared: tuple[str, ...] = ()
     needs: tuple[need.MachineNeeds, ...] = ()
     probes: RunningSystemProbes = RunningSystemProbes()
+    needs_failure: str | None = None
 
     def row(self) -> str:
         return ", ".join(f"rebuild {machine}" for machine in self.machines)
@@ -344,10 +346,16 @@ def read(config: Path = DEFAULT_CONFIG, *, clock: Callable[[], float] = time.tim
     """Combine the cached comparison with open rebuild needs."""
     answer = _read_cache(config, clock)
     try:
+        # Glob can hide an inaccessible folder.
+        try:
+            with os.scandir(need.needs_folder()):
+                pass
+        except FileNotFoundError:
+            pass
         needs = tuple(need.read_needs())
         machines = set(answer.machines) | {summary.newest["machine"] for summary in needs}
-    except (OSError, ValueError, KeyError, TypeError):
-        return answer
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return replace(answer, needs_failure=str(error))
     return replace(answer, machines=tuple(machine for machine in ("natedev", "mac") if machine in machines), needs=needs)
 
 

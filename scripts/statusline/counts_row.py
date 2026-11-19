@@ -22,6 +22,7 @@ except FileNotFoundError:
     pass
 
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -31,8 +32,6 @@ from scripts.lib import conf
 from scripts.hooks import showrunner_footer  # noqa: E402
 from scripts.production import staff
 from scripts.review_links import review_items, review_later
-from scripts.statusline.statusline_rows import console_action_count as console_action_count
-from scripts.statusline.statusline_rows import global_action_count as global_action_count
 from scripts.production.update_registration import QuestionStaff
 from scripts.lib.user_zone import user_zone
 
@@ -183,12 +182,9 @@ def write_cache(cache: Path, line: str, due: str, sources: list[Path], began: in
 
 
 def main(argv: list[str]) -> int:
-    if argv == ["--for-you"]:
-        print(global_action_count())
-        return 0
-    if argv == ["--for-you-console"]:
-        print(console_action_count())
-        return 0
+    if argv in (["--for-you"], ["--for-you-console"]):
+        renderer = Path(__file__).with_name("statusline_rows.py")
+        return subprocess.run([sys.executable, "-I", str(renderer), *argv], check=False).returncode
     if len(argv) == 2 and argv[0] == "--unit":
         _ = write_unit(argv[1])
         return 0

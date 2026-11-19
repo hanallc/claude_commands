@@ -119,7 +119,8 @@ def _completed_requests(names: Mapping[str, str], waiting_work: Callable[[str], 
     return tuple(records)
 
 
-def read(config: Path = rebuild_row.DEFAULT_CONFIG) -> ForYouSnapshot:
+def read(config: Path = rebuild_row.DEFAULT_CONFIG, *,
+         rebuild: rebuild_row.RebuildAnswer | None = None) -> ForYouSnapshot:
     """Project both stores and the comparison cache without running a rebuild or a refresh."""
     unavailable: list[UnavailableSource] = []
     names: dict[str, str] = {}
@@ -166,20 +167,18 @@ def read(config: Path = rebuild_row.DEFAULT_CONFIG) -> ForYouSnapshot:
     except (OSError, ValueError) as error:
         unavailable.append(UnavailableSource("actions", str(error)))
 
+    answer = rebuild if rebuild is not None else rebuild_row.read(config)
     pending: tuple[RebuildRequest, ...] = ()
-    needs_available = True
-    try:
-        # Check folder access because glob can hide an unavailable folder.
-        folder = need.needs_folder()
+    needs_available = answer.needs_failure is None
+    if answer.needs_failure is not None:
+        unavailable.append(UnavailableSource("rebuild needs", answer.needs_failure))
+    else:
         try:
-            _ = tuple(folder.iterdir())
-        except FileNotFoundError:
-            pass
-        pending = tuple(_request(record, names, waiting_work, completed=False)
-                        for summary in need.read_needs() for record in summary.records)
-    except (OSError, ValueError, KeyError, TypeError) as error:
-        needs_available = False
-        unavailable.append(UnavailableSource("rebuild needs", str(error)))
+            pending = tuple(_request(record, names, waiting_work, completed=False)
+                            for summary in answer.needs for record in summary.records)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            needs_available = False
+            unavailable.append(UnavailableSource("rebuild needs", str(error)))
 
     history: tuple[RebuildRequest, ...] = ()
     try:
@@ -199,7 +198,6 @@ def read(config: Path = rebuild_row.DEFAULT_CONFIG) -> ForYouSnapshot:
                 raise ValueError(f"rebuild.cwd.{machine}: provide an absolute path or a home path.")
             working_directories[machine] = directory
         _ = rebuild_row.RebuildSettings.read(config)
-        answer = rebuild_row.read(config)
         compared = answer.compared
         probes = answer.probes
         comparison_current = (not answer.refresh_due and isinstance(answer.expected, rebuild_row.ExpectedSystems)
