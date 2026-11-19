@@ -620,6 +620,8 @@ Source uploads and result downloads have separate limits.
 Provider errors expose safe action names rather than cloud identifiers or signed URLs.
 
 The provider persists its operation before dispatch and holds a separate mutation lock.
+Existing writes store the lifecycle generation and UTC epoch seconds for dispatch, acceptance, or cancellation.
+Acceptance writes identify a direct response or a bootstrap observation.
 Recovery takes that lock without blocking an active mutation.
 Recovery fences an operation that has not reached dispatch.
 A late worker cannot dispatch that fenced operation.
