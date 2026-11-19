@@ -1001,10 +1001,11 @@ class ReportFile:
 
 
 def report_file(report: ReportSections | charts.IndexUnavailable,
-                costs: aws_costs.AwsCosts = aws_costs.NO_COSTS) -> ReportFile:
+                costs: aws_costs.AwsCosts | None = None) -> ReportFile:
     payload = codec.snapshot_value(report)
     assert isinstance(payload, dict)
-    text = json.dumps({**payload, "aws_costs": costs})
+    text = json.dumps({**payload, "aws_costs": costs if costs is not None else aws_costs.empty_costs(int(time.time()))},
+                      separators=(",", ":"))
     return ReportFile(text, hashlib.sha256(text.encode()).hexdigest()[:REPORT_VERSION_LENGTH])
 
 
