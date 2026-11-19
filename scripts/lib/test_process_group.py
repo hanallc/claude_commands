@@ -25,6 +25,7 @@ from unittest.mock import MagicMock, patch
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_group
+from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment
 
@@ -268,10 +269,7 @@ class ShellProcessGroupTests(PrivateGroupFixture):
             + f"raise SystemExit({status})\n")
 
     def cancel_step(self, function: str, child: subprocess.Popen[str]) -> subprocess.CompletedProcess[str]:
-        source = (self.root / "scripts/direct/verify.sh").read_text()
-        definition = re.search(rf"^{function}\(\) \{{\n.*?^\}}", source, re.MULTILINE | re.DOTALL)
-        self.assertIsNotNone(definition)
-        assert definition is not None
+        functions = shell_functions(self.root / "scripts/direct/verify.sh", "stop_run_step", function)
         watch = self.root / "watch"
         watch.mkdir(exist_ok=True)
         driver = """
@@ -291,7 +289,7 @@ verify_cleanup() { :; }
 final_pass_finish() { :; }
 """
         return subprocess.run(
-            ["bash", "-c", driver + definition.group() + f"\n{function} 15\n", "fixture",
+            ["bash", "-c", driver + functions + f"{function} 15\n", "fixture",
              str(child.pid), str(self.root / "scripts/direct/step_record.py"), str(watch)],
             env=self.environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
         )
