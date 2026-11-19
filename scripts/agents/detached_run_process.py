@@ -16,20 +16,30 @@ class ProcessCommandText:
 
 @dataclass(frozen=True)
 class ProcessArgumentsUnavailable:
-    """The ps process check timed out."""
+    """The process arguments are unavailable."""
 
 
-def process_args(pid: int) -> list[str] | ProcessCommandText | ProcessArgumentsUnavailable:
-    """Read the process arguments or report that ps timed out."""
+@dataclass(frozen=True)
+class ProcessAbsent:
+    """The ps process check found no process."""
+
+
+def process_args(pid: int) -> list[str] | ProcessCommandText | ProcessArgumentsUnavailable | ProcessAbsent:
+    """Read the process arguments or report absence or failure."""
     if Path("/proc/self").exists():
         return _proc_args(Path(f"/proc/{pid}"))
     timeout = conf.read("detached_runs").whole("PROCESS_CHECK_SECONDS")
     try:
         shown = subprocess.run(["ps", "-p", str(pid), "-o", "args="],
                                capture_output=True, text=True, check=False, timeout=timeout)
-    except subprocess.TimeoutExpired:
+    except (OSError, UnicodeError, subprocess.SubprocessError):
         return ProcessArgumentsUnavailable()
-    return ProcessCommandText(shown.stdout.strip())
+    command = shown.stdout.strip()
+    if shown.returncode == 1 and not command and not shown.stderr.strip():
+        return ProcessAbsent()
+    if shown.returncode or not command or (command.startswith("(") and command.endswith(")")):
+        return ProcessArgumentsUnavailable()
+    return ProcessCommandText(command)
 
 
 def _proc_args(process: Path) -> list[str]:
@@ -43,6 +53,8 @@ def _command_match(pid: int, command: Sequence[str]) -> bool | ProcessArgumentsU
     if pid <= 0 or not command:
         return False
     observed = process_args(pid)
+    if isinstance(observed, ProcessAbsent):
+        return False
     if isinstance(observed, ProcessArgumentsUnavailable):
         return observed
     separator = " " if isinstance(observed, ProcessCommandText) else "\0"
