@@ -492,8 +492,8 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     unread = isinstance(item.unread_since, datetime)
     unread_answers = the_list.unread_answer_ids(item)
     waiting = isinstance(visibility, the_list.WaitingForAnswer)
-    eta = item.eta.earliest if isinstance(item.eta, the_list.EtaRange) else item.eta
-    eta_sort: tuple[int, float | str] = (0, eta.timestamp()) if isinstance(eta, datetime) else (1, eta_text(eta, today).casefold())
+    due = the_list.eta_due(item.eta)
+    eta_sort: tuple[int, float | str] = (0, due.timestamp()) if due is not None else (1, eta_text(item.eta, today).casefold())
     values = (item.number, owner.casefold(), producer.casefold(), item.title.casefold(), item.state.value.casefold(),
               item.next_step.casefold(), eta_sort, item.unread_since.timestamp() if isinstance(item.unread_since, datetime) else 0)
     parking = (the_list.ParkUntilDelivered.DELIVERED.value

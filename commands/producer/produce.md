@@ -70,7 +70,7 @@ An ETA is the time when the whole item is done: `Mon D HH:MM ZONE` or a date. Wi
 Write the status in two or three sentences that say where the item stands. Start the next step with who acts; put nate first when nate must act. Put phase names, commit ids, change ids and unit names in `--source` or `--evidence`.
 Read your items with `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --all --latest-status`.
 Use `the_list.py update --id L<n>` to update your items.
-Use `--latest-status`, `--next-step`, `--eta`, `--state`, or `--next-check`.
+Use `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, or `--add-evidence`.
 Write no time in `--source`.
 A producer other than morty asks morty to add, close, park, or assign its items.
 It also asks morty to record updates and decisions that it cannot write with `the_list.py`.

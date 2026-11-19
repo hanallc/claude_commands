@@ -16,7 +16,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import BinaryIO, cast, override
@@ -1247,6 +1247,31 @@ document.body.append(result);
         self.assertIn('New title &lt;script&gt;', changed)
         self.assertNotIn('<script>New title', changed)
         self.assertIn('New status', changed)
+
+    def test_date_eta_renders_and_sorts_after_a_time_on_the_same_day(self) -> None:
+        day = date(2026, 11, 20)
+        midnight = datetime(2026, 11, 20, tzinfo=user_zone())
+        timed_eta = midnight.replace(hour=15)
+        dated = the_list.add(MORTY.id, "Date ETA", owner=OWNER.id, source="nate", changes={"eta": midnight})
+        timed = the_list.add(MORTY.id, "Time ETA", owner=OWNER.id, source="nate", changes={"eta": timed_eta})
+        path = the_list.folder(MORTY.id) / f"{dated.id}.md"
+        _ = path.write_text(path.read_text().replace(midnight.isoformat(), day.isoformat()))
+        page = list_page.render(self.root / "reviews", include_counts=False).decode()
+        dated_row, timed_row = (
+            page.split(f'data-number="{item.number}"', 1)[1].split("</tbody>", 1)[0] for item in (dated, timed)
+        )
+
+        def eta_sort_key(row: str) -> list[float]:
+            encoded = row.split('data-sort-values="', 1)[1].split('"', 1)[0]
+            values = cast(list[object], json.loads(html.unescape(encoded)))
+            return cast(list[float], values[6])
+
+        with self.subTest(check="display"):
+            self.assertIn('<td data-label="ETA">2026-11-20</td>', dated_row)
+        with self.subTest(check="sort"):
+            timed_key, dated_key = eta_sort_key(timed_row), eta_sort_key(dated_row)
+            self.assertEqual((timed_key[0], dated_key[0]), (0, 0))
+            self.assertLess(timed_key, dated_key)
 
     def test_linked_reviews_share_one_current_read_and_link_to_the_review_cards(self) -> None:
         def change(identity: str, state: review_items.ReviewState) -> review_items.ReviewItem:
