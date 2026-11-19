@@ -135,10 +135,12 @@ Run this command in a terminal on natedev.
 deploy.py hana-setup --plan
 ```
 
+The plan reports whether the deployed Hana image is current or stale.
 The plan checks root replacement for an existing Hana box with a registered image.
 It accepts stack-owned and direct-owned boxes.
 It refuses first-time setup and pending instance or data volume work.
-It reports whether the deployed guest digest matches the current guest files.
+The plan refuses immediately if the controller lock is busy or another command holds Hana.
+A new replacement requires an idle lifecycle.
 
 For a pending replacement, the plan checks the instance, original data attachment, and registered image.
 For a new replacement, the plan also checks that the instance is stopped.
@@ -160,8 +162,11 @@ deploy.py up --workload merge-gates --plan
 ```
 
 The plan checks the home StackId, account, region, deployment parameters, and installed scaler credentials.
-It holds the same controller lock as approved gate setup and image removal.
-If the controller lock is busy, the plan refuses before it contacts AWS.
+The gate plan, approved gate setup, and image removal take the account stack lock at `gate-up/controller.lock`.
+This lock protects the account stack, regional gate stacks, and `gate-deployment.json`.
+Account apply and teardown take the account stack lock before the Hana resource hold.
+A command refuses before it contacts AWS if another command holds the account stack lock.
+The gate commands leave Hana build claims and permit renewal available.
 It builds the same template and parameter values as approved gate setup.
 The plan previews updates in the home region and in each configured gate region.
 It removes each change set and confirms removal before it checks scaler permissions.
@@ -457,7 +462,21 @@ Setup writes a fixed probe object under `control/<deployment>/setup-probe.json` 
 It reports each operation as `hana-setup probe: <operation>: pass` or `hana-setup probe: <operation>: fail`.
 When AWS supplies an error code, the failure line includes it in parentheses.
 For a policy-only change, setup probes before and after the update.
-Setup requires an idle-stopped lifecycle with no claims or pending start for this change.
+Approved setup waits for an idle-stopped lifecycle with no claim or pending start.
+It makes no AWS write calls while it waits.
+The default setup wait is 1,500 seconds.
+This allows time for work to finish, the 600-second warm idle interval, and the 600-second stop wait.
+Set `setup_idle_wait_timeout_s` above the sum of `idle_stop_seconds` and `stop_wait_timeout_s`.
+The `setup_idle_heartbeat_s` setting reports the lifecycle state every 15 seconds.
+Setup checks the lifecycle again at the wait limit.
+If the box is still busy, setup reports the lifecycle state and the claim holder kind.
+Setup takes exclusive control of the box under the controller lock.
+The setup plan, Hana image registration, and Hana teardown use the same hold.
+Account prepare, Hana prepare, account apply, and account teardown also use the hold.
+The controller skips its tick while a command holds Hana resources.
+A competing command refuses before it calls AWS.
+Build claims and queue evidence report the box as busy during the hold.
+The kernel releases the hold when the command closes it or the process exits.
 It checks the saved stack outputs and confirms the instance is stopped and the disk is attached.
 Setup verifies the live and effective change set parameters against the approved stack parameters.
 The second run starts after CloudFormation confirms the update.
@@ -1414,6 +1433,12 @@ Both capture paths refuse new Git links with `NestedRepository`.
 The sender refuses unexpected ignored inputs, credential paths, Git links, and disallowed environment variables.
 It sends no ignored files, HOME, or target output.
 
+When capture raises `SourceRefused`, offload reports the cause and ends the build before any command runs.
+This applies to pinned builds and builds that the queue places on Hana.
+If the runner cannot release the claim, the queue worker releases it after the runner exits and the lifecycle operation ends.
+A source change during capture returns status 75 with `source_changed` and requests a fresh placement.
+A Git command failure reports its cause and returns status 75 with `runner`.
+
 A frozen `SourceManifest` carries the repository key, private commit, bundle digest, signed URL, basis commits, command, features, environment, and toolchain digest.
 Its JSON fits the receiver's 65536-byte control limit.
 Each repository retains a bounded list of guest-acknowledged commits.
@@ -1499,12 +1524,14 @@ One exact lifecycle claim excludes all other Hana worktrees.
 Boot generations include the deployment, demand-start token, and verified boot identity.
 Permit renewals retain that generation.
 
-F1 receives `HanaClaimPending`, `HanaClaimAdopted`, `HanaClaimRefused`, or `HanaClaimRetained` from `claim_assigned()`.
+F1 receives `HanaClaimPending`, `HanaClaimAdopted`, `HanaClaimRefused`, `HanaClaimRetained`, or `HanaClaimResourcesHeld` from `claim_assigned()`.
+`HanaClaimResourcesHeld` means a resource command holds Hana and prevents a new claim.
 Only an adopted claim can request the queue's first launch authorization.
 `release_assigned()` requires F1's durable command settlement before lifecycle and target claim release.
 An exact guest observation can settle an accepted execution that ended without a compiler result.
 The observation must confirm termination and lease release, and the sender must have issued no source update.
-The sender uses the guest cause when it is available and keeps a specific sender rejection if the guest reports a pending result.
+The sender uses the guest cause when it is available.
+If the guest requests a source basis or reports a pending result, the sender uses its own cause.
 For other confirmed departures, the sender attempts to release the claim without another fence observation.
 The sender requires a fence acknowledgement after a result transfer loss or when it resumes an unsettled fence.
 The sender uses the refusal code from a new image to report `HanaCommandAdmissionRefused`.
