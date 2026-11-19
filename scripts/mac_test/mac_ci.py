@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -10,7 +10,7 @@ from subprocess import DEVNULL, PIPE, TimeoutExpired, run
 from typing import TYPE_CHECKING
 
 from scripts.lib import conf
-from scripts.mac_test.claim_state import MacCiActivity
+from scripts.mac_test.claim_state import MacCiActivity, MacCiReading, NO_MAC_CI_READING, NoMacCiReading
 
 if TYPE_CHECKING:
     from scripts.mac_test import eligibility
@@ -39,7 +39,7 @@ class MacCiEvidencePass:
     """Read one host once during a pass of its evidence worker."""
 
     host: MacSshHost
-    activity: MacCiActivity = MacCiActivity.UNCHECKED
+    reading: MacCiReading | NoMacCiReading = NO_MAC_CI_READING
 
 
 _MAC_CI_EVIDENCE_PASS: ContextVar[MacCiEvidencePass] = ContextVar("mac_ci_evidence_pass")
@@ -62,22 +62,26 @@ def is_runner_worker(name: str) -> bool:
     return name == "Runner.Worker"
 
 
-def read_mac_ci_activity(configuration: conf.ConfigRead) -> MacCiActivity:
+def read_mac_ci_activity(configuration: conf.ConfigRead, now: Callable[[], float]) -> MacCiReading:
     """Read CI activity for this Mac evidence pass or standalone call."""
     from scripts.mac_test import eligibility
 
     settings = eligibility.SshProbeSettings(configuration)
     current = _MAC_CI_EVIDENCE_PASS.get(None)
-    if current is None:
-        return _read_mac_ci_processes(settings)
-    try:
-        if settings.host != current.host.address:
-            return MacCiActivity.UNKNOWN
-    except conf.Unusable:
-        return MacCiActivity.UNKNOWN
-    if current.activity is MacCiActivity.UNCHECKED:
-        current.activity = _read_mac_ci_processes(settings)
-    return current.activity
+    if current is not None:
+        try:
+            matches_host = settings.host == current.host.address
+        except conf.Unusable:
+            matches_host = False
+        if not matches_host:
+            return MacCiReading(MacCiActivity.UNKNOWN, now())
+        if isinstance(current.reading, MacCiReading):
+            return current.reading
+    observed_at = now()
+    reading = MacCiReading(_read_mac_ci_processes(settings), observed_at)
+    if current is not None:
+        current.reading = reading
+    return reading
 
 
 def _read_mac_ci_processes(settings: eligibility.SshProbeSettings) -> MacCiActivity:

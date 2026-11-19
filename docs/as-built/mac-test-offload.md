@@ -24,7 +24,10 @@ The initial limit is one build across repositories.
 A live `Runner.Worker` on the Mac counts as one Hana CI build.
 The admission service groups registered Mac targets by their configured SSH address.
 Each host pass reads CI once for the placement keys due at its start.
-The service dates the evidence at the start of that pass.
+The service checks CI freshness from the start of the CI read.
+It uses each placement probe's own time to enforce queue priority.
+An expedited key takes priority among the remaining probes in the pass.
+A key expedited during the pass also stays due for the next pass.
 New keys wait for the next pass and its new CI read.
 The shared settlement step reads CI before a standalone claim takes the state lock.
 An unreadable CI result keeps new agent builds waiting.

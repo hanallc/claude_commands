@@ -347,6 +347,22 @@ class MacCiActivity(Enum):
     UNCHECKED = "Hana CI activity has not been read"
 
 
+@dataclass(frozen=True)
+class MacCiReading:
+    """The CI activity and the time when its read started."""
+
+    activity: MacCiActivity
+    observed_at: float
+
+
+@dataclass(frozen=True)
+class NoMacCiReading:
+    """The evidence has no timestamp for a CI read."""
+
+
+NO_MAC_CI_READING = NoMacCiReading()
+
+
 class NoRun:
     """No process owns the Mac."""
 
