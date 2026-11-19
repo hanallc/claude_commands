@@ -3015,23 +3015,16 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 - Accepted (review): a deadline during an upload retry; a deterministic box failure costs one more launch; the boot shell retries paired downloads. The signed URL in result.json `log_error` and the boot.log traceback is on main; aws repairs it.
 - Row 75b8c2eb9 on main d5d81400c. Tests in both layouts, 0 failures: 6 suites; types 0.
 
-### Phase 166 — The cloud gate worker polls AWS less  · status: todo
-**Source:** builds, 2026-11-19 03:0x EST: "what polls, how often, and whether it can poll less".
-**Cause:** each cloud gate worker starts four aws CLI processes every 2 s (`result_poll_s`): get-object for gate.log, boot-error.json and result.json, then describe-instances. A 60-s sample showed 29 get-object and 10 describe-instances calls for one worker. Each call is a new Python process.
+### Phase 166 — The cloud gate worker polls AWS less  · status: done
+**Source:** builds, 2026-11-19 03:0x EST: "what polls, how often, and whether it can poll less". Each worker started four aws CLI processes every 2 s.
 
-#### Work Order
-
-**Goal:** one aws CLI call per poll in the usual case, with the same results.
-
-**Spec:**
-1. One `s3api list-objects-v2` on `artifacts/<attempt>/` per poll. Download an object only when it is listed and its ETag changed.
-2. The instance state check runs at most once per new key `instance_check_s=30`.
-
-**Base:** the Phase 165 row `75b8c2eb9` (same file).
-
-**Files:** `scripts/aws_target/cloud_gate.py`, `config/cloud_gate.conf`, `scripts/aws_target/test_cloud_gate.py`.
-
-**Acceptance gate:** a poll with no new object makes one list call; gate.log downloads only on a new ETag; result, boot error, Spot stop and time limit paths keep their outcomes. test_cloud_gate, test_aws_trial, test_control pass; types 0.
+#### As-built
+- `GateWorker.artifact_etags` lists `artifacts/<attempt>/` once per poll (`list-objects-v2`). gate.log downloads only on a new ETag; boot-error.json and result.json download only when listed.
+- Each poll: one `deadline_reached` flag at the top; the EC2 step (when due by `instance_check_s=30`, new key after `result_poll_s`, or at the deadline) in its own try keeps a stop result without raising; the S3 step in its own try reads boot-error.json, then result.json, then the progress log; then a kept EC2 outage error, then the kept stop (Spot code), then the time-limit result.
+- `_PollOutage` gives EC2 and S3 their own outage clocks (`observe_outage_s`). `TimeoutExpired` skips a step, as on main.
+- A running box costs one AWS CLI call per poll instead of four, plus a gate.log get per new ETag and an EC2 check every 30 s.
+- Accepted (review): a result published during the progress-log download at the deadline (main has the same window); a poll that crosses both the gate deadline and the attempt expiry; a list-only AccessDenied (the deploy probe checks `list-objects-v2`); one final gate.log get per gate.
+- Row dd4a56aae on the Phase 165 row 75b8c2eb9. Tests in both layouts, 0 failures: 6 suites; types 0.
 
 ### Phase 167 — A verify.sh run outside a Cargo workspace holds no cargo target  · status: todo
 **Source:** builds (from sdlc), 2026-11-19 04:1x EST: the disk floor sweep named pid 3179104 (devtools' consolecheck `verify.sh`, a Python-only suite) as the owner of four hana targets (about 380 GiB) and skipped them.
