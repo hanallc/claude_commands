@@ -3055,3 +3055,21 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 - The first line says the sweep removed idle build output only when the pass removed some; else it says it found none to remove.
 - Accepted (review): no hourly repeat for an unchanged holder (the asked rule); a repeat skip counts as told; path fit order in a long message; hard-link bytes shared across holders; one extra `/proc/<pid>/stat` read per pid on a recheck.
 - Row e9b059d52 on main 764582979. Tests in both layouts, 0 failures: 11 suites; types 0.
+
+### Phase 170 — Ten resources settings say what they do, their unit and their default  · status: done
+**Source:** builds, 2026-11-19 09:0x EST (user ask via natedev: settings must be reasonably documented). The messaging unit's config audit names resources as owner of ten keys.
+
+#### Work Order
+
+**Goal:** each named key has a comment that gives its meaning, its unit and its allowed values or default.
+
+**Spec:**
+1. `config/hana_instances.conf`: `exempt_ports` (no comment), `test_max_hours`, `unlabelled_max_minutes`, `stop_grace_seconds` (no meaning).
+2. `config/lint.conf`: `clippy_fix_jobs` (no meaning, no unit), `sweep_delete_stamp_grace_seconds`, `sweep_holder_lookback_seconds` (no meaning), `sweep_message_limit`, `sweep_push_text_limit` (no unit), `sweep_message_path_widths` (no unit, no allowed values or default).
+3. Comments only, in STE, from what each reader does. Change no key name and no value.
+
+**Files:** `config/hana_instances.conf`, `config/lint.conf`.
+
+**Workers:** `1 writer`.
+
+**Acceptance gate:** each comment matches its reader; the config tests that read these files pass; `git diff` shows only comment lines.
