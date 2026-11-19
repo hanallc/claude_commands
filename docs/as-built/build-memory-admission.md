@@ -266,23 +266,28 @@ Verify closes the launch before it releases or cancels the grant.
 If shutdown fails, verify reports the error and keeps the reservation for the service to reclaim.
 Before local Cargo starts, the copy owner writes the scope path to each checkout lease record.
 The same owner protocol binds private slots, prepared slots, and source copies.
-The owner keeps the checkout lock and sends only a confirmation.
-Verify registers the supervisor's PID and start time before it permits the supervisor to connect.
-For private slots, Verify registers on the checkout owner's command pipe.
-For prepared slots and source copies, Verify registers on a private socket from the owner.
-The owner puts the endpoint in a sealed file descriptor that each Verify invocation can read.
-Bash marks the registration sockets close-on-exec with its `fdflags` builtin.
-Verify carries the sockets through its Nix re-exec and supplies the owner identities and addresses as arguments.
-The Nix helper gives direnv no registration socket.
-The owner checks the supervisor's PID and start time with `SO_PEERCRED` and the process table.
+The owner keeps the checkout lock throughout binding.
+Each registration issues a random token that the owner accepts once.
+The copy owner gives the registration descriptors to the command the user selects, including a shell wrapper.
+Verify marks the registration sockets close-on-exec with the Bash `fdflags` builtin.
+Verify carries the sockets through its Nix re-exec. The Nix helper closes them when it starts direnv.
+Cargo, the sweep, and Verify helpers receive no registration descriptors.
+Verify reads the token from the owner. Verify passes the token to the supervisor through a private pipe.
+The supervisor closes the pipe before it starts the scope command.
 The supervisor checks the owner's PID and start time before it requests the lease.
+The owner checks the peer UID with `SO_PEERCRED` and requires the token in the first message.
+The owner refuses a used or unknown token before it writes a lease.
+A shared UID gives processes the same privileges.
+The protocol prevents accidental binding and descriptor leaks.
+A hostile process with the same UID is outside this guarantee.
+A process that does not use the protocol cannot bind a lease with an open descriptor alone.
 The private checkout owner watches Verify and the launch shell by pidfd.
 A child with an open protocol pipe cannot keep the lease after either process exits.
 The copy owner keeps the protocol apart from the streams that its commands inherit.
 The Python shim isolates the interpreter probe and cache helpers from caller descriptors.
 The final interpreter receives the caller descriptors.
 `VERIFY_SCOPE_PUBLICATION_SECONDS` sets the deadline in `config/direct.conf`.
-The deadline covers scope publication, the scope request, and lease confirmation.
+The deadline covers token registration, scope publication, the scope request, and lease confirmation.
 The supervisor checks for owner exit and channel capacity before the request.
 The request uses a nonblocking socket send.
 Verify refuses launch if the channel fills after the readiness check.

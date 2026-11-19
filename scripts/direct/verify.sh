@@ -229,22 +229,22 @@ if [[ -n "${COPIES_RUN_LOCK_FD:-}${COPIES_RUN_BIND_FD:-}${BUILDLOG_PREPARED_COPY
 fi
 
 # Take the channels before Nix can change the command environment.
-unset SOURCE_SCOPE_FD SOURCE_SCOPE_BINDING PREPARED_SCOPE_FD PREPARED_SCOPE_BINDING PREPARED_SCOPE_PATH
-SOURCE_SCOPE_FD=""
-SOURCE_SCOPE_BINDING=""
-PREPARED_SCOPE_FD=""
-PREPARED_SCOPE_BINDING=""
-PREPARED_SCOPE_PATH=""
+unset SOURCE_SCOPE_FD SOURCE_SCOPE_REPLY SOURCE_SCOPE_BINDING SOURCE_SCOPE_TIMEOUT
+unset PREPARED_SCOPE_FD PREPARED_SCOPE_REPLY PREPARED_SCOPE_BINDING PREPARED_SCOPE_TIMEOUT PREPARED_SCOPE_PATH
+SOURCE_SCOPE_FD="" SOURCE_SCOPE_REPLY="" SOURCE_SCOPE_BINDING="" SOURCE_SCOPE_TIMEOUT=""
+PREPARED_SCOPE_FD="" PREPARED_SCOPE_REPLY="" PREPARED_SCOPE_BINDING="" PREPARED_SCOPE_TIMEOUT="" PREPARED_SCOPE_PATH=""
 CHECKOUT_BINDINGS_REEXEC=0
 source_endpoint=""
 prepared_endpoint=""
 if [[ "${1:-}" == --checkout-bindings ]]; then
     CHECKOUT_BINDINGS_REEXEC=1
-    SOURCE_SCOPE_FD=$2 SOURCE_SCOPE_BINDING=$3 PREPARED_SCOPE_FD=$4 PREPARED_SCOPE_BINDING=$5 PREPARED_SCOPE_PATH=$6
-    shift 6
+    SOURCE_SCOPE_FD=$2 SOURCE_SCOPE_REPLY=$3 SOURCE_SCOPE_BINDING=$4 SOURCE_SCOPE_TIMEOUT=$5
+    PREPARED_SCOPE_FD=$6 PREPARED_SCOPE_REPLY=$7 PREPARED_SCOPE_BINDING=$8 PREPARED_SCOPE_TIMEOUT=$9
+    PREPARED_SCOPE_PATH=${10}
+    shift 10
 else
-    IFS=: read -r SOURCE_SCOPE_FD source_endpoint <<< "${COPIES_SCOPE_REGISTRATION:-}"
-    IFS=: read -r PREPARED_SCOPE_FD prepared_endpoint <<< "${BUILDLOG_SCOPE_REGISTRATION:-}"
+    IFS=: read -r SOURCE_SCOPE_FD SOURCE_SCOPE_REPLY source_endpoint <<< "${COPIES_SCOPE_REGISTRATION:-}"
+    IFS=: read -r PREPARED_SCOPE_FD PREPARED_SCOPE_REPLY prepared_endpoint <<< "${BUILDLOG_SCOPE_REGISTRATION:-}"
     PREPARED_SCOPE_PATH=${BUILDLOG_PREPARED_COPY:-}
 fi
 unset COPIES_SCOPE_REGISTRATION BUILDLOG_SCOPE_REGISTRATION
@@ -256,24 +256,32 @@ if [[ -n "$SOURCE_SCOPE_FD$PREPARED_SCOPE_FD" ]]; then
         printf 'verify.sh: cannot isolate the checkout registration descriptors\n' >&2
         exit 125
     fi
-    for scope_fd in "$SOURCE_SCOPE_FD" "$PREPARED_SCOPE_FD"; do
+    for scope_fd in "$SOURCE_SCOPE_FD" "$PREPARED_SCOPE_FD" "$SOURCE_SCOPE_REPLY" "$PREPARED_SCOPE_REPLY"; do
         [[ -n "$scope_fd" ]] || continue
         [[ "$scope_fd" =~ ^[1-9][0-9]*$ && "$scope_fd" -gt 2 && -S "/dev/fd/$scope_fd" ]] || exit 125
-        fdflags -s +cloexec,+nonblock "$scope_fd" || exit 125
+        fdflags -s +cloexec "$scope_fd" || exit 125
+    done
+    for scope_fd in "$SOURCE_SCOPE_FD" "$PREPARED_SCOPE_FD"; do
+        [[ -z "$scope_fd" ]] || fdflags -s +nonblock "$scope_fd" || exit 125
     done
     # Reopen the sealed record so successive launches have separate read offsets.
     take_checkout_endpoint() {
-        local endpoint=$1 binding=$2
+        local endpoint=$1 binding=$2 timeout=$3
         [[ "$endpoint" =~ ^[1-9][0-9]*$ && "$endpoint" -gt 2 && -f "/proc/self/fd/$endpoint" ]] || return 125
-        IFS= read -r "$binding" < "/proc/self/fd/$endpoint" || return 125
+        {
+            IFS= read -r "$binding" && IFS= read -r "$timeout"
+        } < "/proc/self/fd/$endpoint" || return 125
         exec {endpoint}<&-
     }
     if [[ "$CHECKOUT_BINDINGS_REEXEC" == 0 ]]; then
-        [[ -z "$SOURCE_SCOPE_FD" ]] || take_checkout_endpoint "$source_endpoint" SOURCE_SCOPE_BINDING || exit 125
-        [[ -z "$PREPARED_SCOPE_FD" ]] || take_checkout_endpoint "$prepared_endpoint" PREPARED_SCOPE_BINDING || exit 125
+        [[ -z "$SOURCE_SCOPE_FD" ]] ||
+            take_checkout_endpoint "$source_endpoint" SOURCE_SCOPE_BINDING SOURCE_SCOPE_TIMEOUT || exit 125
+        [[ -z "$PREPARED_SCOPE_FD" ]] ||
+            take_checkout_endpoint "$prepared_endpoint" PREPARED_SCOPE_BINDING PREPARED_SCOPE_TIMEOUT || exit 125
     fi
 fi
-readonly SOURCE_SCOPE_FD SOURCE_SCOPE_BINDING PREPARED_SCOPE_FD PREPARED_SCOPE_BINDING PREPARED_SCOPE_PATH
+readonly SOURCE_SCOPE_FD SOURCE_SCOPE_REPLY SOURCE_SCOPE_BINDING SOURCE_SCOPE_TIMEOUT
+readonly PREPARED_SCOPE_FD PREPARED_SCOPE_REPLY PREPARED_SCOPE_BINDING PREPARED_SCOPE_TIMEOUT PREPARED_SCOPE_PATH
 
 usage() {
     sed -n '/^# Usage:$/,/^# End usage\./{
@@ -598,9 +606,10 @@ elif [[ -z "${IN_NIX_SHELL:-}" ]]; then
     export VERIFY_NIX_ENV_REEXEC=1
     if [[ -n "$SOURCE_SCOPE_FD$PREPARED_SCOPE_FD" ]]; then
         set -- "$BASH" -p "$VERIFY_NIX_SCRIPT_DIR/${BASH_SOURCE[0]##*/}" \
-            --checkout-bindings "$SOURCE_SCOPE_FD" "$SOURCE_SCOPE_BINDING" \
-            "$PREPARED_SCOPE_FD" "$PREPARED_SCOPE_BINDING" "$PREPARED_SCOPE_PATH" "$@"
-        for scope_fd in "$SOURCE_SCOPE_FD" "$PREPARED_SCOPE_FD"; do
+            --checkout-bindings "$SOURCE_SCOPE_FD" "$SOURCE_SCOPE_REPLY" "$SOURCE_SCOPE_BINDING" "$SOURCE_SCOPE_TIMEOUT" \
+            "$PREPARED_SCOPE_FD" "$PREPARED_SCOPE_REPLY" "$PREPARED_SCOPE_BINDING" "$PREPARED_SCOPE_TIMEOUT" \
+            "$PREPARED_SCOPE_PATH" "$@"
+        for scope_fd in "$SOURCE_SCOPE_FD" "$PREPARED_SCOPE_FD" "$SOURCE_SCOPE_REPLY" "$PREPARED_SCOPE_REPLY"; do
             [[ -z "$scope_fd" ]] || fdflags -s -cloexec "$scope_fd" || exit 125
         done
     else
@@ -2913,10 +2922,11 @@ run_checkout_step() (
         return $?
     fi
     local DOC_COPY_OWNER_PID="" DOC_COPY_LEASE_FD="" DOC_COPY_REPLY_FD="" MAC_SOURCE_ROOT=""
-    local command=() argument_count DOC_COPY_BINDING
+    local command=() argument_count DOC_COPY_BINDING DOC_COPY_TOKEN
     step_checkout "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$VERIFY_SLOT_SOURCE" --tree "$VERIFY_SLOT_TREE" \
         --step "$CMD" --capacity-file "$VERIFY_SLOT_CAPACITY_FILE" --bind-scope -- "$@" || return $?
     if ! IFS= read -r DOC_COPY_BINDING <&"$DOC_COPY_REPLY_FD" ||
+       ! IFS= read -r DOC_COPY_TOKEN <&"$DOC_COPY_REPLY_FD" ||
        ! IFS= read -r argument_count <&"$DOC_COPY_REPLY_FD" ||
        [[ ! "$argument_count" =~ ^[1-9][0-9]*$ ]] ||
        ! mapfile -d '' -n "$argument_count" command <&"$DOC_COPY_REPLY_FD" ||
@@ -2936,6 +2946,18 @@ run_checkout_step() (
     return "$status"
 )
 
+request_checkout_token() {
+    local request=$1 reply=$2 budget=$3 started=$4 result=$5 uptime rest remaining timeout
+    read -r uptime rest < /proc/uptime || return 1
+    # The kernel reports uptime in hundredths of a second.
+    remaining=$((budget - 10 * (10#${uptime/./} - 10#${started/./})))
+    (( remaining > 0 )) || return 1
+    printf -v timeout '%d.%03d' "$((remaining / 1000))" "$((remaining % 1000))"
+    # Read one complete packet even if another Verify invocation is registered.
+    printf 'issue\n' >&"$request" &&
+        IFS= read -r -N 64 -t "$timeout" -u "$reply" "$result"
+}
+
 run_placed_scope() {
     local leader=$1 BUILDLOG_RESERVED_STEP
     shift
@@ -2945,7 +2967,8 @@ run_placed_scope() {
         export BUILDLOG_RESERVED_STEP
     fi
     local output="$PLACEMENT_SCOPE_STATE.output" supervisor reader status=0
-    local checkout_fd="" checkout_binding="" peak=${BUILDLOG_PEAK:-$PLACEMENT_SCOPE_STATE.peak}
+    local checkout_reply="" checkout_timeout="" checkout_fd="" checkout_binding=""
+    local peak=${BUILDLOG_PEAK:-$PLACEMENT_SCOPE_STATE.peak}
     local -a bindings=()
     if [[ -n "$SOURCE_SCOPE_BINDING" ]]; then
         bindings+=(--checkout-binding "$SOURCE_SCOPE_BINDING")
@@ -2954,16 +2977,17 @@ run_placed_scope() {
         return 125
     fi
     if [[ -n "${DOC_COPY_LEASE_FD:-}" ]]; then
-        checkout_fd=$DOC_COPY_LEASE_FD
         checkout_binding=$DOC_COPY_BINDING
     elif [[ -n "${BUILDLOG_PREPARED_COPY:-}" &&
             "$BUILDLOG_PREPARED_COPY" == "${DOC_REPO_TOP:-${VERIFY_REPO_ROOT:-}}" ]]; then
         checkout_fd=$PREPARED_SCOPE_FD
+        checkout_reply=$PREPARED_SCOPE_REPLY
+        checkout_timeout=$PREPARED_SCOPE_TIMEOUT
         checkout_binding=$PREPARED_SCOPE_BINDING
     fi
     if [[ -n "$checkout_binding" ]]; then
         bindings+=(--checkout-binding "$checkout_binding")
-    elif [[ -n "$checkout_fd" ||
+    elif [[ -n "${DOC_COPY_LEASE_FD:-}$checkout_fd" ||
             ( -n "${BUILDLOG_PREPARED_COPY:-}" &&
               "$BUILDLOG_PREPARED_COPY" == "${DOC_REPO_TOP:-${VERIFY_REPO_ROOT:-}}" ) ]]; then
         printf 'the checkout has no scope binding channel\n' > "$PLACEMENT_SCOPE_STATE"
@@ -2974,26 +2998,37 @@ run_placed_scope() {
         printf 'cannot create the scope output file\n' > "$PLACEMENT_SCOPE_STATE"
         return 125
     fi
+    local -a registration_start=() bind_tokens=()
+    local source_token checkout_token=${DOC_COPY_TOKEN:-} started rest
+    if [[ -n "$SOURCE_SCOPE_FD$checkout_fd" ]]; then
+        read -r started rest < /proc/uptime || return 125
+        registration_start=(--checkout-registration-start "$started")
+    fi
+    if [[ -n "$SOURCE_SCOPE_FD" ]]; then
+        if ! request_checkout_token "$SOURCE_SCOPE_FD" "$SOURCE_SCOPE_REPLY" "$SOURCE_SCOPE_TIMEOUT" "$started" source_token; then
+            printf 'the source copy did not issue a binding token\n' > "$PLACEMENT_SCOPE_STATE"
+            return 125
+        fi
+        bind_tokens+=("$source_token")
+    fi
+    if [[ -n "$checkout_binding" ]]; then
+        if [[ -n "$checkout_fd" ]] && ! request_checkout_token "$checkout_fd" "$checkout_reply" "$checkout_timeout" "$started" checkout_token; then
+            printf 'the prepared checkout did not issue a binding token\n' > "$PLACEMENT_SCOPE_STATE"
+            return 125
+        fi
+        bind_tokens+=("$checkout_token")
+    fi
     local -a launch=("$PY" "$VERIFY_START_DIR/verify_scoped_step.py" "$$" "$leader" "$PLACEMENT_SCOPE_STATE"
-                     "$peak" "$BUILDLOG_SCOPE_SH" ${bindings[@]+"${bindings[@]}"} "$@")
+                     "$peak" "$BUILDLOG_SCOPE_SH" ${registration_start[@]+"${registration_start[@]}"}
+                     ${bindings[@]+"${bindings[@]}"} "$@")
     if (( ${#bindings[@]} )); then
-        # Keep the supervisor behind a pipe until Verify registers its identity.
+        # This pipe carries the tokens into the supervisor.
         coproc SCOPE_START {
-            local permission
-            IFS= read -r permission && [[ "$permission" == launch ]] || exit 125
-            exec "${launch[@]}" </dev/null > "$output" 2>&1
+            exec "${launch[@]}" > "$output" 2>&1
         }
         supervisor=$!
-        local start_fd=${SCOPE_START[1]} stat
-        local -a fields
-        if read -r stat < "/proc/$supervisor/stat" && read -r -a fields <<< "${stat##*) }" &&
-           [[ -n "${fields[19]:-}" ]] &&
-           { [[ -z "$SOURCE_SCOPE_FD" ]] || printf '%s:%s\n' "$supervisor" "${fields[19]}" >&"$SOURCE_SCOPE_FD"; } &&
-           { [[ -z "$checkout_fd" ]] || printf '%s:%s\n' "$supervisor" "${fields[19]}" >&"$checkout_fd"; }; then
-            printf 'launch\n' >&"$start_fd" || true
-        else
-            printf 'cannot register the scope supervisor\n' > "$PLACEMENT_SCOPE_STATE"
-        fi
+        local start_fd=${SCOPE_START[1]}
+        printf '%s\n' "${bind_tokens[@]}" >&"$start_fd" || true
         exec {start_fd}>&-
     else
         (exec "${launch[@]}") > "$output" 2>&1 &

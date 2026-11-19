@@ -46,7 +46,7 @@ from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.lib.build_slots import SlotQueuePosition, NewSlotQueuePosition, NEW_SLOT_QUEUE_POSITION
 from scripts.build_queue import first_step, slot_wait
 from scripts.copies.scope_bindings import (
-    CheckoutProcess, CopyScopeRegistration, LaunchedSupervisors, OwnedCheckoutLease, checkout_binding_registration,
+    CheckoutBindTokens, CopyScopeRegistration, OwnedCheckoutLease, checkout_binding_registration,
     checkout_scope_channel, checkout_scope_listener,
 )
 from scripts.lib.build_steps import StepJob, VerifyCommand, command_job, command_program, read_step_names, verify_command
@@ -2467,8 +2467,9 @@ class CheckoutOwnerPipes:
         _ = self.reply.write(os.fsencode(checkout) + b"\n")
         self.reply.flush()
 
-    def publish_step(self, checkout: Path, endpoint: bytes, words: Sequence[str]) -> None:
-        _ = self.reply.write(os.fsencode(checkout) + b"\n" + endpoint + f"{len(words)}\n".encode("ascii"))
+    def publish_step(self, checkout: Path, endpoint: bytes, token: bytes, words: Sequence[str]) -> None:
+        _ = self.reply.write(os.fsencode(checkout) + b"\n" + endpoint + token + b"\n"
+                             + f"{len(words)}\n".encode("ascii"))
         _ = self.reply.write(b"\0".join(map(os.fsencode, words)) + b"\0")
         self.reply.flush()
 
@@ -2536,17 +2537,14 @@ def run_slot_step(source: Path, args: CopyArguments, launch: CheckoutOwnerPipes 
                                            build_folders.CheckoutLeaseKind.READY_SLOT)
                 if sys.platform == "linux":
                     with checkout_scope_listener() as (listener, endpoint):
-                        launch.publish_step(checkout, endpoint.encode(), words)
-                        registration = launch.read_command()
-                        if not registration:
-                            return 0
-                        supervisors = LaunchedSupervisors()
-                        supervisors.record(CheckoutProcess.parse(registration.decode("ascii").rstrip("\n")))
-                        with checkout_scope_channel(listener, lease, supervisors):
+                        tokens = CheckoutBindTokens()
+                        token = tokens.issue()
+                        launch.publish_step(checkout, endpoint.encode(), token.value, words)
+                        with checkout_scope_channel(listener, lease, tokens):
                             if launch.wait_for_publish():
                                 capture_step_files(output, paths, before)
                 else:
-                    launch.publish_step(checkout, b"\n", words)
+                    launch.publish_step(checkout, b"\n", b"", words)
                     if launch.wait_for_publish():
                         capture_step_files(output, paths, before)
                 return 0

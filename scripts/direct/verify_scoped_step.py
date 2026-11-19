@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+from dataclasses import dataclass
 from enum import Enum, auto
 import errno
 import fcntl
@@ -21,8 +22,10 @@ except FileNotFoundError:
     pass
 
 from scripts.build_queue.admission_records import process_start_time
-from scripts.copies.scope_bindings import CheckoutBindingChannel, checkout_peer
-from scripts.lib import conf, inotify
+from scripts.copies.scope_bindings import (
+    CHECKOUT_TOKEN_BYTES, CheckoutBindingChannel, CheckoutBindToken, checkout_peer, checkout_scope_publication_seconds,
+)
+from scripts.lib import inotify
 
 
 SCOPE_STOP_TIMEOUT_SECONDS = 10
@@ -195,18 +198,25 @@ def send_checkout_scope(channel: socket.socket, request: bytes, owners: select.p
         owners.unregister(descriptor)
 
 
-def bind_checkout_scope(checkout: CheckoutBindingChannel, scope: Path, owners: select.poll, deadline: float) -> None:
+@dataclass(frozen=True)
+class AuthorizedCheckoutBinding:
+    endpoint: CheckoutBindingChannel
+    token: CheckoutBindToken
+
+
+def bind_checkout_scope(checkout: AuthorizedCheckoutBinding, scope: Path, owners: select.poll, deadline: float) -> None:
     with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as channel:
         channel.setblocking(False)
-        channel.connect("\0" + checkout.address)
-        if checkout_peer(channel) != checkout.owner:
+        channel.connect("\0" + checkout.endpoint.address)
+        if checkout_peer(channel) != checkout.endpoint.owner:
             raise ValueError("the checkout scope peer is not the registered copy owner")
-        send_checkout_scope(channel, os.fsencode(scope) + b"\n", owners, deadline)
+        send_checkout_scope(channel, checkout.token.value + b"\n" + os.fsencode(scope) + b"\n", owners, deadline)
         wait_for_checkout_confirmation(owners, channel.fileno(), deadline)
 
 
 def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
-                    scope_shell: str, command: list[str], leases: tuple[CheckoutBindingChannel, ...]) -> int:
+                    scope_shell: str, command: list[str], leases: tuple[AuthorizedCheckoutBinding, ...],
+                    registration_started: float | None) -> int:
     # The supervisor and the scope survive the exit of the step shell.
     supervisor = os.getpid()
     unit = f"verify-step-{supervisor}.scope"
@@ -233,11 +243,15 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
             watch = None
             deadline = 0.0
             if leases:
-                seconds = conf.read_or_repository("direct").number("VERIFY_SCOPE_PUBLICATION_SECONDS")
+                seconds = checkout_scope_publication_seconds()
+                if registration_started is not None:
+                    seconds -= time.clock_gettime(time.CLOCK_BOOTTIME) - registration_started
+                if seconds <= 0:
+                    raise TimeoutError("the checkout scope publication timed out")
                 deadline = time.monotonic() + seconds
-            if any(not lease.owner.live_now() for lease in leases):
+            if any(not lease.endpoint.owner.live_now() for lease in leases):
                 raise ValueError("a checkout owner exited before launch")
-            lease_owners = {lease.owner.pid for lease in leases} - {caller, leader, supervisor}
+            lease_owners = {lease.endpoint.owner.pid for lease in leases} - {caller, leader, supervisor}
             lease_owner_fds = tuple(open_pidfd(owner, cleanup) for owner in lease_owners)
             if leases:
                 for descriptor in lease_owner_fds:
@@ -317,11 +331,25 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
 def main(argv: list[str]) -> int:
     caller, leader, release_state, peak, scope_shell, *command = argv
     try:
-        leases: list[CheckoutBindingChannel] = []
-        while command[:1] == ["--checkout-binding"]:
-            leases.append(CheckoutBindingChannel.parse(command[1]))
+        registration_started = None
+        if command[:1] == ["--checkout-registration-start"]:
+            registration_started = float(command[1])
+            if not math.isfinite(registration_started) or registration_started < 0:
+                raise ValueError("invalid checkout registration start")
             del command[:2]
-        return run_scoped_step(int(caller), int(leader), Path(release_state), peak, scope_shell, command, tuple(leases))
+        endpoints: list[CheckoutBindingChannel] = []
+        while command[:1] == ["--checkout-binding"]:
+            endpoints.append(CheckoutBindingChannel.parse(command[1]))
+            del command[:2]
+        leases: list[AuthorizedCheckoutBinding] = []
+        if endpoints:
+            with sys.stdin.buffer as pipe:
+                for endpoint in endpoints:
+                    token = CheckoutBindToken.parse(pipe.readline(CHECKOUT_TOKEN_BYTES + 1).removesuffix(b"\n"))
+                    leases.append(AuthorizedCheckoutBinding(endpoint, token))
+        return run_scoped_step(
+            int(caller), int(leader), Path(release_state), peak, scope_shell, command, tuple(leases), registration_started,
+        )
     except (OSError, ValueError) as error:
         print(f"verify.sh: cannot finish the local build scope ({error})", file=sys.stderr)
         return 125

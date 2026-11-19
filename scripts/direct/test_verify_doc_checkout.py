@@ -10,6 +10,7 @@ import os
 import secrets
 import select
 import signal
+import socket
 from pathlib import Path
 import subprocess
 import sys
@@ -23,6 +24,7 @@ from scripts.agents.remote import local_machine
 from scripts.build_queue import admission_protocol as wire, admission_records, admission_service as service, execution_identity, memory_feed, placement
 from scripts.buildlog import treekey
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+from scripts.copies import scope_bindings
 from scripts.copies.scope_bindings import OwnedCheckoutLease, checkout_binding_registration
 from scripts.direct.verify_doc_test_support import CARGO_STUB, VERIFY, VerifyDocFixture
 from scripts.direct.verify_mac_offload_test_support import processes_carrying, reap, wait_for_marker_exit
@@ -391,6 +393,7 @@ observations = []
 source_locks = set()
 source_registration = set()
 slot_pipes = set()
+token_pipes = set()
 verify_pid = 0
 
 def inspect(pid):
@@ -411,6 +414,8 @@ def inspect(pid):
             source_registration.update(descriptors[fd] for fd in environment[b"COPIES_SCOPE_REGISTRATION"].split(b":"))
         if verify_pid and "copies.py" in names and "hold" in arguments:
             slot_pipes.update(descriptors[fd] for fd in (b"0", b"1") if descriptors[fd].startswith("pipe:"))
+        if "verify_scoped_step.py" in names and descriptors.get(b"0", "").startswith("pipe:"):
+            token_pipes.add(descriptors[b"0"])
         if verify_pid:
             observations.append((pid, arguments, names, set(descriptors.values())))
     return arguments
@@ -423,6 +428,8 @@ if run.status != 0:
 assert source_locks and source_registration and slot_pipes, "the fixture did not see the source lease and checkout pipes"
 assert any("taplo" in names for _, _, names, _ in observations)
 assert any("tee" in names for _, _, names, _ in observations)
+assert token_pipes, "the fixture did not see the private token pipe"
+assert any("cargo" in names for _, _, names, _ in observations)
 assert any("verify_scoped_step.py" in names for _, _, names, _ in observations)
 assert any("dev_features.py" in names for _, _, names, _ in observations), "the helper fallback did not run"
 leaks = set()
@@ -432,6 +439,8 @@ for pid, arguments, names, descriptors in observations:
         unexpected |= descriptors & source_registration
     if not ("copies.py" in names and "hold" in arguments):
         unexpected |= descriptors & slot_pipes
+    if "verify_scoped_step.py" not in names:
+        unexpected |= descriptors & token_pipes
     if unexpected:
         leaks.add(tuple(map(os.path.basename, arguments[:3])))
 assert not leaks, "unbound children inherited checkout descriptors: " + repr(sorted(leaks))
@@ -560,7 +569,8 @@ from types import SimpleNamespace
 send = verify_scoped_step.send_checkout_scope
 poll = verify_scoped_step.poll_checkout_until
 elapsed = 0.0
-clock = SimpleNamespace(monotonic=lambda: time.monotonic() + elapsed)
+clock = SimpleNamespace(monotonic=lambda: time.monotonic() + elapsed,
+                        clock_gettime=time.clock_gettime, CLOCK_BOOTTIME=time.CLOCK_BOOTTIME)
 
 def send_on_full_channel(channel, request, owners, deadline):
     global elapsed
@@ -1146,7 +1156,7 @@ for descriptor in (8, 74):
             lease = OwnedCheckoutLease(slot.path, descriptor, build_folders.CheckoutLeaseKind.READY_SLOT)
             with checkout_binding_registration(lease) as registration:
                 self.environment["BUILDLOG_SCOPE_REGISTRATION"] = registration.handoff()
-                endpoint = Path(f"/proc/self/fd/{registration.endpoint}").read_text().strip()
+                endpoint = Path(f"/proc/self/fd/{registration.endpoint}").read_text().splitlines()[0]
                 self.environment["BUILDLOG_PREPARED_COPY_BIND_ADDRESS"] = endpoint.rsplit(":", 1)[1]
                 try:
                     yield slot.path
@@ -1163,10 +1173,15 @@ for descriptor in (8, 74):
             self.assertEqual(list((self.root / "slots").glob("*-slot*.lease.json")),
                              [build_slots.lease_path(checkout)])
 
+    def prepared_registration_targets(self) -> set[str]:
+        return {os.readlink(f"/proc/self/fd/{fd}")
+                for fd in self.environment["BUILDLOG_SCOPE_REGISTRATION"].split(":")}
+
     def test_direnv_cannot_bind_or_receive_a_prepared_checkout_lease(self) -> None:
         observed = self.root / "direnv-copy-reply"
         _ = self.environment.pop("IN_NIX_SHELL", None)
         self.executable(self.root / "bin/direnv", f'''
+from contextlib import suppress
 import json
 import os
 from pathlib import Path
@@ -1174,6 +1189,12 @@ import socket
 import sys
 
 if sys.argv[1:] == ["export", "json"]:
+    inherited = set()
+    for fd in Path("/proc/self/fd").iterdir():
+        with suppress(FileNotFoundError):
+            inherited.add(os.readlink(fd))
+    expected = set(os.environ["TEST_REGISTRATION_TARGETS"].splitlines())
+    assert not expected & inherited, "direnv inherited checkout registration descriptors"
     legacy = os.environ.get("VERIFY_CHECKOUT_CHANNEL", "")
     address = legacy or os.environ["BUILDLOG_PREPARED_COPY_BIND_ADDRESS"]
     with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as channel:
@@ -1190,11 +1211,12 @@ if sys.argv[1:] == ["export", "json"]:
     print(json.dumps({{"IN_NIX_SHELL": "impure"}}))
 ''')
         with self.prepared_doc_slot() as checkout:
+            self.environment["TEST_REGISTRATION_TARGETS"] = "\n".join(sorted(self.prepared_registration_targets()))
             _ = (checkout / ".envrc").write_text("# Use the fixture direnv.\n")
             descriptor = build_folders.build_folder_lock_fd(checkout)
             process, log, _ = self.start_doc(pass_fds=(descriptor,))
             self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), 0, log.read_text())
-            self.assertEqual(observed.read_bytes(), b"", "direnv received a checkout lease response")
+            self.assertEqual(observed.read_bytes(), b"refused\n", "direnv received a binding confirmation")
             self.assertEqual(len(self.cargo_calls()), 1)
 
     def test_unregistered_scope_peer_cannot_bind_a_prepared_checkout(self) -> None:
@@ -1222,9 +1244,91 @@ print(confirmation.decode(), end="")
             result = subprocess.run(
                 ["bash", str(verify), sys.executable, str(supervisor)], env=self.environment, cwd=self.repo,
                 capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(result.stdout, "", "The unregistered scope peer received confirmation")
+            self.assertEqual(result.stdout, "refused\n", "The unregistered scope peer received confirmation")
             record = cast(dict[str, object], json.loads(build_slots.lease_path(checkout).read_text()))
             self.assertNotIn("scope", record)
+
+    def register_checkout_token(self, _peer: int) -> bytes:
+        request, reply, _ = map(int, self.environment["BUILDLOG_SCOPE_REGISTRATION"].split(":"))
+        with socket.socket(fileno=os.dup(request)) as sender, socket.socket(fileno=os.dup(reply)) as receiver:
+            receiver.settimeout(TEST_HANG_GUARD_SECS)
+            sender.sendall(b"issue\n")
+            return receiver.recv(64)
+
+    def connect_checkout_scope(self) -> socket.socket:
+        address = self.environment["BUILDLOG_PREPARED_COPY_BIND_ADDRESS"]
+        channel = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        try:
+            channel.settimeout(TEST_HANG_GUARD_SECS)
+            channel.connect("\0" + address)
+        except OSError:
+            channel.close()
+            raise
+        return channel
+
+    def scope_request(self, channel: socket.socket, scope: Path, token: bytes = b"") -> bytes:
+        header = token + b"\n" if token else b""
+        channel.sendall(header + os.fsencode(scope) + b"\n")
+        return channel.recv(64)
+
+    def test_stale_checkout_connection_without_token_cannot_bind(self) -> None:
+        worker = self.root / "queued-checkout-peer"
+        self.executable(worker, r"""
+import os
+import socket
+import sys
+
+if sys.stdin.buffer.read(1) != b"x":
+    raise SystemExit(2)
+with socket.socket(fileno=int(sys.argv[1])) as transport:
+    address = os.environ["BUILDLOG_PREPARED_COPY_BIND_ADDRESS"]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as binding:
+        binding.connect("\0" + address)
+        socket.send_fds(transport, [b"connected"], [binding.fileno()])
+""")
+        receive, send = socket.socketpair()
+        with receive, send, self.prepared_doc_slot() as checkout:
+            receive.settimeout(TEST_HANG_GUARD_SECS)
+            with subprocess.Popen([str(worker), str(send.fileno())], env=self.environment, cwd=self.repo,
+                                  stdin=subprocess.PIPE, pass_fds=(send.fileno(),)) as peer:
+                start = admission_records.process_start_time
+
+                def reused_start(pid: int) -> str | None:
+                    return "123456789" if pid == peer.pid else start(pid)
+
+                with mock.patch.object(scope_bindings, "process_start_time", reused_start):
+                    # The old process number denotes a new live identity in the process table.
+                    _ = self.register_checkout_token(peer.pid)
+                    assert peer.stdin is not None
+                    _ = peer.stdin.write(b"x")
+                    peer.stdin.close()
+                    message, descriptors = socket.recv_fds(receive, 32, 1)[:2]
+                    self.assertEqual(message, b"connected")
+                    self.assertEqual(len(descriptors), 1)
+                    with socket.socket(fileno=descriptors[0]) as stale:
+                        self.assertEqual(peer.wait(timeout=TEST_HANG_GUARD_SECS), 0)
+                        stale.settimeout(TEST_HANG_GUARD_SECS)
+                        scope = self.root / f"verify-step-{peer.pid}.scope"
+                        self.assertEqual(self.scope_request(stale, scope), b"refused\n",
+                                         "A stale checkout connection bound without a token")
+                record = cast(dict[str, object], json.loads(build_slots.lease_path(checkout).read_text()))
+                self.assertNotIn("scope", record)
+
+    def test_second_registration_does_not_restore_a_spent_token(self) -> None:
+        first_scope = self.root / "first" / f"verify-step-{os.getpid()}.scope"
+        second_scope = self.root / "second" / first_scope.name
+        with self.prepared_doc_slot() as checkout:
+            first = self.register_checkout_token(os.getpid())
+            with self.connect_checkout_scope() as channel:
+                self.assertEqual(self.scope_request(channel, first_scope, first), b"bound\n")
+            second = self.register_checkout_token(os.getpid())
+            with self.connect_checkout_scope() as channel:
+                self.assertEqual(self.scope_request(channel, second_scope, first), b"refused\n",
+                                 "A second registration restored a spent token")
+            record = cast(dict[str, object], json.loads(build_slots.lease_path(checkout).read_text()))
+            self.assertEqual(record["scope"], str(first_scope))
+            with self.connect_checkout_scope() as channel:
+                self.assertEqual(self.scope_request(channel, second_scope, second), b"bound\n")
 
     @contextmanager
     def scope_confirmation_stub(self) -> Generator[str]:
@@ -1278,7 +1382,7 @@ from dataclasses import replace
 bind = verify_scoped_step.bind_checkout_scope
 
 def redirect(checkout, scope, owners, deadline):
-    bind(replace(checkout, address={address!r}), scope, owners, deadline)
+    bind(replace(checkout, endpoint=replace(checkout.endpoint, address={address!r})), scope, owners, deadline)
 """, 'patch.object(verify_scoped_step, "bind_checkout_scope", redirect)')
             process, log, _ = self.start_doc()
             self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), 125, log.read_text())
@@ -1337,13 +1441,16 @@ exec "$@"'''
         with self.hold_background_sweep() as started:
             with self.prepared_doc_slot() as checkout:
                 descriptor = build_folders.build_folder_lock_fd(checkout)
-                lock = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+                lock = os.readlink(f"/proc/self/fd/{descriptor}")
+                registration_targets = self.prepared_registration_targets()
                 process, log, marker = self.start_doc(command=command, pass_fds=(descriptor,))
                 sweep_pid = wait_for_pid(started, processes=(process,))
                 self.assertEqual(process.wait(timeout=TEST_HANG_GUARD_SECS), 0, log.read_text())
                 self.assertIn(sweep_pid, processes_carrying(marker))
                 descriptors = Path(f"/proc/{sweep_pid}/fd")
-                self.assertNotIn(lock, [entry.resolve() for entry in descriptors.iterdir()])
+                inherited = {os.readlink(entry) for entry in descriptors.iterdir()}
+                self.assertNotIn(lock, inherited)
+                self.assertFalse(inherited & registration_targets, "The sweep inherited registration descriptors")
             self.assertEqual(build_folders.build_folder_state(checkout, wait=False), "free")
 
     def test_prepared_doc_lock_does_not_reach_the_background_sweep(self) -> None:
