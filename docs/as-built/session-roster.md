@@ -282,7 +282,7 @@ The relay runs `command claude -p` with Sonnet, auto mode, and only the `SendMes
 It disables MCP, slash commands, and settings sources and removes inherited `CLAUDE_*` variables.
 The proxy checks the request and writes it to the recipient's verified socket.
 The relay requires a completed proxy write of the approved text and one explicit success result for the forwarded tool ID.
-The `SENT` line reports how many other calls the proxy refused.
+The `SENT` line reports how many SendMessage calls the relay made and that the proxy forwarded one.
 It saves the tool stream in `STATE/relay/<to>.jsonl`.
 `--timeout` defaults to 40 s for every transport.
 If `~/.config/claude/oauth-token.gpg` exists, the relay decrypts it for authentication.

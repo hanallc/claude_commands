@@ -63,7 +63,7 @@ Before it writes any bytes, the proxy compares the decoded body with the exact e
 The encoder matches the two tag escape passes in Claude Code 2.1.319.
 The sender uses the tool ID from the completed proxy write to find the approved call and its result.
 The sender requires a complete forward of the approved text and one explicit success result for that tool ID.
-The sender counts other calls as refusals on the `SENT` line.
+The `SENT` line reports how many SendMessage calls the relay made and that the proxy forwarded one.
 A possible write without confirmed acceptance leaves delivery unconfirmed and retains the claim.
 Claude's socket protocol has no expected conversation field.
 The race window extends from the final registry check until the receiver accepts the request.

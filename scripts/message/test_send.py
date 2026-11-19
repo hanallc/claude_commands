@@ -709,7 +709,7 @@ send._bound_relay(message, 2, [], {}, attempt)
                 ("second call approved", 0,
                  stream(INIT, call(original, "refused"), answer("unexpected SendMessage input", "refused", error=True),
                         call(displayed), answer(OK)),
-                 "sent", "queued there (msg_id m1); 2 SendMessage calls; the proxy refused 1"),
+                 "sent", "queued there (msg_id m1); forwarded 1 of 2 SendMessage calls"),
             ):
                 with (
                     self.subTest(label=label),

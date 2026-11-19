@@ -3389,7 +3389,7 @@ def read_relay(observed: RelayTransportResponse, text: str) -> CheckedRelayAccep
         return _unaccepted_relay(forward, "SendMessage has no matching completed proxy forward")
     detail = f"mode {mode}; verbatim; {describe(answer)}"
     if len(sends) > 1:
-        detail += f"; {len(sends)} SendMessage calls; the proxy refused {len(sends) - 1}"
+        detail += f"; forwarded 1 of {len(sends)} SendMessage calls"
     return CheckedRelayAcceptance(tool_id, detail)
 
 
