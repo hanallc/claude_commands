@@ -473,6 +473,29 @@ Review and The List use Show chips.
 The shared table tracks the selected Show chip.
 The address and refresh retain the selected Show view.
 Review submissions retain the Type, Show and Owner chips and the search words.
+A page owner's New item dialog lists the evidence under **Sent with your words**.
+The server starts a screenshot when the dialog opens with **Include a screenshot** selected.
+The dialog shows **Taking a screenshot** until the preview is available.
+Select the preview to open the image at full size.
+Send saves the item with the evidence shown in the dialog.
+If the native write fails, the server discards the staged evidence.
+The server holds the preview for the retry.
+The draft stays available for edits after a failed Send.
+Send publishes the saved item and delivers its message before it confirms success.
+A retry with the same request ID resumes publication and delivery of the saved item.
+If the content matches, the retry returns the saved item.
+If the content changed, the dialog shows the saved item ID and keeps the edits.
+The next Send uses a new request ID.
+When Back restores an open dialog, the dialog takes a new screenshot if the box is checked.
+Changing the type keeps the same capture.
+If the preview expires, the dialog keeps the draft and shows the placeholder while it takes a new screenshot.
+If the first Send fails because the preview expires, the checkbox stays available.
+Select **Send** again when the new screenshot appears.
+Clear **Include a screenshot** to omit the image.
+A Bug always includes up to 48 rows of visible text from when the dialog opened.
+It also includes the page title, address, filters, render time, error lines, and script errors.
+For other types, Send includes visible text when the block shows the fallback notice.
+A Bug with a screenshot also includes the viewport.
 A new item opens when it matches the current filters.
 Review shows a save confirmation when the current filters hide the new item.
 A save conflict shows its reason and preserves the current filters.

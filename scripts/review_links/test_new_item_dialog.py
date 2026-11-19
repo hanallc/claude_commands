@@ -237,13 +237,19 @@ function untilError() {
 
    const ownerPosts = [], ownerEndpoint = '/console/review/new-item?page=builds';
    let pngAvailable = true, discarded, useLiveSends = false, dropPageReply = true;
-   const captureKey = 'd34db33fd34db33fd34db33fd34db33f';
+   let captureKey = 'd34db33fd34db33fd34db33fd34db33f';
+   let releasePreview, expireNextSend = false, failNextSend = false;
+   let previewGate = new Promise(resolve => { releasePreview = resolve; });
    const json = (value, status = 200) => Promise.resolve(new Response(JSON.stringify(value), {status}));
    window.fetch = (url, options) => {
     if (url === ownerEndpoint) {
      return json({token:'owner-token', page_owner:'builds-staff', recipients:[
       {id:'builds-staff', name:'builds', proposal:false},
       {id:'fixture-list-producer', name:'morty', proposal:false}]});
+    }
+    if (url === '/console/review/new-item?capture_key=' + captureKey) {
+     check(options.headers['X-Review-Token'] === 'owner-token', 'The preview requests use the form token.');
+     return previewGate.then(() => originalFetch('data:image/png;base64,' + png));
     }
     if (url !== '/console/review/new-item' || options?.method !== 'POST') return originalFetch(url, options);
     const payload = JSON.parse(options.body);
@@ -255,6 +261,16 @@ function untilError() {
      discarded?.();
      return json({});
     }
+    if (expireNextSend) {
+     expireNextSend = false;
+     captureKey = 'e34db33fd34db33fd34db33fd34db33f';
+     previewGate = new Promise(resolve => { releasePreview = resolve; });
+     return json({code:'screenshot_expired', error:'The screenshot expired.'}, 409);
+    }
+    if (failNextSend) {
+     failNextSend = false;
+     return json({error:'Could not publish the item. Try Send again.'}, 503);
+    }
     if (useLiveSends) {
      const response = originalFetch(url, {...options, body: JSON.stringify({...payload, token: attempted[0].token})});
      return payload.page && dropPageReply ? response.then(saved => {
@@ -265,9 +281,18 @@ function untilError() {
     return json({id:'I2', key:'saved'});
    };
    const checkbox = dialog.querySelector('[name="include_page"]');
+   function whenShown(element) {
+    if (!element.hidden) return Promise.resolve();
+    return new Promise(resolve => {
+     const observer = new MutationObserver(() => { if (!element.hidden) { observer.disconnect(); resolve(); } });
+     observer.observe(element, {attributes:true, attributeFilter:['hidden']});
+    });
+   }
    async function openOwner() {
     await open({page:'builds', kind:'question', evidence:{kind:'none'}});
-    check(checkbox.checked && !checkbox.closest('label').hidden, 'The page checkbox is checked on open.');
+    if (!pngAvailable) await whenShown(dialog.querySelector('[data-fallback]'));
+    check(checkbox.checked && !checkbox.disabled && !checkbox.closest('label').hidden,
+          'The page checkbox is checked and available on open.');
     check(to().length === 2 && to()[0].checked && to()[0].value === 'builds-staff', 'The page owner is selected.');
     check(morty() && !morty().checked, 'The page dialog also offers morty.');
     check(to()[0].nextElementSibling.hasAttribute('data-button-face'), 'The owner chip uses the shared button style.');
@@ -282,11 +307,23 @@ function untilError() {
    await openOwner();
    check(ownerPosts.length === 1 && ownerPosts[0].page_capture.width === innerWidth,
          'Opening the dialog starts one capture at the requested viewport.');
+   const slot = dialog.querySelector('[data-capture-slot]');
+   const shot = slot.querySelector('[data-shot]');
+   check(!slot.hidden && !slot.querySelector('[data-taking]').hidden && shot.hidden,
+         'The screenshot slot shows the placeholder while the capture runs.');
    checkbox.click();
+   check(slot.hidden, 'Clearing the checkbox hides the capture slot.');
    checkbox.click();
+   releasePreview();
+   await whenShown(shot);
+   const image = shot.href;
+   dialog.querySelector('[name="kind"][value="bug"]').click();
+   check(!shot.hidden && shot.href === image && ownerPosts.length === 1,
+         'Changing to Bug keeps the original image and capture request.');
    await sendOwner();
    check(ownerPosts.length === 2 && ownerPosts[1].capture_key === captureKey &&
-         ownerPosts[1].images.length === 0, 'Send uses the same capture key after the user checks the box again.');
+         ownerPosts[1].images.length === 0 && ownerPosts[1].evidence.kind === 'none',
+         'Send uses the same preview without the fallback rows.');
 
    await openOwner();
    checkbox.click();
@@ -319,6 +356,53 @@ function untilError() {
          'The title and rows keep an emoji at the character limit.');
    check(ownerPosts[8].page === 'builds', 'Send includes the page identity.');
 
+   pngAvailable = true;
+   await openOwner();
+   await whenShown(shot);
+   const oldKey = captureKey, oldImage = shot.href, at = ownerPosts.length;
+   const expired = dialog.querySelector('[data-capture-expired]');
+   type('Keep these words if the screenshot expires.');
+   expireNextSend = true;
+   dialog.querySelector('[type="submit"]').click();
+   await whenShown(expired);
+   check(dialog.open && !checkbox.disabled && !slot.querySelector('[data-taking]').hidden && shot.hidden &&
+         dialog.querySelector('[type="submit"]').disabled, 'Expiration shows the placeholder and pauses Send.');
+   check(textarea.value === 'Keep these words if the screenshot expires.' &&
+         ownerPosts.length === at + 2 && ownerPosts[at].capture_key === oldKey &&
+         ownerPosts[at + 1].page_capture.place === ownerPosts[at - 1].page_capture.place,
+         'Expiration retains the words and takes a new screenshot of the same place.');
+   releasePreview();
+   await whenShown(shot);
+   check(shot.href !== oldImage, 'The new preview replaces the expired image.');
+   await sendSaved();
+   check(ownerPosts.length === at + 3 && ownerPosts[at + 2].capture_key === captureKey &&
+         ownerPosts[at + 2].request_id === ownerPosts[at].request_id &&
+         ownerPosts[at + 2].evidence.kind === 'none', 'The second click sends the new screenshot only.');
+
+   await openOwner();
+   await whenShown(shot);
+   type('Keep this draft when Back restores the page.');
+   const discardedOnHide = new Promise(resolve => { discarded = resolve; });
+   const beforeRestore = captureKey;
+   window.dispatchEvent(new PageTransitionEvent('pagehide', {persisted:true}));
+   await discardedOnHide;
+   check(shot.hidden && send.disabled, 'Leaving the page clears the preview and pauses Send.');
+   captureKey = 'f34db33fd34db33fd34db33fd34db33f';
+   previewGate = new Promise(resolve => { releasePreview = resolve; });
+   window.dispatchEvent(new PageTransitionEvent('pageshow', {persisted:true}));
+   check(dialog.open && !slot.querySelector('[data-taking]').hidden && send.disabled,
+         'Back restores the dialog with its screenshot placeholder.');
+   releasePreview();
+   await whenShown(shot);
+   dialog.querySelector('[name="kind"][value="bug"]').click();
+   await sendSaved();
+   const restored = ownerPosts.at(-1);
+   check(restored.capture_key === captureKey && restored.capture_key !== beforeRestore &&
+         restored.evidence.kind === 'page-data' && restored.evidence.rows.length > 0 &&
+         restored.words === 'Keep this draft when Back restores the page.',
+         'Send uses the new screenshot and the visible Bug rows after Back.');
+
+   pngAvailable = false;
    useLiveSends = true;
    await openOwner();
    dialog.querySelector('[name="kind"][value="investigation"]').click();
@@ -335,11 +419,16 @@ function untilError() {
          'Standard New keeps the failed page draft and its pasted image.');
    const ownerRequest = ownerPosts.at(-1);
    recipient().click();
-   check((await sendSaved()).detail.id === 'I2', 'The retry returns the item already filed.');
+   await trySend();
+   check(dialog.open && textarea.value === 'Keep this draft and its image.' &&
+         error.textContent === 'Your first Send was filed as I2. Your changes were not sent.',
+         'A changed Send reports the first ID and keeps the draft open.');
    const standardRequest = ownerPosts.at(-1);
    check(!standardRequest.page && !standardRequest.capture_key && standardRequest.images[0].base64_data === png &&
          standardRequest.request_id === ownerRequest.request_id,
-         'old -> new: Standard New uses a new request ID -> Standard New keeps the draft request ID.');
+         'The first retry uses the old request ID and the current evidence.');
+   check((await sendSaved()).detail.id === 'I3' && ownerPosts.at(-1).request_id !== ownerRequest.request_id,
+         'The next Send uses a new ID and files the retained draft.');
    await openOwner();
    dialog.querySelector('[name="kind"][value="investigation"]').click();
    type('The first item before replacement.');
@@ -350,9 +439,14 @@ function untilError() {
    await open({evidence:{kind:'none'}});
    type('The replacement item.');
    to()[1].click();
+   await trySend();
+   check(dialog.open && textarea.value === 'The replacement item.' && to()[1].checked &&
+         error.textContent === 'Your first Send was filed as I4. Your changes were not sent.',
+         'The notice keeps the changed words and recipient.');
+   check(ownerPosts.at(-1).request_id === firstDraft.request_id, 'The first retry uses the original request ID.');
    const replacement = (await sendSaved()).detail;
-   check(replacement.id === 'I4', 'The replacement files for the new recipient.');
-   check(ownerPosts.at(-1).request_id === firstDraft.request_id, 'The replacement keeps the ID after the lost response.');
+   check(replacement.id === 'I5' && ownerPosts.at(-1).request_id !== firstDraft.request_id,
+         'The next Send files the changed words for the selected recipient.');
    await openOwner();
    dialog.querySelector('[name="kind"][value="investigation"]').click();
    const undoWords = 'Restore these words after the edit.';
@@ -362,7 +456,7 @@ function untilError() {
    type('Edit the draft.');
    type(undoWords);
    dropPageReply = false;
-   check((await sendSaved()).detail.id === 'I5', 'F013 returns the first item after undo.');
+   check((await sendSaved()).detail.id === 'I6', 'F013 returns the first item after undo.');
 
    const pageTitle = main.querySelector('h1');
    pageTitle.textContent = 'First queue state';
@@ -381,6 +475,26 @@ function untilError() {
    await sendSaved();
    check(ownerPosts.at(-1).recipient_id === 'fixture-list-producer' &&
          ownerPosts.at(-1).page_recipient === 'list-owner', 'Send keeps the selected List owner.');
+
+   useLiveSends = false;
+   pngAvailable = true;
+   for (const checked of [false, true]) {
+    await openOwner();
+    await whenShown(shot);
+    if (!checked) checkbox.click();
+    type('Change the screenshot choice after a failed Send.');
+    failNextSend = true;
+    await trySend();
+    const first = ownerPosts.at(-1);
+    check(!checkbox.disabled, 'A failed Send keeps the screenshot choice available.');
+    checkbox.click();
+    dialog.querySelector('[name="kind"][value="bug"]').click();
+    await sendSaved();
+    const retry = ownerPosts.at(-1);
+    check(retry.request_id === first.request_id && Boolean(retry.capture_key) === !checked &&
+          retry.kind === 'bug' && retry.evidence.kind === 'page-data',
+          'The retry uses the current kind and evidence for the same draft.');
+   }
    window.fetch = originalFetch;
   }
  } catch (failure) {
@@ -413,7 +527,9 @@ const wire = [], fetchHTTP = window.fetch;
 window.fetch = async (path, options) => {
  if (!String(path).startsWith('/console/review/new-item')) return fetchHTTP(path, options);
  if (!options.body) return Response.json({token:'fixture',recipients:[{id:'owner',name:'sdlc',proposal:false}]});
- wire.push(JSON.parse(options.body));
+ const payload = JSON.parse(options.body);
+ wire.push(payload);
+ if (payload.page_capture) return Response.json({error:'No Firefox.'},{status:503});
  return Response.json({id:'I1',key:'bug/owner/I1'});
 };
 const dialog = document.querySelector('dialog');
@@ -453,15 +569,21 @@ const send = () => new Promise(resolve => {
    document.querySelector('main').append(table);
   }
   await open();
-  check(!state.hidden && state.textContent.includes('Page state to send'), 'The Bug dialog shows the page state.');
+  check(!state.hidden && state.closest('[data-sent-details]').textContent.includes('Sent with your words'),
+        'The Bug dialog lists the page facts with the evidence it sends.');
   check(dialog.querySelector('[data-kind="proposal"]').getClientRects().length === 0,
         'The console owner dialog does not display Proposal.');
   check(state.textContent.includes('Type All · State Open · Owner builds'), 'The dialog shows the selected filters.');
+  const address = [...state.querySelectorAll('dt')].find(term => term.textContent === 'Address');
+  check(address?.nextElementSibling.textContent === location.href, 'The Address row shows the full address.');
+  check(state.querySelector('[data-visible-text]').textContent === 'Visible text from this page (up to 48 rows)',
+        'The Bug block lists the visible text.');
   check(state.textContent.includes('2.40 s') && state.textContent.includes('Could not load …/brain.'),
         'The dialog shows the render time and the notice.');
   check(checkbox.checked && checkbox.labels[0].textContent.trim() === 'Include a screenshot',
         'The screenshot box is checked by default.');
-  check(wire.length === 0, 'Opening the Bug dialog requests no screenshot.');
+  check(wire.length === 1 && wire[0].page_capture.place === location.pathname+location.search+location.hash,
+        'Opening the Bug dialog starts the screenshot of the current page.');
   type('Review takes over two seconds with the builds filter. It also shows a load error.');
   if (__PHOTO__) {
    const title = dialog.querySelector('h2');
@@ -473,23 +595,33 @@ const send = () => new Promise(resolve => {
    checkbox.click();
    document.querySelector('.notice').textContent = 'A later notice.';
    await send();
-   const [post] = wire, captured = post.page_state;
-   check(wire.length === 1 && !post.capture_key && !captured.include_screenshot,
-         'Unchecked Send requests no screenshot.');
-   check(post.page === 'review' && captured.url === location.href
-         && captured.viewport.width === innerWidth && captured.viewport.height === innerHeight && captured.viewport.dark,
-         'The request includes the page, the full URL and the viewport.');
+   const post = wire[1], captured = post.page_state;
+   check(wire.length === 2 && !post.capture_key && !captured.include_screenshot,
+         'Unchecked Send omits the screenshot.');
+   check(post.page === 'review' && captured.url === location.href && !('viewport' in captured),
+         'The request includes the page and full address without a viewport.');
    check(captured.render_seconds === 2.4 && captured.notices.join() === 'Could not load …/brain.'
+         && post.evidence.kind === 'page-data'
          && post.evidence.rows.some(row=>row.includes('Could not load …/brain.')),
-         'The request uses the data from dialog open.');
-   const bytes = new TextEncoder().encode(JSON.stringify(post.evidence)).length;
-   check(bytes <= 64*1024 && post.evidence.rows.length < 48 &&
-         post.evidence.rows.some(row=>row.includes('😀'.repeat(240))),
-         'The dialog keeps complete rows within the UTF-8 byte budget.');
+         'The request uses the page facts and visible rows from when the dialog opened.');
    check(captured.script_errors.length === 20 && captured.script_errors[0].message === 'Error 2'
          && captured.script_errors[0].line === 9 && captured.script_errors[0].column === 3
          && captured.script_errors.at(-1).message === 'Rejected', 'The request keeps the last twenty script errors.');
    check(dialog.open === false, 'Send closes the dialog.');
+
+   await open();
+   const fallback = dialog.querySelector('[data-fallback]');
+   if (fallback.hidden) await new Promise(resolve => {
+    const observer = new MutationObserver(() => { if (!fallback.hidden) { observer.disconnect(); resolve(); } });
+    observer.observe(fallback, {attributes:true, attributeFilter:['hidden']});
+   });
+   type('Keep the visible rows when the screenshot fails.');
+   await send();
+   const evidence = wire[3].evidence;
+   const bytes = new TextEncoder().encode(JSON.stringify(evidence)).length;
+   check(bytes <= 64*1024 && evidence.rows.length < 48 &&
+         evidence.rows.some(row=>row.includes('😀'.repeat(240))),
+         'The fallback keeps complete rows within the UTF-8 byte budget.');
   }
  } catch (error) {
   failures.push(String(error));
@@ -625,6 +757,9 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
             if len(fixture.posts) == 1:
                 self.send_json(503, {"error": "Fixture rejected the first send."})
                 return
+            if isinstance(item, review_submissions.EditedSubmission):
+                self.send_json(409, {"code": "already_filed", "id": item.id})
+                return
             self.send_json(201, {"id": item.id, "key": item.key, "state": "Waiting"})
 
         @override
@@ -669,7 +804,7 @@ class NewItemDialogTests(unittest.TestCase):
         self.assertIn('<svg aria-hidden="true"', markup)
         self.assertLess(markup.index('data-evidence'), markup.index('name="words"'))
         self.assertIn('name="include_page" checked', markup)
-        self.assertIn('data-page-capture hidden', markup)
+        self.assertIn('data-sent-details aria-labelledby="sent-details-title" hidden', markup)
 
     def test_page_data_and_capture_size_are_checked(self) -> None:
         fields = {"kind": "page-data", "title": "The List", "rows": [["Item", "State"], ["Console", "Open"]]}
@@ -706,28 +841,28 @@ class NewItemDialogTests(unittest.TestCase):
             with self.subTest(width=width), patch.dict(os.environ, fixture.environment()):
                 self.assertEqual(fixture.results, [])
                 records = investigation.records(OWNER)
-                self.assertEqual([item.id for item in records], ["I1", "I2", "I3", "I5", "I6", "I7"])
-                original = records[2]
+                self.assertEqual([item.id for item in records], ["I1", "I2", "I3", "I4", "I6", "I7", "I8"])
+                original = records[3]
                 for report, title in zip(records[-2:], ("First queue state", "Second queue state"), strict=True):
                     self.assertEqual(report.question, "Show the queue state.")
                     assert isinstance(report.submission, new_item_dialog.ReviewSubmission)
                     evidence = report.submission.evidence
                     assert isinstance(evidence, new_item_dialog.PageDataEvidence)
                     self.assertEqual(evidence.title, title)
-                replacement, = investigation.records(OTHER_RECIPIENT)
+                changed, = investigation.records(OTHER_RECIPIENT)
+                self.assertEqual((changed.id, changed.question), ("I5", "The replacement item."))
                 for_morty, = investigation.records(LIST_PRODUCER)
                 self.assertEqual((for_morty.owner, for_morty.question), (morty.id, "Check the queue for morty."))
                 self.assertEqual(original.question, "The first item before replacement.")
-                self.assertEqual((replacement.id, replacement.question), ("I4", "The replacement item."))
                 self.assertEqual(fixture.recipient_reads, 8)
                 expired, refreshed, reopened, *owner_sends = fixture.wire_posts
                 self.assertEqual(expired["token"], FORM_TOKEN)
                 self.assertEqual(refreshed, {**expired, "token": RESTARTED_TOKEN})
                 self.assertEqual(reopened, refreshed)
-                self.assertEqual(len(owner_sends), 9)
+                self.assertEqual(len(owner_sends), 11)
                 owner_ids = [post["request_id"] for post in owner_sends]
-                self.assertEqual(owner_ids[:6:2], owner_ids[1:6:2])
-                self.assertEqual(len({expired["request_id"], *owner_ids[:6:2], *owner_ids[6:]}), 7)
+                self.assertEqual([owner_ids[0], owner_ids[3], owner_ids[6]], [owner_ids[1], owner_ids[4], owner_ids[7]])
+                self.assertEqual(len({expired["request_id"], *owner_ids}), 9)
                 first, retry = fixture.posts[:2]
                 self.assertEqual(first, retry)
                 self.assertEqual(first.kind, review_submissions.SubmissionKind.BUG)

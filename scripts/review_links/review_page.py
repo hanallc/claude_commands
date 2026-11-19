@@ -232,13 +232,17 @@ def submission_assets(key: str, origin: new_item_dialog.ReviewSubmission) -> str
                 +f'Queue cap {memory.queue_cap_gib:g} GiB</p><p>'+html.escape(segments)
                 +'</p><strong>'+html.escape(evidence.tip_title)+'</strong><p>'+html.escape(evidence.tip_status)
                 +'</p><dl>'+tip+'</dl></section>')
-    if origin.page_state is not None and (page_data := origin.bug_page_data) is not None:
+    page_data = origin.bug_page_data
+    if origin.page_state is not None:
         screenshot = review_submissions.PAGE_SCREENSHOT
-        body += bug_page_state_box(key, origin.page_state, page_data.title, screenshot in images)
+        title = origin.page_state.title or (page_data.title if page_data else origin.page)
+        body += bug_page_state_box(key, origin.page_state, title, screenshot in images)
         images = tuple(image for image in images if image != screenshot)
     elif isinstance(evidence, new_item_dialog.PageDataEvidence):
-        data = json.dumps({'title': evidence.title, 'rows': evidence.rows}, ensure_ascii=False, indent=2)
-        body = '<section data-submission-evidence><h3>Page data</h3><pre>'+html.escape(data)+'</pre></section>'
+        page_data = evidence
+    if page_data is not None:
+        data = json.dumps({'title': page_data.title, 'rows': page_data.rows}, ensure_ascii=False, indent=2)
+        body += '<section data-submission-evidence><h3>Page data</h3><pre>'+html.escape(data)+'</pre></section>'
     if images:
         links: list[str] = []
         for at, image in enumerate(images, 1):
@@ -509,7 +513,11 @@ class ReviewSnapshotCache:
             item = ReviewRecordNotPublished()
         return self.publish_item(current, key, item, members), item
 
-    def create_submission(self, request: new_item_dialog.NewItemRequest) -> PublishedSubmission:
+    def create_submission(
+        self, request: new_item_dialog.NewItemRequest, *,
+        screenshot: new_item_dialog.SubmissionScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT,
+        capture_requested: bool = False,
+    ) -> PublishedSubmission:
         """File the new record and publish it from its exact native path."""
         _ = self.get()
         with self._save_lock:
@@ -517,7 +525,8 @@ class ReviewSnapshotCache:
             remote_staff = not staff.is_owner()
             members = staff.snapshot()
             with staff.supplied_snapshot(members) if remote_staff else nullcontext():
-                saved = review_submissions.submit(request, members=members)
+                saved = review_submissions.submit(request, members=members, screenshot=screenshot,
+                                                  capture_requested=capture_requested)
             if not remote_staff:
                 members = staff.snapshot()
             path = saved.path
@@ -537,28 +546,6 @@ class ReviewSnapshotCache:
             finally:
                 self.invalidate()
             return PublishedSubmission(saved, item.key, fresh.version)
-
-    def attach_page_screenshot(self, saved: review_submissions.SavedSubmission, image: bytes) -> bool:
-        """Add the screenshot to the native record and refresh its Review card."""
-        with self._save_lock:
-            if review_submissions.attach_page_screenshot(saved.key, image):
-                self._publish_submission_evidence(saved.request_id)
-                return True
-            return False
-
-    def publish_submission_evidence(self, request_id: str) -> None:
-        """Publish evidence added to an existing submission."""
-        with self._save_lock:
-            self._publish_submission_evidence(request_id)
-
-    def _publish_submission_evidence(self, request_id: str) -> None:
-        try:
-            current = self.get()
-            key = current.submission_keys.get(request_id)
-            if key is not None:
-                _ = self.publish_record(current, key, members=current.members)
-        finally:
-            self.invalidate()
 
     def publish_item(self, current: ReviewSnapshot, key: str, item: ReviewItem | ReviewRecordNotPublished,
                      members: staff.StaffSnapshot, *, stamps: Mapping[Path, FileStamp] | None = None,

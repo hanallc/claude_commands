@@ -375,9 +375,12 @@ window.fetch=(url,options)=>{
             "http://127.0.0.1/console/review.html#owner=builds", new_item_dialog.PageViewport(1280, 800, True),
             2.4, ("Could not load brain.",), (), "Type All · State Open · Owner <builds>", True)
         request = self.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id)
-        created = cache.create_submission(replace(request, page="review", evidence=evidence, page_state=state))
-        self.assertNotIn(b"Screenshot of Review", cache.get().body(created.key))
-        self.assertTrue(cache.attach_page_screenshot(created.saved, base64.b64decode(PNG)))
+        viewport = new_item_dialog.PageViewport(1280, 800, True)
+        created = cache.create_submission(
+            replace(request, page="review", evidence=evidence, page_state=state),
+            screenshot=new_item_dialog.PageScreenshot(base64.b64decode(PNG), viewport))
+        self.assertIn(b"Screenshot of Review", cache.get().body(created.key))
+        self.assertEqual(created.saved.details.evidence, evidence)
         snapshot = review_page.build_snapshot(self.root)
         self.assertEqual(snapshot.records[created.key].state, review_items.ReviewState.WAITING)
         card = snapshot.body(created.key).decode()
