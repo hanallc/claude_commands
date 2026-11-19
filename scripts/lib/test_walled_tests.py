@@ -3,22 +3,26 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import ExitStack, suppress
 import errno
+import fcntl
 import json
 import os
 from pathlib import Path
 import runpy
 import select
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import time
 from typing import cast, override
 import unittest
 from unittest import mock
 from uuid import uuid4
 
-from scripts.lib import build_folders, conf, walled_tests
+from scripts.lib import conf, walled_tests
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import merge_gate
 
@@ -262,40 +266,80 @@ class TestWallsProof(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "the required test walls are absent after launch"):
                 walled_tests.main(["--inside", sys.executable, "-I", "-c", "raise SystemExit(0)"])
 
-    def test_gate_stop_ends_the_namespace_during_startup(self) -> None:
-        folder = self.enterContext(build_folders.tool_folder("launch", self.job))
-        lease = build_folders.build_folder_lock_fd(folder)
-        marker = folder / "command-started"
+    def test_gate_stop_ends_the_namespace_during_startup_and_after_session_setup(self) -> None:
+        for during_startup in (True, False):
+            with self.subTest(during_startup=during_startup):
+                self.check_gate_stop(during_startup)
+
+    def check_gate_stop(self, during_startup: bool) -> None:
         startup = self.job / "sitecustomize.py"
         _ = startup.write_text("raise SystemExit('untrusted startup ran')\n")
         environment = {**os.environ, "PYTHONPATH": str(self.job)}
-        info_read, info_write = os.pipe()
-        block_read, block_write = os.pipe()
-        status = self.enterContext(os.fdopen(info_read, "rb"))
-        for descriptor in (block_read, block_write):
-            self.addCleanup(os.close, descriptor)
-        with (mock.patch.object(walled_tests, "guarded", return_value=False),
-              walled_tests.gate_inputs(CHECKOUT, environment, read_only=())):
-            argv = walled_tests.command(["touch", str(marker)], folder, lease_fd=lease)
-        argv[1:1] = ["--info-fd", str(info_write), "--block-fd", str(block_read)]
-        with os.fdopen(info_write, "wb"):
-            job = merge_gate.start_gate_job("lib", Path(__file__), argv, CHECKOUT, environment,
-                                           folder / "gate.log", pass_fds=(lease, info_write, block_read))
-        self.addCleanup(job.output.close)
-        try:
-            ready, _, _ = select.select([info_read], [], [], TEST_HANG_GUARD_SECS)
-            self.assertTrue(ready, job.log.read_text())
-            info = cast(dict[str, int], json.load(status))
-            pid = info["child-pid"]
-            descriptor = os.pidfd_open(pid)
-            self.addCleanup(os.close, descriptor)
-            self.assertEqual(os.getpgid(pid), job.process.pid)
-            self.assertFalse(marker.exists())
-            self.assertNotIn("untrusted startup ran", job.log.read_text())
-        finally:
-            self.assertTrue(merge_gate.kill_job_group(job), job.stop_error)
-        self.assertTrue(select.select([descriptor], [], [], 0)[0], "The namespace PID 1 stayed alive.")
-        self.assertFalse(marker.exists())
+
+        def end_leftover_namespace(descriptor: int) -> None:
+            if select.select([descriptor], [], [], 0)[0]:
+                return
+            with suppress(ProcessLookupError):
+                signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+            self.assertTrue(select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)[0])
+
+        with ExitStack() as cleanup:
+            folder = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix="launch-", dir=self.job)))
+            marker = folder / "command-started"
+            lock_path = folder.with_name(folder.name + ".lock")
+            _ = cleanup.callback(lock_path.unlink, missing_ok=True)
+            lock = cleanup.enter_context(lock_path.open("w"))
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lease = lock.fileno()
+            block_read, block_write = os.pipe()
+            for fd in (block_read, block_write):
+                _ = cleanup.callback(os.close, fd)
+            info_read, info_write = os.pipe()
+            status = cleanup.enter_context(os.fdopen(info_read, "rb"))
+            ready_read, ready_write = os.pipe()
+            _ = cleanup.callback(os.close, ready_read)
+            child = """import os, select, sys
+open(sys.argv[1], "x").close()
+os.write(int(sys.argv[2]), b"1")
+select.select([], [], [])
+"""
+            with os.fdopen(info_write, "wb"), os.fdopen(ready_write, "wb"):
+                with (mock.patch.object(walled_tests, "guarded", return_value=False),
+                      walled_tests.gate_inputs(CHECKOUT, environment, read_only=())):
+                    argv = walled_tests.command(
+                        [sys.executable, "-I", "-c", child, str(marker), str(ready_write)], folder, lease_fd=lease,
+                    )
+                argv[1:1] = ["--info-fd", str(info_write), "--block-fd", str(block_read)]
+                job = merge_gate.start_gate_job(
+                    "lib", Path(__file__), argv, CHECKOUT, environment, folder / "gate.log",
+                    pass_fds=(lease, info_write, block_read, ready_write),
+                )
+            _ = cleanup.callback(job.output.close)
+            descriptor = None
+            try:
+                ready, _, _ = select.select([info_read], [], [], TEST_HANG_GUARD_SECS)
+                self.assertTrue(ready, job.log.read_text())
+                info = cast(dict[str, int], json.load(status))
+                pid = info["child-pid"]
+                descriptor = os.pidfd_open(pid)
+                _ = cleanup.callback(os.close, descriptor)
+                _ = cleanup.callback(end_leftover_namespace, descriptor)
+                self.assertFalse(marker.exists())
+                if not during_startup:
+                    _ = os.write(block_write, b"1")
+                    ready, _, _ = select.select([ready_read, descriptor], [], [], TEST_HANG_GUARD_SECS)
+                    self.assertIn(ready_read, ready, job.log.read_text())
+                    self.assertEqual(os.read(ready_read, 1), b"1")
+                    self.assertTrue(marker.exists())
+                self.assertEqual(os.getpgid(pid), job.process.pid)
+                self.assertNotIn("untrusted startup ran", job.log.read_text())
+            finally:
+                with mock.patch.object(merge_gate, "module_stop_deadline",
+                                       return_value=time.monotonic() + TEST_HANG_GUARD_SECS):
+                    self.assertTrue(merge_gate.kill_job_group(job), job.stop_error)
+            assert descriptor is not None
+            self.assertTrue(select.select([descriptor], [], [], 0)[0], "The namespace PID 1 stayed alive.")
+            self.assertEqual(marker.exists(), not during_startup)
 
 
 class TestWallsHookProof(unittest.TestCase):

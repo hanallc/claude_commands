@@ -23,6 +23,7 @@ from contextlib import AbstractContextManager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
 from scripts.lib import scratch, walled_tests
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import change_review, merge_gate, staff
 from scripts.production.gate_modules import GateRefused
 from scripts.production.test_change_review import ProducerFixture
@@ -90,6 +91,29 @@ class ModuleScopeStopTests(unittest.TestCase):
                     self.assertIn(str(scope), job.stop_error)
                     reap.assert_not_called()
 
+
+    def test_recovery_keeps_the_parent_folder_while_a_child_lease_is_held(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "gate"
+            child = folder / "job"
+            child.mkdir(parents=True)
+            record = root / "run.json"
+            config = root / "config"
+            _ = write_config_fixture(config / "build_folders.conf", "locks.probe_retry_seconds=0.005\n")
+            recovery = merge_gate.GateRecovery(record, str(root), os.getpid(), "fixture", folders=[str(folder)])
+            recovery.save()
+            with (mock.patch.object(merge_gate, "module_stop_deadline", return_value=0.0),
+                  mock.patch.dict(os.environ, {"CONF_DIR": str(config)})):
+                with (folder / "job.lock").open("w") as lease:
+                    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    with self.assertRaisesRegex(GateRefused, "gate recovery kept held folder"):
+                        recovery.recover()
+                    self.assertTrue(child.is_dir())
+                    self.assertTrue(record.is_file())
+                recovery.recover()
+            self.assertFalse(folder.exists())
+            self.assertFalse(record.exists())
 
     def test_nested_job_clears_the_caller_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

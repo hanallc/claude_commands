@@ -4460,3 +4460,4 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 #### Work Order
 
 A person at a shell with a raw interpreter has no walls. Shell startup files and Python `.pth` startup code run before the walls.
+The kernel ends all nested gate processes when PID 1 of the outer job exits.

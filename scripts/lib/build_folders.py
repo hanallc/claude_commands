@@ -955,6 +955,16 @@ def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
     return remove_build_folder(path, cleanup, dir_fd=directory, wait=wait)
 
 
+def remove_free_build_folder(path: Path, *, wait: bool = True) -> bool:
+    """Remove a folder only after taking its lease lock and all child lease locks."""
+    with ExitStack() as parents:
+        try:
+            directory = parents.enter_context(build_folder_lock.folder_parent(path, path.parent, create=False))
+        except FileNotFoundError:
+            return True
+        return _remove_free(path, directory, wait=wait)
+
+
 def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
     """Remove free allocations in a parent reserved for temporary maker folders.
     With wait False, a held folder costs one lock try, not the probe wait."""

@@ -94,6 +94,7 @@ def command(argv: Sequence[str], job_folder: Path, *, lease_fd: int | None = Non
         _ = values.setdefault("BUILDLOG_DIR", f"{tmp}/buildlog")
         _ = values.setdefault("SESSION_TEMP_ROOT", f"{tmp}/session")
         if guarded():
+            # The kernel ends nested processes when PID 1 of the outer job exits.
             return ["/usr/bin/env", "-i", *(f"{key}={value}" for key, value in values.items()), *argv]
 
         executable = Path(settings.text("bubblewrap", recover_invalid=False))
