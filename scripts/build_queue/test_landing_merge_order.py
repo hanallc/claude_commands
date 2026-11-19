@@ -13,10 +13,11 @@ from typing import override
 from unittest.mock import patch
 
 from scripts.build_queue import admission_protocol as wire, admission_records as records
-from scripts.build_queue import admission_service as service, head_stall, step_estimator
+from scripts.build_queue import admission_service as service, head_stall, placement, step_estimator
 from scripts.build_queue.admission_records import GIB
 from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
 from scripts.build_queue.queue_fixture import write_process
+from scripts.build_queue.scope_activity import LiveBuildRun
 from scripts.lint import memory_admit as gate
 from scripts.production import staff
 
@@ -150,6 +151,34 @@ class LandingMergeOrderTests(unittest.TestCase):
         self.assertEqual(self.fixture.queue_pids(), [101, 100])
         self.assertEqual(self.fixture.server.slots[first.reservation], claim)
         self.assertEqual(result.policy.returned_claims, frozenset())
+
+    def test_landing_at_head_keeps_normal_admission_for_shared_cargo_folder(self) -> None:
+        self.land_record(10)
+        landing = self.submit(100, step="merge-gate", parent=10)
+        continuations = (self.submit(101, need=4 * GIB), self.submit(102, need=4 * GIB))
+        folder = placement.CargoFolder(self.fixture.root / "shared-target")
+        folders: dict[str, placement.CargoFolder] = {}
+        now = self.fixture.clock.now()
+        for request in continuations:
+            owner = records.run_owner(request.owner.pid, request.owner.start_time)
+            run = self.fixture.run_owner()
+            slot = records.BetweenStepsSlot(LiveBuildRun(run.pid, run.start_time, now),
+                f"previous-{owner}", 4 * GIB, now + 60, records.HoldPredatesStepFacts())
+            self.fixture.server.slots[slot.reservation] = records.ContinuationSlot(slot, owner)
+            folders[owner] = folder
+        self.fixture.free(60 * GIB)
+
+        def place_continuations(inputs: records.QueueInputs, _policy: records.AdmissionPolicy,
+                                _remote_start_hold_seconds: int) -> records.QueueInputs:
+            return replace(inputs, cargo_folders=folders)
+
+        with patch.object(self.fixture.server, "_placement_pass", new=place_continuations):
+            result = self.fixture.run_pass()
+
+        self.assertEqual(self.fixture.queue_pids(), [100, 101, 102])
+        self.assertEqual(set(self.fixture.caller_reservations()), {landing.episode, continuations[0].episode})
+        self.assertTrue(result.rows[1].decision.reused_slot)
+        self.assertEqual(self.fixture.server.landing_pass_counts, {})
 
     def test_reconnect_preserves_the_pass_limit_for_the_same_arrival(self) -> None:
         unit = self.request(100)
