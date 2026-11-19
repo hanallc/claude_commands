@@ -1434,8 +1434,9 @@ The copies private index includes staged, unstaged, deleted, and permitted untra
 The caller's index and refs remain unchanged.
 The existing tree key and a second private capture detect content and executable mode changes.
 Both capture paths refuse new Git links with `NestedRepository`.
-The sender refuses unexpected ignored inputs, credential paths, Git links, and disallowed environment variables.
-It sends no ignored files, HOME, or target output.
+The sender never sends ignored files. A build can read these files, so the source check refuses each ignored file outside `source_allowed_ignored`.
+The refusal names the first path. Remove the file or ask the user to approve a list entry.
+The sender refuses credential paths, Git links, and disallowed environment variables. It omits HOME and target output.
 The sender checks local input paths before it requests a Hana claim.
 The sender refuses the source early only if it confirms that no execution is bound.
 Hana can start if an ignored file appears after the first check. The check after adoption then refuses the file.
