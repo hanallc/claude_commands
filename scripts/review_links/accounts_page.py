@@ -55,9 +55,10 @@ class QuotaLevel(StrEnum):
 
 
 @dataclass(frozen=True)
-class QuotaThresholds:
+class QuotaAlertSettings:
     warning: int
     urgent: int
+    same_window_seconds: int
 
     def level(self, left: float) -> QuotaLevel:
         if 0 <= left <= self.urgent:
@@ -65,6 +66,17 @@ class QuotaThresholds:
         if self.urgent < left <= self.warning:
             return QuotaLevel.WARNING
         return QuotaLevel.NONE
+
+    def same_weekly_window(self, first_reset: str, second_reset: str) -> bool:
+        if not first_reset or not second_reset:
+            return first_reset == second_reset
+        try:
+            first = datetime.fromisoformat(first_reset)
+            second = datetime.fromisoformat(second_reset)
+        except ValueError:
+            return False
+        return (first.tzinfo is not None and second.tzinfo is not None
+                and abs(first - second).total_seconds() < self.same_window_seconds)
 
 
 class ClearedQuota(TypedDict):
@@ -96,13 +108,13 @@ class UnreadableQuotaState(ValueError):
     """The clear records could not be read or parsed."""
 
 
-def quota_thresholds() -> QuotaThresholds:
+def quota_alert_settings() -> QuotaAlertSettings:
     settings = conf.read("review_links")
     warning = settings.whole("accounts_quota_warning_percent")
     urgent = settings.whole("accounts_quota_urgent_percent")
     if warning <= urgent:
         raise InvalidQuotaThresholds("accounts_quota_warning_percent must be greater than accounts_quota_urgent_percent.")
-    return QuotaThresholds(warning, urgent)
+    return QuotaAlertSettings(warning, urgent, settings.whole("accounts_quota_same_window_seconds"))
 
 
 def quota_state(root: Path) -> Path:
@@ -141,16 +153,16 @@ def _parse_cleared_quotas(value: object) -> dict[str, ClearedQuota]:
     return cleared
 
 
-def active_quotas(quotas: Mapping[str, accounts.WeeklyQuota], thresholds: QuotaThresholds,
+def active_quotas(quotas: Mapping[str, accounts.WeeklyQuota], settings: QuotaAlertSettings,
                   cleared: Mapping[str, ClearedQuota]) -> dict[str, QuotaAlert]:
     alerts: dict[str, QuotaAlert] = {}
     for label, quota in quotas.items():
-        level = thresholds.level(quota.left)
+        level = settings.level(quota.left)
         if level is QuotaLevel.NONE or not account_label(label):
             continue
         reset = quota.resets_at.astimezone(timezone.utc).isoformat() if isinstance(quota.resets_at, datetime) else ""
         receipt = cleared.get(label)
-        if (receipt is not None and (not reset or receipt["reset"] == reset)
+        if (receipt is not None and (not reset or settings.same_weekly_window(receipt["reset"], reset))
                 and (receipt["level"] is QuotaLevel.URGENT or receipt["level"] is level)):
             continue
         alerts[label] = QuotaAlert(level, quota.left, reset)
@@ -159,8 +171,8 @@ def active_quotas(quotas: Mapping[str, accounts.WeeklyQuota], thresholds: QuotaT
 
 def nav_quota(root: Path) -> NavQuota:
     cleared = cleared_quotas(quota_state(root))
-    thresholds = quota_thresholds()
-    alerts = active_quotas(accounts.stored_weekly_quotas(datetime.now(timezone.utc)), thresholds, cleared)
+    settings = quota_alert_settings()
+    alerts = active_quotas(accounts.stored_weekly_quotas(datetime.now(timezone.utc)), settings, cleared)
     if not alerts:
         return {"level": QuotaLevel.NONE, "name": ""}
     alert = min(alerts.values(), key=lambda alert: (alert.level is not QuotaLevel.URGENT, alert.left))
@@ -168,7 +180,7 @@ def nav_quota(root: Path) -> NavQuota:
 
 
 def clear_quota(root: Path, label: str, level: str, reset: str) -> Saved | Refused | SaveFailed:
-    """Clear the account's current alert if the submitted level and reset still match."""
+    """Clear the alert if the request names the current level and window."""
     if not account_label(label) or level not in (QuotaLevel.WARNING, QuotaLevel.URGENT):
         return Refused("Use an account label and a warning or urgent level.")
     path = quota_state(root)
@@ -176,13 +188,15 @@ def clear_quota(root: Path, label: str, level: str, reset: str) -> Saved | Refus
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         with file_lock.exclusive(path.with_suffix(".lock")):
             cleared = cleared_quotas(path)
-            current = active_quotas(accounts.stored_weekly_quotas(datetime.now(timezone.utc)), quota_thresholds(), {})
+            settings = quota_alert_settings()
+            current = active_quotas(accounts.stored_weekly_quotas(datetime.now(timezone.utc)), settings, {})
             alert = current.get(label)
-            if alert is None or alert.level != level or alert.reset != reset:
+            if alert is None or alert.level != level or not settings.same_weekly_window(alert.reset, reset):
                 return Refused("The quota alert changed. Read the Accounts page again.")
             receipt = cleared.get(label)
             saved_reset = alert.reset or (receipt["reset"] if receipt is not None else "")
-            if receipt and receipt["reset"] == saved_reset and receipt["level"] is QuotaLevel.URGENT:
+            if (receipt and receipt["level"] is QuotaLevel.URGENT
+                    and settings.same_weekly_window(receipt["reset"], saved_reset)):
                 return Saved()
             cleared[label] = {"level": alert.level, "reset": saved_reset}
             atomic_file.write_text_atomic(path, json.dumps(cleared, sort_keys=True) + "\n", new_file_mode=0o600)
@@ -414,7 +428,7 @@ def page() -> bytes:
     reading = accounts.read_status(source=accounts.StoredUsageOnly(), include_models=True)
     try:
         cleared = cleared_quotas(quota_state(review_link.review_root()))
-        alerts = active_quotas(accounts.weekly_quotas(reading.rows), quota_thresholds(), cleared)
+        alerts = active_quotas(accounts.weekly_quotas(reading.rows), quota_alert_settings(), cleared)
     except (UnreadableQuotaState, InvalidQuotaThresholds) as error:
         reading = replace(reading, notes=(*reading.notes, str(error)))
         alerts = {}
