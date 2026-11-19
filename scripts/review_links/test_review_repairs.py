@@ -639,8 +639,9 @@ window.fetch=(url,options={})=>{
   check(row('C1') && !row('C1').hidden && row('C1').dataset.state==='Validating',
    'Validating shows the saved check.');
   await show('all');
-  check(!row('C1').hidden && !row('C1').querySelector('button') &&
-   row('C1').textContent.includes('With page-owner since'),'All shows the active check without buttons.');
+  check(!row('C1').hidden && row('C1').querySelector('button.list-toggle') &&
+   row('C1').textContent.includes('With page-owner · Validating for'),
+   'All shows the elapsed time and a button to open the active check.');
   await show('open');
   await nativeFetch('/problem');await refresh();check(!row('C1').hidden,'a problem returns to Open');
   row('C2').querySelector('.list-toggle').click();await readyReviewCard(row('C2'));
