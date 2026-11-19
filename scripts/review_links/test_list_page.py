@@ -29,6 +29,7 @@ from scripts.accounts import accounts
 from scripts.agents.remote import local_machine
 from scripts.lib import atomic_file, conf, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.user_zone import user_zone
 from scripts.message import send_result
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
 from scripts.production import change_review, change_routing, delivery_state, investigation, record_store, session_staff, showrunners, staff, the_list
@@ -863,6 +864,31 @@ frame.addEventListener('load',async()=>{
             cell = body.split(f'<td data-label="{label}">', 1)[1].split("</td>", 1)[0]
             self.assertIn(expected, cell)
             self.assertIn(f"{label}</dt><dd>{cell}</dd>", log)
+
+    def test_latest_status_shows_the_update_time_in_the_user_zone(self) -> None:
+        item = self.add("Status time")
+        updated = NOW + timedelta(minutes=20)
+        with patch.object(the_list, "now", return_value=updated):
+            _ = the_list.update(MORTY.id, item.id, {"latest_status": "The report is ready."}, source="morty")
+        for read_at, expected in ((updated, "13:20 EST"), (updated + timedelta(days=1), "2026-11-16 13:20 EST")):
+            with self.subTest(read_at=read_at), patch.object(time, "time", return_value=read_at.timestamp()):
+                body = list_page.render(self.root / "reviews", include_counts=False).decode()
+                self.assertIn(f'<h3>Latest status · <time datetime="{updated.isoformat()}">{expected}</time></h3>', body)
+
+        read_at = NOW + timedelta(hours=11, minutes=5)
+        with (patch.object(the_list, "now", return_value=read_at),
+              patch.object(time, "time", return_value=read_at.timestamp())):
+            read = the_list.mark_read(MORTY.id, item.id, source="nate")
+            self.assertEqual(read.updated, read_at)
+            body = list_page.render(self.root / "reviews", include_counts=False).decode()
+            self.assertIn(f'<h3>Latest status · <time datetime="{updated.isoformat()}">2026-11-16 13:20 EST</time></h3>', body)
+
+    def test_log_shows_the_recorded_clock_time_once(self) -> None:
+        log = self.legacy_log('- 2026-11-16 18:20:00+00:00 Updated state: "Working" — morty, 09:00 CST')
+        self.assertIn('<time datetime="2026-11-16T18:20:00+00:00">13:20 EST</time>', log)
+        self.assertIn("morty</small>", without_role_colors(log))
+        self.assertEqual(log.count("13:20 EST"), 1)
+        self.assertNotIn("09:00 CST", log)
 
     def test_legacy_log_text_renders_with_a_new_field_change(self) -> None:
         item = self.add("Keep the original log")
@@ -2759,6 +2785,7 @@ observer.observe(original.parentNode,{childList:true});
         fields = self.fields(item, "question", words="What changed in <List>?")
         asked_at = NOW - timedelta(days=1)
         answered_at = NOW - timedelta(minutes=25)
+        answer_logged_at = answered_at + timedelta(minutes=1)
         asked_time = f'<time datetime="{asked_at.isoformat()}">2026-11-15 13:00 EST</time>'
         answer_time = f'<time datetime="{answered_at.isoformat()}">12:35 EST</time>'
         question_clock = Mock(wraps=datetime)
@@ -2775,7 +2802,7 @@ observer.observe(original.parentNode,{childList:true});
             with patch.object(change_page, "send_question", return_value=question_outcome()):
                 list_page.deliver(delivery)
             with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": MORTY.current_session}),
-                  patch.object(the_list, "now", return_value=answered_at), redirect_stdout(io.StringIO())):
+                  patch.object(the_list, "now", return_value=answer_logged_at), redirect_stdout(io.StringIO())):
                 self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1", "--text", "The <filter> changed."]), 0)
         _ = list_page.submit(root, urlencode(fields))
         answered = list_page.render(root).decode().split('<script>', 1)[0]
@@ -2802,10 +2829,20 @@ observer.observe(original.parentNode,{childList:true});
         self.assertNotIn('class="question-unread"', panel)
         log = re.sub(r'<span class="staff-name"[^>]*>(.*?)</span>', r'\1', log)
         question_row = '<li data-log-index="Q1-asked">' + asked_time + '<div>Question Q1 <small>— nate</small>'
-        answer_row = '<li data-log-index="Q1-answered">' + answer_time + '<div>Answer <small>— morty</small>'
+        logged_time = f'<time datetime="{answer_logged_at.isoformat()}">12:36 EST</time>'
+        answer_row = '<li data-log-index="Q1-answered">' + logged_time + '<div>Answer <small>— morty</small>'
         self.assertIn(question_row + '<p>What changed in &lt;List&gt;?</p></div></li>', log)
         self.assertIn(answer_row + '<p>The &lt;filter&gt; changed.</p></div></li>', log)
+        self.assertEqual(log.count('12:36 EST'), 1)
+        self.assertNotIn('12:35 EST', log)
         self.assertLess(log.index(answer_row), log.index(question_row))
+
+        saved = the_list.load(MORTY.id, item.id)
+        legacy = replace(saved, log=tuple(entry for entry in saved.log
+                                         if entry.what != the_list.QuestionAnswered("Q1")))
+        legacy_log = list_page.item_log_html(legacy, NOW.astimezone(user_zone()), staff_names.read(), frozenset())
+        self.assertIn('<li data-log-index="Q1-answered">' + answer_time, legacy_log)
+        self.assertEqual(legacy_log.count('12:35 EST'), 1)
 
     def test_stale_mark_read_keeps_the_newer_answer_in_the_panel(self) -> None:
         root = self.root / "reviews"
@@ -4313,6 +4350,7 @@ window.fetch=async(_url,options)=>{
    link.href=fragment;document.body.append(link);link.click();
    await changed;
   }
+  await new Promise(resolve=>parent.requestAnimationFrame(()=>parent.requestAnimationFrame(resolve)));
   const panel=detail.querySelector('.list-panel');
   const first=panel.querySelector('[data-question="Q1"] p:last-child');
   const second=panel.querySelector('[data-question="Q2"] p:last-child');
@@ -4472,7 +4510,9 @@ const act=async (action,words='')=>{
  }finally{observer.disconnect();win.fetch=fetch;}
 };
 const change=async path=>{
- if(!(await fetch(path,{method:'POST'})).ok) throw new Error('Fixture update failed: '+path);
+ const response=await fetch(path,{method:'POST'});
+ if(!response.ok) throw new Error('Fixture update failed: '+path);
+ return response.json();
 };
 (async()=>{
  try{
@@ -4527,11 +4567,11 @@ const change=async path=>{
   await open('all',key);
   check(!row().querySelector('[data-detail]').hidden && nextQuestion(row()) && firstAnswer(row()),
    'a direct link shows both the waiting question and the first answer in the log');
-  await change('/second-answer');
+  const {loggedAt}=await change('/second-answer');
   await open('working','','1');
   const original=row(), doc=frame.contentDocument;
   const panelQuestion=original.querySelector('[data-question="Q2"]');
-  const [askedAt,answeredAt]=[...panelQuestion.querySelectorAll('time')].map(time=>Date.parse(time.dateTime));
+  const askedAt=Date.parse(panelQuestion.querySelector('time').dateTime);
   check(hasDot() && original.querySelector('[data-question="Q2"] .question-unread'),
    'the second answer stays unread before the row opens');
   const refreshed=new Promise(resolve=>{
@@ -4551,7 +4591,7 @@ const change=async path=>{
   const asked=row().querySelector('[data-log-index="Q2-asked"]');
   const answered=row().querySelector('[data-log-index="Q2-answered"]');
   check(asked?.textContent.includes('Which check is next?') && Date.parse(asked.querySelector('time').dateTime)===askedAt &&
-   Date.parse(answered.querySelector('time').dateTime)===answeredAt && !row().querySelector('[data-question="Q2"]'),
+   Date.parse(answered.querySelector('time').dateTime)===Date.parse(loggedAt) && !row().querySelector('[data-question="Q2"]'),
    'The log shows the question and answer with their recorded times after the panel clears.');
   row().querySelector('.list-toggle').click();
   check(row().hidden,'closing the read row removes it from Unread');
@@ -4581,7 +4621,12 @@ const change=async path=>{
                     question_id, words = (("Q1", "The gate passed.") if self.path == '/answer'
                                           else ("Q2", "The next check passed."))
                     result = the_list.main(["answer", item.id, "--question", question_id, "--text", words])
-                    self.json_response(200 if result == 0 else 500, {})
+                    if result:
+                        self.json_response(500, {})
+                        return
+                    logged_at = next(entry.time for entry in the_list.load(MORTY.id, item.id).log
+                                     if entry.what == the_list.QuestionAnswered(question_id))
+                    self.json_response(200, {"loggedAt": logged_at.isoformat()})
                 elif self.path == '/results':
                     results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
                     self.json_response(200, {})

@@ -14,10 +14,10 @@ import re
 import subprocess
 import sys
 import threading
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta, timezone, tzinfo
+from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal, TypedDict, cast
@@ -249,6 +249,13 @@ class ListItem:
     def id(self) -> str:
         return f"L{self.number}"
 
+    @property
+    def latest_status_time(self) -> Timestamp:
+        for entry in reversed(self.log):
+            if isinstance(entry.what, FieldChange) and "latest_status" in entry.what.fields:
+                return entry.time
+        return NoTimestamp.UNSET
+
 
 class AllItems(StrEnum):
     INCLUDED = "all items"
@@ -444,6 +451,11 @@ def parking_date(moment: datetime, zone: tzinfo) -> str:
     return moment.astimezone(zone).date().isoformat()
 
 
+def list_time(moment: datetime, today: datetime) -> str:
+    local = moment.astimezone(today.tzinfo)
+    return local.strftime("%H:%M %Z" if local.date() == today.date() else "%Y-%m-%d %H:%M %Z")
+
+
 def _time_text(value: Timestamp) -> str:
     return value.isoformat() if isinstance(value, datetime) else ""
 
@@ -508,6 +520,29 @@ def _line(value: str, name: str) -> None:
 def _log_line(value: str, name: str) -> None:
     if not value.strip() or "\n" in value or "\r" in value:
         raise ListError(f"{name} must have one nonempty line")
+
+
+_SOURCE_CLOCK = re.compile(r"(?:^|(?<=[\s,]))(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:[.,]\d+)?)?"
+                           + r"(?: [A-Z]{2,6}|Z| ?[+-]\d{2}(?::?\d{2})?)?$")
+
+
+def source_without_clock(source: str) -> str:
+    """Remove a hand-written clock time from the end of a log source."""
+    text = source.rstrip()
+    for boundary in re.finditer(r"^|[ \t,]", text):
+        start = boundary.end()
+        suffix = text[start:]
+        try:
+            _ = datetime.fromisoformat(suffix)
+        except ValueError:
+            continue
+        try:
+            _ = date.fromisoformat(suffix)
+        except ValueError:
+            return text[:start].rstrip(" ,\t")
+
+    clock = _SOURCE_CLOCK.search(text)
+    return text[:clock.start()].rstrip(" ,\t") if clock else source
 
 
 def _staff_id(value: str, name: str) -> None:
@@ -1267,8 +1302,29 @@ def update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source
     return _update(keeper, identity, changes, source=source).item
 
 
+_PRODUCER_UPDATE_FIELDS = ("latest_status", "next_step", "eta", "state", "next_check")
+_PRODUCER_UPDATE_OPTIONS = tuple("--" + field.replace("_", "-") for field in _PRODUCER_UPDATE_FIELDS)
+
+
+def _check_producer_update_fields(fields: Iterable[str]) -> None:
+    refused = sorted("--" + field.replace("_", "-") for field in set(fields).difference(_PRODUCER_UPDATE_FIELDS))
+    if refused:
+        raise ListError(f"producers can update only {', '.join(_PRODUCER_UPDATE_OPTIONS)}. "
+                        + f"Refused options: {', '.join(refused)}")
+
+
 def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source: str,
-            assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListEdit:
+            assigned_to: staff.StaffRow | AllItems = AllItems.INCLUDED) -> ListEdit:
+    scope: staff.StaffId | AllItems = AllItems.INCLUDED
+    if assigned_to is not AllItems.INCLUDED:
+        _check_producer_update_fields(changes)
+        if assigned_to.kind != "producer":
+            raise ListError("the assigned producer has no producer staff row")
+        if isinstance(assigned_to.retirement, staff.RetiredProducer):
+            raise ListError(f"{assigned_to.name}: retired producer. Choose an active producer.")
+        source = assigned_to.name
+        scope = assigned_to.id
+
     def edit(item: ListItem, _: datetime) -> ListItem:
         _open(item)
         if changes.get("state") == ItemState.CLOSED:
@@ -1277,7 +1333,7 @@ def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, sourc
         _validate(changed)
         _check_links(lambda number: load(keeper, f"L{number}"), changed.number, changes)
         return changed
-    return _change(keeper, identity, edit, FieldChange("Updated", {**changes}), source, assigned_to=assigned_to)
+    return _change(keeper, identity, edit, FieldChange("Updated", {**changes}), source, assigned_to=scope)
 
 
 def move_open_producer(keeper: staff.StaffId, identity: str, previous: staff.StaffId,
@@ -1763,6 +1819,7 @@ def table(keeper: staff.StaffId, *, include_closed: bool = False, include_parked
 def _format_table(items: Sequence[ListItem], record: staff.StaffSnapshot, *, include_parked: bool,
                   show_latest_status: bool = False) -> str:
     moment = now()
+    today = moment.astimezone(user_zone()) if show_latest_status else moment
     visible = [item for item in items if include_parked or not parking_active(item.parked_until, moment)]
     visible.sort(key=order)
     columns = ("#", "Owner", "Producer", "Item", "State", "Next step", "ETA", "Update")
@@ -1785,7 +1842,11 @@ def _format_table(items: Sequence[ListItem], record: staff.StaffSnapshot, *, inc
                  producer.name if producer is not None else item.producer, item.title, state,
                  item.next_step, eta_text(item.eta), "●" if isinstance(item.unread_since, datetime) else "—")
         if show_latest_status:
-            cells += (item.latest_status,)
+            status = item.latest_status
+            status_time = item.latest_status_time
+            if status and isinstance(status_time, datetime):
+                status += " · " + list_time(status_time, today)
+            cells += (status,)
         lines.append("| " + " | ".join(" ".join(cell.split()).replace("|", "\\|") for cell in cells) + " |")
     return "\n".join(lines)
 
@@ -1862,10 +1923,11 @@ def _notify_producer_assignment(item: ListItem, previous_producer: staff.StaffId
     showrunner = f"Its showrunner is {owner.name}." if owner is not None else "The item has no assigned showrunner."
     item_text = f"item {item.number}: {item.title}"
     launcher = "~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py"
+    update_options = ", ".join(f"`{option}`" for option in _PRODUCER_UPDATE_OPTIONS)
     notices = (
         ("producer", item.producer, producer, f"You are the producer of {item_text}. {showrunner}\n"
          + f"Run `{launcher} list --all --latest-status` to read it. "
-         + f"Run `{launcher} update --id {item.id}` with `--latest-status`, `--next-step`, or `--eta` to update it."),
+         + f"Run `{launcher} update --id {item.id}` to update it. Use any of {update_options}."),
         ("showrunner", item.owner, owner, f"The saved assignment for {item_text} needs a new producer."
          if producer is None else f"{producer.name} is the producer of {item_text}. "
          + f"Send design questions on this item to {producer.name}."),
@@ -1929,6 +1991,9 @@ def main(argv: list[str] | None = None) -> int:
     if name in ("link", "unlink") and not cast(list[ReviewByShownId | ReviewByKey], args.reviews):
         parser.error("use --review or --review-key")
     try:
+        source = cast(str | None, getattr(args, "source", None))
+        if source is not None and source_without_clock(source) != source:
+            raise ListError("Omit the clock time from --source because the tool adds the time.")
         record = staff.snapshot()
         caller = record.by_current_session(staff.caller_identity())
         if caller is None:
@@ -1957,15 +2022,10 @@ def main(argv: list[str] | None = None) -> int:
                 identity = f"L{identity}"
             if assigned_to is not AllItems.INCLUDED:
                 options = cast(dict[str, object], vars(args))
-                allowed = {"command", "id", "source", "latest_status", "next_step", "eta"}
-                refused = sorted(f"--{key.replace('_', '-')}" for key, value in options.items()
-                                 if value is not None and key not in allowed)
-                if refused:
-                    raise ListError("producers can update only --latest-status, --next-step, and --eta. "
-                                    + f"Refused options: {', '.join(refused)}")
-                _ = _update(keeper, identity, _cli_changes(args, record), source=caller.name, assigned_to=assigned_to)
+                _check_producer_update_fields(key for key, value in options.items()
+                                              if value is not None and key not in {"command", "id", "source"})
+                _ = _update(keeper, identity, _cli_changes(args, record), source=source or "", assigned_to=caller)
                 return 0
-            source = cast(str | None, args.source)
             if source is None:
                 parser.error("update requires --source for morty")
             changed = _update(keeper, identity, _cli_changes(args, record), source=source)
@@ -1981,7 +2041,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise ListError(result.reason)
             print(f"answered {identity} {question}")
             return 0
-        source = cast(str, args.source)
+        assert source is not None
         if name == "clean-evidence":
             changed, unchanged = clean_evidence(keeper, source=source)
             print(f"{changed} changed; {unchanged} unchanged")

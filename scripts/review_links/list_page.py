@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlencode
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, footer_counts, record_store, session_staff, staff, the_list
+from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 from scripts.review_links import change_browser, change_page, console, page_frame, page_question, record_table, review_link
 from scripts.review_links import review_items, review_page
@@ -119,16 +120,11 @@ def owner_name(members: staff.StaffSnapshot, owner: the_list.ItemOwner) -> str:
     return member.name if member is not None else str(owner)
 
 
-def local_time(moment: datetime, today: datetime) -> str:
-    local = moment.astimezone(today.tzinfo)
-    return local.strftime("%H:%M %Z" if local.date() == today.date() else "%Y-%m-%d %H:%M %Z")
-
-
 def eta_text(eta: the_list.Eta, today: datetime) -> str:
     if isinstance(eta, datetime):
-        return local_time(eta, today)
+        return list_time(eta, today)
     if isinstance(eta, the_list.EtaRange):
-        return local_time(eta.earliest, today) + " – " + local_time(eta.latest, today)
+        return list_time(eta.earliest, today) + " – " + list_time(eta.latest, today)
     return the_list.eta_text(eta)
 
 
@@ -154,7 +150,7 @@ def field_html(field: str, value: object, today: datetime, names: staff_names.St
         assert zone is not None
         return parked_label(value, zone)
     if isinstance(value, datetime):
-        return html.escape(local_time(value, today))
+        return html.escape(list_time(value, today))
     if isinstance(value, the_list.CheckCondition):
         return html.escape(value.text)
     if field in ("next_step", "latest_status", "done_when", "closing_words"):
@@ -170,17 +166,21 @@ def field_html(field: str, value: object, today: datetime, names: staff_names.St
 
 
 def log_source_html(source: str, names: staff_names.StaffNames) -> str:
-    return " <small>— " + names.html(source, owner_name(names.members, staff.StaffId(source))) + "</small>"
+    label = names.html(source, owner_name(names.members, staff.StaffId(source)))
+    return " <small>— " + label + "</small>"
+
+
+def time_html(moment: datetime, today: datetime) -> str:
+    return f'<time datetime="{moment.isoformat()}">{html.escape(list_time(moment, today))}</time>'
 
 
 def log_row(index: str, moment: datetime, body: str, today: datetime) -> str:
-    return (f'<li data-log-index="{index}"><time datetime="{moment.isoformat()}">'
-            + html.escape(local_time(moment, today)) + '</time><div>' + body + '</div></li>')
+    return f'<li data-log-index="{index}">' + time_html(moment, today) + '<div>' + body + '</div></li>'
 
 
 def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, names: staff_names.StaffNames) -> str:
     content = change.what
-    by = log_source_html(change.source, names)
+    by = log_source_html(the_list.source_without_clock(change.source), names)
     if isinstance(content, the_list.FieldChange):
         heading = content.action + by
         fields = ''.join(f'<dt>{FIELD_LABELS[field]}</dt><dd>{field_html(field, value, today, names)}</dd>'
@@ -221,12 +221,12 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
 def item_log_html(item: the_list.ListItem, today: datetime, names: staff_names.StaffNames,
                   unread_answers: frozenset[str]) -> str:
     answers = {question.question_id for question in item.questions if question.answer is not None}
-    sources: dict[str, str] = {}
+    answer_entries: dict[str, the_list.ItemChange] = {}
     rows: list[tuple[datetime, str]] = []
     for index, change in enumerate(item.log):
         content = change.what
         if isinstance(content, the_list.QuestionAnswered) and content.question_id in answers:
-            sources[content.question_id] = change.source
+            answer_entries[content.question_id] = change
         elif not the_list.is_page_request_receipt(change):
             rows.append((change.time, log_entry_html(change, index, today, names)))
     for question in item.questions:
@@ -235,9 +235,11 @@ def item_log_html(item: the_list.ListItem, today: datetime, names: staff_names.S
         if answer is None or identity in unread_answers:
             continue
         asked = datetime.fromisoformat(question.asked_at).astimezone(UTC)
-        answered = datetime.fromisoformat(answer.answered_at).astimezone(UTC)
         question_body = "Question " + html.escape(identity) + log_source_html("nate", names)
-        answer_body = "Answer" + log_source_html(sources.get(identity, item.producer), names)
+        entry = answer_entries.get(identity)
+        answered = entry.time if entry is not None else datetime.fromisoformat(answer.answered_at).astimezone(UTC)
+        source = the_list.source_without_clock(entry.source) if entry is not None else item.producer
+        answer_body = "Answer" + log_source_html(source, names)
         rows.append((asked, log_row(f"{identity}-asked", asked,
                                    question_body + change_browser.question_paragraphs(question.words), today)))
         rows.append((answered, log_row(f"{identity}-answered", answered,
@@ -382,8 +384,7 @@ WAITING_NOTE = "The producer will answer."
 
 
 def question_time_html(stamp: str, today: datetime) -> str:
-    moment = datetime.fromisoformat(stamp)
-    return f'<time datetime="{moment.isoformat()}">{html.escape(local_time(moment, today))}</time>'
+    return time_html(datetime.fromisoformat(stamp), today)
 
 
 def panel_questions(item: the_list.ListItem, today: datetime, unread_answers: frozenset[str],
@@ -463,8 +464,12 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[st
     item = entry.item
     if isinstance(visibility, the_list.WaitingForAnswer):
         return waiting_details(entry, today, names, unread_answers, secret, reviews, parking_label)
-    sections = ''.join(f'<section><h3>{FIELD_LABELS[field]}</h3>{field_html(field, value, today, names)}</section>'
-                       for field, value in (("latest_status", item.latest_status), ("done_when", item.done_when)))
+    status_time = item.latest_status_time
+    status_stamp = " · " + time_html(status_time, today) if item.latest_status and isinstance(status_time, datetime) else ""
+    sections = ''.join(
+        f'<section><h3>{FIELD_LABELS[field]}{status_stamp if field == "latest_status" else ""}</h3>'
+        + field_html(field, value, today, names) + '</section>'
+        for field, value in (("latest_status", item.latest_status), ("done_when", item.done_when)))
     links = [f'<li><a data-record-jump href="{html.escape(item_link(entry.keeper, link.number), quote=True)}">#{link.number}</a>'
              + ' — ' + html.escape(link.condition) + '</li>' for link in item.blocked_by]
     links.extend(f'<li>Related: <a data-record-jump href="{html.escape(item_link(entry.keeper, number), quote=True)}">#{number}</a></li>'
@@ -533,7 +538,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
         if feedback.state == "alerted":
             notice = ("not sent; " + names.html(feedback.alerted_to) + " told" if feedback.alerted_to
                       else "not sent; no showrunner for alert")
-        update += '<small>' + notice + ", " + html.escape(local_time(sent, today)) + '</small>'
+        update += '<small>' + notice + ", " + html.escape(list_time(sent, today)) + '</small>'
     cells = (number, field_html("owner", item.owner, today, names), field_html("producer", item.producer, today, names),
              title, state, field_html("next_step", item.next_step, today, names), field_html("eta", item.eta, today, names), update)
     row = ''.join(f'<td' + (' class="record-id"' if label == '#' else '')

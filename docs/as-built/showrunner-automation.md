@@ -576,11 +576,16 @@ An empty optional time removes that time.
 
 Use `--include-parked` to include parked items or `--all` to include parked and closed items.
 Use `--latest-status` to show the latest status column.
+The List page and the command show the saved update time beside the latest status in the user's time zone.
+They include the date for updates from another day.
+The page shows the time of each log entry beside its source.
+The command refuses a `--source` that ends with a clock time.
 Morty can use every command.
 Other producers can list only their own items, including with `--all`.
 If the directory or a record is unreadable, the producer's list reports an incomplete result and exits nonzero.
 The command shows any readable items in scope and omits details of the read error.
-They can update only `--latest-status`, `--next-step`, and `--eta` on those items.
+They can update only `--latest-status`, `--next-step`, `--eta`, `--state`, and `--next-check` on those items.
+Only morty can close an item.
 Their updates use the caller's staff name as the log source.
 
 Morty uses `--producer <name or staff id>` on add or update to assign an item.
