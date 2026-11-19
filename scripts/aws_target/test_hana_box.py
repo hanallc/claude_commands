@@ -59,14 +59,16 @@ mount_timeout_seconds=15
 # whole: 1..
 aws_timeout_s=10
 # whole: 1..
+result_transfer_timeout_s=83
+# whole: 1..
 control_url_seconds=3600
 """ + HANA_GUEST_RUNTIME_SETTINGS)
 
 
-def record_lifecycle_image(directory: Path, workload: Path) -> Path:
+def record_lifecycle_image(directory: Path, workload: Path, *, identity: hana_box.DeploymentIdentity = IDENTITY) -> Path:
     path = directory / 'hana/setup.json'
     path.parent.mkdir(exist_ok=True, parents=True)
-    _ = path.write_text(json.dumps({'deployment': IDENTITY.deployment, 'instance': IDENTITY.instance,
+    _ = path.write_text(json.dumps({'deployment': identity.deployment, 'instance': identity.instance,
         'guest_digest': hana_render.guest_digest(workload).value}))
     return path
 

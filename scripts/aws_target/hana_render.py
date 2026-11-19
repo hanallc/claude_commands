@@ -19,7 +19,7 @@ HANA_TARGET_ALIAS_KEY = 'host'
 HANA_GUEST_KEYS = (
     'enabled', 'guard_grace_seconds', 'watchdog_check_seconds', 'permit_max_seconds',
     'step_cpu_limit', 'step_memory_gib', 'mount_timeout_seconds', 'aws_timeout_s', 'control_poll_seconds',
-    *hana_runner.EXECUTION_CONFIG_KEYS, 'source_max_bytes', 'source_download_timeout_s',
+    'result_transfer_timeout_s', *hana_runner.EXECUTION_CONFIG_KEYS, 'source_max_bytes', 'source_download_timeout_s',
     'source_git_timeout_s', 'source_allowed_environment',
 )
 
@@ -107,12 +107,15 @@ def config_text(settings: dict[str, conf.Setting]) -> str:
     return '\n'.join(rows) + '\n'
 
 
-def guest_files(checkout: Path, configuration: Path, device: Path) -> tuple[RenderedGuestFile, ...]:
+def guest_files(checkout: Path, configuration: Path | conf.ConfigRead, device: Path) -> tuple[RenderedGuestFile, ...]:
     """Render the guest units and their runtime files from one config view."""
-    hana_settings = conf.settings(configuration.read_text(encoding='utf-8'))
+    workload = conf.read(configuration) if isinstance(configuration, Path) else configuration
+    hana_settings = workload.settings
+    if not isinstance(hana_settings, dict):
+        raise ValueError(f'{workload.source}: {hana_settings.reason}')
     host_name = guest_host_name(hana_settings)
     guest_config = resolved_config_text(hana_settings, HANA_GUEST_KEYS, host_name)
-    parsed = conf.ConfigRead(configuration, configuration, conf.settings(guest_config), False)
+    parsed = conf.ConfigRead(workload.source, workload.source, conf.settings(guest_config), False, workload.stamp)
     control = (*hana_guest.render_files(hana_guest.read_settings(parsed), device=device),
                *hana_receiver.render_files(hana_receiver.read_settings(parsed)))
     files = [RenderedGuestFile(Path(file.path.name), file.mode, file.content.encode()) for file in control]
@@ -145,7 +148,7 @@ def digest_files(files: tuple[RenderedGuestFile, ...]) -> GuestDigest:
     return GuestDigest(sha256(json.dumps(entries, separators=(',', ':')).encode()).hexdigest())
 
 
-def guest_digest(configuration: Path, *, checkout: Path = CHECKOUT) -> GuestDigest:
+def guest_digest(configuration: Path | conf.ConfigRead, *, checkout: Path = CHECKOUT) -> GuestDigest:
     return digest_files(guest_files(checkout, configuration, DATA_DEVICE))
 
 

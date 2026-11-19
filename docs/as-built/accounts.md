@@ -449,6 +449,17 @@ The account details include the dot, label, swatch, allowance, reset, credits, a
 A separated row shows the account details again.
 A lone producer row shows all account details.
 The helper preserves the complete input rows for later sorts.
+The Accounts page shows a Lucide warning triangle or urgent octagon beside the weekly percentage.
+`accounts_quota_warning_percent` and `accounts_quota_urgent_percent` in `config/review_links.conf` start at 10 and 5.
+The warning value must be greater than the urgent value.
+The Accounts entry shows the most urgent active icon during the console count refresh.
+The row, the sidebar and Clear use stored weekly readings for accounts that are currently signed in.
+Select a row icon to read the alert and clear it for that account.
+Clear keeps the percentage color and stores the cleared level and reset time on the server.
+A cleared warning can return as urgent. A new weekly reset time makes the alert eligible again.
+If a reading has no reset time, Clear keeps the last reset time in the account's clear record.
+The server keeps the clear records in `console/.accounts-quota-cleared.json` under the review root.
+If the file is malformed, the table shows the problem, the sidebar hides the icon and Clear refuses to write.
 Each named header on the Accounts page has a sort control.
 The first selection sets the order for that column.
 

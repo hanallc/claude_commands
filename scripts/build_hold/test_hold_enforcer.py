@@ -778,9 +778,9 @@ class HoldEnforcerTests(unittest.TestCase):
                         raise OSError("private stop record is full")
                     record_build(build, holder, proc_root, action, stopped_run=stopped_run)
 
-                def save_reason(path: Path, text: str) -> None:
-                    write_text_atomic(path, text)
-                    if path == record and "stop_reason" in text and outcome == "identity change":
+                def stage_reason(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
+                    write_text_atomic(path, text, new_file_mode=new_file_mode)
+                    if "stop_reason" in text and outcome == "identity change":
                         _ = self.process(10, "editor", start=12_000)
 
                 def signal_group(pid: int, signum: int) -> None:
@@ -793,7 +793,7 @@ class HoldEnforcerTests(unittest.TestCase):
                     self.assertIn("gate-owner", cycle["recipients"])
 
                 with mock.patch.object(hold_enforcer, "record_build", side_effect=save_stop), \
-                     mock.patch.object(detached_runs, "write_text_atomic", side_effect=save_reason):
+                     mock.patch.object(detached_runs, "write_text_atomic", side_effect=stage_reason):
                     if outcome.startswith("shared"):
                         before = record.read_bytes()
                         rows = self.rows()
@@ -831,6 +831,8 @@ class HoldEnforcerTests(unittest.TestCase):
                         self.assertIsInstance(result, expected)
                 if outcome == "stopped":
                     self.assertEqual(signals, [(10, signal.SIGTERM)])
+                    saved = cast(dict[str, object], json.loads(record.read_text()))
+                    self.assertEqual(saved["stop_reason"], "stopped for timed test; run again after the release")
                 else:
                     self.assertEqual(signals, [])
                     self.assertEqual([row for row in self.rows() if row["action"] == "stopped"], [])
@@ -926,7 +928,7 @@ class HoldEnforcerTests(unittest.TestCase):
 
                 def signal_group(pid: int, signum: int) -> None:
                     saved = cast(dict[str, object], json.loads(record.read_text()))
-                    self.assertEqual(saved["stop_reason"], "stopped for timed test; run again after the release")
+                    self.assertNotIn("stop_reason", saved)
                     signals.append((pid, signum))
 
                 with mock.patch.object(detached_runs, "command_group", wraps=detached_runs.command_group) as read_group:
@@ -942,6 +944,8 @@ class HoldEnforcerTests(unittest.TestCase):
                 if current:
                     self.assertIsInstance(result, hold_enforcer.StoppedRun)
                     self.assertEqual(signals, [(10, signal.SIGTERM)])
+                    saved = cast(dict[str, object], json.loads(record.read_text()))
+                    self.assertEqual(saved["stop_reason"], "stopped for timed test; run again after the release")
                 else:
                     self.assertIsInstance(result, hold_enforcer.RunIdentityChanged)
                     self.assertEqual(signals, [])

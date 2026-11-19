@@ -70,7 +70,7 @@ def opening_transcript(world: ProducerAdmissionWorld, sent: list[str], *,
 
     with (patch.object(client, "submit_opening_prompt", side_effect=submit),
           patch.object(client, "wait_for_prompt_input", return_value=herdr.PromptInputReady(idle=True)),
-          patch.object(client, "prompt_input_empty", return_value=True),
+          patch.object(client, "composer", return_value=herdr.ComposerInput("")),
           patch.object(herdr, "prompt_recipient_process", return_value=herdr.PromptRecipientUnavailable("fixture")),
           patch.object(herdr, "check_target", return_value=True),
           patch.object(client, "_prompt", side_effect=write_turn)):
@@ -133,7 +133,7 @@ class CreateProducerTests(unittest.TestCase):
                         self.assertEqual(code, 1, errors)
                         self.assertIn("Check the pane, then run agents resume dwight --resend-opening-prompt", errors)
                         self.assertEqual(sent, [OPENING_TEXT])
-                        with patch.object(world.case.client, "prompt_input_empty", return_value=False):
+                        with patch.object(world.case.client, "composer", return_value=herdr.ComposerInput("draft")):
                             code, _, errors = command("resume", "dwight", "--resend-opening-prompt")
                         self.assertEqual(code, 1, errors)
                         self.assertIn("check that the destination pane is idle and its input is empty", errors)
