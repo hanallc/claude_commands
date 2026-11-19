@@ -124,7 +124,7 @@ Every owned cell must be recorded `clean`, `exception`, or `held` at the unit's 
 9. Apply the printed `held built` command only after checking that its change exists in the code.
 10. Apply <CheckpointCommit/> step 7 to confirm release; a cleared record or inactive state releases nothing.
 11. Mark the phase done after confirmation.
-12. Send `From <unit>: ticket <id> closed with no code change; <n> held.`.
+12. Send `ticket <id> closed with no code change; <n> held.`
 13. Continue with <StyleTicketEnd/>.
 
 The fast-forward exception in `docs/production_format.md` item 5 preserves the required receiving-branch ancestry after sync.

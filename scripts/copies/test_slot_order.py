@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 import unittest
 from unittest import mock
 
+from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service, first_step, placement
 from scripts.buildlog import repository, treekey
 from scripts.build_queue.admission_test_support import AdmissionFixture
@@ -30,6 +31,7 @@ from scripts.mac_test import eligibility
 from scripts.disks import slots
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture
 from scripts.lib import build_folders, build_slots, conf
+from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lint.memory_test_support import write_config_fixture, write_pressure_reading
@@ -129,7 +131,8 @@ class SlotOrderTests(unittest.TestCase):
                 process.kill()
             _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
-    def start(self, command: tuple[str, ...], *options: str, since_age: float = 0) -> subprocess.Popen[str]:
+    def start(self, command: tuple[str, ...], *options: str, since_age: float = 0,
+              separate_command: bool = True) -> subprocess.Popen[str]:
         launcher = [sys.executable, "-m", "scripts.copies.copies"]
         if since_age:
             program = ("import sys,time; from types import SimpleNamespace; from unittest.mock import patch; "
@@ -137,8 +140,9 @@ class SlotOrderTests(unittest.TestCase):
                 + f"clock=SimpleNamespace(time=lambda: time.time()-{since_age!r})\n"
                 + "with patch.object(first_step, 'time', clock): raise SystemExit(copies.main(sys.argv[1:]))\n")
             launcher = [sys.executable, "-c", program]
+        separator = ["--"] if separate_command else []
         process = subprocess.Popen([*launcher, "run", "--repo", str(self.source),
-            "--commit", "HEAD", *options, "--", *command], cwd=CHECKOUT, env=dict(os.environ),
+            "--commit", "HEAD", *options, *separator, *command], cwd=CHECKOUT, env=dict(os.environ),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.processes.append(process)
         return process
@@ -200,6 +204,8 @@ class SlotOrderTests(unittest.TestCase):
                   side_effect=AssertionError("the pending bump gate sent a result")),
               self.assertRaises(AdmissionWaitReached), stop_before_slot(self, self.slot_root)):
             _ = bump_gate.run_gate(path)
+        request = next(request for request in self.requests if isinstance(request, wire.AdmitRequest))
+        self.assertEqual(request.identity.job, StepJob("test-all"))
 
     def test_bump_admission_selects_the_package_from_its_tip(self) -> None:
         tools = self.verify_source()
@@ -302,11 +308,16 @@ placement_once
 
     def test_waiting_and_stopped_runs_leave_no_slot_or_lease(self) -> None:
         self.queue.hold_starts()
-        process = self.start((sys.executable, str(self.source / "merge_gate.py"), "--tests-only"))
+        process = self.start((sys.executable, str(self.source / "merge_gate.py"), "--tests-only"),
+                             separate_command=False)
         self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS), "the copy run did not enter the memory queue")
         with self.queue.loop_turn():
             self.assertTrue(self.queue.server.waiters)
             self.assertFalse(self.queue.caller_reservations())
+            reply, = self.queue.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            waiting, = reply.reading.view.waiting
+            self.assertEqual(waiting.job, StepJob("test-all"))
         self.assertFalse(self.slot_root.exists())
         self.assertEqual(self.report()["groups"], [])
         process.kill()
@@ -643,7 +654,7 @@ placement_once
             started = self.next_step(process)
             grant = client.read_assignment(Path(started.get("assignment", "")))
             self.assertIsInstance(grant, wire.Assignment)
-            self.assertEqual(grant.assignment.source_key, placement.SourceKeyKnown(treekey.tree_key(started["cwd"]) or ""))
+            self.assertEqual(grant.assignment.source_key, execution_identity.SourceKeyKnown(treekey.tree_key(started["cwd"]) or ""))
             self.assertEqual((Path(started["cwd"]) / "src/lib.rs").read_text(), "pub fn changed() {}\n")
             self.assertEqual((Path(started["cwd"]) / "src/merged.rs").read_text(), "pub fn merged() {}\n")
             self.assertFalse((tools.root / "src/merged.rs").exists())
@@ -683,7 +694,7 @@ placement_once
                 self.assertEqual(request.constraints.command_kind, arguments[0])
                 self.assertEqual(request.constraints.package, "sample")
                 self.assertEqual(request.constraints.repository, str(tools.root))
-                self.assertEqual(request.constraints.source_key, placement.SourceKeyKnown(source_key))
+                self.assertEqual(request.constraints.source_key, execution_identity.SourceKeyKnown(source_key))
                 self.assertEqual(request.constraints.selection, selection)
                 self.assertEqual(request.route, route)
                 self.assertIsInstance(request.local, wire.LocalAdmissionContext)

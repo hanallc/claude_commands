@@ -8,7 +8,10 @@ import json
 import io
 import fcntl
 import os
+import shlex
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -26,7 +29,7 @@ from scripts.accounts import accounts
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
 from scripts.production.cli_fixture import ImmutableGitSeed
-from scripts.lib import build_folders, cargo_output, copy_record, scratch, session_folder
+from scripts.lib import build_folders, cargo_output, copy_record, git_files, process_group, scratch, session_folder, time_limit
 from scripts.lint import sweep
 
 from scripts.lib import conf
@@ -199,16 +202,547 @@ class ScratchTests(unittest.TestCase):
                             self.assertIn("ambiguous source", error.getvalue())
                             self.assertIn(str(work), error.getvalue())
 
+    def copy_with_published_head(self, name: str, task: str = "gate:copy") -> tuple[Path, Path]:
+        path = self.copy(name=name, task=task)
+        remote = self.base / f"{name}.git"
+        self.git(self.base, "init", "--bare", "-q", str(remote))
+        self.git(path, "commit", "-qm", "Published", "--allow-empty")
+        self.git(path, "remote", "add", "origin", str(remote))
+        self.git(path, "push", "-q", "origin", "HEAD:refs/heads/main")
+        return path, remote
+
+    def publish_next_commit(self, origin: Path) -> Path:
+        publisher = self.base / (origin.stem + "-publisher")
+        self.git(self.base, "clone", "-q", "-b", "main", str(origin), str(publisher))
+        self.git(publisher, "commit", "-qm", "New remote tip", "--allow-empty")
+        self.git(publisher, "push", "-q", "origin", "main")
+        return publisher
+
+    def git_object_files(self, repo: Path) -> dict[Path, bytes]:
+        objects = repo / ".git/objects"
+        return {file.relative_to(objects): file.read_bytes() for file in objects.rglob("*") if file.is_file()}
+
+    def stall_remote_advertisement(self, clone: Path, address: Path) -> None:
+        """Start a transport child that holds its socket until group cleanup."""
+        transport = self.base / "upload-pack"
+        _ = transport.write_text(
+            f"#!{sys.executable}\n"
+            + "import os, signal, socket\n"
+            + "if os.fork() == 0:\n"
+            + "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            + "    signal.alarm(15)\n"
+            + "    with socket.socket(socket.AF_UNIX) as connection:\n"
+            + f"        connection.connect({str(address)!r})\n"
+            + "        assert os.environ['GIT_TERMINAL_PROMPT'] == '0'\n"
+            + "        assert os.environ['GIT_ASKPASS'] == os.environ['SSH_ASKPASS'] == 'false'\n"
+            + "        assert os.environ['SSH_ASKPASS_REQUIRE'] == 'never'\n"
+            + "        assert os.environ['GIT_SSH_COMMAND'] == 'ssh -o BatchMode=yes'\n"
+            + "        connection.sendall(b'R')\n"
+            + "        connection.recv(1)\n"
+            + "else:\n"
+            + "    signal.alarm(15)\n"
+            + "    signal.pause()\n")
+        transport.chmod(0o700)
+        self.git(clone, "config", "remote.origin.uploadpack", shlex.quote(str(transport)))
+
+    def test_task_end_removes_a_detached_head_equal_to_an_advertised_tip(self) -> None:
+        task = "gate:stale-remote"
+        path, origin = self.copy_with_published_head("stale-remote", task)
+        backup = self.base / "backup.git"
+        self.git(self.base, "init", "--bare", "-q", str(backup))
+        self.git(path, "remote", "add", "backup", os.path.relpath(backup, path))
+        self.git(path, "checkout", "--detach", "-q")
+        self.git(path, "commit", "-qm", "Published tag", "--allow-empty")
+        self.git(path, "tag", "published")
+        self.git(path, "push", "-q", str(backup), "refs/tags/published")
+        self.git(backup, "tag", "-f", "-am", "Remote annotation", "published", "refs/tags/published^{commit}")
+        annotation = subprocess.check_output(
+            ["git", "-C", str(backup), "rev-parse", "refs/tags/published"], text=True).strip()
+        self.assertNotEqual(subprocess.run(["git", "-C", str(path), "cat-file", "-e", annotation],
+                                           check=False, capture_output=True).returncode, 0)
+        self.git(path, "checkout", "--detach", "-q", "refs/remotes/origin/main")
+        self.git(path, "commit", "-qm", "Published detached HEAD", "--allow-empty")
+        self.git(path, "push", "-q", str(origin), "HEAD:refs/heads/main")
+        self.assertEqual(subprocess.check_output(["git", "-C", str(path), "for-each-ref", "--contains", "HEAD"]), b"")
+        refs = ["git", "-C", str(path), "for-each-ref"]
+        previous_refs = subprocess.check_output(refs)
+        previous_objects = self.git_object_files(path)
+        fetch_head = path / ".git/FETCH_HEAD"
+        _ = fetch_head.write_text("previous fetch\n")
+        trace = path / ".git/removal.trace"
+        packet_trace = path / ".git/removal-packets.trace"
+        global_git = self.base / "trace.gitconfig"
+        trace2 = {kind: path / ".git" / f"{kind}.trace" for kind in ("normal", "event", "perf")}
+        for kind, destination in trace2.items():
+            self.git(path, "config", "--file", str(global_git), f"trace2.{kind}Target", str(destination))
+        traces = (trace, packet_trace, *trace2.values())
+        for destination in traces:
+            _ = destination.write_text("previous trace\n")
+        scratch.busy_path(path).touch()
+        previous_git_files = {file: file.read_bytes() for file in (path / ".git").rglob("*") if file.is_file()}
+        remove = scratch.remove
+
+        def check_then_remove(folder: Path) -> None:
+            self.assertEqual(fetch_head.read_text(), "previous fetch\n")
+            for destination in traces:
+                self.assertEqual(destination.read_text(), "previous trace\n")
+            self.assertNotIn("built-in: git fetch ", trace.read_text())
+            self.assertEqual({file: file.read_bytes() for file in (folder / ".git").rglob("*") if file.is_file()},
+                             previous_git_files)
+            with mock.patch.dict(os.environ, {"GIT_TRACE": "0", "GIT_TRACE_PACKET": "0", "GIT_TRACE2": "0",
+                                              "GIT_TRACE2_EVENT": "0", "GIT_TRACE2_PERF": "0"}):
+                self.assertEqual(subprocess.check_output(refs), previous_refs)
+                self.assertEqual(self.git_object_files(folder), previous_objects)
+                self.git(folder, "merge-base", "--is-ancestor", "refs/remotes/origin/main", "HEAD")
+            remove(folder)
+
+        with (mock.patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file", "GIT_CONFIG_GLOBAL": str(global_git),
+                                           "GIT_TRACE": str(trace), "GIT_TRACE_PACKET": str(packet_trace)}),
+              mock.patch.object(time_limit, "capture", wraps=time_limit.capture) as query,
+              mock.patch.object(scratch, "remove", side_effect=check_then_remove)):
+            self.assertEqual(scratch.end(task), [path])
+        self.assertFalse(path.exists())
+        self.assertEqual(query.call_count, 2)
+        for remote in ("backup", "origin"):
+            query.assert_any_call(["git", "-C", str(path), "ls-remote", "--", remote], deadline=mock.ANY, env=mock.ANY)
+        self.assertIn("refs/tags/published^{}", subprocess.check_output(
+            ["git", "ls-remote", str(backup)], text=True))
+
+    def test_task_end_keeps_a_head_below_a_remote_tip_that_is_absent_locally(self) -> None:
+        task = "gate:missing-remote-tip"
+        path, origin = self.copy_with_published_head("missing-remote-tip", task)
+        self.git(path, "update-ref", "-d", "refs/remotes/origin/main")
+        publisher = self.publish_next_commit(origin)
+        tip = subprocess.check_output(["git", "-C", str(publisher), "rev-parse", "HEAD"], text=True).strip()
+        self.assertNotEqual(subprocess.run(["git", "-C", str(path), "cat-file", "-e", tip],
+                                           check=False, capture_output=True).returncode, 0)
+        previous_objects = self.git_object_files(path)
+        with mock.patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file"}):
+            result = scratch.end(task)
+        self.assertEqual(result, [])
+        self.assertEqual(len(result.kept), 1)
+        self.assertIn("advertised tips are missing locally", result.kept[0].reason)
+        self.assertTrue(path.is_dir())
+        self.assertEqual(self.git_object_files(path), previous_objects)
+
+    def test_task_end_keeps_an_unpushed_clone_after_a_remote_check(self) -> None:
+        for cleanup in ("task", "terminal-workspace"):
+            with self.subTest(cleanup=cleanup):
+                task = f"gate:unpushed-{cleanup}"
+                path, remote = self.copy_with_published_head(f"unpushed-{cleanup}", task)
+                self.git(path, "commit", "-qm", "Only local", "--allow-empty")
+                tracking = ["git", "-C", str(path), "rev-parse", "--verify", "refs/remotes/origin/main"]
+                previous_tip = subprocess.check_output(tracking)
+
+                if cleanup == "task":
+                    with mock.patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file"}):
+                        result = scratch.end(task)
+                    self.assertEqual(result.kept, [scratch.KeptFolder(path, f"{path}: it has commits that are on no remote")])
+                    self.assertTrue(path.is_dir())
+                    self.git(path, "rev-parse", "--verify", "refs/remotes/origin/main")
+                    self.assertEqual(subprocess.check_output(tracking), previous_tip)
+                    continue
+
+                source = self.base / "workspace-source"
+                self.git(self.base, "clone", "-qb", "main", str(remote), str(source))
+                tip = subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip()
+                manifest = self.base / "crate-run.json"
+                base = previous_tip.decode().strip()
+                _ = manifest.write_text(json.dumps({
+                    "version": 2, "canonical": str(source), "base": base,
+                    "crates": {"saved": {"checkout": str(path), "stage": "abandoned"}},
+                }))
+                scratch.register_copy(path, task=task, owner_unit="maker", source_path=str(source),
+                                      source_commit=base, copy_commit=tip, target_mode="none",
+                                      seed_source="", borrows_from="", crate_run=str(manifest))
+                with (mock.patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file"}),
+                      mock.patch.object(time_limit, "capture", wraps=time_limit.capture) as query,
+                      mock.patch.object(copies, "rescue_workspace", wraps=copies.rescue_workspace) as rescue):
+                    copies.end_workspaces(task, [path])
+                query.assert_called_once()
+                rescue.assert_called_once()
+                self.assertFalse(path.exists())
+                saved = subprocess.check_output(
+                    ["git", "-C", str(source), "for-each-ref", "--contains", tip, "--format=%(refname)", "refs/rescue/"],
+                    text=True)
+                self.assertTrue(saved.strip())
+
+    def test_task_end_keeps_a_clone_when_the_remote_check_fails(self) -> None:
+        for destination in ("missing", "self", "nested", "file", "symlink", "suffix"):
+            with self.subTest(destination=destination):
+                task = f"gate:failed-remote-{destination}"
+                name = f"failed-remote-{destination}" + (".git" if destination == "suffix" else "")
+                path, remote = self.copy_with_published_head(name, task)
+                self.git(path, "update-ref", "-d", "refs/remotes/origin/main")
+                root = target = path
+                if destination == "missing":
+                    _ = remote.rename(self.base / "moved-origin.git")
+                else:
+                    url = "."
+                    if destination == "nested":
+                        root = scratch.new(task, "remote-parent")
+                        path = root / "checkout"
+                        self.git(root, "clone", "-qb", "main", str(remote), str(path))
+                        self.git(path, "update-ref", "-d", "refs/remotes/origin/main")
+                        target = root / "remote.git"
+                        _ = remote.rename(target)
+                        url = "../remote.git"
+                    elif destination == "file":
+                        url = path.as_uri()
+                    elif destination == "symlink":
+                        alias = self.base / "remote-alias"
+                        alias.symlink_to(path, target_is_directory=True)
+                        url = str(alias)
+                    elif destination == "suffix":
+                        url = os.path.relpath(path.with_suffix(""), path)
+                    self.git(path, "remote", "set-url", "origin", url)
+
+                with (mock.patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file"}),
+                      mock.patch.object(time_limit, "capture", wraps=time_limit.capture) as query):
+                    if destination == "missing":
+                        ended = scratch.end(task)
+                        self.assertEqual(ended, [])
+                        self.assertEqual(len(ended.kept), 1)
+                        result = ended.kept[0]
+                    else:
+                        result = scratch.remove_folder(root, scratch.TaskRemoval(task, time.time()))
+                self.assertIsInstance(result, scratch.KeptFolder)
+                assert isinstance(result, scratch.KeptFolder)
+                self.assertEqual(result.path, root)
+                if destination == "missing":
+                    self.assertIn("git cannot read remote 'origin': fatal:", result.reason)
+                    self.assertIn(str(remote), result.reason)
+                    query.assert_called_once()
+                else:
+                    self.assertEqual(result, scratch.RemoteInsideRemovalTree(
+                        root, f"{path}: local remote 'origin' points inside the removal tree: {target}"))
+                    query.assert_not_called()
+                self.assertEqual(len(result.reason.splitlines()), 1)
+                self.assertTrue(path.is_dir())
+                self.assertFalse(scratch.removal_mark(root).exists())
+
+    def test_local_remote_storage_must_survive_removal(self) -> None:
+        for dependency in ("git directory", "common directory", "alternate", "nested alternate", "unreadable alternate",
+                           "independent alternate"):
+            with self.subTest(dependency=dependency):
+                name = dependency.replace(" ", "-")
+                path, remote = self.copy_with_published_head(name)
+                self.git(path, "update-ref", "-d", "refs/remotes/origin/main")
+                git_dir = path / ".git"
+                alternate = remote / "objects/info/alternates"
+                if dependency == "git directory":
+                    location = self.base / "external-checkout"
+                    location.mkdir()
+                    _ = (location / ".git").write_text(f"gitdir: {git_dir}\n")
+                    update = f"private-rewrite:{name}"
+                    self.git(path, "config", f"url.{location}.insteadOf", update)
+                    self.git(path, "remote", "set-url", "origin", update)
+                    target = git_dir
+                elif dependency == "common directory":
+                    _ = (remote / "commondir").write_text(f"{git_dir}\n")
+                    target = git_dir
+                else:
+                    target = git_dir / "objects"
+                    if dependency in ("nested alternate", "independent alternate"):
+                        other = self.base / f"{name}-objects.git"
+                        self.git(self.base, "init", "--bare", "-q", str(other))
+                        _ = alternate.write_text(os.path.relpath(other / "objects", remote / "objects") + "\n")
+                        alternate = other / "objects/info/alternates"
+                    if dependency == "unreadable alternate":
+                        os.mkfifo(alternate)
+                    elif dependency != "independent alternate":
+                        _ = alternate.write_text(f"{target}\n")
+                previous = self.git_object_files(path)
+                with (mock.patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file"}),
+                      mock.patch.object(time_limit, "capture", wraps=time_limit.capture) as query):
+                    outcome = scratch.remove_folder(path)
+                if dependency == "independent alternate":
+                    self.assertEqual(outcome, scratch.RemovedCopy())
+                    self.assertFalse(path.exists())
+                    query.assert_called_once()
+                else:
+                    if dependency == "unreadable alternate":
+                        self.assertEqual(outcome, scratch.RemoteStorageUnproven(
+                            path, f"{path}: cannot verify local remote 'origin' storage: {alternate} is not a regular file"))
+                    else:
+                        self.assertEqual(outcome, scratch.RemoteInsideRemovalTree(
+                            path, f"{path}: local remote 'origin' points inside the removal tree: {target}"))
+                    query.assert_not_called()
+                    self.assertEqual(self.git_object_files(path), previous)
+                    self.assertFalse(scratch.removal_mark(path).exists())
+
+    def test_task_end_keeps_a_clone_when_its_named_remote_times_out(self) -> None:
+        task = "gate:remote-timeout"
+        path, _ = self.copy_with_published_head("remote-timeout", task)
+        self.git(path, "update-ref", "-d", "refs/remotes/origin/main")
+        address = self.base / "remote.sock"
+        self.stall_remote_advertisement(path, address)
+        previous_objects = self.git_object_files(path)
+        with (socket.socket(socket.AF_UNIX) as server,
+              mock.patch.dict(os.environ, {**config_environment(self.base / "config"), "GIT_ALLOW_PROTOCOL": "file"})):
+            for key in ("GIT_SSH_COMMAND", "GIT_SSH"):
+                _ = os.environ.pop(key, None)
+            _ = write_config_fixture(conf.path("scratch"), "removal_remote_timeout_seconds=2\n")
+            server.bind(str(address))
+            server.listen()
+            server.settimeout(1)
+            started = time.monotonic()
+            result = scratch.end(task)
+            with server.accept()[0] as connection:
+                connection.settimeout(1)
+                self.assertEqual(connection.recv(1), b"R")
+                self.assertEqual(connection.recv(1), b"")
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(len(result.kept), 1)
+        self.assertEqual(result.kept[0].path, path)
+        self.assertIn("git cannot read remote 'origin': ls-remote timed out (limit 2 s)", result.kept[0].reason)
+        self.assertTrue(path.is_dir())
+        self.assertEqual(self.git_object_files(path), previous_objects)
+
+    def test_a_deleted_remote_branch_does_not_cover_commits_after_a_remote_check(self) -> None:
+        task = "gate:deleted-remote-branch"
+        path, remote = self.copy_with_published_head("deleted-remote-branch", task)
+        self.git(path, "checkout", "-qb", "deleted")
+        self.git(path, "commit", "-qm", "Only on the deleted branch", "--allow-empty")
+        self.git(path, "push", "-q", "origin", "HEAD:refs/heads/deleted")
+        self.git(remote, "update-ref", "-d", "refs/heads/deleted")
+        self.git(path, "merge-base", "--is-ancestor", "HEAD", "refs/remotes/origin/deleted")
+        self.git(path, "checkout", "-q", "-")
+        self.git(path, "commit", "-qm", "Published after the last fetch", "--allow-empty")
+        self.git(path, "push", "-q", str(remote), "HEAD:refs/heads/main")
+        trace = self.base / "git.trace"
+        trace.touch()
+
+        with (mock.patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file", "GIT_TRACE": str(trace)}),
+              mock.patch.object(time_limit, "capture", wraps=time_limit.capture) as query):
+            result = scratch.end(task)
+        self.assertEqual(result, [])
+        self.assertEqual(result.kept, [scratch.KeptFolder(path, f"{path}: it has commits that are on no remote")])
+        query.assert_called_once()
+        self.assertNotIn("built-in: git fetch ", trace.read_text())
+        self.assertTrue(path.is_dir())
+        self.git(path, "merge-base", "--is-ancestor", "refs/heads/deleted", "refs/remotes/origin/deleted")
+
+    def test_a_remote_check_keeps_a_private_branch_and_does_not_apply_fetch_refspecs(self) -> None:
+        task = "gate:force-refspec"
+        path, _ = self.copy_with_published_head("force-refspec", task)
+        self.git(path, "checkout", "-qb", "private")
+        self.git(path, "commit", "-qm", "Only on the private branch", "--allow-empty")
+        self.git(path, "checkout", "-q", "-")
+        self.git(path, "config", "remote.origin.fetch", "+refs/heads/main:refs/heads/private")
+        self.git(path, "update-ref", "-d", "refs/remotes/origin/main")
+        refs = ["git", "-C", str(path), "for-each-ref"]
+        previous_refs = subprocess.check_output(refs)
+
+        with mock.patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file"}):
+            result = scratch.end(task)
+        self.assertEqual(result.kept, [scratch.KeptFolder(path, f"{path}: it has commits that are on no remote")])
+        self.assertEqual(result, [])
+        self.assertEqual(subprocess.check_output(refs), previous_refs)
+        self.assertTrue(path.is_dir())
+
+    def test_a_remote_check_uses_the_clones_ssh_command(self) -> None:
+        task = "gate:configured-ssh"
+        path, remote = self.copy_with_published_head("configured-ssh", task)
+        self.git(path, "update-ref", "-d", "refs/remotes/origin/main")
+        ssh = self.base / "configured-ssh"
+        _ = ssh.write_text(
+            f"#!{sys.executable}\n"
+            + "import os, sys\n"
+            + "assert sys.argv[1] == 'example.invalid'\n"
+            + "assert os.environ['SSH_ASKPASS_REQUIRE'] == 'never'\n"
+            + f"os.execlp('git', 'git', 'upload-pack', {str(remote)!r})\n")
+        ssh.chmod(0o700)
+        self.git(path, "remote", "set-url", "origin", "ssh://example.invalid/repository")
+        self.git(path, "config", "core.sshCommand", shlex.quote(str(ssh)))
+        self.git(path, "config", "ssh.variant", "simple")
+        with mock.patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "ssh"}):
+            for key in ("GIT_SSH_COMMAND", "GIT_SSH", "GIT_SSH_VARIANT"):
+                _ = os.environ.pop(key, None)
+            self.assertEqual(scratch.end(task), [path])
+        self.assertFalse(path.exists())
+
+    def test_a_remote_check_keeps_a_tag_that_appears_during_the_query(self) -> None:
+        task = "gate:tag-during-query"
+        path, _ = self.copy_with_published_head("tag-during-query", task)
+        self.git(path, "update-ref", "-d", "refs/remotes/origin/main")
+        transport = self.base / "upload-pack-with-tag"
+        _ = transport.write_text(
+            f"#!{sys.executable}\n"
+            + "import os, subprocess, sys\n"
+            + f"repo = {str(path)!r}\n"
+            + "git = ['git', '-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@t']\n"
+            + "subprocess.run(git + ['checkout', '--detach', '-q'], check=True)\n"
+            + "subprocess.run(git + ['commit', '-qm', 'Only on a new tag', '--allow-empty'], check=True)\n"
+            + "subprocess.run(git + ['tag', 'private'], check=True)\n"
+            + "subprocess.run(git + ['checkout', '-q', '-'], check=True)\n"
+            + "os.execvp('git', ['git', 'upload-pack', *sys.argv[1:]])\n")
+        transport.chmod(0o700)
+        self.git(path, "config", "remote.origin.uploadpack", shlex.quote(str(transport)))
+
+        with mock.patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file"}):
+            result = scratch.end(task)
+        self.assertEqual(result, [])
+        self.assertEqual(result.kept, [scratch.KeptFolder(path, f"{path}: it has commits that are on no remote")])
+        self.git(path, "rev-parse", "--verify", "refs/tags/private")
+
+    def test_cargo_recovery_rechecks_local_work_with_the_same_advertised_ids(self) -> None:
+        for change in ("published", "private"):
+            with self.subTest(change=change):
+                path, _ = self.copy_with_published_head(change)
+                self.stop_removal_after_intent(path, "current")
+                self.git(path, "update-ref", "-d", "refs/remotes/origin/main")
+                self.git(path, "branch", "new-published-ref")
+                trace = self.base / f"{change}.trace"
+                trace.touch()
+                roots = cargo_output.CargoOutputRoots(path, path / "target", self.base / "outside-output")
+                saved = scratch.SavedCargoOutput(roots, (), (), time.time())
+
+                def change_refs(repo: Path, _saved: tuple[scratch.SavedCargoOutput, ...]) -> None:
+                    query.assert_called_once()
+                    if change == "private":
+                        self.git(repo, "checkout", "--detach", "-q")
+                        self.git(repo, "commit", "-qm", "Only on a private branch", "--allow-empty")
+                        self.git(repo, "branch", "private")
+                        self.git(repo, "checkout", "-q", "-")
+
+                with (mock.patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file", "GIT_TRACE": str(trace)}),
+                      mock.patch.object(time_limit, "capture", wraps=time_limit.capture) as query,
+                      mock.patch.object(scratch, "save_cargo_outputs", return_value=(saved,)),
+                      mock.patch.object(scratch, "clean_cargo_outputs", side_effect=change_refs)):
+                    result = scratch.remove_folder(path)
+                query.assert_called_once()
+                self.assertNotIn("built-in: git fetch ", trace.read_text())
+                if change == "private":
+                    self.assertEqual(result, scratch.RemoteKeptFolder(path, f"{path}: it has commits that are on no remote"))
+                    self.git(path, "rev-parse", "--verify", "refs/heads/private")
+                    self.assertTrue(scratch.removal_mark(path).exists())
+                else:
+                    self.assertEqual(result, scratch.RemovedCopy())
+                    self.assertFalse(path.exists())
+
+    def test_a_hold_does_not_retry_a_copy_after_its_first_remote_failure(self) -> None:
+        task = "gate:held-remote"
+        path, remote = self.copy_with_published_head("held-remote", task)
+        self.git(path, "update-ref", "-d", "refs/remotes/origin/main")
+        _ = scratch.hold(path, task, "The folder and the hold name the same copy")
+        parked = remote.rename(self.base / "parked.git")
+        remove_folder = scratch.remove_folder
+
+        def restore_remote_after_failure(folder: Path, request: scratch.TaskRemoval, *,
+                                         scratch_settings: conf.ConfigRead) -> scratch.RemovedCopy | scratch.KeptFolder:
+            outcome = remove_folder(folder, request, scratch_settings=scratch_settings)
+            if parked.exists():
+                _ = parked.rename(remote)
+            return outcome
+
+        with (mock.patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file"}),
+              mock.patch.object(scratch, "remove_folder", wraps=restore_remote_after_failure) as attempt):
+            result = scratch.end(task)
+            attempt.assert_called_once()
+        self.assertEqual(result, [])
+        self.assertEqual(len(result.kept), 1)
+        self.assertEqual(result.kept[0].path, path)
+        self.assertIn("git cannot read remote 'origin': fatal:", result.kept[0].reason)
+        self.assertTrue(path.is_dir())
+        self.assertGreater(scratch.holds()[str(path)]["ended"], 0)
+        self.assertEqual(scratch.end(task), [path])
+        self.assertNotIn(str(path), scratch.holds())
+
+    def test_the_portable_runner_stops_the_remote_group_after_removal_is_interrupted(self) -> None:
+        task = "gate:stopped-remote"
+        path, _ = self.copy_with_published_head("stopped-remote", task)
+        self.git(path, "update-ref", "-d", "refs/remotes/origin/main")
+        address = self.base / "stopped.sock"
+        self.stall_remote_advertisement(path, address)
+        scratch.busy_path(path).touch()
+        previous_files = set(path.rglob("*"))
+        previous_objects = self.git_object_files(path)
+        env = {**os.environ, **config_environment(self.base / "config"), "GIT_ALLOW_PROTOCOL": "file",
+               "GIT_ASKPASS": "unused", "SSH_ASKPASS": "unused", "SSH_ASKPASS_REQUIRE": "force"}
+        with mock.patch.dict(os.environ, env):
+            _ = write_config_fixture(conf.path("scratch"), "removal_remote_timeout_seconds=3\n")
+        for key in ("GIT_SSH_COMMAND", "GIT_SSH"):
+            _ = env.pop(key, None)
+        command = [sys.executable, "-m", "scripts.lib.scratch", "end", "--task", task]
+
+        with socket.socket(socket.AF_UNIX) as server:
+            server.bind(str(address))
+            server.listen()
+            server.settimeout(5)
+            with subprocess.Popen(command, env=env, start_new_session=True, stderr=subprocess.PIPE) as removal:
+                try:
+                    with server.accept()[0] as conn:
+                        conn.settimeout(7)
+                        self.assertEqual(conn.recv(1), b"R")
+                        removal.send_signal(signal.SIGINT)
+                        self.assertEqual(removal.wait(timeout=5), -signal.SIGINT)
+                        self.assertEqual(conn.recv(1), b"")
+                finally:
+                    if removal.returncode is None:
+                        process_group.send_process_group(removal.pid, signal.SIGKILL)
+        self.assertTrue(path.is_dir())
+        self.assertFalse(scratch.removal_mark(path).exists())
+        self.assertEqual(set(path.rglob("*")), previous_files)
+        self.assertEqual(self.git_object_files(path), previous_objects)
+
+    def test_removal_dry_run_keeps_a_copy_that_needs_a_remote_check(self) -> None:
+        path, _ = self.copy_with_published_head("dry-remote")
+        self.git(path, "update-ref", "-d", "refs/remotes/origin/main")
+        trace = self.base / "git.trace"
+        trace.touch()
+        with (mock.patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file", "GIT_TRACE": str(trace)}),
+              mock.patch.object(time_limit, "capture", wraps=time_limit.capture) as query):
+            outcome = scratch.remove_folder(path, dry_run=True)
+        self.assertIsInstance(outcome, scratch.KeptFolder)
+        assert isinstance(outcome, scratch.KeptFolder)
+        self.assertIn("a remote check is needed", outcome.reason)
+        self.assertNotIn("built-in: git fetch ", trace.read_text())
+        self.assertNotIn("built-in: git ls-remote ", trace.read_text())
+        query.assert_not_called()
+        self.assertTrue(path.is_dir())
+        self.assertFalse(scratch.removal_mark(path).exists())
+
+    def test_task_end_skips_the_remote_check_when_tracking_refs_cover_the_clone(self) -> None:
+        task = "gate:current-remote"
+        path, remote = self.copy_with_published_head("current-remote", task)
+        _ = remote.rename(self.base / "unavailable-origin.git")
+        trace = self.base / "git.trace"
+        trace.touch()
+        self.git(path, "merge-base", "--is-ancestor", "HEAD", "refs/remotes/origin/main")
+        with (mock.patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file", "GIT_TRACE": str(trace)}),
+              mock.patch.object(time_limit, "capture", wraps=time_limit.capture) as query):
+            self.assertEqual(scratch.end(task), [path])
+        self.assertNotIn("built-in: git fetch ", trace.read_text())
+        self.assertNotIn("built-in: git ls-remote ", trace.read_text())
+        query.assert_not_called()
+        self.assertFalse(path.exists())
+
+    def test_removal_skips_the_remote_check_for_a_linked_worktree_with_an_unpushed_head(self) -> None:
+        source, _ = self.copy_with_published_head("linked-source")
+        path = self.base / "linked"
+        self.git(source, "worktree", "add", "--detach", "-q", str(path))
+        self.git(path, "commit", "-qm", "Only in the worktree", "--allow-empty")
+        trace = self.base / "git.trace"
+        trace.touch()
+        with (mock.patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file", "GIT_TRACE": str(trace)}),
+              mock.patch.object(time_limit, "capture", wraps=time_limit.capture) as query):
+            result = scratch.remove_folder(path)
+        self.assertEqual(result, scratch.KeptFolder(path, f"{path}: it has commits that are on no remote"))
+        self.assertNotIn("built-in: git fetch ", trace.read_text())
+        self.assertNotIn("built-in: git ls-remote ", trace.read_text())
+        query.assert_not_called()
+        self.assertTrue(path.is_dir())
+
     def test_retry_keeps_a_new_commit_held_only_by_a_new_tag(self) -> None:
         for reference in ("new-work", "HEAD"):
             with self.subTest(reference=reference):
                 task = f"gate:commit-after-intent-{reference}"
-                path = self.copy(name=reference, task=task)
+                path, _ = self.copy_with_published_head(reference, task)
                 _ = (path / "tracked").write_text("original")
                 self.git(path, "add", "tracked")
                 self.git(path, "commit", "-qm", "Create the fixture")
-                self.git(path, "remote", "add", "origin", str(self.base / "origin"))
-                self.git(path, "update-ref", "refs/remotes/origin/main", "HEAD")
+                self.git(path, "push", "-q", "origin", "HEAD:refs/heads/main")
                 with mock.patch.object(scratch, "remove", side_effect=OSError("stop after intent")):
                     self.assertTrue(scratch.end(task).kept)
                 self.git(path, "checkout", "--detach", "-q")
@@ -640,6 +1174,373 @@ for descriptor in descriptors:
         self.assertEqual(scratch.remove_folder(worktree, source_deletion=scratch.SourceDeletion.RUN),
                          scratch.RemovedCopy())
         self.assertFalse(worktree.exists())
+
+    def checkout_with_removal_intent(self, version: str, name: str) -> Path:
+        path = self.copy(name=f"{version}-{name}")
+        self.add_saved_work_and_loose_ref(path)
+        self.stop_removal_after_intent(path, version)
+        return path
+
+    def add_saved_work_and_loose_ref(self, path: Path) -> None:
+        _ = (path / "tracked").write_text("saved work")
+        self.git(path, "add", "tracked")
+        self.git(path, "commit", "-qm", "Create the fixture")
+        self.git(path, "remote", "add", "origin", str(self.base / "origin"))
+        self.git(path, "update-ref", "refs/remotes/origin/main", "HEAD")
+        self.git(path, "pack-refs", "--all")
+        self.git(path, "update-ref", "refs/heads/loose", "HEAD")
+
+    def stop_removal_after_intent(self, path: Path, version: str) -> None:
+        with (mock.patch.object(scratch, "remove", side_effect=OSError("stop after removal intent")),
+              self.assertRaisesRegex(OSError, "stop after removal intent")):
+            _ = scratch.remove_folder(path)
+        if version == "legacy":
+            mark = scratch.removal_mark(path)
+            fields = cast(dict[str, object], json.loads(mark.read_text()))
+            for key in ("removal_version", "removal_repositories", "removal_files", "removal_intent_ns"):
+                _ = fields.pop(key)
+            _ = mark.write_text(json.dumps(fields))
+
+    def assert_retry_keeps_metadata(self, path: Path, metadata: Path) -> None:
+        with mock.patch.object(scratch, "remove", side_effect=AssertionError("source deletion started")) as delete:
+            result = scratch.remove_folder(path)
+            delete.assert_not_called()
+        self.assertIsInstance(result, scratch.KeptFolder)
+        assert isinstance(result, scratch.KeptFolder)
+        self.assertEqual(result.path, path)
+        self.assertIn(str(metadata), result.reason)
+        self.assertTrue(path.is_dir())
+        self.assertTrue(scratch.removal_mark(path).is_file())
+
+    def test_retry_checks_internal_metadata_in_a_descendant_checkout(self) -> None:
+        for version in ("current", "legacy"):
+            with self.subTest(version=version):
+                path = self.base / version
+                child = path / "checkout"
+                child.mkdir(parents=True)
+                self.git(child, "init", "-q")
+                _ = (child / "tracked").write_text("saved work")
+                self.git(child, "add", "tracked")
+                self.git(child, "commit", "-qm", "Create the fixture")
+                self.git(child, "remote", "add", "origin", str(self.base / "origin"))
+                self.git(child, "update-ref", "refs/remotes/origin/main", "HEAD")
+                self.stop_removal_after_intent(path, version)
+
+                index = child / ".git/index"
+                index.unlink()
+                index.mkdir()
+                self.assert_retry_keeps_metadata(path, index)
+                self.assertTrue(index.is_dir())
+
+    def test_retry_keeps_a_ref_directory_replaced_by_a_symlink_during_scan(self) -> None:
+        path = self.checkout_with_removal_intent("current", "ref-directory-swap")
+        namespace = path / ".git/refs/heads"
+        moved = self.base / "moved-refs"
+        empty = self.base / "empty-refs"
+        empty.mkdir()
+        open_entry, scan = os.open, os.scandir
+
+        def replace_namespace() -> None:
+            _ = namespace.rename(moved)
+            namespace.symlink_to(empty, target_is_directory=True)
+
+        def open_during_swap(name: str | Path, flags: int, mode: int = 0o777, *,
+                             dir_fd: int | None = None) -> int:
+            if name == namespace.name and dir_fd is not None and flags & os.O_DIRECTORY:
+                parent = namespace.parent.stat()
+                descriptor = os.fstat(dir_fd)
+                self.assertEqual((parent.st_dev, parent.st_ino), (descriptor.st_dev, descriptor.st_ino))
+                required = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+                self.assertEqual(flags & required, required)
+                replace_namespace()
+            return open_entry(name, flags, mode, dir_fd=dir_fd)
+
+        def scan_during_swap(folder: Path | str | int = "."):
+            if folder == namespace:
+                replace_namespace()
+            return scan(folder)
+
+        with (mock.patch.object(os, "open", side_effect=open_during_swap),
+              mock.patch.object(os, "scandir", side_effect=scan_during_swap)):
+            self.assert_retry_keeps_metadata(path, namespace)
+        self.assertTrue(namespace.is_symlink())
+        self.assertTrue((moved / "loose").is_file())
+
+    def test_retry_keeps_a_ref_directory_replaced_by_a_different_directory(self) -> None:
+        path = self.checkout_with_removal_intent("current", "ref-directory-replacement")
+        namespace = path / ".git/refs/heads"
+        loose = namespace / "loose"
+        loose.unlink()
+        loose.mkdir()
+        moved = self.base / "moved-refs"
+        replacement = self.base / "replacement-refs"
+        replacement.mkdir()
+        open_entry = os.open
+
+        def open_during_swap(name: str | Path, flags: int, mode: int = 0o777, *,
+                             dir_fd: int | None = None) -> int:
+            if name == namespace.name and dir_fd is not None and flags & os.O_DIRECTORY:
+                _ = namespace.rename(moved)
+                _ = replacement.rename(namespace)
+            return open_entry(name, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch.object(os, "open", side_effect=open_during_swap):
+            self.assert_retry_keeps_metadata(path, namespace)
+        self.assertTrue((moved / "loose").is_dir())
+        self.assertEqual(list(namespace.iterdir()), [])
+
+    def test_retry_keeps_checkout_when_a_ref_ancestor_changes_during_scan(self) -> None:
+        path = self.checkout_with_removal_intent("current", "ref-ancestor-swap")
+        metadata = path / ".git"
+        refs = metadata / "refs"
+        moved = self.base / "moved-git-directory"
+        replacement = self.base / "replacement-git-directory"
+        (replacement / "refs").mkdir(parents=True)
+        open_entry = os.open
+
+        def open_during_swap(name: str | Path, flags: int, mode: int = 0o777, *,
+                             dir_fd: int | None = None) -> int:
+            if name in (refs, refs.name) and flags & os.O_DIRECTORY:
+                if dir_fd is not None:
+                    self.assertTrue(os.path.samestat(metadata.stat(), os.fstat(dir_fd)))
+                _ = metadata.rename(moved)
+                metadata.symlink_to(replacement, target_is_directory=True)
+            return open_entry(name, flags, mode, dir_fd=dir_fd)
+
+        with (mock.patch.object(os, "open", side_effect=open_during_swap),
+              mock.patch.object(scratch, "remove", side_effect=AssertionError("source deletion started")) as delete):
+            result = scratch.remove_folder(path)
+            delete.assert_not_called()
+        self.assertEqual(result, scratch.KeptFolder(path, f"{metadata}: directory changed during inspection"))
+        self.assertTrue(path.is_dir())
+        self.assertTrue(scratch.removal_mark(path).is_file())
+        self.assertTrue((moved / "refs/heads/loose").is_file())
+
+    def test_retry_accepts_a_symbolic_ref_with_a_ref_target(self) -> None:
+        path = self.copy(name="symbolic-ref")
+        self.add_saved_work_and_loose_ref(path)
+        link = path / ".git/refs/heads/alias"
+        link.symlink_to("refs/heads/loose")
+        self.git(path, "symbolic-ref", "refs/heads/alias")
+        self.stop_removal_after_intent(path, "current")
+        self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
+        self.assertFalse(path.exists())
+        self.assertFalse(scratch.removal_mark(path).exists())
+
+    def test_retry_keeps_a_symbolic_ref_added_or_changed_after_the_intent(self) -> None:
+        for version in ("current", "legacy"):
+            for change in ("add", "replace"):
+                with self.subTest(version=version, change=change):
+                    path = self.copy(name=f"{version}-symbolic-ref-{change}")
+                    self.add_saved_work_and_loose_ref(path)
+                    link = path / ".git/refs/heads/alias"
+                    if change == "replace":
+                        link.symlink_to("refs/remotes/origin/main")
+                    self.stop_removal_after_intent(path, version)
+                    if version == "legacy":
+                        last_file_change = max(scratch.removal_source_files(path).values())
+                        os.utime(scratch.removal_mark(path), ns=(last_file_change, last_file_change))
+
+                    link.unlink(missing_ok=True)
+                    link.symlink_to("refs/heads/loose")
+                    self.git(path, "symbolic-ref", "refs/heads/alias")
+                    self.assert_retry_keeps_metadata(path, link)
+                    self.assertEqual(os.readlink(link), "refs/heads/loose")
+
+    def test_final_removal_scan_checks_metadata_added_after_the_first_scan(self) -> None:
+        scan_metadata = git_files.check_internal_removal_entries
+        for version in ("current", "legacy"):
+            for change in ("index directory", "regular ref", "symbolic ref"):
+                with self.subTest(version=version, change=change):
+                    path = self.checkout_with_removal_intent(version, change.replace(" ", "-"))
+                    mark = scratch.removal_mark(path)
+                    last_file_change = max(scratch.removal_source_files(path).values())
+                    if version == "legacy":
+                        os.utime(mark, ns=(last_file_change, last_file_change))
+                    fields = cast(dict[str, object], json.loads(mark.read_text()))
+                    stored_intent = fields.get("removal_intent_ns", mark.stat().st_mtime_ns)
+                    assert isinstance(stored_intent, int)
+                    intent: int = stored_intent
+                    index = path / ".git/index"
+                    ref = path / ".git/refs/heads/added"
+                    oid = (ref.parent / "loose").read_text()
+
+                    def mutate(checkouts: tuple[git_files.Checkout, ...],
+                               previous: git_files.RecordedRemovalFiles | git_files.LegacyRemovalFiles, *,
+                               removal_root: Path) -> None:
+                        scan_metadata(checkouts, previous, removal_root=removal_root)
+                        if change == "index directory":
+                            index.unlink()
+                            index.mkdir()
+                        elif change == "regular ref":
+                            _ = ref.write_text(oid)
+                        else:
+                            ref.symlink_to("refs/heads/loose")
+                        if change != "index directory":
+                            self.assertGreater(ref.lstat().st_ctime_ns, intent)
+
+                    with mock.patch.object(git_files, "check_internal_removal_entries", side_effect=mutate):
+                        if change == "index directory":
+                            self.assert_retry_keeps_metadata(path, index)
+                            self.assertTrue(index.is_dir())
+                        else:
+                            pending = scratch.pending_removal(path)
+                            assert isinstance(pending, copy_record.Registered)
+                            state = scratch.recovery_state(path, pending, scratch.BusyMarkScope(),
+                                                           scratch_settings=conf.read("scratch"))
+                            if isinstance(state, scratch.KeptFolder):
+                                self.assertIn(str(ref), state.reason)
+                            else:
+                                self.assertEqual(state, scratch.RemovalRetry.RECHECK)
+                        self.assertTrue(mark.is_file())
+
+    def test_retry_validates_source_again_after_cargo_cleanup(self) -> None:
+        for version in ("current", "legacy"):
+            with self.subTest(version=version):
+                path = self.checkout_with_removal_intent(version, "after-cargo")
+                index = path / ".git/index"
+                roots = cargo_output.CargoOutputRoots(path, path / "target", self.base / "outside-output")
+                saved = scratch.SavedCargoOutput(roots, (), (), time.time())
+
+                def change_index(_path: Path, _saved: tuple[scratch.SavedCargoOutput, ...]) -> None:
+                    index.unlink()
+                    index.mkdir()
+
+                with (mock.patch.object(scratch, "save_cargo_outputs", return_value=(saved,)),
+                      mock.patch.object(scratch, "clean_cargo_outputs", side_effect=change_index)):
+                    self.assert_retry_keeps_metadata(path, index)
+                self.assertTrue(index.is_dir())
+
+    def test_retry_removes_checkout_below_a_search_only_ancestor(self) -> None:
+        ancestor = self.base / "search-only"
+        path = ancestor / "readable" / "checkout"
+        path.mkdir(parents=True)
+        self.git(path, "init", "-q")
+        self.add_saved_work_and_loose_ref(path)
+        self.stop_removal_after_intent(path, "current")
+
+        self.addCleanup(ancestor.chmod, ancestor.stat().st_mode & 0o7777)
+        ancestor.chmod(0o111)
+        self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
+        self.assertFalse(path.exists())
+        self.assertFalse(scratch.removal_mark(path).exists())
+
+    def test_retry_keeps_checkout_with_a_symbolic_ref_to_an_outside_path(self) -> None:
+        path = self.checkout_with_removal_intent("current", "outside-ref")
+        link = path / ".git/refs/heads/alias"
+        outside = self.base / "outside"
+        _ = outside.write_text("Keep this file.")
+        for target in (str(outside), "refs/../outside"):
+            with self.subTest(target=target):
+                link.symlink_to(target)
+                self.assert_retry_keeps_metadata(path, link)
+                self.assertEqual(outside.read_text(), "Keep this file.")
+                link.unlink()
+
+    def test_legacy_retry_keeps_standard_namespace_with_exact_ref_evidence(self) -> None:
+        for evidence in ("reflog", "packed"):
+            with self.subTest(evidence=evidence):
+                path = self.copy(name=evidence)
+                self.git(path, "symbolic-ref", "HEAD", "refs/heads/original")
+                self.git(path, "commit", "-q", "--allow-empty", "-m", "Create the fixture")
+                self.git(path, "remote", "add", "origin", str(self.base / "origin"))
+                self.git(path, "update-ref", "refs/remotes/origin/main", "HEAD")
+                self.git(path, "switch", "-q", "--detach")
+                self.git(path, "branch", "-D", "original")
+                namespace = path / ".git/refs/heads"
+                if namespace.is_dir():
+                    namespace.rmdir()
+                self.git(path, "update-ref", "--create-reflog", "refs/heads", "HEAD")
+                log = path / ".git/logs/refs/heads"
+                self.assertTrue(log.is_file())
+                if evidence == "packed":
+                    self.git(path, "pack-refs", "--all", "--no-prune")
+                    log.unlink()
+                self.assertTrue(namespace.is_file())
+                self.stop_removal_after_intent(path, "legacy")
+                namespace.unlink()
+                namespace.mkdir()
+                self.assert_retry_keeps_metadata(path, namespace)
+
+    def test_legacy_retry_removes_checkout_with_a_fresh_empty_tags_namespace(self) -> None:
+        path = self.checkout_with_removal_intent("legacy", "empty-tags")
+        self.assertEqual(list((path / ".git/refs/tags").iterdir()), [])
+        self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
+        self.assertFalse(path.exists())
+        self.assertFalse(scratch.removal_mark(path).exists())
+
+    def test_retry_keeps_internal_metadata_replaced_with_a_directory(self) -> None:
+        names = ("HEAD", "index", "packed-refs", "refs/heads/loose")
+        for version in ("current", "legacy"):
+            for name in names:
+                with self.subTest(version=version, name=name):
+                    path = self.checkout_with_removal_intent(version, Path(name).name)
+                    mark = scratch.removal_mark(path)
+                    fields = cast(dict[str, object], json.loads(mark.read_text()))
+                    intent = fields.get("removal_intent_ns", mark.stat().st_mtime_ns)
+                    assert isinstance(intent, int)
+                    metadata = path / ".git" / name
+                    contents = metadata.read_bytes()
+                    metadata.unlink()
+                    metadata.mkdir()
+                    self.assertTrue(all(ctime <= intent for ctime in scratch.removal_source_files(path).values()))
+
+                    with mock.patch.object(scratch, "remove", side_effect=AssertionError("source deletion started")) as delete:
+                        result = scratch.remove_folder(path)
+                        delete.assert_not_called()
+                    self.assertIsInstance(result, scratch.KeptFolder)
+                    assert isinstance(result, scratch.KeptFolder)
+                    self.assertEqual(result.path, path)
+                    self.assertIn(str(metadata), result.reason)
+                    self.assertTrue(path.is_dir())
+                    self.assertTrue(mark.is_file())
+
+                    metadata.rmdir()
+                    _ = metadata.write_bytes(contents)
+                    self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
+                    self.assertFalse(path.exists())
+                    self.assertFalse(mark.exists())
+
+    def test_retry_keeps_internal_head_replaced_with_a_fifo(self) -> None:
+        program = """import sys
+from pathlib import Path
+from unittest.mock import patch
+from scripts.lib import scratch
+
+path = Path(sys.argv[1])
+with patch.object(scratch, "remove", side_effect=AssertionError("source deletion started")) as delete:
+    result = scratch.remove_folder(path)
+    delete.assert_not_called()
+assert isinstance(result, scratch.KeptFolder), result
+assert str(path / ".git/HEAD") in result.reason, result
+assert path.is_dir()
+assert scratch.removal_mark(path).is_file()
+"""
+        for version in ("current", "legacy"):
+            for kind in ("fifo", "link"):
+                with self.subTest(version=version, kind=kind):
+                    path = self.checkout_with_removal_intent(version, kind)
+                    head = path / ".git/HEAD"
+                    head.unlink()
+                    if kind == "fifo":
+                        os.mkfifo(head)
+                    else:
+                        pipe = self.base / f"{version}-head-pipe"
+                        os.mkfifo(pipe)
+                        head.symlink_to(pipe)
+                    run = subprocess.run([sys.executable, "-c", program, str(path)],
+                                         capture_output=True, text=True, timeout=10)
+                    self.assertEqual(run.returncode, 0, run.stderr)
+
+    def test_retry_recovers_when_interrupted_deletion_removed_internal_head(self) -> None:
+        for version in ("current", "legacy"):
+            with self.subTest(version=version):
+                path = self.checkout_with_removal_intent(version, "absent-head")
+                mark = scratch.removal_mark(path)
+                (path / ".git/HEAD").unlink()
+                self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
+                self.assertFalse(path.exists())
+                self.assertFalse(mark.exists())
 
     def test_retry_keeps_an_emptied_tracked_busy_mark(self) -> None:
         repo = self.base / "checkout"
@@ -1078,10 +1979,12 @@ print(scratch.target('gate:proof', 'tree', False))
         path = self.copy(task="landed:maker/work", land_target="origin/main")
         self.git(path, "init", "-q")
         self.git(path, "commit", "-qm", "base", "--allow-empty")
-        self.git(path, "remote", "add", "origin", str(self.base / "origin"))
-        self.git(path, "update-ref", "refs/remotes/origin/work", "HEAD")
+        remote = self.base / "origin.git"
+        self.git(self.base, "init", "--bare", "-q", str(remote))
+        self.git(path, "remote", "add", "origin", str(remote))
+        self.git(path, "push", "-q", "origin", "HEAD:refs/heads/work")
         self.assertIsInstance(scratch.lifetime(path), scratch.Unknown)
-        self.git(path, "update-ref", "refs/remotes/origin/main", "HEAD")
+        self.git(path, "push", "-q", "origin", "HEAD:refs/heads/main")
         self.assertIsInstance(scratch.lifetime(path), scratch.Ended)
         _ = (path / "edit").write_text("unsaved")
         self.assertIsInstance(scratch.lifetime(path), scratch.Live)
@@ -1089,6 +1992,27 @@ print(scratch.target('gate:proof', 'tree', False))
         self.git(path, "checkout", "-qb", "side")
         self.git(path, "commit", "-qm", "unpushed", "--allow-empty")
         self.assertIsInstance(scratch.lifetime(path), scratch.Live)
+
+    def test_landed_task_removal_checks_the_remote_after_dry_run_keeps_the_clone(self) -> None:
+        task = "landed:maker/work"
+        path, remote = self.copy_with_published_head("landed-remote", task)
+        self.git(path, "push", "-q", "origin", "HEAD:refs/heads/work")
+        self.git(path, "commit", "-qm", "Published after the last fetch", "--allow-empty")
+        self.git(path, "push", "-q", str(remote), "HEAD:refs/heads/main")
+        trace = self.base / "git.trace"
+        trace.touch()
+        with (mock.patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file", "GIT_TRACE": str(trace)}),
+              mock.patch.object(time_limit, "capture", wraps=time_limit.capture) as query):
+            outcome = scratch.remove_folder(path, scratch.TaskRemoval(task, time.time()), dry_run=True)
+            self.assertIsInstance(outcome, scratch.KeptFolder)
+            assert isinstance(outcome, scratch.KeptFolder)
+            self.assertIn("a remote check is needed", outcome.reason)
+            self.assertNotIn("built-in: git fetch ", trace.read_text())
+            query.assert_not_called()
+            self.assertEqual(scratch.end(task), [path])
+        self.assertFalse(path.exists())
+        query.assert_called_once()
+        self.assertNotIn("built-in: git fetch ", trace.read_text())
 
     def test_phase_end_survives_a_stop_when_the_recorder_moves_to_the_next_phase(self) -> None:
         run = self.base / "run"

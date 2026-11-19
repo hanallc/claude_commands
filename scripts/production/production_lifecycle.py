@@ -42,6 +42,7 @@ from scripts.production.update_registration import QuestionStaff, RegistrationFa
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
 from scripts.lib import berth_board
+from scripts.worktree.worktrees import release_worktree_pair
 
 PHASE_TABLE = Path(__file__).resolve().parent.parent / "direct" / "phase_table.py"
 
@@ -219,7 +220,7 @@ def load(production: Production, lines: list[str], resume: bool, scratch: Path |
     report("state", "ok", "; ".join(owed) if owed else "no next list")
     record = staff.snapshot()
     try:
-        marked = unit_lookup.labeled_sessions(production.name, record=record)
+        marked = unit_lookup.every_labeled_session(record=record)
     except OSError as error:
         raise LifecycleStop("session", "failed", str(error)) from error
     checkpoints = {entry.unit: entry for entry in merged_checkpoints(production, record=record)} if isinstance(state, PlanLanded) else {}
@@ -228,8 +229,16 @@ def load(production: Production, lines: list[str], resume: bool, scratch: Path |
         entry = checkpoints.get(name)
         detail = f"phase {entry.phase} ({entry.commit[:7]})" if entry is not None else "no code checkpoint"
         report("last-merged", "ok", f"{name}: {detail}")
-        found = marked.get(row.name)
-        report("session", "ok", f"{name}: " + (f"{found.place.session} live" if found is not None else "gone"))
+        match marked.checked_unit(production.name, name):
+            case unit_lookup.ProvedLiveUnit(owner=unit_lookup.LabeledSession(place=place)):
+                description = f"{place.session} live"
+            case unit_lookup.ProvedLiveUnit():
+                description = "live"
+            case unit_lookup.ProvedAbsentUnit():
+                description = "gone"
+            case unit_lookup.UnknownUnit(reason=reason):
+                description = f"unknown ({reason})"
+        report("session", "ok", f"{name}: {description}")
 
 
 def doc_path_in_checkout(production: Production, path: Path) -> str:
@@ -637,6 +646,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         if unit.worktree.exists():
             retire_reservations(unit.worktree)
             _ = checked(production.checkout, "retire", "worktree", "remove", str(unit.worktree))
+            release_worktree_pair(unit.worktree)
             report("retire", "ok", f"removed {unit.name} worktree")
         if git(production.checkout, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}").returncode == 0:
             if not branch_is_landed(production.checkout, unit.branch, production.merge_branch):

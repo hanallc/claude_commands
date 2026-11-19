@@ -19,9 +19,8 @@ import unittest
 from typing import Never, cast, override
 from unittest import mock
 from contextlib import contextmanager, nullcontext
-from typing import ContextManager
 
-from scripts.lib import build_folders as folders, conf, copy_record, scratch, unit_runs, process_group
+from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, scratch, unit_runs, process_group
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository
@@ -449,7 +448,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
         collision = self.root / "collision"
         collision.mkdir()
         closed: list[int] = []
-        open_lock = cast(Callable[..., int], getattr(folders, "_open_lock"))
+        open_lock = build_folder_lock.open_lock
 
         def remember(path: Path, directory: int, *, create: bool) -> int:
             descriptor = open_lock(path, directory, create=create)
@@ -473,7 +472,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
                 raise KeyboardInterrupt()
 
             try:
-                with mock.patch.object(folders, "_open_lock", side_effect=remember), \
+                with mock.patch.object(build_folder_lock, "open_lock", side_effect=remember), \
                         mock.patch.object(folders, "build_folder_path", side_effect=cancel_after_reuse):
                     with self.assertRaises(KeyboardInterrupt):
                         _ = folders.create_build_folder(folders.UniqueBuildFolder("collision-"))
@@ -491,7 +490,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
         collision.mkdir()
         collided: list[int] = []
         reused: list[int] = []
-        open_lock = cast(Callable[..., int], getattr(folders, "_open_lock"))
+        open_lock = build_folder_lock.open_lock
         close = os.close
 
         def remember(path: Path, directory: int, *, create: bool) -> int:
@@ -516,7 +515,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
                     raise KeyboardInterrupt()
 
             try:
-                with mock.patch.object(folders, "_open_lock", side_effect=remember), \
+                with mock.patch.object(build_folder_lock, "open_lock", side_effect=remember), \
                         mock.patch.object(folders, "build_folder_path", return_value=collision), \
                         mock.patch.object(os, "close", side_effect=cancel_close):
                     with self.assertRaises(KeyboardInterrupt):
@@ -948,7 +947,7 @@ print('signals')
         parent.mkdir()
         moved = self.root / "moved"
         opens: list[Path] = []
-        original = cast(Callable[..., ContextManager[int]], getattr(folders, "_folder_parent"))
+        original = build_folder_lock.folder_parent
 
         @contextmanager
         def replace_parent(path: Path, root: Path, *, create: bool) -> Generator[int]:
@@ -960,7 +959,7 @@ print('signals')
                     _ = (parent / "keep").write_text("replacement")
                 yield descriptor
 
-        with mock.patch("scripts.lib.build_folders._folder_parent", side_effect=replace_parent):
+        with mock.patch("scripts.lib.build_folder_lock.folder_parent", side_effect=replace_parent):
             with folders.temporary_build_folder(folders.UniqueBuildFolder("proof-", folders.ExplicitBuildParent(parent))) as path:
                 self.assertTrue((moved / path.name).is_dir())
                 self.assertFalse(path.exists())
@@ -1015,7 +1014,7 @@ print('signals')
         self.addCleanup(os.close, directory)
 
         with ((path / "child.lock").open("wb") as child_lock,
-              mock.patch("scripts.lib.build_folders._folder_parent", return_value=nullcontext(directory))):
+              mock.patch("scripts.lib.build_folder_lock.folder_parent", return_value=nullcontext(directory))):
             fcntl.flock(child_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             with folders.collector_lease(path, children=True) as free:
                 self.assertFalse(free)
@@ -1042,6 +1041,96 @@ print('signals')
             _ = folders.remove_build_folder(path, cleanup)
         cleanup.assert_called_once_with()
         self.assertFalse(path.parent.exists())
+
+    def test_release_removed_folder_only_releases_a_free_pair_for_an_absent_path(self) -> None:
+        outcome = folders.FolderPairRelease
+        for name, expected in (("released", outcome.RELEASED), ("present", outcome.FOLDER_PRESENT),
+                               ("held", outcome.LOCK_HELD), ("link", outcome.FOLDER_PRESENT)):
+            with self.subTest(name=name):
+                path = self.root / name
+                lease = path.with_suffix(".lease.json")
+                lock = path.with_suffix(".lock")
+                target = self.root / "link-target"
+                temporary = self.root / f"{name}.lease.json.0123456789abcdef.tmp"
+                _ = lease.write_text("lease\n")
+                _ = lock.write_text("lock\n")
+                _ = temporary.write_text("temporary record\n")
+                if name == "present":
+                    path.mkdir()
+                if name == "link":
+                    _ = target.write_text("target\n")
+                    path.symlink_to(target)
+
+                with lock.open("r+") as descriptor:
+                    if name == "held":
+                        fcntl.flock(descriptor, fcntl.LOCK_EX)
+                    with mock.patch("time.sleep", side_effect=AssertionError("waited on a held lock")):
+                        self.assertIs(folders.release_removed_folder(path), expected)
+
+                if name == "released":
+                    self.assertFalse(lease.exists())
+                    self.assertFalse(lock.exists())
+                else:
+                    self.assertEqual(lease.read_text(), "lease\n")
+                    self.assertEqual(lock.read_text(), "lock\n")
+                self.assertEqual(temporary.read_text(), "temporary record\n")
+                if name == "present":
+                    self.assertTrue(path.is_dir())
+                if name == "link":
+                    self.assertTrue(path.is_symlink())
+                    self.assertEqual(target.read_text(), "target\n")
+
+        path = self.root / "missing" / "tree"
+        self.assertIs(folders.release_removed_folder(path), outcome.PARENT_ABSENT)
+        self.assertFalse(path.parent.exists())
+        path = self.root / "no-pair"
+        before = set(self.root.iterdir())
+        self.assertIs(folders.release_removed_folder(path), outcome.PAIR_ABSENT)
+        self.assertEqual(set(self.root.iterdir()), before)
+
+    def test_release_removed_folder_keeps_pairs_under_a_linked_parent(self) -> None:
+        parent = self.root / "parent"
+        nested = parent / "nested"
+        nested.mkdir(parents=True)
+        linked = self.root / "linked"
+        linked.symlink_to(parent, target_is_directory=True)
+        inside_link = parent / "linked"
+        inside_link.symlink_to(nested, target_is_directory=True)
+        lease = parent / "tree.lease.json"
+        lock = parent / "tree.lock"
+        _ = lease.write_text("lease\n")
+        _ = lock.write_text("lock\n")
+        for path in (linked / "tree", inside_link / ".." / "tree"):
+            with self.subTest(path=path):
+                self.assertIs(folders.release_removed_folder(path), folders.FolderPairRelease.PARENT_LINK)
+                self.assertEqual(lease.read_text(), "lease\n")
+                self.assertEqual(lock.read_text(), "lock\n")
+
+    def test_release_removed_folder_reports_partial_release_when_the_lock_stays(self) -> None:
+        path = self.root / "tree"
+        lease = path.with_suffix(".lease.json")
+        lock = path.with_suffix(".lock")
+        replacement = self.root / "replacement"
+        real_unlink = os.unlink
+        for action in ("replace-lock", "deny-unlink"):
+            with self.subTest(action=action):
+                _ = lease.write_text("lease\n")
+                _ = lock.write_text("original\n")
+                _ = replacement.write_text("replacement\n")
+
+                def unlink(name: str, *, dir_fd: int | None = None) -> None:
+                    if name == lock.name and action == "deny-unlink":
+                        raise PermissionError("cannot unlink the lock")
+                    real_unlink(name, dir_fd=dir_fd)
+                    if name == lease.name and action == "replace-lock":
+                        os.replace(replacement, lock)
+
+                with mock.patch.object(os, "unlink", side_effect=unlink):
+                    self.assertIs(folders.release_removed_folder(path), folders.FolderPairRelease.PARTIAL)
+
+                self.assertFalse(lease.exists())
+                contents = "replacement\n" if action == "replace-lock" else "original\n"
+                self.assertEqual(lock.read_text(), contents)
 
     def test_explicit_names_and_attribution_do_not_use_session_names(self) -> None:
         spec = folders.BuildFolderSpec(kind="temporary", parent=self.root, suffix_length=8,

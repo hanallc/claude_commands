@@ -292,12 +292,14 @@ def assert_notifier_browser(case: unittest.TestCase, width: int) -> None:
     'Exercise the real shell with controlled reads, timers, and clipboard writes.'
     settings = Path(__file__).resolve().parents[2] / "config"
     pages = (console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage("/page")),
-             console.ConsolePage("review", "Review", "inbox", "Review", console.AvailablePage("/console/review.html")))
+             console.ConsolePage("review", "Review", "inbox", "Review", console.AvailablePage("/console/review.html")),
+             console.ConsolePage("accounts", "Accounts", "users", "Accounts", console.AvailablePage("/accounts")))
     with patch.dict(os.environ, {"CONF_DIR": str(settings)}):
         source = console.render(pages, console.UnavailablePage()).decode()
     setup = r'''<script>
 const nativeFetch=window.fetch.bind(window),timers=new Map();
 let mode='failed',reads=0,visibility='visible',copied='',finishRead;
+let accountsQuota={level:'urgent',name:'Urgent: 4% left'};
 Object.defineProperty(document,'visibilityState',{get:()=>visibility});
 window.setInterval=(run,ms)=>{const id=timers.size+1;timers.set(id,{run,ms});return id;};
 window.clearInterval=id=>timers.delete(id);
@@ -309,6 +311,7 @@ window.fetch=async(url,options)=>{
  if(String(url).includes('for-you.json')){reads++;if(mode==='failed') throw Error('Read failed.');
   const unavailable=mode==='unavailable' || mode==='http-unavailable';
   const payload=unavailable ? {available:false} : {available:true,count:mode==='zero'?0:2,entries:mode==='zero'?[]:entries};
+  payload.accounts_quota=accountsQuota;
   const status=mode==='http-unavailable' ? 503 : 200;
   const answer={status,ok:status===200,json:async()=>payload};
   if(mode==='delayed') return new Promise(resolve=>{finishRead=()=>resolve(answer);});
@@ -449,11 +452,30 @@ try{
   check(bounds.width>0 && bounds.left>=0 && bounds.right<=innerWidth,'the panel fits beside collapsed navigation');
   check(document.documentElement.scrollWidth===innerWidth,'collapsed navigation has no horizontal overflow');}
  if(innerWidth===1400){
+  const badge=document.querySelector('[data-page=accounts] #nav-quota');
+  check(!badge.hidden && badge.getBoundingClientRect().width>0 && badge.getAttribute('aria-label')==='Urgent: 4% left',
+   'the collapsed Accounts entry shows the urgent icon and its accessible name');
+  if(shell.classList.contains('collapsed')) document.getElementById('nav-toggle').click();
+  accountsQuota={level:'warning',name:'Warning: 9% left'};
+  dispatchEvent(new Event('focus'));await flush();
+  check(badge.getBoundingClientRect().width>0 && badge.querySelector('.lucide-triangle-alert')
+   && !badge.querySelector('.lucide-octagon-alert'),'the next count read changes the open entry to warning');
+  accountsQuota={level:'none',name:''};
+  dispatchEvent(new Event('focus'));await flush();
+  check(badge.hidden,'the next count read removes the last alert');
   const fixture=document.createElement('iframe');
   fixture.style.cssText='position:fixed;left:0;top:0;width:716px;height:800px;border:0';
-  fixture.src='/layout';
+  const bookmark='/console/?page=investigations&at.investigations='+
+   encodeURIComponent('/console/investigations.html?show=all#showrunner=builds&q=shard');
+  fixture.src=bookmark;
   await new Promise(resolve=>{fixture.addEventListener('load',resolve,{once:true});document.body.append(fixture);});
   const layout=fixture.contentDocument;
+  const opened=new URL(fixture.contentWindow.location.href);
+  const reviewFrame=layout.querySelector('iframe[title="Review"]');
+  const filters=new URLSearchParams(new URL(reviewFrame.src).hash.slice(1));
+  check(opened.searchParams.get('page')==='review' && filters.get('type')==='investigations' &&
+   filters.get('show')==='all' && filters.get('source-owner')==='builds' && filters.get('q')==='shard',
+   'the legacy Console bookmark opens the combined filter and preserves its filters');
   const sidebar=layout.querySelector('.shell'),toggle=layout.querySelector('#nav-toggle');
   const box=layout.querySelector('#action-popover');
   const button=layout.querySelector('.for-you-slot button');
@@ -489,7 +511,7 @@ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
             self.end_headers()
             if self.path == '/complete':
                 _ = complete.wait(35)
-            elif self.path == '/layout':
+            elif self.path.startswith('/console/?page=investigations'):
                 _ = self.wfile.write(layout.encode())
             elif self.path.startswith('/?'):
                 _ = self.wfile.write(page)

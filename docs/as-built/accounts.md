@@ -262,6 +262,8 @@ Only proof that the producer runs on the target permits a skip.
 Unreadable live account evidence prevents the stop, start, and home change.
 The [producer launch contract](shutdown-and-restart.md#producer-launch-and-admission) defines the shared move and publication checks.
 An empty group can still select its account.
+The preview and move report an incomplete member list when the Claude registry is unreadable.
+The move saves the group selection and limits session moves to members with live evidence.
 Each member has an independent result.
 A single-session move refuses a grouped session and names the group operation.
 The move path creates no ready mark, conductor, follow command, or cancellation step.
@@ -447,6 +449,17 @@ The account details include the dot, label, swatch, allowance, reset, credits, a
 A separated row shows the account details again.
 A lone producer row shows all account details.
 The helper preserves the complete input rows for later sorts.
+The Accounts page shows a Lucide warning triangle or urgent octagon beside the weekly percentage.
+`accounts_quota_warning_percent` and `accounts_quota_urgent_percent` in `config/review_links.conf` start at 10 and 5.
+The warning value must be greater than the urgent value.
+The Accounts entry shows the most urgent active icon during the console count refresh.
+The row, the sidebar and Clear use stored weekly readings for accounts that are currently signed in.
+Select a row icon to read the alert and clear it for that account.
+Clear keeps the percentage color and stores the cleared level and reset time on the server.
+A cleared warning can return as urgent. A new weekly reset time makes the alert eligible again.
+If a reading has no reset time, Clear keeps the last reset time in the account's clear record.
+The server keeps the clear records in `console/.accounts-quota-cleared.json` under the review root.
+If the file is malformed, the table shows the problem, the sidebar hides the icon and Clear refuses to write.
 Each named header on the Accounts page has a sort control.
 The first selection sets the order for that column.
 
@@ -485,6 +498,16 @@ The swatch opens a color chooser with Try, Save, and Cancel.
 Try changes every label and swatch of that key locally without a request.
 Cancel or Escape restores the saved color.
 Save publishes the color through this checkout's `scripts/lib/tune.py` and refreshes the board.
+Save records the value and its order in the settings journal before it writes the live value.
+Natedev issues the orders from a persistent counter. The published commit carries them in `config/settings-orders.json`.
+Each pull holds the journal lock from the ancestry check through restore.
+The Mac accepts an SSH live write only when its order is greater than the accepted order.
+The journal retains the accepted order after the tree includes that order and the pending value clears.
+Restore changes only the keys with pending values in the live files.
+The move marker records the planned writes before Git changes the checkout.
+Recovery reverses the move at the source commit or completes each write at the target commit.
+When you remove a key by hand in Git, keep its entry in `config/settings-orders.json`.
+A peer commit with the saved value and no order still needs a commit that records the order.
 A host added later whose name matches a model ID suffix makes that model's color key a host override.
 The page pauses refresh while the chooser is open.
 A board line of a selected Claude group carries its account and group.

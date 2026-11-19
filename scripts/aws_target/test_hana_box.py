@@ -12,9 +12,9 @@ import sys
 from typing import cast, override
 from unittest import mock
 
-from scripts.aws_target import aws_target, hana_box, hana_provider, hana_spend, ledger
+from scripts.aws_target import aws_target, hana_box, hana_provider, hana_render, hana_spend, ledger
 from scripts.aws_target.control_test_support import TestClock
-from scripts.aws_target.ledger_test_support import CostFixture, git_only, text_setting
+from scripts.aws_target.ledger_test_support import CostFixture, HANA_GUEST_RUNTIME_SETTINGS, git_only, text_setting
 from scripts.lib import conf, process_start
 
 
@@ -25,6 +25,7 @@ def write_lifecycle_configuration(path: Path) -> None:
     """Give lifecycle tests fixed limits in their private configuration."""
     _ = path.write_text("""\
 enabled=on
+host=fixture-hana
 region=us-east-2
 instance_type=m7a.2xlarge
 fallback_instance_types=c7a.4xlarge,m7i.4xlarge,m6a.4xlarge
@@ -58,8 +59,18 @@ mount_timeout_seconds=15
 # whole: 1..
 aws_timeout_s=10
 # whole: 1..
+result_transfer_timeout_s=83
+# whole: 1..
 control_url_seconds=3600
-""")
+""" + HANA_GUEST_RUNTIME_SETTINGS)
+
+
+def record_lifecycle_image(directory: Path, workload: Path, *, identity: hana_box.DeploymentIdentity = IDENTITY) -> Path:
+    path = directory / 'hana/setup.json'
+    path.parent.mkdir(exist_ok=True, parents=True)
+    _ = path.write_text(json.dumps({'deployment': identity.deployment, 'instance': identity.instance,
+        'guest_digest': hana_render.guest_digest(workload).value}))
+    return path
 
 
 @dataclass
@@ -167,6 +178,26 @@ class HanaBoxTests(CostFixture):
         self.provider = FakeProvider(self.state, self.clock)
         self.controller = hana_box.HanaController(self.state, self.settings, self.workload_path, self.provider, clock=self.clock)
         self.controller.register(IDENTITY)
+        _ = record_lifecycle_image(self.state, self.workload_path)
+
+    def test_only_a_current_image_can_start_a_hana_claim(self) -> None:
+        image = self.state / 'hana/setup.json'
+        current = image.read_text()
+        for proof in ('{}', current.replace(IDENTITY.instance, 'another-box')):
+            with self.subTest(proof=proof):
+                _ = image.write_text(proof)
+                self.assertEqual(self.controller.request('execution-one'), hana_box.ClaimRefused(hana_box.HANA_IMAGE_STALE))
+        _ = image.write_text(current)
+        for key, value in (('spot_max_usd_per_hour', '0.20'), ('execution_shell', 'ci')):
+            with self.subTest(key=key):
+                text_setting(self.workload_path, key, value)
+                self.assertTrue(self.controller.image_is_current(IDENTITY))
+        self.assertIsInstance(self.controller.request('execution-one'), hana_box.ClaimCommitted)
+        _ = self.workload_path.write_text(self.workload_path.read_text().replace(
+            'watchdog_check_seconds=1', 'watchdog_check_seconds=2'))
+        self.assertEqual(self.tick(), hana_box.Lifecycle.IDLE_STOPPED)
+        self.assertEqual(self.provider.calls, [])
+        self.assertEqual(self.controller.claim_status('execution-one'), hana_box.ClaimRefused(hana_box.HANA_IMAGE_STALE))
 
     def record(self) -> dict[str, object]:
         return ledger.mapping(cast(object, json.loads((self.state / 'hana/lifecycle.json').read_text())))
@@ -176,7 +207,9 @@ class HanaBoxTests(CostFixture):
 
     def tick(self) -> hana_box.Lifecycle:
         self.clock.advance(1)
-        return self.controller.tick()
+        result = self.controller.tick()
+        assert isinstance(result, hana_box.Lifecycle)
+        return result
 
     def ready(self) -> None:
         self.assertIsInstance(self.controller.request('execution-one'), hana_box.ClaimCommitted)
@@ -532,7 +565,7 @@ class HanaBoxTests(CostFixture):
         self.assertTrue(self.controller.release('execution-one'))
         self.clock.advance(hana_box.read_settings(conf.read(self.workload_path)).idle_stop_seconds)
         self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPING)
-        received: list[hana_box.ClaimCommitted | hana_box.ClaimRefused] = []
+        received: list[hana_box.ClaimCommitted | hana_box.ClaimRefused | hana_box.HanaResourcesHeld] = []
         self.provider.during_call = lambda: received.append(self.controller.request('execution-two'))
         _ = self.tick()
         self.assertIsInstance(received[0], hana_box.ClaimRefused)
@@ -548,9 +581,23 @@ class HanaBoxTests(CostFixture):
         starts = len(self.provider.starts)
         _ = self.tick()
         self.assertEqual(len(self.provider.starts), starts)
+        interrupted = self.controller.path.read_text()
         self.provider.cause = hana_box.StopCause.UNKNOWN
         self.assertEqual(self.tick(), hana_box.Lifecycle.STOPPED_UNKNOWN)
         self.assertIsInstance(self.controller.request('execution-two'), hana_box.ClaimRefused)
+        unknown = self.controller.path.read_text()
+        for state, cause, record in (
+                (hana_box.Lifecycle.INTERRUPTED, hana_box.StopCause.INTERRUPTION, interrupted),
+                (hana_box.Lifecycle.STOPPED_UNKNOWN, hana_box.StopCause.UNKNOWN, unknown)):
+            with self.subTest(state=state):
+                _ = self.controller.path.write_text(record)
+                self.provider.cause = cause
+                self.assertEqual(ledger.rows(self.record(), 'claims')[0]['execution'], 'execution-one')
+                with mock.patch.object(process_start, 'process_start', return_value=process_start.Gone()):
+                    self.assertEqual(self.tick(), state)
+                self.assertEqual(self.record()['claims'], [])
+                self.assertEqual(self.record()['reason'], 'The Hana start owner exited')
+                self.assertEqual(len(self.provider.starts), starts)
 
     def test_interruption_during_idle_stop_forbids_a_manual_restart(self) -> None:
         self.ready()

@@ -247,7 +247,11 @@ Each pass reads and saves due account usage.
 Each account has its own eligibility time.
 The usage claim records its granted time after credential lookup.
 A held claim keeps that account's time.
-The Mac schedule retains the configured interval and poll allowance.
+The Mac schedule retains each configured interval and the poll allowance.
+Claude accounts use `mac_usage.interval_seconds`.
+Codex homes use `mac_usage.codex_interval_seconds`, which is longer: each Codex read starts an app-server that moves about 1 MB.
+Both keys are required in `config/agent_notes.toml`.
+A saved Codex reading on the Mac can be older than the 10-minute limit that status uses. Status then reads it live.
 Rate-limit backoff still applies.
 The usage schedule lock prevents concurrent passes.
 A second caller prints `already claimed by <id>` and exits with code 0.

@@ -6,6 +6,8 @@ timeout_seconds = 120
 [mac_usage]
 # 60 s drew HTTP 429 that moved between the four Claude accounts (2026-11-01).
 interval_seconds = 120
+# Each Codex read starts an app-server that moves about 1 MB. A 120 s cadence cost about 1.8 GB per day on the Mac.
+codex_interval_seconds = 1800
 
 [parts.notes]
 interval_seconds = 120

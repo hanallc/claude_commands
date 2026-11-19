@@ -48,7 +48,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual((self.state / "notified-tip").read_text(), merge)
         self.assertEqual(self.events("send.py"), [[
             "--to", "session:fake-child", "--from", "example", "--text",
-            f"From the showrunner of example: hand-off {checkpoint[:7]} merged as {merge[:7]}.", "--timeout", "10",
+            f"hand-off {checkpoint[:7]} merged as {merge[:7]}.", "--timeout", "10",
         ]])
         rows = [cast(dict[str, object], json.loads(line)) for line in (self.state / "events.jsonl").read_text().splitlines()]
         commands = [row["command"] for row in rows]

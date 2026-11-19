@@ -1128,6 +1128,9 @@ class FakeGpuAws:
             reply = {'SpotPriceHistory': [{'InstanceType': size, 'AvailabilityZone': region + 'a',
                 'SpotPrice': str(price),
                 'Timestamp': datetime.fromtimestamp(self.now, UTC).isoformat()}]}
+        elif service == 's3' and operation == 'cp':
+            self.objects[arguments[8].split('/', 3)[3]] = b'fixture large upload'
+            reply = {}
         elif operation == 'put-object':
             key = arguments[arguments.index('--key') + 1]
             self.objects[key] = Path(arguments[arguments.index('--body') + 1]).read_bytes()
@@ -1264,6 +1267,14 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
     def execute(self) -> None:
         with redirect_stdout(StringIO()):
             self.worker.execute(self.folder, self.deployment)
+
+    def test_upload_uses_s3_cp_at_the_multipart_limit(self) -> None:
+        payload = self.folder / 'large-payload'
+        with payload.open('wb') as stream:
+            _ = stream.truncate(5 * 1024**3)
+        self.worker.upload('fixture-bucket', 'large-payload', payload, 5)
+        self.assertEqual(self.fake.events, ['cp'])
+        self.assertIn('large-payload', self.fake.objects)
 
     def nextest_cli(self, types: tuple[str, ...], arguments: tuple[str, ...]) -> tuple[int, str, str]:
         self.fake.manifest['tree'] = 'b' * 40

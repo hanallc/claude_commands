@@ -92,7 +92,6 @@ class UnitEffortTests(unittest.TestCase):
             "CODEX_CONFIG_FILE": str(self.root / "codex.toml"),
             "CODEX_MODELS_CACHE_FILE": str(self.root / "models.json"),
             "CODEX_CATALOG_SYNC_STATE_FILE": str(synced)}))
-        _ = self.enterContext(mock.patch.object(unit_lookup, "live_session", return_value=True))
         _ = self.enterContext(fake_unit_host.private_process_registry())
         units = [
             labeled_host("review", "w1:p1", "review", production_name="build-followups", screen=EMPTY),
@@ -241,6 +240,14 @@ class UnitEffortTests(unittest.TestCase):
 
 
 class NativeDirectorEffortTests(StaffTestCase):
+    def test_director_lines_report_an_unreadable_pane_list(self) -> None:
+        from scripts.production import session_staff
+
+        every = unit_lookup.LabeledProductions({}, {"show": ("unit",)}, unreadable_pane_lists=(
+            session_staff.UnreadablePaneList("agents", "pane list denied"),))
+        lines = unit_effort.director_lines(every, "high", True)
+        self.assertTrue(any("unknown" in line and "pane list denied" in line for line in lines), lines)
+
     def test_unknown_and_stopped_directors_require_no_pane_io(self) -> None:
         for state in (unit_lookup.ClaudeUnknown("unreadable session"), unit_lookup.ClaudeNotRunning()):
             with self.subTest(state=state):
