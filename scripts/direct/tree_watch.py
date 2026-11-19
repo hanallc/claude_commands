@@ -98,7 +98,7 @@ def blob(path: bytes) -> bytes:
             data = handle.read()
         mode = b"100755" if os.access(path, os.X_OK) else b"100644"
     else:
-        return treekey.gitlink_content(path)
+        return treekey.gitlink_content(path, gitlinks=treekey.GitlinkScope.TRACKED_SUBMODULES)
     return mode + b" blob " + git_blob_id(data).encode()
 
 
@@ -129,12 +129,7 @@ class TreeInputs:
             self.files = self.files[2:]
         self.top: bytes = run("git", "--no-optional-locks", "rev-parse", "--show-toplevel").strip()
         self.real_top: bytes = os.path.realpath(self.top)
-        self.own: tuple[bytes, ...] = tuple(
-            folder + b"/" for folder in (
-                os.path.relpath(os.path.realpath(os.fsencode(name)), self.real_top)
-                for name in {os.environ.get("UNIT_SESSION_DIR", ""), os.environ.get("UNIT_RUN_DIR", "")} if name
-            ) if not folder.startswith(b"..") and folder != b"."
-        )
+        self.session_prefixes: tuple[bytes, ...] = treekey.session_directory_prefixes(self.real_top)
         self.workspace_root: bytes = b""
         self.watch_entries: dict[str, str] = {}
         try:
@@ -189,7 +184,7 @@ class TreeInputs:
         self.tree_content_key = ""
         # status never refreshes the index; diff does, even with no-optional-locks.
         status = run("git", "--no-optional-locks", "-C", self.top, *treekey.WORKTREE_STATUS_ARGS)
-        changed = [path for path in treekey.changed_paths(status) if not path.startswith(self.own)]
+        changed = treekey.changed_paths(status, exclude=self.session_prefixes)
         entries: dict[bytes, bytes] = {}
         if self.package or watch:
             try:
@@ -226,7 +221,8 @@ class TreeInputs:
         if not self.package:
             key.update(run("git", "--no-optional-locks", "-C", self.top, "rev-parse", "HEAD^{tree}"))
             for path in changed:
-                key.update(path + b"\0" + treekey.content(os.path.join(self.top, path)))
+                key.update(path + b"\0" + treekey.content(os.path.join(self.top, path),
+                                                          gitlinks=treekey.GitlinkScope.TRACKED_SUBMODULES))
         key.update(run("rustc", "-vV"))
         if lint_versions and self.words[:1] == ["lint"]:
             try:
@@ -237,7 +233,7 @@ class TreeInputs:
             key.update(versions)
         tree_content = key.copy()
         for name in self.files:
-            key.update(treekey.content(os.fsencode(name)))
+            key.update(treekey.content(os.fsencode(name), gitlinks=treekey.GitlinkScope.TRACKED_SUBMODULES))
         build_key = key.copy()
         words = iter(self.words)
         for word in words:

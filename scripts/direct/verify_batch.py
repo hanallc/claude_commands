@@ -87,7 +87,8 @@ class BatchCommands:
         return result.returncode if result.returncode >= 0 else 128 - result.returncode
 
     def tree_key(self, repo: Path) -> str:
-        result = self.invoke([sys.executable, str(Path(treekey.__file__).resolve()), str(repo)], {},
+        result = self.invoke([sys.executable, str(Path(treekey.__file__).resolve()), str(repo),
+                              "--exclude-session-dirs"], {},
                              lifetime=CommandLifetime.GROUP, stdout=subprocess.PIPE)
         return result.stdout.decode("ascii").strip() if result.returncode == 0 else ""
 

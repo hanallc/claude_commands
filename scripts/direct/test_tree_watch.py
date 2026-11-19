@@ -33,6 +33,18 @@ class TreeWatchTests(TreeWatchFixture):
         module = self.root / "unrelated" / "submodule"
         self.assert_package_keys_follow_submodule(module, package_root=module)
 
+    def test_plain_package_test_ignores_an_untracked_nested_repository(self) -> None:
+        inputs = tree_watch.TreeInputs([*self.key_arguments(), "test", "sample"], json.dumps(self.metadata))
+        before = inputs.keys()
+        watched = self.key()
+        module = self.root / "unrelated" / "unborn"
+        module.mkdir()
+        _ = subprocess.run(["git", "init", "-q", str(module)], check=True, capture_output=True,
+                           timeout=TEST_HANG_GUARD_SECS)
+
+        self.assertEqual(inputs.keys(), before)
+        self.assertEqual(self.key(), watched)
+
     def assert_package_keys_follow_submodule(self, module: Path, *, package_root: Path | None = None) -> None:
         module.mkdir()
         _ = subprocess.run(["git", "-C", str(module), "init", "-q"], check=True,
