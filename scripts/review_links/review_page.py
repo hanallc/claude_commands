@@ -381,12 +381,13 @@ class ReviewSnapshotCache:
     _wake: threading.Event = field(default_factory=threading.Event,init=False)
     _stop: threading.Event = field(default_factory=threading.Event,init=False)
     _busy: bool = field(default=False,init=False)
-    _initialize: bool = field(default=False,init=False)
+    _initialization_requested: bool = field(default=False,init=False)
     _generation: int = field(default=0,init=False)
     _thread: threading.Thread = field(init=False)
 
     def __post_init__(self) -> None:
         if not self.initialize_on_start and (self.root/change_page.CONSOLE_FOLDER/change_browser.MANIFEST).exists():
+            self._initialization_requested = True
             try:
                 self._snapshot = build_snapshot(self.root)
             except Exception as error:
@@ -397,6 +398,7 @@ class ReviewSnapshotCache:
 
     def start(self) -> None:
         if self.initialize_on_start:
+            self._initialization_requested = True
             self._wake.set()
         self._thread.start()
 
@@ -407,7 +409,7 @@ class ReviewSnapshotCache:
         with self._condition:
             if isinstance(self._snapshot, SnapshotUnavailable) and self._thread.is_alive():
                 if not self._busy:
-                    self._initialize = True
+                    self._initialization_requested = True
                     self._wake.set()
                 _ = self._condition.wait_for(
                     lambda: not isinstance(self._snapshot, SnapshotUnavailable) or
@@ -419,6 +421,7 @@ class ReviewSnapshotCache:
 
     def invalidate(self) -> None:
         with self._condition:
+            self._initialization_requested = True
             self._generation += 1
             self._wake.set()
 
@@ -565,14 +568,10 @@ class ReviewSnapshotCache:
                 unchanged = (isinstance(snapshot, ReviewSnapshot) and time.monotonic()-checked<30
                              and all(source_stamp(path)==stamp for path, stamp in snapshot.source_stamps.items()))
                 with self._condition:
-                    if (isinstance(snapshot, SnapshotUnavailable)
-                            and not self.initialize_on_start and not self._initialize
-                            and not (self.root/change_page.CONSOLE_FOLDER/change_browser.MANIFEST).exists()):
-                        self._wake.clear()
+                    if isinstance(snapshot, SnapshotUnavailable) and not self._initialization_requested:
                         continue
                     if unchanged and not self._wake.is_set():
                         continue
-                    self._initialize = False
                     self._wake.clear()
                     self._busy = True
                 if not (self.root/change_page.CONSOLE_FOLDER/change_browser.MANIFEST).exists():

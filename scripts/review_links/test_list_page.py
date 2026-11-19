@@ -1337,7 +1337,7 @@ document.body.append(result);
             manifest.unlink()
             with (patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending"),
                   patch.object(record_store, "write_text_atomic", wraps=atomic_file.write_text_atomic) as save,
-                  serve.ReviewLinksServer(("127.0.0.1", 0), root) as server):
+                  serve.ReviewLinksServer(("127.0.0.1", 0), root, initialize_review=True) as server):
                 server.review_cache.synchronize()
                 self.assertTrue(manifest.is_file())
                 self.assertEqual(the_list.load(MORTY.id, first.id).log[-1].what,

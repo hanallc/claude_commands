@@ -466,7 +466,8 @@ It also checks all stores every thirty seconds.
 A complete update replaces the current snapshot.
 Requests retain the current snapshot during an update.
 The server starts recovery before the snapshot worker.
-The worker initializes the live Review cache at server startup.
+The live service requests the initial Review build at startup.
+Creating a console manifest after server construction does not start a Review build.
 The native Question writer assigns stable IDs to legacy Questions under the owner lock.
 The same guard tracks and skips each source or record that fails during a build.
 A notice names each skipped source or record.

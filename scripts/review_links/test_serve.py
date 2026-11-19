@@ -389,7 +389,16 @@ class ReviewLinksServerTests(unittest.TestCase):
                 connection.close()
 
     def test_server_initializes_review_on_a_fresh_root(self) -> None:
+        with (patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending")):
+            server = self.enterContext(serve.ReviewLinksServer(("127.0.0.1", 0), self.root, initialize_review=True))
+        server.review_cache.synchronize()
         self.assertTrue((self.root / change_page.CONSOLE_FOLDER / change_page.BROWSER_MANIFEST).exists())
+        self.port = server.server_port
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, TEST_HANG_GUARD_SECS)
+        self.addCleanup(server.shutdown)
         reply = self.request(review_page.PAGE_PATH)
         self.assertEqual(reply.status, 200)
         self.assertIn(b'data-review-index', reply.body)
@@ -1635,7 +1644,8 @@ class ReviewLinksServerTests(unittest.TestCase):
             asked = the_list.ask_question(keeper, item.id, the_list.PageRequest("ask", "question", question), status)
             change_page.deliver(asked, status)
             parked = the_list.park(keeper, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
-            server = running.enter_context(serve.ReviewLinksServer(("127.0.0.1", 0), case.root))
+            server = running.enter_context(
+                serve.ReviewLinksServer(("127.0.0.1", 0), case.root, initialize_review=True))
             self.port = server.server_port
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
@@ -1693,7 +1703,8 @@ class ReviewLinksServerTests(unittest.TestCase):
             asked = pool.submit(the_list.ask_question, keeper, item.id, question, status)
             try:
                 self.assertTrue(list_locked.wait(TEST_HANG_GUARD_SECS))
-                server = running.enter_context(serve.ReviewLinksServer(("127.0.0.1", 0), case.root))
+                server = running.enter_context(
+                    serve.ReviewLinksServer(("127.0.0.1", 0), case.root, initialize_review=True))
                 server.review_cache.synchronize()
                 self.assertEqual(the_list.load(keeper, item.id), parked)
                 with change_review.review_delivery_lock(case.root, wait=False) as lock:
@@ -3012,8 +3023,8 @@ sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 
 class ObservedServer(serve.ReviewLinksServer):
-    def __init__(self, address, root):
-        super().__init__(address, root)
+    def __init__(self, address, root, *, initialize_review=False):
+        super().__init__(address, root, initialize_review=initialize_review)
         os.environ["REVIEW_TEST_PORT"] = str(self.server_port)
         line = f"{os.getpid()} {module.VALUE} {self.server_port}"
         with (checkout / "starts.txt").open("a") as output:

@@ -1161,7 +1161,8 @@ class ConsoleReviewSnapshotCache(review_page.ReviewSnapshotCache):
 
 
 class ReviewLinksServer(ThreadingHTTPServer):
-    def __init__(self, address: tuple[str, int], root: Path, *, mode: ServerMode = ServerMode.LIVE) -> None:
+    def __init__(self, address: tuple[str, int], root: Path, *, mode: ServerMode = ServerMode.LIVE,
+                 initialize_review: bool = False) -> None:
         settings = conf.read("review_links")
         self.mode: ServerMode = mode
         self.store_folder: Path = root.resolve()
@@ -1175,7 +1176,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.branch_deletions_lock: threading.Lock = threading.Lock()
         self.accounts_cache: AccountsPageCache = AccountsPageCache()
         self.review_cache: review_page.ReviewSnapshotCache = ConsoleReviewSnapshotCache(
-            self.root, start_worker=False, initialize_on_start=mode is ServerMode.LIVE)
+            self.root, start_worker=False, initialize_on_start=initialize_review and mode is ServerMode.LIVE)
         self.new_item_token: str = secrets.token_urlsafe()
         self.next_tailscale_check: float = time.monotonic() + settings.number("tailscale_check_seconds")
         self.next_sweep: float = time.monotonic() + settings.number("snapshot_sweep_seconds")
@@ -1301,7 +1302,7 @@ def main(arguments: list[str]) -> int:
         if fixture is None:
             root = change_routing.review_root()
             root.mkdir(parents=True, exist_ok=True)
-            service = ReviewLinksServer(address, root)
+            service = ReviewLinksServer(address, root, initialize_review=True)
         else:
             root = fixture
             os.chdir(root)
