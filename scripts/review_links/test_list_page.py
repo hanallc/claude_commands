@@ -33,7 +33,7 @@ from scripts.message import send_result
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
 from scripts.production import change_review, change_routing, delivery_state, investigation, record_store, session_staff, showrunners, staff, the_list
 from scripts.production.update_registration import QuestionStaff
-from scripts.review_links import console, list_page, serve, staff_names
+from scripts.review_links import console, list_page, page_frame, serve, staff_names
 from scripts.review_links import change_browser, change_page, page_question, question_record
 from scripts.review_links import review_items, review_page
 from scripts.review_links.test_change_page import BrowserForms
@@ -1179,6 +1179,7 @@ document.body.append(result);
             "blocked_by": (the_list.ItemDependency(105, "The status page reaches main"),)}, source="morty")
         markup = list_page.render(self.root / "reviews").decode()
         body = without_role_colors(markup)
+        self.assertEqual(body.count(page_frame.BUTTON_STATES), 1)
         self.assertEqual(body.count('<tbody data-list-item'), 5)
         for label in list_page.HEADERS:
             self.assertIn(label + '<span data-sort-mark', body)
@@ -5430,7 +5431,9 @@ try{
    'an address restores the producer filter');
  location.hash=new URLSearchParams({show:'all',producer:'missing'});await flush();
  check(selectedFilter('producer')==='all' && visible().length===4,'An unknown producer clears the Producer filter.');
- location.hash=new URLSearchParams({show:'unread',state:'Working',owner:OWNER,q:'106'});await flush();
+ const restoredOldAddress=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+ location.hash=new URLSearchParams({show:'unread',state:'Working',owner:OWNER,q:'106'});
+ await restoredOldAddress;
  check(selectedShow()==='working' && selectedFilter('owner')==='staff:'+OWNER && unread().checked &&
   visible().map(row=>row.dataset.number).join(',')==='106','An old address restores the Show and Owner chips, switch and search.');
 

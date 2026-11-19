@@ -517,12 +517,14 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(status, 200)
             payload = cast(dict[str, str], json.loads(reply))
             version = cast(dict[str, str], json.loads(self.request(review_page.PAGE_PATH+'?version=1').body))
-            shell = self.request(review_page.PAGE_PATH+'?show=Done').body.decode()
+            shell = self.request(review_page.PAGE_PATH+'?show=all').body.decode()
             entries = test_review_page.unpack_index(shell.split('data-review-index>',1)[1].split('</script>',1)[0])
             with self.subTest(finding='F022'):
                 self.assertNotEqual(version['version'], before.version)
                 self.assertEqual(payload['version'], version['version'])
-                self.assertEqual(next(entry['state'] for entry in entries if entry['key']==proposal), 'Done')
+                self.assertEqual(payload['state'], 'Done')
+                self.assertNotIn(proposal, {entry['key'] for entry in entries})
+                self.assertEqual(self.request(review_page.PAGE_PATH+'?'+urlencode({'body': proposal})).status, 404)
             with self.subTest(finding='F015'):
                 before_decline = next(item for item in review_items.read(case.root) if item.key == proposal)
                 with patch.object(cache, 'get', return_value=before):
@@ -548,7 +550,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 with self.subTest(outcome=outcome):
                     status, body = self.post(review_page.PAGE_PATH, case.card_body(cache.get(), key, outcome, words)+extra)
                     self.assertEqual(status, 200, body)
-        self.assertEqual(cache.get().records[answer].state, review_items.ReviewState.DONE)
+        self.assertNotIn(answer, cache.get().records)
         self.assertIsInstance(cache.get().records[later].times.later, datetime)
 
     def test_review_verdict_uses_the_current_production_after_a_transfer(self) -> None:
@@ -641,7 +643,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.server, 'delivery_status', case.status), patch.object(change_page, 'deliver'):
                 status, body = self.post(review_page.PAGE_PATH, case.card_body(cache.get(), proposal, 'approve'))
                 self.assertEqual(status, 200, body)
-                self.assertEqual(cache.get().records[proposal].state, review_items.ReviewState.DONE)
+                self.assertNotIn(proposal, cache.get().records)
 
     def test_review_finishes_verdict_scratch_cleanup_after_reply_and_before_delivery(self) -> None:
         case = self.review_fixture(changes=1)
@@ -653,7 +655,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         respond = serve.ReviewLinksHandler.json_response
 
         def response(handler: serve.ReviewLinksHandler, status: int, fields: dict[str, object]) -> None:
-            self.assertEqual(cache.get().records[key].state, review_items.ReviewState.DONE)
+            self.assertNotIn(key, cache.get().records)
             events.append('respond')
             respond(handler, status, fields)
 
@@ -740,14 +742,14 @@ class ReviewLinksServerTests(unittest.TestCase):
         def fail_closeout(review: str, if_proposed: bool = False, *, check_only: bool = False) -> list[str]:
             if check_only:
                 return land(review, if_proposed, check_only=True)
-            self.assertEqual(cache.get().records[key].state, review_items.ReviewState.DONE)
+            self.assertNotIn(key, cache.get().records)
             raise PermissionError('The fixture closeout failed.')
 
         with patch.object(feature_log, 'land_review', side_effect=fail_closeout) as closeout:
             saved = cache.save(case.card_body(cache.get(), key, 'works'), case.status)
             _ = change_page.finish_verdict_cleanup(saved.delivery, case.status)
             self.assertEqual(closeout.call_count, 2)
-        self.assertEqual(cache.get().records[key].state, review_items.ReviewState.DONE)
+        self.assertNotIn(key, cache.get().records)
         self.assertEqual(case.fixture.proposal(key)['status'], 'open')
         with patch.object(change_page, 'send_to_staff'):
             change_page.recover_pending(change_page.DeliveryStatus(case.root))
@@ -1009,7 +1011,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         with patch.object(change_review, 'end_row_scratch', side_effect=cleanup):
             _ = cache.save(case.card_body(cache.get(), key, 'works', 'The fixture passes.'), case.status)
             self.assertEqual(events, [])
-            self.assertEqual(cache.get().records[key].state, review_items.ReviewState.DONE)
+            self.assertNotIn(key, cache.get().records)
             self.assertEqual(len(list(case.root.glob('.review-link-scratch-*'))), 1)
             with patch.object(change_page, 'send_to_staff', side_effect=send):
                 change_page.recover_pending(change_page.DeliveryStatus(case.root))
@@ -1106,7 +1108,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         previous = cache.get()
         request = case.card_body(previous, proposal, 'approve')
         _ = review_page.submit(case.root, case.body(proposal, 'question', 'What changed?'), case.status)
-        fresh = cache.publish_record(previous, proposal)
+        fresh, _ = cache.publish_record(previous, proposal)
         self.assertEqual(fresh.records[proposal].state, review_items.ReviewState.WAITING)
         with patch.object(self.server, 'review_cache', cache), patch.object(
                 serve, 'tailscale_ip', return_value='127.0.0.1'), patch.object(
@@ -1125,7 +1127,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         request = case.card_body(previous, proposal, 'approve')
         path = Path(proposal.removeprefix('proposal/'))
         _ = path.write_text(path.read_text().replace('Run fewer checks.', 'Run a different check.'))
-        fresh = cache.publish_record(previous, proposal)
+        fresh, _ = cache.publish_record(previous, proposal)
         self.assertEqual(fresh.records[proposal].state, previous.records[proposal].state)
         self.assertIn(b'Run a different check.', fresh.body(proposal))
         with patch.object(self.server, 'review_cache', cache), patch.object(
@@ -1178,7 +1180,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         cache.start()
         cache.synchronize()
         self.assertNotEqual(cache.get().version, snapshot.version)
-        self.assertEqual(cache.get().records[proposal].state, review_items.ReviewState.DONE)
+        self.assertNotIn(proposal, cache.get().records)
 
     def test_review_keeps_a_verdict_after_cleanup_or_message_failure(self) -> None:
         case = self.review_fixture(changes=2)
@@ -1238,15 +1240,13 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertTrue(retried.wait(TEST_HANG_GUARD_SECS))
             sent.assert_called_once()
             self.assertFalse(case.status.request_attempts)
-            self.assertEqual(cache.get().records[proposal].state, review_items.ReviewState.DONE)
+            self.assertNotIn(proposal, cache.get().records)
 
     def test_review_conflicts_when_proposal_rank_or_state_changes_or_the_asset_disappears(self) -> None:
         case = self.review_fixture()
         key, _ = case.decisions()
         path = Path(key.removeprefix('proposal/'))
         original = path.read_text()
-        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
-        self.addCleanup(cache.close)
         lock = proposal_issue.issue_lock
         read = proposal_issue.read_issue
         entered = threading.Event()
@@ -1264,18 +1264,19 @@ class ReviewLinksServerTests(unittest.TestCase):
                 target.unlink(missing_ok=True)
             return read(target)
 
-        with patch.object(self.server, 'review_cache', cache), patch.object(
-                self.server, 'delivery_status', case.status), patch.object(change_page, 'send_to_staff') as sent:
+        with patch.object(self.server, 'delivery_status', case.status), patch.object(change_page, 'send_to_staff') as sent:
             for finding in ('F037', 'F040', 'F038'):
                 with self.subTest(finding=finding):
                     sent.reset_mock()
                     case.fixture.delivery_done.clear()
                     _ = path.write_text(original)
-                    snapshot = cache.publish_record(cache.get(), key)
+                    cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+                    self.addCleanup(cache.close)
+                    snapshot = cache.get()
                     request = case.card_body(snapshot, key, 'decline')
                     if finding == 'F037':
                         _ = path.write_text(original.replace('stage: backlog', 'stage: backlog\nbacklog_risk: ★★★'))
-                    with patch.object(proposal_issue, 'issue_lock',
+                    with patch.object(self.server, 'review_cache', cache), patch.object(proposal_issue, 'issue_lock',
                         side_effect=activate_before_lock if finding == 'F040' else lock), patch.object(
                             proposal_issue, 'read_issue', side_effect=delete_before_asset_read if finding == 'F038' else read):
                         status, reply = self.post(review_page.PAGE_PATH, request)
@@ -1348,20 +1349,19 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(review_later.times().get(key), until)
         self.assertEqual(cache.get().records[key].state, snapshot.records[key].state)
 
-    def test_review_accepts_later_on_a_current_done_card(self) -> None:
+    def test_review_accepts_later_on_an_open_question(self) -> None:
         case = self.review_fixture()
         key = case.question()
-        _ = review_page.submit(case.root, case.body(key, 'answer', 'Use the first layout.'), case.status)
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         snapshot = cache.get()
-        self.assertEqual(snapshot.records[key].state, review_items.ReviewState.DONE)
+        self.assertEqual(snapshot.records[key].state, review_items.ReviewState.OPEN)
         with patch.object(self.server, 'review_cache', cache), patch.object(
                 serve, 'tailscale_ip', return_value='127.0.0.1'):
             status, reply = self.post(review_page.PAGE_PATH,
                 case.card_body(snapshot, key, 'later')+'&later=2030-12-02T18%3A30')
             self.assertEqual(status, 200, reply)
             item = cache.get().records[key]
-            self.assertEqual(item.state, review_items.ReviewState.DONE)
+            self.assertEqual(item.state, review_items.ReviewState.OPEN)
             self.assertIsInstance(item.times.later, datetime)
 
             with self.subTest('Question log rollback'):
