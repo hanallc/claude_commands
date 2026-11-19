@@ -3057,19 +3057,11 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 - Row e9b059d52 on main 764582979. Tests in both layouts, 0 failures: 11 suites; types 0.
 
 ### Phase 170 — Ten resources settings say what they do, their unit and their default  · status: done
-**Source:** builds, 2026-11-19 09:0x EST (user ask via natedev: settings must be reasonably documented). The messaging unit's config audit names resources as owner of ten keys.
+**Source:** builds, 2026-11-19 09:0x EST (user ask via natedev: settings must be reasonably documented), from the messaging unit's config doc audit.
 
-#### Work Order
-
-**Goal:** each named key has a comment that gives its meaning, its unit and its allowed values or default.
-
-**Spec:**
-1. `config/hana_instances.conf`: `exempt_ports` (no comment), `test_max_hours`, `unlabelled_max_minutes`, `stop_grace_seconds` (no meaning).
-2. `config/lint.conf`: `clippy_fix_jobs` (no meaning, no unit), `sweep_delete_stamp_grace_seconds`, `sweep_holder_lookback_seconds` (no meaning), `sweep_message_limit`, `sweep_push_text_limit` (no unit), `sweep_message_path_widths` (no unit, no allowed values or default).
-3. Comments only, in STE, from what each reader does. Change no key name and no value.
-
-**Files:** `config/hana_instances.conf`, `config/lint.conf`.
-
-**Workers:** `1 writer`.
-
-**Acceptance gate:** each comment matches its reader; the config tests that read these files pass; `git diff` shows only comment lines.
+#### As-built
+- Comments only. `config/hana_instances.conf`: `exempt_ports`, `test_max_hours`, `unlabelled_max_minutes`, `stop_grace_seconds`. `config/lint.conf`: `clippy_fix_jobs`, `sweep_push_text_limit`, `sweep_holder_lookback_seconds`, `sweep_delete_stamp_grace_seconds`, `sweep_message_path_widths`, `sweep_message_limit`. No key name and no value changed.
+- Each comment gives what the reader does with the value, its unit, the limit form (less than or at most) and the shipped value or fallback.
+- The holder-notice text describes Phase 169: a notice lists only the largest paths that fit `sweep_message_limit`. So the row goes on the Phase 169 row.
+- Blind review: 6 findings, all fixed; closure check clean.
+- Row c0c1e5e07 on the Phase 169 row e9b059d52, branch `builds-resources-p170`. 28 modules, 1,798 tests, 0 failures.
