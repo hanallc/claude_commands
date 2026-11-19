@@ -614,6 +614,19 @@ class NoComposer:
     """The visible screen has no current input box."""
 
 
+@dataclass(frozen=True)
+class ComposerRegion:
+    start: int
+    end: int
+    input: ComposerInput
+
+
+@dataclass(frozen=True)
+class CommandScreen:
+    history: tuple[str, ...]
+    footer: tuple[str, ...]
+
+
 class _OpeningComposer(Enum):
     EMPTY = "empty"
     DRAFT = "matching draft"
@@ -657,13 +670,27 @@ def _typed_text(screen: str) -> str:
     return "".join(kept)
 
 
-def _composer_input(screen: str) -> ComposerInput | NoComposer:
+def _composer_region(screen: str, *, codex: bool = False) -> ComposerRegion | NoComposer:
     """Parse the final live composer, excluding old input and its footer.
 
     An ANSI screen (`--format ansi`) lets faint placeholder text such as `Try "fix lint errors"` read as empty.
     """
     lines = _prompt_screen(screen).splitlines()
     typed = _typed_text(screen).splitlines()
+    if codex:
+        prompt = re.compile(r"^ {0,2}[›»](?:[ \xa0]|$)")
+        for index in range(len(lines) - 1, -1, -1):
+            if marker := prompt.match(lines[index]):
+                end = index + 1
+                while end < len(lines) and lines[end].strip() and lines[end].startswith("   "):
+                    end += 1
+                if (index >= len(typed) or not prompt.match(typed[index])
+                        or any(line.rstrip().endswith(("↑", "↓")) for line in lines[index:end])
+                        or any(line.strip() and not line.startswith("  ") for line in lines[end:])):
+                    break
+                draft = "\n".join((typed[index][marker.end():], *typed[index + 1:end])).rstrip("\xa0")
+                return ComposerRegion(index, end, ComposerInput(draft))
+        return NoComposer()
     closing_borders = [i for i, line in enumerate(lines) if re.fullmatch(r"\s*[─━-]{3,}\s*", line)]
     if not closing_borders:
         return NoComposer()
@@ -677,9 +704,28 @@ def _composer_input(screen: str) -> ComposerInput | NoComposer:
     # Column-zero output below the last box makes that box scrollback.
     if any(line.strip() and not line[0].isspace() for line in lines[closing + 1:]):
         return NoComposer()
-    region = typed[top_borders[-1] + 1:closing]
-    region[0] = re.sub(r"^[❯>]\s*", "", region[0])
-    return ComposerInput("\n".join(line.strip() for line in region))
+    start = top_borders[-1]
+    region = typed[start + 1:closing]
+    if not region:
+        return NoComposer()
+    region[0] = re.sub(r"^[❯>][ \xa0]?", "", region[0])
+    return ComposerRegion(start, closing + 1, ComposerInput("\n".join(region).rstrip("\xa0")))
+
+
+def _composer_input(screen: str) -> ComposerInput | NoComposer:
+    region = _composer_region(screen)
+    if isinstance(region, NoComposer):
+        return region
+    return ComposerInput("\n".join(line.strip() for line in region.input.text.split("\n")))
+
+
+def _command_history(recent: str, *, codex: bool) -> tuple[str, ...]:
+    region = _composer_region(recent, codex=codex)
+    lines = recent.splitlines()
+    history = lines[:region.start] if isinstance(region, ComposerRegion) else lines
+    while history and not history[-1].strip():
+        _ = history.pop()
+    return tuple(history)
 
 
 def prompt_recipient_process(session_id: str) -> PromptRecipientProcess | PromptRecipientUnavailable:
@@ -2937,7 +2983,60 @@ class Herdr:
 
     def composer(self, pane: str) -> ComposerInput | NoComposer:
         """Read the visible input region."""
-        return _composer_input(self.run("pane", "read", pane, "--source", "visible", "--format", "ansi"))
+        return _composer_input(self._visible_screen(pane))
+
+    def _visible_screen(self, pane: str) -> str:
+        return self.run("pane", "read", pane, "--source", "visible", "--format", "ansi")
+
+    def command_terminal(self, pane: str) -> str:
+        row = self.pane_row(pane)
+        if isinstance(row, NoPane) or not (terminal := row.get("terminal_id")):
+            raise HerdrFailure(f"{pane}: the terminal is unknown")
+        return terminal
+
+    def check_command_target(self, pane: str, terminal: str, *, target: str, codex: bool) -> None:
+        """Verify the native conversation and terminal."""
+        kind = "codex" if codex else "claude"
+        if self.native_session(pane, kind, operation_deadline.remaining(PROGRAM_TIMEOUT_SECONDS)) != target:
+            raise HerdrFailure(f"{pane}: the conversation changed", "wrong_target")
+        if self.command_terminal(pane) != terminal:
+            raise HerdrFailure(f"{pane}: the terminal changed", "wrong_target")
+
+    def command_screen(self, pane: str, terminal: str, *, target: str) -> CommandScreen:
+        recent = self.read(pane, 60, joined=True, ansi=False)
+        visible = self._visible_screen(pane)
+        self.check_command_target(pane, terminal, target=target, codex=False)
+        active = _composer_region(visible)
+        footer = tuple(_prompt_screen(visible).splitlines()[active.end:]) if isinstance(active, ComposerRegion) else ()
+        return CommandScreen(_command_history(recent, codex=False), footer)
+
+    def idle_command(self, pane: str, terminal: str, text: str, *, target: str, codex: bool) -> tuple[str, ...]:
+        """Submit to an empty composer and return the history before submission."""
+        record = script_prompts.prepare_record(pane, text, deadline=worker_lifecycle.effective_deadline())
+        record.publish()
+        sent = False
+        try:
+            ready = self.readiness(pane)
+            if not ready["interactive_ready"] or not ready["agent_status"].idle:
+                raise HerdrFailure(f"{pane}: the pane is not idle", "wrong_target")
+            history = _command_history(self.read(pane, 60, joined=True, ansi=False), codex=codex)
+            self.check_command_target(pane, terminal, target=target, codex=codex)
+            region = _composer_region(self._visible_screen(pane), codex=codex)
+            if isinstance(region, NoComposer):
+                raise HerdrFailure(f"{pane}: the native composer is unknown", "wrong_target")
+            if region.input.text:
+                raise HerdrFailure("has unsent text", "wrong_target")
+            sent = True
+            self._prompt(pane, text)
+        except HerdrCommandNotStarted:
+            sent = False
+            raise
+        finally:
+            if sent:
+                record.trim()
+            else:
+                record.path.unlink(missing_ok=True)
+        return history
 
     def _wait_for_submit(self, receipt: Callable[[], PromptSubmitted | TranscriptReadable | TranscriptUnreadable],
                          deadline: float) -> PromptSubmitted | None:
