@@ -29,6 +29,7 @@ Use `~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py list --al
 Save substantive item changes through `the_list.py add`, `update`, `park`, `close`, `reopen`, `mark-read`, `link`, or `unlink`.
 Use `--review <shown id>` or `--review-key <key>` with `link` and `unlink`; both options can repeat and mix.
 Use `--producer <name or staff id>` with `add` or `update` for an item that another producer, such as dwight, runs.
+When a producer gets an item in a Rust project, tell it to load `~/.claude/docs/producer/rust_design.md`. Ask it to confirm.
 New items default to morty.
 The assigned producer writes the latest status, next step, and ETA.
 Morty keeps add, close, park, and reassign for all items.
