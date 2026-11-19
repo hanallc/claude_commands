@@ -12,14 +12,15 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Iterator
+from collections.abc import Callable, Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, redirect_stdout, redirect_stderr
+from contextlib import ExitStack, contextmanager, redirect_stdout, redirect_stderr
 from pathlib import Path
 from threading import Event, current_thread
 from typing import cast, override
@@ -45,10 +46,21 @@ MAKER_ID = fixture_runtime_id("scratch-Claude-session")
 
 RUN = "run:2a858b68-0f9a-4af2-b3cf-a776e6b180cb"
 ROW = "row:cargo-liner-C54"
+REMOTE_CHECK_SECONDS = 30
 
 
 def setUpModule() -> None:
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = write_config_fixture(root / "scratch.conf", "\n".join((
+        "visible_root=~/rust/repro",
+        "holds_file=~/.local/state/scratch/holds.json",
+        "default_life_seconds=86400",
+        "repo_depth=3",
+        "suffix_length=6",
+        "repo_skip=target node_modules .git",
+        "record_lock_attempts=3",
+        f"removal_remote_timeout_seconds={REMOTE_CHECK_SECONDS}",
+    )))
     _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, config_environment(root))))
 
 
@@ -166,7 +178,12 @@ class ScratchTests(unittest.TestCase):
                 with self.subTest(version=version, state=state):
                     task = f"gate:recovery-{version}-{state}"
                     path = self.copy(name=f"{version}-{state}", task=task)
-                    with mock.patch.object(scratch, "remove", side_effect=OSError("stopped after intent")):
+                    def interrupt(folder: Path) -> None:
+                        if state in ("partial-git", "partial-new-work"):
+                            shutil.rmtree(folder / ".git/objects")
+                        raise OSError("stopped after intent")
+
+                    with mock.patch.object(scratch, "remove", side_effect=interrupt):
                         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                             self.assertNotEqual(scratch.main(["end", "--task", task]), 0)
                     mark = scratch.removal_mark(path)
@@ -174,15 +191,13 @@ class ScratchTests(unittest.TestCase):
                     self.assertEqual(fields["removal_version"], scratch.REMOVAL_VERSION)
                     if version == "legacy":
                         for key in ("removal_version", "removal_repositories", "removal_files", "removal_intent_ns", "removal_ref_files"):
-                            _ = fields.pop(key)
+                            _ = fields.pop(key, None)
                         _ = mark.write_text(json.dumps(fields))
                     work = path / "new-work.txt"
                     if state == "new-work":
                         _ = work.write_text("keep new work after deletion intent")
-                    elif state in ("partial-git", "partial-new-work"):
-                        shutil.rmtree(path / ".git/objects")
-                        if state == "partial-new-work":
-                            _ = work.write_text("keep new work after partial deletion")
+                    elif state == "partial-new-work":
+                        _ = work.write_text("keep new work after partial deletion")
                     output, error = io.StringIO(), io.StringIO()
                     with redirect_stdout(output), redirect_stderr(error):
                         code = scratch.main(["end", "--task", task])
@@ -596,11 +611,19 @@ class ScratchTests(unittest.TestCase):
                 self.git(path, "config", "test.retry", "true")
                 trace = self.base / f"{change}.trace"
                 trace.touch()
+                whole = conf.ConfigRead.whole
+                timeouts: list[int] = []
                 roots = cargo_output.CargoOutputRoots(path, path / "target", self.base / "outside-output")
                 saved = scratch.SavedCargoOutput(roots, (), (), time.time())
 
+                def read_setting(settings: conf.ConfigRead, key: str) -> int:
+                    value = whole(settings, key)
+                    if key == "removal_remote_timeout_seconds":
+                        timeouts.append(value)
+                    return value
+
                 def change_refs(repo: Path, _saved: tuple[scratch.SavedCargoOutput, ...]) -> None:
-                    query.assert_called_once()
+                    query.assert_not_called()
                     if change == "private":
                         self.git(repo, "checkout", "--detach", "-q")
                         self.git(repo, "commit", "-qm", "Only on a private branch", "--allow-empty")
@@ -608,17 +631,23 @@ class ScratchTests(unittest.TestCase):
                         self.git(repo, "checkout", "-q", "-")
 
                 with (mock.patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file", "GIT_TRACE": str(trace)}),
+                      mock.patch.object(conf.ConfigRead, "whole", read_setting),
                       mock.patch.object(time_limit, "capture", wraps=time_limit.capture) as query,
                       mock.patch.object(scratch, "save_cargo_outputs", return_value=(saved,)),
                       mock.patch.object(scratch, "clean_cargo_outputs", side_effect=change_refs)):
                     result = scratch.remove_folder(path)
                 query.assert_called_once()
+                self.assertEqual(timeouts, [REMOTE_CHECK_SECONDS])
                 self.assertNotIn("built-in: git fetch ", trace.read_text())
                 if change == "private":
                     self.assertEqual(result, scratch.RemoteKeptFolder(path, f"{path}: it has commits that are on no remote"))
                     self.git(path, "rev-parse", "--verify", "refs/heads/private")
                     self.assertTrue(scratch.removal_mark(path).exists())
                 else:
+                    self.assertIsInstance(result, scratch.KeptFolder)
+                    scratch.removal_mark(path).unlink()
+                    with mock.patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file"}):
+                        result = scratch.remove_folder(path)
                     self.assertEqual(result, scratch.RemovedCopy())
                     self.assertFalse(path.exists())
 
@@ -1160,17 +1189,16 @@ for descriptor in descriptors:
         for name in ("commondir", "HEAD"):
             with self.subTest(name=name):
                 metadata = source / ".git" / "worktrees" / worktree.name / name
-                contents = metadata.read_bytes()
-                metadata.unlink()
+                original = self.base / f"saved-{name}"
+                _ = metadata.rename(original)
                 metadata.mkdir()
                 kept = scratch.KeptFolder(worktree, f"{metadata}: expected a regular file")
-                self.assertEqual(scratch.recovery_state(worktree, pending, scratch.BusyMarkScope(),
-                                                       scratch_settings=settings), kept)
+                self.assertEqual(scratch.remove_folder(worktree, dry_run=True, scratch_settings=settings), kept)
                 self.assertEqual(scratch.remove_folder(worktree, source_deletion=scratch.SourceDeletion.RUN), kept)
                 self.assertTrue(worktree.is_dir())
                 self.assertTrue(scratch.removal_mark(worktree).is_file())
                 metadata.rmdir()
-                _ = metadata.write_bytes(contents)
+                _ = original.rename(metadata)
 
         self.assertEqual(scratch.remove_folder(worktree, source_deletion=scratch.SourceDeletion.RUN),
                          scratch.RemovedCopy())
@@ -1181,6 +1209,110 @@ for descriptor in descriptors:
         self.add_saved_work_and_loose_ref(path)
         self.stop_removal_after_intent(path, version)
         return path
+
+    def test_retry_keeps_linked_worktree_refs_changed_after_intent(self) -> None:
+        for change in ("published alias", "coarse timestamp", "atomic HEAD replacement"):
+            with self.subTest(change=change):
+                source, _ = self.copy_with_published_head(change.replace(" ", "-"))
+                path = self.base / change.replace(" ", "-")
+                self.git(source, "worktree", "add", "-q", "-b", "side", str(path))
+                self.git(source, "branch", "peer", "side")
+                admin = git_files.at(path).git_dir
+                head = admin / "HEAD"
+                before = head.stat()
+                self.stop_removal_after_intent(path, "current")
+                if change == "atomic HEAD replacement":
+                    self.git(path, "symbolic-ref", "HEAD", "refs/heads/peer")
+                    ref = head
+                    os.utime(ref, ns=(before.st_atime_ns, before.st_mtime_ns))
+                    self.assertNotEqual(ref.stat().st_ino, before.st_ino)
+                else:
+                    self.git(path, "symbolic-ref", "refs/worktree/alias", "refs/heads/side")
+                    ref = admin / "refs/worktree/alias"
+                    if change == "coarse timestamp":
+                        os.utime(ref, ns=(before.st_atime_ns, before.st_mtime_ns))
+                contents = ref.read_bytes()
+                self.assert_retry_keeps_metadata(path, ref)
+                self.assertEqual(ref.read_bytes(), contents)
+
+    def test_retry_checks_for_refs_written_during_preparation_without_cargo(self) -> None:
+        path = self.checkout_with_removal_intent("current", "late-ref")
+        reference = path / ".git/refs/heads/late"
+        save = scratch.save_cargo_outputs
+
+        def prepare(folder: Path) -> tuple[scratch.SavedCargoOutput, ...]:
+            saved = save(folder)
+            self.git(folder, "symbolic-ref", "refs/heads/late", "refs/heads/loose")
+            return saved
+
+        with mock.patch.object(scratch, "save_cargo_outputs", side_effect=prepare):
+            self.assert_retry_keeps_metadata(path, reference)
+        self.assertEqual(reference.read_text(), "ref: refs/heads/loose\n")
+
+    def test_retry_keeps_both_tombstones_if_the_checkout_cannot_return(self) -> None:
+        source, _ = self.copy_with_published_head("blocked-restore")
+        path = self.base / "linked"
+        self.git(source, "worktree", "add", "-q", "-b", "side", str(path))
+        admin = git_files.at(path).git_dir
+        self.stop_removal_after_intent(path, "current")
+        self.git(path, "symbolic-ref", "refs/worktree/late", "refs/heads/side")
+        rename = scratch.rename_removal_folder
+        tombstones: dict[Path, Path] = {}
+
+        def occupy_original_name(original: Path, tombstone: Path) -> None:
+            rename(original, tombstone)
+            tombstones[original] = tombstone
+            if original == admin:
+                path.mkdir()
+                _ = (path / "new-source").write_text("keep the replacement")
+
+        with (mock.patch.object(scratch, "rename_removal_folder", side_effect=occupy_original_name),
+              self.assertRaisesRegex(scratch.ScratchError, "cannot restore removal folders")):
+            _ = scratch.remove_folder(path)
+        self.assertEqual((path / "new-source").read_text(), "keep the replacement")
+        self.assertEqual((tombstones[admin] / "refs/worktree/late").read_text(), "ref: refs/heads/side\n")
+        self.assertTrue((tombstones[path] / ".git").is_file())
+        self.assertIsInstance(scratch.remove_folder(path), scratch.KeptFolder)
+        self.assertTrue(scratch.removal_mark(path).is_file())
+
+    def test_fresh_removal_does_not_read_head_when_it_records_intent(self) -> None:
+        path, _ = self.copy_with_published_head("fresh-intent")
+        self.git(path, "update-ref", "refs/remotes/origin/main", "HEAD")
+        clean = scratch.clean_cargo_outputs
+        read_head = git_files.check_internal_head
+        preparing_intent = False
+        late_reads: list[Path] = []
+
+        def clean_before_intent(folder: Path, saved: tuple[scratch.SavedCargoOutput, ...]) -> None:
+            nonlocal preparing_intent
+            clean(folder, saved)
+            preparing_intent = True
+
+        def observe_head(checkout: git_files.Checkout) -> None:
+            if preparing_intent:
+                late_reads.append(checkout.toplevel)
+            read_head(checkout)
+
+        with (mock.patch.object(scratch, "clean_cargo_outputs", side_effect=clean_before_intent),
+              mock.patch.object(git_files, "check_internal_head", side_effect=observe_head)):
+            self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
+        self.assertEqual(late_reads, [])
+
+    def test_retry_scans_once_when_nested_manifest_runs_no_cargo(self) -> None:
+        path, _ = self.copy_with_published_head("nested-manifest")
+        self.git(path, "update-ref", "refs/remotes/origin/main", "HEAD")
+        with (path / ".git/info/exclude").open("a") as exclude:
+            _ = exclude.write("\n/nested/\n")
+        child = path / "nested"
+        child.mkdir()
+        self.git(child, "init", "-q")
+        _ = (child / "Cargo.toml").write_text("[workspace]\n")
+        self.stop_removal_after_intent(path, "current")
+        with (mock.patch.object(git_files, "scan_removal_tree", wraps=git_files.scan_removal_tree) as scan,
+              mock.patch.object(cargo_output, "read_cargo_output_roots",
+                                side_effect=AssertionError("Cargo preparation started"))):
+            self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
+        scan.assert_called_once()
 
     def add_saved_work_and_loose_ref(self, path: Path) -> None:
         _ = (path / "tracked").write_text("saved work")
@@ -1199,7 +1331,7 @@ for descriptor in descriptors:
             mark = scratch.removal_mark(path)
             fields = cast(dict[str, object], json.loads(mark.read_text()))
             for key in ("removal_version", "removal_repositories", "removal_files", "removal_intent_ns", "removal_ref_files"):
-                _ = fields.pop(key)
+                _ = fields.pop(key, None)
             _ = mark.write_text(json.dumps(fields))
 
     def assert_retry_keeps_metadata(self, path: Path, metadata: Path) -> None:
@@ -1212,6 +1344,10 @@ for descriptor in descriptors:
         self.assertIn(str(metadata), result.reason)
         self.assertTrue(path.is_dir())
         self.assertTrue(scratch.removal_mark(path).is_file())
+
+    def source_change_times(self, path: Path) -> dict[Path, int]:
+        return {entry.path: entry.status.st_ctime_ns for entry in git_files.scan_removal_tree(path).values()
+                if stat.S_ISREG(entry.status.st_mode)}
 
     def set_removal_mark_times(self, path: Path, *, intent: int, mtime: int) -> None:
         mark = scratch.removal_mark(path)
@@ -1240,6 +1376,20 @@ for descriptor in descriptors:
                 self.assert_retry_keeps_metadata(path, index)
                 self.assertTrue(index.is_dir())
 
+    @contextmanager
+    def observe_tombstone(self, path: Path) -> Generator[Callable[[Path], Path]]:
+        rename = scratch.rename_removal_folder
+        active = path
+
+        def move(source: Path, destination: Path) -> None:
+            nonlocal active
+            rename(source, destination)
+            if source == active:
+                active = destination
+
+        with mock.patch.object(scratch, "rename_removal_folder", side_effect=move):
+            yield lambda entry: active / entry.relative_to(path)
+
     def test_retry_keeps_a_ref_directory_replaced_by_a_symlink_during_scan(self) -> None:
         path = self.checkout_with_removal_intent("current", "ref-directory-swap")
         namespace = path / ".git/refs/heads"
@@ -1249,26 +1399,29 @@ for descriptor in descriptors:
         open_entry, scan = os.open, os.scandir
 
         def replace_namespace() -> None:
-            _ = namespace.rename(moved)
-            namespace.symlink_to(empty, target_is_directory=True)
+            current = during_scan(namespace)
+            _ = current.rename(moved)
+            current.symlink_to(empty, target_is_directory=True)
 
         def open_during_swap(name: str | Path, flags: int, mode: int = 0o777, *,
                              dir_fd: int | None = None) -> int:
             if name == namespace.name and dir_fd is not None and flags & os.O_DIRECTORY:
-                parent = namespace.parent.stat()
+                parent = during_scan(namespace.parent).stat()
                 descriptor = os.fstat(dir_fd)
-                self.assertEqual((parent.st_dev, parent.st_ino), (descriptor.st_dev, descriptor.st_ino))
-                required = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
-                self.assertEqual(flags & required, required)
-                replace_namespace()
+                if os.path.samestat(parent, descriptor):
+                    self.assertEqual((parent.st_dev, parent.st_ino), (descriptor.st_dev, descriptor.st_ino))
+                    required = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+                    self.assertEqual(flags & required, required)
+                    replace_namespace()
             return open_entry(name, flags, mode, dir_fd=dir_fd)
 
         def scan_during_swap(folder: Path | str | int = "."):
-            if folder == namespace:
+            if folder == during_scan(namespace):
                 replace_namespace()
             return scan(folder)
 
-        with (mock.patch.object(os, "open", side_effect=open_during_swap),
+        with (self.observe_tombstone(path) as during_scan,
+              mock.patch.object(os, "open", side_effect=open_during_swap),
               mock.patch.object(os, "scandir", side_effect=scan_during_swap)):
             self.assert_retry_keeps_metadata(path, namespace)
         self.assertTrue(namespace.is_symlink())
@@ -1288,11 +1441,13 @@ for descriptor in descriptors:
         def open_during_swap(name: str | Path, flags: int, mode: int = 0o777, *,
                              dir_fd: int | None = None) -> int:
             if name == namespace.name and dir_fd is not None and flags & os.O_DIRECTORY:
-                _ = namespace.rename(moved)
-                _ = replacement.rename(namespace)
+                current = during_scan(namespace)
+                if os.path.samestat(current.parent.stat(), os.fstat(dir_fd)):
+                    _ = current.rename(moved)
+                    _ = replacement.rename(current)
             return open_entry(name, flags, mode, dir_fd=dir_fd)
 
-        with mock.patch.object(os, "open", side_effect=open_during_swap):
+        with self.observe_tombstone(path) as during_scan, mock.patch.object(os, "open", side_effect=open_during_swap):
             self.assert_retry_keeps_metadata(path, namespace)
         self.assertTrue((moved / "loose").is_dir())
         self.assertEqual(list(namespace.iterdir()), [])
@@ -1308,14 +1463,18 @@ for descriptor in descriptors:
 
         def open_during_swap(name: str | Path, flags: int, mode: int = 0o777, *,
                              dir_fd: int | None = None) -> int:
-            if name in (refs, refs.name) and flags & os.O_DIRECTORY:
-                if dir_fd is not None:
-                    self.assertTrue(os.path.samestat(metadata.stat(), os.fstat(dir_fd)))
-                _ = metadata.rename(moved)
-                metadata.symlink_to(replacement, target_is_directory=True)
+            if name in (during_scan(refs), refs.name) and flags & os.O_DIRECTORY:
+                current = during_scan(metadata)
+                if dir_fd is None or os.path.samestat(current.stat(), os.fstat(dir_fd)):
+                    if dir_fd is not None:
+                        directory = current.stat()
+                        self.assertTrue(os.path.samestat(directory, os.fstat(dir_fd)))
+                    _ = current.rename(moved)
+                    current.symlink_to(replacement, target_is_directory=True)
             return open_entry(name, flags, mode, dir_fd=dir_fd)
 
-        with (mock.patch.object(os, "open", side_effect=open_during_swap),
+        with (self.observe_tombstone(path) as during_scan,
+              mock.patch.object(os, "open", side_effect=open_during_swap),
               mock.patch.object(scratch, "remove", side_effect=AssertionError("source deletion started")) as delete):
             result = scratch.remove_folder(path)
             delete.assert_not_called()
@@ -1348,7 +1507,7 @@ for descriptor in descriptors:
                         link.symlink_to("refs/remotes/origin/main")
                     self.stop_removal_after_intent(path, version)
                     if version == "legacy":
-                        last_file_change = max(scratch.removal_source_files(path).values())
+                        last_file_change = max(self.source_change_times(path).values())
                         os.utime(scratch.removal_mark(path), ns=(last_file_change, last_file_change))
 
                     if change == "published alias":
@@ -1356,8 +1515,9 @@ for descriptor in descriptors:
                         self.assert_retry_keeps_metadata(path, link)
                         self.assertEqual(link.read_text(), "ref: refs/heads/loose\n")
                     else:
-                        link.unlink(missing_ok=True)
-                        link.symlink_to("refs/heads/loose")
+                        replacement = link.with_name("new-alias")
+                        replacement.symlink_to("refs/heads/loose")
+                        _ = replacement.replace(link)
                         self.git(path, "symbolic-ref", "refs/heads/alias")
                         self.assert_retry_keeps_metadata(path, link)
                         self.assertEqual(os.readlink(link), "refs/heads/loose")
@@ -1375,14 +1535,14 @@ for descriptor in descriptors:
                     self.assertGreater(scratch.removal_mark(path).stat().st_mtime_ns, intent)
                 self.assert_retry_keeps_metadata(path, link)
 
-    def test_final_removal_scan_checks_metadata_added_after_the_first_scan(self) -> None:
-        scan_metadata = git_files.check_internal_removal_entries
+    def test_final_removal_scan_checks_metadata_added_before_the_move(self) -> None:
+        rename = scratch.rename_removal_folder
         for version in ("current", "legacy"):
             for change in ("index directory", "regular ref", "symbolic ref"):
                 with self.subTest(version=version, change=change):
                     path = self.checkout_with_removal_intent(version, change.replace(" ", "-"))
                     mark = scratch.removal_mark(path)
-                    last_file_change = max(scratch.removal_source_files(path).values())
+                    last_file_change = max(self.source_change_times(path).values())
                     if version == "legacy":
                         os.utime(mark, ns=(last_file_change, last_file_change))
                     fields = cast(dict[str, object], json.loads(mark.read_text()))
@@ -1393,33 +1553,33 @@ for descriptor in descriptors:
                     ref = path / ".git/refs/heads/added"
                     oid = (ref.parent / "loose").read_text()
 
-                    def mutate(checkouts: tuple[git_files.Checkout, ...],
-                               previous: git_files.RecordedRemovalFiles | git_files.LegacyRemovalFiles, *,
-                               removal_root: Path) -> None:
-                        scan_metadata(checkouts, previous, removal_root=removal_root)
-                        if change == "index directory":
-                            index.unlink()
-                            index.mkdir()
-                        elif change == "regular ref":
-                            _ = ref.write_text(oid)
-                        else:
-                            ref.symlink_to("refs/heads/loose")
-                        if change != "index directory":
-                            self.assertGreater(ref.lstat().st_ctime_ns, intent)
+                    def mutate(source: Path, destination: Path) -> None:
+                        if source == path:
+                            if change == "index directory":
+                                index.unlink()
+                                index.mkdir()
+                            elif change == "regular ref":
+                                _ = ref.write_text(oid)
+                            else:
+                                ref.symlink_to("refs/heads/loose")
+                            if change != "index directory":
+                                self.assertGreater(ref.lstat().st_ctime_ns, intent)
+                        rename(source, destination)
+                        if source == path:
+                            late_write = subprocess.run(
+                                ["git", "-C", str(path), "symbolic-ref", "refs/heads/post-move", "refs/heads/loose"],
+                                capture_output=True, check=False)
+                            self.assertNotEqual(late_write.returncode, 0)
 
-                    with mock.patch.object(git_files, "check_internal_removal_entries", side_effect=mutate):
+                    with mock.patch.object(scratch, "rename_removal_folder", side_effect=mutate):
                         if change == "index directory":
                             self.assert_retry_keeps_metadata(path, index)
                             self.assertTrue(index.is_dir())
                         else:
-                            pending = scratch.pending_removal(path)
-                            assert isinstance(pending, copy_record.Registered)
-                            state = scratch.recovery_state(path, pending, scratch.BusyMarkScope(),
-                                                           scratch_settings=conf.read("scratch"))
-                            if isinstance(state, scratch.KeptFolder):
-                                self.assertIn(str(ref), state.reason)
-                            else:
-                                self.assertEqual(state, scratch.RemovalRetry.RECHECK)
+                            state = scratch.remove_folder(path)
+                            self.assertIsInstance(state, scratch.KeptFolder)
+                            assert isinstance(state, scratch.KeptFolder)
+                            self.assertIn(str(ref), state.reason)
                         self.assertTrue(mark.is_file())
 
     def test_retry_validates_source_again_after_cargo_cleanup(self) -> None:
@@ -1528,7 +1688,7 @@ for descriptor in descriptors:
                     original = self.base / f"{version}-{metadata.name}-original"
                     _ = metadata.rename(original)
                     metadata.mkdir()
-                    self.assertTrue(all(ctime <= intent for ctime in scratch.removal_source_files(path).values()))
+                    self.assertTrue(all(ctime <= intent for ctime in self.source_change_times(path).values()))
 
                     with mock.patch.object(scratch, "remove", side_effect=AssertionError("source deletion started")) as delete:
                         result = scratch.remove_folder(path)
@@ -1543,7 +1703,14 @@ for descriptor in descriptors:
                     metadata.rmdir()
                     _ = original.rename(metadata)
                     if version == "legacy" and name != "index":
-                        self.assert_retry_keeps_metadata(path, metadata)
+                        evidence = cast(dict[str, object], json.loads(mark.read_text()))
+                        _ = evidence.pop("removal_snapshot")
+                        _ = mark.write_text(json.dumps(evidence))
+                        with mock.patch.object(scratch, "remove",
+                                               side_effect=AssertionError("source deletion started")) as delete:
+                            result = scratch.remove_folder(path)
+                            delete.assert_not_called()
+                        self.assertIsInstance(result, scratch.KeptFolder)
                         mark.unlink()
                     self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
                     self.assertFalse(path.exists())
@@ -1583,9 +1750,21 @@ assert scratch.removal_mark(path).is_file()
     def test_retry_recovers_when_interrupted_deletion_removed_internal_head(self) -> None:
         for version in ("current", "legacy"):
             with self.subTest(version=version):
-                path = self.checkout_with_removal_intent(version, "absent-head")
+                path = self.copy(name=f"{version}-absent-head")
+                self.add_saved_work_and_loose_ref(path)
+
+                def interrupt(folder: Path) -> None:
+                    (folder / ".git/HEAD").unlink()
+                    raise OSError("stop during deletion")
+
+                with (mock.patch.object(scratch, "remove", side_effect=interrupt),
+                      self.assertRaisesRegex(OSError, "stop during deletion")):
+                    _ = scratch.remove_folder(path)
                 mark = scratch.removal_mark(path)
-                (path / ".git/HEAD").unlink()
+                if version == "legacy":
+                    fields = cast(dict[str, object], json.loads(mark.read_text()))
+                    _ = fields.pop("removal_version")
+                    _ = mark.write_text(json.dumps(fields))
                 self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
                 self.assertFalse(path.exists())
                 self.assertFalse(mark.exists())
