@@ -349,6 +349,7 @@ if(options.mount){
 
 
 const sortValues=data=>options.sortValues?.(data) ?? JSON.parse(data.sortValues);
+const defaultOrder=data=>options.defaultOrder?.(data) ?? Number(data.order);
 const words=()=>content.querySelector('[data-filter-words]') ?? content.querySelector('#list-search');
 const sharedWords=()=>words().hasAttribute?.('data-filter-words');
 const chipRow=name=>content.querySelector('[data-filter-row="'+name+'"]');
@@ -411,7 +412,7 @@ function readPlace(params,followingItemLink=false){
  const item=params.get('item');if(item && !followingItemLink){
   if(keys.size) keys.add(item);
   if(!['owner','showrunner','show','q','sort','dir','type','source-owner',...filterNames].some(key=>params.has(key))){
-   owner='';show=options.requiredShow?.(itemWithKey(item)?.dataset) ?? 'all';
+   owner='';show='all';
    query='';type='';for(const name of filterNames) filters[name]='';}
   if(options.single) opened.clear();opened.add(item);revealKey=item;
  }
@@ -534,24 +535,27 @@ function showActionResult(item,submission,label,{kind,message,hiddenMessage}){
 }
 function isSelected(item){return !keys.size || keys.has(item.dataset.key);}
 function canRevealLinked(item,selection){
- const required=options.requiredShow?.(item.dataset);
- if(required && required!==selection.show) return false;
  return item.dataset.key===revealedLinkedItem || options.revealLinked?.(item.dataset,selection);
 }
-function matches(item,selection,counts){
+function matches(item,selection,counts,allowExpanded=false){
  if(!isSelected(item)) return false;
  if(!options.filterValues) return options.visible(item.dataset,selection);
- const values=options.filterValues(item.dataset,selection.query,selection);
+ const data=item.dataset;
+ const activeValues=options.filterValues(data,selection.query,selection);
+ const expanded=!activeValues && allowExpanded && opened.has(data.key) && options.expandedSelection?.(data,selection);
+ const values=activeValues || (expanded && options.filterValues(data,expanded.query,expanded));
  if(!values) return false;
  const selected={show:selection.show,owner:selection.owner,...selection.filters};
- const required=options.requiredShow?.(item.dataset);
  const excluded=Object.entries(values).filter(([name,choices])=>
-  filterChipValue(name,selected[name])==='all' ? name==='show' && required : !choices.includes(selected[name]));
+  filterChipValue(name,selected[name])!=='all' && !choices.includes(selected[name]));
  // A record counts for a row when it matches every other row.
  if(counts && excluded.length<2){
   for(const [name,choices] of Object.entries(values)){
-   if(excluded.length && excluded[0][0]!==name) continue;
-   for(const value of [...(name==='show' && required ? [] : ['all']),...choices.map(choice=>filterChipValue(name,choice))])
+   // A change to Show ends the exception for an open read row.
+   const sameShow=expanded && name==='show';
+   if(excluded.length && (excluded[0][0]!==name || sameShow)) continue;
+   const chipValues=sameShow ? [selection.show] : ['all',...choices.map(choice=>filterChipValue(name,choice))];
+   for(const value of chipValues)
     counts[name][value]=(counts[name][value] ?? 0)+1;
   }
  }
@@ -601,10 +605,10 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
   const transition=windowMotions ? windowMotions.get(item.dataset.key) : rowMotion.get(item);
   return (transition?.sortValues ?? sortValues(item.dataset))[column];
  };
- const items=[...rows,...departingRows].sort((a,b)=>column<0 ? Number(a.dataset.order)-Number(b.dataset.order) :
-  (compare(sortValue(a),sortValue(b)) ||
-   Number(a.dataset.order)-Number(b.dataset.order))*(direction==='desc' ? -1 : 1));
- const table=content.querySelector('table');let count=0,expandedOutsideFilter=false;
+ const compareOrder=(a,b)=>compare(defaultOrder(a.dataset),defaultOrder(b.dataset));
+ const items=[...rows,...departingRows].sort((a,b)=>column<0 ? compareOrder(a,b) :
+  (compare(sortValue(a),sortValue(b)) || compareOrder(a,b))*(direction==='desc' ? -1 : 1));
+ const table=content.querySelector('table');let count=0;
  if(options.mount){
   const visibleKeys=new Set(rows.filter(item=>matches(item,active,counts)).map(item=>item.dataset.key));
   count=visibleKeys.size;
@@ -645,13 +649,10 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
   if(linkedSection) linkedSection.hidden=!linked && !leavingLinked;
   items.forEach(item=>{
    const expanded=opened.has(item.dataset.key);
-   const matched=matches(item,active,counts);
-   const selection=expanded && !matched && item!==linked && options.expandedSelection?.(item.dataset,active);
-   const keepExpanded=selection && matches(item,selection);
-   const showRow=matched || item===linked || keepExpanded,wasShown=!item.hidden;
+   const matched=matches(item,active,counts,item!==linked);
+   const showRow=matched || item===linked,wasShown=!item.hidden;
    if(motion && wasShown && !showRow) animateRow(item.parentElement,item,false);
    item.hidden=!showRow;if(matched) count++;
-   if(keepExpanded) expandedOutsideFilter=true;
    const expansionChanged=setExpanded(item,expanded);
    const transition=rowMotion.get(item);
    if(motion && showRow && (!wasShown || (expansionChanged && transition))) animateRow(item.parentElement,item,true);
@@ -674,7 +675,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
   notice.textContent=missing.map(key=>key+' is no longer on the '+table.getAttribute('aria-label')+' page.').join('\n');
   notice.hidden=!missing.length;
  }
- empty.hidden=count>0 || expandedOutsideFilter || missing.length>0;
+ empty.hidden=count>0 || missing.length>0;
  const missingItem=content.querySelector('[data-missing-item]');
  if(missingItem){
   const message=linkedItem && missingLinkedItem ? options.missingItem(linkedItem) : '';
@@ -731,11 +732,10 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
   opened.add(key);
   const selection=currentSelection();
   if(!preserveFilters && !canRevealLinked(target,selection) && !matches(target,selection)){
-   const targetShow=options.requiredShow?.(target.dataset) ?? 'all';
-   const unfiltered=currentSelection({owner:'',show:targetShow,query:'',type:'',sourceOwner:'',filters:{}});
+   const unfiltered=currentSelection({owner:'',show:'all',query:'',type:'',sourceOwner:'',filters:{}});
    if(!keepMatchingFilters || owner && !matches(target,{...unfiltered,owner})) owner='';
    if(!keepMatchingFilters || sourceOwner && !matches(target,{...unfiltered,sourceOwner})) sourceOwner='';
-   if(!keepMatchingFilters || show!==targetShow && !matches(target,{...unfiltered,show})) show=targetShow;
+   if(!keepMatchingFilters || show!=='all' && !matches(target,{...unfiltered,show})) show='all';
    if(query && !matches(target,{...unfiltered,query:query.trim().toLowerCase()})) query='';
    if(type && !matches(target,{...unfiltered,type})) type='';
    for(const name of filterNames)

@@ -560,7 +560,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
                   "open-question": str(open_question).lower(), "unread-delivery": str(the_list.unread_delivery(item)).lower(),
                   "title": item.title.lower(),
                   "owner-name": owner.lower(),
-                  "order": str(index), "list-order": str(index), "sort-values": json.dumps(values, ensure_ascii=False)}
+                  "order": str(index), "sort-values": json.dumps(values, ensure_ascii=False)}
     attrs = ''.join(f' data-{key}="{html.escape(value, quote=True)}"' for key, value in attributes.items())
     panel = f'list-detail-{index}'
     row_id = html.escape(entry.key.replace("/", "-"), quote=True)
@@ -920,7 +920,6 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     owners: Counter[the_list.ItemOwner] = Counter()
     producers: Counter[the_list.ItemOwner] = Counter()
     rows: list[str] = []
-    parked_rows: list[str] = []
     deferred_links = False
     chip_counts: Counter[ListChip] = Counter()
     for index, entry in enumerate(items):
@@ -939,9 +938,8 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
         ):
             row_reviews = LinkedReviewRead.AFTER_RENDER
             deferred_links = True
-        (parked_rows if parked else rows).append(
-            item_rows(entry, names, today, index, secret, row_reviews, parked=parked,
-                      open_question=open_question, visibility=visibility))
+        rows.append(item_rows(entry, names, today, index, secret, row_reviews, parked=parked,
+                              open_question=open_question, visibility=visibility))
     shows = [record_table.Chip("all", "All", len(items)),
              *(record_table.Chip(chip.value, chip.value.replace("-", " ").capitalize(), chip_counts[chip])
                for chip in ListChip if chip != ListChip.ALL)]
@@ -989,7 +987,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + '<div class="list-table-tools"><div class="list-expansion">' + expansion + '</div>'
                + '<span data-list-count role="status" aria-live="polite"></span></div>'
                + '<div class="list-table"><table aria-label="The List">' + columns + '<thead><tr>' + headers + '</tr></thead>'
-               + ''.join(rows + parked_rows) + '</table>'
+               + ''.join(rows) + '</table>'
                + '<p data-empty hidden>No items in this view.</p></div>'
                + '<section data-linked-item hidden><h2 id="list-linked-heading">Linked item outside filters</h2>'
                + '<div class="list-table"><table aria-labelledby="list-linked-heading">' + columns
@@ -1274,14 +1272,8 @@ const tableView=createRecordTable({content:()=>content,
  },
  filters:['producer','unread'],
  staffChipFilters:['owner','producer'],
- beforeApply:()=>{
-  rememberLogPositions();
-  const rows=content.querySelectorAll('[data-list-item]');
-  for(const {dataset:data} of rows){
-   const order=String(Number(data.listOrder)+(isParked(data) ? rows.length : 0));
-   if(data.order!==order) data.order=order;
-  }
- },
+ defaultOrder:data=>[Number(isParked(data)),Number(data.order)],
+ beforeApply:rememberLogPositions,
  applied:(_items,{show,filters})=>{
   const nextUnreadShow=filters.unread ? show : '';
   if(nextUnreadShow!==unreadShow){

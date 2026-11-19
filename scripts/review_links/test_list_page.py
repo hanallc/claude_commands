@@ -4874,6 +4874,7 @@ window.fetch=async(_url,options)=>{
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_ask_saves_and_shows_the_newer_update_and_answer(self) -> None:
         item = self.add("Check the current result")
+        _ = self.add("Check the other unread result", owner=OTHER.id)
         root = self.root / "reviews"
         results: list[list[str]] = []
         complete = threading.Event()
@@ -4886,7 +4887,7 @@ const open=(show,key='',unread='')=>new Promise(resolve=>{
  frame.onload=resolve;
  frame.src='LIST_PATH?fixture='+show+unread+'#'+new URLSearchParams({show,unread,...(key ? {item:key} : {})});
 });
-const row=()=>frame.contentDocument.querySelector('[data-list-item]');
+const row=()=>frame.contentDocument.querySelector('[data-number="1"]');
 const hasDot=()=>Boolean(row().querySelector('.list-dot'));
 const act=async (action,words='')=>{
  const win=frame.contentWindow, current=row();
@@ -4996,8 +4997,21 @@ const change=async path=>{
   check(asked?.textContent.includes('Which check is next?') && Date.parse(asked.querySelector('time').dateTime)===askedAt &&
    Date.parse(answered.querySelector('time').dateTime)===Date.parse(loggedAt) && !row().querySelector('[data-question="Q2"]'),
    'The log shows the question and answer with their recorded times after the panel clears.');
+  const chip=(filter,value)=>doc.querySelector('[data-filter-row="'+filter+'"] [data-filter-value="'+value+'"]');
+  const count=(filter,value)=>Number(chip(filter,value).dataset.filterCount);
+  const shown=()=>doc.querySelector('table').querySelectorAll('[data-list-item]:not([hidden])').length;
+  check(shown()===2 && count('owner','all')===2 && count('producer','all')===2 && count('show','working')===2,
+   'The Owner, Producer, and Working counts include the row kept open after the read.');
+  check(doc.querySelector('[data-list-count]').textContent.startsWith('2 of 2 items shown'),
+   'The total includes the row kept open after the read.');
+  check(count('show','all')===1,'The Show All count reflects the end of the exception when Show changes.');
+  chip('owner','staff:'+doc.querySelector('[data-number="2"]').dataset.owner).click();
+  const allOwners=count('owner','all');
+  chip('owner','all').click();
+  check(allOwners===2 && allOwners===shown(),'The Owner All count matches the rows after its click.');
   row().querySelector('.list-toggle').click();
-  check(row().hidden,'closing the read row removes it from Unread');
+  check(row().hidden && shown()===1 && count('owner','all')===1,
+   'Closing the read row removes it from Unread only and the Owner All count.');
  }catch(error){errors.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(errors)});
 })();
@@ -5654,6 +5668,13 @@ const until=async (ready,label)=>{
 };
 const rows=()=>[...document.querySelectorAll('[data-list-item]')];
 const visible=()=>rows().filter(row=>!row.hidden);
+const shownNumbers=()=>visible().map(row=>row.dataset.number).join(',');
+const refreshOrder=async label=>{
+ const first=visible()[0],order=shownNumbers();
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await until(()=>!first.isConnected,'the table refresh');
+ check(shownNumbers()===order,label);
+};
 const filterRow=name=>document.querySelector('[data-filter-row="'+name+'"]');
 const staffChip=(name,value)=>filterRow(name).querySelector('[data-filter-value="'+
  (name==='show' || value==='all' ? value : 'staff:'+value)+'"]');
@@ -5707,8 +5728,9 @@ try{
    check(label.getClientRects().length===1,'the desktop header fits on one line: '+header.textContent);
   }
  }
- check(visible().map(row=>row.dataset.number).join(',')==='58,105,106,63,41','Parked rows come last in the default order.');
- check(visible().at(-1).querySelector('[data-parked-note]').textContent==='Parked until 2026-11-18 13:00 EST',
+ check(shownNumbers()==='58,105,106,63,41','Parked rows come last in the initial default order.');
+ await refreshOrder('Parked rows stay last in the default order after a refresh.');
+ check(visible().at(-1).querySelector('[data-parked-note]')?.textContent==='Parked until 2026-11-18 13:00 EST',
        'The parked row shows its park end time.');
  check(['owner','producer','show'].every(name=>staffCount(name,'all')===5),
        'All three All chips count the parked row with no filters.');
@@ -5719,6 +5741,7 @@ try{
  for(let column=1;column<8;column++){
   document.querySelector('[data-sort="'+column+'"]').click();
   check(document.querySelector('[data-sort="'+column+'"]').parentElement.getAttribute('aria-sort')==='ascending','sort column '+column);
+  if(column===1) await refreshOrder('Rows with equal Owner values keep their order after a refresh.');
  }
  show('needs-me');check(visible().length===1 && visible()[0].dataset.number==='58','Needs me');
  show('all');unread().click();
@@ -5843,7 +5866,7 @@ try{
  document.body.style.minHeight='2400px';scrollTo(0,100);
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
  const refreshed=rows().find(row=>row.dataset.number==='106');
- check(reads.length===1,'the shared status requests a fresh page');
+ check(reads.length===3,'Each shared status event requests a fresh page.');
  check(document.querySelector('#list-search').value==='console','refresh keeps the query');
  check(document.activeElement.id==='list-search','refresh keeps focus');
  check(document.activeElement.selectionStart===1 && document.activeElement.selectionEnd===3,'refresh keeps the selection');

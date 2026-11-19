@@ -795,7 +795,7 @@ Working includes other unparked items in New or Working.
 Blocked includes other unparked items in Blocked or Paused.
 All includes every open item, including parked items and Done items.
 The State cell shows the parking end time or delivery condition under the saved state.
-The Unread only switch limits the visible items and chip counts to unread items.
+The Unread only switch shows and counts unread items and rows that stay open after an answer is read.
 Each chip count reflects the words box and the filters in the other rows.
 In All, each Owner and Producer chip counts matching parked items.
 The “need you” total uses the Needs me chip count.
@@ -1033,7 +1033,9 @@ This rule also applies to direct links and to answers that appear in linked deta
 The tab and console frame must also be visible.
 Expand all leaves answers unread.
 A newer update stays unread if it arrives before the read saves.
-With Unread only on, an item can stay visible after this read until the user closes its row or changes Show.
+With Unread only on, the row can stay visible after this read.
+The row counts toward its matching Owner and Producer chips and the selected Show chip.
+Closing the row or changing Show ends this exception.
 Changing the Unread only switch ends this exception.
 After the item is read, the log shows “Question Q<n> — nate” and “Answer — <producer>” at their recorded times.
 The panel clears the question when the log shows it.
