@@ -892,6 +892,22 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                 self.assertTrue(released.called)
             fixture.assert_released(self, reservation_id)
 
+    def test_stop_deadline_keeps_the_program_record_and_reservation(self) -> None:
+        with QueuePlaceFixture() as fixture:
+            with queue.queue_place("rust-analyzer", fixture.root) as place:
+                child = fixture.start_blocked(place)
+                assert isinstance(place.program, queue.StartedProgram)
+                record = place.program.record
+                start = records.process_start_time(child.pid)
+                assert start is not None
+                with mock.patch.object(queue, "program_members", return_value={child.pid: start}), \
+                     mock.patch.object(os, "kill"), \
+                     self.assertRaisesRegex(queue.CleanupUnresolved, "still live"):
+                    place.finish()
+                self.assertTrue(record.is_file())
+                _ = fixture.reservation()
+            self.assertFalse(record.exists())
+
     def test_term_resistant_program_is_killed_before_release(self) -> None:
         with QueuePlaceFixture() as fixture:
             with queue.queue_place("rust-analyzer", fixture.root) as place:
@@ -1590,15 +1606,16 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                     except (ProcessLookupError, ChildProcessError):
                         pass
 
-    def test_the_program_does_not_inherit_the_start_window_signal_mask(self) -> None:
+    def test_the_program_starts_with_cancellation_signals_unblocked(self) -> None:
         with QueuePlaceFixture() as fixture:
             source = ("import signal; mask=signal.pthread_sigmask(signal.SIG_BLOCK,set()); "
-                      "print(int(signal.SIGTERM in mask),int(signal.SIGINT in mask),flush=True)")
+                      "print(int(signal.SIGTERM in mask),int(signal.SIGINT in mask),"
+                      "int(signal.SIGHUP in mask),flush=True)")
             with queue.queue_place("rust-analyzer", fixture.root) as place:
                 process = place.popen([sys.executable, "-c", source], stdout=subprocess.PIPE)
                 output, _ = process.communicate(timeout=3)
                 self.assertEqual(process.returncode, 0)
-                self.assertEqual(output, b"0 0\n")
+                self.assertEqual(output, b"0 0 0\n")
 
     def test_transient_scope_sidecar_and_sampler_use_the_program_scope(self) -> None:
         self.require_transient_scope()

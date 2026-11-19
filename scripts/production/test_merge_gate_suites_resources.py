@@ -19,7 +19,7 @@ import signal
 import sys
 import time
 import threading
-from typing import final
+from typing import cast, final
 from contextlib import redirect_stdout
 from unittest import mock
 from scripts.production import merge_gate
@@ -211,30 +211,42 @@ class MergeGateResourcesTests(GateSuitesFixture):
                     _ = stopped.result(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(self.jobserver_tokens(), b"A")
 
-    def test_stop_after_blocking_acquisition_returns_the_new_slot_too(self) -> None:
+    def test_stop_during_cpu_slot_acquisition_keeps_uncertain_ownership(self) -> None:
         for delivery in ("read", "return"):
             with self.subTest(delivery=delivery):
                 self.supply_jobserver(b"A\0")
                 read = os.read
-                with mock.patch.dict(os.environ, self.environment), \
+                recovery = merge_gate.GateRecovery(self.state / "interrupted.json", str(self.checkout),
+                                                   os.getpid(), "fixture")
+                active = merge_gate.ACTIVE_GATE_RECOVERY.set(recovery)
+                try:
+                    with mock.patch.dict(os.environ, self.environment), \
                         self.assertRaises(KeyboardInterrupt):
-                    with merge_gate.shared_cpu_pool() as pool:
-                        assert isinstance(pool, merge_gate.SharedCPUPool)
-                        self.assertIsInstance(pool.try_acquire(), merge_gate.SharedCPUSlot)
-                        token_descriptor = pool.descriptor
+                        with merge_gate.shared_cpu_pool() as pool:
+                            assert isinstance(pool, merge_gate.SharedCPUPool)
+                            self.assertIsInstance(pool.try_acquire(), merge_gate.SharedCPUSlot)
+                            token_descriptor = pool.descriptor
 
-                        def interrupt_read(descriptor: int, count: int) -> bytes:
-                            token = read(descriptor, count)
-                            if descriptor == token_descriptor and delivery == "read":
-                                os.kill(os.getpid(), signal.SIGINT)
-                            return token
+                            def interrupt_read(descriptor: int, count: int) -> bytes:
+                                token = read(descriptor, count)
+                                if descriptor == token_descriptor and delivery == "read":
+                                    os.kill(os.getpid(), signal.SIGINT)
+                                return token
 
-                        with mock.patch.object(os, "read", side_effect=interrupt_read):
-                            _ = pool.acquire()
-                        os.kill(os.getpid(), signal.SIGINT)
-                self.assertEqual(self.jobserver_tokens(), b"A\0")
+                            with mock.patch.object(os, "read", side_effect=interrupt_read):
+                                _ = pool.acquire()
+                            os.kill(os.getpid(), signal.SIGINT)
+                finally:
+                    merge_gate.ACTIVE_GATE_RECOVERY.reset(active)
+                if delivery == "read":
+                    self.assertEqual([token.operation for token in recovery.tokens], ["acquiring"])
+                    self.assertEqual(self.jobserver_tokens(), b"A")
+                else:
+                    self.assertEqual(recovery.tokens, [])
+                    self.assertEqual(self.jobserver_tokens(), b"A\0")
 
-    def test_interrupt_after_reaping_preserves_status_and_cpu_and_allows_cleanup(self) -> None:
+    def test_interrupt_after_reaping_reports_failure_and_allows_cleanup(self) -> None:
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
         jobs: list[merge_gate.RunningGateJob] = []
         for name, source in (("finished", "raise SystemExit(7)"),
                              ("running", "import signal; signal.pause()")):
@@ -253,21 +265,11 @@ class MergeGateResourcesTests(GateSuitesFixture):
             os.kill(os.getpid(), signal.SIGINT)
             return result
 
-        stopped = threading.Event()
-        worker = threading.Thread(target=stopped.wait, daemon=True)
-        worker.start()
-        try:
-            with mock.patch.object(os, "wait4", side_effect=interrupt_after_wait):
-                with self.assertRaises(KeyboardInterrupt):
-                    merge_gate.reap_gate_job(finished)
-        finally:
-            stopped.set()
-            worker.join(TEST_HANG_GUARD_SECS)
-        self.assertEqual(finished.process.returncode, 7)
-        self.assertGreater(finished.cpu_seconds, 0.0)
+        with mock.patch.object(os, "wait4", side_effect=interrupt_after_wait), self.assertRaises(KeyboardInterrupt):
+            merge_gate.reap_gate_job(finished)
         for job in jobs:
             merge_gate.kill_job_group(job)
-        self.assertEqual(finished.process.returncode, 7)
+        self.assertEqual(finished.process.returncode, 1)
         self.assertEqual(running.process.returncode, -signal.SIGKILL)
 
     @gate_suites("lib", "hooks")
