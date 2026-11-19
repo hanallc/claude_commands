@@ -43,9 +43,6 @@ Each outer timeout covers the largest sum of hook budgets that match one tool.
 It also covers 30 s of dispatcher overhead.
 The PostToolUse and Stop timeouts retain 600 s each from the retired hooks.
 
-The three retired banned-word scripts exit silently with code 0.
-They support sessions that still use a direct registration.
-
 `scripts/hooks/test_hook_dispatch.py` checks that the tables match
 `settings.json`: a dispatched hook file must no longer appear as an entry of
 its own.
