@@ -891,7 +891,8 @@ def _clear_slot_holder(lock: IO[bytes]) -> None:
 def _slot_holder_suffix(lock: IO[bytes]) -> str:
     try:
         _ = lock.seek(0)
-        holder = cast(object, json.loads(lock.readline()))
+        line = lock.read(4096).partition(b"\n")[0]
+        holder = cast(object, json.loads(line))
     except (OSError, ValueError):
         return ""
     if not isinstance(holder, dict):
