@@ -1093,10 +1093,15 @@ Without a bill read, `billed_hours` and `hours_gap_ratio` are `None`, and `box_h
 `aws_target.hourly` checks the last `run_cost_days` days after its price read.
 `buildlog hourly` and `aws_target.py snapshot` both call it.
 It checks the types the snapshot reads: `instance_types`, `price_compare_instance_types` and `gpu_instance_types`.
-Each type, region and day that is over sends one `aws.hours_gap` user notice.
-The key `aws-hours-gap:<type>:<region>:<day>` is saved in `hours-gap-notices.json` before delivery.
-A failed delivery removes the claim, so the next hourly run sends it again.
-A claim for a day before the window is dropped.
+For each type, region, and UTC day above the limit, the check sends a message to bob's fixed staff ID.
+The message gives the billed hours, ledger hours, gap, and limit.
+It asks bob to file an investigation and add it to the list.
+The check saves the key `aws-hours-gap:<type>:<region>:<day>` in `hours-gap-notices.json` after `SENT`, `SKIPPED`, or `QUEUED`.
+After a failure or timeout, the next hourly run tries again.
+The check uses the sender's full time budget for the subprocess.
+The check uses only its claim file to suppress duplicate messages.
+The check keeps the two claims from the old phone route, which bob tracks in investigation I7.
+The check removes claims for days before the window.
 Live, 2026-11-14: the days since 2026-11-12 are within 4.5 %.
 Before that day, the box hours were 7 to 13 % above the bill.
 

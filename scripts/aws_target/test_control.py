@@ -24,6 +24,7 @@ from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.lib import atomic_file, conf
 from scripts.lint.memory_test_support import write_config_fixture
+from scripts.message import send_budget
 from scripts.notify import push_texts
 from scripts.review_links import console_theme, review_link
 
@@ -864,12 +865,14 @@ class HoursCheckTests(CostFixture):
     observations: list[ledger.InstanceObservation] = []
     reservations: list[ledger.GateReservation] = []
     bills: list[ledger.ChargeRead] = []
-    notices: list[tuple[str, push_texts.RenderedPush]] = []
-    notice_accepted: bool = True
+    notice_commands: list[tuple[str, ...]] = []
 
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.configure("# whole: 1..\nrun_cost_days=7\n# range: 0.001..\nsnapshot_notification_timeout_s=5\n"
+                       + "# range: 0..1\nbilled_hours_gap_max_ratio=0.15\n")
+        _ = write_config_fixture(self.root / 'cloud_gate.conf')
         self.clock = TestClock()
         configuration = conf.read(self.settings)
         self.home = configuration.text('region')
@@ -878,8 +881,7 @@ class HoursCheckTests(CostFixture):
         self.builder = configuration.text('instance_type')
         self.observations = []
         self.limit = conf.decimal(configuration.text('billed_hours_gap_max_ratio'))
-        self.reservations, self.bills, self.notices = [], [], []
-        self.notice_accepted = True
+        self.reservations, self.bills, self.notice_commands = [], [], []
 
         def evidence(_book: ledger.CostLedger) -> ledger.LedgerEvidence:
             return ledger.LedgerEvidence(observations=list(self.observations), gate_reservations=list(self.reservations))
@@ -915,13 +917,19 @@ class HoursCheckTests(CostFixture):
         return run_cost.day_hours_checks(ledger.CostLedger(self.state), end - timedelta(days=days), end, self.home,
                                          self.builder, (self.size, self.builder), self.limit)
 
-    def notify(self, key: str, push: push_texts.RenderedPush, _timeout: float) -> bool:
-        self.notices.append((key, push))
-        return self.notice_accepted
+    def notice_run(self, *, code: int = 0, stdout: str = 'SENT: fixture\n', sender_times_out: bool = False) -> int:
+        def run(arguments: Sequence[str], *, capture_output: bool, text: bool, check: bool,
+                timeout: float) -> subprocess.CompletedProcess[str]:
+            self.assertEqual((capture_output, text, check, timeout), (True, True, False, send_budget.seconds(5)))
+            self.assertGreater(timeout, 5)
+            self.notice_commands.append(tuple(arguments))
+            if sender_times_out:
+                self.assertFalse((self.state / 'hours-gap-notices.json').exists())
+                raise subprocess.TimeoutExpired(arguments, timeout)
+            return subprocess.CompletedProcess(arguments, code, stdout, '')
 
-    def notice_run(self) -> int:
-        with redirect_stderr(StringIO()):
-            return aws_target.hours_gap_notices(self.settings, self.state, clock=self.clock, notify=self.notify)
+        with (redirect_stderr(StringIO()), mock.patch.object(subprocess, 'run', run)):
+            return aws_target.hours_gap_notices(self.settings, self.state, clock=self.clock)
 
     def test_box_hours_split_at_utc_midnight_and_count_only_confirmed_gates(self) -> None:
         two, one = self.day(2), self.day(1)
@@ -990,21 +998,26 @@ class HoursCheckTests(CostFixture):
         self.assertEqual(checks[self.size, self.other, self.day(2).date().isoformat()],
                          run_cost.HoursCheck(None, Decimal(1), None, False))
 
-    def test_gap_sends_one_notice_per_type_region_and_day(self) -> None:
+    def test_gap_sends_one_staff_message_and_no_user_push(self) -> None:
         one = self.day(1)
         self.gate(self.size, self.home, one, 3600)
         self.gate(self.size, self.other, one, 3600)
         self.bill(one, {(self.size, self.home): Decimal(1) + self.limit * 2, (self.size, self.other): Decimal(1)})
         self.assertEqual(self.notice_run(), 0)
-        key = f'aws-hours-gap:{self.size}:{self.home}:{one.date().isoformat()}'
-        self.assertEqual([sent for sent, _push in self.notices], [key])
-        push = self.notices[0][1]
-        self.assertEqual(push.id, 'aws.hours_gap')
-        self.assertIn(f'AWS billed {Decimal(1) + self.limit * 2:.2f} h of {self.size} Spot in {self.home}', push.body)
-        self.assertIn(f'The gap is {self.limit * 2:.0%}, above the {self.limit:.0%} limit.', push.body)
-        # The next hourly run sends nothing again for the same day.
+        day = one.date().isoformat()
+        self.assertEqual(len(self.notice_commands), 1)
+        self.assertEqual(self.notice_commands[0][2:], (
+            '--to', 'staff:a898cb38-dbac-4751-b72b-d0b14ab9c38d', '--from', 'AWS hours check',
+            '--timeout', '5', '--text',
+            'AWS Spot hours differ from the cost ledger.\n'
+            + f'On {day} UTC, AWS billed 1.30 h of {self.size} Spot in {self.home}.\n'
+            + 'The cost ledger records 1.00 h for that size, region, and day.\n'
+            + 'The gap is 30%. The limit is 15%.\n'
+            + 'File an investigation for this gap and add it to the list.',
+        ))
+        self.assertTrue(self.notice_commands[0][1].endswith('/message/send.py'))
         self.assertEqual(self.notice_run(), 0)
-        self.assertEqual(len(self.notices), 1)
+        self.assertEqual(len(self.notice_commands), 1)
 
     def test_spot_table_shows_billed_over_box_hours_with_the_gap(self) -> None:
         one, two = self.day(1), self.day(2)
@@ -1028,17 +1041,36 @@ class HoursCheckTests(CostFixture):
         one = self.day(1)
         self.gate(self.size, self.home, one, 3600)
         self.bill(one, {(self.size, self.home): Decimal(1) + self.limit * 2})
-        self.notice_accepted = False
-        self.assertEqual(self.notice_run(), 1)
-        self.notice_accepted = True
-        self.assertEqual(self.notice_run(), 0)
-        self.assertEqual(len(self.notices), 2)
+        self.assertEqual(self.notice_run(code=3, stdout='FAILED: fixture\n'), 1)
         claims = self.state / 'hours-gap-notices.json'
+        self.assertEqual(cast(dict[str, list[str]], json.loads(claims.read_text()))['claimed'], [])
+        self.assertEqual(self.notice_run(), 0)
+        self.assertEqual(len(self.notice_commands), 2)
+        self.assertEqual(self.notice_commands[0], self.notice_commands[1])
         self.assertEqual(len(cast(dict[str, list[str]], json.loads(claims.read_text()))['claimed']), 1)
         # After the window passes the day, its claim is dropped.
         self.clock.advance((conf.read(self.settings).whole('run_cost_days') + 1) * 86400)
         self.assertEqual(self.notice_run(), 0)
         self.assertEqual(cast(dict[str, list[str]], json.loads(claims.read_text()))['claimed'], [])
+
+    def test_queued_notice_saves_the_claim(self) -> None:
+        one = self.day(1)
+        self.bill(one, {(self.size, self.home): Decimal(1)})
+        self.assertEqual(self.notice_run(code=1, stdout='QUEUED: fixture\n'), 0)
+        claims = self.state / 'hours-gap-notices.json'
+        self.assertEqual(cast(dict[str, list[str]], json.loads(claims.read_text()))['claimed'],
+                         [f'aws-hours-gap:{self.size}:{self.home}:{one.date().isoformat()}'])
+        self.assertEqual(self.notice_run(), 0)
+        self.assertEqual(len(self.notice_commands), 1)
+
+    def test_timed_out_notice_never_saves_the_claim(self) -> None:
+        one = self.day(1)
+        self.bill(one, {(self.size, self.home): Decimal(1)})
+        self.assertEqual(self.notice_run(sender_times_out=True), 1)
+        claims = self.state / 'hours-gap-notices.json'
+        self.assertEqual(cast(dict[str, list[str]], json.loads(claims.read_text()))['claimed'], [])
+        self.assertEqual(self.notice_run(), 0)
+        self.assertEqual(len(self.notice_commands), 2)
 
     def test_hourly_runs_the_snapshot_and_the_hours_check_and_keeps_the_worse_status(self) -> None:
         # buildlog hourly calls aws_target.hourly; a failed snapshot must not skip the hours check.
