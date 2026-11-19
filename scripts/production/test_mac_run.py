@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import signal
@@ -136,6 +137,16 @@ sys.stdout.write(stdout)
 sys.stderr.write(stderr)
 raise SystemExit(status)
 '''.replace("__HANG_GUARD__", str(TEST_HANG_GUARD_SECS))
+
+
+def open_copies_listener() -> socket.socket:
+    """Keep the listener separate from the three standard streams."""
+    listener = socket.socket(socket.AF_UNIX)
+    if listener.fileno() >= 3:
+        return listener
+    with listener:
+        descriptor = fcntl.fcntl(listener.fileno(), fcntl.F_DUPFD_CLOEXEC, 3)
+    return socket.socket(fileno=descriptor)
 
 
 def serve_copies_commands(listener: socket.socket) -> int:
@@ -432,7 +443,7 @@ class MacRunTests(unittest.TestCase):
         cls.copies_client = socket_folder / "client.py"
         _ = cls.copies_client.write_text(COPIES_CLIENT)
         children = cls.enterClassContext(ForkChildren())
-        with socket.socket(socket.AF_UNIX) as listener:
+        with open_copies_listener() as listener:
             listener.bind(str(cls.copies_socket))
             listener.listen()
             _ = children.start(lambda: serve_copies_commands(listener))
@@ -1027,7 +1038,7 @@ cleanup_mac_run
                 return serve_copies_commands(listener)
 
         command = [sys.executable, "-IS", str(self.copies_client), "register-remote", "--help"]
-        with ForkChildren() as children, socket.socket(socket.AF_UNIX) as listener:
+        with ForkChildren() as children, open_copies_listener() as listener:
             listener.bind(str(endpoint))
             listener.listen()
             with mock.patch.object(copies, "main", read_stdin):
@@ -1044,6 +1055,28 @@ cleanup_mac_run
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout, payload.hex().encode() + b"\n\n")
+
+        endpoint = self.copies_socket.with_name("stdin-closed")
+        ready = self.root / "registry-listening"
+
+        def start_without_stdin() -> int:
+            os.close(0)
+            with open_copies_listener() as closed_stdin_listener:
+                closed_stdin_listener.bind(str(endpoint))
+                closed_stdin_listener.listen()
+                ready.touch()
+                return serve_copies_commands(closed_stdin_listener)
+
+        with self.subTest(stdin="runner starts closed"), ForkChildren() as children:
+            _ = children.start(start_without_stdin)
+            wait_until(ready.exists, ready.parent)
+            result = subprocess.run(
+                command, cwd=self.root, stdin=subprocess.DEVNULL,
+                env={**self.environment, "MAC_RUN_COPIES_SOCKET": str(endpoint)},
+                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("usage: copies.py register-remote", result.stdout)
 
     def test_missing_remote_interpreter_returns_127(self) -> None:
         program = shell_functions(SCRIPT, "on_mac") + '\nhost=mac\non_mac "$1"\n'
