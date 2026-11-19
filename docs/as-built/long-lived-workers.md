@@ -220,6 +220,7 @@ Unavailable completion evidence keeps the restart entry.
 Pane closure alone keeps the restart entry.
 Completion removes the entry after it saves the final result.
 Restore reports incomplete recovery if pane closure fails.
+Restore reports the worker name and reason when completion recovery keeps its pane.
 The next restore retries closure without sending the completion notice again.
 The hook records closure diagnostic delivery separately from the diagnostic text.
 A later recovery retries an undelivered diagnostic with the same delivery key.
@@ -714,15 +715,24 @@ The stop holds the worker lock, then the admission lock, then the recorder lock.
 The stop checks the shared receipt for DONE before it cancels the pass.
 The recorder saves a verified DONE through normal completion.
 The recorder saves the canceled status, stopped outcome, reason, and notice in one state write.
-Assign can reuse the worker when its pane is idle.
+Assign can reuse the idle worker while the stopped pass waits for another DONE.
+Restore keeps the stopped pane open while a detached result waits for another DONE.
 `worker.py answer` reports `no active pass`.
 The turn hook sends the director one stopped notice with the worker name and phase.
 The recorder retains the notice for delivery after another pass replaces the stopped pass.
 The turn hook uses the shared receipt to save a late DONE reply and keep the stopped outcome.
 The receipt checks detached results that belong to the stopped pass.
 A result received after DONE requires another matching DONE.
+The turn hook records the saved reply path when the stopped pass is still current.
+After the notice is recorded, the hook locks the worker and checks the pass again.
+It refreshes the saved file from the latest verified reply.
+The normal close path requires a current idle state for a stopped pass with a live agent.
+After it releases the worker lock, the hook records a close refusal and sends the reason to the director.
+The hook releases the worker lock before it retries undelivered close refusals, including refusals from replaced passes.
+The notice lock prevents duplicate delivery.
 The recorder retains the original prompt and reply path after a replacement pass starts.
 If the Stop event has no DONE marker, the hook uses each unsaved receipt to check the transcript for its DONE marker.
+The hook records an unreadable archived reply in `turn-end-ignored.jsonl` and continues with the current pass.
 A run without a pane pass uses the ordinary result delivery.
 A newer run of the same command suppresses the older orphan result.
 A repeated stop sends no additional signal or notice.
