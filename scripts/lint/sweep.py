@@ -196,7 +196,7 @@ from scripts.lib.cargo_target_config import (
     cargo_home_folder,
 )
 from scripts.lib.process_failure import failure_detail
-from scripts.lib.process_start import ProcessStart, Started, process_start
+from scripts.lib.process_start import ProcessStart, Started, proc_table_start, process_start
 from scripts.lib.user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
     from scripts.lint import tmp_sweep
@@ -1409,7 +1409,7 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
         if len(found) == len(checked):
             break
         pid = int(name)
-        start = process_start(pid, proc_root=proc_root) if owners.identify_holders else UnobservedHolderStart()
+        start = proc_table_start(pid, proc_root) if owners.identify_holders else UnobservedHolderStart()
         base = os.path.join(proc, name)
         try:
             exe = os.readlink(os.path.join(base, "exe"))

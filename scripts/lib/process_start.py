@@ -70,11 +70,11 @@ def process_start_format() -> str:
     return "darwin-lstart-utc-c-v1" if sys.platform == "darwin" else "linux-proc-stat22-v1"
 
 
-def process_start(pid: int, *, proc_root: Path | None = None) -> ProcessStart:
-    """Read the host identity or use the supplied Linux process table."""
-    if pid <= 0:
-        return Unreadable("invalid process id")
-    if proc_root is None and sys.platform == "darwin":
+def process_start(pid: int) -> ProcessStart:
+    """Read the process start from the host."""
+    if sys.platform == "darwin":
+        if pid <= 0:
+            return Unreadable("invalid process id")
         try:
             result = subprocess.run(
                 ["ps", "-p", str(pid), "-o", "lstart=", "-o", "stat="],
@@ -92,8 +92,13 @@ def process_start(pid: int, *, proc_root: Path | None = None) -> ProcessStart:
                 or not re.fullmatch(r"[A-Za-z][A-Za-z0-9+<>-]*", fields[1])):
             return Unreadable("invalid ps process identity")
         return Zombie(fields[0]) if fields[1].startswith("Z") else Started(fields[0])
-    if proc_root is None:
-        proc_root = Path(os.environ.get("VERIFY_PROC_ROOT", "/proc"))
+    return proc_table_start(pid, Path(os.environ.get("VERIFY_PROC_ROOT", "/proc")))
+
+
+def proc_table_start(pid: int, proc_root: Path) -> ProcessStart:
+    """Read the process start from the specified Linux process table."""
+    if pid <= 0:
+        return Unreadable("invalid process id")
     try:
         path = proc_root / str(pid) / "stat"
         _, separator, rest = path.read_bytes().rpartition(b")")
