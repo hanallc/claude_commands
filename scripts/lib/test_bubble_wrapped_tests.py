@@ -75,18 +75,18 @@ class TestBubblewrapProof(unittest.TestCase):
             path.unlink()
             self.fail(f"The test could create {path}.")
 
-    def test_live_roots_and_git_state_refuse_writes(self) -> None:
-        roots = conf.read(CONFIG).words("live_roots")
-        self.assertTrue(roots)
-        for value in roots:
+    def test_protected_folders_and_git_state_refuse_writes(self) -> None:
+        protected_folders = conf.read(CONFIG).words("protected_folders")
+        self.assertTrue(protected_folders)
+        for value in protected_folders:
             # The guard replaces HOME. Expand the configured natedev home here.
-            root = Path(value.replace("~/", "/home/natepiano/", 1) if value.startswith("~/") else value)
-            with self.subTest(root=root):
-                self.assertTrue(root.is_absolute())
+            protected_folder = Path(value.replace("~/", "/home/natepiano/", 1) if value.startswith("~/") else value)
+            with self.subTest(protected_folder=protected_folder):
+                self.assertTrue(protected_folder.is_absolute())
                 name = f"guard-proof-{uuid4().hex}"
-                self.denied_create(root / name)
-                link = self.job / "live-root"
-                link.symlink_to(root, target_is_directory=True)
+                self.denied_create(protected_folder / name)
+                link = self.job / "protected-folder"
+                link.symlink_to(protected_folder, target_is_directory=True)
                 try:
                     self.denied_create(link / name)
                 finally:
