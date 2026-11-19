@@ -106,6 +106,7 @@ RELEASE_LOCK_WAIT_S = 60
 TYPECHECK_REQUIREMENTS = ("fake-bpy-module==20260822",)
 NIGHTLY_TYPE_DIRS = ("scripts",)
 NIGHTLY_TYPE_DIAGNOSTIC_LINES = 20
+NIGHTLY_TYPE_LINE_BYTES = 512
 # An unrecorded type job keeps its own fallback; recorded jobs all use one margin.
 TYPES_MEMORY_MIB = 3072
 MEMORY_PEAK_MARGIN = 1.2
@@ -2614,20 +2615,38 @@ def _nightly_author(repo: Path, tip: str, blamed: str, receipts: Sequence[Nightl
             continue
         if ancestry.returncode != 1:
             raise GateRefused(f"Could not check the first parent of {receipt.merge}. {failure_detail(ancestry)}")
-        row = _nightly_plan_author(receipt.issue, production, members)
-        if isinstance(row, staff.StaffRow):
-            return row
         producer = change_review.merge_producer(receipt.merge)
         if isinstance(producer, str):
             row = members.by_id(producer)
-            if row is not None and row.kind == "unit":
-                return row
-        break
+            return row if row is not None and row.kind == "unit" else NoNightlyAuthor()
+        return _nightly_plan_author(receipt.issue, production, members)
     return NoNightlyAuthor()
 
 
+@dataclass(frozen=True)
+class NightlyUnitDiagnostic:
+    text: str
+    path: Path
+
+
+def _nightly_diagnostic_line(line: str) -> str:
+    encoded = line.encode()
+    if len(encoded) <= NIGHTLY_TYPE_LINE_BYTES:
+        return line
+    return encoded[:NIGHTLY_TYPE_LINE_BYTES - 3].decode(errors="ignore") + "..."
+
+
+def _nightly_type_recheck(diagnostics: Sequence[NightlyUnitDiagnostic]) -> str:
+    files = sorted({item.path.as_posix() for item in diagnostics})
+    arguments = shlex.join("./" + path if path.startswith("-") else path for path in files)
+    listed = _nightly_diagnostic_line(arguments)
+    if listed != arguments:
+        return f"Files include {listed} Run `basedpyright scripts` to see every diagnostic."
+    return f"Run `basedpyright {listed}` to see every diagnostic in these files."
+
+
 def _nightly_diagnostic_excerpt(lines: Sequence[str]) -> str:
-    shown = "\n".join(lines[:NIGHTLY_TYPE_DIAGNOSTIC_LINES])
+    shown = "\n".join(_nightly_diagnostic_line(line) for line in lines[:NIGHTLY_TYPE_DIAGNOSTIC_LINES])
     omitted = len(lines) - NIGHTLY_TYPE_DIAGNOSTIC_LINES
     return f"{shown}\n{omitted} other diagnostic lines omitted." if omitted > 0 else shown
 
@@ -2647,7 +2666,7 @@ def _notify_nightly_type_authors(repo: Path, tip: str, result_id: str, type_fail
         return NightlyTypeNotices((f"Could not read staff for type diagnostics. {error}",))
     receipts = _nightly_merge_receipts()
     authors: dict[str, staff.StaffRow | NoNightlyAuthor] = {}
-    by_unit: dict[staff.StaffId, tuple[staff.StaffRow, list[str]]] = {}
+    by_unit: dict[staff.StaffId, tuple[staff.StaffRow, list[NightlyUnitDiagnostic]]] = {}
     complete = all(diagnostics)
     for lines in diagnostics:
         for line, filename, number in lines:
@@ -2666,14 +2685,16 @@ def _notify_nightly_type_authors(repo: Path, tip: str, result_id: str, type_fail
             if isinstance(author, NoNightlyAuthor):
                 complete = False
                 continue
-            by_unit.setdefault(author.id, (author, []))[1].append(line)
+            by_unit.setdefault(author.id, (author, []))[1].append(NightlyUnitDiagnostic(line, path))
     details: list[str] = []
-    for author, lines in by_unit.values():
+    for author, items in by_unit.values():
+        lines = [item.text for item in items]
         diagnostics_text = _nightly_diagnostic_excerpt(lines)
         try:
             notice = showrunners.send_to_address(f"session:{author.current_session}",
                 f"merge-gate-nightly:{result_id}:{author.id}",
-                "The nightly type check is red on your change. Fix it in your next phase.\n" + diagnostics_text,
+                "The nightly type check is red on your change. Fix it in your next phase.\n"
+                + diagnostics_text + "\n" + _nightly_type_recheck(items),
                 recipient=author.name, sender="merge_gate")
             delivered = not notice.failed
         except (OSError, ValueError, subprocess.SubprocessError):
@@ -2701,7 +2722,8 @@ def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
             lines = [line for job in type_failures for line in job.output.splitlines()]
             summaries = type_check_summaries("\n".join(lines))
             diagnostics = [line for line in lines if line not in summaries]
-            detail += "\nType check failed:\n" + "\n".join(diagnostics[:NIGHTLY_TYPE_DIAGNOSTIC_LINES])
+            detail += "\nType check failed:\n" + "\n".join(
+                _nightly_diagnostic_line(line) for line in diagnostics[:NIGHTLY_TYPE_DIAGNOSTIC_LINES])
             detail += f"\n{max(0, len(diagnostics) - NIGHTLY_TYPE_DIAGNOSTIC_LINES)} other diagnostic lines omitted."
             if summaries:
                 detail += "\n" + summaries[-1]

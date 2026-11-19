@@ -94,6 +94,8 @@ class MergeGateTypesTests(GateSuitesFixture):
     def test_nightly_sends_each_type_diagnostic_to_its_author_unit(self) -> None:
         history = self.root / "history"
         source = "scripts/receipt.py"
+        hidden_source = "scripts/receipt detail.py"
+        wide_source = "scripts/" + ("long" * 45 + "/") * 3 + "wide.py"
         plan = "docs/plans/receipt.md"
         self.write(self.main / "scripts/unknown.py", "VALUE = 3\n")
         main_change = self.commit(self.main, "Change without an author unit")
@@ -105,6 +107,8 @@ class MergeGateTypesTests(GateSuitesFixture):
         _ = self.git(self.unit, "merge", "--no-ff", "-m", "Merge origin/main into unit-phase", fast_change)
         self.write(self.unit / plan, "# Receipt plan\n")
         self.write(self.unit / source, "VALUE = 1\nOTHER = 2\n")
+        self.write(self.unit / hidden_source, "DETAIL = 1\n")
+        self.write(self.unit / wide_source, "DETAIL = 2\n")
         checkpoint = self.commit(self.unit, "Checkpoint change")
         _ = self.git(self.checkout, "merge", "--no-ff", "-m", "Merge receipt fixture", checkpoint)
         receipt_merge = self.git(self.checkout, "rev-parse", "HEAD")
@@ -119,6 +123,7 @@ class MergeGateTypesTests(GateSuitesFixture):
             receipt_author = fixture_member("unit", name="receipt", parent=owner.id,
                                             worktree=staff.PresentWorktree(remote.local_machine(), self.unit))
             fast_author = fixture_member("unit", name="fast", parent=owner.id)
+            recorded_author = fixture_member("unit", name="original", parent=owner.id)
             _ = progress_history.write_merge_receipt(project="origin", phase_id="2", merge_commit=main_merge,
                                                      source_checkpoint=main_change, target_branch="integration",
                                                      merged_at=1, issue=plan)
@@ -133,12 +138,23 @@ class MergeGateTypesTests(GateSuitesFixture):
             fast_line = "scripts/fast.py:1:1 - error: third"
             unknown_line = "scripts/unknown.py:1:1 - error: fourth"
             limit = merge_gate.NIGHTLY_TYPE_DIAGNOSTIC_LINES
-            for case in ("assigned", "unknown", "test red", "long report", "notice failure"):
+            byte_limit = merge_gate.NIGHTLY_TYPE_LINE_BYTES
+            long_line = f"{source}:1:1 - error: " + "漢" * byte_limit
+            for case in ("assigned", "unknown", "test red", "long report", "wide files", "notice failure", "recorded producer"):
                 with self.subTest(case=case):
                     self.environment["MERGE_GATE_STATE_DIR"] = str(self.root / case)
+                    expected_author = receipt_author
+                    if case == "recorded producer":
+                        change_review.record_merge_producer(
+                            change_review.KnownMergeProducer(receipt_merge, recorded_author.id))
+                        expected_author = recorded_author
                     routed_lines: list[str] = list(receipt_lines)
                     if case == "long report":
-                        routed_lines.extend(f"{source}:1:1 - error: finding {i}." for i in range(limit))
+                        routed_lines.append(long_line)
+                        routed_lines.extend(f"{source}:1:1 - error: finding {i}." for i in range(limit - 2))
+                        routed_lines.append(f"{hidden_source}:1:1 - error: omitted file")
+                    if case == "wide files":
+                        routed_lines.append(f"{wide_source}:1:1 - error: wide path")
                     lines = [*routed_lines, fast_line]
                     if case == "unknown":
                         lines.append(unknown_line)
@@ -155,31 +171,51 @@ class MergeGateTypesTests(GateSuitesFixture):
                         result = self.run_nightly(production=owner.name)
                     self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                     first, second = deliver.call_args_list
-                    self.assertEqual(first.args[0], f"session:{receipt_author.current_session}")
+                    self.assertEqual(first.args[0], f"session:{expected_author.current_session}")
                     self.assertEqual(second.args[0], f"session:{fast_author.current_session}")
                     first_text = cast(str, first.args[2])
                     second_text = cast(str, second.args[2])
+                    shown = first_text.splitlines()[1:-1]
+                    recheck = first_text.splitlines()[-1]
                     expected = routed_lines[:limit]
+                    if case in ("long report", "wide files"):
+                        self.assertLessEqual(len(shown[2].encode()), byte_limit)
+                        self.assertTrue(shown[2].endswith("..."))
+                        self.assertTrue(routed_lines[2].startswith(shown[2][:-3]))
+                        expected[2] = shown[2]
                     if case == "long report":
                         expected.append("2 other diagnostic lines omitted.")
-                    self.assertEqual(first_text.splitlines()[1:], expected)
-                    self.assertEqual(second_text.splitlines()[1:], [fast_line])
+                        self.assertEqual(recheck, "Run `basedpyright 'scripts/receipt detail.py' scripts/receipt.py` "
+                                         + "to see every diagnostic in these files.")
+                    elif case == "wide files":
+                        self.assertLessEqual(len(recheck.encode()), byte_limit + 80)
+                        self.assertTrue(recheck.startswith("Files include scripts/long"))
+                        self.assertIn("Run `basedpyright scripts` to see every diagnostic.", recheck)
+                    else:
+                        self.assertEqual(recheck, f"Run `basedpyright {source}` to see every diagnostic in these files.")
+                    self.assertEqual(shown, expected)
+                    self.assertEqual(second_text.splitlines()[1:], [
+                        fast_line, "Run `basedpyright scripts/fast.py` to see every diagnostic in these files."])
                     self.assertIn("Fix it in your next phase.", first_text)
                     notice.assert_called_once()
                     notice_text = cast(str, notice.call_args.args[2])
-                    self.assertIn("Sent to receipt:\n" + "\n".join(receipt_lines), notice_text)
+                    heading = f"Sent to {expected_author.name}:"
+                    self.assertIn(heading + "\n" + "\n".join(receipt_lines), notice_text)
                     if case == "long report":
-                        author_lines = notice_text[notice_text.index("Sent to receipt:"):].splitlines()
-                        self.assertEqual(author_lines, ["Sent to receipt:", *routed_lines[:limit - 1],
-                                                       "5 other diagnostic lines omitted."])
+                        author_lines = notice_text[notice_text.index(heading):].splitlines()
+                        self.assertEqual(author_lines, [heading, *shown[:limit - 1], "5 other diagnostic lines omitted."])
+                        self.assertNotIn(long_line, notice_text)
+                    elif case == "wide files":
+                        self.assertNotIn(wide_source, notice_text)
+                        self.assertIn("Sent to fast:\n" + fast_line, notice_text)
                     else:
                         self.assertIn("Sent to fast:\n" + fast_line, notice_text)
                     path, = (Path(self.environment["MERGE_GATE_STATE_DIR"]) / "nightly-red").glob("*.json")
                     saved = merge_gate.read_nightly_red(path)
-                    if case in ("assigned", "long report", "notice failure"):
+                    if case not in ("unknown", "test red"):
                         self.assertIsInstance(saved.assignment, merge_gate.NightlyFixAssigned)
                         assert isinstance(saved.assignment, merge_gate.NightlyFixAssigned)
-                        self.assertEqual(saved.assignment.unit, receipt_author.id)
+                        self.assertEqual(saved.assignment.unit, expected_author.id)
                         push.assert_called_once()
                         self.assertNotIn("nightly-assigned", notice_text)
                     else:
@@ -576,7 +612,7 @@ class NightlyPushTests(unittest.TestCase):
         self.assertEqual(first.args[0], command)
         self.assertEqual(command[command.index("--key") + 1], "nightly-result:automatic")
         self.assertEqual(command[command.index("--text-id") + 1], "nightly.result")
-        self.assertFalse(any(word.startswith("received=") for word in command))
+        self.assertFalse(any(word.startswith(("received=", "unit=")) for word in command))
         updated = merge_gate.read_nightly_red(path)
         self.assertEqual(updated.received, saved.received)
         self.assertEqual(updated.assignment, assignment)

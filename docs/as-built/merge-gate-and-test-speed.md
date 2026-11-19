@@ -447,10 +447,13 @@ The gate checks for a `fast-track(<unit>)` subject first.
 For other commits, it uses the earliest checkpoint receipt whose merge added the commit.
 The gate skips main integration receipts and commits already present in the merge's first parent.
 The gate reads the receipt file without a lock and skips incomplete rows.
-The gate matches the receipt's plan to a unit under the production owner.
-If the plan has no unique match, the gate uses the producer ID saved for the merge.
+The gate uses the producer ID saved for the merge.
+When the merge has no producer record, the gate matches the receipt's plan to a unit under the production owner.
 When every diagnostic reaches its author and the tests pass, the gate assigns the result to the unit with the most diagnostics.
 Each unit notice shows up to 20 diagnostic lines and counts any omitted lines.
+The gate caps each diagnostic line at 512 bytes.
+The notice names the files and gives a `basedpyright` command.
+When the file list exceeds 512 bytes, the notice shows part of the list and gives the command for all of `scripts`.
 The notice to the production owner also shows up to 20 lines from the list of author units and their diagnostics.
 `${MERGE_GATE_STATE_DIR:-~/.local/state/merge-gate}/nightly-red/<id>.json` stores each red result.
 The record holds the branch, tree, finish time, failure lines, receipt time, assignment, push acceptance, and last owner alert.
