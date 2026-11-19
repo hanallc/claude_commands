@@ -182,20 +182,24 @@ def admitted_run(command: Sequence[str], source: Path) -> Generator[FirstStepAdm
     owner = wire.Owner(os.getpid(), start)
     run = wire.RunIdentity(owner.pid, owner.start_time)
     position = SlotQueuePosition(uuid4().hex, time.time())
-    keys = ('BUILDLOG_RUN', 'BUILDLOG_FIRST_STEP_ASSIGNMENT', 'BUILDLOG_FIRST_STEP_ROUTE',
+    keys = ('BUILDLOG_RUN', 'BUILDLOG_FIRST_STEP_WAIT_CALL_ID', 'BUILDLOG_FIRST_STEP_ASSIGNMENT', 'BUILDLOG_FIRST_STEP_ROUTE',
             'BUILDLOG_FIRST_STEP_SINCE', 'BUILDLOG_PREPARED_COPY', 'UNIT_DETACHED_RUN')
     previous = {key: os.environ.get(key) for key in keys}
     os.environ['BUILDLOG_RUN'] = f'{owner.pid}:{owner.start_time}'
     os.environ['UNIT_DETACHED_RUN'] = '1'
-    for key in ('BUILDLOG_FIRST_STEP_ASSIGNMENT', 'BUILDLOG_FIRST_STEP_ROUTE',
+    for key in ('BUILDLOG_FIRST_STEP_WAIT_CALL_ID', 'BUILDLOG_FIRST_STEP_ASSIGNMENT', 'BUILDLOG_FIRST_STEP_ROUTE',
                 'BUILDLOG_FIRST_STEP_SINCE', 'BUILDLOG_PREPARED_COPY'):
         _ = os.environ.pop(key, None)
+    call: records.CallRecord | records.NoCallRecord = records.NoCallRecord()
     try:
         with build_folders.tool_folder('copies-admission') as folder:
             assignment_file = folder / 'assignment.json'
             verify = verify_command(command)
             grant: wire.Admitted | wire.LocalPlacementGranted | wire.Assignment
             if isinstance(verify, VerifyCommand):
+                # The copy owns the call before Verify registers it for the request.
+                call = records.CallRecord(records.verify_run_call_id(owner.pid, owner.start_time))
+                os.environ['BUILDLOG_FIRST_STEP_WAIT_CALL_ID'] = call.call_id
                 request = _verify_request(verify, source, folder, owner, position)
                 grant = _placement_grant(request)
             else:
@@ -210,6 +214,8 @@ def admitted_run(command: Sequence[str], source: Path) -> Generator[FirstStepAdm
     except wire.AdmissionUnavailable as error:
         raise FirstStepRefused(str(error)) from error
     finally:
+        if isinstance(call, records.CallRecord):
+            records.finish_placement_waits(call.call_id, time.time())
         for key, value in previous.items():
             if value is None:
                 _ = os.environ.pop(key, None)

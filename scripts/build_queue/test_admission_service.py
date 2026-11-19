@@ -59,11 +59,304 @@ from scripts.build_queue import admission_code, queue_snapshot, queue_view, head
 from scripts.build_queue import admission_records as records, progress_profile as progress, step_estimator
 from zoneinfo import ZoneInfo
 from scripts.build_queue.queue_fixture import write_memory_config, write_process
-from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, InjectedCrash, SocketPeer, caller_admission, only_admitted
+from scripts.build_queue.admission_test_support import AdmissionFixture, FakeClock, GIB, InjectedCrash, SocketPeer, caller_admission, only_admitted
 
 
 def setUpModule() -> None:
     forbid_real_sender()
+
+
+class PlacementWaitOwnerTests(unittest.TestCase):
+    def test_registration_preserves_a_wait_when_the_owner_dies_before_the_first_scan(self) -> None:
+        for observed_seconds in (0, 3):
+            with self.subTest(observed_seconds=observed_seconds), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                proc = root / "proc"
+                owner = records.PlacementWaitOwner(1234, "8000")
+                write_process(proc, owner.pid, start=owner.start_time)
+                with mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(root), "BUILDLOG_PROC": str(proc)}):
+                    clock = FakeClock()
+                    recorder = service.PlacementWaitRecorder(root, service.SystemProc(), clock)
+                    entered = clock.now()
+                    clock.advance(observed_seconds)
+                    records.register_placement_waits("first-scan", owner, entered, entered_at=entered,
+                                                  owner_seen=records.OwnerLastSeen(clock.now()))
+                    records.record_placement_wait(records.PlacementWaitKey("first-scan", "step"),
+                                                  records.PlacementWaitReason.MEMORY, entered)
+                    (proc / str(owner.pid) / "stat").unlink()
+                    clock.advance(5)
+                    recorder.sweep_owners()
+                    row, = records.read_placement_waits("first-scan")
+                    self.assertEqual(row["ended_at"], entered + observed_seconds)
+                    self.assertEqual(row["placement_wait_s"], observed_seconds)
+
+    def test_orphan_closes_at_the_last_live_observation_without_writing_heartbeats(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            proc = root / "proc"
+            owner = records.PlacementWaitOwner(1234, "8000")
+            write_process(proc, owner.pid, start=owner.start_time)
+            with mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(root), "BUILDLOG_PROC": str(proc)}):
+                clock = FakeClock()
+                entered = clock.now()
+                recorder = service.PlacementWaitRecorder(root, service.SystemProc(), clock)
+                records.register_placement_waits("orphan", owner, entered, entered_at=entered)
+                wait = records.PlacementWaitKey("orphan", "step")
+                records.record_placement_wait(wait, records.PlacementWaitReason.MEMORY, entered + 1)
+                journal, = (root / "placement-waits").glob("*.jsonl")
+                initial = journal.read_bytes()
+                clock.advance(40)
+                recorder.sweep_owners()
+                clock.advance(80)
+                recorder.sweep_owners()
+                self.assertEqual(journal.read_bytes(), initial)
+                (proc / str(owner.pid) / "stat").unlink()
+                clock.advance(15)
+                self.assertEqual(records.read_placement_waits("orphan"), ())
+                recorder.sweep_owners()
+                memory, = records.read_placement_waits("orphan")
+                self.assertEqual(memory["ended_at"], entered + 120)
+                self.assertEqual(records.placement_wait_totals("orphan"), {"local_setup": 1, "memory": 119})
+
+    def test_transient_process_errors_keep_the_wait_open_until_identity_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            proc = root / "proc"
+            owner = records.PlacementWaitOwner(1234, "8000")
+            write_process(proc, owner.pid, start=owner.start_time)
+            with mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(root), "BUILDLOG_PROC": str(proc)}):
+                clock = FakeClock()
+                entered = clock.now()
+                recorder = service.PlacementWaitRecorder(root, service.SystemProc(), clock)
+                records.register_placement_waits("transient", owner, entered - 2, entered_at=entered)
+                records.record_placement_wait(records.PlacementWaitKey("transient", "step"),
+                                              records.PlacementWaitReason.MEMORY, entered)
+                for number in (errno.EIO, errno.EACCES, errno.EINTR):
+                    with self.subTest(errno=number), mock.patch.object(service, "read_proc_text",
+                            side_effect=OSError(number, os.strerror(number))):
+                        recorder.sweep_owners()
+                        self.assertEqual(records.read_placement_waits("transient"), ())
+                with mock.patch.object(service, "read_proc_text", return_value="truncated stat"):
+                    recorder.sweep_owners()
+                    self.assertEqual(records.read_placement_waits("transient"), ())
+                clock.advance(8)
+                recorder.sweep_owners()
+                write_process(proc, owner.pid, start="8001")
+                clock.advance(5)
+                recorder.sweep_owners()
+                row, = records.read_placement_waits("transient")
+                self.assertEqual(row["ended_at"], entered + 8)
+
+    def test_esrch_confirms_that_the_wait_owner_is_gone(self) -> None:
+        with mock.patch.object(service, "read_proc_text", side_effect=ProcessLookupError(errno.ESRCH, "gone")):
+            self.assertIsInstance(service.SystemProc().owner_start(1234), service.OwnerProcessGone)
+
+    def test_an_unreaped_owner_closes_its_wait_at_the_last_live_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            proc = root / "proc"
+            owner = records.PlacementWaitOwner(1234, "8000")
+            write_process(proc, owner.pid, start=owner.start_time)
+            with mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(root), "BUILDLOG_PROC": str(proc)}):
+                clock = FakeClock()
+                recorder = service.PlacementWaitRecorder(root, service.SystemProc(), clock)
+                entered = clock.now()
+                records.register_placement_waits("unreaped", owner, entered, entered_at=entered)
+                records.record_placement_wait(records.PlacementWaitKey("unreaped", "step"),
+                                              records.PlacementWaitReason.MEMORY, entered)
+                clock.advance(3)
+                recorder.sweep_owners()
+                self.assertEqual(records.read_placement_waits("unreaped"), ())
+
+                stat_file = proc / str(owner.pid) / "stat"
+                _ = stat_file.write_text(stat_file.read_text().replace(") S ", ") Z "))
+                clock.advance(5)
+                recorder.sweep_owners()
+
+                row, = records.read_placement_waits("unreaped")
+                self.assertEqual(row["ended_at"], entered + 3)
+
+
+class PlacementWaitCloseTests(unittest.TestCase):
+    def test_append_failure_leaves_the_wait_and_assignment_open_until_retry(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, assignment_for, placement_request, publish_candidate
+
+        for retry_at in ("write", "shutdown"):
+            with self.subTest(retry_at=retry_at), PlacementFixture() as fixture:
+                fixture.server.close()
+                fixture.server = fixture.new_server(start=False)
+                request = placement_request(fixture)
+                assert isinstance(request.local, wire.LocalAdmissionContext)
+                call_id = "failed-close"
+                request = replace(request, local=replace(request.local, call=records.CallRecord(call_id)))
+                _ = publish_candidate(fixture, request)
+                assignment = assignment_for(fixture, request)
+                attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+                key = records.PlacementWaitKey(call_id, assignment.episode, assignment.attempt)
+                entered = fixture.clock.now()
+                records.record_placement_wait(key, records.PlacementWaitReason.REMOTE_START, entered)
+                fixture.clock.advance(4)
+
+                errors = io.StringIO()
+                with redirect_stderr(errors), mock.patch.object(records, "_append_wait_event",
+                        side_effect=OSError("journal unavailable")):
+                    reply, = fixture.server.handle_request(wire.ClaimFailure("failed-close", assignment, "busy"))
+                    self.assertIsInstance(reply, wire.DispatchStatus)
+                    assert isinstance(reply, wire.DispatchStatus)
+                    self.assertIsInstance(reply.state, placement.CurrentAssignment)
+                    fixture.server.persist()
+                    saved = service.read_state(fixture.state_dir).assignments[attempt]
+                    self.assertIsInstance(saved.state, placement.CurrentAssignment)
+                    self.assertEqual(records.read_placement_waits(call_id), ())
+                self.assertEqual(errors.getvalue().count("journal unavailable"), 1)
+
+                fixture.clock.advance(5)
+                if retry_at == "write":
+                    fixture.server.persist()
+                else:
+                    fixture.server.close()
+
+                saved = service.read_state(fixture.state_dir).assignments[attempt]
+                self.assertEqual(saved.state, placement.ClosedAssignment("busy"))
+                row, = records.read_placement_waits(call_id)
+                self.assertEqual(row["ended_at"], entered + 4)
+
+    def test_terminal_assignment_keeps_its_wait_close_if_the_service_stops_at_the_state_write(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, assignment_for, placement_request, publish_candidate
+
+        with PlacementFixture() as fixture:
+            fixture.server.close()
+            fixture.server = fixture.new_server(start=False)
+            request = placement_request(fixture)
+            assert isinstance(request.local, wire.LocalAdmissionContext)
+            call_id = "terminal-write"
+            request = replace(request, local=replace(request.local, call=records.CallRecord(call_id)))
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            key = records.PlacementWaitKey(call_id, assignment.episode, assignment.attempt)
+            entered = fixture.clock.now()
+            records.record_placement_wait(key, records.PlacementWaitReason.REMOTE_START, entered)
+            fixture.clock.advance(4)
+
+            fixture.fault.stage = "after_state_write"
+            with self.assertRaises(InjectedCrash):
+                _ = fixture.server.handle_request(wire.ClaimFailure("terminal-close", assignment, "busy"))
+
+            saved_key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+            saved = service.read_state(fixture.state_dir).assignments[saved_key]
+            self.assertEqual(saved.state, placement.ClosedAssignment("busy"))
+            row, = records.read_placement_waits(call_id)
+            self.assertEqual((row["reason"], row["ended_at"]), (records.PlacementWaitReason.REMOTE_START, entered + 4))
+
+    def test_service_shutdown_flushes_pending_wait_closes(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.server.close()
+            fixture.server = fixture.new_server(start=False)
+            entered = fixture.clock.now()
+            key = records.PlacementWaitKey("shutdown", "step")
+            records.record_placement_wait(key, records.PlacementWaitReason.REMOTE_START, entered)
+            fixture.server.wait_records.close_wait(service.PlacementWaitClose(key, entered + 3, remote_start_only=True))
+            self.assertEqual(records.read_placement_waits(key.call_id), ())
+
+            fixture.server.close()
+
+            row, = records.read_placement_waits(key.call_id)
+            self.assertEqual(row["ended_at"], entered + 3)
+
+    def test_restart_replays_the_saved_close_and_never_offers_the_refused_assignment(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, assignment_for, placement_request, publish_candidate
+
+        with PlacementFixture() as fixture:
+            fixture.server.close()
+            fixture.server = fixture.new_server(start=False)
+            request = placement_request(fixture)
+            assert isinstance(request.local, wire.LocalAdmissionContext)
+            call_id = "restart-close"
+            request = replace(request, local=replace(request.local, call=records.CallRecord(call_id)))
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+            key = records.PlacementWaitKey(call_id, assignment.episode, assignment.attempt)
+            entered = fixture.clock.now()
+            records.record_placement_wait(key, records.PlacementWaitReason.REMOTE_START, entered)
+            fixture.clock.advance(4)
+
+            with mock.patch.object(records, "_append_wait_event", side_effect=OSError("journal unavailable")):
+                _ = fixture.server.handle_request(wire.ClaimFailure("restart-close", assignment, "busy"))
+                fixture.server.close()
+                saved = service.read_state(fixture.state_dir)
+                self.assertIsInstance(saved.assignments[attempt].state, placement.CurrentAssignment)
+                self.assertEqual(saved.pending_wait_closes,
+                                 (service.PlacementWaitClose(key, entered + 4, remote_start_only=True),))
+                self.assertEqual(saved.placement_ends_awaiting_close[attempt].saved.state,
+                                 placement.ClosedAssignment("busy"))
+                self.assertEqual(records.read_placement_waits(call_id), ())
+
+                fixture.server = fixture.new_server(start=False)
+                reply, = fixture.server.handle_request(request)
+                self.assertIsInstance(reply, wire.PlacementWait)
+                self.assertIsNot(client.placement_wait_reason(reply), records.PlacementWaitReason.REMOTE_START)
+                fixture.server.close()
+
+            fixture.clock.advance(5)
+            fixture.server = fixture.new_server(start=False)
+            saved = service.read_state(fixture.state_dir)
+            self.assertEqual(saved.assignments[attempt].state, placement.ClosedAssignment("busy"))
+            self.assertEqual(saved.pending_wait_closes, ())
+            self.assertEqual(saved.placement_ends_awaiting_close, {})
+            row, = records.read_placement_waits(call_id)
+            self.assertEqual(row["ended_at"], entered + 4)
+
+
+    def test_hana_refusal_during_journal_recovery_can_place_on_natedev(self) -> None:
+        from scripts.build_queue.test_placement import (PlacementFixture, assignment_for, hana_policy_request,
+                                                        local_candidate, publish_candidate)
+
+        with PlacementFixture() as fixture:
+            fixture.server.close()
+            fixture.server = fixture.new_server(start=False)
+            request, _transport = hana_policy_request(fixture)
+            assert isinstance(request.local, wire.LocalAdmissionContext)
+            call_id = "hana-journal-recovery"
+            request = replace(request, local=replace(request.local, call=records.CallRecord(call_id)),
+                prerequisite=placement.TokenNotRequired(), constraints=replace(request.constraints,
+                    candidates=(*request.constraints.candidates, local_candidate(fixture))))
+            fixture.free(0)
+            _ = publish_candidate(fixture, request)
+            assignment = assignment_for(fixture, request)
+            self.assertEqual(assignment.destination.target, "hana-aws")
+            old_key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+            key = records.PlacementWaitKey(call_id, assignment.episode, assignment.attempt)
+            entered = fixture.clock.now()
+            records.record_placement_wait(key, records.PlacementWaitReason.REMOTE_START, entered)
+            fixture.clock.advance(4)
+            refusal = execution_identity.HanaCommandAdmissionRefused("the fixture command was refused")
+
+            with mock.patch.object(records, "_append_wait_event", side_effect=OSError("journal unavailable")):
+                _ = fixture.server.handle_request(wire.ExecutionReport(
+                    "hana-refusal", assignment, placement.assigned_claim_reference(assignment),
+                    execution_identity.ExecutionNotStarted(), refusal, placement.DispatchPathSettled()))
+                waiting, = fixture.server.handle_request(request)
+                self.assertIsInstance(waiting, wire.PlacementWait)
+                self.assertIsNot(client.placement_wait_reason(waiting), records.PlacementWaitReason.REMOTE_START)
+                fixture.server.close()
+                fixture.server = fixture.new_server(start=False)
+                fixture.free(60 * GIB)
+                fixture.allow_next_start()
+                reply, = fixture.server.handle_request(request)
+                assert isinstance(reply, wire.LocalPlacementGranted)
+                self.assertEqual(reply.assignment.destination.target, "natedev")
+                new_key = execution_identity.attempt_key(reply.assignment.episode, reply.assignment.attempt)
+                saved = service.read_state(fixture.state_dir)
+                self.assertIn(old_key, saved.placement_ends_awaiting_close)
+                self.assertEqual(saved.current_assignments[request.episode], new_key)
+
+            fixture.server.persist()
+            saved = service.read_state(fixture.state_dir)
+            self.assertEqual(saved.current_assignments[request.episode], new_key)
+            self.assertEqual(saved.assignments[old_key].state, placement.ClosedAssignment(refusal.reason))
+            row, = records.read_placement_waits(call_id)
+            self.assertEqual(row["ended_at"], entered + 4)
 
 
 class PlacementStatusTests(unittest.TestCase):
@@ -4358,6 +4651,21 @@ class QueueLifecycleTests(unittest.TestCase):
             return []
         with path.open("rb") as stream:
             return [row for row in reversed(list(gate.queue_times_backward(stream))) if row.get("kind") == kind]
+
+    def test_journal_uses_the_placement_step_start_when_the_wait_file_is_absent(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, local_cargo_request
+
+        with PlacementFixture() as fixture:
+            now = fixture.clock.now()
+            request = local_cargo_request(fixture)
+            assert isinstance(request.local, wire.LocalAdmissionContext)
+            call = records.StepCallRecord("fixture-call", now - 7)
+            request = replace(request, since=now - 40, local=replace(request.local, call=call))
+
+            reply, = fixture.connect(request).replies()
+            self.assertIsInstance(reply, wire.LocalPlacementGranted)
+            row, = self.events(fixture, "admitted")
+            self.assertEqual((row["since"], row["wait_seconds"]), (now - 40, 7))
 
     def test_gate_admission_keeps_original_arrival_and_uncut_need(self) -> None:
         with AdmissionFixture() as fixture:

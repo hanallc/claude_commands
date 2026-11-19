@@ -6,7 +6,7 @@ except FileNotFoundError:
     pass
 
 import argparse
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -21,6 +21,7 @@ import socket
 import shlex
 import subprocess
 import sys
+import time
 from typing import TYPE_CHECKING, Callable, Protocol, cast
 import uuid
 
@@ -194,18 +195,15 @@ def request_placement(request: wire.PlacementRequest
         elif isinstance(retry.placement_wait, records.PlacementWaitKey) and retry.placement_wait.episode == request.episode:
             key = retry.placement_wait
     if isinstance(key, records.PlacementWaitKey):
-        records.record_placement_wait(key, records.PlacementWaitReason.ROUTING, CLOCK.now(), if_idle=True)
+        records.record_placement_wait(key, records.PlacementWaitReason.ROUTING, CLOCK.now(), begin_routing=True)
     try:
         reply = _call(request, lambda _wait: None)
     except BaseException:
         WaitOutput.record_placement(key, records.NoPlacementWait())
         raise
-    if (isinstance(key, records.PlacementWaitKey) and isinstance(reply, wire.LocalPlacementGranted)
-            and key.call_id == records.verify_run_call_id(request.owner.pid, request.owner.start_time)
-            and not key.episode.startswith(key.call_id + "-step-")):
-        WaitOutput.record_placement(records.PlacementWaitKey(key.call_id, "setup"), records.PlacementWaitReason.LOCAL_SETUP)
-    else:
-        WaitOutput.record_placement(key, placement_wait_reason(reply))
+    if isinstance(key, records.PlacementWaitKey) and isinstance(reply, wire.Assignment):
+        key = replace(key, attempt=reply.assignment.attempt)
+    WaitOutput.record_placement(key, placement_wait_reason(reply))
     if isinstance(reply, LeftQueue):
         raise _QueueLeft()
     if isinstance(reply, wire.Refused):
@@ -671,7 +669,7 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                         if not had_wait:
                             call = records.verify_run_call_id(first.owner.pid, first.owner.start_time)
                             records.record_placement_wait(records.PlacementWaitKey(call, first.episode),
-                                records.PlacementWaitReason.FOLDER, CLOCK.now(), only=records.PlacementWaitReason.LOCAL_SETUP)
+                                records.PlacementWaitReason.FOLDER, CLOCK.now())
                         slot_waiting = reply
                         had_wait = True
                         failed_since = None
@@ -896,8 +894,8 @@ def repository_slot(request: wire.RepositorySlotRequest) -> wire.RepositorySlotR
         reply = _call(request, lambda waiting: None, configuration=wire.PROTOCOL_ACQUISITION_TIMING)
     finally:
         call = records.verify_run_call_id(request.owner.pid, request.owner.start_time)
-        records.record_placement_wait(records.PlacementWaitKey(call, "setup"),
-            records.PlacementWaitReason.LOCAL_SETUP, CLOCK.now(), only=records.PlacementWaitReason.FOLDER)
+        records.record_placement_wait(records.PlacementWaitKey(call, request.episode),
+            records.NO_PLACEMENT_WAIT, CLOCK.now(), only=records.PlacementWaitReason.FOLDER)
     if isinstance(reply, (wire.RepositorySlotReady, wire.RepositorySlotExpired, wire.Refused)):
         return reply
     return wire.Refused("left the repository slot queue")
@@ -1007,13 +1005,15 @@ def placement_wait_reason(reply: object) -> records.PlacementWaitReason | record
             return reason.REMOTE_START
         if wait.reason == "busy":
             return reason.SLOT
+    if any(notice.delay_seconds > 0 and notice.reason not in ("starting", "blocked", "recovery")
+           for notice in reply.retry_notices):
+        return reason.AWS_REFUSAL_RETRY
     for candidate in reply.eligibility:
-        if candidate.destination.provider != "ssh":
+        if candidate.destination.provider != "ssh" or not isinstance(candidate.eligibility, placement.TemporaryExclusion):
             continue
-        if any(notice.target == candidate.destination.target and notice.reason not in ("starting", "blocked")
-               for notice in reply.retry_notices):
-            return reason.AWS_REFUSAL_RETRY
-        if isinstance(candidate.eligibility, placement.TemporaryExclusion) and candidate.eligibility.reason == "starting":
+        if candidate.eligibility.reason == "recovery":
+            return reason.HANA_RECOVERY
+        if candidate.eligibility.reason == "starting":
             return reason.REMOTE_START
     return reason.ROUTING
 
@@ -1404,6 +1404,7 @@ def saved_cleanup_timing() -> wire.CleanupTiming:
 
 class ClientArguments(argparse.Namespace):
     command: str = ""
+    label: str = ""
     session_id: str = ""
     reservation: str = ""
     value: int = 0
@@ -1429,7 +1430,12 @@ class ClientArguments(argparse.Namespace):
     step_since: float = 0.0
     call_id: str = ""
     wait_reason: str = ""
+    wait_only: str = ""
     wait_at: float = 0.0
+    copy_pid: int = 0
+    owner_start: str = ""
+    owner_seen_at: float = 0.0
+    continue_call: bool = False
     assignment_file: Path = Path()
     token: str = "none"
     writes_tree: bool = False
@@ -1503,6 +1509,8 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
         def refresh_local() -> wire.AdmitRequest:
             refreshed = step_request(step_argv, os.getcwd(), wire.Owner(args.pid, start), args.since,
                                      args.sidecar, episode, run=parse_run_identity(args.run))
+            if args.call_id and args.step_since > 0:
+                return replace(refreshed, call=records.StepCallRecord(args.call_id, args.step_since))
             return replace(refreshed, call=records.CallRecord(args.call_id)) if args.call_id else refreshed
 
         cargo_folder: placement.CargoFolder | placement.NoCargoFolder = placement.NoCargoFolder()
@@ -1548,9 +1556,6 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
         if args.request_file is not None:
             write_text_atomic(args.request_file, wire.encode_request(request), new_file_mode=0o600)
             return 0
-        if args.step_since > 0 and isinstance(local.call, records.CallRecord):
-            key = records.PlacementWaitKey(local.call.call_id, episode)
-            records.record_placement_wait(key, records.PlacementWaitReason.ROUTING, args.step_since, if_idle=True)
         if already_queued:
             _ = report_prerequisite(wire.PrerequisiteReport(uuid.uuid4().hex, episode, owner, prerequisite))
         while True:
@@ -1627,24 +1632,113 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                 queued_episode_state.unlink(missing_ok=True)
 
 
+def copy_call_start(pid: int, verify_started: float, saved_start: str = "") -> float:
+    """Use the copy process start when it prepared the source before verify."""
+    if pid > 0 and hasattr(time, "CLOCK_BOOTTIME"):
+        from scripts.build_queue import admission_records as records
+
+        try:
+            started = saved_start or records.process_start_time(pid)
+            if started is not None:
+                uptime = time.clock_gettime(time.CLOCK_BOOTTIME)
+                return min(verify_started, CLOCK.now() - uptime + int(started) / os.sysconf("SC_CLK_TCK"))
+        except (OSError, ValueError):
+            pass
+    return verify_started
+
+
+def verify_command_argv(call_id: str, command: Sequence[str]) -> list[str]:
+    """Wrap the command that will run after preparation."""
+    return [sys.executable, str(Path(__file__).resolve()), "verify-command", "--call-id", call_id, "--", *command]
+
+
+def launch_verify_command(call_id: str, command: list[str]) -> int:
+    """Start the command in this group, then record its start."""
+    from scripts.build_queue import admission_records as records
+
+    try:
+        if command[0] == "env":
+            cargo = 1
+            while command[cargo:cargo + 1] == ["-u"]:
+                cargo += 2
+            while cargo < len(command) and "=" in command[cargo] and not command[cargo].startswith("-"):
+                cargo += 1
+            if command[cargo:cargo + 1] == ["cargo"]:
+                os.execvp("env", [*command[:cargo], *verify_command_argv(call_id, command[cargo:])])
+        child = subprocess.Popen(command, close_fds=False)
+    except (OSError, ValueError) as error:
+        print(f"verify.sh: cannot launch {command[0]}: {error}", file=sys.stderr)
+        return 125
+    with child:
+        records.record_started_verify_command(call_id, child.pid)
+        status = child.wait()
+    return status if status >= 0 else 128 - status
+
+
+def detached_verify_handoff(label: str, command: list[str]) -> bool:
+    """Check for a run record that matches this call."""
+    from scripts.agents import detached_runs, worker_lifecycle
+
+    def recorded(directory: str) -> bool:
+        runs = Path(directory) / worker_lifecycle.DETACHED_RUNS_DIR
+        try:
+            for path in runs.glob("*.json"):
+                try:
+                    record = worker_lifecycle.read_json_object(path)
+                except (OSError, ValueError):
+                    continue
+                if (record.get("label") == label and record.get("command") == command
+                        and record.get("status") in ("running", "finished")):
+                    return True
+        except OSError:
+            return False
+        return False
+
+    run_dir = os.environ.get("UNIT_RUN_DIR", "")
+    if run_dir and recorded(run_dir):
+        return True
+    try:
+        caller = detached_runs.caller_from_environment(dict(os.environ))
+    except (OSError, ValueError):
+        return False
+    return isinstance(caller, detached_runs.PaneCaller) and caller.session_dir != run_dir and recorded(caller.session_dir)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
     for name in ("view", "explain", "down-alert", "priority-clear", "code-version", "check-nested"):
         _ = subcommands.add_parser(name)
+    command_parser = subcommands.add_parser("verify-command")
+    _ = command_parser.add_argument("--call-id", required=True)
+    _ = command_parser.add_argument("argv", nargs=argparse.REMAINDER)
+    handoff_parser = subcommands.add_parser("verify-detached-handoff")
+    _ = handoff_parser.add_argument("--label", required=True)
+    _ = handoff_parser.add_argument("argv", nargs=argparse.REMAINDER)
     status_parser = subcommands.add_parser("placement-status")
     _ = status_parser.add_argument("--episode", required=True)
     _ = status_parser.add_argument("--attempt", required=True)
     placement_parser = subcommands.add_parser("place-step")
     for name in ("episode", "repo-root", "package", "kind", "source-key", "target", "session-id", "run", "sidecar", "parent-episode", "call-id"):
         _ = placement_parser.add_argument("--" + name, default="")
-    for name in ("placement-wait", "placement-wait-report"):
+    for name in ("placement-wait", "placement-wait-start", "placement-wait-report"):
         wait_parser = subcommands.add_parser(name)
         _ = wait_parser.add_argument("--call-id", required=True)
         if name == "placement-wait":
             _ = wait_parser.add_argument("--episode", default="")
+            _ = wait_parser.add_argument("--attempt", default="")
             _ = wait_parser.add_argument("--wait-reason", required=True)
+            _ = wait_parser.add_argument("--wait-only", default="")
             _ = wait_parser.add_argument("--wait-at", type=float, required=True)
+        if name != "placement-wait-report":
+            _ = wait_parser.add_argument("--continue-call", action="store_true")
+        if name == "placement-wait-start":
+            _ = wait_parser.add_argument("--wait-at", type=float, required=True)
+            _ = wait_parser.add_argument("--call-started", type=float, default=0.0)
+            _ = wait_parser.add_argument("--pid", type=int, required=True)
+            _ = wait_parser.add_argument("--copy-pid", type=int, default=0)
+            _ = wait_parser.add_argument("--owner-start", default="")
+            _ = wait_parser.add_argument("--owner-seen-at", type=float, default=0.0)
     _ = placement_parser.add_argument("--cargo-folder", type=Path)
     _ = placement_parser.add_argument("--pid", type=int, default=os.getppid())
     _ = placement_parser.add_argument("--since", type=float, required=True)
@@ -1689,20 +1783,41 @@ def main(argv: list[str] | None = None) -> int:
     _ = priority_parser.add_argument("unit")
     _ = priority_parser.add_argument("--why", default="the user's bump")
     args = parser.parse_args(argv, namespace=ClientArguments())
-    if args.command in ("placement-wait", "placement-wait-report"):
+    if args.command == "verify-command":
+        command = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
+        if not command:
+            parser.error("verify-command needs a command after --")
+        return launch_verify_command(args.call_id, command)
+    if args.command == "verify-detached-handoff":
+        command = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
+        return 0 if detached_verify_handoff(args.label, command) else 1
+    if args.command in ("placement-wait", "placement-wait-start", "placement-wait-report"):
         from scripts.build_queue import admission_records as records
 
         if args.command == "placement-wait-report":
-            totals: dict[str, float] = {}
-            for row in records.read_placement_waits(args.call_id):
-                reason = row["reason"]
-                totals[reason] = totals.get(reason, 0.0) + row["placement_wait_s"]
-            print(json.dumps({"call_id": args.call_id, "placement_wait_s": totals}))
+            print(json.dumps({"call_id": args.call_id, "placement_wait_s": records.placement_wait_totals(args.call_id)}))
+        elif args.command == "placement-wait-start":
+            from scripts.lib import process_start
+
+            start = args.owner_start
+            seen = args.owner_seen_at if start else 0.0
+            identity = process_start.process_start(args.pid)
+            if isinstance(identity, process_start.Started) and start in ("", identity.start):
+                start = identity.start
+                seen = max(seen, CLOCK.now())
+            owner = records.PlacementWaitOwner(args.pid, start) if start else records.UNTRACKED_WAIT_OWNER
+            at = args.call_started or copy_call_start(
+                args.copy_pid, args.wait_at, start if args.copy_pid == args.pid else "")
+            observed = records.OwnerLastSeen(seen) if seen else records.OwnerObservationNotRecorded.MISSING
+            records.register_placement_waits(args.call_id, owner, at, entered_at=args.wait_at,
+                                             owner_seen=observed, continued=args.continue_call)
         elif args.wait_reason == "finish":
-            records.finish_placement_waits(args.call_id, args.wait_at)
+            records.finish_placement_waits(args.call_id, args.wait_at, continued=args.continue_call)
         else:
             reason = records.NoPlacementWait() if args.wait_reason == "done" else records.PlacementWaitReason(args.wait_reason)
-            records.record_placement_wait(records.PlacementWaitKey(args.call_id, args.episode), reason, args.wait_at)
+            only = records.PlacementWaitReason(args.wait_only) if args.wait_only else records.NO_PLACEMENT_WAIT
+            records.record_placement_wait(records.PlacementWaitKey(args.call_id, args.episode, args.attempt),
+                                          reason, args.wait_at, only=only)
         return 0
     if args.command in ("check-nested", "place-step"):
         reason = nested_reservation_reason()
