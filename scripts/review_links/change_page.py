@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from functools import partial
 from pathlib import Path
-from typing import IO, Literal, NotRequired, TypedDict, cast
+from typing import IO, Literal, NotRequired, TypedDict, cast, overload
 from urllib.parse import parse_qs, urlsplit
 from weakref import WeakSet, WeakValueDictionary, finalize
 
@@ -194,11 +194,13 @@ class StoredDeliveryCloseout(TypedDict):
 class PendingDeliveryAlert(TypedDict):
     recipient: staff.StaffId
     message: str
+    key: NotRequired[str]
 
 
 class StoredReviewDispatch(TypedDict):
     attempt: str
     state: Literal["started", "finished"]
+    keyed: NotRequired[Literal[True]]
 
 
 class StoredQuestionDispatch(TypedDict):
@@ -356,6 +358,7 @@ class SavedQuestionDelivery:
     recipient: staff.StaffId
     title: str
     answer_command: str
+    alert_owner: staff.StaffId | None = None
 
     @property
     def heading(self) -> str:
@@ -395,26 +398,29 @@ class QuestionDeliveryTarget:
     row: str
     title: str
     answer_command: str
+    alert_owner: staff.StaffId | None = None
 
     def saved(self, question: question_record.Question) -> SavedQuestionDelivery:
         row = f"{self.row}/{question.question_id}"
         source = QuestionSource(str(self.path.resolve()), self.item, question.question_id, question.words, row)
         command = self.answer_command.format(item=shlex.quote(self.item), question_id=question.question_id)
-        return SavedQuestionDelivery(source, self.recipient, self.title, command)
+        return SavedQuestionDelivery(source, self.recipient, self.title, command, self.alert_owner)
 
 
 def list_question_target(path: Path, item: str, number: int, title: str,
-                         recipient: staff.StaffId) -> QuestionDeliveryTarget:
+                         recipient: staff.StaffId, *,
+                         alert_owner: staff.StaffId | None = None) -> QuestionDeliveryTarget:
     command = ('~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py '
                + 'answer {item} --question {question_id} --text "<answer>"')
-    return QuestionDeliveryTarget(path, item, recipient, f"List item {number}", title, command)
+    return QuestionDeliveryTarget(path, item, recipient, f"List item {number}", title, command, alert_owner)
 
 
 def image_question_target(path: Path, image: image_store.ImageRecord) -> QuestionDeliveryTarget:
     command = ('~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py answer '
                + '--id {item} --question {question_id} --text "<answer>"')
-    return QuestionDeliveryTarget(path, image["id"], staff.StaffId(image["owner"]),
-                                  IMAGE_QUESTION_ROW_PREFIX + image["id"], image["caption"], command)
+    owner = staff.StaffId(image["owner"])
+    return QuestionDeliveryTarget(path, image["id"], owner, IMAGE_QUESTION_ROW_PREFIX + image["id"],
+                                  image["caption"], command, owner)
 
 
 @dataclass(frozen=True)
@@ -665,7 +671,8 @@ def ready_question(path: Path, record: QuestionAttempt, saved: SavedQuestionDeli
     if not saved.matches(record):
         raise question_record.AnswerRefused("The saved question does not match this delivery.")
     ready = replace(record, revision=record.revision + 1, state=QuestionSendState.READY,
-                    owner=NoQuestionSendOwner(), receipt=NoQuestionSendReceipt(), error="")
+                    owner=NoQuestionSendOwner(), receipt=NoQuestionSendReceipt(), error="",
+                    earlier_unconfirmed=record.earlier_unconfirmed or record.state is QuestionSendState.SENDING)
     advance_question_attempt(path, record, ready)
     return VerifiedQuestionAttempt(ready, saved)
 
@@ -677,7 +684,7 @@ def send_question(recipient: staff.StaffId, message: str, message_id: str
     if member is None:
         return send_result.ConfirmedSendOutcome(send_result.OutcomeHeader("refused", "No staff record.", "")), "No staff record."
     return unrouted_alert.message_outcome(f"session:{member.current_session}", SENDER, message,
-                                          "--key", message_id, "--recipient-key", recipient)
+                                          *review_send_options(message_id, str(recipient)))
 
 
 def _send_result(delivery: VerifiedQuestionAttempt) -> QuestionAttempt:
@@ -689,11 +696,11 @@ def _send_result(delivery: VerifiedQuestionAttempt) -> QuestionAttempt:
         return replace(result, state=QuestionSendState.UNKNOWN, error=str(failure))
     if isinstance(outcome, send_result.ConfirmedSendOutcome):
         header = outcome.header
-        if header.outcome in ("sent", "kept", "queued"):
-            receipt = QuestionSendReceipt(header.outcome, header.detail)
+        if header.outcome in ("sent", "kept", "queued", "skipped"):
+            receipt = QuestionSendReceipt("kept" if header.outcome == "skipped" else header.outcome, header.detail)
             state = QuestionSendState.QUEUED if receipt.outcome == "queued" else QuestionSendState.SENT
             return replace(result, state=state, receipt=receipt)
-        if header.outcome in ("failed", "refused", "skipped", "replaced"):
+        if header.outcome in ("failed", "refused", "retry", "replaced"):
             return replace(result, state=QuestionSendState.FAILED, error=error)
     return replace(result, state=QuestionSendState.UNKNOWN, error=error)
 
@@ -792,9 +799,16 @@ def deliver_page_question(delivery: PageQuestionSend, status: DeliveryStatus) ->
                 if not isinstance(error, StaleQuestionAttempt):
                     print(f"review-links question alert {delivery.row}: {error}", file=sys.stderr)
                 return
+            owner = verified.saved.alert_owner
+            recipients: tuple[staff.StaffId, ...] = ()
+            if owner is not None:
+                if delivery.row.startswith("List item "):
+                    recipients = tuple(runner.id for runner in staff_showrunner(owner, staff.snapshot()))
+                else:
+                    recipients = review_alert_showrunners(owner)
             _ = alert_delivery_failures([DeliveryFailure(result.recipient_id, result.error)], attempts,
                                         source=delivery.page.review_list, row=delivery.row,
-                                        message=delivery.message, recipients=delivery.alert_recipients)
+                                        message=delivery.message, recipients=recipients, attempt=delivery.attempt)
     except StaleQuestionAttempt:
         return
     finally:
@@ -804,7 +818,8 @@ def deliver_page_question(delivery: PageQuestionSend, status: DeliveryStatus) ->
 
 def recover_page_question(status: DeliveryStatus, path: Path, record: QuestionAttempt) -> None:
     """Check the source before recovery claims an unsent question."""
-    if record.state not in (QuestionSendState.PREPARED, QuestionSendState.READY, QuestionSendState.CLAIMED):
+    if record.state not in (QuestionSendState.PREPARED, QuestionSendState.READY,
+                            QuestionSendState.CLAIMED, QuestionSendState.SENDING):
         return
     source = record.source
     source_path = Path(source.path)
@@ -831,7 +846,8 @@ def recover_page_question(status: DeliveryStatus, path: Path, record: QuestionAt
             except StaleQuestionAttempt:
                 return
             questions = delivery_state.read_list_questions(fields.get("questions", "[]"))
-            target = list_question_target(source_path, fields["id"], int(fields["number"]), fields["title"], record.recipient_id)
+            target = list_question_target(source_path, fields["id"], int(fields["number"]), fields["title"],
+                                          record.recipient_id, alert_owner=staff.StaffId(fields["owner"]))
             delivery = _recover_saved_question(status, target, record, questions)
     else:
         return
@@ -846,8 +862,9 @@ def _recover_saved_question(status: DeliveryStatus, target: QuestionDeliveryTarg
         return NoMessageDelivery()
     saved = target.saved(question)
     view = question_delivery_view(status, saved)
-    if (not isinstance(view, QuestionSendPermitted) or view.attempt != record
-            or view.state is QuestionSendState.FAILED):
+    permitted = isinstance(view, QuestionSendPermitted) and view.state is not QuestionSendState.FAILED
+    interrupted = isinstance(view, QuestionDeliveryUnknown) and record.state is QuestionSendState.SENDING
+    if not (permitted or interrupted) or view.attempt != record or not saved.matches(record):
         return NoMessageDelivery()
     page = saved.page()
     path = status.path(page, saved.source.row)
@@ -989,6 +1006,8 @@ class DeliveryStatus:
             return True
         dispatch = fields.get("review_dispatch")
         if dispatch is not None and dispatch["attempt"] == intent.attempt:
+            if dispatch["state"] == "started" and dispatch.get("keyed"):
+                return True
             if dispatch["state"] != "finished":
                 print(f"review-links delivery {row}: send result unknown for attempt {intent.attempt}; message kept",
                       file=sys.stderr)
@@ -999,7 +1018,7 @@ class DeliveryStatus:
                 self.finish_intent_locked(delivery, slots, intent)
                 return False
         review_started: StoredDeliveryCloseout = {**fields, "review_dispatch": {
-            "attempt": intent.attempt, "state": "started"}}
+            "attempt": intent.attempt, "state": "started", "keyed": True}}
         self.save_dispatch_start(page, row, fields, review_started)
         return True
 
@@ -1043,7 +1062,7 @@ class DeliveryStatus:
                 fields = cast(StoredDeliveryCloseout, json.loads(path.read_text(encoding="utf-8")))
                 alerts = fields.get("pending_alerts", [])
                 for index, alert in enumerate(alerts):
-                    send_to_staff(alert["recipient"], SENDER, alert["message"])
+                    _ = send_to_staff(alert["recipient"], SENDER, alert["message"], key=alert.get("key", ""))
                     fields["pending_alerts"] = alerts[index + 1:]
                     self.write_closeout(path, fields)
         except FileNotFoundError:
@@ -1061,8 +1080,9 @@ class DeliveryStatus:
             sent = self.closeout_fields(page, row)
             if message in sent["messages"]:
                 return
+            key = review_delivery_key(page.review_list, row, message, purpose="closeout")
             for identity in recipients:
-                send_to_staff(identity, SENDER, message)
+                _ = send_to_staff(identity, SENDER, message, key=key)
             sent["messages"].append(message)
             self.write_closeout(path, sent)
 
@@ -1762,15 +1782,42 @@ def route_owner(page: ReviewPage, row: dict[str, str]) -> change_routing.ChangeO
     return routing.owner_and_production(page.review_list, row).owner
 
 
-def send_to_staff(identity: staff.StaffId, sender: str, message: str) -> None:
+@overload
+def send_to_staff(identity: staff.StaffId, sender: str, message: str) -> None: ...
+
+
+@overload
+def send_to_staff(identity: staff.StaffId, sender: str, message: str, *, key: str) -> Literal["skipped"] | None: ...
+
+
+def send_to_staff(identity: staff.StaffId, sender: str, message: str, *, key: str = "") -> Literal["skipped"] | None:
     """Resolve the current conversation immediately before each send."""
     member = staff.snapshot().by_id(identity)
     if member is None:
         raise RuntimeError(f"no staff record for {identity}")
-    send_message(f"session:{member.current_session}", sender, message)
+    address = f"session:{member.current_session}"
+    if key:
+        return send_message(address, sender, message, key=key, recipient_key=identity)
+    _ = send_message(address, sender, message)
+    return None
 
 
-send_message = unrouted_alert.send_message
+def review_send_options(key: str, recipient_key: str) -> tuple[str, ...]:
+    """Use the saved attempt and staff ID for every copy of this send."""
+    return ("--review-delivery", "--key", key, "--recipient-key", recipient_key,
+            "--repeat-minutes", "52560000")
+
+
+def send_message(recipient: str, sender: str, message: str, *, key: str = "",
+                 recipient_key: str = "") -> Literal["skipped"] | None:
+    if not key:
+        unrouted_alert.send_message(recipient, sender, message)
+        return None
+    outcome, error = unrouted_alert.message_outcome(recipient, sender, message, *review_send_options(key, recipient_key))
+    if isinstance(outcome, send_result.ConfirmedSendOutcome) and outcome.header.outcome in (
+            "sent", "kept", "queued", "skipped", "pending"):
+        return "skipped" if outcome.header.outcome == "skipped" else None
+    raise RuntimeError(error)
 
 
 def feature_review_id(page: ReviewPage, doc: Path, row_id: str) -> str:
@@ -2085,9 +2132,16 @@ class DeliveryFailure:
     error: str
 
 
+def review_delivery_key(source: Path, row: str, attempt: str, *, purpose: str = "message") -> str:
+    """Identify one send across retries and server restarts."""
+    identity = json.dumps((str(source.resolve()), row, attempt, purpose))
+    return "review:" + hashlib.sha256(identity.encode()).hexdigest()
+
+
 def send_with_retries(sender: str, recipients: tuple[staff.StaffId, ...], message: str, tries: int,
-                      pause: float) -> list[DeliveryFailure]:
-    """Send to all remaining recipients in each round, pause between rounds, and return the last failures."""
+                      pause: float, *, key: str,
+                      skipped: set[staff.StaffId] | None = None) -> list[DeliveryFailure]:
+    """Retry only failed sends. The sender keeps queued and unconfirmed sends."""
     remaining = recipients
     failures: list[DeliveryFailure] = []
     for attempt in range(tries):
@@ -2096,13 +2150,39 @@ def send_with_retries(sender: str, recipients: tuple[staff.StaffId, ...], messag
         failures = []
         for target in remaining:
             try:
-                send_to_staff(target, sender, message)
+                result = send_to_staff(target, sender, message, key=key)
+                if result == "skipped" and skipped is not None:
+                    skipped.add(target)
             except SEND_ERRORS as error:
                 failures.append(DeliveryFailure(target, str(error)))
         remaining = tuple(failure.recipient for failure in failures if isinstance(failure.recipient, str))
         if remaining and attempt + 1 < tries:
             time.sleep(pause)
     return failures
+
+
+def staff_showrunner(owner: staff.StaffId, members: staff.StaffSnapshot) -> tuple[staff.StaffRow, ...]:
+    """Find the first showrunner on the owner's staff path."""
+    member = members.by_id(owner)
+    visited: set[staff.StaffId] = set()
+    while member is not None and member.id not in visited:
+        if member.kind == "showrunner":
+            return (member,)
+        visited.add(member.id)
+        member = members.parent_of(member)
+    return ()
+
+
+def review_alert_showrunners(owner: staff.StaffId) -> tuple[staff.StaffId, ...]:
+    """Find the showrunner for the Review item's owner."""
+    members = staff.snapshot()
+    if runners := staff_showrunner(owner, members):
+        return tuple(runner.id for runner in runners)
+    fallback = conf.read("review_links").text("unrouted_alert_recipient")
+    try:
+        return (showrunners.owner_for(fallback, members).id,)
+    except ValueError:
+        return ()
 
 
 def is_change_question(delivery: MessageDelivery, slots: DeliverySlots, intent: DeliveryIntent) -> bool:
@@ -2148,31 +2228,43 @@ def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatu
                 if not status.start_review_dispatch_locked(delivery, slots, intent):
                     return
         status.request_attempts[delivery.attempt] = AttemptOwnership(status.path(delivery.page, delivery.row), "sending")
-    failures = (send_with_retries(SENDER, delivery.recipients, delivery.message, tries, pause) if delivery.recipients
+    key = review_delivery_key(page.review_list, delivery.row, delivery.attempt)
+    failures = (send_with_retries(SENDER, delivery.recipients, delivery.message, tries, pause, key=key) if delivery.recipients
                 else [DeliveryFailure(MissingRecipient(), "no showrunner to send to")])
     result = (FailedDelivery(delivery.attempt, delivery.page.review_list, delivery.row, failures[-1].error)
               if failures else NoFailedDelivery())
-    if tracked_review and failures and delivery.alert_recipients:
-        alerts: tuple[PendingDeliveryAlert, ...] = tuple(
-            PendingDeliveryAlert(recipient=recipient, message=delivery_failure_alert(
-                failure, tries, delivery.page.review_list, delivery.row, delivery.message))
-            for failure in failures for recipient in delivery.alert_recipients)
+    showrunners_for_alert = delivery.alert_recipients
+    if failures and isinstance(page, (ReviewMessagePage, UserQuestionPage)):
+        try:
+            showrunners_for_alert = review_alert_showrunners(staff.StaffId(page.saved["owner"]))
+        except (OSError, ValueError) as error:
+            print(f"review-links delivery alert {delivery.row}: {error}", file=sys.stderr)
+            showrunners_for_alert = ()
+    routes = [(failure, tuple(recipient for recipient in showrunners_for_alert if recipient != failure.recipient))
+              for failure in failures]
+    if tracked_review:
+        alerts = tuple(
+            PendingDeliveryAlert(recipient=recipient,
+                key=review_delivery_key(page.review_list, delivery.row, delivery.attempt, purpose=f"alert:{failure.recipient}"),
+                message=delivery_failure_alert(failure, tries, page.review_list, delivery.row, delivery.message))
+            for failure, recipients in routes for recipient in recipients)
         status.record(delivery, result, alerts=alerts)
-        status.send_pending_alerts(status.closeout_path(delivery.page, delivery.row))
-        return
+        if alerts:
+            status.send_pending_alerts(status.closeout_path(delivery.page, delivery.row))
+    elif not tracked_question:
+        status.record(delivery, result)
+    relayed = False
+    for failure, recipients in routes:
+        if not tracked_review or not recipients:
+            relayed |= alert_delivery_failures([failure], tries, source=delivery.page.review_list, row=delivery.row,
+                                               message=delivery.message, recipients=recipients, attempt=delivery.attempt)
     if tracked_question:
-        relayed = alert_delivery_failures(failures, tries, source=page.review_list, row=delivery.row,
-                                          message=delivery.message, recipients=delivery.alert_recipients)
         finished = not failures or relayed
         if finished:
             status.write_save_receipt(page, delivery.row, intent)
         status.record(delivery, result, question_relayed=relayed)
         if finished:
             status.remove_save_receipt(page, delivery.row, intent)
-        return
-    status.record(delivery, result)
-    _ = alert_delivery_failures(failures, tries, source=page.review_list, row=delivery.row,
-                                message=delivery.message, recipients=delivery.alert_recipients)
 
 
 def delivery_failure_alert(failure: DeliveryFailure, tries: int, source: Path, row: str, message: str,
@@ -2184,15 +2276,17 @@ def delivery_failure_alert(failure: DeliveryFailure, tries: int, source: Path, r
 
 def alert_delivery_failures(failures: list[DeliveryFailure], tries: int, *, source: Path, row: str,
                             message: str, recipients: tuple[staff.StaffId, ...],
-                            title: str = "Change review delivery needs attention") -> bool:
+                            attempt: str, title: str = "Change review delivery needs attention") -> bool:
     reached = False
     for failure in failures:
         alert = delivery_failure_alert(failure, tries, source, row, message, title)
-        if not recipients:
-            print(f"review-links delivery {row}: {failure.error}; no showrunner for the alert", file=sys.stderr)
-        for runner in recipients:
+        targets = tuple(recipient for recipient in recipients if recipient != failure.recipient)
+        if not targets:
+            print(f"review-links delivery {row}: {failure.error}; no separate showrunner for the alert", file=sys.stderr)
+        key = review_delivery_key(source, row, attempt, purpose=f"alert:{failure.recipient}")
+        for runner in targets:
             try:
-                send_to_staff(runner, SENDER, alert)
+                _ = send_to_staff(runner, SENDER, alert, key=key)
                 reached = True
             except SEND_ERRORS as failure:
                 print(f"review-links delivery alert {row}: " + " ".join(str(failure).splitlines()), file=sys.stderr)

@@ -27,7 +27,7 @@ from xml.etree import ElementTree
 
 from scripts.accounts import accounts
 from scripts.agents.remote import local_machine
-from scripts.lib import atomic_file, conf, process_start
+from scripts.lib import atomic_file, conf, file_lock, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
 from scripts.message import send_result
@@ -3306,10 +3306,59 @@ observer.observe(original.parentNode,{childList:true});
         send.assert_called_once()
         self.assertEqual(the_list.load(MORTY.id, item.id), current)
 
+    def test_startup_reuses_the_list_question_key_after_a_result_write_failure(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Check the repair")
+        asked = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check passed?")), status)
+        assert isinstance(asked, list_page.ListQuestionDelivery)
+        delivery = asked.delivery
+        assert isinstance(delivery, change_page.PageQuestionSend)
+        path = status.path(delivery.page, delivery.row)
+        transport = FakeQuestionTransport()
+        publish = change_page.publish_question_attempt
+
+        def lose_result(path: Path, record: delivery_state.QuestionAttempt) -> None:
+            if record.state is delivery_state.QuestionSendState.SENT:
+                raise OSError("Cannot save the result.")
+            publish(path, record)
+
+        with patch.object(change_page, "send_question", side_effect=transport.send):
+            with (patch.object(change_page, "publish_question_attempt", side_effect=lose_result),
+                  self.assertRaisesRegex(OSError, "Cannot save the result")):
+                list_page.deliver(asked)
+            sending = change_page.read_question_attempt(path)
+            self.assertEqual(sending.state, delivery_state.QuestionSendState.SENDING)
+            for _ in range(2):
+                change_page.recover_review_messages(change_page.DeliveryStatus(root))
+        self.assertEqual(transport.calls, [sending.message_id] * 2)
+        self.assertEqual(len(transport.receipts), 1)
+        saved = change_page.read_question_attempt(path)
+        self.assertEqual(saved.state, delivery_state.QuestionSendState.SENT)
+        self.assertEqual(saved.attempt_id, sending.attempt_id)
+
+    def test_a_failed_list_question_alerts_the_item_showrunner(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Ask about the repair", owner=OTHER.id)
+        asked = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check passed?")))
+        refused = question_outcome("refused", "List keeper is offline.")
+        with (patch.object(change_page, "send_question", return_value=refused) as send,
+              patch.object(change_page, "send_to_staff") as alert,
+              patch.object(change_page, "review_alert_showrunners") as fallback,
+              patch.object(time, "sleep")):
+            list_page.deliver(asked)
+        self.assertEqual(send.call_count, conf.read("review_links").whole("delivery_tries"))
+        self.assertTrue(all(call.args[0] == MORTY.id for call in send.call_args_list))
+        alert.assert_called_once()
+        self.assertEqual(alert.call_args.args[0], OTHER.id)
+        self.assertIn("Which check passed?", cast(str, alert.call_args.args[2]))
+        fallback.assert_not_called()
+
     def test_question_result_write_failure_leaves_the_saved_question_available_for_resend(self) -> None:
         root = self.root / "reviews"
         status = change_page.DeliveryStatus(root)
         first_jobs: dict[str, the_list.ListItem] = {}
+        locks: dict[str, Path] = {}
         for number in (1, 2):
             item = self.add(f"Recovery question {number}", number=number)
             asked = list_page.submit(root, urlencode(self.fields(item, "question", words=f"Which check {number}?")), status)
@@ -3319,6 +3368,7 @@ observer.observe(original.parentNode,{childList:true});
             assert isinstance(delivery.job, change_page.QuestionJob)
             self.assertEqual(item.id, delivery.job.record.source.item_id)
             first_jobs[delivery.job.record.message_id] = item
+            locks[delivery.job.record.message_id] = Path(cast(str, delivery.job.lock.name))
             _ = delivery.job.release()
             _ = the_list.update(MORTY.id, item.id, {"latest_status": "A newer result arrived."}, source="morty")
         recovering = change_page.DeliveryStatus(root)
@@ -3347,7 +3397,8 @@ observer.observe(original.parentNode,{childList:true});
         with (patch.object(change_page, "publish_question_attempt", side_effect=fail_first_result),
               patch.object(change_page, "send_question", side_effect=send)):
             change_page.recover_review_messages(recovering)
-            change_page.recover_review_messages(change_page.DeliveryStatus(root))
+            with file_lock.exclusive(locks[lost[0]]):
+                change_page.recover_review_messages(change_page.DeliveryStatus(root))
         self.assertEqual(len(transport.calls), 2)
         self.assertEqual(len(transport.receipts), 2)
 
@@ -5331,7 +5382,8 @@ window.fetch=async(_path,options={})=>{
         self.assertEqual(the_list.feedback_requests(the_list.load(MORTY.id, item.id)),
                          {key: replace(value, state="sent") for key, value in the_list.feedback_requests(saved).items()})
         delivery = list_page.submit(root, urlencode(self.fields(item, "remove")))
-        def fail_message(recipient: staff.StaffId, _sender: str, _message: str) -> None:
+        def fail_message(recipient: staff.StaffId, _sender: str, _message: str, *, key: str) -> None:
+            self.assertTrue(key.startswith("review:"))
             if recipient == MORTY.id:
                 raise RuntimeError("fixture offline")
         with (patch.object(change_page, "send_to_staff", side_effect=fail_message) as send,
@@ -5415,7 +5467,8 @@ window.fetch=async(_path,options={})=>{
         other = self.add("Mark this item read")
         delivery = list_page.submit(root, urlencode(self.fields(item, "tell", words="Keep these words.")))
         entered, release = threading.Event(), threading.Event()
-        def send(_recipient: staff.StaffId, _sender: str, _message: str) -> None:
+        def send(_recipient: staff.StaffId, _sender: str, _message: str, *, key: str) -> None:
+            self.assertTrue(key.startswith("review:"))
             entered.set()
             if not release.wait(TEST_HANG_GUARD_SECS):
                 raise RuntimeError("the test did not release delivery")

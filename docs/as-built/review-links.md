@@ -373,7 +373,10 @@ Questions without an owner remain visible under Owner unavailable.
 These questions have the state Open and retain their previous count totals.
 They have no answer control until an owner becomes available.
 
-The page shows Questions, Changes, Investigations, Proposals and Efficiencies.
+The page shows Questions, Responses, Changes, Investigations, Proposals, Efficiencies and Bugs.
+Only an answered Question from New item appears as a Response.
+The Response uses the Question's existing key, owner, exchanges and log.
+The Question stays in its native store during the complete exchange.
 Proposals show `<owner>/P<n>` and efficiencies show `<owner>/E<n>`, where the owner is the production's showrunner.
 The table columns are Id, Type, Owner, Item, State and Age.
 One row can open its card in place.
@@ -409,9 +412,12 @@ An unknown owner returns to All and clears both owner and source-owner constrain
 Owner names resolve against all known owners before the type and Show filters apply.
 The address uses the resulting selection.
 Type and Show changes restore owners when their rows match again.
-The Show row offers Open, Validating and All below the Type row.
-Old Waiting links open All. Old Done links use the default Open filter.
-The Owner row follows the Show row.
+The State row sets the Show filter.
+It offers Open, Validating and All below the Type row.
+With Responses selected, it offers Open and All.
+Old Waiting links open All.
+Old Done links use the default Open filter.
+The Owner row follows the State row.
 Exactly one Show chip stays selected. Pressing that chip changes nothing.
 Each type count uses the selected owner, Show and words.
 Each Show count uses the selected type, owner and words.
@@ -422,6 +428,8 @@ The index contains the key, ID, type, owner, source owner, owner name, title, st
 It also supplies the source name, urgency label and Later time for each summary.
 A Validating Change supplies the time of its request.
 The wire format shares identity names and omits an ID when it equals the key.
+A Response uses the Question type in the index and adds a Response flag.
+Tabs that use the earlier script ignore the flag and display the row as a Question.
 The index contains summary values and shared staff labels.
 The server sends card bodies on demand.
 The server sends gzip when the browser accepts it with a positive quality.
@@ -482,8 +490,12 @@ The text filter matches the ID and title.
 The address retains the filters, sort and open item.
 An address with only `item` selects All and clears the filters.
 The default order uses the existing urgency levels and age.
-Questions use a violet circle-help icon; Changes use a blue diff icon; Investigations use a teal microscope icon.
-Proposals use a pink lamp icon; Efficiencies use a lime zap icon.
+Questions use a violet circle-help icon.
+Responses use a gold inbox icon and a gold card border.
+Changes use a blue diff icon.
+Investigations use a teal microscope icon.
+Proposals use a pink lamp icon.
+Efficiencies use a lime zap icon.
 The HTTP server retains one `ReviewSnapshot` with the records, index and shell.
 The worker records source timestamps before it reads the sources.
 The background worker checks source timestamps every half second.
@@ -542,6 +554,12 @@ An item fragment selects its summary before any body request.
 An efficiency card shows its ledger line.
 
 Questions offer Answer and Send feedback in the closing group.
+A Response shows the original Question, the owner's latest answer, its time and the log.
+**Got it** closes the native Question.
+**Ask a follow-up** sends Your words to the same owner with a new reply token for the same key.
+The Your words placeholder names **Ask a follow-up** as the action that sends the text.
+The Question waits for that reply, then returns as a Response with the same key.
+Both actions retain the current filters.
 Changes offer Works and Does not work in the closing group.
 Ask showrunner to check, Ask question and Send feedback transfer the change to the showrunner.
 Investigations offer Mark read and Send feedback in that group.
@@ -1586,16 +1604,33 @@ Tests use a zero pause.
 Each round sends once to every recipient that has not succeeded.
 The server pauses once between rounds and retries only failed recipients.
 The showrunner receives its first attempt before any recipient receives a second attempt.
-A `QUEUED:` result with exit 1 counts as kept; a `KEPT:` result with exit 0 also counts as kept.
-Other nonzero exits fail.
-After all tries fail for a recipient, the server sends one alert to the row's showrunner, with no alert retries.
+Review uses the record and saved attempt to identify each message.
+Retries and recovery use the same key for each staff recipient.
+List feedback uses its saved request ID.
+Image feedback uses the image registration, action, and feedback to identify the attempt.
+The server saves the answered question IDs before the first send.
+A retry hides the image only if no new question answer has arrived.
+A skipped send can save the feedback mark after a failed write.
+`QUEUED` and `KEPT` count as kept.
+`SKIPPED` confirms that the sender already accepted the key.
+For a Review send, `PENDING` means the message may have arrived.
+Codex queue retries reuse the same client message ID.
+A timeout before the queue request reaches the socket is a definite failure.
+The server stops delivery for that recipient.
+After all tries fail, the server alerts the showrunner who owns the item's tab.
+For a Review producer tab without a showrunner, the server uses the configured routing alert showrunner.
+For a List question, the item owner determines the alert route.
+If the showrunner is the failed recipient, the server records the failure without sending an alert.
 The alert names the list, row, recipient, number of tries, and last error.
 It states that the user's answer is saved and requests a manual handoff.
-If the alert fails, the server prints one line to stderr and stops.
+Each saved alert has its own key.
+Recovery uses that key again if the server cannot clear an alert after sending it.
 The user receives no delivery alert.
 
 At startup, the server delivers pending records with the same retry and alert rules.
 Recovery preserves attempts that a live request owns.
+It resumes a List or Images question if the saved sender released its lock during delivery.
+It reuses the question's message ID.
 Recovery scans each review list once and finds each record through `change_routing.delivery_path`.
 It ignores the `page` field in legacy records.
 The browser and recovery use `StaffRouting.owner_and_production` for the same owner and production document.

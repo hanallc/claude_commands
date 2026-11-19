@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import unittest
 from typing import override
+from urllib.parse import urlencode
+from uuid import uuid4
 
-from scripts.production import investigation, update_registration
+from scripts.agents.remote import local_machine
+from scripts.production import investigation, staff, update_registration
 from scripts.production import test_waiting_why as fixtures
-from scripts.review_links import change_page, review_actions, review_items
+from scripts.review_links import change_browser, change_page, new_item_dialog, review_actions, review_items, review_page, review_submissions
 
 
 class WaitingActionTests(unittest.TestCase):
@@ -19,6 +22,15 @@ class WaitingActionTests(unittest.TestCase):
         self.fixture.setUp()
 
     def test_user_question_automatically_stores_its_text_for_each_type(self) -> None:
+        doc = self.fixture.fixture.production
+        _ = doc.write_text(doc.read_text() + '\n> **Status: PRODUCTION — running.**\n')
+        recipient = staff.snapshot().by_doc(local_machine(), doc)
+        assert recipient is not None
+        request = new_item_dialog.NewItemRequest(f'r1-{uuid4().hex}-question-{recipient.id}',
+            new_item_dialog.SubmissionKind.QUESTION, recipient.id, 'What caused this?', new_item_dialog.NoEvidence())
+        sent = review_submissions.submit(request)
+        self.assertTrue(review_submissions.answer(sent.key, 'The cause is known.', sent.reply_token))
+
         owner = self.fixture.fixture.unit.id
         for report_kind in investigation.InvestigationKind:
             record = investigation.file(owner, f'Check the {report_kind}', 'What caused this?',
@@ -32,12 +44,17 @@ class WaitingActionTests(unittest.TestCase):
                 if kind == review_items.ReviewType.CHANGE:
                     _ = status.ask(self.fixture.fixture.page, 'C1', words)
                 elif kind == review_items.ReviewType.QUESTION:
-                    from scripts.review_links import change_browser
                     browser = change_page.ReviewBrowser('private', kind='questions')
                     question = next(value for value in change_browser.prepare(browser, status).questions if value.key == item.key)
                     identities = update_registration.QuestionStaff.read()
                     scope = update_registration.question_scope(item.owner, identities.record)
                     _ = change_browser.save_outcome(scope, question, 'question', words, identities)
+                elif kind == review_items.ReviewType.RESPONSE:
+                    folder = change_page.console_folder(self.fixture.root)
+                    browser = change_page.ReviewBrowser(*change_browser.browser_manifest(folder))
+                    body = urlencode({'row': item.key, 'token': change_browser.row_token(browser, item.key),
+                                      'outcome': 'question', 'feedback': words})
+                    _ = review_page.submit(self.fixture.root, body, status)
                 elif isinstance(item.source, review_items.InvestigationSource):
                     _ = review_actions.investigation_action(item, 'question', words, status)
                 else:

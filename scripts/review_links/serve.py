@@ -1112,7 +1112,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         result: dict[str, object] = {'answer':saved.answer, 'version':saved.version}
         if isinstance(saved.item, review_items.ReviewItem):
             later = saved.item.times.later
-            result.update(state=saved.item.state, later=0 if isinstance(later, review_items.NoLaterTime) else later.timestamp()*1000)
+            result.update(state=saved.item.state, type=saved.item.type,
+                          later=0 if isinstance(later, review_items.NoLaterTime) else later.timestamp()*1000)
         try:
             self.json_response(200, result)
         finally:
