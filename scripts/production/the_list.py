@@ -1971,8 +1971,7 @@ def _send_assignment_notice(recipient: staff.StaffRow, text: str) -> None:
     command = session_send.send_argv("--to", recipient.id, "--recipient-kind", recipient.kind,
                                      "--from", "morty", "--text", text)
     result = subprocess.run(command, capture_output=True, text=True, check=False)
-    outcome = send_result.send_outcome(result.returncode, result.stdout)
-    if isinstance(outcome, send_result.ConfirmedSendOutcome) and outcome.header.outcome in ("sent", "skipped"):
+    if send_result.delivered_or_kept(result.returncode, result.stdout, accept_skipped=True):
         return
     raise ListError((result.stderr or result.stdout).strip() or "message delivery failed")
 

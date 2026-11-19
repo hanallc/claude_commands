@@ -1700,6 +1700,19 @@ def record_acceptance(message: Message, at: datetime) -> None:
             state["last"][message.to] = at.isoformat()
 
 
+def record_released_acceptances(held: tuple[review_hold.ReviewMessage, ...], recipient: StableRecipient, at: datetime) -> None:
+    """Start the repeat window for each held key when the list reaches the recipient."""
+    keyed = [(item.key, item.key_recipient or recipient.value) for item in held if item.key]
+    if not keyed:
+        return
+    with key_states() as states:
+        for key, address in keyed:
+            state = states.setdefault(key, {"last": {}})
+            last = state["last"].get(address)
+            if last is None or datetime.fromisoformat(last) < at:
+                state["last"][address] = at.isoformat()
+
+
 @dataclass(frozen=True)
 class ClaimGranted:
     """This attempt can deliver the message."""
@@ -5233,7 +5246,8 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
     review_route: review_hold.OpenReview | review_hold.AlreadyKeptForReview | review_hold.ReleasedMessages
     review_route = review_hold.ReleasedMessages(())
     review_error = ""
-    review_message = review_hold.ReviewMessage(display, started.timestamp(), text, sender_native_id(stamp), key or "")
+    review_message = review_hold.ReviewMessage(display, started.timestamp(), text, sender_native_id(stamp),
+                                               key=key or "", key_recipient=stable.value if key is not None else "")
     if (isinstance(claim_result, ClaimGranted) and not isinstance(options.sender_origin, ForwardedSender)):
         if isinstance(route, (ClaudeRecipient, QueuedStaffRecipient)):
             if not isinstance(recipient, (NoRelayReplyMailbox, RelayProcessRecipient)):
@@ -5424,9 +5438,6 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
             else:
                 result = relay_with_claim(relay_message, options.timeout, postmaster_identity, entry_id)
                 log_route = ClaudeRoute("relay", "unresolved", time.monotonic() - claude_started)
-    if isinstance(review_route, review_hold.ReleasedMessages) and review_text:
-        review_route.accepted = (isinstance(result, PaneTextDelivered) if isinstance(route, PaneWorkerRecipient)
-                                 else result.outcome in ("sent", "queued"))
     if result.outcome == "sent" and message.key is not None:
         addresses = ((native_address,) if isinstance(plan, RelayAttempt) and native_address
                      else () if isinstance(plan, RelayAttempt)
@@ -5452,6 +5463,12 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
               and not isinstance(result, RecordedDeliveryAcceptance)
               and result.outcome in {"sent", "queued", "kept", "replaced", "skipped"}):
             accept_sent(key, attempt_recipient.value, started, delivered=result.outcome == "sent")
+    if isinstance(review_route, review_hold.ReleasedMessages) and review_route.held:
+        accepted = (isinstance(result, PaneTextDelivered) if isinstance(route, PaneWorkerRecipient)
+                    else result.outcome in ("sent", "queued"))
+        if accepted:
+            record_released_acceptances(review_route.held, stable, started)
+            review_route.accepted = True
     if message.to == USER and (result.outcome == "failed" or (result.outcome == "held" and isinstance(result.failure, FailedPush))):
         result = user_failure(message, options.action, result, options.need, options.text_id)
     reported_to = native_address if isinstance(plan, SessionIdWithoutLiveRecipient) else message.to

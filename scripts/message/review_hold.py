@@ -25,6 +25,7 @@ class ReviewMessage:
     text: str
     native_id: str = "unavailable"
     key: str = ""
+    key_recipient: str = ""
 
 
 class EndedReview(Enum):
@@ -40,6 +41,7 @@ class ReviewState:
 @dataclass
 class ReleasedMessages:
     messages: tuple[ReviewMessage, ...]
+    held: tuple[ReviewMessage, ...] = ()
     accepted: bool = False
 
 
@@ -102,7 +104,8 @@ def _read_state(count: Path, path: Path) -> ReviewState:
     messages = cast(list[dict[str, str | float]], value["messages"])
     return ReviewState(activity, tuple(
         ReviewMessage(str(item["sender"]), float(item["sent"]), str(item["text"]),
-                      str(item.get("native_id", "unavailable")), str(item.get("key", "")))
+                      str(item.get("native_id", "unavailable")), str(item.get("key", "")),
+                      str(item.get("key_recipient", "")))
         for item in messages))
 
 
@@ -214,7 +217,8 @@ def route(session: str, message: ReviewMessage, *, urgent: bool) -> Generator[Op
                 _write_state(path, ReviewState(EndedReview.HOLD_ENDED, state.messages))
                 if state.messages:
                     repeated = message.key and any(item.key == message.key for item in state.messages)
-                    batch = ReleasedMessages(state.messages if repeated and not urgent else (*state.messages, message))
+                    messages = state.messages if repeated and not urgent else (*state.messages, message)
+                    batch = ReleasedMessages(messages, held=state.messages)
                     yield batch
                     if batch.accepted:
                         try:

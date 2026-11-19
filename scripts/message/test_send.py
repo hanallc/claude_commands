@@ -2086,6 +2086,31 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertIn("\n   > Sender native id: session:spoof", wire)
         review_hold.set_count("recipient", 0, after_idle.timestamp(), self.fail)
 
+    def test_released_review_keys_start_a_new_repeat_window_for_each_original_recipient(self) -> None:
+        self.session("recipient", "Recipient")
+        _ = write_send_config(self.root / "config/send.conf", "review_hold_idle_minutes=1")
+        at = send.now()
+        review_hold.set_count("recipient", 3, at.timestamp(), self.fail)
+        held_options = [
+            local_options(["--to", address, "--from", "test", "--text", words, "--key", key, "--repeat-minutes", "60"])
+            for address, words, key in (("recipient", "Held staff update.", "staff-update"),
+                                        ("session:recipient", "Held session update.", "session-update"))
+        ]
+        with mock.patch.object(send, "now", return_value=at):
+            for options in held_options:
+                self.assertEqual(send.send(options).outcome, "kept")
+        released_at = at + timedelta(minutes=61)
+        with mock.patch.object(send, "now", return_value=released_at):
+            result = send.send(local_options(["--to", "session:recipient", "--from", "test", "--text", "Release the list."]))
+            self.assertEqual(result.outcome, "sent", result.detail)
+        self.assertEqual(len(self.relayed), 1)
+        self.assertIn("Held staff update.", self.relayed[0].text)
+        self.assertIn("Held session update.", self.relayed[0].text)
+        with mock.patch.object(send, "now", return_value=released_at + timedelta(minutes=1)):
+            for options in held_options:
+                self.assertEqual(send.send(options).outcome, "skipped")
+        self.assertEqual(len(self.relayed), 1)
+
     def test_review_holds_stall_watch_and_send_later_timer_prompts(self) -> None:
         self.session("recipient", "Recipient")
         at = send.now()
