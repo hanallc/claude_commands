@@ -83,6 +83,8 @@ class SessionMoveTests(unittest.TestCase):
 
         self.assertEqual(status, 0, errors)
         self.assertIn(f"copy 16 bytes {source} -> {target / self.claude / self.project / source.name} (.id index)", output)
+        self.assertEqual(output.splitlines()[-1],
+                         "session_move: would move 1 folders (0.00 GiB), kept 0 live, refused 0 other")
         self.assertTrue(source.is_dir())
         self.assertEqual(list(target.iterdir()), [])
         self.assertFalse((self.root / session_folder.LOCK).exists())
@@ -107,7 +109,9 @@ class SessionMoveTests(unittest.TestCase):
                 self.assertIn(f"{nested}: open scratch hold, owner holder", errors)
                 self.assertIn(f"{former_scratch}: open scratch hold, owner holder", errors)
                 self.assertEqual(errors.count("an unreleased hold keeps its folder behind"), 1)
-                self.assertEqual(output, "")
+                action = "would move" if args else "moved"
+                self.assertEqual(output,
+                                 f"session_move: {action} 0 folders (0.00 GiB), kept 0 live, refused 2 other\n")
                 self.assertEqual(self.holds.read_bytes(), before)
                 self.assertEqual((former_scratch / "note").read_bytes(), b"hold contents")
                 self.assertEqual((nested / "note").read_bytes(), b"hold contents")
@@ -149,7 +153,9 @@ class SessionMoveTests(unittest.TestCase):
             with self.subTest(args=args):
                 status, output, errors = self.invoke(*args)
                 self.assertEqual(status, 1)
-                self.assertEqual(output, "")
+                action = "would move" if args else "moved"
+                self.assertEqual(output,
+                                 f"session_move: {action} 0 folders (0.00 GiB), kept 0 live, refused 1 other\n")
                 self.assertIn(f"{archive}: zstd decompression failed", errors)
                 self.assertTrue(source.is_dir())
                 self.assertFalse((self.root / "archive").exists())
@@ -181,7 +187,8 @@ class SessionMoveTests(unittest.TestCase):
         self.assertTrue(stat.S_ISFIFO((target / "queue").lstat().st_mode))
         self.assertEqual(sibling.read_text(encoding="utf-8"), "keep")
         status, output, errors = self.invoke()
-        self.assertEqual((status, output), (0, ""))
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(output, "session_move: moved 0 folders (0.00 GiB), kept 0 live, refused 0 other\n")
         self.assertIn(str(sibling), errors)
 
     def test_failed_sha256_check_keeps_source_and_removes_stage(self) -> None:
@@ -243,8 +250,10 @@ class SessionMoveTests(unittest.TestCase):
                     try:
                         self.assertTrue(select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)[0])
                         self.assertEqual(child.stdout.readline(), b"ready\n")
-                        status, _output, errors = self.invoke()
-                        self.assertEqual(status, 1)
+                        status, output, errors = self.invoke()
+                        self.assertEqual(status, 0, errors)
+                        self.assertEqual(output,
+                                         "session_move: moved 0 folders (0.00 GiB), kept 1 live, refused 0 other\n")
                         self.assertIn(f"process {child.pid}", errors)
                         self.assertTrue(source.exists())
                         self.assertFalse(target.exists())
@@ -340,8 +349,10 @@ with (mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapsho
         self.assertFalse((source / "draft.md").exists())
         self.assertEqual((target / "draft.md").read_bytes(), b"scratch content\n")
 
-        status, _, errors = self.invoke()
+        status, output, errors = self.invoke()
         self.assertEqual(status, 0, errors)
+        self.assertEqual(output.splitlines()[-1],
+                         "session_move: moved 1 folders (0.00 GiB), kept 0 live, refused 0 other")
         self.assertFalse(source.exists())
         self.assertEqual((target / "first").read_bytes(), b"another file")
 
@@ -419,14 +430,20 @@ with (mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapsho
     def test_idle_registered_session_keeps_its_scratchpad(self) -> None:
         source = self.leaf("idle")
         target = self.index("idle", "demo") / self.claude / self.project / "idle"
+        movable = self.leaf("movable")
+        moved = self.index(movable.name, "demo") / self.claude / self.project / movable.name
 
         with mock.patch.object(session_records, "read_registry", return_value=self.live_registry("idle")):
-            status, _, errors = self.invoke()
+            status, output, errors = self.invoke()
 
-        self.assertEqual(status, 1)
+        self.assertEqual(status, 0, errors)
         self.assertIn("session idle is live", errors)
         self.assertTrue((source / "draft.md").exists())
         self.assertFalse(target.exists())
+        self.assertFalse(movable.exists())
+        self.assertEqual((moved / "draft.md").read_bytes(), b"scratch content\n")
+        self.assertEqual(output.splitlines()[-1],
+                         "session_move: moved 1 folders (0.00 GiB), kept 1 live, refused 0 other")
         status, _, errors = self.invoke()
         self.assertEqual(status, 0, errors)
         self.assertTrue(target.is_dir())
@@ -448,10 +465,13 @@ with (mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapsho
 
         with (mock.patch.object(session_records, "read_registry", side_effect=lambda: registry),
               mock.patch.object(session_move, "read_manifest", side_effect=resume_during_scan)):
-            status, _, errors = self.invoke()
+            status, output, errors = self.invoke()
 
         self.assertEqual(status, 1, errors)
+        self.assertEqual(output.splitlines()[-1],
+                         "session_move: moved 0 folders (0.00 GiB), kept 0 live, refused 1 other")
         self.assertIn(f"session {source.name} is live", errors)
+        self.assertTrue((self.root / session_move.JOURNAL / session_move.MOVE_RECORD).is_file())
         self.assertEqual((source / "draft.md").read_bytes(), b"scratch content\n")
         self.assertEqual((target / "draft.md").read_bytes(), b"scratch content\n")
 
