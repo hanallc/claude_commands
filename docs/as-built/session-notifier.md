@@ -317,7 +317,10 @@ Both modes keep folders with a running session or an active process when they ch
 The real run checks again after it writes the session index and just before it saves the journal.
 If that check finds a live source, the next run can reuse its index entry.
 Both modes continue with other candidates and return status 0 if they only skip live entries before copying.
-A destination conflict or a failed copy stops a real run and returns status 1.
+Both modes keep entries that fail a check before writing and continue in the same order.
+A destination conflict found during these checks counts as a refusal.
+The command returns status 1 if it records a refusal.
+An error after the move starts writing stops the real run.
 The dry run reads the session index and folder records without creating a preview directory.
 It reads compressed transcripts through a pipe.
 The command checks the scratchpad copy after it scans the source for deletion.

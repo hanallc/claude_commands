@@ -1,6 +1,7 @@
 """Check the cutover with private roots and one live process."""
 from __future__ import annotations
 
+from collections.abc import Sequence
 from contextlib import redirect_stderr, redirect_stdout
 import ctypes
 import io
@@ -17,6 +18,7 @@ import unittest
 from unittest import mock
 from typing import cast, override
 
+from scripts.disks import measure
 from scripts.lib import copy_record, scratch, session_folder, session_move
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.transcript_test_support import compressed_copy
@@ -89,6 +91,79 @@ class SessionMoveTests(unittest.TestCase):
         self.assertEqual(list(target.iterdir()), [])
         self.assertFalse((self.root / session_folder.LOCK).exists())
         self.assertFalse(self.holds.with_name(self.holds.name + ".lock").exists())
+
+    def test_real_run_moves_both_entries_after_a_missing_transcript(self) -> None:
+        refused = self.leaf("a-missing-transcript")
+        first = self.leaf("b-movable")
+        second = self.leaf("c-movable")
+        folder = self.index(first.name, "demo")
+        _ = self.index(second.name, folder.name)
+        target = folder / self.claude / self.project
+
+        status, output, errors = self.invoke()
+
+        self.assertEqual(status, 1, errors)
+        self.assertIn(f"{refused.name}: no working folder in a transcript", errors)
+        self.assertEqual((refused / "draft.md").read_bytes(), b"scratch content\n")
+        self.assertEqual(output.splitlines()[-1],
+                         "session_move: moved 2 folders (0.00 GiB), kept 0 live, refused 1 other")
+        for source in (first, second):
+            self.assertFalse(source.exists())
+            self.assertEqual((target / source.name / "draft.md").read_bytes(), b"scratch content\n")
+
+    def test_publish_error_keeps_the_pending_copy_and_stops(self) -> None:
+        source = self.leaf("a-copy")
+        waiting = self.leaf("b-waiting")
+        folder = self.index(source.name, "demo")
+        _ = self.index(waiting.name, folder.name)
+        target = folder / self.claude / self.project / source.name
+        sync = os.fsync
+
+        def fail_publication_sync(fd: int) -> None:
+            if target.is_dir() and os.path.samestat(os.fstat(fd), target.parent.stat()):
+                raise OSError("cannot sync the published copy")
+            sync(fd)
+
+        with mock.patch.object(os, "fsync", side_effect=fail_publication_sync):
+            status, output, errors = self.invoke()
+
+        self.assertEqual(status, 1, errors)
+        self.assertIn(f"kept {source}: cannot sync the published copy", errors)
+        self.assertEqual(output.splitlines()[-1],
+                         "session_move: moved 0 folders (0.00 GiB), kept 0 live, refused 1 other")
+        self.assertEqual((source / "draft.md").read_bytes(), b"scratch content\n")
+        self.assertEqual((target / "draft.md").read_bytes(), b"scratch content\n")
+        self.assertTrue((self.root / session_move.JOURNAL / session_move.MOVE_RECORD).is_file())
+        self.assertTrue(waiting.is_dir())
+        self.assertFalse((target.parent / waiting.name).exists())
+
+    def test_read_error_leaves_dry_and_real_counts_and_order_equal(self) -> None:
+        first = self.leaf("a-movable")
+        refused = self.leaf("b-unreadable")
+        last = self.leaf("c-movable")
+        for source in (first, refused, last):
+            _ = self.index(source.name, "demo")
+        tree_size = session_move.tree_size
+
+        def size(source: Path, mounts: Sequence[measure.Mount]) -> int:
+            if source == refused:
+                raise PermissionError("cannot read scratchpad")
+            return tree_size(source, mounts)
+
+        with mock.patch.object(session_move, "tree_size", side_effect=size):
+            dry_status, dry_output, dry_errors = self.invoke("--dry-run")
+            real_status, real_output, real_errors = self.invoke()
+
+        self.assertEqual(dry_status, 1, dry_errors)
+        self.assertEqual(real_status, 1, real_errors)
+        self.assertIn(f"kept {refused}: cannot read scratchpad", dry_errors)
+        self.assertEqual(real_errors, dry_errors)
+        self.assertEqual(real_output, dry_output.replace("would move", "moved"))
+        self.assertEqual(real_output.splitlines()[-1],
+                         "session_move: moved 2 folders (0.00 GiB), kept 0 live, refused 1 other")
+        self.assertIn(str(first), real_output.splitlines()[0])
+        self.assertIn(str(last), real_output.splitlines()[1])
+        self.assertTrue(refused.is_dir())
 
     def test_open_holds_report_the_owner_and_keep_the_tree_until_release(self) -> None:
         source = self.leaf("held")

@@ -50,6 +50,10 @@ class JournaledLiveSource(LiveSource):
     """A live source has a saved copy journal."""
 
 
+class CopyWriteFailed(RuntimeError):
+    """A write can have changed the destination or the source."""
+
+
 @dataclass
 class MoveSummary:
     moved_folders: int = 0
@@ -180,10 +184,10 @@ class DestinationNames:
         folder = session_folder.select_folder(self.root, base, session_id)
         return SessionDestination(folder, rule, session_id, owner)
 
-    def remember(self, name: SessionDestination, root_fd: int) -> None:
+    def remember(self, name: SessionDestination, root_fd: int, mount: int) -> None:
         session_id = name.session_id
-        mount = mount_identity(root_fd)
-        with child_directory(root_fd, session_folder.INDEX, create=True, mount=mount) as index:
+        creates_index_entry = name.rule is not NamingRule.INDEX
+        with child_directory(root_fd, session_folder.INDEX, create=creates_index_entry, mount=mount) as index:
             if name.rule is NamingRule.INDEX or stat_at(index, session_id) is not None:
                 check_index_link(index, session_id, name.folder)
             if name.rule is NamingRule.INDEX:
@@ -1066,18 +1070,30 @@ def kept(source: Path, reason: object) -> None:
     print(f"session_move: kept {source}: {reason}", file=sys.stderr, flush=True)
 
 
-def start_copy(move: PlannedCopy, roots: MoveRoots, root_fd: int, session_pids: frozenset[int]) -> int:
-    with (child_directory(root_fd, JOURNAL, create=True, mount=mount_identity(root_fd)) as journal,
-          source_parent(roots, move) as source):
+def start_copy(move: PlannedCopy, name: SessionDestination, names: DestinationNames,
+               roots: MoveRoots, root_fd: int, session_pids: frozenset[int]) -> int:
+    mount = mount_identity(root_fd)
+    with source_parent(roots, move) as source:
         with child_directory(source, move.source.name, mount=mount_identity(source)) as original:
             identity = FolderIdentity.of(os.fstat(original))
-        job = MoveJournal(move, identity, CopyInProgress())
+    job = MoveJournal(move, identity, CopyInProgress())
+    writes_started = name.rule is not NamingRule.INDEX
+    try:
+        names.remember(name, root_fd, mount)
         check_copy_idle(move.source, session_pids)
-        job.save(journal)
-        try:
-            return resume_copy(job, journal, roots, root_fd, session_pids)
-        except LiveSource as error:
-            raise JournaledLiveSource(str(error)) from error
+        writes_started = True
+        with child_directory(root_fd, JOURNAL, create=True, mount=mount) as journal:
+            job.save(journal)
+            try:
+                return resume_copy(job, journal, roots, root_fd, session_pids)
+            except LiveSource as error:
+                raise JournaledLiveSource(str(error)) from error
+    except LiveSource:
+        raise
+    except (MoveRefused, OSError) as error:
+        if writes_started:
+            raise CopyWriteFailed(str(error)) from error
+        raise
 
 
 def move_candidates(roots: MoveRoots, root_fd: int, names: DestinationNames, holds: tuple[OpenScratchHold, ...],
@@ -1139,22 +1155,19 @@ def move_candidates(roots: MoveRoots, root_fd: int, names: DestinationNames, hol
             name = names.destination(leaf.source.name)
             move = PlannedCopy(leaf.source, name.folder / leaf.relative, name.rule, name.session_id)
             size = tree_size(move.source, mounts)
-            show_copy(move, size)
             check_destination(root_fd, roots.sessions, move.target, destinations)
+            show_copy(move, size)
             if not dry_run:
-                names.remember(name, root_fd)
-                size = start_copy(move, roots, root_fd, session_pids)
+                size = start_copy(move, name, names, roots, root_fd, session_pids)
             destinations.add(move.target)
             summary.record_move(size)
-        except LiveSource as error:
-            journaled = isinstance(error, JournaledLiveSource)
-            summary.keep_live(leaf.source, error, journaled=journaled)
-            if journaled:
-                return
-        except (MoveRefused, OSError) as error:
-            kept(leaf.source, error)
-            summary.refused_other += 1
-            if not dry_run:
+        except (MoveRefused, OSError, CopyWriteFailed) as error:
+            if isinstance(error, LiveSource):
+                summary.keep_live(leaf.source, error, journaled=isinstance(error, JournaledLiveSource))
+            else:
+                kept(leaf.source, error)
+                summary.refused_other += 1
+            if isinstance(error, (JournaledLiveSource, CopyWriteFailed)):
                 return
 
 
