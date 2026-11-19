@@ -715,7 +715,10 @@ A batch can contain one item.
 
 1. Take the production merge lock once. While it holds the lock, `land_runs.landing` records every item's commit, so the units board says `waiting on running checkpoint`; a single land records its one commit the same way.
    Each item that lands or stops adds a row to `land_results.jsonl` (`land_runs.record_result`); the board shows the newest row of a checkpoint that has not landed.
-2. Resume each item that the merge branch already contains through the single command's route, in file order.
+2. Record the starting tip and the ordered unit, phase, and commit of every item in Git's internal directory.
+   While the stopped batch has unpushed merges, accept only the same ordered items.
+   To change the batch, reset the merge branch to its pushed tip, then start a fresh batch.
+   Resume each item that the merge branch already contains through the single command's route, in file order.
 3. Retain the starting tip and whether a merge is unfinished.
 4. Check each remaining item and make its own merge commit.
 5. Test all code paths changed from the published merge branch tip through HEAD once.

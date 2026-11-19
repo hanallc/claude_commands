@@ -11,7 +11,7 @@ import unittest
 from typing import final
 from unittest.mock import patch
 
-from scripts.production import staff
+from scripts.production import merge_checkpoint, staff
 from scripts.production.staff_test_support import recorded_showrunner, unit_membership
 from scripts.lib import atomic_file
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -406,6 +406,30 @@ raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
         self.assertEqual(self.git("rev-parse", "HEAD"), start)
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
 
+    def test_a_changed_batch_cannot_resume_unpushed_merges_but_the_same_batch_can(self) -> None:
+        start = self.git("rev-parse", "HEAD")
+        first = self.checkpoint(content="alpha batch change\n")
+        second = self.beta_checkpoint("src/beta.txt", "beta batch change\n")
+        original = self.batch_line("alpha", "2", first)
+        self.executable(self.bin / "checkpoint-test", STUB + "raise KeyboardInterrupt\n")
+        with self.assertRaises(KeyboardInterrupt):
+            _ = self.land_batch([original])
+        unpublished = self.git("rev-parse", "HEAD")
+        self.assertEqual(self.git("rev-parse", "HEAD^2"), first)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
+        self.executable(self.bin / "checkpoint-test", STUB)
+
+        changed = self.land_batch([original, self.batch_line("beta", "2", second)])
+        self.assertEqual(changed.returncode, 1, changed.stdout + changed.stderr)
+        self.assertIn("reset the merge branch to its pushed tip, then start a fresh batch", changed.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD"), unpublished)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
+
+        same = self.land_batch([original])
+        self.assertEqual(same.returncode, 0, same.stdout + same.stderr)
+        self.assertIn("batch: resume — alpha phase 2 is already merged", same.stdout)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), unpublished)
+
     def test_red_package_drops_only_the_item_that_selects_its_command(self) -> None:
         for interrupted, shrink, shared_red, probe_case in ((False, False, False, ""), (True, False, False, ""),
                                                            (True, True, False, ""), (False, False, True, ""),
@@ -426,16 +450,25 @@ raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
                     else:
                         second = self.beta_checkpoint("src/beta.txt", "beta batch change\n")
                         second_line = self.batch_line("beta", "2", second)
-                    self.executable(self.bin / "checkpoint-test", STUB + "raise KeyboardInterrupt\n")
-                    with self.assertRaises(KeyboardInterrupt):
-                        _ = self.land_batch([self.batch_line("alpha", "2", first)])
+                    lines = [self.batch_line("alpha", "2", first), second_line]
+                    merge = merge_checkpoint.merge
+
+                    def stop_before_second(request: merge_checkpoint.MergeRequest) -> str:
+                        if request.commit == first:
+                            return merge(request)
+                        raise KeyboardInterrupt
+
+                    with (patch.object(merge_checkpoint, "merge", side_effect=stop_before_second),
+                          self.assertRaises(KeyboardInterrupt)):
+                        _ = self.land_batch(lines)
                     unpublished = self.git("rev-parse", "HEAD")
                     self.assertNotEqual(unpublished, start)
                     self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
                     self.assertEqual(self.git("rev-parse", "HEAD^2"), first)
-                    self.executable(self.bin / "checkpoint-test", STUB)
+                    self.assertEqual(self.events("verify.sh"), [])
+                    self.assertEqual(self.events("checkpoint-test"), [])
                     (self.state / "fail-always-test-alpha-proof").touch()
-                    result = self.land_batch([self.batch_line("alpha", "2", first), second_line])
+                    result = self.land_batch(lines)
                     # The merged alpha item resumes alone: its red tests undo its unpushed merge.
                     self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                     self.assertNotIn("resume it alone with the single command", result.stdout)
@@ -458,8 +491,8 @@ raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
                             self.assertEqual(self.git("rev-parse", branch, cwd=self.origin), tip)
                         self.assertEqual([row["source_checkpoint"] for row in self.receipts()], [second])
                     self.assertNotEqual(self.git("rev-parse", "HEAD"), unpublished)
-                    self.assertEqual(self.events("verify.sh"), [["test", "alpha-proof"]] * 3)
-                    self.assertEqual(self.events("checkpoint-test"), [[]] * (2 if shrink else 3))
+                    self.assertEqual(self.events("verify.sh"), [["test", "alpha-proof"]] * 2)
+                    self.assertEqual(self.events("checkpoint-test"), [[]] * (1 if shrink else 2))
                 elif probe_case == "main":
                     self.promotions = str(self.promote)
                     self.production_doc()

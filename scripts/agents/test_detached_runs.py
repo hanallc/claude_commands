@@ -2217,6 +2217,29 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIn(f"Detached run: {record['run_id']}", text)
         self.assertIn("Private land completed.", text)
 
+    def test_a_showrunner_starts_a_new_session_and_hears_its_result(self) -> None:
+        showrunner, = staff.snapshot().find(kind="showrunner")
+        run_dir = self.fixture.root / "showrunner-state"
+        with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": showrunner.current_session}),
+              patch.object(treekey, "tree_key", return_value="private-tree"),
+              patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=0)) as spawn,
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(detached_runs.main(["start", "--session-dir", str(run_dir), "--", "private-land"]),
+                             0, output.getvalue())
+        spawn.assert_called_once()
+        self.assertIs(cast(object, spawn.call_args.kwargs["start_new_session"]), True)
+        path, = (run_dir / detached_runs.DETACHED_RUNS_DIR).glob("*.json")
+        record = cast(detached_runs.RunRecord, json.loads(path.read_text()))
+        self.assertEqual((record["session_dir"], record["worker"], record["staff_id"], record.get("pane_dispatch_id")),
+                         (str(run_dir), showrunner.name, showrunner.id, ""))
+        write_text_atomic(Path(record["log"]), "Private land completed.\n")
+        self.assertIn("sent", detached_runs.deliver(record, detached_runs.CompletedCommand(0)))
+        self.assertEqual(self.inputs, [])
+        (target, message), = self.notices
+        self.assertEqual(target, showrunner.name)
+        self.assertIn(f"Detached run: {record['run_id']}", message)
+        self.assertIn("Private land completed.", message)
+
     def test_a_pane_workers_run_keeps_its_owner_when_options_name_another_worker(self) -> None:
         row = self.fixture.worker("TEST-command-owner", family="codex")
         other = self.fixture.worker("TEST-impl", family="codex")
