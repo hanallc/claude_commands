@@ -3155,22 +3155,27 @@ Out of scope: the Hana CI CPU cap (nixos; builds sends it to natedev) and a toke
 ### Phase 44dg — Other claude_commands tests wait while natemerge merges  · status: todo
 **From builds (item 140, replaces 44df), 2026-11-19.** nate, 13:28 EST: "anytime natemerge needs to run - everyone else needs to wait" and "the tests that were running that i asked to have cancelled should get to go first after natemerge finishes its work". nate approved the rule, 15:22 EST: "yes that rule is fine but it only applies to natedev not to aws". The key name needs nate's go before merge (bob asks).
 
+**Decision (bob, item 140, 16:04 EST, on nate 16:02 EST):** nate: "it was part of our change to provide better names - it was supposed to replace the old merge term - and then test all would simply mean a full test run - i think natemerge is SUPPOSED to use it". A landing's tests show as integrate. The job comes from the landing check (lineage to a live land record, natemerge staff identity), not from arguments. The dead merge form of merge_gate.py goes. No new name and no config key change for names. The build log has no integrate run since 2026-10-01 (all 1114 gate_run rows are tests-only).
+
 Rule: while a claude_commands landing test runs or is about to start, the queue starts no other claude_commands test on natedev. Started runs continue. Held runs start in arrival order when the landing ends. A step placed on AWS is not held. Hana Rust steps are not held.
 
 Work:
 1. Runner lease (scripts/production/land_queue.py): `next` writes ~/.local/state/merge-gate/runner.json with the caller's runner pid and start time, and `taking` when it returns an item or `empty` when the line is empty.
 2. Landing signal (scripts/production/land_runs.py): `landing_active()` is on when a live land record exists (running_lands), or when the lease process is alive and its state is `taking`. A dead runner frees the queue at once. A line with items and no live runner does not hold.
-3. Queue (scripts/build_queue/admission_service.py): while the signal is on, the admission walk starts no natedev step whose repository and step are in the key, except the landing's own test (44cy LandingTest). Held waiters keep their places. An AWS placement is not held.
+3. Queue (scripts/build_queue/admission_service.py): while the signal is on, the admission walk starts no other claude_commands test on natedev. An integrate job never waits. Held waiters keep their places. An AWS placement is not held.
 4. A held waiter's wait reason reads "waits for natemerge's landing" in verify.sh and on the Builds page.
-5. One on/off key in config/build_admission.conf (name pending nate's go; suggested `landing_wait=on`). No job-name list: natemerge's landing test is merge_gate.py --tests-only (test all), so a name list would hold natemerge itself. A waiter whose session is in natemerge's staff chain never waits; this covers the runner's tests (inside land_runs.landing()) and natemerge's hand runs. Every other claude_commands waiter on natedev waits, nightly and fast-track included. Off turns the rule off.
+5. One on/off key in config/build_admission.conf (name pending nate's go). No job-name list. Off turns the rule off.
 6. Update the as-built text (build-memory-admission.md, the land line doc).
+8. Job name (scripts/lib/build_steps.py and its readers): one landing check names a test run integrate when its process lineage reaches a live land record and the land's session is natemerge's staff identity. The three landing runs show as integrate: the first full run, the named-module run on the base after a red result, and the repeat full run. Every other --tests-only run shows test all or test named. Every reader that names a running job (admission service, memory feed, slot wait, copies, first step) uses that one check. 44cy's LandingTest uses the same check.
+9. Delete the dead merge form of merge_gate.py: merge_checkpoint(), rollback_merge(), check_local_doc_commits() and DOC_COMMIT_HEAD, checkpoint_retry_origin(), its notify_style(), the GateRecovery merge rollback, the checkpoint source, and the arguments only it reads, with its tests. Keep about.integrate true for what merge_checkpoint.py does. Correct docs/as-built/merge-gate-and-test-speed.md in the same commit.
+10. Landings outside the line (cargo-liner, spacetime, Hana): report the job name their landing tests show today.
 7. After merge, natemerge removes hold_begin, hold_end and hold_off from its runner; the build_hold drain is no longer used for landings.
 
-Tests (each failing first): a landing holds an ordinary claude_commands test; the gap between two items keeps the hold; a dead runner frees it; an AWS placement starts; a Hana step starts; held runs start in arrival order; an empty key turns the rule off.
+Tests (each failing first): each of the three landing runs shows integrate and starts with no wait during an active landing; a unit's --tests-only run shows test all; a landing holds an ordinary claude_commands test; the gap between two items keeps the hold; a dead runner frees it; an AWS placement starts; a Hana step starts; held runs start in arrival order; an empty key turns the rule off.
 
 Risk: a runner that hangs during a land holds all natedev claude_commands tests until it is stopped. That is the rule as given.
 
-Base: 44cy (the landing identity). Cost about 9 worker hours; two writers: land side (items 1-2) and queue side (items 3-6).
+Base: 44cy (the landing identity). Cost about 12 worker hours; three writers: land side (items 1-2, done 00bad2f5d), queue side (items 3-6), job name and deletion (items 8-10).
 
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
