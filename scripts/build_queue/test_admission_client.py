@@ -165,6 +165,67 @@ class ClientTests(unittest.TestCase):
                 self.assertNotIn(request.episode, fixture.server.placement_requests)
                 fixture.release(occupied)
 
+    def test_wait_subject_uses_the_usable_repository_and_step_fields(self) -> None:
+        for repository, step, subject in (
+            ("—", "nextest", "nextest"),
+            ("$REPO", "nextest", "nextest"),
+            ("repository", "unregistered session", "repository"),
+            ("repository", "—", "repository"),
+            ("unregistered session", "$STEP", "build"),
+            ("repository", "step", "repository step"),
+        ):
+            with self.subTest(repository=repository, step=step):
+                snapshot = replace(WAIT.snapshot, repo=repository, step=step)
+                with redirect_stderr(io.StringIO()) as output:
+                    client.WaitOutput()(replace(WAIT, snapshot=snapshot))
+                self.assertIn(f"{subject} needs 8.0 GiB", output.getvalue().split("; "))
+
+    def test_older_wait_lines_normalize_the_head_name_and_label(self) -> None:
+        blocker: records.Waiter = {"pid": 7, "start_time": "7", "need": 2 * GIB, "since": 1,
+                                  "session_name": "—", "step": "  ", "unit": "—"}
+        for label in ("", " \t", "—", "$CALLER", "  other   caller  "):
+            name = "other caller" if label == "  other   caller  " else "unregistered session"
+            for order in (records.NoOrderHold(), records.HeldBehindHead(blocker)):
+                with self.subTest(label=label, order=order):
+                    decision = replace(WAIT.snapshot.decision, order_hold=order)
+                    snapshot = replace(WAIT.snapshot, decision=decision,
+                                       head_reason=records.BehindHead(label, 1, ""))
+                    waiting = replace(WAIT, position=2, text="behind #1", snapshot=snapshot)
+                    with redirect_stderr(io.StringIO()) as output:
+                        client.WaitOutput()(waiting)
+                    expected = (f"reason: behind #1 · head {name} needs 2.0 GiB"
+                                if isinstance(order, records.HeldBehindHead) else f"reason: behind {name}")
+                    self.assertIn(expected, output.getvalue().split("; "))
+            with self.subTest(head_label=label):
+                snapshot = replace(WAIT.snapshot, head_need=2 * GIB, head_label=label)
+                with redirect_stderr(io.StringIO()) as output:
+                    client.WaitOutput()(replace(WAIT, position=2, snapshot=snapshot))
+                self.assertIn(f"head {name} needs 2.0 GiB", output.getvalue().split("; "))
+
+    def test_wait_output_matches_the_service_name_after_reply_decoding(self) -> None:
+        with AdmissionFixture() as fixture:
+            head = fixture.request(need=2 * GIB)
+            waiter: records.Waiter = {"pid": head.owner.pid, "start_time": head.owner.start_time,
+                "since": head.since, "need": 2 * GIB, "session_name": "builder", "unit": "panes",
+                "folder": "/private/widget", "step": "nextest"}
+            service_name = service.wait_line_name(service.WaitingAdmission(head, waiter, service.NO_CONNECTION))
+            self.assertEqual(service_name, "panes · nextest")
+
+            older: records.Waiter = {"pid": head.owner.pid, "start_time": head.owner.start_time,
+                                     "since": head.since, "need": 2 * GIB}
+            for row, label in ((waiter, service_name), (older, "panes")):
+                with self.subTest(row=row):
+                    snapshot = replace(WAIT.snapshot,
+                        decision=replace(WAIT.snapshot.decision, order_hold=records.HeldBehindHead(row)),
+                        head_label=service_name, head_reason=records.BehindHead("panes", head.since, ""))
+                    waiting = replace(WAIT, position=2, text="behind #1", snapshot=snapshot)
+                    decoded = wire.parse_reply(wire.encode_reply(waiting))
+                    assert isinstance(decoded, wire.Wait)
+                    with redirect_stderr(io.StringIO()) as output:
+                        client.WaitOutput()(decoded)
+                    reason, = [part for part in output.getvalue().split("; ") if part.startswith("reason: ")]
+                    self.assertEqual(reason, f"reason: behind #1 · head {label} needs 2.0 GiB")
+
     def test_wait_lines_name_the_head_and_identify_the_current_build(self) -> None:
         for position, label, expected, reason in (
             (2, "hana CI · hana-linux-2 · test", "head hana CI · hana-linux-2 · test needs 12.3 GiB", ""),
@@ -173,7 +234,7 @@ class ClientTests(unittest.TestCase):
             (2, "42 · test", "head 42 · test needs 12.3 GiB", ""),
             (1, "hana CI · hana-linux-2 · test", "this build is the queue head", ""),
             (1, "hana · test", "this build is the queue head", "it edits the merged checkout"),
-            (3, "first · nextest", "behind #2 · second · nextest · compiler", ""),
+            (3, "first · nextest", "behind #2 · compiler · nextest", ""),
         ):
             with self.subTest(position=position, label=label), AdmissionFixture() as fixture:
                 waiting = replace(WAIT, position=position, head=label,
@@ -830,6 +891,36 @@ class ClientTests(unittest.TestCase):
                                                 request.identity, request.profile)
                     self.assertEqual(launch.identity.unit, unit)
                     self.assertEqual(records.waiter_identity("nextest", "tree").get("unit", ""), unit)
+
+    def test_direct_step_identity_includes_the_terminal_worktree(self) -> None:
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "",
+                "CLAUDE_SESSION_NAME": "", "CLAUDE_SESSION_FOLDER": "", "BUILDLOG_OWNER_STAFF_ID": ""}):
+            identity = client.step_identity("nextest", "/work/queue-fixture")
+        self.assertEqual(identity.name, "terminal · queue-fixture")
+
+    def test_step_identity_names_each_caller_kind(self) -> None:
+        with AdmissionFixture() as fixture, isolated_staff_file(fixture.root / "staff.json", {}):
+            runner = fixture_member("showrunner", name="spacetime")
+            unit = fixture_member("unit", name="navigation", parent=runner.id)
+            worker = fixture_member("worker", name="impl", parent=unit.id)
+            environment = {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "", "CLAUDE_SESSION_NAME": "",
+                           "CLAUDE_SESSION_FOLDER": "", "BUILDLOG_UNIT": "", "BUILDLOG_OWNER_STAFF_ID": ""}
+            for session, reference, folder, name, owner_unit in (
+                (runner.current_session, "", "", "spacetime", ""),
+                (unit.current_session, "", "", "navigation", "navigation"),
+                (worker.current_session, "", "", "impl", "navigation"),
+                ("", worker.id, "", "impl", "navigation"),
+                ("unlisted", worker.id, "research", "research", ""),
+                ("unlisted", "", "", "unregistered session", ""),
+                ("", "", "", f"terminal · {Path.cwd().name}", ""),
+            ):
+                with self.subTest(session=session, reference=reference, folder=folder), mock.patch.dict(os.environ, {
+                    **environment, "CLAUDE_CODE_SESSION_ID": session,
+                    "CLAUDE_SESSION_FOLDER": folder, "BUILDLOG_OWNER_STAFF_ID": reference,
+                }):
+                    identity = client.step_identity("nextest", "")
+                    self.assertEqual((identity.name, identity.unit), (name, owner_unit))
+                    self.assertEqual(identity.session_id, worker.current_session if reference and not session else session)
 
     def use_transport(self, fixture: AdmissionFixture, *exchanges: Exchange) -> ScriptedTransport:
         transport = ScriptedTransport(fixture.clock, *exchanges)

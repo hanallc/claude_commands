@@ -10,6 +10,7 @@ from string import Formatter
 from typing import Literal, TypedDict
 
 from scripts.accounts import accounts
+from scripts.build_queue.snapshot_codec import format_queue_name, public_queue_text, UNKNOWN_CALLER
 from scripts.production import staff
 from scripts.lib.build_steps import StepNames
 from scripts.message.owner_role import OwnerRole
@@ -73,11 +74,21 @@ def template_parts(template: str, fields: Mapping[str, str | int | StaffReferenc
 def owned_step_parts(names: StepNames, step: str, unit: str, role: OwnerRole, *,
                      ci: bool = False, current: Sequence[NamePart] = ()) -> list[NamePart]:
     """Keep staff fields separate in the configured step name."""
-    prefix = "owned.ci-" if ci else "owned.showrunner-" if role is OwnerRole.SHOWRUNNER else "owned."
-    template = names.settings.get(prefix + step, names.settings.get(prefix + "default"))
-    if template is not None and (ci or role is OwnerRole.SHOWRUNNER or role is OwnerRole.UNIT and unit):
-        return template_parts(template, {"unit": unit if ci else StaffReference(unit), "step": names.shown(step)})
-    return list(current) if current else text_parts(names.shown(step))
+    unit = public_queue_text(unit)
+    shown = public_queue_text(names.shown(step))
+    template = names.owner_template(step, unit, role, ci=ci)
+    label = format_queue_name(template, unit=unit, step=shown)
+    if label:
+        try:
+            parts = template_parts(template, {"unit": unit if ci else StaffReference(unit), "step": shown})
+        except (KeyError, ValueError):
+            return text_parts(label)
+        return parts if parts_text(parts) == label else text_parts(label)
+    if public_queue_text(parts_text(current)):
+        return list(current)
+    if template and role is OwnerRole.UNIT and not ci:
+        return text_parts(StaffReference(unit), " " if unit and shown else "", shown)
+    return text_parts(shown or UNKNOWN_CALLER)
 
 
 class NameReading(Enum):
