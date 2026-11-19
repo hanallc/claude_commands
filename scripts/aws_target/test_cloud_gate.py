@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator, Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from contextlib import ExitStack, closing, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import AbstractContextManager, ExitStack, closing, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict, replace
 from decimal import Decimal
 from hashlib import sha256
@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 from types import SimpleNamespace
-from typing import Never, cast, override
+from typing import BinaryIO, Never, cast, override
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
@@ -3594,6 +3594,7 @@ class CloudRouteTests(CostFixture):
         self.assertEqual(outcome, cloud_gate.LocalFallback('image or stack is absent'))
         self.assertEqual(errors.getvalue(), 'Cloud gate fallback row was not written: fixture row write denied\n')
         append.assert_called_once()
+        self.assertIsInstance(append.call_args.kwargs.get('deadline'), float)
         service.assert_not_called()
         self.assertFalse((self.state / 'cloud-gate-launches.jsonl').exists())
 
@@ -3814,6 +3815,37 @@ class CloudRouteTests(CostFixture):
         self.assertEqual(outcome, cloud_gate.LocalFallback(reason))
         self.assertEqual(path.read_bytes(), previous)
         self.assertFalse(self.admission.callers_released())
+
+    def test_worker_cleanup_deadline_bounds_the_fallback_log_after_release(self) -> None:
+        _ = write_config_fixture(self.root / 'build_admission.conf', 'program_stop_seconds=0.2\n')
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+        worker_deadline = time.monotonic()
+        reason = 'UNRESOLVED: the cost ledger lock deadline passed'
+
+        def service(command: Sequence[str]) -> int:
+            folder = Path(command[command.index('--worker') + 1])
+            cloud_gate.save(folder / 'outcome.json',
+                            {'status': 'fallback', 'reason': reason, 'cleanup_deadline': worker_deadline})
+            return 0
+
+        locked_append = store.locked_append
+
+        def append_with_deadline(log: Path, *, deadline: float | None = None) -> AbstractContextManager[BinaryIO]:
+            self.assertEqual(deadline, worker_deadline)
+            return locked_append(log, deadline=deadline)
+
+        path = self.state / 'cloud-gate-launches.jsonl'
+        previous = b'{"result":"fallback"}\n'
+        _ = path.write_bytes(previous)
+        with path.open('rb') as locked:
+            fcntl.flock(locked, fcntl.LOCK_EX)
+            with mock.patch.object(store, 'locked_append', side_effect=append_with_deadline) as append:
+                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=True,
+                    module_time_limit_s=1800, service=service)
+            append.assert_called_once_with(path, deadline=worker_deadline)
+        self.assertEqual(outcome, cloud_gate.LocalFallback(reason))
+        self.assertEqual(path.read_bytes(), previous)
+        self.assertTrue(self.admission.callers_released())
 
     def test_route_uses_installed_limit_and_handles_missing_results(self) -> None:
         cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})

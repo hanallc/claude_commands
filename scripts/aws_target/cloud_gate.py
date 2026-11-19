@@ -59,6 +59,8 @@ class CloudAttempt:
     identifier: str = ''
     interruptions: int = 0
     completed: CloudCompleted | None = None
+    reservation: CloudReservation | None = None
+    worker_cleanup_deadline: float | None = None
 
 
 @dataclass(frozen=True)
@@ -351,6 +353,7 @@ class CloudReservation:
     sidecar: Path
     status: int = 1
     keep: bool = False
+    release_deadline: float | None = None
 
 
 @contextmanager
@@ -384,6 +387,7 @@ def cloud_reservation(repo: Path, sidecar: Path, work: gate.SuiteMode | StepJob,
             held.status = reservation.status
             held.keep = reservation.keep
             deadline = time.monotonic() + stop_seconds
+            reservation.release_deadline = deadline
             try:
                 held_slot.close()
             except queue_place.CleanupUnresolved as error:
@@ -414,6 +418,7 @@ class GateWorker:
         self.clock = clock
         self.pause = pause
         self.monotonic = monotonic
+        self.cleanup_deadline: float | None = None
         self.size_vcpus: int = 0
         self.price_read_evidence: tuple[dict[str, object], ...] = ()
 
@@ -459,6 +464,7 @@ class GateWorker:
                   result_seen_at: int | _ResultNotReceived = _RESULT_NOT_RECEIVED) -> None:
         api = self.regional_api(self.box_region)
         deadline = self.monotonic() + settings().number('termination_timeout_s')
+        self.cleanup_deadline = deadline
         requested = False
         while self.monotonic() < deadline:
             try:
@@ -479,6 +485,7 @@ class GateWorker:
                     raise
                 print(f'Cloud gate termination waits on {self.box_region}: {error}', flush=True)
             deadline = self.pause_termination(deadline)
+            self.cleanup_deadline = deadline
         else:
             raise AwsUnavailable('Termination is unconfirmed; the expiry function still owns cleanup')
         ended_at = int(self.clock()) if isinstance(result_seen_at, _ResultNotReceived) else result_seen_at
@@ -909,6 +916,7 @@ class GateWorker:
                 for row in ledger.rows({'Contents': listing.get('Contents', [])}, 'Contents')}
 
     def execute(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> dict[str, object]:
+        self.cleanup_deadline = None
         attempt = ledger.text(request, 'attempt')
         row: dict[str, object] = {}
         interruption_code = ''
@@ -1281,11 +1289,14 @@ def run(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: fl
     else:
         if attempt.interruptions:
             outcome = LocalFallback(f'Spot interruption on {attempt.interruptions} attempts; ' + outcome.reason)
+        release_deadline = attempt.reservation.release_deadline if attempt.reservation is not None else None
+        deadlines = [end for end in (deadline, release_deadline, attempt.worker_cleanup_deadline) if end is not None]
+        log_deadline = min(deadlines) if deadlines else time.monotonic() + queue_place.shell_stop_seconds()
         try:
             append_launch(attempt.directory, {'time': time.time(), 'attempt': attempt.identifier,
                 'instance_type': '', 'vcpus': 0, 'result': 'fallback', 'mode': attempt.mode.value, 'region': '',
                 'availability_zone': '', 'error_code': launch_error_code(outcome.reason), 'reason': outcome.reason},
-                deadline=deadline)
+                deadline=log_deadline)
         except store.AppendLockTimeout:
             pass
         except OSError as error:
@@ -1327,6 +1338,7 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
             else:
                 attempt.identifier = folder.name
                 with cloud_reservation(repo, folder / 'reservation.cgroup', mode) as reservation:
+                    attempt.reservation = reservation
                     outcome = _complete_outcome(repo, folder, request, row, cleanup=str(saved_result.get('cleanup', '')))
                     reservation.status = int(isinstance(outcome, CloudCompleted) and not outcome.run.passed)
                     if isinstance(outcome, CloudCompleted):
@@ -1364,7 +1376,9 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
             retry_limit = min(retry_limit, int(str(previous.get('spot_retry_limit', retry_limit))))
             box_retry_limit = min(box_retry_limit, int(str(previous.get('box_retry_limit', box_retry_limit))))
         with cloud_reservation(repo, sidecar, mode) as reservation:
+            attempt.reservation = reservation
             while True:
+                attempt.worker_cleanup_deadline = None
                 state: dict[str, object] = {'attempt': folder.name, **identity,
                     'spot_interruptions': attempt.interruptions, 'counted_interruption': counted_interruption,
                     'retry_launch': retry_launch, 'spot_retry_limit': retry_limit,
@@ -1399,6 +1413,9 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                     outcome = run_service(repo, folder, request, command, service)
                     result = read(result_path) if result_path.exists() else {}
                     failure = retryable_cloud_failure(result)
+                worker_deadline = result.get('cleanup_deadline')
+                if isinstance(worker_deadline, (int, float)) and 0 <= worker_deadline < float('inf'):
+                    attempt.worker_cleanup_deadline = worker_deadline
                 if isinstance(outcome, CloudCompleted):
                     reservation.status = int(not outcome.run.passed)
                     attempt.completed = outcome
@@ -1522,6 +1539,8 @@ def main() -> int:
         if (folder / 'outcome.json').exists() and read(folder / 'outcome.json').get('status') != 'pending':
             return 0
         outcome = worker.execute(folder, read(folder / 'request.json'), read(folder / 'deployment.json'))
+        if outcome.get('status') != 'complete' and worker.cleanup_deadline is not None:
+            outcome['cleanup_deadline'] = worker.cleanup_deadline
         save(folder / 'outcome.json', outcome)
     return 0
 

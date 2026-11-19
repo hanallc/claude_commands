@@ -37,11 +37,13 @@ from scripts.aws_target import admin_secrets, aws_trial as trial, cloud_gate, ga
 from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.aws_target.aws_target import AwsCli
 from scripts.build_queue.admission_jobs import StepJob
-from scripts.build_queue import cloud_progress
+from scripts.build_queue import cloud_progress, queue_place
 from scripts.build_queue.admission_wire import CloudGroup, Owner
 from scripts.production import merge_gate
+from scripts.production.gate_modules import GateRefused
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.process_group import send_process_group
+from scripts.lib.process_start import Gone, Started, Zombie
 from scripts.lib.fork_test_support import ForkChildren
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -367,6 +369,11 @@ class PairedTrialTests(CostFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        systemd = self.root / 'systemd-run'
+        _ = systemd.write_text('#!/bin/sh\nexit 1\n')
+        systemd.chmod(0o700)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ,
+            {'PATH': str(self.root) + os.pathsep + os.environ['PATH']})))
         _ = self.settings.write_text(self.settings.read_text().replace('region=us-east-1', 'region=us-east-2'))
         _ = self.enterContext(mock.patch.object(trial, 'account_settings_path', return_value=self.settings))
         shipped = Path(__file__).resolve().parents[2]
@@ -876,8 +883,9 @@ else:
 
     def assert_branch_cleanup_stops_git_group(self, cleanup: str) -> None:
         timeout = 10 if cleanup == 'timeout' else 60
+        stop_seconds = 0.2
         _ = write_config_fixture(self.root / 'cloud_gate.conf', f'git_network_timeout_s={timeout}\n')
-        _ = write_config_fixture(self.root / 'build_admission.conf', 'program_stop_seconds=0.2\n')
+        _ = write_config_fixture(self.root / 'build_admission.conf', f'program_stop_seconds={stop_seconds}\n')
         folder = self.root / cleanup
         folder.mkdir()
         record = folder / trial.GIT_RECOVERY
@@ -910,38 +918,75 @@ signal.pause()
                 self.assertTrue(select.select([ready], [], [], TEST_HANG_GUARD_SECS)[0])
                 git_pid, child_pid = map(int, ready.recv(128).split())
                 group = os.getpgid(git_pid)
+                git_exit = os.pidfd_open(git_pid)
+                _ = descriptors.callback(os.close, git_exit)
+                child_exit = os.pidfd_open(child_pid)
+                _ = descriptors.callback(os.close, child_exit)
                 try:
                     saved = cloud_gate.read(record)
                     self.assertEqual(ledger.instant(saved, 'group'), git_pid)
                     self.assertEqual(group, git_pid)
                     self.assertEqual(os.getpgid(child_pid), group)
-                    git_exit = os.pidfd_open(git_pid)
-                    _ = descriptors.callback(os.close, git_exit)
-                    child_exit = os.pidfd_open(child_pid)
-                    _ = descriptors.callback(os.close, child_exit)
                     owner = ledger.instant(saved, 'owner')
                     owner_exit = os.pidfd_open(owner)
                     _ = descriptors.callback(os.close, owner_exit)
                     if cleanup == 'recovery':
                         os.kill(owner, signal.SIGKILL)
                         self.assertTrue(select.select([owner_exit], [], [], TEST_HANG_GUARD_SECS)[0])
+                    began = float(str(saved['deadline'])) if cleanup == 'timeout' else time.monotonic()
+                    deadline = began + stop_seconds + 1
                     if cleanup != 'timeout':
                         os.kill(controller.pid, signal.SIGTERM)
                     if cleanup == 'recovery':
-                        trial.recover_git(record, 0.2)
-                    reply = controller.result()
+                        trial.recover_git(record, stop_seconds, 0.05)
+                    for descriptor in (git_exit, child_exit, owner_exit):
+                        self.assertTrue(select.select([descriptor], [], [], max(0, deadline - time.monotonic()))[0])
+                    self.assertLessEqual(time.monotonic(), deadline)
+                    reply = controller.result(timeout=max(0, deadline - time.monotonic()))
                     self.assertEqual(reply.returncode, 0 if cleanup == 'timeout' else -signal.SIGTERM, reply.stderr)
                     if cleanup == 'timeout':
                         self.assertIn('could not delete branch', reply.stderr)
-                    self.assertTrue(select.select([git_exit], [], [], TEST_HANG_GUARD_SECS)[0])
-                    self.assertTrue(select.select([child_exit], [], [], TEST_HANG_GUARD_SECS)[0])
-                    self.assertTrue(select.select([owner_exit], [], [], TEST_HANG_GUARD_SECS)[0])
                     self.assertFalse(record.exists())
                 finally:
-                    try:
-                        send_process_group(group, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                    for descriptor in (git_exit, child_exit):
+                        try:
+                            signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+
+    def test_git_recovery_stops_only_the_published_scope(self) -> None:
+        path = self.root / trial.GIT_RECOVERY
+        scope = Path('/sys/fs/cgroup/fixture/builds.slice/cloud-trial-git-test.scope')
+        owner = Owner(101, 'original')
+        cloud_gate.save(path, {'boot': 'fixture', 'owner': owner.pid, 'owner_start': owner.start_time,
+                               'group': 102, 'group_start': 'original', 'unit': scope.name})
+        published = queue_place.ProgramStart(owner, Owner(102, 'original'), str(scope))
+        with (mock.patch.object(trial, 'git_boot_identity', return_value='fixture'),
+              mock.patch.object(trial, 'process_start', return_value=Gone()) as identity,
+              mock.patch.object(queue_place, 'read_program_start', return_value=published) as read_start,
+              mock.patch.object(queue_place, 'stop_scope') as stop,
+              mock.patch.object(trial, 'send_process_group') as signal_group):
+            trial.recover_git(path, 0.2, 0.05)
+        identity.assert_called_once_with(owner.pid)
+        read_start.assert_called_once_with(path.with_suffix('.scope.json'))
+        stop.assert_called_once_with(scope, mock.ANY, 0.05)
+        signal_group.assert_not_called()
+        self.assertFalse(path.exists())
+
+    def test_git_recovery_keeps_the_record_if_the_group_leader_is_absent_or_reused(self) -> None:
+        path = self.root / trial.GIT_RECOVERY
+        saved: dict[str, object] = {'boot': 'fixture', 'owner': 101, 'owner_start': 'original',
+                                    'group': 102, 'group_start': 'original'}
+        cloud_gate.save(path, saved)
+        for leader in (Gone(), Started('different'), Zombie('original')):
+            with (self.subTest(leader=leader),
+                  mock.patch.object(trial, 'git_boot_identity', return_value='fixture'),
+                  mock.patch.object(trial, 'process_start', side_effect=(Gone(), leader)),
+                  mock.patch.object(trial, 'send_process_group') as signal_group,
+                  self.assertRaisesRegex(GateRefused, 'UNRESOLVED: cannot verify the leader')):
+                trial.recover_git(path, 0.2, 0.05)
+            signal_group.assert_not_called()
+            self.assertEqual(cloud_gate.read(path), saved)
 
     def test_module_validation_rejects_duplicate_missing_and_traversal(self) -> None:
         for modules in (('fixture/test_sample.py',) * 2, ('fixture/missing.py',), ('../test_sample.py',), ('/fixture/test_sample.py',)):
@@ -1166,6 +1211,7 @@ print('200', end='')
             self.settings, sidecar, clock=lambda: now)
         slot = cloud_gate.CloudReservation(sidecar)
         events: list[object] = []
+        release_error: cloud_gate.CloudReleaseUnresolved | None = None
 
         @contextmanager
         def reserve(repo: Path, path: Path, job: merge_gate.SuiteMode | StepJob, *,
@@ -1173,6 +1219,8 @@ print('200', end='')
             self.assertEqual((repo, path, job, group),
                 (folder, sidecar, trial.PAIRED_TRIAL_JOB, trial_group))
             yield slot
+            if release_error is not None:
+                raise release_error
 
         testcase = self
 
@@ -1193,14 +1241,31 @@ print('200', end='')
             self.assertIsInstance(cloud_progress.read(sidecar), cloud_progress.NoCloudProgress)
             return {'status': 'complete'}
 
-        with (mock.patch.object(cloud_gate, 'GateWorker', return_value=worker),
-              mock.patch.object(cloud_gate, 'cloud_reservation', side_effect=reserve),
-              mock.patch.object(worker, 'execute', side_effect=execute),
-              mock.patch.object(trial, 'cleanup_trial', return_value=True)):
-            trial.paired_module(folder, self.state, self.settings, Barrier(), group=trial_group)
-        self.assertEqual(events, ['ready', 'launch', 'closed'])
-        self.assertEqual(cloud_gate.read(folder / 'outcome.json'), {'status': 'complete'})
-        self.assertEqual(slot.status, 0)
+        for case in ('released', 'release timeout', 'saved result and release timeout'):
+            with self.subTest(case=case):
+                if case != 'released':
+                    release_error = cloud_gate.CloudReleaseUnresolved(
+                        queue_place.CleanupUnresolved('the service did not confirm release'), time.monotonic())
+                outcome_path = folder / 'outcome.json'
+                saved: dict[str, object] = {'status': 'complete'}
+                if case == 'saved result and release timeout':
+                    saved.update(result_file='saved-result.json', cleanup='UNRESOLVED: earlier cleanup')
+                    cloud_gate.save(outcome_path, saved)
+                else:
+                    outcome_path.unlink(missing_ok=True)
+                events.clear()
+                with (mock.patch.object(cloud_gate, 'GateWorker', return_value=worker),
+                      mock.patch.object(cloud_gate, 'cloud_reservation', side_effect=reserve),
+                      mock.patch.object(worker, 'execute', side_effect=execute),
+                      mock.patch.object(trial, 'cleanup_trial', return_value=True),
+                      redirect_stderr(StringIO()) as errors):
+                    trial.paired_module(folder, self.state, self.settings, Barrier(), group=trial_group)
+                self.assertEqual(events, ['ready', 'launch', 'closed'])
+                if release_error is not None:
+                    self.assertIn(str(release_error), errors.getvalue())
+                    saved['cleanup'] = '\n'.join(filter(None, (str(saved.get('cleanup', '')), str(release_error))))
+                self.assertEqual(cloud_gate.read(outcome_path), saved)
+                self.assertEqual(slot.status, 0)
 
     def test_terminal_exception_stops_the_owning_service(self) -> None:
         with (mock.patch.object(subprocess, 'call', side_effect=OSError('fixture')),
