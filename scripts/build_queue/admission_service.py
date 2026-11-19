@@ -833,14 +833,14 @@ class DispatchEvidenceProbe:
     """The probe reads dispatch ownership for one saved assignment outside the service loop."""
     key: placement.HostEvidenceKey
     saved: records.SavedPlacementAssignment
-    read: Callable[[], bool]
+    read: Callable[[], placement.DispatchPathState | wire.ExecutionReport]
 
 
 @dataclass(frozen=True)
 class DispatchEvidence:
     """The reading applies only to the saved assignment that requested it."""
     saved: records.SavedPlacementAssignment
-    pending: bool
+    result: placement.DispatchPathState | wire.ExecutionReport
     observed_at: float
 
 
@@ -886,7 +886,18 @@ class HostEvidenceWorker:
                 self.requested.set()
             observed = self.dispatch_observations.get(attempt)
             return (observed is None or observed.saved != probe.saved
-                    or time.monotonic() - observed.observed_at > self.interval or observed.pending)
+                    or time.monotonic() - observed.observed_at > self.interval
+                    or not isinstance(observed.result, placement.DispatchPathSettled))
+
+    def recovered_dispatch(self, saved: records.SavedPlacementAssignment) -> wire.ExecutionReport | placement.NoTerminalReport:
+        """Read the settled report for the same saved assignment."""
+        assignment = saved.assignment
+        attempt = execution_identity.attempt_key(assignment.episode, assignment.attempt)
+        with self.lock:
+            observed = self.dispatch_observations.get(attempt)
+            if observed is not None and observed.saved == saved and isinstance(observed.result, wire.ExecutionReport):
+                return observed.result
+        return placement.NoTerminalReport()
 
     def request(self, key: placement.HostEvidenceKey) -> None:
         with self.lock:
@@ -954,10 +965,10 @@ class HostEvidenceWorker:
         dispatches_read: list[tuple[str, DispatchEvidenceProbe, DispatchEvidence]] = []
         for attempt, probe in dispatches:
             try:
-                pending = probe.read()
+                result = probe.read()
             except Exception:
-                pending = True
-            dispatches_read.append((attempt, probe, DispatchEvidence(probe.saved, pending, time.monotonic())))
+                result = placement.DispatchPathPending('The dispatch evidence is unavailable')
+            dispatches_read.append((attempt, probe, DispatchEvidence(probe.saved, result, time.monotonic())))
         with self.lock:
             if self.subscriptions.get(key) is not subscription:
                 return True
@@ -3113,15 +3124,38 @@ done
                         return True
                     transport = configuration.transport(target)
                 if isinstance(transport, hana_placement.HanaControlTransport):
-                    from scripts.aws_target.hana_execution import claim_dispatch_pending
-                    reference = placement.assigned_claim_reference(saved.assignment)
-                    def read_dispatch() -> bool:
-                        controller = hana_placement.controller_for(transport, read_only=True)
-                        return (controller.execution_bound(reference.claim_id)
-                                and claim_dispatch_pending(controller.directory, reference))
-
                     if submitted is None or not isinstance(self.last_usable_configuration, records.MemoryConfig):
                         return True
+                    reference = placement.assigned_claim_reference(saved.assignment)
+                    source_root = Path(submitted.constraints.repository)
+
+                    def read_dispatch() -> placement.DispatchPathState | wire.ExecutionReport:
+                        from scripts.aws_target.hana_execution import HanaSettled, claim_dispatch_pending
+                        from scripts.aws_target.hana_placement_adapter import recover_assigned_execution
+
+                        controller = hana_placement.controller_for(transport, read_only=True)
+                        report = saved.terminal_report
+                        if (isinstance(saved.permission, placement.PermissionConsumed)
+                                and isinstance(saved.holder, placement.ClaimHolderIdentity)
+                                and (isinstance(report, placement.NoTerminalReport)
+                                     or isinstance(report.path, placement.DispatchPathPending))):
+                            if saved.provider != reference or destination.host != transport.host:
+                                return placement.DispatchPathPending('The Hana claim differs from the assignment')
+                            recovered = recover_assigned_execution(saved.assignment, saved.holder, controller,
+                                current_source_key=lambda: offload.hana_source_key(source_root))
+                            if isinstance(recovered, HanaSettled):
+                                outcome = report.outcome if isinstance(report, placement.TerminalAttemptReport) else recovered.outcome
+                                evidence = (execution_identity.ExecutionNotStarted()
+                                    if isinstance(outcome, (placement.PrelaunchRefused, execution_identity.HanaCommandAdmissionRefused))
+                                    else recovered.evidence)
+                                return wire.ExecutionReport('hana-recovery:' + reference.claim_id, saved.assignment,
+                                    reference, evidence, outcome, placement.DispatchPathSettled())
+                            return placement.DispatchPathPending(recovered.reason)
+                        if (controller.execution_bound(reference.claim_id)
+                                and claim_dispatch_pending(controller.directory, reference)):
+                            return placement.DispatchPathPending('The Hana dispatch remains pending')
+                        return placement.DispatchPathSettled()
+
                     key = self.host_evidence_key(submitted, destination)
                     self.host_requests[key] = submitted
                     self.placement_host_keys[(submitted.episode, destination)] = key
@@ -3137,6 +3171,15 @@ done
                 return offload.pending_start_path(saved.assignment.destination.target, identity).exists()
             except conf.Unusable:
                 return True
+
+    def _recovered_hana_dispatch(self, saved: records.SavedPlacementAssignment) -> wire.ExecutionReport | placement.NoTerminalReport:
+        if self._ended_claim_holder(saved):
+            _ = self._start_pending(saved)
+            assignment = saved.assignment
+            key = self.placement_host_keys.get((assignment.episode, assignment.destination))
+            if key is not None and (reader := self.host_readers.get(key)) is not None:
+                return reader.worker.recovered_dispatch(saved)
+        return placement.NoTerminalReport()
 
     def _claim_holders(self) -> set[wire.Owner]:
         """The local holders of current provider claims, which the service watches."""
@@ -3850,6 +3893,17 @@ done
                 continue
             submitted = self.placement_requests.get(assignment.episode)
             if submitted is None:
+                continue
+            if isinstance(recovered := self._recovered_hana_dispatch(saved), wire.ExecutionReport):
+                _ = self._handle_placement(recovered)
+                if self.current_assignments.get(assignment.episode) == key:
+                    # The worker already confirmed release for the exact settled decline.
+                    updated = self.assignments[key]
+                    terminal = updated.terminal_report
+                    if (isinstance(terminal, placement.TerminalAttemptReport)
+                            and isinstance(terminal.path, placement.DispatchPathSettled)
+                            and terminal.outcome == recovered.outcome):
+                        self._close_for_report(updated, terminal)
                 continue
             if not self._claim_holder_ended(saved):
                 _ = self._request_host_evidence(submitted, assignment.destination, keys)

@@ -1565,6 +1565,17 @@ The sender reports the refusal before claim cleanup.
 The controller checks whether the holder exited in every lifecycle state, including after a Spot interruption.
 An unresolved start still requires provider recovery.
 The next Hana evidence read can remove the detached target claim.
+The admission service checks saved current assignments on each queue pass, including after a restart.
+For a dead local holder, the Hana evidence worker can replay exact terminal proof from the dispatch journal.
+The journal, guest observation, and retained claim must identify the same boot.
+The worker uses the normal settlement path to release the claim and record settlement.
+Recovery preserves a saved pending report's outcome and sends that report as settled after claim release.
+The sender checks the current source on the normal completion path and sends a settled report. The pending report path sends no completion.
+For a recovered completion, the worker uses the sender's current source check and reports a decline if the source changed.
+The queue consumes the settled execution report on its loop thread and closes the assignment.
+If the service restarts after claim release, it can read the settled journal and finish the report.
+If the journal confirms command settlement and the claim is gone, recovery completes any unfinished journal write and sends the report.
+Missing proof or proof for a different dispatch keeps the assignment current.
 The queue excludes Hana for the refused build and continues in the configured candidate order.
 For a different build, the queue needs provider evidence at or after the refusal report before it can assign the same scope.
 For a pinned build, `verify.sh` prints one line with the refusal cause and exits with status 2.
