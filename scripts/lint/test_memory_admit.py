@@ -5349,7 +5349,8 @@ class ShellTests(unittest.TestCase):
         for contents in ("", "MemTotal: 67108864 kB\n"):
             with self.subTest(contents=contents):
                 _ = path.write_text(contents)
-                result = self.shell('buildlog_wait_for_memory "$@"; printf "step started\\n"')
+                result = self.shell('buildlog_wait_for_memory "$@"; printf "step started\\n"',
+                    BUILDLOG_MEM_CHECK_RETRY_S="2")
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertEqual(result.stdout, "")
                 self.assertIn(f"memory admission check failed (cannot read MemAvailable from {path}); step refused", result.stderr)

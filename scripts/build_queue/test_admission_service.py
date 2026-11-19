@@ -813,6 +813,19 @@ class EndedPlacementPruneTests(unittest.TestCase):
 
 
 class ProcessTextTests(unittest.TestCase):
+    def test_owner_start_uses_the_private_proc_root(self) -> None:
+        with AdmissionFixture() as fixture:
+            owner = fixture.request().owner
+            stat = fixture.proc.path / str(owner.pid) / "stat"
+            tail = b"0 " * 18 + owner.start_time.encode() + b"\n"
+            _ = stat.write_bytes(f"{owner.pid} (".encode() + b"step\xff) S " + tail)
+            proc = service.SystemProc()
+            self.assertEqual(proc.owner_start(owner.pid), service.LiveOwnerIdentity(owner.start_time))
+            _ = stat.write_bytes(b"incomplete stat")
+            self.assertIsInstance(proc.owner_start(owner.pid), service.OwnerProcessUnreadable)
+            stat.unlink()
+            self.assertEqual(proc.owner_start(owner.pid), service.OwnerProcessGone())
+
     def test_process_names_with_invalid_utf8_preserve_memory_readings(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request()
@@ -5768,6 +5781,109 @@ class ServiceTests(unittest.TestCase):
                 # Ended lifetime comes from the real empty scope, not owner polling.
                 self.assertFalse(fixture.server.reservations)
 
+    def test_owner_scan_omission_keeps_a_waiter_and_its_saved_place(self) -> None:
+        from scripts.lib.proc_text import read_proc_text
+
+        for unreadable in (False, True):
+            with self.subTest(unreadable=unreadable), AdmissionFixture() as fixture:
+                fixture.free(0)
+                fixture.hold_starts()
+                older = fixture.request(age=20)
+                younger = fixture.request()
+                peer = fixture.connect(older)
+                self.assertIsInstance(peer.replies()[0], wire.Wait)
+                other = fixture.connect(younger)
+                self.assertIsInstance(other.replies()[0], wire.Wait)
+                server = fixture.server
+                config = server.last_usable_configuration
+                assert isinstance(config, records.MemoryConfig)
+                evidence = service.read_system(service.SystemReadingPlan(config, (), (), False),
+                    fixture.readings, fixture.proc, fixture.clock)
+                processes = dict(evidence.processes)
+                del processes[older.owner.pid]
+                server.system_reader = FixedSystemReader(replace(evidence, processes=processes))
+                read_owner = fixture.proc.owner_start
+
+                def confirm_owner(pid: int) -> service.OwnerStartReading:
+                    if unreadable and pid == older.owner.pid:
+                        return service.SystemProc().owner_start(pid)
+                    return read_owner(pid)
+
+                older_stat = fixture.proc.path / str(older.owner.pid) / "stat"
+
+                def read_with_unreadable_stat(path: Path) -> str:
+                    if path == older_stat:
+                        raise PermissionError("temporary read failure")
+                    return read_proc_text(path)
+
+                with (mock.patch.object(fixture.proc, "owner_start", side_effect=confirm_owner) as confirm,
+                      mock.patch.object(service, "read_proc_text", read_with_unreadable_stat)):
+                    fixture.end_owner(younger.owner)
+                self.assertIn(older.episode, set(server.waiters))
+                self.assertTrue(any(place.episode == older.episode and place.since == older.since
+                                    for place in service.read_state(fixture.state_dir).places.values()))
+                self.assertEqual(confirm.call_args_list.count(mock.call(older.owner.pid)), 1)
+
+    def test_removing_a_dead_waiter_closes_its_connection(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            request = fixture.request()
+            peer = fixture.connect(request)
+            self.assertIsInstance(peer.replies()[0], wire.Wait)
+            fixture.end_owner(request.owner)
+            self.assertNotIn(request.episode, fixture.server.waiters)
+            self.assertEqual(peer.socket.recv(1), b"")
+
+    def test_replacing_a_waiter_connection_keeps_its_order_and_closes_the_old_connection(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            older = fixture.request(age=20)
+            younger = fixture.request()
+            old = fixture.connect(older)
+            self.assertIsInstance(old.replies()[0], wire.Wait)
+            self.assertIsInstance(fixture.connect(younger).replies()[0], wire.Wait)
+            replacement = fixture.connect(older)
+            self.assertIsInstance(replacement.replies()[0], wire.Wait)
+            self.assertEqual(fixture.queue_pids(), [older.owner.pid, younger.owner.pid])
+            waiting = fixture.server.waiters[older.episode]
+            self.assertEqual((waiting.request.episode, waiting.row["since"]), (older.episode, older.since))
+            self.assertEqual(old.socket.recv(1), b"")
+
+    def test_a_stale_socket_event_cannot_end_the_owner_of_a_reused_descriptor(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            older = fixture.request(age=20)
+            self.assertIsInstance(fixture.connect(older).replies()[0], wire.Wait)
+            server = fixture.server
+            old_connection = server.waiters[older.episode].connection
+            assert isinstance(old_connection, service.Connection)
+            descriptor = old_connection.socket.fileno()
+            events = fixture.scope_events()
+            events.events = [(descriptor, select.EPOLLHUP)]
+            replacement = fixture.connect(older)
+            younger = fixture.request()
+            _ = fixture.connect(younger)
+            open_pidfd = fixture.proc.pidfd
+            reused: list[int] = []
+
+            def open_owner_watch(pid: int) -> int:
+                owner_descriptor = open_pidfd(pid)
+                if pid == younger.owner.pid:
+                    reused.append(owner_descriptor)
+                return owner_descriptor
+
+            with mock.patch.object(fixture.proc, "pidfd", side_effect=open_owner_watch):
+                server.run_once(0)
+            self.assertEqual(reused, [descriptor])
+            self.assertIn(younger.episode, set(server.waiters))
+            self.assertEqual(server.watchers[descriptor], service.OwnerWatch(younger.owner))
+            saved = service.read_state(fixture.state_dir)
+            self.assertIn(younger.episode, {place.episode for place in saved.places.values()})
+            self.assertIsInstance(replacement.replies()[0], wire.Wait)
+
     def test_closed_waiting_connection_leaves_queue_but_grant_survives_disconnect(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
@@ -5875,6 +5991,34 @@ class ServiceTests(unittest.TestCase):
                 fixture.server.run_once(0)
                 self.assertTrue(fixture.server.stopped)
                 self.assertTrue((fixture.state_dir / "state.json").exists())
+
+    def test_source_watch_logs_start_change_stop_and_replacement_revision(self) -> None:
+        with AdmissionFixture() as fixture, redirect_stderr(io.StringIO()) as journal:
+            fixture.restart()
+            server = fixture.server
+            count = len(server.sources)
+            first_check = server.next_source_check
+            source = fixture.root / "loaded.py"
+            _ = source.write_text("old")
+            stamp = source.stat()
+            server.sources = {source: (stamp.st_ino, stamp.st_mtime_ns)}
+            _ = source.write_text("changed")
+            fixture.clock.advance(1)
+            server.run_once(0)
+            fixture.clock.advance(2)
+            server.run_once(0)
+            self.assertTrue(server.stopped)
+            fixture.restart()
+            revision = subprocess.check_output(
+                ["git", "-C", str(Path(service.__file__).resolve().parent), "rev-parse", "HEAD"],
+                text=True).strip()
+            entries = journal.getvalue().splitlines()
+            self.assertIn(f"memory admission: source watch checks {count} paths first at monotonic {first_check:.3f}",
+                          entries)
+            self.assertTrue(any("source watch detected changes" in entry and str(source) in entry
+                                for entry in entries))
+            self.assertIn("memory admission: source watch will stop after the changes settled", entries)
+            self.assertEqual(entries[-1], f"memory admission: ready with git revision {revision}")
 
     def test_a_module_loaded_after_start_stops_the_service_when_it_changes(self) -> None:
         from scripts.mac_test import eligibility
@@ -7230,6 +7374,53 @@ class RunPlaceTests(unittest.TestCase):
             self.assertEqual(only_admitted(replay.replies()), granted)
             self.assertEqual(len([record for record in fixture.server.reservations.values()
                                   if record.owner == request.owner]), 1)
+
+    def test_transfer_keeps_order_and_replays_one_grant_after_disconnect(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            older = fixture.request(age=10, need=40 * GIB)
+            younger = fixture.request(need=40 * GIB)
+            original = fixture.connect(older)
+            self.assertIsInstance(original.replies()[0], wire.Wait)
+            younger_peer = fixture.connect(younger)
+            self.assertIsInstance(younger_peer.replies()[0], wire.Wait)
+            self.assertEqual(fixture.queue_pids(), [older.owner.pid, younger.owner.pid])
+            replacement = fixture.connect(older)
+            self.assertIsInstance(replacement.replies()[0], wire.Wait)
+            original.close()
+            _ = replacement.replies()
+            self.assertEqual(fixture.queue_pids(), [older.owner.pid, younger.owner.pid])
+            self.assertFalse(fixture.server.reservations)
+
+            server = fixture.server
+            send = server._send  # pyright: ignore[reportPrivateUsage]
+            disconnect = server._disconnect  # pyright: ignore[reportPrivateUsage]
+            dropped: list[wire.Admitted] = []
+
+            def disconnect_after_save(connection: service.Connection, reply: wire.Reply) -> None:
+                if connection.request == older and isinstance(reply, wire.Admitted):
+                    saved = service.read_state(fixture.state_dir)
+                    self.assertEqual(saved.ledger[older.episode].reply, reply)
+                    self.assertEqual(saved.reservations[older.episode].reservation_id, reply.reservation)
+                    dropped.append(reply)
+                    disconnect(connection)
+                else:
+                    send(connection, reply)
+
+            fixture.free(50 * GIB)
+            write_pressure_reading(fixture.root / "pressure")
+            with mock.patch.object(server, "_send", side_effect=disconnect_after_save):
+                _ = fixture.run_pass()
+            grant, = dropped
+            self.assertEqual(replacement.replies(), [])
+            self.assertEqual(fixture.queue_pids(), [younger.owner.pid])
+            for _ in range(2):
+                replay = fixture.connect(older)
+                self.assertEqual(only_admitted(replay.replies()), grant)
+                self.assertEqual(fixture.queue_pids(), [younger.owner.pid])
+                self.assertEqual(set(fixture.server.reservations), {older.episode})
+                self.assertEqual(fixture.server.reservations[older.episode].reservation_id, grant.reservation)
 
     def test_run_order_never_moves_an_earlier_step_behind_its_own_arrival(self) -> None:
         with AdmissionFixture() as fixture:
