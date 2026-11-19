@@ -21,6 +21,9 @@ class VerifyLintLocalWritesTests(VerifyStepRoutesFixture):
         self.fixture.environment["TEST_REQUIRE_MEND_FIX"] = "1" if tool == "mend" else "0"
         (Path(self.fixture.environment["BUILD_HOLD_DIR"]) / "other").unlink(missing_ok=True)
         script = self.fixture.verify_script
+        invoke = script.parent.parent / "lint/invoke.sh"
+        function = "invoke_mend() {" if tool == "mend" else "invoke_clippy_fix() {"
+        self.assertIn(function, invoke.read_text())
         commands = (("if lint_rewrite invoke_mend --workspace --fix ", "invoke_mend --workspace --fix ")
                     if tool == "mend" else ("lint_rewrite invoke_clippy_fix --workspace ",))
         hold = 'printf held > "$BUILD_HOLD_DIR/other"'
