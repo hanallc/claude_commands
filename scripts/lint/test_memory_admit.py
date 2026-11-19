@@ -5439,11 +5439,25 @@ class QueueLeaveTests(unittest.TestCase):
         from scripts.build_queue.admission_test_support import caller_admission
         self.admission = caller_admission(self, self.root, self.environment)
         self.admission.configure(wait_reply_seconds=0.1, running_pass_seconds=5)
+        handle_request = self.admission.server.handle_request
+
+        def save_width(request: wire.Request, connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                       ) -> list[wire.Reply]:
+            replies = handle_request(request, connection)
+            # Save the new width before Cargo can read the private state file.
+            if isinstance(request, wire.WidthRequest):
+                self.admission.server.persist()
+            return replies
+
+        _ = self.enterContext(patch.object(self.admission.server, "handle_request", side_effect=save_width))
         capture = self.root / "capture-width.py"
-        _ = capture.write_text("import json\nfrom scripts.build_queue import admission_client as client\n"
+        _ = capture.write_text("import json\nimport os\nfrom pathlib import Path\n"
             + "from scripts.build_queue.admission_records import RequestedTestWidth\n"
-            + "row, = client.view().explanation.reservations\n"
-            + "width = row['test_threads']\nassert isinstance(width, RequestedTestWidth)\n"
+            + "from scripts.build_queue.admission_service import read_state\n"
+            + f"record, = read_state(Path({str(self.admission.state_dir)!r})).reservations.values()\n"
+            + "reservation_id, _, _ = os.environ['BUILDLOG_RESERVED_STEP'].split('\\t')\n"
+            + "assert record.reservation_id == reservation_id\n"
+            + "width = record.test_width\nassert isinstance(width, RequestedTestWidth)\n"
             + "print(json.dumps({'test_threads': width.threads}))\n")
         queue_client = self.root / "queue-client.py"
         _ = queue_client.write_text("from __future__ import annotations\nimport sys\n"
