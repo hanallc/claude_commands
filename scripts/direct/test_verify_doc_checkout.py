@@ -751,8 +751,7 @@ def split_reply(descriptor, size):
         self.assertIn("the copy owner did not send a checkout binding token", release.read_text())
         self.assertFalse(self.events.exists())
 
-    @unittest.skipUnless(sys.platform == "linux", "Private slot binding requires Linux")
-    def test_private_slot_token_expires_with_the_pipe_open(self) -> None:
+    def withhold_slot_token(self) -> None:
         config = Path(self.environment["CONF_DIR"]) / "direct.conf"
         _ = write_config_fixture(config, "VERIFY_SCOPE_PUBLICATION_SECONDS=0.1\n")
         self.install_scope_interpreter(f'''
@@ -769,12 +768,38 @@ if "--bind-scope" in script_arguments:
     raise SystemExit(0)
 os.execv(sys.executable, [sys.executable, *arguments])
 ''', scripts=("/copies.py",))
+
+    @unittest.skipUnless(sys.platform == "linux", "Private slot binding requires Linux")
+    def test_private_slot_token_expires_with_the_pipe_open(self) -> None:
+        self.withhold_slot_token()
         result = self.verify()
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode, 125, output)
         self.assertIn("the copy owner did not send a checkout binding token", output)
         self.assertFalse(self.events.exists())
         self.assertFalse(self.pass_records())
+
+    @unittest.skipUnless(sys.platform == "linux", "Private slot binding requires Linux")
+    def test_private_slot_token_timeout_cancels_the_reservation(self) -> None:
+        admission = caller_admission(self, self.root, self.environment)
+        handle_request = admission.server.handle_request
+        cancelled: list[str] = []
+
+        def record_cancel(request: wire.Request,
+                          connection: service.Connection | service.NoConnection = service.NO_CONNECTION) -> list[wire.Reply]:
+            if isinstance(request, wire.CancelPlacement) and request.episode in admission.server.reservations:
+                cancelled.append(request.episode)
+            return handle_request(request, connection)
+
+        self.withhold_slot_token()
+        with mock.patch.object(admission.server, "handle_request", side_effect=record_cancel):
+            result = self.verify()
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 125, output)
+        self.assertIn("the copy owner did not send a checkout binding token", output)
+        self.assertEqual(len(cancelled), 1, output)
+        self.assertFalse(admission.caller_reservations(), output)
+        self.assertNotIn("keeping the reservation", output)
 
     def test_doc_scope_start_error_writes_release_state_before_status_125(self) -> None:
         recorded_failure = self.root / "recorded-scope-failure"

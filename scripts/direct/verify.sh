@@ -2844,6 +2844,7 @@ PLACEMENT_PROVIDER=""
 PLACEMENT_OUTCOME=""
 PLACEMENT_SCOPE_STATE=""
 PLACEMENT_SCOPE_UNRESOLVED=0
+SCOPE_LAUNCH_REFUSED=2
 MAC_BACKOFF_PROBED=0
 
 apply_placement_outcome() {
@@ -3090,17 +3091,24 @@ run_placed_scope() {
 }
 
 finish_placed_scope() {
-    local status=$1 sampler=$2
+    local status=$1 sampler=$2 close_status=0
     if [[ -n "$sampler" ]]; then
         kill "$sampler" 2>/dev/null || true
         wait "$sampler" 2>/dev/null || true
     fi
-    close_scope_launch || return 0
+    close_scope_launch || close_status=$?
+    if (( close_status == SCOPE_LAUNCH_REFUSED )); then
+        local BUILDLOG_MEM_PRELAUNCH_REASON="the slot checkout refused launch"
+        buildlog_release_memory "$status" abandon
+        return
+    fi
+    (( close_status == 0 )) || return 0
     buildlog_release_memory "$status"
     rm -f "${BUILDLOG_PEAK:-$PLACEMENT_SCOPE_STATE.peak}.cgroup" || true
 }
 
 # Serialize release with the supervisor, even if the step shell died.
+# A refusal confirms that the supervisor did not start a scope.
 close_scope_launch() (
     local release_fd
     exec {release_fd}<"$PLACEMENT_SCOPE_STATE" || return 1
@@ -3108,15 +3116,20 @@ close_scope_launch() (
     if [[ ! -s "$PLACEMENT_SCOPE_STATE" ]]; then
         printf 'closed\n' > "$PLACEMENT_SCOPE_STATE"
     else
-        [[ "$(< "$PLACEMENT_SCOPE_STATE")" == closed ]]
+        case "$(< "$PLACEMENT_SCOPE_STATE")" in
+            closed) return 0 ;;
+            'launch refused') return "$SCOPE_LAUNCH_REFUSED" ;;
+            *) return 1 ;;
+        esac
     fi
 )
 
 settle_placed_scope() {
     if (( ${PLACEMENT_SCOPE_UNRESOLVED:-0} )); then return 125; fi
     [[ -n "${PLACEMENT_SCOPE_STATE:-}" ]] || return 0
-    local status=0
-    if ! close_scope_launch; then
+    local status=0 close_status=0
+    close_scope_launch || close_status=$?
+    if (( close_status != 0 && close_status != SCOPE_LAUNCH_REFUSED )); then
         PLACEMENT_SCOPE_UNRESOLVED=1
         PLACEMENT_OUTCOME=unresolved
         PLACEMENT_CLEANUP_ERROR="the build scope did not confirm exit; keeping the reservation"

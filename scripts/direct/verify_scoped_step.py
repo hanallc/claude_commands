@@ -232,6 +232,10 @@ class SlotCheckoutReply:
     owner_pid: int
 
 
+class SlotCheckoutLaunchRefused(ValueError):
+    """The slot reply failed before the supervisor started systemd-run."""
+
+
 def read_slot_command(owners: select.poll, reply: int, deadline: float) -> list[str]:
     timeout_reason = "the copy owner did not send the slot command"
     # Read the count without consuming any bytes from the first word.
@@ -333,7 +337,10 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
                         leases = tuple(AuthorizedCheckoutBinding(endpoint, read_checkout_token(owners, pipe.fileno(), deadline))
                                        for endpoint in endpoints)
                 if isinstance(slot, SlotCheckoutReply):
-                    slot_lease, command = read_slot_checkout(owners, slot, deadline)
+                    try:
+                        slot_lease, command = read_slot_checkout(owners, slot, deadline)
+                    except (OSError, ValueError) as error:
+                        raise SlotCheckoutLaunchRefused(str(error)) from error
                     leases += (slot_lease,)
                 if time.monotonic() >= deadline:
                     raise TimeoutError("the checkout scope publication timed out")
@@ -402,9 +409,13 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
                     pass
                 except OSError as publication_error:
                     reason += f". Cannot restore the reservation scope: {publication_error}"
+            refused = isinstance(error, SlotCheckoutLaunchRefused)
+            state = "launch refused" if refused else reason
             _ = release.seek(0)
-            _ = release.write(f"{reason}\n".encode())
+            _ = release.write(f"{state}\n".encode())
             _ = release.truncate()
+            if refused:
+                print(f"verify.sh: {reason}", file=sys.stderr)
             return 125
     return status if status >= 0 else 128 - status
 
