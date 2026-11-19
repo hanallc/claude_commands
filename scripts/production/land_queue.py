@@ -1,7 +1,11 @@
 """The line of checkpoint lands that wait for the merge gate.
 
-The land runner takes each item with `next`, in order. Each item has a label, which is the runner's own
-line, and the commits it lands: the third field of each line of its batch file, and each `--commit`.
+The land runner takes each item in order with `next`.
+Each item has a label and the commits it lands.
+The commits come from the third field of each batch file line and each `--commit`.
+Each `next` writes the runner's process ID and start time to `runner.json` under the line lock.
+The lease state is `taking` when `next` returns an item and `empty` when the line is empty.
+A live runner with a `taking` lease keeps the landing active between items.
 The units board reads the line to show the place of a checkpoint that waits to land.
 
 Usage:
@@ -15,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from collections.abc import Generator
@@ -25,6 +30,7 @@ from typing import NamedTuple, TypedDict, cast
 
 from scripts.lib import file_lock
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.process_start import Started, process_start
 from scripts.production import land_runs, waits_on
 
 HASH = re.compile(r"[0-9a-f]{7,40}")
@@ -263,13 +269,24 @@ def take_next() -> str:
     """Check the first item before removal and format its label and batch path."""
     with edited() as items:
         if not items:
+            _write_runner_lease("empty")
             return ""
         item = items[0]
         label, batch = item["label"], item["batch"]
         check_label(label)
         check_batch_path(batch)
+        _write_runner_lease("taking")
         _ = items.pop(0)
         return f"{label} {batch}" if batch else label
+
+
+def _write_runner_lease(state: land_runs.RunnerState) -> None:
+    pid = os.getppid()
+    identity = process_start(pid)
+    if not isinstance(identity, Started):
+        raise Refusal(f"cannot read start time for land runner {pid}")
+    lease: land_runs.RunnerLease = {"pid": pid, "start": identity.start, "state": state}
+    write_text_atomic(land_runs.runner_path(), json.dumps(lease) + "\n")
 
 
 def listing() -> str:

@@ -3,14 +3,16 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest.mock import patch
 
-from scripts.production import land_queue, unit_phases
+from scripts.lib.process_start import Started, process_start
+from scripts.production import land_queue, land_runs, unit_phases
 from zoneinfo import ZoneInfo
 
 
@@ -64,6 +66,30 @@ class LandQueueTests(unittest.TestCase):
     def test_next_prints_only_the_label_for_an_item_with_only_commits(self) -> None:
         self.assertEqual(self.run_line("add", "builds hashes", "--commit", "a" * 40), (0, "", ""))
         self.assertEqual(self.run_line("next"), (0, "builds hashes\n", ""))
+
+    def test_next_writes_a_taking_lease_for_the_parent_process(self) -> None:
+        pid = os.getppid()
+        identity = process_start(pid)
+        assert isinstance(identity, Started)
+        self.assertEqual(self.run_line("add", "builds hashes", "--commit", "a" * 40), (0, "", ""))
+        self.assertEqual(land_runs.landing_active(), land_runs.LandingOff())
+        self.assertEqual(self.run_line("next"), (0, "builds hashes\n", ""))
+        lease = cast(land_runs.RunnerLease, json.loads((self.root / "runner.json").read_text()))
+        self.assertEqual(lease, {"pid": pid, "start": identity.start, "state": "taking"})
+        self.assertEqual(land_queue.places(), {})
+        self.assertFalse(land_runs.lands_dir().exists())
+        self.assertEqual(land_runs.landing_active(), land_runs.LandingOn(land_runs.RunnerTaking()))
+
+    def test_next_writes_an_empty_lease_after_the_last_item(self) -> None:
+        pid = os.getppid()
+        identity = process_start(pid)
+        assert isinstance(identity, Started)
+        self.assertEqual(self.run_line("add", "builds hashes", "--commit", "a" * 40), (0, "", ""))
+        self.assertEqual(self.run_line("next"), (0, "builds hashes\n", ""))
+        self.assertEqual(self.run_line("next"), (0, "", ""))
+        lease = cast(land_runs.RunnerLease, json.loads((self.root / "runner.json").read_text()))
+        self.assertEqual(lease, {"pid": pid, "start": identity.start, "state": "empty"})
+        self.assertEqual(land_runs.landing_active(), land_runs.LandingOff())
 
     def test_add_refuses_a_batch_path_with_white_space(self) -> None:
         batch = self.batch("setup wait", "aws hana-setup-wait " + "a" * 40)

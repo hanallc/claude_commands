@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from typing import cast, override
 from unittest.mock import patch
 
-from scripts.lib.process_start import Started, process_start
+from scripts.lib.process_start import Gone, Started, process_start
 from scripts.production import checkpoint_gate, land_runs, merge_checkpoint, merge_gate
 
 
@@ -24,6 +24,53 @@ class LandRunTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(patch.dict(os.environ, {"MERGE_GATE_STATE_DIR": str(self.root)}))
+
+    def write_lease(self, pid: int, start: str, state: land_runs.RunnerState) -> None:
+        record: land_runs.RunnerLease = {"pid": pid, "start": start, "state": state}
+        _ = (self.root / "runner.json").write_text(json.dumps(record), encoding="utf-8")
+
+    def test_a_live_runner_with_a_taking_lease_holds_the_queue(self) -> None:
+        pid = os.getpid()
+        identity = process_start(pid)
+        assert isinstance(identity, Started)
+        self.write_lease(pid, identity.start, "taking")
+        self.assertEqual(land_runs.landing_active(), land_runs.LandingOn(land_runs.RunnerTaking()))
+
+    def test_a_dead_runner_does_not_hold_the_queue(self) -> None:
+        self.write_lease(101, "1234", "taking")
+        with patch.object(land_runs, "process_start", return_value=Gone()):
+            self.assertEqual(land_runs.landing_active(), land_runs.LandingOff())
+        self.assertTrue((self.root / "runner.json").exists())
+
+    def test_a_reused_runner_pid_does_not_hold_the_queue(self) -> None:
+        pid = os.getpid()
+        identity = process_start(pid)
+        assert isinstance(identity, Started)
+        self.write_lease(pid, identity.start + "0", "taking")
+        self.assertEqual(land_runs.landing_active(), land_runs.LandingOff())
+
+    def test_missing_or_unreadable_runner_lease_leaves_the_queue_open(self) -> None:
+        self.assertEqual(land_runs.landing_active(), land_runs.LandingOff())
+        path = self.root / "runner.json"
+        for invalid in (b"\xff", b"{", b"[]", b'{"state":"taking","pid":"1","start":"1234"}'):
+            with self.subTest(record=invalid):
+                _ = path.write_bytes(invalid)
+                self.assertEqual(land_runs.landing_active(), land_runs.LandingOff())
+                self.assertEqual(path.read_bytes(), invalid)
+
+    def test_a_live_land_holds_the_queue_and_the_reader_leaves_stale_records(self) -> None:
+        pid = os.getpid()
+        identity = process_start(pid)
+        assert isinstance(identity, Started)
+        folder = land_runs.lands_dir()
+        folder.mkdir()
+        stale = folder / "ended.json"
+        record: land_runs.LandRecord = {"pid": pid, "start": identity.start + "0", "commits": ["a" * 40]}
+        _ = stale.write_text(json.dumps(record), encoding="utf-8")
+        self.assertEqual(land_runs.landing_active(), land_runs.LandingOff())
+        with land_runs.landing(["b" * 40]):
+            self.assertEqual(land_runs.landing_active(), land_runs.LandingOn(land_runs.LiveLand()))
+        self.assertTrue(stale.exists())
 
     def test_a_land_is_running_only_while_its_process_holds_the_record(self) -> None:
         self.assertEqual(merge_gate.gate_state_dir(), self.root)

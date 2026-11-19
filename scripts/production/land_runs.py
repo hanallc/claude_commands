@@ -10,10 +10,11 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
-from collections.abc import Collection, Generator, Sequence
+from collections.abc import Collection, Generator, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.lib import file_lock
 from scripts.lib.atomic_file import write_text_atomic
@@ -31,6 +32,35 @@ class LandRecord(TypedDict):
     start: str
     commits: list[str]
     owners: NotRequired[list[str]]
+
+
+RunnerState = Literal["taking", "empty"]
+
+
+class RunnerLease(TypedDict):
+    pid: int
+    start: str
+    state: RunnerState
+
+
+@dataclass(frozen=True)
+class LiveLand:
+    """A live process has a land record."""
+
+
+@dataclass(frozen=True)
+class RunnerTaking:
+    """A live runner took an item and has yet to find the line empty."""
+
+
+@dataclass(frozen=True)
+class LandingOn:
+    reason: LiveLand | RunnerTaking
+
+
+@dataclass(frozen=True)
+class LandingOff:
+    """No live land or runner lease holds the queue."""
 
 
 class LandResult(TypedDict):
@@ -54,6 +84,10 @@ def lands_dir() -> Path:
     return state_dir() / "lands"
 
 
+def runner_path() -> Path:
+    return state_dir() / "runner.json"
+
+
 def results_path() -> Path:
     return state_dir() / "land_results.jsonl"
 
@@ -75,25 +109,58 @@ def landing(commits: Sequence[str], owners: Sequence[str] = ()) -> Generator[Non
         path.unlink(missing_ok=True)
 
 
-def running_lands() -> dict[str, str]:
-    """The commits of every land whose process still runs, each with its "unit phase" or "".
-
-    It removes the record of a land that ended.
-    """
-    commits: dict[str, str] = {}
+def _land_records() -> Iterator[tuple[Path, LandRecord]]:
     try:
         paths = sorted(lands_dir().glob("*.json"))
-    except OSError:
-        return {}
+    except (OSError, RuntimeError, ValueError):
+        return
     for path in paths:
         try:
-            record = cast(LandRecord, json.loads(path.read_text()))
-            pid, start, listed, owners = record["pid"], record["start"], record["commits"], record.get("owners", [])
-        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            parsed = cast(object, json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError, RecursionError):
             continue
-        owner = process_start(pid)
-        if owner == Started(start):
-            commits.update((commit, owners[index] if index < len(owners) else "") for index, commit in enumerate(listed))
+        if not isinstance(parsed, dict):
+            continue
+        row = cast(dict[str, object], parsed)
+        pid, start = row.get("pid"), row.get("start")
+        commits, owners = row.get("commits"), row.get("owners", [])
+        if (type(pid) is not int or pid <= 0 or not isinstance(start, str) or not start
+                or not isinstance(commits, list) or not isinstance(owners, list)):
+            continue
+        if (all(isinstance(commit, str) for commit in cast(list[object], commits))
+                and all(isinstance(owner, str) for owner in cast(list[object], owners))):
+            yield path, cast(LandRecord, cast(object, row))
+
+
+def landing_active() -> LandingOn | LandingOff:
+    """Read the landing signal. Leave all records on disk."""
+    for _, record in _land_records():
+        if process_start(record["pid"]) == Started(record["start"]):
+            return LandingOn(LiveLand())
+    try:
+        parsed = cast(object, json.loads(runner_path().read_text(encoding="utf-8")))
+    except (OSError, RuntimeError, ValueError):
+        return LandingOff()
+    if not isinstance(parsed, dict):
+        return LandingOff()
+    lease = cast(dict[str, object], parsed)
+    if lease.get("state") != "taking":
+        return LandingOff()
+    pid, start = lease.get("pid"), lease.get("start")
+    if type(pid) is int and pid > 0 and isinstance(start, str) and start and process_start(pid) == Started(start):
+        return LandingOn(RunnerTaking())
+    return LandingOff()
+
+
+def running_lands() -> dict[str, str]:
+    """Return the commits and owners of live lands. Remove the records of lands that ended."""
+    commits: dict[str, str] = {}
+    for path, record in _land_records():
+        owner = process_start(record["pid"])
+        if owner == Started(record["start"]):
+            owners = record.get("owners", [])
+            commits.update((commit, owners[index] if index < len(owners) else "")
+                           for index, commit in enumerate(record["commits"]))
         elif not isinstance(owner, Unreadable):
             path.unlink(missing_ok=True)
     return commits
