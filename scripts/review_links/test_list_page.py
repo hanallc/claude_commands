@@ -27,7 +27,7 @@ from xml.etree import ElementTree
 
 from scripts.accounts import accounts
 from scripts.agents.remote import local_machine
-from scripts.lib import atomic_file, conf, process_start
+from scripts.lib import atomic_file, conf, file_lock, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
 from scripts.message import send_result
@@ -84,12 +84,103 @@ class ListPageTests(unittest.TestCase):
                 self.assertEqual(parse_qs(place.query), {"show": ["all"]})
                 self.assertEqual(parse_qs(place.fragment), {"key": list(item.reviews)})
 
+    def test_review_summary_reports_a_missing_link_as_unavailable(self) -> None:
+        item = replace(self.add("Linked work"), reviews=("sdlc/C1", "sdlc/C2"))
+        done = review_items.ReviewItem("sdlc/C1", "sdlc/C1", review_items.ReviewType.CHANGE,
+            OWNER.id, OWNER.id, "Completed work", review_items.ReviewState.DONE,
+            review_items.ReviewTimes(NOW, NOW), (), (), review_items.ProposalLedgerSource(self.root / "review.md"))
+        for reviews in ({}, {done.key: done}):
+            with self.subTest(reviews=tuple(reviews)):
+                summary = list_page.review_summary(item, reviews, NOW)
+                self.assertIn(list_page.REVIEW_UNAVAILABLE, summary)
+                self.assertNotIn("Reviews done", summary)
+
     def test_list_ids_use_the_shared_no_wrap_cell(self) -> None:
         _ = self.add("Readable item number")
         body = list_page.render(self.root / "reviews").decode()
         self.assertIn('<td class="record-id" data-label="#">', body)
         self.assertIn('.list-table .record-id{white-space:nowrap;overflow-wrap:normal;width:1%}', body)
         self.assertIn('.list-toggle{white-space:nowrap}', body)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_shows_one_line_of_eta_with_full_text_and_overdue_style(self) -> None:
+        past = NOW - timedelta(hours=1)
+        future = NOW + timedelta(hours=1)
+        text = 'Wait for "QA" & <release approval> before the producer sets a time. ' * 3
+        for number, eta in enumerate((
+            the_list.EtaRange(NOW + timedelta(days=1), NOW + timedelta(days=2)),
+            past, future, the_list.EtaDescription(text.strip()),
+            the_list.EtaRange(past, future), the_list.EtaRange(past - timedelta(hours=1), past),
+            the_list.EtaDescription("After build " + "0123456789abcdef" * 10),
+            datetime(2026, 11, 20, 8, 30, tzinfo=UTC), the_list.EtaStatus.PAUSED,
+            datetime(2026, 12, 3, 8, 30, tzinfo=UTC),
+            date(2026, 11, 20), NOW.date(), NOW.date() - timedelta(days=1),
+        ), start=1):
+            item = self.add(f"ETA example {number}", number=number, next_check=past)
+            _ = the_list.update(MORTY.id, item.id, {"eta": eta}, source="morty")
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        probe = r'''<script>
+const failures=[];
+const check=(condition,message)=>{if(!condition) failures.push(message);};
+const eta=number=>document.querySelector('[data-number="'+number+'"] .list-eta');
+const etaLine=number=>eta(number).querySelector('.list-eta-text');
+const range='2026-11-17 13:00 EST – 2026-11-18 13:00 EST';
+const desktop=innerWidth>960;
+const longNumber=desktop ? 4 : 7;
+const long=eta(longNumber),line=etaLine(longNumber);
+const style=getComputedStyle(line);
+check(etaLine(3).textContent==='Nov 16 14:00 EST','The cell shows the date for today.');
+check(etaLine(8).textContent==='Nov 20 03:30 EST','The cell shows the time in the user zone.');
+check(etaLine(9).textContent==='Paused','The cell shows the status as stored.');
+check(etaLine(10).textContent==='Dec 3 03:30 EST','The cell omits the leading zero from the day.');
+check(etaLine(11).textContent==='Nov 20' && eta(11).title==='2026-11-20',
+ 'The cell shows the date without a time or zone.');
+check(etaLine(1).textContent==='Nov 17 13:00 EST – Nov 18 13:00 EST',
+ 'An old range shows both ends in the short format.');
+if(desktop){
+ const timestamp=etaLine(8);
+ check(getComputedStyle(timestamp).whiteSpace==='nowrap' && timestamp.scrollWidth===timestamp.clientWidth,
+  'The short desktop timestamp fits on one line.');
+ check(style.whiteSpace==='nowrap' && style.textOverflow==='ellipsis' && style.overflowX==='hidden'
+  && line.scrollWidth>line.clientWidth,'The long desktop ETA ends with an ellipsis on one line.');
+}else{
+ const cell=long.closest('td');
+ const range=document.createRange();
+ range.selectNodeContents(line);
+ const bounds=line.getBoundingClientRect();
+ const fragments=[...range.getClientRects()];
+ check(getComputedStyle(cell,'::before').content.includes('ETA'),'The phone row keeps the ETA label.');
+ check(long.closest('tbody').querySelector('[data-detail]').hidden && document.activeElement!==long
+  && line.textContent===long.title && fragments.length>1
+  && fragments.every(fragment=>fragment.right<=bounds.right+1 && fragment.bottom<=bounds.bottom+1),
+  'The phone row shows the full ETA before focus or expansion.');
+ check(document.documentElement.scrollWidth<=innerWidth,'The long phone ETA fits without horizontal scrolling.');
+}
+check(eta(1).title===range && eta(8).title==='2026-11-20 03:30 EST'
+ && eta(4).title.includes('"QA" & <release approval>'),
+ 'The hover text preserves the full dates and the original text.');
+for(const target of [long,eta(8)]){
+ const full=target.querySelector('.list-eta-full');
+ check(!full.getClientRects().length,'The full text starts hidden.');
+ target.focus();
+ check(document.activeElement===target && full.getClientRects().length && full.textContent===target.title,
+  'Keyboard focus shows the full ETA.');
+ target.blur();
+ check(!full.getClientRects().length,'The full text hides when focus leaves.');
+}
+const warning=getComputedStyle(document.querySelector('[data-label="State"] .warning')).color;
+for(const number of [2,6,13]){
+ check(eta(number).classList.contains('warning') && getComputedStyle(eta(number)).color===warning,
+  'Past ETA '+number+' uses the Check overdue color.');
+}
+for(const number of [1,3,4,5,8,11,12]) check(!eta(number).classList.contains('warning'),
+ 'ETA '+number+' stays in the normal color.');
+const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
+document.body.append(result);
+</script>'''
+        for width in (1440, 500):
+            with self.subTest(width=width):
+                self.browser_actions(markup, "", probe, window_size=(width, 900))
 
     def test_bulk_controls_show_lucide_icons_and_accessible_labels(self) -> None:
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()
@@ -191,15 +282,16 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         ready = review_items.ReviewItem("change/sdlc/C1830", "sdlc/C1830", review_items.ReviewType.CHANGE,
             OWNER.id, OWNER.id, "Check the linked change", review_items.ReviewState.OPEN,
             review_items.ReviewTimes(NOW, NOW), (), (), source)
-        reviews = [ready, replace(ready, key="change/sdlc/C1829", id="sdlc/C1829", state=review_items.ReviewState.WAITING),
+        reviews = [ready, replace(ready, key="change/sdlc/C1829", id="sdlc/C1829",
+                                  title="Read the release notes", state=review_items.ReviewState.WAITING),
                    replace(ready, key="change/sdlc/C1831", id="sdlc/C1831", state=review_items.ReviewState.WAITING),
                    replace(ready, key="change/sdlc/C1832", id="sdlc/C1832",
                            times=review_items.ReviewTimes(NOW, NOW, datetime.now(UTC) + timedelta(days=1)))]
         item = self.add("Linked review cards", number=111)
         linked_keys = tuple(review.key for review in reviews)
         _ = the_list.link(MORTY.id, item.id, linked_keys, source="morty")
-        missing = replace(ready, key="change/sdlc/C1833", id="sdlc/C1833")
-        missing_item = self.add("Review removed after rendering", number=112)
+        missing = replace(ready, key="change/sdlc/C1833", id="sdlc/C1833", state=review_items.ReviewState.DONE)
+        missing_item = self.add("Review is Done", number=112)
         _ = the_list.link(MORTY.id, missing_item.id, (missing.key,), source="morty")
         for number in range(1, 16):
             _ = self.add(f"List fixture {number}", number=number)
@@ -208,14 +300,16 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         reviews.append(replace(ready, key="change/builds/C17", id="builds/C17", title="Check a build",
                                owner=OTHER.id, source_unit=OTHER.id))
 
-        def read_reviews(_root: Path, *, show: str = "all", **_kwargs: object) -> list[review_items.ReviewItem]:
+        def read_reviews(_root: Path, *, show: str = "all", owner_options: dict[staff.StaffId, str] | None = None,
+                         **_kwargs: object) -> list[review_items.ReviewItem]:
+            if owner_options is not None:
+                owner_options.update({OWNER.id: OWNER.name, OTHER.id: OTHER.name})
             states = review_items.selected_states(show)
             return [review for review in reviews if review.state in states]
 
         with patch.object(review_items, "read", side_effect=read_reviews), patch.object(list_page, "counts_strip", return_value=""):
             reviews.append(missing)
             listing = list_page.render(self.root / "reviews")
-            _ = reviews.pop()
             review = review_page.build_snapshot(self.root / "reviews")
             reviews[0] = replace(ready, times=review_items.ReviewTimes(NOW, NOW, datetime.now(UTC) + timedelta(days=1)))
             parked_review = review_page.build_snapshot(self.root / "reviews")
@@ -356,7 +450,8 @@ async function inspect(frame){
     check(!target?.querySelector('[data-detail]').hidden,'the linked card detail is open');
     const place=new URLSearchParams(doc.location.hash.slice(1)),search=doc.querySelector('#list-search');
     check(!place.has('key') && !place.has('jump') && place.get('item')===keys[stage],'the address keeps only an open item target');
-    check(selected(doc,'show')===(stage<3 ? 'all' : 'open'),'Review keeps the selected All view or widens Show for a card outside Open');
+    const expectedShow=['all','all','all','open'][stage];
+    check(selected(doc,'show')===expectedShow,'Review selects '+expectedShow+' for '+keys[stage]);
     const reloaded=sessionStorage.getItem('review-reload')===String(stage);
     if(!reloaded){
      const row=target?.querySelector('.list-row'),box=row?.getBoundingClientRect();
@@ -419,7 +514,7 @@ async function inspect(frame){
    }else if(stage===keys.length+1){
     const notice=doc.querySelector('[data-missing-item]');
     check(notice && !notice.hidden && notice.textContent==='This review is no longer on the Review page.',
-      'a removed linked review shows a missing-target notice');
+      'a linked Done review shows a missing-target notice');
     check(visibleRows().some(row=>row.dataset.key==='change/other/C9'),'a missing link leaves the normal Review list visible');
     sessionStorage.setItem('link-stage',String(stage+1));
     location.href=listUrl;
@@ -853,17 +948,19 @@ frame.addEventListener('load',async()=>{
         for text in (OWNER.id, MORTY.id, "EtaRange(", "next_step", "latest_status"):
             self.assertNotIn(text, log)
 
-    def test_updated_log_shares_the_eta_and_next_step_renderers(self) -> None:
+    def test_updated_log_shows_full_eta_and_shares_the_next_step_renderer(self) -> None:
         item = self.add("Log an update")
         _ = the_list.update(MORTY.id, item.id, {
             "eta": NOW + timedelta(hours=3), "next_step": "Read the **new** result <first>."}, source="morty")
         body = list_page.render(self.root / "reviews").decode()
         log = body.split('<ol class="list-log">', 1)[1].split("</li>", 1)[0]
         self.assertIn("Updated", log)
-        for label, expected in (("ETA", "16:00 EST"), ("Next step", "Read the <strong>new</strong> result &lt;first&gt;.")):
-            cell = body.split(f'<td data-label="{label}">', 1)[1].split("</td>", 1)[0]
-            self.assertIn(expected, cell)
-            self.assertIn(f"{label}</dt><dd>{cell}</dd>", log)
+        eta = body.split('<span class="list-eta-text">', 1)[1].split("</span>", 1)[0]
+        self.assertEqual(eta, "Nov 16 16:00 EST")
+        self.assertIn("ETA</dt><dd>16:00 EST</dd>", log)
+        next_step = body.split('<td data-label="Next step">', 1)[1].split("</td>", 1)[0]
+        self.assertIn("Read the <strong>new</strong> result &lt;first&gt;.", next_step)
+        self.assertIn(f"Next step</dt><dd>{next_step}</dd>", log)
 
     def test_latest_status_shows_the_update_time_in_the_user_zone(self) -> None:
         item = self.add("Status time")
@@ -1167,7 +1264,8 @@ document.body.append(result);
             + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config),
             "SHOWRUNNER_STATE_DIR": str(self.root / "state"), "STAFF_FILE": str(self.root / "staff.json"),
-            "USER_ZONE": "America/New_York", "REVIEW_LINKS_ROOT": str(self.root / "reviews")})))
+            "USER_ZONE": "America/New_York", "REVIEW_LINKS_ROOT": str(self.root / "reviews"),
+            "CHANGE_REVIEW_DIR": str(self.root / "change-reviews")})))
         _ = (self.root / "staff.json").write_text(json.dumps({"schema": 1, "rows": [
             row.to_json() for row in (MORTY, DWIGHT, OWNER, OTHER)]}))
         _ = self.enterContext(patch.object(the_list, "now", return_value=NOW))
@@ -1267,7 +1365,8 @@ document.body.append(result);
             return cast(list[float], values[6])
 
         with self.subTest(check="display"):
-            self.assertIn('<td data-label="ETA">2026-11-20</td>', dated_row)
+            self.assertIn('<span class="list-eta-text">Nov 20</span>', dated_row)
+            self.assertIn('title="2026-11-20"', dated_row)
         with self.subTest(check="sort"):
             timed_key, dated_key = eta_sort_key(timed_row), eta_sort_key(dated_row)
             self.assertEqual((timed_key[0], dated_key[0]), (0, 0))
@@ -1297,7 +1396,7 @@ document.body.append(result);
             ((waiting.key, later.key), "2 reviews waiting on others"),
             ((answer.key,), "1 review for you"),
             ((done.key,), "Reviews done — decide: close, keep or park"),
-            (("missing/C9",), "Reviews done — decide: close, keep or park"),
+            (("missing/C9",), list_page.REVIEW_UNAVAILABLE),
             ((), ""),
             ((later.key,), "1 review waiting on others"),
             ((ready[0].key, waiting.key, done.key), "1 change for you"),
@@ -1353,6 +1452,12 @@ document.body.append(result);
         first = refreshed.split(f'data-key="{MORTY.id}/{items[0].id}"', 1)[1].split('</tbody>', 1)[0]
         self.assertIn("Reviews done — decide: close, keep or park", first)
         self.assertNotIn("2 changes for you", first)
+        with (patch.object(list_page, "read_linked_reviews", return_value=reviews) as read,
+              patch.object(list_page, "counts_strip", return_value="")):
+            partial = list_page.render(root, review_records={}).decode()
+        read.assert_called_once_with(root, members=staff.snapshot())
+        first = partial.split(f'data-key="{MORTY.id}/{items[0].id}"', 1)[1].split('</tbody>', 1)[0]
+        self.assertIn("2 changes for you", first)
         self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
 
     def test_live_change_and_delivered_state_return_parked_items_to_needs_me(self) -> None:
@@ -1764,6 +1869,175 @@ document.body.append(result);
         colors.assert_called_once()
         chip = body.split('<span class="list-count-chip">', 1)[1].split('<a ', 1)[0]
         self.assertRegex(chip, r'data-color-text="role.showrunner"[^>]*>sdlc</span> · ')
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_loads_deferred_counts_after_the_list(self) -> None:
+        item = self.add("Show this row first")
+        item = the_list.link(MORTY.id, item.id, ("sdlc/C1",), source="morty")
+        entry = f"{MORTY.id}/{item.id}"
+        template = (f'<template data-list-review-key="{entry}" data-list-review-version="{list_page.review_version(item)}">'
+                    '<span data-list-review-summary>1 change for you</span>'
+                    '<div data-list-review-links><a href="/console/?page=review">sdlc/C1</a></div></template>')
+        counts = '<aside class="list-counts"><a href="/console/?page=changes">2 changes</a></aside>'
+        change = review_items.ReviewItem("sdlc/C1", "sdlc/C1", review_items.ReviewType.CHANGE,
+            OWNER.id, OWNER.id, "Check the change", review_items.ReviewState.OPEN,
+            review_items.ReviewTimes(NOW, NOW), (), (), review_items.ProposalLedgerSource(self.root / "review.md"))
+        published: list_page.ReviewRecords = {change.key: change}
+        partial: list_page.ReviewRecords = {}
+        for lookup, query, response, expected in (
+            (published, list_page.COUNTS_QUERY, counts, ""),
+            (partial, list_page.COUNTS_AND_LINKS_QUERY, counts + template, "1 change for you"),
+            (list_page.LinkedReviewRead.AFTER_RENDER, list_page.COUNTS_AND_LINKS_QUERY,
+             counts + '<template data-list-review-read-error></template>', list_page.REVIEW_UNAVAILABLE),
+        ):
+            with self.subTest(query=query, expected=expected), patch.object(list_page, "counts_strip",
+                    side_effect=AssertionError("The List read the counts.")):
+                markup = list_page.render(self.root / "reviews", defer_counts=True, review_records=lookup).decode()
+                self.assertIn("Show this row first", markup)
+                self.assertEqual("Checking linked reviews…" in markup, bool(expected))
+                setup = """<script>
+let countRequests=[];
+window.fetch=async (url,options)=>{
+ countRequests.push([url,options.cache]);
+ return {ok:true,text:async()=>MARKUP};
+};
+</script>""".replace("MARKUP", json.dumps(response))
+                probe = """
+<script>
+(async()=>{
+ const footer=document.querySelector('[data-list-counts-url]');
+ if(!footer.firstChild) await new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{observer.disconnect();resolve();});
+  observer.observe(footer,{childList:true});
+ });
+ const failures=[];
+ if(countRequests.length!==1 || countRequests[0].join()!==REQUEST)
+  failures.push('The footer uses one independent request.');
+ if(!document.querySelector('[data-list-item]') || footer.querySelector('a')?.textContent!=='2 changes')
+  failures.push('The counts appear without replacing the List rows.');
+ if(EXPECTED && document.querySelector('[data-list-review-summary]')?.textContent!==EXPECTED)
+  failures.push('The same request settles the linked review status.');
+ if(EXPECTED==='1 change for you' && document.querySelector('[data-list-review-links] a')?.textContent!=='sdlc/C1')
+  failures.push('The same request fills the linked review fields.');
+ const result=document.createElement('p');
+ result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
+})();
+</script>""".replace("REQUEST", json.dumps(f"{list_page.PAGE_PATH}?{query},no-store")).replace(
+                    "EXPECTED", json.dumps(expected))
+                self.browser_actions(markup, setup, probe)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_refresh_keeps_the_follow_up_request_and_retries_after_timeout(self) -> None:
+        _ = write_config_fixture(conf.path("review_links"), "page_request_timeout_seconds=4\n")
+        root = self.root / "reviews"
+        changed = self.add("Keep the changed row usable")
+        counts_only = list_page.render(root, defer_counts=True, review_records={}).decode()
+        stable = self.add("Keep the unchanged row usable")
+        changed = the_list.link(MORTY.id, changed.id, ("sdlc/C1",), source="morty")
+        stable = the_list.link(MORTY.id, stable.id, ("sdlc/C1",), source="morty")
+        markup = list_page.render(root, defer_counts=True,
+                                  review_records=list_page.LinkedReviewRead.AFTER_RENDER).decode()
+        renewed = the_list.update(MORTY.id, changed.id, {"title": "Show the new title"}, source="morty")
+        refreshed = list_page.render(root, defer_counts=True,
+                                     review_records=list_page.LinkedReviewRead.AFTER_RENDER).decode()
+
+        def update(item: the_list.ListItem, label: str) -> str:
+            return (f'<template data-list-review-key="{MORTY.id}/{item.id}"'
+                    + f' data-list-review-version="{list_page.review_version(item)}">'
+                    + f'<span data-list-review-summary>{label}</span></template>')
+
+        first_updates = update(changed, "Old review status") + update(stable, "Unchanged review status")
+        current_updates = update(renewed, "Current review status") + update(stable, "Unchanged review status")
+        setup = """<script>
+const requests=[],deadlines=[];
+let page=INITIAL_PAGE;
+AbortSignal.timeout=milliseconds=>{
+ const timer=new AbortController();
+ deadlines.push({milliseconds,timer});
+ return timer.signal;
+};
+window.fetch=(url,options)=>{
+ if(!String(url).includes('?counts=')) return Promise.resolve(new Response(page));
+ return new Promise((resolve,reject)=>{
+  const request={url,signal:options.signal,finish:markup=>resolve({ok:true,text:()=>Promise.resolve(markup)})};
+  requests.push(request);
+  request.signal.addEventListener('abort',()=>reject(request.signal.reason));
+ });
+};
+</script>""".replace("INITIAL_PAGE", json.dumps(markup).replace("</", "<\\/"))
+        probe = """<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ const summary=number=>document.querySelector('[data-number="'+number+'"] [data-list-review-summary]');
+ const footer=()=>document.querySelector('[data-list-counts-url]');
+ const refresh=()=>{
+  const list=document.querySelector('[data-list]');
+  const replaced=changed(list.parentElement);
+  document.dispatchEvent(new Event('visibilitychange'));
+  return replaced;
+ };
+ const changed=node=>new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{observer.disconnect();resolve();});
+  observer.observe(node,{childList:true});
+ });
+ const first=requests[0];
+ await refresh();
+ page=UPDATED_PAGE;
+ await refresh();
+ check(requests.length===1 && !first.signal.aborted,'Refreshes keep the healthy request active.');
+ const firstLoaded=changed(footer());
+ first.finish('<aside>First counts</aside>'+FIRST_UPDATES);
+ await firstLoaded;
+ check(footer().textContent==='First counts' && summary(2).textContent==='Unchanged review status',
+  'The first response fills the current footer and unchanged row.');
+ check(summary(1).textContent==='Checking linked reviews…',
+  'The response skips a changed row with the same review links.');
+ check(requests.length===2,'The changed row starts one follow-up without another refresh.');
+ const timedOut=changed(summary(1));
+ deadlines[1].timer.abort();
+ await timedOut;
+ check(summary(1).textContent===UNAVAILABLE && document.querySelector('.list-toggle').matches(':enabled'),
+  'A timeout leaves the row usable and identifies the unavailable status.');
+ check(requests.length===2,'A timeout does not repeat the same request.');
+ await refresh();
+ check(footer().textContent==='First counts','The refresh keeps the last counts during the active request.');
+ const loaded=changed(footer());
+ requests[2].finish('<aside>New counts</aside>'+CURRENT_UPDATES);
+ await loaded;
+ check(footer().textContent==='New counts' && summary(1).textContent==='Current review status',
+  'The next refresh loads counts and status after a timeout.');
+ page=COUNTS_ONLY_PAGE;
+ await refresh();
+ const counts=requests[3];
+ check(counts.url.endsWith('?counts=1') && !summary(2),'The counts-only request starts before the new row appears.');
+ page=UPDATED_PAGE;
+ await refresh();
+ check(requests.length===4 && !counts.signal.aborted && summary(2).textContent==='Checking linked reviews…',
+  'A refresh adds the waiting row and keeps the counts-only request active.');
+ const countsLoaded=changed(footer());
+ counts.finish('<aside>Counts before linked status</aside>');
+ await countsLoaded;
+ check(requests.length===5 && requests[4].url.endsWith('?counts=1&linked-reviews=1'),
+  'The completed counts request starts one follow-up for the linked status.');
+ const links=requests[4];
+ if(links){
+  const statusLoaded=changed(summary(2));
+  links.finish('<aside>Final counts</aside>'+CURRENT_UPDATES);
+  await statusLoaded;
+  check(summary(2).textContent==='Unchanged review status',
+   'The follow-up fills the new row without another refresh.');
+ }
+ check(requests.length===5 && deadlines.every(deadline=>deadline.milliseconds===4000),
+  'Each request uses the configured time limit.');
+ const result=document.createElement('p');
+ result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
+})();
+</script>""".replace("UPDATED_PAGE", json.dumps(refreshed).replace("</", "<\\/")).replace(
+            "COUNTS_ONLY_PAGE", json.dumps(counts_only).replace("</", "<\\/")).replace(
+            "FIRST_UPDATES", json.dumps(first_updates).replace("</", "<\\/")).replace(
+            "CURRENT_UPDATES", json.dumps(current_updates).replace("</", "<\\/")).replace(
+            "UNAVAILABLE", json.dumps(list_page.REVIEW_UNAVAILABLE))
+        self.browser_actions(markup, setup, probe)
 
     def test_counts_use_status_line_readers(self) -> None:
         owners: list[staff.StaffRow] = []
@@ -3024,10 +3298,59 @@ observer.observe(original.parentNode,{childList:true});
         send.assert_called_once()
         self.assertEqual(the_list.load(MORTY.id, item.id), current)
 
+    def test_startup_reuses_the_list_question_key_after_a_result_write_failure(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Check the repair")
+        asked = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check passed?")), status)
+        assert isinstance(asked, list_page.ListQuestionDelivery)
+        delivery = asked.delivery
+        assert isinstance(delivery, change_page.PageQuestionSend)
+        path = status.path(delivery.page, delivery.row)
+        transport = FakeQuestionTransport()
+        publish = change_page.publish_question_attempt
+
+        def lose_result(path: Path, record: delivery_state.QuestionAttempt) -> None:
+            if record.state is delivery_state.QuestionSendState.SENT:
+                raise OSError("Cannot save the result.")
+            publish(path, record)
+
+        with patch.object(change_page, "send_question", side_effect=transport.send):
+            with (patch.object(change_page, "publish_question_attempt", side_effect=lose_result),
+                  self.assertRaisesRegex(OSError, "Cannot save the result")):
+                list_page.deliver(asked)
+            sending = change_page.read_question_attempt(path)
+            self.assertEqual(sending.state, delivery_state.QuestionSendState.SENDING)
+            for _ in range(2):
+                change_page.recover_review_messages(change_page.DeliveryStatus(root))
+        self.assertEqual(transport.calls, [sending.message_id] * 2)
+        self.assertEqual(len(transport.receipts), 1)
+        saved = change_page.read_question_attempt(path)
+        self.assertEqual(saved.state, delivery_state.QuestionSendState.SENT)
+        self.assertEqual(saved.attempt_id, sending.attempt_id)
+
+    def test_a_failed_list_question_alerts_the_item_showrunner(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Ask about the repair", owner=OTHER.id)
+        asked = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check passed?")))
+        refused = question_outcome("refused", "List keeper is offline.")
+        with (patch.object(change_page, "send_question", return_value=refused) as send,
+              patch.object(change_page, "send_to_staff") as alert,
+              patch.object(change_page, "review_alert_showrunners") as fallback,
+              patch.object(time, "sleep")):
+            list_page.deliver(asked)
+        self.assertEqual(send.call_count, conf.read("review_links").whole("delivery_tries"))
+        self.assertTrue(all(call.args[0] == MORTY.id for call in send.call_args_list))
+        alert.assert_called_once()
+        self.assertEqual(alert.call_args.args[0], OTHER.id)
+        self.assertIn("Which check passed?", cast(str, alert.call_args.args[2]))
+        fallback.assert_not_called()
+
     def test_question_result_write_failure_leaves_the_saved_question_available_for_resend(self) -> None:
         root = self.root / "reviews"
         status = change_page.DeliveryStatus(root)
         first_jobs: dict[str, the_list.ListItem] = {}
+        locks: dict[str, Path] = {}
         for number in (1, 2):
             item = self.add(f"Recovery question {number}", number=number)
             asked = list_page.submit(root, urlencode(self.fields(item, "question", words=f"Which check {number}?")), status)
@@ -3037,6 +3360,7 @@ observer.observe(original.parentNode,{childList:true});
             assert isinstance(delivery.job, change_page.QuestionJob)
             self.assertEqual(item.id, delivery.job.record.source.item_id)
             first_jobs[delivery.job.record.message_id] = item
+            locks[delivery.job.record.message_id] = Path(cast(str, delivery.job.lock.name))
             _ = delivery.job.release()
             _ = the_list.update(MORTY.id, item.id, {"latest_status": "A newer result arrived."}, source="morty")
         recovering = change_page.DeliveryStatus(root)
@@ -3065,7 +3389,8 @@ observer.observe(original.parentNode,{childList:true});
         with (patch.object(change_page, "publish_question_attempt", side_effect=fail_first_result),
               patch.object(change_page, "send_question", side_effect=send)):
             change_page.recover_review_messages(recovering)
-            change_page.recover_review_messages(change_page.DeliveryStatus(root))
+            with file_lock.exclusive(locks[lost[0]]):
+                change_page.recover_review_messages(change_page.DeliveryStatus(root))
         self.assertEqual(len(transport.calls), 2)
         self.assertEqual(len(transport.receipts), 2)
 
@@ -5049,7 +5374,8 @@ window.fetch=async(_path,options={})=>{
         self.assertEqual(the_list.feedback_requests(the_list.load(MORTY.id, item.id)),
                          {key: replace(value, state="sent") for key, value in the_list.feedback_requests(saved).items()})
         delivery = list_page.submit(root, urlencode(self.fields(item, "remove")))
-        def fail_message(recipient: staff.StaffId, _sender: str, _message: str) -> None:
+        def fail_message(recipient: staff.StaffId, _sender: str, _message: str, *, key: str) -> None:
+            self.assertTrue(key.startswith("review:"))
             if recipient == MORTY.id:
                 raise RuntimeError("fixture offline")
         with (patch.object(change_page, "send_to_staff", side_effect=fail_message) as send,
@@ -5133,7 +5459,8 @@ window.fetch=async(_path,options={})=>{
         other = self.add("Mark this item read")
         delivery = list_page.submit(root, urlencode(self.fields(item, "tell", words="Keep these words.")))
         entered, release = threading.Event(), threading.Event()
-        def send(_recipient: staff.StaffId, _sender: str, _message: str) -> None:
+        def send(_recipient: staff.StaffId, _sender: str, _message: str, *, key: str) -> None:
+            self.assertTrue(key.startswith("review:"))
             entered.set()
             if not release.wait(TEST_HANG_GUARD_SECS):
                 raise RuntimeError("the test did not release delivery")
@@ -5536,8 +5863,16 @@ try{
  }
  check(new Set(requestIds).size===4,'each new action uses a fresh request');
  realFeedback=true;failRefresh=false;
+ const beforeRefresh=document.querySelector('[data-list]');
+ const replaced=new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{
+   if(beforeRefresh.isConnected) return;
+   observer.disconnect();resolve();
+  });
+  observer.observe(beforeRefresh.parentElement,{childList:true});
+ });
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
- await flush();await flush();await flush();await flush();
+ await replaced;
  realFeedback=false;failRefresh=true;
  location.hash=new URLSearchParams({show:'closed',sort:'#',dir:'desc'});await flush();
  check(visible().map(row=>row.dataset.number).join(',')==='106,105,63,58' && selectedShow()==='all','An old Closed address opens All in the requested sort order.');

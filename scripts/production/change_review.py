@@ -2185,7 +2185,7 @@ class VerdictRefused:
 def _require_verdict_exchange(slots: delivery_state.DeliverySlots, verdict: str, validation_id: str) -> None:
     """Apply the same exchange checks to a single verdict and a batch verdict."""
     try:
-        if isinstance(slots.question, delivery_state.OpenQuestion):
+        if isinstance(slots.question, delivery_state.OpenQuestion) and not slots.validation_requested:
             _ = delivery_state.question_exchange_for_reply(slots.question, '', verdict)
         if validation_id or slots.validation_requested:
             delivery_state.require_exchange_id(
@@ -2231,10 +2231,12 @@ def clear_change_later(path: Path, row: str) -> Generator[None, None, None]:
             raise
 
 
-def _cleared_validation(delivery: Path) -> str:
+def _cleared_validation(delivery: Path, slots: delivery_state.DeliverySlots) -> str:
     fields = cast(dict[str, object], json.loads(delivery.read_text()))
     # A null slot prevents older fields from restoring the completed validation.
     fields["validation"] = None
+    if isinstance(slots.question, delivery_state.OpenQuestion):
+        fields["question"] = None
     return json.dumps(fields)+"\n"
 
 
@@ -2262,7 +2264,7 @@ def save_verdict(path: Path, row: str, verdict: str, production: Path, *, valida
         except ChangeReviewError as error:
             return VerdictRefused([], str(error))
         if slots.validation_requested and not lands(verdict) and any(item["#"] == local_row for item in pending(path)):
-            cleared = _cleared_validation(delivery)
+            cleared = _cleared_validation(delivery, slots)
             event = _validation_fault_event(production, verdict)
             _edit(path, production, event.time.date(), lambda lines: _append_review_log(path, lines, local_row, event),
                   lambda _: f"review {local_row}", report_warning=warnings.append)
@@ -2848,7 +2850,7 @@ def _batch_item(value: object, index: int, day: date, review_root: Path,
             if slots.validation_requested and not lands(verdict):
                 _, first, end = _table(path, lines, SECTION)
                 if any(line.startswith(f"| {target.row} |") for line in lines[first:end]):
-                    cleared_validations[target] = _cleared_validation(delivery)
+                    cleared_validations[target] = _cleared_validation(delivery, slots)
                     _append_review_log(path, lines, target.row, _validation_fault_event(doc, verdict))
                     return lambda: _validation_fault_output(shown)
             result = change_verdict.write(lines)

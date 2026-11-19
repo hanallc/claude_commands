@@ -90,8 +90,6 @@ class CodexAccountAlertTests(unittest.TestCase):
         _ = config.write_text(("""# range: 0..
 threshold_percent=1
 # range: 0..
-repeat_minutes=30
-# range: 0..
 stall_minutes=5
 faults_to=director
 always=director
