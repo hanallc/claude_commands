@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import select
+import shlex
 import shutil
 import stat
 import subprocess
@@ -150,7 +151,7 @@ class StandingTests(unittest.TestCase):
                        if not key.startswith("GIT_") and key not in ("UNIT_RUN_DIR", "CARGO_BUILD_BUILD_DIR")}
         environment.update({
             **slot_configuration.environment,
-            "HOME": str(home), "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "HOME": str(home),
             "GIT_TERMINAL_PROMPT": "0", "GIT_AUTHOR_NAME": "Gate Tests",
             "GIT_AUTHOR_EMAIL": "gate-tests@example.invalid", "GIT_COMMITTER_NAME": "Gate Tests",
             "GIT_COMMITTER_EMAIL": "gate-tests@example.invalid",
@@ -170,7 +171,6 @@ class StandingTests(unittest.TestCase):
         os.environ["CLAUDE_CODE_SESSION_ID"] = owner.current_session
         self.source = self.base / "checkout"
         self.source_seed.copy_to(self.source, self.base / "origin.git")
-        _ = shutil.copyfile(self.source_seed.checkout.parent / "git-config", self.base / "git-config")
         self.gates = slot_configuration.slots
 
     @contextmanager
@@ -199,7 +199,7 @@ class StandingTests(unittest.TestCase):
 
     def run_cli(self, *options: str, command: tuple[str, ...] = ()) -> subprocess.CompletedProcess[str]:
         return self.cli("run", "--repo", str(self.source),
-                        "--commit", "HEAD", *options, "--", *(command or (sys.executable, "-c", "pass")))
+                        "--commit", "HEAD", *options, "--", *(command or ("true",)))
 
     def test_claude_and_codex_workers_use_their_unit_owner(self) -> None:
         unit = next(row for row in staff.local_snapshot().rows if row.kind == "unit")
@@ -1664,7 +1664,7 @@ with patch.object(subprocess, 'run', pause_clone):
         def third_use() -> Path:
             with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
                 return tree
-        with self.queue_service(), ThreadPoolExecutor(max_workers=1) as executor:
+        with self.queue_service() as queue, ThreadPoolExecutor(max_workers=1) as executor:
             holder_context = copy_context()
             with ExitStack() as primary:
                 first = holder_context.run(primary.enter_context, copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)))
@@ -1675,6 +1675,7 @@ with patch.object(subprocess, 'run', pause_clone):
                         self.assertFalse(third.done())
                         self.assertIn('origin slot (2 of 2', notice.getvalue())
                     holder_context.run(primary.close)
+                    _ = queue.run_pass()
                     self.assertEqual(third.result(timeout=TEST_HANG_GUARD_SECS), first)
         self.assertEqual(len([line for line in notice.getvalue().splitlines() if line.strip()]), 1)
         self.assertEqual(sorted(path.name for path in self.gates.iterdir() if path.is_dir()),
@@ -1685,13 +1686,14 @@ with patch.object(subprocess, 'run', pause_clone):
         def third_use() -> Path:
             with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
                 return tree
-        with self.queue_service(), ThreadPoolExecutor(max_workers=1) as executor:
+        with self.queue_service() as queue, ThreadPoolExecutor(max_workers=1) as executor:
             with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)):
                 with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as second:
                     with redirect_stderr(notice):
                         third = executor.submit(third_use)
                         self.assertTrue(notice.noticed.wait(TEST_HANG_GUARD_SECS))
                         self.assertFalse(third.done())
+                _ = queue.run_pass()
                 self.assertEqual(third.result(timeout=TEST_HANG_GUARD_SECS), second)
 
     def test_configured_root_contains_only_the_two_standing_checkouts(self) -> None:
@@ -1753,6 +1755,14 @@ with patch.object(subprocess, 'run', pause_clone):
                 self.assertEqual(copies.repository_name(source), "project")
         _ = self.git(reload, "remote", "set-url", "origin", checkout.as_uri())
         self.assertEqual(copies.repository_name(reload), "project")
+        _ = self.git(self.source, "remote", "set-url", "origin", "work:team/project.git")
+        _ = self.git(self.source, "remote", "set-url", "--add", "origin", "ssh://backup.invalid/project.git")
+        _ = self.git(self.source, "config", "url.ssh://fallback.invalid/.insteadOf", "work:")
+        _ = self.git(self.source, "config", "url.ssh://preferred.invalid/team/.insteadOf", "work:team/")
+        settings = copies.read_git_settings(self.source)
+        resolved = self.git(self.source, "remote", "get-url", "origin")
+        self.assertEqual(resolved, "ssh://preferred.invalid/team/project.git")
+        self.assertEqual(copies.origin_url(self.source, settings=settings), resolved)
 
     def test_repository_without_origin_uses_main_checkout_name(self) -> None:
         _ = self.git(self.source, "remote", "remove", "origin")
@@ -2159,14 +2169,13 @@ with patch.object(subprocess, 'run', pause_clone):
             + "str(Path('target').resolve())]))",
             "sys.exit(int(sys.argv[4]))",
         ])
-        slot_program = "\n".join((
-            "import os, subprocess, sys",
-            "root = os.environ['COPIES_STEP_SOURCE']",
-            "tree = subprocess.check_output(['git', 'write-tree'], text=True).strip()",
-            "command = ['hold', '--repo', root, '--tree', tree, '--capacity-file', sys.argv[1], '--']",
-            f"raise SystemExit(subprocess.call([sys.executable, {str(Path(copies.__file__).resolve())!r}, *command,",
-            "                                  sys.executable, '-c', sys.argv[2], *sys.argv[3:]]))",
-        ))
+        slot_program = dedent("""\
+            python=$1 script=$2 capacity=$3
+            shift 3
+            tree=$(git write-tree)
+            exec "$python" "$script" hold --repo "$COPIES_STEP_SOURCE" --tree "$tree" \
+                --capacity-file "$capacity" -- "$python" -c "$@"
+            """)
         slot_write = program.replace("Path(relative)", "Path(os.environ['CARGO_TARGET_DIR']) / Path(relative).relative_to('target')").replace(
             "Path('target/debug/broken')", "(Path(os.environ['CARGO_TARGET_DIR']) / 'debug/broken')")
         cases = (
@@ -2221,7 +2230,8 @@ with patch.object(subprocess, 'run', pause_clone):
                             path.write_bytes(b"replacement")
                             """)
                     result = self.run_cli(*options, command=(
-                        sys.executable, "-c", slot_program, str(self.base / "capacity"), slot_command, *arguments,
+                        "sh", "-eu", "-c", slot_program, "copies-test-slot", sys.executable,
+                        str(Path(copies.__file__).resolve()), str(self.base / "capacity"), slot_command, *arguments,
                     ))
                     self.assertEqual(result.returncode, 0, result.stderr)
                     published = [Path(line.removeprefix("published: ").rsplit(" ", 1)[0])
@@ -2919,17 +2929,22 @@ with patch.object(subprocess, 'run', pause_clone):
         binaries.mkdir()
         marker = self.base / "lease-before-checkout"
         fake = binaries / "git"
-        _ = fake.write_text(f"#!{sys.executable}\n" + """import json, os, pathlib, sys
-if sys.argv[1] == '-C' and sys.argv[3] == 'checkout':
-    path = pathlib.Path(sys.argv[2])
-    lease = json.loads(path.with_name(path.name + '.lease.json').read_text())
-    assert lease['commit'] == os.environ['COPY_TEST_COMMIT']
-    pathlib.Path(os.environ['COPY_TEST_MARKER']).write_text(lease['commit'])
-os.execv(os.environ['COPY_TEST_GIT'], [os.environ['COPY_TEST_GIT'], *sys.argv[1:]])
-""")
+        _ = fake.write_text(dedent(f"""\
+            #!/bin/sh
+            if [ "$1" = -C ] && [ "$3" = checkout ]; then
+                {shlex.quote(sys.executable)} - "$2" <<'PYTHON' || exit "$?"
+            import json, os, pathlib, sys
+            path = pathlib.Path(sys.argv[1])
+            lease = json.loads(path.with_name(path.name + '.lease.json').read_text())
+            assert lease['commit'] == os.environ['COPY_TEST_COMMIT']
+            pathlib.Path(os.environ['COPY_TEST_MARKER']).write_text(lease['commit'])
+            PYTHON
+            fi
+            exec {shlex.quote(real_git)} "$@"
+            """))
         fake.chmod(0o755)
         with mock.patch.dict(os.environ, {"PATH": str(binaries) + os.pathsep + os.environ["PATH"],
-                "COPY_TEST_GIT": real_git, "COPY_TEST_MARKER": str(marker), "COPY_TEST_COMMIT": self.head}):
+                "COPY_TEST_MARKER": str(marker), "COPY_TEST_COMMIT": self.head}):
             with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
                 self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
         self.assertEqual(marker.read_text(), self.head)
@@ -2968,7 +2983,7 @@ os.execv(os.environ['COPY_TEST_GIT'], [os.environ['COPY_TEST_GIT'], *sys.argv[1:
         settings = self.base / 'config/build_folders.conf'
         _ = write_config_fixture(settings, f"# whole: 1..\nslots.{self.lease_machine()}.origin.max=1\n")
         new_revision = self.incoming()
-        with self.queue_service(), ThreadPoolExecutor(max_workers=1) as executor:
+        with self.queue_service() as queue, ThreadPoolExecutor(max_workers=1) as executor:
             holder_context = copy_context()
             with ExitStack() as primary:
                 first = holder_context.run(primary.enter_context, copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)))
@@ -2983,6 +2998,7 @@ os.execv(os.environ['COPY_TEST_GIT'], [os.environ['COPY_TEST_GIT'], *sys.argv[1:
                     self.assertFalse(future.done())
                 self.assertEqual(self.git(first, 'rev-parse', 'HEAD'), self.head)
                 holder_context.run(primary.close)
+                _ = queue.run_pass()
                 self.assertEqual(future.result(timeout=TEST_HANG_GUARD_SECS), first)
                 self.assertEqual(self.git(first, 'rev-parse', 'HEAD'), new_revision)
 
@@ -3000,13 +3016,21 @@ os.execv(os.environ['COPY_TEST_GIT'], [os.environ['COPY_TEST_GIT'], *sys.argv[1:
     def test_each_git_step_uses_runtime_timeout_and_next_use_resets(self) -> None:
         real_git = shutil.which("git")
         self.assertIsNotNone(real_git)
+        assert real_git is not None
         wrappers = self.base / "bin"
         wrappers.mkdir()
         wrapper = wrappers / "git"
-        _ = wrapper.write_text(f"#!{sys.executable}\n"
-                               + "import os,sys,time\n"
-                               + "if os.environ['GATE_TEST_BLOCK'] in sys.argv[1:]: time.sleep(10)\n"
-                               + f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n")
+        fifo = self.base / "git-timeout"
+        os.mkfifo(fifo)
+        _ = wrapper.write_text(dedent(f"""\
+            #!/bin/sh
+            for arg do
+                if [ "$arg" = "$GATE_TEST_BLOCK" ]; then
+                    read -r line < {shlex.quote(str(fifo))}
+                fi
+            done
+            exec {shlex.quote(real_git)} "$@"
+            """))
         wrapper.chmod(0o755)
         for step in ("clone", "fetch", "checkout", "clean", "apply", "merge"):
             with self.subTest(step=step):
@@ -3025,12 +3049,16 @@ os.execv(os.environ['COPY_TEST_GIT'], [os.environ['COPY_TEST_GIT'], *sys.argv[1:
         wrappers = self.base / "bin"
         wrappers.mkdir()
         wrapper = wrappers / "git"
-        _ = wrapper.write_text(f"#!{sys.executable}\n"
-            + "import os, sys\n"
-            + "if os.environ['COPY_TEST_FAIL'] in sys.argv[1:]:\n"
-            + " sys.stderr.write('fixture slot Git failure\\n')\n"
-            + " sys.exit(47)\n"
-            + f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n")
+        _ = wrapper.write_text(dedent(f"""\
+            #!/bin/sh
+            for arg do
+                if [ "$arg" = "$COPY_TEST_FAIL" ]; then
+                    printf '%s\\n' 'fixture slot Git failure' >&2
+                    exit 47
+                fi
+            done
+            exec {shlex.quote(real_git)} "$@"
+            """))
         wrapper.chmod(0o755)
         for step in ("add", "checkout", "clean"):
             with self.subTest(step=step):
