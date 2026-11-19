@@ -366,7 +366,7 @@ class RowQueueNotes(TypedDict):
     about_parts: NotRequired[list[staff_names.NamePart]]
     because_parts: NotRequired[list[staff_names.NamePart]]
     key: NotRequired[str]
-    # A gate job's description sentence and what it changes (build_steps about. and changes.).
+    # A gate job's work phrase and what it changes (build_steps about. and changes.).
     about: NotRequired[str]
     changes: NotRequired[str]
     # True on the step the queue admits next; only that step shows its room.
@@ -686,7 +686,7 @@ def job_notes(job: StepJobReading, unit: str, names: StepNames) -> RowQueueNotes
     template, owner = names.about_template(job, unit_name(unit))
     if not template:
         return {"changes": names.changes(job)}
-    parts = staff_names.template_parts(template,
+    parts = staff_names.template_parts(template[:1].lower() + template[1:].rstrip("."),
         {"unit": staff_names.StaffReference(owner), "branch": job.branch, "modules": job.modules})
     return {"about": staff_names.parts_text(parts), "about_parts": parts, "changes": names.changes(job)}
 
@@ -1478,8 +1478,8 @@ def route_reason(reason: str) -> str:
     """Use a phrase for the route restriction."""
     phrases = {"step writes the tree": "edits the tree", "the run asks for it": "requested by the caller",
                "a direct cargo command runs where it starts": "direct cargo command"}
-    phrase = phrases.get(reason, reason.removeprefix("it "))
-    return phrase.rstrip(".")
+    phrase = phrases.get(reason, reason.strip().removeprefix("it "))
+    return phrase.rstrip(".!?")
 
 
 def read_stalls() -> PressureValues:
@@ -1561,13 +1561,13 @@ class TokenHoldersUnknown:
     reason: str
 
 
-NO_TOKEN_DUMP_YET = TokenHoldersUnknown("The feed has not read a steve token dump yet.")
+NO_TOKEN_DUMP_YET = TokenHoldersUnknown("waiting for a steve token dump")
 STEVE_UNIT = "steve.service"
 # systemctl must never ask for a password: the polkit rule allows this reload alone.
 STEVE_DUMP_COMMAND = ("systemctl", "--no-ask-password", "reload", STEVE_UNIT)
 STEVE_DUMP_TIMEOUT_SECONDS = 5
 STEVE_DUMP_DENIED = "Access denied"
-STEVE_DUMP_DENIED_REASON = "natedev does not yet let the feed ask steve which build holds each token."
+STEVE_DUMP_DENIED_REASON = "no permission to request a steve token dump"
 STEVE_DUMP_HEADER = re.compile(r"steve: currently (\d+) tokens available out of (\d+)")
 STEVE_DUMP_HOLDER = re.compile(r"\s+PID (\d+)(?: \(.*\))? holds (\d+) tokens:")
 STEVE_DUMP_DETAIL = re.compile(r"\s+(job 0x[0-9a-f]+ running for .*|\d+ processes waiting for a job token.*|PID \d+ is .*)")
@@ -1607,7 +1607,7 @@ def token_holders(journal: str) -> TokenHolders | TokenHoldersUnknown:
     messages = [line.split(": ", 1)[1] for line in journal.splitlines() if ": " in line]
     starts = [index for index, message in enumerate(messages) if STEVE_DUMP_HEADER.fullmatch(message)]
     if not starts:
-        return TokenHoldersUnknown("steve wrote no token dump in the journal window.")
+        return TokenHoldersUnknown("no recent steve token dump")
     for start in reversed(starts):
         header = STEVE_DUMP_HEADER.fullmatch(messages[start])
         assert header is not None
@@ -1620,7 +1620,7 @@ def token_holders(journal: str) -> TokenHolders | TokenHoldersUnknown:
                 break
         if sum(held.values()) == int(header[2]) - int(header[1]):
             return TokenHolders(held)
-    return TokenHoldersUnknown("Each steve token dump in the journal window was incomplete.")
+    return TokenHoldersUnknown("incomplete steve token dumps")
 
 
 def newest_token_holders(dump_seconds: int) -> TokenHolders | TokenHoldersUnknown:
@@ -1628,7 +1628,7 @@ def newest_token_holders(dump_seconds: int) -> TokenHolders | TokenHoldersUnknow
     try:
         return token_holders(steve_journal(2 * dump_seconds))
     except (OSError, subprocess.TimeoutExpired) as error:
-        return TokenHoldersUnknown(f"The steve journal is unreadable: {error}")
+        return TokenHoldersUnknown(f"unreadable steve journal · {error}")
 
 
 def parent_pid(pid: int) -> int:
