@@ -1415,6 +1415,28 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
 
+### Phase 85 — send.py prints FAILED only when delivery failed  · status: todo
+**Depends on:** phase 84 on main
+
+#### Work Order
+
+**Goal:** the sdlc showrunner (06:30 EST Nov 19; phases-unit owns send.py). verify-unit sent two messages to builds at 06:27 and 06:28. Copy 1 printed `FAILED: SendMessage used a different target or payload`. Copy 2 printed `FAILED: 2 SendMessage calls; delivery unconfirmed`. builds got both. The resend rule then made copies, and the repeat guard held copy 3 as a flood.
+
+**Spec:**
+1. The proxy forward record is the proof of delivery. In `read_relay` (send.py), when the proxy completed one forward and its payload is the message text, the result is SENT. A relay tool-call count, target or payload that does not match is a note on the SENT line, not a failure.
+2. Keep FAILED or queued for each case where the proxy forwarded nothing, was refused, or was interrupted. Keep "delivery unconfirmed" only where the proxy state cannot show whether the bytes went.
+3. A forward whose payload is not the message text stays FAILED.
+4. Add rows to the existing relay tests in `test_send.py`: a different target or payload in the tool call with a matching forward prints SENT; two SendMessage calls with one matching forward prints SENT; no forward stays queued or FAILED; an interrupted forward stays unconfirmed.
+
+**Files:** `scripts/message/send.py`, `scripts/message/test_send.py`, `docs/as-built/` where it states the relay result rules.
+
+**Workers:** 1 writer.
+
+**Order:** first on the console batch line after phase 84 is on main. Branch from main.
+
+**Acceptance gate:**
+1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
