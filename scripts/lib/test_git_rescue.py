@@ -125,6 +125,27 @@ class GitRescueTests(unittest.TestCase):
         self.assertEqual(self.git(self.source, "rev-parse", result.ref + "^1"), local)
         self.assertEqual((restored / "local.txt").read_text(), "detached work\n")
 
+    def test_clean_unreachable_commit_is_saved_without_a_git_identity(self) -> None:
+        local = commit_repository(self.slot, "detached", allow_empty=True)
+        self.assertEqual(self.git(self.slot, "status", "--porcelain"), "")
+        self.assertEqual(self.git(self.slot, "rev-list", "HEAD", "--not", "--branches", "--tags", "--remotes"), local)
+
+        with mock.patch.dict(os.environ, {
+            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "user.useConfigOnly", "GIT_CONFIG_VALUE_0": "true",
+        }):
+            for name in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME",
+                         "GIT_COMMITTER_EMAIL", "EMAIL", "GIT_CONFIG_PARAMETERS"):
+                _ = os.environ.pop(name, None)
+            result = self.saved("no-user-identity")
+
+        self.assertEqual(self.git(self.source, "rev-parse", result.ref + "^1"), local)
+        self.assertEqual(self.git(self.slot, "rev-parse", "HEAD"), local)
+        self.assertEqual(self.git(self.slot, "status", "--porcelain"), "")
+        identity = "git-rescue <git-rescue@localhost>"
+        self.assertEqual(self.git(self.source, "show", "-s", "--format=%an <%ae>%n%cn <%ce>", result.ref),
+                         f"{identity}\n{identity}")
+
     def test_conflict_rescue_keeps_all_stages_and_merge_parent(self) -> None:
         _ = (self.slot / "tracked.txt").write_text("ours\n")
         ours = commit_repository(self.slot, "ours")
