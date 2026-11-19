@@ -5297,3 +5297,45 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - impl: copies.py, build_slots and their tests.
 
 **Acceptance gate:** fewer Git starts per operation; an AWS pair shows lower median CPU; the full suite is green.
+
+### Phase 373 — the fast track test halves its AWS CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `production/test_fast_track.py` uses half its AWS gate CPU (51.1 s median, 66.0 s wall, 50 tests on 2026-11-19).
+
+**Spec:**
+- AWS rank 5 on 2026-11-19 00:23 EST. Ranks 1-4 and 6-7 have phases (365, 368, 348, 346, 349) that wait on merges. Slowest kept test: `test_reruns_after_restore_or_promotion_failure_do_not_push_twice` 5.2 s.
+1. Measure with `module_cost.py --tests 20 --commands 20` like the gate: fresh TMPDIR, bytecode on. Name the top commands and fixtures and their CPU share. Count the Git calls and say which ones each test needs.
+2. Cut the cost at its cause: repeated Git repository setup, Python starts, or polling. Share setup per class where the tests stay independent. Replace fixed waits with an event the test drives.
+3. Name any cause in the fast track production code; fix it there when it also costs production runs.
+- Every assertion remains. Tests read no /tune-changeable value. No lazy imports, no copies, no signal handlers.
+
+**Files:** scripts/production/test_fast_track.py; its test support; the fast track production code only when the cost lives there.
+
+**Workers:** 1 writer. One module and its subject.
+- impl: the test module, its support and any production cause.
+
+**Acceptance gate:** an AWS pair (3 rounds) shows the median CPU at half or less, or a floor result with its cause; the module passes 20 times under load in a 2 GB scope; the full suite is green.
+
+### Phase 374 — the models conf publish test halves its AWS CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `agents/test_models_conf_publish.py` uses half its AWS gate CPU (48.1 s median, 51.1 s wall, 53 tests on 2026-11-19).
+
+**Spec:**
+- AWS rank 8 on 2026-11-19 00:23 EST. Slowest kept test: `test_push_retry_preserves_an_earlier_unpublished_registry_row` 4.0 s. An earlier phase turned Git auto maintenance off for this module (6.06 CPU s saved).
+1. Measure with `module_cost.py --tests 20 --commands 20` like the gate: fresh TMPDIR, bytecode on. Name the top commands and fixtures and their CPU share. Count the Git calls and say which ones each test needs.
+2. Cut the cost at its cause: repeated Git repository setup, Python starts, or polling. Share setup per class where the tests stay independent. Replace fixed waits with an event the test drives.
+3. Name any cause in the registry publish code; fix it there when it also costs production runs.
+- Every assertion remains. Tests read no /tune-changeable value. No lazy imports, no copies, no signal handlers.
+
+**Files:** scripts/agents/test_models_conf_publish.py; its test support; the registry publish code only when the cost lives there.
+
+**Workers:** 1 writer. One module and its subject.
+- impl: the test module, its support and any production cause.
+
+**Acceptance gate:** an AWS pair (3 rounds) shows the median CPU at half or less, or a floor result with its cause; the module passes 20 times under load in a 2 GB scope; the full suite is green.
