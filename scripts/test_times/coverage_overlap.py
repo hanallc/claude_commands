@@ -19,12 +19,14 @@ import json
 import os
 from pathlib import Path
 import platform
+import stat
 import sys
 from typing import TYPE_CHECKING, TypedDict, cast, override
 import unittest
 
 
 from scripts.lib import build_folders, walled_tests
+from scripts.lib.python_startup.sitecustomize import inherited_paths
 from scripts.test_times.line_collector import (
     REPOSITORY, SHARED_TEST, SHARED_THREAD, ChildLaunch, ChildReport, ExecutedLine, LineCollector, read_child_reports,
 )
@@ -77,8 +79,6 @@ class ChildEnvironment:
         self.saved: dict[str, str] = {name: os.environ[name] for name in self.names if name in os.environ}
         child_path = str(Path(__file__).resolve().parent / "coverage_child")
         previous = self.saved.get("PYTHONPATH", "")
-        from scripts.lib.python_startup.sitecustomize import inherited_paths
-
         paths = inherited_paths(previous)
         self.python_path: str = os.pathsep.join((child_path, *paths))
         self.leaves: str = " ".join(conf.read("test_times").words("COVERAGE_LEAF_PROGRAMS"))
@@ -306,17 +306,41 @@ def print_candidates(rows: Sequence[CoverageRow]) -> None:
             print(f'{row["id"]}: {row["child"]}')
 
 
+def run_with_output(command: list[str], output: Path) -> int:
+    """Publish the report from the private job folder after the child exits."""
+    with build_folders.tool_folder("coverage-overlap") as folder:
+        report = folder.resolve() / "coverage.json"
+        environment = {**os.environ, "COVERAGE_OUT": str(report)}
+        with walled_tests.gate_inputs(REPOSITORY, environment, read_only=()):
+            status = walled_tests.run(command, folder)
+        try:
+            descriptor = os.open(report, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            if status != 0:
+                return status
+            raise
+        with os.fdopen(descriptor, "rb") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise OSError("the coverage report must be a regular file")
+            _ = output.write_bytes(source.read())
+        return status
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print("usage: coverage_overlap.py scripts/<folder> <file> [<file> ...]", file=sys.stderr)
         return 2
     if not walled_tests.guarded():
         try:
-            if os.environ.get("COVERAGE_OUT"):
-                raise walled_tests.WallsUnavailable("coverage output requires a path inside the test walls")
-            walled_tests.enter([sys.executable, *sys.orig_argv[1:]])
+            command = [sys.executable, *sys.orig_argv[1:]]
+            if output := os.environ.get("COVERAGE_OUT"):
+                return run_with_output(command, Path(output))
+            walled_tests.enter(command)
         except walled_tests.WallsUnavailable as error:
             print(f"walled tests: {error}", file=sys.stderr)
+            return 2
+        except OSError as error:
+            print(f"coverage overlap: cannot write output: {error}", file=sys.stderr)
             return 2
     folder = Path(argv[0]).resolve()
     modules = {path.resolve() for _, path in discover_test_modules(REPOSITORY)}

@@ -14,11 +14,15 @@ import io
 import os
 from pathlib import Path
 import re
+import select
+import signal
+import subprocess
+import tempfile
 from typing import cast, final, override
 from contextlib import AbstractContextManager, redirect_stdout
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
-from scripts.lib import scratch
+from scripts.lib import process_group, scratch, walled_tests
 from scripts.production import change_review, merge_gate, staff
 from scripts.production.gate_modules import GateRefused
 from scripts.production.test_change_review import ProducerFixture
@@ -26,6 +30,69 @@ from scripts.production.staff_test_support import (
     fixture_member, fixture_unit_location, isolated_source_readers, isolated_staff_file, recorded_showrunner, source_environment,
 )
 from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
+
+
+class ModuleScopeStopTests(unittest.TestCase):
+    def test_scope_stop_waits_for_zero_population(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scope = Path(directory)
+            events = scope / "cgroup.events"
+            kill = scope / "cgroup.kill"
+            _ = events.write_text("populated 1\n")
+
+            def empty(_timeout: int) -> list[tuple[int, int]]:
+                self.assertEqual(kill.read_text(), "1\n")
+                _ = events.write_text("populated 0\n")
+                return []
+
+            poll = mock.Mock(side_effect=empty)
+            with mock.patch.object(select, "poll", return_value=mock.Mock(poll=poll)):
+                self.assertTrue(merge_gate.stop_module_scope(scope))
+            poll.assert_called_once()
+
+    def test_scope_that_appears_during_a_stop_is_checked_after_reap(self) -> None:
+        scope = Path("/scopes/module.scope")
+        process = cast(subprocess.Popen[str], mock.Mock(spec=subprocess.Popen, pid=123, returncode=None))
+        job = merge_gate.RunningGateJob("lib", Path("test_one.py"), process, 0, 0,
+                                      io.StringIO(), Path("output.log"), "test_one.py", scope=scope)
+        actions: list[str] = []
+
+        def stop(path: Path) -> bool:
+            self.assertEqual(path, scope)
+            actions.append("scope")
+            return "reap" in actions
+
+        def stop_group(pid: int, number: int) -> None:
+            self.assertEqual((pid, number), (123, signal.SIGKILL))
+            actions.append("group")
+
+        def reap(current: merge_gate.RunningGateJob, *, block: bool = False) -> None:
+            self.assertIs(current, job)
+            self.assertTrue(block)
+            actions.append("reap")
+
+        with (mock.patch.object(merge_gate, "stop_module_scope", side_effect=stop),
+              mock.patch.object(process_group, "send_process_group", side_effect=stop_group),
+              mock.patch.object(merge_gate, "reap_gate_job", side_effect=reap)):
+            merge_gate.kill_job_group(job)
+        self.assertEqual(actions, ["scope", "group", "reap", "scope"])
+
+    def test_nested_job_clears_the_caller_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            config = folder / "walled_tests.conf"
+            _ = config.write_text("kept_environment=PATH HOME\n")
+            environment = {"PATH": "/bin", "HOME": "/home/test", "GIT_DIR": "/private/git",
+                           "BASH_ENV": "/private/startup.sh", "COPIES_RUN_PID": "123"}
+            with (mock.patch.object(walled_tests, "CONFIG", config),
+                  mock.patch.object(walled_tests, "guarded", return_value=True),
+                  mock.patch.dict(os.environ, environment, clear=True)):
+                command = walled_tests.command(["/bin/true"], folder)
+        self.assertEqual(command[:2], ["/usr/bin/env", "-i"])
+        self.assertEqual(command[-1], "/bin/true")
+        self.assertIn("PATH=/bin", command)
+        self.assertTrue({"GIT_DIR", "BASH_ENV", "COPIES_RUN_PID"}.isdisjoint(
+            part.split("=", 1)[0] for part in command[2:-1]))
 
 
 @final

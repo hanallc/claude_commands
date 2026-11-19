@@ -16,11 +16,13 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from importlib.machinery import ModuleSpec, PathFinder
-from importlib.util import module_from_spec
+from importlib.util import module_from_spec, spec_from_file_location
 from types import CodeType, ModuleType
+from typing import cast
 
 
-STARTUP_FILES = ("scripts/lib/py", "scripts/lib/package_root.py", "scripts/lib/python_startup/sitecustomize.py")
+STARTUP_FILES = ("scripts/lib/py", "scripts/lib/package_root.py", "scripts/lib/python_startup/sitecustomize.py",
+                 "scripts/lib/raw_starts.py")
 TEST_RUNNER_FILES = (*STARTUP_FILES, "scripts/test_times/module_run.py", "scripts/lib/descendants.py",
                      "scripts/lib/conf_reads.py", "scripts/lib/build_folders.py", "scripts/lib/build_folder_lock.py",
                      "scripts/lib/boot_identity.py",
@@ -32,6 +34,29 @@ DATACLASS_CODE_FLAGS = 0
 # A read refreshes an entry's time once a day, so the prune age counts in days.
 DATACLASS_CODE_TOUCH_SECONDS = 86400
 _dataclass_code_folder: list[str] = []
+
+
+def _load_raw_starts() -> ModuleType:
+    """Load the classifier without selecting a package checkout."""
+    name = "_devtools_raw_starts"
+    if name in sys.modules:
+        return sys.modules[name]
+    path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "raw_starts.py")
+    spec = spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"walled tests: cannot load {path}")
+    module = module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except OSError as error:
+        raise SystemExit(f"walled tests: cannot load {path}: {error}") from error
+    sys.modules[name] = module
+    return module
+
+
+_raw_starts = _load_raw_starts()
+is_test_start = cast(Callable[[Sequence[str]], bool], _raw_starts.__dict__["is_test_start"])
+python_target = cast(Callable[[tuple[str, ...]], tuple[str, ...]], _raw_starts.__dict__["python_target"])
 
 
 def checkout_root(start: str) -> str:
@@ -214,7 +239,7 @@ def start_process(arguments: list[str]) -> str:
     if "dataclasses" not in sys.modules and not any(
             type(finder).__name__ == DataclassCodeFinder.__name__ for finder in sys.meta_path):
         sys.meta_path.insert(0, DataclassCodeFinder())
-    _start_test_run(selected, arguments)
+    _start_test_run(selected)
     return selected
 
 
@@ -240,33 +265,23 @@ def kernel_guarded() -> bool:
         return False
 
 
-def _python_module(original: Sequence[str]) -> str:
-    """Read the interpreter's module argument before its program arguments."""
-    options = iter(original[1:])
-    for option in options:
-        if option == "-m":
-            return next(options, "")
-        if option.startswith("-m"):
-            return option[2:]
-        if option in ("-W", "-X", "--check-hash-based-pycs"):
-            _ = next(options, "")
-        elif option in ("-", "--") or option.startswith("-c") or not option.startswith("-"):
-            break
-    return ""
-
-
-def _start_test_run(selected: str, arguments: list[str]) -> None:
+def _start_test_run(selected: str) -> None:
     original = sys.orig_argv
-    target = arguments[0] if arguments else ""
-    module = _python_module(original) if target == "-m" else target
-    test_module = (module.partition(".")[0] in ("unittest", "pytest")
-                   or module.startswith("scripts.") and module.rsplit(".", 1)[-1].startswith("test_"))
-    filename = os.path.basename(target)
-    guard = os.path.join(selected, "scripts/lib/walled_tests.py")
-    test_file = filename.startswith("test_") and filename.endswith(".py")
-    if not (test_module or filename == "module_run.py" or test_file):
+    target = ["python", *original[1:]]
+    if __name__ == "_shim_python_startup":
+        # The isolated shim uses a Python command string to start the target.
+        bootstrap = python_target(tuple(original[1:]))
+        if len(bootstrap) < 5 or bootstrap[0] != "-c":
+            return
+        mode, entry = bootstrap[3:5]
+        if mode == "m":
+            target = ["python", "-m", entry]
+        elif mode == "file":
+            target = ["python", "--", entry]
+    if not is_test_start(target):
         return
     if not kernel_guarded():
+        guard = os.path.join(selected, "scripts/lib/walled_tests.py")
         if not os.path.isfile(guard):
             raise SystemExit(f"walled tests: launcher not found: {guard}")
         # The launcher calls enter() before it restarts Python.
@@ -309,8 +324,6 @@ def finish_startup(filename: str, arguments: list[str]) -> None:
     # Python adds its automatic path after this hook returns.
     state.__dict__["completed_selection"] = (selected, _selection_inputs(automatic_paths))
     if "ready" in state.__dict__:
-        from typing import cast
-
         ready = cast(Callable[[], None], state.__dict__.pop("ready"))
         ready()
 

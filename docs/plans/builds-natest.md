@@ -4454,3 +4454,9 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - `test_task_end_requires_confirmed_exit_and_failed_stops_keep_the_checkout` keeps one full `mac_run.sh` run for the success case. The two kept-checkout cases call `cleanup_mac_run` through `shell_functions` with `on_mac` stubbed.
 - The scratch-clone loop stays: no function exposes its purpose and owner words.
 - Paired natedev CPU: 35.5/32.0/33.6 to 29.5/34.0/28.1 s (median saving 5.5 s). Commit c8599345f.
+
+### Phase 392 — Test walls on natedev · status: todo
+
+#### Work Order
+
+A person at a shell with a raw interpreter has no walls. Shell startup files and Python `.pth` startup code run before the walls.

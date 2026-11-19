@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator
-from contextlib import contextmanager, redirect_stderr
+from contextlib import contextmanager, nullcontext, redirect_stderr
 import io
 from dataclasses import dataclass
 import json
@@ -19,7 +19,7 @@ import unittest
 from unittest import mock
 
 
-from scripts.lib import walled_tests
+from scripts.lib import build_folders, walled_tests
 from scripts.lib.checkout_test_support import copy_test_runner
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -213,6 +213,29 @@ class CoverageOverlapTests(unittest.TestCase):
         enter.assert_called_once_with(original)
         discover.assert_not_called()
         self.assertIn("Bubblewrap is unavailable", error.getvalue())
+
+    def test_direct_run_publishes_the_report_after_the_guarded_child_exits(self) -> None:
+        arguments = ["scripts/lib", "test_py_root.py"]
+        original = [sys.executable, str(TOOL), *arguments]
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory) / "job"
+            folder.mkdir()
+            output = folder.parent / "report.json"
+
+            def run(command: list[str], job: Path) -> int:
+                self.assertEqual(command, original)
+                self.assertEqual(job, folder)
+                self.assertFalse(output.exists())
+                _ = (job / "coverage.json").write_text('{"tests": []}\n', encoding="utf-8")
+                return 1
+
+            with (mock.patch.object(sys, "orig_argv", original),
+                  mock.patch.dict(os.environ, {"COVERAGE_OUT": str(output)}),
+                  mock.patch.object(walled_tests, "guarded", return_value=False),
+                  mock.patch.object(walled_tests, "run", side_effect=run),
+                  mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(folder))):
+                self.assertEqual(coverage_overlap.main(arguments), 1)
+            self.assertEqual(output.read_text(encoding="utf-8"), '{"tests": []}\n')
 
     @contextmanager
     def fixture_command(self, sources: dict[str, str]) -> Generator[tuple[subprocess.CompletedProcess[str], Path]]:

@@ -11,6 +11,7 @@ import tarfile
 import unittest
 from unittest import mock
 
+from scripts.lib.checkout_test_support import copy_startup
 from scripts.lib.python_startup import sitecustomize
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -98,7 +99,7 @@ class PythonRootTests(unittest.TestCase):
                   mock.patch.object(sitecustomize, "kernel_guarded", return_value=False),
                   mock.patch.object(os, "execv", side_effect=FileNotFoundError("launcher refused")) as launch):
                 with self.assertRaisesRegex(SystemExit, "cannot start the launcher"):
-                    sitecustomize._start_test_run(root, arguments)  # pyright: ignore[reportPrivateUsage]
+                    sitecustomize._start_test_run(root)  # pyright: ignore[reportPrivateUsage]
                 launch.assert_called_once_with(
                     sys.executable, [sys.executable, "-I", guard, "--", *original],
                 )
@@ -106,15 +107,21 @@ class PythonRootTests(unittest.TestCase):
     def test_startup_does_not_treat_program_arguments_as_interpreter_options(self) -> None:
         with (mock.patch.object(sys, "orig_argv", [sys.executable, "command.py", "-m", "unittest"]),
               mock.patch.object(sitecustomize, "kernel_guarded") as guarded):
-            sitecustomize._start_test_run("/fixture", ["command.py", "-m", "unittest"])  # pyright: ignore[reportPrivateUsage]
+            sitecustomize._start_test_run("/fixture")  # pyright: ignore[reportPrivateUsage]
         guarded.assert_not_called()
+
+    def test_isolated_shim_classifies_the_module_in_its_bootstrap(self) -> None:
+        original = [sys.executable, "-I", "-P", "-c", "shim bootstrap", "/checkout", "m", "unittest.__main__"]
+        with (mock.patch.object(sitecustomize, "__name__", "_shim_python_startup"),
+              mock.patch.object(sys, "orig_argv", original),
+              mock.patch.object(sitecustomize, "kernel_guarded", return_value=True) as guarded,
+              mock.patch.dict(os.environ, {"MERGE_GATE_PARENT_PID": "1"})):
+            sitecustomize._start_test_run("/checkout")  # pyright: ignore[reportPrivateUsage]
+        guarded.assert_called_once_with()
 
     def checkout(self, root: Path, value: str) -> Path:
         library = root / "scripts/lib"
-        library.mkdir(parents=True)
-        _ = shutil.copy2(Path(__file__).with_name("py"), library / "py")
-        _ = shutil.copytree(Path(__file__).with_name("python_startup"), library / "python_startup",
-                            ignore=shutil.ignore_patterns("__pycache__"))
+        copy_startup(root)
         package = root / "scripts/example"
         package.mkdir()
         _ = (package / "value.py").write_text(f"VALUE = {value!r}\n")

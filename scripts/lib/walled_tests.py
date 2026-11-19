@@ -10,7 +10,9 @@ import fcntl
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
+import tempfile
 from typing import NamedTuple, NoReturn
 
 if __name__ == "__main__":
@@ -62,25 +64,39 @@ def guarded() -> bool:
 def host_environment(environment: Mapping[str, str]) -> dict[str, str]:
     """Keep only the settings that the host scope and bootstrap need."""
     try:
-        keys = conf.read(CONFIG).words("kept_environment")
+        return _kept_environment(conf.read(CONFIG), environment)
     except conf.Unusable as error:
         raise WallsUnavailable(str(error)) from error
+
+
+def _kept_environment(settings: conf.ConfigRead, environment: Mapping[str, str]) -> dict[str, str]:
+    keys = settings.words("kept_environment")
     return {key: environment[key] for key in keys if key in environment}
 
 
-def command(argv: Sequence[str], job_folder: Path | None) -> list[str]:
+def command(argv: Sequence[str], job_folder: Path) -> list[str]:
     """Build a guarded command. The caller owns the job folder lease."""
     if not argv:
         raise WallsUnavailable("a guarded command requires an executable")
-    if guarded():
-        return ["/usr/bin/env", "MERGE_GATE_PARENT_PID=1", *argv]
-
     try:
         settings = conf.read(CONFIG)
+        inputs = _gate_inputs.get()
+        source = os.environ if inputs is None else inputs.environment
+        values = _kept_environment(settings, source)
+        values.update({key: source[key] for key in MODULE_VALUES if key in source})
+        tmp = str(job_folder.resolve(strict=True))
+        values.update(TMPDIR=tmp, TMP=tmp, TEMP=tmp, MERGE_GATE_PARENT_PID="1")
+        if source.get("COVERAGE_OUT") == f"{tmp}/coverage.json":
+            values["COVERAGE_OUT"] = f"{tmp}/coverage.json"
+        _ = values.pop("DBUS_SESSION_BUS_ADDRESS", None)
+        _ = values.setdefault("BUILDLOG_DIR", f"{tmp}/buildlog")
+        _ = values.setdefault("SESSION_TEMP_ROOT", f"{tmp}/session")
+        if guarded():
+            return ["/usr/bin/env", "-i", *(f"{key}={value}" for key, value in values.items()), *argv]
+
         executable = Path(settings.text("bubblewrap", recover_invalid=False))
         if executable != SYSTEM / "bin/bwrap" or not executable.is_file() or not os.access(executable, os.X_OK):
             raise WallsUnavailable(f"Bubblewrap is unavailable at {SYSTEM / 'bin/bwrap'}")
-        inputs = _gate_inputs.get()
         checkout = Path.cwd().resolve() if inputs is None else inputs.checkout.resolve()
         working = checkout
         if inputs is None:
@@ -91,20 +107,24 @@ def command(argv: Sequence[str], job_folder: Path | None) -> list[str]:
             else:
                 checkout = CHECKOUT
                 working = CHECKOUT
-        folder = job_folder.resolve(strict=True) if job_folder is not None else None
-        if folder is not None and (not folder.is_dir() or folder in working.parents or folder == working
-                                   or folder in CHECKOUT.parents or folder == CHECKOUT
-                                   or folder in (Path("/tmp"), Path("/dev/shm"), Path("/var/tmp"))):
+        folder = Path(tmp)
+        if (not folder.is_dir() or folder in working.parents or folder == working
+                or folder in CHECKOUT.parents or folder == CHECKOUT
+                or folder in (Path("/tmp"), Path("/dev/shm"), Path("/var/tmp"))):
             raise WallsUnavailable(f"unsafe test job folder: {folder}")
 
-        source = os.environ if inputs is None else inputs.environment
-        values = {key: source[key] for key in settings.words("kept_environment") if key in source}
+        account = Path(tempfile.mkdtemp(prefix="test-account-", dir=folder))
+        uid, gid = os.getuid(), os.getgid()
+        _ = (account / "passwd").write_text(f"test:x:{uid}:{gid}:Test account:{HOME}:/bin/sh\n", encoding="ascii")
+        _ = (account / "group").write_text(f"test:x:{gid}:\n", encoding="ascii")
         arguments = [str(executable), "--unshare-user", "--unshare-pid", "--unshare-net",
                      "--unshare-cgroup", "--unshare-ipc", "--unshare-uts", "--cap-drop", "ALL",
                      "--new-session", "--die-with-parent", "--clearenv", "--proc", "/proc", "--dev", "/dev",
                      "--tmpfs", "/tmp", "--tmpfs", "/dev/shm", "--dir", HOME]
         for path in ("/nix/store", "/bin", "/usr/bin"):
             arguments.extend(("--ro-bind", path, path))
+        for name in ("passwd", "group"):
+            arguments.extend(("--ro-bind", str(account / name), f"/etc/{name}"))
         arguments.extend(("--symlink", str(SYSTEM.resolve(strict=True)), str(SYSTEM)))
         cache = f"/var/tmp/dataclass-code-{os.getuid()}"
         arguments.extend(("--ro-bind-try", cache, cache))
@@ -113,27 +133,18 @@ def command(argv: Sequence[str], job_folder: Path | None) -> list[str]:
         for path in mounts:
             if not path.is_relative_to("/nix/store"):
                 arguments.extend(("--ro-bind", str(path), str(path)))
-        if folder is not None:
-            arguments.extend(("--bind", str(folder), str(folder)))
-            for key in MODULE_VALUES:
-                if key in source:
-                    values[key] = source[key]
+        arguments.extend(("--bind", tmp, tmp, "--ro-bind", str(account), str(account)))
 
-        tmp = str(folder) if folder is not None else "/tmp"
         runtime = "/tmp/test-runtime"
         arguments.extend(("--dir", runtime, "--chmod", "0700", runtime,
                           "--symlink", str(CHECKOUT), f"{HOME}/.claude"))
-        _ = values.pop("DBUS_SESSION_BUS_ADDRESS", None)
         values.update({
-            "HOME": HOME, "PATH": values.get("PATH", str(SYSTEM / "bin")),
+            "HOME": HOME, "USER": "test", "LOGNAME": "test", "PATH": values.get("PATH", str(SYSTEM / "bin")),
             "XDG_CACHE_HOME": "/tmp/test-cache", "XDG_CONFIG_HOME": "/tmp/test-config",
             "XDG_DATA_HOME": "/tmp/test-data", "XDG_STATE_HOME": "/tmp/test-state", "XDG_RUNTIME_DIR": runtime,
-            "TMPDIR": tmp, "TMP": tmp, "TEMP": tmp, "MERGE_GATE_PARENT_PID": "1",
             "PYTHONPATH": os.pathsep.join((str(checkout / "scripts/lib/python_startup"), str(checkout))),
             "AWS_EC2_METADATA_DISABLED": "true",
         })
-        _ = values.setdefault("BUILDLOG_DIR", f"{tmp}/buildlog")
-        _ = values.setdefault("SESSION_TEMP_ROOT", f"{tmp}/session")
         for key, value in values.items():
             arguments.extend(("--setenv", key, value))
         arguments.extend(("--remount-ro", "/dev", "--remount-ro", "/", "--chdir", str(working), "--", *argv))
@@ -181,17 +192,34 @@ def _exec(argv: Sequence[str], environment: Mapping[str, str]) -> NoReturn:
         raise WallsUnavailable(f"cannot start {argv[0]}: {error}") from error
 
 
+def _verified_command(argv: Sequence[str], folder: Path) -> list[str]:
+    return command([sys.executable, "-I", str(Path(__file__).resolve()), "--inside", *argv], folder)
+
+
+def run(argv: Sequence[str], folder: Path) -> int:
+    """Keep the caller and its folder until the guarded command exits."""
+    if not argv:
+        raise WallsUnavailable("a guarded command requires an executable")
+    try:
+        status = subprocess.run(_verified_command(argv, folder), env={}, check=False, restore_signals=False).returncode
+    except OSError as error:
+        raise WallsUnavailable(f"cannot start {argv[0]}: {error}") from error
+    return status if status >= 0 else 128 - status
+
+
 def enter(argv: Sequence[str]) -> NoReturn:
-    """Replace this process with a guarded command or refuse it."""
+    """Run a command behind the test walls or refuse it."""
     if not argv:
         raise WallsUnavailable("a guarded command requires an executable")
     if guarded():
-        _exec(argv, os.environ)
+        _exec(command(argv, Path(tempfile.gettempdir())), {})
     folder = profile_folder()
-    if "TEST_TIMES_OUT" in os.environ and folder is None:
-        raise WallsUnavailable("test timing output requires a private profiler folder")
-    verification = [sys.executable, "-I", str(Path(__file__).resolve()), "--inside", *argv]
-    launch = command(verification, folder)
+    if folder is None:
+        if "TEST_TIMES_OUT" in os.environ:
+            raise WallsUnavailable("test timing output requires a private profiler folder")
+        with tempfile.TemporaryDirectory(prefix="walled-tests-", dir="/tmp") as directory:
+            raise SystemExit(run(argv, Path(directory)))
+    launch = _verified_command(argv, folder)
     # Bubblewrap passes inherited descriptors to its child.
     try:
         for entry in Path("/proc/self/fd").iterdir():
