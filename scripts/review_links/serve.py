@@ -448,16 +448,23 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.end_headers()
             return BytesIO(content)
         if route.path == "/console/for-you.json":
+            extra: dict[str, object] = {}
+            if route.query == "view=console":
+                extra["accounts_quota"] = {"level": accounts_page.QuotaLevel.NONE, "name": ""}
+                try:
+                    extra["accounts_quota"] = accounts_page.nav_quota(root)
+                except (accounts_page.UnreadableQuotaState, accounts_page.InvalidQuotaThresholds) as error:
+                    print(f"review-links accounts: {error}", file=sys.stderr)
+                except (OSError, ValueError):
+                    print("review-links accounts: could not read the quota alerts", file=sys.stderr)
             try:
-                if route.query == "view=count":
-                    payload = console.for_you_count(for_you.read())
-                else:
-                    payload = console.for_you_payload()
+                payload = (console.for_you_count(for_you.read()) if route.query == "view=count"
+                           else console.for_you_payload())
             except (OSError, ValueError) as error:
                 print(f"review-links actions: {error}", file=sys.stderr)
-                self.json_response(503, {"available": False})
+                self.json_response(503, {"available": False, **extra})
             else:
-                self.json_response(200, payload)
+                self.json_response(200, {**payload, **extra})
             return None
         if route.path == accounts_page.PAGE_PATH:
             try:
@@ -1110,20 +1117,24 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 server.review_cache.invalidate()
 
     def accounts_post(self) -> None:
-        """Validate and save one account color or one next move from the Accounts page."""
+        """Apply one Accounts page action."""
+        quota_fields = {"quota_account", "quota_level", "quota_reset"}
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= 4096:
                 raise ValueError("Invalid accounts request size.")
             fields = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
-            if (set(fields) not in ({"key", "value"}, {"group", "to"}, {"group", "clear"})
+            if (set(fields) not in ({"key", "value"}, {"group", "to"}, {"group", "clear"}, quota_fields)
                     or any(len(values) != 1 for values in fields.values())
                     or ("clear" in fields and fields["clear"] != ["first"])):
-                raise ValueError("Use one color key and one color value, one group and one account, or one group and clear=first.")
+                raise ValueError("Send one Accounts action with its required fields.")
         except (ValueError, UnicodeError) as error:
             self.json_response(400, {"reason": str(error)})
             return
-        result = (accounts_page.save_color(fields["key"][0], fields["value"][0]) if "key" in fields
+        server = cast(ReviewLinksServer, self.server)
+        result = (accounts_page.clear_quota(server.root, fields["quota_account"][0], fields["quota_level"][0],
+                                            fields["quota_reset"][0]) if set(fields) == quota_fields
+                  else accounts_page.save_color(fields["key"][0], fields["value"][0]) if "key" in fields
                   else accounts_page.clear_next_move(fields["group"][0]) if "clear" in fields
                   else accounts_page.save_next_move(fields["group"][0], fields["to"][0]))
         if isinstance(result, accounts_page.Refused):

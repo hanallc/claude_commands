@@ -20,6 +20,7 @@ from types import MappingProxyType
 from typing import Literal, cast, override
 from unittest import mock
 
+from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import OwningSession
 from scripts.build_hold import build_hold, hold_enforcer, override_guard
 from scripts.build_queue import admission_service, admission_records, placement
@@ -118,7 +119,7 @@ class HoldEnforcerTests(unittest.TestCase):
         paths = claim_state.StatePaths(self.root / 'hana-claims')
         paths.directory.mkdir()
         record: claim_state.RemoteJobClaim = {
-            'claim_id': placement.assigned_claim_id('fixture-episode', 'fixture-attempt'),
+            'claim_id': execution_identity.assigned_claim_id('fixture-episode', 'fixture-attempt'),
             'episode': 'fixture-episode', 'attempt': 'fixture-attempt',
             'submitting_session': 'other', 'pid': 701, 'proc_start': '11000', 'what': 'Hana check',
             'worktree': str(self.root), 'since': '2026-11-16T12:00:00+00:00', 'remote_host': 'fixture-hana',
@@ -157,9 +158,9 @@ class HoldEnforcerTests(unittest.TestCase):
         claim, = claim_state.read_claims(paths)
         assignment = placement.PlacementAssignment('fixture-episode', 'fixture-attempt',
             placement.PlacementDestination('ssh', target.name, 'fixture-hana', claim.scope, 1),
-            placement.SourceKeyKnown('fixture-source'),
+            execution_identity.SourceKeyKnown('fixture-source'),
             placement.SubmittingOwner(store.host_name(), 700, '11000'), OwningSession('other'), 100)
-        key = placement.attempt_key(assignment.episode, assignment.attempt)
+        key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         state = admission_service.ServiceState({}, {}, {}, admission_records.ReadyToStart())
         state.current_assignments[assignment.episode] = key
         for match in (True, False):
@@ -210,9 +211,9 @@ class HoldEnforcerTests(unittest.TestCase):
         claim, = claim_state.read_claims(paths)
         assignment = placement.PlacementAssignment('fixture-episode', 'fixture-attempt',
             placement.PlacementDestination('ssh', target.name, 'fixture-hana', claim.scope, 1),
-            placement.SourceKeyKnown('fixture-source'),
+            execution_identity.SourceKeyKnown('fixture-source'),
             placement.SubmittingOwner(store.host_name(), 700, '11000'), OwningSession('other'), 100)
-        key = placement.attempt_key(assignment.episode, assignment.attempt)
+        key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         state = admission_service.ServiceState({}, {}, {}, admission_records.ReadyToStart())
         state.current_assignments[assignment.episode] = key
         state.assignments[key] = admission_records.SavedPlacementAssignment(assignment)
@@ -221,7 +222,7 @@ class HoldEnforcerTests(unittest.TestCase):
             (self.holders / 'holder').unlink()
 
         for module, operation in ((target_config, 'read_execution_transport'),
-                (placement, 'attempt_key'), (placement, 'assigned_claim_id')):
+                (execution_identity, 'attempt_key'), (execution_identity, 'assigned_claim_id')):
             for error_type in (OSError, ValueError):
                 with self.subTest(operation=operation, error=error_type.__name__):
                     self.write_holder()

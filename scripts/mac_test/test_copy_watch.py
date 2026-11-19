@@ -22,6 +22,7 @@ from unittest import mock
 from collections.abc import Callable
 from typing import TypedDict, cast, final, override
 
+from scripts.build_queue import execution_identity
 from scripts.lib import process_start as process_identity
 
 
@@ -120,7 +121,7 @@ attempt = len(events.read_text().splitlines())
 modes = os.environ["TEST_COPY_MODES"].split(",")
 mode = modes[min(attempt, len(modes)) - 1]
 fixture_cleanup_confirmed = True
-fixture_evidence = placement.ExecutionEvidenceUnavailable("the private copy has ended", time.time())
+fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private copy has ended", time.time())
 fixture_outcome = placement.AttemptDeclined("busy")
 if mode.endswith("+busy"):
     mode = mode.removesuffix("+busy")
@@ -350,7 +351,7 @@ class StoppedCopyReleaseTests(unittest.TestCase):
             repository = eligibility.KnownRepository("repo")
             destination = placement.PlacementDestination("mac", "mac", "mac", claim_state.RepositoryScope("repo"))
             assignment = placement.PlacementAssignment("v-call-copy-1", "attempt-1", destination,
-                placement.SourceKeyKnown("source"), placement.SubmittingOwner("natedev", os.getpid(), "start"),
+                execution_identity.SourceKeyKnown("source"), placement.SubmittingOwner("natedev", os.getpid(), "start"),
                 NoOwningSession(), 1.0)
             assignment_file = root / "copy.assignment.json"
             admission_client.write_assignment(assignment_file, wire.Assignment(assignment))
@@ -367,7 +368,7 @@ class StoppedCopyReleaseTests(unittest.TestCase):
                                                           release.call_args.args)
                     self.assertEqual((paths.directory, pid, settings), (Path(directory), process.pid, str(request.settings)))
                     self.assertEqual(identity, claim_state.ClaimIdentity(
-                        placement.assigned_claim_id("v-call-copy-1", "attempt-1"), "v-call-copy-1", "attempt-1"))
+                        execution_identity.assigned_claim_id("v-call-copy-1", "attempt-1"), "v-call-copy-1", "attempt-1"))
                     self.assertEqual(release.call_args.kwargs, {"remote_work": mac_test.EndStoppedWork(repository)})
                     self.assertEqual(report.call_count, reports)
                     if reports:

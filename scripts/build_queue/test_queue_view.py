@@ -1,6 +1,7 @@
 """The fixed queue stays one row per step and explains waits once."""
 from __future__ import annotations
 
+from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_records
 
 from scripts.lint.memory_test_support import write_pressure_reading
@@ -19,7 +20,6 @@ from unittest import mock
 from scripts.build_queue import queue_view, queue_evidence
 from scripts.build_queue import admission_service as service
 from scripts.build_queue import admission_protocol as wire, cloud_progress, progress_profile
-from scripts.build_queue import placement
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue.queue_fixture import NOW, QueueFixture
 from scripts.lint import memory_admit as gate
@@ -124,14 +124,14 @@ class RecordedOwnerQueueTests(unittest.TestCase):
 def with_converted_executions(reading: admission_records.QueueRead) -> admission_records.QueueRead:
     """Keep a local charge beside host-scoped executions with equal process values."""
     local = reading.view.running[0]
-    local = replace(local, execution=placement.ObservedExecution(
-        placement.ProcessExecution("local-host", "local-generation", 900, "equal-start")), assignment_host="local-host")
+    local = replace(local, execution=execution_identity.ObservedExecution(
+        execution_identity.ProcessExecution("local-host", "local-generation", 900, "equal-start")), assignment_host="local-host")
     remote = tuple(replace(local, session_id=f"remote-{host}", session_name=f"remote-{host}",
         promise=0, measured=admission_records.RemoteMemoryUnavailable("remote memory is unavailable"), pid=900,
-        execution=placement.ObservedExecution(placement.ProcessExecution(host, "remote-generation", 900, "equal-start")),
+        execution=execution_identity.ObservedExecution(execution_identity.ProcessExecution(host, "remote-generation", 900, "equal-start")),
         assignment_host=host) for host in ("fixture-mac", "fixture-ssh"))
     uncertain = replace(remote[0], session_id="remote-uncertain", session_name="remote-uncertain",
-        pid=admission_records.PidNotRecorded(), execution=placement.ExecutionEvidenceUnavailable("transport unavailable", NOW),
+        pid=admission_records.PidNotRecorded(), execution=execution_identity.ExecutionEvidenceUnavailable("transport unavailable", NOW),
         assignment_host="uncertain-mac")
     explained = tuple(admission_records.ExplainedRunningStep(step, admission_records.AdmissionTimeNotRecorded(),
         0, 0, 0, owner=f"remote-{index}") for index, step in enumerate((*remote, uncertain)))

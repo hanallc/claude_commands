@@ -33,6 +33,7 @@ if __name__ == "__main__":
 
 FEED_IMPORT_STARTED_AT_NS = time.time_ns()
 
+from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_code
 
 
@@ -2392,7 +2393,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
             remote_row: RunRow = {**queue_row_labels(title_step, display_name, unit=owner.unit),
                 "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
                 **owner.fields(),
-                "state": "running" if isinstance(step.execution, placement.ObservedExecution) else "uncertain",
+                "state": "running" if isinstance(step.execution, execution_identity.ObservedExecution) else "uncertain",
                 "pid": step.pid, "detail": detail, "used": admission_records.RunUseUnavailable(memory.reason),
                 "counted": 0.0, "reserved": 0.0, "started_at": step.started_at,
                 "progress": row_progress((step,), progress.TOKEN_WAIT_REASON),
