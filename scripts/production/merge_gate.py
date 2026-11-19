@@ -2340,6 +2340,8 @@ def merge_checkpoint(args: GateArguments) -> int:
     except (KeyboardInterrupt, SystemExit):
         raise
     except BaseException as error:
+        if isinstance(recovery, GateRecovery) and recovery.unresolved:
+            raise GateRefused(f"{error}; recovery must stop the remaining work before rollback") from error
         rollback_merge(repo, baseline)
         if isinstance(recovery, GateRecovery):
             recovery.rollback = ""
