@@ -328,6 +328,11 @@ class QuestionAnswered:
 
 
 @dataclass(frozen=True)
+class QuestionClosed:
+    question: question_record.Question
+
+
+@dataclass(frozen=True)
 class MarkedRead:
     pass
 
@@ -380,7 +385,8 @@ class EvidenceCopyRemoved:
 
 
 PageActivity = PageFeedback | PageRequest | QuestionRequestReceipt | UnparkNoChangeReceipt
-ListEvent = FieldChange | QuestionAnswered | MarkedRead | Reopened | Unparked | ReviewLinksChanged | EvidenceCopyRemoved | PageActivity
+ListEvent = (FieldChange | QuestionAnswered | QuestionClosed | MarkedRead | Reopened | Unparked
+             | ReviewLinksChanged | EvidenceCopyRemoved | PageActivity)
 LogContent = str | ListEvent
 
 
@@ -825,6 +831,8 @@ def _log_content(content: LogContent) -> dict[str, object]:
         return {"action": content.action, "fields": _log_fields(content.fields)}
     if isinstance(content, QuestionAnswered):
         return {"action": "Answered", "question_id": _question_id(content.question_id)}
+    if isinstance(content, QuestionClosed):
+        return {"action": "Question closed with item", "question": question_record.stored(content.question)}
     if isinstance(content, MarkedRead):
         return {"action": "Marked read"}
     if isinstance(content, Reopened):
@@ -886,6 +894,11 @@ def _read_log_line(line: str, number: int) -> ItemChange:
                 content = _read_field_change(action, values, number)
             case {"action": "Answered", "question_id": question_id} if len(fields) == 2:
                 content = QuestionAnswered(_question_id(question_id))
+            case {"action": "Question closed with item", "question": value} if len(fields) == 2:
+                question = question_record.read(value)
+                if question.answer is not None:
+                    raise ListError("a question closed with the item has no answer")
+                content = QuestionClosed(question)
             case {"action": "Marked read"} if len(fields) == 1:
                 content = MarkedRead()
             case {"action": "Reopened"} if len(fields) == 1:
@@ -1175,7 +1188,7 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
                 entries.insert(0, ItemChange(moment, request, PAGE_SOURCE))
         if not entries:
             return UnchangedEdit(item)
-        changed = replace(changed, log=(*item.log, *entries))
+        changed = replace(changed, log=(*changed.log, *entries))
         _validate(changed)
         if item.state == ItemState.CLOSED or changed.producer != item.producer:
             _require_active_open_producers((changed,))
@@ -1400,7 +1413,11 @@ def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
             if item.closing_words == words:
                 return item
             raise ListError("the item is already Closed with different closing words")
-        return replace(item, state=ItemState.CLOSED, closed=moment, closing_words=words)
+        answered = tuple(question for question in item.questions if question.answer is not None)
+        closed_questions = tuple(ItemChange(moment, QuestionClosed(question), source)
+                                 for question in item.questions if question.answer is None)
+        return replace(item, state=ItemState.CLOSED, closed=moment, closing_words=words,
+                       questions=answered, log=(*item.log, *closed_questions))
     return _change(keeper, identity, edit, FieldChange("Closed", {"closing_words": words}), source,
                    unread=False, page_action=notice).item
 
@@ -1521,6 +1538,12 @@ def feedback_requests(item: ListItem) -> dict[str, PageFeedback]:
     return {request: saved for request, saved in _page_requests(item).items() if isinstance(saved, PageFeedback)}
 
 
+def has_park_receipt(item: ListItem, request: str) -> bool:
+    """Check whether this exact Park request saved."""
+    saved = _page_requests(item).get(_request_id(request))
+    return isinstance(saved, (PageRequest, PageFeedback)) and saved.action == "park"
+
+
 def unpark_no_change_reason(item: ListItem, request: str) -> UnparkNoChangeReason:
     """Read the original reason from an Unpark receipt."""
     saved = _page_requests(item).get(_request_id(request))
@@ -1577,8 +1600,16 @@ class _ListQuestionStore:
     resend_id: str = ""
 
     def questions(self, item: str) -> tuple[question_record.Question, ...]:
-        questions = load(self.keeper, item).questions
-        return tuple(question for question in questions if question.question_id == self.resend_id) if self.resend_id else questions
+        current = load(self.keeper, item)
+        if self.resend_id:
+            return tuple(question for question in current.questions if question.question_id == self.resend_id)
+        if isinstance(self.ask_request, PageRequest):
+            # The shared allocator reserves IDs of resolved questions through its answer field.
+            archived = tuple(replace(entry.what.question, answer=question_record.Answer(
+                "Closed with the item.", entry.time.isoformat()))
+                for entry in current.log if isinstance(entry.what, QuestionClosed))
+            return (*current.questions, *archived)
+        return current.questions
 
     def add(self, item: str, question: question_record.Question) -> None:
         # ask_question holds the List lock from the receipt check through this write.
@@ -1620,6 +1651,10 @@ def ask_question(keeper: staff.StaffId, identity: str, request: PageRequest,
     with store.locked():
         item = load(keeper, identity)
         previous = _previous_page_request(item, request)
+        if item.state == ItemState.CLOSED:
+            if isinstance(previous, QuestionRequestReceipt):
+                return change_page.NoMessageDelivery()
+            raise question_record.AnswerRefused("This item is Closed.")
         open_question = next((question for question in item.questions
                               if question.answer is None and question.words == request.words), None)
         if isinstance(previous, QuestionRequestReceipt):
@@ -1645,6 +1680,8 @@ def resend_question(keeper: staff.StaffId, identity: str, question_id: str,
     """Claim delivery for the saved question with this ID."""
     with _store(keeper).locked():
         item = load(keeper, identity)
+        if item.state == ItemState.CLOSED:
+            return change_page.NoMessageDelivery()
         for question in item.questions:
             if question.question_id == question_id and question.answer is None:
                 return _claim_question(_ListQuestionStore(keeper, resend_id=question_id), item, question.words, status,
