@@ -1811,7 +1811,7 @@ document.addEventListener('click',event=>{
  frame.addEventListener('review-card-saved',()=>{
   reviewSaveVersion++;
   savedReview=card;
-  void refreshSavedReview();
+  refreshAfterListSave(false);
  });
  reviewDialog.append(frame);
  pressedBackdrop=false;
