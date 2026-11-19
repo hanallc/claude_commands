@@ -1334,6 +1334,29 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. The new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
 
+### Phase 82 — A producer sets the state and check time of its own List items  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the user (19:58 EST, via morty and the sdlc showrunner, 2026-11-18): "sure absolutely let a producer write the state and check time of its own items". Today a producer can update only `--latest-status`, `--next-step` and `--eta` (6c7fc5687).
+
+**Spec:**
+1. `the_list.py update` from a producer also accepts `--state` and `--next-check` on an item where it is the producer.
+2. Limits, set by morty, the List page producer: own items only. Owner, producer, title, done-when, related-to, and the add, close, park and link commands stay with morty. A producer cannot set Closed. Each write records its source, as now.
+3. The producer assignment notice and the refusal text name the five options.
+4. Update `commands/producer/produce.md` and `docs/as-built/showrunner-automation.md` where they list the producer options.
+5. Add rows to the existing producer tests in `test_the_list.py`: an allowed state, a refused Closed, a refused item of another producer, a written next check, and the recorded source.
+
+**Files:** `scripts/production/the_list.py`, `scripts/production/test_the_list.py`, `commands/producer/produce.md`, `docs/as-built/showrunner-automation.md`.
+
+**Workers:** 1 writer.
+
+**Order:** after phase 81. Unit-board's parkdelivered and listfollow also change the_list.py; merge main after they land, before the hash.
+
+**Acceptance gate:**
+1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
