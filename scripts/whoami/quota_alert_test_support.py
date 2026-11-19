@@ -215,8 +215,6 @@ class QuotaReminderFixture(unittest.TestCase):
         _ = (self.root / "showrunners.conf").write_text(("""# range: 0..
 threshold_percent=1
 # range: 0..
-repeat_minutes=30
-# range: 0..
 stall_minutes=5
 faults_to=natedev
 always=natedev
@@ -449,8 +447,6 @@ class CodexZeroEpisodeFixture(unittest.TestCase):
         config = self.root / "showrunners.conf"
         _ = config.write_text(("""# range: 0..
 threshold_percent=1
-# range: 0..
-repeat_minutes=30
 # range: 0..
 stall_minutes=5
 faults_to=director

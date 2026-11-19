@@ -24,7 +24,7 @@ from scripts.lib.user_zone import user_zone
 from scripts.production import investigation, proposal_issue, record_store, staff, update_registration
 from scripts.production.issues import Issue
 from scripts.production.production_doc import WRAPPED, Refusal
-from scripts.review_links import image_store, new_item_dialog, page_frame, review_link
+from scripts.review_links import image_store, new_item_dialog, page_frame, review_events, review_link
 from scripts.review_links.new_item_dialog import (
     KEY_PREFIX as KEY_PREFIX, NATIVE_ID_PREFIX, check_recipient_id,
     ScopedSubmissionKey, read_submission_key, require_request_binding, submission_key as submission_key,
@@ -80,6 +80,27 @@ def native_origin(record: NativeSubmittedRecord) -> new_item_dialog.SubmissionOr
     if isinstance(record, Issue):
         return proposal_issue.review_submission(record)
     return record.submission
+
+
+@dataclass(frozen=True)
+class QuestionResponse:
+    """The latest answer to a Question from New item."""
+
+    question: str
+    answer: str
+    answered_at: datetime | None
+
+
+def question_response(record: update_registration.QuestionRecord,
+                      log: tuple[review_events.ReviewLog, ...]) -> QuestionResponse | None:
+    fields = record.item
+    exchanges = fields.get("followups", [])
+    if "review_submission" not in fields or "followup" in fields or not exchanges:
+        return None
+    answer = exchanges[-1]["reply"]
+    answered_at = next((event.time for event in reversed(log)
+                        if event.who == record.owner and event.words == "Answer: " + answer), None)
+    return QuestionResponse(fields.get("question", exchanges[0]["followup"]), answer, answered_at)
 
 
 @dataclass(frozen=True)
