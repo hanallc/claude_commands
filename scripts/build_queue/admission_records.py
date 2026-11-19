@@ -443,7 +443,7 @@ class PeakSoFar:
     peak_at: float | PeakTimeUnknown = PeakTimeUnknown()
     last_near_peak_at: float | PeakTimeUnknown = PeakTimeUnknown()
     old_sampler: bool = False
-    resumed_after_decay: bool = field(default=False, kw_only=True)
+    near_peak_is_fresh: bool = field(default=False, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -455,7 +455,6 @@ class PeakDecayed:
     decayed_at: float
     old_sampler: bool
     margin: float = field(default=TEST_PHASE_MARGIN_FALLBACK, kw_only=True)
-    compiler_in_scope: bool = field(default=False, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -497,11 +496,28 @@ class ScopeSource:
 class ProcessSource:
     """The memory reading comes from these individual processes."""
     processes: tuple[ProcessAnonymousUse, ...]
+    memory_read_incomplete: bool = field(default=False, kw_only=True)
 
 
 @dataclass(frozen=True)
 class NoSource:
     """The memory reading has no recorded source."""
+
+TestCompilers = Literal["unrecorded", "none", "running", "incomplete"]
+TestNeedReason = Literal["compiler", "compiler evidence unavailable", "near-peak sample",
+                         "peak evidence unavailable", "peak after decay"]
+
+
+@dataclass(frozen=True)
+class TestNeedOverride:
+    """The test evidence selects this need over the progress window."""
+    bytes: int
+    reason: TestNeedReason
+
+
+@dataclass(frozen=True)
+class NoTestNeedOverride:
+    """Test evidence leaves the existing calculation in effect."""
 
 
 @dataclass(frozen=True)
@@ -517,6 +533,7 @@ class MeasuredMemory:
     # An existing peak file could not be read; its promise remains a floor.
     unknown_peak_promise: int = 0
     peak_history: PeakHistory = NoPeakRecorded()
+    test_compilers: TestCompilers = field(default="unrecorded", kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -525,6 +542,7 @@ class ProgressAdjustedMemory(MeasuredMemory):
     counter: progress.ProgressCounter | progress.NoCounter = field(kw_only=True)
     window: progress.WindowPeak | progress.NoMatchingProfile = field(kw_only=True)
     remaining_need: int = field(kw_only=True)
+    test_need_override: TestNeedOverride | NoTestNeedOverride = field(default_factory=NoTestNeedOverride, kw_only=True)
 
 
 @dataclass(frozen=True)

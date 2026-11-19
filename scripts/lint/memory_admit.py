@@ -871,12 +871,23 @@ def observed_test_phase(row: Reservation) -> ObservedTestPhase | UnobservedTestP
     return UnobservedTestPhase()
 
 
-COMPILER_PROGRAMS = frozenset({b"rustc", b"rustdoc", b"clippy-driver", b"cc1", b"cc1plus", b"clang", b"clang++"})
+COMPILER_PROGRAMS = frozenset({
+    b"rustc", b"rustdoc", b"clippy-driver", b"cc", b"gcc", b"g++", b"cc1", b"cc1plus", b"clang", b"clang++",
+    b"mold", b"ld.lld", b"ld", b"lld", b"collect2", b"rust-lld", b"ld.gold", b"ld.bfd",
+})
 
 
-def process_table(proc: Path = PROC) -> dict[int, ProcessIdentity]:
+class ProcessTable(dict[int, ProcessIdentity]):
+    """The process scan records whether a live process could be missing."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.incomplete: bool = False
+
+
+def process_table(proc: Path = PROC) -> ProcessTable:
     # The service reads this table on each pass. Plain strings and bytes cost half the CPU of Path objects.
-    processes: dict[int, ProcessIdentity] = {}
+    processes = ProcessTable()
     root = os.fspath(proc)
     for name in os.listdir(root):
         if not name.isdecimal():
@@ -885,11 +896,17 @@ def process_table(proc: Path = PROC) -> dict[int, ProcessIdentity]:
             with open(f"{root}/{name}/stat", "rb", buffering=0) as handle:
                 name_field, stat = handle.read().rsplit(b") ", 1)
                 fields = stat.split()
+            _, separator, program = name_field.partition(b" (")
+            if not separator or not program:
+                raise ValueError("missing process name")
             if fields[0] not in (b"Z", b"X"):
                 processes[int(name)] = ProcessIdentity(int(fields[1]), fields[19].decode(),
-                    is_compiler=name_field.partition(b" (")[2] in COMPILER_PROGRAMS)
+                    is_compiler=program in COMPILER_PROGRAMS)
+        except (FileNotFoundError, ProcessLookupError):
+            if os.path.exists(f"{root}/{name}"):
+                processes.incomplete = True
         except (OSError, ValueError, IndexError):
-            continue
+            processes.incomplete = True
     return processes
 
 
@@ -919,7 +936,7 @@ class LiveOwnerProcess:
     pass
 
 
-def scope_members(directory: Path) -> set[int]:
+def scope_members(directory: Path, *, require_complete: bool = False) -> set[int]:
     """Read nested scope members and skip scopes removed during the walk."""
     members: set[int] = set()
     pending = [directory]
@@ -931,7 +948,7 @@ def scope_members(directory: Path) -> set[int]:
             members.update(int(pid) for pid in path.read_text().split())
             pending.extend(child for child in scope.iterdir() if child.is_dir())
         except OSError as error:
-            if error.errno not in (errno.ENOENT, errno.ESRCH, errno.ENODEV):
+            if error.errno not in (errno.ENOENT, errno.ESRCH, errno.ENODEV) or (require_complete and scope.exists()):
                 raise
     return members
 
@@ -941,18 +958,20 @@ def process_memory(source: set[int] | PopulatedStepScope, proc: Path = PROC) -> 
     if isinstance(source, PopulatedStepScope):
         reading = slice_working_set(source.directory)
         try:
-            members = frozenset(scope_members(source.directory))
+            members = frozenset(scope_members(source.directory, require_complete=True))
         except (OSError, ValueError) as error:
             return replace(reading, anonymous=RunUseUnavailable(f"{source.directory}: {error}"),
                            anonymous_source=ScopeSource(source.directory, frozenset()))
         return replace(reading, anonymous_source=ScopeSource(source.directory, members))
     used, swapped = 0, 0
+    memory_read_incomplete = False
     process_uses: list[ProcessAnonymousUse] = []
     for child in sorted(source):
         path = proc / str(child) / "status"
         try:
             contents = _read_proc_text(path).splitlines()
         except OSError as error:
+            memory_read_incomplete = True
             use = (AnonymousRunUse(0) if error.errno in (errno.ENOENT, errno.ESRCH) else
                    RunUseUnavailable(f"{path}: {error.strerror or error}"))
             process_uses.append(ProcessAnonymousUse(child, use))
@@ -979,6 +998,7 @@ def process_memory(source: set[int] | PopulatedStepScope, proc: Path = PROC) -> 
                 swap_backed_seen.add(parts[0])
                 swap_backed_fields.update(kib_fields(parts))
         if not rss_present:
+            memory_read_incomplete = True
             use = AnonymousRunUse(0)
         elif "RssAnon" in swap_backed_fields and "RssShmem" in swap_backed_fields:
             use = AnonymousRunUse(swap_backed_fields["RssAnon"] + swap_backed_fields["RssShmem"])
@@ -986,7 +1006,7 @@ def process_memory(source: set[int] | PopulatedStepScope, proc: Path = PROC) -> 
             use = RunUseUnavailable(f"{path}: swap-backed memory unavailable (RssAnon or RssShmem missing or invalid)")
         process_uses.append(ProcessAnonymousUse(child, use))
     return MeasuredMemory(used, swap_bytes=swapped, anonymous=sum_swap_backed_use(item.use for item in process_uses),
-                          anonymous_source=ProcessSource(tuple(process_uses)))
+                          anonymous_source=ProcessSource(tuple(process_uses), memory_read_incomplete=memory_read_incomplete))
 
 
 def sum_swap_backed_use(readings: Iterable[AnonymousRunUse | RunUseUnavailable]) -> AnonymousRunUse | RunUseUnavailable:
@@ -1125,9 +1145,13 @@ def reservation_memory(path: Path, row: Reservation, now: datetime,
                 peak_time = peak_at
     except (OSError, ValueError):
         pass
-    history: PeakHistory = PeakSoFar(peak, peak_at, peak_time, old_sampler) if peak > 0 else NoPeakRecorded()
-    if not release_build(row) and now.timestamp() - last_near_peak_at >= policy.peak_hold.seconds_for(row.get("step", "")):
-        history = PeakDecayed(0, peak, last_near_peak_at, last_near_peak_at + policy.peak_hold.seconds_for(row.get("step", "")), old_sampler)
+    hold = policy.peak_hold.seconds_for(row.get("step", ""))
+    fresh = now.timestamp() - last_near_peak_at < hold
+    history: PeakHistory = (PeakSoFar(peak, peak_at, peak_time, old_sampler,
+        near_peak_is_fresh=row["step"] in DECAYING_TEST_STEPS and fresh and not isinstance(peak_time, PeakTimeUnknown))
+        if peak > 0 else NoPeakRecorded())
+    if not release_build(row) and not fresh:
+        history = PeakDecayed(0, peak, last_near_peak_at, last_near_peak_at + hold, old_sampler)
         peak = 0
     if isinstance(reading, MeasuredMemory):
         return replace(reading, observed_peak=peak, peak_history=history)
@@ -1156,46 +1180,59 @@ class NoStepScope:
     """The process names no step scope."""
 
 
-def named_step_scope(pid: int, proc: Path) -> Path | NoStepScope:
+@dataclass(frozen=True)
+class UnreadableStepScope:
+    """The compiler's environment cannot identify its step scope."""
+
+
+def named_step_scope(pid: int, proc: Path) -> Path | NoStepScope | UnreadableStepScope:
     """Read the step scope that invoke.sh exports; sccache gives each compiler its client's environment."""
     try:
         environment = (proc / str(pid) / "environ").read_bytes()
     except OSError:
-        return NoStepScope()
+        return UnreadableStepScope()
     for entry in environment.split(b"\0"):
         if entry.startswith(STEP_SCOPE_ENTRY):
             return Path(os.fsdecode(entry.removeprefix(STEP_SCOPE_ENTRY)))
     return NoStepScope()
 
 
-def compiler_jobs(members: Iterable[int], proc: Path) -> tuple[CompilerJob, ...]:
+def compiler_jobs(programs: Mapping[int, str], proc: Path) -> tuple[tuple[CompilerJob, ...], bool]:
     """Group the compiler service processes by the step scope that each one names."""
     scopes: dict[Path, set[int]] = {}
-    for pid in members:
+    incomplete = False
+    for pid, program in programs.items():
         scope = named_step_scope(pid, proc)
         if isinstance(scope, Path):
             scopes.setdefault(scope, set()).add(pid)
-    return tuple(CompilerJob(scope, process_memory(pids, proc).anonymous) for scope, pids in sorted(scopes.items()))
+        elif isinstance(scope, UnreadableStepScope) or os.fsencode(program) in COMPILER_PROGRAMS:
+            incomplete = True
+    return tuple(CompilerJob(scope, process_memory(pids, proc).anonymous)
+                 for scope, pids in sorted(scopes.items())), incomplete
 
 
 def sccache_memory(proc: Path = PROC) -> list[StepMemory]:
     """Charge the compiler service once, outside all step process trees; each step's compilers count in that step."""
-    directory = builds_slice_cgroup()
+    directory = builds_slice_cgroup() / "sccache.service"
     try:
-        reading = slice_working_set(directory / "sccache.service")
-        try:
-            members = (directory / "sccache.service" / "cgroup.procs").read_text().split()
-        except OSError:
-            members = []
-        pids = [int(member) for member in members if member.isdecimal()]
-        programs = member_programs(pids, proc, skip_unreadable=True)
-        servers = [pid for pid, program in programs.items() if program == "sccache"]
-        jobs = compiler_jobs(pids, proc)
-        charged = sum(job.use.bytes for job in jobs if isinstance(job.use, AnonymousRunUse))
-        return [CompilerServiceMemory(max(0, reading.bytes - charged), swap_bytes=reading.swap_bytes,
-                                      pid=min(servers) if servers else PidNotRecorded(), jobs=jobs)]
+        reading = slice_working_set(directory)
+    except FileNotFoundError:
+        return ([CompilerServiceMemory(0, pid=PidNotRecorded(), test_compilers="incomplete")]
+                if directory.exists() else [])
     except (OSError, ValueError):
-        return []
+        return [CompilerServiceMemory(0, pid=PidNotRecorded(), test_compilers="incomplete")]
+    try:
+        pids = [int(member) for member in (directory / "cgroup.procs").read_text().split()]
+        programs = member_programs(pids, proc, skip_unreadable=True)
+        jobs, incomplete = compiler_jobs(programs, proc)
+        incomplete = incomplete or len(programs) != len(set(pids))
+    except (OSError, ValueError):
+        programs, jobs, incomplete = {}, (), True
+    servers = [pid for pid, program in programs.items() if program == "sccache"]
+    charged = sum(job.use.bytes for job in jobs if isinstance(job.use, AnonymousRunUse))
+    return [CompilerServiceMemory(max(0, reading.bytes - charged), swap_bytes=reading.swap_bytes,
+                                  pid=min(servers) if servers else PidNotRecorded(), jobs=jobs,
+                                  test_compilers="incomplete" if incomplete else "none")]
 
 
 class LiveMemoryReading(RuntimeError):
@@ -1821,20 +1858,35 @@ def test_phase_charge(phase: TestPhaseStarted) -> int:
 DECAYING_TEST_STEPS = frozenset({"merge-gate", "targeted-test", "nextest", "test"})
 
 
+def test_need_override(row: Reservation, reading: StepMemory, compiling_scopes: Collection[Path]
+                       ) -> records.TestNeedOverride | records.NoTestNeedOverride:
+    """Select a test need that takes precedence over progress or phase estimates."""
+    if row["step"] not in DECAYING_TEST_STEPS or not isinstance(reading, MeasuredMemory):
+        return records.NoTestNeedOverride()
+    history = reading.peak_history
+    source = reading.anonymous_source
+    accepted = row["need"]
+    if reading.test_compilers == "running" or (isinstance(source, ScopeSource) and source.directory in compiling_scopes):
+        return records.TestNeedOverride(accepted, "compiler")
+    if isinstance(history, PeakSoFar) and history.near_peak_is_fresh:
+        return records.TestNeedOverride(accepted, "near-peak sample")
+    if reading.test_compilers == "incomplete":
+        return records.TestNeedOverride(accepted, "compiler evidence unavailable")
+    if isinstance(history, PeakFileUnreadable):
+        return records.TestNeedOverride(accepted, "peak evidence unavailable")
+    if isinstance(history, PeakDecayed):
+        if reading.test_compilers != "none" or isinstance(reading.anonymous, RunUseUnavailable):
+            return records.TestNeedOverride(accepted, "compiler evidence unavailable")
+        if history.bytes > 0 and isinstance(source, (ScopeSource, ProcessSource)):
+            return records.TestNeedOverride(min(accepted, math.ceil(history.bytes * history.margin)), "peak after decay")
+    return records.NoTestNeedOverride()
+
+
 def reservation_need(row: Reservation, reading: StepMemory, *, compiling_scopes: Collection[Path] = ()) -> int:
     """Select the need from the accepted need and current memory evidence."""
-    if row["step"] in DECAYING_TEST_STEPS and isinstance(reading, MeasuredMemory):
-        history = reading.peak_history
-        source = reading.anonymous_source
-        if isinstance(source, ScopeSource) and source.directory in compiling_scopes:
-            return row["need"]
-        if isinstance(history, PeakSoFar) and history.resumed_after_decay:
-            return row["need"]
-        if isinstance(history, PeakDecayed):
-            if history.compiler_in_scope or isinstance(reading.anonymous, RunUseUnavailable):
-                return row["need"]
-            if history.bytes > 0 and isinstance(source, ScopeSource):
-                return min(row["need"], math.ceil(history.bytes * history.margin))
+    override = test_need_override(row, reading, compiling_scopes)
+    if isinstance(override, records.TestNeedOverride):
+        return override.bytes
     if isinstance(reading, ProgressAdjustedMemory):
         return reading.remaining_need
     if row["step"] == "nextest" and isinstance(reading, MeasuredMemory) and isinstance(reading.peak_history, TestPhaseStarted):
@@ -1963,10 +2015,14 @@ def progress_memory(row: Reservation, reading: MeasuredMemory, attributed: Attri
                     profile: progress.ProgressProfile | progress.NoMatchingProfile,
                     policy: AdmissionPolicy, *, compiling_scopes: Collection[Path] = ()) -> ProgressAdjustedMemory:
     """Use a profile only with a current attributed swap-backed reading."""
+    override = test_need_override(row, reading, compiling_scopes)
     full_need = reservation_need(row, reading, compiling_scopes=compiling_scopes)
-    window = (progress.window_peak(profile, counter, policy.progress_lookahead_percent)
-              if isinstance(attributed.use, AnonymousRunUse) else
-              progress.NoMatchingProfile("swap-backed use unavailable"))
+    if isinstance(override, records.TestNeedOverride):
+        window: progress.WindowPeak | progress.NoMatchingProfile = progress.NoMatchingProfile(override.reason)
+    elif isinstance(attributed.use, AnonymousRunUse):
+        window = progress.window_peak(profile, counter, policy.progress_lookahead_percent)
+    else:
+        window = progress.NoMatchingProfile("swap-backed use unavailable")
     need = full_need
     if isinstance(window, progress.WindowPeak):
         basis = read_need_basis(row.get("queue_waiter", {}).get("need_basis"))
@@ -1978,13 +2034,19 @@ def progress_memory(row: Reservation, reading: MeasuredMemory, attributed: Attri
             else:
                 window = progress.NoMatchingProfile("test phase reset or unmatched phase")
                 need = full_need
-    adjusted = ProgressAdjustedMemory(reading.bytes, anonymous=reading.anonymous,
+    return ProgressAdjustedMemory(reading.bytes, anonymous=reading.anonymous,
         anonymous_source=reading.anonymous_source, promise=reading.promise,
         swap_bytes=reading.swap_bytes, observed_peak=reading.observed_peak,
         unknown_peak_promise=reading.unknown_peak_promise, peak_history=reading.peak_history,
-        counter=counter, window=window, remaining_need=need)
-    selected = reservation_need(row, adjusted, compiling_scopes=compiling_scopes)
-    return adjusted if selected == need else replace(adjusted, remaining_need=selected)
+        test_compilers=reading.test_compilers, counter=counter, window=window, remaining_need=need,
+        test_need_override=override)
+
+
+def test_need_text(need: records.TestNeedOverride) -> str:
+    """Explain the test evidence that selected the need."""
+    if need.reason == "peak after decay":
+        return "peak after decay with the test margin"
+    return f"full need: {need.reason}"
 
 
 def progress_text(reading: StepMemory) -> str:
@@ -1994,9 +2056,12 @@ def progress_text(reading: StepMemory) -> str:
     counter = reading.counter
     phase = (f"{counter.phase}, {format_percent(counter.percent, complete=counter.done == counter.total)} done" if isinstance(counter, progress.ProgressCounter)
              else counter.reason)
-    reason = (f"highest anonymous use in the next {format_percent(reading.window.lookahead_percent)}"
-              if isinstance(reading.window, progress.WindowPeak) else
-              f"full need: {reading.window.reason}")
+    if isinstance(reading.test_need_override, records.TestNeedOverride):
+        reason = test_need_text(reading.test_need_override)
+    elif isinstance(reading.window, progress.WindowPeak):
+        reason = f"highest anonymous use in the next {format_percent(reading.window.lookahead_percent)}"
+    else:
+        reason = f"full need: {reading.window.reason}"
     return f"{phase}; need {reading.remaining_need / GIB:.1f} GiB; {reason}"
 
 

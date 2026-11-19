@@ -1846,10 +1846,12 @@ It prints `verify.sh: example-test is removed: examples carry no tests (user, 20
 A second promise rule is measured and declined (showrunner, 2026-10-28: simple wins). The rule: a running build whose need is above a limit keeps its full promise; the running builds at or under it are promised the largest gap in full plus `max(0, 0.6 x need - anon)` each. The replay used 4 h of 5 s admission samples (2026-10-28 03:27-07:27Z, 240 waits, 1863 wait minutes), and "short" counts admitting ticks where the running builds' real growth after the tick passes `MemAvailable` minus the reserve. With a 6 GiB limit the rule saves 331 of 1863 minutes against 249 for the current rule, with the short rate at 0.8% against 0% (5 GiB: 326 min, 0.9%; 8 GiB: 501 min, 1.4%). The same rule limited by the waiting step's need never gets below 6.9% short. At about 4% of the wait for a second rule and a nonzero short rate, it is not built; a shortfall is the 2026-09-30 freeze. Do not measure it again unless the mix of steps changes.
 
 A scoped reservation stays active while its scope contains a process.
-For `merge-gate`, `targeted-test`, `nextest`, and `test`, the service can reduce the need after `peak_hold` passes without a near-peak sample.
+For `merge-gate`, `targeted-test`, `nextest`, and `test`, a complete scope or process tree reading can reduce the need after `peak_hold`.
 The reduced need uses the largest anonymous memory sample since decay, multiplied by `test_phase_margin` and capped at the accepted need.
 The service keeps this peak in memory for the current decay. After a restart, the first sample starts the measurement again.
-A new near-peak sample or a compiler job in the step scope restores the accepted need.
+A recorded near-peak sample retains the accepted need for `peak_hold`, including after a service restart.
+A compiler or linker in the scope or process tree restores the accepted need. Incomplete compiler evidence also retains the accepted need.
+These conditions override the progress window and the frozen nextest test-phase need.
 The decay rule works without a progress counter or a profile.
 The freed room can admit another step before a second compile starts. `MemAvailable` and the PSI hold still guard this interval.
 Admission and queue views use the same need calculation.
