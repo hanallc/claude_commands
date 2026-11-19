@@ -1520,7 +1520,9 @@ It gives the runner the verified local Git bundle.
 The runner reads the per-run shell, disk floor, Git timeout, environment rules, and maker settings.
 The bootstrap applies the image's approved roots, slot capacity, and probe timing.
 The runner uses the image's command timeout.
-The result uses the same stdout contract.
+The runner sends the reason for an expected refusal.
+If an exception escapes the runner, the entry point sends a refusal that names the exception class.
+It flushes the reply before it tries to print the traceback on the box.
 Systemd removes the per-run runtime filesystem when the unit ends.
 
 ## Hana placement adapter
