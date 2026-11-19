@@ -144,11 +144,11 @@ class HanaExecutionTests(unittest.TestCase):
         assert not isinstance(state, execution_identity.HanaCommandAdmissionRefused)
         return state
 
-    def release(self) -> bool:
+    def release(self) -> hana.HanaClaimRelease:
         self.releases += 1
         self.assertTrue(execution.execution_command_settled(self.root, self.key.claim_id))
         self.assertTrue(execution.claim_dispatch_pending(self.root, self.reference))
-        return True
+        return hana.HanaClaimReleased()
 
     def settle(self, *, cancelled: bool = False, reason: str = 'The remote attempt ended') -> execution.HanaSettlement:
         current = 1000.0
@@ -408,7 +408,8 @@ class HanaExecutionTests(unittest.TestCase):
         self.assertIsInstance(settled, execution.HanaSettled)
         assert isinstance(settled, execution.HanaSettled)
         self.assertEqual(settled.outcome, placement.AttemptCompleted(1))
-        self.assertEqual(execution.accept_result(self.root, self.request, content, 'fixture-host', lambda: self.source_key), accepted)
+        self.assertEqual(execution.accept_result(self.root, self.request, content, 'fixture-host',
+            lambda: execution_identity.SourceKeyKnown('edited')), accepted)
 
     def test_edited_replaced_and_fenced_results_never_become_accepted(self) -> None:
         _ = self.dispatch()
@@ -487,10 +488,10 @@ class HanaExecutionTests(unittest.TestCase):
                 self.root = Path(folder)
                 releases: list[bool] = []
 
-                def release() -> bool:
+                def release() -> hana.HanaClaimRelease:
                     released = bool(releases)
                     releases.append(released)
-                    return released
+                    return hana.HanaClaimReleased() if released else hana.HanaClaimReleaseRefused('The Hana claim is busy')
 
                 if published:
                     _ = self.dispatch()
