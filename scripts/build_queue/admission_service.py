@@ -2399,10 +2399,9 @@ class AdmissionServer:
             pools.setdefault((request.repository, request.machine, request.root), []).append(waiting)
         if not pools:
             return
-        locks = read_proc_text(Path("/proc/locks"))
         now = self.clock.now()
         for (repository, machine, root), waiting_pool in pools.items():
-            pool = slot_wait.read_pool(repository, machine, Path(root), locks)
+            pool = slot_wait.read_pool(repository, machine, Path(root))
             available = len(pool.held) < pool.maximum
             for waiting in sorted(waiting_pool, key=lambda item: (item.request.since, item.request.owner.pid)):
                 request = waiting.request

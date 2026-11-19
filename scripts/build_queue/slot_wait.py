@@ -264,7 +264,7 @@ class SlotWaitExpired(RuntimeError):
     """The repository pool has no capacity before the wait ends."""
 
 
-def read_pool(repository: str, machine: str, root: Path, _locks: str) -> wire.RepositorySlotWaiting:
+def read_pool(repository: str, machine: str, root: Path) -> wire.RepositorySlotWaiting:
     """Check each slot without waiting for its lease."""
     settings = conf.read_or_repository("build_folders")
     key = f"slots.{machine}.{repository}.max"
