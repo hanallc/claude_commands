@@ -692,7 +692,7 @@ class NativePaneSessionTests(StaffTestCase):
             self.assertIsInstance(herdr.foreground_pane_owner(info, for_input=True), herdr.ProvedCodexForeground)
             self.assertEqual(read.call_args_list, [call(457), call(457)])
 
-    def test_known_codex_with_unreadable_live_node_descendant_is_unknown(self) -> None:
+    def test_foreground_evidence_when_argv_is_unavailable(self) -> None:
         node = {"pid": 457, "name": "node"}
         codex = {"pid": 456, "argv": ["codex"]}
         with (patch.object(herdr, "_PLATFORM", "linux"),
@@ -701,6 +701,26 @@ class NativePaneSessionTests(StaffTestCase):
                 with self.subTest(processes=processes):
                     owner = herdr.foreground_pane_owner({"foreground_processes": processes})
                     self.assertIsInstance(owner, herdr.UnprovedForegroundOwner)
+
+        place = herdr.HerdrPlace("fixture", "w1:p1")
+        reason = "agent argv is unavailable"
+        claude = {"pid": 458, "name": "claude"}
+        shell = {"pid": 459, "name": "sh", "argv": ["sh"]}
+        for processes, foreground, pane in (
+                ([claude], herdr.ClaudeForegroundWithoutArgv("claude", reason, 458),
+                 herdr.ClaudePaneWithoutArgv(place, reason, 458)),
+                ([shell, claude], herdr.ClaudeForegroundWithoutArgv("claude", reason, 458),
+                 herdr.ClaudePaneWithoutArgv(place, reason, 458)),
+                ([claude, {"pid": 460, "name": "claude"}], herdr.UnprovedForegroundOwner("claude", reason),
+                 herdr.UnknownPaneOwner(place, reason)),
+                ([claude, {**shell, "pid": 458}], herdr.UnprovedForegroundOwner("claude", reason),
+                 herdr.UnknownPaneOwner(place, reason)),
+                ([{"pid": True, "name": "claude"}], herdr.UnprovedForegroundOwner("claude", reason),
+                 herdr.UnknownPaneOwner(place, reason))):
+            with self.subTest(processes=processes):
+                info: dict[str, object] = {"foreground_processes": processes}
+                self.assertEqual(herdr.foreground_pane_owner(info), foreground)
+                self.assertEqual(herdr.pane_foreground(place, info), pane)
 
     def test_foreground_input_reads_each_ancestor_and_descendant_once(self) -> None:
         codex, ancestor, child = 456, 457, 458
@@ -2300,6 +2320,36 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertTrue(any(at >= 10 for at in failures))
         self.assertIsInstance(herdr.submitted_prompt(self.transcript, "resume the saved work", self.launched_at),
                               herdr.PromptSubmitted)
+
+        with self.subTest(transcript="malformed Codex line"):
+            from scripts.agents.stop_resume import CodexProducerPromptCursor
+
+            self.typed.clear()
+            self.turn_delay = 0
+            self.path = self.transcript.config_dir / "sessions" / f"rollout-{self.transcript.session_id}.jsonl"
+            self.path.parent.mkdir()
+            cursor = CodexProducerPromptCursor(self.transcript, self.launched_at)
+
+            def type_with_malformed_record(pane: str, text: str) -> None:
+                self.type_prompt(pane, text)
+                _ = self.path.write_text('{"type":broken}\n')
+                self.screen = "────────\n❯ \n────────"
+
+            opening = herdr.OpeningPrompt("resume the saved work", self.transcript, cursor=cursor)
+            with patch.object(self.client, "_prompt", side_effect=type_with_malformed_record):
+                outcome = self.client.submit_opening_prompt("destination:p1", opening, self.launched_at, 16_000)
+            self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+            self.assertEqual(len(self.typed), 1)
+            self.assertEqual(self.enters, [])
+            self.assertIsInstance(cursor.readability, herdr.TranscriptUnreadable)
+            retry = herdr.OpeningPrompt(opening.text, self.transcript, cursor=cursor, resend_once=True)
+            with patch.object(self.client, "_prompt", side_effect=type_with_malformed_record):
+                outcome = self.client.submit_opening_prompt("destination:p1", retry, self.launched_at, 16_000)
+            self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+            self.assertEqual(len(self.typed), 2)
+            self.assertEqual(self.enters, [])
+            self.write_turn(opening.text)
+            self.assertIsInstance(cursor.submitted_prompt(script_prompt(opening.text)), herdr.PromptSubmitted)
 
     def test_unreadable_accepted_turn_is_found_after_reads_recover_without_retyping(self) -> None:
         self.turn_delay = 8

@@ -561,12 +561,18 @@ NO_FIXED_STAFF_LOOKUP = NoFixedStaffLookup()
 
 
 @dataclass(frozen=True)
+class NoPaneReportCheck:
+    """The relay does not use the missing argv fallback."""
+
+
+@dataclass(frozen=True)
 class ClaudeDeliveryAttempt:
     recipient: ClaudeRecipientIdentity
     pid: int
     started: str
     socket: str
     staff_requirement: FixedStaffLookup | NoFixedStaffLookup = NO_FIXED_STAFF_LOOKUP
+    fallback_pane: HerdrPlace | NoPaneReportCheck = NoPaneReportCheck()
 
 
 @dataclass(frozen=True)
@@ -3840,6 +3846,10 @@ def _forward_relay_socket(listener: socket.socket, peer: socket.socket, stop: so
                         tool_id = approved.read_text(encoding="utf-8").strip()
                         if not tool_id:
                             return RefusedRelayRequest("failed", "the relay tool call has no approval")
+                        if isinstance(attempt.fallback_pane, HerdrPlace):
+                            pane = _validate_fallback_pane(attempt, attempt.fallback_pane, peer.gettimeout() or 1.0)
+                            if isinstance(pane, unit_lookup.SocketUnavailable):
+                                return pane
                         check = unit_lookup.validate_claude_connection(peer, attempt.pid, attempt.started)
                         if isinstance(check, unit_lookup.SocketUnavailable):
                             return check
@@ -3893,6 +3903,21 @@ def _validate_attempt_recipient(attempt: ClaudeDeliveryAttempt) -> SocketAttempt
         staff_session = _current_staff_session(attempt.staff_requirement, ExpectedStaffSession(recipient.current.conversation))
         if isinstance(staff_session, RecipientLookupFailed):
             return unit_lookup.SocketUnavailable(staff_session.reason)
+    return SocketAttemptValidated()
+
+
+def _validate_fallback_pane(attempt: ClaudeDeliveryAttempt, place: HerdrPlace,
+                            timeout: float) -> SocketAttemptValidated | unit_lookup.SocketUnavailable:
+    from scripts.herdr import herdr
+
+    recipient = attempt.recipient
+    assert not isinstance(recipient, RelayProcessRecipient)
+    try:
+        report = herdr.Herdr(place.session).pane_session_report(place.pane, deadline=time.monotonic() + timeout)
+    except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+        return unit_lookup.SocketUnavailable(f"cannot read the Claude pane report before delivery: {error}")
+    if isinstance(report, herdr.ReportedAgentSession) and report.session_id != conversation_recipient(recipient).conversation:
+        return unit_lookup.ClaudeOwnerMismatch("the Claude pane reports a different conversation")
     return SocketAttemptValidated()
 
 
@@ -4012,9 +4037,24 @@ def _claude_delivery_plan(message: Message, mailbox: ClaudeMailbox, registry: se
                           records: list[sessions.SessionRecord]) -> RelayPlan:
     conversation = conversation_recipient(mailbox).conversation
     checked = unit_lookup.checked_conversation(conversation, registry=registry, probe_address=False)
+    candidates = [record for record in records if record["sessionId"] == conversation]
+    if isinstance(checked, unit_lookup.ClaudeArgvUnavailable):
+        try:
+            _ = staff.native_id(conversation)
+        except staff.StaffRefused as error:
+            return ClaudeRoutingFailed(unit_lookup.SocketUnavailable(str(error)))
+        registered = [item.record for item in registry.entries if item.record["sessionId"] == conversation]
+        if registry.unreadable or len(candidates) != 1 or candidates != registered:
+            return ClaudeRoutingFailed(unit_lookup.SocketUnavailable(checked.reason))
+        candidate = candidates[0]
+        started = candidate.get("procStart", "")
+        path = candidate["messagingSocketPath"]
+        if candidate["pid"] != checked.pid or not started or not path:
+            return ClaudeRoutingFailed(unit_lookup.SocketUnavailable(checked.reason))
+        attempt = ClaudeDeliveryAttempt(mailbox, checked.pid, started, path, fallback_pane=checked.place)
+        return RelayAttempt(replace(message, to=f"uds:{path}", claude_attempt=attempt))
     if isinstance(checked, unit_lookup.UnknownUnit):
         return ClaudeRoutingFailed(unit_lookup.SocketUnavailable(checked.reason))
-    candidates = [record for record in records if record["sessionId"] == conversation]
     if isinstance(checked, unit_lookup.ProvedAbsentUnit):
         if registry.unreadable:
             return ClaudeRoutingFailed(unit_lookup.SocketUnavailable("the Claude registry is unreadable"))

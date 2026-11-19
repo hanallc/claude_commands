@@ -104,7 +104,6 @@ color:var(--filter-selected-ink)}
 [data-filter-row] button[data-filter-count="0"][aria-pressed=true]{
 background:color-mix(in srgb,var(--filter-selected-bg) 75%,var(--card))}
 [data-filter-row] b{font-variant-numeric:tabular-nums}[data-filter-row] b:empty{display:none}
-.record-filter-row+[data-list-count]{display:block;margin:8px 0 12px;text-align:right}
 .list-table{border:1px solid var(--line);border-radius:12px;background:var(--card);overflow:hidden}
 .list-table table{width:100%;border-collapse:collapse;table-layout:fixed}
 .list-table th{text-align:left;color:var(--ink-2);font-size:13px;border-bottom:1px solid var(--line)}
@@ -247,7 +246,7 @@ function createRecordTable(options){
 const contentProxy=()=>options.content();
 const defaultShow=options.defaultShow ?? 'open';
 let content=contentProxy(),owner='',show=defaultShow,query='',sort='',direction='asc',type='',sourceOwner='',keys=new Set();
-let linkedItem='';
+let linkedItem='',revealedLinkedItem='';
 let placeHash=location.hash;
 let highlightedRow,highlightTimer;
 const opened=new Set(),filterNames=options.filters || [],filters={};
@@ -394,6 +393,11 @@ function placeParams(){
  return params;
 }
 function place(){return readPlace(placeParams());}
+function itemWithKey(key){
+ if(options.hasKey && !options.hasKey(key)) return;
+ return options.entries ? options.entries().map(dataset=>({dataset})).find(item=>item.dataset.key===key) :
+  [...content.querySelectorAll('[data-list-item]')].find(item=>item.dataset.key===key);
+}
 function readPlace(params,followingItemLink=false){
  placeHash=location.hash;
  keys=new Set(params.getAll('key'));
@@ -407,12 +411,15 @@ function readPlace(params,followingItemLink=false){
  const item=params.get('item');if(item && !followingItemLink){
   if(keys.size) keys.add(item);
   if(!['owner','showrunner','show','q','sort','dir','type','source-owner',...filterNames].some(key=>params.has(key))){
-   owner='';show='all';query='';type='';for(const name of filterNames) filters[name]='';}
+   owner='';show=options.requiredShow?.(itemWithKey(item)?.dataset) ?? 'all';
+   query='';type='';for(const name of filterNames) filters[name]='';}
   if(options.single) opened.clear();opened.add(item);revealKey=item;
  }
  const saved=followingItemLink ? null : history.state?.recordTable;
  linkedItem=options.missingItem ? saved?.linkedItem ?? (
   !options.persistLinkedTarget || params.get('linked')==='1' ? item ?? '' : '') : '';
+ const reveal=options.revealLinked && params.get('reveal')==='1';
+ revealedLinkedItem=reveal || saved?.revealedLinkedItem===linkedItem ? linkedItem : '';
  if(saved && (!options.mount || saved.top!==undefined)){
   opened.clear();
   saved.opened.forEach(key=>opened.add(key));
@@ -490,7 +497,8 @@ function animateRow(table,item,showRow,previousItem=item){
  const finished=animation.finished.then(()=>{
   if(rowMotion.get(item)?.animation!==animation) return;
   stopMotion(item);
-  scheduleWindow();
+  if(table.closest('[data-linked-item]')) apply(false,{animate:true});
+  else scheduleWindow();
  },()=>{});
  rowMotion.set(item,{spacer,clip,copy,animation,finished,sortValues:showRow ? sortValues(item.dataset) :
   previous?.sortValues ?? sortValues(item.dataset)});
@@ -524,20 +532,25 @@ function showActionResult(item,submission,label,{kind,message,hiddenMessage}){
  }
 }
 function isSelected(item){return !keys.size || keys.has(item.dataset.key);}
-function canRevealLinked(item,selection){return options.revealLinked?.(item.dataset,selection);}
+function canRevealLinked(item,selection){
+ const required=options.requiredShow?.(item.dataset);
+ if(required && required!==selection.show) return false;
+ return item.dataset.key===revealedLinkedItem || options.revealLinked?.(item.dataset,selection);
+}
 function matches(item,selection,counts){
  if(!isSelected(item)) return false;
  if(!options.filterValues) return options.visible(item.dataset,selection);
  const values=options.filterValues(item.dataset,selection.query,selection);
  if(!values) return false;
  const selected={show:selection.show,owner:selection.owner,...selection.filters};
+ const required=options.requiredShow?.(item.dataset);
  const excluded=Object.entries(values).filter(([name,choices])=>
-  filterChipValue(name,selected[name])!=='all' && !choices.includes(selected[name]));
+  filterChipValue(name,selected[name])==='all' ? name==='show' && required : !choices.includes(selected[name]));
  // A record counts for a row when it matches every other row.
  if(counts && excluded.length<2){
   for(const [name,choices] of Object.entries(values)){
    if(excluded.length && excluded[0][0]!==name) continue;
-   for(const value of ['all',...choices.map(choice=>filterChipValue(name,choice))])
+   for(const value of [...(name==='show' && required ? [] : ['all']),...choices.map(choice=>filterChipValue(name,choice))])
     counts[name][value]=(counts[name][value] ?? 0)+1;
   }
  }
@@ -551,6 +564,7 @@ function apply(write=true,layout={}){
  applyRows(write,layout);
 }
 function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false,top}={}){
+ const previousReveal=revealedLinkedItem;
  const motion=animate && !matchMedia('(prefers-reduced-motion: reduce)').matches;
  if(!motion) for(const item of rowMotion.keys()) stopMotion(item);
  const rows=options.entries ? options.entries().map(dataset=>({dataset})) : [...content.querySelectorAll('[data-list-item]')];
@@ -565,6 +579,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
   opened.delete(linkedItem);
   linkedItem='';
  }
+ if(revealedLinkedItem!==linkedItem) revealedLinkedItem='';
  const previousOwner=owner,previousShow=show,previousFilters={...filters};
  owner=options.resolveOwner?.(owner) ?? owner;
  const search=query.trim().toLowerCase();
@@ -579,16 +594,18 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
  const counts=options.filterValues ? Object.fromEntries(['show','owner',...filterNames].map(name=>[name,Object.create(null)])) : undefined;
  const column=columns.indexOf(sort);
  const windowMotions=options.mount && rowMotion.size ? motionsByKey() : null;
+ const currentKeys=windowMotions && new Set(rows.map(item=>item.dataset.key));
+ const departingRows=currentKeys ? [...rowMotion.keys()].filter(item=>!currentKeys.has(item.dataset.key)) : [];
  const sortValue=item=>{
   const transition=windowMotions ? windowMotions.get(item.dataset.key) : rowMotion.get(item);
   return (transition?.sortValues ?? sortValues(item.dataset))[column];
  };
- const items=rows.toSorted((a,b)=>column<0 ? Number(a.dataset.order)-Number(b.dataset.order) :
+ const items=[...rows,...departingRows].sort((a,b)=>column<0 ? Number(a.dataset.order)-Number(b.dataset.order) :
   (compare(sortValue(a),sortValue(b)) ||
    Number(a.dataset.order)-Number(b.dataset.order))*(direction==='desc' ? -1 : 1));
  const table=content.querySelector('table');let count=0,expandedOutsideFilter=false;
  if(options.mount){
-  const visibleKeys=new Set(items.filter(item=>matches(item,active,counts)).map(item=>item.dataset.key));
+  const visibleKeys=new Set(rows.filter(item=>matches(item,active,counts)).map(item=>item.dataset.key));
   count=visibleKeys.size;
   for(const [key,node] of mounted){
    if(visibleKeys.has(key)) continue;
@@ -606,11 +623,17 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
   const linkedTable=linkedSection?.querySelector('table');
   const linked=linkedTable && opened.has(linkedItem) && items.find(item=>
    item.dataset.key===linkedItem && canRevealLinked(item,active) && !matches(item,active));
-  if(linked && linked.parentElement!==linkedTable){
-   stopMotion(linked);
-   linkedTable.append(linked);
+  if(linked){
+   // Keep the link when a refresh changes the item's filter values.
+   revealedLinkedItem=linkedItem;
+   if(linked.parentElement!==linkedTable){
+    stopMotion(linked);
+    linkedTable.append(linked);
+   }
   }
-  const results=linked ? items.filter(item=>item!==linked) : items;
+  const leavingLinked=motion && linkedTable && items.find(item=>item!==linked && item.parentElement===linkedTable &&
+   (!item.hidden || rowMotion.has(item)) && !matches(item,active));
+  const results=linked || leavingLinked ? items.filter(item=>item!==linked && item!==leavingLinked) : items;
   const tableRows=linkedTable ? rows.filter(item=>item.parentElement===table) : rows;
   if(results.some((item,index)=>item!==tableRows[index])) for(const item of results){
    if(linkedTable && item.parentElement===linkedTable) stopMotion(item);
@@ -618,14 +641,14 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
    const spacer=rowMotion.get(item)?.spacer;
    if(spacer) table.append(spacer);
   }
-  if(linkedSection) linkedSection.hidden=!linked;
+  if(linkedSection) linkedSection.hidden=!linked && !leavingLinked;
   items.forEach(item=>{
    const expanded=opened.has(item.dataset.key);
    const matched=matches(item,active,counts);
    const selection=expanded && !matched && item!==linked && options.expandedSelection?.(item.dataset,active);
    const keepExpanded=selection && matches(item,selection);
    const showRow=matched || item===linked || keepExpanded,wasShown=!item.hidden;
-   if(motion && wasShown && !showRow) animateRow(table,item,false);
+   if(motion && wasShown && !showRow) animateRow(item.parentElement,item,false);
    item.hidden=!showRow;if(matched) count++;
    if(keepExpanded) expandedOutsideFilter=true;
    const expansionChanged=setExpanded(item,expanded);
@@ -666,7 +689,8 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
  if(!options.mount) showHiddenActionResults(items);
  options.applied?.(selection,active);
  if(write || location.hash===placeHash &&
-  (owner!==previousOwner || show!==previousShow || filterNames.some(name=>filters[name]!==previousFilters[name])))
+  (revealedLinkedItem!==previousReveal || owner!==previousOwner || show!==previousShow ||
+   filterNames.some(name=>filters[name]!==previousFilters[name])))
   writePlace(pushPlace,top);
 }
 function writePlace(push=false,top){
@@ -675,8 +699,9 @@ function writePlace(push=false,top){
  const item=linkedItem || [...opened][0];
  if(item) place.set('item',item);
  if(options.persistLinkedTarget && linkedItem) place.set('linked','1');
+ if(linkedItem && revealedLinkedItem===linkedItem) place.set('reveal','1');
  keys.forEach(key=>place.append('key',key));
- const hash='#'+place,state={recordTable:{opened:[...opened],linkedItem,top}};
+ const hash='#'+place,state={recordTable:{opened:[...opened],linkedItem,revealedLinkedItem,top}};
  if(push && hash!==location.hash) history.pushState(state,'',location.pathname+hash);
  else history.replaceState(state,'',location.pathname+hash);
  placeHash=location.hash;
@@ -693,12 +718,11 @@ function saveDeparturePlace(){
  if(sharedWords() && query!==words().value){
   query=words().value;
   writePlace(false,scrollY);
- }else history.replaceState({recordTable:{opened:[...opened],linkedItem,top:scrollY}},'');
+ }else history.replaceState({recordTable:{opened:[...opened],linkedItem,revealedLinkedItem,top:scrollY}},'');
 }
 function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false}={}){
  if(pushPlace) saveDeparturePlace();
- const target=options.entries ? options.entries().map(dataset=>({dataset})).find(item=>item.dataset.key===key) :
-  [...content.querySelectorAll('[data-list-item]')].find(item=>item.dataset.key===key);
+ const target=itemWithKey(key);
  linkedItem=options.missingItem ? key : '';
  if(target){
   if(keys.size) keys.add(key);
@@ -706,10 +730,11 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false}={}
   opened.add(key);
   const selection=currentSelection();
   if(!canRevealLinked(target,selection) && !matches(target,selection)){
-   const unfiltered=currentSelection({owner:'',show:'all',query:'',type:'',sourceOwner:'',filters:{}});
+   const targetShow=options.requiredShow?.(target.dataset) ?? 'all';
+   const unfiltered=currentSelection({owner:'',show:targetShow,query:'',type:'',sourceOwner:'',filters:{}});
    if(!keepMatchingFilters || owner && !matches(target,{...unfiltered,owner})) owner='';
    if(!keepMatchingFilters || sourceOwner && !matches(target,{...unfiltered,sourceOwner})) sourceOwner='';
-   if(!keepMatchingFilters || show!=='all' && !matches(target,{...unfiltered,show})) show='all';
+   if(!keepMatchingFilters || show!==targetShow && !matches(target,{...unfiltered,show})) show=targetShow;
    if(query && !matches(target,{...unfiltered,query:query.trim().toLowerCase()})) query='';
    if(type && !matches(target,{...unfiltered,type})) type='';
    for(const name of filterNames)
@@ -742,7 +767,7 @@ function setRowsExpanded(items,expanded){
  for(const item of items){
   const key=item.dataset.key;
   if(opened.has(key)===expanded) continue;
-  linkedItem='';
+  if(!expanded && key===linkedItem) linkedItem='';
   if(expanded){
    if(options.single) opened.clear();
    opened.add(key);
@@ -798,9 +823,22 @@ return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,saveDepar
  },
  closeCard(key){
   const wasOpen=opened.delete(key);
-  if(linkedItem===key) linkedItem='';
+  if(linkedItem===key){linkedItem='';revealedLinkedItem='';}
   else if(!wasOpen) return;
   if(location.hash===placeHash) writePlace();
+ },
+ releaseLink(key){
+  if(linkedItem!==key) return;
+  const wasRevealed=revealedLinkedItem===key;
+  linkedItem='';revealedLinkedItem='';
+  if(location.hash===placeHash) writePlace();
+  const releasedAt=placeHash;
+  return ()=>{
+   if(linkedItem || location.hash!==releasedAt || placeHash!==releasedAt) return;
+   linkedItem=key;
+   if(wasRevealed) revealedLinkedItem=key;
+   writePlace();
+  };
  },
  startAction(item){
   const submission=++latestSubmission;
@@ -987,7 +1025,9 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,prepareMenu=
    }
    return;
   }
-  const list=items(),index=list.indexOf(document.activeElement);
+  const list=items();
+ if(!list.length) return;
+ const index=list.indexOf(document.activeElement);
   const next={ArrowDown:index+1,ArrowUp:index-1+list.length,Home:0,End:list.length-1}[event.key];
   if(next===undefined) return;
   event.preventDefault();list[next%list.length].focus();

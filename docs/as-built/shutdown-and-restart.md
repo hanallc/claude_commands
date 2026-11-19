@@ -293,9 +293,20 @@ The reader finds transcripts through `scripts/lib/transcripts.py` and reads from
 
 `agents add-producer NAME` reads `producer_defaults.model` from `config/models.conf`.
 The create command validates the name and records its profile and README text before it writes them.
+The staff owner publishes the creation machine and creation ID under `[producer_creations]` with the profile.
+The staff owner compares names without case distinctions and refuses a claim when a marker or staff row exists.
+The staff owner checks the current marker before removal.
+A pending creation requires the local creation record on that machine.
+Resume on another machine names the machine that holds the record and gives the `add-producer` command.
 It creates the README from `templates/producer/README.md` when the README is absent.
 The first conversation receives a prompt to read the README and run `/producer:produce`.
-The producer admission record keeps the time for prompt recovery after a failed start.
+The creation record keeps the time for prompt recovery after a failed start.
+Resume accepts a matching Codex user turn even when the turn has no timestamp.
+A malformed Codex rollout line blocks automatic retries of the opening prompt.
+Check the reserved pane for the opening prompt.
+If the prompt is absent, run `agents resume NAME --resend-opening-prompt` on the creation machine.
+The command sends the prompt once when the pane is idle and its input is empty.
+The create or resume command removes the shared creation entry after prompt confirmation, staff admission, and pane publication.
 The command reports the staff id, account and tab.
 
 ### Rename or retire a producer

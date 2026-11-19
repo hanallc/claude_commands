@@ -1536,18 +1536,24 @@ _held_review_locks: ContextVar[frozenset[Path]] = ContextVar("held_review_locks"
 
 
 @contextmanager
-def _list_lock(path: Path) -> Generator[None]:
+def _list_lock(path: Path, *, wait: bool = True) -> Generator[file_lock.LockResult]:
     folder = path.parent.resolve()
     held = _held_review_locks.get()
     if folder in held:
-        yield
+        yield file_lock.LockResult.ACQUIRED
         return
     descriptor = os.open(folder, os.O_RDONLY)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            if wait:
+                raise
+            yield file_lock.LockResult.BUSY
+            return
         token = _held_review_locks.set(held | {folder})
         try:
-            yield
+            yield file_lock.LockResult.ACQUIRED
         finally:
             _held_review_locks.reset(token)
     finally:
@@ -1555,16 +1561,19 @@ def _list_lock(path: Path) -> Generator[None]:
 
 
 @contextmanager
-def review_delivery_lock(root: Path) -> Generator[None]:
+def review_delivery_lock(root: Path, *, wait: bool = True) -> Generator[file_lock.LockResult]:
     lock = root.resolve() / ".review-link-delivery.lock"
     held = _held_review_locks.get()
     if lock in held:
-        yield
+        yield file_lock.LockResult.ACQUIRED
         return
-    with file_lock.exclusive(lock):
+    with file_lock.exclusive(lock, wait=wait) as result:
+        if result is file_lock.LockResult.BUSY:
+            yield result
+            return
         token = _held_review_locks.set(held | {lock})
         try:
-            yield
+            yield result
         finally:
             _held_review_locks.reset(token)
 
@@ -1574,6 +1583,17 @@ def checked_review_write(path: Path, root: Path, check: Callable[[], Result]) ->
     """Check a Review card while holding its list and delivery locks."""
     with review_delivery_lock(root), _list_lock(path):
         yield check()
+
+
+@contextmanager
+def try_review_write(path: Path, root: Path) -> Generator[file_lock.LockResult]:
+    """Try the Review delivery lock, then the change list lock."""
+    with review_delivery_lock(root, wait=False) as result:
+        if result is file_lock.LockResult.BUSY:
+            yield result
+            return
+        with _list_lock(path, wait=False) as result:
+            yield result
 
 
 @contextmanager
@@ -2215,7 +2235,6 @@ def _cleared_validation(delivery: Path) -> str:
     fields = cast(dict[str, object], json.loads(delivery.read_text()))
     # A null slot prevents older fields from restoring the completed validation.
     fields["validation"] = None
-    _ = fields.pop("handed_at", None)
     return json.dumps(fields)+"\n"
 
 

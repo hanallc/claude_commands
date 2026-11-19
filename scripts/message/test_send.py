@@ -27,7 +27,7 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, ExitStack, closing, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
@@ -213,6 +213,8 @@ send._bound_relay(message, 2, [], {}, attempt)
         relay.assert_called_once_with(message, 2)
 
     def test_delivery_refuses_an_unbound_socket_and_sends_over_the_checked_connection(self) -> None:
+        from scripts.herdr import herdr
+
         with (short_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener,
               mock.patch.object(send, "STATE", Path(directory) / "message"),
               mock.patch.object(sessions, "sessions_dir", return_value=Path(directory)),
@@ -225,11 +227,12 @@ send._bound_relay(message, 2, [], {}, attempt)
             listener.listen()
             listener.settimeout(2)
             message = send.Message(f"uds:{path}", "test", "Preview", "body", None)
+            conversation = fixture_runtime_id("argv-missing-recipient")
 
             def record(pid: int) -> sessions.SessionRecord:
                 started = sessions.process_start(pid)
                 assert started is not None
-                row = sessions.SessionRecord(pid=pid, sessionId="recipient", procStart=started,
+                row = sessions.SessionRecord(pid=pid, sessionId=conversation, procStart=started,
                     name="recipient", updatedAt=1, formerNames=[], tmux="", messagingSocketPath=path)
                 _ = (Path(directory) / f"{pid}.json").write_text(json.dumps(row))
                 return row
@@ -237,7 +240,7 @@ send._bound_relay(message, 2, [], {}, attempt)
             def checked(pid: int) -> unit_lookup.ProvedLiveUnit:
                 row = record(pid)
                 return unit_lookup.ProvedLiveUnit(
-                    unit_lookup.LiveClaude("recipient", "recipient", path, pid),
+                    unit_lookup.LiveClaude("recipient", conversation, path, pid),
                     session_staff.ProvedProcessGeneration(pid, row.get("procStart", "")))
 
             self.assertEqual(send.relay(message, 2).outcome, "failed")
@@ -246,7 +249,7 @@ send._bound_relay(message, 2, [], {}, attempt)
             def bound(pid: int) -> send.Message:
                 proved = checked(pid).generation
                 assert isinstance(proved, session_staff.ProvedProcessGeneration)
-                attempt = send.ClaudeDeliveryAttempt(send.ConversationRecipient(send.machine(), "recipient"),
+                attempt = send.ClaudeDeliveryAttempt(send.ConversationRecipient(send.machine(), conversation),
                                                     pid, proved.started, path)
                 return replace(message, claude_attempt=attempt)
 
@@ -258,7 +261,9 @@ send._bound_relay(message, 2, [], {}, attempt)
                 self.assertEqual(rejected.recv(1), b"")
 
             def relay(command: list[str], prompt: str, _timeout: float,
-                      _environment: dict[str, str], _cwd: Path) -> tuple[int, str, str]:
+                      _environment: dict[str, str], _cwd: Path, *,
+                      change_report: Callable[[], None] | None = None,
+                      expect_no_write: bool = False) -> tuple[int, str, str]:
                 destination = cast(str, json.loads(next(line[6:] for line in prompt.splitlines()
                                                        if line.startswith("- to: "))))
                 self.assertNotEqual(destination, message.to)
@@ -270,9 +275,14 @@ send._bound_relay(message, 2, [], {}, attempt)
                 with socket.socket(socket.AF_UNIX) as client:
                     client.settimeout(2)
                     client.connect(destination.removeprefix("uds:"))
+                    if change_report is not None:
+                        change_report()
                     wire = stream({"type": "auth", "token": "fixture"}).encode() + relay_wire(text)
                     client.sendall(wire)
                     client.shutdown(socket.SHUT_WR)
+                    if expect_no_write:
+                        self.assertEqual(client.recv(1), b"")
+                        return 0, stream(INIT, call(text, target=destination), answer(OK)), ""
                     with listener.accept()[0] as checked:
                         checked.settimeout(2)
                         with checked.makefile("rb") as request:
@@ -280,6 +290,98 @@ send._bound_relay(message, 2, [], {}, attempt)
                         checked.sendall(b"fixture reply")
                     self.assertEqual(client.recv(40), b"fixture reply")
                 return 0, stream(INIT, call(text, target=destination), answer(OK)), ""
+
+            pid = os.getpid()
+            registered = record(pid)
+            observation = sessions.RegistryObservation(registered, {})
+            stale = sessions.RegistryObservation({**registered, "procStart": "different start"}, {})
+            invalid = sessions.RegistryObservation({**registered, "sessionId": "invalid-id"}, {})
+            place = herdr.HerdrPlace("fixture", "w1:p1")
+            other_conversation = fixture_runtime_id("other-pane-conversation")
+            other = herdr.NativeAgentProcess(herdr.PaneSessionReport(other_conversation),
+                                            registered.get("procStart", ""), {})
+            registry_path = Path(directory) / f"{pid}.json"
+            changed_record: sessions.SessionRecord = {**registered, "sessionId": other_conversation}
+            late_refusals: dict[str, tuple[object, str]] = {
+                "pane report changed after connection": ({"kind": "id", "value": other_conversation},
+                                                         "the Claude pane reports a different conversation"),
+                "pane report unreadable after connection": ({"kind": "id", "value": 7},
+                                                            "cannot read the Claude pane report before delivery"),
+                "pane report has null kind after connection": ({"kind": None, "value": None},
+                                                               "cannot read the Claude pane report before delivery"),
+                "registry changed during pane read": (None, "registry record does not match"),
+            }
+            for case, foreground, entries, pane_report, expected in (
+                    ("argv missing", pid, (observation,), "", "sent"),
+                    ("matching pane report", pid, (observation,), conversation, "sent"),
+                    ("legacy pane report without kind", pid, (observation,), "", "sent"),
+                    ("start mismatch", pid, (stale,), "", "failed"),
+                    ("PID mismatch", os.getppid(), (observation,), "", "failed"),
+                    ("two records", pid, (observation, stale), "", "failed"),
+                    ("another owner", pid, (observation,), "", "failed"),
+                    ("conflicting pane report", pid, (observation,), other_conversation, "failed"),
+                    ("unreadable pane report", pid, (observation,), "", "failed"),
+                    ("invalid session ID", pid, (invalid,), "", "failed"),
+                    ("registry changed before relay", pid, (observation,), "", "failed"),
+                    ("pane report changed after connection", pid, (observation,), conversation, "failed"),
+                    ("pane report unreadable after connection", pid, (observation,), conversation, "failed"),
+                    ("pane report has null kind after connection", pid, (observation,), conversation, "failed"),
+                    ("registry changed during pane read", pid, (observation,), conversation, "failed")):
+                process = {"name": "claude", "pid": foreground, "argv": ["claude"] if case == "another owner" else []}
+                info = {"process_info": {"foreground_processes": [process]}}
+                pane: dict[str, object] = {"pane_id": place.pane}
+                if pane_report:
+                    pane["agent_session"] = {"kind": "id", "value": pane_report}
+                if case == "unreadable pane report":
+                    pane["agent_session"] = {"kind": "id"}
+                if case == "legacy pane report without kind":
+                    pane["agent_session"] = {"value": None}
+
+                def read_pane_and_change_registry(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+                    _ = registry_path.write_text(json.dumps(changed_record))
+                    return [pane]
+
+                with (self.subTest(case=case),
+                      mock.patch.object(herdr, "live_sessions", return_value=[{"name": place.session}]),
+                      mock.patch.object(herdr, "herdr_processes",
+                          return_value=[herdr.HerdrProcess(pid, place, {}, "claude", directory)]),
+                      mock.patch.object(herdr, "native_process", return_value=other),
+                      mock.patch.object(herdr.Herdr, "listed", return_value=[pane]) as read_panes,
+                      mock.patch.object(herdr.Herdr, "result", return_value=info)):
+                    launch.reset_mock()
+                    late = late_refusals.get(case)
+                    change_report = (None if late is None or late[0] is None
+                                     else partial(pane.__setitem__, "agent_session", late[0]))
+                    launch.side_effect = partial(
+                        relay, expect_no_write=late is not None, change_report=change_report)
+                    registry = sessions.RegistryRead(entries, ())
+                    recipient = entries[0].record["sessionId"]
+                    mailbox = send.ConversationRecipient(send.machine(), recipient)
+                    _ = registry_path.write_text(json.dumps(entries[0].record))
+                    plan = send.relay_plan(replace(message, to=f"session:{recipient}"), registry,
+                        sessions.running_records(registry), staff.StaffSnapshot(()), mailbox)
+                    if expected == "sent" or case == "registry changed before relay" or late is not None:
+                        assert isinstance(plan, send.RelayAttempt), plan
+                        if case == "registry changed before relay":
+                            _ = registry_path.write_text(json.dumps(stale.record))
+                        if case == "registry changed during pane read":
+                            read_panes.side_effect = read_pane_and_change_registry
+                        result = send.relay(plan.message, 2)
+                        self.assertEqual(result.outcome, expected, result.detail)
+                        if expected == "sent":
+                            launch.assert_called_once()
+                        elif late is not None:
+                            self.assertIn(late[1], result.detail)
+                            launch.assert_called_once()
+                            with listener.accept()[0] as rejected:
+                                rejected.settimeout(2)
+                                self.assertEqual(rejected.recv(1), b"")
+                        else:
+                            self.assertIn("registry record does not match", result.detail)
+                            launch.assert_not_called()
+                    else:
+                        self.assertIsInstance(plan, send.ClaudeRoutingFailed)
+                        launch.assert_not_called()
 
             launch.side_effect = relay
             connect = unit_lookup.connect_claude_socket
