@@ -1472,6 +1472,28 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
 
+### Phase 87 — A busy staff row names the command and PID that hold it  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** sdlc, from natedev's accounts analysis of the 07:16 EST move failure (2026-11-19). Name: slotholder. Today the error "another operation holds this row" does not name the holder, so nobody can tell which process blocks a move.
+
+**Spec:**
+1. `scripts/production/staff.py`, `slot_operation`: after it takes the lock, write the holder's PID and command into the lock file. Replace the old content. A joined child operation writes nothing.
+2. When the lock is busy, the error names the holder: `<name>: another operation holds this row (pid <pid>: <command>)`. If the file has no holder yet, keep the old text.
+3. Keep one place that writes and one place that reads the holder line.
+4. Add a row to an existing test in `test_staff_operation.py`; add no new test module.
+
+**Files:** `scripts/production/staff.py`, `scripts/production/test_staff_operation.py`, `docs/as-built/` where it states the row lock error.
+
+**Workers:** 1 writer.
+
+**Order:** while phase 86 waits for its gate. Tests run only when natemerge allows them.
+
+**Acceptance gate:**
+1. The new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
