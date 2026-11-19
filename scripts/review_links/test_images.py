@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlencode
 
 from scripts.review_links.test_page_frame import assert_status_states
 from scripts.review_links.test_staff_names import without_role_colors
-from scripts.lib import atomic_file, process_start
+from scripts.lib import atomic_file, conf, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result
@@ -237,13 +237,18 @@ class ImagesTests(ImagesFixture):
         older_folder = self.root / image_store.IMAGES_FOLDER / older["id"]
         older["registered_at"] = (datetime.now(UTC) - timedelta(days=9)).isoformat(timespec="seconds")
         image_store.write_record(older_folder, older)
-        source = images.render(self.status).decode()
+        settings = self.temporary / "config/review_links.conf"
+        _ = write_config_fixture(settings, "card_fade_out_ms=365\ncard_fade_in_ms=725\n")
+        with patch.object(conf, "read", wraps=conf.read) as read:
+            source = images.render(self.status).decode()
+        self.assertEqual(sum(call.args == ("review_links",) for call in read.call_args_list), 1)
         self.assertEqual(source.count(page_frame.BUTTON_STATES), 1)
         self.assertEqual(source.count(page_frame.ZOOM_STYLE), 1)
         self.assertEqual(source.count(page_frame.ZOOM_SCRIPT), 1)
         self.assertEqual(source.count(page_frame.MOTION_SCRIPT), 1)
         self.assertEqual(source.count(page_frame.REFRESH_SCRIPT), 1)
         self.assertIn('data-refresh-seconds="0"', source)
+        self.assertIn('data-card-fade-out-ms="365" data-card-fade-in-ms="725"', source)
         self.assertIn("prefers-reduced-motion: reduce", source)
         self.assertLess(source.index(older["id"]), source.index(newer["id"]))
         self.assertIn('<nav data-image-groups aria-label="Image groups"></nav>', source)
@@ -378,13 +383,28 @@ class ImagesTests(ImagesFixture):
  for (let step = 0; step < 100 && !oldRefreshReady; step++) await wait(20);
  check(oldRefreshReady, 'the older refresh has a page with the card');
  const previous = list();
+ const departingForm = previous.querySelector('form');
+ const feedbackButton = departingForm.querySelector('button[value="feedback"]');
  submitFeedback('Routine feedback.');
+ const fade = departingForm.closest('article').getAnimations()[0];
+ if (!fade) throw new Error('The card must fade after feedback.');
+ fade.pause();
+ fade.currentTime = fade.effect.getTiming().duration / 2;
+ check([...departingForm.querySelectorAll('button')].every(button => button.disabled),
+       'The card disables all form buttons during the fade.');
+ feedbackButton.click();
+ departingForm.requestSubmit(feedbackButton);
+ fade.finish();
  for (let step = 0; step < 100 && list() === previous; step++) await wait(20);
  check(list() !== previous, 'routine feedback refreshes the list');
  check(!list().querySelector('article'), 'routine feedback leaves the card absent');
  releaseOldRefresh();
  for (let step = 0; step < 100 && !oldRefreshReleased; step++) await wait(20);
  check(oldRefreshReleased && !list().querySelector('article'), 'the older refresh cannot restore the card');
+ const updated = list();
+ document.dispatchEvent(new Event('visibilitychange'));
+ for (let step = 0; step < 100 && list() === updated; step++) await wait(20);
+ check(list() !== updated && !list().querySelector('article'), 'A later refresh still replaces the list.');
  check(list() !== null && location.pathname === '""" + images.PAGE_PATH + """', 'the page stays after Send Feedback');
  await report(failures);
 })().catch(error => fetch('/results', {method:'POST', body:JSON.stringify([String(error)])}));
@@ -477,7 +497,7 @@ class ImagesTests(ImagesFixture):
                 server.shutdown()
                 thread.join(TEST_HANG_GUARD_SECS)
         self.assertEqual(results, [[]], "The browser must complete every check without a failure.")
-        self.assertEqual(len(gets), 12, "load, update, reload, update, then one refresh per POST")
+        self.assertEqual(len(gets), 13, "Load, update, reload, update, one refresh per POST, and the later update.")
         self.assertEqual([(post["action"], post["feedback"]) for post in posts], [
             (["approved"], [""]), (["not approved"], [""]), (["feedback"], ["Too dark."]),
             (["question"], ["Which check passed?"]), (["feedback"], ["Please retry."]),

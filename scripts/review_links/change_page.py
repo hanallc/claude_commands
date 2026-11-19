@@ -31,6 +31,7 @@ from typing import IO, Literal, NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, urlsplit
 from weakref import WeakSet, WeakValueDictionary, finalize
 
+from scripts.agents import remote
 from scripts.lib import build_folders, process_start
 from scripts.lib.boot_identity import boot_identity
 from scripts.message import send_result
@@ -51,7 +52,8 @@ from scripts.production.production_doc import (
     Refusal as Refusal, production_field, read_production,
 )
 from scripts.feature_log import feature_log
-from scripts.review_links import console_theme, image_store, page_frame, question_record, review_events, review_link
+from scripts.review_links import (console_theme, image_store, new_item_dialog, page_frame, question_record, review_events,
+                                  review_link)
 from scripts.review_links.question_record import AnswerRefused as AnswerRefused
 from scripts.review_links.review_items import (
     CompletedFeedback as CompletedFeedback, OpenFeedback as OpenFeedback,
@@ -2397,8 +2399,9 @@ def rebuilds_url() -> str:
 
 
 def reply_command(key: str, question: str = '') -> str:
+    machine = ' --machine '+shlex.quote(remote.local_machine()) if key.startswith(new_item_dialog.KEY_PREFIX) else ''
     return ('~/.claude/scripts/lib/py ~/.claude/scripts/review_links/change_page.py answer-question '
-            + '--item '+shlex.quote(key)+(' --question '+shlex.quote(question) if question else '')
+            + '--item '+shlex.quote(key)+(' --question '+shlex.quote(question) if question else '')+machine
             + " --text '<your answer>'")
 
 
@@ -2460,6 +2463,18 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
     raise question_record.AnswerRefused('this item cannot receive an answer')
 
 
+def _forward_reply(machine: str, key: str, words: str, token: str) -> int:
+    arguments = shlex.join(["answer-question", "--item=" + key, "--question=" + token, "--text=" + words])
+    command = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" ' + arguments
+    result = subprocess.run(["ssh", "-o", "BatchMode=yes", machine, command], stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True, timeout=30, check=False)
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    return result.returncode
+
+
 def main(arguments: list[str]) -> int:
     if arguments and arguments[0] == "answer-question":
         parser = argparse.ArgumentParser(description="Answer an Ask question action on a Review item.")
@@ -2468,13 +2483,27 @@ def main(arguments: list[str]) -> int:
         _ = parser.add_argument("--list", type=Path)
         _ = parser.add_argument("--row")
         _ = parser.add_argument("--question", default="")
+        _ = parser.add_argument("--machine", default="")
         _ = parser.add_argument("--text", required=True)
         args = parser.parse_args(arguments[1:])
         try:
-            if cast(str,args.item):
-                changed = answer_item(cast(str,args.item),cast(str,args.text),cast(str,args.question),
-                                                     DeliveryStatus(review_link.review_root()))
-                print(f'Answered {cast(str,args.item)}' if changed else f'{cast(str,args.item)} already has this answer')
+            key, words, token = cast(str, args.item), cast(str, args.text), cast(str, args.question)
+            machine = cast(str, args.machine)
+            scoped = key.startswith(new_item_dialog.KEY_PREFIX)
+            if machine:
+                if not scoped:
+                    raise ValueError("Use --machine with a sent item's full key.")
+                if machine != remote.local_machine():
+                    host = remote.machine_alias(machine)
+                    if isinstance(host, remote.MachineNameRefused):
+                        raise ValueError(host.reason)
+                    if host.alias != remote.this_machine():
+                        return _forward_reply(host.alias, key, words, token)
+            if key:
+                retained = scoped and not staff.is_owner()
+                with staff.supplied_snapshot(staff.local_snapshot()) if retained else nullcontext():
+                    changed = answer_item(key, words, token, DeliveryStatus(review_link.review_root()))
+                print(f'Answered {key}' if changed else f'{key} already has this answer')
                 return 0
             if not all((cast(str | None,args.production),cast(Path | None,args.list),cast(str | None,args.row),cast(str,args.question))):
                 parser.error('pass --item, or --production, --list, --row and --question')
