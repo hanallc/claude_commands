@@ -43,10 +43,10 @@ from scripts.direct import phase_reservation, phase_table, plan_history, progres
 from scripts.direct.progress_history import _supplier_message  # pyright: ignore[reportPrivateUsage]
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct.findings_test_support import invoke_findings
+from scripts.direct.verify_shell_test_support import verify_shell_functions
 from scripts.history.rounds import load_phases
 from scripts.history import history as stage_history
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.production.cli_fixture import invoke_cli
 
@@ -2790,7 +2790,7 @@ with patch.object(fcntl, "flock", admission):
         holds.mkdir()
         _ = (holds / member.id).write_text(json.dumps({"holder": member.name, "for": "history checks",
             "since": datetime.now(UTC).isoformat(), "release_eta": "unknown"}))
-        script = shell_functions(SCRIPT.with_name("verify.sh"), "verify_helper", "phase_wait_holder_flags")
+        script = verify_shell_functions("verify_helper", "phase_wait_holder_flags")
         script += '\nPY=$1 PHASE_WAIT_RECORDER=$2 BUILD_HOLD_DIR=$3\nphase_wait_holder_flags hold\n'
         environment = {**os.environ, "CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "",
                        "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "", "PLAN_DELEGATE_BOARD_DIR": "",

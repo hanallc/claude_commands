@@ -14,6 +14,7 @@ from typing import final
 
 from scripts.build_hold import build_hold
 from scripts.direct.verify_mac_offload_test_support import ASSIGNED_RUNNER_SETUP, BusyClaimRecord, VerifyMacOffloadFixture, VERIFY as VERIFY
+from scripts.direct.verify_shell_test_support import verify_shell_functions
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -141,9 +142,11 @@ class NextestArgumentTests(unittest.TestCase):
     @staticmethod
     def compose_script(root: Path, *extra: str) -> str:
         """Return the verify.sh functions that compose nextest words, with fixture metadata for one package."""
-        functions = shell_functions(VERIFY, "verify_helper", "read_metadata", "set_gate_metadata", "load_metadata",
-                                    "require_member", "qualify_features", "merge_dev_features",
-                                    "take_features", "take_test_targets", "compose_nextest_args", *extra)
+        functions = verify_shell_functions(
+            "verify_helper", "read_metadata", "set_gate_metadata", "load_metadata",
+            "require_member", "qualify_features", "merge_dev_features",
+            "take_features", "take_test_targets", "compose_nextest_args", *extra,
+        )
         metadata: dict[str, object] = {
             "workspace_root": str(root), "workspace_members": ["sample-id"],
             "packages": [{"name": "sample", "id": "sample-id", "features": {},

@@ -29,10 +29,10 @@ from scripts.copies.scope_bindings import OwnedCheckoutLease, checkout_binding_r
 from scripts.direct.verify_doc_test_support import CARGO_STUB, VERIFY, VerifyDocFixture
 from scripts.direct.verify_mac_offload_test_support import processes_carrying, reap, wait_for_marker_exit
 from scripts.direct.verify_scope_test_support import use_fixture_scope_readings, write_real_scope_launcher
+from scripts.direct.verify_shell_test_support import verify_shell_functions
 from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
 from scripts.lib import build_folders, build_slots
 from scripts.lib.build_steps import RECORDED_STEP_NAMES
-from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_admit import scope_members
 from scripts.lint.memory_test_support import write_config_fixture, write_pressure_reading
@@ -57,8 +57,7 @@ if IFS= read -r request; then
 fi
 : > owner-received-eof
 ''')
-            functions = shell_functions(VERIFY.parents[1] / "lint/invoke.sh", "find_unused_file_descriptor")
-            script = functions + shell_functions(VERIFY, "step_checkout", "step_close_checkout") + r'''
+            script = verify_shell_functions("step_checkout", "step_close_checkout") + r'''
 export TEST_COPY_LIMIT=$1
 checkout() { step_checkout "$BASH" ./copy-owner.sh; }
 ''' + probe

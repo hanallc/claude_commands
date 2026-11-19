@@ -13,7 +13,8 @@ import unittest
 from pathlib import Path
 from typing import cast
 
-from scripts.lib.shell_test_support import shell_function
+from scripts.direct.verify_shell_test_support import verify_shell_functions
+from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.direct.memory_kill_test_support import (
     EARLYOOM_MESSAGE, KILL_AT, failed_compile_log, install_journal, journal_event,
@@ -38,14 +39,13 @@ def classifier_functions() -> str:
         'step_stopped_by_hold() { return 1; }',
         'collect_hold_wait() { :; }',
     ]
-    for path, name in (
-        (VERIFY.parent.parent / "lint" / "invoke.sh", "buildlog_step_compiles"),
-        *((VERIFY, name) for name in (
-            "verify_helper", "memory_kill_in_journal", "step_was_killed_for_memory", "lint_failure_is_the_tree",
-            "release_wait_claim", "step_writes_tree", "run", "run_step", "step_uses_build_scope", "verify_uses_build_scope", "settle_placed_scope", "note_event")),
-    ):
-        functions.append(shell_function(path.read_text(), name))
-    return "\n".join(functions)
+    return "\n".join(functions) + "\n" + shell_functions(
+        VERIFY.parent.parent / "lint/invoke.sh", "buildlog_step_compiles",
+    ) + verify_shell_functions(
+        "verify_helper", "memory_kill_in_journal", "step_was_killed_for_memory", "lint_failure_is_the_tree",
+        "release_wait_claim", "step_writes_tree", "run", "run_step", "step_uses_build_scope",
+        "verify_uses_build_scope", "settle_placed_scope", "note_event",
+    )
 
 
 class MemoryKillTests(unittest.TestCase):

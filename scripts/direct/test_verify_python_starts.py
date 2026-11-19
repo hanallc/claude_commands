@@ -14,6 +14,7 @@ from typing import override
 import unittest
 from unittest.mock import patch
 
+from scripts.direct.verify_shell_test_support import verify_shell_functions
 from scripts.lib.shell_test_support import shell_function, shell_functions
 from scripts.direct.tree_watch_test_support import TreeWatchFixture
 from scripts.direct.verify_doc_test_support import VerifyDocFixture
@@ -243,9 +244,7 @@ class VerifyOutputRootsTests(unittest.TestCase):
                 'set -euo pipefail\n'
                 + shell_functions(VERIFY.parent.parent / "lint/invoke.sh",
                                   "close_checkout_handoffs", "run_without_checkout_handoffs")
-                + shell_function(VERIFY.read_text(), "verify_helper") + "\n"
-                + shell_function(VERIFY.read_text(), "set_gate_metadata") + "\n"
-                + shell_function(VERIFY.read_text(), "load_metadata") + "\n"
+                + verify_shell_functions("verify_helper", "set_gate_metadata", "load_metadata")
                 + "cargo() { [[ ${CARGO_FAIL:-0} == 0 ]] || return 1; cat metadata.json; }\n"
                 + 'set_gate_metadata\nprintf "%s\\n" "$BUILDLOG_OUTPUT_ROOTS"\n'
                 + 'mkdir .cargo\nprintf \'[build]\\nbuild-dir = "changed-build"\\n\' > .cargo/config.toml\n'
@@ -288,9 +287,10 @@ class PairedTreeKeyTests(TreeWatchFixture):
         session.mkdir(exist_ok=True)
         _ = (session / "lint.conf").write_text("# key input\n")
         harness = session / "keys.sh"
-        _ = harness.write_text('set -euo pipefail\nCMD=$1; shift; ARGS=("$@")\n'
-                               + 'GATE_METADATA=$TEST_METADATA\n'
-                               + "\n".join(shell_function(VERIFY.read_text(), name) for name in ("verify_helper", "lint_code_files", "tree_key", "set_verdict_keys")) + '''
+        _ = harness.write_text(
+            'set -euo pipefail\nCMD=$1; shift; ARGS=("$@")\n'
+            + 'GATE_METADATA=$TEST_METADATA\n'
+            + verify_shell_functions("verify_helper", "lint_code_files", "tree_key", "set_verdict_keys") + '''
 tree_key
 tree_key --tree-content
 set_verdict_keys --watch-start "$UNIT_SESSION_DIR/start"

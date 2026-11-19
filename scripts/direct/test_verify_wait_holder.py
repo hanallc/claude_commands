@@ -18,6 +18,7 @@ from scripts.direct.verify_token_wait_test_support import VERIFY, VerifyTokenWai
 from scripts.direct.verify_hold_wait_test_support import VerifyHoldWaitFixture
 from scripts.direct.verify_mac_offload_test_support import ROUTING_WAIT_STUB
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, TAPLO_STUB
+from scripts.direct.verify_shell_test_support import verify_shell_functions
 from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.shell_test_support import shell_functions
@@ -123,9 +124,9 @@ class VerifyMemoryWaitHolderTests(RecordedWaitFixture):
         self.environment["TEST_FAIL_RECORDER"] = failure
         script = self.root / "memory-events.sh"
         _ = script.write_text('set -euo pipefail\nsource "$1"\n'
-            + shell_functions(VERIFY, "verify_helper", "phase_wait_holder_flags", "phase_wait_start", "phase_wait_finish",
-                              "phase_wait_finish_all", "collect_routing_wait", "start_routing_wait",
-                              "buildlog_memory_event")
+            + verify_shell_functions("verify_helper", "phase_wait_holder_flags", "phase_wait_start", "phase_wait_finish",
+                                     "phase_wait_finish_all", "collect_routing_wait", "start_routing_wait",
+                                     "buildlog_memory_event")
             + shell_functions(VERIFY.parents[1] / "lint/invoke.sh", "buildlog_now") + '''
 PY=$TEST_EVENT_ROOT/recorder-python
 PHASE_WAIT_RECORDER=$2

@@ -13,6 +13,7 @@ from scripts.direct import tree_watch
 from scripts.direct.tree_watch_test_support import TreeWatchFixture
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, VERIFY
+from scripts.direct.verify_shell_test_support import verify_shell_functions
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -32,8 +33,8 @@ class VerifyLintToolVersionTests(VerifyLintCacheFixture):
         self.events.unlink(missing_ok=True)
         self.taplo_events.unlink(missing_ok=True)
         functions = self.root / "cache-functions.sh"
-        _ = functions.write_text(shell_functions(
-            VERIFY, "verify_helper", "hash_stream", "lint_code_files", "lint_code_key", "tree_key", "set_verdict_keys",
+        _ = functions.write_text(verify_shell_functions(
+            "verify_helper", "hash_stream", "lint_code_files", "lint_code_key", "tree_key", "set_verdict_keys",
             "cache_lookup", "user_clock", "cache_record",
         ) + shell_functions(VERIFY.parent.parent / "lint/invoke.sh", "invoke_clippy"), encoding="utf-8")
         script = r'''

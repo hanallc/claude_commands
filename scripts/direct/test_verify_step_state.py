@@ -16,6 +16,7 @@ from scripts.direct import step_record
 from scripts.direct.step_row_test_support import read_step_row
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture, TARGETS
 from scripts.direct.verify_mac_offload_test_support import VERIFY
+from scripts.direct.verify_shell_test_support import verify_shell_functions
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -129,8 +130,8 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
     def call_step_functions(
         self, body: str, *, kind: str, package: str = "sample", pinned: str = "",
     ) -> subprocess.CompletedProcess[str]:
-        functions = shell_functions(
-            VERIFY, "verify_helper", "initialize_step_record", "publish_step_state", "step_state", "step_writes_tree",
+        functions = verify_shell_functions(
+            "verify_helper", "initialize_step_record", "publish_step_state", "step_state", "step_writes_tree",
             "run", "run_step", "step_uses_build_scope", "route_compiling_step", "place_compiling_step",
             "take_local_placement", "apply_placement_outcome", "settle_placed_scope",
             "build_hold_wait_local",

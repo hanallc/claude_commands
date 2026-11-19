@@ -18,6 +18,7 @@ from scripts.direct.verify_lint_diagnostics_test_support import (
     RUSTC_DENY_ATTRIBUTE,
 )
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, VERIFY
+from scripts.direct.verify_shell_test_support import verify_shell_functions
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -123,8 +124,8 @@ class VerifyLintJudgmentTests(VerifyLintJudgmentFixture):
         """Run the lint sequence with real tools and private state."""
         self.events.unlink(missing_ok=True)
         self.taplo_events.unlink(missing_ok=True)
-        functions = shell_functions(
-            VERIFY, "collect_child", "verify_helper", "first_judgment_permits_repair", "read_metadata", "load_metadata", "workspace_taplo",
+        functions = verify_shell_functions(
+            "collect_child", "verify_helper", "first_judgment_permits_repair", "read_metadata", "load_metadata", "workspace_taplo",
             "lint_code_files", "tree_key", "set_verdict_keys", "after_tree_change", "stop_tree_watch", "cancel_tree_run",
             "start_tree_watch", "finish_tree_watch", "run_lint_judgment", "run_lint_held_sequence", "run_lint_sequence",
             "lint_copy_begin", "lint_rewrite", "lint_copy_return", "lint_copy_drop", "lint_fix_tree_key",
