@@ -123,7 +123,10 @@ import sys
 with socket.socket(socket.AF_UNIX) as connection:
     connection.settimeout(__HANG_GUARD__)
     connection.connect(os.environ["MAC_RUN_COPIES_SOCKET"])
-    socket.send_fds(connection, [b"-"], [sys.stdin.fileno()])
+    if sys.stdin is None:
+        connection.sendall(b"-")
+    else:
+        socket.send_fds(connection, [b"-"], [sys.stdin.fileno()])
     with connection.makefile("rw", encoding="utf-8") as stream:
         stream.write(json.dumps({"arguments": sys.argv[1:], "cwd": os.getcwd(),
                                  "environment": dict(os.environ)}) + "\n")
@@ -137,14 +140,16 @@ raise SystemExit(status)
 
 def serve_copies_commands(listener: socket.socket) -> int:
     """Run local registry commands with the client shell's arguments and environment."""
-    with listener:
+    with listener, open(os.devnull, "rb") as worker_stdin:
+        _ = os.dup2(worker_stdin.fileno(), 0)
         while True:
             connection = listener.accept()[0]
             with connection, suppress(BrokenPipeError, ConnectionResetError):
-                descriptors = socket.recv_fds(connection, 1, 1)[1]
-                if not descriptors:
+                marker, descriptors = socket.recv_fds(connection, 1, 1)[:2]
+                if not marker:
                     continue
-                with os.fdopen(descriptors[0], encoding="utf-8", errors="surrogateescape") as stdin:
+                descriptor = descriptors[0] if descriptors else os.open(os.devnull, os.O_RDONLY)
+                with os.fdopen(descriptor, encoding="utf-8", errors="surrogateescape") as stdin:
                     with connection.makefile("r", encoding="utf-8") as stream:
                         try:
                             invocation = cast(CopiesInvocation, json.loads(stream.readline()))
@@ -1004,6 +1009,41 @@ cleanup_mac_run
         self.assertEqual(good.returncode, 0, good.stdout + good.stderr)
         record, = self.clone_registry_records(self.environment["COPIES_CONFIG"])
         self.assertEqual(record["path"], "/fixture")
+
+    def test_registry_worker_gives_stdin_only_to_the_command(self) -> None:
+        endpoint = self.copies_socket.with_name("stdin")
+        worker_input = self.root / "worker-input"
+        _ = worker_input.write_bytes(b"worker input\n")
+
+        def read_stdin(_arguments: list[str]) -> int:
+            print(os.fsencode(sys.stdin.read()).hex())
+            child_input = subprocess.check_output(["cat"], timeout=TEST_HANG_GUARD_SECS)
+            print(child_input.hex())
+            return 0
+
+        def start_worker() -> int:
+            with worker_input.open("rb") as source:
+                _ = os.dup2(source.fileno(), 0)
+                return serve_copies_commands(listener)
+
+        command = [sys.executable, "-IS", str(self.copies_client), "register-remote", "--help"]
+        with ForkChildren() as children, socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(endpoint))
+            listener.listen()
+            with mock.patch.object(copies, "main", read_stdin):
+                _ = children.start(start_worker)
+            for name, payload in (("open", b"bytes\0\xff\n"), ("empty", b""), ("closed", b"")):
+                with self.subTest(stdin=name):
+                    arguments = command
+                    if name == "closed":
+                        arguments = ["/bin/sh", "-c", 'exec 0<&-; exec "$@"', "closed-stdin", *command]
+                    result = subprocess.run(
+                        arguments, cwd=self.root, input=payload,
+                        env={**self.environment, "MAC_RUN_COPIES_SOCKET": str(endpoint)},
+                        capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, payload.hex().encode() + b"\n\n")
 
     def test_missing_remote_interpreter_returns_127(self) -> None:
         program = shell_functions(SCRIPT, "on_mac") + '\nhost=mac\non_mac "$1"\n'
