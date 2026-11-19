@@ -73,10 +73,12 @@ def configured_limits() -> tuple[float, float]:
 
 
 def last_admission(times: Path) -> float:
-    """The newest admitted time of a step with memory need in the tail of queue_times.jsonl; 0 when none.
+    """Find the last start that added a memory promise."""
+    return quiet_since(times, records.NoWaiter())
 
-    A merge gate or targeted test is admitted with zero need every few minutes; it frees nothing for the head.
-    """
+
+def quiet_since(times: Path, head: records.Waiter | records.NoWaiter) -> float:
+    """Find the last start with memory need or the last pass of this head."""
     try:
         with times.open("rb") as stream:
             size = stream.seek(0, 2)
@@ -84,19 +86,27 @@ def last_admission(times: Path) -> float:
             lines = stream.read().decode(errors="replace").splitlines()
     except OSError:
         return 0.0
+    newest_pass = 0.0
     for line in reversed(lines):
-        if '"kind":"admitted"' not in line:
+        if '"kind":"admitted"' not in line and '"kind":"landing_pass"' not in line:
             continue
         try:
             row = cast(object, json.loads(line))
         except ValueError:
             continue
-        if isinstance(row, dict):
-            fields = cast(dict[str, object], row)
+        if not isinstance(row, dict):
+            continue
+        fields = cast(dict[str, object], row)
+        if fields.get("kind") == "admitted":
             value, need = fields.get("admitted_at"), fields.get("need")
             if isinstance(value, (int, float)) and isinstance(need, int) and need > 0:
-                return float(value)
-    return 0.0
+                return max(newest_pass, float(value))
+        elif (not isinstance(head, records.NoWaiter) and fields.get("pid") == head["pid"]
+                and fields.get("start_time") == head["start_time"] and fields.get("since") == head["since"]):
+            passed_at = fields.get("passed_at")
+            if isinstance(passed_at, (int, float)):
+                newest_pass = max(newest_pass, float(passed_at))
+    return newest_pass
 
 
 def _used(memory: records.StepMemory) -> int | None:
@@ -127,7 +137,10 @@ def current_stall(paths: StallPaths, now: float, limit: float, freshest: float) 
     snapshot = read_queue_snapshot(paths.admission)
     if not isinstance(snapshot, QueueSnapshot) or now - snapshot.written_at > freshest:
         return NoStall()
-    return find_stall(snapshot, last_admission(paths.admission / "queue_times.jsonl"), now, limit)
+    if not snapshot.inputs.ordered:
+        return NoStall()
+    _, head = snapshot.inputs.ordered[0]
+    return find_stall(snapshot, quiet_since(paths.admission / "queue_times.jsonl", head), now, limit)
 
 
 def _folder_name(folder: str) -> str:

@@ -6,7 +6,7 @@ except FileNotFoundError:
     pass
 
 from collections import deque
-from collections.abc import Generator, Mapping
+from collections.abc import Generator, Mapping, Sequence
 from concurrent.futures import Future
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -50,7 +50,8 @@ from scripts.build_queue.admission_records import AdmissionWaitSnapshot, WaitHol
 from scripts.build_queue.system_clock import SystemClock as SystemClock
 from scripts.lint import memory_admit as gate
 from scripts.build_hold import override_guard
-from scripts.production import staff
+from scripts.production import land_runs, staff
+from scripts.lib.process_start import Started, Unreadable, process_start
 
 from scripts.buildlog import store
 from scripts.lib import test_phase
@@ -317,6 +318,8 @@ class WaiterPlace:
     token_left_at: float | TokenNotLeft = TokenNotLeft()
     order_since: float | OrderNotStarted = field(default_factory=OrderNotStarted, kw_only=True)
     queue_identity: records.QueueLifeIdentity = field(kw_only=True)
+    landing_passes: int = 0
+    landing_merge: bool = False
 
 
 def waiter_place(row: records.Waiter, episode: str) -> WaiterPlace:
@@ -384,6 +387,7 @@ class ReservationRecord:
     cargo_folder: placement.CargoFolder | placement.NoCargoFolder = placement.NoCargoFolder()
     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
     cloud_launch_seen: bool = False
+    landing_merge: bool = False
 
 
 def admitted_gate_job(request: wire.AdmitRequest, proc: Path) -> StepJob | GateJobNotRecorded:
@@ -396,6 +400,62 @@ def admitted_gate_job(request: wire.AdmitRequest, proc: Path) -> StepJob | GateJ
         if isinstance(job, StepJob):
             return job
     return GATE_JOB_NOT_RECORDED
+
+
+@dataclass(frozen=True)
+class LandingTest:
+    """The gate has a live land ancestor and a natemerge staff ancestor."""
+
+    land: wire.Owner
+
+
+@dataclass(frozen=True)
+class OrdinaryTest:
+    """The request has no verified landing priority."""
+
+
+def landing_test(request: wire.AdmitRequest | wire.LaunchRequest, proc: Path) -> LandingTest | OrdinaryTest:
+    """Match a local merge gate to the land that started it."""
+    if (not isinstance(request, wire.AdmitRequest) or not isinstance(request.place, wire.LocalPlace)
+            or request.profile.step != "merge-gate" or not request.identity.session_id):
+        return OrdinaryTest()
+    from scripts.build_targets import build_targets
+
+    lineage = build_targets.read_caller_lineage(proc, request.owner.pid, request.owner.start_time)
+    if not isinstance(lineage, build_targets.ConfirmedCallerLineage):
+        return OrdinaryTest()
+    directory = land_runs.lands_dir()
+    for ancestor in sorted(lineage.processes, key=lambda item: (int(item.start_time), item.pid), reverse=True):
+        if ancestor.pid == request.owner.pid:
+            continue
+        try:
+            parsed = cast(object, json.loads((directory / f"{ancestor.pid}.json").read_text()))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        row = cast(dict[str, object], parsed)
+        if (row.get("pid") == ancestor.pid and row.get("start") == ancestor.start_time
+                and process_start(ancestor.pid) == Started(ancestor.start_time)):
+            try:
+                members = staff.local_snapshot()
+            except staff.StaffUnreadable:
+                break
+            if any(map(gate.is_natemerge, gate.queue_staff_chain(members, request.identity.session_id))):
+                return LandingTest(wire.Owner(ancestor.pid, ancestor.start_time))
+            break
+    return OrdinaryTest()
+
+
+def landing_pass_limit() -> int:
+    """Read the current limit. Zero leaves the queue order as it was."""
+    settings = conf.read("build_admission")
+    try:
+        if settings.value("landing_merge_first", str, default="off") == "on":
+            return settings.whole("landing_merge_max_passes")
+    except conf.Unusable:
+        pass
+    return 0
 
 
 def step_staff(row: records.Waiter, host: str) -> staff.StaffId | records.NoEndedStepStaff:
@@ -512,6 +572,22 @@ class PendingLeft:
     episode: str
     reason: gate.LeftReason
     ended_at: float
+    landing_merge: bool = False
+
+
+@dataclass(frozen=True)
+class PendingLandingPass:
+    identity: records.QueueLifeIdentity
+    land_episode: str
+    passed_at: float
+    landing_merge: bool
+
+
+@dataclass(frozen=True)
+class LandingFirstPlace:
+    land: wire.Owner
+    episode: str
+    passed_places: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -532,11 +608,12 @@ class ServiceState:
 
     run_places: dict[str, wire.RunPlace] = field(default_factory=dict)
     caller_versions: dict[str, str] = field(default_factory=dict)
-    lifecycle_outbox: tuple[PendingAdmission | PendingLeft, ...] = ()
+    lifecycle_outbox: tuple[PendingAdmission | PendingLeft | PendingLandingPass, ...] = ()
     placement_requests: dict[str, wire.PlacementRequest] = field(default_factory=dict)
     assignments: dict[str, records.SavedPlacementAssignment] = field(default_factory=dict)
     current_assignments: dict[str, str] = field(default_factory=dict)
     pending_cloud_groups: dict[str, PendingCloudGroup] = field(default_factory=dict)
+    landing_first_places: dict[str, LandingFirstPlace] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1191,6 +1268,7 @@ class WaitingAdmission:
     last_reply: wire.Wait | NoWaitReply = NoWaitReply()
     last_sent: float = float("-inf")
     continuation_claim: records.ContinuationSlot | NoContinuationClaim = NoContinuationClaim()
+    landing: LandingTest | OrdinaryTest = OrdinaryTest()
 
 
 @dataclass
@@ -1385,8 +1463,9 @@ class AdmissionServer:
         self.pending_cloud_groups: dict[str, PendingCloudGroup] = {}
         self.repository_slot_waiters: dict[str, WaitingRepositorySlot] = {}
         self.reservations: dict[str, ReservationRecord] = {}
-        self.lifecycle_outbox: tuple[PendingAdmission | PendingLeft, ...] = ()
+        self.lifecycle_outbox: tuple[PendingAdmission | PendingLeft | PendingLandingPass, ...] = ()
         self.places: dict[str, WaiterPlace] = {}
+        self.landing_first_places: dict[str, LandingFirstPlace] = {}
         self.run_places: dict[str, wire.RunPlace] = {}
         self.build_history_generation: int = 0
         self.ledger: ReplayLedger = ReplayLedger({})
@@ -1515,6 +1594,7 @@ class AdmissionServer:
             self.assignments = state.assignments
             self.current_assignments = state.current_assignments
             self.pending_cloud_groups = state.pending_cloud_groups
+            self.landing_first_places = state.landing_first_places
         self.persist()
         for episode, record in list(self.reservations.items()):
             if not self._end_if_finished(episode, record):
@@ -1588,7 +1668,8 @@ class AdmissionServer:
             self._prune_ended_placements(now - self.last_usable_configuration.ended_placement_seconds)
         state = ServiceState(self.reservations, self.places, self.ledger, self.spacing, self.priority,
             self.build_history_generation, self.run_places, self.caller_versions, self.lifecycle_outbox,
-            self.placement_requests, self.assignments, self.current_assignments, self.pending_cloud_groups)
+            self.placement_requests, self.assignments, self.current_assignments, self.pending_cloud_groups,
+            self.landing_first_places)
         encodings: dict[tuple[str, str], DurableRecordEncoding] = {}
         changed = False
 
@@ -1742,6 +1823,68 @@ class AdmissionServer:
         return gate.apply_queue_priority(rows, gate.QueueOrderContext(self.priority, labels))
 
 
+    def _landing_order(self, rows: Sequence[tuple[Path, records.Waiter]], now: float,
+                       pending_remote_starts: frozenset[str], *, record_passes: bool
+                       ) -> list[tuple[Path, records.Waiter]]:
+        """Place the first eligible landing after the last protected waiter."""
+        ordinary = list(rows)
+        landings = {records.waiter_owner(waiting.row): waiting for waiting in self.waiters.values()
+                    if isinstance(waiting.landing, LandingTest)}
+        if not landings:
+            return ordinary
+        limit = landing_pass_limit()
+        if limit == 0:
+            return ordinary
+        positions: dict[int, WaiterPlace] = {}
+        for index, (_, row) in enumerate(ordinary):
+            owner = records.waiter_owner(row)
+            if (not gate.can_use_natedev(row) or isinstance(gate.waiter_state(row), records.TokenWaitingWaiter)
+                    and owner not in pending_remote_starts):
+                continue
+            key = _place_key(wire.Owner(row["pid"], row["start_time"]), row["since"])
+            place = self.places.get(key)
+            if place is not None:
+                positions[index] = place
+        for index in positions:
+            _, row = ordinary[index]
+            waiting = landings.get(records.waiter_owner(row))
+            if waiting is None or not isinstance(waiting.landing, LandingTest):
+                continue
+            land = waiting.landing.land
+            land_key = records.run_owner(land.pid, land.start_time)
+            award = self.landing_first_places.get(land_key)
+            episode = waiting.request.episode
+            if award is not None and award.episode != episode:
+                continue
+            if not record_passes and award is None:
+                continue
+            first_place = award or LandingFirstPlace(land, episode)
+            return self._place_landing(ordinary, positions, index, limit, land_key, first_place, now, record_passes)
+        return ordinary
+
+    def _place_landing(self, rows: list[tuple[Path, records.Waiter]], positions: dict[int, WaiterPlace],
+                       index: int, limit: int, land_key: str, award: LandingFirstPlace, now: float,
+                       record_passes: bool) -> list[tuple[Path, records.Waiter]]:
+        preceding = {position: place for position, place in positions.items() if position < index}
+        keys = {position: _place_key(place.owner, place.since) for position, place in preceding.items()}
+        protected = [position for position, place in preceding.items()
+                     if keys[position] not in award.passed_places and place.landing_passes >= limit]
+        destination = max(protected, default=-1) + 1
+        if destination == index and preceding:
+            return rows
+        passed = {position: key for position, key in keys.items()
+                  if position >= destination and key not in award.passed_places}
+        if record_passes and (passed or land_key not in self.landing_first_places):
+            for position, key in passed.items():
+                place = preceding[position]
+                self.places[key] = replace(place, landing_passes=place.landing_passes + 1)
+            if preceding and (head := min(preceding)) in passed:
+                place = preceding[head]
+                self.lifecycle_outbox = (*self.lifecycle_outbox, PendingLandingPass(
+                    place.queue_identity, award.episode, now, place.landing_merge))
+            self.landing_first_places[land_key] = replace(award, passed_places=award.passed_places | frozenset(passed.values()))
+        return gate.waiter_order(rows, landing_from=index, landing_to=destination)
+
     def _prune_runs(self) -> None:
         now = self.clock.now()
         for key, slot in list(self.slots.items()):
@@ -1831,7 +1974,7 @@ class AdmissionServer:
     def _prune_places(self) -> None:
         for key, place in list(self.places.items()):
             if not self._live(place.owner) and not any(record.owner == place.owner for record in self.reservations.values()):
-                self._record_left(place.episode, place.queue_identity, "owner_gone")
+                self._record_left(place.episode, place.queue_identity, "owner_gone", place.landing_merge)
                 del self.places[key]
         self.persist()
 
@@ -2269,7 +2412,10 @@ class AdmissionServer:
             inputs = replace(inputs, ordered=[(path, row) for path, row in inputs.ordered
                                              if records.waiter_owner(row) not in held_owners])
         inputs = self._placement_pass(inputs, policy, remote_start_hold_seconds)
-        result = gate.admission_pass(inputs, inputs.now, policy)
+        if any(isinstance(waiting.landing, LandingTest) for waiting in self.waiters.values()):
+            inputs = replace(inputs, ordered=self._landing_order(
+                inputs.ordered, inputs.now, inputs.pending_remote_starts, record_passes=True))
+        result = gate.admission_pass(inputs, inputs.now, policy, resolved_order=True)
         for reservation in result.policy.returned_claims:
             del self.slots[reservation]
         self._check_reading_alert(inputs, result, config)
@@ -2338,8 +2484,9 @@ class AdmissionServer:
             self.next_pass = self.clock.monotonic()
         try:
             ordered, priority = self._queue_order()
+            snapshot_order = self._landing_order(ordered, inputs.now, inputs.pending_remote_starts, record_passes=False)
             queue_snapshot.write_queue_snapshot(self.state_dir,
-                replace(inputs, ordered=ordered, spacing=self.spacing, priority=priority,
+                replace(inputs, ordered=snapshot_order, spacing=self.spacing, priority=priority,
                         slots=tuple(slot for slot in inputs.slots
                             if gate.between_steps(slot).reservation not in result.policy.returned_claims)), policy)
         except OSError:
@@ -2648,8 +2795,9 @@ class AdmissionServer:
             return
         key = _place_key(request.owner, row["since"])
         previous = self.places.get(key)
-        place = waiter_place(row, request.episode)
-        self.places[key] = replace(place, queue_identity=previous.queue_identity) if previous is not None else place
+        place = replace(waiter_place(row, request.episode), landing_merge=isinstance(waiting.landing, LandingTest))
+        self.places[key] = (replace(place, queue_identity=previous.queue_identity, landing_passes=previous.landing_passes)
+                            if previous is not None else place)
 
 
     def _wait_snapshot(self, waiting: WaitingAdmission, decision: records.AdmissionDecision,
@@ -2675,19 +2823,29 @@ class AdmissionServer:
                         "is_head": pending.is_head,
                         "wait_seconds": pending.wait_seconds,
                 }
-                gate.append_queue_time(self.state_dir, cast(dict[str, object], codec.snapshot_value(event)), admitted_at)
+                gate.append_queue_time(self.state_dir, {**cast(dict[str, object], codec.snapshot_value(event)),
+                    "landing_merge": record.landing_merge}, admitted_at)
                 self.fault("after_admitted_append")
+            elif isinstance(pending, PendingLandingPass):
+                identity = pending.identity
+                step = _place_key(wire.Owner(identity["pid"], identity["start_time"]), identity["since"])
+                gate.append_queue_time(self.state_dir, {**identity, "kind": "landing_pass",
+                    "event_id": f"landing_pass:{pending.land_episode}:{step}", "passed_at": pending.passed_at,
+                    "landing_merge": pending.landing_merge}, pending.passed_at)
             else:
                 left: gate.LeftEvent = {
                     **gate.lifecycle_event(pending.identity, "left", pending.episode + ":" + pending.reason),
                     "reason": pending.reason, "ended_at": pending.ended_at,
                 }
-                gate.append_queue_time(self.state_dir, cast(dict[str, object], codec.snapshot_value(left)), pending.ended_at)
+                gate.append_queue_time(self.state_dir, {**cast(dict[str, object], codec.snapshot_value(left)),
+                    "landing_merge": pending.landing_merge}, pending.ended_at)
                 self.fault("after_left_append")
             self.lifecycle_outbox = self.lifecycle_outbox[1:]
 
-    def _record_left(self, episode: str, identity: records.QueueLifeIdentity, reason: gate.LeftReason) -> None:
-        self.lifecycle_outbox = (*self.lifecycle_outbox, PendingLeft(identity, episode, reason, self.clock.now()))
+    def _record_left(self, episode: str, identity: records.QueueLifeIdentity, reason: gate.LeftReason,
+                     landing_merge: bool) -> None:
+        self.lifecycle_outbox = (*self.lifecycle_outbox,
+            PendingLeft(identity, episode, reason, self.clock.now(), landing_merge))
 
     def _freeze_test_phase_need(self, record: ReservationRecord, config: records.MemoryConfig,
                                 share_percent: int) -> ReservationRecord:
@@ -2721,7 +2879,7 @@ class AdmissionServer:
             profile.repository.key if isinstance(profile.repository, records.RepositoryIdentity) else "",
             profile.scope, step_estimator.test_package(list(request.argv)), tuple(step_estimator.test_filters(list(request.argv))),
             shape, run=request.run, place=request.place, cargo_folder=cargo_folder,
-            gate_job=admitted_gate_job(request, self.proc.path))
+            gate_job=admitted_gate_job(request, self.proc.path), landing_merge=isinstance(waiting.landing, LandingTest))
         self.writes.register(record)
         if cloud:
             return record
@@ -2794,11 +2952,14 @@ class AdmissionServer:
         if isinstance(ending, TokenWaiting):
             row_waiter = record.queue_waiter.copy()
             row_waiter["token_left_at"] = ending.left_at
-            self.places[_place_key(record.owner, row_waiter["since"])] = waiter_place(row_waiter, record.episode)
+            place_key = _place_key(record.owner, row_waiter["since"])
+            previous = self.places.get(place_key)
+            self.places[place_key] = replace(waiter_place(row_waiter, record.episode), landing_merge=record.landing_merge,
+                                            landing_passes=previous.landing_passes if previous is not None else 0)
         _ = gate.finalize_reservation(path, row, outcome, datetime.fromtimestamp(ended_at, UTC), status,
             intents=StateIntents(self.reservations, self._advance_build_history, episode, self.persist, self.fault,
                                 self.places, RegisteredServiceWrites(self.writes)),
-            end_kind=end_kind)
+            end_kind=end_kind, landing_merge=record.landing_merge)
         if (isinstance(record.place, wire.LocalPlace) and isinstance(record.run, wire.RunIdentity)
                 and self._run_alive(record.run)
                 and isinstance(self.last_usable_configuration, records.MemoryConfig)):
@@ -4391,7 +4552,8 @@ done
             elif self.pass_stale and isinstance(self.last_inputs, records.QueueInputs):
                 if isinstance(self.last_policy, records.AdmissionPolicy):
                     self.last_inputs = self._inputs_with_current_slots(self.last_inputs)
-                    self.last_result = gate.admission_pass(self.last_inputs, self.last_inputs.now, self.last_policy)
+                    self.last_result = gate.admission_pass(
+                        self.last_inputs, self.last_inputs.now, self.last_policy, resolved_order=True)
                 self.pass_stale = False
                 self._publish_replies()
             if isinstance(self.configuration, gate.UnusableAdmissionConfiguration):
@@ -4432,14 +4594,20 @@ done
             row = self._row(request, self.places.get(place_key, records.NoWaiter()))
             place = waiter_place(row, key)
             self._run_place(request, place)
-            self.waiters[key] = WaitingAdmission(request, row, connection)
+            landing = landing_test(request, self.proc.path)
+            if isinstance(landing, LandingTest):
+                self.landing_first_places = {key: award for key, award in self.landing_first_places.items()
+                                            if isinstance(started := process_start(award.land.pid), Unreadable)
+                                            or started == Started(award.land.start_time)}
+            self.waiters[key] = WaitingAdmission(request, row, connection, landing=landing)
             self._save_place(self.waiters[key])
             self._watch_owner(request.owner)
             if (isinstance(request, wire.AdmitRequest) and request.token_back_at
                     and not isinstance(place.token_left_at, TokenNotLeft)):
                 gate.append_queue_time(self.state_dir, {"kind": "token_gap", "episode": key,
                     **gate.queue_life_identity(self.waiters[key].row),
-                    "token_left_at": place.token_left_at, "token_back_at": request.token_back_at}, self.clock.now())
+                    "token_left_at": place.token_left_at, "token_back_at": request.token_back_at,
+                    "landing_merge": isinstance(landing, LandingTest)}, self.clock.now())
         elif isinstance(request, wire.ReleaseRequest):
             episode = next((episode for episode, record in self.reservations.items() if record.reservation_id == request.reservation), None)
             if episode is not None:
@@ -4674,7 +4842,8 @@ done
         changed = False
         for episode, waiting in list(self.waiters.items()):
             if waiting.connection is connection:
-                self._record_left(episode, gate.queue_life_identity(waiting.row), "cancelled")
+                self._record_left(episode, gate.queue_life_identity(waiting.row), "cancelled",
+                                  isinstance(waiting.landing, LandingTest))
                 _ = self.places.pop(_place_key(waiting.request.owner, waiting.row["since"]), None)
                 self._drop_waiter(episode, return_claim=True)
                 changed = True
