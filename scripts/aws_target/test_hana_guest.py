@@ -243,7 +243,7 @@ mount_timeout_seconds=15
         self.assertIn('ConditionPathIsMountPoint=' + str(guest.DATA), files['hana-tools.service'].content)
         self.assertEqual(files['safety.py'].mode, 0o600)
         self.assertEqual(files['safety.json'].mode, 0o600)
-        receiver = hana_receiver.render_files(hana_receiver.ReceiverSettings(10, 1, 83))[-1].content
+        receiver = hana_receiver.render_files(hana_receiver.ReceiverSettings(10, 1, 83, 1048576, 120, 23))[-1].content
         for unit in (guard, files['hana-watchdog.service'].content, receiver):
             self.assertIn('Environment=PATH=' + guest.SYSTEM_BIN + '\n', unit)
 
@@ -260,8 +260,12 @@ mount_timeout_seconds=15
         settings = control / 'safety.json'
         _ = settings.write_text(json.dumps(asdict(self.settings)))
         program = self.root / 'safety.py'
-        _ = program.write_text(guest.guest_program().replace(str(guest.CONTROL), str(control))
-                               .replace(str(guest.PERMIT), str(self.permit)))
+        image = self.root / 'image'
+        module = image / 'scripts/aws_target/hana_guest.py'
+        module.parent.mkdir(parents=True)
+        _ = module.write_text(Path(guest.__file__).read_text().replace(str(guest.CONTROL), str(control))
+                              .replace(str(guest.PERMIT), str(self.permit)))
+        _ = program.write_text(guest.guest_program().replace(str(guest.IMAGE_RUNTIME), str(image)))
         binary = self.root / 'bin'
         binary.mkdir()
         systemctl = binary / 'systemctl'

@@ -218,15 +218,29 @@ def insert(items: list[LineItem], item: LineItem, *, first: bool, before: str | 
     items.insert(index, item)
 
 
+def check_label(label: str) -> None:
+    if not re.fullmatch(r"\S+ \S+", label):
+        raise Refusal(f"label {label!r} must contain two words separated by one space")
+
+
+def check_batch_path(batch: str) -> None:
+    if any(character.isspace() for character in batch):
+        raise Refusal(f"batch path {batch!r} must have no white space")
+
+
 def add(label: str, *, batch: str, commits: list[str], first: bool, before: str | None) -> None:
-    if batch and not batch_commits(batch):
+    check_label(label)
+    check_batch_path(batch)
+    batch_path = str(Path(batch).resolve()) if batch else ""
+    check_batch_path(batch_path)
+    if batch_path and not batch_commits(batch_path):
         raise Refusal(f"batch file {batch} names no commit")
-    if not batch and not commits:
+    if not batch_path and not commits:
         raise Refusal("give --batch or --commit")
     bad = [commit for commit in commits if not HASH.fullmatch(commit)]
     if bad:
         raise Refusal(f"not a commit hash: {', '.join(bad)}")
-    item: LineItem = {"label": label, "batch": str(Path(batch).resolve()) if batch else "", "commits": commits,
+    item: LineItem = {"label": label, "batch": batch_path, "commits": commits,
                       "added": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     with edited() as items:
         if any(entry["label"] == label for entry in items):
@@ -246,9 +260,16 @@ def remove(label: str) -> None:
 
 
 def take_next() -> str:
-    """Remove the first item and return its label; an empty line returns an empty label."""
+    """Check the first item before removal and format its label and batch path."""
     with edited() as items:
-        return items.pop(0)["label"] if items else ""
+        if not items:
+            return ""
+        item = items[0]
+        label, batch = item["label"], item["batch"]
+        check_label(label)
+        check_batch_path(batch)
+        _ = items.pop(0)
+        return f"{label} {batch}" if batch else label
 
 
 def listing() -> str:
@@ -278,7 +299,7 @@ def parser() -> argparse.ArgumentParser:
         _ = where.add_argument("--before")
     removed = commands.add_parser("remove", help="remove an item")
     _ = removed.add_argument("label")
-    _ = commands.add_parser("next", help="remove the first item and print its label")
+    _ = commands.add_parser("next", help="remove the first item and print its label and any batch path")
     _ = commands.add_parser("list", help="print the line")
     return root
 
@@ -303,9 +324,9 @@ def main(argv: list[str] | None = None) -> int:
             case "remove":
                 remove(args.label)
             case "next":
-                label = take_next()
-                if label:
-                    print(label)
+                output = take_next()
+                if output:
+                    print(output)
             case _:
                 print(listing())
     except (Refusal, OSError, ValueError, KeyError, TypeError) as error:
