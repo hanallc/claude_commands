@@ -1886,22 +1886,24 @@ class AdmissionServer:
                 if place is None:
                     continue
                 waiting = landings.get(owner)
-                if waiting is not None and isinstance(waiting.landing, LandingTest) and (not preceding or destination < index):
+                if waiting is not None and isinstance(waiting.landing, LandingTest):
+                    passed = tuple(place for position, place in preceding if position >= destination)
                     land = waiting.landing.land
-                    if records.run_owner(land.pid, land.start_time) not in self.landing_first_places and live_land(land):
+                    if ((not preceding or passed)
+                            and records.run_owner(land.pid, land.start_time) not in self.landing_first_places
+                            and live_land(land)):
                         trial_inputs = inputs
                         claim_policy = gate.ContinuationClaimPolicy.RELEASE_FOR_EARLIER_WAITER
-                        if index != destination:
+                        if passed:
                             rows = list(inputs.ordered)
                             gate.move_waiter(rows, index, destination)
                             trial_inputs = replace(inputs, ordered=rows)
                             claim_policy = gate.ContinuationClaimPolicy.KEEP_FOR_OWNER
                         trial = gate.admission_pass(trial_inputs, inputs.now, policy, resolved_order=True,
                                                     claim_policy=claim_policy)
-                        decision = trial.rows[destination]
+                        decision = trial.rows[destination if passed else index]
                         if (isinstance(decision.admission, gate.ProposedAdmission)
                                 and isinstance(decision.decision.room.basis, (records.Fits, records.WithinSlot))):
-                            passed = tuple(place for position, place in preceding if position >= destination)
                             claim = LandingFirstPlace(land, waiting.request.episode)
                             return trial_inputs, trial, LandingAdmission(claim, passed, destination == 0)
                 preceding.append((index, place))

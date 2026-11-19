@@ -153,6 +153,27 @@ class LandingMergeOrderTests(unittest.TestCase):
         self.assertEqual(result.policy.returned_claims, frozenset())
 
     def test_landing_at_head_keeps_normal_admission_for_shared_cargo_folder(self) -> None:
+        self.check_landing_at_memory_head(include_token_waiter=False)
+
+    def test_token_waiter_ahead_keeps_normal_admission_for_shared_cargo_folder(self) -> None:
+        self.check_landing_at_memory_head(include_token_waiter=True)
+
+    def check_landing_at_memory_head(self, *, include_token_waiter: bool) -> None:
+        expected_order = [100, 101, 102]
+        if include_token_waiter:
+            self.fixture.free(60 * GIB)
+            token_waiter = self.request(99)
+            token_grant = only_admitted(self.fixture.server.handle_request(token_waiter))
+            self.fixture.free(0)
+            self.assertEqual(self.fixture.server.handle_request(
+                wire.TokenWaitRequest("return-for-token", token_grant.reservation)), [wire.Ok()])
+            self.fixture.allow_next_start()
+            request = replace(token_waiter, episode="needs-token")
+            self.assertIsInstance(self.fixture.server.handle_request(request)[0], wire.Wait)
+            self.assertIsInstance(
+                gate.waiter_state(self.fixture.server.waiters[request.episode].row), records.TokenWaitingWaiter)
+            expected_order.insert(0, token_waiter.owner.pid)
+
         self.land_record(10)
         landing = self.submit(100, step="merge-gate", parent=10)
         continuations = (self.submit(101, need=4 * GIB), self.submit(102, need=4 * GIB))
@@ -175,9 +196,9 @@ class LandingMergeOrderTests(unittest.TestCase):
         with patch.object(self.fixture.server, "_placement_pass", new=place_continuations):
             result = self.fixture.run_pass()
 
-        self.assertEqual(self.fixture.queue_pids(), [100, 101, 102])
         self.assertEqual(set(self.fixture.caller_reservations()), {landing.episode, continuations[0].episode})
-        self.assertTrue(result.rows[1].decision.reused_slot)
+        self.assertEqual(self.fixture.queue_pids(), expected_order)
+        self.assertTrue(result.rows[expected_order.index(continuations[0].owner.pid)].decision.reused_slot)
         self.assertEqual(self.fixture.server.landing_pass_counts, {})
 
     def test_reconnect_preserves_the_pass_limit_for_the_same_arrival(self) -> None:
