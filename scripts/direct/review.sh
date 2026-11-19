@@ -164,12 +164,17 @@ write_review_status() {
   fi
 }
 
-# Validate before any reviewer starts. UX records launch evidence without a pass window.
+# Validate the review and read its run owner before the reviewer starts.
+FAST_TRACK_UNIT=""
 if [[ -f "${PROGRESS_STATE}" ]]; then
-  if ! UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" check-launch \
+  RUN_OWNER_OPTION=()
+  if [[ "${PASS_INDEX}" == 1 && "${LENS}" != ux ]]; then
+    RUN_OWNER_OPTION=(--print-run-owner)
+  fi
+  if ! FAST_TRACK_UNIT="$(UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" check-launch \
     --session-dir "${SESSION_DIR}" --pass-kind review \
     --prompt-file "${PROMPT_FILE}" --lens "${LENS}" \
-    ${PHASE_ID:+--phase-id "${PHASE_ID}"}; then
+    ${PHASE_ID:+--phase-id "${PHASE_ID}"} ${RUN_OWNER_OPTION[@]+"${RUN_OWNER_OPTION[@]}"})"; then
     echo "ERROR: unable to check the review launch." >&2
     write_review_status error
     exit 1
@@ -284,44 +289,37 @@ bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" header "${BEAT_TAG} (${AGENT_FAMI
 
 # A broad pass reviews the exact pending snapshot it receives. New pushes made
 # during this pass stay pending for the next pass.
-FAST_TRACK_UNIT=""
 FAST_TRACK_COMMITS=()
-FAST_TRACK_SCRIPT="${SCRIPT_DIR}/../production/fast_track.py"
-if [[ "${PASS_INDEX}" == 1 && "${LENS}" != ux && -f "${PROGRESS_STATE}" ]]; then
-  FAST_TRACK_UNIT="$("$PY" - "${PROGRESS_STATE}" <<'PY'
-import json
-import sys
-from pathlib import Path
-from scripts.lib import unit_runs
-from scripts.production import staff
-
-state = json.loads(Path(sys.argv[1]).read_text())
-owner = unit_runs.run_owner(state, staff.local_snapshot())
-print(owner.name if isinstance(owner, staff.StaffRow) else "")
-PY
-)"
-  if [[ -n "${FAST_TRACK_UNIT}" ]]; then
-    FAST_TRACK_DIFF="${ARTIFACT_DIR}/review_fast_track_${PASS_INDEX}.diff"
-    # One atomic snapshot for every lens and retry of this phase's broad pass.
-    (
-      lock_file_descriptor 9
-      if [[ ! -f "${FAST_TRACK_DIFF}" ]]; then
-        SNAPSHOT_TEMP="${FAST_TRACK_DIFF}.$$.tmp"
-        trap 'rm -f "${SNAPSHOT_TEMP}"' EXIT
-        (cd "${WORKING_DIR}" && "$PY" "${FAST_TRACK_SCRIPT}" --pending --unit "${FAST_TRACK_UNIT}") > "${SNAPSHOT_TEMP}"
-        mv "${SNAPSHOT_TEMP}" "${FAST_TRACK_DIFF}"
-      fi
-    ) 9>"${FAST_TRACK_DIFF}.lock"
-    while IFS= read -r commit; do
-      [[ -z "${commit}" ]] || FAST_TRACK_COMMITS+=(--commit "${commit}")
-    done < <(sed -n 's/^## Fast-track \([0-9a-f]*\) .*/\1/p' "${FAST_TRACK_DIFF}")
-    if [[ ${#FAST_TRACK_COMMITS[@]} -gt 0 ]]; then
-      REVIEW_PROMPT="${ARTIFACT_DIR}/review_with_fast_track_${PASS_INDEX}${SUFFIX}.$$.md"
-      cat "${PROMPT_FILE}" > "${REVIEW_PROMPT}"
-      printf '\nReview these pending fast-track fixes against the same rules:\n' >> "${REVIEW_PROMPT}"
-      cat "${FAST_TRACK_DIFF}" >> "${REVIEW_PROMPT}"
-      PROMPT_FILE="${REVIEW_PROMPT}"
+FAST_TRACK_SCRIPT="${SCRIPT_DIR}/../production/fast_track_review.py"
+if [[ -n "${FAST_TRACK_UNIT}" ]]; then
+  FAST_TRACK_DIFF="${ARTIFACT_DIR}/review_fast_track_${PASS_INDEX}.diff"
+  # One atomic snapshot for every lens and retry of this phase's broad pass.
+  (
+    lock_file_descriptor 9
+    if [[ ! -f "${FAST_TRACK_DIFF}" ]]; then
+      SNAPSHOT_TEMP="${FAST_TRACK_DIFF}.$$.tmp"
+      trap 'rm -f "${SNAPSHOT_TEMP}"' EXIT
+      (
+        cd "${WORKING_DIR}"
+        STATE_DIR="${FAST_TRACK_STATE_DIR-$HOME/.local/state/fast-track}"
+        if [[ -n "${STATE_DIR}" && ! -e "${STATE_DIR}" && ! -L "${STATE_DIR}" ]]; then
+          git rev-parse --show-toplevel >/dev/null
+        else
+          "$PY" "${FAST_TRACK_SCRIPT}" --pending --unit "${FAST_TRACK_UNIT}"
+        fi
+      ) > "${SNAPSHOT_TEMP}"
+      mv "${SNAPSHOT_TEMP}" "${FAST_TRACK_DIFF}"
     fi
+  ) 9>"${FAST_TRACK_DIFF}.lock"
+  while IFS= read -r commit; do
+    [[ -z "${commit}" ]] || FAST_TRACK_COMMITS+=(--commit "${commit}")
+  done < <(sed -n 's/^## Fast-track \([0-9a-f]*\) .*/\1/p' "${FAST_TRACK_DIFF}")
+  if [[ ${#FAST_TRACK_COMMITS[@]} -gt 0 ]]; then
+    REVIEW_PROMPT="${ARTIFACT_DIR}/review_with_fast_track_${PASS_INDEX}${SUFFIX}.$$.md"
+    cat "${PROMPT_FILE}" > "${REVIEW_PROMPT}"
+    printf '\nReview these pending fast-track fixes against the same rules:\n' >> "${REVIEW_PROMPT}"
+    cat "${FAST_TRACK_DIFF}" >> "${REVIEW_PROMPT}"
+    PROMPT_FILE="${REVIEW_PROMPT}"
   fi
 fi
 

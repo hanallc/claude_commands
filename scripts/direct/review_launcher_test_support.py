@@ -7,13 +7,16 @@ from scripts.agents import remote
 from scripts.lib import test_hang_guard
 from scripts.lib.test_models_registry import ExactRows, registry_text
 from scripts.production import staff, unit_config
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
 import json
+import os
 import shutil
 import subprocess
 from functools import cached_property
 from pathlib import Path
 from typing import TypedDict, cast, override
+from unittest.mock import patch
 
 from scripts.direct.recorder_fixture import LauncherFixture, communicate_launcher, configure_launcher_fixture, launcher_environment, prepare_launcher_runtime
 
@@ -106,13 +109,11 @@ class ReviewLauncherFixture(LauncherFixture):
         super().setUp()
         self.prompt_file: Path = self.root / "review_prompt.md"
         self.review_script = self.root / "scripts" / "direct" / "review.sh"
-        _ = unit_config.write(self.working_dir, unit_config.UnitConfig(
-            unit_config.PlanFile(Path("plan.md")), unit_config.NoAppPort(), ()))
 
     @cached_property
     def staff_parent(self) -> str:
-        from scripts.production.staff_test_support import isolated_staff_file, unit_membership
-        with isolated_staff_file(self.root / "staff.json", {}):
+        with (patch.dict(os.environ, {"STAFF_CONFIG": str(self.root / "staff.conf")}),
+              isolated_staff_file(self.root / "staff.json", {})):
             member = unit_membership("fixture", "fixture")
             return staff.ensure("unit", name=member.name, parent=member.parent,
                                 runtime_id=member.current_session,
@@ -152,6 +153,8 @@ class ReviewLauncherFixture(LauncherFixture):
             text=True,
             timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
+        _ = unit_config.write(self.working_dir, unit_config.UnitConfig(
+            unit_config.PlanFile(Path("plan.md")), unit_config.NoAppPort(), ()))
         self.review_script = self.build_script_tree()
 
     def build_script_tree(self) -> Path:
@@ -173,8 +176,6 @@ class ReviewLauncherFixture(LauncherFixture):
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/process_failure.py", lib / "process_failure.py")
         for name in ("conf.py", "conf_reads.py", "conf.sh", "conf_record.sh", "session_paths.py", "boot_identity.py", "package_root.py"):
             _ = shutil.copy2(DIRECT_DIR.parent / "lib" / name, lib / name)
-        _ = shutil.copy2(DIRECT_DIR.parent / "production/fast_track.py",
-                         self.root / "scripts/production/fast_track.py")
         config = self.root / "config"
         config.mkdir(exist_ok=True)
         _ = shutil.copy2(DIRECT_DIR.parents[1] / "config/fast_track.conf", config / "fast_track.conf")

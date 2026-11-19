@@ -7,6 +7,7 @@ from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file
 
 from scripts.lib.py_floor_test_support import cache_file_name
+from scripts.lint.memory_test_support import write_config_fixture
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -16,7 +17,7 @@ from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor
 from scripts.direct.local_release_wait import IntervalReleasePolling
 from pathlib import Path
-from typing import cast
+from typing import ClassVar, cast
 import json
 import os
 import hashlib
@@ -32,6 +33,22 @@ from scripts.lib.test_models_registry import RegistryReadProbe, claude_catalog_e
 
 
 class ReviewLauncherPassTests(support.ReviewLauncherFixture):
+
+    @override
+    def prepare_fixture(self) -> None:
+        super().prepare_fixture()
+        _ = self.config_file.write_text("""UNIT_PROGRESS_INTERVAL_SECONDS=180
+UNIT_COMPACT_ABOVE_TOKENS=100000
+ROUTING_FROM_ROUND=4
+ASTRA_AFTER_FAILED_FIXES=2
+""")
+        _ = (self.root / "config/accounts.toml").write_text("[trust]\nfolders=[]\n")
+        _ = write_config_fixture(self.root / "accounts.conf", "account_command_timeout_seconds=15\n")
+        _ = write_config_fixture(self.root / "staff.conf", """OPERATION_LOCK_SECONDS=30
+REMOTE_SECONDS=20
+PRODUCER_WORKSPACE=producers
+""")
+        _ = write_config_fixture(self.root / "fast_track.conf", "fetch_lock_attempts=3\nfetch_lock_wait_seconds=0\n")
 
     def test_review_reads_one_registry_snapshot_across_its_child_processes(self) -> None:
         session = self.start_implementation("registry-snapshot")
@@ -53,9 +70,10 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
                 if catalog:
                     environment["AGENT_NOTES_DIR"] = str(self.root / "account-notes")
                     notes = Path(environment["AGENT_NOTES_DIR"])
-                    notes.mkdir()
+                    notes.mkdir(exist_ok=True)
                     _ = (notes / "claude2.md").write_text("---\nlogin: review@example.invalid\n---\n")
-                    with patch.dict(os.environ, environment, clear=True):
+                    with (patch.dict(os.environ, environment, clear=True),
+                          patch.object(accounts, "REPOSITORY_ROOT", self.root)):
                         self.assertEqual(accounts.setup("claude2"), [])
                         _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({
                             "oauthAccount": {"emailAddress": "review@example.invalid"}}))
@@ -119,13 +137,17 @@ exec bash "''' + str(agent_exec) + '''" "$@"
     @override
     def environment(self) -> dict[str, str]:
         environment = super().environment()
+        environment.update(AGENT_NOTES_DIR=str(self.root / "account-notes"),
+                           STAFF_CONFIG=str(self.root / "staff.conf"),
+                           SHOWRUNNERS_CONFIG=str(self.root / "showrunners.conf"))
         environment["FAST_TRACK_REVIEW_PROMPT"] = str(self.root / "received-fast-track-prompt.md")
         return environment
 
     def prepare_fast_track_review(self, name: str) -> tuple[Path, dict[str, str], str]:
         session = self.start_implementation(name)
         self.finish_implementation(session)
-        with isolated_staff_file(self.root / "staff.json", {}):
+        with (patch.dict(os.environ, {"STAFF_CONFIG": str(self.root / "staff.conf")}),
+              isolated_staff_file(self.root / "staff.json", {})):
             owner = staff.local_snapshot().by_member_reference(self.staff_parent)
             assert owner is not None
             _ = staff.rename(owner.id, "alpha")
@@ -144,11 +166,6 @@ exec bash "''' + str(agent_exec) + '''" "$@"
                "patch_sha256": hashlib.sha256(b"sample fix").hexdigest(),
                "time": "2026-10-31T12:00:00+00:00", "review": "pending"}
         _ = (directory / "records.jsonl").write_text(json.dumps(row) + "\n")
-        # Keep the real command and its imports; only its fixture entry path changes.
-        command = self.root / "scripts/production/fast_track.py"
-        real_command = Path(__file__).resolve().parents[1] / "production/fast_track.py"
-        _ = command.write_text("import os, sys\nos.execv(sys.executable, [sys.executable, "
-                               + repr(str(real_command)) + ", *sys.argv[1:]])\n")
         agent = self.root / "scripts/agents/agent_exec.sh"
         with agent.open("a") as output:
             # Concurrent reviews write this file; cp can fail with "File exists" when two create it at once.
@@ -191,17 +208,29 @@ exec bash "''' + str(agent_exec) + '''" "$@"
         self.assertIsNone(shutil.which("flock", path=environment["PATH"]))
         self.assertIsNone(shutil.which("perl", path=environment["PATH"]))
         calls = session / "snapshot-calls"
-        script = self.root / "scripts/production/fast_track.py"
-        _ = script.write_text("from pathlib import Path\nimport sys\n"
-                              + "if '--pending' in sys.argv:\n"
-                              + "    with Path(" + repr(str(calls)) + ").open('a') as output:\n"
-                              + "        output.write('pending\\n')\n" + script.read_text())
-        lenses = ("contract", "adversary")
-        with ThreadPoolExecutor(max_workers=len(lenses)) as executor:
-            reviews = [executor.submit(subprocess.run, self.review_command(session, lens, ""),
+        release = session / "snapshot-release"
+        script = self.root / "scripts/production/fast_track_review.py"
+        entry = 'if __name__ == "__main__":'
+        _ = script.write_text(script.read_text().replace(entry,
+            "from scripts.direct.wait_for_test_state import wait_for_file\n\n"
+            + entry + "\n    if '--pending' in sys.argv:\n"
+            + f"        Path({str(calls)!r}).touch()\n"
+            + f"        wait_for_file(Path({str(release)!r}))\n"
+            + f"        with Path({str(calls)!r}).open('a') as output:\n"
+            + "            output.write('pending\\n')"))
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            contract = executor.submit(subprocess.run, self.review_command(session, "contract", ""),
                                        env=environment, capture_output=True, text=True,
-                                       timeout=TEST_HANG_GUARD_SECS) for lens in lenses]
-            for review in reviews:
+                                       timeout=TEST_HANG_GUARD_SECS)
+            try:
+                wait_until(calls.exists, session, timeout=TEST_HANG_GUARD_SECS)
+                adversary = executor.submit(subprocess.run, self.review_command(session, "adversary", ""),
+                                            env=environment, capture_output=True, text=True,
+                                            timeout=TEST_HANG_GUARD_SECS)
+                wait_until((session / "review_pid_adversary").exists, session, timeout=TEST_HANG_GUARD_SECS)
+            finally:
+                release.touch()
+            for review in (contract, adversary):
                 first = review.result(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         snapshot = session / "review_fast_track_1.diff"
@@ -275,85 +304,6 @@ exec bash "''' + str(agent_exec) + '''" "$@"
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((session / "wait-context").read_text(), f"{session}|")
 
-    def test_interpreter_cache_reuses_the_resolved_python_without_a_version_probe(self) -> None:
-        launcher = self.root / "scripts" / "lib" / "py"
-        binaries = self.root / "binaries"
-        binaries.mkdir()
-        interpreter = binaries / "python3"
-        calls = self.root / "python-calls"
-        _ = interpreter.write_text(
-            '#!/bin/bash\nprintf "%s\\n" "$*" >> "$CACHE_TEST_CALLS"\nexec "$CACHE_TEST_REAL_PYTHON" "$@"\n'
-        )
-        interpreter.chmod(0o755)
-        environment = self.environment()
-        environment.update({"PATH": str(binaries) + os.pathsep + environment["PATH"],
-                            "XDG_CACHE_HOME": str(self.root / "cold-cache"),
-                            "CACHE_TEST_CALLS": str(calls), "CACHE_TEST_REAL_PYTHON": sys.executable})
-        for _ in range(2):
-            result = subprocess.run(["bash", str(launcher), "-c", "print('ready')"],
-                                    env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual((result.returncode, result.stdout), (0, "ready\n"), result.stderr)
-        commands = calls.read_text().splitlines()
-        self.assertEqual(len(commands), 3)
-        self.assertIn("sys.version_info", commands[0])
-        self.assertEqual(commands[1:], ["-P -c print('ready')"] * 2)
-        self.assertEqual((self.root / "cold-cache" / "claude" / cache_file_name()).read_text().strip(), str(interpreter))
-
-    def test_interpreter_resolver_rejects_python310_and_its_old_cache(self) -> None:
-        launcher = self.root / "scripts" / "lib" / "py"
-        binaries = self.root / "python310-bin"
-        binaries.mkdir()
-        interpreter = binaries / "python3"
-        _ = interpreter.write_text(
-            f"#!{sys.executable}\n"
-            + "import datetime, sys\n"
-            + "sys.version_info = (3, 10, 0, 'final', 0)\n"
-            + "del datetime.UTC\n"
-            + "exec(sys.argv[2])\n",
-            encoding="utf-8",
-        )
-        interpreter.chmod(0o755)
-        environment = self.environment()
-        cache_root = self.root / "python310-cache"
-        old_cache = cache_root / "claude" / "python3-3.10"
-        old_cache.parent.mkdir(parents=True)
-        _ = old_cache.write_text(str(interpreter) + "\n")
-        environment.update({"PATH": str(binaries) + os.pathsep + environment["PATH"],
-                            "XDG_CACHE_HOME": str(cache_root)})
-        result = subprocess.run(
-            ["bash", str(launcher), "-c", "import datetime; print(datetime.UTC)"],
-            env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
-        )
-        self.assertEqual((result.returncode, result.stdout), (0, "UTC\n"), result.stderr)
-
-    def test_interpreter_resolver_rejects_python311_and_its_old_cache(self) -> None:
-        launcher = self.root / "scripts" / "lib" / "py"
-        binaries = self.root / "python311-bin"
-        binaries.mkdir()
-        interpreter = binaries / "python3"
-        _ = interpreter.write_text(
-            f"#!{sys.executable}\n"
-            + "import sys\n"
-            + "sys.version_info = (3, 11, 0, 'final', 0)\n"
-            + "exec(sys.argv[2])\n",
-            encoding="utf-8",
-        )
-        interpreter.chmod(0o755)
-        environment = self.environment()
-        cache_root = self.root / "python311-cache"
-        old_cache = cache_root / "claude" / "python3-3.11"
-        old_cache.parent.mkdir(parents=True)
-        _ = old_cache.write_text(str(interpreter) + "\n")
-        environment.update({"PATH": str(binaries) + os.pathsep + environment["PATH"],
-                            "XDG_CACHE_HOME": str(cache_root)})
-        result = subprocess.run(
-            ["bash", str(launcher), "-c", "import sys; print(sys.version_info[:2])"],
-            env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
-        )
-        self.assertEqual((result.returncode, result.stdout), (0, f"{sys.version_info[:2]}\n"), result.stderr)
-        self.assertNotEqual((cache_root / "claude" / cache_file_name()).read_text().strip(), str(interpreter))
-
-
     def test_without_a_named_worker_the_fresh_read_only_path_is_unchanged(self) -> None:
         session_dir = self.start_implementation("fresh")
         self.finish_implementation(session_dir)
@@ -417,10 +367,10 @@ exec bash "''' + str(agent_exec) + '''" "$@"
         self.assertEqual(list(phase.glob("review_status*")), [])
 
     def test_removed_review_options_refuse_before_any_review_starts(self) -> None:
+        session = self.start_implementation("removed-options")
+        self.finish_implementation(session)
         for flag in ("--pool", "--lease", "--to", "--slot"):
             with self.subTest(flag=flag):
-                session = self.start_implementation("removed-option-" + flag[2:])
-                self.finish_implementation(session)
                 command = self.review_command(session, "contract", "")
                 command[2:2] = [flag, "unused"]
                 result = subprocess.run(command, capture_output=True, text=True, check=False,
@@ -428,6 +378,99 @@ exec bash "''' + str(agent_exec) + '''" "$@"
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertEqual(result.stderr.splitlines(), ["ERROR: unknown review option '" + flag + "'."])
                 self.assertEqual(self.turn_records(session), [])
+
+
+class ReviewInterpreterTests(unittest.TestCase):
+    root: Path = Path()
+    launcher: ClassVar[Path] = support.DIRECT_DIR.parent / "lib/py"
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def environment(self) -> dict[str, str]:
+        environment = dict(os.environ, HOME=str(self.root))
+        _ = environment.pop("CLAUDE_PYTHON", None)
+        return environment
+
+    def test_interpreter_cache_reuses_the_resolved_python_without_a_version_probe(self) -> None:
+        launcher = self.launcher
+        binaries = self.root / "binaries"
+        binaries.mkdir()
+        interpreter = binaries / "python3"
+        calls = self.root / "python-calls"
+        _ = interpreter.write_text(
+            '#!/bin/bash\nprintf "%s\\n" "$*" >> "$CACHE_TEST_CALLS"\nexec "$CACHE_TEST_REAL_PYTHON" "$@"\n'
+        )
+        interpreter.chmod(0o755)
+        environment = self.environment()
+        environment.update({"PATH": str(binaries) + os.pathsep + environment["PATH"],
+                            "XDG_CACHE_HOME": str(self.root / "cold-cache"),
+                            "CACHE_TEST_CALLS": str(calls), "CACHE_TEST_REAL_PYTHON": sys.executable})
+        for _ in range(2):
+            result = subprocess.run(["bash", str(launcher), "-c", "print('ready')"],
+                                    env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual((result.returncode, result.stdout), (0, "ready\n"), result.stderr)
+        commands = calls.read_text().splitlines()
+        self.assertEqual(len(commands), 3)
+        self.assertIn("sys.version_info", commands[0])
+        self.assertEqual(commands[1:], ["-P -c print('ready')"] * 2)
+        self.assertEqual((self.root / "cold-cache" / "claude" / cache_file_name()).read_text().strip(), str(interpreter))
+
+    def test_interpreter_resolver_rejects_python310_and_its_old_cache(self) -> None:
+        launcher = self.launcher
+        binaries = self.root / "python310-bin"
+        binaries.mkdir()
+        interpreter = binaries / "python3"
+        _ = interpreter.write_text(
+            f"#!{sys.executable}\n"
+            + "import datetime, sys\n"
+            + "sys.version_info = (3, 10, 0, 'final', 0)\n"
+            + "del datetime.UTC\n"
+            + "exec(sys.argv[2])\n",
+            encoding="utf-8",
+        )
+        interpreter.chmod(0o755)
+        environment = self.environment()
+        cache_root = self.root / "python310-cache"
+        old_cache = cache_root / "claude" / "python3-3.10"
+        old_cache.parent.mkdir(parents=True)
+        _ = old_cache.write_text(str(interpreter) + "\n")
+        environment.update({"PATH": str(binaries) + os.pathsep + environment["PATH"],
+                            "XDG_CACHE_HOME": str(cache_root)})
+        result = subprocess.run(
+            ["bash", str(launcher), "-c", "import datetime; print(datetime.UTC)"],
+            env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual((result.returncode, result.stdout), (0, "UTC\n"), result.stderr)
+
+    def test_interpreter_resolver_rejects_python311_and_its_old_cache(self) -> None:
+        launcher = self.launcher
+        binaries = self.root / "python311-bin"
+        binaries.mkdir()
+        interpreter = binaries / "python3"
+        _ = interpreter.write_text(
+            f"#!{sys.executable}\n"
+            + "import sys\n"
+            + "sys.version_info = (3, 11, 0, 'final', 0)\n"
+            + "exec(sys.argv[2])\n",
+            encoding="utf-8",
+        )
+        interpreter.chmod(0o755)
+        environment = self.environment()
+        cache_root = self.root / "python311-cache"
+        old_cache = cache_root / "claude" / "python3-3.11"
+        old_cache.parent.mkdir(parents=True)
+        _ = old_cache.write_text(str(interpreter) + "\n")
+        environment.update({"PATH": str(binaries) + os.pathsep + environment["PATH"],
+                            "XDG_CACHE_HOME": str(cache_root)})
+        result = subprocess.run(
+            ["bash", str(launcher), "-c", "import sys; print(sys.version_info[:2])"],
+            env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual((result.returncode, result.stdout), (0, f"{sys.version_info[:2]}\n"), result.stderr)
+        self.assertNotEqual((cache_root / "claude" / cache_file_name()).read_text().strip(), str(interpreter))
 
 
 class FixtureReadinessTests(unittest.TestCase):

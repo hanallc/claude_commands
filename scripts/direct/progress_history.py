@@ -1868,6 +1868,10 @@ def _check_launch(args: argparse.Namespace) -> None:
         event.update(launch_check=launch_check, pass_kind=_arg_string(args, "pass_kind"),
                      lens="ux", prompt_file=_optional_arg(args, "prompt_file"))
         _append_event(state, event)
+    if getattr(args, "print_run_owner", False):
+        owner = unit_runs.run_owner(state, staff.local_snapshot())
+        if isinstance(owner, staff.StaffRow):
+            print(owner.name)
 
 
 @dataclass(frozen=True)
@@ -7473,6 +7477,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = check_launch.add_argument("--prompt-file", default="")
     _ = check_launch.add_argument("--fix-cause", default="")
     _ = check_launch.add_argument("--lens", default="")
+    _ = check_launch.add_argument("--print-run-owner", action="store_true")
     check_launch.set_defaults(handler=_check_launch)
 
     start_pass = subparsers.add_parser("start-pass")

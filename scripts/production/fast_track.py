@@ -13,7 +13,6 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-import fcntl
 import fnmatch
 import hashlib
 import json
@@ -27,7 +26,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Literal, TypedDict, cast
 from uuid import uuid4
 
 from scripts.lib import land_main, main_push_lock
@@ -35,13 +33,12 @@ from scripts.lib import process_group
 
 from scripts.copies import copies
 from scripts.production import checkpoint_gate
+from scripts.production.fast_track_review import (
+    PushAttempt, PushIntent, PushRecord, Refused, attempts, mark_reviewed, read_attempt as read_attempt,
+    record_lock, records, save_attempt, save_records, snapshot_pending, state_file,
+)
 from scripts.lib import build_folders, conf
-from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.process_failure import failure_detail
-
-
-class Refused(Exception):
-    """The requested patch must not be pushed."""
 
 
 class PublishedFailure(Exception):
@@ -55,35 +52,6 @@ class FastTrackLimits:
     check_time_limit_seconds: float
     max_push_attempts: int
     refused_paths: tuple[str, ...]
-
-
-class PushRecord(TypedDict):
-    patch_sha256: str
-    unit: str
-    commit: str
-    why: str
-    time: str
-    review: str
-    repo: str
-    paths: list[str]
-    review_pass: str
-
-
-class PushIntent(TypedDict):
-    record: PushRecord
-    worktree_head: str
-    worktree_tree: str
-    index_tree: str
-
-
-class PushAttempt(TypedDict):
-    restore: PushIntent
-    base: str
-    production: str
-    publication: Literal["prepared", "published", "not_published"]
-    restored: bool
-    restore_closed: Literal["", "ancestry", "explicit"]
-    promoted: bool
 
 
 @dataclass(frozen=True)
@@ -316,108 +284,9 @@ def check_paths(runner: GitRunner, repo: Path, paths: list[str], config: FastTra
             pending.extend(imported_paths(runner, repo, dependency) - seen)
 
 
-def state_file() -> Path:
-    return Path(os.environ.get("FAST_TRACK_STATE_DIR", str(Path.home() / ".local/state/fast-track"))) / "records.jsonl"
-
-
-@contextmanager
-def record_lock() -> Generator[None]:
-    path = state_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.with_suffix(".lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        yield
-
-
-def push_record(value: object, path: Path) -> PushRecord:
-    if not isinstance(value, dict):
-        raise Refused(f"invalid fast-track record in {path}")
-    fields = cast(dict[str, object], value)
-    for key in ("patch_sha256", "unit", "commit", "why", "time", "review"):
-        if key not in fields or not isinstance(fields[key], str):
-            raise Refused(f"invalid fast-track record key {key} in {path}")
-    # Older review rows contain only the public review fields.
-    for key in ("repo", "review_pass"):
-        if key not in fields:
-            fields[key] = ""
-    if "paths" not in fields:
-        fields["paths"] = []
-    if (not isinstance(fields["repo"], str) or not isinstance(fields["review_pass"], str)
-            or not isinstance(fields["paths"], list)
-            or any(not isinstance(item, str) for item in cast(list[object], fields["paths"]))
-            or fields["review"] not in ("pending", "reviewed")):
-        raise Refused(f"invalid fast-track record in {path}")
-    return cast(PushRecord, cast(object, fields))
-
-
-def records() -> list[PushRecord]:
-    path = state_file()
-    if not path.exists():
-        return []
-    return [push_record(cast(object, json.loads(line)), path) for line in path.read_text().splitlines()]
-
-
-def read_attempt(path: Path) -> PushAttempt:
-    value = cast(object, json.loads(path.read_text()))
-    if not isinstance(value, dict):
-        raise Refused(f"invalid fast-track attempt in {path}")
-    fields = cast(dict[str, object], value)
-    snapshot = fields["restore"]
-    if not isinstance(snapshot, dict):
-        raise Refused(f"invalid restore snapshot in {path}")
-    restore = cast(dict[str, object], snapshot)
-    row = push_record(restore["record"], path)
-    restore["record"] = row
-    if "restore_closed" not in fields:
-        fields["restore_closed"] = ""
-    if (any(not isinstance(restore[key], str) for key in ("worktree_head", "worktree_tree", "index_tree"))
-            or any(not isinstance(fields[key], str) for key in ("base", "production"))
-            or fields["publication"] not in ("prepared", "published", "not_published")
-            or fields["restore_closed"] not in ("", "ancestry", "explicit")
-            or any(not isinstance(fields[key], bool) for key in ("restored", "promoted"))):
-        raise Refused(f"invalid fast-track attempt in {path}")
-    return cast(PushAttempt, cast(object, fields))
-
-
-def attempts() -> list[tuple[Path, PushAttempt]]:
-    folder = state_file().parent / "attempts"
-    return [(path, read_attempt(path)) for path in sorted(folder.glob("*.json"))]
-
-
-def save_attempt(path: Path, attempt: PushAttempt) -> None:
-    write_text_atomic(path, json.dumps(attempt) + "\n")
-
-
-def save_records(rows: list[PushRecord]) -> None:
-    write_text_atomic(state_file(), "".join(json.dumps(row) + "\n" for row in rows))
-
-
 def pending(runner: GitRunner, repo: Path, unit: str, settings_read: conf.ConfigRead) -> None:
     _ = reconcile(runner, repo, unit, settings_read=settings_read)
-    with record_lock():
-        rows = records()
-    for row in rows:
-        if row["unit"] == unit and row["review"] == "pending":
-            print(f"\n## Fast-track {row['commit']} — {row['why']}\n")
-            print(runner.git(repo, "show", "--format=fuller", "--binary", row["commit"]))
-
-
-def mark_reviewed(unit: str, commits: list[str], review_pass: str) -> None:
-    if not commits or not review_pass:
-        raise Refused("--mark-reviewed requires --commit and --pass")
-    with record_lock():
-        rows = records()
-        for row in rows:
-            if row["unit"] == unit and row["commit"] in commits and row["review"] == "pending":
-                row["review"] = "reviewed"
-                row["review_pass"] = review_pass
-        save_records(rows)
-        for path, attempt in attempts():
-            row = attempt["restore"]["record"]
-            if row["unit"] == unit and row["commit"] in commits and row["review"] == "pending":
-                row["review"] = "reviewed"
-                row["review_pass"] = review_pass
-                save_attempt(path, attempt)
+    snapshot_pending(unit, lambda commit: runner.git(repo, "show", "--format=fuller", "--binary", commit))
 
 
 def check_command(command: list[str], repo: Path, environment: dict[str, str], deadline: float,
