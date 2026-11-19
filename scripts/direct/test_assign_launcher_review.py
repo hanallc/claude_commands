@@ -19,7 +19,7 @@ from scripts.production import staff, worker
 from scripts.herdr import turn_end, worker_panes
 from scripts.production.cli_fixture import invoke_cli
 from scripts.direct.assign_launcher_test_support import (
-    GIT_LOCATION_VARIABLES, ROOT, AssignLauncherFixture, assignment_environment, read_object,
+    ROOT, AssignLauncherFixture, assignment_environment, read_object,
 )
 from scripts.lib import build_folders, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
@@ -41,15 +41,21 @@ class AssignmentFixtureIsolationTests(unittest.TestCase):
         write_text_atomic(sentinel / "tracked", "Sentinel contents.\n")
         head = commit_repository(sentinel, "Create the sentinel.", env=environment)
         index = (git_dir / "index").read_bytes()
-        locations = dict.fromkeys(GIT_LOCATION_VARIABLES, str(git_dir))
-        locations["GIT_WORK_TREE"] = str(sentinel)
-        locations["GIT_INDEX_FILE"] = str(git_dir / "index")
-        locations["GIT_OBJECT_DIRECTORY"] = str(git_dir / "objects")
+        shallow = root / "shallow"
+        write_text_atomic(shallow, head + "\n")
+        locations = {
+            "GIT_DIR": str(git_dir), "GIT_WORK_TREE": str(sentinel), "GIT_INDEX_FILE": str(git_dir / "index"),
+            "GIT_COMMON_DIR": str(git_dir), "GIT_OBJECT_DIRECTORY": str(git_dir / "objects"),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(git_dir / "objects"), "GIT_CEILING_DIRECTORIES": str(root),
+            "GIT_SHALLOW_FILE": str(shallow), "GIT_TEMPLATE_DIR": str(root / "external-templates"),
+        }
         case = AssignLauncherFixture("runTest")
         with patch.dict(os.environ, locations):
             try:
                 case.setUp()
-                self.assertTrue(set(GIT_LOCATION_VARIABLES).isdisjoint(os.environ))
+                self.assertTrue(locations.keys().isdisjoint(os.environ))
+                self.assertEqual({name for name in os.environ if name.startswith("GIT_")},
+                                 {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"})
                 write_text_atomic(case.project / "fixture.txt", "Private work.\n")
                 case.commit_project("Record private work.")
             finally:
@@ -66,8 +72,10 @@ class AssignmentFixtureIsolationTests(unittest.TestCase):
         case = AssignLauncherFixture("runTest")
         try:
             case.setUp()
+            held = build_folders.held_build_folder_descriptors()
             folder = style_review.start(case.project, "HEAD", case.session_dir / "phases/7", case.prompt, "review")
-            self.assertIn(build_folders.build_folder_lock_fd(folder), build_folders.held_build_folder_descriptors())
+            self.assertEqual(build_folders.held_build_folder_descriptors(), held)
+            self.assertTrue((folder / "prompt.md").is_file())
         finally:
             case.doCleanups()
         self.assertEqual(len(list(descriptors.iterdir())), before)
@@ -155,6 +163,8 @@ class PaneAstraReviewTests(HeldRolePaneCase):
                     self.assertEqual(saved["state"], "complete")
                     self.assertEqual(saved["in_flight"], False)
                     directory = Path(str(saved["input_directory"]))
+                    self.assertTrue(directory.name.startswith(f"{name}-"))
+                    self.assertEqual(len(directory.name.removeprefix(f"{name}-")), 11)
                     self.assertTrue((directory / "assignment.md").read_text())
                     self.assertEqual((directory / "style-review-additions.txt").read_text(), "+The next design.\n")
 

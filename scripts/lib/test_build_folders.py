@@ -1003,6 +1003,13 @@ print('signals')
         self.assertFalse(path.exists())
         self.assertFalse(path.with_name(path.name + ".lock").exists())
         self.assertFalse(path.with_name(path.name + ".lease.json").exists())
+        with self.subTest(request="persistent unique"):
+            request = folders.UniqueBuildFolder("persistent-", folders.ExplicitBuildParent(self.root))
+            with folders.leased_build_folder(request) as persistent:
+                self.assertEqual(folders.build_folder_state(persistent), "held")
+                _ = (persistent / "proof").write_text("saved")
+            self.assertEqual(folders.build_folder_state(persistent), "free")
+            self.assertEqual((persistent / "proof").read_text(), "saved")
 
     def test_collector_scans_the_folder_path_after_the_parent_changes(self) -> None:
         old_parent = self.root / "old-parent"

@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 import unittest
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +17,6 @@ from scripts.direct import assign, phase_table
 from scripts.direct.assign_claude_test_support import direct_launcher_helpers
 from scripts.direct.findings_test_support import invoke_findings
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
-from scripts.lib import build_folders
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
@@ -29,11 +28,6 @@ from scripts.agents import remote
 
 ROOT = Path(__file__).resolve().parents[2]
 ASSIGN = ROOT / "scripts/direct/assign.sh"
-
-GIT_LOCATION_VARIABLES = (
-    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
-    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CEILING_DIRECTORIES",
-)
 
 ASSIGNMENT_SETTINGS = {
     "direct": """\
@@ -75,7 +69,7 @@ WORKER_PUBLISH_LOCK_SECONDS=15
 """,
     "build_folders": """\
 # whole: 1..
-names.suffix_length=8
+names.suffix_length=11
 # whole: 1..64
 names.repository_key_length=8
 names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_
@@ -195,7 +189,7 @@ def invoke_assignment(arguments: list[str], environment: dict[str, str]) -> subp
 
 @contextmanager
 def assignment_environment(bytecode_setting: str) -> Generator[None]:
-    """Pin settings and release the fixture's style folder locks."""
+    """Pin settings and use only the fixture's Git configuration."""
     config = Path(os.environ["CONF_DIR"])
     for stem, settings in ASSIGNMENT_SETTINGS.items():
         _ = (config / f"{stem}.conf").write_text(settings)
@@ -210,27 +204,14 @@ def assignment_environment(bytecode_setting: str) -> Generator[None]:
         "LINT_CONFIG_FILE": str(config / "lint.conf"),
         "USER_ZONE": "America/New_York",
         "GIT_CONFIG_GLOBAL": str(git_config), "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_COUNT": "0", "GIT_CONFIG_PARAMETERS": "",
         "PROCESS_TABLE_PS": "sh -c :",
     }
-    with (patch.dict(os.environ, environment), patch.object(process_table, "PS", ["sh", "-c", ":"]),
-          ExitStack() as style_locks):
-        for name in GIT_LOCATION_VARIABLES:
-            _ = os.environ.pop(name, None)
-        allocate_folder = build_folders.create_build_folder
-        release_folder = cast(Callable[[Path], None], getattr(build_folders, "_release_build_folder"))
-
-        def allocate(request: build_folders.BuildFolderRequest | build_folders.BuildFolderSpec) -> Path:
-            path = allocate_folder(request)
-            if (isinstance(request, build_folders.UniqueBuildFolder)
-                    and isinstance(request.parent, build_folders.ExplicitBuildParent)
-                    and request.parent.path.name == "style"
-                    and path.is_relative_to(config.parent)):
-                _ = style_locks.callback(release_folder, path)
-            return path
-
-        with patch.object(build_folders, "create_build_folder", allocate):
-            yield
+    with patch.dict(os.environ), patch.object(process_table, "PS", ["sh", "-c", ":"]):
+        for name in tuple(os.environ):
+            if name.startswith("GIT_"):
+                del os.environ[name]
+        os.environ.update(environment)
+        yield
 
 
 @contextmanager

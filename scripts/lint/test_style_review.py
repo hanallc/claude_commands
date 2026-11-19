@@ -16,6 +16,7 @@ from typing import cast, override
 from scripts.agents import worker_lifecycle
 from scripts.agents.worker_lifecycle import LockFileDescriptor, NO_LOCK_DEADLINE
 from scripts.message import sessions
+from scripts.lib import build_folders
 from scripts.lib.atomic_file import write_text_atomic
 from unittest import mock
 
@@ -66,7 +67,9 @@ class PreparationTests(unittest.TestCase):
         return style.start(self.repo, "HEAD", self.root / "phase", prompt, name)
 
     def test_live_dispatch_refuses_a_second_style_owner_without_changing_artifacts(self) -> None:
+        held = build_folders.held_build_folder_descriptors()
         first = self.style_start()
+        self.assertEqual(build_folders.held_build_folder_descriptors(), held)
         before = file_snapshot(first.parent.parent)
         with self.assertRaisesRegex(style.StyleReviewBusy, "in flight: dispatch-1"):
             _ = self.style_start("dispatch-101")
