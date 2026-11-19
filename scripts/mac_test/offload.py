@@ -2218,22 +2218,22 @@ def return_fix(
     transport = ["-e", shlex.join(["ssh", *ssh_options(config.connection)])]
     metadata = [f"--exclude=/{name}" for name in floor_claims.MIRROR_METADATA]
     root = request.repo_root
-    try:
-        with mirror_exclude_file(ignored) as exclude_path:
-            listing = controller.capture([
-                "rsync", "-rlpc", "--dry-run", "--itemize-changes", "--delete", *metadata,
-                f"--exclude-from={exclude_path}", *transport, f"{config.host}:{mirror}/", f"{root}/",
-            ])
+
+    def compare(exclude_path: Path) -> fix_return.MirrorChanges | fix_return.FixFailed:
+        listing = controller.capture([
+            "rsync", "-rlpc", "--dry-run", "--itemize-changes", "--delete", *metadata,
+            f"--exclude-from={exclude_path}", *transport, f"{config.host}:{mirror}/", f"{root}/",
+        ])
         if not isinstance(listing, CommandOutput) or listing.status != 0:
             return fix_return.FixFailed("the Mac mirror could not be compared with the worktree")
         changes = fix_return.parse_itemized(listing.stdout)
-        if isinstance(changes, fix_return.MirrorChanges):
-            changes = fix_return.without_ignored(root, changes)
-        if isinstance(changes, fix_return.FixFailed):
-            return changes
-        if not changes.changed and not changes.removed:
-            return fix_return.FixNone()
-        with tempfile.TemporaryDirectory(prefix="mac-fix-") as staging:
+        return fix_return.without_ignored(root, changes) if isinstance(changes, fix_return.MirrorChanges) else changes
+
+    try:
+        with mirror_exclude_file(ignored) as exclude_path, tempfile.TemporaryDirectory(prefix="mac-fix-") as staging:
+            changes = compare(exclude_path)
+            if isinstance(changes, fix_return.FixFailed):
+                return changes
             if changes.changed:
                 with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="mac-fix-files-") as names:
                     _ = names.write("".join(f"{path}\n" for path in changes.changed))
@@ -2244,20 +2244,30 @@ def return_fix(
                     ])
                 if not isinstance(fetched, CommandOutput) or fetched.status != 0:
                     return fix_return.FixFailed("the changed files could not be fetched from the Mac")
-            return fix_return.apply_fix(root, Path(staging), changes,
-                                        lambda: read_tree_key(root) == sent_tree_key)
+            result = fix_return.apply_fix(root, Path(staging), changes,
+                                          lambda: read_tree_key(root) == sent_tree_key)
+            if isinstance(result, fix_return.FixApplied):
+                remaining = compare(exclude_path)
+                if isinstance(remaining, fix_return.FixFailed):
+                    return remaining
+                if remaining.changed or remaining.removed:
+                    return fix_return.FixRefused("the returned worktree differs from the Mac mirror")
+            return result
     except OSError as error:
         return fix_return.FixFailed(str(error))
 
 
 def report_fix(result: FixResult) -> None:
-    if isinstance(result, fix_return.FixApplied):
+    if isinstance(result, (fix_return.FixApplied, fix_return.FixPartial)):
         count = len(result.changed) + len(result.removed)
-        print(f"mac_test: the Mac fix pass passed; wrote {count} file{'s' if count != 1 else ''} into the worktree")
+        files = "file" if count == 1 else "files"
+        print(f"mac_test: wrote {count} {files} into the worktree.")
+        if isinstance(result, fix_return.FixPartial):
+            print("mac_test: the partial return needs a new lint judgment.")
     elif isinstance(result, fix_return.FixNone):
         print("mac_test: the Mac fix pass passed and changed no file")
     elif isinstance(result, (fix_return.FixRefused, fix_return.FixFailed)):
-        print(f"mac_test: the Mac fix pass passed, but no file was written: {result.reason}; natedev repairs the tree")
+        print(f"mac_test: the Mac fix return stopped: {result.reason}. Natedev repairs the tree.")
     for line in fix_return.withheld_lines(result):
         print(f"mac_test: {line}")
 

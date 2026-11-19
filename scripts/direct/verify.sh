@@ -4466,9 +4466,8 @@ run_lint_judgment() {
 }
 
 # The Mac runs mend --fix and then clippy on its copy in one run. offload.py
-# writes the changed files into the worktree only when the worktree still has
-# the tree key that the copy sent. Any other answer leaves the tree as it was,
-# and the caller repairs it on natedev.
+# checks the source key before returning the fixes. The caller needs a new
+# lint judgment if the return omits fixes or detects a conflict.
 run_mac_lint_fix() {
     local STEP_FORCE_MAC=1 LINT_MAC_FIX=1 fix_status=0
     MAC_FIX_RESULT=""
@@ -4479,6 +4478,11 @@ run_mac_lint_fix() {
         LINT_FIX_INCOMPLETE=1
         echo 'verify.sh: the Mac fix pass fixed a path that no reservation holds; see above.' >&2
         exit 1
+    fi
+    if [[ "$MAC_FIX_RESULT" == partial ]]; then
+        LINT_FIX_INCOMPLETE=1
+        echo 'verify.sh: another reservation holds part of the Mac fix. The live tree needs a new lint judgment.'
+        return 1
     fi
     if (( fix_status != 0 )) || [[ "$STEP_RAN_ON_MAC" != 1 \
             || ( "$MAC_FIX_RESULT" != applied && "$MAC_FIX_RESULT" != none ) ]]; then
