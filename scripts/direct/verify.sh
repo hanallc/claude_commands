@@ -693,6 +693,11 @@ verify_helper() {
     local input="" has_input=0 status output errors entry name lock_fd replied=0
     local names=()
     local forwarded=()
+    if [[ "${forward_result_environment:-0}" == 1 ]]; then
+        find_unused_file_descriptor VERIFY_RESULT_ENVIRONMENT_FD 10
+        eval 'exec '"$VERIFY_RESULT_ENVIRONMENT_FD"'< <(printf "%s\0" ${VERIFY_USER_ENVIRONMENT[@]+"${VERIFY_USER_ENVIRONMENT[@]}"})' || return 1
+        export VERIFY_RESULT_ENVIRONMENT_FD
+    fi
     if [[ "${1:-}" == --stdin ]]; then
         shift
         has_input=1
@@ -1993,10 +1998,9 @@ tree_key() {
     if [[ "$CMD" == lint && -z "${CACHE_DIR:-}" ]]; then
         key_options+=(--without-lint-versions)
     fi
-    VERIFY_RESULT_ENVIRONMENT_FD=3 \
+    local forward_result_environment=1
     VERIFY_TEST_BUILD_INPUTS_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/test-build-inputs}" \
     verify_helper --stdin "$TREE_WATCH_SCRIPT" --key ${key_options[@]+"${key_options[@]}"} ${scope[@]+"${scope[@]}"} ${scripts[@]+"${scripts[@]}"} -- "${words[@]}" \
-        3< <(printf '%s\0' ${VERIFY_USER_ENVIRONMENT[@]+"${VERIFY_USER_ENVIRONMENT[@]}"}) \
         <<< "${GATE_METADATA}" 2>/dev/null || true
 }
 
@@ -2128,12 +2132,10 @@ step_checkout() {
     # A failed move leaves the original descriptor in the variable.
     DOC_COPY_LEASE_FD=${DOC_COPY[1]:-}
     DOC_COPY_REPLY_FD=${DOC_COPY[0]:-}
-    local pipe descriptor=10 direction='>&' moved=0
+    local pipe descriptor direction='>&' moved=0
     for pipe in DOC_COPY_LEASE_FD DOC_COPY_REPLY_FD; do
         [[ -n "${!pipe}" ]] || break
-        while [[ -e "/dev/fd/$descriptor" || -L "/dev/fd/$descriptor" ]]; do
-            descriptor=$((descriptor + 1))
-        done
+        find_unused_file_descriptor descriptor 10
         eval "exec $descriptor$direction${!pipe}-" || break
         printf -v "$pipe" '%s' "$descriptor"
         moved=$((moved + 1))
@@ -3125,7 +3127,10 @@ finish_placed_scope() {
 # Serialize release with the supervisor, even if the step shell died.
 # A refusal confirms that the supervisor did not start a scope.
 close_scope_launch() (
-    flock -x -w 35 8 || return 1
+    local lock_fd
+    find_unused_file_descriptor lock_fd 10
+    eval 'exec '"$lock_fd"'<"$PLACEMENT_SCOPE_STATE"' || return 1
+    flock -x -w 35 "$lock_fd" || return 1
     if [[ ! -s "$PLACEMENT_SCOPE_STATE" ]]; then
         printf 'closed\n' > "$PLACEMENT_SCOPE_STATE"
     else
@@ -3135,7 +3140,7 @@ close_scope_launch() (
             *) return 1 ;;
         esac
     fi
-) 8<"$PLACEMENT_SCOPE_STATE"
+)
 
 settle_placed_scope() {
     if (( ${PLACEMENT_SCOPE_UNRESOLVED:-0} )); then return 125; fi

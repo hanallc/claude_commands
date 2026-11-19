@@ -57,7 +57,8 @@ if IFS= read -r request; then
 fi
 : > owner-received-eof
 ''')
-            script = shell_functions(VERIFY, "step_checkout", "step_close_checkout") + r'''
+            functions = shell_functions(VERIFY.parents[1] / "lint/invoke.sh", "find_unused_file_descriptor")
+            script = functions + shell_functions(VERIFY, "step_checkout", "step_close_checkout") + r'''
 export TEST_COPY_LIMIT=$1
 checkout() { step_checkout "$BASH" ./copy-owner.sh; }
 ''' + probe
