@@ -343,8 +343,9 @@ Each local Promote checkout must exist before the command pushes.
      An unreachable Mac queues its target and source through `main_publish` and permits the merge to finish.
      An answering Mac whose pull fails still fails promotion.
   10. Record the code checkpoint's review ledger row and production log line.
-     `review_regime.py add` uses the configured plan, unit, phase, merge time, review numbers, and optional exclusion.
-     The ledger key includes unit, plan, and phase.
+     The merge command passes the checkpoint commit as the required `--checkpoint` argument to `review_regime.py add`.
+     It also passes the configured plan, unit, phase, merge time, review numbers, and any exclusion.
+     The review ledger matches rows by unit, plan, phase and checkpoint.
      The LOG line identifies the checkpoint, merge, tests, push, and promotion.
      An existing matching log line skips the write.
 - **Merge report.** Step 9 prints `into: <path> (<branch>) — <why>; unblocks: <what>` as it reaches each place: the merge-branch checkout (`the merge branch collects every unit's checkpoints`; unblocks `<gate id>: <Waiting cell>` for each Gates row whose **Waits on** is `<unit> phase <N>`, else `no gate`), then each Promote checkout and the Mac (`sessions on <machine> run the installed commands from it`; unblocks `the live gate of <unit> phase <N>`). Only a code checkpoint's first merge names a gate.

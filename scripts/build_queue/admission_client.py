@@ -24,6 +24,7 @@ import sys
 from typing import TYPE_CHECKING, Callable, Protocol, cast
 import uuid
 
+from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_code, placement, snapshot_codec
 from scripts.build_queue import admission_wire as status_wire
 from scripts.build_queue.admission_wire import read_assignment as read_assignment
@@ -56,7 +57,7 @@ class PlacementConstraintBuilder(Protocol):
     def __call__(self, repo_root: Path, package: str,
                  kind: placement.CommandKind,
                  command: tuple[str, ...], session: placement.SubmittingSession,
-                 source_key: placement.SourceIdentity, routing: target_config.Routing,
+                 source_key: execution_identity.SourceIdentity, routing: target_config.Routing,
                  selection: step_selection.TargetSelection, *, writes_tree: bool) -> placement.PlacementConstraints: ...
 
 
@@ -248,7 +249,7 @@ def finish_step(path: Path, status: int, reason: str = "", *,
             reply.assignment.episode, reply.assignment.owner, prerequisite))
     _ = release(reply.grant.reservation, status, reply.grant.cleanup_timing)
     result = report_execution(wire.ExecutionReport(uuid.uuid4().hex, reply.assignment, placement.NoProviderClaim(),
-        placement.ExecutionNotStarted() if reason else placement.ExecutionEvidenceUnavailable("the local command has ended", CLOCK.now()),
+        execution_identity.ExecutionNotStarted() if reason else execution_identity.ExecutionEvidenceUnavailable("the local command has ended", CLOCK.now()),
         placement.PrelaunchRefused(reason) if reason else placement.AttemptCompleted(status),
         placement.DispatchPathSettled()))
     if result.assignment != reply.assignment or result.state != placement.ClosedAssignment(reason or "completed"):
@@ -934,6 +935,20 @@ class PlacementWaitNotice:
     provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
 
 
+def first_hana_image_notice() -> bool:
+    """Share the notice with other clients that use the same verify run folder."""
+    hold_wait_file = os.environ.get("BUILDLOG_HOLD_WAIT_FILE", "")
+    if hold_wait_file:
+        try:
+            with Path(hold_wait_file).with_name("hana-image-stale").open("x"):
+                pass
+        except FileExistsError:
+            return False
+        except OSError:
+            pass
+    return True
+
+
 @dataclass
 class WaitOutput:
     started: float = field(default_factory=lambda: CLOCK.monotonic())
@@ -947,6 +962,7 @@ class WaitOutput:
     elapsed_memory_seconds: float = 0.0
     last_provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
     announced_retries: set[str] = field(default_factory=set)
+    announced_hana_image_stale: bool = False
     status_open: bool = False
     local_reason: str = field(default_factory=lambda: os.environ.get("BUILD_QUEUE_LOCAL_REASON", ""))
 
@@ -976,12 +992,20 @@ class WaitOutput:
 
     def placement_notices(self, reply: wire.Assignment | wire.LocalPlacementGranted | wire.PlacementWait | wire.DispatchStatus,
                           *, placement_events: bool) -> None:
+        from scripts.build_queue import placement
+
         if isinstance(reply, (wire.PlacementWait, wire.Assignment, wire.LocalPlacementGranted)):
             self.provider_diagnostics(reply.provider_diagnostics)
             if reply.mac_disk_exclusions:
                 self.on_event("disk " + ",".join(reply.mac_disk_exclusions))
         if isinstance(reply, wire.PlacementWait):
             self.retry_notices(reply.retry_notices, placement_events=placement_events)
+        elif (isinstance(reply, (wire.Assignment, wire.LocalPlacementGranted)) and reply.hana_image_stale
+              and not self.announced_hana_image_stale):
+            self.announced_hana_image_stale = True
+            if first_hana_image_notice():
+                self.end_status()
+                print(placement.HANA_IMAGE_STALE, file=sys.stderr, flush=True)
 
     def resource_wait(self, reply: wire.PlacementResourceWait) -> None:
         from scripts.build_queue import placement
@@ -1374,7 +1398,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             import_module("scripts.build_targets.build_targets"), "fixed_placement_constraints"))
         constraints = builder(Path(args.repo_root or os.getcwd()), args.package,
             cast(placement.CommandKind, kind), tuple(step_argv), session,
-            placement.SourceKeyKnown(args.source_key) if args.source_key else placement.SourceKeyUnavailable("source key is unavailable"),
+            execution_identity.SourceKeyKnown(args.source_key) if args.source_key else execution_identity.SourceKeyUnavailable("source key is unavailable"),
             routing, selection,
             writes_tree=args.writes_tree)
         constraints = replace(constraints, cargo_folder=cargo_folder)
@@ -1406,6 +1430,10 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                 output.placement_notices(answer, placement_events=args.wait_events)
             if not isinstance(answer, wire.PlacementWait):
                 break
+            if _leave_queue():
+                _ = cancel_placement(wire.CancelPlacement(uuid.uuid4().hex, episode, owner,
+                    "the caller left before placement"))
+                raise _QueueLeft()
             # The first pass only lets a free remote target take the step; it is no memory wait.
             token_check = (isinstance(prerequisite, placement.TokenRequired)
                            and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked))
@@ -1501,6 +1529,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = finish_parser.add_argument("--status", type=int, default=1)
     _ = finish_parser.add_argument("--reason", default="")
     _ = finish_parser.add_argument("--token", choices=TOKEN_REQUIRED_CHOICES, default="")
+    pause_parser = subcommands.add_parser("release-step-memory")
+    _ = pause_parser.add_argument("--assignment-file", type=Path, required=True)
     prerequisite_parser = subcommands.add_parser("report-prerequisite")
     _ = prerequisite_parser.add_argument("--assignment-file", type=Path, required=True)
     _ = prerequisite_parser.add_argument("--token", choices=TOKEN_REQUIRED_CHOICES, required=True)
@@ -1540,6 +1570,14 @@ def main(argv: list[str] | None = None) -> int:
             prerequisite = token_prerequisite(args.token) if args.token else KEEP_PLACEMENT_PREREQUISITE
             print(wire.encode_reply(finish_step(args.assignment_file, args.status, args.reason,
                 prerequisite=prerequisite)), end="")
+            return 0
+        if args.command == "release-step-memory":
+            assignment = read_assignment(args.assignment_file)
+            if not isinstance(assignment, wire.LocalPlacementGranted):
+                raise wire.AdmissionUnavailable("release-step-memory requires a local grant")
+            answer = release(assignment.grant.reservation, 75, assignment.grant.cleanup_timing)
+            if not isinstance(answer, wire.Ok):
+                raise wire.AdmissionUnavailable("the service did not confirm the memory release")
             return 0
         if args.command == "report-prerequisite":
             reply = read_assignment(args.assignment_file)

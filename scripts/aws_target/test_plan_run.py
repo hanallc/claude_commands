@@ -1,5 +1,6 @@
 """Check the Hana setup plan with private fixtures and a restricted AWS fake."""
 from collections.abc import Callable, Generator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
 import json
@@ -7,18 +8,22 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from typing import cast, final, override
+from typing import Literal, cast, final, override
 from unittest import mock
 
-from scripts.aws_target import admin_secrets, deploy, hana_box, ledger, plan_identity, plan_run, test_deploy
+from scripts.aws_target.aws_cli import AwsUnavailable
+from scripts.aws_target import admin_secrets, aws_trial, deploy, hana_box, hana_image, hana_render, hana_replacement, ledger, plan_identity, plan_run, test_deploy
 from scripts.aws_target.config import DeploymentSettings
-from scripts.aws_target.controller_lock import control_lock
+from scripts.aws_target.control_test_support import TestClock
+from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, control_lock, hana_command_lock
 from scripts.aws_target.ledger_test_support import CostFixture, text_setting
-from scripts.lib import conf, file_lock
+from scripts.aws_target.test_hana_box import IDENTITY, FakeProvider, record_lifecycle_image, write_lifecycle_configuration
+from scripts.lib import conf
+from scripts.lib.file_lock import LockResult
 
 
 OWNER = plan_identity.PlanAccount('aws', '0' * 12)
-CREDENTIAL = plan_identity.PlanCredentials('fixture-plan-key', 'fixture-plan-secret', OWNER)
+CREDENTIAL = plan_identity.PlanCredentials('AKIA' + 'P' * 16, 'p' * 40, OWNER)
 SCALER = OWNER.iam('user/fixture/fixture-scaler')
 POLICY = OWNER.iam('policy/fixture/scaler')
 DEPLOYMENT = 'a' * 32
@@ -38,18 +43,13 @@ S3_SIMULATIONS = [('iam', 's3:PutObject'), ('iam', 's3:GetObject')]
 CONFIRM_REMOVAL = ('cloudformation', 'describe-change-set')
 PLAN_CALLS = (
     ('sts', 'get-caller-identity'),
-    ('cloudformation', 'describe-stacks'),
     ('ec2', 'describe-instances'),
+    ('ec2', 'describe-images'),
     ('ec2', 'describe-volumes'),
+    ('cloudformation', 'describe-stacks'),
     ('cloudformation', 'get-template'),
-    ('configure', 'export-credentials'),
     ('sts', 'get-caller-identity'),
     ('cloudformation', 'describe-stack-resource'),
-    ('cloudformation', 'describe-stacks'),
-    ('cloudformation', 'create-change-set'),
-    ('cloudformation', 'describe-change-set'),
-    ('cloudformation', 'delete-change-set'),
-    ('cloudformation', 'describe-change-set'),
     ('ec2', 'describe-instances'),
     ('iam', 'ec2:DescribeInstances'),
     ('iam', 'ec2:DescribeSpotInstanceRequests'),
@@ -58,6 +58,15 @@ PLAN_CALLS = (
     ('iam', 'ec2:StartInstances'),
     ('iam', 'ec2:StopInstances'),
 )
+REPLACEMENT_SIMULATIONS = [
+    ('iam', 'ec2:DescribeImages'),
+    ('iam', 'ec2:DescribeVolumes'),
+    ('iam', 'ec2:DescribeReplaceRootVolumeTasks'),
+    *([('iam', 'ec2:CreateReplaceRootVolumeTask')] * 5),
+]
+CREATE_CHANGE = ('cloudformation', 'create-change-set')
+DELETE_CHANGE = ('cloudformation', 'delete-change-set')
+
 
 
 @final
@@ -78,6 +87,7 @@ class PlanSetupTests(CostFixture):
         self.parameters: dict[str, str] = {}
         self.live_template: dict[str, object] = {}
         self.expect_bucket_policy = True
+        self.image_description = ''
         self.credentials_path = Path()
         self.setup_path = Path()
 
@@ -139,6 +149,25 @@ class PlanSetupTests(CostFixture):
             'template_sha256': 'fixture',
         }))
         hana_box.HanaController(self.state, self.settings, workload, hana_box.ProviderNotInstalled()).register(identity)
+        digest = hana_render.guest_digest(workload)
+        self.image_description = 'Hana guest digest ' + digest.value
+        _ = hana_image.save(self.state, hana_image.RegisteredImage(
+            'fixture-image', 'ami-fixture-next', OWNER.account, 'fixture-vpc', 'fixture-subnet', digest))
+
+    def run_change(self) -> tuple[int, str]:
+        output = StringIO()
+        plan = plan_run.PlanRun(lambda: CREDENTIAL, self.execute, time.sleep)
+        with redirect_stdout(output):
+            try:
+                with plan.change(plan.api(self.region, 1), self.stack_arn, b'{}', [], 15) as change:
+                    self.assertEqual(change['Status'], 'CREATE_COMPLETE')
+            except KeyboardInterrupt:
+                print('plan run: refused: interrupted')
+                return 1, output.getvalue()
+            except (AwsUnavailable, plan_run.PlanRefused) as error:
+                print('plan run: refused: ' + plan_run.safe_reason(error))
+                return 1, output.getvalue()
+        return 0, output.getvalue()
 
     def execute(self, arguments: Sequence[str], *, capture_output: bool, text: bool, timeout: float,
                 check: bool, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -200,12 +229,8 @@ class PlanSetupTests(CostFixture):
             self.assertEqual(option('--change-set-type'), 'UPDATE')
             self.change_name = option('--change-set-name')
             self.assertTrue(self.change_name.startswith(plan_identity.CHANGE_SET_PREFIX))
-            template = ledger.mapping(cast(object, json.loads(option('--template-body'))))
-            expected_policy = ledger.mapping(cast(object, json.loads(deploy.HANA_TEMPLATE.read_bytes())))
-            self.assertEqual(template, self.live_template | {'Resources': ledger.mapping(self.live_template['Resources'])
-                | {'ScalerPolicy': ledger.mapping(expected_policy['Resources'])['ScalerPolicy']}})
-            values = ledger.rows({'rows': cast(object, json.loads(option('--parameters')))}, 'rows')
-            self.assertCountEqual(values, [{'ParameterKey': key, 'UsePreviousValue': True} for key in self.parameters])
+            self.assertEqual(option('--template-body'), '{}')
+            self.assertEqual(option('--parameters'), '[]')
             injected = inject('create', 'CreateChangeSet')
             if injected is not None:
                 return injected
@@ -267,6 +292,9 @@ class PlanSetupTests(CostFixture):
                                'ContextKeyValues': ['true']}, cast(list[object], request['ContextEntries']))
             elif action in ('ec2:StartInstances', 'ec2:StopInstances', 'ec2:ModifyInstanceAttribute'):
                 self.assertEqual(resource, f'arn:aws:ec2:{self.region}:{OWNER.account}:instance/fixture-instance')
+            elif action == 'ec2:CreateReplaceRootVolumeTask':
+                self.assertIn(':' + self.region + ':', resource)
+                self.assertNotIn('*', resource)
             else:
                 self.assertEqual(resource, '*')
             self.calls[-1] = (service, action)
@@ -274,22 +302,47 @@ class PlanSetupTests(CostFixture):
                      'EvalDecision': 'implicitDeny' if self.failure == action else 'allowed'}]}
         elif operation == 'describe-instances':
             instance = {'InstanceId': 'fixture-instance', 'LaunchTime': 'fixture-launch',
+                        'SpotInstanceRequestId': 'fixture-request', 'InstanceLifecycle': 'spot',
+                        'RootDeviceName': '/dev/xvda', 'RootDeviceType': 'ebs', 'ImageId': 'ami-fixture-prev',
+                        'CurrentInstanceBootMode': 'uefi', 'Architecture': 'x86_64', 'VirtualizationType': 'hvm',
+                        'PlatformDetails': 'Linux/UNIX', 'UsageOperation': 'RunInstances',
+                        'BlockDeviceMappings': [
+                            {'DeviceName': '/dev/xvda', 'Ebs': {'VolumeId': 'vol-fixture-old'}},
+                            {'DeviceName': '/dev/sdf', 'Ebs': {'VolumeId': 'fixture-disk', 'DeleteOnTermination': False}},
+                        ],
                         'State': {'Name': 'running' if self.failure == 'running' else 'stopped'},
                         'Tags': [{'Key': 'HanaDeployment', 'Value': DEPLOYMENT}, {'Key': 'Workload', 'Value': 'hana'}]}
             reply = {'Reservations': [{'Instances': [instance]}]}
+        elif operation == 'describe-images':
+            reply = {'Images': [{'ImageId': 'ami-fixture-next', 'OwnerId': OWNER.account, 'Name': 'fixture-image',
+                'State': 'available', 'RootDeviceType': 'ebs', 'RootDeviceName': '/dev/xvda', 'BootMode': 'uefi',
+                'Description': self.image_description,
+                'Architecture': 'x86_64', 'VirtualizationType': 'hvm',
+                'PlatformDetails': 'Linux/UNIX', 'UsageOperation': 'RunInstances',
+                'BlockDeviceMappings': [{'DeviceName': '/dev/xvda',
+                    'Ebs': {'VolumeSize': 20, 'SnapshotId': 'snap-fixture-next'}}]}]}
         elif operation == 'describe-volumes':
             reply = {'Volumes': [{'VolumeId': 'fixture-disk', 'Attachments': [
-                {'InstanceId': 'fixture-instance', 'Device': '/dev/sdf', 'State': 'attached'}]}]}
+                {'InstanceId': 'fixture-instance', 'Device': '/dev/sdf', 'State': 'attached',
+                 'DeleteOnTermination': False, 'AttachTime': 'fixture-attach-time'}]}]}
         else:
             raise AssertionError(operation)
         return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+    def test_registered_current_image_keeps_the_stale_notice_and_policy_plan(self) -> None:
+        self.prepare_hana()
+        status, output = self.run_plan('hana-setup')
+        self.assertEqual(status, 0, output)
+        self.assertTrue(output.startswith(hana_box.HANA_IMAGE_STALE + '\n'))
+        self.assertEqual(output.splitlines().count(hana_box.HANA_IMAGE_STALE), 1)
+        self.assertIn('Plan Hana: Keep the instance and the data volume.', output)
+        self.assertEqual(self.calls, [*PLAN_CALLS, *S3_SIMULATIONS, *REPLACEMENT_SIMULATIONS])
 
     def test_stack_owned_plan_passes_with_the_current_allow_list(self) -> None:
         self.prepare_hana()
         status, output = self.run_plan('hana-setup')
         self.assertEqual(status, 0, output)
-        self.assertEqual(self.calls, [*PLAN_CALLS, *S3_SIMULATIONS])
-        self.assertIn('plan guard: Hana instance stopped and data disk attached', output)
+        self.assertEqual(self.calls, [*PLAN_CALLS, *S3_SIMULATIONS, *REPLACEMENT_SIMULATIONS])
         self.assertIn('plan IAM: Modify ScalerPolicy AWS::IAM::ManagedPolicy replacement=False', output)
         self.assertIn('ec2:DescribeInstanceAttribute simulation only', output)
         self.assertIn('s3:PutObject allowed', output)
@@ -300,35 +353,59 @@ class PlanSetupTests(CostFixture):
 
     def test_stack_owned_plan_accepts_the_explicit_hana_workload(self) -> None:
         self.prepare_hana()
-        status, output = self.run_plan('hana-setup', '--workload', 'hana')
-        self.assertEqual(status, 0, output)
-        self.assertEqual(self.calls, [*PLAN_CALLS, *S3_SIMULATIONS])
+        for invalid_timing in (False, True):
+            with self.subTest(invalid_timing=invalid_timing):
+                if invalid_timing:
+                    workload = conf.path('hana_aws')
+                    text_setting(workload, 'setup_idle_wait_timeout_s', 'invalid')
+                    text_setting(workload, 'setup_idle_heartbeat_s', 'invalid')
+                self.calls.clear()
+                self.deleting = False
+                self.confirmations = 0
+                status, output = self.run_plan('hana-setup', '--workload', 'hana')
+                self.assertEqual(status, 0, output)
+                self.assertEqual(self.calls, [*PLAN_CALLS, *S3_SIMULATIONS, *REPLACEMENT_SIMULATIONS])
 
     def test_plan_blocks_claims_after_the_idle_check_and_through_the_last_simulation(self) -> None:
-        self.prepare_hana()
         workload = conf.path('hana_aws')
         text_setting(workload, 'enabled', 'on')
+        self.prepare_hana()
         controller = hana_box.HanaController(self.state, self.settings, workload, hana_box.ProviderNotInstalled())
         blocked: list[str] = []
 
-        @contextmanager
-        def try_controller_lock(directory: Path) -> Generator[None]:
-            with file_lock.exclusive(directory / 'controller.lock', wait=False) as result:
-                if result is file_lock.LockResult.BUSY:
-                    raise BlockingIOError
-                yield
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            def check_claim() -> None:
+                claim = worker.submit(controller.request, 'fixture-claim')
+                self.assertIsInstance(claim.result(timeout=5), hana_box.HanaResourcesHeld)
+                tick = worker.submit(controller.tick)
+                self.assertIsInstance(tick.result(timeout=5), hana_box.HanaResourcesHeld)
+                blocked.append(self.calls[-1][1])
 
-        def check_claim() -> None:
-            with mock.patch.object(hana_box, 'control_lock', new=try_controller_lock), \
-                    self.assertRaises(BlockingIOError):
-                _ = controller.request('fixture-claim')
-            blocked.append(self.calls[-1][1])
-
-        self.check_claim = check_claim
-        status, output = self.run_plan('hana-setup')
+            self.check_claim = check_claim
+            status, output = self.run_plan('hana-setup')
         self.assertEqual(status, 0, output)
         self.assertEqual(blocked, ['get-template', 'simulate-principal-policy'])
-        self.assertIsInstance(controller.request('fixture-claim'), hana_box.ClaimCommitted)
+        with mock.patch.object(controller, 'image_is_current', return_value=True):
+            self.assertIsInstance(controller.request('fixture-claim'), hana_box.ClaimCommitted)
+
+    def test_hana_down_refuses_while_the_plan_holds_the_box(self) -> None:
+        self.prepare_hana()
+        subject = deploy.Deployment(self.settings, self.state, self.root / 'output', execute=self.execute)
+        refused: list[str] = []
+
+        def check_teardown() -> None:
+            before = list(self.calls)
+            with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.HanaControlRefused,
+                    r'^hana-down: Another command is using the Hana resources\. '
+                    + r'Run the same command again when that command ends\.$'):
+                _ = subject.hana_down(approve_destroy=True)
+            self.assertEqual(self.calls, before)
+            refused.append(before[-1][1])
+
+        self.check_claim = check_teardown
+        status, output = self.run_plan('hana-setup')
+        self.assertEqual(status, 0, output)
+        self.assertEqual(refused, ['get-template', 'simulate-principal-policy'])
 
     def test_busy_controller_lock_refuses_before_aws(self) -> None:
         self.prepare_hana()
@@ -336,8 +413,23 @@ class PlanSetupTests(CostFixture):
             status, output = self.run_plan('hana-setup')
         self.assertEqual(status, 1, output)
         self.assertEqual(self.calls, [])
+        self.assertTrue(output.endswith('plan run: refused: The Hana controller holds the lock. '
+                                        + 'Run the same command again when the controller releases it.\n'))
+
+    def test_claimed_box_refuses_without_waiting_or_creating_a_change_set(self) -> None:
+        workload = conf.path('hana_aws')
+        text_setting(workload, 'enabled', 'on')
+        self.prepare_hana()
+        controller = hana_box.HanaController(self.state, self.settings, workload, hana_box.ProviderNotInstalled())
+        with mock.patch.object(controller, 'image_is_current', return_value=True):
+            self.assertIsInstance(controller.request('existing-claim'), hana_box.ClaimCommitted)
+        with mock.patch.object(time, 'sleep') as pause:
+            status, output = self.run_plan('hana-setup')
+        self.assertEqual(status, 1, output)
+        self.assertEqual(self.calls, list(PLAN_CALLS[:1]))
         self.assertTrue(output.endswith('plan run: refused: The Hana lifecycle is busy. '
                                         + 'Run hana-setup again when the box is idle.\n'))
+        pause.assert_not_called()
 
     def test_stack_owned_plan_passes_without_a_bucket_policy(self) -> None:
         self.prepare_hana()
@@ -346,7 +438,7 @@ class PlanSetupTests(CostFixture):
         self.expect_bucket_policy = False
         status, output = self.run_plan('hana-setup')
         self.assertEqual(status, 0, output)
-        self.assertEqual(self.calls, [*PLAN_CALLS, *S3_SIMULATIONS])
+        self.assertEqual(self.calls, [*PLAN_CALLS, *S3_SIMULATIONS, *REPLACEMENT_SIMULATIONS])
         self.assertIn('plan note: no bucket policy in the stack template', output)
         self.assertTrue(output.endswith('plan run: pass\n'))
 
@@ -358,7 +450,7 @@ class PlanSetupTests(CostFixture):
         self.expect_bucket_policy = False
         status, output = self.run_plan('hana-setup')
         self.assertEqual(status, 0, output)
-        self.assertEqual(self.calls, [*PLAN_CALLS, *S3_SIMULATIONS])
+        self.assertEqual(self.calls, [*PLAN_CALLS, *S3_SIMULATIONS, *REPLACEMENT_SIMULATIONS])
         self.assertIn('plan note: bucket policy not simulated (ControlBucketPolicy)', output)
         self.assertNotIn('plan note: no bucket policy in the stack template', output)
         self.assertTrue(output.endswith('plan run: pass\n'))
@@ -369,6 +461,7 @@ class PlanSetupTests(CostFixture):
         status, output = self.run_plan('hana-setup')
         self.assertEqual(status, 1, output)
         self.assertEqual(self.calls, [*PLAN_CALLS, ('iam', 's3:PutObject')])
+        self.assertTrue(output.startswith(hana_box.HANA_IMAGE_STALE + '\n'))
         self.assertTrue(output.endswith('plan run: refused: Hana scaler s3:PutObject denied.\n'))
 
     def assert_unsupported(self, reason: str, *arguments: str) -> None:
@@ -378,19 +471,39 @@ class PlanSetupTests(CostFixture):
         self.assertTrue(output.endswith(f'plan run: refused: no plan run exists for this state ({reason})\n'))
 
     def test_first_setup_refuses_before_aws(self) -> None:
-        self.assert_unsupported('first-time Hana setup', 'hana-setup')
+        status, output = self.run_plan('hana-setup')
+        self.assertEqual(status, 1)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(output, 'plan run: refused: Hana has no saved setup. Run deploy.py prepare --workload hana.\n')
 
     def test_pending_setup_refuses_before_aws(self) -> None:
         self.setup_path.parent.mkdir()
+        (self.state / 'controller.lock').touch()
         for field in ('pending_launch', 'pending_volume', 'stop_pending'):
             with self.subTest(field=field):
                 _ = self.setup_path.write_text(json.dumps({'version': 2, field: True}))
                 self.assert_unsupported('Hana setup has pending instance or volume work', 'hana-setup')
 
-    def test_direct_owned_setup_refuses_before_aws(self) -> None:
+    def test_no_image_refuses_before_aws(self) -> None:
+        self.prepare_hana()
+        (self.state / hana_image.RECORD).unlink()
+        status, output = self.run_plan('hana-setup')
+        self.assertEqual(status, 1)
+        self.assertEqual(output, hana_box.HANA_IMAGE_STALE + '\n' +
+                         'plan run: refused: Hana has no verified image registration. '
+                         + hana_replacement.REGISTER_IMAGE + '\n')
+        self.assertEqual(self.calls, [])
+
+    def test_direct_owned_setup_without_image_registration_refuses_before_aws(self) -> None:
         self.setup_path.parent.mkdir()
+        (self.state / 'controller.lock').touch()
         _ = self.setup_path.write_text(json.dumps({'version': 2, 'instance': 'fixture-instance'}))
-        self.assert_unsupported('Hana uses direct-owned resources', 'hana-setup')
+        status, output = self.run_plan('hana-setup')
+        self.assertEqual(status, 1)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(output, hana_box.HANA_IMAGE_STALE + '\n' +
+                         'plan run: refused: Hana has no verified image registration. '
+                         + hana_replacement.REGISTER_IMAGE + '\n')
 
     def test_credential_mode_refuses_before_aws(self) -> None:
         self.prepare_hana()
@@ -408,27 +521,26 @@ class PlanSetupTests(CostFixture):
         self.assertEqual(self.calls, list(PLAN_CALLS[:7]))
         self.assertIn('STS did not confirm the configured Hana scaler user', output)
 
-    def test_hana_plan_deletes_the_change_set_when_the_guard_refuses(self) -> None:
+    def test_hana_plan_refuses_a_stack_disk_change_without_a_change_set(self) -> None:
         self.prepare_hana()
-        self.change = {'Action': 'Modify', 'LogicalResourceId': 'DataVolume',
-                       'ResourceType': 'AWS::EC2::Volume', 'Replacement': 'True'}
+        resources = ledger.mapping(self.live_template['Resources'])
+        ledger.mapping(resources['DataVolume'])['Type'] = 'AWS::S3::Bucket'
         status, output = self.run_plan('hana-setup')
         self.assertEqual(status, 1)
-        self.assertEqual(self.calls, list(PLAN_CALLS[:13]))
-        self.assertIn('plan stack: change set removal confirmed', output)
-        self.assertTrue(output.endswith('plan run: refused: hana-setup refuses replacement: DataVolume\n'))
+        self.assertEqual(self.calls, list(PLAN_CALLS[:6]))
+        self.assertEqual(output, hana_box.HANA_IMAGE_STALE + '\n' +
+                         'plan run: refused: The live template does not match the saved Hana setup.\n')
+        self.assertFalse(self.change_exists)
 
     def test_plan_deletes_the_change_set_when_description_fails(self) -> None:
-        self.prepare_hana()
         self.failure = 'describe'
-        status, output = self.run_plan('hana-setup')
+        status, output = self.run_change()
         self.assertEqual(status, 1)
-        self.assertEqual(self.calls, list(PLAN_CALLS[:13]))
+        self.assertEqual(self.calls, [CREATE_CHANGE, CONFIRM_REMOVAL, DELETE_CHANGE, CONFIRM_REMOVAL])
         self.assertIn('plan stack: change set removal confirmed', output)
         self.assertTrue(output.splitlines()[-1].startswith('plan run: refused: An error occurred (AccessDenied)'))
 
     def test_change_set_cleanup_after_failure_at_each_step(self) -> None:
-        self.prepare_hana()
         for stage in ('create', 'describe', 'delete', 'confirm'):
             for failure in ('error', 'timeout', 'interrupt'):
                 with self.subTest(stage=stage, failure=failure):
@@ -436,7 +548,7 @@ class PlanSetupTests(CostFixture):
                     self.change_exists = False
                     self.deleting = False
                     self.failure = f'{stage}-{failure}'
-                    status, output = self.run_plan('hana-setup')
+                    status, output = self.run_change()
                     self.assertEqual(status, 1, output)
                     self.assertIn(('cloudformation', 'delete-change-set'), self.calls)
                     confirmed = 'plan stack: change set removal confirmed'
@@ -456,15 +568,14 @@ class PlanSetupTests(CostFixture):
                                   else 'AWS did not confirm describe-change-set')
                         self.assertTrue(output.splitlines()[-1].startswith('plan run: refused: ' + reason))
                     if stage == 'create':
-                        self.assertEqual(self.calls, [*PLAN_CALLS[:10], PLAN_CALLS[11],
+                        self.assertEqual(self.calls, [CREATE_CHANGE, DELETE_CHANGE,
                             *([CONFIRM_REMOVAL] * len(plan_identity.PROOF_RETRY_DELAYS))])
                         self.assertIn('plan stack: change set may still appear: ' + self.change_name, output)
 
     def test_unknown_create_reply_requires_the_full_removal_check(self) -> None:
-        self.prepare_hana()
         self.failure = 'create-unknown'
         with mock.patch.object(time, 'sleep') as pause:
-            status, output = self.run_plan('hana-setup')
+            status, output = self.run_change()
         self.assertEqual(status, 1, output)
         self.assertEqual(pause.call_args_list, [mock.call(delay) for delay in plan_identity.PROOF_RETRY_DELAYS if delay])
         self.assertNotIn('plan stack: change set removal confirmed', output)
@@ -472,23 +583,21 @@ class PlanSetupTests(CostFixture):
         self.assertTrue(output.endswith('plan run: refused: change set not removed\n'))
 
     def test_late_change_set_gets_a_second_delete_and_confirmation(self) -> None:
-        self.prepare_hana()
         self.failure = 'create-late'
-        status, output = self.run_plan('hana-setup')
+        status, output = self.run_change()
         self.assertEqual(status, 1, output)
-        self.assertEqual(self.calls, [*PLAN_CALLS[:10], PLAN_CALLS[11],
-            CONFIRM_REMOVAL, CONFIRM_REMOVAL, PLAN_CALLS[11], CONFIRM_REMOVAL])
+        self.assertEqual(self.calls, [CREATE_CHANGE, DELETE_CHANGE,
+            CONFIRM_REMOVAL, CONFIRM_REMOVAL, DELETE_CHANGE, CONFIRM_REMOVAL])
         self.assertFalse(self.change_exists)
         self.assertIn('plan stack: change set removal confirmed', output)
         self.assertTrue(output.endswith('plan run: refused: AWS did not confirm create-change-set before the call ended.\n'))
 
     def test_interrupt_in_the_change_set_wait_reports_the_name(self) -> None:
-        self.prepare_hana()
         self.failure = 'wait-interrupt'
         with mock.patch.object(time, 'sleep', side_effect=KeyboardInterrupt):
-            status, output = self.run_plan('hana-setup')
+            status, output = self.run_change()
         self.assertEqual(status, 1, output)
-        self.assertEqual(self.calls, list(PLAN_CALLS[:13]))
+        self.assertEqual(self.calls, [CREATE_CHANGE, CONFIRM_REMOVAL, DELETE_CHANGE, CONFIRM_REMOVAL])
         self.assertIn('plan stack: change set removal confirmed', output)
         self.assertIn(self.change_name, output)
         self.assertTrue(output.endswith('plan run: refused: interrupted\n'))
@@ -512,20 +621,18 @@ class PlanSetupTests(CostFixture):
         self.assertNotIn('plan stack: interrupted', output.getvalue())
 
     def test_obsolete_change_set_refuses_and_confirms_removal(self) -> None:
-        self.prepare_hana()
         self.execution_status = 'OBSOLETE'
-        status, output = self.run_plan('hana-setup')
+        status, output = self.run_change()
         self.assertEqual(status, 1, output)
-        self.assertEqual(self.calls, list(PLAN_CALLS[:13]))
+        self.assertEqual(self.calls, [CREATE_CHANGE, CONFIRM_REMOVAL, DELETE_CHANGE, CONFIRM_REMOVAL])
         self.assertIn('plan stack: change set removal confirmed', output)
         self.assertTrue(output.endswith('plan run: refused: The change set execution status is OBSOLETE. Expected AVAILABLE.\n'))
 
     def assert_delete_failed(self, failure: str) -> None:
-        self.prepare_hana()
         self.failure = failure
-        status, output = self.run_plan('hana-setup')
+        status, output = self.run_change()
         self.assertEqual(status, 1, output)
-        self.assertEqual(self.calls, [*PLAN_CALLS[:12],
+        self.assertEqual(self.calls, [CREATE_CHANGE, CONFIRM_REMOVAL, DELETE_CHANGE,
             *([('cloudformation', 'describe-change-set')] * len(plan_identity.PROOF_RETRY_DELAYS))])
         self.assertTrue(output.endswith('plan run: refused: change set not removed\n'))
         self.assertIn('plan stack: change set may remain: ' + self.change_name, output)
@@ -599,12 +706,13 @@ class GatePlanTests(CostFixture):
         self.displaced_policies: dict[str, dict[str, str]] = {}
         self.unresolved_policy = ''
         self.cleanup_timeouts: list[tuple[float, float]] = []
+        self.on_aws_call: Callable[[str, str, str], None] = lambda _region, _service, _operation: None
 
     @override
     def setUp(self) -> None:
         super().setUp()
         self.regions = (GATE_HOME, GATE_REGION)
-        with control_lock(self.state / 'gate-up'):
+        with account_stack_lock(self.state):
             pass
         self.credentials_path = self.root / '.config/aws-build/credentials'
         self.credentials_path.parent.mkdir(parents=True)
@@ -636,11 +744,13 @@ class GatePlanTests(CostFixture):
                  'scaler_user': {'name': 'fixture-scaler', 'arn': GATE_USER, 'user_id': GATE_USER_ID}}
         _ = (self.state / 'deployment.json').write_text(json.dumps(saved | overrides))
 
-    def run_plan(self, *arguments: str) -> tuple[int, str]:
-        _ = conf.path('cloud_gate').write_text(f"""regions={' '.join(self.regions)}
-credential_file={self.credentials_path}
+    def write_gate_configuration(self) -> None:
+        _ = conf.path('cloud_gate').write_text(f'''\
+regions={' '.join(self.regions)}
 instance_types=m7a.8xlarge
+credential_file={self.credentials_path}
 hana_gpu_instance_types={GATE_HANA_GPU_TYPE}
+hana_gpu_spot_max_usd_per_hour={json.dumps({GATE_HANA_GPU_TYPE: '0.5'})}
 gpu_size_trial_spot_max_usd_per_hour={json.dumps({GATE_TRIAL_GPU_TYPE: '0.25'})}
 gpu_size_trial_limit_usd=2
 gpu_size_trial_box_extra_usd=0.05
@@ -648,10 +758,10 @@ gpu_size_trial_box_extra_usd=0.05
 gpu_size_trial_lifetime_minutes=10
 # range: 1..
 api_timeout_s=5
-# whole: 1..
-root_gib=30
 # range: 0..
 spot_max_usd_per_hour=0.5
+# whole: 1..
+root_gib=30
 # whole: 1..
 artifact_days=7
 # whole: 1..
@@ -662,7 +772,12 @@ expiry_schedule_minutes=5
 expiry_timeout_s=20
 # whole: 1..
 expiry_memory_mib=128
-""")
+# range: 0..
+shared_usd_per_month=1
+''')
+
+    def run_plan(self, *arguments: str) -> tuple[int, str]:
+        self.write_gate_configuration()
         before = {path: path.read_bytes() if path.is_file() else None for path in self.root.rglob('*')}
         output, errors = StringIO(), StringIO()
         argv = ['deploy.py', 'up', '--workload', 'merge-gates', '--settings', str(self.settings),
@@ -686,8 +801,8 @@ expiry_memory_mib=128
             return arguments[arguments.index(name) + 1]
 
         region = option('--region')
-        with file_lock.exclusive(self.state / 'gate-up/controller.lock', wait=False) as lock:
-            self.assertIs(lock, file_lock.LockResult.BUSY)
+        with account_stack_lock(self.state) as access:
+            self.assertIs(access, LockResult.BUSY)
         if '--profile' in arguments:
             self.assertEqual(option('--profile'), 'build-scaler')
             self.assertEqual((env or {}).get('AWS_SHARED_CREDENTIALS_FILE'), str(self.credentials_path))
@@ -707,6 +822,7 @@ expiry_memory_mib=128
         self.assertIn(plan_run.action_name(service, operation), ALLOWED)
         self.assertTrue(set(arguments).isdisjoint(('--dry-run', '--template-url', '--role-arn')))
         self.calls.append((region, service, operation))
+        self.on_aws_call(region, service, operation)
 
         def error(code: str, action: str, reason: str) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(arguments, 1, '',
@@ -747,7 +863,11 @@ expiry_memory_mib=128
         elif operation == 'describe-images':
             images = [{'ImageId': 'ami-home' if region == GATE_HOME else 'ami-' + region,
                        'OwnerId': OWNER.account, 'Name': 'fixture-image'}]
-            reply = {'Images': [] if self.failure == 'image' and region == self.failure_region else images}
+            if region != GATE_HOME and '--image-ids' in arguments:
+                self.assertEqual(option('--image-ids'), 'ami-' + region)
+                reply = {'Images': [dict(images[0], State='available')]}
+            else:
+                reply = {'Images': [] if self.failure == 'image' and region == self.failure_region else images}
         elif operation in ('create-change-set', 'describe-change-set', 'delete-change-set'):
             self.assertEqual(option('--stack-name'), self.stack_id(region))
             name = option('--change-set-name')
@@ -901,12 +1021,174 @@ expiry_memory_mib=128
             with self.subTest(region=region):
                 self.assertEqual(self.calls_in(region), calls)
 
-    def test_busy_gate_controller_refuses_before_aws(self) -> None:
-        with control_lock(self.state / 'gate-up'):
+    def test_busy_account_stack_lock_refuses_the_plan_before_aws(self) -> None:
+        with account_stack_lock(self.state) as access:
+            self.assertIs(access, LockResult.ACQUIRED)
             status, output = self.run_plan()
         self.assertEqual(status, 1, output)
-        self.assertEqual(output, 'plan run: refused: The gate controller lock gate-up/controller.lock is busy.\n')
+        self.assertEqual(output, 'plan run: refused: up --workload merge-gates --plan: '
+                                 + 'Another command is using the AWS account stack. '
+                                 + 'Run the same command again when that command ends.\n')
         self.assertEqual(self.calls, [])
+
+    def test_gate_plan_can_run_during_a_hana_resource_hold(self) -> None:
+        with hana_command_lock(self.state) as access:
+            self.assertIs(access, HanaCommandAccess.ACQUIRED)
+            status, output = self.run_plan()
+        self.assertEqual(status, 0, output)
+
+    @contextmanager
+    def hana_activity(
+        self, directory: Path, claim: str, *, renew_on: str, release_on: str,
+    ) -> Generator[tuple[TestClock, Callable[[str], None]]]:
+        clock = TestClock()
+        workload = conf.path('hana_aws')
+        write_lifecycle_configuration(workload)
+        book = ledger.CostLedger(directory)
+        book.record_inventory(ledger.ResourceInventory(clock.now, (), 'private inventory', True))
+        book.observe(ledger.InstanceObservation(clock.now, 'terminated', 'private account inventory'))
+        provider = FakeProvider(directory, clock)
+        controller = hana_box.HanaController(directory, self.settings, workload, provider, clock=clock)
+        controller.register(IDENTITY)
+        _ = record_lifecycle_image(directory, workload)
+        self.assertIsInstance(controller.request(claim), hana_box.ClaimCommitted)
+        for _step in range(4):
+            clock.advance(1)
+            _ = controller.tick()
+        initial = controller.inspect_for_settlement()
+        assert isinstance(initial, hana_box.HanaLifecycleEvidence)
+        permit = initial.permit
+        assert isinstance(permit, hana_box.DeliveredPermit)
+        settled: list[str] = []
+
+        def renew_and_settle(operation: str) -> None:
+            if operation == renew_on:
+                clock.now = permit.expires - 100
+                self.assertEqual(controller.tick(), hana_box.Lifecycle.READY)
+                clock.advance(1)
+                self.assertEqual(controller.tick(), hana_box.Lifecycle.READY)
+                current = controller.inspect_for_settlement()
+                assert isinstance(current, hana_box.HanaLifecycleEvidence)
+                assert isinstance(current.permit, hana_box.DeliveredPermit)
+                self.assertGreater(current.permit.expires, permit.expires)
+                self.assertEqual(provider.published[-1].expected_generation, permit.generation)
+                settled.append('renewed')
+            if operation == release_on:
+                self.assertTrue(controller.release(claim))
+                self.assertIsInstance(controller.claim_status(claim), hana_box.ClaimRefused)
+                settled.append('released')
+
+        yield clock, renew_and_settle
+        self.assertEqual(settled, ['renewed', 'released'])
+
+    def test_gate_plan_renews_a_hana_permit_and_settles_the_claim_during_aws_calls(self) -> None:
+        with self.hana_activity(self.state, 'gate-plan-claim', renew_on='create-change-set',
+                                release_on='delete-change-set') as (_clock, observe):
+            def on_aws_call(region: str, service: str, operation: str) -> None:
+                if (region, service) == (GATE_HOME, 'cloudformation'):
+                    observe(operation)
+
+            self.on_aws_call = on_aws_call
+            self.write_gate_configuration()
+            plan = plan_run.PlanRun(lambda: CREDENTIAL, self.execute, lambda _seconds: None)
+            subject = deploy.Deployment(self.settings, self.state, self.root / 'output', execute=self.execute, mode=plan)
+            with redirect_stdout(StringIO()):
+                subject.gate_plan()
+        self.assertEqual(self.change_sets, {})
+
+    def test_account_stack_lock_excludes_writes_and_allows_hana_activity(self) -> None:
+        unexpected = mock.Mock(side_effect=AssertionError('Unexpected AWS call'))
+        approved = deploy.Deployment(self.settings, self.state, self.root / 'output', execute=unexpected)
+        operations: tuple[tuple[str, Callable[[], object]], ...] = (
+            ('up --workload merge-gates', lambda: approved.gate_up(approve_resources=True)),
+            ('remove-images', lambda: approved.remove_images(approve_destroy=True)),
+            ('apply', lambda: approved.apply(approve_resources=True)),
+            ('down', lambda: approved.down(approve_destroy=True)),
+        )
+        refused: list[str] = []
+
+        def check_exclusion(region: str, service: str, operation: str) -> None:
+            if (region, service, operation) != (GATE_HOME, 'sts', 'get-caller-identity'):
+                return
+            for command, run in operations:
+                with self.subTest(command=command), self.assertRaises(deploy.DeploymentRefused) as error:
+                    _ = run()
+                self.assertEqual(str(error.exception), f'{command}: Another command is using the AWS account stack. '
+                                 + 'Run the same command again when that command ends.')
+                refused.append(command)
+
+        self.on_aws_call = check_exclusion
+        status, output = self.run_plan()
+        self.assertEqual(status, 0, output)
+        self.assertEqual(refused, [command for command, _run in operations])
+        unexpected.assert_not_called()
+
+        self.regions = (GATE_HOME,)
+        self.write_gate_configuration()
+        self.replace('deploy_progress_interval_s', '60')
+        self.text_setting('admin_secret_file', str(self.root / 'admin.gpg'))
+        self.text_setting('deployment_profile', 'fixture-admin')
+        approved_rows: tuple[tuple[Literal['gate-up', 'remove-images'], str, str], ...] = (
+            ('gate-up', 'create-change-set', 'execute-change-set'),
+            ('remove-images', 'get-template', 'delete-snapshot snap-old'),
+        )
+        for command, renew_on, release_on in approved_rows:
+            with self.subTest(command=command):
+                self.check_approved_gate_command(command, renew_on, release_on)
+
+    def check_approved_gate_command(
+        self, command: Literal['gate-up', 'remove-images'], renew_on: str, release_on: str,
+    ) -> None:
+        directory = self.root / 'approved' / command
+        directory.mkdir(parents=True)
+        _ = (directory / 'deployment.json').write_bytes((self.state / 'deployment.json').read_bytes())
+        images = test_deploy.GateImageAws()
+        images.manifest = directory / 'gate-deployment.json'
+        if command == 'remove-images':
+            _ = images.manifest.write_text(json.dumps({'regions': [{'region': GATE_HOME, 'image': 'ami-old'}]}))
+            (directory / 'gate-image').mkdir()
+
+        with self.hana_activity(directory, command, renew_on=renew_on, release_on=release_on) as (clock, observe):
+            def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+                with account_stack_lock(directory) as access:
+                    self.assertIs(access, LockResult.BUSY)
+                operation = arguments[arguments.index('--region') + 3]
+                observe(operation + ' ' + arguments[arguments.index('--snapshot-id') + 1]
+                        if operation == 'delete-snapshot' else operation)
+                if operation == 'get-caller-identity':
+                    return subprocess.CompletedProcess(arguments, 0, json.dumps({'Account': OWNER.account}), '')
+                reply = images(arguments)
+                if operation == 'describe-stacks':
+                    body = ledger.mapping(cast(object, json.loads(reply.stdout)))
+                    stack, = ledger.rows(body, 'Stacks')
+                    stack['StackId'] = self.stack_id(GATE_HOME)
+                    outputs = {'GateBucket': GATE_BUCKET, 'GateLaunchTemplate': 'lt-fixture',
+                               'GateLaunchVersion': str(images.version), 'GateSecurityGroup': 'sg-fixture',
+                               'GateRoleId': 'fixture-role', 'ScalerUserName': 'fixture-scaler'}
+                    stack['Outputs'] = [{'OutputKey': key, 'OutputValue': value} for key, value in outputs.items()]
+                    reply.stdout = json.dumps(body)
+                return reply
+
+            subject = deploy.Deployment(self.settings, directory, self.root / command, execute=execute, clock=clock)
+            credentials = admin_secrets.AdminCredentials('fixture-key', 'fixture-secret', 'fixture-id', 'fixture-oauth')
+            with (mock.patch.object(subject.admin, 'get', return_value=credentials), redirect_stdout(StringIO())):
+                if command == 'gate-up':
+                    with (mock.patch.object(aws_trial, 'host_nixpkgs_revision', return_value='fixture-revision'),
+                          mock.patch.object(deploy, 'gate_subnets', return_value=[{'id': 'subnet-fixture', 'zone': GATE_HOME + 'a'}]),
+                          mock.patch.object(subject, '_fill_prices'),
+                          mock.patch.object(subject, '_probe_gate_gpu', return_value=True)):
+                        self.assertTrue(subject.gate_up(approve_resources=True))
+                else:
+                    self.assertTrue(subject.remove_images(approve_destroy=True))
+
+    def test_plan_reuses_saved_regional_image_by_id(self) -> None:
+        self.failure, self.failure_region = 'image', GATE_REGION
+        _ = (self.state / 'regional-images.json').write_text(json.dumps({
+            f'{GATE_REGION}:ami-home': {'region': GATE_REGION, 'image': 'ami-' + GATE_REGION},
+        }))
+        status, output = self.run_plan()
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self.calls_in(GATE_REGION).count(('ec2', 'describe-images')), 2)
 
     def test_missing_home_image_refuses_all_regions(self) -> None:
         self.regions = (GATE_HOME, GATE_REGION, GATE_LAST)

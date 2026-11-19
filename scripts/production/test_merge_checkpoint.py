@@ -958,6 +958,8 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
         review = self.events("review_regime.py")
         self.assertEqual(len(review), 1)
+        self.assertIn("--checkpoint", review[0])
+        self.assertEqual(review[0][review[0].index("--checkpoint") + 1], sha)
         for flag, value in (("--ux-findings", "2"), ("--code-findings", "3"),
                             ("--review-minutes", "14"), ("--ux-check-minutes", "4"),
                             ("--ux-repair-minutes", "1")):
@@ -965,6 +967,25 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
         self.assertNotIn("--simplify-findings", review[0])
         self.assertNotIn("--simplify-minutes", review[0])
         self.assertNotIn("--note", review[0])
+
+    def test_a_checkpoint_merge_adds_a_review_row_beside_an_older_row(self) -> None:
+        self.env["MERGE_CHECKPOINT_REVIEW_REGIME"] = str(Path(__file__).with_name("review_regime.py"))
+        ledger = Path(self.env["HOME"]) / ".claude/data/review_regime.jsonl"
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        old = {"unit": "alpha", "plan": "docs/plans/alpha.md", "phase": "2", "regime": "after",
+               "started": STARTED, "merged": STARTED, "holds": 0, "merge_defects": 0}
+        before = json.dumps(old) + "\n"
+        _ = ledger.write_text(before)
+
+        sha = self.checkpoint()
+        result = self.run_checkpoint(sha)
+
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        self.assertIn("record: ok — review ledger and production log updated\n", result.process.stdout)
+        saved = ledger.read_text()
+        self.assertTrue(saved.startswith(before))
+        added = cast(dict[str, object], json.loads(saved[len(before):]))
+        self.assertEqual(added["checkpoint"], sha)
 
     def test_a_failed_repair_review_add_keeps_the_first_log_until_a_retry_succeeds(self) -> None:
         first = self.run_checkpoint(self.checkpoint())

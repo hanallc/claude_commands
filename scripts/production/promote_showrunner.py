@@ -209,10 +209,11 @@ def finish_child(promotion: Promotion, target: Path, pending: Path, pid: int) ->
     prompt = f"/showrunner:produce {promotion.child.doc} resume"
     transcript = herdr.SessionTranscript(target, promotion.claude.session_id)
     outcome = herdr.submitted_prompt(transcript, prompt, at)
-    if not isinstance(outcome, herdr.PromptSubmitted):
+    if outcome.state != "confirmed":
         outcome = herdr.Herdr(place.session).submit_opening_prompt(
-            place.pane, herdr.OpeningPrompt(prompt, transcript), at, 90_000)
-    if isinstance(outcome, herdr.PromptNotSubmitted):
+            place.pane, herdr.OpeningPrompt(prompt, transcript, may_type=False), at, 90_000)
+    if outcome.state != "confirmed":
+        print(f"promote_showrunner: {outcome.reason}", file=sys.stderr)
         return add_showrunner.SESSION_NOT_READY
     if not add_showrunner.showrunner_appeared(promotion.child.name):
         return 1

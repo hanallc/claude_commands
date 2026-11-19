@@ -1,6 +1,10 @@
 """Verify which retained resources belong to deleted Hana stacks."""
 from __future__ import annotations
 
+from collections.abc import Sequence
+import json
+import subprocess
+from typing import cast
 import unittest
 from unittest import mock
 
@@ -25,7 +29,11 @@ class RetainedTests(unittest.TestCase):
             {'StackEvents': [{'ResourceStatus': 'DELETE_SKIPPED', 'Timestamp': started,
                               'ResourceType': retained.BUCKET, 'PhysicalResourceId': 'bucket'}]},
         ])
-        api = mock.Mock(spec=AwsCli, call=call)
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            reply = cast(object, call(arguments[6], *arguments[7:-2], service=arguments[5]))
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+        api = AwsCli('fixture-profile', 'us-east-2', 1, execute)
         self.assertEqual(retained.deleted_since(api, 'hana', instant(started)),
                          retained.Retained(frozenset({'disk'}), frozenset({'bucket'})))
         self.assertEqual(call.call_args_list, [

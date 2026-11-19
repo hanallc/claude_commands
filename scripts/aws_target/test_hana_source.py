@@ -1,19 +1,25 @@
 """Exercise exact source bundles with private Git repositories and guest slots."""
 from __future__ import annotations
 
+from collections.abc import Generator
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
+from functools import cached_property
 import hashlib
+import io
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
+import tarfile
 import tempfile
 from typing import cast, override
 import unittest
 from unittest import mock
-from urllib.parse import urlsplit
 
-from scripts.aws_target import hana_source as source, hana_transport as transport, hana_receiver
+from scripts.aws_target import hana_payload, hana_protocol, hana_receiver, hana_render
+from scripts.aws_target import hana_source as source, hana_transport as transport
 from scripts.copies import copies
 from scripts.lib import build_folders, build_slots, conf
 from scripts.lib.build_slots_test_support import private_slot_config
@@ -36,17 +42,13 @@ class MemorySourceObjects:
     def signed_get(self, sha256: str) -> str:
         return 'https://fixture-bucket.s3.us-east-2.amazonaws.com/source/' + sha256
 
-    def fetch(self, url: str, destination: Path, limits: source.SourceLimits) -> None:
-        _ = limits
-        _ = destination.write_bytes(self.objects[urlsplit(url).path.rsplit('/', 1)[1]])
-
-
 class HanaSourceTests(unittest.TestCase):
     def __init__(self, methodName: str = 'runTest') -> None:
         super().__init__(methodName)
         self.root: Path = Path()
         self.pool_settings: Path = Path()
         self.checkout: Path = Path()
+        self.runtime_checkout: Path = Path()
         self.base: str = ''
         self.objects: MemorySourceObjects = MemorySourceObjects()
 
@@ -55,19 +57,31 @@ class HanaSourceTests(unittest.TestCase):
         return conf.read(Path(os.environ['CONF_DIR']) / 'hana_aws.conf')
 
     @property
-    def limits(self) -> source.SourceLimits:
+    def limits(self) -> hana_protocol.SourceLimits:
         return source.read_limits(self.configuration)
 
-    @property
+    @cached_property
     def sender(self) -> transport.SourceSender:
-        return transport.SourceSender(self.objects, self.root / 'acknowledged', self.configuration)
+        return transport.SourceSender(self.objects, self.root / 'acknowledged', self.configuration,
+                                      checkout=self.runtime_checkout)
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         private = private_slot_config(self.root, repository='hana')
         self.enterContext(mock.patch.dict(os.environ, private.environment))
+
         self.pool_settings = private.settings
+        _ = write_config_fixture(self.configuration.source, 'host=aws-hana\n')
+        self.runtime_checkout = self.root / 'commands'
+        (self.runtime_checkout / 'config').mkdir(parents=True)
+        for name in ('build_targets.conf', 'build_folders.conf', 'copies.conf'):
+            _ = shutil.copyfile(self.configuration.source.with_name(name), self.runtime_checkout / 'config' / name)
+        manifest = self.runtime_checkout / hana_render.RUNTIME_FILE_LIST
+        manifest.parent.mkdir(parents=True)
+        _ = manifest.write_text('scripts/aws_target/fixture_runtime.py\nscripts/aws_target/hana_protocol.py\n')
+        _ = (manifest.parent / 'hana_protocol.py').write_text(f'RUNTIME_ABI = {hana_protocol.RUNTIME_ABI}\n')
+        _ = (manifest.parent / 'fixture_runtime.py').write_text('version = "captured"\n')
         _ = write_config_fixture(private.settings,
             f'roots.slots.aws-hana={self.root / "guest-slots"}\n'
             + '# whole: 1..\nslots.aws-hana.hana.max=1\n# whole: 1..\nslots.aws-hana.hana.max_bytes=1073741824\n')
@@ -87,12 +101,34 @@ class HanaSourceTests(unittest.TestCase):
         return subprocess.run(['git', '-C', str(self.checkout), *arguments], check=True, capture_output=True,
                               text=True, timeout=self.limits.git_timeout_s).stdout.strip()
 
-    def prepare(self, checkout: Path | None = None) -> source.SourceManifest:
-        return self.sender.prepare(checkout or self.checkout, ('cargo', 'check'), environment={'RUST_BACKTRACE': '1'})
+    def prepare(self, checkout: Path | None = None) -> hana_protocol.SourceManifest:
+        with ExitStack() as staging:
+            manifest, upload = self.sender.prepare(checkout or self.checkout, ('cargo', 'check'),
+                                                    environment={'RUST_BACKTRACE': '1'}, staging=staging)
+            upload()
+            return manifest
 
-    def materialize(self, manifest: source.SourceManifest):
-        return source.materialize(manifest, self.limits, root=self.root / 'guest', fetch=self.objects.fetch,
-                                  showrunner='builds', unit='aws', work='source-test')
+    @contextmanager
+    def verified_bundle(self, manifest: hana_protocol.SourceManifest) -> Generator[source.VerifiedGitBundle]:
+        with (tempfile.TemporaryDirectory(dir=self.root) as directory,
+              tempfile.TemporaryFile(dir=self.root) as archive):
+            _ = archive.write(self.objects.objects[manifest.bundle_sha256])
+            section = hana_payload.unpack_payload(archive, manifest, Path(directory) / 'runtime')
+            yield source.VerifiedGitBundle(archive.fileno(), section.offset, section.size)
+
+    @contextmanager
+    def materialize(self, manifest: hana_protocol.SourceManifest) -> Generator[source.LeasedSource | source.MissingBasis]:
+        with (self.verified_bundle(manifest) as bundle,
+              source.materialize(manifest, self.limits, bundle, root=self.root / 'guest',
+                  showrunner='builds', unit='aws', work='source-test') as leased):
+            yield leased
+
+    def member(self, manifest: hana_protocol.SourceManifest, name: str) -> bytes:
+        with tarfile.open(fileobj=io.BytesIO(self.objects.objects[manifest.bundle_sha256]), mode='r:') as archive:
+            member = archive.extractfile(name)
+            assert member is not None
+            with member:
+                return member.read()
 
     def guest(self):
         return mock.patch('socket.gethostname', return_value='aws-hana')
@@ -140,8 +176,8 @@ class HanaSourceTests(unittest.TestCase):
         _ = (self.checkout / 'new').write_text('second request\n')
         second = self.prepare()
         self.assertEqual(second.basis_commits, (first.commit,))
-        complete = self.objects.objects[first.bundle_sha256]
-        delta = self.objects.objects[second.bundle_sha256]
+        complete = self.member(first, 'source.bundle')
+        delta = self.member(second, 'source.bundle')
         self.assertLess(len(delta), len(complete))
         with self.guest(), self.materialize(second) as leased:
             assert isinstance(leased, source.LeasedSource)
@@ -153,7 +189,7 @@ class HanaSourceTests(unittest.TestCase):
 
     def test_lost_basis_returns_a_typed_answer_then_a_complete_bundle_succeeds(self) -> None:
         first = self.prepare()
-        self.sender.acknowledge(source.SourceIdentity(first.repository, first.commit, first.toolchain))
+        self.sender.acknowledge(hana_protocol.SourceIdentity(first.repository, first.commit, first.toolchain))
         _ = (self.checkout / 'new').write_text('later source\n')
         delta = self.prepare()
         with self.guest(), self.materialize(delta) as answer:
@@ -163,7 +199,17 @@ class HanaSourceTests(unittest.TestCase):
             self.assertIn(first.commit, answer.commits)
             self.assertNotIn(self.base, answer.commits)
             _ = (self.checkout / 'new').write_text('caller changed after the request\n')
-            complete = self.sender.retry_complete(self.checkout, delta, answer)
+            runtime = self.runtime_checkout / 'scripts/aws_target/fixture_runtime.py'
+            _ = runtime.write_text('version = "changed"\n')
+            _ = runtime.with_name('hana_protocol.py').write_text(f'RUNTIME_ABI = {delta.runtime_abi + 1}\n')
+            with ExitStack() as staging:
+                complete, upload = self.sender.retry_complete(self.checkout, delta, answer, staging=staging)
+                upload()
+        self.assertEqual(self.objects.uploads, [first.bundle_sha256, delta.bundle_sha256, complete.bundle_sha256])
+        self.assertEqual(self.member(complete, 'runtime/scripts/aws_target/fixture_runtime.py'),
+                         b'version = "captured"\n')
+        self.assertEqual(complete.runtime_abi, delta.runtime_abi)
+        self.assertEqual(self.member(complete, 'runtime/abi'), f'{delta.runtime_abi}\n'.encode())
         self.assertEqual(complete.commit, delta.commit)
         self.assertEqual(complete.basis_commits, ())
         with self.guest(), self.materialize(complete) as leased:
@@ -172,20 +218,34 @@ class HanaSourceTests(unittest.TestCase):
 
     def test_wrong_sha_changed_commit_and_failed_bundle_verification_are_refused(self) -> None:
         manifest = self.prepare()
-        for changed, reason in ((replace(manifest, bundle_sha256='0' * 64), 'BundleDigestMismatch'),
-                                (replace(manifest, commit=self.base), 'BundleCommitMismatch')):
-            with self.subTest(reason=reason), self.guest():
-                if reason == 'BundleDigestMismatch':
-                    self.objects.objects[changed.bundle_sha256] = self.objects.objects[manifest.bundle_sha256]
-                    changed = replace(changed, bundle_url=self.objects.signed_get(changed.bundle_sha256))
-                with self.assertRaisesRegex(source.SourceRefused, reason), self.materialize(changed):
-                    self.fail('invalid source was admitted')
-        content = b'not a Git bundle\n'
-        digest = hashlib.sha256(content).hexdigest()
-        self.objects.objects[digest] = content
+        digest = '0' * 64
+        self.objects.objects[digest] = self.objects.objects[manifest.bundle_sha256]
+        changed = replace(manifest, bundle_sha256=digest, bundle_url=self.objects.signed_get(digest))
+        with self.guest(), self.assertRaisesRegex(ValueError, 'BundleDigestMismatch'), self.materialize(changed):
+            self.fail('invalid source was admitted')
+        changed = replace(manifest, commit=self.base)
+        with self.guest(), self.assertRaisesRegex(hana_protocol.SourceRefused, 'BundleCommitMismatch'), self.materialize(changed):
+            self.fail('invalid source was admitted')
+        invalid_archive = io.BytesIO()
+        with (tarfile.open(fileobj=io.BytesIO(self.objects.objects[manifest.bundle_sha256]), mode='r:') as original,
+              tarfile.open(fileobj=invalid_archive, mode='w:') as invalid):
+            for member in original:
+                if member.name == 'source.bundle':
+                    content = b'not a Git bundle\n'
+                    member.size = len(content)
+                    invalid.addfile(member, io.BytesIO(content))
+                else:
+                    body = original.extractfile(member)
+                    assert body is not None
+                    with body:
+                        invalid.addfile(member, body)
+        digest = hashlib.sha256(invalid_archive.getvalue()).hexdigest()
+        self.objects.objects[digest] = invalid_archive.getvalue()
         invalid = replace(manifest, bundle_sha256=digest, bundle_url=self.objects.signed_get(digest))
-        with self.guest(), self.assertRaisesRegex(source.SourceRefused, 'GitSourceRefused'), self.materialize(invalid):
+        with (self.guest(), self.assertRaisesRegex(hana_protocol.SourceRefused, 'GitSourceRefused') as refused,
+              self.materialize(invalid)):
             self.fail('invalid bundle was admitted')
+        self.assertIsInstance(refused.exception.__cause__, subprocess.CalledProcessError)
 
     def test_full_pool_uses_existing_admission_and_never_creates_an_overflow_slot(self) -> None:
         manifest = self.prepare()
@@ -210,25 +270,25 @@ class HanaSourceTests(unittest.TestCase):
 
     def test_ignored_input_outside_the_allowed_list_refuses_before_upload(self) -> None:
         _ = (self.checkout / 'private.bin').write_text('ignored build input')
-        with self.assertRaisesRegex(source.SourceRefused, 'IgnoredInput'):
+        with self.assertRaisesRegex(hana_protocol.SourceRefused, 'IgnoredInput'):
             _ = self.prepare()
         self.assertEqual(self.objects.uploads, [])
 
     def test_credentials_and_disallowed_environment_refuse_before_upload(self) -> None:
         _ = (self.checkout / '.env').write_text('fixture secret')
-        with self.assertRaisesRegex(source.SourceRefused, 'CredentialOrBuildInput: .* forbidden path .env'):
+        with self.assertRaisesRegex(hana_protocol.SourceRefused, 'CredentialOrBuildInput: .* forbidden path .env'):
             _ = self.prepare()
         (self.checkout / '.env').unlink()
         unreadable = Path(os.fsdecode(os.fsencode(self.checkout) + b'/\xff.key'))
         _ = unreadable.write_text('fixture secret')
-        with self.assertRaises(source.SourceRefused) as refused:
+        with self.assertRaises(hana_protocol.SourceRefused) as refused:
             _ = self.prepare()
         self.assertIn(b'\\xff.key', str(refused.exception).encode())
         unreadable.unlink()
         (self.checkout / 'build/target').mkdir(parents=True)
         _ = (self.checkout / 'build/target/output').write_text('untracked build output')
         _ = (self.checkout / '.gitignore').write_text('.direnv/\n__pycache__/\n.claude/settings.local.json\nprivate.bin\n')
-        with self.assertRaisesRegex(source.SourceRefused, 'forbidden path build/target/output'):
+        with self.assertRaisesRegex(hana_protocol.SourceRefused, 'forbidden path build/target/output'):
             _ = self.prepare()
         _ = self.git('add', 'build/target/output')
         self.assertIn('build/target/output', self.git('ls-tree', '-r', '--name-only', self.prepare().commit))
@@ -236,50 +296,78 @@ class HanaSourceTests(unittest.TestCase):
         _ = self.git('checkout', '--quiet', '.gitignore')
         self.objects.uploads.clear()
         for name in ('HOME', 'AWS_ACCESS_KEY_ID', 'CARGO_TARGET_DIR'):
-            with self.subTest(name=name), self.assertRaisesRegex(source.SourceRefused, 'EnvironmentRefused'):
-                _ = self.sender.prepare(self.checkout, ('cargo', 'check'), environment={name: 'fixture'})
+            with (self.subTest(name=name), ExitStack() as staging,
+                  self.assertRaisesRegex(hana_protocol.SourceRefused, 'EnvironmentRefused')):
+                _, upload = self.sender.prepare(self.checkout, ('cargo', 'check'),
+                                                environment={name: 'fixture'}, staging=staging)
+                upload()
         self.assertEqual(self.objects.uploads, [])
 
     def test_toolchain_mismatch_refuses_before_execution(self) -> None:
         manifest = replace(self.prepare(), toolchain='0' * 64)
-        with self.guest(), self.assertRaisesRegex(source.SourceRefused, 'ToolchainMismatch'), self.materialize(manifest):
+        with self.guest(), self.assertRaisesRegex(hana_protocol.SourceRefused, 'ToolchainMismatch'), self.materialize(manifest):
             self.fail('wrong toolchain was admitted')
 
     def test_manifest_json_is_typed_bounded_and_has_no_caller_home(self) -> None:
         manifest = self.prepare()
-        self.assertEqual(source.decode_manifest(manifest.encode(), self.limits), manifest)
-        self.assertLessEqual(len(manifest.encode()), hana_receiver.CONTROL_MAX_BYTES)
-        self.assertEqual(source.MANIFEST_MAX_BYTES, hana_receiver.CONTROL_MAX_BYTES)
+        self.assertEqual(hana_protocol.decode_manifest(manifest.encode(), self.limits), manifest)
+        self.assertLessEqual(len(manifest.encode()), hana_protocol.CONTROL_MAX_BYTES)
         self.assertNotIn(str(Path.home()), manifest.encode().decode())
-        with self.assertRaisesRegex(source.SourceRefused, 'ManifestTooLarge'):
-            _ = replace(manifest, argv=('x' * hana_receiver.CONTROL_MAX_BYTES,)).encode()
+        at_limit = manifest.encode().ljust(hana_protocol.CONTROL_MAX_BYTES, b' ')
+        self.assertEqual(hana_receiver.read_document(at_limit), cast(object, json.loads(manifest.encode())))
+        with self.assertRaisesRegex(ValueError, 'protocol limit'):
+            _ = hana_receiver.read_document(at_limit + b' ')
+        with self.assertRaisesRegex(hana_protocol.SourceRefused, 'ManifestTooLarge'):
+            _ = replace(manifest, argv=('x' * hana_protocol.CONTROL_MAX_BYTES,)).encode()
         raw = cast(dict[str, object], json.loads(manifest.encode()))
-        raw['argv'] = [True]
-        with self.assertRaisesRegex(source.SourceRefused, 'InvalidManifest'):
-            _ = source.decode_manifest(json.dumps(raw).encode(), self.limits)
+        for field, value in (('argv', [True]), ('runtime_abi', True)):
+            with self.subTest(field=field), self.assertRaisesRegex(hana_protocol.SourceRefused, 'InvalidManifest'):
+                _ = hana_protocol.decode_manifest(json.dumps({**raw, field: value}).encode(), self.limits)
+        _ = raw.pop('runtime_abi')
+        self.assertNotEqual(hana_protocol.decode_manifest(json.dumps(raw).encode(), self.limits).runtime_abi,
+                            hana_protocol.RUNTIME_ABI)
+
+    def test_archive_manifest_uses_the_abi_of_the_captured_runtime(self) -> None:
+        newer = hana_protocol.RUNTIME_ABI + 1
+        runtime = self.runtime_checkout / 'scripts/aws_target/hana_protocol.py'
+        _ = runtime.write_text(f'RUNTIME_ABI = {newer}\n')
+        manifest = self.prepare()
+        self.assertEqual(manifest.runtime_abi, newer)
+        self.assertEqual(self.member(manifest, 'runtime/abi'), f'{newer}\n'.encode())
+
+    def test_upload_bound_applies_to_the_entire_archive(self) -> None:
+        manifest = self.prepare()
+        bundle_size = len(self.member(manifest, 'source.bundle'))
+        _ = write_config_fixture(self.configuration.source, f'source_max_bytes={bundle_size}\n')
+        objects = MemorySourceObjects()
+        sender = transport.SourceSender(objects, self.root / 'acknowledged', self.configuration,
+                                        checkout=self.runtime_checkout)
+        with ExitStack() as staging, self.assertRaisesRegex(hana_protocol.SourceRefused, 'archive exceeds its size bound'):
+            _, upload = sender.prepare(self.checkout, ('cargo', 'check'), environment={}, staging=staging)
+            upload()
+        self.assertEqual(objects.uploads, [])
 
     def test_download_uses_curl_with_total_time_and_size_bounds(self) -> None:
         manifest = self.prepare()
-        limits = replace(self.limits, max_bytes=4)
-        destination = self.root / 'download'
-        _ = destination.write_bytes(b'good')
-        with mock.patch('scripts.aws_target.hana_source.subprocess.run') as runner:
-            source.download(manifest.bundle_url, destination, limits)
-        runner.assert_called_once_with(
-            ['curl', '--fail', '--silent', '--max-time', str(limits.download_timeout_s),
-             '--max-filesize', '4', '--output', str(destination), manifest.bundle_url],
-            check=True, capture_output=True, timeout=limits.download_timeout_s,
-            pass_fds=build_folders.held_build_folder_descriptors())
-        for failure in (subprocess.TimeoutExpired('curl', limits.download_timeout_s),
-                        subprocess.CalledProcessError(63, 'curl')):
-            with self.subTest(failure=type(failure).__name__):
-                with mock.patch('scripts.aws_target.hana_source.subprocess.run', side_effect=failure):
-                    with self.assertRaisesRegex(source.SourceRefused, 'SourceDownloadBound'):
-                        source.download(manifest.bundle_url, destination, limits)
-        _ = destination.write_bytes(b'too much')
-        with mock.patch('scripts.aws_target.hana_source.subprocess.run'):
-            with self.assertRaisesRegex(source.SourceRefused, 'SourceDownloadBound'):
-                source.download(manifest.bundle_url, destination, limits)
+        timeout = self.configuration.whole('source_download_timeout_s')
+        with tempfile.TemporaryFile(dir=self.root) as archive:
+            _ = archive.write(b'good')
+            with mock.patch.object(subprocess, 'run') as runner:
+                hana_payload.download_payload(manifest.bundle_url, archive, 4, timeout)
+            runner.assert_called_once_with(
+                ['curl', '--disable', '--fail', '--silent', '--globoff', '--proto', '=https',
+                 '--max-time', str(timeout), '--max-filesize', '4', '--', manifest.bundle_url],
+                stdout=archive, stderr=subprocess.DEVNULL, check=True, timeout=timeout)
+            for failure in (subprocess.TimeoutExpired('curl', timeout),
+                            subprocess.CalledProcessError(63, 'curl')):
+                with (self.subTest(failure=type(failure).__name__),
+                      mock.patch.object(subprocess, 'run', side_effect=failure),
+                      self.assertRaisesRegex(ValueError, 'size or time bound')):
+                    hana_payload.download_payload(manifest.bundle_url, archive, 4, timeout)
+            _ = archive.write(b'too much')
+            with (mock.patch.object(subprocess, 'run'),
+                  self.assertRaisesRegex(ValueError, 'size bound')):
+                hana_payload.download_payload(manifest.bundle_url, archive, 4, timeout)
 
     def test_deleted_credentials_never_enter_complete_or_delta_bundle_objects(self) -> None:
         _ = (self.checkout / '.env').write_text('synthetic credential history\n')
@@ -288,7 +376,7 @@ class HanaSourceTests(unittest.TestCase):
         secret = self.git('rev-parse', 'HEAD:.env')
         _ = self.git('rm', '.env')
         first = self.prepare()
-        self.sender.acknowledge(source.SourceIdentity(first.repository, first.commit, first.toolchain))
+        self.sender.acknowledge(hana_protocol.SourceIdentity(first.repository, first.commit, first.toolchain))
         _ = (self.checkout / 'new').write_text('later snapshot\n')
         second = self.prepare()
         self.assertEqual(second.basis_commits, (first.commit,))
@@ -297,7 +385,7 @@ class HanaSourceTests(unittest.TestCase):
             for number, manifest in enumerate((first, second)):
                 with self.subTest(bundle=number):
                     self.assertEqual(self.git('rev-list', '--parents', '-1', manifest.commit), manifest.commit)
-                    payload = self.objects.objects[manifest.bundle_sha256].split(b'\n\n', 1)[1]
+                    payload = self.member(manifest, 'source.bundle').split(b'\n\n', 1)[1]
                     indexed = subprocess.run(['git', '-C', str(inspection), 'index-pack', '--stdin', '--fix-thin'],
                                        input=payload, check=True, capture_output=True, timeout=self.limits.git_timeout_s)
                     objects = source.git(inspection, self.limits, 'cat-file', '--batch-all-objects', '--batch-check')
@@ -315,8 +403,9 @@ class HanaSourceTests(unittest.TestCase):
         _ = copies.git(nested, 'init', '--quiet')
         _ = (nested / 'file').write_text('nested source\n')
         _ = commit_repository(nested, 'nested source')
-        with self.assertRaisesRegex(copies.PreparationError, 'NestedRepository: nested'):
+        with self.assertRaisesRegex(hana_protocol.SourceRefused, 'NestedRepository: nested') as refused:
             _ = self.prepare()
+        self.assertIsInstance(refused.exception.__cause__, copies.PreparationError)
         self.assertEqual(self.objects.uploads, [])
 
     def test_executable_mode_change_during_capture_refuses(self) -> None:
@@ -344,7 +433,7 @@ class HanaSourceTests(unittest.TestCase):
                 _ = (path / 'tracked').write_text('changed during capture\n')
             return tree
         with mock.patch.object(copies, 'staged_tree', side_effect=change_during_capture):
-            with self.assertRaisesRegex(copies.PreparationError, 'SourceChanged'):
+            with self.assertRaisesRegex(copies.SourceChangedDuringCapture, 'SourceChanged'):
                 _ = self.prepare()
         self.assertEqual(index.read_bytes(), before)
         self.assertEqual(self.objects.uploads, [])

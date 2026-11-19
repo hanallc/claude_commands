@@ -6,6 +6,7 @@ from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.checkout_test_support import python_tool_source
 
 import fcntl
+import base64
 import importlib.util
 import json
 import gzip
@@ -19,9 +20,10 @@ import tempfile
 import threading
 import time
 import unittest
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from http.client import HTTPConnection
 from io import StringIO
@@ -43,10 +45,19 @@ from scripts.production import change_review, change_routing, investigation, nex
 from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
+from scripts.review_links import new_item_dialog, review_submissions
 from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, review_actions, review_later, review_page, review_items, serve, test_review_page
 from scripts.lib import atomic_file, conf, scratch
 from scripts.feature_log import feature_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+ROLE_COLOR_CONFIG = (
+    "role.showrunner=#a379fd\n"
+    "role.unit-director=#ffaf02\n"
+    "role.producer=#90fe42\n"
+    "role.worker=#ff0404\n"
+)
 
 
 @dataclass(frozen=True)
@@ -67,7 +78,9 @@ def setUpModule() -> None:
         + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n"
         + "rebuilds.url=python:scripts.review_links.change_page:rebuilds_url\n")
     _ = write_config_fixture(configuration / "scratch.conf", "record_lock_attempts=3\n")
-    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
+    _ = (configuration / "statusline.conf").write_text(ROLE_COLOR_CONFIG, encoding="utf-8")
+    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {
+        "CONF_DIR": str(configuration), "USER_ZONE": "America/New_York"})))
 
 
 class ReviewLinksServerTests(unittest.TestCase):
@@ -143,6 +156,171 @@ class ReviewLinksServerTests(unittest.TestCase):
                 '--behavior', 'Each group starts at 1', '--see', 'Numbers start at 1',
                 '--link', '1'*40, '--evidence', 'The page test passes', '--completed', '2026-11-01'])
         self.assertEqual((result, errors.getvalue()), (0, ''))
+
+    def new_item_http(self, body: bytes | None = None, *, query: str = '',
+                      headers: dict[str, str] | None = None) -> HttpReply:
+        connection = HTTPConnection('127.0.0.1', self.port, timeout=TEST_HANG_GUARD_SECS)
+        try:
+            connection.request('GET' if body is None else 'POST', review_page.NEW_ITEM_PATH + query,
+                               body, {'Content-Type': 'application/json', **(headers or {})})
+            response = connection.getresponse()
+            self.assertEqual(response.getheader('Cache-Control'), 'no-store')
+            return HttpReply(response.status, response.getheader('Content-Type', ''), response.read())
+        finally:
+            connection.close()
+
+    def test_new_item_options_and_refusals(self) -> None:
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        options = self.new_item_http()
+        self.assertEqual(options.status, 200)
+        fields = cast(dict[str, object], json.loads(options.body))
+        self.assertEqual(fields['recipients'], [{'id': owner.id, 'name': owner.name, 'proposal': True}])
+        token = fields['token']
+        request = case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id)
+        payload = {**asdict(request), 'token': token}
+
+        def encoded(fields: dict[str, object]) -> bytes:
+            return json.dumps(fields).encode()
+
+        with patch.object(self.server, 'review_cache', cache), patch.object(self.server, 'delivery_status', case.status):
+            expired = self.new_item_http(encoded({**payload, 'token': 'different'}))
+            self.assertEqual(expired.status, 403)
+            self.assertEqual(json.loads(expired.body), {
+                'code': 'stale_token', 'error': 'The New item token expired. Try Send again.'})
+            cases: tuple[tuple[bytes, str, dict[str, str], int], ...] = (
+                (encoded(payload), '?extra=1', {}, 400),
+                (encoded(payload), '', {'Content-Type': 'text/plain'}, 400),
+                (encoded(payload), '', {'Origin': 'https://elsewhere.invalid'}, 403),
+                (b'\xff', '', {}, 400),
+                (b'{', '', {}, 400),
+                (encoded({**payload, 'images': 'invalid'}), '', {}, 400),
+                (encoded(payload), '', {'Content-Length': str(serve.MAX_NEW_ITEM_BODY+1)}, 400),
+            )
+            for body, query, headers, status in cases:
+                with self.subTest(code=status, query=query, headers=headers):
+                    response = self.new_item_http(body, query=query, headers=headers)
+                    self.assertEqual(response.status, status, response.body)
+                    self.assertEqual(set(cast(dict[str, object], json.loads(response.body))), {'error'})
+            with patch.object(self.server, 'verified_tailscale_address', '127.0.0.2'):
+                self.assertEqual(self.new_item_http(encoded(payload)).status, 403)
+            original = case.fixture.production.read_text()
+            _ = case.fixture.production.write_text(original.replace('running.**', 'stopped.**'))
+            self.assertEqual(cast(dict[str, object], json.loads(self.new_item_http().body))['recipients'], [])
+            self.assertEqual(self.new_item_http(encoded(payload)).status, 409)
+            _ = case.fixture.production.write_text(original)
+            with patch.object(review_submissions, 'submit', side_effect=OSError('The native store is unavailable.')):
+                self.assertEqual(self.new_item_http(encoded(payload)).status, 503)
+            self.assertEqual(cache.get().records, {})
+
+    def test_new_item_offers_a_producer_with_a_directory_document(self) -> None:
+        _ = self.review_fixture()
+        directory = self.root.parent / 'brain'
+        directory.mkdir()
+        producer = fixture_member('producer', name='brain', doc=staff.LiveDoc(local_machine(), directory))
+        response = self.new_item_http()
+        self.assertEqual(response.status, 200)
+        fields = cast(dict[str, object], json.loads(response.body))
+        self.assertEqual(fields['recipients'], [{'id': producer.id, 'name': producer.name, 'proposal': False}])
+
+    def test_new_item_publishes_native_records_before_success(self) -> None:
+        from scripts.review_links.test_review_submissions import EVIDENCE, PNG, identify_fixture_image
+
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        _ = cache.get()
+        address = self.enterContext(patch.object(serve, 'tailscale_ip', return_value='127.0.0.1'))
+        token = cast(dict[str, object], json.loads(self.new_item_http().body))['token']
+        self.assertEqual(self.new_item_http().status, 200)
+        handler = cast(type[serve.ReviewLinksHandler], self.server.RequestHandlerClass)
+        respond = handler.json_response
+        delivered = threading.Event()
+
+        def see_published(active: serve.ReviewLinksHandler, status: int, fields: Mapping[str, object]) -> None:
+            if active.path == review_page.NEW_ITEM_PATH and status == 200:
+                key = str(fields['key'])
+                snapshot = cache.get()
+                self.assertIn(key, snapshot.records)
+                self.assertEqual(snapshot.version, fields['version'])
+                self.assertEqual(snapshot.records[key].state, review_items.ReviewState.WAITING)
+            respond(active, status, fields)
+
+        def message_sent(_recipient: staff.StaffId, _sender: str, _message: str) -> None:
+            delivered.set()
+
+        with (patch.object(self.server, 'review_cache', cache),
+              patch.object(self.server, 'delivery_status', case.status),
+              patch.object(handler, 'json_response', see_published),
+              patch.object(review_items, 'read', side_effect=AssertionError('Send scanned Review.')),
+              patch.object(review_submissions, '_identify_image', autospec=True, side_effect=identify_fixture_image),
+              patch.object(change_page, 'send_to_staff', side_effect=message_sent) as send):
+            for kind in new_item_dialog.SubmissionKind:
+                with self.subTest(kind=kind):
+                    delivered.clear()
+                    request = case.submission_request(kind, owner.id)
+                    if kind == new_item_dialog.SubmissionKind.BUG:
+                        request = replace(request, evidence=EVIDENCE,
+                                          images=(new_item_dialog.PastedImage('image/png', PNG),))
+                    body = json.dumps({**asdict(request), 'token': token}).encode()
+                    if kind == new_item_dialog.SubmissionKind.BUG:
+                        with ThreadPoolExecutor(max_workers=2) as workers:
+                            first = workers.submit(self.new_item_http, body)
+                            second = workers.submit(self.new_item_http, body)
+                            replies = [first.result(TEST_HANG_GUARD_SECS), second.result(TEST_HANG_GUARD_SECS)]
+                    else:
+                        replies = [self.new_item_http(body), self.new_item_http(body)]
+                    for reply in replies:
+                        self.assertEqual(reply.status, 200, reply.body)
+                    self.assertTrue(delivered.wait(TEST_HANG_GUARD_SECS))
+                    saved = cast(dict[str, str], json.loads(replies[0].body))
+                    self.assertEqual(saved, json.loads(replies[1].body))
+                    self.assertEqual(set(saved), {'id', 'key', 'version'})
+                    self.assertRegex(saved['id'], '^'+new_item_dialog.NATIVE_ID_PREFIX[kind]+r'[1-9][0-9]*$')
+                    snapshot = cache.get()
+                    origin = review_items.submission_origin(snapshot.records[saved['key']])
+                    assert isinstance(origin, new_item_dialog.ReviewSubmission)
+                    self.assertNotIn(origin.reply_token.encode(), replies[0].body + snapshot.payload + snapshot.page)
+                    if kind == new_item_dialog.SubmissionKind.BUG:
+                        self.assertNotIn(EVIDENCE.title.encode(), snapshot.payload)
+                        card = self.request(review_page.PAGE_PATH+'?'+urlencode({'body': saved['key']}))
+                        self.assertIn(EVIDENCE.title.encode(), card.body)
+                        image, = origin.images
+                        attachment = self.request(review_page.ATTACHMENT_PATH+'?'+urlencode({
+                            'key': saved['key'], 'id': image.id}))
+                        self.assertEqual((attachment.status, attachment.content_type, attachment.body),
+                                         (200, 'image/png', base64.b64decode(PNG)))
+                        for fields in ({'key': 'missing', 'id': image.id},
+                                       {'key': saved['key'], 'id': '../receipt.json'}):
+                            self.assertEqual(self.request(review_page.ATTACHMENT_PATH+'?'+urlencode(fields)).status, 404)
+            self.assertEqual(len(cache.get().records), 4)
+            self.assertEqual(send.call_count, 4)
+        address.assert_called_once_with()
+
+    def test_sent_proposal_key_survives_a_rebuild_with_a_symlinked_folder(self) -> None:
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        folder = case.fixture.production.parent
+        native = folder / 'real-proposals'
+        native.mkdir()
+        (folder / 'native-proposals').symlink_to(native, target_is_directory=True)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        token = cast(dict[str, object], json.loads(self.new_item_http().body))['token']
+        request = case.submission_request(new_item_dialog.SubmissionKind.PROPOSAL, owner.id)
+        with (patch.object(self.server, 'review_cache', cache),
+              patch.object(self.server, 'delivery_status', case.status),
+              patch.object(change_page, 'deliver')):
+            response = self.new_item_http(json.dumps({**asdict(request), 'token': token}).encode())
+            self.assertEqual(response.status, 200, response.body)
+            key = cast(dict[str, str], json.loads(response.body))['key']
+            self.assertIn(key, cache.get().records)
+            rebuilt = review_page.build_snapshot(case.root)
+            self.assertIn(key, rebuilt.records)
+            self.assertEqual(review_items.source_path(rebuilt.records[key]).parent, native.resolve())
+            with patch.object(cache, 'get', return_value=rebuilt):
+                card = self.request(review_page.PAGE_PATH+'?'+urlencode({'body': key}))
+            self.assertEqual(card.status, 200)
 
     def request(self, path: str) -> HttpReply:
         connection = HTTPConnection("127.0.0.1", self.port, timeout=TEST_HANG_GUARD_SECS)
@@ -1368,6 +1546,23 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(failed.status, 503)
             self.assertIn(b"The List page is not available.", failed.body)
 
+    def test_list_serves_linked_items_with_a_producer_directory_document(self) -> None:
+        case = self.review_fixture(changes=2)
+        _ = conf.path("statusline").write_text(ROLE_COLOR_CONFIG, encoding="utf-8")
+        directory = self.root.parent / "brain"
+        directory.mkdir()
+        producer = fixture_member("producer", name="brain", doc=staff.LiveDoc(local_machine(), directory))
+        item = the_list.add(producer.id, "Read the linked changes", owner=the_list.UnassignedOwner.NATE,
+                            source="nate", changes={})
+        _ = the_list.link(producer.id, item.id, ("page-owner/C1", "page-owner/C2"), source="nate")
+        with patch.object(self.server, "root", case.root):
+            self.assertEqual(self.request(list_page.PAGE_PATH).status, 200)
+            change_routing.delivery_path(case.root, case.fixture.review_list, "C1").mkdir()
+            response = self.request(list_page.PAGE_PATH)
+        self.assertEqual(response.status, 200)
+        self.assertIn(b"Read the linked changes", response.body)
+        self.assertIn(b">page-owner/C2</a>", response.body)
+
     def test_older_console_browser_and_rebuild_links_forward_to_the_fixed_address(self) -> None:
         for path, location in (
             ("/abc123/console.html?page=questions", "/console/?page=questions"),
@@ -1809,6 +2004,78 @@ class ReviewLinksServerTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 _ = self.post(images.PAGE_PATH, 'fixture-question')
             self.assertTrue(completed.wait(TEST_HANG_GUARD_SECS))
+
+    def test_quota_clear_changes_the_nav_until_an_escalation_or_reset(self) -> None:
+        from scripts.accounts import accounts
+
+        reset = datetime.now(timezone.utc) + timedelta(days=1)
+        quotas = {"claude1": accounts.WeeklyQuota(9, reset), "codex1": accounts.WeeklyQuota(4, reset)}
+        path = "/console/for-you.json?view=console"
+        state = accounts_page.quota_state(self.root)
+
+        def clear(label: str, level: str, at: datetime | None) -> int:
+            form = urlencode({"quota_account": label, "quota_level": level,
+                              "quota_reset": at.isoformat() if at is not None else ""})
+            return self.post(accounts_page.PAGE_PATH, form)[0]
+
+        def nav() -> dict[str, str]:
+            reply = self.request(path)
+            self.assertEqual(reply.status, 200)
+            return cast(dict[str, dict[str, str]], json.loads(reply.body))["accounts_quota"]
+
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(accounts, "stored_weekly_quotas", return_value=quotas),
+              patch.object(console, "for_you_payload", return_value={"available": True, "count": 0, "entries": []})):
+            self.assertEqual(nav(), {"level": "urgent", "name": "Urgent: 4% left"})
+            for body in ("quota_account=codex1&quota_level=urgent",
+                         "quota_account=codex1&quota_account=claude1&quota_level=urgent&quota_reset=",
+                         "quota_account=codex1&quota_level=invalid&quota_reset=",
+                         "quota_account=codex1&quota_level=urgent&quota_reset=invalid"):
+                with self.subTest(body=body):
+                    self.assertEqual(self.post(accounts_page.PAGE_PATH, body)[0], 400)
+                    self.assertFalse(state.exists())
+            self.assertEqual(clear("codex1", "urgent", reset), 200)
+            self.assertEqual(nav(), {"level": "warning", "name": "Warning: 9% left"})
+            self.assertEqual(clear("claude1", "warning", reset), 200)
+            self.assertEqual(nav(), {"level": "none", "name": ""})
+            self.assertEqual(json.loads(state.read_text()), {
+                "claude1": {"level": "warning", "reset": reset.isoformat()},
+                "codex1": {"level": "urgent", "reset": reset.isoformat()},
+            })
+            quotas["codex1"] = accounts.WeeklyQuota(7, reset)
+            self.assertEqual(nav(), {"level": "none", "name": ""})
+            quotas["claude1"] = accounts.WeeklyQuota(5, reset)
+            self.assertEqual(nav(), {"level": "urgent", "name": "Urgent: 5% left"})
+            self.assertEqual(clear("claude1", "urgent", reset), 200)
+            quotas["codex1"] = accounts.WeeklyQuota(7, reset + timedelta(days=7))
+            self.assertEqual(nav(), {"level": "warning", "name": "Warning: 7% left"})
+
+            next_reset = reset + timedelta(days=7)
+            self.assertEqual(clear("codex1", "warning", next_reset), 200)
+            for observed_reset in (accounts.StatusUnavailable(), next_reset):
+                with self.subTest(reset_read=isinstance(observed_reset, datetime)):
+                    quotas["codex1"] = accounts.WeeklyQuota(4, observed_reset)
+                    if not isinstance(observed_reset, datetime):
+                        self.assertEqual(nav(), {"level": "urgent", "name": "Urgent: 4% left"})
+                        self.assertEqual(clear("codex1", "urgent", None), 200)
+                        self.assertEqual(json.loads(state.read_text())["codex1"]["reset"], next_reset.isoformat())
+                    self.assertEqual(nav(), {"level": "none", "name": ""})
+
+            for contents in (b"{", b"[]", b'{"codex1":{"level":"urgent","reset":"invalid"}}'):
+                with self.subTest(contents=contents):
+                    _ = state.write_bytes(contents)
+                    reply = self.request(path)
+                    self.assertEqual(reply.status, 200)
+                    self.assertEqual(json.loads(reply.body), {
+                        "available": True, "count": 0, "entries": [],
+                        "accounts_quota": {"level": "none", "name": ""},
+                    })
+                    form = urlencode({"quota_account": "codex1", "quota_level": "urgent",
+                                      "quota_reset": next_reset.isoformat()})
+                    code, body = self.post(accounts_page.PAGE_PATH, form)
+                    self.assertEqual(code, 503)
+                    self.assertEqual(json.loads(body), {"reason": f"Invalid quota clear state in {state}."})
+                    self.assertEqual(state.read_bytes(), contents)
 
     def test_accounts_post_saves_and_clears_a_producers_next_move(self) -> None:
         from scripts.accounts import accounts, next_moves
@@ -2656,8 +2923,9 @@ class ServerStartupTests(unittest.TestCase):
         store.mkdir()
         keeper = staff.StaffId(str(uuid4()))
         producer = staff.StaffRow(keeper, "producer", "morty", staff.StaffRoot(), current_session=keeper)
-        _ = (store / "staff.json").write_text(json.dumps({"schema": 2, "rows": [producer.to_json()]}))
-        with patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(store / "records")}):
+        staff_file = store / "staff.json"
+        _ = staff_file.write_text(json.dumps({"schema": 2, "rows": [producer.to_json()]}))
+        with patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(store / "records"), "STAFF_FILE": str(staff_file)}):
             item = the_list.add(keeper, "Private List item", owner=the_list.UnassignedOwner.NATE,
                                 source="morty", changes={})
 
