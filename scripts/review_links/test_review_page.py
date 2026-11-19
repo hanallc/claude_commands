@@ -59,7 +59,7 @@ def unpack_index(payload: str) -> list[review_page.ReviewIndexEntry]:
         key, item_id, kind, owner_ref, source_ref, title, state, filed, updated, hidden_until, urgency = fields
         owner, source = names[int(owner_ref)], names[int(source_ref)]
         entry = review_page.ReviewIndexEntry(key=str(key), id=str(item_id or key),
-            type=tuple(review_items.ReviewType)[int(kind)], owner=owner[0], sourceOwner=source[0],
+            type=review_page.WIRE_TYPES[int(kind)], owner=owner[0], sourceOwner=source[0],
             ownerName=owner[1], sourceName=source[1], title=str(title), state=review_page.INDEX_STATES[int(state)],
             filed=int(filed), updated=str(updated), hiddenUntil=float(hidden_until), urgency=str(urgency or 'normal'),
             ownerHtml=owner[2], sourceHtml=source[2])
@@ -67,6 +67,8 @@ def unpack_index(payload: str) -> list[review_page.ReviewIndexEntry]:
             entry['handoff'] = (handoff[0], handoff[1])
         if len(row) > 12 and isinstance(why := row[12], str):
             entry['waitingWhy'] = why
+        if len(row) > 13 and row[13] is True:
+            entry['type'] = review_items.ReviewType.RESPONSE
         entries.append(entry)
     return entries
 
@@ -238,6 +240,110 @@ class ReviewPageTests(unittest.TestCase):
         open_keys = {item.key for item in review_items.read_open(self.root)}
         self.assertTrue({item.key for item in published} <= open_keys)
         self.assertEqual(review_items.investigations(self.fixture.production, staff.snapshot()), 2)
+        reopened = review_page.build_snapshot(self.root)
+        self.assertEqual([reopened.records[created.key].type for created in published],
+                         [review_items.ReviewType.RESPONSE, *[case[2] for case in cases[1:]]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_old_review_tab_refreshes_a_response_as_a_question(self) -> None:
+        owner = self.ready_submission_recipient()
+        request = self.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id)
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        created = cache.create_submission(request)
+        before = cache.get().render(show='all').decode()
+        self.assertTrue(review_submissions.answer(created.saved.key, 'Use the wide layout.', created.saved.reply_token))
+        fresh = review_page.build_snapshot(self.root)
+        self.assertEqual(fresh.records[created.key].type, review_items.ReviewType.RESPONSE)
+
+        source = subprocess.check_output(
+            ['git', 'show', 'eb6e3239d:scripts/review_links/review_page.py'],
+            cwd=Path(__file__).resolve().parents[2], text=True)
+        start = '(reviewPlace => {'
+        shared_script = review_page.SCRIPT.split(start, 1)[0]
+        old_script = start + source.split("r'''"+start, 1)[1].rsplit("''')", 1)[0]
+        markup = before.replace(review_page.SCRIPT, shared_script+old_script, 1)
+        markup = re.sub(r'<button id="review-type-response"[^>]*>.*?</button>', '', markup, count=1)
+        setup = r'''<script>
+const nextReview=SNAPSHOT, responseKey=KEY, nativeFetch=fetch;
+window.fetch=(url,options)=>{
+ const params=new URL(url,location.href).searchParams;
+ if(params.has('index') || (params.has('version') && !params.has('body')))
+  return Promise.resolve(Response.json(nextReview));
+ return nativeFetch(url,options);
+};
+</script>'''.replace('SNAPSHOT', fresh.index_response().decode()).replace('KEY', json.dumps(created.key))
+        probe = r'''<script>(async()=>{
+ const review=document.querySelector('[data-review]'), failures=[];
+ const row=()=>review.querySelector('[data-key="'+CSS.escape(responseKey)+'"]');
+ const questions=review.querySelector('[data-type-chip="question"]');
+ questions.click();
+ review.querySelector('[data-show-chip="all"]').click();
+ if(row()?.dataset.state!=='Waiting') failures.push('The old tab shows the Waiting Question.');
+ const refreshed=new Promise(resolve=>review.addEventListener('review-refreshed',resolve,{once:true}));
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await refreshed;
+ if(review.dataset.version!==nextReview.version || row()?.dataset.state!=='Open' || row()?.dataset.type!=='question')
+  failures.push('The old tab refreshes the Response as an Open Question.');
+ if(questions.getAttribute('aria-pressed')!=='true') failures.push('The old tab keeps the Questions filter.');
+ await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        markup = markup.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_response_card_hides_validating_and_keeps_the_filters_on_submit(self) -> None:
+        owner = self.ready_submission_recipient()
+        request = replace(self.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                          words='Which layout should I use?')
+        saved = review_submissions.submit(request)
+        self.assertTrue(review_submissions.answer(saved.key, 'Use the wide layout.', saved.reply_token))
+        source = browser_markup(self.root)
+        for action, state in (('read', 'Done'), ('question', 'Waiting')):
+            with self.subTest(action=action):
+                self.check_card_motion(source, 'const action='+json.dumps(action)+',state='+json.dumps(state)+r""";
+ const chip=(name,value)=>document.querySelector('[data-'+name+'-chip="'+value+'"]');
+ const selected=name=>document.querySelector('[data-'+name+'-chip][aria-pressed="true"]');
+ chip('show','Validating').click();
+ const responses=chip('type','response');responses.click();
+ check(responses.previousElementSibling===chip('type','question') &&
+  responses.nextElementSibling===chip('type','change') && responses.textContent.trim()==='Responses 1',
+  'Responses has a count between Questions and Changes.');
+ check(chip('show','Validating').hidden && !chip('show','Done') && selected('show')===chip('show','open'),
+  'Responses uses Open when Validating was selected.');
+ const row=rows().find(item=>item.dataset.type==='response');
+ chip('owner',row.dataset.owner).click();
+ chip('show','all').click();
+ const words=document.querySelector('#list-search');
+ words.value='which layout';words.dispatchEvent(new Event('input',{bubbles:true}));
+ document.querySelector('[data-sort="3"]').click();
+ const place=()=>{const params=new URLSearchParams(location.hash.slice(1));params.delete('item');return params.toString();};
+ const form=await openCard(rows().find(item=>item.dataset.key===row.dataset.key));
+ const before=place(),card=form.closest('.review-panel');
+ check(card.querySelector('[data-review-body]').textContent.includes('Which layout should I use?') &&
+  card.querySelector('.response-answer h3').textContent==='Answer from page-owner' &&
+  card.querySelector('.response-answer time')?.dateTime &&
+  card.querySelector('.response-answer').textContent.includes('Use the wide layout.'),
+  'The Response shows the question, answer, owner and answer time.');
+ check(card.querySelector('.list-log').textContent.includes('Answered — page-owner') && !card.querySelector('.review-source'),
+  'The Response log names the owner.');
+ check([...form.querySelectorAll('.review-action-group')].map(group=>group.textContent.trim()).join('|')===
+  'Closes the itemGot it|Sends to page-ownerAsk a follow-up' && form.elements.feedback.labels[0].textContent==='Your words',
+  'The Response shows both labeled actions and Your words.');
+ check(form.elements.feedback.placeholder==='Type your words for Ask a follow-up.',
+  'The placeholder says which action sends the words.');
+ const panel=form.closest('[data-list-item]'),id=panelId(panel);
+ if(action==='question') form.elements.feedback.value='Can I use it on a phone?';
+ form.requestSubmit(form.querySelector('[value="'+action+'"]'));
+ const motion=copy(id)?.getAnimations()[0];
+ if(!motion || !posts.has(row.dataset.key)) throw new Error('The Response save must start the fade.');
+ posts.get(row.dataset.key)({ok:true,json:async()=>({answer:'saved',state,type:action==='read'?'response':'question',later:0})});
+ motion.finish();await frame();
+ check(postCount===1 && !rows().some(item=>item.dataset.type==='response'),
+  'The Response leaves the view after one submit.');
+ check(place()===before && selected('owner').dataset.ownerChip===row.dataset.owner &&
+  selected('type')===responses && selected('show')===chip('show','all') && words.value==='which layout',
+  'The Response submit keeps each filter and the sort.');
+""")
 
     def test_page_feedback_uses_the_native_review_reply_and_keeps_its_data(self) -> None:
         owner = self.ready_submission_recipient()
@@ -2535,6 +2641,9 @@ window.fetch=async(url,options)=>{
         _ = self.investigation()
         _ = investigation.file(self.fixture.unit.id, 'Check the build', 'Which step stopped?',
                                waiting_why='The owner checks the build.', kind=investigation.InvestigationKind.BUG)
+        owner = self.ready_submission_recipient()
+        sent = review_submissions.submit(self.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id))
+        self.assertTrue(review_submissions.answer(sent.key, 'Use the wide layout.', sent.reply_token))
         examples = {item.type: item for item in review_items.read(self.root)}
         owners = {fixture_member('showrunner', name=name).id: name
                   for name in ('natedev', 'second-owner', 'third-owner')}
@@ -2543,7 +2652,8 @@ window.fetch=async(url,options)=>{
         for owner_index, owner in enumerate(owners):
             for type_index, kind in enumerate(review_items.REVIEW_TYPES):
                 active = state_type.VALIDATING if kind == review_items.ReviewType.CHANGE else state_type.WAITING
-                states = (state_type.OPEN, active, state_type.DONE)
+                states = ((state_type.OPEN, state_type.DONE) if kind == review_items.ReviewType.RESPONSE
+                          else (state_type.OPEN, active, state_type.DONE))
                 record_states = list(states)
                 for offset in range(owner_index + type_index):
                     record_states.append(states[(type_index + offset) % len(states)])
@@ -2615,8 +2725,10 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
   changeShow('Validating');checkCounts('Validating','change');
   check(counts()!==allStates,'Show alone changes the Owner counts for Changes.');
   for(const [show,types] of Object.entries(expected)){
+   if(show==='Validating' && selected('type')==='response') chip('type','').click();
    if(selected('show')!==show) changeShow(show);
    for(const type of Object.keys(types)){
+    if(show==='Validating' && type==='response') continue;
     chip('type',type).click();
     checkCounts(show,type);
    }

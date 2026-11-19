@@ -47,7 +47,7 @@ from scripts.production import change_review, change_routing, investigation, nex
 from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
-from scripts.review_links import new_item_dialog, page_frame, page_question, review_submissions
+from scripts.review_links import new_item_dialog, page_frame, page_question, question_record, review_submissions
 from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, review_actions, review_later, review_page, review_items, serve, test_review_page
 from scripts.lib import atomic_file, conf, file_lock, scratch
 from scripts.feature_log import feature_log
@@ -1742,6 +1742,70 @@ class ReviewLinksServerTests(unittest.TestCase):
         assert isinstance(question, change_page.OpenQuestion)
         self.assertEqual(question.question_id, asked.question_id)
         self.assertTrue(change_page.answer_item(key, 'The layout changed.', asked.question_id, recovered))
+
+    def test_response_followup_uses_the_same_owner_and_got_it_closes_the_question(self) -> None:
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        request = case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id)
+        with (patch.object(self.server, 'review_cache', cache),
+              patch.object(self.server, 'delivery_status', case.status),
+              patch.object(change_page, 'send_to_staff') as send):
+            created = self.new_item_http(self.new_item_body(request), finished=True)
+            self.assertEqual(created.status, 200, created.body)
+            sent = cast(dict[str, str], json.loads(created.body))
+            key = sent['key']
+            waiting = cache.get().records[key]
+            self.assertEqual((waiting.type, waiting.state), (review_items.ReviewType.QUESTION,
+                                                            review_items.ReviewState.WAITING))
+            path = review_items.source_path(waiting)
+            initial = review_items.submission_origin(waiting)
+            assert isinstance(initial, new_item_dialog.ReviewSubmission)
+            reply_key = new_item_dialog.submission_key(request.kind, owner.id, sent['id'], request.request_id)
+            self.assertTrue(change_page.answer_item(reply_key, 'Use the wide layout.', initial.reply_token, case.status))
+            response, _ = cache.publish_record(cache.get(), key)
+            self.assertEqual(response.records[key].type, review_items.ReviewType.RESPONSE)
+            card_url = review_page.PAGE_PATH + '?' + urlencode({'body': key})
+            card = self.request(card_url)
+            self.assertEqual(card.status, 200, card.body)
+            self.assertIn(b'Use the wide layout.', card.body)
+            self.assertIn(b'Got it', card.body)
+
+            send.reset_mock()
+            followup = 'Can I use it on a phone?'
+            post = case.card_body(response, key, 'question', followup)
+            status, body = self.post(review_page.PAGE_PATH, post)
+            self.assertEqual(status, 200, body)
+            result = cast(dict[str, str], json.loads(body))
+            self.assertEqual((result['type'], result['state']), ('question', 'Waiting'))
+            send.assert_called_once_with(owner.id, change_page.SENDER, ANY)
+            message = cast(str, send.call_args.args[2])
+            self.assertIn(followup, message)
+            command = shlex.split(next(line for line in message.splitlines() if ' answer-question ' in line))
+            self.assertEqual(command[command.index('--item')+1], reply_key)
+            token = command[command.index('--question')+1]
+            self.assertNotEqual(token, initial.reply_token)
+            self.assertEqual(self.post(review_page.PAGE_PATH, post)[0], 409)
+            send.assert_called_once()
+            with self.assertRaises(question_record.AnswerRefused):
+                _ = change_page.answer_item(reply_key, 'Old reply.', initial.reply_token, case.status)
+
+            self.assertTrue(change_page.answer_item(reply_key, 'Yes, use the narrow layout.', token, case.status))
+            self.assertFalse(change_page.answer_item(reply_key, 'Yes, use the narrow layout.', token, case.status))
+            returned, _ = cache.publish_record(cache.get(), key)
+            self.assertEqual(self.post(review_page.PAGE_PATH, post)[0], 409)
+            self.assertEqual(returned.records[key].type, review_items.ReviewType.RESPONSE)
+            self.assertEqual(review_items.source_path(returned.records[key]), path)
+            self.assertIn(b'Yes, use the narrow layout.', self.request(card_url).body)
+            self.assertEqual([record.path for record in update_registration.question_records_for_owner(owner.id)], [path])
+
+            status, body = self.post(review_page.PAGE_PATH, case.card_body(returned, key, 'read'))
+            self.assertEqual(status, 200, body)
+            self.assertEqual(cast(dict[str, str], json.loads(body))['state'], 'Done')
+            self.assertNotIn(key, cache.get().records)
+            self.assertEqual(update_registration.read_review_question(path, owner.id).status, 'closed')
+            self.assertEqual(self.request(card_url).status, 404)
+            send.assert_called_once()
 
     def test_review_waits_for_directory_sync_and_list_commit_before_feature_closeout(self) -> None:
         case = self.review_fixture(changes=1, feature_project=True)
