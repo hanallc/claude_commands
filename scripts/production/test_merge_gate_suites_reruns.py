@@ -182,6 +182,7 @@ class MergeGateRerunsTests(GateSuitesFixture):
             return result
 
         with mock.patch.dict(os.environ, self.environment), \
+                mock.patch.object(merge_gate, "RunningGateJob", wraps=merge_gate.RunningGateJob) as construct_job, \
                 mock.patch.object(merge_gate, "finish_gate_job", side_effect=record_finish), redirect_stdout(output):
             run = merge_gate.run_suites(self.checkout, type_dirs=("scripts/production",))
         report = output.getvalue()
@@ -229,6 +230,8 @@ class MergeGateRerunsTests(GateSuitesFixture):
         for command in commands[-2:]:
             self.assertEqual(commands.count(command), 2)
         self.assertEqual(sum(Path(command[0]).name == "basedpyright" for command in commands), 1)
+        self.assertEqual({call.kwargs.get("scope") for call in construct_job.call_args_list},
+                         {scope / unit.removeprefix("--unit=") for unit in units})
 
     def test_disabled_scope_skips_the_probe(self) -> None:
         self.environment["BUILDLOG_SCOPE"] = "0"
@@ -239,17 +242,39 @@ class MergeGateRerunsTests(GateSuitesFixture):
         self.assertFalse(any(call["tool"] == "systemd-run" for call in self.calls()))
         self.assertIn("Module scope skipped: BUILDLOG_SCOPE=0", output.getvalue())
 
-    def test_failed_scope_probe_refuses_before_tracked_work_starts(self) -> None:
-        self.environment["BUILDLOG_SCOPE"] = "1"
+    def fail_scope_probe(self, manager_exit: int) -> None:
+        _ = self.environment.pop("BUILDLOG_SCOPE", None)
         self.write(self.state / "scope-fails", "fail")
+        systemctl = self.bin / "systemctl"
+        self.write(systemctl, f'''#!/bin/sh
+[ "$*" = "--user show-environment" ] || exit 99
+touch "$MERGE_GATE_TEST_STATE/user-manager-queried"
+exit {manager_exit}
+''')
+        systemctl.chmod(0o755)
+
+    def test_failed_scope_probe_refuses_when_the_user_manager_answers(self) -> None:
+        self.fail_scope_probe(manager_exit=0)
         output = io.StringIO()
-        with mock.patch.dict(os.environ, self.environment), redirect_stdout(output), \
+        with mock.patch.dict(os.environ, self.environment, clear=True), redirect_stdout(output), \
                 self.assertRaisesRegex(GateRefused, "the systemd scope probe failed.*builds.slice"):
             _ = merge_gate.run_suites(self.checkout, type_dirs=("scripts/production",))
+        self.assertTrue((self.state / "user-manager-queried").exists())
         self.assertIn("probe failed (exit 1)", output.getvalue())
         self.assertEqual([call["args"][-1] for call in self.calls() if call["tool"] == "systemd-run"], ["true"])
         self.assertEqual(self.module_events(), [])
         self.assertFalse((self.state / "types-ran").exists())
+
+    def test_failed_scope_probe_runs_unscoped_without_a_user_manager(self) -> None:
+        self.fail_scope_probe(manager_exit=1)
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, self.environment, clear=True), redirect_stdout(output):
+            run = merge_gate.run_suites(self.checkout, type_dirs=("scripts/production",))
+        self.assertTrue((self.state / "user-manager-queried").exists())
+        self.assertTrue(run.passed, output.getvalue())
+        self.assertEqual([call["args"][-1] for call in self.calls() if call["tool"] == "systemd-run"], ["true"])
+        self.assertEqual(len(self.module_events()), 2 * self.module_count)
+        self.assertTrue((self.state / "types-ran").exists())
 
     @gate_suites(*FIXTURE_FOLDERS[:merge_gate.RERUN_LIMIT])
     def test_more_than_the_rerun_limit_keeps_all_first_failures(self) -> None:

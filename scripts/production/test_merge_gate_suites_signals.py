@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 from contextlib import ExitStack, redirect_stdout
+from dataclasses import replace
 import fcntl
 import io
 import json
@@ -249,31 +250,77 @@ sys.stdin.read(1)
         self.assertEqual(sidecar.with_name(build_folders.RECOVERY_MARKER).readlink(), record)
 
     def test_cpu_wait_repairs_the_last_slot_after_one_bounded_slice(self) -> None:
-        self.supply_jobserver(b"Q")
         with mock.patch.dict(os.environ, self.environment, clear=True), merge_gate.shared_cpu_pool() as pool:
             assert isinstance(pool, merge_gate.SharedCPUPool)
-            path = merge_gate.gate_run_directory(self.checkout) / "dead-reader.json"
-            recovery = merge_gate.GateRecovery(path, str(self.checkout), os.getpid(), "ended-owner")
-            recovery.tokens.append(recovery.token(pool.descriptor, b"", "acquiring", available=1))
-            recovery.save()
-            self.assertEqual(os.read(pool.descriptor, 1), b"Q")
             ready = select.select
             stop_seconds = admission_records.read_memory_config().program_stop_seconds
+            waits = 0
 
             def expire_slice(readers: list[int], writers: list[int], errors: list[int],
                              timeout: float | None = None) -> tuple[list[int], list[int], list[int]]:
+                nonlocal waits
                 if pool.blocking in readers:
+                    waits += 1
+                    self.assertEqual(waits, 1)
                     assert timeout is not None
                     self.assertGreater(timeout, 0)
                     self.assertLessEqual(timeout, stop_seconds)
                     return [], [], []
                 return ready(readers, writers, errors, timeout)
 
-            with mock.patch.object(select, "select", side_effect=expire_slice):
-                slot = pool.acquire()
-            self.assertEqual(slot.token, b"+")
-            self.assertFalse(path.exists())
-        self.assertEqual(self.jobserver_tokens(), b"+")
+            cases: tuple[tuple[Literal["acquiring", "returning"], bytes, int, bytes], ...] = (
+                ("acquiring", b"", 1, b"+"), ("returning", b"Q", 0, b"Q"))
+            for operation, value, available, expected in cases:
+                with self.subTest(operation=operation):
+                    waits = 0
+                    self.supply_jobserver(b"Q" if operation == "acquiring" else b"")
+                    path = merge_gate.gate_run_directory(self.checkout) / f"dead-{operation}.json"
+                    recovery = merge_gate.GateRecovery(path, str(self.checkout), os.getpid(), "ended-owner")
+                    recovery.tokens.append(recovery.token(pool.descriptor, value, operation, available=available))
+                    recovery.save()
+                    if operation == "acquiring":
+                        self.assertEqual(os.read(pool.descriptor, 1), b"Q")
+                    with mock.patch.object(select, "select", side_effect=expire_slice):
+                        slot = pool.acquire()
+                    self.assertEqual(slot.token, expected)
+                    self.assertFalse(path.exists())
+                    slot.release()
+                    self.assertEqual(self.jobserver_tokens(), expected)
+
+    def test_last_slot_repair_checks_fifo_identity_before_the_token_value(self) -> None:
+        other = self.root / "other-fifo"
+        os.mkfifo(other)
+        other_descriptor = os.open(other, os.O_RDWR | os.O_NONBLOCK)
+        self.addCleanup(os.close, other_descriptor)
+        with mock.patch.dict(os.environ, self.environment, clear=True), merge_gate.shared_cpu_pool() as pool:
+            assert isinstance(pool, merge_gate.SharedCPUPool)
+            directory = merge_gate.gate_run_directory(self.checkout)
+            valid = merge_gate.GateRecovery(directory / "valid.json", str(self.checkout),
+                                            os.getpid(), "ended-owner")
+            valid.tokens.append(valid.token(pool.descriptor, b"Q", "returning"))
+            invalid = merge_gate.GateRecovery(directory / "invalid.json", str(self.checkout),
+                                              os.getpid(), "ended-owner")
+            for same_fifo in (False, True):
+                with self.subTest(same_fifo=same_fifo):
+                    self.supply_jobserver(b"")
+                    valid.save()
+                    descriptor = pool.descriptor if same_fifo else other_descriptor
+                    token = invalid.token(descriptor, b"Q", "returning")
+                    invalid.tokens[:] = [replace(token, value="zz")]
+                    invalid.save()
+                    original = invalid.path.read_text()
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        merge_gate.recover_lost_fifo_token(pool.descriptor)
+                    self.assertEqual(invalid.path.read_text(), original)
+                    if same_fifo:
+                        self.assertTrue(valid.path.is_file())
+                        self.assertEqual(self.jobserver_tokens(), b"")
+                        self.assertIn("UNRESOLVED: invalid CPU slot value", output.getvalue())
+                        self.assertIn(str(invalid.path), output.getvalue())
+                    else:
+                        self.assertFalse(valid.path.exists())
+                        self.assertEqual(self.jobserver_tokens(), b"Q")
 
     def test_cpu_wait_retries_while_a_live_gate_holds_the_slot(self) -> None:
         self.supply_jobserver(b"Q")

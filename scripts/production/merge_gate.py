@@ -90,8 +90,8 @@ from scripts.build_queue import admission_records  # noqa: E402
 from scripts.build_queue import progress_profile
 from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E402
 from scripts.build_queue.queue_place import (  # noqa: E402
-    CleanupUnresolved, QueuePlace, QueuePlaceRefused, in_builds_slice, probe_scope_prefix,
-    queue_place, recoverable_tool_folder, stop_scope,
+    CleanupUnresolved, QueuePlace, QueuePlaceRefused, probe_scope_prefix, queue_place,
+    recoverable_tool_folder, stop_scope,
 )
 from scripts.lint import memory_admit
 
@@ -287,6 +287,13 @@ class RunningGateJob:
     memory_stopped: bool = False
     folder_cleanup: ExitStack = field(default_factory=ExitStack)
     scope: Path | None = None
+
+
+@dataclass(frozen=True)
+class ScopedGateCommand:
+    scope: Path
+    prefix: Sequence[str]
+    arguments: Sequence[str]
 
 
 @dataclass(frozen=True)
@@ -1137,14 +1144,29 @@ def recover_private_gate_runs(root: Path, repo: str) -> None:
             report_gate_recovery(folder, error)
 
 
-def read_gate_recovery(path: Path) -> GateRecovery | None:
+def read_gate_recovery(path: Path, *, fifo_identity: tuple[int, int] | None = None) -> GateRecovery | None:
     try:
-        data = cast(dict[str, object], json.loads(path.read_text()))
+        payload = cast(object, json.loads(path.read_text()))
     except FileNotFoundError:
         return
-    groups = cast(dict[str, str], data["groups"])
+    if not isinstance(payload, dict):
+        raise ValueError("the gate record must be an object")
+    data = cast(dict[str, object], payload)
+    raw_tokens = data["tokens"]
+    if not isinstance(raw_tokens, list):
+        raise ValueError("the gate token records must be a list")
+    token_rows: list[dict[str, object]] = []
+    for row in cast(list[object], raw_tokens):
+        if not isinstance(row, dict):
+            raise ValueError("the gate token record must be an object")
+        token_rows.append(cast(dict[str, object], row))
+    identities = [(token["device"], token["inode"]) for token in token_rows]
+    if any(type(device) is not int or type(inode) is not int for device, inode in identities):
+        raise ValueError("invalid FIFO device or inode in the gate token record")
+    if fifo_identity is not None and fifo_identity not in identities:
+        return None
     tokens: list[HeldGateToken] = []
-    for token in cast(list[dict[str, object]], data["tokens"]):
+    for token, (device, inode) in zip(token_rows, identities, strict=True):
         operation = token.get("operation", "held")
         value = token["value"]
         if operation not in ("acquiring", "held", "returning"):
@@ -1152,15 +1174,20 @@ def read_gate_recovery(path: Path) -> GateRecovery | None:
         pattern = "" if operation == "acquiring" else r"[0-9a-fA-F]{2}"
         if not isinstance(value, str) or re.fullmatch(pattern, value) is None:
             raise ValueError(f"invalid CPU slot value {value!r} for {operation}")
-        tokens.append(HeldGateToken(cast(str, token["path"]), cast(int, token["device"]),
-                                    cast(int, token["inode"]), value,
-                                    operation,
-                                    cast(int, token.get("available", 0))))
-    return GateRecovery(path, cast(str, data["repo"]), cast(int, data["pid"]), cast(str, data["start"]),
-                            {int(group): identity for group, identity in groups.items()},
-                            cast(list[str], data["folders"]), tokens, cast(str, data["rollback"]),
-                            cast(str, data["rollback_head"]), cast(str, data["rollback_source"]),
-                            scope=cast(str, data.get("scope", "")))
+        token_path, available = token["path"], token.get("available", 0)
+        if not isinstance(token_path, str) or type(available) is not int or available < 0:
+            raise ValueError("invalid CPU slot path or available byte count")
+        tokens.append(HeldGateToken(token_path, cast(int, device), cast(int, inode), value, operation, available))
+    pid, start = data["pid"], data["start"]
+    groups, folders, scope = data["groups"], data["folders"], data.get("scope", "")
+    if type(pid) is not int or not isinstance(start, str):
+        raise ValueError("invalid gate owner identity")
+    if not isinstance(groups, dict) or not isinstance(folders, list) or not isinstance(scope, str):
+        raise ValueError("invalid gate groups, folders, or scope")
+    return GateRecovery(path, cast(str, data["repo"]), pid, start,
+                        {int(group): identity for group, identity in cast(dict[str, str], groups).items()},
+                        cast(list[str], folders), tokens, cast(str, data["rollback"]),
+                        cast(str, data["rollback_head"]), cast(str, data["rollback_source"]), scope=scope)
 
 
 
@@ -1194,24 +1221,31 @@ def recover_gate_record(path: Path, repo: str, *, deadline: float = math.inf) ->
         ACTIVE_GATE_RECOVERY.reset(active)
 
 
-def fifo_holders(descriptor: int) -> list[tuple[GateRecovery, HeldGateToken]]:
+def fifo_holders(descriptor: int) -> list[tuple[GateRecovery, HeldGateToken]] | None:
     status = os.fstat(descriptor)
+    identity = status.st_dev, status.st_ino
     holders: list[tuple[GateRecovery, HeldGateToken]] = []
+    uncertain = False
     for directory in shared_gate_directories():
         for path in directory.glob("*.json"):
-            record = read_gate_recovery(path)
+            try:
+                record = read_gate_recovery(path, fifo_identity=identity)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                report_gate_recovery(path, error)
+                uncertain = True
+                continue
             if record is not None:
                 holders.extend((record, token) for token in record.tokens
-                               if (token.device, token.inode) == (status.st_dev, status.st_ino))
-    return holders
+                               if (token.device, token.inode) == identity)
+    return None if uncertain else holders
 
 
 def recover_lost_fifo_token(descriptor: int, *, deadline: float = math.inf) -> None:
-    """Restore the last slot when one dead reader owned the only available byte."""
+    """Restore the last slot when a dead gate left one interrupted operation."""
     if not stat.S_ISFIFO(os.fstat(descriptor).st_mode) or fifo_bytes(descriptor):
         return
     holders = fifo_holders(descriptor)
-    if len(holders) != 1:
+    if holders is None or len(holders) != 1:
         return
     record, _ = holders[0]
     try:
@@ -1225,17 +1259,19 @@ def recover_lost_fifo_token(descriptor: int, *, deadline: float = math.inf) -> N
             return
         with token_operation(descriptor, deadline=deadline):
             holders = fifo_holders(descriptor)
-            if fifo_bytes(descriptor) or len(holders) != 1:
+            if fifo_bytes(descriptor) or holders is None or len(holders) != 1:
                 return
             candidate, token = holders[0]
-            if (candidate.path != record.path or token.operation != "acquiring" or token.available != 1
+            if (candidate.path != record.path or token.operation == "held"
+                    or (token.operation == "acquiring" and token.available != 1)
                     or candidate.groups or candidate.folders or candidate.scope):
                 return
             owner = process_start(candidate.pid)
             if isinstance(owner, Unreadable) or isinstance(owner, Started) and owner.start == candidate.start:
                 return
-            # The private FIFO uses each byte as one slot and assigns no meaning to its value.
-            candidate.return_token(token, descriptor, recovering=True, recovered_value=b"+")
+            # An interrupted read has no saved byte. Each byte represents one slot.
+            value = b"+" if token.operation == "acquiring" else None
+            candidate.return_token(token, descriptor, recovering=True, recovered_value=value)
             if not (candidate.tokens or candidate.rollback):
                 candidate.path.unlink(missing_ok=True)
             print(f"Recovered a lost FIFO slot from {candidate.path}", flush=True)
@@ -1352,9 +1388,19 @@ def suite_scope_prefix() -> list[str]:
     if sys.platform != "linux":
         return []
     prefix = probe_scope_prefix()
-    if not prefix and (setting == "1" or Path("/run/systemd/system").is_dir() or in_builds_slice()):
+    if not prefix and user_manager_answers():
         raise GateRefused("the systemd scope probe failed to start a scope in builds.slice")
     return prefix
+
+
+def user_manager_answers() -> bool:
+    timeout = admission_records.read_memory_config().program_stop_seconds
+    try:
+        reply = subprocess.run(["systemctl", "--user", "show-environment"], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return reply.returncode == 0
 
 
 def publish_gate_scope(recovery: GateRecovery, reservation: QueuePlace, prefix: list[str]) -> list[str]:
@@ -1583,7 +1629,7 @@ def module_order(modules: Sequence[tuple[str, Path]], timings: dict[str, float],
                                              -timings.get(f"{item[0]}/{test_module_name(repo, *item)}", 0)))
 
 
-def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
+def start_gate_job(suite: str, path: Path, argv: Sequence[str] | ScopedGateCommand, repo: Path,
                    environment: dict[str, str], log: Path, *,
                    kind: GateJobKind = GateJobKind.TEST_MODULE) -> RunningGateJob:
     module = test_module_name(repo, suite, path)
@@ -1591,16 +1637,22 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     started = time.monotonic()
     started_at = time.time()
     recovery = ACTIVE_GATE_RECOVERY.get()
+    if isinstance(argv, ScopedGateCommand):
+        scope = argv.scope
+        arguments = [*argv.prefix[:-1], f"--unit={scope.name}", "--", *argv.arguments]
+    else:
+        scope = None
+        arguments = argv
 
     def register(process: subprocess.Popen[str]) -> RunningGateJob:
-        job = RunningGateJob(suite, path, process, started, started_at, output, log, module, kind=kind)
+        job = RunningGateJob(suite, path, process, started, started_at, output, log, module, kind=kind, scope=scope)
         if isinstance(recovery, GateRecovery) and recovery.register_job is not None:
             recovery.register_job(job)
         return job
 
     try:
         return start_recorded_gate_child(
-            [str(python_shim(repo)), "-c", SUITE_BOOTSTRAP, *argv], repo,
+            [str(python_shim(repo)), "-c", SUITE_BOOTSTRAP, *arguments], repo,
             stdout=output, stderr=subprocess.STDOUT, suite=True,
             environment={**environment, "MERGE_GATE_PARENT_PID": str(os.getpid())}, register=register)
     except BaseException:
@@ -2234,21 +2286,19 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                                        else test_module_environment(root, environment))
                     if request.kind is GateJobKind.TYPE_CHECK:
                         _ = job_environment.pop("BUILDLOG_LIVE_MEMORY_TRIPWIRE", None)
-                    argv = ([os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright"), "--pythonpath", str(types_python),
-                             *type_dirs]
-                            if request.kind is GateJobKind.TYPE_CHECK else
-                            [python, str(runner), str(path.parent), path.name])
-                    job_scope = None
+                    argv: list[str] | ScopedGateCommand = (
+                        [os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright"), "--pythonpath", str(types_python),
+                         *type_dirs] if request.kind is GateJobKind.TYPE_CHECK else
+                        [python, str(runner), str(path.parent), path.name])
                     if scope_prefix:
                         scope = Path(recovery.scope)
                         job_scope = scope / f"{scope.stem}-job{os.urandom(8).hex()}.scope"
-                        argv = [*scope_prefix[:-1], f"--unit={job_scope.name}", "--", *argv]
+                        argv = ScopedGateCommand(job_scope, scope_prefix, argv)
 
                     def register_job(job: RunningGateJob, cpu_slot: SharedCPUSlot | NoSharedCPU = slot) -> None:
                         nonlocal job_started
                         job.folder_cleanup = folder_cleanup
                         job.cpu_slot = cpu_slot
-                        job.scope = job_scope
                         running.append(job)
                         job_started = True
 
