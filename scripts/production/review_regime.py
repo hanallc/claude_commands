@@ -2,7 +2,7 @@
 """Track whether the extra review workers pay for themselves.
 
 Usage:
-  review_regime.py add --unit <unit> --plan <plan path> --phase <N> [--checkpoint <commit>]
+  review_regime.py add --unit <unit> --plan <plan path> --phase <N> --checkpoint <commit>
                        --regime before|trial|after
                        --started <ISO> --merged <ISO> --holds <K> --merge-defects <D>
                        [--ux-findings <N>] [--code-findings <N>] [--review-minutes <M>]
@@ -78,7 +78,7 @@ class Row:
     ux_repair_minutes: float | None
     note: str | None
     excluded: str | None
-    # Rows from callers that omit --checkpoint have no hash.
+    # Older rows can have no checkpoint.
     checkpoint: str | None
 
     def hours(self) -> float:
@@ -137,14 +137,12 @@ def add(arguments: argparse.Namespace) -> None:
         parsed = datetime.fromisoformat(moment)
         if parsed.tzinfo is None:
             raise SystemExit(f"review_regime: --{label} {moment!r} needs a UTC offset")
-    checkpoint_ref = cast(str | None, arguments.checkpoint)
-    checkpoint = None
-    if checkpoint_ref is not None:
-        resolved = subprocess.run(["git", "rev-parse", "--verify", "--end-of-options", f"{checkpoint_ref}^{{commit}}"],
-                                  capture_output=True, text=True, check=False)
-        if resolved.returncode:
-            raise SystemExit(f"review_regime: cannot resolve --checkpoint {checkpoint_ref!r}: {resolved.stderr.strip()}")
-        checkpoint = resolved.stdout.strip()
+    checkpoint_ref = cast(str, arguments.checkpoint)
+    resolved = subprocess.run(["git", "rev-parse", "--verify", "--end-of-options", f"{checkpoint_ref}^{{commit}}"],
+                              capture_output=True, text=True, check=False)
+    if resolved.returncode:
+        raise SystemExit(f"review_regime: cannot resolve --checkpoint {checkpoint_ref!r}: {resolved.stderr.strip()}")
+    checkpoint = resolved.stdout.strip()
     check_minutes = cast(float | None, arguments.ux_check_minutes)
     excluded = cast(str | None, arguments.excluded)
     if excluded is None and check_minutes == 0:
@@ -169,12 +167,9 @@ def add(arguments: argparse.Namespace) -> None:
     )
     if row.hours() < 0:
         raise SystemExit("review_regime: --merged is before --started")
+    identity = (row.unit, row.plan, row.phase, checkpoint)
     for existing in read_rows():
-        if (existing.unit, existing.plan, existing.phase) != (row.unit, row.plan, row.phase):
-            continue
-        if (row.checkpoint is None or existing.checkpoint == row.checkpoint
-                or (existing.checkpoint is None
-                    and datetime.fromisoformat(existing.started) == datetime.fromisoformat(row.started))):
+        if (existing.unit, existing.plan, existing.phase, existing.checkpoint) == identity:
             print(f"kept {row.unit} phase {row.phase} of {row.plan}: "
                   + f"a row exists from the merge at {existing.merged}; nothing added")
             return
@@ -263,7 +258,7 @@ def main() -> int:
     _ = adding.add_argument("--unit", required=True)
     _ = adding.add_argument("--plan", required=True, help="the unit's plan, as its production doc names it")
     _ = adding.add_argument("--phase", required=True)
-    _ = adding.add_argument("--checkpoint", help="the checkpoint commit in the current repository")
+    _ = adding.add_argument("--checkpoint", required=True, help="the checkpoint commit in the current repository")
     _ = adding.add_argument("--regime", choices=REGIMES, required=True)
     _ = adding.add_argument("--started", required=True)
     _ = adding.add_argument("--merged", required=True)

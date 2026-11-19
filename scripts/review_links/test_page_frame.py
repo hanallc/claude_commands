@@ -36,6 +36,13 @@ class PageStatusTests(unittest.TestCase):
                 self.assertIn('role="status" aria-live="off"', markup)
                 self.assertEqual(markup.count('data-status-icon='), 5)
                 self.assertIn('aria-live="polite" data-status-announcement', markup)
+        scripts = Path(__file__).resolve().parents[1]
+        for page, path in (('builds', 'build_queue/memory_live.html'),
+                           ('aws', 'aws_target/aws_prices.html'),
+                           ('disks', 'disks/disks.html')):
+            with self.subTest(page=page):
+                source = (scripts / path).read_text(encoding='utf-8')
+                self.assertEqual(page_frame.template(source, page.title(), page).count(page_frame.BUTTON_STATES), 1)
 
     def test_each_page_uses_the_same_states_and_retains_the_last_good_read(self) -> None:
         for page in ('accounts', 'aws', 'builds', 'disks', 'images', 'list', 'review'):
