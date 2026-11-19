@@ -5,6 +5,7 @@ from pathlib import Path
 from contextlib import AbstractContextManager
 
 import io
+import os
 import subprocess
 import sys
 import time
@@ -68,6 +69,18 @@ class StaffOperationTests(StaffTestCase):
                 _ = holder.communicate(timeout=3)
         with staff.operation():
             self.assertTrue(staff.operation_fds())
+
+        with self.subTest(lock="row"):
+            contender = ("from scripts.production import staff; "
+                         "raise SystemExit(staff.cli_result(lambda: "
+                         "staff.slot_operation('busy', 'busy').__enter__()))")
+            with mock.patch.object(sys, "argv", ["staff.py", "move", "busy worker"]), staff.slot_operation("busy", "busy"):
+                refused = subprocess.run([str(CHECKOUT / "scripts/lib/py"), "-c", contender], cwd=CHECKOUT,
+                                         env=staff.child_environment(os.environ), capture_output=True,
+                                         text=True, check=False, timeout=3)
+            self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+            self.assertIn(f"busy: another operation holds this row (pid {os.getpid()}: staff.py move 'busy worker')",
+                          refused.stderr)
 
 
     def test_row_transaction_stops_at_the_operation_deadline_without_a_write(self) -> None:

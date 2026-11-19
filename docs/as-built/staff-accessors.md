@@ -106,6 +106,9 @@ Its [admission boundary](long-lived-workers.md#staff-identity-and-admission) pub
 `set_worktree` compares an expected `PresentWorktree`, `RemovedWorktree`, or `WorktreeUnfilled` under the staff lock.
 The comparison includes the machine and path when present.
 A row lock protects one member during a worker change.
+The process that takes the lock records its PID and command in the lock file.
+A joined child leaves that record intact.
+The busy-row error includes the PID and command when it can read the record.
 `staff.child_environment` removes inherited row-lock proofs and the staff ID before an agent starts.
 It also removes the [operation configuration](agent-registry.md#agent-environment-boundary).
 Staff lock and remote waits read `OPERATION_LOCK_SECONDS` and `REMOTE_SECONDS` from `config/staff.conf` at use.

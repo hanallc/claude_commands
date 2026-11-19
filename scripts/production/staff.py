@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import sys
 import time
 from collections.abc import Mapping, Callable, Generator, Sequence
@@ -21,7 +22,7 @@ from datetime import datetime
 from functools import cached_property
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Literal, NewType, Protocol, Self, TypeVar, cast
+from typing import TYPE_CHECKING, ClassVar, IO, Literal, NewType, Protocol, Self, TypeVar, cast
 from uuid import UUID
 
 from scripts.lib import git_files
@@ -875,6 +876,28 @@ def row_operation(reference: str) -> Generator[None]:
         yield
 
 
+def _write_slot_holder(lock: IO[str]) -> None:
+    holder = {"pid": os.getpid(), "command": shlex.join(sys.argv)}
+    os.ftruncate(lock.fileno(), 0)
+    _ = lock.write(json.dumps(holder) + "\n")
+    lock.flush()
+
+
+def _slot_holder_suffix(lock: IO[str]) -> str:
+    try:
+        _ = lock.seek(0)
+        holder = cast(object, json.loads(lock.readline()))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(holder, dict):
+        return ""
+    record = cast(dict[str, object], holder)
+    pid, command = record.get("pid"), record.get("command")
+    if type(pid) is not int or pid <= 0 or not isinstance(command, str) or not command:
+        return ""
+    return f" (pid {pid}: {command})"
+
+
 @contextmanager
 def slot_operation(key: str, name: str) -> Generator[None]:
     """Lock a row or a named worker slot across inherited children."""
@@ -883,11 +906,12 @@ def slot_operation(key: str, name: str) -> Generator[None]:
         yield
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as lock:
+    with path.open("a+", encoding="utf-8") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise StaffRefused(f"{name}: another operation holds this row") from error
+            raise StaffRefused(f"{name}: another operation holds this row{_slot_holder_suffix(lock)}") from error
+        _write_slot_holder(lock)
         previous = os.environ.get(variable)
         os.environ[variable] = str(lock.fileno())
         try:
