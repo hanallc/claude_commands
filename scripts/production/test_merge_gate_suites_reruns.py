@@ -1,8 +1,6 @@
 """Merge gate suites contracts."""
 
 from __future__ import annotations
-from scripts.build_queue import queue_place
-
 import unittest
 import io
 import os
@@ -184,7 +182,6 @@ class MergeGateRerunsTests(GateSuitesFixture):
             return result
 
         with mock.patch.dict(os.environ, self.environment), \
-                mock.patch.object(queue_place, "in_builds_slice", return_value=False), \
                 mock.patch.object(merge_gate, "finish_gate_job", side_effect=record_finish), redirect_stdout(output):
             run = merge_gate.run_suites(self.checkout, type_dirs=("scripts/production",))
         report = output.getvalue()
@@ -211,37 +208,48 @@ class MergeGateRerunsTests(GateSuitesFixture):
                 self.assertEqual(timings[key], first.seconds)
                 self.assertEqual(history[key], [first.seconds])
         scopes = [call for call in self.calls() if call["tool"] == "systemd-run"]
-        self.assertEqual(len(scopes), self.module_count + 3)
+        self.assertEqual(len(scopes), self.module_count + 4)
         flags = ["--user", "--scope", "--quiet", "--collect", "--expand-environment=no"]
         self.assertEqual(scopes[0]["args"], [*flags, "--slice=builds.slice", "--", "true"])
         [scope] = reservation_scopes
         self.assertEqual(scope.parent, Path(self.environment["BUILDLOG_BUILDS_CGROUP"]))
         self.assertRegex(scope.name, r"^builds-gate[0-9a-f]{16}\.slice$")
-        module_flags = [*flags, f"--slice={scope.name}", "--"]
+        job_flags = [*flags, f"--slice={scope.name}"]
+        units: set[str] = set()
+        commands: list[list[str]] = []
         for call in scopes[1:]:
-            self.assertEqual(call["args"][:len(module_flags)], module_flags)
-        for call in scopes[-2:]:
-            self.assertEqual(sum(previous["args"] == call["args"] for previous in scopes), 2)
-        self.assertFalse(any("basedpyright" in " ".join(call["args"]) for call in scopes))
+            args = call["args"]
+            self.assertEqual(args[:len(job_flags)], job_flags)
+            unit, separator, *command = args[len(job_flags):]
+            self.assertRegex(unit, rf"^--unit={scope.stem}-job[0-9a-f]{{16}}\.scope$")
+            self.assertNotIn(unit, units)
+            self.assertEqual(separator, "--")
+            units.add(unit)
+            commands.append(command)
+        for command in commands[-2:]:
+            self.assertEqual(commands.count(command), 2)
+        self.assertEqual(sum(Path(command[0]).name == "basedpyright" for command in commands), 1)
 
-    def test_scope_skips_disabled_failed_probe_and_existing_builds_slice(self) -> None:
-        for reason in ("disabled", "probe", "existing"):
-            with self.subTest(reason=reason):
-                self.environment["MERGE_GATE_PASSED_DIR"] = str(self.state / ("passes-" + reason))
-                self.environment["BUILDLOG_SCOPE"] = "0" if reason == "disabled" else "1"
-                self.write(self.state / "scope-fails", "fail")
-                (self.state / "tools.jsonl").unlink(missing_ok=True)
-                output = io.StringIO()
-                with mock.patch.dict(os.environ, self.environment), \
-                        mock.patch.object(queue_place, "in_builds_slice", return_value=reason == "existing"), \
-                        redirect_stdout(output):
-                    run = merge_gate.run_suites(self.checkout)
-                self.assertTrue(run.passed, output.getvalue())
-                scopes = [call for call in self.calls() if call["tool"] == "systemd-run"]
-                self.assertEqual([call["args"][-1] for call in scopes], ["true"] if reason == "probe" else [])
-                message = {"disabled": "BUILDLOG_SCOPE=0", "probe": "probe failed (exit 1)",
-                           "existing": "gate already runs in builds.slice"}[reason]
-                self.assertIn("Module scope skipped: " + message, output.getvalue())
+    def test_disabled_scope_skips_the_probe(self) -> None:
+        self.environment["BUILDLOG_SCOPE"] = "0"
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, self.environment), redirect_stdout(output):
+            run = merge_gate.run_suites(self.checkout)
+        self.assertTrue(run.passed, output.getvalue())
+        self.assertFalse(any(call["tool"] == "systemd-run" for call in self.calls()))
+        self.assertIn("Module scope skipped: BUILDLOG_SCOPE=0", output.getvalue())
+
+    def test_failed_scope_probe_refuses_before_tracked_work_starts(self) -> None:
+        self.environment["BUILDLOG_SCOPE"] = "1"
+        self.write(self.state / "scope-fails", "fail")
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, self.environment), redirect_stdout(output), \
+                self.assertRaisesRegex(GateRefused, "the systemd scope probe failed.*builds.slice"):
+            _ = merge_gate.run_suites(self.checkout, type_dirs=("scripts/production",))
+        self.assertIn("probe failed (exit 1)", output.getvalue())
+        self.assertEqual([call["args"][-1] for call in self.calls() if call["tool"] == "systemd-run"], ["true"])
+        self.assertEqual(self.module_events(), [])
+        self.assertFalse((self.state / "types-ran").exists())
 
     @gate_suites(*FIXTURE_FOLDERS[:merge_gate.RERUN_LIMIT])
     def test_more_than_the_rerun_limit_keeps_all_first_failures(self) -> None:

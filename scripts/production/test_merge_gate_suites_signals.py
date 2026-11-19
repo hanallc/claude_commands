@@ -15,12 +15,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Literal, cast, final
 from unittest import mock
 from scripts.build_queue import admission_records
 from scripts.build_queue.queue_place import QueuePlace
 from scripts.lib import build_folders
 from scripts.lib.process_group import send_process_group
+from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.production import merge_gate, merge_gate_suites_test_support
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.production.merge_gate_test_support import gate_suites
@@ -203,6 +205,33 @@ sys.stdin.read(1)
                             self.assertEqual(token["operation"], operation)
                             recovery.path.unlink()
 
+    def test_bad_slot_values_leave_their_records_and_allow_other_recovery(self) -> None:
+        self.supply_jobserver(b"Q")
+        with mock.patch.dict(os.environ, self.environment, clear=True), merge_gate.shared_cpu_pool() as pool:
+            assert isinstance(pool, merge_gate.SharedCPUPool)
+            directory = merge_gate.gate_run_directory(self.checkout)
+            valid = merge_gate.GateRecovery(directory / "valid.json", str(self.checkout),
+                                            os.getpid(), "ended-owner")
+            valid.tokens.append(valid.token(pool.descriptor, os.read(pool.descriptor, 1), "held"))
+            valid.save()
+            invalid: dict[Path, str] = {}
+            for index, value in enumerate(("zz", "", "5152")):
+                path = directory / f"invalid-{index}.json"
+                data = cast(dict[str, object], json.loads(valid.path.read_text()))
+                [token] = cast(list[dict[str, object]], data["tokens"])
+                token["value"] = value
+                invalid[path] = json.dumps(data)
+                self.write(path, invalid[path])
+            output = io.StringIO()
+            with redirect_stdout(output):
+                merge_gate.recover_gate_directory(directory, str(self.checkout))
+            self.assertFalse(valid.path.exists())
+            self.assertEqual(self.jobserver_tokens(), b"Q")
+            for path, original in invalid.items():
+                self.assertEqual(path.read_text(), original)
+                self.assertIn(f"Record: {path}", output.getvalue())
+            self.assertEqual(output.getvalue().count("UNRESOLVED: invalid CPU slot value"), len(invalid))
+
     def test_gate_scope_sidecar_names_the_slice_before_the_child_starts(self) -> None:
         sidecar = self.state / "gate.cgroup"
         sidecar.touch()
@@ -245,6 +274,57 @@ sys.stdin.read(1)
             self.assertEqual(slot.token, b"+")
             self.assertFalse(path.exists())
         self.assertEqual(self.jobserver_tokens(), b"+")
+
+    def test_cpu_wait_retries_while_a_live_gate_holds_the_slot(self) -> None:
+        self.supply_jobserver(b"Q")
+        with mock.patch.dict(os.environ, self.environment, clear=True), \
+                merge_gate.gate_recovery(self.checkout), merge_gate.shared_cpu_pool() as pool:
+            assert isinstance(pool, merge_gate.SharedCPUPool)
+            holder = pool.try_acquire()
+            assert isinstance(holder, merge_gate.SharedCPUSlot)
+            ready = select.select
+            waits = 0
+            stop_seconds = admission_records.read_memory_config().program_stop_seconds
+
+            def advance_wait(readers: list[int], writers: list[int], errors: list[int],
+                             timeout: float | None = None) -> tuple[list[int], list[int], list[int]]:
+                nonlocal waits
+                if pool.blocking in readers:
+                    waits += 1
+                    assert timeout is not None
+                    self.assertGreater(timeout, 0)
+                    self.assertLessEqual(timeout, stop_seconds)
+                    if waits < 3:
+                        return [], [], []
+                    self.assertEqual(waits, 3)
+                    holder.release()
+                return ready(readers, writers, errors, timeout)
+
+            with mock.patch.object(select, "select", side_effect=advance_wait):
+                slot = pool.acquire()
+            self.assertEqual(slot.token, b"Q")
+            self.assertEqual(waits, 3)
+        self.assertEqual(self.jobserver_tokens(), b"Q")
+
+    def test_start_barrier_expires_while_the_parent_holds_the_writer(self) -> None:
+        self.configure_gate("program_stop_seconds=0.25")
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            stop_seconds = admission_records.read_memory_config().program_stop_seconds
+        marker = self.state / "child-started"
+        reader, writer = os.pipe()
+        try:
+            began = time.monotonic()
+            result = subprocess.run([sys.executable, "-I", "-S", "-c", merge_gate.GATE_START_PERMISSION
+                                     + f"open({str(marker)!r}, 'w').close()\n"],
+                                    env={**self.environment, "MERGE_GATE_START_FD": str(reader),
+                                         "MERGE_GATE_START_SECONDS": str(stop_seconds)},
+                                    pass_fds=(reader,), timeout=stop_seconds + 1, check=False)
+            self.assertLessEqual(time.monotonic() - began, stop_seconds + 1)
+            self.assertEqual(result.returncode, 1)
+            self.assertFalse(marker.exists())
+        finally:
+            os.close(reader)
+            os.close(writer)
 
     def test_held_nested_lease_keeps_folders_and_slot_without_stopping_the_scan(self) -> None:
         self.supply_jobserver(b"Q")
@@ -496,78 +576,70 @@ merge_gate.start_gate_job = interrupt_after_start
     @gate_suites("hooks")
     def test_unresolved_module_cleanup_keeps_capacity_and_folders(self) -> None:
         self.supply_jobserver(b"Q")
-        self.write(self.state / "hold-module", "hold")
-        sidecar = self.state / "sidecar-path"
-        proof = self.state / "live-group-proof"
-        preamble = f"""from contextlib import contextmanager
-import json
-from scripts.direct.wait_for_test_state import wait_until
+        self.configure_gate("program_stop_seconds=1\nprogram_sample_seconds=0.05")
+        self.environment["BUILDLOG_SCOPE"] = "1"
+        processes = OwnedTestProcesses()
+        self.addCleanup(processes.finish)
+        environment = processes.environment(self.environment)
+        descendant = self.state / "detached-pid"
+        runner = self.state / "scope-runner.py"
+        self.write(runner, f"""import subprocess
+import sys
+from pathlib import Path
 
-reservation = merge_gate.gate_reservation
-reap = merge_gate.reap_gate_job
-send = merge_gate.process_group.send_process_group
-state = Path(os.environ["MERGE_GATE_TEST_STATE"])
-attempts = []
-held = None
+child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+Path({str(descendant)!r}).write_text(str(child.pid))
+""")
+        finish = merge_gate.finish_gate_job
+        send = os.kill
+        escaped = 0
+        began = 0.0
+        signals: list[int] = []
+        leaders: list[int] = []
 
-def record_job(job):
-    global held
-    if job.suite == "hooks":
-        wait_until((state / "module-held").exists, state, timeout={TEST_HANG_GUARD_SECS})
-        held = job.process.pid
-        job.process.returncode = 0
-    else:
-        reap(job)
+        def record_scope(job: merge_gate.RunningGateJob, status: int) -> merge_gate.GateJobResult:
+            nonlocal escaped, began
+            escaped = int(descendant.read_text())
+            self.assertEqual(os.getsid(escaped), escaped)
+            self.assertFalse(merge_gate.live_group(job.process.pid))
+            assert job.scope is not None
+            job.scope.mkdir(parents=True)
+            self.write(job.scope.parent / "cgroup.procs", "")
+            self.write(job.scope / "cgroup.procs", f"{escaped}\n")
+            leaders.append(job.process.pid)
+            began = time.monotonic()
+            return finish(job, status)
 
-def hold_fixture_group(pid, number):
-    if pid != held or number == 0:
-        send(pid, number)
+        def retain_fixture_member(pid: int, number: int) -> None:
+            if pid == escaped and number in (signal.SIGTERM, signal.SIGKILL):
+                signals.append(number)
+            else:
+                send(pid, number)
 
-def unresolved_finish(job, *, deadline=None):
-    assert job.process.pid == held and merge_gate.live_group(held)
-    attempts.append("finish" if deadline is None else "final")
-    raise merge_gate.GateRefused("UNRESOLVED: fixture module did not stop")
-
-@contextmanager
-def record_sidecar(*arguments, **options):
-    with reservation(*arguments, **options) as place:
-        Path({str(sidecar)!r}).write_text(str(place.sidecar))
-        try:
-            yield place
-        finally:
-            recovery = merge_gate.ACTIVE_GATE_RECOVERY.get()
-            record = json.loads(recovery.path.read_text())
-            assert record["groups"][str(held)]
-            assert merge_gate.live_group(held)
-            assert place.keep_reservation
-            assert all(Path(path).is_dir() for path in record["folders"])
-            assert [token["operation"] for token in record["tokens"]] == ["held"]
-            Path({str(proof)!r}).write_text(json.dumps(attempts))
-
-merge_gate.reap_gate_job = record_job
-merge_gate.process_group.send_process_group = hold_fixture_group
-merge_gate.kill_job_group = unresolved_finish
-merge_gate.gate_reservation = record_sidecar
-"""
-        try:
-            result = self.run_gate("--tests-only", own_process=True, preamble=preamble, type_dirs=())
-            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertIn("UNRESOLVED: fixture module did not stop", result.stderr)
-            self.assertEqual(json.loads(proof.read_text()), ["finish", "final"])
-            self.assertEqual(self.jobserver_tokens(), b"")
-            self.assertTrue(Path(sidecar.read_text()).is_file())
-            [path] = (self.state / "runner" / "active-runs").glob("*/*.json")
-            record = cast(dict[str, object], json.loads(path.read_text()))
-            folders = [Path(folder) for folder in cast(list[str], record["folders"])]
-            self.assertTrue(folders)
-            self.assertTrue(all(folder.is_dir() for folder in folders))
-        finally:
-            module = self.state / "module-held"
-            if module.exists():
-                try:
-                    send_process_group(int(module.read_text()), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(merge_gate, "module_runner", return_value=runner), \
+                mock.patch.object(merge_gate, "finish_gate_job", side_effect=record_scope), \
+                mock.patch.object(os, "kill", side_effect=retain_fixture_member):
+            stop_seconds = admission_records.read_memory_config().program_stop_seconds
+            with self.assertRaisesRegex(merge_gate.GateRecoveryUnresolved, "scope .* still has live processes"):
+                _ = merge_gate.run_suites(self.checkout)
+            self.assertLessEqual(time.monotonic() - began, stop_seconds + 1)
+        self.assertTrue(signals)
+        self.assertEqual(os.getsid(escaped), escaped)
+        self.assertEqual(self.jobserver_tokens(), b"")
+        [reservation] = self.admission.server.reservations.values()
+        [path] = (self.state / "runner" / "active-runs").glob("*/*.json")
+        record = cast(dict[str, object], json.loads(path.read_text()))
+        self.assertEqual(Path(reservation.sidecar).read_text().strip(), record["scope"])
+        [leader] = leaders
+        self.assertIn(str(leader), cast(dict[str, str], record["groups"]))
+        tokens = cast(list[dict[str, object]], record["tokens"])
+        self.assertEqual([token["operation"] for token in tokens], ["held"])
+        folders = cast(list[str], record["folders"])
+        self.assertTrue(folders)
+        self.assertTrue(all(Path(folder).is_dir() for folder in folders))
 
     @gate_suites("hooks", "lib")
     def test_stop_with_pending_modules_returns_owned_slot_and_reservation(self) -> None:

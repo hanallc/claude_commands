@@ -930,6 +930,25 @@ def scope_members(directory: Path) -> set[int]:
     return members
 
 
+def scope_populated(scope: Path) -> bool:
+    """Check for live processes in the scope and its descendants."""
+    events = scope / "cgroup.events"
+    check_memory_reading(events)
+    try:
+        lines = events.read_text().splitlines()
+    except FileNotFoundError:
+        return bool(scope_members(scope))
+    except OSError as error:
+        if error.errno != errno.ENODEV:
+            raise
+        return False
+    if "populated 1" in lines:
+        return True
+    if "populated 0" in lines:
+        return False
+    raise ValueError(f"{events} has no populated value")
+
+
 def process_memory(source: set[int] | PopulatedStepScope, proc: Path = PROC) -> MeasuredMemory:
     """Read swap-backed use from the scope or processes; retain resident bytes and swap."""
     if isinstance(source, PopulatedStepScope):
@@ -1028,18 +1047,8 @@ def reservation_lifetime(row: Reservation, owner_live: bool) -> StepLifetime:
             scope_name = ""
         if scope_name:
             scope = Path(scope_name)
-            # cgroup.events includes descendants of an empty slice root.
-            events = scope / "cgroup.events"
-            check_memory_reading(events)
-            try:
-                if "populated 1" in events.read_text().splitlines():
-                    return PopulatedStepScope(scope)
-            except FileNotFoundError:
-                if scope_members(scope):
-                    return PopulatedStepScope(scope)
-            except OSError as error:
-                if error.errno != errno.ENODEV:
-                    raise
+            if scope_populated(scope):
+                return PopulatedStepScope(scope)
     return LiveOwnerProcess() if owner_live else EndedStep()
 
 
