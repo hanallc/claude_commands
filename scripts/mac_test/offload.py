@@ -1389,9 +1389,14 @@ def mac_mirror_root() -> MacMirrorRoot:
     return conf.read("mac_test").value("mirror_root", MacMirrorRoot.parse)
 
 
+def legacy_mac_mirror(repository: KnownRepository) -> str:
+    """Return the mirror path after the caller selects the Mac layout."""
+    return f"{mac_mirror_root().relative}/{repository.legacy_mirror_name}"
+
+
 def remote_mirror(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
     if target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform):
-        return f"{mac_mirror_root().relative}/{repository.legacy_mirror_name}"
+        return legacy_mac_mirror(repository)
     if slot < 1:
         raise ValueError("slot must be positive")
     name = build_folders.repository_key_for(repository.policy_name, repository.key or repository.name)
@@ -1974,21 +1979,30 @@ def runner_values(config: OffloadConfig, target: str) -> dict[str, str]:
             'pinned_target': os.environ.get('BUILDLOG_PINNED_TARGET', '')}
 
 
+def has_custom_target(words: tuple[str, ...]) -> bool:
+    return any(word == "--target-dir" or word.startswith("--target-dir=") for word in words)
+
+
 def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repository: KnownRepository) -> str:
     """Trim the mirror budget before the run releases its lease."""
-    if any(word == "--target-dir" or word.startswith("--target-dir=") for word in request.nextest_words):
+    if has_custom_target(request.nextest_words):
         return "echo mac_cleanup=skipped"
     budget = config.values.get(f"mac_budget_gib.{repository.name}", config.default_target_budget_gib)
-    target = shlex.quote(mirror_target(repository, request.target, request.slot))
+    return remote_cleanup_script(remote_mirror(repository, request.target, request.slot), budget, config.free_floor_gib)
+
+
+def remote_cleanup_script(mirror: str, budget: str, free_floor_gib: float) -> str:
+    """Trim the output and report the disk floor result for one mirror."""
+    target = shlex.quote(f"{mirror}/target")
     program = (
         'import sys; from scripts.lint import sweep; from scripts.lib import conf; '
         'config = conf.read("lint"); '
         'sys.exit(sweep.sweep_workspace(sys.argv[1], config, False, '
         'config.number(sweep.RECENT_KEY)))'
     )
-    floor = shlex.quote(f"{config.free_floor_gib:g}")
+    floor = shlex.quote(f"{free_floor_gib:g}")
     return (
-        f'cd "$HOME"/{shlex.quote(remote_mirror(repository, request.target, request.slot))} && '
+        f'cd "$HOME"/{shlex.quote(mirror)} && '
         + 'trim_started=$(date +%s); '
         + f'if LINT_SWEEP_BUDGET_GIB={shlex.quote(budget)} "$HOME/.claude/scripts/lib/py" '
         + f'-B -c {shlex.quote(program)} "$HOME"/{target} >/dev/null 2>&1; then '
@@ -2044,14 +2058,16 @@ def remote_test_command(
         if isinstance(sent_tree_key, KnownTreeKey) else ""
     )
     repo_identity = f"BUILDLOG_REPO_IDENTITY={shlex.quote(repository.key)} " if repository.key else ""
-    target = shlex.quote(mirror_target(repository, request.target, request.slot))
-    custom_target = any(word == "--target-dir" or word.startswith("--target-dir=") for word in words)
+    mirror = legacy_mac_mirror(repository)
+    target = shlex.quote(f"{mirror}/target")
     if isinstance(request.fetch, FetchFolder):
         cleanup_command = "echo mac_cleanup=kept"
+    elif has_custom_target(request.nextest_words):
+        cleanup_command = "echo mac_cleanup=skipped"
     else:
-        cleanup_command = remote_cleanup_command(config, request, repository)
+        cleanup_command = remote_cleanup_script(mirror, budget, config.free_floor_gib)
     abandoned_sessions = ""
-    if not custom_target:
+    if not has_custom_target(words):
         abandoned_sessions = removal_script(f'"$HOME"/{target}', config.abandoned_session_minutes) + " && "
     forced_config = "LINT_CONFIG_FORCE=1 " if request.verb == "doc" else ""
     remove_folder = f"rm -rf -- {shlex.quote(request.fetch.value)} && " if isinstance(request.fetch, FetchFolder) else ""
@@ -2071,7 +2087,7 @@ def remote_test_command(
         report_status = f" || echo {MAC_NEXTTEST_SETUP_FAILURE}"
     runner = "run_nextest_logged " if capture else ""
     return (
-        f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
+        f"cd {shlex.quote(mirror)} && "
         f"{abandoned_sessions}{remove_folder}{clear_environment}{capture}{environment}"
         f'PATH="{MAC_CARGO_GATE_BIN}:$HOME/.cargo/bin:$PATH" '
         f"{mac_placement}"

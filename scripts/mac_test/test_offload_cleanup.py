@@ -14,15 +14,53 @@ import unittest
 from contextlib import redirect_stdout
 import io
 from pathlib import Path
-from typing import cast, override
+from typing import Literal, cast, override
 from unittest import mock
 from scripts.mac_test import eligibility, offload, mac_test, nextest_log
 from scripts.mac_test.offload_test_commands import (
-    ACTIVITY_SELECTOR_STUB, configure_nextest_trim, install_nextest_log_writer, write_shell,
+    ACTIVITY_SELECTOR_STUB, install_nextest_log_writer, write_shell,
 )
 from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
+from scripts.lib.checkout_test_support import fixture_shim_source
 from scripts.lib import conf, test_hang_guard
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+
+
+MAC_TARGET_CONFIG = "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+LINT_TRIM_CONFIG = """\
+# range: 0..
+recent_minutes=60
+# range: 0..
+sweep_doc_index_mib=250
+# whole: 1..
+sweep_max_tree_depth=3
+# whole: 1..
+sweep_floor_search_depth=8
+sweep_floor_skip=.git node_modules
+# whole: 1..
+sweep_discovery_workers=4
+# whole: 1..
+sweep_dep_info_head_bytes=4096
+"""
+
+TRIM_WITHOUT_PROC = """\
+import os
+import sys
+from functools import partial
+from scripts.lint import sweep
+
+# The Mac has no /proc. Use a private missing path on the test host.
+sweep.process_uses = partial(sweep.process_uses, proc=os.environ["CLEANUP_TEST_PROC"])
+exec(sys.argv.pop(1))
+"""
+
+
+def nextest_settings(tail_bytes: str = "65536", summary_bytes: str = "1024") -> str:
+    return f"""\
+# whole: 1..
+{nextest_log.TAIL_BYTES}={tail_bytes}
+# whole: 1..1024
+{nextest_log.SUMMARY_BYTES}={summary_bytes}
+"""
 
 
 class MacCleanupProtocolTests(unittest.TestCase):
@@ -124,16 +162,19 @@ class MacTargetCleanupShellTests(unittest.TestCase):
     mirror: Path = Path()
     temporary_directory: Path = Path()
     bin_directory: Path = Path()
-    configuration_environment: dict[str, str] = {}
-    python: Path = Path()
+    configuration: Path = Path()
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        configuration = self.root / "config"
-        environment = config_environment(configuration)
-        _ = write_config_fixture(configuration / "build_targets.conf", "platform.mac=macos\n")
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
+        self.configuration = self.root / "config"
+        self.configuration.mkdir()
+        _ = (self.configuration / "build_targets.conf").write_text(MAC_TARGET_CONFIG)
+        mac_settings = self.configuration / "mac_test.conf"
+        _ = mac_settings.write_text("mirror_root=~/.local/state/mac-test/mirror\n" + nextest_settings())
+        _ = (self.configuration / "lint.conf").write_text(LINT_TRIM_CONFIG)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.configuration)})))
+        _ = cast(object, self.enterContext(mock.patch.object(nextest_log, "DEFAULT_SETTINGS", mac_settings)))
         self.home_directory = self.root / "home with spaces"
         self.mirror = self.home_directory / offload.remote_mirror(eligibility.KnownRepository("hana's project"))
         self.mirror.mkdir(parents=True)
@@ -141,9 +182,31 @@ class MacTargetCleanupShellTests(unittest.TestCase):
         self.temporary_directory.mkdir()
         self.bin_directory = self.root / "bin"
         self.bin_directory.mkdir()
-        self.configuration_environment = config_environment(self.root / "configuration")
-        # Use the real log writer and stub the trim unless the test needs it.
-        self.python = install_nextest_log_writer(self.home_directory)
+        python = self.home_directory / ".claude/scripts/lib/py"
+        python.parent.mkdir(parents=True)
+        interpreter, _, body = fixture_shim_source().partition("\n")
+        launcher = r'''
+case ${2##*/} in
+    nextest_log.py)
+        [ "$1" = -B ] && [ "$3" = run ] || exit 99
+        shift 5
+        "$@"
+        printf 'mac_exit=%s\n' "$?"
+        exit 0
+        ;;
+    -c)
+        [ "$1" = -B ] || exit 99
+        if [ "$CLEANUP_TEST_TRIM" != run ]; then
+            exit "$CLEANUP_TEST_TRIM"
+        fi
+        shift 2
+        set -- -B -c ''' + shlex.quote(TRIM_WITHOUT_PROC) + r''' "$@"
+        ;;
+    *) exit 99 ;;
+esac
+'''
+        _ = python.write_text(interpreter + "\n" + launcher + body)
+        python.chmod(0o755)
         disk_space = self.bin_directory / "df"
         write_shell(disk_space, r'''
 json_args "$@" > "$CLEANUP_TEST_DIR/df-arguments.json"
@@ -177,16 +240,18 @@ exit "$CLEANUP_TEST_STATUS"
         abandoned_session_minutes: int = 7,
         budget_gib: str = "24",
         budget_values: tuple[tuple[str, str], ...] = (),
+        trim: int | Literal["run"] = 0,
     ) -> subprocess.CompletedProcess[str]:
         request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture-session")
         settings = self.root / "command-mac.conf"
-        _ = write_config_fixture(settings, "".join(f"{key}={value}\n" for key, value in budget_values),
-                                 template="mac_test")
+        overrides = dict(budget_values)
+        _ = settings.write_text(nextest_settings(overrides.get(nextest_log.TAIL_BYTES, "65536"),
+                                                overrides.get(nextest_log.SUMMARY_BYTES, "1024")))
         config = eligibility.OffloadConfig(
             enabled=True, connection=eligibility.SshConnectionSettings("unused-host", 6, 10), probe_timeout_s=1,
             unreachable_backoff_s=300, free_floor_gib=free_floor_gib,
             default_target_budget_gib=budget_gib,
-            values={"abandoned_session_minutes": str(abandoned_session_minutes), **dict(budget_values)},
+            values={"abandoned_session_minutes": str(abandoned_session_minutes), **overrides},
             settings=conf.read(settings),
         )
         text = (
@@ -195,12 +260,13 @@ exit "$CLEANUP_TEST_STATUS"
         )
         return subprocess.run(
             [*shell, "-c", text], cwd=self.home_directory,
-            env={**os.environ, **self.configuration_environment,
+            env={**os.environ,
                  "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib/python_startup"),
                  "HOME": str(self.home_directory), "TMPDIR": str(self.temporary_directory),
                  "PATH": str(self.bin_directory) + os.pathsep + os.environ["PATH"],
                  "CLEANUP_TEST_DIR": str(self.root), "CLEANUP_TEST_STATUS": str(status),
-                 "CLEANUP_TEST_DF_OUTPUT": disk_output, "CLEANUP_TEST_DF_STATUS": str(disk_status)},
+                 "CLEANUP_TEST_DF_OUTPUT": disk_output, "CLEANUP_TEST_DF_STATUS": str(disk_status),
+                 "CLEANUP_TEST_TRIM": str(trim), "CLEANUP_TEST_PROC": str(self.root / "mac-proc")},
             capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
@@ -213,6 +279,7 @@ exit "$CLEANUP_TEST_STATUS"
         return lines[:2] + lines[3:]
 
     def test_unusable_log_directory_refuses_setup_before_lint(self) -> None:
+        _ = install_nextest_log_writer(self.home_directory)
         path = self.home_directory / nextest_log.DIRECTORY
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text("a regular file blocks log setup")
@@ -224,13 +291,14 @@ exit "$CLEANUP_TEST_STATUS"
                 self.assertFalse((self.root / "lint-arguments.json").exists())
 
     def test_python_shim_start_failure_declines_but_child_status_is_preserved(self) -> None:
+        python = install_nextest_log_writer(self.home_directory)
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             for status in (75, 127):
                 with self.subTest(shell=shell, source="nextest", status=status):
                     answer = self.run_remote(shell, status, ("--target-dir=other-target",))
                     self.assertEqual(answer.stdout.splitlines()[-2:], [f"mac_exit={status}", "mac_cleanup=skipped"])
         (self.root / "lint-arguments.json").unlink()
-        write_shell(self.python, "exit 127\n")
+        write_shell(python, "exit 127\n")
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             with self.subTest(shell=shell, source="shim"):
                 answer = self.run_remote(shell, 42, ("--target-dir=other-target",))
@@ -238,6 +306,7 @@ exit "$CLEANUP_TEST_STATUS"
                 self.assertFalse((self.root / "lint-arguments.json").exists())
 
     def test_nextest_replays_success_and_retains_bounded_failure_output(self) -> None:
+        _ = install_nextest_log_writer(self.home_directory)
         summary = "     Summary [  0.1s] 1 test run: 1 failed, " + "detail " * 30
         fragment = "mac_exit=99\nlast output"
         output = "     Summary [  0.0s] 1 test run: 1 passed\n" + "\033[31m" + summary + "\033[0m\n"
@@ -384,7 +453,6 @@ exit 1
                         self.assertEqual(existing.read_text(), "keep\n")
                         self.assertEqual((target / "nextest-output").read_text(), "built\n")
 
-        configure_nextest_trim(self.python, "run")
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             for status in (0, 42):
                 for default_kib, repository_kib, trim in ((96, 0, True), (256, 96, True), (96, 256, False)):
@@ -404,7 +472,7 @@ exit 1
                         answer = self.run_remote(
                             shell, status, free_floor_gib=100,
                             disk_output="Filesystem GiB Used Available Capacity Mounted\nfixture 500 300 200 60% /\n",
-                            budget_gib=str(default_kib / 1024 ** 2), budget_values=overrides,
+                            budget_gib=str(default_kib / 1024 ** 2), budget_values=overrides, trim="run",
                         )
                         self.assertEqual((answer.returncode, answer.stderr), (0, ""), answer.stdout)
                         self.assertEqual(self.cleanup_lines(answer),
@@ -421,9 +489,9 @@ exit 1
                     target.mkdir()
                     retained = target / "unmatched-output"
                     _ = retained.write_bytes(os.urandom(128 * 1024))
-                    configure_nextest_trim(self.python, 9 if trim_fails else "run")
                     answer = self.run_remote(
                         shell, 42, budget_gib=str(96 / 1024 ** 2),
+                        trim=9 if trim_fails else "run",
                         disk_output=("Filesystem GiB Used Available Capacity Mounted\n"
                                      + f"fixture 500 300 {99 if trim_fails else 200} 60% /\n"),
                     )
@@ -498,10 +566,10 @@ class MacActivityShellTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         configuration = self.root / "config"
-        environment = config_environment(configuration)
-        _ = write_config_fixture(configuration / "build_targets.conf", "platform.mac=macos\n")
-        _ = write_config_fixture(configuration / "mac_test.conf", "mirror_root=~/.local/state/mac-test/test-mirror\n")
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
+        configuration.mkdir()
+        _ = (configuration / "build_targets.conf").write_text(MAC_TARGET_CONFIG)
+        _ = (configuration / "mac_test.conf").write_text("mirror_root=~/.local/state/mac-test/test-mirror\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         self.bin_directory = self.root / "bin"
         self.bin_directory.mkdir()
         for name in ("pgrep", "lsof", "ps", "id"):
