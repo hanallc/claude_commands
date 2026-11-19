@@ -3190,6 +3190,15 @@ Base: 44cy (the landing identity). Clone /session/queue/landhold, branch builds-
 **From 44dg closure pass 4, 2026-11-19.** Findings that are not a regression, broken function or failing test move here.
 1. F011 (minor): the Builds page reports the next start's memory need from a gate that is past its route-check deadline and that younger waiters now pass. A probe showed 9 GiB for the bypassed gate when the eligible gate needed 1 GiB. Exclude such gates when it selects the head for the report (memory_admit.py:2050, memory_feed.py:2222).
 
+### Phase 44di — Unused queue settings are gone  · status: todo
+**From builds, 2026-11-19 18:16 EST**, on the 44cz audit. User rule 11-19: prove no reader, then delete the key and its checks; no go needed. Base: 44cz (b14eaad58). Branch builds-queue-44di, clone /session/queue/settingdocs.
+1. Delete roots.mirror and roots.shell (config/build_folders.conf) and the hana_render.py:208 filter that names them.
+2. Delete loopback.probe_timeout_s (config/build_targets.conf).
+3. Delete patterns.gate, patterns.standing, patterns.target and patterns.shell-cache (config/build_folders.conf), their reader support, and any test that exists only for them.
+4. Before each delete, prove no reader with a repository search; name the search in the commit.
+5. build_folders.conf: resources edits it in item 143 track B. Whichever merges second merges the other first.
+Tests (after the hold): the config reader tests and the hana_render tests.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
