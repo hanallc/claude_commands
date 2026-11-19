@@ -2772,7 +2772,8 @@ Move the other `copies.standing` callers to the 44ax order with the same code: m
 
 **Work Order:** `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44bg/work_order.md`.
 
-### Phase 44bh — The Builds page splits "Other build tools"  · status: todo
+### Phase 44bh — The Builds page splits "Other build tools"  · status: moved to report
+**builds, 2026-11-18 22:20 EST:** report owns memory_live.html and memory_feed.py. This phase (#122) moves to report unstarted; queue holds no commits for it.
 **User, 2026-11-17 15:1x ("yes - make that change"):** the "Other build tools" row becomes "Python tests" (worker Python test runs in builds-detached.slice that never enter the queue) and "Waiting runs" (the wrapper processes of queued verify runs). After 44bb merges, because both change memory_feed.py and memory_live.html. Proof: one dark desktop image of the Build tools tooltip. Hash due 19:00 EST.
 
 ### Phase 44bi — A waiting verify run uses one Python process  · status: todo
