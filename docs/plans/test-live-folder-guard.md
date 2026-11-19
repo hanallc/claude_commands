@@ -44,7 +44,7 @@ Use a shared natedev launcher. Put the file guard after trusted setup and before
 6. Bind only the new leased folder writable.
 7. Remove capabilities and set `no_new_privs` before executing the command.
 8. Send output through pipes to the trusted parent.
-9. Release the folder when its owner and all test descendants exit.
+9. Release the folder only after the supervisor proves that the owner and all test descendants exited.
 
 Reuse `test_run_folder()` and the existing build folder leases. Use an explicit parent from the supervisor, inside the new writable mount.
 Keep `BUILDLOG_DIR`, the session fixture root, Python bytecode, and browser profiles inside the lease.
@@ -80,28 +80,63 @@ Verify nextest admission and token return through the queue route after Builds r
 
 ### Gate parent-death handoff
 
-Run the trusted launcher as the direct child of `start_gate_job()`. Keep the gate's host process and recovery group on this side of the namespace.
+Run the trusted launcher as a direct child of the gate. Keep the gate PID in trusted host setup.
 Set `PR_SET_PDEATHSIG` to `SIGKILL` in that child and then compare `getppid()` with the expected gate PID.
 Abort on a mismatch or a failed setup call. Exec the trusted `unshare` binary in the same process without a credential change.
 Use `unshare --fork --kill-child=SIGKILL` with its pidfd parent check to tie namespace PID 1 to the launcher.
-Use `--forward-signals` with a trusted PID 1 that handles cancellation. Exit PID 1 to remove all remaining descendants.
-Wait for the candidate command in PID 1 and return its status.
-Keep setup and recovery descriptors out of the candidate process. Restore the candidate command's signal defaults and mask before exec.
-Keep accounting and any request to the user manager on the host. Preserve the host job group for cancellation, recovery, and accounting.
-Register the launcher with the host scope without inserting a process between the gate and the launcher.
-Remove the Linux parent-death block from the candidate-side `SUITE_BOOTSTRAP`. The host gate PID has no meaning in that namespace.
-Keep the parent identity check in the trusted host child. The unshare pidfd check covers a launcher exit before PID 1 arms its death signal.
-[Gate bootstrap](../../scripts/production/merge_gate.py#L121), [Gate launch](../../scripts/production/merge_gate.py#L1086), [Gate cleanup](../../scripts/production/merge_gate.py#L1000), [Linux parent-death signal](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html), [PID namespaces](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html), [unshare source](https://github.com/util-linux/util-linux/blob/v2.42.2/sys-utils/unshare.c#L1092-L1184)
+The unshare pidfd check covers a launcher exit before PID 1 arms its death signal.
+
+Remove the inherited `MERGE_GATE_PARENT_PID` in the launcher before entering the namespace.
+Run the candidate command as a direct child of trusted PID 1.
+Set `MERGE_GATE_PARENT_PID=1` in the candidate environment before the first shim or interpreter starts.
+Remove the Linux parent-death block from the candidate-side `SUITE_BOOTSTRAP`.
+`sitecustomize.py` still uses the variable to skip startup folder allocation. The launcher already supplies a lease.
+`module_run.py` consumes the variable and watches a pidfd for namespace PID 1.
+The module runner still sets a parent-death signal for its own test child.
+PID 1 waits for the candidate command and returns its status. When PID 1 exits, the kernel stops all remaining namespace members.
+[Gate bootstrap](../../scripts/production/merge_gate.py#L121), [Gate launch](../../scripts/production/merge_gate.py#L1086), [Python startup](../../scripts/lib/python_startup/sitecustomize.py#L220), [Module runner](../../scripts/test_times/module_run.py#L610), [Linux parent-death signal](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html), [PID namespaces](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html), [unshare source](https://github.com/util-linux/util-linux/blob/v2.42.2/sys-utils/unshare.c#L1092-L1184)
+
+#### Cancellation
+
+The gate defers `SIGTERM` and `SIGINT` during spawn and registration. The launcher inherits that mask.
+In the launcher, restore the default dispositions and unblock both signals after the parent check and cgroup registration, before exec.
+Send cancellation directly from the gate to PID 1 through a pidfd.
+In PID 1, block both signals during setup. Install cancellation handlers, then unblock both signals before reporting readiness.
+Pass a pidfd for PID 1 to the gate over the private setup socket with `SCM_RIGHTS`.
+The gate must authorize candidate start after it receives the pidfd. If cancellation is pending, cancel the job before this authorization.
+If setup fails or does not complete before the deadline, stop the job through its cgroup.
+Start the candidate in its own process group. If cancellation arrives before the fork, PID 1 exits.
+If cancellation arrives during the fork, PID 1 records it and forwards the signal once the process group is ready.
+Forced cleanup covers all process groups.
+In the candidate child, restore default signal dispositions and set an empty signal mask before the first exec.
+Close setup and recovery descriptors before candidate exec.
+
+#### Lease release and recovery
+
+Use one host-owned cgroup v2 child per job under the build scope. Keep accounting and user manager requests on the host.
+Record its unique identity with the lease before launch. Keep the launcher blocked until the gate places it in the cgroup.
+Do not fork if the setup channel closes before placement. Keep the gate as the launcher's parent.
+Hide cgroup control files from the candidate. Keep the cgroup available after a gate crash until recovery confirms it is empty.
+On forced stop, write `1` to the recorded `cgroup.kill`. This reaches descendants that called `setsid()` or changed process groups.
+For normal exit, forced stop, and crash recovery, require `cgroup.events` to report `populated 0` before releasing the lease.
+This proves that PID 1 and all descendants exited. Reaping the host launcher alone cannot give this proof.
+Retain the lease and recovery record if the cgroup identity or empty state cannot be verified.
+Require the same proof in the folder sweeper, even if a crash closes the lease lock.
+Remove the cgroup after recording the proof. Refuse launch if the required cgroup controls are unavailable.
+[Gate recovery](../../scripts/production/merge_gate.py#L700), [Gate cleanup](../../scripts/production/merge_gate.py#L1000)
 
 The `start_gate_job()` proof is pending. Use separate fixture launches through that entry point after Builds releases the hold.
 
 | Case | Required result |
 | --- | --- |
 | Normal test module and type check | The candidate shim can write only to its lease. A wrong-root write in the shim fails. The gate receives the command status. |
+| Python startup and module runner | A host PID in the input environment never reaches either reader. Startup uses the supplied lease. The module runner watches namespace PID 1. |
 | Gate exits before the host child arms the death signal | The host parent check refuses to start candidate code. |
 | Host launcher exits between the namespace fork and the pidfd check | The namespace refuses to start candidate code. |
-| Gate exits after a fixture starts a descendant in a new process group | The launcher, namespace init, and descendant exit before recovery releases the lease. |
-| Gate timeout and cancellation | The gate reaps the host job and records its status. No descendant retains the lease. |
+| Gate exits or forces a stop after a fixture calls `setsid()` | Recovery waits for the cgroup to become empty after the launcher exits. The fixture process and PID 1 exit before lease release. |
+| `SIGTERM` and `SIGINT` during registration | Cancellation prevents candidate start. The gate keeps the lease until the cgroup is empty. |
+| `SIGTERM` and `SIGINT` after readiness | PID 1 handles both signals. The candidate starts with default dispositions and an empty mask. |
+| Gate timeout | The gate reaps the host job and records its status. The lease remains held until the cgroup is empty. |
 
 Represent a leased path as `PrivateTestFolder` after the launcher verifies its owner, mount, and lifetime.
 Return `ProtectedTestProcess` or `TestIsolationUnavailable`. Include the failed setup operation in `TestIsolationUnavailable`.
