@@ -95,7 +95,7 @@ background:var(--card);color:var(--ink);width:300px;max-width:100%;min-width:0;b
 .record-filter-row{display:grid;grid-template-columns:5rem minmax(0,1fr);align-items:baseline;gap:8px;margin-bottom:8px}
 .record-filter-row>span{color:var(--ink-2);font-size:13px}
 .record-filter-row>div{display:flex;flex-wrap:wrap;gap:6px}
-[data-filter-row] button,.list-expansion button{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:13px;min-height:36px;
+[data-filter-row] button{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:13px;min-height:36px;
 color:var(--ink);border:1px solid var(--line);border-radius:999px;background:var(--card);padding:4px 10px;margin:0}
 [data-filter-row] button[aria-pressed=true]{background:var(--filter-selected-bg);border-color:var(--filter-selected-bg);
 color:var(--filter-selected-ink)}
@@ -413,17 +413,18 @@ function readPlace(params,followingItemLink=false){
   if(!['owner','showrunner','show','q','sort','dir','type','source-owner',...filterNames].some(key=>params.has(key))){
    owner='';show='all';
    query='';type='';for(const name of filterNames) filters[name]='';}
-  if(options.single) opened.clear();opened.add(item);revealKey=item;
+  if(options.hasKey?.(item) ?? itemWithKey(item)){openCard(item);revealKey=item;}
  }
  const saved=followingItemLink ? null : history.state?.recordTable;
+ if(saved && (!options.mount || saved.top!==undefined)){
+  opened.clear();
+  const key=saved.opened.includes(item) ? item : saved.opened[0];
+  if(key) openCard(key);
+ }
  linkedItem=options.missingItem ? saved?.linkedItem ?? (
   !options.persistLinkedTarget || params.get('linked')==='1' ? item ?? '' : '') : '';
  const reveal=options.revealLinked && params.get('reveal')==='1';
  revealedLinkedItem=reveal || saved?.revealedLinkedItem===linkedItem ? linkedItem : '';
- if(saved && (!options.mount || saved.top!==undefined)){
-  opened.clear();
-  saved.opened.forEach(key=>opened.add(key));
- }
  owner=options.resolveOwner?.(owner) ?? owner;
  if(sharedWords()) words().value=query;
  return saved?.top;
@@ -727,8 +728,7 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
  linkedItem=options.missingItem ? key : '';
  if(target){
   if(keys.size) keys.add(key);
-  if(options.single) opened.clear();
-  opened.add(key);
+  openCard(key);
   const selection=currentSelection();
   if(!preserveFilters && !canRevealLinked(target,selection) && !matches(target,selection)){
    const unfiltered=currentSelection({owner:'',show:'all',query:'',type:'',sourceOwner:'',filters:{}});
@@ -763,18 +763,19 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
  highlightTimer=setTimeout(()=>row.removeAttribute('data-record-highlight'),1200);
  options.itemOpened?.(mountedTarget);
 }
-function setRowsExpanded(items,expanded){
- for(const item of items){
-  const key=item.dataset.key;
-  if(opened.has(key)===expanded) continue;
-  if(!expanded && key===linkedItem) linkedItem='';
-  if(expanded){
-   if(options.single) opened.clear();
-   opened.add(key);
-  }else opened.delete(key);
-  measured.delete(key);
- }
- apply(true,{animate:true});
+function openCard(key){
+ for(const previous of opened) measured.delete(previous);
+ opened.clear();
+ opened.add(key);
+ measured.delete(key);
+ if(linkedItem!==key){linkedItem='';revealedLinkedItem='';}
+}
+function closeCard(key,write=true){
+ const wasOpen=opened.delete(key);
+ if(linkedItem===key){linkedItem='';revealedLinkedItem='';}
+ else if(!wasOpen) return;
+ measured.delete(key);
+ if(write && location.hash===placeHash) writePlace();
 }
 function bind(){
  if(boundRoots.has(content)) return;boundRoots.add(content);
@@ -804,35 +805,22 @@ function bind(){
  content.addEventListener('click',event=>{
   const item=event.target.closest('.list-row')?.closest('[data-list-item]');if(!item) return;
   if(event.target.closest('a') || (event.target.closest('button') && !event.target.closest('.list-toggle'))) return;
-  const expanded=!opened.has(item.dataset.key);
-  setRowsExpanded([item],expanded);
+  const key=item.dataset.key,expanded=!opened.has(key);
+  if(expanded) openCard(key);else closeCard(key,false);
+  apply(true,{animate:true});
   if(expanded && !item.hidden) options.itemOpened?.(item);
  });
  content.querySelectorAll('[data-type-chip]').forEach(button=>button.addEventListener('click',()=>{
   type=button.dataset.typeChip;changeFilter();
  }));
 }
-return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,saveDeparturePlace,get linkedItem(){return linkedItem;},
+return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,followItemLink,saveDeparturePlace,get linkedItem(){return linkedItem;},
  revealMatchingItem(key){
   const target=itemWithKey(key);
   const selection=currentSelection({query:words().value.trim().toLowerCase()});
   if(!target || !matches(target,selection)) return false;
   jump(key,{preserveFilters:true});
   return true;
- },
- setShownExpanded(expanded){
-  const currentQuery=words().value;
-  if(query!==currentQuery){
-   query=currentQuery;
-   apply(false,{dismissMissingItem:true});
-  }
-  setRowsExpanded(content.querySelector('table').querySelectorAll('[data-list-item]:not([hidden])'),expanded);
- },
- closeCard(key){
-  const wasOpen=opened.delete(key);
-  if(linkedItem===key){linkedItem='';revealedLinkedItem='';}
-  else if(!wasOpen) return;
-  if(location.hash===placeHash) writePlace();
  },
  releaseLink(key){
   if(linkedItem!==key) return;
