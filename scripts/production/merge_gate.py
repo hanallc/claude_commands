@@ -36,7 +36,7 @@ except FileNotFoundError:
 
 import argparse
 from collections import deque
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, closing, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
@@ -76,7 +76,6 @@ from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
 )
 from scripts.direct.local_release_wait import local_release_waiter  # noqa: E402
-from scripts.build_targets import build_targets  # noqa: E402
 from scripts.build_hold import build_hold  # noqa: E402
 from scripts.buildlog import store  # noqa: E402
 from scripts.buildlog.store import host_name  # noqa: E402
@@ -101,10 +100,9 @@ UNRECORDED_MODULE_RESERVATION_MIB = 640
 DEFAULT_MODULE_TIME_LIMIT_S = 1800
 RERUN_LIMIT = 8
 RELEASE_LOCK_WAIT_S = 60
-# basedpyright resolves bpy (Blender's interpreter only) and PIL (a PEP 723 dependency) from this
-# type-check-only venv, so the full tree reports 0/0. The stub date matches the 2026-08-23 sweep;
-# later dates report new diagnostics in bake_textures.py.
-TYPECHECK_REQUIREMENTS = ("pillow==13.0.0", "fake-bpy-module==20260822")
+# basedpyright resolves bpy with these Blender stubs.
+# Later versions report diagnostics in bake_textures.py.
+TYPECHECK_REQUIREMENTS = ("fake-bpy-module==20260822",)
 NIGHTLY_TYPE_DIRS = ("scripts",)
 NIGHTLY_TYPE_DIAGNOSTIC_LINES = 20
 # An unrecorded type job keeps its own fallback; recorded jobs all use one margin.
@@ -499,7 +497,10 @@ class BuildHoldWait:
         try:
             directory = build_hold.holder_directory()
             holds = build_hold.natedev_holds(directory)
-            held = build_targets.caller_waits_on_hold(holds, directory)
+            # Load the hold check here to avoid the GPU routing import cycle.
+            caller_waits_on_hold = cast(Callable[[build_hold.NatedevHolds, Path], bool], getattr(
+                import_module("scripts.build_targets.build_targets"), "caller_waits_on_hold"))
+            held = caller_waits_on_hold(holds, directory)
         except (OSError, ValueError) as error:
             raise GateRefused(f"natedev hold state cannot be read: {error}") from error
         if held and not self.waiting:

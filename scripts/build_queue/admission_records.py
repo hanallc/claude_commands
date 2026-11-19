@@ -15,21 +15,46 @@ import sys
 from pathlib import Path
 
 
+from scripts.build_queue import execution_identity
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import placement
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
+from scripts.build_targets import target_config
 from scripts.build_targets.target_config import LocalRequired, StepRoute
 from scripts.buildlog import parse
 from scripts.lib import conf
-from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
+from scripts.lib.proc_text import read_proc_text
 from scripts.production.staff import StaffId
 from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as NoCallRecord,
                                    TestPhaseChargeUse as TestPhaseChargeUse)
 
 GIB = 1 << 30
 DIRECT_CARGO = LocalRequired("a direct cargo command runs where it starts")
+
+
+@dataclass(frozen=True)
+class UnregisteredTarget:
+    """The target name has no registration."""
+
+
+def effective_target(name: str, settings: placement.ProviderSettings, *,
+                     configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                     ) -> target_config.Target | UnregisteredTarget:
+    """Select the registered target with the settings supplied by the request."""
+    for target in target_config.read_targets(selected=name, purpose=target_config.RegistryRead.PLACEMENT,
+                                              configuration=configuration):
+        return ssh_target_settings(target, settings) if isinstance(target, target_config.SshTarget) else target
+    return UnregisteredTarget()
+
+
+def ssh_target_settings(target: target_config.SshTarget, settings: placement.ProviderSettings) -> target_config.SshTarget:
+    """Apply the settings supplied by the request to an SSH target."""
+    if isinstance(settings, placement.ExplicitProviderSettings):
+        return replace(target, settings=settings.path)
+    return target
 
 
 @dataclass(frozen=True)
@@ -41,6 +66,23 @@ class RefusalSettings:
 @dataclass(frozen=True)
 class NoRefusalSettings:
     """The report supplies no settings digest."""
+
+
+@dataclass(frozen=True)
+class RemoteStartHoldUnrecorded:
+    """The assignment has no recorded hold for a remote start."""
+
+
+@dataclass(frozen=True)
+class RemoteStartHold:
+    """Keep the local place until this deadline while a remote start is pending."""
+
+    deadline: float
+
+
+@dataclass(frozen=True)
+class RemoteStartHoldEnded:
+    """The remote assignment no longer keeps a place on natedev."""
 
 
 @dataclass(frozen=True)
@@ -56,6 +98,7 @@ class SavedPlacementAssignment:
     assigned_settings_generation: placement.AssignedSettingsGeneration | placement.UnknownAssignedSettingsGeneration = (
         placement.UnknownAssignedSettingsGeneration())
     refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
+    remote_start_hold: RemoteStartHold | RemoteStartHoldUnrecorded | RemoteStartHoldEnded = RemoteStartHoldUnrecorded()
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125
@@ -1017,7 +1060,7 @@ class RunningStep:
     started_at: float = 0.0
     unit: str = ""
     project: str = ""
-    execution: placement.ExecutionEvidence = placement.ExecutionNotStarted()
+    execution: execution_identity.ExecutionEvidence = execution_identity.ExecutionNotStarted()
     assignment_host: str = ""
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
@@ -1026,17 +1069,17 @@ class RunningStep:
 
 def execution_host(step: RunningStep, local_host: str) -> str:
     evidence = step.execution
-    if isinstance(evidence, placement.ObservedExecution):
+    if isinstance(evidence, execution_identity.ObservedExecution):
         identity = evidence.identity
-        return identity.host if isinstance(identity, placement.ProcessExecution) else identity.target
+        return identity.host if isinstance(identity, execution_identity.ProcessExecution) else identity.target
     return step.assignment_host or local_host
 
 
 def execution_group(step: RunningStep, fallback: str) -> str:
     evidence = step.execution
-    if isinstance(evidence, placement.ObservedExecution):
+    if isinstance(evidence, execution_identity.ObservedExecution):
         identity = evidence.identity
-        if isinstance(identity, placement.ProcessExecution):
+        if isinstance(identity, execution_identity.ProcessExecution):
             return repr((identity.host, identity.generation, identity.pid, identity.start_time))
         return repr((identity.target, identity.generation, identity.instance, identity.attempt))
     if step.assignment_host:
@@ -1212,6 +1255,8 @@ class QueueInputs:
     slots: tuple[RunSlot, ...] = field(default=(), kw_only=True)
     cargo_folders: dict[str, placement.CargoFolder] = field(default_factory=dict, kw_only=True)
     occupied_cargo_folders: frozenset[placement.CargoFolder] = field(default=frozenset(), kw_only=True)
+    pending_remote_starts: frozenset[str] = field(default=frozenset(), kw_only=True)
+    local_waits: dict[str, placement.EvidenceNeeded] = field(default_factory=dict, kw_only=True)
 
     def __post_init__(self) -> None:
         orders = {waiter_owner(row): (waiter_priority(row) if isinstance(row.get("order"), (PriorityUnit, NormalOrder))
@@ -1471,7 +1516,7 @@ test_threads = parse.test_threads
 
 def process_start_time(pid: int) -> str | None:
     try:
-        stat = (Path("/proc") / str(pid) / "stat").read_text()
+        stat = read_proc_text(Path("/proc") / str(pid) / "stat")
         fields = stat.rsplit(") ", 1)[1].split()
         return fields[19] if fields[0] not in ("Z", "X") else None
     except (OSError, IndexError):

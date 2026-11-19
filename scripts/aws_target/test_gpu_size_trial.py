@@ -12,6 +12,7 @@ import tarfile
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import signal
 import subprocess
@@ -28,6 +29,7 @@ from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.build_hold import build_hold
 from scripts.build_targets import build_targets
 from scripts.lib import conf
+from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import merge_gate
@@ -992,7 +994,6 @@ elif name == 'cargo':
         self.assertTrue(all(command[command.index('--retries') + 1] == '0' for command in runs))
         candidate = next(iter(limits.spot_max_usd_per_hour))
         machine = folder / 'machines' / candidate
-        import shutil
         _ = shutil.copytree(folder / 'machines/natedev', machine)
         report = trial.compare(folder)
         self.assertIn('| same |', report)
@@ -1128,6 +1129,9 @@ class FakeGpuAws:
             reply = {'SpotPriceHistory': [{'InstanceType': size, 'AvailabilityZone': region + 'a',
                 'SpotPrice': str(price),
                 'Timestamp': datetime.fromtimestamp(self.now, UTC).isoformat()}]}
+        elif service == 's3' and operation == 'cp':
+            self.objects[arguments[8].split('/', 3)[3]] = b'fixture large upload'
+            reply = {}
         elif operation == 'put-object':
             key = arguments[arguments.index('--key') + 1]
             self.objects[key] = Path(arguments[arguments.index('--body') + 1]).read_bytes()
@@ -1264,6 +1268,14 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
     def execute(self) -> None:
         with redirect_stdout(StringIO()):
             self.worker.execute(self.folder, self.deployment)
+
+    def test_upload_uses_s3_cp_at_the_multipart_limit(self) -> None:
+        payload = self.folder / 'large-payload'
+        with payload.open('wb') as stream:
+            _ = stream.truncate(5 * 1024**3)
+        self.worker.upload('fixture-bucket', 'large-payload', payload, 5)
+        self.assertEqual(self.fake.events, ['cp'])
+        self.assertIn('large-payload', self.fake.objects)
 
     def nextest_cli(self, types: tuple[str, ...], arguments: tuple[str, ...]) -> tuple[int, str, str]:
         self.fake.manifest['tree'] = 'b' * 40
@@ -2061,6 +2073,93 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
         self.assertNotIn('scripts.aws_target', guest)
         self.assertNotIn('signal.signal', guest)
         self.assertIn('publish(run)', guest)
+
+    def test_cancel_stops_the_assigned_unit_and_terminates_the_box(self) -> None:
+        claim = self.folder.name
+        self.fake.manifest['trial'] = claim
+        self.fake.manifest['tree'] = 'b' * 40
+        self.fake.manifest['hana_nextest'] = {
+            'arguments': ['--test', 'shader_variants'], 'instance_types': ['g6.2xlarge']}
+        self.fake.manifest['sha256'] = {name: checksum for name, checksum in
+            trial.mapping(self.fake.manifest['sha256']).items() if name not in
+            ('hana-tests.tar.zst', 'gpu_trial_wrapper.py', 'inventory.json')}
+        trial.write_json(self.folder / 'manifest.json', self.fake.manifest)
+        commands: list[Sequence[str]] = []
+
+        def launch(command: Sequence[str]) -> int:
+            commands.append(command)
+            self.assertIn('--unit=' + trial.gpu_service_name(claim), command)
+            self.assertIn('--assigned', command)
+            self.fake.unconfirmed = True
+            with self.assertRaisesRegex(ValueError, 'termination remains unconfirmed'):
+                self.execute()
+            self.assertIn('running', self.fake.instances.values())
+            return 1
+
+        self.assertEqual(trial.start_service(self.folder, self.state, self.settings, launch, assigned=True), 1)
+        command, = commands
+        cleanup, = [word.removeprefix('--property=ExecStopPost=') for word in command
+                    if word.startswith('--property=ExecStopPost=')]
+
+        def stop(arguments: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
+            self.assertEqual(list(arguments), ['systemctl', '--user', 'stop', trial.gpu_service_name(claim)])
+            self.fake.unconfirmed = False
+            status = trial.online_main(shlex.split(cleanup)[3:])
+            return subprocess.CompletedProcess(arguments, status)
+
+        with (mock.patch.object(trial, 'assigned_gpu_cleanup_pending', return_value=True),
+                mock.patch.object(trial, 'AwsCli', return_value=self.worker.gates.api),
+                mock.patch.object(subprocess, 'run', new=stop)):
+            self.assertEqual(trial.stop_assigned_gpu_service(claim), 0)
+        self.assertTrue(all(state == 'terminated' for state in self.fake.instances.values()))
+        self.assertEqual(trial.read_json(trial.cleanup_receipt(self.folder)), {'trial': claim})
+
+        cancel = shell_functions(trial.ROOT / 'scripts/direct/verify.sh',
+                                 'stop_assigned_gpu_unit', 'cancel_tree_run', 'forward_mac_runner_signal')
+        cancel += """
+after_tree_change() { return 0; }
+find_mac_runner_pid() { runner_pid=42; }
+stop_tree_watch() { :; }
+collect_child() { printf '%s %s\n' "$@"; }
+verify_helper() { if [[ "$2" == stop-hana-gpu ]]; then printf '%s\n' "$*"; fi; }
+note_event() { :; }
+STEP_ASSIGNED_TARGET=hana-gpu
+PLACEMENT_ASSIGNMENT_FILE=assignment.json
+BUILD_TARGETS_SCRIPT=build_targets.py
+TREE_WATCH_DIR=$1
+TREE_CHANGED_STATUS=77
+RUN_STARTED=0
+CMD=test
+"""
+        for command, status in (('forward_mac_runner_signal TERM 143', 143), ('cancel_tree_run', 77)):
+            with self.subTest(command=command):
+                result = subprocess.run(['bash', '-c', cancel + command, 'verify.sh', str(self.root)],
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual(result.stdout.splitlines(),
+                    ['42 TERM', 'build_targets.py stop-hana-gpu --assignment-file assignment.json'])
+
+    def test_hana_worker_terminates_at_expiry_without_a_caller_stop(self) -> None:
+        size = 'g6.2xlarge'
+        _ = write_config_fixture(conf.path('cloud_gate'), 'hana_gpu_lifetime_minutes=10')
+        self.fake.live_prices = {(self.fake.region, size): Decimal('.44')}
+        self.fake.lose_nextest_result = True
+        started = int(self.fake.now)
+        code, _, errors = self.nextest_cli((size,), ('--test', 'shader_variants'))
+        self.assertEqual(code, trial.NEXTEST_INFRASTRUCTURE_EXIT)
+        self.assertIn('reached its stop time without a result', errors)
+        launch, = self.fake.launches
+        booking, = self.book.read_snapshot().gate_reservations
+        self.assertIsInstance(booking.state, ledger.GateTerminated)
+        assert isinstance(booking.state, ledger.GateTerminated)
+        deadline = started + 10 * 60
+        self.assertEqual(booking.state.at, deadline)
+        self.assertEqual(booking.expires, deadline + 67 * 60)
+        tags = ledger.rows(ledger.rows(launch, 'TagSpecifications')[0], 'Tags')
+        self.assertIn({'Key': 'ExpiresAt', 'Value': str(deadline)}, tags)
+        bootstrap = base64.b64decode(str(launch['UserData'])).decode()
+        self.assertIn(f'--on-calendar=@{deadline} ', bootstrap)
+        self.assertEqual(set(self.fake.instances.values()), {'terminated'})
 
     def test_service_has_scaler_credentials_and_stop_cleanup(self) -> None:
         commands: list[list[str]] = []

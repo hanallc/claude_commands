@@ -18,8 +18,13 @@ def save_notice_failures(page: bytes, action: Literal['works', 'remove']) -> lis
 const realFetch=fetch;
 let finishPost;
 window.setInterval=()=>0;
-window.fetch=(_path,options={})=>{
- if(options.method!=='POST') return new Promise(()=>{});
+window.fetch=(path,options={})=>{
+ if(options.method!=='POST'){
+  if(new URL(path,location.href).searchParams.has('item-state')){
+   return Promise.resolve({ok:true,json:async()=>({item_state:'Working',parked:'false',unread:'true'})});
+  }
+  return new Promise(()=>{});
+ }
  return new Promise((resolve,reject)=>{
   finishPost=reason=>reason ? reject(new Error(reason)) : resolve({ok:true,json:async()=>({
    answer:'works',request:'a'.repeat(32),token:'b'.repeat(64),item_state:'Closed'
@@ -77,6 +82,8 @@ window.fetch=(_path,options={})=>{
    await save.finish(reason);
   };
   const failure=(row,reason)=>{
+   // A lost Remove restores the row. Collapse it to check the table notice.
+   if(action==='remove' && !row.querySelector('[data-detail]').hidden) row.querySelector('.list-toggle').click();
    const label=action==='works' ? row.dataset.key : 'Item '+row.dataset.number;
    const prefix=action==='works' ? 'Not saved: ' : 'Save not confirmed: ';
    check(!status.hidden && status.textContent===label+': '+prefix+reason,

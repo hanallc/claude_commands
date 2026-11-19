@@ -13,6 +13,7 @@ from typing import cast
 
 from scripts.lib.atomic_file import atomic_sample
 from scripts.lib import conf
+from scripts.lib.proc_text import read_proc_text as _read_proc_text
 from scripts.buildlog import parse
 from scripts.build_queue.snapshot_codec import parse_snapshot_value, snapshot_value
 
@@ -176,12 +177,13 @@ def read_processes(pids: Iterable[int], proc: Path) -> tuple[ProfileProcess, ...
         directory = proc / str(pid)
         try:
             command: tuple[str, ...] | ProcessCommandUnavailable = tuple(
-                part for part in (directory / "cmdline").read_bytes().decode(errors="replace").split("\0") if part)
+                part for part in _read_proc_text(directory / "cmdline").split("\0") if part)
         except OSError as error:
             command = ProcessCommandUnavailable(str(error))
         try:
             status = directory / "status"
-            fields = next((line.split() for line in status.read_text().splitlines() if line.startswith("RssAnon:")), list[str]())
+            fields = next((line.split() for line in _read_proc_text(status).splitlines() if line.startswith("RssAnon:")),
+                          list[str]())
             rss_anon: int | ProcessRssAnonUnavailable = int(fields[1]) * 1024
         except (OSError, UnicodeError, ValueError, IndexError) as error:
             rss_anon = ProcessRssAnonUnavailable(str(error))

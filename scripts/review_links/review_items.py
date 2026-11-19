@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
@@ -34,19 +34,18 @@ from scripts.review_links import efficiency_reviews, new_item_dialog, review_eve
 from scripts.review_links.review_events import ReviewLog as ReviewLog, ReviewMark
 
 
-def source_stamp(path: Path) -> tuple[int, int]:
+def source_stamp(path: Path) -> record_store.FileStamp:
     try:
-        stat = path.stat()
+        return record_store.file_stamp(path)
     except OSError:
-        return (0, 0)
-    return (stat.st_mtime_ns, stat.st_size)
+        return record_store.MISSING_STAMP
 
 
 class ReviewSourceStamps(list[Path]):
     """Record each source and its parent before a snapshot reads them."""
     def __init__(self) -> None:
         super().__init__()
-        self.before_read: dict[Path, tuple[int, int]] = {}
+        self.before_read: dict[Path, record_store.FileStamp] = {}
         self.notices: dict[tuple[Path, str], str] = {}
         self.folder_entries: dict[Path, tuple[Path, ...]] = {}
 
@@ -89,17 +88,18 @@ class ReviewSourceStamps(list[Path]):
 @contextmanager
 def guard_source(path: Path, sources: list[Path] | None, *,
                  skip: tuple[type[Exception], ...] = (), entry: str = '') -> Generator[None]:
-    """Track the source first and isolate its failure during snapshot reads."""
+    """Track the source and isolate read failures during Review scans."""
     if isinstance(sources, ReviewSourceStamps):
         sources.append(path)
     try:
         yield
     except Exception as error:
+        source = error.path if isinstance(error, change_routing.ProductionPathUnreadable) else path
         if isinstance(sources, ReviewSourceStamps):
-            source = error.path if isinstance(error, change_routing.ProductionPathUnreadable) else path
             sources.skipped(source, entry, error)
-        elif isinstance(error, skip):
-            logging.getLogger(__name__).warning('Review source %s: %s', path, error)
+        elif isinstance(error, skip) or sources is None and isinstance(error, (OSError, UnicodeError)):
+            label = f'{source} ({entry})' if entry else str(source)
+            logging.getLogger(__name__).warning('Review source %s: %s', label, error)
         else:
             raise
 
@@ -146,6 +146,8 @@ def selected_states(show: str) -> tuple[ReviewState, ...]:
     """Select the states before a store loads complete records."""
     if show == 'all':
         return REVIEW_STATES
+    if show == 'active':
+        return (ReviewState.OPEN, ReviewState.VALIDATING, ReviewState.WAITING)
     if show in ('open', 'For you', 'for-you', 'for you'):
         return (ReviewState.OPEN,)
     return (ReviewState(show),)
@@ -687,6 +689,10 @@ def investigation_items(members: staff.StaffSnapshot, *, owners: tuple[staff.Sta
                 with guard_source(path, sources, skip=(FileNotFoundError, investigation.InvestigationError)):
                     if not path.is_file():
                         continue
+                    if ReviewState.DONE not in states:
+                        header = issue_store.frontmatter(path, sources=sources, keys=frozenset({'state'}))
+                        if header.get('state') == [investigation.InvestigationState.READ]:
+                            continue
                     record = investigation.read_review_record(path)
                     if record.owner != identity or investigation_type(record) not in kinds:
                         continue
@@ -810,18 +816,6 @@ def proposal_belongs_to(issue: Issue, owner: staff.StaffId, proposers: set[staff
     return proposal_issue.proposal_owner(issue, legacy_owner) == owner
 
 
-def proposal_store_folders(owner: staff.StaffId, member: staff.StaffRow | None, doc: Path | None,
-                           sources: list[Path] | None) -> tuple[Path, ...]:
-    current: tuple[Path, ...] = ()
-    if member is not None and member.kind == 'producer' and isinstance(member.doc, staff.LiveDoc):
-        with guard_source(member.doc.path, sources, skip=(FileNotFoundError,)):
-            folder = review_submissions.proposal_folder(member)
-            if isinstance(folder, Path):
-                current = (folder,)
-    return record_store.known_folders(record_store.RecordKind.PROPOSAL, owner, current, document=doc,
-                                      strict=sources is not None, sources=sources)
-
-
 def read_proposal_prerequisite(path: Path, dependency: str, owner: staff.StaffId,
                                proposers: set[staff.StaffId], retained: Path | None,
                                sources: list[Path] | None) -> str:
@@ -885,14 +879,24 @@ def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
     if own is None:
         folders: dict[Path, list[Path | staff.StaffId]] = {}
         for scope, owner in scopes.items():
-            member = members.by_id(owner)
-            doc = scope if isinstance(scope, Path) else record_store.local_document(member)
             if exact:
                 if selection.key == 'proposal/'+str(selection.path):
                     paths_by_scope.setdefault(selection.path, []).append(scope)
                 continue
+            member = members.by_id(owner)
+            doc = scope if isinstance(scope, Path) else record_store.local_document(member)
+            current: tuple[Path, ...] = ()
+            if member is not None and member.kind == 'producer' and isinstance(member.doc, staff.LiveDoc):
+                producer_doc = member.doc.path
+                with suppress(OSError):
+                    if producer_doc.is_file():
+                        if sources is not None:
+                            sources.append(producer_doc)
+                        if (configured := record_store.issues_folder(producer_doc)) is not None:
+                            current = (configured,)
             with guard_source(doc if doc is not None else state_root(), sources):
-                for folder in proposal_store_folders(owner, member, doc, sources):
+                for folder in record_store.known_folders(record_store.RecordKind.PROPOSAL, owner, current, document=doc,
+                                                         strict=sources is not None, sources=sources):
                     folders.setdefault(folder, []).append(scope)
         for folder, owners in folders.items():
             for path in store_paths((folder,), sources):
@@ -920,8 +924,8 @@ def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
             with guard_source(path, sources, skip=(FileNotFoundError, ValueError)):
                 if not path.is_file():
                     continue
-                fields = (issue_store.frontmatter(path, sources=sources) if exact else
-                          record_store.read_header(path, sources=sources, strict=sources is not None))
+                fields = (issue_store.frontmatter(path, sources=sources) if exact or ReviewState.DONE not in states
+                          else record_store.read_header(path, sources=sources, strict=sources is not None))
                 issue = Issue(path, fields)
                 add_issue(issue, candidates)
     else:
@@ -1036,9 +1040,9 @@ def efficiency_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], 
                                 or EFFICIENCY_LINE.match(line) is None or identity in invalid):
                             continue
                         review = reviews.get(identity, efficiency_reviews.EfficiencyReview())
-                        item = efficiency_item(path, index, line, review, owner, members)
-                        if item.state not in states:
+                        if efficiency_state(line.partition(' — ')[2], review) not in states:
                             continue
+                        item = efficiency_item(path, index, line, review, owner, members)
                         if owner_options is not None:
                             owner_options[owner] = name(owner,members)
                         found.append(item)
@@ -1212,7 +1216,13 @@ def with_later(items: list[ReviewItem], sources: list[Path] | None = None) -> li
         elif key in selected:
             raise error
 
-    times = review_later.times(sources, skipped=skip_time if sources is not None else None)
+    try:
+        times = review_later.times(sources, skipped=skip_time if sources is not None else None)
+    except (OSError, UnicodeError) as error:
+        if sources is not None:
+            raise
+        logging.getLogger(__name__).warning('Review source %s: %s', review_later.path(), error)
+        return items
     return [replace(item, times=replace(item.times, later=times.get(item.key, item.times.later)))
             if item.state != ReviewState.VALIDATING else item
             for item in items if item.key not in invalid or item.state == ReviewState.VALIDATING]

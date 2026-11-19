@@ -38,7 +38,7 @@ STARTED_NS = time.time_ns()
 
 from scripts.disks import disks_page, sessions, slots
 from scripts.lib import conf, scratch
-from scripts.production import change_routing, change_review, staff
+from scripts.production import change_routing, change_review, staff, the_list
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
 from scripts.review_links import new_item_dialog, question_record, review_actions, review_submissions
 from scripts.review_links.review_link import private_name
@@ -325,16 +325,23 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.end_headers()
             return BytesIO(content)
         if route.path == "/console/for-you.json":
+            extra: dict[str, object] = {}
+            if route.query == "view=console":
+                extra["accounts_quota"] = {"level": accounts_page.QuotaLevel.NONE, "name": ""}
+                try:
+                    extra["accounts_quota"] = accounts_page.nav_quota(root)
+                except (accounts_page.UnreadableQuotaState, accounts_page.InvalidQuotaThresholds) as error:
+                    print(f"review-links accounts: {error}", file=sys.stderr)
+                except (OSError, ValueError):
+                    print("review-links accounts: could not read the quota alerts", file=sys.stderr)
             try:
-                if route.query == "view=count":
-                    payload = console.for_you_count(for_you.read())
-                else:
-                    payload = console.for_you_payload()
+                payload = (console.for_you_count(for_you.read()) if route.query == "view=count"
+                           else console.for_you_payload())
             except (OSError, ValueError) as error:
                 print(f"review-links actions: {error}", file=sys.stderr)
-                self.json_response(503, {"available": False})
+                self.json_response(503, {"available": False, **extra})
             else:
-                self.json_response(200, payload)
+                self.json_response(200, {**payload, **extra})
             return None
         if route.path == accounts_page.PAGE_PATH:
             try:
@@ -383,11 +390,14 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.review_response(content, 'text/html; charset=utf-8',prepared)
             return None
         if route.path == list_page.PAGE_PATH:
+            fields = parse_qs(route.query)
+            if "item-state" in fields:
+                self.list_action_state(fields)
+                return None
             try:
                 with server.list_store_access():
                     content = list_page.render(root, include_counts=server.mode is not ServerMode.LIST_FIXTURE,
-                                               status=server.delivery_status,
-                                               assign_review_ids=not isinstance(server.mode, ReadOnlyConsole))
+                                               status=server.delivery_status)
             except (OSError, ValueError) as error:
                 print(f"review-links list: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The List page is not available.</p>"))
@@ -930,20 +940,24 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 server.review_cache.invalidate()
 
     def accounts_post(self) -> None:
-        """Validate and save one account color or one next move from the Accounts page."""
+        """Apply one Accounts page action."""
+        quota_fields = {"quota_account", "quota_level", "quota_reset"}
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= 4096:
                 raise ValueError("Invalid accounts request size.")
             fields = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
-            if (set(fields) not in ({"key", "value"}, {"group", "to"}, {"group", "clear"})
+            if (set(fields) not in ({"key", "value"}, {"group", "to"}, {"group", "clear"}, quota_fields)
                     or any(len(values) != 1 for values in fields.values())
                     or ("clear" in fields and fields["clear"] != ["first"])):
-                raise ValueError("Use one color key and one color value, one group and one account, or one group and clear=first.")
+                raise ValueError("Send one Accounts action with its required fields.")
         except (ValueError, UnicodeError) as error:
             self.json_response(400, {"reason": str(error)})
             return
-        result = (accounts_page.save_color(fields["key"][0], fields["value"][0]) if "key" in fields
+        server = cast(ReviewLinksServer, self.server)
+        result = (accounts_page.clear_quota(server.root, fields["quota_account"][0], fields["quota_level"][0],
+                                            fields["quota_reset"][0]) if set(fields) == quota_fields
+                  else accounts_page.save_color(fields["key"][0], fields["value"][0]) if "key" in fields
                   else accounts_page.clear_next_move(fields["group"][0]) if "clear" in fields
                   else accounts_page.save_next_move(fields["group"][0], fields["to"][0]))
         if isinstance(result, accounts_page.Refused):
@@ -953,6 +967,23 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         else:
             cast(ReviewLinksServer, self.server).accounts_cache = AccountsPageCache()
             self.json_response(200, {"state": "saved"})
+
+    def list_action_state(self, fields: dict[str, list[str]]) -> None:
+        """Read the current item after an action response is lost."""
+        server = cast(ReviewLinksServer, self.server)
+        try:
+            (identity,) = fields["item-state"]
+            (keeper,) = fields.get("keeper", [])
+            (park_request,) = fields.get("park-request", [""])
+            with server.list_store_access():
+                current = list_page.saved_action_state(keeper, identity, status=server.delivery_status,
+                                                       park_request=park_request)
+        except ValueError as error:
+            self.browser_failure(400, "The List item is unavailable.", error)
+        except OSError as error:
+            self.browser_failure(503, "The List item cannot be read. Try again.", error)
+        else:
+            self.json_response(200, current)
 
     def list_post(self) -> None:
         """Save List feedback before the shared sender starts."""
@@ -1126,8 +1157,56 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         return "text/plain; charset=utf-8"
 
 
+def release_delivery_parks(root: Path, snapshot: review_page.ReviewSnapshot) -> None:
+    """Use published changes to find parks that can be checked and released."""
+    now = the_list.now()
+    ready = {key: change for key, change in snapshot.records.items()
+             if isinstance(change.source, review_items.ChangeSource)
+             and key not in snapshot.unavailable_cards and change.for_you(now)}
+    if not ready:
+        return
+    for entry in list_page.records():
+        park = the_list.delivery_park_event(entry.item)
+        if not isinstance(park, the_list.DeliveryParkEvent):
+            continue
+        for key in entry.item.reviews:
+            change = ready.get(key)
+            if change is None or not isinstance(change.source, review_items.ChangeSource):
+                continue
+            try:
+                result = release_park_for_change(root, snapshot.members, entry, park, change, change.source)
+            except (OSError, ValueError, change_review.ChangeReviewError) as error:
+                print(f"review-links List delivery park {entry.key}: {error}", file=sys.stderr)
+                continue
+            if result is the_list.DeliveryParkRelease.RELEASED:
+                break
+
+
+def release_park_for_change(root: Path, members: staff.StaffSnapshot, entry: list_page.ListRecord,
+                            park: the_list.DeliveryParkEvent, change: review_items.ReviewItem,
+                            source: review_items.ChangeSource) -> the_list.DeliveryParkRelease:
+    def change_ready() -> bool:
+        try:
+            return review_items.read_current(root, change, members).for_you(the_list.now())
+        except review_items.ReviewRecordMissing:
+            return False
+
+    return the_list.unpark_for_delivered_change(entry.keeper, entry.item.id, park, change.key,
+                                               review_root=root, review_list=source.path, change_ready=change_ready)
+
+
+class ConsoleReviewSnapshotCache(review_page.ReviewSnapshotCache):
+    @override
+    def _after_snapshot_update(self, snapshot: review_page.ReviewSnapshot, /) -> None:
+        try:
+            release_delivery_parks(self.root, snapshot)
+        except (OSError, ValueError) as error:
+            print(f"review-links List delivery parks: {error}", file=sys.stderr)
+
+
 class ReviewLinksServer(ThreadingHTTPServer):
-    def __init__(self, address: tuple[str, int], root: Path, *, mode: ServerMode | ReadOnlyConsole = ServerMode.LIVE) -> None:
+    def __init__(self, address: tuple[str, int], root: Path, *,
+                 mode: ServerMode | ReadOnlyConsole = ServerMode.LIVE, initialize_review: bool = False) -> None:
         if isinstance(mode, ReadOnlyConsole) and address[0] != "127.0.0.1":
             raise ValueError("The read-only console needs a loopback address.")
         settings = conf.read("review_links")
@@ -1142,7 +1221,8 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.branch_deletions: set[Path] = set()
         self.branch_deletions_lock: threading.Lock = threading.Lock()
         self.accounts_cache: AccountsPageCache = AccountsPageCache()
-        self.review_cache: review_page.ReviewSnapshotCache = review_page.ReviewSnapshotCache(self.root,start_worker=False)
+        self.review_cache: review_page.ReviewSnapshotCache = ConsoleReviewSnapshotCache(
+            self.root, start_worker=False, initialize_on_start=initialize_review and mode is ServerMode.LIVE)
         self.new_item_token: str = secrets.token_urlsafe()
         self.next_tailscale_check: float = time.monotonic() + settings.number("tailscale_check_seconds")
         self.next_sweep: float = time.monotonic() + settings.number("snapshot_sweep_seconds")
@@ -1272,7 +1352,7 @@ def main(arguments: list[str]) -> int:
         if fixture is None:
             root = change_routing.review_root()
             root.mkdir(parents=True, exist_ok=True)
-            service = ReviewLinksServer(address, root)
+            service = ReviewLinksServer(address, root, initialize_review=True)
         else:
             root = fixture
             os.chdir(root)

@@ -559,8 +559,7 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
 - Exit 5 with `Ran 0 tests` and `NO TESTS RAN` counts as a pass: Python 3.13's exit for a helper module with no tests.
 - A requested basedpyright job (`types`) starts first; only nightly and an explicit `--type-dirs` request it.
   `--pythonpath` selects `typecheck-venv` in the state directory.
-  The venv holds the pinned `TYPECHECK_REQUIREMENTS`: pillow and fake-bpy-module dated 2026-08-22.
-  These packages resolve `bpy` and `PIL`.
+  The venv uses the pinned `fake-bpy-module==20260822` to resolve `bpy`.
   The gate builds the venv with uv under a lock when it is absent or its pins change.
   A failed build makes the types job red and prints the cause and build command.
   Basedpyright then does not run.
@@ -1007,7 +1006,7 @@ Outside the gate, it retains inherited Python paths after that root.
 It preserves the caller's working directory, interpreter cache, version floor, and `CLAUDE_PYTHON` override.
 `module_run.py` and `fast_track.py` load tests by package name.
 The cloud guest bootstrap supplies its own root after a fresh clone.
-The Pillow analysis and Blender entries retain their foreign interpreters and explicit `PYTHONPATH`.
+Blender uses its own interpreter and sets `PYTHONPATH` explicitly.
 
 `update_registration.state_block` imports `merged_checkpoints` in its body.
 This keeps `scripts.production.merge_checkpoint` and `scripts.production.merge_gate` out of each `scripts.statusline.counts_row` start, which costs 0.1 to 0.2 s of CPU when they load.

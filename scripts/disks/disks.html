@@ -46,7 +46,7 @@ __STEP_TIP_STYLE__
   font: inherit; line-height: 1; font-weight: 600;
   border: 1px solid var(--line); border-radius: 4px; background: var(--card); color: var(--ink); cursor: pointer; }
 #measure-now svg { width: 16px; height: 16px; }
-#measure-now:hover:enabled, #measure-now:focus-visible { color: var(--accent); }
+#measure-now:focus-visible { color: var(--accent); }
 #measure-now:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 #measure-now:disabled { color: var(--ink-3); cursor: default; }
 h2 { font-size: 1.05rem; margin: 0; }
@@ -83,7 +83,7 @@ td.path { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.8
 /* A long folder name wraps, so no name is cut. */
 .tree td:first-child { white-space: normal; overflow-wrap: anywhere; }
 td.dim, .dim { color: var(--ink-3); }
-tbody tr:hover td { background: var(--hover); }
+tbody tr:not([aria-expanded]):hover td { background: var(--hover); }
 .slots col.size { width: 80px; } .slots col.used { width: 120px; }
 .slots td:first-child, .slots td.use { white-space: normal; overflow-wrap: break-word; }
 .slots .tag { white-space: nowrap; }
@@ -91,7 +91,6 @@ tbody tr:hover td { background: var(--hover); }
 /* A repository is a band that opens and closes; its slots sit indented below it. */
 .slots tr.group th { padding: 7px 10px 7px 6px; border-top: 4px solid var(--card); background: color-mix(in srgb, var(--accent) 12%, var(--card));
   background-clip: padding-box; color: var(--ink); white-space: normal; cursor: pointer; }
-.slots tr.group:hover th { background-color: color-mix(in srgb, var(--accent) 18%, var(--card)); }
 .slots tr.group .name { font-weight: 700; }
 .slots tr.group .sum { color: var(--ink-2); font-weight: 400; margin-left: 8px; }
 .slots tr.group .folder { display: inline-flex; margin-right: 6px; color: var(--accent); vertical-align: -2px; }

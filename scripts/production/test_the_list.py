@@ -16,8 +16,10 @@ from typing import cast, final, override
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
-from scripts.lib import atomic_file
-from scripts.production import investigation, record_store, staff, the_list, update_registration
+from scripts.agents.remote import local_machine
+from scripts.lib import atomic_file, conf
+from scripts.message import send_result
+from scripts.production import change_review, delivery_state, investigation, record_store, staff, the_list, update_registration
 from scripts.production.test_investigation import OWNER, OTHER, RUNNER
 from scripts.review_links import change_page, list_page, question_record, review_items
 
@@ -588,6 +590,38 @@ class TheListTests(unittest.TestCase):
                     (1, "", f"the_list: {item.id}: reopen the Closed item before changing it\n"))
                 self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
+    def test_review_link_ignores_a_producer_directory(self) -> None:
+        folder = self.root / "producer"
+        folder.mkdir()
+        _ = (folder / "README.md").write_text("# Producer\n")
+        members = staff.snapshot()
+        rows = tuple(replace(row, doc=staff.LiveDoc(local_machine(), folder)) if row.id == MORTY.id
+                     else row for row in members.rows)
+        _ = staff.record_path().write_text(replace(members, rows=rows).encode())
+        report = investigation.file(OWNER.id, "Read the result", "Check the result.", waiting_why="Check the result.")
+        item = self.add()
+        with (patch.object(change_review, "lists_directory", return_value=self.root),
+              self.assertNoLogs(review_items.__name__, level="WARNING")):
+            self.assertEqual(self.command("link", item.id, "--review", f"{OWNER.name}/{report.id}",
+                                          "--source", "morty"), (0, "", ""))
+        self.assertEqual(the_list.load(MORTY.id, item.id).reviews, (f"investigation/{OWNER.id}/{report.id}",))
+
+    def test_review_link_warns_and_skips_an_unreadable_change_list(self) -> None:
+        unreadable = self.root / f"{change_review.PREFIX}broken.md"
+        _ = unreadable.write_bytes(b"\xff")
+        listing = self.root / f"{change_review.PREFIX}{RUNNER.name}.md"
+        _ = listing.write_text(
+            "## To review\n\n| # | Change | How to check | Producer |\n| --- | --- | --- | --- |\n"
+            + f"| C1 | Review the result | Open the result | {RUNNER.id} |\n", encoding="utf-8")
+        item = self.add()
+        key = f"{RUNNER.name}/C1"
+        with (patch.object(change_review, "lists_directory", return_value=self.root),
+              self.assertLogs(review_items.__name__, level="WARNING") as warnings):
+            self.assertEqual(self.command("link", item.id, "--review", key, "--source", "morty"), (0, "", ""))
+        warning, = warnings.output
+        self.assertIn(f"Review source {unreadable}:", warning)
+        self.assertEqual(the_list.load(MORTY.id, item.id).reviews, (key,))
+
     def test_old_records_without_reviews_load_without_writes(self) -> None:
         item = self.add()
         path = the_list.folder(MORTY.id) / f"{item.id}.md"
@@ -753,11 +787,121 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(reopened.unread_since, reopened_at)
         self.assertIsInstance(the_list.unread_update(reopened), the_list.UnreadUpdate)
 
-    def test_answer_marks_a_closed_item_unread_until_mark_read(self) -> None:
+    def close_with_legacy_question(self, item: the_list.ListItem) -> None:
+        _ = the_list.close(MORTY.id, item.id, "The report is retired.", source="nate")
+        self.write_legacy_question(item, question_record.Question("Q1", START.isoformat(), "Which check passed?"))
+
+    def write_legacy_question(self, item: the_list.ListItem, question: question_record.Question) -> None:
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        field = json.dumps(json.dumps([question_record.stored(question)]))
+        _ = path.write_text(path.read_text().replace("\n---\n", f"\nquestions: {field}\n---\n", 1))
+
+    def test_close_archives_open_questions_without_requesting_an_answer(self) -> None:
         item = self.add()
         status = change_page.DeliveryStatus(self.root / "reviews")
-        _ = the_list.ask_question(MORTY.id, item.id, the_list.PageRequest("ask", "question", "Which check passed?"), status)
+        request = the_list.PageRequest("ask", "question", "Which check passed?")
+        sent = the_list.ask_question(MORTY.id, item.id, request, status)
+        self.assertEqual(self.command("answer", item.id, "--question", "Q1", "--text", "The page check."),
+                         (0, f"answered {item.id} Q1\n", ""))
+        pending = the_list.PageRequest("next", "question", "Which file changed?")
+        claimed = the_list.ask_question(MORTY.id, item.id, pending, status)
+        asked = the_list.load(MORTY.id, item.id)
+        closed = the_list.close(MORTY.id, item.id, "The report is retired.", source="nate")
+        self.assertEqual(the_list.load(MORTY.id, item.id), closed)
+        self.assertEqual(closed.questions, asked.questions[:1])
+        self.assertEqual(closed.log[-2].what, the_list.QuestionClosed(asked.questions[1]))
+        self.assertEqual(the_list.close(MORTY.id, item.id, closed.closing_words, source="nate"), closed)
+        self.assertEqual(self.command("answer", item.id, "--question", "Q2", "--text", "The report."),
+                         (1, "", "the_list: Unknown question id.\n"))
+        self.assertIsInstance(the_list.resend_question(MORTY.id, item.id, "Q2", "retry", status),
+                              change_page.NoMessageDelivery)
+        self.assertIsInstance(the_list.ask_question(MORTY.id, item.id, pending, status),
+                              change_page.NoMessageDelivery)
+        with self.assertRaisesRegex(question_record.AnswerRefused, "This item is Closed"):
+            _ = the_list.ask_question(MORTY.id, item.id, replace(pending, request="unsaved"), status)
+        assert isinstance(sent, change_page.MessageDelivery) and isinstance(claimed, change_page.PageQuestionSend)
+        with patch.object(change_page, "send_question") as send:
+            list_page.deliver(list_page.ListQuestionDelivery(sent, status))
+            change_page.deliver(claimed, status)
+            path = status.path(claimed.page, claimed.row)
+            change_page.recover_page_question(status, path, change_page.read_question_attempt(path))
+            send.assert_not_called()
+        _ = the_list.reopen(MORTY.id, item.id, source="nate")
+        _ = the_list.ask_question(MORTY.id, item.id, replace(pending, request="new"), status)
+        self.assertEqual([question.question_id for question in the_list.load(MORTY.id, item.id).questions],
+                         ["Q1", "Q3"])
+
+    def test_close_stops_question_retries_and_retains_the_transport_result(self) -> None:
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        for expected in (delivery_state.QuestionSendState.SENT, delivery_state.QuestionSendState.FAILED):
+            with self.subTest(outcome=expected):
+                item = self.add()
+                delivery = the_list.ask_question(MORTY.id, item.id,
+                    the_list.PageRequest("ask", "question", "Which check passed?"), status)
+                assert isinstance(delivery, change_page.PageQuestionSend)
+                header = send_result.OutcomeHeader(
+                    "sent" if expected is delivery_state.QuestionSendState.SENT else "failed", "Test result", "")
+
+                def close_during_send(*_args: object) -> tuple[send_result.ConfirmedSendOutcome, str]:
+                    _ = the_list.close(MORTY.id, item.id, "The report is retired.", source="nate")
+                    return send_result.ConfirmedSendOutcome(header), header.detail
+
+                settings = Mock(whole=Mock(return_value=2), number=Mock(return_value=0))
+                with (patch.object(conf, "read", return_value=settings),
+                      patch.object(change_page, "send_question", side_effect=close_during_send) as send,
+                      patch.object(change_page, "alert_delivery_failures") as alert):
+                    change_page.deliver(delivery, status)
+                send.assert_called_once()
+                alert.assert_not_called()
+                path = status.path(delivery.page, delivery.row)
+                self.assertEqual(change_page.read_question_attempt(path).state, expected)
+
+    def test_retry_read_error_preserves_the_confirmed_failure(self) -> None:
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        header = send_result.OutcomeHeader("failed", "The transport refused delivery.", "")
+        settings = Mock(whole=Mock(return_value=2), number=Mock(return_value=0))
+        for error in (PermissionError("The List file cannot be read."), ValueError("Invalid List record.")):
+            with self.subTest(error=type(error).__name__):
+                item = self.add()
+                delivery = the_list.ask_question(MORTY.id, item.id,
+                    the_list.PageRequest("ask", "question", "Which check passed?"), status)
+                assert isinstance(delivery, change_page.PageQuestionSend)
+                listing = record_store.NumberedRecords(MORTY.id, "list", "L", "list item", ValueError)
+                fields = listing.read(item.id)
+                with (patch.object(conf, "read", return_value=settings),
+                      patch.object(record_store.NumberedRecords, "read", side_effect=[fields, error]),
+                      patch.object(change_page, "send_question",
+                                   return_value=(send_result.ConfirmedSendOutcome(header), header.detail)) as send,
+                      patch.object(change_page, "alert_delivery_failures") as alert,
+                      redirect_stderr(io.StringIO()) as log):
+                    change_page.deliver(delivery, status)
+                saved = change_page.read_question_attempt(status.path(delivery.page, delivery.row))
+                self.assertEqual(saved.state, delivery_state.QuestionSendState.FAILED)
+                self.assertEqual(saved.error, header.detail)
+                self.assertIn(str(error), log.getvalue())
+                send.assert_called_once()
+                alert.assert_not_called()
+
+    def test_question_recovery_skips_a_legacy_closed_item(self) -> None:
+        item = self.add()
+        status = change_page.DeliveryStatus(self.root / "reviews")
+        delivery = the_list.ask_question(MORTY.id, item.id,
+            the_list.PageRequest("ask", "question", "Which check passed?"), status)
+        assert isinstance(delivery, change_page.PageQuestionSend)
+        assert isinstance(delivery.job, change_page.QuestionJob)
+        question, = the_list.load(MORTY.id, item.id).questions
         _ = the_list.close(MORTY.id, item.id, "The report is retired.", source="nate")
+        self.write_legacy_question(item, question)
+        delivery.job.release()
+        path = status.path(delivery.page, delivery.row)
+        with patch.object(change_page, "send_question") as send:
+            change_page.recover_page_question(status, path, change_page.read_question_attempt(path))
+        send.assert_not_called()
+        self.assertEqual(the_list.load(MORTY.id, item.id).questions, (question,))
+
+    def test_answer_marks_a_legacy_closed_item_unread_until_mark_read(self) -> None:
+        item = self.add()
+        self.close_with_legacy_question(item)
         _ = the_list.mark_read(MORTY.id, item.id, source="nate")
         answered_at = START + timedelta(minutes=1)
         with patch.object(the_list, "now", return_value=answered_at):
@@ -781,10 +925,7 @@ class TheListTests(unittest.TestCase):
     def test_load_reads_a_legacy_closed_record_without_an_unread_update(self) -> None:
         item = self.add(changes={"latest_status": "The report is ready.", "next_step": "Review the report.",
                                  "evidence": "The page check passed.", "done_when": "The report closes."})
-        status = change_page.DeliveryStatus(self.root / "reviews")
-        _ = the_list.ask_question(MORTY.id, item.id,
-                                  the_list.PageRequest("ask", "question", "Which check passed?"), status)
-        _ = the_list.close(MORTY.id, item.id, "The report is retired.", source="nate")
+        self.close_with_legacy_question(item)
         _ = the_list.mark_read(MORTY.id, item.id, source="nate")
         path = the_list.folder(MORTY.id) / f"{item.id}.md"
         field = f'unread_since: {json.dumps(START.isoformat())}\n'
@@ -1086,6 +1227,45 @@ class TheListTests(unittest.TestCase):
             self.assertIn("| 1 |", self.command("list")[1])
         self.assertEqual(self.command("park", "--id", item.id, "--until", "", "--source", "nate"), (0, "", ""))
         self.assertIs(the_list.load(MORTY.id, item.id).parked_until, the_list.NoTimestamp.UNSET)
+
+    def test_park_until_delivered_through_the_cli(self) -> None:
+        item = self.add(changes={"state": the_list.ItemState.WORKING})
+        self.assertEqual(self.command("park", "--id", item.id, "--until", "delivered", "--source", "morty"),
+                         (0, "", ""))
+        parked = the_list.load(MORTY.id, item.id)
+        self.assertIs(parked.parked_until, the_list.ParkUntilDelivered.DELIVERED)
+        self.assertEqual(parked.log[-1].what, the_list.FieldChange("Parked", {"parked_until": parked.parked_until}))
+        with patch.object(the_list, "now", return_value=START + timedelta(days=30)):
+            self.assertNotIn(item.title, self.command("list")[1])
+            self.assertIn("parked until delivered", self.command("list", "--include-parked")[1])
+            self.assertEqual(self.command("update", "--id", item.id, "--state", "Delivered", "--source", "morty"),
+                             (0, "", ""))
+            delivered = the_list.load(MORTY.id, item.id)
+            self.assertIs(delivered.parked_until, the_list.NoTimestamp.UNSET)
+            self.assertEqual(delivered.unread_since, START + timedelta(days=30))
+            self.assertEqual(delivered.log[-1].what, the_list.UnparkedForDelivery(the_list.ItemDelivered.RECORDED))
+            self.assertIn(item.title, self.command("list")[1])
+            self.assertEqual(self.command("update", "--id", item.id, "--state", "Delivered", "--source", "morty"),
+                             (0, "", ""))
+            self.assertEqual(the_list.load(MORTY.id, item.id), delivered)
+
+    def test_delivery_does_not_clear_a_saved_date(self) -> None:
+        item = self.add(changes={"state": the_list.ItemState.WORKING})
+        date = "2026-11-17"
+        zone = ZoneInfo("America/New_York")
+        with patch.object(the_list, "user_zone", return_value=zone):
+            moment = datetime(2026, 11, 17, tzinfo=zone)
+            parked = the_list.park(MORTY.id, item.id, moment, source="morty")
+            path = the_list.folder(MORTY.id) / f"{item.id}.md"
+            encoded = path.read_text()
+            old = encoded.replace(moment.isoformat(), date)
+            self.assertNotEqual(encoded, old)
+            _ = path.write_text(old)
+            self.assertEqual(the_list.load(MORTY.id, item.id), parked)
+            delivered = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.DELIVERED}, source="morty")
+            self.assertEqual(delivered.parked_until, moment)
+            self.assertNotIn(item.title, self.command("list")[1])
+            self.assertFalse(any(isinstance(entry.what, the_list.Unparked) for entry in delivered.log))
 
     def test_unpark_clears_active_parking_and_saves_one_notice(self) -> None:
         item = self.add(changes={"state": the_list.ItemState.WORKING})
