@@ -54,6 +54,9 @@ window.fetch=(path,options={})=>{
    return row;
   };
   const startSave=async row=>{
+   const animations=[...document.querySelectorAll('[data-record-motion]')].flatMap(node=>node.getAnimations({subtree:true}));
+   for(const animation of animations) animation.finish();
+   await Promise.allSettled(animations.map(animation=>animation.finished));
    row=open(row);
    const form=action==='works' ? await readyReviewCard(row) : row.querySelector('form');
    const settled=new Promise(resolve=>{
@@ -73,11 +76,12 @@ window.fetch=(path,options={})=>{
    const save=await startSave(row);
    row=save.row;
    if(!reason){
+    const duration=Number(document.querySelector('[data-review],[data-list]').dataset.cardFadeOutMs);
     const motion=row.nextElementSibling ?? [...document.querySelectorAll('[data-record-motion]')].find(
      node=>node.querySelector('.list-toggle').textContent===row.querySelector('.list-toggle').textContent);
     check(row.hidden && motion?.matches('[data-record-motion]') &&
-      motion.getAnimations({subtree:true}).some(animation=>animation.effect.getTiming().duration===200),
-      'a successful save starts the 200 ms row fade');
+      motion.getAnimations({subtree:true}).some(animation=>animation.effect.getTiming().duration===duration),
+      'a successful save starts the configured row fade');
    }else if(action==='works') open(anchor);
    await save.finish(reason);
   };

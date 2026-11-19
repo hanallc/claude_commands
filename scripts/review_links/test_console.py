@@ -113,6 +113,7 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn("open: current === rebuildLink ? '' : current.dataset.page", source)
         self.assertNotIn("<iframe", source)
         self.assertIn(".frame-area iframe[hidden]{display:block!important;visibility:hidden;pointer-events:none}", source)
+
         self.assertIn("const placeKey = identity => 'at.' + identity;", source)
         self.assertIn("target.pathname === new URL(base, location.href).pathname", source)
         self.assertIn("event.data !== 'console-place'", source)
@@ -138,6 +139,16 @@ class ConsoleTests(unittest.TestCase):
         self.assertNotIn('page-header', source)
         self.assertIn('.workspace{flex:1;width:100%}', source)
         self.assertIn("mobileToggle.setAttribute('aria-expanded', String(!value))", source)
+
+    def test_repository_config_names_staff_for_every_console_page(self) -> None:
+        path = Path(__file__).resolve().parents[2] / "config" / "console.conf"
+        settings = conf.read(path).values()
+        pages = {key.split(".")[1] for key in settings if key.startswith("page.") and key.endswith(".url")}
+        self.assertEqual(pages | {"rebuilds"}, page_frame.OWNER_PAGES)
+        for page in page_frame.OWNER_PAGES:
+            with self.subTest(page=page):
+                self.assertRegex(settings[f"page.{page}.owner"], r"^[a-f0-9-]{36}$")
+        self.assertEqual(settings["owner.default"], settings["page.review.owner"])
 
     def test_builds_url_resolves_from_its_public_function(self) -> None:
         folder = self.root / "snapshots/builds"
