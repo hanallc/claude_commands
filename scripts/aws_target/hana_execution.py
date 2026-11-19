@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 CONTROL_MAX_BYTES = 65536
 COMMAND_RESULT_PENDING = 'The command result is pending'
+_MISSING_BASIS_PREFIX = 'MissingBasis: '
 
 
 def fence_settlement_seconds(control_timeout_s: int, poll_seconds: int) -> int:
@@ -513,10 +514,10 @@ class NoMissingBasis:
 def missing_basis(observation: HanaCommandObservation, request: HanaExecutionRequest) -> hana_source.MissingBasis | NoMissingBasis:
     """Decode the guest diagnostic without accepting a different repository or basis."""
     evidence = observation.evidence
-    if not isinstance(evidence, placement.ExecutionEvidenceUnavailable) or not evidence.reason.startswith('MissingBasis: '):
+    if not isinstance(evidence, placement.ExecutionEvidenceUnavailable) or not evidence.reason.startswith(_MISSING_BASIS_PREFIX):
         return NoMissingBasis()
     try:
-        diagnostic = hana_result.object_fields(cast(object, json.loads(evidence.reason.removeprefix('MissingBasis: '))))
+        diagnostic = hana_result.object_fields(cast(object, json.loads(evidence.reason.removeprefix(_MISSING_BASIS_PREFIX))))
         commits = diagnostic.get('commits')
         if diagnostic.get('repository') != request.manifest.repository or not isinstance(commits, list) or not commits:
             return NoMissingBasis()
@@ -875,7 +876,7 @@ def settle_execution(directory: Path, request: HanaExecutionRequest, objects: Ex
                     row['phase'] = 'settled'
                 elif guest_ended and isinstance(evidence, placement.ExecutionEvidenceUnavailable):
                     cause = ' '.join(evidence.reason.splitlines())
-                    if cause == COMMAND_RESULT_PENDING:
+                    if cause == COMMAND_RESULT_PENDING or cause.startswith(_MISSING_BASIS_PREFIX):
                         cause = ' '.join(reason.splitlines())
                     outcome = {'kind': 'guest-ended', 'reason': cause}
                 else:
