@@ -2855,7 +2855,6 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
     evidence = controller.attempt_evidence
     evidence.slot = request.slot
     controller.placement = request.placement
-    controller.pending = PendingHanaOperation()
 
     def release() -> hana.HanaClaimRelease:
         return hana.release_assigned(assignment, holder, lifecycle)
@@ -2888,6 +2887,24 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
                 return HanaCommandAdmissionRefused(pending.reason, elapsed_seconds(started))
         return DeclinedMacRun('state', elapsed_seconds(started), refusal.reason)
 
+    try:
+        hana_transport.check_inputs(request.source_root, configuration)
+    except (OSError, ValueError, RuntimeError, SyntaxError, TypeError, KeyError, subprocess.SubprocessError,
+            copies.CopyError) as error:
+        if not lifecycle.execution_bound(placement.assigned_claim_reference(assignment).claim_id):
+            label = ('The Hana source capture failed'
+                     if isinstance(error, subprocess.SubprocessError) or isinstance(error.__cause__, subprocess.SubprocessError)
+                     else 'The Hana payload could not be prepared')
+            reason = f'{label}: {error}'
+            refusal = execution_identity.HanaCommandAdmissionRefused(' '.join(reason.splitlines()))
+            controller.hana_settlement = execution.HanaAdmissionRefusalSettled(
+                refusal, execution_identity.ExecutionNotStarted())
+            evidence.execution = controller.hana_settlement.evidence
+            evidence.cleanup = 'confirmed'
+            evidence.unresolved_count = 0
+            return HanaCommandAdmissionRefused(refusal.reason, elapsed_seconds(started))
+
+    controller.pending = PendingHanaOperation()
     claim = hana.claim_assigned(assignment, holder, lifecycle, worktree=str(request.repo_root))
     while isinstance(claim, hana.HanaClaimPending) and time.time() < claim.deadline:
         evidence.provider = claim.reference
