@@ -803,7 +803,7 @@ class BusyHolderTests(unittest.TestCase):
 class VerifyMirrorWaitTests(verify_mac_offload_test_support.VerifyMacOffloadFixture):
     def test_verify_waits_and_names_the_busy_mirror_session(self) -> None:
         _ = self.routing_fixture()
-        holder = "last recorded mirror session reader"
+        holder = "last recorded mirror session reader (mirror process check)"
         self.environment.update({"TEST_FREE_NOW_FREE": "1", "TEST_RUNNER_HOLDER": holder})
         process = self.start_routing()
 
@@ -1248,15 +1248,21 @@ class OffloadCommandTests(OffloadCommandFixture):
 
         self.fixture["rsync_status"] = 12
         self.sync_fixture()
-        _ = stub.write_text(source.replace(
-            "rsync: destination denied", "copies: /mirror/hana: busy; held by session reader (mirror lease)",
-        ).replace("code 23", "code 12"))
-        result = self.command(runner_options=("--target", "mac"))
-        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
-        self.assert_wire("declined", "busy")
-        self.assertEqual(self.wire_result().get("holder"), "last recorded mirror session reader")
-        self.assertGreater(float((self.state_directory / "mirror-busy-hana.until").read_text()), time.time())
-        self.assertFalse(self.claim_file.exists())
+        backoff = self.state_directory / "mirror-busy-hana.until"
+        for check in ("mirror lease", "mirror process check"):
+            with self.subTest(check=check):
+                _ = stub.write_text(source.replace(
+                    "rsync: destination denied", f"copies: /mirror/hana: busy; held by session reader ({check})",
+                ).replace("code 23", "code 12"))
+                before = len(self.events_for("rsync"))
+                result = self.command(runner_options=("--target", "mac"))
+                self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+                self.assert_wire("declined", "busy")
+                self.assertEqual(self.wire_result().get("holder"), f"last recorded mirror session reader ({check})")
+                self.assertEqual(len(self.events_for("rsync")), before + 1)
+                self.assertGreater(float(backoff.read_text()), time.time())
+                self.assertFalse(self.claim_file.exists())
+                backoff.unlink()
 
     def test_tracked_script_transfer_keeps_the_failed_command_error(self) -> None:
         controller = offload.ProcessController()

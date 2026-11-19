@@ -11,6 +11,7 @@ import argparse
 from collections.abc import Generator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from functools import partial
 from importlib import import_module
 import fcntl
@@ -269,11 +270,21 @@ class UnreadableMacHolder:
 MacHolder = KnownMacJob | RecordedMirrorSession | LostRunLeftovers | UnreadableMacHolder
 
 
+class MirrorBusyCheck(Enum):
+    """The mirror check that reported a busy refusal."""
+
+    UNREPORTED = ""
+    LEASE = "mirror lease"
+    PROCESS = "mirror process check"
+
+
 @dataclass(frozen=True)
 class BusyMacDecline:
-    """The decline holds the Mac holder and elapsed time."""
+    """The result records the Mac holder and any reported mirror check."""
+
     holder: MacHolder
     seconds: float
+    mirror_check: MirrorBusyCheck = MirrorBusyCheck.UNREPORTED
 
     @property
     def reason(self) -> Literal["busy"]:
@@ -827,6 +838,7 @@ class MirrorBusyRefusal:
     """A receiver or runner could not acquire the mirror."""
 
     holder: RecordedMirrorSession | UnreadableMacHolder
+    mirror_check: MirrorBusyCheck
 
 
 @dataclass(frozen=True)
@@ -1325,7 +1337,11 @@ def write_result(
     fetched = result.fetch if isinstance(result, (PassedOnMac, FailedOnMac, NoTestMatchedOnMac)) else FetchNotRun()
     fixed = result.fix if isinstance(result, PassedOnMac) else FIX_NOT_RUN
     if isinstance(destination, ResultFile):
-        holder_line = f"holder={holder_value(result.holder)}\n" if isinstance(result, BusyMacDecline) else ""
+        holder_line = ""
+        if isinstance(result, BusyMacDecline):
+            check = result.mirror_check.value
+            suffix = f" ({check})" if check else ""
+            holder_line = f"holder={holder_value(result.holder)}{suffix}\n"
         linux = bool(target) and not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target).platform)
         prefix = f"outcome={mac}\ntarget={target}" if linux else f"mac={mac}"
         details = ""
@@ -1359,14 +1375,14 @@ def mirror_busy_refusal(detail: str) -> MirrorBusyRefusal | NoMirrorBusyRefusal:
     """Read the receiver or runner diagnostic, including older receivers."""
     match = re.search(
         r"(?:^copy: rsync: |^|; )copies: [^\r\n]+?: busy; held by session"
-        + r"(?: (?P<session>[^;\r\n]*?))?(?: \(mirror (?:lease|process check)\))?(?=; |$)",
+        + r"(?: (?P<session>[^;\r\n]*?))?(?: \((?P<check>mirror (?:lease|process check))\))?(?=; |$)",
         detail.rstrip(),
     )
     if match is None:
         return NoMirrorBusyRefusal()
     session = (match["session"] or "").strip()
     holder = RecordedMirrorSession(session) if session and session != "unreadable" else UnreadableMacHolder()
-    return MirrorBusyRefusal(holder)
+    return MirrorBusyRefusal(holder, MirrorBusyCheck(match["check"] or ""))
 
 
 def write_backoff(until: float, target: str = "mac") -> None:
@@ -2677,7 +2693,7 @@ def claimed_run(
         if isinstance(remote_status, MirrorBusyRefusal):
             release_allowed = True
             write_mirror_busy(config, repository.name, request.target)
-            return BusyMacDecline(remote_status.holder, elapsed_seconds(started))
+            return BusyMacDecline(remote_status.holder, elapsed_seconds(started), remote_status.mirror_check)
         if not isinstance(remote_status, (ReportedMacStatus, MacNextestSetupFailed)):
             if isinstance(controller.pending, PendingStartOperation):
                 settlement = settle_pending_start(controller, config, config.host, repository, request.target, request.slot)
@@ -3221,7 +3237,7 @@ def run_offload(
                 refusal = mirror_busy_refusal(result.detail)
                 if isinstance(refusal, MirrorBusyRefusal):
                     write_mirror_busy(config, repository.name, request.target)
-                    return BusyMacDecline(refusal.holder, result.seconds)
+                    return BusyMacDecline(refusal.holder, result.seconds, refusal.mirror_check)
             return result
     except copies.CopyError as error:
         return DeclinedMacRun("copy", elapsed_seconds(started), str(error))
