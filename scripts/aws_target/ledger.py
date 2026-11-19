@@ -500,21 +500,9 @@ class ResourceInventory:
 
 
 @dataclass(frozen=True)
-class FloorBounds:
-    start: int
-    end: int
-
-
-@dataclass(frozen=True)
-class LegacyUnboundedFloor:
-    """The saved floor has a day label and no time bounds."""
-
-
-@dataclass(frozen=True)
 class EstablishedDayCost:
     day: str
     usd: Decimal
-    bounds: FloorBounds | LegacyUnboundedFloor = LegacyUnboundedFloor()
 
 
 @dataclass(frozen=True)
@@ -555,19 +543,10 @@ class ChargeRead:
 
 
 @dataclass(frozen=True)
-class GuardDayBills:
-    """Validated day amounts and the bill inputs that HEAD could price."""
-
-    readings: tuple[ChargeRead, ...]
-    legacy_readings: tuple[ChargeRead, ...]
-
-
-@dataclass(frozen=True)
-class HistoricalReconciliation:
-    """Establish and apply saved cost floors for a historical estimate."""
-
-
-_HISTORICAL_RECONCILIATION = HistoricalReconciliation()
+class CompleteDayAmount:
+    start: int
+    end: int
+    usd: Decimal
 
 
 @dataclass(frozen=True)
@@ -755,19 +734,6 @@ def rows(row: dict[str, object], key: str) -> tuple[dict[str, object], ...]:
     return tuple(mapping(item) for item in cast(list[object], value))
 
 
-def _decode_floor(row: dict[str, object]) -> EstablishedDayCost:
-    return EstablishedDayCost(date.fromisoformat(text(row, 'day')).isoformat(), money(text(row, 'usd')),
-        FloorBounds(instant(row, 'start'), instant(row, 'end'))
-        if 'start' in row or 'end' in row else LegacyUnboundedFloor())
-
-
-def _floor_record(floor: EstablishedDayCost) -> dict[str, object]:
-    row: dict[str, object] = {'day': floor.day, 'usd': str(floor.usd)}
-    if isinstance(floor.bounds, FloorBounds):
-        row.update(start=floor.bounds.start, end=floor.bounds.end)
-    return row
-
-
 def _decode(row: dict[str, object]) -> LedgerEvidence:
     if row.get("version") != 1:
         raise LedgerUnavailable("unsupported ledger version")
@@ -785,7 +751,8 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
          for r in rows(row, "inventories")],
         [CostReconciliation(instant(r, "at"), instant(r, "period_start"), instant(r, "period_end"),
                             conf.decimal(text(r, "usd")), text(r, "source"), money(str(r.get("query_usd", "0"))),
-                            tuple(_decode_floor(d) for d in rows(r, "established_days")) if "established_days" in r else ())
+                            tuple(EstablishedDayCost(date.fromisoformat(text(d, "day")).isoformat(), money(text(d, "usd")))
+                                  for d in rows(r, "established_days")) if "established_days" in r else ())
          for r in rows(row, "reconciliations")],
         [LimitEvent(text(r, "event_id"), instant(r, "at"), text(r, "period"), money(text(r, "estimate_usd")),
                     money(text(r, "limit_usd")), text(r, "recipient"), instant(r, "timeout_s"),
@@ -936,7 +903,7 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
                         for r in state.inventories],
         "reconciliations": [{"at": r.at, "period_start": r.period_start, "period_end": r.period_end,
                              "usd": str(r.usd), "source": r.source, "query_usd": str(r.query_usd),
-                             "established_days": [_floor_record(d) for d in r.established_days]}
+                             "established_days": [{"day": d.day, "usd": str(d.usd)} for d in r.established_days]}
                             for r in state.reconciliations],
         "events": [{"event_id": r.event_id, "at": r.at, "period": r.period, "estimate_usd": str(r.estimate_usd),
                     "limit_usd": str(r.limit_usd), "recipient": r.recipient, "timeout_s": r.timeout_s,
@@ -1002,6 +969,11 @@ def _month_seconds(at: int, zone: ZoneInfo) -> int:
     return int(following.timestamp()) - int(first.timestamp())
 
 
+def _month_bounds(day: date, zone: ZoneInfo) -> tuple[int, int]:
+    start, _ = period_bounds(day.replace(day=1), zone)
+    return start, start + _month_seconds(start, zone)
+
+
 def _overlap(charge: ChargedInterval, start: int, end: int) -> Decimal:
     if charge.start == charge.end:
         return charge.usd if start <= charge.start < end else Decimal(0)
@@ -1009,74 +981,9 @@ def _overlap(charge: ChargedInterval, start: int, end: int) -> Decimal:
     return charge.usd * Decimal(seconds) / Decimal(charge.end - charge.start)
 
 
-def _reconciliation_floors(reading: CostReconciliation) -> dict[FloorBounds, Decimal]:
-    utc = ZoneInfo('UTC')
-    eastern = ZoneInfo('America/New_York')
-    unbounded = {floor.day for floor in reading.established_days if isinstance(floor.bounds, LegacyUnboundedFloor)}
-    eastern_days = {datetime.fromtimestamp(start, eastern).date().isoformat()
-                    for start, _ in _days(reading.period_start, reading.period_end, eastern)}
-    utc_days = {datetime.fromtimestamp(start, utc).date().isoformat()
-                for start, _ in _days(reading.period_start, reading.period_end, utc)}
-    legacy_zone = eastern if unbounded == eastern_days and unbounded != utc_days else utc
-    floors: dict[FloorBounds, Decimal] = {}
-    for floor in reading.established_days:
-        if isinstance(floor.bounds, FloorBounds):
-            bounds = floor.bounds
-        else:
-            day = next(iter(utc_days)) if legacy_zone == utc and len(utc_days) == 1 else floor.day
-            start, end = period_bounds(date.fromisoformat(day), legacy_zone)
-            bounds = FloorBounds(max(start, reading.period_start), min(end, reading.period_end))
-        if not reading.period_start <= bounds.start < bounds.end <= reading.period_end:
-            raise LedgerUnavailable('invalid reconciliation floor bounds')
-        floors[bounds] = max(floors.get(bounds, Decimal(0)), floor.usd)
-    return floors
-
-
-def _reconciliation_charges(reading: CostReconciliation, zone: ZoneInfo,
-                            usage: Sequence[ChargedInterval]) -> tuple[ChargedInterval, ...]:
-    start, end = reading.period_start, reading.period_end
-    floors = _reconciliation_floors(reading)
-    cuts = sorted({start, end, *(left for left, _ in _days(start, end, zone)),
-                   *(edge for bounds in floors for edge in (bounds.start, bounds.end))})
-    extra = max(Decimal(0), reading.usd - period_cost(usage, start, end))
-    charges = [ChargedInterval(left, right, extra * Decimal(right - left) / Decimal(end - start),
-                               reading.source, 'reconciliation') for left, right in zip(cuts, cuts[1:])]
-    # Apply each smaller floor before a floor that can include it.
-    for bounds in sorted(floors, key=lambda span: (span.end - span.start, span.start)):
-        remaining = floors[bounds] - period_cost(usage, bounds.start, bounds.end)
-        remaining -= period_cost(charges, bounds.start, bounds.end)
-        if remaining > 0:
-            for index, charge in enumerate(charges):
-                if bounds.start <= charge.start < bounds.end:
-                    share = remaining * Decimal(charge.end - charge.start) / Decimal(bounds.end - bounds.start)
-                    charges[index] = replace(charge, usd=charge.usd + share)
-    return tuple(charges)
-
-
-def _head_reconcile(reading: CostReconciliation, zone: ZoneInfo,
-                    intervals: list[ChargedInterval]) -> CostReconciliation:
-    """Apply the saved day labels with the original guard calculation."""
-    estimated = period_cost((r for r in intervals if r.kind != "explorer"), reading.period_start, reading.period_end)
-    extra = max(Decimal(0), reading.usd - estimated)
-    established_days = list(reading.established_days)
-    previous = {d.day: d.usd for d in reading.established_days}
-    for start, end in _days(reading.period_start, reading.period_end, zone):
-        day = datetime.fromtimestamp(start, zone).date().isoformat()
-        base = period_cost((r for r in intervals if r.kind != "explorer"), start, end)
-        computed = base + extra * Decimal(end - start) / Decimal(reading.period_end - reading.period_start)
-        established = max(computed, previous.get(day, Decimal(0)))
-        if day not in previous or established > previous[day]:
-            bounds = FloorBounds(start, end)
-            established_days = [floor for floor in established_days if (floor.day, floor.bounds) != (day, bounds)]
-            established_days.append(EstablishedDayCost(day, established, bounds))
-        intervals.append(ChargedInterval(start, end, established - base, reading.source, "reconciliation"))
-    return replace(reading, established_days=tuple(established_days))
-
-
 def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
              current_window: bool = False, require_fresh: bool = True,
-             window: date | None = None, pricing_end: int | None = None,
-             basis: GuardDayBills | HistoricalReconciliation = _HISTORICAL_RECONCILIATION) -> CostEstimate:
+             window: date | None = None, pricing_end: int | None = None) -> CostEstimate:
     if type(now) is not int or now < 0:
         raise LedgerUnavailable("decision time must use nonnegative integer seconds")
     pricing_end = now if pricing_end is None else pricing_end
@@ -1085,9 +992,8 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
     inventories = sorted(state.inventories, key=lambda item: item.at)
     observations = sorted((r for r in state.observations if r.state != "unknown"), key=lambda item: item.at)
     prices = sorted(state.prices, key=lambda item: item.at)
-    reconciliations = state.reconciliations
     if any(r.at > pricing_end for r in (*inventories, *observations, *prices)) or (require_fresh and any(
-            r.at > now for r in reconciliations)):
+            r.at > now for r in state.reconciliations)):
         raise LedgerUnavailable("cost evidence is from the future")
     if (require_fresh and observations and observations[-1].state != "terminated"
             and now - observations[-1].at > settings.observation_max_age_seconds):
@@ -1097,13 +1003,10 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
     window_start = period_bounds(window, settings.accounting_zone)[0] if window is not None else month_start if current_window else 0
     requested_start = window_start
     # Include the complete periods needed by overlapping reconciliations.
-    for reading in sorted(reconciliations, key=lambda r: r.period_end, reverse=True):
+    for reading in sorted(state.reconciliations, key=lambda r: r.period_end, reverse=True):
         if reading.period_end > window_start and reading.period_start < now:
             window_start = min(window_start, reading.period_start)
-    if isinstance(basis, GuardDayBills):
-        window_start = min([window_start, *(bill.period_start for bill in basis.readings
-                                            if bill.period_start < requested_start < bill.period_end)])
-    relevant_readings = [r for r in reconciliations if r.period_end > window_start and r.period_start < now]
+    relevant_readings = [r for r in state.reconciliations if r.period_end > window_start and r.period_start < now]
     intervals: list[ChargedInterval] = []
     inventory_index = max(0, bisect_right(inventories, window_start, key=lambda r: r.at) - 1)
     for index in range(inventory_index, len(inventories)):
@@ -1169,17 +1072,13 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
         else:
             for left, right in _days(max(charge.start, window_start), charge.end, settings.accounting_zone):
                 intervals.append(replace(charge, start=left, end=right, usd=_overlap(charge, left, right)))
-    open_allowances: list[ChargedInterval] = []
     for reservation in state.gate_reservations:
         if isinstance(reservation.state, GateAbsent):
             continue
         if window_start <= reservation.at < pricing_end:
             allowance = gate_allowance(reservation)
-            charge = ChargedInterval(reservation.at, reservation.at, allowance.usd,
-                'gate storage and transfer:' + reservation.attempt + ' (' + allowance.source + ')', 'fixed')
-            intervals.append(charge)
-            if isinstance(basis, GuardDayBills) and gate_is_open(reservation):
-                open_allowances.append(charge)
+            intervals.append(ChargedInterval(reservation.at, reservation.at, allowance.usd,
+                                             'gate storage and transfer:' + reservation.attempt + ' (' + allowance.source + ')', 'fixed'))
     for charge in hana_intervals(state, pricing_end, settings.box_minimum_seconds):
         if charge.start == charge.end:
             if charge.start >= window_start:
@@ -1196,34 +1095,28 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
         for reading in relevant_readings:
             intervals.append(ChargedInterval(reading.period_start, reading.period_start, reading.query_usd,
                                              "confirmed Cost Explorer read", "explorer"))
-    estimates = tuple(row for row in intervals if row.kind != 'explorer') if isinstance(basis, GuardDayBills) else ()
     established_reconciliations: list[CostReconciliation] = []
     for reading in relevant_readings:
         if reading.period_end <= reading.period_start:
             raise LedgerUnavailable("invalid Cost Explorer period")
-        if isinstance(basis, GuardDayBills):
-            established_reconciliations.append(_head_reconcile(reading, settings.accounting_zone, intervals))
-            continue
-        usage = [r for r in intervals if r.kind != 'explorer']
-        charges = _reconciliation_charges(reading, settings.accounting_zone, usage)
-        floors = tuple(EstablishedDayCost(datetime.fromtimestamp(charge.start, settings.accounting_zone).date().isoformat(),
-            period_cost(usage, charge.start, charge.end) + charge.usd, FloorBounds(charge.start, charge.end))
-            for charge in charges)
-        established_reconciliations.append(replace(reading, established_days=floors))
-        intervals.extend(charges)
-    for charge in open_allowances:
-        intervals.remove(charge)
+        estimated = period_cost((r for r in intervals if r.kind != "explorer"), reading.period_start, reading.period_end)
+        extra = max(Decimal(0), reading.usd - estimated)
+        established_days: list[EstablishedDayCost] = []
+        previous = {d.day: d.usd for d in reading.established_days}
+        for start, end in _days(reading.period_start, reading.period_end, settings.accounting_zone):
+            day = datetime.fromtimestamp(start, settings.accounting_zone).date().isoformat()
+            base = period_cost((r for r in intervals if r.kind != "explorer"), start, end)
+            computed = base + extra * Decimal(end - start) / Decimal(reading.period_end - reading.period_start)
+            established = max(computed, previous.get(day, Decimal(0)))
+            established_days.append(EstablishedDayCost(day, established))
+            intervals.append(ChargedInterval(start, end, established - base, reading.source, "reconciliation"))
+        established_reconciliations.append(replace(reading, established_days=tuple(established_days)))
     if window is not None or pricing_end > now:
         intervals = [replace(r, start=max(r.start, requested_start), end=min(r.end, now),
                              usd=_overlap(r, requested_start, now),
                              confirmed_uptime_s=max(0, min(now, r.end) - max(requested_start, r.start))
                              if r.confirmed_uptime_s else 0) for r in intervals
                      if (r.end > requested_start or r.start == r.end >= requested_start) and r.start < now]
-    if isinstance(basis, GuardDayBills):
-        estimates = tuple(row for row in estimates if row not in open_allowances)
-        intervals.extend(_billed_day_adjustments(intervals, estimates, basis, requested_start, settings))
-        intervals.extend(gate_allowance_reservations(
-            (row for row in state.gate_reservations if row.at < now), now))
     day, month = local.date().isoformat(), local.strftime("%Y-%m")
     daily = sum((r.usd for r in intervals if datetime.fromtimestamp(r.start, settings.accounting_zone).date().isoformat() == day), Decimal(0))
     monthly_total = sum((r.usd for r in intervals if datetime.fromtimestamp(r.start, settings.accounting_zone).strftime("%Y-%m") == month), Decimal(0))
@@ -1252,6 +1145,22 @@ def costs_from_evidence(state: LedgerEvidence, settings: SpendingSettings, now: 
 def period_cost(intervals: Sequence[ChargedInterval] | Iterator[ChargedInterval], start: int, end: int) -> Decimal:
     """Return the sum of charges inside the requested period."""
     return sum((_overlap(charge, start, end) for charge in intervals), Decimal(0))
+
+
+def complete_day_adjustment(complete_days: Sequence[CompleteDayAmount], intervals: Sequence[ChargedInterval],
+                            gate_reservations: Sequence[GateReservation], start: int, end: int, *,
+                            reserve: bool = False) -> Decimal:
+    """Replace old usage with the AWS amount for each complete UTC day in the window."""
+    covered = tuple(day for day in complete_days if start <= day.start and day.end <= end)
+    if not covered:
+        return Decimal(0)
+    open_gates = tuple(row for row in gate_reservations if gate_is_open(row))
+    preserved = {'gate storage and transfer:' + row.attempt + ' (' + gate_allowance(row).source + ')'
+                 for row in open_gates}
+    if reserve:
+        preserved.update('gate:' + row.attempt for row in open_gates)
+    usage = tuple(row for row in intervals if row.kind != 'explorer' and row.source not in preserved)
+    return sum((day.usd - period_cost(usage, day.start, day.end) for day in covered), Decimal(0))
 
 
 def read_charge(path: Path) -> ChargeRead:
@@ -1325,78 +1234,6 @@ def is_billed_day(reading: ChargeRead) -> bool:
     return reading.account_bill and reading.actual_usd.quantize(Decimal('.01')) >= Decimal('.01')
 
 
-def bill_is_complete(reading: ChargeRead, settings: SpendingSettings) -> bool:
-    return reading.at - reading.period_end >= settings.bill_complete_after_seconds
-
-
-def _guard_bill_day(path: Path, reading: ChargeRead, now: int) -> bool:
-    day = date.fromisoformat(reading.day)
-    if path.stem != reading.day or not reading.account_bill or reading.actual_usd <= 0 or reading.at > now:
-        return False
-    start = int(datetime.combine(day, day_time(), ZoneInfo('UTC')).timestamp())
-    return day.isoformat() == reading.day and reading.period_start == start and reading.period_end == start + 86400 <= now
-
-
-def _guard_slice_amount(head: Decimal, proposed: Decimal, *, complete: bool = False) -> Decimal:
-    """Keep the HEAD amount unless a complete bill can replace it."""
-    return proposed if complete else max(head, proposed)
-
-
-def _billed_day_adjustments(intervals: Sequence[ChargedInterval], estimates: Sequence[ChargedInterval],
-                            bills: GuardDayBills, window_start: int,
-                            settings: SpendingSettings) -> tuple[ChargedInterval, ...]:
-    """Compare each UTC day with the guard estimate in each accounting slice."""
-    head_usage = tuple(row for row in intervals if row.kind != 'explorer')
-    adjustments: list[ChargedInterval] = []
-    for bill in bills.readings:
-        if bill.period_end <= window_start:
-            continue
-        complete = bill_is_complete(bill, settings)
-        if complete and not is_billed_day(bill):
-            continue
-        actual = ChargedInterval(bill.period_start, bill.period_end, bill.actual_usd, 'AWS bill', 'reconciliation')
-        spans = [(start, end, period_cost(estimates, start, end))
-                 for start, end in _days(bill.period_start, bill.period_end, settings.accounting_zone)]
-        estimated = sum((base for _, _, base in spans), Decimal(0))
-        excess = max(Decimal(0), bill.actual_usd - estimated)
-        for index, (start, end, base) in enumerate(spans):
-            head = period_cost(head_usage, start, end)
-            if complete:
-                proposed = _overlap(actual, start, end)
-            elif estimated:
-                proposed = base + excess * base / estimated
-            else:
-                proposed = excess if index == len(spans) - 1 else Decimal(0)
-            difference = _guard_slice_amount(head, proposed, complete=complete) - head
-            if difference and end > window_start:
-                adjustments.append(replace(actual, start=start, end=end, usd=difference))
-    return tuple(adjustments)
-
-
-def _keep_head_slices(costs: CostEstimate, head: CostEstimate, settings: SpendingSettings,
-                      bills: GuardDayBills, now: int) -> CostEstimate:
-    """Keep each original slice when fallback rates change the allocation."""
-    zone = settings.accounting_zone
-    today = datetime.fromtimestamp(now, zone).date()
-    month_start, _ = period_bounds(today.replace(day=1), zone)
-    day_start, _ = period_bounds(today, zone)
-    complete_days = {bill.period_start for bill in bills.readings
-                     if bill_is_complete(bill, settings) and is_billed_day(bill)}
-    extra: list[ChargedInterval] = []
-    for utc_start, utc_end in _days(month_start, now + 1, ZoneInfo('UTC')):
-        if utc_start - utc_start % 86400 in complete_days:
-            continue
-        for start, end in _days(utc_start, utc_end, zone):
-            selected = period_cost(costs.intervals, start, end)
-            original = period_cost(head.intervals, start, end)
-            amount = _guard_slice_amount(original, selected) - selected
-            if amount > 0:
-                extra.append(ChargedInterval(start, end, amount, 'original guard estimate', 'reconciliation'))
-    return replace(costs, intervals=costs.intervals + tuple(extra),
-                   daily=replace(costs.daily, usd=costs.daily.usd + period_cost(extra, day_start, now + 1)),
-                   monthly=replace(costs.monthly, usd=costs.monthly.usd + period_cost(extra, month_start, now + 1)))
-
-
 @dataclass(frozen=True)
 class _GateCountUnavailable:
     """The bill day has S3 costs but no recorded gate launches."""
@@ -1420,7 +1257,6 @@ class _AllowanceRate:
     usd_per_hour: Decimal
     usd_per_gate: Decimal | _GateCountUnavailable
     source: str
-    rejected: bool
 
 
 @dataclass(frozen=True)
@@ -1429,18 +1265,11 @@ class _BillRates:
     rates: tuple[BoxRate, ...]
     allowance_days: tuple[str, ...] = ()
     allowances: tuple[_AllowanceRate | _AllowanceRatesUnavailable, ...] = ()
-    rejected_rate_days: frozenset[str] = frozenset()
 
     def for_day(self, day: str, fallback: Decimal) -> BoxRate:
         """Select the day's rate without reading the bill history again."""
-        configured = BoxRate(fallback, 'spot_max_usd_per_hour')
-        if not self.days:
-            return configured
-        index = max(0, bisect_right(self.days, day) - 1)
-        rate = self.rates[index]
-        if self.days[index] in self.rejected_rate_days and rate.usd_per_hour < fallback:
-            return configured
-        return rate
+        return (self.rates[max(0, bisect_right(self.days, day) - 1)] if self.days
+                else BoxRate(fallback, 'spot_max_usd_per_hour'))
 
     def allowance_for_day(self, day: str) -> _AllowanceRate | _AllowanceRatesUnavailable:
         """Select non-compute rates with the same bill day rule."""
@@ -1463,15 +1292,12 @@ def usage_region(usage_type: str, usage: str) -> str | None:
     return next((region for region, codes in REGION_USAGE_PREFIXES.items() if code in codes), None)
 
 
-def _bill_rates(bills: Sequence[ChargeRead] | GuardDayBills, instance_type: str, now: int, region: str = '', *,
+def _bill_rates(readings: Sequence[ChargeRead], instance_type: str, now: int, region: str = '', *,
                 root_gib: int = 0,
                 gate_counts: Mapping[str, int] | _GateCountsNotRead = _GATE_COUNTS_NOT_READ) -> _BillRates:
     """Index completed bills once for one type and region."""
-    readings = bills.legacy_readings if isinstance(bills, GuardDayBills) else bills
-    rejected = set(bills.legacy_readings).difference(bills.readings) if isinstance(bills, GuardDayBills) else set[ChargeRead]()
     prefixes = REGION_USAGE_PREFIXES
     rates: dict[str, BoxRate] = {}
-    rejected_rate_days: set[str] = set()
     allowances: dict[str, _AllowanceRate | _AllowanceRatesUnavailable] = {}
     for reading in sorted(readings, key=lambda row: row.at):
         if not is_billed_day(reading) or reading.period_end > now:
@@ -1484,10 +1310,6 @@ def _bill_rates(bills: Sequence[ChargeRead] | GuardDayBills, instance_type: str,
         usd = sum((row.usd for row in rows_for_type), Decimal(0))
         if hours > 0 and usd > 0:
             rates[reading.day] = BoxRate(usd / hours, 'AWS bill ' + reading.day)
-            if reading in rejected:
-                rejected_rate_days.add(reading.day)
-            else:
-                rejected_rate_days.discard(reading.day)
         if isinstance(gate_counts, _GateCountsNotRead):
             continue
         def matches(row: UsageTypeCost, usage: str, *, regional: bool = True) -> bool:
@@ -1510,11 +1332,12 @@ def _bill_rates(bills: Sequence[ChargeRead] | GuardDayBills, instance_type: str,
             hourly += (sum((row.usd for row in root), Decimal(0)) * root_gib / root_months / month_hours
                        if root_months > 0 else Decimal(0))
             share = s3_usd / count if count else Decimal(0) if not s3_usd else _GateCountUnavailable()
-            allowances[reading.day] = _AllowanceRate(hourly, share, 'AWS bill ' + reading.day, reading in rejected)
+            allowances[reading.day] = _AllowanceRate(hourly, share,
+                                                    'AWS bill ' + reading.day)
     days = tuple(sorted(rates))
     allowance_days = tuple(sorted(allowances))
     return _BillRates(days, tuple(rates[day] for day in days), allowance_days,
-                      tuple(allowances[day] for day in allowance_days), frozenset(rejected_rate_days))
+                      tuple(allowances[day] for day in allowance_days))
 
 
 def gate_allowance(reservation: GateReservation) -> GateAllowance:
@@ -1530,7 +1353,6 @@ def _book_allowance(reservation: GateReservation, indexes: Sequence[_BillRates])
         return GateAllowanceUnpriced()
     total = Decimal(0)
     sources: list[str] = []
-    used_rejected_rate = False
     spans = tuple(_days(reservation.at, reservation.state.at, ZoneInfo('UTC'))) or ((reservation.at, reservation.at),)
     for number, (start, end) in enumerate(spans):
         day = datetime.fromtimestamp(start, ZoneInfo('UTC')).date().isoformat()
@@ -1538,7 +1360,6 @@ def _book_allowance(reservation: GateReservation, indexes: Sequence[_BillRates])
         if not candidates or any(isinstance(rate, _AllowanceRatesUnavailable)
                 or (number == 0 and isinstance(rate.usd_per_gate, _GateCountUnavailable)) for rate in candidates):
             return GateAllowance(reservation.allowance_usd, 'attempt_allowance_usd')
-        used_rejected_rate |= any(isinstance(rate, _AllowanceRate) and rate.rejected for rate in candidates)
         costs = [GateAllowance(rate.usd_per_hour * Decimal(end - start) / Decimal(3600)
                                + (rate.usd_per_gate if number == 0 and isinstance(rate.usd_per_gate, Decimal)
                                   else Decimal(0)), rate.source)
@@ -1547,8 +1368,6 @@ def _book_allowance(reservation: GateReservation, indexes: Sequence[_BillRates])
         total += selected.usd
         if selected.source not in sources:
             sources.append(selected.source)
-    if used_rejected_rate and total < reservation.allowance_usd:
-        return GateAllowance(reservation.allowance_usd, 'attempt_allowance_usd')
     return GateAllowance(total, ', '.join(sources))
 
 
@@ -1606,16 +1425,15 @@ def day_compute_intervals(start: int, end: int, minimum_seconds: int, rate_for_d
 
 
 def trial_gate_cost(reservation: GateReservation, minimum_seconds: int) -> Decimal:
-    """Book completed costs and retain the configured maximum for open boxes."""
+    """Keep the full maximum for open boxes and book confirmed box costs."""
     if isinstance(reservation.state, GateAbsent):
         return Decimal(0)
-    evidence = LedgerEvidence(gate_reservations=[reservation])
     if isinstance(reservation.state, GateTerminated):
-        compute = gate_compute_intervals(evidence, reservation.state.at, minimum_seconds)
-        return sum((row.usd for row in compute), Decimal(0)) + gate_allowance(reservation).usd
-    compute = gate_compute_intervals(evidence, reservation.expires, minimum_seconds, reserve=True)
-    configured = reservation.usd_per_hour * Decimal(max(minimum_seconds, reservation.expires - reservation.at)) / Decimal(3600)
-    return max(configured, sum((row.usd for row in compute), Decimal(0))) + reservation.allowance_usd
+        evidence = LedgerEvidence(gate_reservations=[reservation])
+        return (sum((row.usd for row in gate_compute_intervals(evidence, reservation.state.at, minimum_seconds)), Decimal(0))
+                + gate_allowance(reservation).usd)
+    return (reservation.usd_per_hour * Decimal(max(minimum_seconds, reservation.expires - reservation.at))
+            / Decimal(3600) + reservation.allowance_usd)
 
 
 def gate_compute_intervals(state: LedgerEvidence, now: int, minimum_seconds: int, *,
@@ -1655,7 +1473,7 @@ def hana_intervals(state: LedgerEvidence, now: int, minimum_seconds: int, *,
     return tuple(intervals)
 
 
-def older_compute_intervals(intervals: Sequence[ChargedInterval], readings: Sequence[ChargeRead] | GuardDayBills,
+def older_compute_intervals(intervals: Sequence[ChargedInterval], readings: Sequence[ChargeRead],
                             settings: SpendingSettings, now: int) -> tuple[ChargedInterval, ...]:
     """Price each UTC day and apply the minimum once per builder lifetime."""
     lifetimes: list[ChargedInterval] = []
@@ -1684,7 +1502,7 @@ def spending_periods(intervals: Sequence[ChargedInterval], zone: ZoneInfo) -> tu
     return daily, monthly
 
 
-def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, bill_inputs: Sequence[ChargeRead] | GuardDayBills, now: int, *,
+def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings: Sequence[ChargeRead], now: int, *,
                     reserve: bool = False) -> tuple[DailySpend, ...]:
     """Use account bills for completed days and bill rates for unbilled days."""
     zone = ZoneInfo('UTC')
@@ -1695,21 +1513,15 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, bill_inpu
     last_at = max((r.expires for r in state.gate_reservations
                    if gate_is_open(r)), default=now) if reserve else now
     last = datetime.fromtimestamp(max(now, last_at - 1), zone).date()
-    readings = bill_inputs.legacy_readings if isinstance(bill_inputs, GuardDayBills) else bill_inputs
     bills = {r.day: r for r in readings if is_billed_day(r) and r.period_end <= now}
-    latest = max(bills.values(), key=lambda row: row.day, default=None)
-    if isinstance(bill_inputs, GuardDayBills):
-        bills.update((row.day, row) for row in bill_inputs.readings
-                     if bill_is_complete(row, settings) and is_billed_day(row))
     if bills:
         first = min(first, date.fromisoformat(min(bills)))
-    base = _charges(replace(state, gate_reservations=[], hana_compute=[], hana_storage=[]),
-                    replace(settings, accounting_zone=zone), now, require_fresh=False,
-                    basis=GuardDayBills((), ()) if reserve else _HISTORICAL_RECONCILIATION)
-    open_allowances = gate_allowance_reservations(iter(state.gate_reservations), now) if reserve else ()
+    latest = max(bills.values(), key=lambda row: row.day, default=None)
+    base = _charges(replace(state, gate_reservations=[], hana_compute=[], hana_storage=[]), replace(settings, accounting_zone=zone), now,
+                    require_fresh=False)
     older = tuple(row for row in base.intervals if row.kind == 'instance')
     if latest is not None:
-        older = older_compute_intervals(older, bill_inputs, settings, now)
+        older = older_compute_intervals(older, readings, settings, now)
     gate_compute: dict[str, list[ChargedInterval]] = {}
     for charge in gate_compute_intervals(state, now, settings.box_minimum_seconds, reserve=reserve):
         gate_compute.setdefault(charge.source, []).append(charge)
@@ -1792,15 +1604,12 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, bill_inpu
         for reservation in state.gate_reservations:
             if isinstance(reservation.state, GateAbsent) or not start <= reservation.at < end:
                 continue
-            if bill is None and latest is None and not (reserve and gate_is_open(reservation)):
+            if ((bill is None and latest is None) or
+                    (reserve and gate_is_open(reservation))):
                 allowance = gate_allowance(reservation)
                 groups['other'] += allowance.usd
                 include(ChargedInterval(reservation.at, reservation.at, allowance.usd,
                                          'gate storage and transfer:' + reservation.attempt + ' (' + allowance.source + ')', 'fixed'))
-        for allowance in open_allowances:
-            if start <= allowance.start < end:
-                groups['other'] += allowance.usd
-                include(allowance)
         days.append(DailySpend(key, source, tuple(SpendGroupCost(group, usd) for group, usd in groups.items()),
                               runs, query_usd, tuple(intervals), provisional_bill=bill is not None and bill.provisional))
     return tuple(days)
@@ -1814,25 +1623,18 @@ def _reserved_fixed_costs(state: LedgerEvidence, settings: SpendingSettings, cos
                       sum((p.usd_per_month for p in inventory.resources), Decimal(0)))
     day_start, day_end = period_bounds(local.date(), settings.accounting_zone)
     denominator = Decimal(_month_seconds(costs.at, settings.accounting_zone))
-    inventory_charges = tuple(row for row in costs.intervals if row.kind == 'fixed'
-                              and row.source != 'Hana storage' and not row.source.startswith('gate storage and transfer:'))
-    month_start, _ = period_bounds(local.date().replace(day=1), settings.accounting_zone)
-    daily_accrued = period_cost(inventory_charges, day_start, day_end)
-    monthly_accrued = period_cost(inventory_charges, month_start, day_end)
+    daily_accrued = sum((r.usd for r in costs.intervals if r.kind == "fixed" and r.source != "Hana storage"
+                         and datetime.fromtimestamp(r.start, settings.accounting_zone).date() == local.date()), Decimal(0))
+    monthly_accrued = sum((r.usd for r in costs.intervals if r.kind == "fixed" and r.source != "Hana storage"
+                           and datetime.fromtimestamp(r.start, settings.accounting_zone).strftime("%Y-%m") == costs.monthly.month), Decimal(0))
     return (max(Decimal(0), monthly * Decimal(day_end - day_start) / denominator - daily_accrued),
             max(Decimal(0), monthly - monthly_accrued))
 
 
-def gate_allowance_reservations(reservations: Iterator[GateReservation], now: int) -> tuple[ChargedInterval, ...]:
-    """Reserve open allowances at the decision time or the future launch time."""
-    return tuple(ChargedInterval(at, at, row.allowance_usd, 'gate storage and transfer:' + row.attempt, 'fixed')
-                 for row in reservations if gate_is_open(row) for at in (max(now, row.at),))
-
-
 def gate_future_periods(state: LedgerEvidence, settings: SpendingSettings, now: int) -> tuple[dict[str, Decimal], dict[str, Decimal]]:
     """Reserve each open gate across all affected days and months."""
-    daily, monthly = spending_periods(gate_allowance_reservations(
-        (row for row in state.gate_reservations if row.at >= now), now), settings.accounting_zone)
+    daily: dict[str, Decimal] = {}
+    monthly: dict[str, Decimal] = {}
     for reservation in state.gate_reservations:
         if isinstance(reservation.state, (GateAbsent, GateTerminated)):
             continue
@@ -1845,6 +1647,10 @@ def gate_future_periods(state: LedgerEvidence, settings: SpendingSettings, now: 
             cost = max(Decimal(0), reserved - accrued_days.get(day, Decimal(0)))
             daily[day] = daily.get(day, Decimal(0)) + cost
             monthly[day[:7]] = monthly.get(day[:7], Decimal(0)) + cost
+        if reservation.at >= now:
+            day = datetime.fromtimestamp(reservation.at, settings.accounting_zone).strftime('%Y-%m-%d')
+            daily[day] = daily.get(day, Decimal(0)) + reservation.allowance_usd
+            monthly[day[:7]] = monthly.get(day[:7], Decimal(0)) + reservation.allowance_usd
     return daily, monthly
 
 
@@ -1949,26 +1755,30 @@ class CostLedger:
     def read_bills(self) -> tuple[ChargeRead, ...]:
         return tuple(read_charge(path) for path in self.bill_paths())
 
-    def read_guard_bills(self, now: int) -> GuardDayBills:
-        readings: list[ChargeRead] = []
-        legacy_readings: list[ChargeRead] = []
+    def read_complete_day_amounts(self, settings: SpendingSettings, now: int) -> tuple[CompleteDayAmount, ...]:
+        """Read amounts that qualify to replace a full UTC day."""
+        complete: list[CompleteDayAmount] = []
+        utc = ZoneInfo('UTC')
         for path in self.bill_paths():
             try:
                 reading = read_charge(path)
-                accepted = _guard_bill_day(path, reading, now)
-            except (FileNotFoundError, ValueError, ArithmeticError):
+                day = date.fromisoformat(reading.day)
+                start, end = period_bounds(day, utc)
+            except (OSError, ValueError, ArithmeticError):
                 continue
-            legacy_readings.append(reading)
-            if accepted:
-                readings.append(reading)
-        return GuardDayBills(tuple(readings), tuple(legacy_readings))
+            key = day.isoformat()
+            if (reading.day == key and path.name == key + '.json'
+                    and (reading.period_start, reading.period_end) == (start, end)
+                    and end + settings.bill_complete_after_seconds <= reading.at <= now
+                    and reading.account_bill and reading.actual_usd >= Decimal('.01')):
+                complete.append(CompleteDayAmount(start, end, reading.actual_usd))
+        return tuple(complete)
 
     def launches(self) -> tuple[dict[str, object], ...]:
         path = self.launch_history_path
         return tuple(mapping(cast(object, json.loads(line))) for line in path.read_text().splitlines()) if path.exists() else ()
 
-    def _price_gates(self, state: LedgerEvidence, bills: Sequence[ChargeRead] | GuardDayBills, now: int) -> None:
-        readings = bills.legacy_readings if isinstance(bills, GuardDayBills) else bills
+    def _price_gates(self, state: LedgerEvidence, readings: Sequence[ChargeRead], now: int) -> None:
         launch_rows = self.launches()
         launches = {str(row.get('attempt', '')): row for row in reversed(launch_rows) if row.get('result') == 'launched'}
         gate_counts: dict[str, int] = {}
@@ -1995,7 +1805,7 @@ class CostLedger:
             for region in regions:
                 key = (size, region, reservation.root_gib or root_gib)
                 if key not in indexes:
-                    indexes[key] = _bill_rates(bills, size, now, region, root_gib=key[2], gate_counts=gate_counts)
+                    indexes[key] = _bill_rates(readings, size, now, region, root_gib=key[2], gate_counts=gate_counts)
             rates = tuple((day, max((indexes[(size, region, reservation.root_gib or root_gib)].for_day(day, reservation.usd_per_hour) for region in regions),
                                    key=lambda rate: rate.usd_per_hour,
                                    default=BoxRate(reservation.usd_per_hour, 'spot_max_usd_per_hour'))) for day in days)
@@ -2003,8 +1813,7 @@ class CostLedger:
             priced.append(replace(reservation, booked_allowance=_book_allowance(
                 reservation, tuple(indexes[(size, region, reservation.root_gib or root_gib)] for region in regions))))
         state.gate_reservations = priced
-        if not isinstance(bills, GuardDayBills):
-            _correct_allowance_estimates(state, readings, now)
+        _correct_allowance_estimates(state, readings, now)
 
     def priced_snapshot(self, now: int) -> LedgerEvidence:
         """Read current bill prices without publishing ledger changes."""
@@ -2025,19 +1834,6 @@ class CostLedger:
                 and datetime.fromtimestamp(r.at, ZoneInfo('UTC')).date().isoformat() == day.day
                 for r in state.gate_reservations)) for day in days)
 
-    def _guard_costs(self, state: LedgerEvidence, settings: SpendingSettings, now: int,
-                     bills: GuardDayBills, *, require_fresh: bool = True) -> CostEstimate:
-        legacy = replace(state) if len(bills.readings) != len(bills.legacy_readings) else state
-        self._price_gates(state, bills, now)
-        costs = _charges(state, settings, now, current_window=True, require_fresh=require_fresh, basis=bills)
-        if legacy is state:
-            return costs
-
-        # A higher rate can move reconciliation costs between accounting slices.
-        self._price_gates(legacy, bills.legacy_readings, now)
-        head = _charges(legacy, settings, now, current_window=True, require_fresh=require_fresh, basis=GuardDayBills((), ()))
-        return _keep_head_slices(costs, head, settings, bills, now)
-
     def reserve_gate(self, settings_path: Path, request: GateReservation) -> GateReserved | GateCapReached | GateAttemptEnded:
         """Reserve gate costs under the shared Rust accounting lock."""
         with self._locked() as state:
@@ -2047,7 +1843,6 @@ class CostLedger:
                         return GateAttemptEnded()
                     return GateReserved(previous)
             settings = read_settings(settings_path)
-            bills = self.read_guard_bills(request.at)
             if isinstance(request.trial, GateTrialBudget):
                 if request.mode != 'gpu-size-trial' or not request.trial.trial_id or request.trial.limit_usd <= 0:
                     raise LedgerUnavailable('The GPU trial budget is invalid')
@@ -2055,16 +1850,17 @@ class CostLedger:
                     if isinstance(row.trial, GateTrialBudget) and row.trial.trial_id == request.trial.trial_id]
                 limit = min([request.trial.limit_usd, *(row.trial.limit_usd for row in previous_trials
                                                        if isinstance(row.trial, GateTrialBudget))])
-                request = replace(request, trial=GateTrialBudget(request.trial.trial_id, limit))
-            state.gate_reservations.append(request)
-            costs = self._guard_costs(state, settings, request.at, bills, require_fresh=False)
-            if isinstance(request.trial, GateTrialBudget):
+                trial_id = request.trial.trial_id
+                request = replace(request, trial=GateTrialBudget(trial_id, limit))
+                self._price_gates(state, self.read_bills(), request.at)
                 scoped = [row for row in state.gate_reservations
-                    if isinstance(row.trial, GateTrialBudget) and row.trial.trial_id == request.trial.trial_id]
+                    if isinstance(row.trial, GateTrialBudget) and row.trial.trial_id == trial_id]
                 total = sum((trial_gate_cost(row, settings.box_minimum_seconds) for row in scoped), Decimal(0))
-                if total > request.trial.limit_usd:
+                if total + trial_gate_cost(request, settings.box_minimum_seconds) > limit:
                     return GateCapReached('gpu_size_trial_limit_usd')
-            reason = self._reservation_cap(state, settings, request.at, costs, bills)
+            costs = _charges(state, settings, request.at, current_window=True, require_fresh=False)
+            state.gate_reservations.append(request)
+            reason = self.reservation_cap(state, settings, request.at, costs)
             if reason:
                 state.gate_reservations = [r for r in state.gate_reservations if r.attempt != request.attempt]
                 self._save(state)
@@ -2087,38 +1883,50 @@ class CostLedger:
 
     def spending_decision(self, state: LedgerEvidence, settings_path: Path, now: int) -> SpendingDecision:
         """Validate account evidence and apply the shared bill cap to a proposed reservation."""
-        return self._decide(state, settings_path, 'start', now, placement_preview=True)
+        decision = self._decide(state, settings_path, 'start', now)
+        if not isinstance(decision, SpendingAllowed):
+            return decision
+        policy, costs = decision.evidence.policy, decision.evidence.costs
+        if isinstance(policy, SpendingPolicyUnavailable) or isinstance(costs, CostEvidenceUnavailable):
+            return SpendingUnavailable(now, 'Spending evidence is unavailable', decision.evidence)
+        reason = self.reservation_cap(state, policy, now, costs)
+        return SpendingRefused(now, reason, decision.evidence) if reason else decision
 
     def placement_spending_preview(self, state: LedgerEvidence, settings_path: Path, now: int) -> SpendingDecision:
         """Project spending for placement with one read of the pricing inputs."""
         return self._decide(state, settings_path, 'start', now, placement_preview=True)
 
+    def reservation_cap(self, state: LedgerEvidence, settings: SpendingSettings, now: int, costs: CostEstimate) -> str:
+        """Refresh prices and apply the account bill cap to the proposed reservations."""
+        readings = self.read_bills()
+        self._price_gates(state, readings, now)
+        complete_days = self.read_complete_day_amounts(settings, now)
+        return self._reservation_cap(state, settings, now, costs, readings, complete_days)
+
     def _reservation_cap(self, state: LedgerEvidence, settings: SpendingSettings, now: int,
-                         costs: CostEstimate, bills: GuardDayBills) -> str:
+                         costs: CostEstimate, readings: Sequence[ChargeRead],
+                         complete_days: Sequence[CompleteDayAmount]) -> str:
         """Apply the account bill cap to the priced resource reservations."""
-        days = gate_spend_days(state, settings, bills, now, reserve=True)
+        days = gate_spend_days(state, settings, readings, now, reserve=True)
         fixed_daily, fixed_monthly = _reserved_fixed_costs(state, settings, costs)
-        if any(is_billed_day(row) and row.period_end <= now for row in bills.legacy_readings):
+        if any(is_billed_day(r) and r.period_end <= now for r in readings):
             fixed_daily = fixed_monthly = Decimal(0)
         today = datetime.fromtimestamp(now, settings.accounting_zone).date().isoformat()
-        intervals = [charge for day in days for charge in day.intervals]
-        by_day = {day.day: day.intervals for day in days}
-        for bill in bills.readings:
-            if bill_is_complete(bill, settings):
-                continue
-            projection = by_day.get(bill.day, ())
-            for start, end in _days(bill.period_start, bill.period_end, settings.accounting_zone):
-                head = period_cost(projection, start, end)
-                missing = _guard_slice_amount(head, period_cost(costs.intervals, start, end)) - head
-                if missing > 0:
-                    intervals.append(ChargedInterval(start, end, missing, 'incomplete AWS bill estimate', 'reconciliation'))
-        daily, monthly = spending_periods(intervals, settings.accounting_zone)
+        intervals = tuple(charge for day in days for charge in day.intervals)
+        zone = settings.accounting_zone
+        daily, monthly = spending_periods(intervals, zone)
         reason = ''
         for day, amount in daily.items():
-            if day >= today and amount + fixed_daily + settings.limit_reserve_usd >= settings.daily_limit_usd:
-                reason = 'daily_limit'
-        if not reason and any(amount + fixed_monthly + settings.limit_reserve_usd >= settings.monthly_limit_usd
-                              for month, amount in monthly.items() if month >= today[:7]):
+            if day >= today:
+                bounds = period_bounds(date.fromisoformat(day), zone)
+                adjustment = complete_day_adjustment(complete_days, intervals, state.gate_reservations, *bounds, reserve=True)
+                if amount + adjustment + fixed_daily + settings.limit_reserve_usd >= settings.daily_limit_usd:
+                    reason = 'daily_limit'
+        if not reason and any(amount + complete_day_adjustment(
+                complete_days, intervals, state.gate_reservations,
+                *_month_bounds(date.fromisoformat(month + '-01'), zone), reserve=True)
+                + fixed_monthly + settings.limit_reserve_usd >= settings.monthly_limit_usd
+                for month, amount in monthly.items() if month >= today[:7]):
             reason = 'monthly_limit'
         return reason
 
@@ -2242,7 +2050,7 @@ class CostLedger:
 
     def _reconcile_charge(self, state: LedgerEvidence, reading: ChargeRead) -> None:
         key = (reading.period_start, reading.period_end, 'Cost Explorer')
-        established: dict[FloorBounds, EstablishedDayCost] = {}
+        established: dict[str, Decimal] = {}
         query_usd = reading.query_usd
         for saved in state.reconciliations:
             if (saved.period_start, saved.period_end, saved.source) == key:
@@ -2250,13 +2058,11 @@ class CostLedger:
                     query_usd += saved.query_usd
                 else:
                     query_usd = saved.query_usd
-                for bounds, amount in _reconciliation_floors(saved).items():
-                    if bounds not in established or amount > established[bounds].usd:
-                        day = datetime.fromtimestamp(bounds.start, ZoneInfo('UTC')).date().isoformat()
-                        established[bounds] = EstablishedDayCost(day, amount, bounds)
+                for day in saved.established_days:
+                    established[day.day] = max(established.get(day.day, Decimal(0)), day.usd)
         reconciliation = CostReconciliation(reading.at, reading.period_start, reading.period_end,
                                              reading.actual_usd, 'Cost Explorer', query_usd,
-                                             tuple(established[bounds] for bounds in sorted(established, key=lambda span: span.start)))
+                                             tuple(EstablishedDayCost(day, usd) for day, usd in sorted(established.items())))
         if reconciliation in state.reconciliations and state.charge_refresh_at >= reading.at:
             return
         state.reconciliations = [r for r in state.reconciliations
@@ -2340,8 +2146,9 @@ class CostLedger:
         try:
             settings = read_settings(settings_path)
             evidence = GuardEvidence(purpose, settings.limits, evidence.costs, settings)
-            bills = self.read_guard_bills(now)
-            costs = self._guard_costs(state, settings, now, bills)
+            readings = self.read_bills()
+            self._price_gates(state, readings, now)
+            costs = _charges(state, settings, now, current_window=True)
             evidence = GuardEvidence(purpose, settings.limits, costs, settings)
             if purpose != "deployment" and not any(r.state != "unknown" for r in state.observations):
                 raise LedgerUnavailable("instance state evidence is missing")
@@ -2355,6 +2162,16 @@ class CostLedger:
                                            - accrued.get(costs.daily.day, Decimal(0)))
             monthly_fixed += gate_monthly + max(Decimal(0), reserved_months.get(costs.monthly.month, Decimal(0))
                                                - accrued_months.get(costs.monthly.month, Decimal(0)))
+            complete_days = self.read_complete_day_amounts(settings, now)
+            zone = settings.accounting_zone
+            day = datetime.fromtimestamp(now, zone).date()
+            daily_adjustment = complete_day_adjustment(
+                complete_days, costs.intervals, state.gate_reservations, *period_bounds(day, zone))
+            monthly_adjustment = complete_day_adjustment(
+                complete_days, costs.intervals, state.gate_reservations, *_month_bounds(day, zone))
+            if daily_adjustment or monthly_adjustment:
+                costs = replace(costs, daily=replace(costs.daily, usd=costs.daily.usd + daily_adjustment),
+                                monthly=replace(costs.monthly, usd=costs.monthly.usd + monthly_adjustment))
             evidence = GuardEvidence(purpose, settings.limits, costs, settings, daily_fixed, monthly_fixed)
             reason = ""
             for period, key, total, limit in (
@@ -2369,7 +2186,7 @@ class CostLedger:
                     state.events.append(LimitEvent(event_id, now, period, total, limit,
                                                    settings.notification_recipient, settings.notification_timeout_s))
             if not reason and placement_preview:
-                reason = self._reservation_cap(state, settings, now, costs, bills)
+                reason = self._reservation_cap(state, settings, now, costs, readings, complete_days)
             return SpendingRefused(now, reason, evidence) if reason else SpendingAllowed(now, evidence)
         except SpendingConfigurationUnavailable as error:
             return SpendingUnavailable(now, str(error), GuardEvidence(purpose, error.limits, evidence.costs))

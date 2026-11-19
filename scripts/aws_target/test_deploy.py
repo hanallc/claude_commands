@@ -5581,7 +5581,7 @@ esac
         _ = book.estimate(aws_config.read_settings(self.settings), self.now)
         reopened = ledger.CostLedger(self.state).read_snapshot()
         self.assertEqual(reopened.reconciliations[0].established_days,
-                         (ledger.EstablishedDayCost(DAY, Decimal(2), ledger.FloorBounds(start, self.now)),))
+                         (ledger.EstablishedDayCost(DAY, Decimal(2)),))
 
     def test_estimate_preserves_distinct_replies_for_the_same_period(self) -> None:
         self.costs({'fixed_usd_per_month': '0', 'cost_explorer_read_usd': '0'})

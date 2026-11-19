@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-import json
 import os
 import re
 from decimal import Decimal
@@ -35,13 +34,6 @@ def git_only(arguments: Sequence[str], **options: object) -> subprocess.Complete
 def instant(value: str) -> int:
     """Convert an explicit zone timestamp to an integer accounting boundary."""
     return int(datetime.fromisoformat(value).timestamp())
-
-
-def write_charge_fixture(directory: Path, reading: ledger.ChargeRead) -> None:
-    """Save a bill at the path used by the ledger."""
-    charges = directory / 'charges'
-    charges.mkdir(exist_ok=True)
-    _ = (charges / (reading.day + '.json')).write_text(json.dumps(ledger.charge_record(reading)))
 
 
 def numeric_settings(path: Path, values: dict[str, str]) -> None:
