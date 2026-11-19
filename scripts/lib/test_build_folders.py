@@ -19,9 +19,8 @@ import unittest
 from typing import Never, cast, override
 from unittest import mock
 from contextlib import contextmanager, nullcontext
-from typing import ContextManager
 
-from scripts.lib import build_folders as folders, conf, copy_record, scratch, unit_runs, process_group
+from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, scratch, unit_runs, process_group
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository
@@ -449,7 +448,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
         collision = self.root / "collision"
         collision.mkdir()
         closed: list[int] = []
-        open_lock = cast(Callable[..., int], getattr(folders, "_open_lock"))
+        open_lock = build_folder_lock.open_lock
 
         def remember(path: Path, directory: int, *, create: bool) -> int:
             descriptor = open_lock(path, directory, create=create)
@@ -473,7 +472,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
                 raise KeyboardInterrupt()
 
             try:
-                with mock.patch.object(folders, "_open_lock", side_effect=remember), \
+                with mock.patch.object(build_folder_lock, "open_lock", side_effect=remember), \
                         mock.patch.object(folders, "build_folder_path", side_effect=cancel_after_reuse):
                     with self.assertRaises(KeyboardInterrupt):
                         _ = folders.create_build_folder(folders.UniqueBuildFolder("collision-"))
@@ -491,7 +490,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
         collision.mkdir()
         collided: list[int] = []
         reused: list[int] = []
-        open_lock = cast(Callable[..., int], getattr(folders, "_open_lock"))
+        open_lock = build_folder_lock.open_lock
         close = os.close
 
         def remember(path: Path, directory: int, *, create: bool) -> int:
@@ -516,7 +515,7 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
                     raise KeyboardInterrupt()
 
             try:
-                with mock.patch.object(folders, "_open_lock", side_effect=remember), \
+                with mock.patch.object(build_folder_lock, "open_lock", side_effect=remember), \
                         mock.patch.object(folders, "build_folder_path", return_value=collision), \
                         mock.patch.object(os, "close", side_effect=cancel_close):
                     with self.assertRaises(KeyboardInterrupt):
@@ -948,7 +947,7 @@ print('signals')
         parent.mkdir()
         moved = self.root / "moved"
         opens: list[Path] = []
-        original = cast(Callable[..., ContextManager[int]], getattr(folders, "_folder_parent"))
+        original = build_folder_lock.folder_parent
 
         @contextmanager
         def replace_parent(path: Path, root: Path, *, create: bool) -> Generator[int]:
@@ -960,7 +959,7 @@ print('signals')
                     _ = (parent / "keep").write_text("replacement")
                 yield descriptor
 
-        with mock.patch("scripts.lib.build_folders._folder_parent", side_effect=replace_parent):
+        with mock.patch("scripts.lib.build_folder_lock.folder_parent", side_effect=replace_parent):
             with folders.temporary_build_folder(folders.UniqueBuildFolder("proof-", folders.ExplicitBuildParent(parent))) as path:
                 self.assertTrue((moved / path.name).is_dir())
                 self.assertFalse(path.exists())
@@ -1015,7 +1014,7 @@ print('signals')
         self.addCleanup(os.close, directory)
 
         with ((path / "child.lock").open("wb") as child_lock,
-              mock.patch("scripts.lib.build_folders._folder_parent", return_value=nullcontext(directory))):
+              mock.patch("scripts.lib.build_folder_lock.folder_parent", return_value=nullcontext(directory))):
             fcntl.flock(child_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             with folders.collector_lease(path, children=True) as free:
                 self.assertFalse(free)

@@ -12,6 +12,7 @@ except FileNotFoundError:
 
 import json
 import socket
+import struct
 import subprocess
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -388,7 +389,24 @@ class SocketUnavailable:
     reason: str
 
 
+@dataclass(frozen=True)
+class ClaudeOwnerMismatch(SocketUnavailable):
+    """The available evidence identifies a different owner."""
+
+
+@dataclass(frozen=True)
+class ClaudeSocketAbsent(SocketUnavailable):
+    """The connection did not reach any listener."""
+
+
 type ClaudeAddress = CheckedSocket | SocketUnavailable
+
+
+@dataclass(frozen=True)
+class RegisteredSocketPath:
+    """The path recorded for this generation, before a peer check."""
+
+    path: str
 
 
 @dataclass(frozen=True)
@@ -397,12 +415,16 @@ class ProvedClaudeOwner:
     recorded_start: str
     conversation: str
     placement: HerdrPlace | herdr.NotInHerdr
-    address: ClaudeAddress
+    address: RegisteredSocketPath | SocketUnavailable
     name: str
     activity: str
 
-    def session(self) -> LiveClaude:
-        path = self.address.path if isinstance(self.address, CheckedSocket) else ""
+    def session(self, *, probe_address: bool) -> LiveClaude:
+        path = ""
+        if probe_address and isinstance(self.address, RegisteredSocketPath):
+            checked = _check_claude_address(self.address.path, self.pid, self.recorded_start)
+            if isinstance(checked, CheckedSocket):
+                path = checked.path
         return LiveClaude(self.name, self.conversation, path, self.pid, self.activity)
 
 
@@ -423,17 +445,85 @@ class UnknownClaudeOwner:
     reason: str
 
 
-def _check_claude_address(path: str) -> ClaudeAddress:
+def current_claude_record(pid: int, started: str, conversation: str) -> SessionRecord | SocketUnavailable:
+    """Read the current registry details for the proved conversation and process generation."""
+    current = sessions.read_session(sessions.sessions_dir() / f"{pid}.json")
+    if isinstance(current, sessions.UnreadableSessionRecord):
+        return SocketUnavailable("the current Claude registry record is unreadable")
+    if (current["pid"] != pid or not started or current.get("procStart", "") != started
+            or current["sessionId"] != conversation):
+        return ClaudeOwnerMismatch("the current Claude registry record does not match the owner")
+    return current
+
+
+def _peer_pid(connection: socket.socket) -> int:
+    if sys.platform == "linux":
+        pid, _, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        return pid
+    if sys.platform == "darwin":
+        # Darwin defines SOL_LOCAL as 0 and LOCAL_PEERPID as 2.
+        return struct.unpack("i", connection.getsockopt(0, 2, 4))[0]
+    raise OSError("Unix peer credentials are unavailable on this platform")
+
+
+@dataclass(frozen=True)
+class CheckedSocketOwner:
+    """The connected peer matches the expected process generation."""
+
+
+def validate_claude_connection(connection: socket.socket, pid: int, started: str) -> CheckedSocketOwner | SocketUnavailable:
+    """Validate the peer PID and process start on an existing connection."""
+    try:
+        if _peer_pid(connection) != pid:
+            return ClaudeOwnerMismatch("the messaging socket peer is not the Claude owner")
+        observed_start = sessions.process_start(pid)
+        if not observed_start:
+            return SocketUnavailable("the Claude owner process start is unreadable")
+        if observed_start != started:
+            return ClaudeOwnerMismatch("the Claude owner process start changed")
+        return CheckedSocketOwner()
+    except (OSError, ValueError, struct.error) as error:
+        return SocketUnavailable(f"cannot check the messaging socket: {error}")
+
+
+def connect_claude_socket(path: str, pid: int, started: str, *, timeout: float = 0.0) -> socket.socket | SocketUnavailable:
+    """Return the connected socket only when its peer owns the expected process generation."""
     if not path:
         return SocketUnavailable("the owner has no messaging socket")
-    if "\0" in path:
+    if not Path(path).is_absolute() or "\0" in path:
         return SocketUnavailable("the messaging socket path is invalid")
+    observed_start = sessions.process_start(pid)
+    if not started or not observed_start:
+        return SocketUnavailable("the Claude owner process start is unreadable")
+    if observed_start != started:
+        return ClaudeOwnerMismatch("the Claude owner process start changed")
+    connection = None
+    keep = False
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
-            probe.setblocking(False)
-            probe.connect(path)
-    except (OSError, ValueError) as error:
-        return SocketUnavailable(f"cannot connect to the messaging socket: {error}")
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.settimeout(timeout)
+        try:
+            connection.connect(path)
+        except (FileNotFoundError, ConnectionRefusedError) as error:
+            name = "ENOENT" if isinstance(error, FileNotFoundError) else "ECONNREFUSED"
+            return ClaudeSocketAbsent(f"cannot connect to the messaging socket: {name}: {error}")
+        owner = validate_claude_connection(connection, pid, started)
+        if isinstance(owner, SocketUnavailable):
+            return owner
+        keep = True
+        return connection
+    except (OSError, ValueError, struct.error) as error:
+        return SocketUnavailable(f"cannot check the messaging socket: {error}")
+    finally:
+        if connection is not None and not keep:
+            connection.close()
+
+
+def _check_claude_address(path: str, pid: int, started: str) -> ClaudeAddress:
+    connection = connect_claude_socket(path, pid, started)
+    if isinstance(connection, SocketUnavailable):
+        return connection
+    connection.close()
     return CheckedSocket(path)
 
 
@@ -450,9 +540,13 @@ def _validate_claude_owner(record: SessionRecord, placement: HerdrPlace | herdr.
         return UnknownClaudeOwner(str(error))
     if started != native.started or record["sessionId"] != conversation:
         return UnknownClaudeOwner("Claude registry does not match the native conversation or process start")
-    return ProvedClaudeOwner(pid, started, conversation, placement,
-                             _check_claude_address(record["messagingSocketPath"]),
-                             record["name"], record.get("status", ""))
+    current = current_claude_record(pid, started, conversation)
+    if isinstance(current, SocketUnavailable):
+        return ProvedClaudeOwner(pid, started, conversation, placement, current, record["name"], "")
+    path = current["messagingSocketPath"]
+    address = (RegisteredSocketPath(path) if path == record["messagingSocketPath"]
+               else SocketUnavailable("the snapshot names a different Claude messaging socket"))
+    return ProvedClaudeOwner(pid, started, conversation, placement, address, current["name"], current.get("status", ""))
 
 
 def _claudes(processes: list[herdr.HerdrProcess], *,
@@ -612,7 +706,8 @@ def _herdr_labeled(registry: dict[HerdrPlace, dict[int, list[SessionRecord]]], e
                                              registry_problem=problem, native_identity=identity.id)
                 continue
             process = session_staff.ProvedCodexPaneProcess(owner.pid, owner.kind)
-            label = LabeledSession("", ClaudeUnknown(problem or "no live Claude registry record"), place, process, identity)
+            label = LabeledSession("", ClaudeUnknown(problem or "no live Claude registry record"), place, process, identity,
+                                   generation=session_staff.ProvedProcessGeneration(owner.pid, native.started))
             yield ProvedCodexOwner(owner.pid, native.started, identity.id, label)
         except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
             yield _unproved_pane(place, holders, claudes, problem or str(error), pane, registry_problem=problem)
@@ -632,7 +727,7 @@ def _reduce_owner_proofs(proofs: Iterable[ConversationProof]) -> dict[str, Conve
 
 
 def _resolved_labels(
-    panes: list[LabeledSession | ConversationProof], evidence: ClaudeRegistryEvidence,
+    panes: list[LabeledSession | ConversationProof], evidence: ClaudeRegistryEvidence, *, probe_address: bool,
 ) -> tuple[tuple[LabeledSession, ...], dict[str, ProvedLiveUnit | UnknownUnit]]:
     """Publish pane labels and standalone owners after resolving each conversation."""
     pane_proofs = (pane for pane in panes if not isinstance(pane, LabeledSession))
@@ -643,7 +738,8 @@ def _resolved_labels(
         if isinstance(result, UnknownUnit):
             owners[identity] = result
         elif isinstance(result, ProvedClaudeOwner) and not isinstance(result.placement, HerdrPlace):
-            owners[identity] = ProvedLiveUnit(result.session())
+            owners[identity] = ProvedLiveUnit(result.session(probe_address=probe_address),
+                                             session_staff.ProvedProcessGeneration(result.pid, result.recorded_start))
 
     labels: list[LabeledSession] = []
     for pane in panes:
@@ -656,19 +752,24 @@ def _resolved_labels(
         if isinstance(pane, ProvedCodexOwner):
             label = pane.pane
             if isinstance(result, UnknownUnit):
-                label = replace(label, claude=ClaudeUnknown(result.reason), process=ObservedProcess(pane.pid, "codex"))
+                label = replace(label, claude=ClaudeUnknown(result.reason), process=ObservedProcess(pane.pid, "codex"),
+                                generation=session_staff.NoProvedProcessGeneration())
         else:
             assert isinstance(pane.placement, HerdrPlace)
-            claude = ClaudeUnknown(result.reason) if isinstance(result, UnknownUnit) else pane.session()
+            claude = (ClaudeUnknown(result.reason) if isinstance(result, UnknownUnit)
+                      else pane.session(probe_address=probe_address))
+            generation = (session_staff.NoProvedProcessGeneration() if isinstance(result, UnknownUnit)
+                          else session_staff.ProvedProcessGeneration(pane.pid, pane.recorded_start))
             label = LabeledSession("", claude, pane.placement, ObservedProcess(pane.pid, "claude"),
-                                   LiveSession(pane.conversation))
+                                   LiveSession(pane.conversation), generation=generation)
         labels.append(label)
     return tuple(labels), owners
 
 
 def observed_session_labels(*, record: staff.StaffSnapshot | None = None,
                             running: Sequence[SessionRecord] | None = None,
-                            registry: sessions.RegistryRead | None = None) -> session_staff.SessionLabelObservations:
+                            registry: sessions.RegistryRead | None = None,
+                            probe_address: bool = True) -> session_staff.SessionLabelObservations:
     """Read native identities and retain failures to list panes."""
     from scripts.herdr import herdr
 
@@ -697,7 +798,7 @@ def observed_session_labels(*, record: staff.StaffSnapshot | None = None,
                 for records in claudes[place].values():
                     for candidate in records:
                         _ = evidence.registry_unknowns.setdefault(candidate["sessionId"], UnknownUnit(reason))
-            labels, owners = _resolved_labels(panes, evidence)
+            labels, owners = _resolved_labels(panes, evidence, probe_address=probe_address)
             registry_failures = (evidence.unplaced.reason,) if isinstance(evidence.unplaced, RecordsPartlyUnread) else ()
             if registry_failures:
                 session_staff.report_anomaly(registry_failures[0])
@@ -707,14 +808,16 @@ def observed_session_labels(*, record: staff.StaffSnapshot | None = None,
 
 
 def checked_conversation(identity: str, *, record: staff.StaffSnapshot | None = None,
-                         registry: sessions.RegistryRead | None = None) -> UnitOwner:
+                         registry: sessions.RegistryRead | None = None, probe_address: bool = True) -> UnitOwner:
     """Check the exact conversation with fresh pane evidence."""
     from scripts.herdr import herdr
 
     try:
         with herdr.process_action():
-            observed = (observed_session_labels(record=record) if registry is None
-                        else observed_session_labels(record=record, registry=registry))
+            if probe_address and registry is None:
+                observed = observed_session_labels(record=record)
+            else:
+                observed = observed_session_labels(record=record, registry=registry, probe_address=probe_address)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         return UnknownUnit(str(error))
     return observed.checked_conversation(identity)

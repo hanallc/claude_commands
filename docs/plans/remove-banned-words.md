@@ -30,7 +30,7 @@
 2. Remove the four command overrides from `settings.json` and remove direct registrations if an installed copy still has them.
 3. Retain the shared PostToolUse and Stop dispatch commands, their other hooks, and the separate Berth and continuation registrations.
 4. Replace the two active script bodies with silent exit-zero stubs. Keep `post-tool-use-banned-words-block.py` as a stub during deployment.
-5. Install the stubs and dispatcher on natedev and the Mac before deploying their settings. Roll the phase into active project checkouts.
+5. Install the stubs and dispatcher on natedev and the Mac before deploying their settings. Hooks run only from `~/.claude`, so the main merge and the normal publish are the whole deploy; unit worktrees take the change at their next main merge.
 6. Check settings on both machines for direct routes. Wait for sessions with old snapshots to end or restart before Phase 2 deletes the stubs.
 
 The repo and installed settings already use the dispatcher. The second PostToolUse script is a retired path for older sessions. The settings have no direct registration for any of the three scripts on natedev.

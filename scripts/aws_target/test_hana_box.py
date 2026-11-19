@@ -188,7 +188,10 @@ class HanaBoxTests(CostFixture):
                 _ = image.write_text(proof)
                 self.assertEqual(self.controller.request('execution-one'), hana_box.ClaimRefused(hana_box.HANA_IMAGE_STALE))
         _ = image.write_text(current)
-        text_setting(self.workload_path, 'spot_max_usd_per_hour', '0.20')
+        for key, value in (('spot_max_usd_per_hour', '0.20'), ('execution_shell', 'ci')):
+            with self.subTest(key=key):
+                text_setting(self.workload_path, key, value)
+                self.assertTrue(self.controller.image_is_current(IDENTITY))
         self.assertIsInstance(self.controller.request('execution-one'), hana_box.ClaimCommitted)
         _ = self.workload_path.write_text(self.workload_path.read_text().replace(
             'watchdog_check_seconds=1', 'watchdog_check_seconds=2'))

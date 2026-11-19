@@ -24,6 +24,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast, final, override
 
+from scripts.build_queue import execution_identity
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_start as process_identity
 
@@ -812,7 +813,7 @@ class MacTestCommandTests(NotificationGuardedTestCase):
 
         assignment = placement.PlacementAssignment("import-episode", "import-attempt",
             placement.PlacementDestination("mac", "mac", "fixture-host", mac_test.WHOLE_MAC),
-            placement.SourceKeyUnavailable("the import test has no source tree"),
+            execution_identity.SourceKeyUnavailable("the import test has no source tree"),
             placement.SubmittingOwner("fixture-host", first.pid, run["proc_start"]), NoOwningSession(), 1.0)
         saved_assignment = self.root / "assignment.json"
         _ = saved_assignment.write_text(wire.encode_reply(wire.Assignment(assignment)))

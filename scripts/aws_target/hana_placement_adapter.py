@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from scripts.build_queue import execution_identity
 from scripts.aws_target.hana_placement import (
     ExecutionTransport, HanaControlTransport, HanaHostGeneration,
     DisabledHanaRoute, EnabledHanaRoute, HanaRouteSettings, HanaCheck, HanaClippyJudgment,
@@ -12,7 +13,9 @@ from scripts.aws_target.hana_placement import (
     HanaClaimRefused, HanaClaimRetained, HanaClaimResourcesHeld, generation_text,
 )
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from scripts.aws_target import hana_box as box
+    from scripts.aws_target.hana_execution import HanaSettlement
     from scripts.aws_target.hana_placement import HanaEvidenceRequest
     from scripts.build_queue import admission_records as records, placement
     from scripts.build_targets.target_config import SshTarget
@@ -101,7 +104,6 @@ def controller_for(transport: HanaControlTransport, *, read_only: bool = False) 
 def validate_assignment(assignment: placement.PlacementAssignment, holder: placement.ClaimHolderIdentity
                         ) -> HanaControlTransport | HanaClaimRefused:
     """Check the configured destination, scope, source, and live local holder."""
-    from scripts.build_queue import placement
     from scripts.build_targets import target_config
     from scripts.lib import conf, process_start
     from scripts.mac_test import claim_state
@@ -118,7 +120,7 @@ def validate_assignment(assignment: placement.PlacementAssignment, holder: place
     if (destination.provider != 'ssh' or destination.host != transport.host or destination.slot != 1
             or not isinstance(destination.scope, claim_state.RepositoryScope)
             or destination.scope.slot != 1 or destination.scope.key != settings.repository_key
-            or not isinstance(assignment.source_key, placement.SourceKeyKnown)
+            or not isinstance(assignment.source_key, execution_identity.SourceKeyKnown)
             or not assignment.source_key.key or not assignment.episode or not assignment.attempt):
         return HanaClaimRefused('The assignment differs from the configured Hana scope')
     if (holder.host != store.host_name() or holder.pid <= 0
@@ -145,7 +147,7 @@ def claim_assigned(assignment: placement.PlacementAssignment, holder: placement.
     if controller.workload_path.resolve() != transport.settings.resolve():
         return HanaClaimRefused('The lifecycle controller differs from the assigned workload')
     destination = assignment.destination
-    execution = placement.assigned_claim_id(assignment.episode, assignment.attempt)
+    execution = execution_identity.assigned_claim_id(assignment.episode, assignment.attempt)
     reference = placement.ProviderClaimReference('ssh', destination.target, destination.scope,
         execution, assignment.episode, assignment.attempt)
     paths = claim_state.state_paths(destination.target)
@@ -202,12 +204,11 @@ def release_assigned(assignment: placement.PlacementAssignment, holder: placemen
                      controller: box.HanaController) -> bool:
     """Release the exact target claim after durable execution and lifecycle settlement."""
     from scripts.aws_target.hana_execution import execution_command_settled
-    from scripts.build_queue import placement
     from scripts.build_targets import target_config
     from scripts.mac_test import claim_state
 
     destination = assignment.destination
-    execution = placement.assigned_claim_id(assignment.episode, assignment.attempt)
+    execution = execution_identity.assigned_claim_id(assignment.episode, assignment.attempt)
     if not execution_command_settled(controller.directory, execution):
         return False
     target = target_config.configured_ssh_target(destination.target)
@@ -218,14 +219,66 @@ def release_assigned(assignment: placement.PlacementAssignment, holder: placemen
     paths = claim_state.state_paths(destination.target)
     with claim_state.locked(paths.lock):
         held = claim_state.read_claims(paths)
-        matching = tuple(claim for claim in held if claim.scope == destination.scope
-            and claim.record['claim_id'] == execution and claim.record['episode'] == assignment.episode
-            and claim.record['attempt'] == assignment.attempt and claim.record['pid'] == holder.pid
-            and claim.record['proc_start'] == holder.start_time
-            and claim.record['submitting_session'] == claim_state.session_id(assignment.session))
+        matching = tuple(claim for claim in held if claim.record['claim_id'] == execution
+            and _matches_assigned_claim(claim, assignment, holder))
         if held and not matching and any(claim.record['claim_id'] == execution for claim in held):
             return False
         return _release_claims(controller, execution, matching)
+
+
+def _matches_assigned_claim(claim: claim_state.HeldClaim, assignment: placement.PlacementAssignment,
+                           holder: placement.ClaimHolderIdentity) -> bool:
+    from scripts.mac_test import claim_state
+
+    record = claim.record
+    return (claim.scope == assignment.destination.scope and record['episode'] == assignment.episode
+            and record['attempt'] == assignment.attempt and record['pid'] == holder.pid
+            and record['proc_start'] == holder.start_time
+            and record['submitting_session'] == claim_state.session_id(assignment.session))
+
+
+def _holder_ended(pid: int, start_time: str) -> bool:
+    from scripts.lib import process_start
+
+    owner = process_start.process_start(pid)
+    return (isinstance(owner, (process_start.Gone, process_start.Zombie))
+            or isinstance(owner, process_start.Started) and owner.start != start_time)
+
+
+def recover_assigned_execution(assignment: placement.PlacementAssignment, holder: placement.ClaimHolderIdentity,
+                               controller: box.HanaController, *,
+                               current_source_key: Callable[[], execution_identity.SourceIdentity]) -> HanaSettlement:
+    """Settle a dead local holder's exact dispatch without contacting the guest."""
+    from functools import partial
+    from scripts.aws_target import hana_box as box
+    from scripts.aws_target.hana_execution import HanaSettlementPending, replay_execution_settlement
+    from scripts.build_queue import placement
+    from scripts.buildlog import store
+    from scripts.mac_test import claim_state
+
+    if holder.host != store.host_name() or not _holder_ended(holder.pid, holder.start_time):
+        return HanaSettlementPending('The Hana claim holder has not ended')
+    reference = placement.assigned_claim_reference(assignment)
+    paths = claim_state.state_paths(reference.target)
+    with claim_state.locked(paths.lock):
+        claims = tuple(claim for claim in claim_state.read_claims(paths) if claim.record['claim_id'] == reference.claim_id)
+        if claims:
+            claim = claims[0]
+            if (len(claims) != 1 or not _matches_assigned_claim(claim, assignment, holder)
+                    or claim.record.get('remote_host') != assignment.destination.host):
+                return HanaSettlementPending('The Hana claim differs from the assignment or holder')
+            generation: str | placement.NoProviderClaim = claim.record.get('instance_generation', '')
+            release: Callable[[], bool] = partial(release_assigned, assignment, holder, controller)
+        else:
+            snapshot = controller.inspect_for_settlement()
+            if (not isinstance(snapshot, box.HanaLifecycleEvidence)
+                    or any(claim.execution == reference.claim_id for claim in snapshot.claims)
+                    or isinstance(snapshot.operation, box.PendingOperation) and snapshot.operation.execution == reference.claim_id):
+                return HanaSettlementPending('The Hana lifecycle claim remains unresolved')
+            generation = placement.NoProviderClaim()
+            release = lambda: True
+    return replay_execution_settlement(controller.directory, assignment, retained_generation=generation,
+        release_claim=release, current_source_key=current_source_key)
 
 
 def _release_claims(controller: box.HanaController, execution: str, matching: tuple[claim_state.HeldClaim, ...],
@@ -280,10 +333,9 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, 
     import time
     from scripts.aws_target import hana_box as box, hana_spend, ledger
     from scripts.aws_target.hana_execution import (
-        HanaSettled, claim_admission_refused, read_claim_execution, settle_unpublished_claim,
+        HanaSettled, claim_admission_refused, dispatch_claim_boot_matches, read_claim_execution, settle_unpublished_claim,
     )
     from scripts.build_queue import placement
-    from scripts.lib import process_start
     from scripts.mac_test import claim_state, mac_test
     from scripts.build_hold.owning_session import NoOwningSession, OwningSession
     from scripts.buildlog import store
@@ -316,23 +368,25 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, 
             record = claim.record
             execution = record['claim_id']
             if ('remote_host' not in record or record['remote_host'] != transport.host
-                    or execution != placement.assigned_claim_id(record['episode'], record['attempt'])
+                    or execution != execution_identity.assigned_claim_id(record['episode'], record['attempt'])
                     or snapshot.state in (box.Lifecycle.STARTING, box.Lifecycle.STOPPING)
                     or isinstance(snapshot.operation, box.PendingOperation) and snapshot.operation.execution == execution):
                 held.append(claim)
                 continue
-            owner = process_start.process_start(record['pid'])
-            if isinstance(owner, (process_start.Gone, process_start.Zombie)) or (
-                    isinstance(owner, process_start.Started) and owner.start != record['proc_start']):
+            if _holder_ended(record['pid'], record['proc_start']):
                 reference = placement.ProviderClaimReference('ssh', target_name, claim.scope,
                     execution, record['episode'], record['attempt'])
+                if not dispatch_claim_boot_matches(controller.directory, reference, record.get('instance_generation', '')):
+                    held.append(claim)
+                    continue
                 attached = any(row.execution == execution for row in snapshot.claims)
                 release = partial(_release_claims, controller, execution, (claim,), detached_only=not attached)
                 if claim_admission_refused(controller.directory, reference):
                     if not attached and release():
                         continue
                 # The lifecycle controller owns a start until a journal proves that dispatch did not occur.
-                elif not attached or isinstance(read_claim_execution(controller.directory, reference), placement.ExecutionNotStarted):
+                elif not attached or isinstance(read_claim_execution(controller.directory, reference),
+                                                execution_identity.ExecutionNotStarted):
                     closed = settle_unpublished_claim(controller.directory, reference, release_claim=release,
                         reason='The Hana start owner exited')
                     if isinstance(closed, HanaSettled):
@@ -348,7 +402,7 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, 
         block = mac_test.blocking_claim_block(paths, key.session)
     adopted: list[placement.AdoptedProviderClaim] = []
     cleanup: list[placement.RetainedCleanupClaim] = []
-    executions: list[tuple[placement.ProviderClaimReference, placement.ExecutionEvidence]] = []
+    executions: list[tuple[placement.ProviderClaimReference, execution_identity.ExecutionEvidence]] = []
     generation = (generation_text(HanaHostGeneration(snapshot.deployment.deployment,
         snapshot.boot.start_token, snapshot.boot.boot_id)) if isinstance(snapshot.boot, box.VerifiedBoot) else '')
     holder: placement.ResourceHolder = placement.ResourceHolderUnknown()
