@@ -271,7 +271,7 @@ def _private_index_git(source: Path, index: Path, *arguments: str) -> bytes:
     except subprocess.TimeoutExpired as error:
         raise PreparationError(f"git {' '.join(arguments)} in {source}: timed out after {timeout:g} seconds") from error
     if result.returncode:
-        raise PreparationError(result.stderr.decode(errors="replace"))
+        raise PreparationError(result.stderr.decode(errors="replace").strip() or f"Git exited with status {result.returncode}")
     return result.stdout
 
 
@@ -291,7 +291,7 @@ def staged_tree(source: Path, *, include_worktree: bool = False) -> str:
             for row in git(source, "ls-tree", "-rz", tree).split(b"\0"):
                 if row.startswith(b"160000 ") and row.split(b"\t", 1)[1] not in head_links:
                     path = os.fsdecode(row.split(b"\t", 1)[1])
-                    raise PreparationError(f"NestedRepository: {path}: new Git links cannot supply working files")
+                    raise NestedRepository(f"NestedRepository: {path}: new Git links cannot supply working files")
         return tree
 
 
@@ -314,7 +314,7 @@ def capture_source(source: Path) -> str:
     if (staged_tree(source, include_worktree=True) != tree or not before
             or treekey.tree_key(str(source)) != before or staged_tree(source) != index
             or commit_at(source, "HEAD") != head):
-        raise PreparationError("SourceChanged: inputs changed during source capture")
+        raise SourceChangedDuringCapture("SourceChanged: inputs changed during source capture")
     return git(source, "-c", "user.name=copies.py", "-c", "user.email=copies@localhost",
                "commit-tree", tree, data=b"copies: source snapshot\n").decode().strip()
 
@@ -348,6 +348,14 @@ class PreparationError(CopyError):
     """Uncommitted changes or a merge could not be applied to the gate commit."""
 
     exit_code: int = 3
+
+
+class NestedRepository(PreparationError):
+    """The worktree adds a Git link that cannot supply working files."""
+
+
+class SourceChangedDuringCapture(PreparationError):
+    """The source changed before capture could verify its snapshot."""
 
 
 class PostUseError(CopyError):
@@ -1221,16 +1229,23 @@ def requested_source(source: Path, policy: SourcePolicy, merge: MergePolicy) -> 
             ADMISSION_SOURCE_COPIES.reset(token)
 
 
-def ssh_trust_anchor(caller: Path, commit: str, trusted_caller: Callable[[Path], bool]) -> CloneSourceCommit | CloneSource:
-    """Find the approved repository and commit that can anchor an SSH copy."""
-    from scripts.lib import nix_env
+@dataclass(frozen=True)
+class SshSourceTrust:
+    """Provide the checks for an SSH copy's source."""
 
-    if not trusted_caller(caller):
+    trusted_caller: Callable[[Path], bool]
+    trusted_root: Callable[[Path], bool]
+    registered_worktree: Callable[[Path], bool]
+
+
+def ssh_trust_anchor(caller: Path, commit: str, trust: SshSourceTrust) -> CloneSourceCommit | CloneSource:
+    """Find the approved repository and commit for an SSH copy."""
+    if not trust.trusted_caller(caller):
         return CloneSource.UNAPPROVED
     try:
-        if nix_env.trusted_root(caller):
+        if trust.trusted_root(caller):
             anchor = CloneSourceCommit(str(caller), commit)
-        elif nix_env.registered_worktree(caller):
+        elif trust.registered_worktree(caller):
             anchor = CloneSourceCommit(str(main_checkout(caller)), commit)
         else:
             path = copy_record.record_path(caller)
@@ -1245,7 +1260,7 @@ def ssh_trust_anchor(caller: Path, commit: str, trusted_caller: Callable[[Path],
                 return CloneSource.UNAPPROVED
             anchor = CloneSourceCommit(source, pinned)
         repository = Path(anchor.repository)
-        if nix_env.trusted_root(repository) and commit_at(repository, anchor.commit) == anchor.commit:
+        if trust.trusted_root(repository) and commit_at(repository, anchor.commit) == anchor.commit:
             return anchor
     except (OSError, CopyError, SlotGitFailure, ValueError):
         pass
@@ -1297,8 +1312,7 @@ def ssh_envrc_anchor(snapshot: Path, checkout: Path, origin: SnapshotOrigin,
 
 
 @contextmanager
-def remote_step_source(source: Path, tree_id: str, caller: Path,
-                       trusted_caller: Callable[[Path], bool]) -> Generator[Path]:
+def remote_step_source(source: Path, tree_id: str, caller: Path, trust: SshSourceTrust) -> Generator[Path]:
     """Keep a registered copy of the admitted tree while the SSH runner uses it."""
     with build_folders.tool_folder("copies-ssh-source", copy_record.root()) as checkout:
         _ = prepare_requested_source(checkout, source, StagedSource(tree_id), NO_MERGE)
@@ -1312,7 +1326,7 @@ def remote_step_source(source: Path, tree_id: str, caller: Path,
         envrc: CloneSourceCommit | CloneSource = CloneSource.UNAPPROVED
         if isinstance(origin, SnapshotOrigin):
             base = origin.base
-            anchor = ssh_trust_anchor(Path(base.repository), base.commit, trusted_caller)
+            anchor = ssh_trust_anchor(Path(base.repository), base.commit, trust)
             if isinstance(anchor, CloneSourceCommit):
                 envrc = ssh_envrc_anchor(source, checkout, origin, anchor)
         register_scratch_clone(checkout, envrc, generated_from=anchor)

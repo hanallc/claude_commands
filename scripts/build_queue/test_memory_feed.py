@@ -6,6 +6,7 @@ from scripts.build_queue import admission_records, placement
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.test_queue_view import with_converted_executions
 
+import fcntl
 import json
 import io
 import os
@@ -30,17 +31,19 @@ from unittest import mock
 from scripts.buildlog import charts, cost_actions, costs, parse
 from scripts.buildlog.mac_idle_test_support import write_idle_alert, write_idle_config
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, memory_feed, step_estimator, progress_profile, queue_lines, queue_view, target_availability
+from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.test_queue_view import cloud_reading
 from scripts.build_queue.slot_wait import NoNamedStep, SlotCaller, recorded_step
 from scripts.build_queue.test_target_availability import MAC, NATEDEV, snapshot
 from scripts.build_targets import build_targets, target_config, targets
+from scripts.disks.slots import lease_record
 from scripts.build_queue.queue_view import refresh_mac_builds
 from scripts.build_queue.admission_test_support import AdmissionFixture, NOW as ADMISSION_NOW, only_admitted
 from scripts.build_queue.queue_fixture import write_process, write_scope
 from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice,
                                                 ScopeProcess, ScopeProcesses)
 from scripts.lint import test_memory_admit as memory_tests
-from scripts.lib import atomic_file, conf, test_hang_guard
+from scripts.lib import atomic_file, build_folders, build_slots, conf, test_hang_guard
 from scripts.review_links import console_theme, page_frame, review_link, test_serve
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, command_job, read_step_names
@@ -55,6 +58,11 @@ REQUEST_TOKEN_DUMP = memory_feed.request_token_dump
 STEVIE_OUTPUT = memory_feed.stevie_output
 UNIT_LABELS_FOR = unit_labels.unit_labels_for
 STEVIE = Path("/fixture/bin/stevie")
+
+
+def needs_all_page_proof_views(repo: Path) -> bool:
+    """Use all views while the nightly run holds its slot."""
+    return lease_record(repo).get("work") == "test-nightly" and build_folders.build_folder_state(repo) == "held"
 
 
 class FeedStopped(Exception):
@@ -1114,13 +1122,14 @@ process.stdout.write(JSON.stringify({
             sys.exit(1)
         """))
         chrome.chmod(0o755)
+        proof = self.root / "proof"
         for ending in ('exit', 'kill', 'request'):
             with self.subTest(ending=ending), tempfile.TemporaryDirectory(dir=self.root) as directory:
                 caller = Path(directory)
-                environment = {**os.environ, "TMPDIR": str(caller), "CHROME": str(chrome),
-                    "CHROME_REPORT": str(report), "CHROME_END": ending}
+                environment = {**os.environ, "TMPDIR": str(caller), "PYTHON": sys.executable,
+                    "CHROME": str(chrome), "CHROME_REPORT": str(report), "CHROME_END": ending}
                 result = subprocess.run([executable, str(Path(memory_feed.__file__).with_name("memory_page_proof.mjs")),
-                    str(self.root / "proof")], env=environment, text=True, capture_output=True,
+                    str(proof)], env=environment, text=True, capture_output=True,
                     timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
                 self.assertNotEqual(result.returncode, 0)
                 if ending == 'request':
@@ -2822,6 +2831,32 @@ process.stdout.write(JSON.stringify({
                     for field in ("used", "counted", "reserved", "need"):
                         self.assertNotIn(field, row)
 
+    def test_reserved_cloud_slot_counts_as_used_and_waits_in_the_queue(self) -> None:
+        reading = cloud_reading(reservation_reading())
+        first, waiting = reading.cloud
+        reserved = replace(first, wait=wire.CloudSlotWait(1, 1, ReservedCloudSlot()),
+            progress=cloud_progress.NoCloudProgress(), counter=progress_profile.NoCounter())
+        for active, table in ((reserved, "waiters"), (first, "walk")):
+            with self.subTest(table=table):
+                reply = wire.ViewReply(replace(reading, cloud=(active, waiting)))
+                decoded = wire.parse_reply(wire.encode_reply(reply))
+                self.assertEqual(decoded, reply)
+                assert isinstance(decoded, wire.ViewReply)
+                with (mock.patch.object(admission_client, "view", return_value=decoded.reading),
+                      mock.patch.object(memory_feed, "host_name", return_value="fixture")):
+                    page = memory_feed.reading()
+                self.assertEqual(page["cloud_slots_used"], 1)
+                queued = [row for row in page["waiters"] if row.get("kind") == "cloud"]
+                running = [row for row in page["walk"] if row.get("kind") == "cloud"]
+                if table == "waiters":
+                    before_launch = next(row for row in queued if row["pid"] == first.owner.pid)
+                    self.assertEqual(before_launch["reason"], "waits for launch")
+                    self.assertEqual(cast(memory_feed.CloudWaitRow, before_launch)["activity"], "waits for launch")
+                    self.assertFalse(running)
+                else:
+                    self.assertEqual([row["pid"] for row in running], [first.owner.pid])
+                    self.assertEqual([row["pid"] for row in queued], [waiting.owner.pid])
+
     def test_project_names_follow_the_queue_formatter_for_running_and_waiting_steps(self) -> None:
         for raw_step, project, folder, expected in (
             ("nextest", "known-project", "/fixture", "known-project nextest"),
@@ -3202,6 +3237,40 @@ process.stdout.write(JSON.stringify({
         page = cast(dict[str, object], json.loads(memory_feed.page_json(payload)))
         self.assertEqual(page["cap"], {"kind": "CapUnavailable", "runs": []})
         self.assertIn("PressureNotRecorded", json.dumps(page["psi"]))
+
+
+class BuildsPageProofTests(unittest.TestCase):
+    def test_held_nightly_lease_selects_all_page_proof_views(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory) / "checkout"
+            checkout.mkdir()
+            self.assertFalse(needs_all_page_proof_views(checkout))
+            _ = build_slots.lease_path(checkout).write_text(json.dumps({"work": "test-nightly"}), encoding="utf-8")
+            with checkout.with_name(checkout.name + ".lock").open("wb") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertTrue(needs_all_page_proof_views(checkout))
+            self.assertFalse(needs_all_page_proof_views(checkout))
+
+    def test_builds_page_renders_the_queue_and_tooltips_in_chrome(self) -> None:
+        source = Path(__file__).resolve()
+        all_views = needs_all_page_proof_views(source.parents[2])
+        executable = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
+        proof = source.with_name("memory_page_proof.mjs")
+        mode = [] if all_views else ["--gate"]
+        environment = {**os.environ, "PYTHON": sys.executable}
+        for setting in ("MEMORY_PAGE_SHOT", "SWAP_BEFORE_PAGE", "STEADY_BASELINE"):
+            _ = environment.pop(setting, None)
+        with tempfile.TemporaryDirectory(prefix="builds-page-proof-") as directory:
+            result = subprocess.run([executable, str(proof), *mode, directory],
+                env={**environment, "TMPDIR": directory}, text=True, capture_output=True,
+                timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            verdict = cast(dict[str, object], json.loads(result.stdout.splitlines()[-1]))
+            self.assertIs(verdict.get("pass"), True)
+            self.assertEqual(verdict.get("views"), 6 if all_views else 1)
+            self.assertEqual(list(Path(directory).glob("*.png")), [])
+            for report in ("proof.json", "steady-refresh.json"):
+                self.assertFalse((Path(directory) / report).exists())
 
 
 def write_user_slices(user: Path, *, agents: bool = True, guarantee: str = "2147483648") -> None:

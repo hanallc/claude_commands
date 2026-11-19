@@ -5,6 +5,7 @@ import unittest
 import os
 from pathlib import Path
 from typing import final
+from scripts.build_queue import execution_identity
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture
 from scripts.build_queue.admission_test_support import caller_admission
 import ctypes
@@ -131,7 +132,7 @@ class VerifyMacReleaseEventsTests(VerifyMacOffloadFixture):
                         admission.server.publish_host_evidence(placement.FreshHostEvidence(
                             key, admission.clock.now(), "", placement.AllowedHost()))
                         _ = admission.server.handle_request(wire.ExecutionReport("waiter-settle", original, claim,
-                            placement.ExecutionNotStarted(), placement.PrelaunchRefused("busy"), placement.DispatchPathSettled()))
+                            execution_identity.ExecutionNotStarted(), placement.PrelaunchRefused("busy"), placement.DispatchPathSettled()))
                         admission.clock.advance(1)
                         admission.server.publish_host_evidence(placement.FreshHostEvidence(
                             key, admission.clock.now(), "", placement.AllowedHost()))

@@ -14,7 +14,8 @@ from scripts.aws_target.hana_generation import HanaHostGeneration as HanaHostGen
 if TYPE_CHECKING:
     from scripts.aws_target import hana_box as box
     from scripts.aws_target.hana_box import (HanaLifecycleEvidence as HanaLifecycleEvidence,
-        HanaUnprovisioned as HanaUnprovisioned, HanaLifecycleUnavailable as HanaLifecycleUnavailable)
+        HanaUnprovisioned as HanaUnprovisioned, HanaLifecycleUnavailable as HanaLifecycleUnavailable,
+        HanaResourcesHeld as HanaResourcesHeld)
     from scripts.build_queue import admission_records as records, placement
     from scripts.build_targets.target_config import SshTarget
     from scripts.lib import conf
@@ -80,7 +81,12 @@ class HanaClaimRetained:
     reason: str
 
 
-HanaClaimResult = HanaClaimPending | HanaClaimAdopted | HanaClaimRefused | HanaClaimRetained
+@dataclass(frozen=True)
+class HanaClaimResourcesHeld:
+    """A resource command holds the box, so the claim has no binding."""
+
+
+HanaClaimResult = HanaClaimPending | HanaClaimAdopted | HanaClaimRefused | HanaClaimRetained | HanaClaimResourcesHeld
 
 
 @dataclass(frozen=True)
@@ -230,7 +236,7 @@ def run_gpu_assignment(assignment: placement.PlacementAssignment, repo: Path, pa
 
 def __getattr__(name: str) -> object:
     """Load lifecycle projection types only when a backend requests them."""
-    if name in ('HanaLifecycleEvidence', 'HanaUnprovisioned', 'HanaLifecycleUnavailable'):
+    if name in ('HanaLifecycleEvidence', 'HanaUnprovisioned', 'HanaLifecycleUnavailable', 'HanaResourcesHeld'):
         from importlib import import_module
         return cast(object, getattr(import_module('scripts.aws_target.hana_box'), name))
     raise AttributeError(name)

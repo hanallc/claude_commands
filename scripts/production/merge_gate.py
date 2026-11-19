@@ -100,10 +100,9 @@ UNRECORDED_MODULE_RESERVATION_MIB = 640
 DEFAULT_MODULE_TIME_LIMIT_S = 1800
 RERUN_LIMIT = 8
 RELEASE_LOCK_WAIT_S = 60
-# basedpyright resolves bpy (Blender's interpreter only) and PIL (a PEP 723 dependency) from this
-# type-check-only venv, so the full tree reports 0/0. The stub date matches the 2026-08-23 sweep;
-# later dates report new diagnostics in bake_textures.py.
-TYPECHECK_REQUIREMENTS = ("pillow==13.0.0", "fake-bpy-module==20260822")
+# basedpyright resolves bpy with these Blender stubs.
+# Later versions report diagnostics in bake_textures.py.
+TYPECHECK_REQUIREMENTS = ("fake-bpy-module==20260822",)
 NIGHTLY_TYPE_DIRS = ("scripts",)
 NIGHTLY_TYPE_DIAGNOSTIC_LINES = 20
 # An unrecorded type job keeps its own fallback; recorded jobs all use one margin.

@@ -23,7 +23,8 @@ from zoneinfo import ZoneInfo
 import unittest
 from unittest import mock
 
-from scripts.build_queue import admission_protocol as wire, admission_service, first_step, placement
+from scripts.build_queue import execution_identity
+from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_service, first_step, placement
 from scripts.buildlog import repository, treekey
 from scripts.build_queue.admission_test_support import AdmissionFixture, private_caller_provider
 from scripts.build_targets import target_config
@@ -516,7 +517,7 @@ placement_once
             self.finish(step)
             self.assertEqual(build_folders.build_folder_state(folder), "free")
             self.assertEqual((folder / "src/lib.rs").read_bytes(), admitted_content)
-            self.assertEqual(request.constraints.source_key, placement.SourceKeyKnown(treekey.tree_key(str(folder)) or ""))
+            self.assertEqual(request.constraints.source_key, execution_identity.SourceKeyKnown(treekey.tree_key(str(folder)) or ""))
         placements = [request for request in self.requests if isinstance(request, wire.PlacementRequest)]
         self.assertGreaterEqual(len(placements), 2)
         self.assertEqual({(request.episode, request.since) for request in placements},
@@ -1085,6 +1086,8 @@ placement_once
                 root = request.source_root
                 row = [str(Path.cwd()), str(root), treekey.tree_key(str(root)),
                        (root / "src/lib.rs").read_text(), (root / "src/merged.rs").read_text()]
+                if "TEST_REMOTE_ASSIGNMENT" in os.environ:
+                    observed.with_suffix(".assignment").write_bytes(Path(arguments.assignment_file).read_bytes())
                 if "TEST_TRUST_CALLER" in os.environ:
                     caller = Path(os.environ["TEST_TRUST_CALLER"])
                     repo = request.repo_root
@@ -1160,6 +1163,8 @@ placement_once
                 case_environment = {**environment, "VERIFY_MAC_RUNNER": str(parser_runner),
                                     "TEST_REMOTE_SOURCE": str(observed), "SLOT_ORDER_CHECK": str(started),
                                     "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"}
+                if scenario == "prepared":
+                    case_environment["TEST_REMOTE_ASSIGNMENT"] = "1"
                 if linux:
                     trusted_folder = other.name if mismatch else tools.root.name if trusted else "other-repository"
                     _ = write_config_fixture(config / "nix_env.conf", f"trusted_home_folders={trusted_folder}\n")
@@ -1240,7 +1245,7 @@ placement_once
                         self.assertEqual(content, "pub fn retried() {}\n")
                         local = next(reply for reply in self.replies[first_reply:]
                                      if isinstance(reply, wire.LocalPlacementGranted))
-                        self.assertEqual(local.assignment.source_key, placement.SourceKeyKnown(local_key or ""))
+                        self.assertEqual(local.assignment.source_key, execution_identity.SourceKeyKnown(local_key or ""))
                         records = [cast(dict[str, object], json.loads(line))
                                    for path in Path(environment["BUILDLOG_DIR"]).glob("*/*.jsonl")
                                    for line in path.read_text().splitlines()]
@@ -1261,10 +1266,13 @@ placement_once
                     grant = next(reply for reply in self.replies[first_reply:] if isinstance(reply, wire.Assignment))
                     if linux:
                         self.assertEqual(grant.assignment.destination.provider, "ssh")
-                    self.assertEqual(grant.assignment.source_key, placement.SourceKeyKnown(executed_key))
+                    self.assertEqual(grant.assignment.source_key, execution_identity.SourceKeyKnown(executed_key))
                     if scenario == "prepared":
-                        self.assertEqual(grant.assignment.source_key, placement.SourceKeyKnown(key or ""))
+                        self.assertEqual(grant.assignment.source_key, execution_identity.SourceKeyKnown(key or ""))
                         self.assertEqual(Path(supplied_root), snapshot)
+                        saved = client.read_assignment(observed.with_suffix(".assignment"))
+                        self.assertIsInstance(saved, wire.Assignment)
+                        self.assertEqual(saved.assignment.source_key, execution_identity.SourceKeyKnown(executed_key))
 
     def test_verify_request_only_keeps_the_first_step_routing_and_creates_no_slot(self) -> None:
         tools = self.verify_source()
@@ -1300,7 +1308,7 @@ placement_once
                 self.assertEqual(request.constraints.command_kind, arguments[0])
                 self.assertEqual(request.constraints.package, "sample")
                 self.assertEqual(request.constraints.repository, str(tools.root))
-                self.assertEqual(request.constraints.source_key, placement.SourceKeyKnown(source_key))
+                self.assertEqual(request.constraints.source_key, execution_identity.SourceKeyKnown(source_key))
                 self.assertEqual(request.constraints.selection, selection)
                 self.assertEqual(request.route, route)
                 self.assertIsInstance(request.local, wire.LocalAdmissionContext)

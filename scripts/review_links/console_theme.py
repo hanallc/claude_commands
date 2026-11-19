@@ -8,16 +8,26 @@ from __future__ import annotations
 TOKENS_PLACEHOLDER = "/*__CONSOLE_TOKENS__*/"
 PLACEHOLDER = "/*__CONSOLE_THEME__*/"
 
+_LIGHT_QUOTA = "--error:#c22d2c;--warning:#8a5a00"
+_DARK_QUOTA = "--error:#ef7372;--warning:#e3a83f"
+
 _LIGHT = ("--bg:#f6f5f2;--card:#fcfcfb;--line:#dcdad4;--hover:#efede8;--ink:#0b0b0b;--ink-2:#52514e;--ink-3:#66645f;"
           "--filter-selected-bg:#19467f;--filter-selected-ink:#fcfcfb;"
-          "--accent:#2a78d6;--room:#1baf7a;--error:#c22d2c;--warning:#8a5a00;--edge:rgb(0 0 0 / 0.18)")
+          f"--accent:#2a78d6;--room:#1baf7a;{_LIGHT_QUOTA};--edge:rgb(0 0 0 / 0.18)")
 _DARK = ("--bg:#121211;--card:#1a1a19;--line:#34332f;--hover:#242422;--ink:#f0efec;--ink-2:#c3c2b7;--ink-3:#9a988f;"
          "--filter-selected-bg:#24599a;--filter-selected-ink:#f0efec;"
-         "--accent:#3987e5;--room:#199e70;--error:#ef7372;--warning:#e3a83f;--edge:rgb(0 0 0 / 0.6)")
+         f"--accent:#3987e5;--room:#199e70;{_DARK_QUOTA};--edge:rgb(0 0 0 / 0.6)")
 
-TOKENS = (f":root{{color-scheme:light;{_LIGHT}}}\n"
-          f'@media (prefers-color-scheme:dark){{:root:not([data-theme="light"]){{color-scheme:dark;{_DARK}}}}}\n'
-          f':root[data-theme="dark"]{{color-scheme:dark;{_DARK}}}\n')
+def _tokens(light: str, dark: str, *, scheme: bool = False) -> str:
+    light_scheme = "color-scheme:light;" if scheme else ""
+    dark_scheme = "color-scheme:dark;" if scheme else ""
+    return (f":root{{{light_scheme}{light}}}\n"
+            + f'@media (prefers-color-scheme:dark){{:root:not([data-theme="light"]){{{dark_scheme}{dark}}}}}\n'
+            + f':root[data-theme="dark"]{{{dark_scheme}{dark}}}\n')
+
+
+TOKENS = _tokens(_LIGHT, _DARK, scheme=True)
+QUOTA_TOKENS = _tokens(_LIGHT_QUOTA, _DARK_QUOTA)
 CSS = TOKENS + (
        "*{box-sizing:border-box}\n"
        'body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}\n'

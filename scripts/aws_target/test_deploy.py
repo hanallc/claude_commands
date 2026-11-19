@@ -2,8 +2,9 @@
 from __future__ import annotations
 from scripts.lint.memory_test_support import write_config_fixture
 
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Callable, Generator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from decimal import Decimal
 from functools import lru_cache
@@ -23,20 +24,25 @@ import time
 from types import CodeType, SimpleNamespace
 from typing import ClassVar, Literal, cast, override
 from unittest import mock
-from zoneinfo import ZoneInfo
 
 
-from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, hana_box, hana_spend, ledger, remote
+from scripts.aws_target import admin_secrets, aws_cli, aws_target, aws_trial, box, config as aws_config, deploy, gate_box, gpu_size_trial, hana_box, hana_image, hana_render, hana_spend, ledger, plan_identity, plan_run, remote
 from scripts.aws_target.control_test_support import TestClock
+from scripts.aws_target.controller_lock import HanaCommandAccess, account_stack_lock, hana_command_lock
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, numeric_settings, text_setting, write_hana_config
+from scripts.aws_target.hana_provider import AwsHanaProvider
 from scripts.aws_target.measurement_test_support import DAY, narrow
 from scripts.aws_target.test_box import SYSTEM, FakeTailnet, write_aws_claim
 from scripts.aws_target.test_spot_end import Disk, FakeEc2, TAG as HANA_TAG
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib import conf
+from scripts.lib import conf, file_lock
 from scripts.mac_test import mac_test
 from scripts.build_targets import target_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+QUOTA_PLAN_KEY = plan_identity.PlanCredentials('AKIAFIXTUREEXAMPLE00', 'Fixture000' * 4,
+                                               plan_identity.PlanAccount('aws', '123456789012'))
 
 
 FAKE_AWS = r'''import datetime, json, os, pathlib, sys
@@ -68,7 +74,7 @@ if override.exists():
     reply(json.loads(override.read_text()))
     sys.exit(0)
 keys_path = root / 'fake-keys.json'
-keys = json.loads(keys_path.read_text()) if keys_path.exists() else ['old-key']
+keys = json.loads(keys_path.read_text()) if keys_path.exists() else ['FIXTUREOLDKEY0000000']
 if service == 'sts' and operation == 'get-caller-identity':
     if '--profile' not in args:
         reply({'Account': '123456789012'})
@@ -77,7 +83,7 @@ if service == 'sts' and operation == 'get-caller-identity':
     credentials = configparser.ConfigParser()
     credentials.read(os.environ['AWS_SHARED_CREDENTIALS_FILE'])
     profile = args[args.index('--profile') + 1]
-    valid = credentials.get(profile, 'aws_access_key_id', fallback='') == 'new-key'
+    valid = credentials.get(profile, 'aws_access_key_id', fallback='') == 'FIXTURENEWKEY0000000'
     if not valid or (root / 'fail-scaler').exists():
         print('The profile is not ready', file=sys.stderr)
         sys.exit(1)
@@ -132,9 +138,9 @@ elif service == 'cloudformation' and operation == 'create-change-set':
         print('lost CREATE response', file=sys.stderr); sys.exit(1)
     reply({'StackId': stack_id})
 elif service == 'iam' and operation == 'create-access-key':
-    keys.append('new-key')
+    keys.append('FIXTURENEWKEY0000000')
     keys_path.write_text(json.dumps(keys))
-    reply({'AccessKey': {'AccessKeyId': 'new-key', 'SecretAccessKey': 'fixture-secret-only-in-credentials'}})
+    reply({'AccessKey': {'AccessKeyId': 'FIXTURENEWKEY0000000', 'SecretAccessKey': 'fixture-secret-only-in-credentials'}})
 elif service == 'iam' and operation == 'list-access-keys':
     if (root / 'deleted-stack').exists():
         print('NoSuchEntity', file=sys.stderr); sys.exit(1)
@@ -450,7 +456,8 @@ class HanaSetupFailureTests(CostFixture):
         self.scaler_calls = []
         self.instance_reads = []
         self.deleted_stacks = {}
-        numeric_settings(self.workload, {'intent_lookup_timeout_s': '15'})
+        numeric_settings(self.workload, {'intent_lookup_timeout_s': '15', 'idle_stop_seconds': '10',
+                                          'stop_wait_timeout_s': '25', 'setup_idle_wait_timeout_s': '45'})
         self.book.record_inventory(ledger.ResourceInventory(self.clock.now, (), 'fixture setup inventory', True))
         self.book.observe(ledger.InstanceObservation(self.clock.now, 'terminated', 'fixture setup account'))
         original = conf.read_or_repository
@@ -779,6 +786,11 @@ class HanaSetupFailureTests(CostFixture):
         fake = FakeEc2(raise_once='create-volume')
         subject = self.subject(fake, volume_errors=(
             'aws: [ERROR]: An error occurred (UnauthorizedOperation) when calling the CreateVolume operation: denied',))
+        workload = conf.read(self.workload)
+        fake.image = workload.text('ami_id')
+        _ = hana_image.save(self.state, hana_image.RegisteredImage('fixture', fake.image,
+            workload.text('ami_owner_id'), workload.text('vpc_id'), workload.text('subnet_id'),
+            hana_render.guest_digest(self.workload)))
         _ = subject.prepare_hana()
         with redirect_stdout(StringIO()), self.assertRaises(subprocess.TimeoutExpired):
             _ = subject.hana_setup(approve_resources=True)
@@ -885,6 +897,21 @@ class HanaSetupFailureTests(CostFixture):
                 self.assertEqual(remote.read_record(self.setup_path), record)
                 self.assertEqual(self.book.read_snapshot(), evidence)
 
+    def test_hana_down_recovers_the_request_and_disk_from_a_saved_instance(self) -> None:
+        fake = FakeEc2(stack=True)
+        instance = fake.launch(tagged=False)
+        fake.disks['fixture-data'] = Disk('available', {'HanaDeployment': HANA_TAG[1], 'HanaData': 'true'})
+        subject = self.subject(fake)
+        _ = self.write_leftover(subject)
+        saved = remote.read_record(self.setup_path)
+        saved.update(version=2, instance=instance)
+        write_text_atomic(self.setup_path, json.dumps(saved))
+        with redirect_stdout(StringIO()):
+            self.assertTrue(subject.hana_down(approve_destroy=True))
+        self.assertIn('cancel-spot-instance-requests', fake.operations)
+        self.assertIn('delete-volume', fake.operations)
+        self.assertEqual(fake.leftovers(), ([], [], [], [], False))
+
     def test_hana_down_reports_missing_direct_ids_and_continues(self) -> None:
         fake = FakeEc2(stack=True)
         subject = self.subject(fake)
@@ -948,7 +975,8 @@ class HanaSetupFailureTests(CostFixture):
                               admin_spot_error: str = '',
                               scaler_faults: Mapping[tuple[str, str], str] | None = None,
                               bad_readback: bool = False, volume_device: str = '/dev/sdf',
-                              stack_owned: bool = False) -> tuple[deploy.Deployment, dict[str, str]]:
+                              stack_owned: bool = False, current_guest_image: bool = False
+                              ) -> tuple[deploy.Deployment, dict[str, str]]:
         scaler_faults = scaler_faults or {}
         credentials = self.root / '.config/aws-build/credentials'
         service_settings = self.root / 'service-aws-target.conf'
@@ -1018,6 +1046,10 @@ class HanaSetupFailureTests(CostFixture):
 
         subject = deploy.Deployment(self.settings, self.state, self.root / 'output',
                                     execute=scaler, clock=self.clock, notify=lambda _event: True)
+        if current_guest_image:
+            text_setting(self.workload, 'enabled', 'on')
+        # Exercise the policy update path separately from the existing box preflight.
+        _ = self.enterContext(mock.patch.object(subject, '_hana_root_replacement', return_value=False))
         prepared = subject.prepare_hana()
         outputs = {'ControlBucket': 'fixture-bucket', 'LaunchTemplate': 'fixture-template',
                    'LaunchTemplateVersion': '3', 'SecurityGroup': 'fixture-group'}
@@ -1039,6 +1071,8 @@ class HanaSetupFailureTests(CostFixture):
             for key in ('launch_template', 'security_group', 'instance_type'):
                 del saved[key]
             shutil.rmtree(subject.output / 'hana')
+        if current_guest_image:
+            saved['guest_digest'] = hana_render.guest_digest(self.workload).value
         pending_template = template
         write_text_atomic(self.setup_path, json.dumps(saved))
         hana_box.HanaController(self.state, self.settings, self.workload, hana_box.ProviderNotInstalled(),
@@ -1058,13 +1092,16 @@ class HanaSetupFailureTests(CostFixture):
                 self.instance_reads.append(list(arguments))
                 self.assertEqual(arguments[offset + 2:offset + 4], ['--instance-ids', instance])
                 reply = {'Reservations': [{'Instances': [{'InstanceId': instance,
-                    'LaunchTime': 'fixture-launch', 'State': {'Name': live_state},
+                    'LaunchTime': 'fixture-launch', 'State': {'Name': live_state}, 'InstanceLifecycle': 'spot',
+                    'BlockDeviceMappings': [{'DeviceName': '/dev/sdf', 'Ebs': {
+                        'VolumeId': volume, 'DeleteOnTermination': False}}],
                     'SpotInstanceRequestId': saved['spot_request']}]}]}
                 return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
             if service == 'ec2' and operation == 'describe-volumes':
                 self.assertEqual(arguments[offset + 2:offset + 4], ['--volume-ids', volume])
                 reply = {'Volumes': [{'VolumeId': volume, 'Attachments': [
-                    {'InstanceId': instance, 'Device': volume_device, 'State': 'attached'}]}]}
+                    {'InstanceId': instance, 'Device': volume_device, 'State': 'attached',
+                     'AttachTime': '2026-01-15T11:00:00Z', 'DeleteOnTermination': False}]}]}
                 return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
             if admin_spot_error and (service, operation, arguments[offset + 2]) == ('ec2', 'wait', 'instance-exists'):
                 return subprocess.CompletedProcess(arguments, 0, '{}', '')
@@ -1429,8 +1466,9 @@ class HanaSetupFailureTests(CostFixture):
         self.assertNotIn('execute-change-set', operations)
         self.assertEqual(self.setup_path.read_bytes(), saved)
 
-    def test_hana_policy_update_refuses_a_busy_lifecycle(self) -> None:
+    def test_hana_policy_update_refuses_when_the_lifecycle_stays_busy(self) -> None:
         subject, _ = self.policy_update_fixture([])
+        subject.pause = self.advance_pause
         path = self.setup_path.with_name('lifecycle.json')
         lifecycle = remote.read_record(path)
         busy_values: tuple[dict[str, object], ...] = (
@@ -1441,11 +1479,138 @@ class HanaSetupFailureTests(CostFixture):
             with self.subTest(values=values):
                 self.calls.clear()
                 write_text_atomic(path, json.dumps({**lifecycle, **values}))
-                with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'again when the box is idle'):
+                state = values.get('state', 'idle-stopped')
+                holder = 'unrecorded' if 'claims' in values else 'none'
+                with redirect_stdout(StringIO()) as output, mock.patch.object(time, 'monotonic', self.clock), \
+                        self.assertRaisesRegex(deploy.DeploymentRefused,
+                            rf'still busy after 45 s \(state {state}, claim holder {holder}\).*again when the box is idle'):
                     _ = subject.hana_setup(approve_resources=True)
+                self.assertIn('waiting up to 45 s for Hana to become idle', output.getvalue())
                 self.assertEqual(self.instance_reads, [])
                 self.assertEqual(self.scaler_calls, [])
-                self.assertEqual([call[call.index('cloudformation') + 1] for call in self.calls], ['describe-stacks'])
+                self.assertEqual(self.policy_calls, [])
+
+    def test_hana_setup_takes_the_box_at_the_deadline_and_holds_it_through_the_probe(self) -> None:
+        subject, _ = self.policy_update_fixture([{
+            'LogicalResourceId': 'ScalerPolicy', 'ResourceType': 'AWS::IAM::ManagedPolicy',
+            'Action': 'Modify', 'Replacement': 'False',
+        }], stack_owned=True, current_guest_image=True)
+        controller = hana_box.HanaController(self.state, self.settings, self.workload, hana_box.ProviderNotInstalled(),
+                                            clock=self.clock)
+        path = self.setup_path.with_name('lifecycle.json')
+        idle = path.read_bytes()
+        self.assertIsInstance(controller.request('fixture-live-claim'), hana_box.ClaimCommitted)
+        lifecycle = remote.read_record(path)
+        write_text_atomic(path, json.dumps(lifecycle | {'state': 'starting'}))
+        live_claim, = ledger.rows(lifecycle, 'claims')
+        pauses: list[float] = []
+
+        def advance(seconds: float) -> None:
+            self.assertEqual(self.policy_calls, [])
+            self.assertIsInstance(controller.inspect(), hana_box.HanaLifecycleEvidence)
+            pauses.append(seconds)
+            self.advance_pause(seconds)
+            if len(pauses) == 1:
+                write_text_atomic(path, json.dumps(lifecycle | {
+                    'state': 'ready', 'claims': [live_claim | {'active': True}],
+                }))
+            elif len(pauses) == 3:
+                _ = path.write_bytes(idle)
+
+        original_probe = subject._probe_hana_scaler  # pyright: ignore[reportPrivateUsage]
+
+        subject.pause = advance
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            def check_claim(provider: AwsHanaProvider, identity: hana_box.DeploymentIdentity) -> bool:
+                claim = worker.submit(controller.request, 'fixture-late-claim')
+                self.assertIsInstance(claim.result(timeout=5), hana_box.HanaResourcesHeld)
+                self.assertIsInstance(worker.submit(controller.tick).result(timeout=5), hana_box.HanaResourcesHeld)
+                self.assertEqual(path.read_bytes(), idle)
+                return original_probe(provider, identity)
+
+            with mock.patch.object(time, 'monotonic', self.clock), \
+                    mock.patch.object(subject, '_probe_hana_scaler', side_effect=check_claim) as probe:
+                status, output, errors = self.run_hana_setup_cli(subject)
+        self.assertEqual((status, errors), (0, ''), output)
+        self.assertEqual(pauses, [15, 15, 15])
+        self.assertEqual([line for line in output.splitlines() if line.startswith('hana-setup:')][:4], [
+            'hana-setup: waiting up to 45 s for Hana to become idle (state starting, claim holder local process).',
+            'hana-setup: still waiting for Hana (state ready, claim holder local process, 15 s of 45 s).',
+            'hana-setup: still waiting for Hana (state ready, claim holder local process, 30 s of 45 s).',
+            'hana-setup: Hana is idle-stopped. Setup holds the box.',
+        ])
+        self.assertEqual(probe.call_count, 2)
+        self.assertIn(('cloudformation', 'execute-change-set'), self.policy_calls)
+        self.assertIsInstance(controller.request('fixture-late-claim'), hana_box.ClaimCommitted)
+
+    def test_exclusive_commands_refuse_while_approved_hana_setup_holds_the_box(self) -> None:
+        subject, _ = self.policy_update_fixture([], stack_owned=True)
+        unexpected_aws = mock.Mock(side_effect=AssertionError('Unexpected AWS call'))
+        plan = plan_run.PlanRun(unexpected_aws, unexpected_aws, unexpected_aws)
+        planned = deploy.Deployment(self.settings, self.state, self.root / 'plan', mode=plan)
+        image = hana_image.BuiltImage('fixture-image', self.root, self.root / 'image.raw', 'raw', 'uefi', 1024)
+        operations: tuple[tuple[str, Callable[[], object]], ...] = (
+            ('hana-down', lambda: subject.hana_down(approve_destroy=True)),
+            ('hana-image', lambda: subject.hana_image(self.root, approve_resources=True)),
+            ('hana-setup', lambda: subject.hana_setup(approve_resources=True)),
+            ('hana-setup --plan', planned.hana_setup),
+            ('prepare --workload hana', subject.prepare_hana),
+            ('prepare', subject.prepare),
+            ('apply', lambda: subject.apply(approve_resources=True)),
+            ('down', lambda: subject.down(approve_destroy=True)),
+        )
+
+        def check_competing_commands(*_arguments: object) -> bool:
+            with (mock.patch.object(subject, '_api', side_effect=AssertionError('Unexpected AWS call')) as api,
+                    mock.patch.object(subject, 'pause', side_effect=AssertionError('Unexpected idle wait')),
+                    mock.patch.object(hana_image, 'read_built', return_value=image)):
+                for name, operation in operations:
+                    with self.subTest(command=name), self.assertRaisesRegex(deploy.HanaControlRefused,
+                            f'^{name}: Another command is using the Hana resources. '
+                            + r'Run the same command again when that command ends\.$'):
+                        _ = operation()
+                api.assert_not_called()
+                unexpected_aws.assert_not_called()
+            return True
+
+        with (redirect_stdout(StringIO()),
+                mock.patch.object(subject, '_update_stack_owned_hana', side_effect=check_competing_commands) as update):
+            self.assertTrue(subject.hana_setup(approve_resources=True))
+        update.assert_called_once()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.policy_calls, [])
+        self.assertEqual(self.scaler_calls, [])
+
+    def test_hana_setup_rejects_a_wait_that_cannot_cover_the_warm_idle_and_stop_intervals(self) -> None:
+        subject, _ = self.policy_update_fixture([])
+        for timeout in ('34', '35'):
+            with self.subTest(timeout=timeout), redirect_stdout(StringIO()):
+                numeric_settings(self.workload, {'setup_idle_wait_timeout_s': timeout})
+                with self.assertRaisesRegex(deploy.HanaSetupTimingRefused,
+                        'setup_idle_wait_timeout_s must exceed idle_stop_seconds plus stop_wait_timeout_s'):
+                    _ = subject.hana_setup(approve_resources=True)
+                self.assertEqual(self.calls, [])
+        numeric_settings(self.workload, {'setup_idle_wait_timeout_s': '36'})
+        self.assertEqual(deploy.HanaSetupTiming.read(conf.read(self.workload)).idle_wait_s, 36)
+
+    def test_hana_setup_interrupt_while_waiting_leaves_the_lifecycle_and_aws_untouched(self) -> None:
+        subject, _ = self.policy_update_fixture([], stack_owned=True)
+        path = self.setup_path.with_name('lifecycle.json')
+        write_text_atomic(path, json.dumps(remote.read_record(path) | {'state': 'ready'}))
+        busy = path.read_bytes()
+
+        def interrupt(_seconds: float) -> None:
+            raise KeyboardInterrupt
+
+        subject.pause = interrupt
+        status, output, errors = self.run_hana_setup_cli(subject)
+        self.assertEqual(status, 130)
+        self.assertIn('waiting up to 45 s for Hana to become idle', output)
+        self.assertEqual(errors, 'hana-setup: interrupted\n')
+        self.assertEqual(self.policy_calls, [])
+        self.assertEqual(path.read_bytes(), busy)
+        with file_lock.exclusive(self.state / 'controller.lock', wait=False) as result:
+            self.assertIs(result, file_lock.LockResult.ACQUIRED)
 
     def test_hana_policy_update_requires_the_live_instance_to_be_stopped(self) -> None:
         subject, _ = self.policy_update_fixture([], live_state='running')
@@ -1493,7 +1658,7 @@ class HanaSetupFailureTests(CostFixture):
         subject, _parameters = self.policy_update_fixture([], volume_device='/dev/sdg')
         saved = self.setup_path.read_bytes()
 
-        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'resource identities changed'):
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(deploy.DeploymentRefused, 'retained Hana data attachment'):
             _ = subject.hana_setup(approve_resources=True)
 
         self.assertEqual(self.scaler_calls, [])
@@ -1836,6 +2001,10 @@ class HanaSetupFailureTests(CostFixture):
         instance = fake.launch(tagged=True)
         subject = self.subject(fake)
         _ = self.write_leftover(subject, instance=instance)
+        workload = conf.read(self.workload)
+        _ = hana_image.save(self.state, hana_image.RegisteredImage('fixture', workload.text('ami_id'),
+            workload.text('ami_owner_id'), workload.text('vpc_id'), workload.text('subnet_id'),
+            hana_render.guest_digest(self.workload)))
         saved = self.setup_path.read_bytes()
         evidence = self.book.read_snapshot()
 
@@ -2103,6 +2272,23 @@ sys.exit(7)
         self.assertEqual(self.previous_output(output.getvalue(), 'up'), '')
         self.assertFalse(any(worker.name == 'deployment-progress' for worker in threading.enumerate()))
 
+    def test_scaler_key_cleans_stale_and_unconfirmed_keys(self) -> None:
+        subject = self.deployment()
+        checkpoint = self.state / 'scaler-key.json'
+        old_key = 'FIXTUREOLDKEY0000000'
+        _ = checkpoint.write_text(json.dumps({'access_key_id': old_key}))
+        with mock.patch.object(subject, '_scaler_present', return_value=False), \
+                mock.patch.object(time, 'sleep', return_value=None):
+            with self.assertRaisesRegex(deploy.DeploymentRefused, 'the new key was removed'):
+                subject.scaler_key()
+        deletes = [cast(list[str], row['args']) for row in self.commands('delete-access-key')]
+        removed = [words[words.index('--access-key-id') + 1] for words in deletes]
+        self.assertEqual(len(removed), 2)
+        self.assertEqual(removed[0], old_key)
+        self.assertNotEqual(removed[1], old_key)
+        self.assertFalse(checkpoint.exists())
+        self.assertEqual(self.credentials.read_text(), '')
+
     def test_stack_wait_uses_its_own_timeout_through_the_admin_executor(self) -> None:
         self.replace('stack_wait_timeout_s', '3600')
         calls: list[tuple[tuple[str, ...], float]] = []
@@ -2222,6 +2408,32 @@ sys.exit(7)
             'fixture-admin', 'us-east-1', 1, execute=fake)))
         return subject, fake
 
+    def test_account_apply_takes_the_account_stack_lock_before_the_hana_hold(self) -> None:
+        subject = self.deployment()
+
+        @contextmanager
+        def take_hana_hold(directory: Path) -> Generator[HanaCommandAccess]:
+            with account_stack_lock(directory) as account:
+                self.assertIs(account, file_lock.LockResult.BUSY)
+            with hana_command_lock(directory) as access:
+                yield access
+
+        def check_holds(*_arguments: object) -> None:
+            with account_stack_lock(self.state) as account:
+                self.assertIs(account, file_lock.LockResult.BUSY)
+            with hana_command_lock(self.state) as hana:
+                self.assertIs(hana, HanaCommandAccess.RESOURCES_HELD)
+            raise ValueError('Fixture stops apply before AWS')
+
+        with (mock.patch.object(deploy, 'hana_command_lock', new=take_hana_hold),
+              mock.patch.object(subject, '_load', side_effect=check_holds) as load,
+              self.assertRaisesRegex(ValueError, 'Fixture stops apply before AWS')):
+            _ = subject.apply(approve_resources=True)
+        load.assert_called_once()
+        with account_stack_lock(self.state) as account, hana_command_lock(self.state) as hana:
+            self.assertIs(account, file_lock.LockResult.ACQUIRED)
+            self.assertIs(hana, HanaCommandAccess.ACQUIRED)
+
     def test_remove_gate_image_dry_run_needs_no_credentials_and_writes_nothing(self) -> None:
         self.credentials.unlink()
         before = {path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
@@ -2293,6 +2505,14 @@ sys.exit(7)
         self.assertEqual(ledger.rows(remote.read_record(fake.manifest), 'regions')[1], regional)
         self.assertEqual({name: (subject.directory / name).read_bytes() for name in records}, before)
         self.assertTrue(all(command[command.index('--region') + 1] == 'us-east-1' for command in fake.commands))
+
+    def test_remove_gate_image_reads_events_when_the_update_wait_fails(self) -> None:
+        subject, fake = self.gate_image_fixture('waiter')
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(aws_target.AwsUnavailable, 'fixture stack waiter failure'):
+            _ = subject.remove_images(approve_destroy=True)
+        operations = [command[command.index('--region') + 3] for command in fake.commands]
+        self.assertEqual(operations[-2:], ['wait', 'describe-stack-events'])
+        self.assertIn('snap-old', fake.snapshots)
 
     def test_remove_gate_image_keeps_the_selected_image_launchable_when_a_step_fails(self) -> None:
         for failure in ('activate', 'waiter', 'manifest', 'narrow waiter'):
@@ -3062,21 +3282,16 @@ sys.exit(7)
                 self.assertNotIn('arn:', output.getvalue())
                 self.assertNotIn('123456789012', output.getvalue())
 
-    def test_quota_status_prints_aligned_regional_blocks_without_writes(self) -> None:
+    def test_quota_status_reads_with_plan_key_and_prints_newest_request_without_ids(self) -> None:
         gates = self.root / 'cloud_gate.conf'
         home = conf.read(self.settings).text('region')
         other, candidate = 'us-west-2', 'eu-north-1'
         text_setting(gates, 'regions', home + ' ' + other)
         text_setting(gates, 'spot_candidate_regions', other + ' ' + candidate)
-        text_setting(gates, 'credential_file', str(self.credentials))
-        values = conf.read(gates)
-        desired = {'L-34B43A08': values.whole('spot_quota_request_vcpus'),
-                   'L-3819A6DF': values.whole('gpu_spot_quota_request_vcpus')}
-        zone = 'Pacific/Honolulu'
-        updated = datetime.fromtimestamp(self.now, UTC)
-        created = datetime.fromtimestamp(self.now - 86400, UTC)
-        date = updated.astimezone(ZoneInfo(zone)).strftime('%Y-%m-%d %H:%M:%S %Z')
-        created_date = created.astimezone(ZoneInfo(zone)).strftime('%Y-%m-%d %H:%M:%S %Z')
+        text_setting(gates, 'gpu_size_trial_spot_max_usd_per_hour', '{"g6.8xlarge": "1"}')
+        applied = {'L-34B43A08': 120, 'L-3819A6DF': 32}
+        day_ago = datetime.fromtimestamp(self.now - 86400, UTC)
+        hours_ago = datetime.fromtimestamp(self.now - 10800, UTC).isoformat()
         history = 'list-requested-service-quota-change-history-by-quota'
         calls: list[tuple[str, str, str]] = []
         subject = self.deployment()
@@ -3088,37 +3303,46 @@ sys.exit(7)
             self.assertGreater(timeout, 0)
             self.assertNotIn('--profile', arguments)
             assert env is not None
-            self.assertEqual(env['AWS_ACCESS_KEY_ID'], 'fixture-admin-id')
-            self.assertEqual(env['AWS_SECRET_ACCESS_KEY'], 'fixture-admin-secret')
-            self.assertEqual(env['AWS_SHARED_CREDENTIALS_FILE'], str(self.credentials))
+            self.assertEqual(env['AWS_ACCESS_KEY_ID'], QUOTA_PLAN_KEY.access_key_id)
+            self.assertEqual(env['AWS_SECRET_ACCESS_KEY'], QUOTA_PLAN_KEY.secret_access_key)
+            self.assertEqual(env['AWS_SHARED_CREDENTIALS_FILE'], '/dev/null')
+            self.assertEqual(env['AWS_CONFIG_FILE'], '/dev/null')
+            self.assertNotIn('AWS_PROFILE', env)
+            self.assertNotIn('AWS_SESSION_TOKEN', env)
             region = arguments[arguments.index('--region') + 1]
             operation = arguments[arguments.index('service-quotas') + 1]
             code = arguments[arguments.index('--quota-code') + 1]
             self.assertIn(operation, ('get-service-quota', history))
-            self.assertNotIn('--no-paginate', arguments)
-            self.assertNotIn('--max-items', arguments)
+            self.assertEqual(list(arguments), ['aws', '--region', region, 'service-quotas', operation,
+                '--service-code', 'ec2', '--quota-code', code, '--output', 'json'])
             calls.append((region, code, operation))
             reply: dict[str, object]
             if operation == 'get-service-quota':
-                reply = {'Quota': {'Value': desired[code], 'QuotaName': 'private-name', 'QuotaArn': 'arn:private-quota'}}
+                reply = {'Quota': {'Value': applied[code], 'QuotaName': 'private-name', 'QuotaArn': 'arn:private-quota'}}
             else:
                 rows: list[dict[str, object]] = []
                 if (region, code) == (home, 'L-34B43A08'):
-                    rows = [{'DesiredValue': desired[code], 'Status': 'APPROVED', 'Created': created.timestamp(),
-                             'LastUpdated': created.timestamp()},
-                            {'DesiredValue': desired[code] + 1, 'Status': 'CASE_OPENED', 'CaseId': 'case-fixture',
-                             'Created': created.isoformat(), 'LastUpdated': updated.isoformat(),
-                             'Id': 'private-request', 'Requester': 'private-account', 'QuotaArn': 'arn:private-quota'}]
+                    rows = [{'DesiredValue': 128, 'Status': 'APPROVED', 'Created': day_ago.timestamp(),
+                             'LastUpdated': self.now},
+                            {'DesiredValue': 129, 'Status': 'CASE_OPENED', 'CaseId': 'case-fixture',
+                             'Created': hours_ago, 'LastUpdated': hours_ago,
+                             'Id': 'private-request', 'Requester': '123456789012', 'QuotaArn': 'arn:private-quota'}]
+                elif (region, code) == (other, 'L-34B43A08'):
+                    rows = [{'DesiredValue': 130, 'Status': 'FUTURE_STATUS', 'Created': hours_ago},
+                            {'DesiredValue': 128, 'Status': 'PENDING', 'Created': day_ago.timestamp()}]
                 elif (region, code) == (other, 'L-3819A6DF'):
-                    rows = [{'DesiredValue': desired[code], 'Status': 'PENDING',
-                             'Created': created.isoformat().replace('+00:00', 'Z')}]
+                    rows = [{'DesiredValue': 4, 'Status': 'PENDING',
+                             'LastUpdated': day_ago.isoformat().replace('+00:00', 'Z')}]
                 reply = {'RequestedQuotas': rows}
             return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
 
         subject.execute = execute
         before = {path.relative_to(self.root): path.read_bytes() if path.is_file() else None
                   for path in self.root.rglob('*')}
-        with (mock.patch.dict(os.environ, {'USER_ZONE': zone}),
+        with (mock.patch.dict(os.environ, {'AWS_SESSION_TOKEN': 'ambient-token', 'AWS_PROFILE': 'ambient-profile'}),
+              mock.patch.object(plan_identity, 'plan_credentials', return_value=QUOTA_PLAN_KEY) as plan_key,
+              mock.patch.object(subject.admin, 'get', side_effect=AssertionError('The report must not read the admin key')),
+              mock.patch.object(admin_secrets, 'credentials_file', side_effect=AssertionError('The report must not load the admin path')),
               mock.patch.object(deploy, 'Deployment', return_value=subject),
               mock.patch.object(sys, 'argv', ['deploy.py', 'quota-status', '--settings', str(self.settings)]),
               mock.patch.object(deploy, 'write_text_atomic', side_effect=AssertionError('The report must not write')),
@@ -3126,6 +3350,7 @@ sys.exit(7)
               mock.patch.object(subject, '_guard', side_effect=AssertionError('The report must not change the ledger')),
               redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors):
             self.assertEqual(deploy.main(), 0, errors.getvalue())
+        plan_key.assert_called_once_with()
         after = {path.relative_to(self.root): path.read_bytes() if path.is_file() else None
                  for path in self.root.rglob('*')}
         self.assertEqual(before, after)
@@ -3133,31 +3358,22 @@ sys.exit(7)
         self.assertEqual(calls, [(region, code, operation) for region, code in (
             (home, 'L-34B43A08'), (home, 'L-3819A6DF'), (other, 'L-34B43A08'), (other, 'L-3819A6DF'))
             for operation in ('get-service-quota', history)])
-        lines = output.getvalue().splitlines()
-        self.assertEqual([line for line in lines if line and not line.startswith((' ', 'Summary:'))],
-                         [home, other])
-        self.assertEqual([line.strip() for line in lines if line.startswith('  ') and not line.startswith('    ')], [
-            f'Standard Spot: {desired["L-34B43A08"]} vCPUs applied',
-            f'G and VT Spot: {desired["L-3819A6DF"]} vCPUs applied',
-            f'Standard Spot: {desired["L-34B43A08"]} vCPUs applied',
-            f'G and VT Spot: {desired["L-3819A6DF"]} vCPUs applied'])
-        headers = [line for line in lines if 'Asked vCPUs' in line]
-        requests = [line for line in lines if line.startswith('    ') and any(
-            status in line for status in ('CASE_OPENED', 'APPROVED', 'PENDING'))]
-        self.assertEqual([re.split(r' {2,}', line.strip()) for line in requests], [
-            [str(desired['L-34B43A08'] + 1), 'CASE_OPENED', 'case-fixture', date],
-            [str(desired['L-34B43A08']), 'APPROVED', '-', created_date],
-            [str(desired['L-3819A6DF']), 'PENDING', '-', created_date]])
-        for line, status in zip(requests[:2], ('CASE_OPENED', 'APPROVED')):
-            self.assertEqual(line.index(status), headers[0].index('Status'))
-            self.assertEqual(line.index(date if status == 'CASE_OPENED' else created_date), headers[0].index('Updated'))
-        self.assertEqual(lines.count('    No requests.'), 2)
-        needed = gpu_size_trial.required_vcpus(gpu_size_trial.settings())
-        fits = f'{home}, {other}' if desired['L-3819A6DF'] >= needed else 'no region has enough applied quota'
-        self.assertEqual(lines[-1], f'Summary: GPU trial needs {needed} vCPUs; quota fits: {fits}; '
-            + f'open requests: {home} Standard Spot {desired["L-34B43A08"] + 1} vCPUs (CASE_OPENED), '
-            + f'{other} G and VT Spot {desired["L-3819A6DF"]} vCPUs (PENDING)')
-        for private in ('private-name', 'private-request', 'private-account', 'arn:', 'fixture-admin-id', 'fixture-admin-secret'):
+        self.assertEqual(output.getvalue().splitlines(), [
+            home, '  Standard Spot: 120 vCPUs applied, 128 vCPUs needed',
+            '    Newest request: CASE_OPENED for 129 vCPUs (3h old).',
+            '  G and VT Spot: 32 vCPUs applied, 4 vCPUs needed', '    No requests.', '',
+            other, '  Standard Spot: 120 vCPUs applied, 128 vCPUs needed',
+            '    Newest request: FUTURE_STATUS for 130 vCPUs (3h old).',
+            '  G and VT Spot: 32 vCPUs applied, 4 vCPUs needed',
+            '    Newest request: PENDING for 4 vCPUs (1d old).', '',
+            f'Summary: GPU trial needs 32 vCPUs; quota fits: {home}, {other}; '
+            + f'open requests: {home} Standard Spot 129 vCPUs (CASE_OPENED), '
+            + f'{other} Standard Spot 130 vCPUs (FUTURE_STATUS), '
+            + f'{other} Standard Spot 128 vCPUs (PENDING), '
+            + f'{other} G and VT Spot 4 vCPUs (PENDING)'])
+        for private in ('private-name', 'private-request', 'case-fixture', '123456789012', 'arn:',
+                        'fixture-admin-id', 'fixture-admin-secret', QUOTA_PLAN_KEY.access_key_id,
+                        QUOTA_PLAN_KEY.secret_access_key):
             self.assertNotIn(private, output.getvalue() + errors.getvalue())
 
     def test_quota_status_continues_after_regional_failures_and_exits_one(self) -> None:
@@ -3165,10 +3381,17 @@ sys.exit(7)
         home = conf.read(self.settings).text('region')
         other = 'us-west-2'
         text_setting(gates, 'regions', home + ' ' + other)
-        text_setting(gates, 'spot_candidate_regions', home + ' ' + other)
+        text_setting(gates, 'gpu_size_trial_spot_max_usd_per_hour', '{"g6.8xlarge": "1"}')
         history = 'list-requested-service-quota-change-history-by-quota'
-        for failure in ('get-service-quota', history, 'timeout', 'uncoded'):
-            with self.subTest(failure=failure):
+        cases = (
+            ('get-service-quota', 'AccessDeniedException'), (history, 'AccessDeniedException'),
+            ('timeout', ''), ('uncoded', ''),
+            ('get-service-quota', 'InvalidClientTokenId'), ('get-service-quota', 'UnrecognizedClientException'),
+            ('get-service-quota', 'AuthFailure'), ('get-service-quota', 'SignatureDoesNotMatch'),
+            (history, 'AuthFailure'),
+        )
+        for failure, error_code in cases:
+            with self.subTest(failure=failure, error_code=error_code):
                 subject = self.deployment()
                 calls: list[tuple[str, str, str]] = []
 
@@ -3184,20 +3407,32 @@ sys.exit(7)
                         if failure == 'timeout':
                             raise subprocess.TimeoutExpired('private-timeout', timeout)
                         if failure == 'uncoded' or operation == failure:
+                            action = 'GetServiceQuota' if operation == 'get-service-quota' else 'ListRequestedServiceQuotaChangeHistoryByQuota'
                             reason = 'private-error' if failure == 'uncoded' else (
-                                'An error occurred (AccessDeniedException) when calling quota operation: private-error arn:private')
+                                f'An error occurred ({error_code}) when calling the {action} operation: private-error arn:private')
                             return subprocess.CompletedProcess(arguments, 1, '', reason)
-                    reply: dict[str, object] = {'Quota': {'Value': conf.read(gates).whole('spot_quota_request_vcpus')}}
+                    reply: dict[str, object] = {'Quota': {'Value': 128}}
                     if operation == history:
                         reply = {'RequestedQuotas': []}
                     return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
 
                 subject.execute = execute
-                with (mock.patch.object(deploy, 'Deployment', return_value=subject),
+                with (mock.patch.object(plan_identity, 'plan_credentials', return_value=QUOTA_PLAN_KEY),
+                      mock.patch.object(deploy, 'Deployment', return_value=subject),
                       mock.patch.object(sys, 'argv', ['deploy.py', 'quota-status', '--settings', str(self.settings)]),
                       redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors):
                     self.assertEqual(deploy.main(), 1)
-                expected = 'TimeoutExpired' if failure == 'timeout' else 'AwsUnavailable' if failure == 'uncoded' else 'AccessDeniedException'
+                if error_code and error_code != 'AccessDeniedException':
+                    expected_calls = [(home, 'L-34B43A08', 'get-service-quota')]
+                    if failure == history:
+                        expected_calls.append((home, 'L-34B43A08', history))
+                    self.assertEqual(calls, expected_calls)
+                    self.assertEqual(output.getvalue(), '')
+                    self.assertEqual(errors.getvalue(), 'quota-status: AWS rejected the plan key. '
+                                                       + 'Run deploy.py plan-identity --check.\n')
+                    continue
+                self.assertEqual(errors.getvalue(), '')
+                expected = error_code or ('PlanRefused' if failure == 'timeout' else 'AwsUnavailable')
                 self.assertIn(f'    Quota status failed: {expected}', output.getvalue())
                 self.assertIn((other, 'L-34B43A08', history), calls)
                 self.assertIn((other, 'L-3819A6DF', history), calls)
@@ -3213,15 +3448,10 @@ sys.exit(7)
         gates = self.root / 'cloud_gate.conf'
         home = conf.read(self.settings).text('region')
         text_setting(gates, 'regions', home)
-        text_setting(gates, 'spot_candidate_regions', home)
-        prices = gpu_size_trial.settings().spot_max_usd_per_hour
-        sizes = sorted(prices, key=lambda name: aws_target.largest_gate_vcpus((name,)))
-        applied = aws_target.largest_gate_vcpus((sizes[0],))
-        asked = conf.read(gates).whole('gpu_spot_quota_request_vcpus')
-        for size in (sizes[0], sizes[-1]):
+        applied = 4
+        for size, needed in (('g4dn.xlarge', 4), ('g6.8xlarge', 32)):
             with self.subTest(size=size):
-                text_setting(gates, 'gpu_size_trial_spot_max_usd_per_hour', json.dumps({size: str(prices[size])}))
-                needed = aws_target.largest_gate_vcpus(tuple(gpu_size_trial.settings().spot_max_usd_per_hour))
+                text_setting(gates, 'gpu_size_trial_spot_max_usd_per_hour', json.dumps({size: '1'}))
                 subject = self.deployment()
                 def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
                     operation = arguments[arguments.index('service-quotas') + 1]
@@ -3229,12 +3459,14 @@ sys.exit(7)
                         reply: dict[str, object] = {'Quota': {'Value': applied}}
                     else:
                         self.assertEqual(operation, 'list-requested-service-quota-change-history-by-quota')
-                        reply = {'RequestedQuotas': [{'DesiredValue': asked, 'Status': status}
+                        reply = {'RequestedQuotas': [{'DesiredValue': 4, 'Status': status}
                             for status in ('APPROVED', 'DENIED', 'CASE_CLOSED', 'NOT_APPROVED', 'INVALID_REQUEST')]}
                     return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
                 subject.execute = execute
-                with redirect_stdout(StringIO()) as output:
+                with (mock.patch.object(plan_identity, 'plan_credentials', return_value=QUOTA_PLAN_KEY),
+                      redirect_stdout(StringIO()) as output):
                     self.assertTrue(subject.quota_status())
+                self.assertIn('Newest request: APPROVED for 4 vCPUs (age unknown).', output.getvalue())
                 fits = home if applied >= needed else 'no region has enough applied quota'
                 self.assertEqual(output.getvalue().splitlines()[-1],
                     f'Summary: GPU trial needs {needed} vCPUs; quota fits: {fits}; open requests: none')
@@ -3244,8 +3476,8 @@ sys.exit(7)
         home = conf.read(self.settings).text('region')
         other = 'us-west-2'
         text_setting(gates, 'regions', home + ' ' + other)
-        text_setting(gates, 'spot_candidate_regions', home + ' ' + other)
-        needed = gpu_size_trial.required_vcpus(gpu_size_trial.settings())
+        text_setting(gates, 'gpu_size_trial_spot_max_usd_per_hour', '{"g6.8xlarge": "1"}')
+        needed = 32
         history = 'list-requested-service-quota-change-history-by-quota'
         for failure in ('get-service-quota', history):
             with self.subTest(failure=failure):
@@ -3256,14 +3488,14 @@ sys.exit(7)
                     code = arguments[arguments.index('--quota-code') + 1]
                     self.assertIn(operation, ('get-service-quota', history))
                     if region == home and code == 'L-3819A6DF' and operation == failure:
-                        return subprocess.CompletedProcess(arguments, 1, '',
-                            'An error occurred (AccessDeniedException) when calling quota operation: fixture refusal')
+                        return subprocess.CompletedProcess(arguments, 1, '', 'fixture refusal')
                     reply: dict[str, object] = {'Quota': {'Value': needed}}
                     if operation == history:
                         reply = {'RequestedQuotas': [{'DesiredValue': needed, 'Status': 'PENDING'}]}
                     return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
                 subject.execute = execute
-                with redirect_stdout(StringIO()) as output:
+                with (mock.patch.object(plan_identity, 'plan_credentials', return_value=QUOTA_PLAN_KEY),
+                      redirect_stdout(StringIO()) as output):
                     self.assertFalse(subject.quota_status())
                 fits = f'{other}, unknown for {home}' if failure == 'get-service-quota' else f'{home}, {other}'
                 self.assertEqual(output.getvalue().splitlines()[-1],
@@ -3271,17 +3503,54 @@ sys.exit(7)
                     + f'request history unavailable: {home} G and VT Spot')
                 self.assertIn('PENDING', output.getvalue())
 
-    def test_quota_status_credential_refusal_stops_before_aws(self) -> None:
+    def test_quota_status_omits_identifiers_from_a_closed_request(self) -> None:
+        gates = self.root / 'cloud_gate.conf'
+        text_setting(gates, 'gpu_size_trial_spot_max_usd_per_hour', '{"g6.xlarge": "1"}')
         subject = self.deployment()
-        message = 'Run deploy.py secrets in a terminal'
-        with (mock.patch.object(subject.admin, 'get', side_effect=admin_secrets.SecretsRefused(message)),
-              mock.patch.object(subject, 'execute', side_effect=AssertionError('The refusal must stop AWS calls')),
-              mock.patch.object(deploy, 'Deployment', return_value=subject),
-              mock.patch.object(sys, 'argv', ['deploy.py', 'quota-status', '--settings', str(self.settings)]),
-              redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors):
-            self.assertEqual(deploy.main(), 1)
-        self.assertEqual(output.getvalue(), '')
-        self.assertEqual(errors.getvalue(), 'aws_deploy: ' + message + '\n')
+
+        def execute(arguments: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            operation = arguments[arguments.index('service-quotas') + 1]
+            reply: dict[str, object]
+            if operation == 'get-service-quota':
+                reply = {'Quota': {'Value': 4}}
+            else:
+                self.assertEqual(operation, 'list-requested-service-quota-change-history-by-quota')
+                reply = {'RequestedQuotas': [{'DesiredValue': 4, 'Status': 'CASE_CLOSED', 'CaseId': 'case-private',
+                    'Id': 'request-private', 'Requester': '123456789012', 'Created': self.now - 120}]}
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')
+
+        subject.execute = execute
+        with (mock.patch.object(plan_identity, 'plan_credentials', return_value=QUOTA_PLAN_KEY),
+              redirect_stdout(StringIO()) as output):
+            self.assertTrue(subject.quota_status())
+        for identity in ('case-private', 'request-private', '123456789012'):
+            self.assertNotIn(identity, output.getvalue())
+        self.assertIn('    Newest request: CASE_CLOSED for 4 vCPUs (2m old).', output.getvalue())
+
+    def test_quota_status_credential_refusal_stops_before_aws(self) -> None:
+        plan_key = self.root / 'plan.gpg'
+        for locked, message in (
+            (False, 'The AWS plan key is missing. On natedev, run deploy.py plan-identity --approve-resources.'),
+            (True, 'The AWS plan key is locked. Run github-warmup in a terminal on natedev.'),
+        ):
+            with self.subTest(locked=locked):
+                if locked:
+                    _ = plan_key.write_bytes(b'fixture-plan-key')
+                    plan_key.chmod(0o600)
+                subject = self.deployment()
+                refusal = subprocess.CompletedProcess(['gpg'], 2, b'', b'[GNUPG:] ERROR pkdecrypt_failed 85\n')
+                with (mock.patch.object(plan_identity, 'credential_path', return_value=plan_key),
+                      mock.patch('scripts.aws_target.plan_identity._gpg', return_value=refusal),
+                      mock.patch.object(subject.admin, 'get',
+                                        side_effect=admin_secrets.SecretsRefused('Run deploy.py secrets in a terminal')) as admin_key,
+                      mock.patch.object(subject, 'execute', side_effect=AssertionError('The refusal must stop AWS calls')),
+                      mock.patch.object(deploy, 'Deployment', return_value=subject),
+                      mock.patch.object(sys, 'argv', ['deploy.py', 'quota-status', '--settings', str(self.settings)]),
+                      redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors):
+                    self.assertEqual(deploy.main(), 1)
+                self.assertEqual(output.getvalue(), '')
+                self.assertEqual(errors.getvalue(), 'quota-status: ' + message + '\n')
+                admin_key.assert_not_called()
 
     def test_quota_request_without_an_environment_override_reaches_aws_with_the_configured_file(self) -> None:
         gates = self.root / 'cloud_gate.conf'
@@ -3864,12 +4133,16 @@ sys.exit(7)
             args = list(arguments)
             calls.append(args)
             reply: dict[str, object] = {'Reservations': []}
+            if 'describe-instances' in args and args[args.index('--region') + 1] == 'us-west-2':
+                reply = {'Reservations': [{'Instances': [{'InstanceId': 'i-fixture-west'}]}]}
             if 'describe-images' in args:
                 reply = {'Images': [{'BlockDeviceMappings': [{'Ebs': {'SnapshotId': 'snap-west'}}]}]}
             return subprocess.CompletedProcess(args, 0, json.dumps(reply), '')
         api = aws_target.AwsCli('fixture', 'us-east-2', 1, execute=execute)
         self.assertTrue(teardown.remove_regional_gates(api, self.state))
         operations = [command[command.index('--region') + 3] for command in calls]
+        self.assertLess(operations.index('terminate-instances'), operations.index('wait'))
+        self.assertLess(operations.index('wait'), operations.index('delete-stack'))
         self.assertLess(operations.index('delete-stack'), operations.index('deregister-image'))
         self.assertLess(operations.index('deregister-image'), operations.index('delete-snapshot'))
         sweeps = [command for command in calls if 'describe-instances' in command]
@@ -4487,6 +4760,14 @@ sys.exit(7)
         _ = (self.state / 'image.json').write_text(json.dumps({'image_id': 'ami-cache', 'system': SYSTEM}))
         with mock.patch.object(aws_target.AwsCli, 'call', side_effect=aws_target.AwsUnavailable('InvalidAMIID.NotFound')):
             self.assertEqual(box.saved_image(subject._api(aws_config.read_deployment_settings(self.settings)), self.state), {})  # pyright: ignore[reportPrivateUsage]
+
+    def test_create_saved_image_tags_the_image_and_snapshot(self) -> None:
+        subject = self.deployment()
+        api = subject._api(aws_config.read_deployment_settings(self.settings))  # pyright: ignore[reportPrivateUsage]
+        image = box.create_saved_image(api, self.state, 'i-fixture', name='fixture-image',
+            tags=[{'Key': box.IMAGE_OWNER_TAG, 'Value': 'true'}], identity={}, exclude_devices=('/dev/sdf',))
+        self.assertEqual(image, {'image_id': 'ami-cache'})
+        self.assertEqual(box.saved_image(api, self.state)['ImageId'], 'ami-cache')
 
 
     def test_down_keeps_and_reports_the_saved_image(self) -> None:

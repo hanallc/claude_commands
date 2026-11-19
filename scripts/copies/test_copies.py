@@ -29,7 +29,7 @@ from scripts.build_queue import admission_protocol as wire, slot_wait
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
-from scripts.lib import build_folders, copy_record, scratch, session_folder
+from scripts.lib import build_folders, copy_record, nix_env, scratch, session_folder
 from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.lint import folder_audit, sweep, tmp_sweep
 from scripts.lint.memory_test_support import write_config_fixture
@@ -41,6 +41,10 @@ from scripts.message import sessions
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker
+
+
+SSH_SOURCE_TRUST = copies.SshSourceTrust(trusted_caller=offload.trusted_linux_source, trusted_root=nix_env.trusted_root,
+                                        registered_worktree=nix_env.registered_worktree)
 
 
 class WaitNotice(io.StringIO):
@@ -672,7 +676,7 @@ class StandingTests(unittest.TestCase):
                 with copies.requested_source(caller, copies.CommittedSource("HEAD"), copies.NO_MERGE) as source:
                     _ = (source / "tracked.txt").write_text("the admitted change\n")
                     tree = copies.staged_tree(source, include_worktree=True)
-                    with copies.remote_step_source(source, tree, caller, offload.trusted_linux_source) as checkout:
+                    with copies.remote_step_source(source, tree, caller, SSH_SOURCE_TRUST) as checkout:
                         self.assertEqual((checkout / "tracked.txt").read_text(), "the admitted change\n")
                         approved = anchor_path is not None
                         self.assertEqual(offload.trusted_linux_source(checkout), approved,
@@ -774,7 +778,7 @@ class StandingTests(unittest.TestCase):
                     self.assertEqual((source / ".envrc").read_text(), expected)
                     _ = (source / "tracked.txt").write_text("change after snapshot preparation\n")
                     tree = copies.staged_tree(source, include_worktree=True)
-                    with copies.remote_step_source(source, tree, caller, offload.trusted_linux_source) as checkout:
+                    with copies.remote_step_source(source, tree, caller, SSH_SOURCE_TRUST) as checkout:
                         self.assertEqual((checkout / ".envrc").read_text(), expected)
                         self.assertEqual(offload.trusted_linux_source(checkout), not edited,
                                          "SSH envrc approval differs from the prepared merge")

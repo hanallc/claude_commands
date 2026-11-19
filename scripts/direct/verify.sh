@@ -2039,9 +2039,12 @@ from pathlib import Path
 import sys
 with open(Path(sys.argv[1]).resolve().parents[2] / "scripts/lib/package_root.py") as package_root: exec(package_root.read(), {"__file__": package_root.name})
 from scripts.copies import copies
+from scripts.lib import nix_env
 from scripts.mac_test.offload import trusted_linux_source
 
-with copies.remote_step_source(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4]), trusted_linux_source) as checkout:
+trust = copies.SshSourceTrust(trusted_caller=trusted_linux_source, trusted_root=nix_env.trusted_root,
+                             registered_worktree=nix_env.registered_worktree)
+with copies.remote_step_source(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4]), trust) as checkout:
     print(checkout, flush=True)
     sys.stdin.read(1)
 '
@@ -2440,7 +2443,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else step_state waiting_ssh; fi
             return
             ;;
-        failed)
+        failed|prelaunch_failed)
             exec 9>&-
             rm -f "$MAC_LOG_FILE"
             MAC_LOG_FILE=""

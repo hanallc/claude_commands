@@ -24,6 +24,7 @@ import sys
 from typing import TYPE_CHECKING, Callable, Protocol, cast
 import uuid
 
+from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_code, placement, snapshot_codec
 from scripts.build_queue import admission_wire as status_wire
 from scripts.build_queue.admission_wire import read_assignment as read_assignment
@@ -56,7 +57,7 @@ class PlacementConstraintBuilder(Protocol):
     def __call__(self, repo_root: Path, package: str,
                  kind: placement.CommandKind,
                  command: tuple[str, ...], session: placement.SubmittingSession,
-                 source_key: placement.SourceIdentity, routing: target_config.Routing,
+                 source_key: execution_identity.SourceIdentity, routing: target_config.Routing,
                  selection: step_selection.TargetSelection, *, writes_tree: bool) -> placement.PlacementConstraints: ...
 
 
@@ -248,7 +249,7 @@ def finish_step(path: Path, status: int, reason: str = "", *,
             reply.assignment.episode, reply.assignment.owner, prerequisite))
     _ = release(reply.grant.reservation, status, reply.grant.cleanup_timing)
     result = report_execution(wire.ExecutionReport(uuid.uuid4().hex, reply.assignment, placement.NoProviderClaim(),
-        placement.ExecutionNotStarted() if reason else placement.ExecutionEvidenceUnavailable("the local command has ended", CLOCK.now()),
+        execution_identity.ExecutionNotStarted() if reason else execution_identity.ExecutionEvidenceUnavailable("the local command has ended", CLOCK.now()),
         placement.PrelaunchRefused(reason) if reason else placement.AttemptCompleted(status),
         placement.DispatchPathSettled()))
     if result.assignment != reply.assignment or result.state != placement.ClosedAssignment(reason or "completed"):
@@ -1397,7 +1398,7 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             import_module("scripts.build_targets.build_targets"), "fixed_placement_constraints"))
         constraints = builder(Path(args.repo_root or os.getcwd()), args.package,
             cast(placement.CommandKind, kind), tuple(step_argv), session,
-            placement.SourceKeyKnown(args.source_key) if args.source_key else placement.SourceKeyUnavailable("source key is unavailable"),
+            execution_identity.SourceKeyKnown(args.source_key) if args.source_key else execution_identity.SourceKeyUnavailable("source key is unavailable"),
             routing, selection,
             writes_tree=args.writes_tree)
         constraints = replace(constraints, cargo_folder=cargo_folder)
