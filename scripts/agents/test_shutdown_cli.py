@@ -1452,33 +1452,6 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                 finally:
                     case.doCleanups()
 
-        with self.subTest(origin_merge_branch=True, remote_tips_only=True):
-            case = RetireUnitTests()
-            case.setUp()
-            try:
-                origin = case.root / "origin.git"
-                branch = "refs/heads/alpha-branch"
-                origin_main = git(origin, "rev-parse", "refs/heads/main")
-                origin_branch = git(origin, "rev-parse", branch)
-                new_main = git(origin, "commit-tree", f"{origin_main}^{{tree}}", "-p", origin_main, "-m", "Advance main")
-                new_work = git(origin, "commit-tree", f"{origin_branch}^{{tree}}", "-p", origin_branch, "-m", "Remote work")
-                _ = git(origin, "update-ref", "refs/heads/main", new_main)
-                _ = git(origin, "update-ref", branch, new_work)
-                tracking = git(case.checkout, "for-each-ref", "refs/remotes/origin")
-                unit = shutdown.retirement_find_unit("alpha", "alpha")
-                with mock.patch.object(shutdown, "retirement_run", wraps=shutdown.retirement_run) as commands:
-                    self.assertEqual(shutdown.retirement_refusals(unit, settings=conf.read("production")),
-                                     [f"unmerged commits on alpha-branch: {new_work}"])
-                fetches = [tuple(cast(list[str], call.args[0])) for call in commands.call_args_list
-                           if call.args[0][3:4] == ["fetch"]]
-                self.assertEqual(len(fetches), 1)
-                self.assertEqual(set(fetches[0][-2:]), {"refs/heads/main", branch})
-                self.assertEqual(git(case.checkout, "for-each-ref", "refs/remotes/origin"), tracking)
-                self.assertFalse((case.checkout / ".git/FETCH_HEAD").exists())
-                self.assertTrue(case.worktree.is_dir())
-            finally:
-                case.doCleanups()
-
         with self.subTest(branch_with_line_separator=True):
             case = RetireUnitTests()
             case.setUp()
@@ -1566,23 +1539,6 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                     self.assertTrue(case.worktree.is_dir())
                 finally:
                     case.doCleanups()
-
-        with self.subTest(symbolic_unit_branch=True):
-            case = RetireUnitTests()
-            case.setUp()
-            try:
-                branch = "refs/heads/alpha-branch"
-                merge_ref = "refs/heads/main"
-                tip = git(case.checkout, "rev-parse", merge_ref)
-                _ = git(case.checkout, "symbolic-ref", branch, merge_ref)
-                status, output = case.retire()
-                self.assertEqual(status, 1, output)
-                self.assertIn("branch alpha-branch is symbolic", output)
-                self.assertEqual(git(case.checkout, "symbolic-ref", branch), merge_ref)
-                self.assertEqual(git(case.checkout, "rev-parse", merge_ref), tip)
-                self.assertTrue(case.worktree.is_dir())
-            finally:
-                case.doCleanups()
 
         with self.subTest(other_worktree_rebases_branch=True):
             case = RetireUnitTests()

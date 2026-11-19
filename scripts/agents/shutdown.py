@@ -1208,44 +1208,23 @@ def retirement_find_unit(production_name: str, given: str, *,
 def retirement_last_session(unit: RetiringUnit) -> str:
     return unit.staff_member.current_session
 
-def retirement_branch_refs(unit: RetiringUnit, refs: tuple[str, ...], *,
-                           settings: conf.ConfigRead) -> dict[str, list[str]]:
-    """Find local refs and fetch the advertised branch refs without updating tracking refs."""
-    observed = retirement_git(unit, "for-each-ref", "--format=%(refname)%00%(symref)%00",
-                              "--", *refs, settings=settings)
-    if observed.returncode or observed.stderr.strip():
+def retirement_branch_commits(unit: RetiringUnit, branch: str, *, settings: conf.ConfigRead) -> list[str]:
+    commits: list[str] = []
+    branch_ref = f"refs/heads/{branch}"
+    observed = retirement_git(unit, "show-ref", "--verify", "--quiet", branch_ref, settings=settings)
+    if observed.returncode == 0:
+        commits.append(branch_ref)
+    elif observed.returncode != 1:
         raise OSError(retirement_failure(observed))
-    # Git adds a newline after each NUL-delimited record.
-    fields = observed.stdout.split("\0")
-    local = {ref.removeprefix("\n"): target for ref, target in zip(fields[::2], fields[1::2])}
-    unit_ref = f"refs/heads/{unit.branch}"
-    if local.get(unit_ref):
-        raise OSError(f"refused: branch {unit.branch} is symbolic")
-
-    sources = {ref: [ref] if ref in local else [] for ref in refs}
-    advertised: dict[str, str] = {}
-    for ref in refs:
-        remote = retirement_git(unit, "ls-remote", "--exit-code", "--heads", "origin", ref, settings=settings)
-        if remote.returncode not in (0, 2):
-            raise OSError(retirement_failure(remote))
-        if remote.returncode == 0:
-            # A suffix-only match still requires the full ref to exist at fetch.
-            advertised[ref] = ""
-            for line in remote.stdout.split("\n"):
-                commit, _, name = line.partition("\t")
-                if name == ref:
-                    advertised[ref] = commit
-                    break
-    if advertised:
-        fetched = retirement_git(unit, "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "-q",
-                                 "origin", *advertised, settings=settings)
+    remote = retirement_git(unit, "ls-remote", "--exit-code", "--heads", "origin", branch_ref, settings=settings)
+    if remote.returncode not in (0, 2):
+        raise OSError(retirement_failure(remote))
+    if remote.returncode == 0:
+        fetched = retirement_git(unit, "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "-q", "origin", branch_ref, settings=settings)
         if fetched.returncode:
             raise OSError(retirement_failure(fetched))
-        for ref, commit in advertised.items():
-            if not commit:
-                raise OSError(f"origin did not advertise the exact branch {ref}")
-            sources[ref].append(commit)
-    return sources
+        commits.append(remote.stdout.split()[0])
+    return commits
 
 def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead, check_absent_branch: bool = False) -> list[str]:
     """Keep uncommitted work and commits outside the merge branch."""
@@ -1261,12 +1240,9 @@ def retirement_refusals(unit: RetiringUnit, *, settings: conf.ConfigRead, check_
                  if not (line[:2] == " M" and retirement_recorder_line_only(unit.worktree, line[3:], settings=settings))]
         if paths:
             found.append(f"uncommitted work in {unit.worktree}: {', '.join(paths)}")
-    merge_ref = f"refs/heads/{unit.production.merge_branch}"
-    branch_ref = f"refs/heads/{unit.branch}"
-    branches = tuple(dict.fromkeys((branch_ref, merge_ref))) if unit.branch else (merge_ref,)
-    sources = retirement_branch_refs(unit, branches, settings=settings)
-    refs = sources[branch_ref] if unit.branch else ["HEAD"]
-    merge_refs = sources[merge_ref]
+    refs = (retirement_branch_commits(unit, unit.branch, settings=settings) if unit.branch else
+            ["HEAD"] if present else [])
+    merge_refs = retirement_branch_commits(unit, unit.production.merge_branch, settings=settings)
     if not merge_refs:
         raise OSError(f"merge branch {unit.production.merge_branch} is absent from origin and this clone")
     for ref in refs:
@@ -1282,6 +1258,7 @@ def retirement_members(unit: RetiringUnit, record: staff.StaffSnapshot) -> list[
     return [unit.staff_member, *record.find(kind="worker", parent=unit.staff_member.id)]
 
 def retirement_remove(unit: RetiringUnit, *, settings: conf.ConfigRead) -> list[str]:
+    failed: list[str] = []
     if unit.worktree.exists():
         result = retirement_git(unit, "worktree", "remove", "--force", str(unit.worktree), settings=settings)
         if result.returncode:
@@ -1292,15 +1269,15 @@ def retirement_remove(unit: RetiringUnit, *, settings: conf.ConfigRead) -> list[
         if retirement_git(unit, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}", settings=settings).returncode == 0:
             result = retirement_git(unit, "branch", "-D", unit.branch, settings=settings)
             if result.returncode:
-                return [retirement_failure(result)]
+                failed.append(retirement_failure(result))
         observed = retirement_git(unit, "ls-remote", "--exit-code", "--heads", "origin", unit.branch, settings=settings)
         if observed.returncode not in (0, 2):
             return [retirement_failure(observed)]
         if observed.returncode == 0:
             result = retirement_git(unit, "push", "-q", "origin", "--delete", unit.branch, settings=settings)
             if result.returncode:
-                return [retirement_failure(result)]
-    return []
+                failed.append(retirement_failure(result))
+    return failed
 
 def retirement_release_reservations(unit: RetiringUnit, *, settings: conf.ConfigRead) -> None:
     for key in retirement_reservations(unit.worktree):
