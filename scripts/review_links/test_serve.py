@@ -47,7 +47,7 @@ from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
 from scripts.review_links import new_item_dialog, page_question, review_submissions
 from scripts.review_links import accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, review_actions, review_later, review_page, review_items, serve, test_review_page
-from scripts.lib import atomic_file, conf, file_lock, scratch
+from scripts.lib import atomic_file, conf, file_lock, scratch, urgency
 from scripts.feature_log import feature_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -1580,6 +1580,96 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(failed.status, 503)
             self.assertIn(b"The List page is not available.", failed.body)
 
+    def test_list_serves_published_review_links_and_counts_in_separate_requests(self) -> None:
+        case = self.review_fixture(changes=1)
+        cache = serve.ConsoleReviewSnapshotCache(case.root, start_worker=False)
+        snapshot = cache.get()
+        change = next(item for item in snapshot.records.values() if item.type == review_items.ReviewType.CHANGE)
+        owner = staff.StaffId("fixture-list-owner")
+        item = the_list.add(owner, "Read the published review", owner=the_list.UnassignedOwner.NATE,
+                            source="nate", changes={})
+        _ = the_list.link(owner, item.id, (change.key,), source="nate")
+        footer = '<aside class="list-counts">2 questions</aside>'
+        with (patch.object(self.server, "root", case.root), patch.object(self.server, "review_cache", cache),
+              patch.object(list_page, "counts_strip", return_value=footer) as counts,
+              patch.object(list_page, "read_linked_reviews", side_effect=AssertionError("The List read all reviews."))):
+            page = self.request(list_page.PAGE_PATH)
+            self.assertEqual(page.status, 200)
+            self.assertIn(b"Read the published review", page.body)
+            self.assertIn(b"1 change for you", page.body)
+            self.assertIn(b'data-list-counts-url="/console/list.html?counts=1"', page.body)
+            self.assertNotIn(footer.encode(), page.body)
+            counts.assert_not_called()
+            with patch.object(list_page, "records", side_effect=AssertionError("The counts request read the List.")):
+                response = self.request(f"{list_page.PAGE_PATH}?{list_page.COUNTS_QUERY}")
+            self.assertEqual((response.status, response.body), (200, footer.encode()))
+            counts.assert_called_once()
+
+    def test_list_reads_a_change_missing_from_a_partial_review_snapshot(self) -> None:
+        case = self.review_fixture(changes=1)
+        change = next(item for item in review_items.read(case.root) if item.type == review_items.ReviewType.CHANGE)
+        owner = fixture_member("producer", name="morty").id
+        item = the_list.add(owner, "Read the omitted review", owner=the_list.UnassignedOwner.NATE,
+                            source="nate", changes={})
+        _ = the_list.link(owner, item.id, (change.key,), source="nate")
+        with patch.dict(os.environ, {"NEXT_STATE_DIR": str(self.root / "fixture-next")}):
+            queue = urgency.queue_state_path(change.queue)
+            queue.parent.mkdir()
+            _ = queue.write_text("invalid JSON", encoding="utf-8")
+            cache = serve.ConsoleReviewSnapshotCache(case.root, start_worker=False)
+            self.assertNotIn(change.key, cache.get().records)
+            with (patch.object(self.server, "root", case.root), patch.object(self.server, "review_cache", cache),
+                  patch.object(self.server, "delivery_status", case.status), patch.object(list_page, "deliver"),
+                  patch.object(list_page, "read_linked_reviews", wraps=list_page.read_linked_reviews) as read):
+                page = self.request(list_page.PAGE_PATH)
+                self.assertEqual(page.status, 200)
+                self.assertIn(b"Checking linked reviews", page.body)
+                self.assertNotIn(b"Reviews done", page.body)
+                read.assert_not_called()
+                updates = self.request(f"{list_page.PAGE_PATH}?{list_page.COUNTS_AND_LINKS_QUERY}")
+                read.assert_called_once()
+                request = uuid4().hex
+                fields = {"keeper": owner, "id": item.id, "request": request, "words": "Which check passed?",
+                          "until": "", "token": list_page.request_token(case.root, owner, item.id, request),
+                          "action": "question"}
+                read.reset_mock()
+                status, body = self.post(list_page.PAGE_PATH, urlencode(fields))
+                self.assertEqual(status, 200)
+                read.assert_called_once()
+                recovery = urlencode({"item-state": item.id, "keeper": owner})
+                read.reset_mock()
+                recovered = self.request(f"{list_page.PAGE_PATH}?{recovery}")
+                self.assertEqual(recovered.status, 200)
+                read.assert_called_once()
+                for source, response in (("action", body), ("recovery", recovered.body)):
+                    with self.subTest(source=source):
+                        saved = cast(list_page.SavedActionState, json.loads(response))
+                        self.assertEqual(saved["waiting_for_answer"], "true")
+                        panel = saved.get("waiting_details_html", "")
+                        self.assertIn("1 change for you", saved.get("review_summary_html", ""))
+                        self.assertIn("1 change for you", panel)
+                        self.assertIn(f">{change.id}</a>", panel)
+                        self.assertNotIn(list_page.REVIEW_UNAVAILABLE, panel)
+            self.assertEqual(updates.status, 200)
+            self.assertIn(b"1 change for you", updates.body)
+
+    def test_list_returns_counts_when_the_linked_change_list_is_malformed(self) -> None:
+        case = self.review_fixture(changes=1)
+        owner = staff.StaffId("fixture-list-owner")
+        item = the_list.add(owner, "Read the malformed review list", owner=the_list.UnassignedOwner.NATE,
+                            source="nate", changes={})
+        _ = the_list.link(owner, item.id, ("page-owner/C1",), source="nate")
+        _ = case.fixture.review_list.write_text("# Missing review table\n", encoding="utf-8")
+        counts = '<aside class="list-counts">2 questions</aside>'
+        with (patch.object(self.server, "root", case.root), patch.object(list_page, "counts_strip", return_value=counts),
+              patch.object(list_page, "read_linked_reviews", wraps=list_page.read_linked_reviews) as read):
+            response = self.request(f"{list_page.PAGE_PATH}?{list_page.COUNTS_AND_LINKS_QUERY}")
+            read.assert_called_once()
+        self.assertEqual(response.status, 200)
+        self.assertIn(counts.encode(), response.body)
+        self.assertIn(b"data-list-review-read-error", response.body)
+        self.assertNotIn(b"data-list-review-key=", response.body)
+
     def test_list_serves_linked_items_with_a_producer_directory_document(self) -> None:
         case = self.review_fixture(changes=2)
         _ = conf.path("statusline").write_text(ROLE_COLOR_CONFIG, encoding="utf-8")
@@ -1592,10 +1682,16 @@ class ReviewLinksServerTests(unittest.TestCase):
         with patch.object(self.server, "root", case.root):
             self.assertEqual(self.request(list_page.PAGE_PATH).status, 200)
             change_routing.delivery_path(case.root, case.fixture.review_list, "C1").mkdir()
-            response = self.request(list_page.PAGE_PATH)
-        self.assertEqual(response.status, 200)
-        self.assertIn(b"Read the linked changes", response.body)
-        self.assertIn(b">page-owner/C2</a>", response.body)
+            with patch.object(list_page, "read_linked_reviews", wraps=list_page.read_linked_reviews) as read:
+                response = self.request(list_page.PAGE_PATH)
+                read.assert_not_called()
+                self.assertEqual(response.status, 200)
+                self.assertIn(b"Read the linked changes", response.body)
+                self.assertIn(b"Checking linked reviews", response.body)
+                review = self.request(f"{list_page.PAGE_PATH}?{list_page.COUNTS_AND_LINKS_QUERY}")
+                read.assert_called_once()
+        self.assertEqual(review.status, 200)
+        self.assertIn(b">page-owner/C2</a>", review.body)
 
     def test_older_console_browser_and_rebuild_links_forward_to_the_fixed_address(self) -> None:
         for path, location in (

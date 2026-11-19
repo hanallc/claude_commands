@@ -1116,6 +1116,17 @@ The page uses `page_refresh_seconds` and the shared refresh helper.
 A refresh retains the search text, selection, focus, scroll position, open rows, and filters.
 An older response cannot replace a newer response.
 Phone layouts show each row as a card.
+The List uses the published Review snapshot for rows with all their linked records.
+The List requests the counts strip separately after it renders the rows.
+The same request reads from disk if the snapshot lacks a linked record.
+List action responses also read from disk if the snapshot lacks a linked record.
+The List shows unavailable status when it cannot read a linked record.
+A failed Review read leaves the counts available.
+A refresh keeps the current counts until the next counts request succeeds.
+A refresh lets an active counts request finish.
+The response updates linked Review status only when the row version matches the request and the response.
+If a row starts waiting for linked Review status during a request, the List starts a follow-up when that request ends.
+`list_follow_up_timeout_seconds` sets the request time limit.
 The counts strip uses the status line readers for questions, changes, and rebuilds.
 Each count links to its existing page.
 The strip omits proposals and efficiencies.
