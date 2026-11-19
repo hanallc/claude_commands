@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
-from functools import cache, cached_property, lru_cache
+from functools import cache, lru_cache
 import os
 from pathlib import Path
 import re
@@ -144,9 +144,9 @@ class SlotCaller:
     command: tuple[str, ...]
     work: str
 
-    @cached_property
+    @property
     def step(self) -> QueueRowName | NoNamedStep:
-        """Read the command only when the slot must wait."""
+        """Read the step name for this slot request."""
         if self.command:
             return command_slot_name(self.command, RECORDED_STEP_NAMES)
         return recorded_step(self.work, RECORDED_STEP_NAMES)
@@ -227,16 +227,21 @@ printf '%s' "$VERIFY_PACKAGE"
 """
 
 
-@lru_cache(maxsize=128)
 def verify_package(step: str, arguments: tuple[str, ...]) -> str:
     """Pass literal arguments to the verify parser without starting a build."""
     try:
-        result = subprocess.run(["bash", "--noprofile", "--norc", "-c", verify_package_parser(),
-                                 "verify-package", step, *arguments], env={}, stdin=subprocess.DEVNULL,
-                                capture_output=True, text=True, timeout=2, check=False)
-    except (OSError, subprocess.TimeoutExpired, AssertionError):
+        return _parse_verify_package(step, arguments)
+    except (OSError, subprocess.SubprocessError, AssertionError):
         return ""
-    return result.stdout if result.returncode == 0 else ""
+
+
+@lru_cache(maxsize=128)
+def _parse_verify_package(step: str, arguments: tuple[str, ...]) -> str:
+    result = subprocess.run(["bash", "--noprofile", "--norc", "-c", verify_package_parser(),
+                             "verify-package", step, *arguments], env={}, stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True, timeout=2, check=False)
+    result.check_returncode()
+    return result.stdout
 
 
 def command_slot_name(command: Sequence[str], names: StepNames) -> QueueRowName | NoNamedStep:

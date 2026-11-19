@@ -7,6 +7,7 @@ import io
 import json
 import os
 import socket
+import subprocess
 import time
 import unittest
 from unittest import mock
@@ -15,6 +16,32 @@ from typing import cast
 from scripts.build_queue import admission_client as client, admission_protocol as wire, slot_wait
 from scripts.build_queue.admission_test_support import AdmissionFixture, Exchange, ScriptedTransport, reply_bytes
 from scripts.lib.build_slots_test_support import SlotTestConfiguration, private_slot_config
+
+
+class VerifyPackageTests(unittest.TestCase):
+    def test_failed_parse_retries_and_caches_the_next_package(self) -> None:
+        cases = (
+            ("timeout-package", subprocess.TimeoutExpired("bash", 2)),
+            ("os-error-package", OSError("cannot start bash")),
+            ("failed-exit-package", subprocess.CompletedProcess(["bash"], 2, stdout="partial", stderr="")),
+            ("failed-extraction-package", AssertionError("cannot extract the parser")),
+        )
+        for package, failure in cases:
+            success = subprocess.CompletedProcess(["bash"], 0, stdout=package, stderr="")
+            with (self.subTest(package=package),
+                  mock.patch.object(slot_wait, "verify_package_parser", return_value="") as extract,
+                  mock.patch.object(subprocess, "run", return_value=success) as run):
+                if isinstance(failure, AssertionError):
+                    parse = extract
+                    parse.side_effect = (failure, "")
+                else:
+                    parse = run
+                    parse.side_effect = (failure, success)
+                arguments = ("--filter", "name with spaces", package)
+                self.assertEqual(slot_wait.verify_package("test", arguments), "")
+                self.assertEqual(slot_wait.verify_package("test", arguments), package)
+                self.assertEqual(slot_wait.verify_package("test", arguments), package)
+                self.assertEqual(parse.call_count, 2)
 
 
 class RepositorySlotWaitTests(unittest.TestCase):
@@ -77,6 +104,28 @@ class RepositorySlotWaitTests(unittest.TestCase):
         _ = fixture.server.run_pass()
         self.assertEqual(retry_peer.replies()[-1], wire.RepositorySlotReady())
         self.assertIn(second.episode, fixture.server.repository_slot_waiters)
+
+    def test_slot_retry_names_the_package_after_the_first_parse_times_out(self) -> None:
+        fixture, settings = self.pool()
+        request = self.request(fixture, settings)
+        requests: list[wire.RepositorySlotRequest] = []
+
+        def ready(attempt: wire.RepositorySlotRequest) -> wire.RepositorySlotReady:
+            requests.append(attempt)
+            return wire.RepositorySlotReady()
+
+        command = ("bash", "/fixture/verify.sh", "test", "slot-retry-package")
+        success = subprocess.CompletedProcess(["bash"], 0, stdout="slot-retry-package", stderr="")
+        with (slot_wait.slot_caller("slot-session", "builds", fixture.root, command, "test"),
+              mock.patch.object(client, "repository_slot", side_effect=ready),
+              mock.patch.object(subprocess, "run", side_effect=(subprocess.TimeoutExpired("bash", 2), success)) as parse):
+            for _attempt in range(2):
+                slot_wait.wait_for_slot("widget", settings.machine, settings.slots, 1,
+                    episode=request.episode, since=request.since, showrunner="builds", unit="unit",
+                    work="test", purpose="verify")
+
+        self.assertEqual([attempt.identity.step for attempt in requests], ["test", "test slot-retry-package"])
+        self.assertEqual(parse.call_count, 2)
 
     def test_finite_wait_names_the_repository_held_slots_and_maximum_key(self) -> None:
         fixture, settings = self.pool()

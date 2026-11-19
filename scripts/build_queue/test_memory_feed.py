@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.review_links.test_page_frame import assert_status_states
-from scripts.build_queue import admission_records, placement
+from scripts.build_queue import admission_records, placement, slot_wait
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.test_queue_view import with_converted_executions
 
@@ -1793,17 +1793,20 @@ process.stdout.write(JSON.stringify({
         verify = "bash ~/.claude/scripts/direct/verify.sh --session-dir"
         cases = (
             ("startup", "/home/natepiano/rust/hana_catalyst-startup",
-             f"{verify} /fixture/sessions/startup test hana --filter 'name with spaces'", "test hana"),
+             f"{verify} /fixture/sessions/startup test hana --filter 'name with spaces'", "test hana",
+             ("hana", "--filter", "name with spaces")),
             ("widget", "/home/natepiano/rust/widget-enhancements",
              f"direnv allow . >/dev/null; direnv exec . {verify} /fixture/sessions/widget test hana_diegetic; " +
-             f"{verify} /fixture/sessions/widget build hana_diegetic --example scrolling --local test", "test hana_diegetic"),
+             f"{verify} /fixture/sessions/widget build hana_diegetic --example scrolling --local test", "test hana_diegetic",
+             ("hana_diegetic",)),
         )
-        for unit, source, command, name in cases:
-            with self.subTest(unit=unit):
+        for unit, source, command, name, arguments in cases:
+            with self.subTest(unit=unit), mock.patch.object(slot_wait, "verify_package", return_value=arguments[0]) as parse:
                 row, = self.copies_slot_page(command, source=source, unit=unit)["waiters"]
                 self.assertEqual(row["name"], name)
                 self.assertEqual(row["unit"], unit)
                 self.assertEqual(row["showrunner"], "hana")
+                parse.assert_called_once_with("test", arguments)
 
     def test_wrapped_copies_waiter_without_verify_names_the_script(self) -> None:
         for unit, staff_id in (("row-check", "staff-row-check"), ("", "")):
