@@ -1436,6 +1436,9 @@ The existing tree key and a second private capture detect content and executable
 Both capture paths refuse new Git links with `NestedRepository`.
 The sender refuses unexpected ignored inputs, credential paths, Git links, and disallowed environment variables.
 It sends no ignored files, HOME, or target output.
+The sender checks local input paths before it requests a Hana claim.
+The sender refuses the source early only if it confirms that no execution is bound.
+Hana can start if an ignored file appears after the first check. The check after adoption then refuses the file.
 
 When source preparation fails before the command starts, offload reports the cause as a typed admission refusal.
 The queue records `DoNotRetry` and the build runs locally.
