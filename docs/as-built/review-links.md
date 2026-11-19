@@ -1576,16 +1576,33 @@ Tests use a zero pause.
 Each round sends once to every recipient that has not succeeded.
 The server pauses once between rounds and retries only failed recipients.
 The showrunner receives its first attempt before any recipient receives a second attempt.
-A `QUEUED:` result with exit 1 counts as kept; a `KEPT:` result with exit 0 also counts as kept.
-Other nonzero exits fail.
-After all tries fail for a recipient, the server sends one alert to the row's showrunner, with no alert retries.
+Review uses the record and saved attempt to identify each message.
+Retries and recovery use the same key for each staff recipient.
+List feedback uses its saved request ID.
+Image feedback uses the image registration, action, and feedback to identify the attempt.
+The server saves the answered question IDs before the first send.
+A retry hides the image only if no new question answer has arrived.
+A skipped send can save the feedback mark after a failed write.
+`QUEUED` and `KEPT` count as kept.
+`SKIPPED` confirms that the sender already accepted the key.
+For a Review send, `PENDING` means the message may have arrived.
+Codex queue retries reuse the same client message ID.
+A timeout before the queue request reaches the socket is a definite failure.
+The server stops delivery for that recipient.
+After all tries fail, the server alerts the showrunner who owns the item's tab.
+For a Review producer tab without a showrunner, the server uses the configured routing alert showrunner.
+For a List question, the item owner determines the alert route.
+If the showrunner is the failed recipient, the server records the failure without sending an alert.
 The alert names the list, row, recipient, number of tries, and last error.
 It states that the user's answer is saved and requests a manual handoff.
-If the alert fails, the server prints one line to stderr and stops.
+Each saved alert has its own key.
+Recovery uses that key again if the server cannot clear an alert after sending it.
 The user receives no delivery alert.
 
 At startup, the server delivers pending records with the same retry and alert rules.
 Recovery preserves attempts that a live request owns.
+It resumes a List or Images question if the saved sender released its lock during delivery.
+It reuses the question's message ID.
 Recovery scans each review list once and finds each record through `change_routing.delivery_path`.
 It ignores the `page` field in legacy records.
 The browser and recovery use `StaffRouting.owner_and_production` for the same owner and production document.
