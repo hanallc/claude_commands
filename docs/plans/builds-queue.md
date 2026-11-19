@@ -2929,6 +2929,11 @@ Work:
 2. A test adds an item whose label differs from its batch file name, and checks that `next` prints the stored path.
 3. Send natemerge the one-line runner change: use the printed path, never a path built from the label.
 
+### Phase 44cj — Admission hooks and grants keep their limits after 44cb  · status: todo
+**From 44cb review pass 6 and Astra (/tmp/claude/astra/20261119T003304Z-2566773/review.md), 2026-11-18:** two cases are outside the 44cb guarantee. Starts after 44cb merges.
+1. F014: before an outage, the leave hook runs with no timeout and can pass the launch deadline. The base (47027a14c, admission_client.py:424 and :492) has the same gap. The hook gets only the time left to the active deadline.
+2. A replacement refusal can arrive while the original socket holds only part of a grant frame. The service saves the grant before delivery and does not release it on disconnect (admission_service.py:2645, :4323). Design the service coordination for this case and for cancellation, so a saved grant is never left unresolved.
+
 ### Phase 44cg — A memory wait fixture gives the same result under load  · status: todo
 **From builds, 2026-11-18 18:3x:** queue's next item after 44cf.
 
