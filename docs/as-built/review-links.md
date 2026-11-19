@@ -173,6 +173,13 @@ An older response cannot replace a newer response.
 Accounts and List read their rendered page at `page_refresh_seconds` intervals.
 Review checks the snapshot version at that interval.
 It requests the compact index only when the version changes.
+On machines that read staff over SSH, GET, HEAD, News polls, and background Review builds share a staff snapshot.
+The server reuses this snapshot for `staff_snapshot_seconds`.
+After a cache read fails, readers use direct staff reads for the same interval.
+The staff owner reads its local file directly.
+POST routes that can save answers, change staff, or send messages read staff directly.
+These routes clear the snapshot when the action ends.
+Accounts preferences, News polls, and Disks polls keep the snapshot.
 Builds reads `memory.json` at its feed interval.
 Disks reads `disks.json` at `page.poll_seconds` intervals and requests a new measure when needed.
 Disks shows Paused with the reason **Measuring…** while a measure runs and reads succeed.

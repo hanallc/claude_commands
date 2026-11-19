@@ -6,7 +6,7 @@ import hashlib
 import gzip
 import threading
 import logging
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field, replace
 import json
 import re
@@ -455,6 +455,7 @@ class ReviewSnapshotCache:
     interval: float = 0.5
     start_worker: bool = True
     initialize_on_start: bool = False
+    staff_scope: Callable[[], AbstractContextManager[None]] = field(default=nullcontext, kw_only=True)
     _snapshot: ReviewSnapshot | SnapshotUnavailable = field(default_factory=SnapshotUnavailable,init=False)
     _condition: threading.Condition = field(default_factory=threading.Condition,init=False)
     _save_lock: threading.Lock = field(default_factory=threading.Lock,init=False)
@@ -469,7 +470,8 @@ class ReviewSnapshotCache:
         if not self.initialize_on_start and (self.root/change_page.CONSOLE_FOLDER/change_browser.MANIFEST).exists():
             self._initialization_requested = True
             try:
-                self._snapshot = build_snapshot(self.root)
+                with self.staff_scope():
+                    self._snapshot = build_snapshot(self.root)
             except Exception as error:
                 logging.getLogger(__name__).warning('Review snapshot: %s',error)
         self._thread = threading.Thread(target=self._update,name='review-snapshot',daemon=True)
@@ -684,7 +686,8 @@ class ReviewSnapshotCache:
                     self._busy = True
                 if not (self.root/change_page.CONSOLE_FOLDER/change_browser.MANIFEST).exists():
                     _ = change_page.console_folder(self.root)
-                fresh = build_snapshot(self.root)
+                with self.staff_scope():
+                    fresh = build_snapshot(self.root)
                 with self._save_lock, self._condition:
                     if self._snapshot is not snapshot or self._generation != generation:
                         self._wake.set()
