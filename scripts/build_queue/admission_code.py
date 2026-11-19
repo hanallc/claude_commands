@@ -14,6 +14,7 @@ ADMISSION_CODE_PATHS = (
     "build_queue/admission_jobs.py",
     "build_queue/system_clock.py", "build_queue/admission_records.py", "build_queue/step_estimator.py",
     "build_queue/admission_service.py", "build_queue/queue_place.py", "build_queue/placement.py",
+    "build_queue/execution_identity.py",
     "aws_target/hana_placement.py", "aws_target/hana_placement_adapter.py", "aws_target/hana_box.py", "aws_target/hana_spend.py",
     "aws_target/hana_execution.py", "build_targets/target_config.py", "build_targets/build_targets.py",
     "build_targets/execution_transport.py",

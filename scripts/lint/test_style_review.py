@@ -197,7 +197,7 @@ class PreparationTests(unittest.TestCase):
             self.assertIn("+++ b/new file.rs", result.inputs.diff.read_text())
             self.assertEqual(result.inputs.additions.read_text(), "+fn added() {}\n")
 
-    def test_nonrust_additions_keep_the_scanner_without_loading_rust(self) -> None:
+    def test_nonrust_additions_do_not_require_the_rust_checklist(self) -> None:
         _ = (self.repo / "note.txt").write_text("new\n")
         result = style.prepare(self.repo, "HEAD", self.output)
         self.assertIsInstance(result, style.Ready)
@@ -225,9 +225,35 @@ class PreparationTests(unittest.TestCase):
         scripts = Path(style.__file__).resolve().parents[1]
         self.assertNotEqual(scripts.parent, self.repo)
         self.assertIn(f'zsh "{scripts}/rust_style/load-rust-style.sh"', assignment)
-        self.assertIn(f'"{scripts}/lib/py" "{scripts}/hooks/banned_words_lib.py" --diff', assignment)
         self.assertNotIn("~/.claude/scripts", assignment)
         self.assertNotIn("$scripts", assignment)
+
+    def test_rust_and_nonrust_reports_keep_the_marked_status(self) -> None:
+        _ = (self.repo / "note.txt").write_text("new\n")
+        prompt = self.root / "prompt.md"
+        _ = prompt.write_text("Review the change.\n")
+        for rust, row, outcome in (
+            ("no", "| — | Rust checklist | Skip (no Rust change) |", "Pass"),
+            ("yes", "| 1 | Fixture rule | VIOLATION: use a named item at sample.rs:1 |", "Findings"),
+        ):
+            with self.subTest(rust=rust):
+                if rust == "yes":
+                    _ = (self.repo / "sample.rs").write_text("const _: () = ();\n")
+                phase = self.root / f"phase-{rust}"
+                directory = style.start(self.repo, "HEAD", phase, prompt, "review")
+                assignment = (directory / "assignment.md").read_text()
+                self.assertIn(f"- Rust change: {rust}", assignment)
+                self.assertIn(style.BEGIN, assignment)
+                self.assertIn(style.END, assignment)
+                self.assertIn("Skip (no Rust change)", assignment)
+                self.assertIn("VIOLATION: description at path:line", assignment)
+                report = f"| # | Rule | Result |\n| --- | --- | --- |\n{row}\nStyle review: {outcome}\n"
+                capture = self.root / "capture.md"
+                _ = capture.write_text(f"{style.BEGIN}\n{report}{style.END}\n")
+                style.finish(directory, capture, 0)
+                self.assertIn(report, (phase / "phase_style_review.md").read_text())
+                state = cast(dict[str, object], json.loads((phase / "style_review_state.json").read_text()))
+                self.assertEqual(state["state"], "complete")
 
     def test_committed_range_excludes_later_commits_dirty_and_untracked_work(self) -> None:
         baseline = style.git(self.repo, "rev-parse", "HEAD").stdout.decode().strip()
@@ -252,24 +278,6 @@ class PreparationTests(unittest.TestCase):
             self.assertIn("invalid end commit", result.cause)
         self.assertFalse(self.output.exists())
 
-    def test_diff_scanner_does_not_touch_counters(self) -> None:
-        home = self.root / "scanner-home"
-        environment = no_temp_environment(home)
-        guide = home / "rust/nate_style/rust/forbidden-words.md"
-        guide.parent.mkdir(parents=True)
-        _ = guide.write_text('### "delve"\n')
-        diff = "diff --git a/a.rs b/a.rs\n+++ b/a.rs\n@@ -0,0 +1 @@\n+// delve\n"
-        counters = home / ".claude/state/forbidden-word-counts.json"
-        counters.parent.mkdir(parents=True)
-        _ = counters.write_text('{"delve": {"count": 3}}')
-        before = file_snapshot(home)
-        result = subprocess.run([sys.executable, str(style.ROOT / "scripts/hooks/banned_words_lib.py"), "--diff"],
-                                input=diff, text=True, capture_output=True,
-                                env=environment, check=False)
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("a.rs:1:", result.stdout)
-        self.assertEqual(file_snapshot(home), before)
-
     def test_guide_loader_does_not_populate_a_cold_interpreter_cache(self) -> None:
         home = self.root / "home"
         environment = no_temp_environment(home)
@@ -291,7 +299,8 @@ class PreparationTests(unittest.TestCase):
                                 cwd=self.repo, env=environment, text=True, capture_output=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Rust style guide loaded", result.stdout)
-        self.assertIn("Local forbidden-word counters: delve=3", result.stdout)
+        self.assertIn("Keep the fixture readable.", result.stdout)
+        self.assertNotIn("Local forbidden-word counters", result.stdout)
         self.assertIn("See also: Other rule", result.stdout)
         self.assertNotIn("temp file", result.stderr)
         self.assertEqual(file_snapshot(home), before)

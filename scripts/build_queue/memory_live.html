@@ -972,7 +972,6 @@ function rowUnit(row) {
   return ciRow(row) ? "CI" : row.unit;
 }
 function rowOwner(row, waiting = false) {
-  if (typeof row.owner_text === "string") return row.owner_text;
   if (row.caller) return row.caller;
   if (row.kind === "repository-slot") return "";
   if (ciRow(row)) return (row.ci_label || "").split(" · ")[0];

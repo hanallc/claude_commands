@@ -18,6 +18,7 @@ from typing import cast
 
 from scripts.build_queue.scope_activity import ScopeProcesses, LiveBuildRun, NotServiceSlice
 from scripts.build_queue import admission_protocol as wire, cloud_progress, progress_profile
+from scripts.build_queue.admission_wire import cloud_queue_order
 from scripts.build_queue.admission_records import (reason_phrase as reason_phrase, behind_place as behind_place,
     eligible_head_position as eligible_head_position)
 from scripts.build_queue.queue_evidence import step_labels as step_labels
@@ -819,14 +820,19 @@ class WaitingBuild:
 
 
 def waiting_builds(model: QueueModel) -> list[WaitingBuild | wire.CloudRow | wire.RepositorySlotRow]:
-    """Insert cloud waits by arrival time without changing the local queue order."""
+    """Insert cloud waits in admission order. Keep the local queue order."""
     rows: list[WaitingBuild | wire.CloudRow | wire.RepositorySlotRow] = [WaitingBuild(index, step)
         for index, step in enumerate(model.reading.view.waiting, 1)]
     slot_rows = model.reading.repository_slots if isinstance(model.reading, wire.CloudQueueRead) else ()
+
+    def order(row: wire.CloudRow | wire.RepositorySlotRow) -> tuple[float, int, str]:
+        return cloud_queue_order(row.place, row.since) if isinstance(row, wire.CloudRow) else (row.since, 1, "")
+
     for cloud in sorted([*(row for row in cloud_rows(model) if isinstance(row.wait, wire.CloudSlotWait)), *slot_rows],
-                        key=lambda row: row.since):
+                        key=order):
+        order_time = order(cloud)[0]
         position = next((index for index, row in enumerate(rows)
-                         if (row.step.since if isinstance(row, WaitingBuild) else row.since) > cloud.since), len(rows))
+                         if (row.step.since if isinstance(row, WaitingBuild) else order(row)[0]) > order_time), len(rows))
         rows.insert(position, cloud)
     return rows
 

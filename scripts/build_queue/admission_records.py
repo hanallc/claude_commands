@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 
+from scripts.build_queue import execution_identity
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import placement
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
@@ -1064,7 +1065,7 @@ class RunningStep:
     started_at: float = 0.0
     unit: str = ""
     project: str = ""
-    execution: placement.ExecutionEvidence = placement.ExecutionNotStarted()
+    execution: execution_identity.ExecutionEvidence = execution_identity.ExecutionNotStarted()
     assignment_host: str = ""
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
@@ -1074,17 +1075,17 @@ class RunningStep:
 
 def execution_host(step: RunningStep, local_host: str) -> str:
     evidence = step.execution
-    if isinstance(evidence, placement.ObservedExecution):
+    if isinstance(evidence, execution_identity.ObservedExecution):
         identity = evidence.identity
-        return identity.host if isinstance(identity, placement.ProcessExecution) else identity.target
+        return identity.host if isinstance(identity, execution_identity.ProcessExecution) else identity.target
     return step.assignment_host or local_host
 
 
 def execution_group(step: RunningStep, fallback: str) -> str:
     evidence = step.execution
-    if isinstance(evidence, placement.ObservedExecution):
+    if isinstance(evidence, execution_identity.ObservedExecution):
         identity = evidence.identity
-        if isinstance(identity, placement.ProcessExecution):
+        if isinstance(identity, execution_identity.ProcessExecution):
             return repr((identity.host, identity.generation, identity.pid, identity.start_time))
         return repr((identity.target, identity.generation, identity.instance, identity.attempt))
     if step.assignment_host:

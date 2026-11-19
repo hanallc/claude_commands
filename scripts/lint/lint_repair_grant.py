@@ -7,6 +7,7 @@ from pathlib import Path
 import shlex
 import sys
 
+from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_client, admission_records, admission_wire as wire, placement
 from scripts.buildlog import parse, store, treekey
 from scripts.lib import git_files
@@ -81,7 +82,7 @@ def check_repair_grant(assignment_file: Path, grant_file: Path, episode: str, pi
     cwd = os.getcwd()
     tree = repair_tree_key(Path(cwd), command, copy_tree)
     source = saved.assignment.source_key
-    if tree is None or not isinstance(source, placement.SourceKeyKnown) or source.key != tree:
+    if tree is None or not isinstance(source, execution_identity.SourceKeyKnown) or source.key != tree:
         raise ValueError("the repair tree differs from the judgment tree")
 
     repair = admission_client.step_request(command, cwd, wire.Owner(pid, start), saved.assignment.since, "", episode)

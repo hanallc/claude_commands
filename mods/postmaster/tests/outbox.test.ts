@@ -1,6 +1,7 @@
 import { describe, expect, test } from "claude-code/testing";
 import type { FsEntry, SessionSendArgs, SessionSendResult } from "claude-code";
 import type { OutboxEntry, PostmasterCalls, Replies, RouteToken } from "../hooks/protocol";
+import { isOutboxResult } from "../hooks/protocol";
 import { startOutbox } from "../hooks/outbox";
 
 const directory = "/test-state/message/postmaster";
@@ -9,7 +10,9 @@ const firstId = "00000000000000000000000000000001";
 const secondId = "00000000000000000000000000000002";
 
 function entry(id = firstId, deadline_ms = 100000): OutboxEntry {
-  return { id, session_id: "recipient", socket: "uds:/test-sockets/recipient.sock", sender: "Original sender", reply_to_session_id: "original-session", text: "hello", sha256: helloHash, deadline_ms };
+  return { id, session_id: "recipient", recipient_pid: 321, recipient_start: "recipient-process",
+    socket: "uds:/test-sockets/recipient.sock", sender: "Original sender", reply_to_session_id: "original-session",
+    text: "hello", sha256: helloHash, deadline_ms };
 }
 
 function path(folder: string, id: string): string {
@@ -126,7 +129,29 @@ function fakeCalls() {
   };
 }
 
+export async function captureReceiptFixture(): Promise<string> {
+  const fake = fakeCalls();
+  fake.put(entry());
+  const outbox = await startOutbox(fake.calls, fake.replies);
+  try {
+    await outbox.poll();
+    const receipt = fake.files.get(path("results", firstId));
+    if (receipt === undefined) throw new Error("The mod wrote no receipt");
+    return receipt;
+  } finally { outbox.cancel(); }
+}
+
 describe("outbox delivery", () => {
+  test("the receipt fixture records the claimed recipient", async () => {
+    const receipt: unknown = JSON.parse(await captureReceiptFixture());
+    expect(isOutboxResult(receipt)).toBe(true);
+    if (!isOutboxResult(receipt)) throw new Error("Invalid mod receipt");
+    const { session_id, recipient_pid, recipient_start } = entry();
+    expect({ session_id: receipt.session_id, recipient_pid: receipt.recipient_pid, recipient_start: receipt.recipient_start })
+      .toEqual({ session_id, recipient_pid, recipient_start });
+    expect(receipt.outcome).toBe("delivered");
+  });
+
   test("delivers an entry once with the hash of the unchanged text", async () => {
     const fake = fakeCalls();
     fake.put({ ...entry(), sha256: "0".repeat(64) });
@@ -196,8 +221,26 @@ describe("outbox delivery", () => {
     await outbox.poll();
     expect(fake.sent).toEqual([]);
     expect(fake.result(firstId).outcome).toBe("withdrawn");
+    expect(fake.result(firstId).recipient_pid).toBe(entry().recipient_pid);
     expect(fake.registered).toEqual([]);
     outbox.cancel();
+  });
+
+  test("an entry removed before the read produces a receipt without recipient fields", async () => {
+    const fake = fakeCalls();
+    fake.put(entry());
+    fake.onBeforeRead(async filename => {
+      if (filename === path("outbox", firstId)) fake.files.delete(filename);
+    });
+    const outbox = await startOutbox(fake.calls, fake.replies);
+    try {
+      await outbox.poll();
+      const receipt = fake.result(firstId);
+      expect(isOutboxResult(receipt)).toBe(true);
+      expect(receipt.outcome).toBe("withdrawn");
+      expect(["session_id", "recipient_pid", "recipient_start"].every(field => !(field in receipt))).toBe(true);
+      expect(fake.sent).toEqual([]);
+    } finally { outbox.cancel(); }
   });
 
   const orders = [
@@ -325,6 +368,8 @@ describe("outbox delivery", () => {
       await outbox.poll();
       expect(fake.result(firstId).outcome).toBe("failed");
       expect(fake.result(firstId).detail).toBe("unreadable entry");
+      expect(isOutboxResult(fake.result(firstId))).toBe(true);
+      expect("session_id" in fake.result(firstId)).toBe(false);
       expect(fake.registered.map(item => item.id)).toEqual([secondId]);
       expect(fake.result(secondId).outcome).toBe("delivered");
       expect(fake.sent.length).toBe(1);
