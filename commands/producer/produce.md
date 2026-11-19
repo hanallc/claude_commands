@@ -57,6 +57,12 @@ File each improvement as a question for nate when you see it, as "Questions and 
 Give the problem, the proposed change, the benefit, and the cost.
 nate evaluates each one.
 
+## Rust design
+
+If one of your items is in a Rust project, load `~/.claude/docs/producer/rust_design.md` at startup and after compaction. Keep it in context.
+Use it when you read a plan or a design call. Do not review code lines with it.
+Ask the style unit about a hard case.
+
 ## Work with showrunners and morty
 
 Check your assignments on The List. Keep the status, next step, and ETA current for your items.
