@@ -29,6 +29,7 @@ The current resource inventory excludes the removed builder's ongoing storage co
 
 The state folder is `~/.local/state/build-targets/aws`.
 `gate-deployment.json` records the bucket, the deployed `instance_types` and regional launch resources.
+`gate-probe.json` records the verdicts of a completed gate setup probe, including failed checks.
 `deployment.json` records foundation ownership.
 The configured region list alone does not prove that all regional stacks exist.
 Preserve the ledger, deployment records, launch records, and cleanup records during recovery.
@@ -189,9 +190,16 @@ Update the existing gate foundation at your terminal:
 
 ```sh
 python3 scripts/aws_target/deploy.py up --workload merge-gates --approve-resources
+python3 scripts/aws_target/deploy.py probe-status
 ```
 
-This path updates gate resources and preserves the foundation's existing builder parameters.
+Approved setup removes the old probe record before it changes resources.
+An interruption or early setup failure leaves the record absent.
+`probe-status` prints the verdicts and age only for a valid record for the current gate deployment.
+For other record states, it prints one status line.
+This command makes no AWS calls.
+
+`up` updates gate resources and preserves the foundation's existing builder parameters.
 It requires the saved foundation ownership record.
 It does not activate the removed builder route.
 The home stack supplies the bucket, role, instance profile, and home launch resources.
