@@ -52,7 +52,11 @@ class MergeGateSuitesTests(GateSuitesFixture):
                     suite, path, log = cast(str, arguments[0]), cast(Path, arguments[1]), cast(Path, arguments[5])
                     now = began + 9.98
                     self.write(log, "OK\n")
-                    return merge_gate.RunningGateJob(suite, path, process, began, 0, log.open("r+"), log, path.name)
+                    job = merge_gate.RunningGateJob(suite, path, process, began, 0, log.open("r+"), log, path.name)
+                    recovery = merge_gate.ACTIVE_GATE_RECOVERY.get()
+                    assert isinstance(recovery, merge_gate.GateRecovery) and recovery.register_job is not None
+                    recovery.register_job(job)
+                    return job
 
                 def reap(*arguments: int) -> tuple[int, int, resource.struct_rusage]:
                     return (arguments[0] if now >= began + 9.99 else 0), 0, resource.getrusage(resource.RUSAGE_SELF)

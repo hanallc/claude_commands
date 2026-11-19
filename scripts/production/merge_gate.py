@@ -35,6 +35,7 @@ except FileNotFoundError:
     pass
 
 import argparse
+from array import array
 from collections import deque
 from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, closing, contextmanager, nullcontext
@@ -42,6 +43,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum, auto
+import errno
 import fcntl
 import hashlib
 import inspect
@@ -61,6 +63,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 from typing import Literal, Protocol, TextIO, cast
 
@@ -556,11 +559,21 @@ def fetch_branches(repo: Path, *branches: str) -> None:
 
 def command(arguments: Sequence[str], repo: Path) -> subprocess.CompletedProcess[str]:
     recovery = ACTIVE_GATE_RECOVERY.get()
-    process = start_recorded_gate_child(arguments, repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    launched: list[subprocess.Popen[str]] = []
     deadline = recovery.rollback_deadline if isinstance(recovery, GateRecovery) else None
+
+    def register(child: subprocess.Popen[str]) -> subprocess.Popen[str]:
+        launched.append(child)
+        return child
+
     try:
-        output, errors = process.communicate(timeout=None if deadline is None else max(0, deadline - time.monotonic()))
+        child = start_recorded_gate_child(arguments, repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                          register=register)
+        output, errors = child.communicate(timeout=None if deadline is None else max(0, deadline - time.monotonic()))
     except BaseException as error:
+        if not launched:
+            raise
+        process = launched[0]
         try:
             process_group.send_process_group(process.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -581,17 +594,21 @@ def command(arguments: Sequence[str], repo: Path) -> subprocess.CompletedProcess
             raise GateRefused(f"UNRESOLVED: the rollback command exceeded its deadline: {shlex.join(arguments)}") from error
         raise
     finally:
-        for stream in (process.stdout, process.stderr):
-            if stream is not None:
-                stream.close()
-        if isinstance(recovery, GateRecovery) and process.returncode is not None and not recovery.unresolved:
-            recovery.remove_group(process.pid)
-    return subprocess.CompletedProcess(arguments, cast(int, process.returncode), output, errors)
+        if launched:
+            process = launched[0]
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+            if isinstance(recovery, GateRecovery) and process.returncode is not None and not recovery.unresolved:
+                recovery.remove_group(process.pid)
+    return subprocess.CompletedProcess(arguments, cast(int, child.returncode), output, errors)
 
 
-def start_recorded_gate_child(arguments: Sequence[str], repo: Path, *, stdout: int | TextIO, stderr: int,
-                              environment: dict[str, str] | None = None, suite: bool = False) -> subprocess.Popen[str]:
-    """Publish the process group before the child runs its command."""
+def start_recorded_gate_child[Child](arguments: Sequence[str], repo: Path, *,
+                                     stdout: int | TextIO, stderr: int,
+                                     register: Callable[[subprocess.Popen[str]], Child],
+                                     environment: dict[str, str] | None = None, suite: bool = False) -> Child:
+    """Publish the process group and register the child before it runs."""
     recovery = ACTIVE_GATE_RECOVERY.get()
     with ExitStack() as closer:
         writer: int | None = None
@@ -614,8 +631,10 @@ def start_recorded_gate_child(arguments: Sequence[str], repo: Path, *, stdout: i
             recovery.add_group(process.pid)
             if process.pid not in recovery.groups:
                 raise GateRefused(f"cannot record gate group {process.pid}")
+        child = register(process)
+        if writer is not None:
             _ = os.write(writer, b"1")
-        return process
+        return child
 
 
 def git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -731,6 +750,7 @@ class GateRecovery:
     rollback_source: str = ""
     unresolved: bool = False
     rollback_deadline: float | None = None
+    register_job: Callable[[RunningGateJob], None] | None = None
 
     def save(self) -> None:
         write_text_atomic(self.path, json.dumps({
@@ -764,17 +784,55 @@ class GateRecovery:
             self.tokens[position] = replacement
         self.save()
 
-    def return_token(self, token: HeldGateToken, descriptor: int) -> None:
+    def return_token(self, token: HeldGateToken, descriptor: int, *, recovering: bool = False) -> None:
         pending = replace(token, operation="returning")
         self.update_token(token, pending)
         try:
             count = os.write(descriptor, bytes.fromhex(token.value))
-        except BlockingIOError:
-            self.update_token(pending, token)
+        except OSError as error:
+            if recovering and error.errno == errno.ENOSPC:
+                self.update_token(pending)
+                return
+            if isinstance(error, BlockingIOError):
+                self.update_token(pending, token)
             raise
         if count != 1:
             raise GateRefused("UNRESOLVED: could not confirm the shared CPU slot return")
         self.update_token(pending)
+
+    def recover_tokens(self) -> None:
+        for token in reversed(self.tokens[:]):
+            problem = f"UNRESOLVED: CPU slot {token.operation} in {token.path}. Record: {self.path}"
+            try:
+                descriptor = os.open(token.path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
+            except FileNotFoundError:
+                self.update_token(token)
+                continue
+            except OSError as error:
+                print(f"{problem} ({error})", flush=True)
+                continue
+            try:
+                status = os.fstat(descriptor)
+                # The jobserver device reclaims slots when their owner dies.
+                if (not stat.S_ISFIFO(status.st_mode)
+                        or (status.st_dev, status.st_ino) != (token.device, token.inode)):
+                    self.update_token(token)
+                    continue
+                unread = array("i", [0])
+                _ = cast(int, fcntl.ioctl(descriptor, termios.FIONREAD, unread))
+                # A full FIFO has no room for an additional slot.
+                if unread[0] == fcntl.fcntl(descriptor, fcntl.F_GETPIPE_SZ):
+                    self.update_token(token)
+                    continue
+                if token.operation == "held":
+                    self.return_token(token, descriptor, recovering=True)
+                    continue
+            except OSError as error:
+                print(f"{problem} ({error})", flush=True)
+                continue
+            finally:
+                os.close(descriptor)
+            print(problem, flush=True)
 
     def recover(self) -> None:
         """Stop recorded groups before removing their folders and undoing the merge."""
@@ -808,7 +866,7 @@ class GateRecovery:
             except ProcessLookupError:
                 pass
         # A dead leader can leave writers in its group. Wait before deleting their files.
-        for entry in Path("/proc").iterdir():
+        for entry in Path("/proc").iterdir() if stopping else ():
             if not entry.name.isdecimal():
                 continue
             try:
@@ -823,37 +881,20 @@ class GateRecovery:
                     raise GateRefused(f"UNRESOLVED: gate group member {entry.name} did not stop")
             finally:
                 os.close(descriptor)
-        self.groups.clear()
-        self.save()
-        while self.tokens:
-            token = self.tokens[-1]
-            try:
-                descriptor = os.open(token.path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
-            except FileNotFoundError:
-                descriptor = -1
-            try:
-                if descriptor >= 0:
-                    status = os.fstat(descriptor)
-                    # The jobserver device reclaims tokens from a dead owner.
-                    if (stat.S_ISFIFO(status.st_mode)
-                            and (status.st_dev, status.st_ino) == (token.device, token.inode)):
-                        if token.operation != "held":
-                            raise GateRefused(f"UNRESOLVED: interrupted CPU slot {token.operation} in {token.path}")
-                        self.return_token(token, descriptor)
-                        continue
-                self.update_token(token)
-            finally:
-                if descriptor >= 0:
-                    os.close(descriptor)
-        for folder in self.folders:
+        if self.groups:
+            self.groups.clear()
+            self.save()
+        self.recover_tokens()
+        for folder in reversed(self.folders):
             path = Path(folder)
             try:
                 if not build_folders.remove_build_folder(path, lambda: shutil.rmtree(path), wait=False):
                     raise GateRefused(f"UNRESOLVED: gate recovery kept held folder {path}")
             except FileNotFoundError:
                 pass
-        self.folders.clear()
-        self.save()
+        if self.folders:
+            self.folders.clear()
+            self.save()
         if self.rollback:
             repo = Path(self.repo)
             with gate_operation_lock(repo) as descriptor, ExitStack() as cleanup:
@@ -880,7 +921,8 @@ class GateRecovery:
                 finally:
                     self.rollback_deadline = None
             print(f"Recovered gate {self.pid}: merge undone, not pushed", flush=True)
-        self.path.unlink(missing_ok=True)
+        if not self.tokens:
+            self.path.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -897,16 +939,20 @@ def gate_run_directory(repo: Path) -> Path:
     return gate_state_dir() / "active-runs" / identity
 
 
-def recover_gate_runs(repo: Path) -> None:
+def recover_gate_runs(repo: Path, *, shared: bool = True) -> None:
     current = ACTIVE_GATE_RECOVERY.get()
     if isinstance(current, GateRecovery) and current.repo == str(repo.resolve()) and current.pid == os.getpid():
         return
-    root = gate_state_dir() / "active-runs"
-    if not root.exists():
-        return
-    for directory in sorted(root.iterdir()):
-        if directory.is_dir():
-            recover_gate_directory(directory)
+    gate_root = build_folders.tmpfs_gate_root()
+    temporary = build_folders.tmpfs_temporary_parent()
+    for parent in dict.fromkeys((gate_root, temporary)):
+        recover_private_gate_runs(parent)
+    if shared:
+        root = gate_state_dir() / "active-runs"
+        if root.exists():
+            for directory in sorted(root.iterdir()):
+                if directory.is_dir():
+                    recover_gate_directory(directory)
 
 
 def recover_gate_directory(directory: Path) -> None:
@@ -915,29 +961,65 @@ def recover_gate_directory(directory: Path) -> None:
     try:
         lock_gate_state(descriptor, fcntl.LOCK_EX)
         for path in sorted(directory.glob("*.json")):
-            data = cast(dict[str, object], json.loads(path.read_text()))
-            pid, start = cast(int, data["pid"]), cast(str, data["start"])
-            owner = process_start(pid)
-            if isinstance(owner, Unreadable):
-                raise GateRefused(f"cannot recover gate {pid}: {owner.reason}")
-            if isinstance(owner, Started) and owner.start == start:
-                continue
-            groups = cast(dict[str, str], data["groups"])
-            tokens = [HeldGateToken(cast(str, token["path"]), cast(int, token["device"]),
-                                    cast(int, token["inode"]), cast(str, token["value"]),
-                                    cast(Literal["acquiring", "held", "returning"], token.get("operation", "held")))
-                      for token in cast(list[dict[str, object]], data["tokens"])]
-            recovery = GateRecovery(path, cast(str, data["repo"]), pid, start,
-                                    {int(group): identity for group, identity in groups.items()},
-                                    cast(list[str], data["folders"]), tokens, cast(str, data["rollback"]),
-                                    cast(str, data["rollback_head"]), cast(str, data["rollback_source"]))
-            active = ACTIVE_GATE_RECOVERY.set(recovery)
-            try:
-                recovery.recover()
-            finally:
-                ACTIVE_GATE_RECOVERY.reset(active)
+            recover_gate_record(path)
     finally:
         os.close(descriptor)
+
+
+def recover_private_gate_runs(root: Path) -> None:
+    """Read whole-machine records under the tool folder lease."""
+    for folder in sorted(root.glob(f"{build_folders.GATE_RECOVERY_TOOL}*")):
+        if not build_folders.gate_recovery_folder(folder.name):
+            continue
+        try:
+            status = folder.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if status.st_uid != os.geteuid() or not stat.S_ISDIR(status.st_mode) or not (folder / "run.json").is_file():
+            continue
+
+        def recover_folder() -> bool:
+            try:
+                current = folder.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                return True
+            if not os.path.samestat(current, status):
+                return False
+            path = folder / "run.json"
+            recover_gate_record(path)
+            if path.exists():
+                return False
+            shutil.rmtree(folder)
+            return True
+
+        _ = build_folders.remove_build_folder(folder, recover_folder, wait=False)
+
+
+def recover_gate_record(path: Path) -> None:
+    try:
+        data = cast(dict[str, object], json.loads(path.read_text()))
+    except FileNotFoundError:
+        return
+    pid, start = cast(int, data["pid"]), cast(str, data["start"])
+    owner = process_start(pid)
+    if isinstance(owner, Unreadable):
+        raise GateRefused(f"cannot recover gate {pid}: {owner.reason}")
+    if isinstance(owner, Started) and owner.start == start:
+        return
+    groups = cast(dict[str, str], data["groups"])
+    tokens = [HeldGateToken(cast(str, token["path"]), cast(int, token["device"]),
+                            cast(int, token["inode"]), cast(str, token["value"]),
+                            cast(Literal["acquiring", "held", "returning"], token.get("operation", "held")))
+              for token in cast(list[dict[str, object]], data["tokens"])]
+    recovery = GateRecovery(path, cast(str, data["repo"]), pid, start,
+                            {int(group): identity for group, identity in groups.items()},
+                            cast(list[str], data["folders"]), tokens, cast(str, data["rollback"]),
+                            cast(str, data["rollback_head"]), cast(str, data["rollback_source"]))
+    active = ACTIVE_GATE_RECOVERY.set(recovery)
+    try:
+        recovery.recover()
+    finally:
+        ACTIVE_GATE_RECOVERY.reset(active)
 
 
 @contextmanager
@@ -998,7 +1080,7 @@ def gate_recovery(repo: Path) -> Generator[GateRecovery]:
 
 
 @contextmanager
-def private_gate_recovery(repo: Path, parent: Path) -> Generator[GateRecovery]:
+def private_gate_recovery(repo: Path) -> Generator[GateRecovery]:
     """Keep a whole-machine run's recovery files in its own temporary directory."""
     current = ACTIVE_GATE_RECOVERY.get()
     if isinstance(current, GateRecovery) and current.repo == str(repo.resolve()) and current.pid == os.getpid():
@@ -1008,17 +1090,16 @@ def private_gate_recovery(repo: Path, parent: Path) -> Generator[GateRecovery]:
     if not isinstance(identity, Started):
         raise GateRefused("the gate has no readable process start")
     keep = False
-    with recoverable_tool_folder("merge-gate-recovery", parent, keep=lambda: keep) as directory:
-        with (directory / "operation.lock").open("a") as lock:
-            lock_gate_state(lock.fileno(), fcntl.LOCK_SH)
-            recovery = GateRecovery(directory / "run.json", str(repo.resolve()), os.getpid(), identity.start)
-            recovery.save()
-            token = ACTIVE_GATE_RECOVERY.set(recovery)
-            try:
-                yield recovery
-            finally:
-                keep = recovery.unresolved or bool(recovery.groups or recovery.folders)
-                ACTIVE_GATE_RECOVERY.reset(token)
+    with recoverable_tool_folder(build_folders.GATE_RECOVERY_TOOL, build_folders.tmpfs_gate_root(),
+                                 keep=lambda: keep) as directory:
+        recovery = GateRecovery(directory / "run.json", str(repo.resolve()), os.getpid(), identity.start)
+        recovery.save()
+        token = ACTIVE_GATE_RECOVERY.set(recovery)
+        try:
+            yield recovery
+        finally:
+            keep = recovery.unresolved or bool(recovery.groups or recovery.folders or recovery.tokens)
+            ACTIVE_GATE_RECOVERY.reset(token)
 
 
 @contextmanager
@@ -1028,12 +1109,13 @@ def gate_temporary(recovery: GateRecovery, tool: str, parent: Path) -> Generator
         with recoverable_tool_folder(tool, parent, keep=lambda: recovery.unresolved) as folder:
             recovery.folders.append(str(folder))
             recovery.save()
+            write_text_atomic(folder / build_folders.RECOVERY_MARKER, "")
             yield folder
     except CleanupUnresolved as error:
         recovery.unresolved = True
         raise GateRefused(str(error)) from error
     finally:
-        if folder is not None and not recovery.unresolved and str(folder) in recovery.folders:
+        if folder is not None and str(folder) in recovery.folders and not folder.exists():
             recovery.folders.remove(str(folder))
             recovery.save()
 
@@ -1247,19 +1329,26 @@ def module_order(modules: Sequence[tuple[str, Path]], timings: dict[str, float],
 def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
                    environment: dict[str, str], log: Path, *,
                    kind: GateJobKind = GateJobKind.TEST_MODULE) -> RunningGateJob:
+    module = test_module_name(repo, suite, path)
     output = log.open("w+")
     started = time.monotonic()
     started_at = time.time()
+    recovery = ACTIVE_GATE_RECOVERY.get()
+
+    def register(process: subprocess.Popen[str]) -> RunningGateJob:
+        job = RunningGateJob(suite, path, process, started, started_at, output, log, module, kind=kind)
+        if isinstance(recovery, GateRecovery) and recovery.register_job is not None:
+            recovery.register_job(job)
+        return job
+
     try:
-        process = start_recorded_gate_child(
+        return start_recorded_gate_child(
             [str(python_shim(repo)), "-c", SUITE_BOOTSTRAP, *argv], repo,
             stdout=output, stderr=subprocess.STDOUT, suite=True,
-            environment={**environment, "MERGE_GATE_PARENT_PID": str(os.getpid())})
+            environment={**environment, "MERGE_GATE_PARENT_PID": str(os.getpid())}, register=register)
     except BaseException:
         output.close()
         raise
-    module = test_module_name(repo, suite, path)
-    return RunningGateJob(suite, path, process, started, started_at, output, log, module, kind=kind)
 
 
 def test_module_environment(root: Path, environment: dict[str, str]) -> dict[str, str]:
@@ -1293,7 +1382,13 @@ raise SystemExit(99)
 
 def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
     seconds = time.monotonic() - job.started
-    kill_job_group(job)
+    try:
+        kill_job_group(job)
+    except BaseException:
+        recovery = ACTIVE_GATE_RECOVERY.get()
+        if isinstance(recovery, GateRecovery):
+            recovery.unresolved = True
+        raise
     job.output.close()
     captured = job.log.read_text(errors="replace")
     marker = job.log.parent / "build-tool-calls.jsonl"
@@ -1578,8 +1673,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                selected: AllModules | SelectedModules = ALL_MODULES,
                time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit = gate_record.READ_GATE_TIME_LIMIT) -> GateRun:
     shared = isinstance(machine, SharedMachine)
-    if shared:
-        recover_gate_runs(repo)
+    recover_gate_runs(repo, shared=shared)
     governor_gib = merge_gate_governor_gib() if shared else 0.0
     try:
         memory_stop_reruns = conf.read("merge_gate").whole("memory_stop_reruns") if shared else 0
@@ -1715,7 +1809,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 record(1, aborted=True)
             raise
 
-    with ((gate_recovery(repo) if shared else private_gate_recovery(repo, tmpfs)) as recovery, record_on_abort(),
+    with ((gate_recovery(repo) if shared else private_gate_recovery(repo)) as recovery, record_on_abort(),
           gate_temporary(recovery, mode.value, tmpfs) as temporary,
           ExitStack() as module_folders,
           (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode) if hold is not None else nullcontext(None)) as reservation,
@@ -1757,12 +1851,10 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                         status = job.process.returncode
                     if status is None:
                         continue
-                    try:
-                        result = finish_gate_job(job, status)
-                        executions.append(result)
-                    finally:
-                        if isinstance(job.cpu_slot, SharedCPUSlot):
-                            job.cpu_slot.release()
+                    result = finish_gate_job(job, status)
+                    executions.append(result)
+                    if isinstance(job.cpu_slot, SharedCPUSlot) and not recovery.unresolved:
+                        job.cpu_slot.release()
                     running.remove(job)
                     if admission is not None:
                         admission.release(job.process.pid)
@@ -1884,16 +1976,23 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                              *type_dirs]
                             if request.kind is GateJobKind.TYPE_CHECK else
                             [*scope_prefix, python, str(runner), str(path.parent), path.name])
-                    if request.kind is GateJobKind.TYPE_CHECK:
-                        job = start_gate_job(suite, path, argv, repo, job_environment, log, kind=request.kind)
-                    else:
-                        job = start_gate_job(suite, path, argv, repo, job_environment, log)
-                    job.folder_cleanup = folder_cleanup
-                    job.cpu_slot = slot
-                    running.append(job)
+                    def register_job(job: RunningGateJob, cpu_slot: SharedCPUSlot | NoSharedCPU = slot) -> None:
+                        nonlocal job_started
+                        job.folder_cleanup = folder_cleanup
+                        job.cpu_slot = cpu_slot
+                        running.append(job)
+                        job_started = True
+
+                    recovery.register_job = register_job
+                    try:
+                        if request.kind is GateJobKind.TYPE_CHECK:
+                            job = start_gate_job(suite, path, argv, repo, job_environment, log, kind=request.kind)
+                        else:
+                            job = start_gate_job(suite, path, argv, repo, job_environment, log)
+                    finally:
+                        recovery.register_job = None
                     if not shared:
                         print(f"Starting module: {job.suite}/{job.module}", flush=True)
-                    job_started = True
                     if job.kind is GateJobKind.TEST_MODULE:
                         _ = suite_started.setdefault(suite, job.started)
                     if admission is not None:

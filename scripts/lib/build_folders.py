@@ -37,6 +37,9 @@ MKDTEMP_SUFFIX_PATTERN = r"[a-z0-9_]{8}"
 # Read old shell mktemp folders until 2026-12-03.
 LEGACY_MKTEMP_SUFFIX_PATTERN = r"[A-Za-z0-9]{6}"
 BUSY = ".claude-busy"
+RECOVERY_MARKER = ".build-folder-recovery"
+GATE_RECOVERY_TOOL = "merge-gate-recovery"
+_GATE_RECOVERY_FOLDER = re.compile(re.escape(GATE_RECOVERY_TOOL) + r"(?:-[0-9]+)?")
 REMOVAL_RECORD_PREFIX = ".scratch-removing-"
 REMOVAL_RECORD_SUFFIX = ".json"
 
@@ -194,9 +197,14 @@ def inherited_temporary_parent() -> Path:
     return Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
 
 
+def tmpfs_gate_root() -> Path:
+    """Get the configured root for gate folders."""
+    return Path(_settings().text("roots.gate"))
+
+
 def tmpfs_temporary_parent() -> Path:
     """Keep nested work under the caller's tmpfs folder."""
-    root = Path(_settings().text("roots.gate"))
+    root = tmpfs_gate_root()
     inherited = inherited_temporary_parent().resolve()
     return inherited if inherited.is_relative_to(root) else root
 
@@ -783,6 +791,22 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
     return HeldFolderRemovalLease(path, directory, descriptor)
 
 
+def gate_recovery_folder(name: str) -> bool:
+    return _GATE_RECOVERY_FOLDER.fullmatch(name) is not None
+
+
+def _recovery_record_present(folder: str, directory: int) -> bool:
+    try:
+        descriptor = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    try:
+        return (_folder_exists(Path(RECOVERY_MARKER), descriptor)
+                or (gate_recovery_folder(folder) and _folder_exists(Path("run.json"), descriptor)))
+    finally:
+        os.close(descriptor)
+
+
 def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True) -> bool:
     """Hold every lease lock below path without following links. False when an owner holds one."""
     def unreadable(error: OSError) -> None:
@@ -790,6 +814,8 @@ def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True) -> bo
             raise error
 
     for top, folders, files, directory in os.fwalk(path, follow_symlinks=False, onerror=unreadable):
+        if RECOVERY_MARKER in files or (gate_recovery_folder(Path(top).name) and "run.json" in files):
+            return False
         for name in files:
             stem = name.removesuffix(".lock")
             if stem != name and (stem in folders or stem + ".lease.json" in files):
@@ -808,11 +834,13 @@ def folder_removal_lease(path: Path, *, children: bool = False, wait: bool = Tru
             directory = stack.enter_context(build_folder_lock.folder_parent(folder, folder.parent, create=False))
             lease = _hold_free_lease(folder, directory, stack, wait=wait)
             if not isinstance(lease, RefusedRemovalLease):
-                if metadata is not None:
+                if _recovery_record_present(folder.name, directory):
+                    lease = RefusedRemovalLease()
+                elif metadata is not None:
                     lease = UnreservedRemovalFolder()
                 elif children:
                     with suppress(FileNotFoundError):
-                        if not _hold_child_leases(folder, stack):
+                        if not _hold_child_leases(folder, stack, wait=wait):
                             lease = RefusedRemovalLease()
         except FileNotFoundError:
             lease = UnreservedRemovalFolder()
@@ -943,9 +971,9 @@ def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
         except FileNotFoundError:
             return True
         with ExitStack() as children:
-            # A held lease below a free folder, or an unreadable folder below it, keeps the folder.
             try:
-                if not _hold_child_leases(path, children, wait=wait):
+                if (_recovery_record_present(path.name, directory)
+                        or not _hold_child_leases(path, children, wait=wait)):
                     return False
             except OSError:
                 return False
