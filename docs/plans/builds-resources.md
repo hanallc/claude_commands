@@ -3043,3 +3043,41 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 **Files:** `scripts/lint/sweep.py` (or `scripts/lib/cargo_target_config.py` if the manifest check belongs there), `scripts/lint/test_sweep.py` (a row in `test_a_nextest_run_uses_its_workspace_target_between_test_binaries`'s table).
 
 **Acceptance gate:** the new row passes; test_sweep, test_tmp_sweep and the cargo_target_config tests pass in both layouts; types 0.
+
+### Phase 168 — One lint.conf key sets the /build disk floor  · status: todo
+**Source:** builds, 2026-11-19 04:3x EST: natedev ruled that the /build floor should be 300 GiB, not `sweep_free_floor_percent=20` (733.3 GiB). The value change needs the user's go. This phase only makes it one key and keeps today's value.
+
+#### Work Order
+
+**Goal:** one lint.conf key sets the free-space floor of each filesystem other than the home disk.
+
+**Spec:**
+1. New key `sweep_build_floor_gib.<host>`, else `sweep_build_floor_gib`, read through the same host lookup as `sweep_free_floor_gib`.
+2. With neither key set, the floor stays `sweep_free_floor_percent` x the filesystem size.
+3. lint.conf sets `sweep_build_floor_gib.natedev=733.29`, which equals 20 percent of /build today.
+
+**Base:** main `764582979`.
+
+**Files:** `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py`, `config/lint.conf`.
+
+**Acceptance gate:** new rows in the percent-floor test pass; test_sweep and test_tmp_sweep pass; types 0.
+
+### Phase 169 — The disk floor sweep sends one notice for each holder, not one for each target  · status: todo
+**Source:** builds, 2026-11-19 04:2x EST: from 04:08 to 04:30 EST the sweep sent more than 150 messages to devtools (session 33c5eac0), about one each 10 s. Each one named the same pid 3179104 and one target.
+**Cause:** one `disk-floor.service` pass (pid 1787514, started 03:50:33) found 273 protected targets. `floor_holders` gives one `FloorHolder` for each busy target, and the pass sends `holder_message_text` once for each holder, one after the other (`sweep.py` near the `told = frozenset(...)` line). Each send takes about 9 s. The pass reads the process table once, so it still names the pid after the pid ends. The message says "removed all idle build output" when the pass removed nothing.
+
+#### Work Order
+
+**Goal:** a session gets one floor notice for each holder process, and the next pass does not repeat it while nothing changes.
+
+**Spec:**
+1. Group the busy targets by holder (session and pid). Send one message for each group. It gives the target count, the total size and the largest paths that fit `sweep_message_limit`.
+2. Give each send a delivery key built from the holder pid, its start time and its target set, with a repeat window, so a later pass with the same holder and targets sends nothing.
+3. Before each send, check that the holder pid is still the same live process. Send nothing for a process that ended.
+4. Say "removed all idle build output" only when the pass removed output. Else say that no idle build output was found.
+
+**Base:** main after Phases 167 and 168.
+
+**Files:** `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py` (rows in the existing holder-message tests).
+
+**Acceptance gate:** new rows pass for one holder with many targets, a repeat pass with no change, and a holder that ended before the send; test_sweep and test_tmp_sweep pass; types 0.
