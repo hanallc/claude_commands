@@ -97,6 +97,7 @@ class CommandLine(argparse.Namespace):
     excluded: list[str] = []
     finish_step: bool = False
     retired: bool = False
+    resend_opening_prompt: bool = False
     old: str = ""
     new: str = ""
     to_doc: str = ""
@@ -244,6 +245,7 @@ USAGE = """usage: agents COMMAND
   agents exit NAME [--finish-step] --why TEXT
   agents pause --production SHOWRUNNER [--except UNIT ...] [--finish-step] --why TEXT
   agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]
+  agents resume PRODUCER --resend-opening-prompt
   agents resume --production SHOWRUNNER
   agents retire NAME [--to PRODUCER]
   agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]
@@ -684,6 +686,7 @@ def main(argv: list[str] | None = None) -> int:
         _ = selection.add_argument("--production", default="")
         if verb == "resume":
             _ = command.add_argument("--retired", action="store_true")
+            _ = command.add_argument("--resend-opening-prompt", action="store_true")
             _ = command.add_argument("--to")
             _ = command.add_argument("--why", default="resumed by name")
         else:
@@ -728,6 +731,10 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("--session", dest="account", required=True)
     options = parser.parse_args(arguments, namespace=CommandLine())
     try:
+        if options.command == "resume" and options.resend_opening_prompt:
+            if options.production or options.retired:
+                raise ValueError("--resend-opening-prompt needs one producer name and an active pane")
+            return _result_code(stop_resume.resend_producer_opening(options.session, to=options.to or ""))
         if options.command == "remove-stray":
             return remove_stray_producer(options.producer, options.session)
         if options.command == "transfer":

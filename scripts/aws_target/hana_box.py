@@ -460,7 +460,7 @@ class HanaController:
             with hana_work_lock(self.directory) as access:
                 if access is file_lock.LockResult.BUSY or hana_replacement_record.held(self.directory):
                     return HanaResourcesHeld()
-                return self._read_evidence()
+                return self.read_saved_lifecycle()
         except (OSError, ValueError, KeyError, TypeError) as error:
             return HanaLifecycleUnavailable(type(error).__name__, int(self.clock()))
 
@@ -468,11 +468,12 @@ class HanaController:
         """Read the lifecycle evidence needed to close an existing claim."""
         try:
             with control_lock(self.directory):
-                return self._read_evidence()
+                return self.read_saved_lifecycle()
         except (OSError, ValueError, KeyError, TypeError) as error:
             return HanaLifecycleUnavailable(type(error).__name__, int(self.clock()))
 
-    def _read_evidence(self) -> HanaLifecycleEvidence | HanaUnprovisioned:
+    def read_saved_lifecycle(self) -> HanaLifecycleEvidence | HanaUnprovisioned:
+        """Read the atomically saved lifecycle row without taking the controller lock."""
         row = self._read()
         if isinstance(row, NoDeployment):
             return HanaUnprovisioned()

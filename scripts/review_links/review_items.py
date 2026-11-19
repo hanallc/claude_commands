@@ -34,19 +34,18 @@ from scripts.review_links import efficiency_reviews, new_item_dialog, review_eve
 from scripts.review_links.review_events import ReviewLog as ReviewLog, ReviewMark
 
 
-def source_stamp(path: Path) -> tuple[int, int]:
+def source_stamp(path: Path) -> record_store.FileStamp:
     try:
-        stat = path.stat()
+        return record_store.file_stamp(path)
     except OSError:
-        return (0, 0)
-    return (stat.st_mtime_ns, stat.st_size)
+        return record_store.MISSING_STAMP
 
 
 class ReviewSourceStamps(list[Path]):
     """Record each source and its parent before a snapshot reads them."""
     def __init__(self) -> None:
         super().__init__()
-        self.before_read: dict[Path, tuple[int, int]] = {}
+        self.before_read: dict[Path, record_store.FileStamp] = {}
         self.notices: dict[tuple[Path, str], str] = {}
         self.folder_entries: dict[Path, tuple[Path, ...]] = {}
 

@@ -268,6 +268,7 @@ route_test
         oversized = 'SourceUploadBound: archive exceeds its size bound'
         for case, release_succeeds in (('stale image', True), ('stale image', False),
                                        ('oversized archive', True), ('oversized archive', False),
+                                       ('consume refusal', True), ('consume refusal', False),
                                        ('pending renewal', False)):
             with (self.subTest(case=case, release_succeeds=release_succeeds), tempfile.TemporaryDirectory(dir=root) as folder):
                 self.root = Path(folder)
@@ -278,11 +279,13 @@ route_test
                 reason = 'The Hana payload could not be prepared: ' + detail if detail else placement.HANA_IMAGE_STALE
                 if case == 'pending renewal':
                     reason = 'The claim, boot identity, or delivered permit is stale'
+                elif case == 'consume refusal':
+                    reason = 'the exact claim is not adopted'
                 self.assert_prelaunch_refusal(reason, oversized=detail, release_succeeds=release_succeeds,
-                                              renewal_pending=case == 'pending renewal')
+                                              renewal_pending=case == 'pending renewal', consume_refused=case == 'consume refusal')
 
     def assert_prelaunch_refusal(self, reason: str, *, oversized: str, release_succeeds: bool,
-                                 renewal_pending: bool) -> None:
+                                 renewal_pending: bool, consume_refused: bool) -> None:
         uploaded = False
 
         def upload() -> None:
@@ -298,6 +301,10 @@ route_test
             if oversized:
                 _ = context.enter_context(mock.patch.object(hana_transport.SourceSender, 'prepare',
                     side_effect=hana_protocol.SourceRefused(oversized)))
+            elif consume_refused:
+                _ = context.enter_context(mock.patch.object(admission_client, 'consume_permission',
+                    return_value=wire.DispatchStatus(self.fixture.assignment, placement.CurrentAssignment(),
+                                                    placement.PermissionAvailable(), reason)))
             elif renewal_pending:
                 _ = context.enter_context(mock.patch.object(hana_transport.SourceSender, 'prepare',
                     return_value=(self.fixture.manifest, upload)))
@@ -312,15 +319,18 @@ route_test
         sent = cast(wire.ExecutionReport, report.call_args.args[0])
         self.assertEqual(sent.outcome, execution_identity.HanaCommandAdmissionRefused(reason))
         assert isinstance(sent.outcome, execution_identity.HanaCommandAdmissionRefused)
-        self.assertIsInstance(sent.path, placement.DispatchPathSettled)
+        self.assertIsInstance(sent.path, placement.DispatchPathSettled if release_succeeds else placement.DispatchPathPending)
         self.assertIsInstance(sent.evidence, execution_identity.ExecutionNotStarted)
         self.assertEqual(execution.claim_admission_refused(self.root, self.fixture.reference), release_succeeds)
         self.assertEqual(execution.claim_dispatch_pending(self.root, self.fixture.reference), not release_succeeds)
         assert isinstance(outcome, offload.HanaCommandAdmissionRefused)
         self.assertEqual(outcome.reason, reason)
-        settled = self.controller.hana_settlement
-        assert isinstance(settled, execution.HanaSettled)
-        self.assertEqual(settled.outcome, execution_identity.HanaCommandAdmissionRefused(reason))
+        if release_succeeds:
+            settled = self.controller.hana_settlement
+            assert isinstance(settled, execution.HanaSettled)
+            self.assertEqual(settled.outcome, execution_identity.HanaCommandAdmissionRefused(reason))
+        else:
+            self.assertIsInstance(self.controller.hana_settlement, offload.NoHanaSettlement)
         self.assertEqual(self.fixture.objects.envelopes, [])
         self.assertEqual(placement.retry_decision(self.fixture.assignment.destination, sent.outcome, 1000),
                          placement.DoNotRetry(reason))
@@ -337,7 +347,8 @@ route_test
             released = execution.settle_execution(self.root, self.fixture.request, self.fixture.objects,
                 release_claim=lambda: True, reason='Replay the command settlement',
                 fence_window=execution.FenceAcknowledgementWindow(0, 1))
-            self.assertEqual(released, settled)
+            self.assertEqual(released, execution.HanaAdmissionRefusalSettled(
+                execution_identity.HanaCommandAdmissionRefused(reason), execution_identity.ExecutionNotStarted()))
             self.assertFalse(execution.claim_dispatch_pending(self.root, self.fixture.reference))
 
     def test_invalid_control_documents_refuse_before_the_archive_or_command_upload(self) -> None:
@@ -811,6 +822,8 @@ route_test
         for code, reason, abi, refusal_in_fence_ack, release_succeeds in (
             (CommandAdmissionRefusalCode.ADMISSION_DISABLED, disabled, installed_abi, False, True),
             (CommandAdmissionRefusalCode.ADMISSION_DISABLED, disabled, installed_abi, True, True),
+            (CommandAdmissionRefusalCode.ADMISSION_DISABLED, disabled, installed_abi, False, False),
+            (CommandAdmissionRefusalCode.ADMISSION_DISABLED, disabled, installed_abi, True, False),
             (CommandAdmissionRefusalCode.PRE_COMMAND_FAILED, abi_reason, requested_abi, False, True),
             (CommandAdmissionRefusalCode.PRE_COMMAND_FAILED, abi_reason, requested_abi, False, False),
         ):
@@ -839,17 +852,25 @@ route_test
         _ = queue_fixtures.publish_candidate(queue, submitted)
         assigned = queue_fixtures.assignment_for(queue, submitted)
         claim = placement.assigned_claim_reference(assigned)
-        provider_claim = placement.AdoptedProviderClaim(claim, queue_fixtures.coordinator_holder(assigned),
-            assigned.session, assigned.destination.host, hana.generation_text(self.fixture.adopted.generation))
-        key = queue.server.host_evidence_key(submitted, assigned.destination)
-        evidence = placement.FreshHostEvidence(key, queue.clock.now(), provider_claim.generation,
-                                               placement.AllowedHost(), (provider_claim,))
-        queue.provider_evidence[key] = evidence
-        queue.server.publish_host_evidence(evidence)
-        authorization, = queue.connect(queue_fixtures.consume_permission('consume', assigned, claim)).replies()
+        holder = queue_fixtures.coordinator_holder(assigned)
+        generation = self.fixture.adopted.generation
+        now = int(self.lifecycle.clock())
+        work_claim = box.WorkClaim(claim.claim_id, 'fixture-token', now, active=True)
+        snapshot = box.HanaLifecycleEvidence(
+            box.DeploymentIdentity(generation.deployment, 'fixture-instance', 'fixture-spot', 'us-east-2'),
+            box.Lifecycle.READY, box.VerifiedBoot(generation.boot_id, generation.start_token), box.NoOperation(),
+            box.DeliveredPermit(3, now + 1800, claim.claim_id), (work_claim,), now)
+        with (mock.patch.dict(os.environ, {'BUILD_TARGETS_STATE_DIR': str(self.root / 'targets')}),
+              mock.patch.object(hana_placement_adapter, 'validate_assignment', return_value=self.transport),
+              mock.patch.object(hana_placement_adapter, 'controller_for', return_value=self.lifecycle),
+              mock.patch.object(self.lifecycle, 'request', return_value=box.ClaimCommitted(work_claim)),
+              mock.patch.object(self.lifecycle, 'read_saved_lifecycle', return_value=snapshot)):
+            adopted = hana_placement_adapter.claim_assigned(assigned, holder, self.lifecycle)
+            assert isinstance(adopted, hana.HanaClaimAdopted), adopted
+            authorization, = queue.connect(queue_fixtures.consume_permission('consume', assigned, claim)).replies()
         self.assertEqual(authorization, wire.FirstAuthorization(assigned, claim))
         self.fixture.assignment, self.fixture.reference = assigned, claim
-        self.fixture.adopted = replace(self.fixture.adopted, reserved=placement.ReservedHost(assigned, provider_claim))
+        self.fixture.adopted = adopted
         self.fixture.key = replace(self.fixture.key, episode=assigned.episode, attempt=assigned.attempt, claim_id=claim.claim_id)
         self.fixture.request = replace(self.fixture.request, key=self.fixture.key,
                                        link=replace(self.fixture.request.link, episode=assigned.episode))
@@ -934,16 +955,23 @@ route_test
         sent = cast(wire.ExecutionReport, report.call_args.args[0])
         self.assertEqual(sent.outcome, execution_identity.HanaCommandAdmissionRefused(reason))
         self.assertIsInstance(sent.evidence, execution_identity.ExecutionNotStarted)
-        self.assertIsInstance(sent.path, placement.DispatchPathSettled)
+        path = (placement.DispatchPathSettled() if release_succeeds
+                else placement.DispatchPathPending('The exact Hana lifecycle claim remains retained'))
+        self.assertEqual(sent.path, path)
+        cleanup = 'confirmed' if release_succeeds else 'unconfirmed'
+        self.assertIn(f'cleanup={cleanup}', result.path.read_text().splitlines())
         saved = queue.server.assignments[execution_identity.attempt_key(assigned.episode, assigned.attempt)]
-        self.assertEqual(saved.state, placement.ClosedAssignment(reason))
+        self.assertEqual(saved.state, placement.ClosedAssignment(reason) if release_succeeds else placement.CurrentAssignment())
         self.assertEqual(saved.retry, placement.DoNotRetry(reason))
         envelopes: list[type[hana_protocol.HanaExecutionEnvelope]] = [hana_protocol.HanaCommandEnvelope]
         if refusal_in_fence_ack:
             envelopes.append(hana_protocol.HanaFenceEnvelope)
         self.assertEqual([type(envelope) for envelope in objects.envelopes], envelopes)
         observe.assert_called_once()
-        loss.assert_called_once()
+        if release_succeeds:
+            loss.assert_called_once()
+        else:
+            loss.assert_not_called()
 
     def test_repair_flags_and_mend_profiles_never_claim_the_hana_target(self) -> None:
         repository = eligibility.KnownRepository('hana', 'github.com/natepiano/hana')

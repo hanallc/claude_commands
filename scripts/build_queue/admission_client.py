@@ -1430,6 +1430,10 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                 output.placement_notices(answer, placement_events=args.wait_events)
             if not isinstance(answer, wire.PlacementWait):
                 break
+            if _leave_queue():
+                _ = cancel_placement(wire.CancelPlacement(uuid.uuid4().hex, episode, owner,
+                    "the caller left before placement"))
+                raise _QueueLeft()
             # The first pass only lets a free remote target take the step; it is no memory wait.
             token_check = (isinstance(prerequisite, placement.TokenRequired)
                            and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked))
@@ -1525,6 +1529,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = finish_parser.add_argument("--status", type=int, default=1)
     _ = finish_parser.add_argument("--reason", default="")
     _ = finish_parser.add_argument("--token", choices=TOKEN_REQUIRED_CHOICES, default="")
+    pause_parser = subcommands.add_parser("release-step-memory")
+    _ = pause_parser.add_argument("--assignment-file", type=Path, required=True)
     prerequisite_parser = subcommands.add_parser("report-prerequisite")
     _ = prerequisite_parser.add_argument("--assignment-file", type=Path, required=True)
     _ = prerequisite_parser.add_argument("--token", choices=TOKEN_REQUIRED_CHOICES, required=True)
@@ -1564,6 +1570,14 @@ def main(argv: list[str] | None = None) -> int:
             prerequisite = token_prerequisite(args.token) if args.token else KEEP_PLACEMENT_PREREQUISITE
             print(wire.encode_reply(finish_step(args.assignment_file, args.status, args.reason,
                 prerequisite=prerequisite)), end="")
+            return 0
+        if args.command == "release-step-memory":
+            assignment = read_assignment(args.assignment_file)
+            if not isinstance(assignment, wire.LocalPlacementGranted):
+                raise wire.AdmissionUnavailable("release-step-memory requires a local grant")
+            answer = release(assignment.grant.reservation, 75, assignment.grant.cleanup_timing)
+            if not isinstance(answer, wire.Ok):
+                raise wire.AdmissionUnavailable("the service did not confirm the memory release")
             return 0
         if args.command == "report-prerequisite":
             reply = read_assignment(args.assignment_file)

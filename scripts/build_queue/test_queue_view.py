@@ -20,6 +20,7 @@ from unittest import mock
 from scripts.build_queue import queue_view, queue_evidence
 from scripts.build_queue import admission_service as service
 from scripts.build_queue import admission_protocol as wire, cloud_progress, progress_profile
+from scripts.build_queue.admission_wire import CloudGroup
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue.queue_fixture import NOW, QueueFixture
 from scripts.lint import memory_admit as gate
@@ -551,6 +552,18 @@ class MacQueueViewTests(unittest.TestCase):
 
 
 class CloudQueueViewTests(unittest.TestCase):
+    def test_group_waits_sort_by_trial_start_before_a_newer_single_request(self) -> None:
+        model, _fixture = self.cloud_model()
+        reading = model.reading
+        assert isinstance(reading, wire.CloudQueueRead)
+        single = reading.cloud[1]
+        for trial_started in (single.since - 30, single.since):
+            with self.subTest(trial_started=trial_started):
+                grouped = replace(single, owner=wire.Owner(700003, "300"), since=single.since + 30,
+                    place=wire.CloudPlace("aws", CloudGroup("older", 2, trial_started, wire.Owner(700004, "400"))))
+                waiting = queue_view.waiting_builds(replace(model, reading=replace(reading, cloud=(single, grouped))))
+                self.assertEqual([row for row in waiting if isinstance(row, wire.CloudRow)], [grouped, single])
+
     def test_page_step_names_use_roles_and_configured_owner_templates(self) -> None:
         model = self.cloud_model()[0]
         reading = model.reading

@@ -105,6 +105,25 @@ class RowDocumentLiveUnitsTests(StaffTestCase):
             units = {item.unit: item for item in listing.units}
             self.assertEqual(units[unit.name].status, "unknown")
 
+    def test_live_unit_ids_preserve_unknowns_beside_proved_claude_ids(self) -> None:
+        from scripts.production import live_units, showrunners, unit_lookup
+
+        fixture = self.row_production()
+        unknown = fixture_member("unit", name="unreadable", parent=fixture.runner.id)
+        reason = unit_lookup.UnknownUnit("pane read denied")
+        claude = unit_lookup.LiveClaude(fixture.unit.name, fixture.unit.current_session, "", 456)
+        listing = live_units.UnitListing([
+            live_units.LiveUnit(fixture.unit.name, None, owner=unit_lookup.ProvedLiveUnit(claude), member=fixture.unit),
+            live_units.LiveUnit(unknown.name, None, status="unknown", owner=reason, member=unknown),
+        ], (), failures=("registry unreadable",))
+        runner = showrunners.Showrunner(name=fixture.name, doc="", session="", socket="", zone="")
+        with (mock.patch.object(live_units, "read_units", return_value=listing),
+              mock.patch.object(live_units, "units_of", return_value=listing.units)):
+            ids = live_units.live_unit_ids(runner)
+        self.assertEqual(ids.proved_ids, [fixture.unit.id])
+        self.assertEqual(ids.unknown, {unknown.name: reason})
+        self.assertEqual(ids.failures, ("registry unreadable",))
+
     def test_unassigned_pane_proof_failure_is_visible_in_the_report(self) -> None:
         from scripts.herdr import herdr
         from scripts.production import live_units, unit_lookup
