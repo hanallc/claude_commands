@@ -10,7 +10,10 @@ from functools import lru_cache
 import math
 from pathlib import Path
 from types import UnionType
-from typing import Callable, Literal, NewType, NotRequired, cast, get_args, get_origin, get_type_hints, is_typeddict
+from typing import TYPE_CHECKING, Callable, Literal, NewType, NotRequired, cast, get_args, get_origin, get_type_hints, is_typeddict
+
+if TYPE_CHECKING:
+    from scripts.production.staff import StaffId, StaffSnapshot
 
 # Literal unions use typing.Union on Python 3.13.
 LITERAL_UNION_ORIGIN = get_origin(Literal[0] | Literal[1])
@@ -22,6 +25,17 @@ class SnapshotReadPolicy(Enum):
 
 
 _READ_POLICY = ContextVar("snapshot_read_policy", default=SnapshotReadPolicy.ALL_FIELDS)
+_READ_STAFF: ContextVar[StaffSnapshot | None] = ContextVar("snapshot_staff", default=None)
+
+
+@contextmanager
+def snapshot_staff(members: StaffSnapshot) -> Generator[None]:
+    """Supply staff for older holds during this read."""
+    token = _READ_STAFF.set(members)
+    try:
+        yield
+    finally:
+        _READ_STAFF.reset(token)
 
 
 @contextmanager
@@ -107,24 +121,28 @@ def ended_step_facts(value: object) -> object:
             **({"caller_name": identity["caller_name"]} if "caller_name" in identity else {})}
 
 
+def usable_caller(value: object) -> str:
+    return value if isinstance(value, str) and value.strip() not in ("", "—") else ""
+
+
 def recover_slot_callers(record: dict[str, object]) -> dict[str, object]:
-    """Use matching reservation evidence to name older holds."""
+    """Recover names from reservations or fixed staff IDs."""
     slots, reservations = record.get("slots"), record.get("reservations")
-    if not isinstance(slots, list) or not slots or not isinstance(reservations, list) or not reservations:
+    if not isinstance(slots, list) or not slots:
         return record
+    members = _READ_STAFF.get()
     callers: dict[str, str] = {}
-    for value in cast(list[object], reservations):
-        if not isinstance(value, dict):
-            continue
-        reservation = cast(dict[str, object], value)
-        key = reservation.get("reservation_id")
-        identity = reservation.get("queue_waiter", reservation)
-        if isinstance(key, str) and isinstance(identity, dict):
-            name = cast(dict[str, object], identity).get("session_name")
-            if isinstance(name, str) and name.strip():
-                callers[key] = name
-    if not callers:
-        return record
+    if isinstance(reservations, list):
+        for value in cast(list[object], reservations):
+            if not isinstance(value, dict):
+                continue
+            reservation = cast(dict[str, object], value)
+            key = reservation.get("reservation_id")
+            identity = reservation.get("queue_waiter", reservation)
+            if isinstance(key, str) and isinstance(identity, dict):
+                name = usable_caller(cast(dict[str, object], identity).get("session_name"))
+                if name:
+                    callers[key] = name
 
     def recover(value: object) -> object:
         if not isinstance(value, dict):
@@ -132,12 +150,21 @@ def recover_slot_callers(record: dict[str, object]) -> dict[str, object]:
         slot = cast(dict[str, object], value)
         if slot.get("kind") == "ContinuationSlot":
             return {**slot, "slot": recover(slot["slot"])}
-        key, identity = slot.get("reservation"), slot.get("identity")
-        if slot.get("kind") == "BetweenStepsSlot" and isinstance(key, str) and key in callers and isinstance(identity, dict):
-            facts = cast(dict[str, object], identity)
-            if "caller_name" not in facts:
-                return {**slot, "identity": {**facts, "caller_name": callers[key]}}
-        return slot
+        if slot.get("kind") != "BetweenStepsSlot":
+            return slot
+        identity = ended_step_facts(slot.get("identity"))
+        if not isinstance(identity, dict):
+            return slot
+        facts = cast(dict[str, object], identity)
+        if facts.get("kind") != "EndedStepFacts" or usable_caller(facts.get("caller_name")):
+            return slot
+        key = slot.get("reservation")
+        name = callers.get(key, "") if isinstance(key, str) else ""
+        staff_id = facts.get("staff_id")
+        if not name and members is not None and isinstance(staff_id, str):
+            member = members.by_id(cast("StaffId", staff_id))
+            name = (usable_caller(member.name) if member is not None else "") or "unregistered session"
+        return {**slot, "identity": {**facts, "caller_name": name}} if name else slot
 
     return {**record, "slots": [recover(slot) for slot in cast(list[object], slots)]}
 

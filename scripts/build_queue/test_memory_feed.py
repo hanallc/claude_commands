@@ -46,6 +46,7 @@ from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNot
 from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, command_job, read_step_names
 from scripts.message import unit_labels
 from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 from scripts.production.merge_gate import SuiteMode
 from scripts.review_links import staff_names
 from scripts.lint import memory_admit as gate
@@ -1538,6 +1539,64 @@ process.stdout.write(JSON.stringify({
                         self.assertEqual(row["name"], first.identity.name)
                         self.assertEqual(row.get("caller"), first.identity.name)
 
+    def test_legacy_gate_holds_recover_the_fixed_staff_caller(self) -> None:
+        inputs = captured_reading().explanation.decided_from
+        policy = admission_policy_fixture()
+        run = LiveBuildRun(101, "start", inputs.now - 15)
+        director = staff.StaffRow(staff.StaffId("director"), "unit", "fixture unit", staff.StaffRoot(),
+                                  current_session=staff.StaffId("director-session"))
+        worker = staff.StaffRow(staff.StaffId("worker"), "worker", "fixture worker", staff.ReportsTo(director.id),
+                                current_session=staff.StaffId("worker-session"))
+        members = staff.StaffSnapshot((director, worker))
+        absent = admission_records.EndedStepFactNotRecorded()
+        for caller, member, expected in (
+            (None, worker.id, worker.name),
+            ({"kind": "EndedStepFactNotRecorded"}, worker.id, worker.name),
+            ("", worker.id, worker.name),
+            (" \t", worker.id, worker.name),
+            ("—", worker.id, worker.name),
+            (None, staff.StaffId("missing"), "unregistered session"),
+            ("saved caller", staff.StaffId("missing"), "saved caller"),
+        ):
+            for legacy in (False, True):
+                for continuation in (False, True):
+                    with self.subTest(caller=caller, member=member, legacy=legacy, continuation=continuation):
+                        facts = admission_records.EndedStepFacts("merge-gate", admission_records.PackageNotRecorded(),
+                                                                 absent, absent, member)
+                        held = admission_records.BetweenStepsSlot(run, "finished", admission_records.GIB,
+                                                                  inputs.now + 10, facts)
+                        slot = admission_records.ContinuationSlot(held, "next") if continuation else held
+                        reading = gate.queue_read_from(replace(inputs, slots=(slot,), reservations=()), policy)
+                        raw = cast(dict[str, object], codec.snapshot_value(reading))
+                        explanation = cast(dict[str, object], raw["explanation"])
+                        decided = cast(dict[str, object], explanation["decided_from"])
+                        encoded, = cast(list[dict[str, object]], decided["slots"])
+                        if continuation:
+                            encoded = cast(dict[str, object], encoded["slot"])
+                        identity = cast(dict[str, object], encoded["identity"])
+                        if legacy:
+                            identity.update(kind="EndedStepIdentity", source="step", name="merge-gate")
+                        _ = identity.pop("caller_name", None)
+                        if caller is not None:
+                            identity["caller_name"] = caller
+                        encoded["identity"] = identity
+
+                        def view() -> admission_records.QueueRead:
+                            decoded = cast(admission_records.QueueRead, codec.parse_snapshot_value(raw, admission_records.QueueRead))
+                            decoded_slot, = decoded.explanation.decided_from.slots
+                            restored = decoded_slot.slot if isinstance(decoded_slot, admission_records.ContinuationSlot) else decoded_slot
+                            self.assertEqual(restored.identity, replace(facts, caller_name=expected))
+                            self.assertEqual(restored.bytes, held.bytes)
+                            return decoded
+
+                        with (mock.patch.object(staff, "snapshot", return_value=members),
+                              mock.patch.object(admission_client, "view", side_effect=view)):
+                            page = memory_feed.reading()
+                        row, = [row for row in page["walk"] if row.get("between_steps")]
+                        self.assertEqual(row["name"], expected)
+                        self.assertEqual(row.get("caller"), expected)
+                        self.assertEqual(page["reserved"], 1.0)
+
     def test_between_steps_holds_name_their_distinct_owners(self) -> None:
         inputs = captured_reading().explanation.decided_from
         policy = admission_policy_fixture()
@@ -2460,13 +2519,16 @@ process.stdout.write(JSON.stringify({
                 expected = " · ".join(filter(None, (detail, "7 of 12 modules", "1 failed module")))
                 self.assertEqual(remote["status"], expected)
 
-    def cloud_owner_page(self, step: str, owner: unit_labels.UnitLabels) -> memory_feed.MemoryPage:
-        """Supply one owner for running and waiting cloud steps."""
+    def cloud_owner_page(self, step: str, owner: unit_labels.UnitLabels | None = None, *,
+                         identity: wire.Identity | None = None) -> memory_feed.MemoryPage:
+        """Use the same identity for running and waiting cloud steps."""
         reading = cloud_reading(reservation_reading())
-        rows = tuple(replace(row, identity=replace(row.identity, step=step)) for row in reading.cloud)
+        rows = tuple(replace(row, identity=identity or replace(row.identity, step=step)) for row in reading.cloud)
         labels = {row.identity.session_id: owner for row in rows}
-        with (mock.patch.object(admission_client, "view", return_value=replace(reading, cloud=rows)),
-              mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
+        with mock.patch.object(admission_client, "view", return_value=replace(reading, cloud=rows)):
+            if owner is not None:
+                with mock.patch.object(unit_labels, "unit_labels_for", return_value=labels):
+                    return memory_feed.reading()
             return memory_feed.reading()
 
     def gate_job_page(self, step: str, argv: tuple[str, ...], *,
@@ -2741,6 +2803,7 @@ process.stdout.write(JSON.stringify({
         for step, owner, expected in (
             ("targeted-test", director, "panes"),
             ("build", director, "panes build"),
+            ("literal{step}", director, "panes literal{step}"),
             ("merge-gate", runner, "builds"),
             ("merge-gate", director, "panes"),
             ("merge-gate", merge_staff, "sdlc-merge-gate"),
@@ -2759,6 +2822,40 @@ process.stdout.write(JSON.stringify({
                 waiting = [row for row in page["waiters"] if row.get("kind") == "cloud"]
                 self.assertEqual([row["name"] for row in running], [expected])
                 self.assertEqual([row["name"] for row in waiting], [expected])
+
+        config = self.root / "build_steps.conf"
+        _ = config.write_text(config.read_text().replace("owned.targeted-test={unit} targeted",
+                                                         "owned.targeted-test=targeted for {unit}"))
+        step = "targeted-test"
+        for owner, expected in ((director, "targeted for panes"), (None, "unregistered session")):
+            with self.subTest(owner=owner, expected=expected):
+                page = self.cloud_owner_page(step, owner, identity=wire.Identity("old-cloud", "", step, ""))
+                self.assertEqual([row["name"] for row in page["walk"] if row.get("kind") == "cloud"], [expected])
+                self.assertEqual([row["name"] for row in page["waiters"] if row.get("kind") == "cloud"], [expected])
+
+    def test_detached_and_systemd_cloud_rows_use_the_fixed_staff_owner(self) -> None:
+        with isolated_staff_file(self.root / "staff.json", {}):
+            runner = fixture_member("showrunner", name="hana")
+            unit = fixture_member("unit", name="panes", parent=runner.id)
+            worker = fixture_member("worker", name="impl", parent=unit.id)
+            current = fixture_runtime_id("cloud-owner-after-restart")
+            worker = staff.update_current_session(worker.current_session, staff.native_id(current))
+            for source, member, role, worker_name in (
+                ("detached", worker, unit_labels.Runner.WORKER, worker.name),
+                ("systemd", unit, unit_labels.Runner.UNIT_DIRECTOR, ""),
+            ):
+                with (self.subTest(source=source), mock.patch.dict(os.environ, {
+                    "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "", "CLAUDE_SESSION_NAME": "",
+                    "BUILDLOG_UNIT": "", "BUILDLOG_OWNER_STAFF_ID": str(member.id),
+                }), mock.patch.object(unit_labels, "unit_labels_for", new=UNIT_LABELS_FOR),
+                      mock.patch.object(unit_labels, "newest_sessions", return_value=[])):
+                    identity = admission_client.step_identity("targeted-test", "/private/tree")
+                    self.assertEqual(identity.session_id, member.current_session)
+                    page = self.cloud_owner_page(identity.step, identity=identity)
+                    for table in (page["walk"], page["waiters"]):
+                        row, = [cast(memory_feed.CloudWorkRow, row) for row in table if row.get("kind") == "cloud"]
+                        self.assertEqual((row["name"], row["showrunner"], row["unit"], row.get("runner"), row.get("worker")),
+                                         ("panes", "hana", "panes", role, worker_name))
 
     def test_cloud_page_shows_the_recorded_staff_role(self) -> None:
         for name, role, worker in (("impl", unit_labels.Runner.WORKER, "impl"),
@@ -3365,12 +3462,16 @@ def write_browser_fixture(folder: Path) -> None:
         director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),
                                           unit_labels.DirectsUnit("panes"))
         runner = unit_labels.make_labels("builds", unit_labels.RunsProduction("builds"), unit_labels.NoDirector())
-        targeted = fixture.cloud_owner_page("targeted-test", director)
-        merge = fixture.cloud_owner_page("merge-gate", runner)
-        targeted["walk"] = [row for page in (targeted, merge) for row in page["walk"] if row.get("kind") == "cloud"]
-        targeted["waiters"] = [row for page in (targeted, merge) for row in page["waiters"] if row.get("kind") == "cloud"]
-        owner_names = cast(object, json.loads(memory_feed.page_json(targeted)))
-        pages["owner_names_before"] = pages["owner_names_after"] = owner_names
+        names = read_step_names()
+        for version in ("before", "after"):
+            named_pages: list[memory_feed.MemoryPage] = []
+            for step, label in (("targeted-test", director), ("merge-gate", runner)):
+                name = names.shown(step) if version == "before" else names.for_owner(step, label.unit, label.role)
+                named_pages.append(fixture.cloud_owner_page(step, identity=wire.Identity("", name, step, "")))
+            comparison = named_pages[0]
+            comparison["walk"] = [row for page in named_pages for row in page["walk"] if row.get("kind") == "cloud"]
+            comparison["waiters"] = [row for page in named_pages for row in page["waiters"] if row.get("kind") == "cloud"]
+            pages[f"owner_names_{version}"] = json.loads(memory_feed.page_json(comparison))
         owner = unit_labels.make_labels("impl", unit_labels.UnderShowrunner("hana", "hana", ""),
                                         unit_labels.UnderDirector("research", "research", ""))
         pages["step_owners"] = json.loads(memory_feed.page_json(fixture.owner_machine_page(owner)))

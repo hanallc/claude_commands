@@ -2241,7 +2241,9 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     if isinstance(configuration, conf.UseConfiguredValue):
         configuration = read_configuration()
     names = read_step_names()
-    parsed = admission_client.view()
+    staff_display = staff_names.read()
+    with codec.snapshot_staff(staff_display.members):
+        parsed = admission_client.view()
     explanation = parsed.explanation
     captured = explanation.room
     host = explanation.decided_from.host
@@ -2254,7 +2256,6 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     machine = host_name()
     slot_homes = {mac_machine: mac_reading.home, machine: str(Path.home())}
     repository_slots = parsed.repository_slots if isinstance(parsed, wire.CloudQueueRead) else ()
-    staff_display = staff_names.read()
     with staff.supplied_snapshot(staff_display.members):
         labels = unit_labels.unit_labels_for(
             [*(step.session_id for step in (*parsed.view.running, *parsed.view.waiting)),
@@ -2562,10 +2563,16 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 title_step = display_name = QueueRowName.owner_only(public_queue_text(unit)
                     or identity.owner_text)
                 parts = staff_names.text_parts(display_name)
+                if owner and not public_owner_name(recorded.name, recorded.session_id):
+                    parts = queue_owner_parts(names, step, unit, identity.role, current=parts)
+                    display_name = QueueRowName.owner_only(staff_names.parts_text(parts) or title_step)
             else:
                 title_step = build_row_step(step, "", "", "", names, kind=QueueKind.AWS)
                 display_name = title_step.for_owner(names, step, unit, identity.role)
                 parts = queue_owner_parts(names, step, unit, identity.role)
+                if title_step == QueueKind.AWS.value and isinstance(program := QueueRowName.recorded_program(step), QueueRowName):
+                    title_step = program
+                    display_name = QueueRowName.owner_only(staff_names.parts_text(parts) or program)
             values: CloudWorkRow = {"kind": "cloud", **queue_row_labels(title_step, display_name, unit=unit),
                 "name_parts": parts if staff_names.parts_text(parts) == display_name else staff_names.text_parts(display_name),
                 **page_owner_labels(identity, unit=unit), "pid": cloud.owner.pid,

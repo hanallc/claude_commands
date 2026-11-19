@@ -2025,7 +2025,9 @@ Each new start sets the next start time through `start_spacing_after`.
 The interval is `recovery_start_seconds`, currently 5 seconds, for launches and build steps alike.
 A completed step leaves its run a slot for `slot_gap_seconds`, currently 10 seconds.
 The slot keeps the caller name from the reservation, including when a continuation claims the slot.
-A snapshot that includes the matching reservation can restore a missing caller name.
+The snapshot decoder restores a missing caller name from the matching reservation.
+If the reservation has no usable name, the decoder looks up the fixed staff ID in the supplied staff snapshot.
+An unknown staff ID shows `unregistered session`.
 A continuation within the slot bypasses order, spacing, and pressure.
 A larger continuation holds the slot and requests only its extra memory before new runs.
 A closed connection frees its claim. An idle slot expires or ends with its verified run owner.
