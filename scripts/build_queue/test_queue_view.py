@@ -509,16 +509,16 @@ class MacQueueViewTests(unittest.TestCase):
                         _ = path.write_text("#!/bin/sh\n" + body + "\n")
                         path.chmod(0o755)
                     environment = {"HOME": str(fixture.root), **environment}
-                    # The kernel buffer contains argv, then environment fields.
+                    # XNU can place metadata immediately after the environment.
                     data = struct.pack("i", 3) + b"/bin/cargo\0\0cargo\0test\0CARGO_TARGET_DIR=not-an-environment-field\0"
                     data += b"\0".join(os.fsencode(key + "=" + value) for key, value in environment.items())
-                    data += b"\0TOKEN=not-public\0\0"
+                    data += b"\0TOKEN=not-public\0pfz=0x123\0stack_guard=0x456\0"
                     script = queue_view.mac_build_script().replace('CAPTURE_ROOT = Path("/tmp/cargo-tile")',
                         f"CAPTURE_ROOT = Path({str(fixture.root / 'captures')!r})")
                     script = script.replace("print(json.dumps(read_reading()))",
-                        f"observed = cargo_environment({data!r})\n"
-                        + f"assert observed == ProcessEnvironment({environment!r})\n"
-                        + "read_process_environment = lambda pid: observed\nprint(json.dumps(read_builds()))")
+                        f"read_process_arguments = lambda pid: parse_process_arguments({data!r})\n"
+                        + f"assert process_environment(100) == {environment!r}\n"
+                        + "print(json.dumps(read_builds()))")
                     result = subprocess.run(["sh", "-c", script], text=True, capture_output=True,
                         env={**os.environ, "PATH": str(binary) + os.pathsep + os.environ["PATH"]}, timeout=5)
                     self.assertEqual(result.returncode, 0, result.stderr)

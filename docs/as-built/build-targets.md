@@ -245,7 +245,8 @@ The runner, the claim and the block are covered in [mac-test-offload.md](mac-tes
 - `scripts/production/mac_run.sh` uses `mac_queue_run.py` to reserve a claim through placement.
   Before SSH launch, the runner binds the claim to the attempt's remote start fence.
   The claim holds capacity until the fence settles and the SSH user's process check finds no matching `MAC_PLACEMENT` value.
-  The process check skips confirmed exits and keeps the claim when it cannot read a process or confirm its exit.
+  After a failed read, the process check keeps the claim if the kernel cannot confirm exit.
+  The scan can miss a child that starts after the snapshot if the listed parent exits before inspection.
   The script compiles Hana or the selected example in a Mac checkout.
 
 ### The commands: `commands/build/`

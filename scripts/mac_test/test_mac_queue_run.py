@@ -312,7 +312,7 @@ class QueueRunTests(unittest.TestCase):
             self.assertFalse(saved.exists())
             self.assertEqual([event[0] for event in self.events(root)], ["place-step", "place-step", "cancel-placement"])
 
-    def test_process_scan_distinguishes_a_confirmed_exit_from_an_unreadable_environment(self) -> None:
+    def test_process_scan_checks_all_strings_and_keeps_unknown_reads(self) -> None:
         arguments = shlex.split(mac_process_environment.placement_pids_command("episode", "attempt"))
 
         def process_list(command: list[str], *, text: bool) -> str:
@@ -322,25 +322,42 @@ class QueueRunTests(unittest.TestCase):
 
         exit_errors = {"exited": ProcessLookupError(errno.ESRCH, "process exited"),
                        "exit check failed": PermissionError(errno.EPERM, "process is unreadable")}
-        for outcome in ("exited", "size failed", "read failed", "exit check failed", "malformed",
-                        "arguments only", "unterminated environment", "empty", "unmarked", "matching", "apple metadata"):
+        marker = b"MAC_PLACEMENT=episode/attempt"
+        header = struct.pack("i", 1) + b"/bin/build\0\0build\0"
+        metadata = b"pfz=0x123\0stack_guard=0x456\0"
+        environment = b"HOME=/fixture\0"
+        unmarked = header + environment + metadata
+        cases = {
+            "exited": unmarked,
+            "size failed": unmarked,
+            "read failed": unmarked,
+            "exit check failed": unmarked,
+            "malformed": header + b"HOME=/fixture",
+            "omitted environment": header,
+            "empty environment": header + b"\0",
+            "complete without padding": unmarked,
+            "complete with padding": header + environment + b"\0\0" + metadata,
+            "marker in environment": header + marker + b"\0" + metadata,
+            "marker in argv": struct.pack("i", 2) + header[4:] + marker + b"\0" + environment + metadata,
+            "marker after padding": header + environment + b"\0" + metadata + marker + b"\0",
+            "marker prefix only": header + marker + b"-different\0" + metadata,
+            "fake pfz before marker": header + b"pfz=0xabc\0" + marker + b"\0" + metadata,
+            "short buffer": header + environment + b"\0",
+            "short buffer with fake pfz": header + b"pfz=0xabc\0",
+        }
+        for outcome, data in cases.items():
             with self.subTest(outcome=outcome):
-                matching = outcome in ("matching", "apple metadata")
-                field = b"MAC_PLACEMENT=episode/attempt" if matching else b"HOME=/fixture"
-                header = struct.pack("i", 1) + b"/bin/build\0\0build\0"
-                environments = {"arguments only": b"", "malformed": field, "unterminated environment": field + b"\0",
-                                "empty": b"\0", "apple metadata": field + b"\0commpage_pfz=0x123\0stack_guard=0x456\0"}
-                data = header + environments.get(outcome, field + b"\0\0")
-
                 def sysctl(mib: ctypes.Array[ctypes.c_int], _count: int, buffer: object, size: object,
                            _new: object, _new_count: int) -> int:
+                    length = ctypes.cast(cast(ctypes.c_void_p, size), ctypes.POINTER(ctypes.c_size_t))
                     if buffer is None:
-                        length = ctypes.cast(cast(ctypes.c_void_p, size), ctypes.POINTER(ctypes.c_size_t))
                         length.contents.value = len(data)
                         return int(outcome == "size failed" or (outcome == "exited" and mib[2] == 4567))
                     if outcome in ("read failed", "exit check failed"):
                         return 1
                     _ = ctypes.memmove(cast(ctypes.c_void_p, buffer), data, len(data))
+                    if not outcome.startswith("short buffer"):
+                        length.contents.value = len(data)
                     return 0
 
                 kernel = mock.Mock(sysctl=mock.Mock(side_effect=sysctl))
@@ -351,7 +368,10 @@ class QueueRunTests(unittest.TestCase):
                       mock.patch.object(subprocess, "check_output", side_effect=process_list),
                       redirect_stdout(output), redirect_stderr(errors), self.assertRaises(SystemExit) as status):
                     exec(compile(arguments[2], "<placement process probe>", "exec"), {"__name__": "__main__"})
-                if matching or outcome in ("exited", "empty", "unmarked"):
+                matching = outcome in ("marker in environment", "marker in argv", "marker after padding",
+                                       "fake pfz before marker")
+                if matching or outcome in ("exited", "complete without padding", "complete with padding",
+                                           "marker prefix only"):
                     self.assertEqual(status.exception.code, 0)
                     self.assertEqual(output.getvalue(), "4567\n4568\n" if matching else "")
                     self.assertEqual(errors.getvalue(), "")

@@ -401,9 +401,13 @@ def repository_name(folder):
 
 
 def process_environment(pid):
-    """Supply display fields when the process environment is readable."""
-    observed = read_process_environment(pid)
-    return observed.fields if isinstance(observed, ProcessEnvironment) else {}
+    """Supply display fields from the strings after argv when available."""
+    observed = read_process_arguments(pid)
+    if isinstance(observed, ProcessInspectionUnavailable):
+        return {}
+    return {os.fsdecode(key): os.fsdecode(value) for key, value in observed.environment_fields().items()
+            if key in (b"CARGO_TARGET_DIR", b"CARGO_BUILD_TARGET_DIR", b"CARGO_HOME", b"HOME",
+                       b"RUNNER_NAME", b"GITHUB_JOB", b"MAC_PLACEMENT")}
 
 
 def test_output_directories(pid, folder, command, members, processes):
