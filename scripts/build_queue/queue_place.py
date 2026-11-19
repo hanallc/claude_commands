@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from enum import Enum, auto
 import os
 from pathlib import Path
+import re
 import select
 import signal
 import shutil
@@ -212,6 +213,21 @@ def read_program_start(record: Path) -> ProgramStart | None:
         return None
 
 
+def _recorded_sidecar(path: Path) -> str:
+    """Read a complete sidecar field from a damaged record for retention."""
+    with suppress(OSError, ValueError):
+        if match := re.search(r'(?:^|[,{])\s*"sidecar"\s*:\s*("(?:[^"\\]|\\.)*")', path.read_text()):
+            return wire.parse_record(match[1], str)
+    return ""
+
+
+def _mark_program_recovery(path: Path, sidecar: Path) -> None:
+    """Link the folder to its record if the folder has no recovery marker."""
+    marker = sidecar.with_name(build_folders.RECOVERY_MARKER)
+    with suppress(FileExistsError, FileNotFoundError):
+        marker.symlink_to(path.absolute())
+
+
 def wait_for_start(descriptor: int, stop_seconds: float) -> None:
     with os.fdopen(descriptor, "rb") as permission:
         if not select.select([permission], [], [], stop_seconds)[0] or permission.read(1) != b"1":
@@ -297,16 +313,15 @@ def cleanup_program_starts(configuration: admission_records.MemoryConfig | wire.
         if target is not None:
             atomic_file.remove_dead_temporary_files(directory / target)
     for path in directory.glob("*.json"):
-        record = read_program_start(path)
-        if record is None or admission_records.process_start_time(record.holder.pid) == record.holder.start_time:
-            continue
-        deadline = time.monotonic() + configuration.program_stop_seconds
+        record: ProgramStart | None = None
         try:
+            record = read_program_start(path)
+            if record is None or admission_records.process_start_time(record.holder.pid) == record.holder.start_time:
+                continue
+            deadline = time.monotonic() + configuration.program_stop_seconds
             if record.sidecar:
                 # Records from older launches may have no folder marker.
-                marker = Path(record.sidecar).with_name(build_folders.RECOVERY_MARKER)
-                with suppress(FileExistsError, FileNotFoundError):
-                    marker.symlink_to(path.absolute())
+                _mark_program_recovery(path, Path(record.sidecar))
             if record.scope:
                 stop_scope(Path(record.scope), deadline, configuration.program_sample_seconds)
             else:
@@ -319,9 +334,15 @@ def cleanup_program_starts(configuration: admission_records.MemoryConfig | wire.
                 if published is not None and published.scope:
                     stop_scope(Path(published.scope), deadline, configuration.program_sample_seconds)
             path.unlink(missing_ok=True)
-        except (CleanupUnresolved, OSError, ValueError) as error:
-            if record.sidecar:
-                kept.add(Path(record.sidecar))
+        except (CleanupUnresolved, OSError, ValueError, RecursionError) as error:
+            name = record.sidecar if record is not None else _recorded_sidecar(path)
+            if name:
+                sidecar = Path(name)
+                kept.add(sidecar)
+                if record is None:
+                    with suppress(OSError, ValueError):
+                        if sidecar.is_file():
+                            _mark_program_recovery(path, sidecar)
             print(f"UNRESOLVED: recovery kept {path}: {error}", file=sys.stderr)
     return kept
 

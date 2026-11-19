@@ -1337,6 +1337,38 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                             except ProcessLookupError:
                                 pass
 
+    def test_truncated_program_record_keeps_its_folder_and_allows_admission(self) -> None:
+        with QueuePlaceFixture() as fixture, mock.patch.dict(os.environ, {"TMPDIR": str(fixture.root)}):
+            holder = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True, timeout=3)
+            owner = wire.Owner(int(holder.stdout), "1")
+            spec = build_folders.BuildFolderSpec(kind="tool", parent=fixture.root, purpose="queue-place",
+                                                suffix_length=0, owner_pid=owner.pid)
+            with build_folders.leased_build_folder(spec) as old:
+                sidecar = old / build_folders.QUEUE_PROGRAM_SIDECAR
+                _ = sidecar.write_text("")
+
+            directory = queue.program_starts()
+            directory.mkdir(parents=True, exist_ok=True)
+            damaged = directory / "damaged.json"
+            text = wire.encode_record(queue.ProgramStart(owner, owner, "", sidecar=str(sidecar)))[:-1]
+            _ = damaged.write_text(text)
+            recoverable = directory / "recoverable.json"
+            empty_scope = fixture.root / "empty-scope"
+            empty_scope.mkdir()
+            _ = (empty_scope / "cgroup.procs").write_text("")
+            _ = recoverable.write_text(wire.encode_record(queue.ProgramStart(owner, owner, str(empty_scope))))
+
+            output = io.StringIO()
+            with redirect_stderr(output), queue.queue_place("rust-analyzer", fixture.root) as place:
+                _ = fixture.reservation()
+                self.assertNotEqual(place.sidecar.parent, old)
+                self.assertFalse(recoverable.exists())
+            self.assertIn(f"UNRESOLVED: recovery kept {damaged}", output.getvalue())
+            self.assertEqual(damaged.read_text(), text)
+            self.assertTrue(sidecar.is_file())
+            self.assertEqual(sidecar.with_name(build_folders.RECOVERY_MARKER).readlink(), damaged.absolute())
+            fixture.assert_cleaned(self)
+
     def test_allocation_keeps_a_dead_holders_folder_until_the_scope_is_empty(self) -> None:
         self.assert_pending_scope_keeps_folder(legacy=False)
 

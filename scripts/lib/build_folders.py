@@ -819,7 +819,7 @@ def _legacy_program_recovery_pending() -> bool:
             record = cast(object, json.loads((records / name).read_text()))
         except FileNotFoundError:
             continue
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             return True
         if not isinstance(record, dict):
             return True
