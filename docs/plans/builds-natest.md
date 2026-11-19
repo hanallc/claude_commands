@@ -26,3 +26,23 @@
 - impl: the test module, its support and any production cause.
 
 **Acceptance gate:** an AWS pair (3 rounds) shows the median CPU at half or less, or a floor result with its cause; the module and the modules that import its support pass 20 times under load in a 2 GB scope; the full suite is green.
+
+### Phase 383 — gate recovery accepts a full token pool  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** A new merge gate recovers a dead gate's record when the jobserver pool is already full, and then runs its modules.
+- **Spec:**
+  1. Defect (found by sdlc with strace, reported by builds): a gate killed by the claude5 move left its record under `~/.local/state/merge-gate/active-runs/<repo id>/`. The jobserver (`/dev/steve`) took the dead pid's tokens back. `GateRecovery.recover` (`scripts/production/merge_gate.py`, the token loop near line 743) writes each recorded token back. The pool is full, so `os.write` raises `OSError(ENOSPC)`. The error becomes `REFUSED: [Errno 28] No space left on device`, no module runs, and the record stays. Every later gate on that copies key refuses.
+  2. Fix in `recover`: an `OSError` with `errno.ENOSPC` from the token write means the token is already back. Pop the token, save the record and continue. Any other `OSError` keeps the current behavior.
+  3. Then the existing folder cleanup runs on the record's folders, including a `/dev/shm/merge-gate-*` folder. Confirm that path is cleaned by the existing folder step; if it is refused, fix the cause in the same phase and say why.
+  4. Smallest fix: no new layer, no retry loop, no signal handler, no lazy import.
+- **Files:** `scripts/production/merge_gate.py` (recover token loop); `scripts/production/test_merge_gate_suites_signals.py` (new row).
+- **Workers:** 1 writer. The fix and its test row are one small change.
+  - impl: merge_gate.py and the test row.
+- **Constraints from prior phases:** Phase 222 built GateRecovery. Tests read no /tune-changeable value. Fixture Git commands use `git_test_support.fixture_git_environment`.
+- **Acceptance gate:**
+  1. A test row: a recorded token whose write raises ENOSPC (a full pool) leaves no token in the record, removes the record file, and refuses nothing.
+  2. Existing recovery rows in test_merge_gate_suites_signals.py pass.
+  3. basedpyright on both files: zero errors and zero warnings.
+  4. `TMPDIR=/tmp ~/.claude/scripts/lib/py -m unittest scripts.production.test_merge_gate_suites_signals` passes 20 loaded runs.
