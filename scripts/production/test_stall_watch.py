@@ -352,8 +352,6 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         _ = self.config.write_text((f"""# range: 0..
 threshold_percent=1
 # range: 0..
-repeat_minutes=30
-# range: 0..
 stall_minutes={stall_minutes}
 faults_to=natedev
 always=natedev

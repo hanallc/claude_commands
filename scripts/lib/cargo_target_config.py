@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import errno
 import os
+import stat
 import sys
 import tomllib
 from collections.abc import Mapping
@@ -116,6 +118,18 @@ def cargo_folder_settings(argv: list[str], cwd: str, environment: Mapping[str, s
     return settings
 
 
+class NoCargoManifest(FileNotFoundError):
+    """No implicit Cargo manifest exists in the working directory or its parents."""
+
+
+def _cargo_manifest_exists(manifest: Path) -> bool:
+    """Skip non-regular files and treat a dangling link as unreadable."""
+    try:
+        return stat.S_ISREG(manifest.stat().st_mode)
+    except FileNotFoundError:
+        return manifest.is_symlink()
+
+
 def cargo_workspace_manifest(argv: list[str], cwd: str, cargo_home: str = "") -> Path:
     """Find the workspace manifest without starting Cargo or reading its cache.
 
@@ -126,8 +140,14 @@ def cargo_workspace_manifest(argv: list[str], cwd: str, cargo_home: str = "") ->
     if named:
         manifest = Path(os.path.abspath(directory / named))
     else:
-        manifest = next((parent / "Cargo.toml" for parent in (directory, *directory.parents)
-                         if (parent / "Cargo.toml").is_file()), directory / "Cargo.toml")
+        if any(arg == "--manifest-path" or arg.startswith("--manifest-path=") for arg in argv):
+            raise ValueError("Cargo --manifest-path has no value")
+        for parent in (directory, *directory.parents):
+            manifest = parent / "Cargo.toml"
+            if _cargo_manifest_exists(manifest):
+                break
+        else:
+            raise NoCargoManifest(errno.ENOENT, os.strerror(errno.ENOENT), directory / "Cargo.toml")
     table = cast(dict[str, object], tomllib.loads(manifest.read_text()))
     if isinstance(table.get("workspace"), dict):
         return manifest
@@ -146,7 +166,7 @@ def cargo_workspace_manifest(argv: list[str], cwd: str, cargo_home: str = "") ->
         if cargo_home and manifest.is_relative_to(cargo_home) and not parent.is_relative_to(cargo_home):
             break
         root = parent / "Cargo.toml"
-        if not root.is_file():
+        if not _cargo_manifest_exists(root):
             continue
         table = cast(dict[str, object], tomllib.loads(root.read_text()))
         workspace = table.get("workspace")

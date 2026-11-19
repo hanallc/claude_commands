@@ -4,32 +4,36 @@ from __future__ import annotations
 import errno
 import fcntl
 import hashlib
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from dataclasses import asdict, dataclass, replace
 from http.client import IncompleteRead
 import json
 import os
 from pathlib import Path
 import select
+import selectors
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
+from types import SimpleNamespace
 from typing import BinaryIO, NamedTuple, cast, override
 import unittest
 from unittest import mock
 from urllib.request import Request
 
 from scripts.build_queue import execution_identity
-from scripts.aws_target import hana_protocol
+from scripts.aws_target import hana_protocol, hana_render
 from scripts.aws_target import hana_guest as guest, hana_receiver as receiver
 from scripts.aws_target import hana_result, hana_runner as runner, hana_source as source
 from scripts.aws_target.hana_placement import HanaHostGeneration
 from scripts.aws_target.hana_result import HanaAttemptKey, LogicalStepLink
 from scripts.aws_target import test_hana_receiver as receiver_tests, test_hana_source as source_tests
-from scripts.lib import build_folders, build_slots, process_stat
+from scripts.lib import build_folders, build_slots
 from scripts.mac_test import linux_runner
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
@@ -267,28 +271,67 @@ class HanaRunnerTests(unittest.TestCase):
                 _ = output.write(hana_protocol.encode_outcome(outcome))
             self.assertEqual(supervisor.outcome(directory), outcome)
 
-    def test_silent_command_deadline_kills_its_descendants_and_releases_the_slot(self) -> None:
-        pids = self.root / 'hung-pids'
-        code = ('import os, pathlib, subprocess, sys, threading; '
-            + 'child = subprocess.Popen([sys.executable, "-c", "import threading; threading.Event().wait(60)"]); '
-            + f'pathlib.Path({str(pids)!r}).write_text(str(os.getpid()) + " " + str(child.pid)); '
-            + 'threading.Event().wait(60)')
-        self.tool('cargo', 'exec ' + shlex.join([sys.executable, '-c', code]) + '\n')
-        outcome = self.run_request(self.request, command_timeout_s=0.25)
-        assert isinstance(outcome, hana_protocol.HanaExecutionLost)
-        self.assertIn('execution deadline', outcome.reason)
-        for value in pids.read_text().split():
+    def assert_command_deadline(self, ready: Path, process_count: int, *,
+                                streams: selectors.BaseSelector | None = None) -> None:
+        """Advance the command clock after the fixture reports readiness."""
+        timeout_s = 1.0
+        first_tick = True
+        ready_at = 0.0
+        pidfds: list[int] = []
+        os.mkfifo(ready)
+        with ready.open('r+b', buffering=0) as pipe:
+            def monotonic() -> float:
+                nonlocal first_tick, ready_at
+                if first_tick:
+                    first_tick = False
+                    return 0.0
+                if not pidfds:
+                    readable, _, _ = select.select([pipe], [], [], TEST_HANG_GUARD_SECS)
+                    self.assertTrue(readable, 'Cargo did not report its PIDs')
+                    for pid in map(int, os.read(pipe.fileno(), 128).split()):
+                        pidfds.append(os.pidfd_open(pid))
+                    self.assertEqual(len(pidfds), process_count)
+                    ready_at = time.monotonic()
+                if streams is not None and streams.get_map():
+                    self.assertLess(time.monotonic() - ready_at, TEST_HANG_GUARD_SECS,
+                                    'Cargo did not close both output streams')
+                    return 0.0
+                return timeout_s
+
             try:
-                self.assertIn(process_stat.process_fields(int(value))[0], ('Z', 'X'))
-            except FileNotFoundError:
-                pass
+                clock = SimpleNamespace(time=time.time, monotonic=monotonic)
+                with mock.patch.object(linux_runner, 'time', clock):
+                    outcome = self.run_request(self.request, command_timeout_s=timeout_s)
+                assert isinstance(outcome, hana_protocol.HanaExecutionLost)
+                self.assertIn('execution deadline', outcome.reason)
+                self.assertEqual(len(pidfds), process_count)
+                for descriptor in pidfds:
+                    exited, _, _ = select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)
+                    self.assertTrue(exited, 'The command process did not exit')
+            except BaseException:
+                for descriptor in pidfds:
+                    with suppress(ProcessLookupError):
+                        signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                raise
+            finally:
+                for descriptor in pidfds:
+                    os.close(descriptor)
+
+    def test_silent_command_deadline_kills_its_descendants_and_releases_the_slot(self) -> None:
+        ready = self.root / 'hung-pids'
+        self.tool('cargo', 'sleep infinity &\n'
+                  + f'printf "%s %s\\n" "$$" "$!" > {shlex.quote(str(ready))}\nwait\n')
+        self.assert_command_deadline(ready, 2)
         self.assertEqual(build_folders.build_folder_state(self.root / 'guest-slots/hana-slot1'), 'free')
 
     def test_command_deadline_also_bounds_the_wait_after_output_closes(self) -> None:
-        self.tool('cargo', 'exec >/dev/null 2>&1\nexec sleep 60\n')
-        outcome = self.run_request(self.request, command_timeout_s=0.1)
-        assert isinstance(outcome, hana_protocol.HanaExecutionLost)
-        self.assertIn('execution deadline', outcome.reason)
+        ready = self.root / 'eof-pid'
+        self.tool('cargo', f'printf "%s\\n" "$$" > {shlex.quote(str(ready))}\n'
+                  + 'exec >/dev/null 2>&1\nexec sleep infinity\n')
+        with (selectors.DefaultSelector() as streams,
+              mock.patch.object(linux_runner, 'selectors', SimpleNamespace(
+                  DefaultSelector=lambda: streams, EVENT_READ=selectors.EVENT_READ))):
+            self.assert_command_deadline(ready, 1, streams=streams)
 
     def test_complete_source_update_repairs_the_original_capture_without_running_cargo(self) -> None:
         self.fixture.sender.acknowledge(hana_protocol.SourceIdentity(self.manifest.repository,
@@ -370,6 +413,77 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
                               result.stdout)
         self.assertEqual((slot_root / 'hana-slot1/tracked').read_text(), 'committed\n')
         self.assertFalse(cargo.exists() or shell.exists())
+
+    def test_isolated_runtime_writes_a_refusal_for_input_import_and_runtime_errors(self) -> None:
+        runtime = self.root / 'runtime'
+        for file in hana_render.runtime_files(Path(__file__).resolve().parents[2], self.fixture.configuration):
+            path = runtime / file.path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_bytes(file.content)
+            path.chmod(file.mode)
+        source_module = runtime / 'scripts/aws_target/hana_source.py'
+        source_text = source_module.read_text()
+        runner_module = runtime / 'scripts/aws_target/hana_runner.py'
+        runner_text = runner_module.read_text()
+        request = cast(object, json.loads(hana_protocol.encode_request(self.request)))
+        fixture_message = 'The source worker failed at /private/credentials with fixture-private-text'
+
+        for case, action, expected, diagnostic in (
+            ('arguments', 'execute', 'The Hana runner refused its arguments', 'The verified bundle range is invalid'),
+            ('input', 'execute', 'The Hana runner stopped: ValueError', 'Invalid Hana integer: output_max_bytes'),
+            ('missing-dependency', 'execute', 'The Hana runner stopped: ImportError', "cannot import name 'hana_source'"),
+            ('missing-runner', 'execute', 'The Hana runner stopped: ImportError', "cannot import name 'hana_runner'"),
+            ('runtime-error', 'execute', 'The Hana runner stopped: RuntimeError', fixture_message),
+            ('runtime-error', 'source-update', 'The Hana runner stopped: RuntimeError', fixture_message),
+            ('broken-string', 'execute', 'The Hana runner stopped: UnprintableError', '<exception str() failed>'),
+            ('broken-stderr', 'execute', 'The Hana runner stopped: RuntimeError', None),
+        ):
+            with self.subTest(case=case, action=action), self.fixture.verified_bundle(self.manifest) as bundle:
+                if case == 'missing-dependency':
+                    source_module.unlink()
+                else:
+                    _ = source_module.write_text(source_text)
+                if case == 'missing-runner':
+                    runner_module.unlink()
+                else:
+                    script = runner_text
+                    if case == 'runtime-error':
+                        operation = 'materialize_and_run' if action == 'execute' else 'materialize_source_update'
+                        script += f'\ndef {operation}(*args, **kwargs):\n    raise RuntimeError({fixture_message!r})\n'
+                    if case == 'broken-string':
+                        script += (
+                            '\nclass UnprintableError(Exception):\n'
+                            + '    def __str__(self):\n        raise RuntimeError("fixture-private-text")\n'
+                            + '\ndef materialize_and_run(*args, **kwargs):\n    raise UnprintableError()\n')
+                    if case == 'broken-stderr':
+                        script += (
+                            '\nclass UnwritableStderr:\n'
+                            + '    def write(self, text):\n        raise OSError("The diagnostic write failed")\n'
+                            + '    def flush(self):\n        pass\n'
+                            + '\ndef materialize_and_run(*args, **kwargs):\n'
+                            + '    sys.stderr = UnwritableStderr()\n    raise RuntimeError("fixture failure")\n')
+                    _ = runner_module.write_text(script)
+                fields = {'action': action, 'request': request}
+                if case != 'input':
+                    fields['output_max_bytes'] = 1024
+                size = 0 if case == 'arguments' else bundle.size
+                result = subprocess.run([sys.executable, '-IB', str(runtime / 'runner.py'),
+                    '--bundle-fd', str(bundle.descriptor), '--bundle-offset', str(bundle.offset),
+                    '--bundle-size', str(size), '--command-timeout-s', '600'],
+                    input=json.dumps(fields).encode(), pass_fds=(bundle.descriptor,), capture_output=True,
+                    cwd=runtime, env={**os.environ, 'CONF_DIR': str(runtime / 'config')},
+                    timeout=TEST_HANG_GUARD_SECS, check=False)
+                self.assertEqual(result.returncode, 0)
+                if diagnostic is None:
+                    self.assertEqual(result.stderr, b'')
+                else:
+                    self.assertIn(diagnostic.encode(), result.stderr)
+                    if case != 'arguments':
+                        self.assertIn(b'Traceback (most recent call last):', result.stderr)
+                outcome = (hana_protocol.decode_source_outcome(result.stdout) if action == 'source-update'
+                    else hana_protocol.decode_outcome(result.stdout))
+                assert isinstance(outcome, (hana_protocol.HanaExecutionRefused, hana_protocol.HanaSourceUpdateRefused))
+                self.assertEqual(outcome.reason, expected)
 
     def test_shell_failure_and_compiler_mismatch_start_no_cargo(self) -> None:
         cargo = self.root / 'cargo-started'

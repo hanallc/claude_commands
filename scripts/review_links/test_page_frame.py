@@ -11,12 +11,14 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 from typing import cast, override
 
-from scripts.review_links import console, page_frame
+from scripts.review_links import console, page_frame, review_submissions, serve
 from scripts.lib import conf
+from scripts.production import staff
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 NO_DATA_FILE: dict[str, object] = {}
@@ -43,6 +45,36 @@ class PageStatusTests(unittest.TestCase):
             with self.subTest(page=page):
                 source = (scripts / path).read_text(encoding='utf-8')
                 self.assertEqual(page_frame.template(source, page.title(), page).count(page_frame.BUTTON_STATES), 1)
+
+    def test_page_owner_uses_current_name_and_parent_chain(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        config = root / "console.conf"
+        _ = config.write_text("page.list.owner=owner\nowner.default=default\n", encoding="utf-8")
+        document = root / "remote" / "production.md"
+        live = staff.LiveDoc("natedev", document)
+        parent = staff.StaffRow(staff.StaffId("parent"), "showrunner", "Nearest", staff.STAFF_ROOT,
+                                current_session=staff.StaffId("session-parent"), doc=live)
+        default = replace(parent, id=staff.StaffId("default"), name="Default")
+        owner = replace(parent, id=staff.StaffId("owner"), name="Current & name", parent=staff.ReportsTo(parent.id))
+        rows = staff.StaffSnapshot((parent, default, owner))
+        settings = conf.read(config)
+        self.assertEqual(review_submissions.page_owner("list", settings, rows), owner)
+        self.assertEqual(review_submissions.page_owner("list", settings, replace(rows, pending_retire=(owner.id,))), parent)
+        wrapped = replace(owner, doc=staff.WrappedDoc("natedev", document))
+        self.assertEqual(review_submissions.page_owner("list", settings, replace(rows, rows=(parent, default, wrapped))), parent)
+        self.assertEqual(review_submissions.page_owner("list", settings, replace(rows, rows=(parent, default))), default)
+        self.assertEqual(review_submissions.page_owner("images", settings, rows), default)
+        with (patch.object(staff, "local_snapshot", return_value=rows),
+              patch.dict(os.environ, {"CONF_DIR": str(root)}),
+              patch.object(subprocess, "Popen", side_effect=AssertionError("The owner launched a process."))):
+            page = serve.owned_document(b'<html><head></head><body><main><h1>The List</h1></main></body></html>', "list")
+        self.assertIn(b'data-page-owner="list"', page)
+        self.assertIn(b'<div class="page-heading"><h1>The List</h1><div class="page-heading-actions">', page)
+        self.assertIn(page_frame.HEADING_STYLE.encode(), page)
+        self.assertIn(b'class="staff-name" data-color-text="role.showrunner"', page)
+        self.assertIn(b'aria-label="New item for Current &amp; name" title="New item for Current &amp; name"', page)
+        self.assertEqual(page.count(b'<dialog id="review-new-item"'), 1)
+        self.assertEqual(page_frame.with_owner(page, "list", owner, rows, lambda: self.fail("The dialog already exists.")), page)
 
     def test_each_page_uses_the_same_states_and_retains_the_last_good_read(self) -> None:
         for page in ('accounts', 'aws', 'builds', 'disks', 'images', 'list', 'review'):
@@ -353,14 +385,15 @@ window.fetch=async(url,options={})=>{
   check(positions.length===4 && positions[0].matches('.page-status-state') && positions[1]===part('age') &&
    positions[2]===part('trip') && positions[3]===part('render'),'the Live line has the same four positions');
   const title=document.querySelector('.page-title'),titleBox=title.getBoundingClientRect(),lineBox=line.getBoundingClientRect();
+  const headingBox=(title.closest('.page-heading') || title).getBoundingClientRect();
   const main=document.querySelector('main'),mainBox=main.getBoundingClientRect(),width=document.documentElement.clientWidth;
   // A wide page uses the pane width; a text page keeps the 1124 px column.
   check(mainBox.width===(main.classList.contains('page-wide')?width:Math.min(width,1124)) &&
    Math.abs(mainBox.left-(width-mainBox.right))<1,'the page uses the shared centered column');
   check(main.classList.contains('page-wide')===(document.title==='Builds'),'only the Builds page is wide');
-  check(titleBox.x===mainBox.x+32 && titleBox.y+scrollY===32,'the title starts at the shared column edge');
-  check(lineBox.x===titleBox.x && lineBox.y===titleBox.bottom+8,'the line follows the title in the same column');
-  check(lineBox.width===titleBox.width && lineBox.height===21,'the line uses the full title width and shared height');
+  check(titleBox.x===mainBox.x+32 && headingBox.y+scrollY===32,'the title starts at the shared column edge');
+  check(lineBox.x===titleBox.x && lineBox.y===headingBox.bottom+8,'the line follows the title row in the same column');
+  check(lineBox.width===headingBox.width && lineBox.height===21,'the line uses the full title row width and shared height');
   check(getComputedStyle(title).fontSize==='26px' && getComputedStyle(title).fontWeight==='700',
    'the title uses the shared size and weight');
   check(getComputedStyle(line).fontSize==='14px' && getComputedStyle(line).lineHeight==='21px' &&

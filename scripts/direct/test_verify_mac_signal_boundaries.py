@@ -83,7 +83,7 @@ before_mac_runner() {
             printf 'after:%s\n' "$MAC_RUNNER_PID" > "$TEST_PID_BOUNDARY"
         fi
     fi
-    if [[ "$BASH_COMMAND" == *'"$MAC_RUNNER"'* && "$BASH_COMMAND" == *'"${runner_args[@]}"'* ]]; then
+    if [[ "$BASH_COMMAND" == *'"$runner"'* && "$BASH_COMMAND" == *'"${runner_args[@]}"'* ]]; then
         trap - DEBUG
         printf '%s\n' "$MAC_LOG_FILE" > "$TEST_BEFORE_RUNNER_MARKER"
         "$TEST_REAL_PYTHON" "$TEST_WAIT_HELPER" "$TEST_CONTINUE_RUNNER"

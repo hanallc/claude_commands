@@ -3,9 +3,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+from pathlib import Path
 from scripts.build_targets.execution_transport import (
     ExecutionTransport as ExecutionTransport, SshCommandTransport as SshCommandTransport,
-    HanaControlTransport as HanaControlTransport,
+    HanaControlTransport as HanaControlTransport, HanaGpuNextestTransport,
 )
 from typing import TYPE_CHECKING, Protocol, cast
 from scripts.aws_target.hana_claim_release import (
@@ -147,6 +148,18 @@ class _PlacementAdapter(Protocol):
         ...
 
 
+    def gpu_setup(self, transport: HanaGpuNextestTransport) -> tuple[str, ...] | HanaStepRefused:
+        ...
+
+    def gpu_step(self, transport: HanaGpuNextestTransport, repository: str, package: str, kind: str,
+                 command: tuple[str, ...]) -> placement.AllowedHost | placement.FixedExclusion:
+        ...
+
+    def run_gpu_assignment(self, assignment: placement.PlacementAssignment, repo: Path, package: str,
+                           command: tuple[str, ...], result_file: Path) -> int:
+        ...
+
+
 def _adapter() -> _PlacementAdapter:
     from importlib import import_module
     return cast(_PlacementAdapter, cast(object, import_module('scripts.aws_target.hana_placement_adapter')))
@@ -209,6 +222,20 @@ def read_evidence(key: placement.HostEvidenceKey, request: HanaEvidenceRequest, 
                   transport: HanaControlTransport, workload: conf.ConfigRead) -> placement.HostEvidence:
     """Use the workload that selected the Hana transport to read evidence."""
     return _adapter().read_evidence(key, request, transport=transport, workload=workload)
+
+
+def gpu_setup(transport: HanaGpuNextestTransport) -> tuple[str, ...] | HanaStepRefused:
+    return _adapter().gpu_setup(transport)
+
+
+def gpu_step(transport: HanaGpuNextestTransport, repository: str, package: str, kind: str,
+             command: tuple[str, ...]) -> placement.AllowedHost | placement.FixedExclusion:
+    return _adapter().gpu_step(transport, repository, package, kind, command)
+
+
+def run_gpu_assignment(assignment: placement.PlacementAssignment, repo: Path, package: str,
+                       command: tuple[str, ...], result_file: Path) -> int:
+    return _adapter().run_gpu_assignment(assignment, repo, package, command, result_file)
 
 
 def __getattr__(name: str) -> object:

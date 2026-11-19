@@ -679,6 +679,8 @@ def _herdr_labeled(registry: dict[HerdrPlace, dict[int, list[SessionRecord]]], e
                                      "unit pane process info")
             owner = herdr.pane_foreground(place, info)
             if isinstance(owner, herdr.ObservedEmpty):
+                holders = [process for process in holders
+                           if not process.ancestry.is_detached_from_shell(process.pid, owner.shell_pid)]
                 if problem or claudes or any(process.pid != owner.shell_pid for process in holders):
                     yield _unproved_pane(place, holders, claudes, problem or "no foreground agent", pane)
                 elif holders and (identity := holders[0].marks.get("CLAUDE_CODE_SESSION_ID")):
