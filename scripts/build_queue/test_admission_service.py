@@ -378,7 +378,7 @@ class PlacementStatusTests(unittest.TestCase):
                 self.assertEqual(fixture.server.assignments[key].terminal_report, report)
 
     def test_hana_claim_failure_uses_the_exact_dispatch_journal(self) -> None:
-        from scripts.aws_target import hana_box, hana_execution, hana_placement, hana_result
+        from scripts.aws_target import hana_box, hana_execution, hana_placement, hana_placement_adapter, hana_result
         from scripts.aws_target.test_hana_execution import FakeExecutionObjects
         from scripts.build_queue.test_placement import (
             PlacementFixture, assignment_for, coordinator_holder, hana_policy_request, local_candidate,
@@ -428,7 +428,8 @@ class PlacementStatusTests(unittest.TestCase):
                         objects = FakeExecutionObjects(dispatch)
 
                         def consume(message: wire.ConsumePermission) -> wire.FirstAuthorization:
-                            authorized, = fixture.server.handle_request(message)
+                            with mock.patch.object(hana_placement_adapter, "read_assigned_adoption", return_value=adopted_claim):
+                                authorized, = fixture.server.handle_request(message)
                             assert isinstance(authorized, wire.FirstAuthorization), authorized
                             return authorized
 
