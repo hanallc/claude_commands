@@ -13,6 +13,7 @@ from typing import Protocol, cast
 from uuid import uuid4
 
 from scripts.aws_target import hana_guest, hana_replacement_record, hana_spend, ledger, remote
+from scripts.aws_target.hana_claim_release import HanaClaimRelease, HanaClaimReleased, HanaClaimReleaseRefused
 from scripts.aws_target.controller_lock import control_lock, hana_work_lock
 from scripts.build_queue.placement import HANA_IMAGE_STALE as HANA_IMAGE_STALE
 from scripts.lib import conf, file_lock, process_start
@@ -424,6 +425,14 @@ def require_idle_setup(path: Path, identity: DeploymentIdentity) -> None:
         raise ValueError('The Hana lifecycle is busy. Run hana-setup again when the box is idle.')
 
 
+def lifecycle_release_block(state: Lifecycle, operation: PendingOperation | NoOperation) -> HanaClaimRelease:
+    if isinstance(operation, PendingOperation):
+        return HanaClaimReleaseRefused(f'The Hana lifecycle operation {operation.action.value} is pending')
+    if state in (Lifecycle.STARTING, Lifecycle.STOPPING):
+        return HanaClaimReleaseRefused(f'The Hana lifecycle is {state.value}')
+    return HanaClaimReleased()
+
+
 def record_replacement_stop(path: Path, generation: int, now: int, *, stopped: bool) -> None:
     """Record the handoff of the stopped or stopping box."""
     previous = _decode(remote.read_record(path))
@@ -460,7 +469,7 @@ class HanaController:
             with hana_work_lock(self.directory) as access:
                 if access is file_lock.LockResult.BUSY or hana_replacement_record.held(self.directory):
                     return HanaResourcesHeld()
-                return self._read_evidence()
+                return self.read_saved_lifecycle()
         except (OSError, ValueError, KeyError, TypeError) as error:
             return HanaLifecycleUnavailable(type(error).__name__, int(self.clock()))
 
@@ -468,11 +477,12 @@ class HanaController:
         """Read the lifecycle evidence needed to close an existing claim."""
         try:
             with control_lock(self.directory):
-                return self._read_evidence()
+                return self.read_saved_lifecycle()
         except (OSError, ValueError, KeyError, TypeError) as error:
             return HanaLifecycleUnavailable(type(error).__name__, int(self.clock()))
 
-    def _read_evidence(self) -> HanaLifecycleEvidence | HanaUnprovisioned:
+    def read_saved_lifecycle(self) -> HanaLifecycleEvidence | HanaUnprovisioned:
+        """Read the atomically saved lifecycle row without taking the controller lock."""
         row = self._read()
         if isinstance(row, NoDeployment):
             return HanaUnprovisioned()
@@ -586,7 +596,7 @@ class HanaController:
         except (OSError, ValueError, KeyError, TypeError):
             return True
 
-    def release(self, execution: str) -> bool:
+    def release(self, execution: str) -> HanaClaimRelease:
         """Keep unresolved starts owned until lifecycle recovery settles them."""
         with control_lock(self.directory):
             from importlib import import_module
@@ -597,19 +607,23 @@ class HanaController:
 
             guarded = execution_guard_path(self.directory, execution).exists()
             if guarded and not execution_command_settled(self.directory, execution):
-                return False
+                return HanaClaimReleaseRefused('The Hana command settlement is unconfirmed')
             row = self._read()
-            if isinstance(row, NoDeployment) or not row.claims or row.claims[0].execution != execution:
-                return (guarded and isinstance(row, BoxRecord) and not row.claims
-                        and row.state not in (Lifecycle.STARTING, Lifecycle.STOPPING)
-                        and not isinstance(row.operation, PendingOperation))
-            if row.state in (Lifecycle.STARTING, Lifecycle.STOPPING) or isinstance(row.operation, PendingOperation):
-                return False
-            row.claims = []
-            row.delivered = NoDeliveredPermit()
-            row.idle_since = int(self.clock())
-            self._save(row)
-            return True
+            if isinstance(row, NoDeployment):
+                return HanaClaimReleaseRefused('No Hana deployment is available for release')
+            if row.claims and row.claims[0].execution != execution:
+                return HanaClaimReleaseRefused('The Hana lifecycle claim belongs to another execution')
+            if not guarded and not row.claims:
+                return HanaClaimReleaseRefused('The Hana lifecycle claim is missing')
+            blocked = lifecycle_release_block(row.state, row.operation)
+            if isinstance(blocked, HanaClaimReleaseRefused):
+                return blocked
+            if row.claims:
+                row.claims = []
+                row.delivered = NoDeliveredPermit()
+                row.idle_since = int(self.clock())
+                self._save(row)
+            return HanaClaimReleased()
 
     def permission(self, execution: str, boot_id: str, generation: int) -> CommandPermission | ClaimRefused:
         with hana_work_lock(self.directory) as access:

@@ -378,7 +378,7 @@ class PlacementStatusTests(unittest.TestCase):
                 self.assertEqual(fixture.server.assignments[key].terminal_report, report)
 
     def test_hana_claim_failure_uses_the_exact_dispatch_journal(self) -> None:
-        from scripts.aws_target import hana_box, hana_execution, hana_placement, hana_result
+        from scripts.aws_target import hana_box, hana_execution, hana_placement, hana_placement_adapter, hana_result
         from scripts.aws_target.test_hana_execution import FakeExecutionObjects
         from scripts.build_queue.test_placement import (
             PlacementFixture, assignment_for, coordinator_holder, hana_policy_request, local_candidate,
@@ -428,7 +428,8 @@ class PlacementStatusTests(unittest.TestCase):
                         objects = FakeExecutionObjects(dispatch)
 
                         def consume(message: wire.ConsumePermission) -> wire.FirstAuthorization:
-                            authorized, = fixture.server.handle_request(message)
+                            with mock.patch.object(hana_placement_adapter, "read_assigned_adoption", return_value=adopted_claim):
+                                authorized, = fixture.server.handle_request(message)
                             assert isinstance(authorized, wire.FirstAuthorization), authorized
                             return authorized
 
@@ -451,7 +452,7 @@ class PlacementStatusTests(unittest.TestCase):
                         self.assertEqual(fixture.server.current_assignments[assignment.episode], key)
                         continue
                     if case == "fenced start refusal":
-                        def release() -> bool:
+                        def release() -> hana_placement.HanaClaimRelease:
                             return hana_placement.release_assigned(assignment, coordinator_holder(assignment), controller)
 
                         fenced = hana_execution.settle_unpublished_claim(controller.directory, claim,
@@ -470,7 +471,7 @@ class PlacementStatusTests(unittest.TestCase):
                             release_claim=release, reason=reason)
                     else:
                         settlement = hana_execution.settle_unpublished_claim(controller.directory, claim,
-                            release_claim=lambda: True, reason=reason)
+                            release_claim=hana_placement.HanaClaimReleased, reason=reason)
                     self.assertIsInstance(settlement, hana_execution.HanaSettled)
                     self.assertFalse(hana_execution.claim_dispatch_pending(controller.directory, claim))
                     if case == "fenced start refusal":

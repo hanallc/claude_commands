@@ -1228,6 +1228,45 @@ class TheListTests(unittest.TestCase):
         self.assertEqual(self.command("park", "--id", item.id, "--until", "", "--source", "nate"), (0, "", ""))
         self.assertIs(the_list.load(MORTY.id, item.id).parked_until, the_list.NoTimestamp.UNSET)
 
+    def test_park_until_delivered_through_the_cli(self) -> None:
+        item = self.add(changes={"state": the_list.ItemState.WORKING})
+        self.assertEqual(self.command("park", "--id", item.id, "--until", "delivered", "--source", "morty"),
+                         (0, "", ""))
+        parked = the_list.load(MORTY.id, item.id)
+        self.assertIs(parked.parked_until, the_list.ParkUntilDelivered.DELIVERED)
+        self.assertEqual(parked.log[-1].what, the_list.FieldChange("Parked", {"parked_until": parked.parked_until}))
+        with patch.object(the_list, "now", return_value=START + timedelta(days=30)):
+            self.assertNotIn(item.title, self.command("list")[1])
+            self.assertIn("parked until delivered", self.command("list", "--include-parked")[1])
+            self.assertEqual(self.command("update", "--id", item.id, "--state", "Delivered", "--source", "morty"),
+                             (0, "", ""))
+            delivered = the_list.load(MORTY.id, item.id)
+            self.assertIs(delivered.parked_until, the_list.NoTimestamp.UNSET)
+            self.assertEqual(delivered.unread_since, START + timedelta(days=30))
+            self.assertEqual(delivered.log[-1].what, the_list.UnparkedForDelivery(the_list.ItemDelivered.RECORDED))
+            self.assertIn(item.title, self.command("list")[1])
+            self.assertEqual(self.command("update", "--id", item.id, "--state", "Delivered", "--source", "morty"),
+                             (0, "", ""))
+            self.assertEqual(the_list.load(MORTY.id, item.id), delivered)
+
+    def test_delivery_does_not_clear_a_saved_date(self) -> None:
+        item = self.add(changes={"state": the_list.ItemState.WORKING})
+        date = "2026-11-17"
+        zone = ZoneInfo("America/New_York")
+        with patch.object(the_list, "user_zone", return_value=zone):
+            moment = datetime(2026, 11, 17, tzinfo=zone)
+            parked = the_list.park(MORTY.id, item.id, moment, source="morty")
+            path = the_list.folder(MORTY.id) / f"{item.id}.md"
+            encoded = path.read_text()
+            old = encoded.replace(moment.isoformat(), date)
+            self.assertNotEqual(encoded, old)
+            _ = path.write_text(old)
+            self.assertEqual(the_list.load(MORTY.id, item.id), parked)
+            delivered = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.DELIVERED}, source="morty")
+            self.assertEqual(delivered.parked_until, moment)
+            self.assertNotIn(item.title, self.command("list")[1])
+            self.assertFalse(any(isinstance(entry.what, the_list.Unparked) for entry in delivered.log))
+
     def test_unpark_clears_active_parking_and_saves_one_notice(self) -> None:
         item = self.add(changes={"state": the_list.ItemState.WORKING})
         parked = the_list.park(MORTY.id, item.id, START + timedelta(days=1), source="nate")
