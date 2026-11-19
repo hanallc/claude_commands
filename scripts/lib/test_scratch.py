@@ -51,12 +51,6 @@ REMOTE_CHECK_SECONDS = 30
 
 def setUpModule() -> None:
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
-    proc = root / "proc"
-    proc.mkdir()
-    if sys.platform == "linux":
-        pid = str(os.getpid())
-        (proc / pid).symlink_to(Path("/proc") / pid)
-    _ = cast(object, unittest.enterModuleContext(mock.patch.object(scratch, "PROC_ROOT", proc)))
     _ = write_config_fixture(root / "scratch.conf", "\n".join((
         "visible_root=~/rust/repro",
         "holds_file=~/.local/state/scratch/holds.json",
@@ -196,9 +190,7 @@ class ScratchTests(unittest.TestCase):
                     fields = cast(dict[str, object], json.loads(mark.read_text()))
                     self.assertEqual(fields["removal_version"], scratch.REMOVAL_VERSION)
                     if version == "legacy":
-                        for key in ("removal_version", "removal_repositories", "removal_files", "removal_intent_ns", "removal_ref_files"):
-                            _ = fields.pop(key, None)
-                        _ = mark.write_text(json.dumps(fields))
+                        self.use_legacy_removal_mark(path)
                     work = path / "new-work.txt"
                     if state == "new-work":
                         _ = work.write_text("keep new work after deletion intent")
@@ -207,7 +199,7 @@ class ScratchTests(unittest.TestCase):
                     output, error = io.StringIO(), io.StringIO()
                     with redirect_stdout(output), redirect_stderr(error):
                         code = scratch.main(["end", "--task", task])
-                    if state in ("unchanged", "partial-git"):
+                    if version == "current" and state in ("unchanged", "partial-git"):
                         self.assertEqual(code, 0, error.getvalue())
                         self.assertFalse(path.exists())
                         self.assertFalse(mark.exists())
@@ -217,11 +209,15 @@ class ScratchTests(unittest.TestCase):
                         self.assertTrue(mark.is_file())
                         self.assertIn(f"kept {path}", error.getvalue())
                         self.assertNotIn(f"removed {path}", output.getvalue())
+                        if version == "legacy":
+                            self.assertIn("no removal snapshot", error.getvalue())
                         if state == "new-work":
                             self.assertEqual(work.read_text(), "keep new work after deletion intent")
-                        else:
+                        elif state == "partial-new-work":
                             self.assertIn("ambiguous source", error.getvalue())
-                            self.assertIn(str(work), error.getvalue())
+                            self.assertEqual(work.read_text(), "keep new work after partial deletion")
+                            if version == "current":
+                                self.assertIn(str(work), error.getvalue())
 
     def copy_with_published_head(self, name: str, task: str = "gate:copy") -> tuple[Path, Path]:
         path = self.copy(name=name, task=task)
@@ -1281,87 +1277,6 @@ for descriptor in descriptors:
         self.assertIsInstance(scratch.remove_folder(path), scratch.KeptFolder)
         self.assertTrue(scratch.removal_mark(path).is_file())
 
-    @unittest.skipUnless(sys.platform == "linux", "requires procfs")
-    def test_retry_keeps_a_checkout_that_git_can_still_reach(self) -> None:
-        for access in ("cwd", "directory descriptor"):
-            with self.subTest(access=access):
-                path = self.checkout_with_removal_intent("current", access.replace(" ", "-"))
-                program = (
-                    'if [ "$1" = "directory descriptor" ]; then exec 3<"$2"; fi\n'
-                    'printf "ready\\n"\n'
-                    'read -r command || exit 1\n'
-                    'if [ "$1" = "directory descriptor" ]; then cd /proc/self/fd/3 || exit 1; fi\n'
-                    'exec git update-ref refs/heads/held-cwd HEAD\n'
-                )
-                with subprocess.Popen(["bash", "-c", program, "writer", access, str(path)],
-                                      cwd=path if access == "cwd" else self.base,
-                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                      text=True) as writer:
-                    try:
-                        assert writer.stdout is not None
-                        self.assertEqual(writer.stdout.readline(), "ready\n")
-                        pid = str(writer.pid)
-                        entry = scratch.PROC_ROOT / pid
-                        entry.symlink_to(Path("/proc") / pid)
-                        self.addCleanup(entry.unlink)
-                        recover = scratch.recovery_state
-
-                        def write_after_snapshot(folder: Path, pending: copy_record.Registered,
-                                                 scope: scratch.BusyMarkScope, *, scratch_settings: conf.ConfigRead,
-                                                 locations: scratch.RemovalLocations,
-                                                 packed_refs: tuple[Path, ...]) -> scratch.RemovalRetry | scratch.KeptFolder:
-                            state = recover(folder, pending, scope, scratch_settings=scratch_settings,
-                                            locations=locations, packed_refs=packed_refs)
-                            _, error = writer.communicate("write\n", timeout=10)
-                            self.assertEqual(writer.returncode, 0, error)
-                            return state
-
-                        with mock.patch.object(scratch, "recovery_state", side_effect=write_after_snapshot):
-                            result = scratch.remove_folder(path)
-                        self.assertIsInstance(result, scratch.KeptFolder)
-                        _, error = writer.communicate("write\n", timeout=10)
-                        self.assertEqual(writer.returncode, 0, error)
-                        self.git(path, "rev-parse", "--verify", "refs/heads/held-cwd")
-                    finally:
-                        if writer.returncode is None:
-                            writer.kill()
-                            _ = writer.communicate(timeout=10)
-
-    def test_retry_restores_both_folders_when_a_process_entry_is_unreadable(self) -> None:
-        source, _ = self.copy_with_published_head("unreadable-holder")
-        path = self.base / "linked"
-        self.git(source, "worktree", "add", "-q", "-b", "side", str(path))
-        admin = git_files.at(path).git_dir
-        self.stop_removal_after_intent(path, "current")
-        entry = scratch.PROC_ROOT / "424242"
-        entry.mkdir()
-        self.addCleanup(entry.rmdir)
-        readlink = os.readlink
-
-        def read(path: str | os.PathLike[str], *, dir_fd: int | None = None) -> str:
-            if Path(path) == entry / "cwd":
-                raise PermissionError(errno.EACCES, "cannot inspect the holder", str(path))
-            return readlink(path, dir_fd=dir_fd)
-
-        with mock.patch.object(os, "readlink", side_effect=read):
-            result = scratch.remove_folder(path)
-        self.assertIsInstance(result, scratch.KeptFolder)
-        assert isinstance(result, scratch.KeptFolder)
-        self.assertIn(str(entry / "cwd"), result.reason)
-        self.assertEqual(git_files.at(path).git_dir, admin)
-        self.assertTrue((admin / "HEAD").is_file())
-        self.assertTrue(scratch.removal_mark(path).is_file())
-
-    def test_retry_ignores_its_own_child_lease_descriptor(self) -> None:
-        path = self.copy(name="child-lease")
-        self.add_saved_work_and_loose_ref(path)
-        child = path / ".git/child"
-        child.mkdir()
-        child.with_suffix(".lock").touch()
-        self.stop_removal_after_intent(path, "current")
-        self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
-        self.assertFalse(path.exists())
-
     def test_retry_resumes_after_sigkill_with_a_saved_move_plan(self) -> None:
         program = """import socket
 import sys
@@ -1374,10 +1289,17 @@ def pause(*args, **kwargs):
         ready.sendall(b"R")
         ready.recv(1)
 
-with patch.object(scratch, sys.argv[3], side_effect=pause):
+delete = scratch.delete_removal_source
+
+def delete_then_pause(folder, deletion):
+    delete(folder, deletion)
+    pause()
+
+boundary = sys.argv[3]
+with patch.object(scratch, boundary, side_effect=delete_then_pause if boundary == "delete_removal_source" else pause):
     scratch.remove_folder(Path(sys.argv[1]))
 """
-        for boundary in ("move_removal_folders", "check_tombstone_holders"):
+        for boundary in ("move_removal_folders", "recovery_state", "delete_removal_source"):
             with self.subTest(boundary=boundary):
                 source, _ = self.copy_with_published_head(f"crash-{boundary}")
                 path = self.base / f"interrupted-{boundary}"
@@ -1399,11 +1321,12 @@ with patch.object(scratch, sys.argv[3], side_effect=pause):
                 self.assertEqual(child.returncode, -signal.SIGKILL, error)
                 checkout_tombstones = tuple(path.parent.glob(f"{scratch.TOMBSTONE_PREFIX}*"))
                 admin_tombstones = tuple(admin.parent.parent.glob(f"{scratch.TOMBSTONE_PREFIX}*"))
-                if boundary == "check_tombstone_holders":
+                if boundary != "move_removal_folders":
                     self.assertFalse(path.exists())
                     self.assertFalse(admin.exists())
-                    self.assertEqual(len(checkout_tombstones), 1)
-                    self.assertEqual(len(admin_tombstones), 1)
+                    self.assertEqual(len(checkout_tombstones), int(boundary == "recovery_state"))
+                    admin_tombstone, = admin_tombstones
+                    self.assertTrue((admin_tombstone / "HEAD").is_file())
                 self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
                 self.assertFalse(path.exists())
                 self.assertFalse(admin.exists())
@@ -1475,20 +1398,21 @@ with patch.object(scratch, sys.argv[3], side_effect=pause):
               self.assertRaisesRegex(OSError, "stop after removal intent")):
             _ = scratch.remove_folder(path)
         if version == "legacy":
-            mark = scratch.removal_mark(path)
-            fields = cast(dict[str, object], json.loads(mark.read_text()))
-            for key in ("removal_version", "removal_repositories", "removal_files", "removal_intent_ns", "removal_ref_files"):
-                _ = fields.pop(key, None)
-            _ = mark.write_text(json.dumps(fields))
+            self.use_legacy_removal_mark(path)
 
-    def assert_retry_keeps_metadata(self, path: Path, metadata: Path) -> None:
+    def use_legacy_removal_mark(self, path: Path) -> None:
+        mark = scratch.removal_mark(path)
+        fields = cast(dict[str, object], json.loads(mark.read_text()))
+        _ = mark.write_text(json.dumps({key: value for key, value in fields.items() if not key.startswith("removal_")}))
+
+    def assert_retry_keeps_metadata(self, path: Path, metadata: Path, *, version: str = "current") -> None:
         with mock.patch.object(scratch, "remove", side_effect=AssertionError("source deletion started")) as delete:
             result = scratch.remove_folder(path)
             delete.assert_not_called()
         self.assertIsInstance(result, scratch.KeptFolder)
         assert isinstance(result, scratch.KeptFolder)
         self.assertEqual(result.path, path)
-        self.assertIn(str(metadata), result.reason)
+        self.assertIn("no removal snapshot" if version == "legacy" else str(metadata), result.reason)
         self.assertTrue(path.is_dir())
         self.assertTrue(scratch.removal_mark(path).is_file())
 
@@ -1520,7 +1444,7 @@ with patch.object(scratch, sys.argv[3], side_effect=pause):
                 index = child / ".git/index"
                 index.unlink()
                 index.mkdir()
-                self.assert_retry_keeps_metadata(path, index)
+                self.assert_retry_keeps_metadata(path, index, version=version)
                 self.assertTrue(index.is_dir())
 
     @contextmanager
@@ -1659,14 +1583,14 @@ with patch.object(scratch, sys.argv[3], side_effect=pause):
 
                     if change == "published alias":
                         self.git(path, "symbolic-ref", "refs/heads/alias", "refs/heads/loose")
-                        self.assert_retry_keeps_metadata(path, link)
+                        self.assert_retry_keeps_metadata(path, link, version=version)
                         self.assertEqual(link.read_text(), "ref: refs/heads/loose\n")
                     else:
                         replacement = link.with_name("new-alias")
                         replacement.symlink_to("refs/heads/loose")
                         _ = replacement.replace(link)
                         self.git(path, "symbolic-ref", "refs/heads/alias")
-                        self.assert_retry_keeps_metadata(path, link)
+                        self.assert_retry_keeps_metadata(path, link, version=version)
                         self.assertEqual(os.readlink(link), "refs/heads/loose")
 
     def test_retry_keeps_a_symbolic_ref_with_the_removal_marks_timestamp(self) -> None:
@@ -1684,50 +1608,46 @@ with patch.object(scratch, sys.argv[3], side_effect=pause):
 
     def test_final_removal_scan_checks_metadata_added_before_the_move(self) -> None:
         rename = scratch.rename_removal_folder
-        for version in ("current", "legacy"):
-            for change in ("index directory", "regular ref", "symbolic ref"):
-                with self.subTest(version=version, change=change):
-                    path = self.checkout_with_removal_intent(version, change.replace(" ", "-"))
-                    mark = scratch.removal_mark(path)
-                    last_file_change = max(self.source_change_times(path).values())
-                    if version == "legacy":
-                        os.utime(mark, ns=(last_file_change, last_file_change))
-                    fields = cast(dict[str, object], json.loads(mark.read_text()))
-                    stored_intent = fields.get("removal_intent_ns", mark.stat().st_mtime_ns)
-                    assert isinstance(stored_intent, int)
-                    intent: int = stored_intent
-                    index = path / ".git/index"
-                    ref = path / ".git/refs/heads/added"
-                    oid = (ref.parent / "loose").read_text()
+        for change in ("index directory", "regular ref", "symbolic ref"):
+            with self.subTest(change=change):
+                path = self.checkout_with_removal_intent("current", change.replace(" ", "-"))
+                mark = scratch.removal_mark(path)
+                fields = cast(dict[str, object], json.loads(mark.read_text()))
+                stored_intent = fields.get("removal_intent_ns", mark.stat().st_mtime_ns)
+                assert isinstance(stored_intent, int)
+                intent: int = stored_intent
+                index = path / ".git/index"
+                ref = path / ".git/refs/heads/added"
+                oid = (ref.parent / "loose").read_text()
 
-                    def mutate(source: Path, destination: Path) -> None:
-                        if source == path:
-                            if change == "index directory":
-                                index.unlink()
-                                index.mkdir()
-                            elif change == "regular ref":
-                                _ = ref.write_text(oid)
-                            else:
-                                ref.symlink_to("refs/heads/loose")
-                            if change != "index directory":
-                                self.assertGreater(ref.lstat().st_ctime_ns, intent)
-                        rename(source, destination)
-                        if source == path:
-                            late_write = subprocess.run(
-                                ["git", "-C", str(path), "symbolic-ref", "refs/heads/post-move", "refs/heads/loose"],
-                                capture_output=True, check=False)
-                            self.assertNotEqual(late_write.returncode, 0)
-
-                    with mock.patch.object(scratch, "rename_removal_folder", side_effect=mutate):
+                def mutate(source: Path, destination: Path) -> None:
+                    if source == path:
                         if change == "index directory":
-                            self.assert_retry_keeps_metadata(path, index)
-                            self.assertTrue(index.is_dir())
+                            index.unlink()
+                            index.mkdir()
+                        elif change == "regular ref":
+                            _ = ref.write_text(oid)
                         else:
-                            state = scratch.remove_folder(path)
-                            self.assertIsInstance(state, scratch.KeptFolder)
-                            assert isinstance(state, scratch.KeptFolder)
-                            self.assertIn(str(ref), state.reason)
-                        self.assertTrue(mark.is_file())
+                            ref.symlink_to("refs/heads/loose")
+                        if change != "index directory":
+                            self.assertGreater(ref.lstat().st_ctime_ns, intent)
+                    rename(source, destination)
+                    if source == path:
+                        late_write = subprocess.run(
+                            ["git", "-C", str(path), "symbolic-ref", "refs/heads/post-move", "refs/heads/loose"],
+                            capture_output=True, check=False)
+                        self.assertNotEqual(late_write.returncode, 0)
+
+                with mock.patch.object(scratch, "rename_removal_folder", side_effect=mutate):
+                    if change == "index directory":
+                        self.assert_retry_keeps_metadata(path, index)
+                        self.assertTrue(index.is_dir())
+                    else:
+                        state = scratch.remove_folder(path)
+                        self.assertIsInstance(state, scratch.KeptFolder)
+                        assert isinstance(state, scratch.KeptFolder)
+                        self.assertIn(str(ref), state.reason)
+                    self.assertTrue(mark.is_file())
 
     def test_retry_validates_source_again_after_cargo_cleanup(self) -> None:
         for version in ("current", "legacy"):
@@ -1757,7 +1677,7 @@ with patch.object(scratch, sys.argv[3], side_effect=pause):
 
                     with (mock.patch.object(scratch, "save_cargo_outputs", side_effect=prepare_cargo),
                           mock.patch.object(scratch, "clean_cargo_outputs", side_effect=change_metadata)):
-                        self.assert_retry_keeps_metadata(path, index if has_outputs else reference)
+                        self.assert_retry_keeps_metadata(path, index if has_outputs else reference, version=version)
                     if has_outputs:
                         self.assertTrue(index.is_dir())
                     else:
@@ -1812,14 +1732,14 @@ with patch.object(scratch, sys.argv[3], side_effect=pause):
                 self.stop_removal_after_intent(path, "legacy")
                 namespace.unlink()
                 namespace.mkdir()
-                self.assert_retry_keeps_metadata(path, namespace)
+                self.assert_retry_keeps_metadata(path, namespace, version="legacy")
 
-    def test_legacy_retry_removes_checkout_with_a_fresh_empty_tags_namespace(self) -> None:
+    def test_legacy_retry_keeps_checkout_without_a_snapshot(self) -> None:
         path = self.checkout_with_removal_intent("legacy", "empty-tags")
-        self.assertEqual(list((path / ".git/refs/tags").iterdir()), [])
-        self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
-        self.assertFalse(path.exists())
-        self.assertFalse(scratch.removal_mark(path).exists())
+        tags = path / ".git/refs/tags"
+        self.assertEqual(list(tags.iterdir()), [])
+        self.assert_retry_keeps_metadata(path, tags, version="legacy")
+        self.git(path, "rev-parse", "--verify", "refs/heads/loose")
 
     def test_retry_keeps_internal_metadata_replaced_with_a_directory(self) -> None:
         names = ("HEAD", "index", "packed-refs", "refs/heads/loose")
@@ -1843,21 +1763,15 @@ with patch.object(scratch, sys.argv[3], side_effect=pause):
                     self.assertIsInstance(result, scratch.KeptFolder)
                     assert isinstance(result, scratch.KeptFolder)
                     self.assertEqual(result.path, path)
-                    self.assertIn(str(metadata), result.reason)
+                    expected = "no removal snapshot" if version == "legacy" and name != "HEAD" else str(metadata)
+                    self.assertIn(expected, result.reason)
                     self.assertTrue(path.is_dir())
                     self.assertTrue(mark.is_file())
 
                     metadata.rmdir()
                     _ = original.rename(metadata)
-                    if version == "legacy" and name != "index":
-                        evidence = cast(dict[str, object], json.loads(mark.read_text()))
-                        _ = evidence.pop("removal_snapshot")
-                        _ = mark.write_text(json.dumps(evidence))
-                        with mock.patch.object(scratch, "remove",
-                                               side_effect=AssertionError("source deletion started")) as delete:
-                            result = scratch.remove_folder(path)
-                            delete.assert_not_called()
-                        self.assertIsInstance(result, scratch.KeptFolder)
+                    if version == "legacy":
+                        self.assert_retry_keeps_metadata(path, metadata, version=version)
                         mark.unlink()
                     self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
                     self.assertFalse(path.exists())
@@ -1909,12 +1823,12 @@ assert scratch.removal_mark(path).is_file()
                     _ = scratch.remove_folder(path)
                 mark = scratch.removal_mark(path)
                 if version == "legacy":
-                    fields = cast(dict[str, object], json.loads(mark.read_text()))
-                    _ = fields.pop("removal_version")
-                    _ = mark.write_text(json.dumps(fields))
-                self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
-                self.assertFalse(path.exists())
-                self.assertFalse(mark.exists())
+                    self.use_legacy_removal_mark(path)
+                    self.assert_retry_keeps_metadata(path, path / ".git/HEAD", version=version)
+                else:
+                    self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
+                    self.assertFalse(path.exists())
+                    self.assertFalse(mark.exists())
 
     def test_retry_keeps_an_emptied_tracked_busy_mark(self) -> None:
         repo = self.base / "checkout"

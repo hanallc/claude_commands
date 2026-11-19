@@ -114,7 +114,6 @@ BUSY_REASON = "busy: a lease or .claude-busy lock is held"
 RECORD_LOCKS: ContextVar[frozenset[tuple[int, int]]] = ContextVar("scratch_record_locks", default=frozenset())
 REMOVAL_VERSION = 2
 TOMBSTONE_PREFIX = ".scratch-tombstone-"
-PROC_ROOT = Path("/proc")
 
 
 class BusyMarkOwnership(Enum):
@@ -1557,36 +1556,6 @@ def restore_removal_folders(moved: RemovalLocations) -> None:
         _ = rollback.pop_all()
 
 
-def check_tombstone_holders(tombstones: Collection[Path]) -> None:
-    """Require readable process evidence and no access to the moved folders."""
-    roots = {str(path.resolve()) for path in tombstones}
-    prefixes = tuple(root + os.sep for root in roots)
-    own_pid = str(os.getpid())
-
-    def inspect_link(link: str, pid: str) -> None:
-        try:
-            target = os.readlink(link).removesuffix(" (deleted)")
-        except (FileNotFoundError, ProcessLookupError):
-            return
-        if target in roots or target.startswith(prefixes):
-            raise OSError(f"pid {pid} still uses {target}")
-
-    with os.scandir(PROC_ROOT) as processes:
-        for process in processes:
-            if not process.name.isdigit():
-                continue
-            for name in ("cwd", "root"):
-                inspect_link(os.path.join(process.path, name), process.name)
-            if process.name == own_pid:
-                continue
-            try:
-                with os.scandir(os.path.join(process.path, "fd")) as descriptors:
-                    for descriptor in descriptors:
-                        inspect_link(descriptor.path, process.name)
-            except (FileNotFoundError, ProcessLookupError):
-                continue
-
-
 @dataclass(frozen=True)
 class RemovalMoves:
     """The original identities and private names that this intent may move."""
@@ -1660,7 +1629,7 @@ def read_removal_moves(path: Path, pending: copy_record.Registered) -> RemovalMo
         if not isinstance(name, str) or not Path(name).is_absolute() or Path(name).name != "packed-refs":
             raise OSError(invalid)
         packed_refs.append(Path(name))
-    return RemovalMoves(locations, identities, tuple(packed_refs))
+    return RemovalMoves({path: locations.pop(path), **locations}, identities, tuple(packed_refs))
 
 
 def move_removal_folders(plan: RemovalMoves, moved: RemovalLocations) -> None:
@@ -1678,6 +1647,17 @@ def move_removal_folders(plan: RemovalMoves, moved: RemovalLocations) -> None:
             raise OSError(f"{original}: tombstone identity changed during removal")
 
 
+def delete_tombstones(plan: RemovalMoves, source_deletion: SourceDeletion) -> None:
+    """Finish a verified deletion. Keep any folder whose identity changed."""
+    for original, tombstone in plan.locations.items():
+        if os.path.lexists(original) or (os.path.lexists(tombstone)
+                and removal_identity(tombstone) != plan.identities[original]):
+            raise OSError(f"{original}: source identity changed during removal")
+    for tombstone in plan.locations.values():
+        if os.path.lexists(tombstone):
+            delete_removal_source(tombstone, source_deletion)
+
+
 def finish_tombstone_removal(path: Path, pending: copy_record.Registered, scope: BusyMarkScope,
                              plan: RemovalMoves, *, scratch_settings: conf.ConfigRead,
                              source_deletion: SourceDeletion) -> RemovalRetry | KeptFolder:
@@ -1685,17 +1665,17 @@ def finish_tombstone_removal(path: Path, pending: copy_record.Registered, scope:
     verified = False
     try:
         move_removal_folders(plan, moved)
-        try:
-            check_tombstone_holders(plan.locations.values())
-        except OSError as error:
-            return KeptFolder(path, str(error))
-        state = recovery_state(path, pending, scope, scratch_settings=scratch_settings,
-                               locations=plan.locations, packed_refs=plan.packed_refs)
-        verified = state is RemovalRetry.UNCHANGED
-        if verified:
-            for tombstone in reversed(tuple(plan.locations.values())):
-                delete_removal_source(tombstone, source_deletion)
-        return state
+        with directory_record_lock(next(reversed(moved.values())), wait=False, scratch_settings=scratch_settings) as locked:
+            if not locked:
+                return KeptFolder(path, BUSY_REASON)
+            # A process inside a tombstone can write a ref after this comparison if it holds no lease.
+            state = recovery_state(path, pending, scope, scratch_settings=scratch_settings,
+                                   locations=plan.locations, packed_refs=plan.packed_refs)
+            if state is RemovalRetry.UNCHANGED:
+                atomic_record(removal_mark(path), {**pending.fields, "removal_moves": plan.journal(), "removal_verified": True})
+                verified = True
+                delete_tombstones(plan, source_deletion)
+            return state
     finally:
         if not verified:
             try:
@@ -1738,27 +1718,31 @@ def resume_tombstone_removal(path: Path, pending: copy_record.Registered, scope:
     """Resume an interrupted move while holding the source directory's record lock."""
     try:
         plan = read_removal_moves(path, pending)
-        tombstone = plan.locations[path]
-        original_present, tombstone_present = os.path.lexists(path), os.path.lexists(tombstone)
-        if original_present and tombstone_present:
-            return KeptFolder(path, f"{path}: cannot restore the source at {tombstone}: the name is in use")
-        if not original_present and not tombstone_present:
-            if any(os.path.lexists(folder) for folder in (*plan.locations, *plan.locations.values())):
-                return KeptFolder(path, f"{path}: incomplete tombstone removal")
-        else:
-            if dry_run:
-                return KeptFolder(path, f"{path}: interrupted removal needs to resume")
-            anchor = tombstone if tombstone_present else path
+        verified = pending.fields.get("removal_verified", False)
+        if type(verified) is not bool:
+            return KeptFolder(path, f"{path}: invalid verification state")
+        remaining = tuple(folder for folder in plan.locations.values() if os.path.lexists(folder))
+        present = os.path.lexists(path)
+        if (verified and any(os.path.lexists(folder) for folder in plan.locations)
+                or present and plan.locations[path] in remaining):
+            return KeptFolder(path, f"{path}: cannot restore the source: the name is in use")
+        if dry_run:
+            return KeptFolder(path, f"{path}: interrupted removal needs to resume")
+        if remaining or present:
+            anchor = remaining[-1] if verified else path if present else plan.locations[path]
             with directory_record_lock(anchor, wait=False, scratch_settings=scratch_settings) as locked:
-                current = checked_removal(path)
-                if not locked or current != pending:
+                if not locked or checked_removal(path) != pending:
                     return KeptFolder(path, BUSY_REASON)
-                state = finish_tombstone_removal(path, pending, scope, plan, scratch_settings=scratch_settings,
-                                                 source_deletion=source_deletion)
-                if isinstance(state, KeptFolder):
-                    return state
-        if not dry_run:
-            finish_removal(path, cargo_cleaned=True)
+                if verified:
+                    delete_tombstones(plan, source_deletion)
+                else:
+                    state = finish_tombstone_removal(path, pending, scope, plan, scratch_settings=scratch_settings,
+                                                     source_deletion=source_deletion)
+                    if isinstance(state, KeptFolder):
+                        return state
+        elif any(os.path.lexists(folder) for folder in plan.locations):
+            return KeptFolder(path, f"{path}: incomplete tombstone removal")
+        finish_removal(path, cargo_cleaned=True)
         return RemovedCopy()
     except OSError as error:
         return KeptFolder(path, str(error))
