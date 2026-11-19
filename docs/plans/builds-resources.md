@@ -2972,7 +2972,7 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 #### As-built
 - The Gate column and the cheapest-gate line take the lowest current price among the zones in `gate-deployment.json`, placement's slow filter (`max_gate_minutes`) and placement's run history window. The Spot column keeps the lowest price of any zone.
 - A Gate cell with no price shows a dash; its tooltip says `too slow`, `no current gate price` or `no runs`.
-- `run_cost` holds the shared readers: `read_deployed_gate_variants`, `slow_gate_types`, `placement_run_evidence`. The page and the break-even card use them. `placement_run_evidence` matches `cloud_gate.rank_variants` lines 571-579; `cloud_gate.py` is unchanged, so a later phase can switch placement to it.
+- `run_cost` holds the shared readers: `read_deployed_gate_variants`, `slow_gate_types` and the placement history read (Phase 163 names it `read_placement_run_history`; placement uses it too). The page and the break-even card use them.
 - Each page build reads current zone prices once and passes them to the Gate table and the card (`aws_page.py`).
 - The per-type run and paid tables keep the full launch ledger read.
 - Review: 3 passes, 7 findings (2 blockers, 5 minor); 6 fixed in 2 rounds. Accepted: a `max_gate_minutes` change during one page build can make the Gate cell and the card differ until the next build.
@@ -2981,21 +2981,15 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 
 **Files:** `scripts/aws_target/spot_table.py`, `run_cost.py`, `aws_page.py`, `test_aws_page.py`, `test_control.py`.
 
-### Phase 163 — Placement reads its run history through the shared function  · status: todo
-**Source:** builds, 2026-11-19 01:3x EST, from the Phase 162 as-built.
-**Cause:** `run_cost.placement_run_evidence` (Phase 162) copies the history read in `cloud_gate.GateWorker.rank_variants` (lines 571-579). The rule lives in two places.
+### Phase 163 — Placement reads its run history through the shared function  · status: done
+**Source:** builds, 2026-11-19, from the Phase 162 as-built.
 
-#### Work Order
+#### As-built
+- `run_cost.read_placement_run_history` reads placement's launch window once and returns `PlacementRunHistory` (launch rows and run evidence). It replaces `placement_run_evidence`.
+- `cloud_gate.GateWorker.rank_variants` calls it, and its refused-zone check uses the returned rows. The copied window and evidence lines are gone. The Gate column and the break-even card use the same function. No behavior change.
+- aws was told the lines; its runner-start fix does not overlap.
+- Accepted (review): a bad `capacity_cooldown_seconds` value prints its recovery warning twice per ranking.
+- Tests on the row in both layouts, 0 failures: 9 suites, 314 tests; types 0.
+- Checkpoint `e251ffea8`; row `15d7f8099` on the Phase 162 row `7a8fc310f`, branch `builds-resources-p163`.
 
-**Goal:** placement, the Gate column and the break-even card read gate run history through one function; the copy in `cloud_gate.py` goes away.
-
-**Spec:**
-1. `rank_variants` gets its launch rows and its run evidence from the `run_cost` function. It reads the launch history once; its refused-zone check uses the same rows.
-2. No behavior change: the same window, the same evidence, the same order of variants.
-3. `cloud_gate.py` is aws's file. Tell aws the lines before the edit; merge after aws's runner-start fix.
-
-**Base:** row `7a8fc310f` (Phase 162).
-
-**Files:** `scripts/aws_target/cloud_gate.py`, `scripts/aws_target/run_cost.py`, `scripts/aws_target/test_cloud_gate.py` (only if a test needs a change).
-
-**Acceptance gate:** test_cloud_gate and the aws page suites pass unchanged; types 0; grep finds one `gate_launch_history(` call for placement's window.
+**Files:** `scripts/aws_target/cloud_gate.py`, `scripts/aws_target/run_cost.py`.
