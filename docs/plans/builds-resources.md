@@ -2993,3 +2993,43 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 - Checkpoint `e251ffea8`; row `15d7f8099` on the Phase 162 row `7a8fc310f`, branch `builds-resources-p163`.
 
 **Files:** `scripts/aws_target/cloud_gate.py`, `scripts/aws_target/run_cost.py`.
+
+### Phase 164 — The doc prune never removes a doc tree a new process opened  · status: todo
+**Source:** builds, 2026-11-19 02:0x EST, from natest's phase 370 review (reproduced with a read-only probe).
+**Cause:** `_sweep_workspace` scans process uses once, then `prune_doc_index` removes an over-budget doc tree with `shutil.rmtree` (`scripts/lint/sweep.py:2513` on main `d5d81400c`). A process that opens the doc tree after the scan loses it.
+
+#### Work Order
+
+**Goal:** the doc prune removes a doc tree only when no process uses it at the moment of removal.
+
+**Spec:**
+1. Under the rustdoc lock, rename the doc tree to a fixed sibling name in the same output root (atomic). A process that starts after the rename cannot open the old path.
+2. Scan process uses of the renamed tree and of the output root. A use renames the tree back and keeps it, with a printed reason.
+3. With no use, remove the renamed tree. A removal that fails leaves it for the next run.
+4. A leftover renamed tree (crash, failed removal) is removed by the next sweep, under the same check.
+5. No new config key.
+
+**Base:** main `d5d81400c`.
+
+**Files:** `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py` (new tests at the end).
+
+**Acceptance gate:** a process that opens the doc tree between the first scan and the removal keeps it; with no process, the tree goes and the next doc run rebuilds it; a leftover renamed tree goes on the next run. test_sweep, test_tmp_sweep and the buildlog record tests pass; types 0.
+
+### Phase 165 — One failed result upload no longer sends a merge gate to natedev  · status: todo
+**Source:** builds, 2026-11-19 02:3x EST: the sdlc pageowner2 land ran its whole suite on natedev (end near 10:10).
+**Cause:** cloud attempt `f163adffc25f4d2eae15ef0c0b46eef9` ran 867 of 867 modules green. Then the guest's one 30-s S3 PUT of its result timed out (`curl: (28)`). `gate_box.boot_trap` labels any guest exit "Tool preparation failed", and `cloud_gate.run_cloud` retries only Spot interruptions, so the gate fell back to natedev. The same timeout is in 5 gate logs since 11-13.
+
+#### Work Order
+
+**Goal:** a box that fails once gets a new cloud attempt before natedev runs the suite.
+
+**Spec:**
+1. The guest's curl transfers retry a transient failure (a presigned PUT is idempotent).
+2. The box error names the stage that failed.
+3. A box failure gets a new cloud attempt on the next variant, up to a new key `box_failure_retries=1`, then the local fallback.
+
+**Base:** main `d5d81400c` (independent of the 161-163 chain).
+
+**Files:** `scripts/aws_target/gate_box.py`, `scripts/aws_target/cloud_gate.py`, `config/cloud_gate.conf`, their tests.
+
+**Acceptance gate:** a timed-out PUT that succeeds on retry gives a cloud result; a box failure retries once on a new box, then falls back; the error text names the stage. test_cloud_gate, test_gate_box, test_aws_trial pass; types 0.
