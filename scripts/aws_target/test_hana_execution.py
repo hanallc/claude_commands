@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 import json
 from pathlib import Path
@@ -11,8 +12,10 @@ import unittest
 from unittest import mock
 from typing import cast, final, override
 
+from scripts.build_queue import execution_identity
+from scripts.aws_target import hana_protocol
 from scripts.aws_target import hana_box as box, hana_execution as execution, hana_placement as hana, hana_result as result
-from scripts.aws_target import hana_source, hana_transport
+from scripts.aws_target import hana_transport
 from scripts.aws_target.hana_guest import CommandAdmissionRefusalCode, WorkPermit
 from scripts.build_hold.owning_session import NoOwningSession
 from scripts.build_queue import admission_protocol as wire, placement
@@ -21,8 +24,8 @@ from scripts.mac_test.claim_state import RepositoryScope
 
 @dataclass
 class FakeExecutionObjects:
-    request: execution.HanaExecutionRequest
-    envelopes: list[execution.HanaExecutionEnvelope] = field(default_factory=list)
+    request: hana_protocol.HanaExecutionRequest
+    envelopes: list[hana_protocol.HanaExecutionEnvelope] = field(default_factory=list)
     accepted: bool = False
     fenced: bool = False
     terminated: bool = False
@@ -39,9 +42,9 @@ class FakeExecutionObjects:
         assert key == self.request.key
         return 10**10
 
-    def execution_access(self, key: result.HanaAttemptKey) -> execution.HanaExecutionAccess:
+    def execution_access(self, key: result.HanaAttemptKey) -> hana_protocol.HanaExecutionAccess:
         assert key == self.request.key
-        return execution.HanaExecutionAccess('https://bucket.s3.us-east-2.amazonaws.com/observation',
+        return hana_protocol.HanaExecutionAccess('https://bucket.s3.us-east-2.amazonaws.com/observation',
                                              'https://bucket.s3.us-east-2.amazonaws.com/result', 2000)
 
     def accept(self) -> bool:
@@ -50,14 +53,15 @@ class FakeExecutionObjects:
         self.accepted = True
         return True
 
-    def publish_execution(self, envelope: execution.HanaExecutionEnvelope) -> None:
+    def publish_execution(self, content: bytes) -> None:
+        envelope = hana_protocol.decode_envelope(content)
         self.envelopes.append(envelope)
-        if isinstance(envelope, execution.HanaCommandEnvelope):
+        if isinstance(envelope, hana_protocol.HanaCommandEnvelope):
             if not self.delay_acceptance:
                 _ = self.accept()
             if self.lose_publication:
                 raise RuntimeError('The publication reply was lost')
-        elif isinstance(envelope, execution.HanaSourceUpdateEnvelope):
+        elif isinstance(envelope, hana_protocol.HanaSourceUpdateEnvelope):
             self.source_updated = True
         else:
             if self.fail_fence:
@@ -67,17 +71,17 @@ class FakeExecutionObjects:
             self.lease_free = self.release_lease
 
     def observe_execution(self, key: result.HanaAttemptKey, *,
-                          timeout_s: float | None = None) -> execution.HanaCommandObservation:
+                          timeout_s: float | None = None) -> hana_protocol.HanaCommandObservation:
         assert key == self.request.key
         assert timeout_s is None or timeout_s > 0
         if self.fail_observation:
             raise RuntimeError('The observation failed')
-        evidence = (placement.ObservedExecution(placement.ProcessExecution('fixture-host',
-            hana.generation_text(key.generation), 123, 'fixture-start')) if self.accepted else placement.ExecutionNotStarted())
+        evidence = (execution_identity.ObservedExecution(execution_identity.ProcessExecution('fixture-host',
+            hana.generation_text(key.generation), 123, 'fixture-start')) if self.accepted else execution_identity.ExecutionNotStarted())
         if self.missing_basis:
-            evidence = placement.ExecutionEvidenceUnavailable('MissingBasis: ' + json.dumps({
+            evidence = execution_identity.ExecutionEvidenceUnavailable('MissingBasis: ' + json.dumps({
                 'repository': self.request.manifest.repository, 'commits': self.request.manifest.basis_commits}), 1000)
-        return execution.HanaCommandObservation(key, self.request.slot, self.accepted, self.fenced,
+        return hana_protocol.HanaCommandObservation(key, self.request.slot, self.accepted, self.fenced,
             self.terminated, self.lease_free, 1000, evidence, self.source_updated)
 
     def execution_result(self, key: result.HanaAttemptKey) -> bytes:
@@ -91,8 +95,8 @@ class HanaExecutionTests(unittest.TestCase):
         super().__init__(methodName)
         self.root = Path()
         self.key = result.HanaAttemptKey('fixture-episode', 'fixture-attempt',
-            placement.assigned_claim_id('fixture-episode', 'fixture-attempt'), hana.HanaHostGeneration('deployment', 'start', 'boot'))
-        self.source_key = placement.SourceKeyKnown('verify-source')
+            execution_identity.assigned_claim_id('fixture-episode', 'fixture-attempt'), hana.HanaHostGeneration('deployment', 'start', 'boot'))
+        self.source_key = execution_identity.SourceKeyKnown('verify-source')
         scope = RepositoryScope('hana', 'github.com/natepiano/hana', 1)
         self.assignment = placement.PlacementAssignment(self.key.episode, self.key.attempt,
             placement.PlacementDestination('ssh', 'configured-target', 'fixture-host', scope, 1),
@@ -103,9 +107,10 @@ class HanaExecutionTests(unittest.TestCase):
         self.adopted = hana.HanaClaimAdopted(placement.ReservedHost(self.assignment,
             placement.AdoptedProviderClaim(self.reference, self.holder, self.assignment.session,
                                           'fixture-host', hana.generation_text(self.key.generation))), self.key.generation)
-        self.manifest = hana_source.SourceManifest(1, 'hana-source', 'a' * 40, 'b' * 64,
-            'https://bucket.s3.us-east-2.amazonaws.com/source', (), ('cargo', 'check'), (), (), 'c' * 64)
-        self.request = execution.HanaExecutionRequest(self.key, self.manifest, 1, self.source_key,
+        self.manifest = hana_protocol.SourceManifest(1, 'hana-source', 'a' * 40, 'b' * 64,
+            'https://bucket.s3.us-east-2.amazonaws.com/source', (), ('cargo', 'check'), (), (), 'c' * 64,
+            runtime_abi=hana_protocol.RUNTIME_ABI)
+        self.request = hana_protocol.HanaExecutionRequest(self.key, self.manifest, 1, self.source_key,
             self.manifest.argv, result.LogicalStepLink('call', self.key.episode))
         self.objects = FakeExecutionObjects(self.request)
         self.permission = box.CommandPermission(self.key.claim_id, box.VerifiedBoot('boot', 'start'), 3, 1800)
@@ -124,11 +129,15 @@ class HanaExecutionTests(unittest.TestCase):
         self.assertTrue(execution.execution_path(self.root, self.key.claim_id).exists())
         return wire.FirstAuthorization(request.assignment, request.claim)
 
-    def dispatch(self, *, consume: Callable[[wire.ConsumePermission], wire.FirstAuthorization | wire.DispatchStatus] | None = None
+    def dispatch(self, *, consume: Callable[[wire.ConsumePermission], wire.FirstAuthorization | wire.DispatchStatus] | None = None,
+                 upload_source: Callable[[], None] | None = None
                  ) -> execution.HanaDispatchState:
-        return execution.dispatch_execution(self.root, self.request, self.adopted, self.objects,
+        state = execution.dispatch_execution(self.root, self.request, self.adopted, self.objects,
+            upload_source=(lambda: None) if upload_source is None else upload_source,
             consume=self.consume if consume is None else consume, current_permission=lambda: self.permission,
             current_source_key=lambda: self.source_key)
+        assert not isinstance(state, execution_identity.HanaCommandAdmissionRefused)
+        return state
 
     def release(self) -> bool:
         self.releases += 1
@@ -155,18 +164,19 @@ class HanaExecutionTests(unittest.TestCase):
             result.PeakUnavailable('The fake has no memory measurement'))
 
     def test_codecs_preserve_identity_permission_and_scoped_access(self) -> None:
-        envelope = execution.HanaCommandEnvelope(self.request,
+        envelope = hana_protocol.HanaCommandEnvelope(self.request,
             WorkPermit(1800, '3', 'boot'), self.objects.execution_access(self.key))
-        self.assertEqual(execution.decode_request(execution.encode_request(self.request)), self.request)
-        self.assertEqual(execution.decode_envelope(execution.encode_envelope(envelope)), envelope)
+        self.assertEqual(hana_protocol.decode_request(hana_protocol.encode_request(self.request)), self.request)
+        self.assertEqual(hana_protocol.decode_envelope(hana_protocol.encode_envelope(envelope)), envelope)
         observation = self.objects.observe_execution(self.key)
-        self.assertEqual(execution.decode_observation(execution.encode_observation(observation)), observation)
-        self.assertNotIn(b'observation_url', execution.encode_request(self.request))
-        no_code = execution.NoCommandAdmissionRefusalCode()
+        self.assertEqual(hana_protocol.decode_observation(hana_protocol.encode_observation(observation)), observation)
+        self.assertNotIn(b'observation_url', hana_protocol.encode_request(self.request))
+        no_code = None
         rows = (
             (CommandAdmissionRefusalCode.ADMISSION_DISABLED, 'Guest policy refused the command', True),
             (CommandAdmissionRefusalCode.DATA_NOT_MOUNTED, 'The Hana data directory is not mounted', True),
             (CommandAdmissionRefusalCode.PERMIT_REJECTED, 'The Hana permit is not fresh: the wall-clock expiry has passed', True),
+            (CommandAdmissionRefusalCode.PRE_COMMAND_FAILED, 'The Hana runtime ABI 2 differs from image ABI 1', True),
             (no_code, 'The data mount and a fresh permit are required', True),
             (no_code, 'The data mount and a fresh permit are required during setup', False),
             (no_code, 'Hana command admission is disabled on the guest', False),
@@ -175,25 +185,35 @@ class HanaExecutionTests(unittest.TestCase):
         )
         for code, reason, refused in rows:
             with self.subTest(code=code, reason=reason):
-                reply = replace(observation, accepted=True, terminated=True, lease_free=True,
-                                evidence=placement.ExecutionEvidenceUnavailable(reason, 1000), refusal_code=code)
-                decoded = execution.decode_observation(execution.encode_observation(reply))
+                reply = (hana_protocol.ConfirmedCommandAdmissionRefusal(
+                    observation.key, observation.slot, observation.fenced, observation.observed_at, reason, code)
+                    if code is not None else replace(observation, accepted=True, terminated=True, lease_free=True,
+                        evidence=execution_identity.ExecutionEvidenceUnavailable(reason, 1000)))
+                decoded = hana_protocol.decode_observation(hana_protocol.encode_observation(reply))
                 self.assertEqual(decoded, reply)
-                expected = (placement.HanaCommandAdmissionRefused(reason) if refused
-                            else execution.NoCommandAdmissionRefusal())
-                self.assertEqual(execution.command_admission_refusal(decoded), expected)
-        invalid = execution.encode_observation(replace(observation, evidence=placement.ExecutionEvidenceUnavailable('refused', 1000)))
+                expected = (execution_identity.HanaCommandAdmissionRefused(reason) if refused
+                            else hana_protocol.NoCommandAdmissionRefusal())
+                self.assertEqual(hana_protocol.command_admission_refusal(decoded), expected)
+        invalid = hana_protocol.encode_observation(replace(observation, evidence=execution_identity.ExecutionEvidenceUnavailable('refused', 1000)))
         with self.assertRaises(ValueError):
-            _ = execution.decode_observation(invalid.replace(
+            _ = hana_protocol.decode_observation(invalid.replace(
                 b'"kind":"unavailable"', b'"kind":"unavailable","refusal_code":"invalid"'))
+
+        confirmed = hana_protocol.ConfirmedCommandAdmissionRefusal(
+            observation.key, observation.slot, False, observation.observed_at, 'The payload could not start',
+            CommandAdmissionRefusalCode.PRE_COMMAND_FAILED)
+        raw = hana_protocol.encode_observation(confirmed)
+        for field in (b'accepted', b'terminated', b'lease_free'):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'confirmed departure'):
+                _ = hana_protocol.decode_observation(raw.replace(b'"' + field + b'":true', b'"' + field + b'":false'))
 
     def test_codecs_reject_wrong_claim_source_command_and_boolean_slot(self) -> None:
         for request in (replace(self.request, key=replace(self.key, claim_id='wrong')),
                         replace(self.request, argv=('cargo', 'clippy')), replace(self.request, slot=True)):
             with self.subTest(request=request), self.assertRaises(ValueError):
-                _ = execution.encode_request(request)
+                _ = hana_protocol.encode_request(request)
         with self.assertRaises(ValueError):
-            _ = execution.decode_envelope(b'x' * (execution.CONTROL_MAX_BYTES + 1))
+            _ = hana_protocol.decode_envelope(b'x' * (hana_protocol.CONTROL_MAX_BYTES + 1))
 
     def test_dispatch_consumes_once_and_never_republishes_after_lost_acknowledgement(self) -> None:
         self.objects.lose_publication = True
@@ -202,8 +222,8 @@ class HanaExecutionTests(unittest.TestCase):
         self.assertEqual(self.authorizations, 1)
         self.assertEqual(len(self.objects.envelopes), 1)
         self.assertTrue(execution.claim_dispatch_pending(self.root, self.reference))
-        self.assertIsInstance(execution.read_claim_execution(self.root, self.reference), placement.ExecutionEvidenceUnavailable)
-        self.assertIsInstance(execution.observe_execution(self.root, self.request, self.objects), placement.ObservedExecution)
+        self.assertIsInstance(execution.read_claim_execution(self.root, self.reference), execution_identity.ExecutionEvidenceUnavailable)
+        self.assertIsInstance(execution.observe_execution(self.root, self.request, self.objects), execution_identity.ObservedExecution)
         self.assertIsInstance(self.settle(), execution.HanaSettled)
         self.assertFalse(execution.claim_dispatch_pending(self.root, self.reference))
 
@@ -221,10 +241,32 @@ class HanaExecutionTests(unittest.TestCase):
         self.assertIsInstance(settled.outcome, placement.PrelaunchRefused)
 
     def test_status_only_permission_never_launches(self) -> None:
-        status = wire.DispatchStatus(self.assignment, placement.CurrentAssignment(), placement.PermissionConsumed(1000))
-        _ = self.dispatch(consume=lambda request: status)
-        self.assertEqual(self.objects.envelopes, [])
-        self.assertIsInstance(self.settle(), execution.HanaSettled)
+        root = self.root
+        for source_changed in (False, True):
+            with self.subTest(source_changed=source_changed), tempfile.TemporaryDirectory(dir=root) as folder:
+                self.root = Path(folder)
+                if source_changed:
+                    self.source_key = execution_identity.SourceKeyKnown('edited')
+                status = wire.DispatchStatus(self.assignment, placement.CurrentAssignment(), placement.PermissionConsumed(1000))
+                consume = mock.Mock(return_value=status)
+                upload = mock.Mock()
+                _ = self.dispatch(consume=consume, upload_source=upload)
+                self.assertEqual(consume.call_count, 0 if source_changed else 1)
+                upload.assert_not_called()
+                self.assertEqual(self.objects.envelopes, [])
+                self.assertIsInstance(self.settle(), execution.HanaSettled)
+
+    def test_dispatch_uses_the_permit_renewed_during_source_upload(self) -> None:
+        renewed = replace(self.permission, generation=4, expires=1900)
+
+        def upload() -> None:
+            self.assertEqual(self.authorizations, 1)
+            self.permission = renewed
+
+        self.assertIsInstance(self.dispatch(upload_source=upload), execution.DispatchSent)
+        envelope, = self.objects.envelopes
+        assert isinstance(envelope, hana_protocol.HanaCommandEnvelope)
+        self.assertEqual(envelope.permission, WorkPermit(renewed.expires, str(renewed.generation), renewed.boot.boot_id))
 
     def test_a_fence_acknowledgement_blocks_delayed_command_acceptance(self) -> None:
         self.objects.delay_acceptance = True
@@ -238,7 +280,7 @@ class HanaExecutionTests(unittest.TestCase):
         self.objects.fail_fence = True
         self.assertIsInstance(self.settle(), execution.HanaSettlementPending)
         observation = replace(self.objects.observe_execution(self.key), terminated=True, lease_free=True,
-                              evidence=placement.ExecutionEvidenceUnavailable(execution.COMMAND_RESULT_PENDING, 1000))
+                              evidence=execution_identity.ExecutionEvidenceUnavailable(hana_protocol.COMMAND_RESULT_PENDING, 1000))
         with mock.patch.object(self.objects, 'observe_execution', return_value=observation):
             _ = execution.observe_execution(self.root, self.request, self.objects)
         self.assertIsInstance(self.settle(), execution.HanaSettlementPending)
@@ -252,7 +294,7 @@ class HanaExecutionTests(unittest.TestCase):
         observe = self.objects.observe_execution
 
         def observe_held_lease(key: result.HanaAttemptKey, *,
-                               timeout_s: float | None = None) -> execution.HanaCommandObservation:
+                               timeout_s: float | None = None) -> hana_protocol.HanaCommandObservation:
             timeouts.append(timeout_s)
             return observe(key, timeout_s=timeout_s)
 
@@ -281,14 +323,14 @@ class HanaExecutionTests(unittest.TestCase):
             _ = self.dispatch()
             reason = 'The data mount and a fresh permit are required'
             observation = replace(self.objects.observe_execution(self.request.key), terminated=True, lease_free=True,
-                                  evidence=placement.ExecutionEvidenceUnavailable(reason, 1000))
+                                  evidence=execution_identity.ExecutionEvidenceUnavailable(reason, 1000))
             with mock.patch.object(self.objects, 'observe_execution', return_value=observation):
                 _ = execution.observe_execution(self.root, self.request, self.objects)
-            settled = execution.HanaAdmissionRefusalSettled(placement.HanaCommandAdmissionRefused(reason),
-                                                            placement.ExecutionNotStarted())
+            settled = execution.HanaAdmissionRefusalSettled(execution_identity.HanaCommandAdmissionRefused(reason),
+                                                            execution_identity.ExecutionNotStarted())
             self.assertEqual(self.settle(), settled)
             self.assertEqual(self.settle(), settled)
-            self.assertEqual(self.releases, 1)
+            self.assertEqual(self.releases, 2)
 
     def test_cancellation_and_restart_keep_one_settlement(self) -> None:
         _ = self.dispatch()
@@ -314,14 +356,14 @@ class HanaExecutionTests(unittest.TestCase):
     def test_edited_replaced_and_fenced_results_never_become_accepted(self) -> None:
         _ = self.dispatch()
         replaced = replace(self.command_result(), key=replace(self.key, attempt='replacement'))
-        for remote, live in ((self.command_result(), placement.SourceKeyKnown('edited')),
+        for remote, live in ((self.command_result(), execution_identity.SourceKeyKnown('edited')),
                              (replace(self.command_result(), argv=('cargo', 'clippy')), self.source_key)):
             with self.subTest(remote=remote, live=live):
                 decision = execution.accept_result(self.root, self.request, result.encode_result(remote), 'fixture-host', lambda: live)
                 self.assertIsInstance(decision, result.RejectedHanaResult)
         with self.subTest('Replaced result with a pending guest result'):
             observation = replace(self.objects.observe_execution(self.key), terminated=True, lease_free=True,
-                                  evidence=placement.ExecutionEvidenceUnavailable(execution.COMMAND_RESULT_PENDING, 1000))
+                                  evidence=execution_identity.ExecutionEvidenceUnavailable(hana_protocol.COMMAND_RESULT_PENDING, 1000))
             with mock.patch.object(self.objects, 'observe_execution', return_value=observation):
                 _ = execution.observe_execution(self.root, self.request, self.objects)
             rejected = execution.accept_result(self.root, self.request, result.encode_result(replaced),
@@ -340,14 +382,14 @@ class HanaExecutionTests(unittest.TestCase):
         self.assertTrue(execution.claim_dispatch_pending(self.root, replace(self.reference, attempt='other')))
         _ = execution.execution_path(self.root, self.key.claim_id).write_text('{')
         self.assertTrue(execution.claim_dispatch_pending(self.root, self.reference))
-        self.assertIsInstance(execution.read_claim_execution(self.root, self.reference), placement.ExecutionEvidenceUnavailable)
+        self.assertIsInstance(execution.read_claim_execution(self.root, self.reference), execution_identity.ExecutionEvidenceUnavailable)
 
     def test_source_capture_rechecks_live_source_before_permission(self) -> None:
         sender = cast(hana_transport.SourceSender, mock.create_autospec(hana_transport.SourceSender, instance=True))
-        reads = iter((self.source_key, placement.SourceKeyKnown('edited')))
-        with mock.patch.object(sender, 'prepare', return_value=self.manifest):
+        reads = iter((self.source_key, execution_identity.SourceKeyKnown('edited')))
+        with ExitStack() as staging, mock.patch.object(sender, 'prepare', return_value=(self.manifest, lambda: None)):
             prepared = execution.prepare_execution(self.adopted, sender, self.root, self.request.argv, self.request.link,
-                current_source_key=lambda: next(reads), environment={})
+                current_source_key=lambda: next(reads), environment={}, staging=staging)
         self.assertIsInstance(prepared, execution.ExecutionPreparationRefused)
         self.assertEqual(self.authorizations, 0)
         self.assertEqual(self.objects.envelopes, [])
@@ -355,9 +397,11 @@ class HanaExecutionTests(unittest.TestCase):
     def test_source_change_after_authorization_prevents_publication(self) -> None:
         def changed(request: wire.ConsumePermission) -> wire.FirstAuthorization:
             authorized = self.consume(request)
-            self.source_key = placement.SourceKeyKnown('edited')
+            self.source_key = execution_identity.SourceKeyKnown('edited')
             return authorized
-        _ = self.dispatch(consume=changed)
+        upload = mock.Mock()
+        _ = self.dispatch(consume=changed, upload_source=upload)
+        upload.assert_not_called()
         self.assertEqual(self.objects.envelopes, [])
         self.assertIsInstance(self.settle(), execution.HanaSettled)
 
@@ -374,6 +418,44 @@ class HanaExecutionTests(unittest.TestCase):
                                                     reason='The holder ended')
         self.assertIsInstance(refused, execution.HanaSettlementPending)
         self.assertEqual(self.releases, 0)
+
+    def test_refusal_retries_claim_release_until_it_succeeds(self) -> None:
+        reason = 'The payload could not start'
+        outcome = execution_identity.HanaCommandAdmissionRefused(reason)
+        expected = execution.HanaAdmissionRefusalSettled(outcome, execution_identity.ExecutionNotStarted())
+        root = self.root
+        for published in (False, True):
+            with self.subTest(published=published), tempfile.TemporaryDirectory(dir=root) as folder:
+                self.root = Path(folder)
+                releases: list[bool] = []
+
+                def release() -> bool:
+                    released = bool(releases)
+                    releases.append(released)
+                    return released
+
+                if published:
+                    _ = self.dispatch()
+                    observation = hana_protocol.ConfirmedCommandAdmissionRefusal(
+                        self.key, self.request.slot, False, 1000, reason, CommandAdmissionRefusalCode.PRE_COMMAND_FAILED)
+                    with mock.patch.object(self.objects, 'observe_execution', return_value=observation):
+                        _ = execution.observe_execution(self.root, self.request, self.objects)
+
+                def settle() -> execution.HanaSettlement:
+                    if published:
+                        return execution.settle_execution(self.root, self.request, self.objects, release_claim=release,
+                            reason='The result is unavailable', fence_window=execution.FenceAcknowledgementWindow(0, 1))
+                    return execution.settle_unpublished_claim(self.root, self.reference,
+                                                              release_claim=release, reason=outcome)
+
+                self.assertIsInstance(settle(), execution.HanaSettlementPending)
+                self.assertEqual(releases, [False])
+                self.assertTrue(execution.execution_command_settled(self.root, self.key.claim_id))
+                self.assertTrue(execution.claim_dispatch_pending(self.root, self.reference))
+                self.assertEqual(settle(), expected)
+                self.assertFalse(execution.claim_dispatch_pending(self.root, self.reference))
+                self.assertEqual(settle(), expected)
+                self.assertEqual(releases, [False, True])
 
     def test_settlement_during_authorization_prevents_a_delayed_publication(self) -> None:
         def settled_during_authorization(request: wire.ConsumePermission) -> wire.FirstAuthorization:
@@ -411,27 +493,30 @@ class HanaExecutionTests(unittest.TestCase):
         _ = self.dispatch()
         _ = execution.observe_execution(self.root, self.request, self.objects)
         complete = replace(self.manifest, basis_commits=(), bundle_sha256='e' * 64)
-        self.assertTrue(execution.publish_source_update(self.root, self.request, complete, self.objects))
-        self.assertFalse(execution.publish_source_update(self.root, self.request, complete, self.objects))
+        upload = mock.Mock()
+        self.assertTrue(execution.publish_source_update(self.root, self.request, complete, self.objects, upload_source=upload))
+        self.assertFalse(execution.publish_source_update(self.root, self.request, complete, self.objects, upload_source=upload))
+        upload.assert_called_once()
         update = self.objects.envelopes[-1]
-        self.assertIsInstance(update, execution.HanaSourceUpdateEnvelope)
-        self.assertEqual(execution.decode_envelope(execution.encode_envelope(update)), update)
-        self.assertEqual(sum(isinstance(envelope, execution.HanaCommandEnvelope) for envelope in self.objects.envelopes), 1)
+        self.assertIsInstance(update, hana_protocol.HanaSourceUpdateEnvelope)
+        self.assertEqual(hana_protocol.decode_envelope(hana_protocol.encode_envelope(update)), update)
+        self.assertEqual(sum(isinstance(envelope, hana_protocol.HanaCommandEnvelope) for envelope in self.objects.envelopes), 1)
         self.assertEqual(self.authorizations, 1)
         self.assertEqual(complete.commit, self.manifest.commit)
         _ = execution.observe_execution(self.root, self.request, self.objects)
         observation = execution.read_dispatch_observation(self.root, self.request)
-        self.assertIsInstance(observation, execution.HanaCommandObservation)
-        assert isinstance(observation, execution.HanaCommandObservation)
+        self.assertIsInstance(observation, hana_protocol.HanaCommandObservation)
+        assert isinstance(observation, hana_protocol.HanaCommandObservation)
         self.assertTrue(observation.source_updated)
         self.assertIsInstance(self.settle(), execution.HanaSettled)
 
     def test_source_update_cannot_change_the_captured_commit_or_command(self) -> None:
         _ = self.dispatch()
         for manifest in (replace(self.manifest, commit='e' * 40), replace(self.manifest, argv=('cargo', 'clippy')),
+                         replace(self.manifest, runtime_abi=self.manifest.runtime_abi + 1),
                          replace(self.manifest, basis_commits=('d' * 40,))):
             with self.subTest(manifest=manifest), self.assertRaises(ValueError):
-                _ = execution.publish_source_update(self.root, self.request, manifest, self.objects)
+                _ = execution.publish_source_update(self.root, self.request, manifest, self.objects, upload_source=lambda: None)
         self.assertEqual(len(self.objects.envelopes), 1)
 
 

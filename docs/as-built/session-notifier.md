@@ -311,6 +311,13 @@ That rule controls turn continuation and does not permit deletion.
 Run `scripts/lib/py scripts/lib/session_move.py --dry-run` before the cutover.
 The output gives each source, destination, size, move type, and naming rule.
 Run the command without `--dry-run` to move the files.
+The final line gives the folder count, size in GiB, live entries kept, and other refusals.
+The dry run uses `would move` in that line.
+Both modes keep folders with a running session or an active process when they check candidates.
+The real run checks again after it writes the session index and just before it saves the journal.
+If that check finds a live source, the next run can reuse its index entry.
+Both modes continue with other candidates and return status 0 if they only skip live entries before copying.
+A destination conflict or a failed copy stops a real run and returns status 1.
 The dry run reads the session index and folder records without creating a preview directory.
 It reads compressed transcripts through a pipe.
 The command checks the scratchpad copy after it scans the source for deletion.
@@ -327,8 +334,11 @@ It compares directory identities to detect overlaps with held folders, including
 It skips each scratchpad tree that overlaps an open hold and returns status 1.
 Ask the owner to release a hold before you retry the cutover.
 The journal in `<session-root>/.session-move` records the pending scratchpad copy.
+A live source found during a journaled copy counts as kept live.
+The program keeps the journal and stops with status 1 because it uses one journal for all copies.
 Run the same command after an interruption to resume the pending copy or deletion.
 If source data changes before publication, the command saves a copy-in-progress state before it discards the stage.
 The command keeps the source and can rebuild the stage on retry.
 The command reports unrecognized entries and preserves them.
+Entries outside Claude projects do not affect the refusal count or the exit status.
 It refuses an existing destination unless the journal identifies it as the result of the pending move.

@@ -4349,6 +4349,33 @@ class SessionModelCountDocument(TypedDict):
 
 
 @dataclass(frozen=True)
+class WeeklyQuota:
+    """A weekly percentage and its reset, when the provider supplies one."""
+
+    left: float
+    resets_at: datetime | StatusUnavailable
+
+
+def stored_weekly_quotas(now: datetime) -> dict[str, WeeklyQuota]:
+    """Read weekly quota for current sign-ins without counting sessions or refreshing usage."""
+    usage = usage_store.load()
+    if not usage:
+        return {}
+    account_config = read_account_settings(CURRENT_ACCOUNT_SETTINGS)
+    with role_map.stored_role_map():
+        claude = account_statuses()
+        try:
+            workers_home = _status_workers_account().home
+        except AccountsError:
+            workers_home = accounts_home() / ".codex"
+        codex = codex_statuses(workers_home)
+    return weekly_quotas(
+        _status_row(status, usage.get(usage_store.key(tool, status.login)), now, (), account_config=account_config)
+        for tool, statuses in (("Claude", claude), ("Codex", codex)) for status in statuses
+    )
+
+
+@dataclass(frozen=True)
 class StatusRow:
     """One account's values, shared by the table and JSON renderers."""
     label: str
@@ -4371,6 +4398,11 @@ class StatusRow:
     login_ends_at: agent_accounts.LoginEndKnown | agent_accounts.LoginEndUnknown = field(default_factory=agent_accounts.LoginEndUnknown)
     models_by_role: dict[str, Counter[ObservedSessionModel]] = field(default_factory=dict)
     inherited_roles: tuple[ClaudeGroup, ...] = ()
+
+
+def weekly_quotas(rows: Iterable[StatusRow]) -> dict[str, WeeklyQuota]:
+    return {row.label: WeeklyQuota(row.weekly_left_percent, row.resets_at)
+            for row in rows if isinstance(row.weekly_left_percent, (int, float))}
 
 
 @dataclass(frozen=True)
@@ -5499,6 +5531,23 @@ def _test_signin_role_advice(problem: StatusProblem, test_accounts: set[CauseAcc
             and problem.cause.kind in ("note", "unreadable note", "unnoted", "wrong login"))
 
 
+def _status_workers_account() -> CodexWorkersAccount:
+    selected_workers = role_account("workers")
+    label = read_role_map().workers
+    if not label:
+        raise AccountsError("accounts: workers has no mapped account; run accounts.py set-role workers <codexN>")
+    selected = agent_accounts.codex_account_home(label)
+    if not isinstance(selected, agent_accounts.CodexHomeHoldingLogin):
+        kind: ProblemKind = "signed out" if selected.home.is_dir() else "access"
+        state = "not logged in" if selected.home.is_dir() else "not set up"
+        step = (f"CODEX_HOME={shlex.quote(str(selected.home))} codex login" if selected.home.is_dir()
+                else f"run accounts.py setup {label}")
+        diagnostic = f"accounts: workers is on {label}, which is {state} on this machine; {step}"
+        raise AccountsError(diagnostic, source=ObservedStateCause(diagnostic,
+            ProblemCauseKey(kind, CauseAccount(label), CauseFile(str(selected.home)))))
+    return selected_workers
+
+
 def _read_status(source: UsageSource, *, detail: bool, include_models: bool = False,
                  account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> StatusReading:
     """One table row per account folder, then one line for each thing wrong in a folder.
@@ -5513,19 +5562,7 @@ def _read_status(source: UsageSource, *, detail: bool, include_models: bool = Fa
             _observe_status_problem(problem)
     role_problems: list[AccountsError | str] = []
     try:
-        selected_workers = role_account("workers")
-        label = read_role_map().workers
-        if not label:
-            raise AccountsError("accounts: workers has no mapped account; run accounts.py set-role workers <codexN>")
-        selected = agent_accounts.codex_account_home(label)
-        if not isinstance(selected, agent_accounts.CodexHomeHoldingLogin):
-            kind: ProblemKind = "signed out" if selected.home.is_dir() else "access"
-            state = "not logged in" if selected.home.is_dir() else "not set up"
-            step = (f"CODEX_HOME={shlex.quote(str(selected.home))} codex login" if selected.home.is_dir()
-                    else f"run accounts.py setup {label}")
-            diagnostic = f"accounts: workers is on {label}, which is {state} on this machine; {step}"
-            raise AccountsError(diagnostic, source=ObservedStateCause(diagnostic,
-                ProblemCauseKey(kind, CauseAccount(label), CauseFile(str(selected.home)))))
+        selected_workers = _status_workers_account()
     except AccountsError as error:
         role_problems.append(error)
         _observe_status_problem(_role_problem(error, tuple(str(note_file.note_path(status.label)) for status in statuses)))
