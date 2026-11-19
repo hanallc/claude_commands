@@ -87,24 +87,25 @@ def checked_git(repo: Path, *arguments: str) -> str:
 
 
 def network_git(repo: Path, *arguments: str) -> str:
-    """Bound network Git calls and stop their process groups when the call ends."""
+    """Bound network Git calls and stop unreaped Git groups on failure."""
     command = ['git', '-C', str(repo), *arguments]
     timeout = cloud_gate.settings().number('git_network_timeout_s')
-    process: subprocess.Popen[str] | None = None
-    try:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   text=True, start_new_session=True)
-        output, errors = process.communicate(timeout=timeout)
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, start_new_session=True) as process:
+        try:
+            output, errors = process.communicate(timeout=timeout)
+        except BaseException:
+            if process.returncode is None:
+                with cancellation.defer_cleanup_signals():
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    _ = process.wait()
+            raise
         if process.returncode:
             raise subprocess.CalledProcessError(process.returncode, command, output=output, stderr=errors)
         return output.strip()
-    finally:
-        if process is not None:
-            with cancellation.defer_cleanup_signals(), process:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
 
 
 def trial_request(repo: Path, base: str, changed: str, modules: Sequence[str], rounds: int) -> PairedTrialRequest:
