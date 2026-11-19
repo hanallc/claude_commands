@@ -2977,6 +2977,17 @@ Lead: `offload.py` `submit_direct_placement` sends `local.profile` from `admissi
 2. Fix it at its cause. A Mac-pinned request waits for its Mac slot only. It never holds or blocks the natedev memory line, and the page shows it as a Mac wait.
 3. The test replays the case: a verify call holds a local nextest grant, and its Mac offload child asks for placement.
 
+### Phase 44cp — The holder-death scope tests pass under load  · status: todo
+**From builds (reported by report), 2026-11-19 ~00:05 EST:** `test_scope_*_survives_holder_death*` in `scripts/build_queue/test_queue_place.py` fails in a full module run under load and passes alone. Seen on main 610cb1a3d. Seen cause: the holder exits before the launcher finishes its last holder check, after the launcher publishes its ownership file. It can turn a gate red at random. Runs after 44cn and 44co.
+1. Make a loaded repro first and keep each failed log.
+2. Fix the cause in the code or the fixture, never with a retry or a longer wait. If the fix needs `scripts/build_queue/queue_place.py`, ask builds first.
+3. The repro then passes in each loop.
+
+### Phase 44cq — Step peak estimates count sccache compile memory  · status: todo
+**From 44cn (impl4, 2026-11-18):** admission charges and progress profiles count the step's sccache compiler jobs. The historical peak sampler (`scripts/lint/invoke.sh:248`) reads only the step cgroup `.max`, so a step that compiles through sccache records a low peak, and its next estimate is low.
+1. Show the undercount with a test that replays a compiling step under sccache.
+2. Make the recorded peak include the step's compiler jobs, with the same rule admission uses.
+
 ### Phase 44cg — A memory wait fixture gives the same result under load  · status: todo
 **From builds, 2026-11-18 18:3x:** queue's next item after 44cf.
 
