@@ -116,6 +116,10 @@ If the route declines, the gate requests local admission with its first arrival 
 A wait for memory, a slot, or a build hold does not retry the route.
 An `integrate` job does not enter this hold.
 
+`merge_gate.py --tests-only --module` requests shared admission and can wait behind a local `integrate` job.
+When the shared landing check verifies natemerge's land, the named modules use the whole machine without admission.
+A named-module run writes no gate record or pass ledger entry.
+
 ### Placement status
 
 `PlacementStatusRequest(episode, attempt)` reads the saved assignment without changing state or launch permission.

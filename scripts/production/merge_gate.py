@@ -187,6 +187,11 @@ class SelectedModules:
 
 
 @dataclass(frozen=True)
+class NamedModules(SelectedModules):
+    """Run the requested module paths without recording a gate pass."""
+
+
+@dataclass(frozen=True)
 class TreeSelection:
     """Hold selected paths and the Git tree that the selection read."""
     paths: tuple[str, ...]
@@ -1434,8 +1439,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     ledger: PassedTreeLedger | None = None
     required: FullSuite | NoFullRunRequired = NoFullRunRequired()
     reused = False
-    selection: AffectedSelection | FullSuite = FullSuite("whole machine")
-    if shared:
+    selection: AffectedSelection | FullSuite = FullSuite("" if shared else "whole machine")
+    if shared and not isinstance(selected, NamedModules):
         try:
             tested_tree = clean_test_tree(repo)
         except (GateRefused, OSError) as error:
@@ -1461,6 +1466,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
             if isinstance(selection, AffectedSelection):
                 selected_paths = set(selection.modules)
                 modules = [(suite, path) for suite, path in modules if path in selected_paths]
+    if shared:
         print(f"Runner: {len(modules)} modules, memory governor {governor_gib:g} GiB", flush=True)
     else:
         print(f"Runner: {len(modules)} modules, whole machine, {max_running_jobs} CPUs", flush=True)
@@ -2517,12 +2523,18 @@ def tell_time_limit(owner: str, repo: Path, run: GateRun) -> None:
 
 
 def run_named_modules(repo: Path, names: Sequence[str], module_time_limit_s: float, mode: SuiteMode) -> GateRun:
-    """Run only the named modules, as a merge red's check on its base.
+    """Run only the named modules and skip the gate record and pass ledger.
 
-    The run takes no admission, hold, time limit, ledger entry or gate record, so it never certifies the tree.
+    Natemerge's landing uses the whole machine. Other callers use shared admission.
     """
-    return run_suites(repo, [], module_time_limit_s, machine=WholeMachine(), mode=mode,
-                      selected=SelectedModules(tuple(f"scripts/{name}" for name in names)),
+    from scripts.build_hold import build_hold
+    from scripts.build_targets import build_targets
+
+    lineage = build_targets.current_caller_lineage()
+    landing = (isinstance(lineage, build_targets.ConfirmedCallerLineage)
+               and not isinstance(land_runs.natemerge_land(build_hold.PROC_ROOT, lineage.processes), land_runs.NoNatemergeLand))
+    return run_suites(repo, [], module_time_limit_s, machine=WholeMachine() if landing else SHARED_MACHINE, mode=mode,
+                      selected=NamedModules(tuple(f"scripts/{name}" for name in names)),
                       time_limit=gate_record.NoGateTimeLimit("named modules"))
 
 

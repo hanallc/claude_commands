@@ -19,8 +19,9 @@ from dataclasses import replace
 from typing import cast, final, override
 from contextlib import redirect_stdout, redirect_stderr
 from unittest import mock
-from scripts.production import merge_gate
+from scripts.production import land_runs, merge_gate
 from scripts.lib import build_folders
+from scripts.build_hold import build_hold
 from scripts.production.gate_modules import GateRefused
 from scripts.build_queue import queue_place as queue, admission_client as client, admission_protocol as wire, admission_service as service
 from scripts.build_queue import progress_profile as progress, step_estimator
@@ -73,6 +74,76 @@ class ServiceGateFixture(GateSuitesFixture):
 
 @final
 class SharedGateAdmissionTests(ServiceGateFixture):
+    def check_named_module_admission(self, *, landing: bool = False, integrate_running: bool = False) -> None:
+        self.configure_gate(f"# one of: on, off\n{memory_admit.MERGE_TEST_WAIT_KEY}=on\n")
+        fixture = self.admission
+        name = "hooks/test_first.py"
+        args = ["--tests-only", "--repo", str(self.checkout), "--module", name]
+        start_time = admission_records.process_start_time(os.getpid())
+        assert start_time is not None
+        owner = wire.Owner(os.getpid(), start_time)
+        with fixture.loop_turn():
+            fixture.proc.register(owner)
+            argv = ["python3", "merge_gate.py", *args]
+            _ = (fixture.proc.path / str(owner.pid) / "cmdline").write_bytes(("\0".join(argv) + "\0").encode())
+
+        start_job = merge_gate.start_gate_job
+
+        def start(suite: str, path: Path, argv: list[str], repo: Path,
+                  environment: dict[str, str], log: Path) -> merge_gate.RunningGateJob:
+            with fixture.loop_turn():
+                if landing:
+                    self.assertEqual(fixture.server.reservations, {})
+                else:
+                    _, row = self.reservation()
+                    self.assertEqual(row.get("job"), StepJob("test-modules", modules=1))
+            return start_job(suite, path, argv, repo, environment, log)
+
+        waits: list[wire.Wait] = []
+        if integrate_running:
+            with fixture.loop_turn():
+                request = fixture.request(step="merge-gate")
+                integrate = only_admitted(fixture.server.handle_request(
+                    replace(request, identity=replace(request.identity, job=StepJob("integrate")))))
+                fixture.allow_next_start()
+
+            def release_merge(_output: client.WaitOutput, reply: wire.Wait) -> None:
+                waits.append(reply)
+                with fixture.loop_turn():
+                    self.assertEqual(reply.text, admission_records.LANDING_WAIT_TEXT)
+                    self.assertEqual(self.module_events(), [])
+                    pending, = fixture.server.waiters.values()
+                    self.assertEqual(pending.row.get("job"), StepJob("test-modules", modules=1))
+                    fixture.release(integrate)
+                    _ = fixture.run_pass()
+
+            _ = self.enterContext(mock.patch.object(client.WaitOutput, "__call__", new=release_merge))
+
+        result = build_hold.ProcessIdentity(owner.pid, owner.start_time) if landing else land_runs.NoNatemergeLand()
+        repository = admission_records.RepositoryIdentity("fixture-repository", "claude_commands")
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(land_runs, "natemerge_land", return_value=result) as check,
+              mock.patch.object(step_estimator, "git_identity", return_value=(repository, "merge")),
+              mock.patch.object(merge_gate, "start_gate_job", side_effect=start),
+              mock.patch.object(merge_gate, "record_gate_run") as record):
+            self.assertEqual(merge_gate.main(args), 0)
+            self.assertEqual(sum(call.args[0] == build_hold.PROC_ROOT for call in check.call_args_list), 1)
+            record.assert_not_called()
+        self.assertEqual(self.pass_records(), [])
+        self.assertEqual([(row["suite"], row["module"]) for row in self.module_events()
+                          if row["event"] == "start"], [("hooks", "test_first.py")])
+        self.assertEqual(len(waits), int(integrate_running))
+        self.assert_gate_released()
+
+    def test_natemerge_named_modules_use_the_whole_machine(self) -> None:
+        self.check_named_module_admission(landing=True)
+
+    def test_unit_named_modules_take_a_queue_place(self) -> None:
+        self.check_named_module_admission()
+
+    def test_unit_named_modules_wait_while_a_local_merge_test_runs(self) -> None:
+        self.check_named_module_admission(integrate_running=True)
+
     def check_merge_route_retry(self, *, accepts: bool) -> None:
         from scripts.aws_target import cloud_gate
 
