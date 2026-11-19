@@ -1133,7 +1133,7 @@ A refresh keeps the current counts until the next counts request succeeds.
 A refresh lets an active counts request finish.
 The response updates linked Review status only when the row version matches the request and the response.
 If a row starts waiting for linked Review status during a request, the List starts a follow-up when that request ends.
-`list_follow_up_timeout_seconds` sets the request time limit.
+`page_request_timeout_seconds` sets the request time limit.
 The counts strip uses the status line readers for questions, changes, and rebuilds.
 Each count links to its existing page.
 The strip omits proposals and efficiencies.

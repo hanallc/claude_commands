@@ -942,7 +942,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     if include_counts:
         if defer_counts:
             query = COUNTS_AND_LINKS_QUERY if deferred_links else COUNTS_QUERY
-            timeout_ms = settings.whole("list_follow_up_timeout_seconds") * 1000
+            timeout_ms = settings.whole("page_request_timeout_seconds") * 1000
             counts = (f'<div data-list-counts-url="{PAGE_PATH}?{html.escape(query)}"'
                       + f' data-list-counts-timeout-ms="{timeout_ms}"></div>')
         else:

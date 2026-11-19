@@ -1790,7 +1790,7 @@ window.fetch=async (url,options)=>{
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_refresh_keeps_the_follow_up_request_and_retries_after_timeout(self) -> None:
-        _ = write_config_fixture(conf.path("review_links"), "list_follow_up_timeout_seconds=4\n")
+        _ = write_config_fixture(conf.path("review_links"), "page_request_timeout_seconds=4\n")
         root = self.root / "reviews"
         changed = self.add("Keep the changed row usable")
         counts_only = list_page.render(root, defer_counts=True, review_records={}).decode()
