@@ -2243,12 +2243,12 @@ class RebuildRowTests(unittest.TestCase):
             cache = Path(directory) / "cache"
             _ = config.write_text(f"rebuild.cache={cache}\n", encoding="utf-8")
             self.assertEqual(rebuild_row.read(config),
-                             rebuild_row.RebuildAnswer((), True, needs=rebuild_row.OpenRebuildNeeds(())))
+                             rebuild_row.RebuildAnswer((), True, needs=()))
             for text in ("invalid\n9999999999\n", "rebuild mac\ninvalid\n"):
                 with self.subTest(text=text):
                     _ = cache.write_text(text, encoding="utf-8")
                     self.assertEqual(rebuild_row.read(config),
-                                     rebuild_row.RebuildAnswer((), True, needs=rebuild_row.OpenRebuildNeeds(())))
+                                     rebuild_row.RebuildAnswer((), True, needs=()))
 
     def test_stale_cache_keeps_the_answer_for_the_reader_and_command(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

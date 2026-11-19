@@ -175,7 +175,7 @@ def read(config: Path = rebuild_row.DEFAULT_CONFIG, *,
     answer = rebuild if rebuild is not None else rebuild_row.read(config)
     pending: tuple[RebuildRequest, ...] = ()
     needs = answer.needs
-    needs_available = isinstance(needs, rebuild_row.OpenRebuildNeeds)
+    needs_available = isinstance(needs, tuple)
     if isinstance(needs, rebuild_row.RebuildNeedsNotRead):
         unavailable.append(UnavailableSource("rebuild needs", "The open rebuild records have not been read."))
     elif isinstance(needs, rebuild_row.RebuildNeedsUnavailable):
@@ -183,7 +183,7 @@ def read(config: Path = rebuild_row.DEFAULT_CONFIG, *,
     else:
         try:
             pending = tuple(_request(record, names, waiting_work, completed=False)
-                            for summary in needs.machines for record in summary.records)
+                            for summary in needs for record in summary.records)
         except (OSError, ValueError, KeyError, TypeError) as error:
             needs_available = False
             unavailable.append(UnavailableSource("rebuild needs", str(error)))

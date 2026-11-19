@@ -13,7 +13,7 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Protocol, cast
@@ -186,20 +186,23 @@ def row(settings: RebuildSettings, expected: ExpectedSystems | NoExpectedSystems
     return compare(settings, expected, run).row
 
 
+type OpenRebuildNeeds = tuple[need.MachineNeeds, ...]
+
+
+class _NoKnownRebuildNeeds:
+    """Let the Rebuilds page list the records that are available."""
+
+    def __iter__(self) -> Iterator[need.MachineNeeds]:
+        return iter(())
+
+
 @dataclass(frozen=True)
-class RebuildNeedsNotRead:
+class RebuildNeedsNotRead(_NoKnownRebuildNeeds):
     """The open rebuild records have not been read."""
 
 
 @dataclass(frozen=True)
-class OpenRebuildNeeds:
-    """The open rebuild records that were read successfully."""
-
-    machines: tuple[need.MachineNeeds, ...]
-
-
-@dataclass(frozen=True)
-class RebuildNeedsUnavailable:
+class RebuildNeedsUnavailable(_NoKnownRebuildNeeds):
     """The open rebuild records could not be read."""
 
     reason: str
@@ -210,7 +213,7 @@ class RebuildAnswer:
     """The known rebuild machines and whether the cache needs a refresh.
 
     `compared` holds the machines whose running system differs from main;
-    `needs` holds the open rebuild needs that `read` joined into `machines`.
+    `needs` holds the open rebuild records or the reason they are unavailable.
     `probes` records whether each machine supplied a running system path.
     """
 
@@ -375,7 +378,7 @@ def read(config: Path = DEFAULT_CONFIG, *, clock: Callable[[], float] = time.tim
     except (OSError, ValueError, KeyError, TypeError) as error:
         return replace(answer, needs=RebuildNeedsUnavailable(str(error)))
     return replace(answer, machines=tuple(machine for machine in ("natedev", "mac") if machine in machines),
-                   needs=OpenRebuildNeeds(needs))
+                   needs=needs)
 
 
 def _read_cache(config: Path, clock: Callable[[], float]) -> RebuildAnswer:
