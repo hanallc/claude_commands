@@ -1090,7 +1090,7 @@ class ReviewPageTests(unittest.TestCase):
         _ = later.write_text(json.dumps({key:'2030-12-01T12:00:00', bad_key:'bad'}))
         snapshot = review_page.build_snapshot(self.root)
         with self.subTest(finding='F035'):
-            self.assertEqual(snapshot.records[efficiency].state, review_items.ReviewState.DONE)
+            self.assertNotIn(efficiency, snapshot.records)
             self.assertIn(str(marks).encode(), snapshot.page)
         with self.subTest(finding='F040 Later times'):
             until = snapshot.records[key].times.later
@@ -1119,7 +1119,8 @@ class ReviewPageTests(unittest.TestCase):
                 staff, 'snapshot', side_effect=AssertionError('A request read staff.')):
             shell = snapshot.render(show='all').decode()
             card = snapshot.body(key).decode()
-            done = snapshot.body('page-owner/C1').decode()
+            with self.assertRaises(LookupError):
+                _ = snapshot.body('page-owner/C1')
         self.assertNotRegex(shell, r'<form[^>]*\bdata-review-form\b')
         self.assertRegex(shell, r'<dialog id="review-new-item"[^>]*>\s*<form>')
         self.assertEqual(len(re.findall(r'<form\b', shell)), 1)
@@ -1130,11 +1131,6 @@ class ReviewPageTests(unittest.TestCase):
         revision = review_page.record_revision(snapshot.records[key], snapshot.assets)
         self.assertRegex(revision, r'^[0-9a-f]{16}$')
         self.assertIn(f'name="revision" value="{revision}"', card)
-        self.assertIn('How to check', done, 'A Done key loads its body directly.')
-        self.assertIn('data-send-status', done)
-        for hidden in ('<h3>Proof</h3>', 'data-later-toggle', 'Your words', 'name="feedback"'):
-            with self.subTest(hidden=hidden):
-                self.assertNotIn(hidden, done)
         with self.assertRaises(LookupError):
             _ = snapshot.body('missing/key')
 
@@ -1197,11 +1193,11 @@ class ReviewPageTests(unittest.TestCase):
         previous = cache.get()
         read, release, retry = threading.Event(), threading.Event(), threading.Event()
         original = review_page.build_snapshot
-        during_retry: list[review_items.ReviewState] = []
+        during_retry: list[bool] = []
 
         def rebuild(root: Path) -> review_page.ReviewSnapshot:
             if read.is_set():
-                during_retry.append(cache.get().records[key].state)
+                during_retry.append(key in cache.get().records)
                 retry.set()
                 return original(root)
             read.set()
@@ -1216,13 +1212,13 @@ class ReviewPageTests(unittest.TestCase):
                 self.assertTrue(read.wait(TEST_HANG_GUARD_SECS))
                 saved = cache.save(self.card_body(previous, key, 'answer', 'Use the first layout.'), self.status)
                 self.assertEqual(cache.get().version, saved.version)
-                self.assertEqual(cache.get().records[key].state, review_items.ReviewState.DONE)
+                self.assertNotIn(key, cache.get().records)
             finally:
                 release.set()
             self.assertTrue(retry.wait(TEST_HANG_GUARD_SECS))
             cache.synchronize()
-        self.assertEqual(during_retry, [review_items.ReviewState.DONE])
-        self.assertEqual(cache.get().records[key].state, review_items.ReviewState.DONE)
+        self.assertEqual(during_retry, [False])
+        self.assertNotIn(key, cache.get().records)
 
     def test_snapshot_skips_a_malformed_question_at_startup_and_during_updates(self) -> None:
         key = self.question()
@@ -1342,8 +1338,7 @@ class ReviewPageTests(unittest.TestCase):
             ask='Which layout?',context='Keep the draft.',items=[],recommend='',choices=['Compact','Wide'])
         change = next(item for item in records if item.type == review_items.ReviewType.CHANGE)
         records = [question]+[replace(change,key=f'page-owner/C{number}',id=f'page-owner/C{number}',
-            title=f'Review the completed change {number}',
-            state=review_items.ReviewState.DONE if number%2 else review_items.ReviewState.OPEN)
+            title=f'Review change {number}', state=review_items.ReviewState.OPEN)
             for number in range(1,401)]
         with patch.object(review_items,'read',return_value=records):
             initial = review_page.build_snapshot(self.root)
@@ -1374,11 +1369,11 @@ class ReviewPageTests(unittest.TestCase):
   check(document.querySelectorAll('[data-list-item]').length>1,
     'F077: the table mounts while the linked body request is pending.');
   window.releaseColdBody();
-  await until(()=>form('page-owner/C399'),'the cold Done card');
+  await until(()=>form('page-owner/C399'),'the cold Open card');
   check(window.coldBodyMounts===0,'The cold card request starts before the first summary mounts.');
-  check(row('page-owner/C399').dataset.state==='Done' &&
+  check(row('page-owner/C399').dataset.state==='Open' &&
    row('page-owner/C399').querySelector('.list-toggle').getAttribute('aria-expanded')==='true',
-   'A Done item opens directly from its key.');
+   'An Open item opens directly from its key.');
   check(document.querySelectorAll('[data-list-item]').length<=100,'The first window mounts at most 100 summaries.');
   await open(DRAFT_KEY);
   const draft=form(DRAFT_KEY),choice=row(DRAFT_KEY).querySelector('input[name=choice]');
@@ -1489,13 +1484,17 @@ class ReviewPageTests(unittest.TestCase):
   await until(()=>document.querySelector('[data-review]').dataset.show==='open' && form('page-owner/C4'),'the Open form');
   conflict='/resolve-conflict';
   const stale=form('page-owner/C4');
+  const conflictVersion=document.querySelector('[data-review]').dataset.version;
   stale.requestSubmit(stale.querySelector('button[value=works]'));
-  await until(()=>!row('page-owner/C4') && !stale.dataset.sending,'the refreshed Open view');
+  await until(()=>!row('page-owner/C4') && !stale.dataset.sending &&
+   document.querySelector('[data-review]').dataset.version!==conflictVersion,
+   'the refreshed view without the completed row');
+  const conflictNotice=document.querySelector('[data-review-notice]');
   check(document.querySelector('[data-review]').dataset.show==='open' &&
-   document.querySelector('[data-review-notice]').textContent.includes('This item is already Done.'),
-   'A verdict conflict keeps Open selected and shows the reason.');
-  await open('page-owner/C6');
+   !conflictNotice.hidden && conflictNotice.textContent.includes('This item is already Done.'),
+   'F015: HTTP 409 keeps the reason when the completed item leaves Review.');
   conflict='/remove-conflict';
+  await open('page-owner/C6');
   const removed=form('page-owner/C6');
   removed.elements.later.value='2030-12-02T18:30';
   const removalVersion=document.querySelector('[data-review]').dataset.version;
@@ -1519,8 +1518,7 @@ class ReviewPageTests(unittest.TestCase):
                 for item in changed]):
             newer = review_page.build_snapshot(self.root)
         with patch.object(review_items, 'read', return_value=[
-                replace(item, state=review_items.ReviewState.DONE, actions=()) if item.key=='page-owner/C4' else item
-                for item in newer.records.values()]):
+                item for item in newer.records.values() if item.key != 'page-owner/C4']):
             accepted = review_page.build_snapshot(self.root)
         with patch.object(review_items, 'read', return_value=[
                 item for item in accepted.records.values() if item.key != 'page-owner/C6']):
@@ -1613,7 +1611,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
                 server.shutdown()
                 thread.join(5)
         self.assertEqual(results,[[]])
-        self.assertEqual(set(requested_bodies),{'page-owner/C399',key,'page-owner/C2','page-owner/C4','page-owner/C6'},
+        self.assertEqual(set(requested_bodies), {'page-owner/C399', key, 'page-owner/C2', 'page-owner/C4', 'page-owner/C6'},
                          'Only opened keys request a body.')
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
@@ -1836,7 +1834,7 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
 
     def test_review_show_row_has_validating_between_open_and_done(self) -> None:
         markup = review_page.render(self.root).decode()
-        self.assertEqual(re.findall(r'data-show-chip="([^"]+)"', markup), ['open', 'Validating', 'Done', 'all'])
+        self.assertEqual(re.findall(r'data-show-chip="([^"]+)"', markup), ['open', 'Validating', 'all'])
 
     def test_validating_change_is_read_only_in_validating_and_all(self) -> None:
         key = 'page-owner/C1'
@@ -2002,7 +2000,7 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
         self.assertTrue(all(item.actions for item in actionable))
         self.assertEqual(review_items.read(self.root, show='open'), actionable)
         self.assertEqual(review_page.SHOWS,
-                         (('open', 'Open'), ('Validating', 'Validating'), ('Done', 'Done'), ('all', 'All')))
+                         (('open', 'Open'), ('Validating', 'Validating'), ('all', 'All')))
         for spelling in ('For you', 'for-you', 'for you'):
             with self.subTest(spelling=spelling):
                 markup = review_page.render(self.root, show=spelling).decode()
@@ -2080,12 +2078,13 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
         records = review_items.read(self.root)
         members = staff.snapshot()
         entries = review_page.filter_index(records, members)
-        self.assertEqual(len(entries), len(records))
-        self.assertEqual({entry['state'] for entry in entries}, {'Open', 'Waiting', 'Done'})
+        active = [item for item in records if item.state != review_items.ReviewState.DONE]
+        self.assertEqual(len(entries), len(active))
+        self.assertEqual({entry['state'] for entry in entries}, {'Open', 'Waiting'})
         self.assertIn(f'investigation/{waiting.owner}/{waiting.id}', {entry['key'] for entry in entries})
         self.assertEqual(set(entries[0]), {'key', 'id', 'type', 'owner', 'sourceOwner', 'ownerName',
                                         'title', 'state', 'filed', 'updated', 'hiddenUntil', 'sourceName', 'urgency', 'ownerHtml', 'sourceHtml'})
-        self.assertEqual([entry['updated'] for entry in entries], [item.times.updated.isoformat() for item in records])
+        self.assertEqual([entry['updated'] for entry in entries], [item.times.updated.isoformat() for item in active])
         encoded = review_page.index_json(entries)
         self.assertNotIn('<', encoded)
         self.assertNotIn('&', encoded)
@@ -2110,10 +2109,10 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
         review_later.save('page-owner/C1', datetime.now(user_zone()) + timedelta(days=1))
         validating_keys = ['page-owner/C1']
         waiting_keys = [f'investigation/{waiting.owner}/{waiting.id}']
-        done_keys = [f'investigation/{finished.owner}/{finished.id}']
+        done_key = f'investigation/{finished.owner}/{finished.id}'
         open_keys = ['page-owner/C2', 'page-owner/C3', question, f'investigation/{ready.owner}/{ready.id}', *proposals]
-        expected = {'open':open_keys, 'Validating':validating_keys, 'Done':done_keys, 'waitingInvestigation':waiting_keys[0],
-                    'all':open_keys+validating_keys+waiting_keys+done_keys}
+        expected = {'open':open_keys, 'Validating':validating_keys, 'doneKey':done_key, 'waitingInvestigation':waiting_keys[0],
+                    'all':open_keys+validating_keys+waiting_keys}
         pages = {show: browser_markup(self.root, show=show) for show, _ in review_page.SHOWS}
         setup = r"""<script>
 const nativeFetch=fetch,nativeTimeout=setTimeout;
@@ -2145,15 +2144,15 @@ window.fetch=async(url,options)=>{
  try{
   await flush();
   check([...document.querySelectorAll('[data-show-chip]')].map(button=>button.dataset.showChip).join('|')===
-    'open|Validating|Done|all','Show chips have the required order');
+    'open|Validating|all','Show chips have the required order');
   check(selected('open'),'exactly one Open chip starts pressed');
   check(exactKeys('open'),'F020: Open mounts the exact Open keys');
-  check(noMountedKey(EXPECTED.Done[0]),'F064: Open does not mount the Done investigation');
+  check(noMountedKey(EXPECTED.doneKey),'F064: Open does not mount the Done investigation');
   check(noMountedKey(EXPECTED.waitingInvestigation),'F064: Open does not mount the Waiting investigation');
   check(noMountedState('Done'),'F064: the initial Open view mounts no Done rows');
   check(noMountedKey(EXPECTED.Validating[0]),'Open must not mount the active check.');
   check(count('open')?.textContent==='6' && count('Validating')?.textContent==='1' &&
-    count('Done')?.textContent==='1' && count('all')?.textContent==='9',
+    !chip('Done') && count('all')?.textContent==='8',
     'F001: Open shows complete counts, including the active check in Validating');
   check(chip('Validating') && getComputedStyle(chip('Validating')).opacity==='1',
     'A nonzero Validating chip has full opacity.');
@@ -2199,7 +2198,11 @@ window.fetch=async(url,options)=>{
   const handed=document.querySelector('[data-key="page-owner/C1"]');
   check(handed && !handed.hidden && handed.textContent.includes('With page-owner since') &&
    !handed.querySelector('button'),'All shows the handed change without buttons.');
-  check(count('all')?.textContent==='9','All counts the handed change.');
+  check(count('all')?.textContent==='8','All counts the handed change.');
+  check(noMountedKey(EXPECTED.doneKey) &&
+    document.querySelector('[data-type-chip="investigation"] b').textContent==='2' &&
+    document.querySelector('[data-owner-chip=""] b').textContent==='8',
+    'All excludes the completed investigation from the rows, Type counts and Owner counts.');
   check(document.activeElement===chip('all'),'F002: the pressed Show chip keeps focus after the load');
   chip('Validating')?.focus();chip('Validating')?.click();await flush();await flush();
   check(exactKeys('Validating'),'F020: Validating mounts the exact Waiting keys');
@@ -2213,38 +2216,30 @@ window.fetch=async(url,options)=>{
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
   check(document.activeElement===typeChip(),'F002: the type chip keeps focus after refresh');
   document.querySelector('[data-type-chip=""]').click();
-  chip('Done')?.click();await flush();await flush();
-  check(selected('Done') && new URLSearchParams(location.hash.slice(1)).get('show')==='Done',
-    'a Show chip changes the pressed state and address');
-  check(document.querySelector('[data-review]').dataset.show==='Done' &&
-    [...document.querySelectorAll('[data-list-item]')].every(row=>row.dataset.state==='Done'),
-    'a Show chip loads only the selected server rows');
-  check(exactKeys('Done'),'F020: Done mounts the exact Done keys');
-  check(noMountedKey(EXPECTED.waitingInvestigation),'F064: Done does not mount the Waiting investigation');
-  check(noMountedState('Open'),'F064: Done mounts no Open rows');
-  check(noMountedKey(EXPECTED.Validating[0]),'Done must not mount the active check.');
-  check(noMountedState('Waiting'),'F064: Done mounts no Waiting rows');
-  check(count('Done')?.textContent==='1' && count('open')?.textContent==='6' && count('Validating')?.textContent==='1' &&
-    [...document.querySelectorAll('[data-show-chip] b')].every(number=>!number.hidden),
-    'F001: Done retains all complete Show counts');
+  chip('Validating')?.click();await flush();await flush();
+  check(selected('Validating') && new URLSearchParams(location.hash.slice(1)).get('show')==='Validating',
+    'A State chip changes the pressed state and address.');
+  check(exactKeys('Validating'),'Validating shows the active check.');
+  check(['open','Validating','all'].map(value=>count(value)?.textContent).join('|')==='6|1|8',
+    'State counts exclude the completed investigation.');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
-  check(selected('Done') && new URL(window.refreshRequests.at(-1),location.href).searchParams.has('version'),
+  check(selected('Validating') && new URL(window.refreshRequests.at(-1),location.href).searchParams.has('version'),
     'refresh checks the version and retains the pressed Show view');
   const reload=document.createElement('iframe');reload.src='/reload'+location.hash;
   const loaded=new Promise(resolve=>reload.addEventListener('load',resolve,{once:true}));document.body.append(reload);await loaded;
   await flush();await flush();
-  check(selected('Done',reload.contentDocument) && reload.contentDocument.querySelector('[data-review]').dataset.show==='Done',
+  check(selected('Validating',reload.contentDocument) && reload.contentDocument.querySelector('[data-review]').dataset.show==='Validating',
     'a reload keeps the shared Show address');reload.remove();
   for(const value of ['all','open']){
    chip(value)?.click();await flush();await flush();
    check(selected(value),'exactly one chip stays pressed for '+value);
    check(exactKeys(value),'F020: the selected view mounts its exact keys for '+value);
-   if(value!=='all') check(noMountedState('Done'),'F064: changing to '+value+' mounts no Done rows');
+   check(noMountedKey(EXPECTED.doneKey) && noMountedState('Done'),'Done stays hidden under '+value+'.');
    if(value==='open') check(decisions().length===2 && decisions().every(row=>!row.hidden),
     'Open retains the two decision rows after a Show load');
   }
   chip('all')?.click();await flush();await flush();
-  check(['open','Validating','Done','all'].map(value=>count(value)?.textContent).join('|')==='6|1|1|9' &&
+  check(['open','Validating','all'].map(value=>count(value)?.textContent).join('|')==='6|1|8' &&
     [...document.querySelectorAll('[data-show-chip] b')].every(number=>!number.hidden),
     'All supplies the count for every Show chip');
   const groups=[...document.querySelectorAll('.review-types')],buttons=[...document.querySelectorAll('[data-show-chip]')];
@@ -2260,7 +2255,7 @@ window.fetch=async(url,options)=>{
   check(groups.length===3 && groups[1].getBoundingClientRect().top>=groups[0].getBoundingClientRect().bottom &&
     groups[2].getBoundingClientRect().top>=groups[1].getBoundingClientRect().bottom,
     'Show follows Type and Owner follows Show');
-  check(buttons.length===4 && buttons.every(button=>button.type==='button' && button.tabIndex===0),
+  check(buttons.length===3 && buttons.every(button=>button.type==='button' && button.tabIndex===0),
     'Show chips use native keyboard buttons in tab order');
   chip('all')?.focus();
   check(document.activeElement===chip('all'),'a Show chip accepts keyboard focus');
@@ -2302,19 +2297,19 @@ window.fetch=async(url,options)=>{
     ownerChip(builder).hidden,
     'F007: Owner lists only owners with the selected type and words in any Show.');
   check(selectedOwner().dataset.ownerChip==='' && !new URLSearchParams(location.hash.slice(1)).get('owner') &&
-    ['open','Done','all'].map(value=>count(value)?.textContent).join('|')==='1|0|1',
+    ['open','Validating','all'].map(value=>count(value)?.textContent).join('|')==='1|0|1',
     'F007: an owner without the selected type resets to All with matching counts.');
   check([...document.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden).length===1,
     'F007: the question appears after the owner resets.');
   chooseType('investigation');
   check(ownerChips().some(button=>button.dataset.ownerChip===builder) && ownerChips()[0].textContent==='All 1',
     'a type change restores owners and counts');
-  chooseOwner(builder);chip('Done').click();await flush();await flush();
-  check(ownerChips()[0].textContent==='All 1' && selectedOwner().dataset.ownerChip===builder,
+  chooseOwner(builder);chip('all').click();await flush();await flush();
+  check(ownerChips()[0].textContent==='All 2' && selectedOwner().dataset.ownerChip===builder,
     'Show limits Owner counts and retains an owner with matching loaded rows');
   chip('open').click();await flush();await flush();
   chooseType('question');chooseOwner(ownerChips().find(button=>button.dataset.ownerName==='page-owner')?.dataset.ownerChip);
-  chip('Done').click();await flush();await flush();
+  chip('Validating').click();await flush();await flush();
   check(ownerChips().length===2 && ownerChips()[0].textContent==='All 0' && selectedOwner().dataset.ownerChip!=='' &&
     ownerChips()[1].textContent==='page-owner 0',
     'Show retains the selected owner with a zero count.');
@@ -2351,16 +2346,17 @@ window.fetch=async(url,options)=>{
     'F003: a legacy investigation reset clears both owner constraints and shows the All rows');
   translated.remove();
   chooseType('question');chooseOwner(ownerChips().find(button=>button.dataset.ownerName==='page-owner')?.dataset.ownerChip);
+  const questionOwner=selectedOwner().dataset.ownerChip;
+  const hasEmptyOwnerSelection=()=>ownerChips().length===2 && ownerChips()[0].textContent==='All 0' &&
+   selectedOwner().dataset.ownerChip===questionOwner && selectedOwner().textContent==='page-owner 0';
   const question=document.querySelector('[data-type="question"]');question.querySelector('.list-toggle').click();await readyReviewCard(question);
   const form=question.querySelector('[data-review-form]');form.elements.feedback.value='Use this layout.';
   form.querySelector('[value="answer"]').click();await new Promise(resolve=>nativeTimeout(resolve,1100));
-  check(ownerChips().length===2 && ownerChips()[0].textContent==='All 0' && selectedOwner().dataset.ownerChip!=='' && !question.isConnected &&
-    count('Done').textContent==='1',
-    'A save retains the selected owner and moves its count to Done.');
+  check(hasEmptyOwnerSelection() && !question.isConnected && count('all').textContent==='0',
+    'A save removes the completed question from the Owner and State counts.');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
-  check(ownerChips().length===2 && ownerChips()[0].textContent==='All 0' && selectedOwner().dataset.ownerChip!=='' &&
-    count('Done').textContent==='1',
-    'Refresh retains the zero count for the selected owner.');
+  check(hasEmptyOwnerSelection() && count('all').textContent==='0',
+    'Refresh keeps the completed question out of the counts.');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>""".replace('EXPECTED', json.dumps(expected))
@@ -2421,8 +2417,8 @@ window.fetch=async(url,options)=>{
  const show=new URL(url,location.href).searchParams.get('show') || 'open';
  const page=new DOMParser().parseFromString(showPages[show],'text/html');
  if(window.didSave){const payload=page.querySelector('[data-review-index]'),entries=JSON.parse(payload.textContent);
-  entries.r.find(entry=>entry[2]===0)[6]=2;
-  entries.r.find(entry=>entry[0]==='page-owner/C2')[6]=3;payload.textContent=JSON.stringify(entries);}
+  entries.r=entries.r.filter(entry=>entry[2]!==0);
+  entries.r.find(entry=>entry[0]==='page-owner/C2')[6]=2;payload.textContent=JSON.stringify(entries);}
  return {ok:true,text:async()=>page.documentElement.outerHTML};
 };
 </script>""".replace('PAGES', json.dumps(pages).replace('</', '<\\/'))
@@ -2437,56 +2433,56 @@ window.fetch=async(url,options)=>{
  try{
   await flush();
   check(!document.querySelector('[data-list-count]'),'The Show chips replace the right count text.');
-  check(counts('[data-show-chip]')==='3|0|1|5','The index counts states outside the rendered view.');
+  check(counts('[data-show-chip]')==='3|0|4','The index counts states outside the rendered view.');
   const ownerChip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
   const selectedOwner=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]');
   const builder=document.querySelector('[data-type="change"]').dataset.sourceOwner;
   const chooseOwner=value=>ownerChip(value).click();
   show('all').click();await flush();await flush();
   chooseOwner(builder);
-  check(counts('[data-show-chip]')==='0|0|0|1','Show counts use the selected owner.');
+  check(counts('[data-show-chip]')==='0|0|1','Show counts use the selected owner.');
   check(type('change').querySelector('b').textContent==='0' && type('investigation').querySelector('b').textContent==='1',
    'Type counts use the selected owner.');
   type('change').click();
-  check(selectedOwner().dataset.ownerChip==='' && counts('[data-show-chip]')==='2|0|1|3',
+  check(selectedOwner().dataset.ownerChip==='' && counts('[data-show-chip]')==='2|0|2',
    'F007: an owner without the selected type resets to All.');
   type('investigation').click();
   chooseOwner(builder);show('open').click();await flush();await flush();
-  check(selectedOwner().dataset.ownerChip===builder && counts('[data-show-chip]')==='0|0|0|1' &&
+  check(selectedOwner().dataset.ownerChip===builder && counts('[data-show-chip]')==='0|0|1' &&
    [...document.querySelectorAll('[data-list-item]')].every(row=>row.hidden),
    'F007: the user case keeps an owner with rows in another Show.');
   show('all').click();await flush();await flush();
-  check(counts('[data-show-chip]')==='0|0|0|1','Show counts combine the type and owner.');
+  check(counts('[data-show-chip]')==='0|0|1','Show counts combine the type and owner.');
   search('gate');
-  check(counts('[data-show-chip]')==='0|0|0|1' && ownerChip('').textContent==='All 1',
+  check(counts('[data-show-chip]')==='0|0|1' && ownerChip('').textContent==='All 1',
    'All counts combine the words, owner, type and Show filters.');
   search('');chooseOwner('');type('').click();show('open').click();await flush();await flush();
   type('change').click();
-  check(counts('[data-show-chip]')==='2|0|1|3','Show counts use the selected type.');
+  check(counts('[data-show-chip]')==='2|0|2','Show counts use the selected type.');
   search('Numbered');
-  check(counts('[data-show-chip]')==='1|0|1|2','Show counts use the words filter.');
+  check(counts('[data-show-chip]')==='1|0|1','Show counts use the words filter.');
   check(type('change').querySelector('b').textContent==='1' && type('question').querySelector('b').textContent==='0',
    'Type counts use the words filter and Show.');
   check(selectedOwner().textContent==='All 1',
    'Owner counts use the type, Show and words.');
   search('no matching title');
-  check(counts('[data-show-chip]')==='0|0|0|0' && [...document.querySelectorAll('[data-type-chip] b')].every(n=>n.textContent==='0') &&
+  check(counts('[data-show-chip]')==='0|0|0' && [...document.querySelectorAll('[data-type-chip] b')].every(n=>n.textContent==='0') &&
    selectedOwner().textContent==='All 0',
    'An empty filtered view has zero in every applicable count.');
   search('');show('all').click();await flush();await flush();
-  check(type('change').querySelector('b').textContent==='3','Type counts include the selected Show.');
+  check(type('change').querySelector('b').textContent==='2','Type counts include the selected Show.');
   type('question').click();
   const row=document.querySelector('[data-list-item][data-type="question"]');
   row.querySelector('.list-toggle').click();await readyReviewCard(row);
   const form=row.querySelector('form');form.elements.feedback.value='Use the first layout.';
   form.requestSubmit(form.querySelector('[value="answer"]'));
   await new Promise(resolve=>nativeTimeout(resolve,1100));
-  check(counts('[data-show-chip]')==='0|0|1|1','A save moves the index entry to Done.');
+  check(counts('[data-show-chip]')==='0|0|0','A save removes the completed entry from all State counts.');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
   await flush();await flush();
-  check(counts('[data-show-chip]')==='0|0|1|1','A refresh retains the saved state from the server index.');
+  check(counts('[data-show-chip]')==='0|0|0','A refresh retains the saved state from the server index.');
   type('change').click();
-  check(counts('[data-show-chip]')==='1|1|1|3','A refresh replaces an unsaved entry in the index.');
+  check(counts('[data-show-chip]')==='1|1|2','A refresh replaces an unsaved entry in the index.');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/result',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
@@ -2556,8 +2552,8 @@ window.fetch=async(url,options)=>{
                     records.append(replace(examples[kind], key=key, id=key, owner=owner, source_unit=owner,
                                            state=state, actions=()))
 
-        show_states = {'open': (state_type.OPEN,), 'Done': (state_type.DONE,),
-                       'all': tuple(state_type)}
+        show_states = {'open': (state_type.OPEN,), 'Validating': (state_type.VALIDATING,),
+                       'all': review_items.selected_states('active')}
         expected: dict[str, dict[str, dict[str, int]]] = {}
         for show, selected_states in show_states.items():
             expected[show] = {}
@@ -2567,7 +2563,8 @@ window.fetch=async(url,options)=>{
                           for owner in owners}
                 expected[show][kind] = {'': sum(counts.values()), **counts}
 
-        with patch.object(review_items, 'read', return_value=records):
+        active = [item for item in records if item.state != state_type.DONE]
+        with patch.object(review_items, 'read', return_value=active):
             page = review_page.render(self.root).decode()
 
         setup = r"""<script>
@@ -2615,7 +2612,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
   chip('type','change').click();checkCounts('all','change');
   check(counts()!==allTypes,'Type alone changes the Owner counts in Show All.');
   const allStates=counts();
-  changeShow('Done');checkCounts('Done','change');
+  changeShow('Validating');checkCounts('Validating','change');
   check(counts()!==allStates,'Show alone changes the Owner counts for Changes.');
   for(const [show,types] of Object.entries(expected)){
    if(selected('show')!==show) changeShow(show);
@@ -2639,9 +2636,10 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         done_key = f'investigation/{ready.owner}/{ready.id}'
         waiting_key = f'investigation/{waiting.owner}/{waiting.id}'
         done = review_page.render(self.root, show='Done').decode()
-        self.assertEqual(next(entry['state'] for entry in unpack_index(done.split('data-review-index>',1)[1].split('</script>',1)[0]) if entry['key']==done_key),'Done')
+        self.assertIn('data-show="open"', done)
+        self.assertNotIn('data-show-chip="Done"', done)
         all_items = review_page.render(self.root, show='all').decode()
-        self.assertIn(done_key,{entry['key'] for entry in unpack_index(all_items.split('data-review-index>',1)[1].split('</script>',1)[0])})
+        self.assertNotIn(done_key,{entry['key'] for entry in unpack_index(all_items.split('data-review-index>',1)[1].split('</script>',1)[0])})
         self.assertIn(waiting_key,{entry['key'] for entry in unpack_index(all_items.split('data-review-index>',1)[1].split('</script>',1)[0])})
         for show in ('open', 'Validating'):
             with self.subTest(show=show):
@@ -2650,6 +2648,28 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 owner_menu = source.partition('id="list-owner"')[2].partition('</div>')[0]
                 self.assertIn(f'data-owner-chip="{waiting.owner}"', owner_menu,
                               'F002: the unit Owner option remains when its Show view has no rows')
+
+    def test_completed_bug_stays_in_its_store_and_out_of_review(self) -> None:
+        producer = fixture_member('producer', name='builds')
+        bug = investigation.file(producer.id, 'Check the build', 'Which step stopped?', waiting_why='builds checks the failure.',
+                                 kind=investigation.InvestigationKind.BUG)
+        _ = investigation.answer(bug.owner, bug.id, 'The test step.')
+        key = f'investigation/{bug.owner}/{bug.id}'
+        before = review_page.build_snapshot(self.root)
+        request = console.NewsRequest(self.root)
+        self.assertTrue(any(item.startswith(key+'/') for item in review_page.waiting_items(request, snapshot=before)))
+
+        _ = investigation.mark_read(bug.owner, bug.id)
+        with patch.object(investigation, 'read_review_record', wraps=investigation.read_review_record) as read:
+            after = review_page.build_snapshot(self.root)
+        read.assert_not_called()
+        for show, _ in review_page.SHOWS:
+            page = after.render(show=show)
+            self.assertNotIn(key.encode(), page)
+            self.assertNotIn(f'data-owner-chip="{producer.id}"'.encode(), page)
+        waiting = review_page.waiting_items(console.NewsRequest(self.root), snapshot=after)
+        self.assertFalse(any(item.startswith(key+'/') for item in waiting))
+        self.assertEqual(investigation.load(bug.owner, bug.id).state, investigation.InvestigationState.READ)
 
     def test_open_read_skips_done_payloads_and_retains_full_selected_records(self) -> None:
         question_key = self.question()
@@ -2667,7 +2687,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         owners: dict[staff.StaffId, str] = {}
         with patch.object(review_items, 'change_item', wraps=review_items.change_item) as project_change, patch.object(
                 review_items, 'question_item', wraps=review_items.question_item) as project_question, patch.object(
-                investigation, 'load', wraps=investigation.load) as load_investigation:
+                investigation, 'read_review_record', wraps=investigation.read_review_record) as load_investigation:
             opened = review_items.read(self.root, show='open', owner_options=owners)
         self.assertEqual(opened, [item for item in all_items if item.state == review_items.ReviewState.OPEN])
         self.assertEqual(owners, expected_owners, 'The owner menu includes owners of omitted Done records.')
@@ -2675,7 +2695,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         self.assertFalse(any(cast(dict[str, str], call.args[1]).get('Verdict') for call in project_change.call_args_list),
                          'An Open read does not project a Done change.')
         self.assertFalse(project_question.called, 'An Open read does not project a closed question.')
-        self.assertNotIn(ready.id, [call.args[1] for call in load_investigation.call_args_list],
+        self.assertNotIn(ready.id, [cast(Path, call.args[0]).stem for call in load_investigation.call_args_list],
                          'An Open read does not load a read investigation.')
         for show in ('Open', 'Done', 'all'):
             with self.subTest(show=show):
@@ -3987,7 +4007,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  form.querySelector('[data-later-toggle]').click();
  form.querySelector('[data-later-preset="soon"]').click();
  const clip=copy(panel),exit=clip.getAnimations()[0];
- exit.currentTime=100;
+ halfway(exit);
  const position=top(clip);
  posts.get(row.dataset.key)({ok:true,json:async()=>({answer:'later',state:'Open',later:Date.now()+3600000})});
  await frame();
@@ -4031,6 +4051,8 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  if(!motion || !posts.has(row.dataset.key)) throw new Error('The save must start the fade.');
  posts.get(row.dataset.key)({ok:true,json:async()=>({answer:'saved',state:action.state,later:0})});
  motion.finish();await frame();
+ if(action.state==='Done') check(!rows().some(item=>item.dataset.key===row.dataset.key),
+  'The completed item leaves Review.');
  const place=new URLSearchParams(location.hash.slice(1));
  check(Object.entries(filters).every(([key,value])=>place.get(key)===value),
   'The card submit keeps every filter in the address.');
@@ -4069,10 +4091,10 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  const firstKey=first.dataset.key;
  send(await openCard(first));
  const firstExit=copy(firstPanel).getAnimations()[0];
- firstExit.currentTime=100;
+ halfway(firstExit);
  send(await openCard(second));
  const secondClip=copy(secondPanel),secondExit=secondClip.getAnimations()[0];
- secondExit.currentTime=100;
+ halfway(secondExit);
  posts.get(firstKey)({ok:false,json:async()=>({reason:'Try again.'})});
  await frame();
  const returning=copy(firstPanel),returnFade=returning.getAnimations()[0];
@@ -4108,6 +4130,38 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  check(near(top(next),following),'The next card keeps its position when the save completes.');
  exit.finish();await exit.finished;await frame();
  check(!copy(panel) && top(next)<following,'The next card fills the gap when the fade ends.');
+""")
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_completed_card_leaves_after_remount_during_save(self) -> None:
+        change = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
+        records = [replace(change, key=f'change-{number}', id=f'C{number}') for number in range(1, 181)]
+        with patch.object(review_items, 'read', return_value=records):
+            source = browser_markup(self.root)
+        self.check_card_motion(source, r"""
+ document.querySelector('[data-sort="0"]').click();
+ const row=rows()[1],key=row.dataset.key,panel=panelId(row);
+ const current=()=>rows().find(node=>node.dataset.key===key);
+ send(await openCard(row));
+ check(posts.has(key) && !row.isConnected,'The pending save removes the original row.');
+ const firstExit=copy(panel)?.getAnimations()[0];
+ if(!firstExit) throw new Error('The original row must animate when it leaves.');
+ scrollTo({top:document.documentElement.scrollHeight,behavior:'instant'});await frame();
+ check(scrollY>innerHeight && !current() && copy(panel),'Scrolling away preserves the first fade.');
+ firstExit.finish();await firstExit.finished;await frame();
+ check(!current() && !copy(panel),'The first fade ends while the row is outside the window.');
+ scrollTo({top:0,behavior:'instant'});await frame();
+ const remounted=current();
+ if(!remounted || remounted===row) throw new Error('The pending row must mount again.');
+ const form=await readyReviewCard(remounted);
+ check(form.dataset.sending==='true','The remounted form shows the pending save.');
+ posts.get(key)({ok:true,json:async()=>({answer:'works',state:'Done',later:0})});
+ await frame();
+ check(!current(),'The completed row leaves the table.');
+ const exit=copy(panel)?.getAnimations()[0];
+ if(!exit) throw new Error('The remounted row must animate when it leaves.');
+ exit.finish();await exit.finished;await frame();
+ check(!current() && !document.querySelector('[data-record-motion]'),'The animation leaves no row or spacer.');
 """)
 
     def check_card_motion(self, source: str, steps: str) -> None:
@@ -4187,13 +4241,11 @@ if(!sessionStorage.getItem('review-reload')) history.replaceState(null,'','#item
    location.reload();return;
   }
   if(CASE==='verdict'){
-   const deadline=performance.now()+8000;
-   while(row() && !row().dataset.bodyLoaded && performance.now()<deadline)
-    await new Promise(resolve=>requestAnimationFrame(resolve));
-   check(row()?.dataset.state==='Done' && row()?.querySelector('[data-review-body]') &&
-      !row()?.querySelector('[value="works"]'),'A reload during publication retry hides the old verdict action.');
+   const savedKey='review-saved-verdicts:'+location.pathname;
+   check(!row() && !content.querySelector('[data-missing-item]').hidden && sessionStorage.getItem(savedKey),
+    'A reload hides the completed Change while the snapshot still contains it.');
    const index=JSON.parse(content.querySelector('[data-review-index]').textContent);
-   index.r.find(entry=>entry[0]===key)[6]=2;
+   index.r=index.r.filter(entry=>entry[0]!==key);
    const facts=pageRefreshFacts(),version='confirmed';
    window.fetch=(url,options)=>{
     const params=new URL(url,location.href).searchParams;
@@ -4204,10 +4256,8 @@ if(!sessionStorage.getItem('review-reload')) history.replaceState(null,'','#item
    const refreshed=new Promise(resolve=>content.addEventListener('review-refreshed',resolve,{once:true}));
    dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
    await refreshed;
-   row().querySelector('.list-toggle').click();
-   content.querySelector('[data-show-chip="Done"]').click();
-   check(row()?.dataset.state==='Done' && !row().hidden && row().querySelector('[data-detail]').hidden,
-    'The confirmed Change appears in the Done list after its linked card closes.');
+   check(!row() && !sessionStorage.getItem(savedKey),
+    'The new snapshot confirms the removal and clears the saved verdict marker.');
   }else{
    check(content.dataset.show==='open' && !row(),'A reload restores Open when the address names a Done Change.');
   }
@@ -4289,8 +4339,8 @@ window.fetch=(url,options={})=>{
      failures.push('The deferred link keeps the Validating marker when a new snapshot still shows the old Change.');
     continue;
    }
-   if(item!==key || target?.dataset.state!=='Done' || target.querySelector('[data-detail]').hidden)
-    failures.push('Back keeps the link and opens the Done card for '+key+'.');
+   if(item!==key || target || content.querySelector('[data-missing-item]').hidden)
+    failures.push('Back keeps the link and reports the completed item as unavailable: '+key+'.');
   }
  }catch(error){failures.push(String(error));}
  await sendProbe('/results',{method:'POST',body:JSON.stringify(failures)});
@@ -4388,9 +4438,8 @@ window.fetch=(url,options={})=>{
   }
   await afterFades();
   const linked=REFUSE_QUESTION ? change : question,target=row(linked);
-  if(item()!==linked || target?.dataset.state!=='Done' || target.querySelector('[data-detail]').hidden)
-   failures.push('The save opens the Done card at the restored link. State: '+
-    target?.dataset.state+', expanded: '+(target?.querySelector('[data-detail]').hidden===false)+'.');
+   if(item()!==linked || target || content.querySelector('[data-missing-item]').hidden)
+    failures.push('The restored link reports the completed item as unavailable after the fades.');
  }catch(error){failures.push(String(error));}
  await sendProbe('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
@@ -4417,9 +4466,9 @@ window.fetch=(url,options)=>String(url)==='/results' ? sendProbe(url,options) :
         probe = r"""<script>
 (async()=>{
  const failures=[],stage=sessionStorage.getItem('console-reload');
- const frame=document.querySelector('iframe'),key='page-owner/C1';
- const explicit='/console/review.html?show=open&item='+encodeURIComponent(key);
- const row=()=>frame.contentDocument.querySelector('[data-key="'+key+'"]');
+ const frame=document.querySelector('iframe'),open='page-owner/C2',done='page-owner/C1';
+ const explicit='/console/review.html?show=all&item='+encodeURIComponent(open);
+ const row=key=>frame.contentDocument.querySelector('[data-key="'+key+'"]');
  const show=()=>frame.contentDocument.querySelector('[data-review]')?.dataset.show;
  const until=async (predicate,label)=>{
   const end=performance.now()+8000;
@@ -4435,14 +4484,14 @@ window.fetch=(url,options)=>String(url)==='/results' ? sendProbe(url,options) :
   }
   await until(()=>frame.contentWindow.history.state?.recordTable,'Review to load');
   if(stage==='linked'){
-   if(show()!=='all' || row()?.querySelector('[data-detail]').hidden!==false)
-    failures.push('An explicit link opens the Done Change.');
+   if(show()!=='all' || row(open)?.querySelector('[data-detail]').hidden!==false || row(done))
+    failures.push('An explicit link opens the active Change under All and leaves the completed Change hidden.');
    frame.contentDocument.querySelector('[data-show-chip="open"]').click();
    await until(()=>new URLSearchParams(location.search).get('at.review')==='/console/review.html'+
     frame.contentWindow.location.hash,'Console to record Open');
    sessionStorage.setItem('console-reload','reloaded');location.reload();return;
   }
-  if(show()!=='open' || row()) failures.push('A Console reload keeps Open and hides the Done Change. Show: '+show());
+  if(show()!=='open' || row(done)) failures.push('A Console reload keeps Open and hides the completed Change.');
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
@@ -4453,7 +4502,7 @@ window.fetch=(url,options)=>String(url)==='/results' ? sendProbe(url,options) :
         self.assertEqual(firefox_probe_results(router.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
-    def test_same_tab_link_shows_the_change_that_just_closed(self) -> None:
+    def test_links_keep_completed_changes_and_questions_hidden(self) -> None:
         _ = self.question()
         setup = r"""<script>
 const nativeFetch=fetch;
@@ -4506,9 +4555,6 @@ window.fetch=(url,options={})=>{
  try{
   const owner=change('page-owner/C1').dataset.owner;
   document.querySelector('[data-owner-chip="'+CSS.escape(owner)+'"]').click();
-  selectShow('Done');
-  check(expanded(await follow({show:'Done'}),'Open') && review.dataset.show==='all' && selectedOwner()===owner,
-   'F003: A link with Done selected shows the Open Change C1.');
   selectShow('open');
   if(selectedOwner()!==owner) document.querySelector('[data-owner-chip="'+CSS.escape(owner)+'"]').click();
   check(expanded(await follow({}),'Open') && review.dataset.show==='open' && selectedOwner()===owner,
@@ -4530,7 +4576,7 @@ window.fetch=(url,options={})=>{
     if(!exit) throw new Error('The Change must fade during the save.');
     const midpoint=exit.effect.getTiming().duration/2;
     exit.pause();exit.currentTime=midpoint;
-    await follow({show:'Done',owner});
+    await follow({show:'all',owner});
     finishVerdict();
     await saved;
     check(clip.isConnected && exit.currentTime===midpoint && !change(key),
@@ -4542,24 +4588,20 @@ window.fetch=(url,options={})=>{
    }
    await saved;
    check(form.querySelector('[data-send-status]').textContent==='Saved: works',key+' saved.');
-   check(row.hidden,'The save hides '+key+'.');
+   check(!change(key),'The save removes '+key+'.');
    if(key==='page-owner/C2'){
     const fades=[...review.querySelectorAll('.record-motion-clip')].flatMap(node=>node.getAnimations());
     await Promise.allSettled(fades.map(animation=>animation.finished));
    }
   }
-  check(expanded(change('page-owner/C1'),'Done') && review.dataset.show==='Done' && selectedOwner()===owner,
-   'F006: A link during the save opens the Done Change and keeps the matching filters.');
-
-  const linked=await follow({show:'all'});
-  check(expanded(linked,'Done'),'The same-tab link shows the closed Change C1.');
-  check(linked?.querySelector('[data-review-body]'),'The reopened card keeps its cached details.');
-  check(!linked?.querySelector('[data-review-form]'),'The reopened card hides stale actions until the snapshot arrives.');
+  check(!change('page-owner/C1') && selectedOwner()===owner,
+   'A link during a save keeps the completed Change hidden and preserves the owner.');
+  check(!(await follow({show:'all'})) && review.dataset.show==='all',
+   'A same-tab link cannot reopen the completed Change under All.');
   selectShow('open');
-  check(review.dataset.show==='open','Open is selected before the link.');
-  check(expanded(await follow({show:'open'}),'Done') && review.dataset.show==='all',
-   'A link from Open selects All and shows the closed Change C1.');
-  check(!change('page-owner/C2'),'The unlinked Change C2 stays hidden.');
+  check(!(await follow({show:'open'})) && review.dataset.show==='open',
+   'A same-tab link cannot reopen the completed Change under Open.');
+  check(!change('page-owner/C2'),'The other completed Change stays hidden.');
 
   const question=document.querySelector('[data-type="question"][data-list-item]');
   question.querySelector('.list-toggle').click();
@@ -4568,11 +4610,9 @@ window.fetch=(url,options={})=>{
   answerForm.requestSubmit(answerForm.querySelector('[value="answer"]'));
   if(!answerForm.dataset.sending) throw new Error('The Question save did not start.');
   await answered;
-  selectShow('Done');
-  const answeredQuestion=await follow({},question.dataset.key);
-  check(expanded(answeredQuestion,'Done') && review.dataset.show==='Done' &&
-    answeredQuestion.querySelector('[data-review-body]') && !answeredQuestion.querySelector('[value="answer"]'),
-   'F007: A link opens the Done Question without the old Answer action.');
+  selectShow('all');
+  check(!(await follow({},question.dataset.key)) && review.dataset.show==='all',
+   'A link cannot reopen the answered Question.');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
@@ -4588,9 +4628,9 @@ window.fetch=(url,options={})=>{
         initial_link = '<script>history.replaceState(null, "", "#show=open&item=page-owner%2FC1");</script>'
         initial_probe = r"""<script>
 const review=document.querySelector('[data-review]'),row=review.querySelector('[data-key="page-owner/C1"]');
-const opened=row?.dataset.state==='Done' && !row.hidden && !row.querySelector('[data-detail]').hidden;
-void fetch('/results',{method:'POST',body:JSON.stringify(opened && review.dataset.show==='all' ? [] :
- ['F004: A fresh link with Open selected shows the Done Change C1.'])});
+const hidden=!row && !review.querySelector('[data-missing-item]').hidden;
+void fetch('/results',{method:'POST',body:JSON.stringify(hidden && review.dataset.show==='open' ? [] :
+ ['F004: A fresh link reports that the completed Change is unavailable.'])});
 </script>"""
         page = markup.replace('<head>', '<head>'+initial_link, 1).replace('</body>', initial_probe+'</body>', 1)
         with self.subTest(navigation='fresh load'):
@@ -4611,10 +4651,8 @@ void fetch('/results',{method:'POST',body:JSON.stringify(opened && review.datase
             done = self.investigation()
             _ = investigation.mark_read(done.owner, done.id)
         source = browser_markup(self.root)
-        done_source = browser_markup(self.root, show='Done')
         setup = r"""<script>
 const nativeFetch=fetch, nativeTimeout=setTimeout, original=MARKUP;
-window.doneMarkup=DONE_MARKUP;
 window.setInterval=()=>0;window.clearInterval=()=>{};
 window.refreshMarkup=original;
 window.transformFixtureBody=(text,key)=>{
@@ -4635,7 +4673,7 @@ window.fetch=async(_url,options={})=>{
  }
  window.refreshRequests.push(_url);return {ok:true,text:async()=>window.refreshMarkup};
 };
-</script>""".replace('DONE_MARKUP',json.dumps(done_source).replace('</','<\\/')).replace('MARKUP',json.dumps(source).replace('</','<\\/'))
+</script>""".replace('MARKUP',json.dumps(source).replace('</','<\\/'))
         probe = r"""<script>
 (async()=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
@@ -4726,8 +4764,7 @@ window.fetch=async(_url,options={})=>{
   check(allTarget.hidden,'F010: the saved row leaves All');
   location.hash=new URLSearchParams({item:target.dataset.key});await flush();
   const reopened=liveRow(target.dataset.key);
-  check(reopened && !reopened.hidden && !reopened.querySelector('[data-detail]').hidden,
-   'A same-tab link shows and opens the saved Change.');
+  check(!reopened, 'A same-tab link keeps the completed Change hidden.');
   check(!liveRow(allTarget.dataset.key),'F010: the unlinked saved Change stays hidden in All.');
   const reloaded=document.createElement('iframe');reloaded.src='/console/review.html#'+new URLSearchParams({item:target.dataset.key});
   const reloadComplete=new Promise(resolve=>reloaded.addEventListener('load',resolve,{once:true}));document.body.append(reloaded);await reloadComplete;
@@ -4864,7 +4901,7 @@ window.fetch=async(_url,options={})=>{
     ['Validating','2099-02-01T09:00:00+00:00',false],['Open','2099-02-01T10:00:00+00:00',true]]){
    const update=new DOMParser().parseFromString(original,'text/html');
    const payload=update.querySelector('[data-review-index]'),entries=JSON.parse(payload.textContent);
-   const entry=entries.r.find(entry=>entry[0]===pendingKey);entry[6]=['Open','Waiting','Done','Validating'].indexOf(state);entry[8]=updated;
+   const entry=entries.r.find(entry=>entry[0]===pendingKey);entry[6]=['Open','Waiting','Validating'].indexOf(state);entry[8]=updated;
    payload.textContent=JSON.stringify(entries);
    window.refreshMarkup=update.documentElement.outerHTML;
    dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
@@ -4873,16 +4910,16 @@ window.fetch=async(_url,options={})=>{
    check(Number(document.querySelector('[data-show-chip="open"] b').textContent)===initialCount-(revealed?0:1),
      'F021: only the new Open response restores the count');
   }
-  window.refreshMarkup=window.doneMarkup;
   const beforeShowRequests=window.refreshRequests.length;
-  choose('list-show','Done');await flush();await flush();
-  check(document.querySelector('[data-show-chip="Done"] b').textContent==='6',
-    'Done counts three server records, two saved verdicts and one saved answer.');
+  choose('list-show','all');await flush();await flush();
+  check(document.querySelector('[data-show-chip="all"] b').textContent==='3' &&
+    rows().every(row=>row.dataset.state!=='Done'),
+    'All excludes completed records, saved verdicts and the saved answer.');
   check(window.refreshRequests.length===beforeShowRequests,
     'the Show chips select rows without a request');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
   check(new URL(window.refreshRequests.at(-1),location.href).searchParams.has('version') &&
-    showValue()==='Done','the refresh keeps the selected Show view');
+    showValue()==='all','the refresh keeps the selected State view');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
