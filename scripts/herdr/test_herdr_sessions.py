@@ -952,9 +952,15 @@ class StandaloneLaunchTests(unittest.TestCase):
         _ = prompt.write_text("first line\nsecond line\n")
         self.destination()
         transcript = directory / "projects/fixture/recorded-id.jsonl"
-        self.responses["--session agents pane process-info --pane w1:p1"] = CommandResponse(code=0, stdout=json.dumps({
-            "result": {"process_info": {"shell_pid": 100, "foreground_process_group_id": 101,
-                                        "foreground_processes": [{"pid": 101, "name": "claude", "argv": ["claude"]}]}}}))
+        fake_unit_host.process(os.environ, 101, 100, ["claude"], {}, started="fixture-start")
+        registry = runtime_sessions.sessions_dir() / "101.json"
+        self.responses["--session agents pane process-info --pane w1:p1"] = CommandResponse(
+            code=0, stdout=json.dumps({"result": {"process_info": {
+                "shell_pid": 100, "foreground_process_group_id": 101,
+                "foreground_processes": [{"pid": 101, "name": "claude", "argv": ["claude"]}]}}}),
+            write_files={str(registry): json.dumps({"pid": 101, "procStart": "fixture-start",
+                "name": "solo", "sessionId": "recorded-id", "updatedAt": 1, "messagingSocketPath": ""})},
+        )
         def native_process(pid: int, kind: str) -> herdr.NativeAgentProcess:
             self.assertEqual((pid, kind), (101, "claude"))
             return herdr.NativeAgentProcess(herdr.EnvironmentThread("recorded-id"), "fixture-start", {})
