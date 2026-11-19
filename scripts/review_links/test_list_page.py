@@ -2581,8 +2581,8 @@ window.fetch=async(_path,options={})=>{
  check(requests[0]?.get('action')==='park' && requests[0].get('until')==='delivered','The POST uses the delivery value');
  finishPost({item_state:'Working',parked:'true',parked_until:'delivered'});
  await flush();
- check(!row.hidden && row.previousElementSibling?.dataset.number==='2',
-  'All moves the newly parked row after the unparked row.');
+ check(!row.hidden && row.nextElementSibling?.dataset.number==='2',
+  'All keeps the server order until a refresh.');
  check(document.querySelector('#filter-show-all b').textContent==='2' &&
   document.querySelector('#filter-show-parked b').textContent==='1','All and Parked count the parked item.');
  check(form.querySelector('[data-send-status]').textContent==='Parked until delivered',

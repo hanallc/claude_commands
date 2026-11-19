@@ -782,9 +782,10 @@ On desktop, the ETA cell stays on one line and shows an ellipsis if the text is 
 Hover or focus on the ETA to see the full text.
 On a phone, the ETA wraps to show the full text in the row.
 Past times and past range end times use the same warning color as Check overdue.
-The default order puts parked items after other items.
+The server puts parked items after other items in the default order.
 Within each group, the List uses `the_list.order`.
 User decisions come first, then unread updates, then the earliest next check.
+The page uses the order from the latest server response.
 A column button sorts all matching items by its values.
 A second click reverses that order.
 

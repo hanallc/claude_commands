@@ -938,17 +938,17 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                                        defer_missing=include_counts and defer_counts))
     zone = user_zone()
     today = datetime.fromtimestamp(read_at, zone)
+    ordered_items = [(entry, the_list.parking_active(entry.item.parked_until, today)) for entry in items]
+    ordered_items.sort(key=lambda pair: pair[1])
     secret = form_secret(root)
     owners: Counter[the_list.ItemOwner] = Counter()
     producers: Counter[the_list.ItemOwner] = Counter()
     rows: list[str] = []
-    parked_rows: list[str] = []
     deferred_links = False
     chip_counts: Counter[ListChip] = Counter()
-    for index, entry in enumerate(items):
+    for index, (entry, parked) in enumerate(ordered_items):
         owners[entry.item.owner] += 1
         producers[entry.item.producer] += 1
-        parked = the_list.parking_active(entry.item.parked_until, today)
         open_question = has_open_question(entry.item)
         visibility = the_list.question_visibility(entry.keeper, entry.item, status)
         chip_counts[list_chip(entry.item.state, parked=parked, open_question=open_question,
@@ -961,7 +961,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
         ):
             row_reviews = LinkedReviewRead.AFTER_RENDER
             deferred_links = True
-        (parked_rows if parked else rows).append(
+        rows.append(
             item_rows(entry, names, today, index, secret, row_reviews, parked=parked,
                       open_question=open_question, visibility=visibility))
     shows = [record_table.Chip("all", "All", len(items)),
@@ -1011,7 +1011,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + '<div class="list-table-tools"><div class="list-expansion">' + expansion + '</div>'
                + '<span data-list-count role="status" aria-live="polite"></span></div>'
                + '<div class="list-table"><table aria-label="The List">' + columns + '<thead><tr>' + headers + '</tr></thead>'
-               + ''.join(rows) + ''.join(parked_rows) + '</table>'
+               + ''.join(rows) + '</table>'
                + '<p data-empty hidden>No items in this view.</p></div>'
                + '<section data-linked-item hidden><h2 id="list-linked-heading">Linked item outside filters</h2>'
                + '<div class="list-table"><table aria-labelledby="list-linked-heading">' + columns
@@ -1300,7 +1300,6 @@ const tableView=createRecordTable({content:()=>content,
  },
  filters:['producer','unread'],
  staffChipFilters:['owner','producer'],
- defaultOrder:data=>[Number(isParked(data)),Number(data.order)],
  beforeApply:rememberLogPositions,
  applied:(_items,{show,filters})=>{
   const nextUnreadShow=filters.unread ? show : '';

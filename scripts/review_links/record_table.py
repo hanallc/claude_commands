@@ -349,7 +349,6 @@ if(options.mount){
 
 
 const sortValues=data=>options.sortValues?.(data) ?? JSON.parse(data.sortValues);
-const defaultOrder=data=>options.defaultOrder?.(data) ?? Number(data.order);
 const words=()=>content.querySelector('[data-filter-words]') ?? content.querySelector('#list-search');
 const sharedWords=()=>words().hasAttribute?.('data-filter-words');
 const chipRow=name=>content.querySelector('[data-filter-row="'+name+'"]');
@@ -605,7 +604,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
   const transition=windowMotions ? windowMotions.get(item.dataset.key) : rowMotion.get(item);
   return (transition?.sortValues ?? sortValues(item.dataset))[column];
  };
- const compareOrder=(a,b)=>compare(defaultOrder(a.dataset),defaultOrder(b.dataset));
+ const compareOrder=(a,b)=>compare(Number(a.dataset.order),Number(b.dataset.order));
  const items=[...rows,...departingRows].sort((a,b)=>column<0 ? compareOrder(a,b) :
   (compare(sortValue(a),sortValue(b)) || compareOrder(a,b))*(direction==='desc' ? -1 : 1));
  const table=content.querySelector('table');let count=0;
