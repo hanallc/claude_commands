@@ -22,6 +22,7 @@ from typing import ClassVar, cast, final, override
 import unittest
 from unittest.mock import patch
 
+from scripts.buildlog.store import host_name
 from scripts.lib import build_folders, user_zone, zone
 from scripts.lint.memory_test_support import config_environment
 from scripts.direct.wait_for_test_state import wait_until
@@ -245,6 +246,53 @@ class FastTrackTests(MergeCheckpointFixture):
         self.initial: str = ""
 
     @override
+    def bind_fixture(self, root: Path) -> None:
+        super().bind_fixture(root)
+        machine = host_name()
+        settings = f"""# whole: 1..
+names.suffix_length=8
+# whole: 1..64
+names.repository_key_length=8
+names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_
+roots.system={root}
+roots.temporary=${{TMPDIR}}/builds
+roots.gate=/dev/shm
+roots.scratch={root / 'scratch'}
+roots.copies={root / 'copies'}
+roots.slot_cargo={root / 'cargo'}
+roots.slots={root / 'slots'}
+roots.workspace={root / 'workspaces'}
+roots.session={root / 'session'}
+# whole: 1..
+slots.unused_days=7
+# range: 5e-324..
+slots.wait_seconds=30
+# whole: 1..
+slots.{machine}.default_max=1
+# whole: 1..
+slots.{machine}.origin.max=2
+patterns.named={{showrunner}}-{{unit}}/{{work}}-{{purpose}}
+patterns.temporary={{repository}}/{{owner}}-{{purpose}}-{{suffix}}
+patterns.gate={{purpose}}-{{suffix}}
+patterns.standing={{repository}}/{{owner}}-gate{{suffix}}
+patterns.editable={{repository}}-{{owner}}/{{purpose}}
+patterns.legacy-unique={{purpose}}{{suffix}}
+patterns.tool={{purpose}}{{suffix}}
+# range: 0.001..60
+locks.probe_wait_seconds=0.25
+# range: 0.001..1
+locks.probe_retry_seconds=0.005
+# whole: 0..1
+seed.enabled=0
+# whole: 1..
+seed.max_gib=24
+# whole: 0..
+seed.min_free_gib=350
+"""
+        for config in (root, root / "config"):
+            _ = (config / "build_folders.conf").write_text(settings)
+
+    @override
     def build_fixture(self) -> None:
         super().build_fixture()
         for path, content in {
@@ -283,6 +331,7 @@ class FastTrackTests(MergeCheckpointFixture):
         self.config = self.root / "config" / "fast_track.conf"
         self.config.parent.mkdir(exist_ok=True)
         self.env.update(config_environment(self.config.parent))
+        self.enterContext(patch.dict(os.environ, {"CONF_DIR": self.env["CONF_DIR"]}))
         self.records_dir = self.root / "fast-track-state"
         self.events_path = self.root / "fast-track-events.jsonl"
         self.control = self.root / "fast-track-control"
@@ -560,15 +609,47 @@ class FastTrackTests(MergeCheckpointFixture):
         (self.unit / deleted).unlink()
         self.write(self.unit, untracked, "untracked\n")
         paths = [added, changed, deleted, untracked]
+        with self.subTest(settings="default"), patch.dict(os.environ, self.env, clear=True):
+            _ = self.compare_selected_tree(self.unit, paths)
+        with self.subTest(settings="inherited diff settings"):
+            settings = [("diff.noprefix", "true"), ("color.ui", "always"), ("diff.relative", "true")]
+            environment = {**self.env, "GIT_CONFIG": os.devnull, "GIT_CONFIG_COUNT": str(len(settings))}
+            for number, (key, value) in enumerate(settings):
+                environment[f"GIT_CONFIG_KEY_{number}"] = key
+                environment[f"GIT_CONFIG_VALUE_{number}"] = value
+            with patch.dict(os.environ, environment, clear=True):
+                counts = self.compare_selected_tree(self.unit, paths)
+                self.assertCountEqual(counts, [(added, 1, 0), (changed, 1, 1),
+                                               (deleted, 0, 1), (untracked, 1, 0)])
+        with self.subTest(settings="submodule ignore in the index"):
+            self.compare_tree_with_ignored_submodule()
+
+    def compare_selected_tree(self, repo: Path, paths: list[str]) -> list[tuple[str, int, int]]:
         runner = fast_track.GitRunner()
-        with patch.dict(os.environ, self.env, clear=True), fast_track.select_patch(runner, self.unit, paths) as selection:
+        with fast_track.select_patch(runner, repo, paths) as selection:
             environment = {**os.environ, "GIT_INDEX_FILE": str(self.root / "patch-comparison-index")}
-            _ = runner.git(self.unit, "read-tree", selection.worktree_head, environment=environment)
-            _ = runner.git(self.unit, "apply", "--cached", input=selection.patch, environment=environment)
-            expected_tree = runner.git(self.unit, "write-tree", environment=environment).strip()
+            _ = runner.git(repo, "read-tree", selection.worktree_head, environment=environment)
+            _ = runner.git(repo, "apply", "--cached", input=selection.patch, environment=environment)
+            expected_tree = runner.git(repo, "write-tree", environment=environment).strip()
             self.assertEqual(selection.worktree_tree, expected_tree)
-            self.assertCountEqual([path for path, _, _ in fast_track.patch_counts(
-                runner, self.unit, selection.patch)], paths)
+            counts = fast_track.patch_counts(runner, repo, selection.patch)
+            self.assertCountEqual([path for path, _, _ in counts], paths)
+            return counts
+
+    def compare_tree_with_ignored_submodule(self) -> None:
+        nested = self.other / "nested"
+        nested.mkdir()
+        _ = self.git("init", "-q", cwd=nested)
+        _ = self.git("commit", "--allow-empty", "-qm", "Initial submodule", cwd=nested)
+        self.write(self.other, ".gitmodules", '[submodule "nested"]\n\tpath = nested\n\turl = ./nested\n\tignore = all\n')
+        _ = self.git("add", "--", ".gitmodules", "nested", cwd=self.other)
+        _ = self.git("commit", "-qm", "Add submodule", cwd=self.other)
+        (self.other / ".gitmodules").unlink()
+        _ = self.git("commit", "--allow-empty", "-qm", "Update submodule", cwd=nested)
+        self.write(self.other, "src/alpha.txt", "after\n")
+        with patch.dict(os.environ, self.env, clear=True):
+            counts = self.compare_selected_tree(self.other, ["src/alpha.txt", "nested"])
+            self.assertCountEqual(counts, [("src/alpha.txt", 1, 1), ("nested", 1, 1)])
 
     def test_deleted_python_module_still_runs_its_direct_importing_tests(self) -> None:
         (self.unit / "scripts/sample/item.py").unlink()
@@ -1153,6 +1234,30 @@ class FastTrackTests(MergeCheckpointFixture):
         outside = self.root / "outside.txt"
         _ = outside.write_text("outside\n")
         self.assert_refused(self.fast_track(str(outside)))
+        with self.subTest(reason="HEAD changes before a conflicting patch can apply"):
+            source = self.unit / "src/alpha.txt"
+            source.unlink()
+            self.write(self.unit, "src/alpha.txt/child", "new child\n")
+            head = self.git("rev-parse", "HEAD", cwd=self.unit)
+            moved = self.git("commit-tree", f"{head}^{{tree}}", "-p", head, "-m", "Move HEAD", cwd=self.unit)
+            runner = fast_track.GitRunner()
+            run_bytes = runner.run_bytes
+            head_moved = False
+
+            def move_head(repo: Path, *arguments: str, input: bytes | None = None,
+                          environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[bytes]:
+                nonlocal head_moved
+                result = run_bytes(repo, *arguments, input=input, environment=environment)
+                if "diff" in arguments and not head_moved:
+                    _ = self.git("update-ref", "HEAD", moved, head, cwd=self.unit)
+                    head_moved = True
+                return result
+
+            with (patch.dict(os.environ, self.env, clear=True),
+                  patch.object(runner, "run_bytes", side_effect=move_head),
+                  self.assertRaisesRegex(fast_track.Refused, "HEAD changed while selecting the patch"),
+                  fast_track.select_patch(runner, self.unit, ["src/alpha.txt/child"])):
+                self.fail("The selection accepted a different HEAD")
 
     def test_sensitive_paths_are_refused_before_any_check(self) -> None:
         for path in ("scripts/production/add_unit.py", "scripts/agents/fixture.py",

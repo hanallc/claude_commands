@@ -228,6 +228,7 @@ def stage_worktree(runner: GitRunner, repo: Path, head: str, paths: list[str]) -
     with build_folders.tool_folder("fast-track-index") as temporary:
         environment = {**os.environ, "GIT_INDEX_FILE": str(temporary / "index"),
                        "GIT_LITERAL_PATHSPECS": "1"}
+        _ = environment.pop("GIT_DIFF_OPTS", None)
         _ = runner.git(repo, "read-tree", head, environment=environment)
         # A missing untracked path after a successful restore is an empty patch.
         missing = [p for p in paths if not (repo / p).exists() and not (repo / p).is_symlink()]
@@ -240,8 +241,15 @@ def stage_worktree(runner: GitRunner, repo: Path, head: str, paths: list[str]) -
 
 
 def staged_diff(runner: GitRunner, repo: Path, head: str, staged: StagedWorktree, *arguments: str) -> bytes:
-    result = runner.run_bytes(repo, "diff", "--cached", "--binary", "--full-index", "--no-renames",
-                              head, *arguments, environment=staged.environment)
+    result = runner.run_bytes(
+        repo, "-c", "diff.suppressBlankEmpty=false", "-c", "core.quotePath=true",
+        "diff", "--cached", "--binary", "--full-index", "--no-renames",
+        "--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/",
+        "--no-relative", "--ignore-submodules=none", "--submodule=short",
+        "--unified=3", "--inter-hunk-context=0", "--diff-algorithm=myers", "--indent-heuristic",
+        "--output-indicator-old=-", "--output-indicator-new=+", "--output-indicator-context= ",
+        "-O", os.devnull, head, *arguments, environment=staged.environment,
+    )
     if result.returncode:
         raise Refused(result.stderr.decode(errors="replace"))
     return result.stdout
@@ -250,28 +258,22 @@ def staged_diff(runner: GitRunner, repo: Path, head: str, staged: StagedWorktree
 def patch_for(runner: GitRunner, repo: Path, head: str, paths: list[str]) -> WorktreePatch:
     """Return the patch and the tree it selects."""
     with stage_worktree(runner, repo, head, paths) as staged:
-        if not staged.paths:
-            return WorktreePatch(b"", runner.git(repo, "rev-parse", f"{head}^{{tree}}").strip())
+        diff = staged_diff(runner, repo, head, staged, "--raw", "-z") if staged.paths else b""
+        if runner.git(repo, "rev-parse", "HEAD").strip() != head:
+            raise Refused("HEAD changed while selecting the patch; retry the command")
 
-        config = runner.run(repo, "config", "--name-only", "--get-regexp", r"^(apply|diff|submodule)\.")
-        if config.returncode not in (0, 1):
-            raise Refused(failure_detail(config))
-        if not (config.stdout or (repo / ".gitmodules").exists()
-                or "GIT_DIFF_OPTS" in os.environ or "GIT_EXTERNAL_DIFF" in os.environ):
-            raw, _, patch = staged_diff(runner, repo, head, staged, "--raw", "-z").partition(b"\0\0")
-            changed = [os.fsdecode(path) for path in raw.split(b"\0")[1::2]]
-            if all(any(path == selected or path.startswith(selected + "/") or selected == "."
+        raw, _, patch = diff.partition(b"\0\0")
+        changed = [os.fsdecode(path) for path in raw.split(b"\0")[1::2]]
+        if any(not any(path == selected or path.startswith(selected + "/") or selected == "."
                        for selected in staged.paths) for path in changed):
-                return WorktreePatch(patch, runner.git(repo, "write-tree", environment=staged.environment).strip())
-
-        # Git settings can alter patch application. Adding a child can also remove an unselected parent.
-        patch = staged_diff(runner, repo, head, staged, "--", *staged.paths)
-        if not patch:
-            return WorktreePatch(b"", runner.git(repo, "rev-parse", f"{head}^{{tree}}").strip())
-        _ = runner.git(repo, "read-tree", head, environment=staged.environment)
-        result = runner.run_bytes(repo, "apply", "--cached", input=patch, environment=staged.environment)
-        if result.returncode:
-            raise Refused(result.stderr.decode(errors="replace"))
+            # Adding a child can remove an unselected parent. Apply only the requested changes.
+            patch = staged_diff(runner, repo, head, staged, "--", *staged.paths)
+            _ = runner.git(repo, "read-tree", head, environment=staged.environment)
+            if patch:
+                result = runner.run_bytes(repo, "apply", "--cached", "--whitespace=nowarn",
+                                          input=patch, environment=staged.environment)
+                if result.returncode:
+                    raise Refused(result.stderr.decode(errors="replace"))
         return WorktreePatch(patch, runner.git(repo, "write-tree", environment=staged.environment).strip())
 
 
@@ -544,8 +546,6 @@ def select_patch(runner: GitRunner, repo: Path, paths: list[str]) -> Generator[S
         commands = f"update {prefix}/head {head}\nupdate {prefix}/index {index}\n"
         _ = runner.git(repo, "update-ref", "--stdin", input=commands.encode())
         worktree = patch_for(runner, repo, head, paths)
-        if runner.git(repo, "rev-parse", "HEAD").strip() != head:
-            raise Refused("HEAD changed while selecting the patch; retry the command")
         _ = runner.git(repo, "update-ref", prefix + "/worktree", worktree.tree)
         yield SelectedPatch(worktree.patch, head, worktree.tree, index, prefix)
     finally:
