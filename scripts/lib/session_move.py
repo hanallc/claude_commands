@@ -52,10 +52,16 @@ class MoveSummary:
     moved_bytes: int = 0
     kept_live: int = 0
     refused_other: int = 0
+    live_copy_pending: bool = False
 
     def record_move(self, size: int) -> None:
         self.moved_folders += 1
         self.moved_bytes += size
+
+    def keep_live(self, source: Path, reason: LiveSource, *, journaled: bool) -> None:
+        kept(source, reason)
+        self.kept_live += 1
+        self.live_copy_pending |= journaled
 
 
 @dataclass(frozen=True)
@@ -658,7 +664,10 @@ def discard_stage(journal: int, stage: int) -> None:
     clear_journal(journal)
 
 
-def process_uses(sources: tuple[Path, ...], session_pids: frozenset[int]) -> tuple[tuple[Path, int, str], ...]:
+type SourceProcessUses = tuple[tuple[Path, int, str], ...]
+
+
+def process_uses(sources: tuple[Path, ...], session_pids: frozenset[int]) -> SourceProcessUses:
     if not sources:
         return ()
     prefixes = tuple(str(path) for path in sources)
@@ -672,7 +681,7 @@ def process_uses(sources: tuple[Path, ...], session_pids: frozenset[int]) -> tup
     return tuple((Path(path.removesuffix(tmp_sweep.DELETED_SUFFIX)), pid, how) for path, pid, how in uses.paths)
 
 
-def require_idle(source: Path, uses: tuple[tuple[Path, int, str], ...]) -> None:
+def require_idle(source: Path, uses: SourceProcessUses) -> None:
     for path, pid, how in uses:
         if path.is_relative_to(source):
             raise LiveSource(f"{source}: process {pid} {how} ({path})")
@@ -897,9 +906,14 @@ def require_session_stopped(session_id: str, registry: session_records.RegistryR
         raise MoveRefused(state.reason)
 
 
-def check_copy_idle(move: PlannedCopy, session_pids: frozenset[int]) -> None:
-    require_session_stopped(move.session_id, session_records.read_registry())
-    require_idle(move.source, process_uses((move.source,), session_pids))
+def check_source_idle(source: Path, registry: session_records.RegistryRead,
+                      read_uses: Callable[[], SourceProcessUses]) -> None:
+    require_session_stopped(source.name, registry)
+    require_idle(source, read_uses())
+
+
+def check_copy_idle(source: Path, session_pids: frozenset[int]) -> None:
+    check_source_idle(source, session_records.read_registry(), lambda: process_uses((source,), session_pids))
 
 
 @contextmanager
@@ -919,7 +933,7 @@ def require_parent_path(path: Path, expected: int) -> None:
 
 def prepare_copy(job: MoveJournal, journal: int, source: int, session_pids: frozenset[int]) -> VerifiedCopy:
     move = job.move
-    check_copy_idle(move, session_pids)
+    check_copy_idle(move.source, session_pids)
     with (child_directory(source, move.source.name, mount=mount_identity(source)) as original,
           child_directory(journal, STAGED, create=True, mount=mount_identity(journal)) as staged):
         try:
@@ -978,7 +992,7 @@ def resume_copy(job: MoveJournal, journal: int, roots: MoveRoots, root_fd: int,
                             replace(job, state=CopyInProgress()).save(journal)
                             discard_stage(journal, staged)
                             raise
-                check_copy_idle(move, session_pids)
+                check_copy_idle(move.source, session_pids)
                 require_parent_path(move.target.parent, target)
                 rename_exclusive(journal, STAGED, target, move.target.name)
             elif not verified.folder.matches(new) or stat_at(journal, STAGED) is not None:
@@ -1003,7 +1017,7 @@ def finish_copy(job: MoveJournal, verified: VerifiedCopy, source: int, target: i
     source_present = stat_at(source, move.source.name) is not None
     source_mount = mount_identity(source)
     if source_present:
-        check_copy_idle(move, session_pids)
+        check_copy_idle(move.source, session_pids)
         with child_directory(source, move.source.name, mount=source_mount) as original:
             if not job.source.matches(os.fstat(original)):
                 raise MoveRefused("source changed before deletion")
@@ -1024,7 +1038,7 @@ def finish_copy(job: MoveJournal, verified: VerifiedCopy, source: int, target: i
                 raise MoveRefused("published copy changed before source deletion")
             proof = CopyDeletion(source_identities, destination_identities, expected, published)
             # Close the source scan before checking for open files.
-            check_copy_idle(move, session_pids)
+            check_copy_idle(move.source, session_pids)
             with child_directory(source, move.source.name, mount=source_mount) as original:
                 if not job.source.matches(os.fstat(original)):
                     raise MoveRefused("source changed before deletion")
@@ -1038,7 +1052,6 @@ def check_destination(root_fd: int, root: Path, target: Path, destinations: set[
     with destination_parent(root_fd, root, target, create=False) as parent:
         if target in destinations or stat_at(parent, target.name) is not None:
             raise MoveRefused(f"destination conflict at {target}")
-    destinations.add(target)
 
 
 def show_copy(move: PlannedCopy, size: int) -> None:
@@ -1094,7 +1107,11 @@ def move_candidates(roots: MoveRoots, root_fd: int, names: DestinationNames, hol
             if dry_run:
                 summary.refused_other += 1
                 return
-            summary.record_move(resume_copy(pending, journal, roots, root_fd, session_pids))
+            try:
+                summary.record_move(resume_copy(pending, journal, roots, root_fd, session_pids))
+            except LiveSource as error:
+                summary.keep_live(pending.move.source, error, journaled=True)
+                return
             sources.discard(pending.move.source)
 
     eligible = sources - blocked
@@ -1107,27 +1124,27 @@ def move_candidates(roots: MoveRoots, root_fd: int, names: DestinationNames, hol
     uses = process_uses(tuple(leaf.source for leaf in leaves), session_pids)
     destinations: set[Path] = set()
     for leaf in leaves:
+        journaled = False
         try:
             if leaf.source.is_relative_to(roots.sessions):
                 raise MoveRefused("source is inside the destination root")
-            session_id = leaf.source.name
-            # A copy that holds the journal must finish before another copy starts.
-            try:
-                require_session_stopped(session_id, names.registry)
-                require_idle(leaf.source, uses)
-            except LiveSource as error:
-                kept(leaf.source, error)
-                summary.kept_live += 1
-                continue
-            name = names.destination(session_id)
-            move = PlannedCopy(leaf.source, name.folder / leaf.relative, name.rule, session_id)
+            check_source_idle(leaf.source, names.registry, lambda: uses)
+            name = names.destination(leaf.source.name)
+            move = PlannedCopy(leaf.source, name.folder / leaf.relative, name.rule, name.session_id)
             size = tree_size(move.source, mounts)
             show_copy(move, size)
             check_destination(root_fd, roots.sessions, move.target, destinations)
             if not dry_run:
+                check_copy_idle(leaf.source, session_pids)
                 names.remember(name, root_fd)
+                journaled = True
                 size = start_copy(move, roots, root_fd, session_pids)
+            destinations.add(move.target)
             summary.record_move(size)
+        except LiveSource as error:
+            summary.keep_live(leaf.source, error, journaled=journaled)
+            if journaled:
+                return
         except (MoveRefused, OSError) as error:
             kept(leaf.source, error)
             summary.refused_other += 1
@@ -1164,7 +1181,7 @@ def main(argv: list[str]) -> int:
     action = "would move" if dry_run else "moved"
     print(f"session_move: {action} {summary.moved_folders} folders ({summary.moved_bytes / 2**30:.2f} GiB), "
           + f"kept {summary.kept_live} live, refused {summary.refused_other} other", flush=True)
-    return int(summary.refused_other > 0)
+    return int(summary.refused_other > 0 or summary.live_copy_pending)
 
 
 if __name__ == "__main__":

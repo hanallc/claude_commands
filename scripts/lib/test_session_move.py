@@ -448,9 +448,33 @@ with (mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapsho
         self.assertEqual(status, 0, errors)
         self.assertTrue(target.is_dir())
 
+    def test_session_that_becomes_live_before_copy_keeps_the_next_move(self) -> None:
+        source = self.leaf("becomes-live")
+        target = self.index(source.name, "live")
+        movable = self.leaf("movable")
+        moved = self.index(movable.name, "demo") / self.claude / self.project / movable.name
+        stopped = session_records.RegistryRead((), ())
+        resumed = self.live_registry(source.name)
+        before_first_copy = iter((stopped,))
+
+        with mock.patch.object(session_records, "read_registry", side_effect=lambda: next(before_first_copy, resumed)):
+            status, output, errors = self.invoke()
+
+        self.assertEqual(status, 0, errors)
+        self.assertIn(f"session {source.name} is live", errors)
+        self.assertEqual((source / "draft.md").read_bytes(), b"scratch content\n")
+        self.assertEqual(list(target.iterdir()), [])
+        self.assertFalse(movable.exists())
+        self.assertEqual((moved / "draft.md").read_bytes(), b"scratch content\n")
+        self.assertEqual(output.splitlines()[-1],
+                         "session_move: moved 1 folders (0.00 GiB), kept 1 live, refused 0 other")
+
     def test_session_that_resumes_during_verification_keeps_its_source(self) -> None:
         source = self.leaf("resuming")
         target = self.index("resuming", "demo") / self.claude / self.project / source.name
+        movable = self.leaf("waiting")
+        moved = self.index(movable.name, "demo") / self.claude / self.project / movable.name
+        journal = self.root / session_move.JOURNAL / session_move.MOVE_RECORD
         source_info = source.stat()
         scan = session_move.read_manifest
         registry = session_records.RegistryRead((), ())
@@ -465,15 +489,26 @@ with (mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapsho
 
         with (mock.patch.object(session_records, "read_registry", side_effect=lambda: registry),
               mock.patch.object(session_move, "read_manifest", side_effect=resume_during_scan)):
-            status, output, errors = self.invoke()
+            for phase in ("new copy", "journal recovery"):
+                with self.subTest(phase=phase):
+                    status, output, errors = self.invoke()
 
-        self.assertEqual(status, 1, errors)
-        self.assertEqual(output.splitlines()[-1],
-                         "session_move: moved 0 folders (0.00 GiB), kept 0 live, refused 1 other")
-        self.assertIn(f"session {source.name} is live", errors)
-        self.assertTrue((self.root / session_move.JOURNAL / session_move.MOVE_RECORD).is_file())
-        self.assertEqual((source / "draft.md").read_bytes(), b"scratch content\n")
-        self.assertEqual((target / "draft.md").read_bytes(), b"scratch content\n")
+                    self.assertEqual(status, 1, errors)
+                    self.assertIn(f"session {source.name} is live", errors)
+                    self.assertTrue(journal.is_file())
+                    self.assertEqual((source / "draft.md").read_bytes(), b"scratch content\n")
+                    self.assertEqual((target / "draft.md").read_bytes(), b"scratch content\n")
+                    self.assertTrue(movable.is_dir())
+                    self.assertFalse(moved.exists())
+                    self.assertEqual(output.splitlines()[-1],
+                                     "session_move: moved 0 folders (0.00 GiB), kept 1 live, refused 0 other")
+
+        status, _, errors = self.invoke()
+        self.assertEqual(status, 0, errors)
+        self.assertFalse(journal.exists())
+        self.assertFalse(source.exists())
+        self.assertFalse(movable.exists())
+        self.assertEqual((moved / "draft.md").read_bytes(), b"scratch content\n")
 
     def test_mount_and_parent_swap_keep_data_in_the_intended_trees(self) -> None:
         with self.subTest("same-device bind mount"):

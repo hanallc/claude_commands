@@ -314,7 +314,8 @@ Run the command without `--dry-run` to move the files.
 The final line gives the folder count, size in GiB, live entries kept, and other refusals.
 The dry run uses `would move` in that line.
 Both modes keep folders with a running session or an active process when they check candidates.
-They continue with the other candidates and return status 0 when only live entries remain.
+The real run checks again before it writes the journal for a new copy.
+Both modes continue with other candidates and return status 0 if they only skip live entries before copying.
 A destination conflict or a failed copy stops a real run and returns status 1.
 The dry run reads the session index and folder records without creating a preview directory.
 It reads compressed transcripts through a pipe.
@@ -332,7 +333,8 @@ It compares directory identities to detect overlaps with held folders, including
 It skips each scratchpad tree that overlaps an open hold and returns status 1.
 Ask the owner to release a hold before you retry the cutover.
 The journal in `<session-root>/.session-move` records the pending scratchpad copy.
-A live source found during a journaled copy stops the run with status 1 and retains the journal.
+A live source found during a journaled copy counts as kept live.
+The program keeps the journal and stops with status 1 because it uses one journal for all copies.
 Run the same command after an interruption to resume the pending copy or deletion.
 If source data changes before publication, the command saves a copy-in-progress state before it discards the stage.
 The command keeps the source and can rebuild the stage on retry.
