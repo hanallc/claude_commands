@@ -31,7 +31,20 @@ class GateBoxTests(unittest.TestCase):
         fixture = trial_tests.PairedTrialTests()
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
-        reply, _ = fixture.guest()
+        check_transfers = '''import subprocess
+run = subprocess.run
+
+def check_transfer(args, *positional, **options):
+    if args[0] == 'curl':
+        assert args == ['curl', '--fail', '--silent', '--show-error', '--max-time', '30',
+                        '-X', 'PUT', '--data-binary', '@-', args[-1]], args
+    return run(args, *positional, **options)
+
+subprocess.run = check_transfer
+'''
+        with mock.patch.object(gate_box, 'GUEST', check_transfers + gate_box.GUEST):
+            reply, _ = fixture.guest()
+        self.assertNotIn('log_error', reply)
         log = (fixture.root / 'box/uploaded-log').read_text()
         lines = [line for line in log.splitlines() if ' stage=' in line]
         self.assertEqual([line.split(' stage=', 1)[1] for line in lines], [
@@ -157,8 +170,9 @@ class GateBoxTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('base64 -d', script)
         self.assertNotIn(gate_box.GUEST, script)
-        self.assertIn('curl --fail --silent --show-error --max-time 60 https://fixture.invalid/requests/attempt.guest.py -o "$box_dir/guest.py"', script)
-        self.assertIn('curl --fail --silent --show-error --max-time 60 https://fixture.invalid/requests/attempt.json -o "$box_dir/request.json"', script)
+        for name in ('guest.py', 'request.json'):
+            with self.subTest(download=name):
+                self.assertIn(f'-o "$box_dir/{name}"', script)
         session = shlex.split(script[script.index('nix --extra-experimental-features'):])[-1]
         self.assertLess(session.index('curl --fail'), session.index('exec python3'))
 
@@ -183,8 +197,9 @@ class GateBoxTests(unittest.TestCase):
             _ = (root / 'source.py').write_text(gate_box.GUEST)
             _ = (root / 'manifest.json').write_text(json.dumps({'modules': modules}))
             curl = root / 'curl'
-            _ = curl.write_text('#!/bin/sh\ncase "$6" in *.guest.py) cp "$FIXTURE/source.py" "$8" ;;'
-                                + ' *.json) cp "$FIXTURE/manifest.json" "$8" ;; *) exit 1 ;; esac\n')
+            _ = curl.write_text('#!/bin/sh\nwhile [ "$2" != "-o" ]; do shift; done\n'
+                                + 'case "$1" in *.guest.py) cp "$FIXTURE/source.py" "$3" ;;'
+                                + ' *.json) cp "$FIXTURE/manifest.json" "$3" ;; *) exit 1 ;; esac\n')
             curl.chmod(0o700)
             result = subprocess.run(['sh', '-ec', 'umask 077\n' + downloads + 'mkdir "$box_dir/session-directory"\n'],
                 env={**os.environ, 'PATH': str(root) + os.pathsep + os.environ['PATH'], 'FIXTURE': str(root), 'box_dir': str(root)},
@@ -195,7 +210,8 @@ class GateBoxTests(unittest.TestCase):
             self.assertEqual(json.loads((root / 'request.json').read_text()), {'modules': modules})
 
     def test_production_boot_stages_and_errors_with_local_stubs(self) -> None:
-        self.production_boot_stubs(('', 'nix', 'tools shell', 'tools ready', 'source ready', 'tests start'))
+        self.production_boot_stubs(('', 'boot', 'nix', 'tools shell', 'tools ready', 'source ready',
+                                    'tests start', 'result upload'))
 
     def test_candidate_renamed_suite_runner_uses_its_own_entry_point(self) -> None:
         self.production_boot_stubs(('',), candidate_change='rename')
@@ -217,7 +233,15 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
         self.assertEqual(reply.returncode, 0, reply.stdout + reply.stderr)
 
     def production_boot_stubs(self, failures: tuple[str, ...], *, candidate_change: str = '') -> None:
-        stages = ['boot', 'tools ready', 'tools checked', 'source ready', 'tests start']
+        stages = ['boot', 'tool preparation', 'tools ready', 'tools checked', 'source ready', 'tests start',
+                  'result upload']
+        boot_errors = {
+            'boot': 'The box failed at stage boot (exit 7)',
+            'nix': 'Tool preparation failed (exit 7)',
+            'tools shell': 'Tool preparation failed (exit 7)',
+            'tools ready': 'The box failed at stage tools ready (exit 7)',
+            'result upload': 'The box failed at stage result upload (exit 1)',
+        }
         for failure in failures:
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -259,6 +283,7 @@ with mock.patch.object(merge_gate, 'process_memory_mib'):
                 _ = (root / 'source.py').write_text(gate_box.GUEST)
                 _ = (root / 'request.json').write_text(json.dumps({
                     'clone_url': 'https://example.invalid/repo.git', 'origin_main': 'b' * 40, 'modules': [],
+                    'mode': 'merge-gate',
                     'head': 'e' * 40, 'dirty_paths': ['scripts/fixture/test_one.py']}))
                 stub = '#!' + sys.executable + '\n' + r'''import json, os, pathlib, shutil, subprocess, sys
 root = pathlib.Path(os.environ['FIXTURE'])
@@ -279,6 +304,17 @@ if name == 'nix':
     sys.exit(subprocess.call(command))
 elif name == 'curl':
     destination = next(word for word in args if word.startswith('https://'))
+    retries = int(args[args.index('--retry') + 1]) if '--retry' in args else 0
+    if retries:
+        assert retries == 2, args
+        assert '--retry-all-errors' in args, args
+        assert args[args.index('--retry-delay') + 1] == '1', args
+    else:
+        assert destination.endswith('/gate.log'), args
+        assert '--retry-all-errors' not in args and '--retry-delay' not in args, args
+    assert args[args.index('--max-time') + 1] == ('60' if '-o' in args else '30'), args
+    if destination.endswith('/result.json'):
+        fail('result upload')
     if '-o' in args:
         fail('tools ready')
         shutil.copyfile(root / ('source.py' if destination.endswith('.guest.py') else 'request.json'), args[args.index('-o') + 1])
@@ -287,7 +323,7 @@ elif name == 'curl':
         body = sys.stdin.read() if source == '@-' else pathlib.Path(source[1:]).read_text()
         event('upload result' if destination.endswith(('result.json', 'boot-error.json')) else 'upload log')
         with (root / 'uploads').open('a') as output:
-            output.write(json.dumps({'destination': destination, 'body': body}) + '\n')
+            output.write(json.dumps({'destination': destination, 'body': body, 'retries': retries}) + '\n')
 elif name == 'runuser':
     command = args[args.index('--') + 1:]
     command = ['HOME=' + str(root / 'home') if word.startswith('HOME=') else word for word in command]
@@ -305,7 +341,9 @@ elif name == 'git' and 'fetch' in args:
     event('fetch ' + args[-1])
 elif name == 'git' and 'rev-parse' in args:
     print('c' * 40)
-elif name in ('systemd-run', 'loginctl', 'mount', 'chown', 'ln', 'cp', 'shutdown', 'git'):
+elif name == 'loginctl':
+    fail('boot')
+elif name in ('systemd-run', 'mount', 'chown', 'ln', 'cp', 'shutdown', 'git'):
     pass
 else:
     print('fixture-version')
@@ -347,9 +385,16 @@ else:
                     self.assertNotIn('stage=tests start', log)
                 if failure:
                     self.assertIn('error', results[-1])
-                if failure == 'nix':
+                if failure in boot_errors:
+                    self.assertEqual(results[-1]['error'], boot_errors[failure], log)
                     self.assertIn('stage=boot', ledger.text(uploads[0], 'body'))
-                    self.assertEqual(ledger.text(uploads[-1], 'destination'), links['boot_error'])
+                    self.assertEqual([row['destination'] for row in uploads[-2:]],
+                                     [links['log'], links['boot_error']])
+                    self.assertEqual([row['retries'] for row in uploads], [2] * (len(uploads) - 2) + [0, 2])
+                    if failure == 'result upload':
+                        self.assertIn('Traceback', ledger.text(uploads[-2], 'body'))
+                else:
+                    self.assertTrue(all(row['retries'] == 2 for row in uploads))
                 if not failure and candidate_change != 'missing':
                     self.assertEqual((root / 'received-limit').read_text(), '2.5')
                     self.assertEqual(reply.returncode, 0, log + reply.stderr)
