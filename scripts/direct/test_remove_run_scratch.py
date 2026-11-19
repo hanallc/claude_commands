@@ -12,16 +12,24 @@ import tempfile
 import unittest
 from pathlib import Path
 from contextlib import redirect_stderr
-from typing import override
+from typing import cast, override
 from unittest import mock
 
 from scripts.direct import remove_run_scratch, workers
-from scripts.lib import scratch
+from scripts.lib import copy_record, scratch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, fixture_member, fixture_worker
 
 SCRIPT = Path(__file__).parent / "remove_run_scratch.py"
+
+
+def setUpModule() -> None:
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = write_config_fixture(root / "build_folders.conf",
+                             "locks.probe_wait_seconds=0.25\nlocks.probe_retry_seconds=1\n")
+    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, config_environment(root))))
 
 
 class RemoveRunScratchTests(unittest.TestCase):
@@ -242,6 +250,24 @@ class RemoveRunScratchTests(unittest.TestCase):
         self.assertEqual(self.worktrees(source), [str(source)])
         _ = subprocess.run(["git", "-C", str(source), "worktree", "add", "-q", str(gate), "copy"],
                            check=True, capture_output=True)
+
+    def test_run_cleanup_resumes_the_original_path_without_selecting_its_tombstone(self) -> None:
+        source, run, gate = self.worktree_run()
+        with (mock.patch.object(remove_run_scratch, "remove_tree", side_effect=OSError("stopped after intent")),
+              self.assertRaisesRegex(OSError, "stopped after intent")):
+            remove_run_scratch.remove(gate)
+        pending = scratch.checked_removal(gate)
+        assert isinstance(pending, copy_record.Registered)
+        plan = scratch.plan_removal_moves(gate, scratch.removal_metadata(gate, scratch.git_directory(gate), ()))
+        mark = scratch.removal_mark(gate)
+        scratch.atomic_record(mark, {**pending.fields, "removal_moves": plan.journal()})
+        scratch.move_removal_folders(plan, {})
+
+        result = subprocess.run([sys.executable, str(SCRIPT), str(run)], check=False, capture_output=True,
+                                text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.worktrees(source), [str(source)])
+        self.assertFalse(any(path.exists() for path in (gate, mark, *plan.locations.values())))
 
     def test_a_worktree_the_source_cannot_remove_is_deleted_and_the_source_pruned(self) -> None:
         source, _, gate = self.worktree_run()

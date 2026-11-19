@@ -51,6 +51,8 @@ REMOTE_CHECK_SECONDS = 30
 
 def setUpModule() -> None:
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = write_config_fixture(root / "build_folders.conf",
+                             "locks.probe_wait_seconds=0.25\nlocks.probe_retry_seconds=1\n")
     _ = write_config_fixture(root / "scratch.conf", "\n".join((
         "visible_root=~/rust/repro",
         "holds_file=~/.local/state/scratch/holds.json",
@@ -1264,7 +1266,7 @@ for descriptor in descriptors:
         def occupy_original_name(original: Path, tombstone: Path) -> None:
             rename(original, tombstone)
             tombstones[original] = tombstone
-            if original == admin:
+            if original == path:
                 path.mkdir()
                 _ = (path / "new-source").write_text("keep the replacement")
 
@@ -1290,21 +1292,33 @@ def pause(*args, **kwargs):
         ready.recv(1)
 
 delete = scratch.delete_removal_source
+rename = scratch.rename_removal_folder
 
 def delete_then_pause(folder, deletion):
     delete(folder, deletion)
     pause()
 
+def rename_then_pause(original, tombstone):
+    rename(original, tombstone)
+    pause()
+
 boundary = sys.argv[3]
-with patch.object(scratch, boundary, side_effect=delete_then_pause if boundary == "delete_removal_source" else pause):
+interruption = {"delete_removal_source": delete_then_pause, "rename_removal_folder": rename_then_pause}
+with patch.object(scratch, boundary, side_effect=interruption.get(boundary, pause)):
     scratch.remove_folder(Path(sys.argv[1]))
 """
-        for boundary in ("move_removal_folders", "recovery_state", "delete_removal_source"):
+        for boundary in ("move_removal_folders", "rename_removal_folder", "recovery_state", "delete_removal_source"):
             with self.subTest(boundary=boundary):
                 source, _ = self.copy_with_published_head(f"crash-{boundary}")
-                path = self.base / f"interrupted-{boundary}"
+                path = self.base / boundary / "interrupted"
+                path.parent.mkdir()
                 self.git(source, "worktree", "add", "-q", "-b", "side", str(path))
                 admin = git_files.at(path).git_dir
+                task = f"gate:resume-{boundary}"
+                scratch.atomic_record(path / copy_record.RECORD, {"task": task, "test_hana_clone": True})
+                sidecars = tuple(path.with_name(path.name + suffix) for suffix in (".lock", ".lease.json"))
+                for sidecar in sidecars:
+                    sidecar.touch()
                 self.stop_removal_after_intent(path, "current")
                 ready, writer = socket.socketpair()
                 with ready, writer, subprocess.Popen(
@@ -1321,18 +1335,42 @@ with patch.object(scratch, boundary, side_effect=delete_then_pause if boundary =
                 self.assertEqual(child.returncode, -signal.SIGKILL, error)
                 checkout_tombstones = tuple(path.parent.glob(f"{scratch.TOMBSTONE_PREFIX}*"))
                 admin_tombstones = tuple(admin.parent.parent.glob(f"{scratch.TOMBSTONE_PREFIX}*"))
-                if boundary != "move_removal_folders":
+                request = scratch.TaskRemoval(task, time.time())
+                if boundary == "rename_removal_folder":
+                    self.git(source, "worktree", "prune", "--expire", "now")
+                    self.assertTrue(path.is_dir())
+                    self.assertFalse(admin.exists())
+                    changed = path / "keep"
+                    _ = changed.write_text("work after the removal intent")
+                    self.assertIsInstance(scratch.remove_folder(path, request), scratch.KeptFolder)
+                    self.git(path, "rev-parse", "--verify", "HEAD")
+                    self.assertEqual(git_files.at(path).git_dir, admin)
+                    self.assertEqual(changed.read_text(), "work after the removal intent")
+                    self.assertTrue(all(sidecar.is_file() for sidecar in sidecars))
+                    self.assertTrue(scratch.removal_mark(path).is_file())
+                    continue
+                if boundary in ("recovery_state", "delete_removal_source"):
                     self.assertFalse(path.exists())
                     self.assertFalse(admin.exists())
                     self.assertEqual(len(checkout_tombstones), int(boundary == "recovery_state"))
                     admin_tombstone, = admin_tombstones
                     self.assertTrue((admin_tombstone / "HEAD").is_file())
-                self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
+                self.assertEqual(scratch.remove_folder(path, request), scratch.RemovedCopy())
                 self.assertFalse(path.exists())
                 self.assertFalse(admin.exists())
                 for tombstone in (*checkout_tombstones, *admin_tombstones):
                     self.assertFalse(tombstone.exists())
                 self.assertFalse(scratch.removal_mark(path).exists())
+                self.assertFalse(any(sidecar.exists() for sidecar in sidecars))
+
+    def test_retry_accepts_a_symlink_to_the_checkout_parent(self) -> None:
+        path = self.checkout_with_removal_intent("current", "parent-alias")
+        alias = self.base / "alias"
+        alias.symlink_to(path.parent, target_is_directory=True)
+        self.assertEqual(scratch.remove_folder(alias / path.name), scratch.RemovedCopy())
+        self.assertFalse(path.exists())
+        self.assertFalse(scratch.removal_mark(path).exists())
+        self.assertTrue(alias.is_symlink())
 
     def test_fresh_removal_keeps_separate_git_storage(self) -> None:
         _, remote = self.copy_with_published_head("separate-source")

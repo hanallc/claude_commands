@@ -71,6 +71,8 @@ def scratch_folders(run: Path) -> list[Path]:
         except OSError:
             continue
         for folder in sorted(folders):
+            if Path(folder).name.startswith(scratch.TOMBSTONE_PREFIX):
+                continue
             candidate = Path(folder).resolve()
             if candidate in protected:
                 continue

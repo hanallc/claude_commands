@@ -1550,7 +1550,12 @@ def restore_removal_folders(moved: RemovalLocations) -> None:
         if os.path.lexists(original):
             raise OSError(f"cannot restore {original}: it already exists")
     with ExitStack() as rollback:
-        for original, tombstone in reversed(tuple(moved.items())):
+        for original, tombstone in moved.items():
+            if tombstone.parent == original.parent.parent:
+                # Git can remove the empty worktrees directory.
+                original.parent.mkdir(exist_ok=True)
+                if original.parent.is_symlink():
+                    raise OSError(f"{original.parent}: cannot restore through a symbolic link")
             rename_removal_folder(tombstone, original)
             _ = rollback.callback(rename_removal_folder, original, tombstone)
         _ = rollback.pop_all()
@@ -1634,7 +1639,8 @@ def read_removal_moves(path: Path, pending: copy_record.Registered) -> RemovalMo
 
 def move_removal_folders(plan: RemovalMoves, moved: RemovalLocations) -> None:
     """Complete the moves that the saved intent authorized."""
-    for original, tombstone in plan.locations.items():
+    # Move the admin folders first so Git cannot prune them when the checkout moves.
+    for original, tombstone in reversed(plan.locations.items()):
         if os.path.lexists(tombstone):
             if os.path.lexists(original) or removal_identity(tombstone) != plan.identities[original]:
                 raise OSError(f"{original}: cannot resume removal at {tombstone}")
@@ -1665,7 +1671,8 @@ def finish_tombstone_removal(path: Path, pending: copy_record.Registered, scope:
     verified = False
     try:
         move_removal_folders(plan, moved)
-        with directory_record_lock(next(reversed(moved.values())), wait=False, scratch_settings=scratch_settings) as locked:
+        with directory_record_lock(next(reversed(plan.locations.values())), wait=False,
+                                   scratch_settings=scratch_settings) as locked:
             if not locked:
                 return KeptFolder(path, BUSY_REASON)
             # A process inside a tombstone can write a ref after this comparison if it holds no lease.
@@ -1842,7 +1849,7 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
     """Own removal locks, safety checks, preparation, deletion intent, source deletion, and completion."""
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
-    path = path.absolute()
+    path = path.parent.resolve() / path.name if path.is_symlink() else path.resolve()
     if any(part.startswith(TOMBSTONE_PREFIX) for part in path.parts):
         return KeptFolder(path, f"{path}: interrupted removal retains a tombstone")
     scope = BusyMarkScope()
@@ -1862,7 +1869,7 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                     record = task_of(path, scratch_settings=scratch_settings)
                     if (isinstance(record, copy_record.Registered) and record.task == request.task
                             and not task_has_end_evidence(record)
-                            and (copy_record.copy_folder(path) == path.resolve() or record.fields.get("test_hana_clone") is True)):
+                            and (copy_record.copy_folder(path) == path or record.fields.get("test_hana_clone") is True)):
                         fields = {**record.fields, "ended": request.now, "ended_task": request.task}
                         _ = update_record(path, lambda current: fields, scratch_settings=scratch_settings)
             return KeptFolder(path, BUSY_REASON)
@@ -1888,15 +1895,24 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                 if isinstance(record, copy_record.Registered):
                     if request.require_task and record.task != request.task:
                         return KeptFolder(path, f"task changed to {record.task}")
-                elif copy_record.copy_folder(path) == path.resolve() or not present:
+                elif copy_record.copy_folder(path) == path or not present:
                     return KeptFolder(path, "the copy has no task record")
+            held = _held_removal_lock(path)
+            if held is not None:
+                scope = held.marks
+            task_request = TaskRemoval(request.expected.task, request.now) if isinstance(request, SelectedCopyRemoval) else request
+            lease = (held.lease if isinstance(task_request, TaskRemoval) and isinstance(record, copy_record.Registered)
+                     and record.fields.get("test_hana_clone") is True and held is not None
+                     and isinstance(held.lease, HeldFolderRemovalLease) and held.lease.folder == path else None)
+            sidecars = lease.sidecar_identities() if lease is not None else {}
             if isinstance(pending, copy_record.Registered) and "removal_moves" in pending.fields:
                 if isinstance(request, SelectedCopyRemoval):
                     request.validate()
-                held = _held_removal_lock(path)
-                return resume_tombstone_removal(path, pending, held.marks if held is not None else scope,
-                                                scratch_settings=scratch_settings, source_deletion=source_deletion,
-                                                dry_run=dry_run)
+                outcome = resume_tombstone_removal(path, pending, scope, scratch_settings=scratch_settings,
+                                                   source_deletion=source_deletion, dry_run=dry_run)
+                if isinstance(outcome, RemovedCopy) and lease is not None:
+                    lease.unlink_sidecars(sidecars)
+                return outcome
             if not present:
                 if isinstance(request, SelectedCopyRemoval):
                     request.validate()
@@ -1905,9 +1921,6 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                 return RemovedCopy()
             if isinstance(request, SelectedCopyRemoval):
                 request.validate()
-            held = _held_removal_lock(path)
-            if held is not None:
-                scope = held.marks
             descendant_checkouts: tuple[Path, ...] = ()
             if path.is_dir() and not path.is_symlink():
                 checked = lock_descendant_clones(path, descendants, scope, create=not dry_run,
@@ -1920,8 +1933,7 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                 return KeptFolder(path, git.reason)
             empty_run_worktree = (isinstance(pending, copy_record.NotRegistered)
                                   and source_deletion is SourceDeletion.RUN and empty_lost_worktree(path, git))
-            task_request = TaskRemoval(request.expected.task, request.now) if isinstance(request, SelectedCopyRemoval) else request
-            copy = (copy_record.copy_folder(path) == path.resolve()
+            copy = (copy_record.copy_folder(path) == path
                     or isinstance(record, copy_record.Registered) and record.fields.get("test_hana_clone") is True)
             if isinstance(task_request, TaskRemoval) and isinstance(record, copy_record.Registered):
                 if (copy and record.task == task_request.task and not dry_run and isinstance(pending, copy_record.NotRegistered)
@@ -1931,7 +1943,7 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                                            "ended_task": task_request.task}, scratch_settings=scratch_settings)
             check = RemovalWorkCheck.STANDARD
             if (isinstance(task_request, TaskRemoval) and isinstance(record, copy_record.Registered) and copy
-                    or isinstance(task_request, ExpiredFolderRemoval) and copy_record.copy_folder(path) == path.resolve()):
+                    or isinstance(task_request, ExpiredFolderRemoval) and copy_record.copy_folder(path) == path):
                 state = record_lifetime(path, task_request.now, scratch_settings=scratch_settings)
                 if isinstance(state, LandedRemoteCheckNeeded) and isinstance(publication, RemovalAdvertisements):
                     check = RemovalWorkCheck.LANDED
@@ -1967,14 +1979,10 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                     else:
                         path.unlink()
                 return RemovedCopy()
-            lease = (held.lease if isinstance(task_request, TaskRemoval) and isinstance(record, copy_record.Registered)
-                     and record.fields.get("test_hana_clone") is True and held is not None
-                     and isinstance(held.lease, HeldFolderRemovalLease) and held.lease.folder == path else None)
-            sidecars = lease.sidecar_identities() if lease is not None else {}
             if not dry_run:
                 saved = save_cargo_outputs(path)
                 clean_cargo_outputs(path, saved)
-            metadata = removal_metadata(path.resolve(), git, descendant_checkouts)
+            metadata = removal_metadata(path, git, descendant_checkouts)
             if isinstance(pending, copy_record.Registered):
                 state = retry_removal(path, pending, scope, metadata, scratch_settings=scratch_settings,
                                       source_deletion=source_deletion, dry_run=dry_run)
@@ -1991,9 +1999,9 @@ def remove_folder(path: Path, request: TaskRemoval | SelectedCopyRemoval | Folde
                 directory = path.stat()
                 fields: dict[str, object] = dict(record.fields) if isinstance(record, copy_record.Registered) else {
                     "task": task_request.task if isinstance(task_request, TaskRemoval) else "gate:folder-removal"}
-                locations = {folder: folder for folder in (path.resolve(), *metadata.admin_folders)}
+                locations = {folder: folder for folder in (path, *metadata.admin_folders)}
                 evidence = removal_file_snapshot(locations, metadata.shared_packed_refs)
-                fields.update(removal_version=REMOVAL_VERSION, copy_path=str(path.resolve()),
+                fields.update(removal_version=REMOVAL_VERSION, copy_path=str(path),
                               copy_device=directory.st_dev, copy_inode=directory.st_ino, removal_snapshot=evidence,
                               removal_repositories=[], removal_files=[], removal_intent_ns=time.time_ns())
                 mark = removal_mark(path)
