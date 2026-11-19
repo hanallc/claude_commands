@@ -130,15 +130,9 @@ Removing a prerequisite from tracking does not prove completion. Retain its cond
 
 ## ETA and communication
 
-ETA describes completion of the named item, not a prerequisite or checkpoint.
-Limit ETA cells to a date, time, range, or status; retain the parenthesized update time for Pending.
-Move checkpoints, conditions, causes, and delivery details to State or Next Step.
-For separate delivery targets, use short labels, such as `Fixes 23:20; names 22:05`.
-Label estimates, conditions, ranges, and uncertainty. Do not present a rough target as a guaranteed deadline.
-Use `Not asked`, `Paused`, or `Delivered` where appropriate.
-For requested but unknown estimates, use `Pending (HH:MM ZONE)` for the promised ETA update.
-Without an owner promise, use `Pending (check HH:MM ZONE)` and schedule that inquiry.
-Include the date when it is not today. Replace superseded check times and timers.
+ETA describes completion of the whole named item, not a prerequisite or checkpoint.
+Use only the ETA forms in `/producer:produce`. Move checkpoints, conditions, causes, and part times to the status.
+Do not present a rough target as a guaranteed deadline. Replace superseded check times and timers.
 Keep the user-facing status to one or two plain sentences: where it stands and what happens next.
 Standalone updates name the topic and number. Do not use the number alone.
 Surface decisions, completion, new blockers, and meaningful timing changes. Save routine detail for requests.
