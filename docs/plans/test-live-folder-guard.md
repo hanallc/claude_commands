@@ -1,15 +1,27 @@
-# List item 141 — A test cannot delete or change live folders
+# List item 141 — Three walls for every test
 
-This is Part 1 of phase 389. The producer and reviewer is `bob`. The plan is due on 2026-11-19 at 15:00 EST.
+Phase 389. Bob owns plan review. The plan is due on 2026-11-19 at 15:00 EST.
+Cover every `claude_commands` test and its descendants across all productions and units. Include manual runs and remote execution.
 
-Cover every test in `claude_commands` on natedev, across all productions and units. Include manual tests and every descendant of a test.
-Part 2 covers process visibility, outside access, and the Mac and AWS forms. The start inventory below includes the remote paths.
+## Summary for bob
+
+| Wall | Protection | Cost evidence |
+| --- | --- | --- |
+| Files | Block writes to live folders and Git state. Give each job private writable storage. | The earlier mapped-user prototype added 14.61 ms per start. The Bubblewrap cost for this wall is pending. |
+| Processes | Hide host PIDs. Keep each job's descendants in a cgroup that the supervisor can stop and verify. | The systemd PID prototype added 9.275 ms to the service median. The Bubblewrap cost for this wall is pending. |
+| Outside access | Block host services, credential sockets, and external network access. Allow approved private fixtures. | The systemd network prototype added 12.590 ms to the service median. The Bubblewrap cost for this wall is pending. |
+
+On natedev, Bubblewrap with all three walls and seccomp took 40.309 ms per launch at the median. Direct start took 5.013 ms.
+The 35.296 ms difference is about 31 seconds of summed launch time for 867 modules. The integrated gate time is pending.
+Mac guest costs and AWS launch costs are pending. The measured Mac times cover only `sandbox-exec`.
+The [code phases](#code-phases-and-eta) total 53–88 worker hours, or about 7–11 workdays in sequence. Queue time can extend the schedule.
+
+## Why the guards are required
 
 On 2026-11-19 at 12:46 EST, a queue sweep test used a live default and deleted 11 entries in `/tmp/claude/unit`.
 On 2026-11-14, an inherited `GIT_DIR` let fixture commits reach live `~/.claude` main.
 Builds reported a test run that used the inherited `TMPDIR` and wrote under `/session/queue`.
-A wrong path can come from an argument, an environment variable, a config file, or a direct absolute path.
-The kernel must refuse the write even when the caller chooses the wrong path.
+Arguments, environment variables, config files, and absolute paths can select the wrong root. The kernel must enforce the write boundary.
 
 ## Live roots on natedev
 
@@ -32,193 +44,177 @@ Keep host files read-only or hidden in a test. Verify each named root and alias 
 An environment override can select another data root. It cannot grant write access.
 A bind mount can expose the same files at two paths. Check the mount tree, including child mounts, before starting the command.
 
-## One file guard at test start
+## Natedev — One Bubblewrap launcher
 
-Use the same Bubblewrap launcher for all three guards on natedev. Bubblewrap provides the mounts, namespaces, and PID 1 reaper in one launch.
-Start the guard after trusted setup and before any candidate interpreter, shell, test binary, or build script.
-Use the [Part 2 launch profile](test-live-folder-guard-walls.md#natedev--one-guarded-launch) for process and outside-access controls.
+Start every candidate interpreter, shell, test binary, and build script inside the guard. Keep trusted staging and admission on the host.
+Bubblewrap provides the mount layout, namespaces, PID 1 reaper, and syscall filters in one launch.
+Use absolute paths to trusted tools. Apply the phase 388 environment allow list before the first launcher exec.
+Clear Git overrides and startup variables, including `BASH_ENV`.
+Send stdout and stderr through pipes. Use a pipe or private device for stdin.
+Close every inherited descriptor other than the selected standard streams before candidate exec.
+Use a private user, mount, PID, IPC, cgroup, network, and UTS namespace. Use `--new-session`.
+Drop all capabilities with `--cap-drop ALL`. Bubblewrap sets `no_new_privs`.
+Block `setns`. Disable nested user namespaces except for an approved private mount fixture.
+Verify placement, resource limits, and the three walls before candidate exec. Refuse a launch if any required guard is unavailable. Return `ProtectedTestProcess` after a verified start.
+[Gate start](../../scripts/production/merge_gate.py#L1086), [Type check](../../scripts/production/merge_gate.py#L1722), [Python shim](../../scripts/lib/py)
 
-1. Allocate one leased folder with the build folder maker.
-2. Create the run's `TMPDIR`, `HOME`, XDG directories, logs, and writable fixtures inside it.
-3. Select the source checkout and any read-only build inputs.
-4. Start Bubblewrap inside the verified job scope with an empty root and the namespaces from Part 2.
-5. Add approved inputs with `--ro-bind`, a fresh private `/proc`, and the devices listed below.
-6. Use `--bind` for the job's leased storage.
-7. Apply `--remount-ro /` and `--cap-drop ALL`. Bubblewrap sets `no_new_privs` before exec.
-8. Send output through pipes to the trusted parent.
-9. Release the folder only after the supervisor proves that the owner and all test descendants exited.
+### Files
 
-Reuse `test_run_folder()` and the existing build folder leases. Use an explicit parent from the supervisor, inside the new writable mount.
-Keep `BUILDLOG_DIR`, the session fixture root, Python bytecode, and browser profiles inside the lease.
-Do not reuse the caller's `DEVTOOLS_TEST_RUN_FOLDER` or `TMPDIR` as a writable mount.
-Replace `TMPDIR`, `TMP`, and `TEMP` before interpreter startup. Clear the inherited run-folder marker.
-Keep nested allocations under the lease, including when a helper selects a sibling of an existing run folder.
-Pass the private parent explicitly to helpers that allocate or sweep test folders.
-Keep run output and worker records in the trusted parent. Keep one new folder per invocation and one private child folder per gate module.
-Keep recovery, lease ownership, and the locks in `copies.COMMAND_LOCKS` in the trusted supervisor. Coordinate lock ownership with phase 383.
-Close all inherited descriptors before the candidate exec except the selected standard streams. Use pipes for output and a pipe or private device for input.
-Use the phase 388 environment allow list before the first launcher exec. Use trusted absolute paths for launch tools.
-Clear Git overrides and startup variables at the launcher boundary.
-A fixture may set `GIT_DIR` again. The file guard still protects the live Git directory.
+1. Allocate one leased folder per invocation and a child folder per gate module. Verify its owner, mount, and lifetime as `PrivateTestFolder`.
+2. Start with an empty root. Expose only approved read-only inputs with `--ro-bind`.
+3. Use `--bind` for the job's leased storage. Limit writable storage with a tmpfs size or disk quota.
+4. Give the job private `HOME`, XDG directories, shared memory, and a fallback `/tmp`. Supply synthetic passwd and group files.
+5. Change to the guarded working directory and apply `--remount-ro /`. Hide the old root and alternate proc mounts.
 
-Mount approved source and Cargo inputs read-only. Use a private checkout when a test must edit source or Git state.
-Use a private copy without shared writable inodes. A linked worktree or a hard link to live data cannot be a writable fixture.
-Use a private Cargo output when the compiler or tests need writes. Fetch dependencies in trusted setup and pass the required inputs read-only.
-Use a fresh proc mount. Hide alternate proc mounts and all routes to the old root.
-Change the working directory into the new mount view before exec. Close old root and host directory descriptors.
-Part 2 owns writable services and outside access through sockets. A read-only mount does not prevent a write that a service performs.
+Replace `TMPDIR`, `TMP`, and `TEMP` before interpreter startup. Clear the inherited `DEVTOOLS_TEST_RUN_FOLDER`.
+Keep `BUILDLOG_DIR`, session fixtures, bytecode, browser profiles, and fixture sockets within the storage limit.
+Pass the private parent to `test_run_folder()` and other allocation or sweep helpers. Keep nested and sibling allocations inside the lease.
+Resolve fixture PIDs in the job's PID namespace. Recreate the private paths for every local and remote job.
+Keep output records, lease ownership, and `copies.COMMAND_LOCKS` with the supervisor. Coordinate lock ownership with phase 383.
+Fetch dependencies in trusted setup. Give tests private Cargo output and a private Git checkout when they need writes.
+Use copies without shared writable inodes. Keep linked worktrees and hard links to live data outside writable fixtures.
+A visible read-only path rejects writes with `EROFS`. A hidden live path is absent and gets `ENOENT`.
+[Temp folder setup](../../scripts/lib/testing_folders.py#L28), [Staff fixture import](../../scripts/production/staff_test_support.py#L45), [Unit-run fixtures](../../scripts/lib/test_unit_runs.py#L267)
 
-### FIFOs and devices
+#### FIFOs and devices
 
-Linux permits I/O on existing FIFOs on read-only mounts. Reading a jobserver FIFO can also remove a token. [Linux VFS permission check](https://github.com/torvalds/linux/blob/v6.18/fs/namei.c#L512-L520)
-Use a mount view with no host FIFOs. Expose immutable tool paths and stage mutable inputs as ordinary files, directories, and symlinks.
-Exclude FIFOs, sockets, and device nodes from staged inputs. Keep mounted inputs immutable for the life of the test.
-Detach the old root before candidate exec. A scan of the live filesystem cannot prove that a host FIFO will stay absent.
-Use a private `/dev` with only approved devices such as `null`, `zero`, and `urandom`. Hide `/dev/steve` and its aliases.
-Keep host jobserver paths and descriptors in the trusted supervisor. Strip `CARGO_MAKEFLAGS`, `MAKEFLAGS`, and `MFLAGS` from the child environment.
-Use the existing supervisor to reserve and release host tokens. Pass only the admitted thread count to nextest.
-Use a private fixture FIFO for tests that need a jobserver. Verify the private FIFO and refusal of opens on host endpoints with disposable fixtures.
-Verify nextest admission and token return through the queue route after Builds releases the hold. [invoke.sh:64](../../scripts/lint/invoke.sh#L64), [invoke.sh:707](../../scripts/lint/invoke.sh#L707)
+Expose immutable tool paths. Stage mutable inputs as ordinary files, directories, and symlinks.
+Exclude FIFOs, sockets, and device nodes from staged inputs. Keep mounted inputs immutable for the test.
+A read-only mount still permits FIFO I/O. Reading the live jobserver FIFO can remove a token.
+Use a private `/dev` with approved devices such as `null`, `zero`, and `urandom`. Hide `/dev/steve` and its aliases.
+Keep host jobserver descriptors and paths with the supervisor. Strip `CARGO_MAKEFLAGS`, `MAKEFLAGS`, and `MFLAGS`.
+Reserve and return tokens in the existing supervisor. Pass only the admitted thread count to nextest.
+Use private fixture FIFOs for jobserver tests. Verify those FIFOs, host endpoint refusal, and token return through the queue route.
+[Linux FIFO permission check](https://github.com/torvalds/linux/blob/v6.18/fs/namei.c#L512-L520), [Jobserver token reservation](../../scripts/lint/invoke.sh#L64), [Nextest token use](../../scripts/lint/invoke.sh#L707)
 
-### Gate parent-death handoff
+### Processes
 
-Run the trusted launcher as a direct child of the gate. Keep the gate PID in trusted host setup.
-After scope registration, exec Bubblewrap in the same process with `--unshare-pid --proc /proc --die-with-parent`.
-Keep the Bubblewrap reaper as PID 1. Bubblewrap uses its parent-death option for the monitor, the reaper, and the command.
-The scope record lets recovery stop the job if a parent exits before Bubblewrap arms its parent-death signal.
-
-Remove the inherited `MERGE_GATE_PARENT_PID` in the launcher before entering the namespace.
-Run the candidate command as a direct child of the Bubblewrap reaper.
-Set `MERGE_GATE_PARENT_PID=1` in the candidate environment before the first shim or interpreter starts.
+Use `--unshare-pid --proc /proc --die-with-parent`. Keep Bubblewrap as PID 1 inside the namespace.
+Run the launcher as the gate's direct child. Exec Bubblewrap in that same process after cgroup registration.
+Bubblewrap uses its parent-death option for the monitor, the reaper, and the command. The monitor passes the candidate status to the gate.
+Recovery uses the recorded cgroup if a parent exits before Bubblewrap arms its parent-death signal.
+Remove the host `MERGE_GATE_PARENT_PID` in the launcher. Set `MERGE_GATE_PARENT_PID=1` for the candidate.
+`sitecustomize.py` uses the variable to skip startup folder allocation. The launcher supplies the lease.
+`module_run.py` consumes the variable and watches the reaper's pidfd. It retains the parent-death signal for its own test child.
 Skip `SUITE_BOOTSTRAP` on the guarded path. The trusted launcher applies its startup rules before candidate exec.
-`sitecustomize.py` still uses the variable to skip startup folder allocation. The launcher already supplies a lease.
-`module_run.py` consumes the variable and watches a pidfd for namespace PID 1.
-The module runner still sets a parent-death signal for its own test child.
-The Bubblewrap monitor reports the candidate status. When PID 1 exits, the kernel stops all remaining namespace members.
-[Gate bootstrap](../../scripts/production/merge_gate.py#L121), [Gate launch](../../scripts/production/merge_gate.py#L1086), [Python startup](../../scripts/lib/python_startup/sitecustomize.py#L220), [Module runner](../../scripts/test_times/module_run.py#L610), [PID namespaces](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html), [Bubblewrap parent-death option](https://github.com/containers/bubblewrap/blob/v0.11.2/bubblewrap.c#L349-L374)
+[Gate bootstrap](../../scripts/production/merge_gate.py#L121), [Python startup](../../scripts/lib/python_startup/sitecustomize.py#L220), [Module runner](../../scripts/test_times/module_run.py#L610), [Bubblewrap parent-death option](https://github.com/containers/bubblewrap/blob/v0.11.2/bubblewrap.c#L349-L374)
 
-#### Cancellation
+### Cgroup layout and cancellation
 
-The existing gate code blocks cancellation signals during spawn and registration. The launcher inherits that mask.
-After registration, exec the trusted GNU `env --default-signal` with the absolute Bubblewrap path as its command.
-GNU `env` restores default signal dispositions and unblocks inherited signals before it execs Bubblewrap.
-Bubblewrap keeps its built-in reaper. It unblocks its internal `SIGCHLD` mask before candidate exec.
-Keep the default cancellation dispositions in PID 1 and the candidate.
+Use one phase 44df scope per admitted local gate under `builds.slice`, with `Delegate=yes`.
+Keep `MemoryMax=44G` on `builds.slice` and keep the existing gate reservation. The gate scope has no separate memory limit.
+Create one `keeper` leaf and a `job-<id>` leaf for each job. Move the keeper before enabling the memory and task controllers.
+Keep the scope root free of processes. Set each job's `memory.max` and `pids.max` before attaching it.
+Keep the sum of the job budgets within the reservation. Set each deadline in the trusted supervisor.
+Publish the scope path in the reservation's cgroup sidecar. Record the scope invocation identity and each job leaf with its lease.
+Record the wrapper's host PID and start time. Extend phase 383 recovery, which currently tracks process groups.
+Keep the launcher waiting until the gate records its placement. Authorize Bubblewrap after the existing cancellation deferral ends.
+If the setup channel closes before approval, exit before starting Bubblewrap.
+If a gate cannot use its phase 44df scope, try existing admission with a verified job cgroup and the same controls.
+A single-scope job can use its admitted scope with those limits. The survey requires its assigned scope.
+[Queue scope](../../scripts/build_queue/queue_place.py#L88), [Phase 44df scope design](/session/queue-impl6/landcpu/scripts/build_queue/queue_place.py#L137)
+
+The launcher inherits the gate's spawn mask. Exec trusted GNU `env --default-signal` with Bubblewrap's absolute path as its command.
+GNU `env` clears the mask and restores default dispositions. Bubblewrap unblocks its internal `SIGCHLD` mask before candidate exec.
 Add no signal handlers, masks, or disposition changes in new Python or shell code, including fixtures.
-On cancellation, timeout, or setup failure, write `1` to the verified job's `cgroup.kill`.
-The kernel sends `SIGKILL` to every member, regardless of its mask or process group.
-[GNU env implementation](https://github.com/coreutils/coreutils/blob/v9.10/src/env.c#L751-L754), [Bubblewrap candidate exec](https://github.com/containers/bubblewrap/blob/v0.11.2/bubblewrap.c#L3370-L3392)
+On cancellation, timeout, or failed setup, write `1` to the verified job's `cgroup.kill`.
+Use the same stop if the monitor exits with live cgroup members. `SIGKILL` reaches descendants that use `setsid()`.
+Reap the launcher. Require `cgroup.events` to show `populated 0` before release after normal exit, forced stop, or crash recovery.
+Keep the cgroup available until the gate or recovery records that proof. Keep the lease if verification fails.
+Require the same proof in the folder sweeper, even when a crash closes the lease lock.
+Release gate admission after every job and the keeper have exited. Keep cgroup controls and the user manager outside the guard.
+[GNU env implementation](https://github.com/coreutils/coreutils/blob/v9.10/src/env.c#L751-L754), [Bubblewrap exec](https://github.com/containers/bubblewrap/blob/v0.11.2/bubblewrap.c#L3370-L3392), [Gate recovery](../../scripts/production/merge_gate.py#L700)
 
-#### Lease release and recovery
+### Outside access
 
-Use the [Part 2 scope layout](test-live-folder-guard-walls.md#cgroup-layout). Each job has its own host-owned cgroup v2.
-Keep the launcher blocked until the gate verifies its cgroup placement and records the scope's invocation identity with the lease.
-Authorize Bubblewrap start after the existing cancellation deferral ends.
-If the setup channel closes before approval, exit before starting Bubblewrap. Keep the gate as the launcher's parent.
-Hide cgroup control files from the candidate. Keep accounting and user manager requests on the host.
-If the Bubblewrap monitor exits and the cgroup still has members, stop the remaining processes through `cgroup.kill`.
-Reap the launcher on the live gate path, including when cancellation occurs before cgroup placement.
-For normal exit, forced stop, and crash recovery, require `cgroup.events` to report `populated 0` before releasing the lease.
-This proves that PID 1 and all descendants exited. Reaping the host launcher alone cannot give this proof.
-Retain the lease and recovery record if the cgroup identity or empty state cannot be verified.
-Require the same proof in the folder sweeper, even if a crash closes the lease lock.
-Keep the cgroup available until the gate or recovery records the proof. Refuse launch if the required cgroup controls are unavailable.
-[Gate recovery](../../scripts/production/merge_gate.py#L700), [Gate cleanup](../../scripts/production/merge_gate.py#L1000)
+Use `--unshare-net` with no external interface. Permit private Unix fixture sockets by default.
+Allow IPv4 and IPv6 for the private loopback profile. Keep abstract Unix sockets in the private network namespace.
+Hide the host system bus, user bus, credential agents, service sockets, session sockets, and network mounts.
+A read-only mount can still expose a usable socket. Block other socket families, `io_uring`, and kernel keyring access.
+Keep queue, logging, and result capabilities in the trusted supervisor. [Systemd execution controls](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html)
 
-The `start_gate_job()` proof is pending. Use separate fixture launches through that entry point after Builds releases the hold.
+## Test requests and runner grants
 
-| Case | Required result |
+The protected runner owns the policy outside the tested checkout. Read capability requests from static entries for a module or an exact test ID. Read the request before importing candidate code. The effective profile comes from the runner's reviewed policy for that repository and test ID.
+
+| Request | Runner grant |
 | --- | --- |
-| Normal test module and type check | The candidate shim can write only to its lease. A wrong-root write in the shim fails. The gate receives the command status. |
-| Python startup and module runner | A host PID in the input environment never reaches either reader. Startup uses the supplied lease. The module runner watches namespace PID 1. |
-| Gate exits before scope registration | The launcher's setup channel closes. The launcher exits before starting Bubblewrap. |
-| Gate or Bubblewrap monitor exits during Bubblewrap setup | Recovery stops any remaining members of the recorded cgroup before it releases the lease. |
-| Gate exits or forces a stop after a fixture calls `setsid()` | Recovery waits for the cgroup to become empty after the launcher exits. The fixture process and PID 1 exit before lease release. |
-| Cancellation during launch or after candidate start | The gate stops the recorded cgroup. The lease remains held until the cgroup is empty. |
-| Candidate startup from the existing deferred spawn | The first exec receives default dispositions for `SIGTERM`, `SIGHUP`, and `SIGINT`. Its signal mask is empty. |
-| Gate timeout | The gate reaps the host job and records its status. The lease remains held until the cgroup is empty. |
+| No extra need | Private files, processes, and Unix fixture sockets. |
+| `PrivateLoopbackFixture` | IPv4 and IPv6 within the isolated network namespace or guest. Create the server in the same sandbox. |
+| `PrivateMountFixture` | A guest-owned mount fixture or a separately validated private namespace profile. Keep the same file, PID, and egress limits. |
+| `PrivateServiceManagerFixture` | A disposable guest with its own real systemd and cgroups. Permit changes only to that manager. |
+| `ScopedIntegrationRequest` | A dedicated fixture endpoint or controller operation for named actions and resources. Use a short expiry and dedicated credentials for that fixture. |
 
-Represent a leased path as `PrivateTestFolder` after the launcher verifies its owner, mount, and lifetime.
-Return `ProtectedTestProcess` or `TestIsolationUnavailable`. Include the failed setup operation in `TestIsolationUnavailable`.
-Refuse the test if setup fails. An unavailable user namespace or build scope cannot permit an unguarded test.
+Use `GrantedTestIsolation` for approval. Use `TestIsolationUnavailable` with the failed setup operation for refusals. Only the runner can approve a request. Refuse unknown requests before loading the test. Keep fixture Git pushes inside a private bare repository. Use a fake message endpoint and a fixture AWS service for ordinary tests.
 
-### Natedev measurements
+Use a trusted broker only when a reviewed integration needs an external operation. Grant one named operation and resource set, and record the decision. Exclude production accounts, session endpoints, Git targets, and service managers from test policy. Key reused gate results on the guard policy version and test grants as well as the tested tree. Keep all privileged publication in the separate controller.
 
-The probes ran on natedev on 2026-11-19. The host used UID 1000, Linux 6.18.50, util-linux 2.42.2, and systemd 260.2.
-Each timing uses seven sequential starts of `true`. The median includes command startup.
-The saved command output is in this natedev session transcript.
+## Mac — All three walls in a macOS guest
 
-```text
-/home/natepiano/.codex/sessions/2026/11/19/rollout-2026-11-19T08-36-04-01a1f405-844f-7aa2-b750-7ecf8791d2f5.jsonl
-```
+Use Apple Virtualization to run one disposable macOS guest per admitted job. The guest cannot see host processes or services.
+[Apple Virtualization](https://developer.apple.com/documentation/virtualization/installing-macos-on-a-virtual-machine)
 
-| Transcript lines | Saved output |
-| --- | --- |
-| 495 and 524 | Host mount sources, scope option refusal, tool versions, and plain mount namespace refusal. |
-| 551 | Root-map mount flags, fixture write refusals, and private writes under the `/session` bind. |
-| 586 and 589 | Timing command and output for root-map, scope, user service, and Landlock. The output includes the Git canaries. |
-| 696 and 699 | Mapped-user command and output for timings, file canaries, proc mount, and the direct module run. |
+1. **Files.** Clone a sealed guest image into task scratch. Attach read-only source and a private writable disk. Use a private copy for source changes. Lease host scratch through `scratch.py` with an end.
+2. **Processes.** Run tests under a guest identity. Keep boot, cancellation, guest shutdown, and disk cleanup with the Mac supervisor.
+3. **Outside access.** Set `networkDevices` and `directorySharingDevices` to empty lists. Use guest loopback and private Unix sockets. Keep host credentials, agents, pasteboard, and command receivers outside the guest. [Virtual machine configuration](https://developer.apple.com/documentation/virtualization/vzvirtualmachineconfiguration)
 
-The timing commands saved the count, median, minimum, and maximum. The individual timing samples are pending.
+Pass guest stdout, stderr, and console output through a bounded log channel. Render `mac_group=` and `mac_exit=` as log text.
+Use a separate control channel. Give its descriptor only to the protected monitor in the sealed guest.
+Bind the run identity to its VM handle in the host supervisor. Use that handle for cancellation.
+Report exit status through the control channel. Treat a lost channel as a lost run. Only the host supervisor reports to the queue.
+[Mac queue output](../../scripts/mac_test/mac_queue_run.py#L116), [Mac queue result](../../scripts/mac_test/mac_queue_run.py#L155)
 
-| Candidate | Median and range | Result |
-| --- | --- | --- |
-| Direct start in the mapped-user batch | 3.64 ms, 2.65–5.69 ms | Baseline. |
-| Plain `unshare -m` | — | Refused with `EPERM`. |
-| `unshare -rm` and recursive read-only mount | 27.22 ms, 22.30–38.74 ms | Works without host root. The child maps UID 1000 to UID 0. |
-| Mapped-user mount and private proc | 18.25 ms, 15.62–64.18 ms | Works without host root. Keeps UID 1000. This was the first file guard prototype. |
-| Current `systemd-run --user --scope` | 16.28 ms, 14.11–73.03 ms | The scope starts. It rejects `ReadOnlyPaths` as an unknown assignment. |
-| Transient `systemd-run --user --pipe` service | 57.82 ms, 45.66–106.60 ms | `ProtectSystem=strict`, `ReadWritePaths`, and `ReadOnlyPaths` worked without host root. The service changes launch and recovery behavior. |
-| Python Landlock probe, ABI 7 | 47.28 ms, 30.01–232.05 ms | Blocked append, truncate, and unlink with `EACCES`. The tested rules allowed `chmod`. |
+Start the guest after trusted source staging. Preinstall the pinned compiler and dependencies. Let SwiftPM use its sandbox inside the guest.
+Verify SwiftPM, Metal requirements, cold boot, and cancellation on the target Mac. Refuse jobs whose required feature the guest cannot provide.
+The guest design remains unverified. See [Mac measurements](#mac-measurements) for the wrapper pilot.
+[Mac offload](../../scripts/mac_test/offload.py), [Lint entry point](../../scripts/lint/invoke.sh#L31)
 
-The mapped-user prototype added 14.61 ms to the paired median.
-Part 2 records the [Bubblewrap pilot timings](test-live-folder-guard-walls.md#natedev-timing-output). The integrated gate timing with Bubblewrap is pending.
-The root-map probe and user service blocked a fixture Git commit at `index.lock` with `EROFS`.
-The root-map batch timed out after five seconds on `test_process_failure.py`. Its result under the production launcher is pending.
-The mapped-user probe blocked append, truncate, chmod, dirfd unlink, and a symlink alias with `EROFS`. A rename across the bind returned `EXDEV`.
-The directory descriptor came from an open inside the guard. Closure of writable file and directory descriptors inherited from the host is pending.
-Pass both descriptor types from a disposable host fixture. Verify they are closed before the candidate shim starts.
-The probe wrote inside the private mount. `findmnt` reported `ro` for `/`, `/session`, `/build`, and the checkout.
-The host mount source identifies `/session` as a bind of the `session` directory on `/build`. The host still reported `rw` for `/session`.
-Mutation checks through both bind paths of the same disposable fixture are pending.
-The mapped-user probe showed a private read-only `/proc`. A lookup of a known host process through `/proc/<pid>/root` is pending.
-The mapped-user prototype passed one test from `scripts/lib/test_git_index.py` through `module_run.py` with private `TMPDIR`.
+## AWS — All three walls on the execution box
 
-The Bubblewrap launcher sets `TMPDIR`, `HOME`, and XDG paths before exec. Apply the mount, device, descriptor, and parent-death rules above.
-Check the bootstrap with `findmnt -T`, a disposable sibling canary, and `/proc/self/status`. Record setup errors separately from test failures.
-Keep the existing build scope for accounting. Start it outside the file guard. Keep parent identity and recovery checks on the side that can see the host PIDs.
-Record raw timing samples and proof output during the first authorized integration run. Verify all three guards in that launch.
+Install the trusted Bubblewrap launcher and toolchain on the NixOS image. Give base and candidate jobs the same isolation.
+Stage source as data with hooks and filters disabled. Fetch approved dependencies in the controller's credential scope.
+Keep the controller's working directory and import paths outside the candidate checkout.
+Start the guard before candidate Python startup, the `scripts.aws_target.gate_box` import, and `run_guest`.
+Give the guarded process source, fixtures, private home and Python paths, and a bounded request channel.
+[Guest bootstrap](../../scripts/aws_target/gate_box.py#L399)
 
-## Test starts and repairs
+Freeze the required module set from the trusted gate request. Validate each request against that set and the staged inventory.
+Start each accepted module in its own sandbox. Keep artifact selection, upload, and result publication in trusted code.
+Validate returned data for format and size. Record one terminal result per required module from trusted launch records and child statuses.
+A refusal, timeout, lost result, or missing launch fails the gate. Require successful results for the complete set.
+A retry can replace only its own result. Duplicate and unexpected results do not count.
+[Module dispatch](../../scripts/aws_target/gate_box.py#L116), [Module results](../../scripts/aws_target/gate_box.py#L243)
 
-The step scope can run a command directly if scope setup fails. Keep the file guard on the command through that fallback. [invoke.sh:165](../../scripts/lint/invoke.sh#L165)
-Use one file guard for the paths below. Test each route through its normal entry point with a disposable wrong-root canary.
+1. **Files.** Bind source and tools read-only. Give each module private Git, temp, and build output storage. Keep cloud-init, signed URLs, signing material, and upload files outside the sandbox.
+2. **Processes.** Give each job private PID and IPC namespaces and a fresh proc mount. Keep interruption monitoring and cgroup cleanup with the box supervisor.
+3. **Outside access.** Hide external interfaces, VPC routes, DNS, IMDS, and local host services. Keep credentials and role access in trusted staging and upload. Use an image without an instance role when staging and retrieval can work without it. [EC2 metadata access](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-metadata-limiting-access.html)
+
+Expose a real GPU only under a reviewed grant for that device. Verify files, PIDs, loopback, IMDS, cancellation, and results on the image.
+AWS launch and gate measurements are pending.
+
+## Test start paths
+
+Use the normal entry point for each verification. Certify only launches that the supervisor records as guarded.
+An unrestricted host shell can start any interpreter. Enforce the protected profile in managed worker and manual test sessions.
+Keep operator commands in separate entry points. Command aliases, Python startup hooks, and pre-tool hooks cannot enforce coverage by themselves.
 
 | Start path on the base | Required change or named gap |
 | --- | --- |
 | Landing merge tests, checkpoint tests, fast-track tests, and base-red reruns | Route leaf tests from `checkpoint_gate.run_test_command()` to the guard. Let gate and verify supervisors start their own guarded test children. Keep fetch, commit, and push in the controller. [checkpoint_gate.py:117](../../scripts/production/checkpoint_gate.py#L117), [merge_checkpoint.py:1304](../../scripts/production/merge_checkpoint.py#L1304), [merge_gate.py:1086](../../scripts/production/merge_gate.py#L1086) |
 | Full gate, tests-only, selected modules, retries, type check, and `targeted_test.py` | Apply the guard at `start_gate_job()` before every candidate `<repo>/scripts/lib/py` exec. Include `TYPE_CHECK`. `targeted_test.py` calls the same runner. Keep the boundary if phase 355 moves the runner into `gate.py`. [merge_gate.py:1086](../../scripts/production/merge_gate.py#L1086), [merge_gate.py:1722](../../scripts/production/merge_gate.py#L1722), [targeted_test.py:17](../../scripts/production/targeted_test.py#L17) |
 | Nightly merge gate | Guard each module and type-check job in the nightly clone through `run_suites()`. Keep clone setup, notification, and slot sweep in the controller. [merge_gate.py:2563](../../scripts/production/merge_gate.py#L2563), [merge_gate.py:2730](../../scripts/production/merge_gate.py#L2730) |
-| Queue-started test, lint wrapper, local `verify.sh`, and token-limited nextest | Select the guard before the test command reaches `buildlog_exec()` or the queue fallback. Keep the wrapper on the command when scopes are unavailable. Put nextest execution and its test subprocesses behind the guard. [queue_place.py:196](../../scripts/build_queue/queue_place.py#L196), [invoke.sh:774](../../scripts/lint/invoke.sh#L774), [verify.sh:3305](../../scripts/direct/verify.sh#L3305), [verify.sh:4815](../../scripts/direct/verify.sh#L4815) |
+| Queue-started test, lint wrapper, local `verify.sh`, and token-limited nextest | Select the guard before the test command reaches `buildlog_exec()` or the queue fallback. Keep the guard through the [step scope fallback](../../scripts/lint/invoke.sh#L165). Put nextest execution and its test subprocesses behind the guard. [queue_place.py:196](../../scripts/build_queue/queue_place.py#L196), [invoke.sh:774](../../scripts/lint/invoke.sh#L774), [verify.sh:3305](../../scripts/direct/verify.sh#L3305), [verify.sh:4815](../../scripts/direct/verify.sh#L4815) |
 | Worker pane, manual session, and detached run | Provide a protected test shell for arbitrary commands. Connect worker and session test launches to it. Wrap detached test commands before the target shell starts. Detached accounting alone has no file rules. [worker_panes.py:1404](../../scripts/herdr/worker_panes.py#L1404), [pane_launch.py:1073](../../scripts/herdr/pane_launch.py#L1073), [detached_runs.py:1292](../../scripts/agents/detached_runs.py#L1292) |
 | Raw `python -m unittest`, `pytest`, direct Python, `python -I`, or direct `module_run.py` | Start the interpreter inside the protected shell. The Python shim only makes a temporary folder for certain command shapes. It cannot enforce protection for another interpreter or before import side effects. [sitecustomize.py:220](../../scripts/lib/python_startup/sitecustomize.py#L220), [module_run.py:516](../../scripts/test_times/module_run.py#L516) |
 | Raw `cargo test`, `cargo nextest run`, a test executable, shell tests, and hook checks | Use the protected shell for the entire command. Match the route by its execution boundary. A filename filter cannot find every test program. [test_agent_exec.sh](../../scripts/agents/test_agent_exec.sh), [test_cancel_prior.sh](../../scripts/validate_and_push/test_cancel_prior.sh), [BERTH hook checks](../../scripts/berth/install/README.md#L44) |
 | `module_cost.py` time run and trace run | Guard both module starts from `measure()`, before `task_cpu.exec_stage()` executes the candidate module runner. Keep profiling and its lease lock in the trusted supervisor. Check both trace attribution and test results after integration. [module_cost.py:94](../../scripts/test_times/module_cost.py#L94), [task_cpu.py:217](../../scripts/test_times/task_cpu.py#L217) |
 | `coverage_overlap.py` | Start its interpreter inside the guard. It imports and runs the suite in that interpreter. Keep `COVERAGE_OUT` inside the lease and collect its result in the supervisor. [coverage_overlap.py:219](../../scripts/test_times/coverage_overlap.py#L219), [coverage_overlap.py:328](../../scripts/test_times/coverage_overlap.py#L328) |
 | `memory_page_proof.mjs` from the gate or a manual command | Guard Node before it starts Python for fixtures or starts Chrome. Inherit the test module's guard for calls from the gate. Use the protected shell for direct runs. Put the short Chrome profile, fixture output, and screenshots under the lease. [memory_page_proof.mjs:52](../../scripts/build_queue/memory_page_proof.mjs#L52), [memory_page_proof.mjs:158](../../scripts/build_queue/memory_page_proof.mjs#L158), [test_memory_feed.py:1131](../../scripts/build_queue/test_memory_feed.py#L1131), [test_memory_feed.py:3254](../../scripts/build_queue/test_memory_feed.py#L3254) |
-| Mac offload, Mac queue, and another SSH runner | Part 2 must apply the guard on the execution host before the remote command starts. The local scope has no effect there. [offload.py:2024](../../scripts/mac_test/offload.py#L2024), [mac_queue_run.py:95](../../scripts/mac_test/mac_queue_run.py#L95), [linux_runner.py:691](../../scripts/mac_test/linux_runner.py#L691) |
-| AWS production and trial gates, paired trial, and Hana nextest | Part 2 must guard candidate suites, the paired trial's direct module spawn, and the Hana guest command. [gate_box.py:116](../../scripts/aws_target/gate_box.py#L116), [gate_box.py:243](../../scripts/aws_target/gate_box.py#L243), [hana_runner_entry.py:17](../../scripts/aws_target/hana_runner_entry.py#L17), [gpu_trial_wrapper.py:16](../../scripts/aws_target/gpu_trial_wrapper.py#L16) |
-
-The type-check job passes the caller's `BASH_ENV` path to the candidate shim when the variable is set. The gate supplies no fixed path.
-The job copies the inherited environment, then changes `TMPDIR` and removes the memory tripwire.
-Bash can source the file named by `$BASH_ENV` before the shim body. The variable is unset in the current natedev shell.
-Clear `BASH_ENV` before the first trusted shell and before candidate exec. Use a disposable `$private_test_folder/gate-bash-env.sh` to verify that Bash skips it.
-Verify that both the candidate shim and Python startup run only after the file guard applies. [merge_gate.py:1571](../../scripts/production/merge_gate.py#L1571), [merge_gate.py:1722](../../scripts/production/merge_gate.py#L1722), [scripts/lib/py](../../scripts/lib/py)
-
-An unrestricted host shell can still start any interpreter. This is an open gap until repository test sessions cannot obtain that execution path.
-Move raw test sessions to a dedicated execution profile. Give them protected or disposable checkouts and deny access to the live account's write authority.
-Keep trusted operator actions in separate entry points. Route a terminal test command through the guarded shell even when it uses an absolute interpreter path.
-Do not call coverage complete until the session and worker launch configuration enforces this boundary. A command alias or a pre-tool hook alone cannot enforce it.
+| Mac offload, Mac queue, and manual Mac test sessions | Use the protected guest before starting the remote test. [offload.py:2024](../../scripts/mac_test/offload.py#L2024), [mac_queue_run.py:95](../../scripts/mac_test/mac_queue_run.py#L95) |
+| AWS production and trial gates, and paired trials | Guard guest dispatch and the paired trial's direct module spawn on the execution box. [gate_box.py:116](../../scripts/aws_target/gate_box.py#L116), [gate_box.py:243](../../scripts/aws_target/gate_box.py#L243) |
+| GPU trial archive preparation | Guard the controller-side build before candidate Nix shell preparation. Keep `nextest list --list-type binaries-only` and `nextest archive` inside it. Use private build and archive output paths. Export the verified archive through the trusted controller. Guard the later guest `nextest run` on its execution box too. [gpu_size_trial.py:647](../../scripts/aws_target/gpu_size_trial.py#L647), [gpu_size_trial.py:716](../../scripts/aws_target/gpu_size_trial.py#L716), [gpu_trial_wrapper.py](../../scripts/aws_target/gpu_trial_wrapper.py) |
+| Hana AWS runner | Place the guard after source materialization and before `prepare_shell`. Keep export sourcing, `shellHook`, and `run_slot` inside the guard. Keep slot descriptors and build-start reporting authority in trusted code. [hana_runner.py:79](../../scripts/aws_target/hana_runner.py#L79), [linux_runner.py:220](../../scripts/mac_test/linux_runner.py#L220) |
+| Linux SSH offload | Guard on the remote Linux host before `prepare_shell`. Keep the shell export, `shellHook`, and remote lint or test command in the guard. Keep the mirror lease, admission descriptors, and cleanup with the remote supervisor. [linux_runner.py:703](../../scripts/mac_test/linux_runner.py#L703), [linux_runner.py:770](../../scripts/mac_test/linux_runner.py#L770) |
 
 ## Delete paths that choose live roots
 
@@ -242,41 +238,167 @@ Find removal sites with `rg -n 'rmtree\(|\.unlink\(|\brmdir\(|sweep|prune|cleanu
 Follow each selected path to its root resolver. An explicit leaf argument does not make a live root default safe upstream.
 Check new hits when the base changes. For example, `prune_finished(runs)` already takes its root. Verify its callers. [detached_runs.py:712](../../scripts/agents/detached_runs.py#L712)
 
-## First report-only run
+## Report-only census and compatibility survey
 
-Wait for Builds to release the hold. This run will collect the measurement after the file guard exists.
-Give natemerge priority. Follow the run order Builds sets after natemerge finishes.
-Report-only means the results do not block landing yet. Keep the write protection on throughout the run.
-Use the existing gate's discovery and module runner. Add the tracked shell tests and the BERTH hook check, which gate discovery omits.
-At `81ac379ca`, `git ls-files` counted 867 tracked `scripts/**/test_*.py` files and five tracked `test_*.sh` files.
-Add `node scripts/build_queue/memory_page_proof.mjs --gate` with a real Chrome and private output as a distinct census entry.
-Keep the gate module that tests real and fixture Chrome in the manifest. Mark the direct browser entry as incomplete if Chrome is unavailable.
-Include a guarded type-check job and checks for both `module_cost.py` stages and the `coverage_overlap.py` interpreter.
-Record the manifest at the tested SHA. Record any additional commands from actual start paths separately.
-Repair `MergeGateFixture.setUpClass()` before the census. Replace `TemporaryDirectory(prefix="gate-config-", dir="/tmp")` with a folder under the verified private parent.
-Set the fixture's `roots.gate` in that class config before selecting its tmpfs parent. Apply the same repair to callers of the class setup.
-Keep the fixture's short socket paths inside the lease. [merge_gate_test_support.py:319](../../scripts/production/merge_gate_test_support.py#L319), [build_folders.py:197](../../scripts/lib/build_folders.py#L197)
-Use a detached run at normal admission limits. Use no CPU load generator. Make each module's writable folder fresh.
-Trace mutating file calls with descendants and decoded file descriptors. Keep syscall, path, PID, and errno.
-Include creates, writes, truncates, rename and link pairs, deletion, and metadata changes. Include relative paths and directory-descriptor paths.
-Record attempted writes outside each module's folder, including requests that fail before lookup. Separate shared fixture setup, cases, and teardown.
-Record guard setup refusals, import failures, and class setup failures apart from test failures and later write attempts.
-Mark cases skipped by failed setup as unobserved. Rerun those cases after fixture repair before reporting their write results.
-Use module names for attribution first. Rerun affected cases with case names and timestamps if the trace cannot identify the caller.
-Bound raw output per module, retain a compact summary, and delete raw output before the next run. Report dropped records as incomplete.
-Record module exit status and counts for protected, refused setup, traced violations, and missing results. Report holds and interruptions as incomplete.
-An empty violation list only counts when every manifest entry has a result. Change fixtures for legitimate writes. Never broaden the host write grant.
-Verify a wrong-root unlink and a Git commit against disposable fixtures through each real start path before making the guard mandatory.
+Start after bob approves the plan and Builds confirms that natemerge allows tests. Follow the run order Builds sets.
+Use normal admission and a detached run. Keep all three guards active. The report does not block landing during this stage.
+Record the manifest at the tested SHA. At `81ac379ca` the inventory had 867 tracked Python modules and five tracked shell tests.
+Use the gate's discovery and module runner. Add the following entries that the module inventory does not cover.
 
-## Build phases and cost
+1. Run the five shell tests under the manual test profile. [Agent exec](../../scripts/agents/test_agent_exec.sh), [Models config](../../scripts/agents/test_models_config.sh), [Codex catalog](../../scripts/agents/test_sync_codex_catalog.sh), [Models registry](../../scripts/lib/test_models_registry.sh), [Cancel prior](../../scripts/validate_and_push/test_cancel_prior.sh)
+2. Run the [BERTH hook check](../../scripts/berth/tests/check_installed_hooks.py) against a private installation.
+3. Run `node scripts/build_queue/memory_page_proof.mjs --gate` with real Chrome and private output. Mark it incomplete if Chrome is unavailable.
+4. Check guarded type checking, both `module_cost.py` stages, and the `coverage_overlap.py` interpreter. Record other commands found at actual entry points.
 
-These are worker-hour estimates. Measure elapsed run time and launcher cost again after integration. Time starts after bob approves the plan.
+Keep the gate module that tests real and fixture Chrome in the manifest.
+Repair `MergeGateFixture.setUpClass()` before the census. Replace its absolute `/tmp` allocation with the verified private parent.
+Pin the fixture's `roots.gate` before selecting its tmpfs parent. Apply the repair to callers and keep short socket paths inside the lease.
+[Merge gate fixture](../../scripts/production/merge_gate_test_support.py#L319), [Parent selection](../../scripts/lib/build_folders.py#L197)
 
-| Phase | Worker hours | ETA and completion evidence |
+### Write and lookup trace
+
+Trace the job and its descendants. Decode directory descriptors and record the syscall, path, PID, and result.
+Include creates, writes, truncation, metadata changes, deletion, and both paths of rename and link operations.
+Record lookups, scans, and writes at live roots and aliases. Include failures before lookup and live path names recreated inside private mounts.
+Count attempts even when the test passes or skips. Classify deliberate canaries separately.
+Separate fixture setup, test cases, and teardown. Attribute by module first. Rerun with case names and times when necessary.
+Record guard refusal, import failure, and class setup failure separately. Mark tests blocked by setup as unobserved and rerun after repair.
+Bound raw output per module. Keep a compact summary and remove the raw output before the next run.
+Record module status and counts for guarded runs, setup refusals, violations, and missing results. Report any lost data or interruption as incomplete.
+Require a result for every entry before reporting an empty violation list. Give legitimate writes private fixtures.
+
+### Compatibility survey runner
+
+Use the existing [survey runner](/session/natest-impl5/guard-walls/probe_walls.py) outside the candidate checkout.
+The survey stages an independent checkout of the exact base. It runs one module at a time with private loopback.
+Compare its test counts, errors, and skips with the recorded base. Repeat new errors under the guard and record the required resource or syscall.
+Classify modules that require the private loopback grant. Treat any new skip as a loss of coverage.
+
+The runner reserves a merge-gate place and verifies the assigned scope and memory grant under `builds.slice`.
+It uses 512 tasks, an eight-hour survey deadline, a 15-minute module deadline, 1 GiB of temp space, and 64 MiB of shared memory per module.
+The supervisor checks the count record from a separate pipe against the child status.
+Exit 5 counts as empty only if the record gives zero tests, failures, errors, and skips. Missing or invalid counts fail the module.
+Drain logs in chunks of up to 8 KiB. Retain up to 8 KiB from each end of a module's log.
+Stop retaining bytes at 16 MiB. Keep draining until exit or timeout. Record the offset and retained and omitted bytes in each JSONL row.
+
+### Gate proof and enforcement
+
+| Case | Required evidence through `start_gate_job()` |
+| --- | --- |
+| Normal module and type check | The first shim can write only inside the lease. The supervisor receives the command status. |
+| Python startup and module runner | Startup uses the supplied lease. The module runner watches namespace PID 1. No host PID reaches either reader. |
+| Gate exits before scope registration | Closing the setup channel stops the launcher before Bubblewrap starts. |
+| Gate or monitor exits during setup | Recovery stops any remaining members before releasing the lease. |
+| Cancellation or timeout with a `setsid()` descendant | Reap the launcher and verify that PID 1 and the descendant exited before releasing the lease. |
+| Startup after the existing deferred spawn | Read the signal state at first exec. `SIGTERM`, `SIGHUP`, and `SIGINT` have default dispositions and the mask is empty. |
+
+Use disposable canaries to check wrong-root unlink and Git commit through every start path.
+Verify that Bash skips a disposable script supplied through `BASH_ENV` on the type-check route.
+Check mount flags with `findmnt -T` and inspect `/proc/self/status`.
+Verify that inherited writable descriptors close, that both bind aliases reject mutations, and that host `/proc/<pid>/root` is hidden.
+Require the guard after fixture repairs and enforcement of the worker and manual session profile.
+
+## Measurement evidence
+
+### Natedev file prototype
+
+The earlier file probes used UID 1000, Linux 6.18.50, util-linux 2.42.2, and systemd 260.2 on 2026-11-19.
+The [session transcript](/home/natepiano/.codex/sessions/2026/11/19/rollout-2026-11-19T08-36-04-01a1f405-844f-7aa2-b750-7ecf8791d2f5.jsonl) has the commands and results.
+
+| Transcript lines | Saved output |
+| --- | --- |
+| 495 and 524 | Mount sources, scope option refusal, versions, and plain mount namespace refusal. |
+| 551 | Root-map flags, write refusals, and private writes under the `/session` bind. |
+| 586 and 589 | Root-map, scope, user service, and Landlock timings with Git canaries. |
+| 696 and 699 | Mapped-user timings, file canaries, proc mount, and direct module run. |
+
+| Earlier file prototype | Median | Range | Result |
+| --- | ---: | ---: | --- |
+| Direct start in mapped-user batch | 3.64 ms | 2.65–5.69 ms | Baseline. |
+| Plain `unshare -m` | — | — | `EPERM`. |
+| `unshare -rm` with recursive read-only mount | 27.22 ms | 22.30–38.74 ms | Maps UID 1000 to UID 0 without host root. |
+| Mapped-user mount with private proc | 18.25 ms | 15.62–64.18 ms | Keeps UID 1000. |
+| `systemd-run --user --scope` | 16.28 ms | 14.11–73.03 ms | The scope refuses `ReadOnlyPaths`. |
+| `systemd-run --user --pipe` service | 57.82 ms | 45.66–106.60 ms | Applies `ProtectSystem=strict`, `ReadWritePaths`, and `ReadOnlyPaths`. |
+| Landlock ABI 7 | 47.28 ms | 30.01–232.05 ms | Blocks append, truncate, and unlink with `EACCES`. Permits `chmod`. |
+
+The timing rows use seven sequential starts of `true`. The commands saved counts, medians, and ranges.
+The root-map and user service probes blocked a Git fixture commit at `index.lock` with `EROFS`.
+The root-map run of `test_process_failure.py` reached a five-second timeout. Its result under the production guard is pending.
+The mapped-user probe blocked append, truncate, chmod, dirfd unlink, and writes through a symlink alias with `EROFS`.
+Rename across the bind returned `EXDEV`. The probe opened the directory descriptor inside the guard.
+The host reported `/session` writable. Inside the guard, `/`, `/session`, `/build`, and the checkout were read-only.
+Private writes succeeded. The probe ran one test from `scripts/lib/test_git_index.py` through `module_run.py` with private `TMPDIR`.
+
+### Natedev three-wall pilot
+
+The pilot used non-setuid Bubblewrap 0.11.2. Each row measures 15 sequential starts of `true` through exit, with no artificial load.
+The earlier `unshare` probe created PID and network namespaces. Systemd 260.2 supported `PrivatePIDs=yes` and `PrivateNetwork=yes` in user services.
+
+| Natedev launch | Median | Range |
+| --- | ---: | ---: |
+| Direct | 5.013 ms | 2.043–10.924 ms |
+| Systemd user service | 61.229 ms | 36.271–126.514 ms |
+| Systemd service with PID wall | 70.504 ms | 39.802–131.603 ms |
+| Systemd service with network wall | 73.819 ms | 50.743–134.123 ms |
+| Systemd service with both walls | 90.409 ms | 53.888–166.000 ms |
+| Bubblewrap with all walls and seccomp | 40.309 ms | 13.493–265.202 ms |
+
+The timing predates the synthetic passwd and group files. The final pilot used them in run `20261119T132023-1344039-a94e`.
+The guarded process kept UID 1000 with no effective capabilities. It saw a fresh proc mount and only the loopback interface.
+Signal 0 to an owned host PID returned `ESRCH`. Connections to host TCP, pathname Unix, and abstract Unix listeners failed.
+Private TCP and Unix listeners accepted connections. The root and checkout were read-only. The private temp folder was writable.
+
+| Existing test | Guarded result | Required action |
+| --- | --- | --- |
+| `herdr/test_pane_columns.py` | 2 passed through `module_run.py` in a private network namespace. Its fake Herdr uses a private Unix socket. | Use the default profile. |
+| `usage/test_collect_processes.py` | 2 passed through `module_run.py` with private loopback. `test_running_pass_keeps_its_lock_through_the_mac_read_until_exit` failed with `EAFNOSUPPORT` under the Unix-only profile. | Declare a private loopback fixture. |
+| `build_queue/test_queue_place.py::QueuePlaceTests.test_nested_scope_stops_an_unsampled_setsid_descendant_before_release` | 1 skipped because the minimal root had no cgroup v2 mount. The fixture also requires a real user manager. | Run this kernel check against a guest-owned manager in a disposable Linux guest. |
+| `lib/test_session_move.py::SessionMoveTests.test_hold_through_a_bind_mount_keeps_the_source_tree` | 1 failed with `ENOSPC` when the guard disabled new user namespaces. The same row passed when it permitted a nested user namespace. | Use a reviewed private mount fixture profile or the disposable Linux guest. |
+
+Of 867 modules, 34 directly reference `systemd-run`. Some use a stub. The real AWS CLI test needs private loopback.
+[Admission fixture](../../scripts/build_queue/admission_test_support.py#L711), [Mount fixture](../../scripts/lib/test_session_move.py#L267), [AWS CLI fixture](../../scripts/aws_target/test_real_aws_cli.py)
+
+### Mac measurements
+
+The arm64 Mac used macOS 27.0.1 build 26A434. `kern.hv_support` returned 1.
+The pilot measured seven sequential starts of `true` per row.
+
+| Mac launch | Median |
+| --- | ---: |
+| Direct | 5.973 ms |
+| `sandbox-exec` with an allow profile | 23.685 ms |
+| `sandbox-exec` with network denied | 21.325 ms |
+
+Both sandbox profiles refused `ps` with exit 71 and let Python check the same-user host parent with signal 0.
+The allow profile let a fixture bind loopback. The denied profile returned `EPERM` for that bind.
+
+### Pending evidence
+
+Record individual samples and raw proof output after authorization. The timing probes saved only counts, medians, and ranges.
+Phase cleanup removed the detached three-wall pilot log after recording its results.
+Save the next results under [the evidence folder](/session/natest-impl5/guard-walls/evidence).
+
+| Measurement | File |
+| --- | --- |
+| Cost for each Bubblewrap wall and the integrated gate | `natedev-bubblewrap-walls.tsv` |
+| Mac guest cold boot, module dispatch, and cancellation | `mac-guest.tsv` |
+| AWS launch and module cost on the NixOS image | `aws-guard.tsv` |
+| Guarded survey counts and exit statuses | `survey-results.jsonl` |
+| Bounded survey log | `survey-output.log` |
+| Wrong-root trace summary | `wrong-root-census.jsonl` |
+
+## Code phases and ETA
+
+Estimates use eight worker hours per workday and start after bob approves the plan. Count shared launcher and survey work once.
+Queue time and host availability can extend these estimates. Update the fixture estimate after the census.
+
+| Code phase | Worker hours | ETA and completion evidence |
 | --- | ---: | --- |
-| Implement the launcher and lease integration | 5–7 | One workday. Prove writes fail before test imports, private writes work, and failed setup stops the command. |
-| Connect local start paths and remove live root defaults | 8–12 | Two more workdays. Verify landing, retry, nightly, queue, worker, and raw terminal routes. Coordinate the queue sweep guard with Queue. |
-| Run the census and repair fixtures | 4–8 initially | Start after Builds releases the hold. Allow one workday for the first run and report. Estimate the remaining repairs from the results. |
-| Require the file guard on natedev | 3–5 | One workday after fixture repairs and the session bypass repair. Verify the manifest and the one-canary proof for every route. |
-
-The initial estimate is 20–32 worker hours. The full-suite result, the enforced session profile, and Part 2 determine the final rollout date.
+| Linux launcher, grants, admission, and lease recovery | 12–18 | About two workdays. Verify all three walls before the first candidate exec. |
+| Local start paths and explicit delete roots | 8–12 | One to two workdays. Connect gate, queue, and manual routes. Coordinate sweep ownership with Queue. |
+| Census, compatibility survey, and fixture changes | 8–20 | One to three workdays after natemerge releases the hold. Report results for the full manifest. |
+| Mac guest image, runner, and admission | 12–18 | About two workdays. Verify cold boot, SwiftPM, Metal, and cancellation. |
+| AWS image, guest bootstrap, GPU archive, Hana, and Linux SSH | 8–12 | One to two workdays. Verify fixture requests and trusted results. |
+| Verify routes, measure cost, and require the guard | 5–8 | About one workday after fixture and session repairs. Record proof for each route. |
+| **Total** | **53–88** | **About 7–11 workdays in sequence.** |
