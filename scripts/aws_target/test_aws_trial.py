@@ -255,9 +255,9 @@ class GuestTests(unittest.TestCase):
             _ = (root / 'meminfo').write_text('MemTotal: 1000000 kB\nMemAvailable: 200000 kB\n')
             original_reap = merge_gate.reap_gate_job
             broken_finished = False
-            def reap(job: merge_gate.RunningGateJob, *, block: bool = False) -> None:
+            def reap(job: merge_gate.RunningGateJob) -> None:
                 nonlocal broken_finished
-                original_reap(job, block=block)
+                original_reap(job)
                 if job.module == 'test_broken.py' and job.process.returncode is not None:
                     broken_finished = True
                 if (job.module == 'test_stuck.py' and broken_finished and
