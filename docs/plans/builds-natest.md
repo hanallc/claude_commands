@@ -5339,3 +5339,26 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - impl: the test module, its support and any production cause.
 
 **Acceptance gate:** an AWS pair (3 rounds) shows the median CPU at half or less, or a floor result with its cause; the module passes 20 times under load in a 2 GB scope; the full suite is green.
+
+### Phase 375 — verify.sh runs its inline Python through the doc helper  · status: todo
+**Depends on:** Phase 368
+**Blocked by:** verify 43h merges to main (it also changes verify.sh).
+
+#### Work Order
+
+**Goal:** four verify modules lose the CPU of extra Python and wrapper starts, with every assertion kept.
+
+**Spec:**
+- Builds approved this proposal from phase 368 on 2026-11-19.
+- Profiles (phase 368, detached_runs/20261118T214049-3663276-1859.log): wrapper starts are about 19% of command CPU in `direct/test_verify_wait_holder.py`. Inline Python is about 12% in `direct/test_verify_mac_only.py`, 12% in `direct/test_verify_ssh_targets_routing.py` and 8% in `direct/test_verify_lint_free_mac.py`. The four cost about 188 AWS CPU s together.
+1. Route each synchronous inline Python call in verify.sh through the existing doc helper (phase 368) where the calls share one checkout.
+2. Keep every process boundary a test checks: admission, the routing entry, the holder and the runner.
+3. Measure each module with an AWS pair (`aws_trial.py --rounds 3`) before and after.
+- Every assertion remains. Tests read no /tune-changeable value. No lazy imports, no copies, no signal handlers.
+
+**Files:** scripts/direct/verify.sh; the doc helper from phase 368; the four test modules and their support only where a fixture names a moved call.
+
+**Workers:** 1 writer. verify.sh is one hub file.
+- impl: verify.sh, the helper and the fixtures.
+
+**Acceptance gate:** an AWS pair shows the CPU saved per module; the four modules and every verify test module pass; basedpyright clean on changed files; the full suite is green.
