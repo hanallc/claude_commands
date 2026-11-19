@@ -11,7 +11,7 @@ import unittest
 from dataclasses import asdict, replace, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import cast, override
+from typing import Literal, cast, override
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
@@ -366,6 +366,59 @@ function untilError() {
    const secondReport = (await sendOwner()).detail;
    check(firstReport.id !== secondReport.id, 'F015 files a new item after a confirmed Send.');
    check(firstReportRequest.request_id !== ownerPosts.at(-1).request_id, 'F015 starts a new draft ID after success.');
+   const listPosts = [];
+   let listOwner = 'first-owner';
+   window.fetch = (url, options) => {
+    if (url === '/console/review/new-item?page=list') {
+     return json({token:'list-token',recipients:[{id:listOwner,name:listOwner}]});
+    }
+    if (url === '/console/review/new-item' && options?.method === 'POST') {
+     const payload = JSON.parse(options.body);
+     if (payload.page_capture) return json({});
+     listPosts.push(payload);
+     return listOwner === 'first-owner' ? json({error:'The List link is unavailable.'}, 503) : json({id:'Q1'});
+    }
+    return originalFetch(url, options);
+   };
+   await open({page:'list'});
+   type('Keep these List words.');
+   await trySend();
+   check(error.textContent === 'The List link is unavailable.', 'The first List Send fails.');
+   dialog.querySelector('[data-cancel]').click();
+   await open({page:'list'});
+   await trySend();
+   check(listPosts[1].request_id === listPosts[0].request_id &&
+         listPosts[1].recipient_id === 'first-owner', 'The same List owner keeps the request ID.');
+   dialog.querySelector('[data-cancel]').click();
+   listOwner = 'new-owner';
+   await open({page:'list'});
+   check(to()[0].checked && to()[0].value === listOwner, 'The reopened List dialog selects the new owner.');
+   await sendSaved();
+   check(listPosts[2].request_id === listPosts[0].request_id && listPosts[2].recipient_id === listOwner &&
+         listPosts[2].words === listPosts[0].words, 'The new List owner sends the same words with the same request ID.');
+
+   window.fetch = (url, options) => {
+    if (url === '/console/review/new-item?page=list') {
+     return json({token:'', recipients:[{id:'list-staff',name:'morty'}],
+                  send_disabled:'Sending is off on a practice List.'});
+    }
+    if (url === '/console/review/new-item' && options?.method === 'POST') {
+     ownerPosts.push(JSON.parse(options.body));
+     return json({});
+    }
+    return originalFetch(url, options);
+   };
+   const beforePractice = ownerPosts.length;
+   await open({page:'list',kind:'question'});
+   const notice = dialog.querySelector('[data-send-disabled]');
+   check(dialog.open && to()[0].checked && to()[0].value === 'list-staff', 'The practice dialog shows the List owner.');
+   type('A practice item.');
+   check(!notice.hidden && notice.textContent === 'Sending is off on a practice List.',
+         'The practice dialog shows one reason.');
+   check(send.disabled && checkbox.closest('label').hidden, 'The practice dialog disables Send and hides capture.');
+   send.click();
+   check(ownerPosts.length === beforePractice, 'The practice dialog makes no POST.');
+   dialog.querySelector('[data-cancel]').click();
    window.fetch = originalFetch;
   }
  } catch (failure) {
@@ -655,6 +708,12 @@ class NewItemDialogTests(unittest.TestCase):
         self.assertLess(markup.index('data-evidence'), markup.index('name="words"'))
         self.assertIn('name="include_page" checked', markup)
         self.assertIn('data-page-capture hidden', markup)
+        buttons: tuple[tuple[Literal["review", "list"], str], ...] = (("review", "New"), ("list", "New item"))
+        for page, label in buttons:
+            with self.subTest(page=page):
+                button = new_item_dialog.title_button(page)
+                self.assertIn(f'aria-label="New item" title="New item" data-{page}-new>', button)
+                self.assertIn(f'<span aria-hidden="true">+</span><span class="review-new-label">{label}</span>', button)
 
     def test_page_data_and_capture_size_are_checked(self) -> None:
         fields = {"kind": "page-data", "title": "The List", "rows": [["Item", "State"], ["Console", "Open"]]}

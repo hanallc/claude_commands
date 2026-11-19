@@ -1,4 +1,4 @@
-"""Render the New item dialog shared by Review and Builds."""
+"""Render the shared New item dialog."""
 from __future__ import annotations
 
 import hmac
@@ -544,6 +544,13 @@ KINDS = ((SubmissionKind.QUESTION, "Question", "circle-help"),
          (SubmissionKind.BUG, "Bug", "bug"))
 
 
+def title_button(page: Literal["list", "review"]) -> str:
+    """Place the New item button beside the page title."""
+    label = "New item" if page == "list" else "New"
+    return (f'<button class="review-new" type="button" aria-label="New item" title="New item" data-{page}-new>'
+            + f'<span aria-hidden="true">+</span><span class="review-new-label">{label}</span></button>')
+
+
 def render() -> str:
     """Mount once and open with window.reviewNewItem.open({trigger, kind, evidence})."""
     chips = "".join(
@@ -578,6 +585,7 @@ def render() -> str:
    <div class="new-item-previews" data-previews hidden></div>
   </div>
   <footer>
+   <p data-send-disabled role="status" hidden></p>
    <p class="new-item-error" role="alert" hidden></p>
    <div><button type="button" data-cancel>Cancel</button><button type="submit" disabled>Send</button></div>
   </footer>
@@ -603,6 +611,14 @@ PAGE_STATE_STYLE = '''
 
 
 STYLE = '''
+.page-heading-actions>.review-new{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;
+min-height:36px;background:var(--card);border:1px solid var(--line);border-radius:999px;color:var(--accent);
+padding:5px 14px;margin:0;flex:none;white-space:nowrap}
+.review-new>[aria-hidden]{font-size:1.2em;line-height:1}
+@media(max-width:360px){
+ .page-heading-actions>.review-new{justify-content:center;min-width:36px;padding:5px}
+ .review-new-label{display:none}
+}
 #review-new-item {
  position: fixed; inset: 0; box-sizing: border-box; margin: auto; padding: 0;
  width: min(560px, calc(100vw - 32px)); max-width: none; max-height: calc(100dvh - 32px);
@@ -728,6 +744,7 @@ STYLE = '''
  min-height: 38px; padding: 6px 14px; border: 1px solid var(--ink-3, #9a988f); border-radius: 8px;
  background: transparent; color: inherit;
 }
+#review-new-item [data-send-disabled] { margin: 0 0 8px; color: var(--ink-2); }
 #review-new-item .new-item-error { color: var(--error, #ef7372); margin: 0 0 8px; overflow-wrap: anywhere; }
 @media (max-width: 480px) {
  #review-new-item header, #review-new-item footer, #review-new-item .new-item-body { padding-inline: 16px; }
@@ -751,10 +768,11 @@ SCRIPT = r'''(() => {
  const pageCapture = dialog.querySelector('[data-page-capture]'), includePage = form.elements.include_page;
  const bugStateBox = dialog.querySelector('[data-bug-page-state]');
  const send = dialog.querySelector('[type="submit"]'), error = dialog.querySelector('.new-item-error');
+ const sendNotice = dialog.querySelector('[data-send-disabled]');
  const fields = [...form.querySelectorAll('fieldset'), words, includePage, dialog.querySelector('[data-close]'),
                  dialog.querySelector('[data-cancel]')];
  let launcher, opening, evidence, token, recipients, images = [], sending = false;
- let draftId, keepDraft = false, ownerPage = '';
+ let draft, keepDraft = false, ownerPage = '';
  let captureSession, bugPageState;
 
  function node(tag, text = '', css = '') {
@@ -921,7 +939,7 @@ SCRIPT = r'''(() => {
   const path = ownerPage ? endpoint + '?' + new URLSearchParams({page: ownerPage}) : endpoint;
   const response = await fetch(path, {cache: 'no-store', signal});
   const data = await responseData(response, 'Could not load recipients.');
-  if (!Array.isArray(data.recipients) || typeof data.token !== 'string' || !data.token) {
+  if (!Array.isArray(data.recipients) || typeof data.token !== 'string' || (!data.token && !data.send_disabled)) {
    throw new Error('Could not load recipients.');
   }
   return data;
@@ -1091,6 +1109,7 @@ SCRIPT = r'''(() => {
   setPageMode(page);
   launcher = trigger || document.activeElement;
   token = '';
+  sendNotice.hidden = true;
   if (!keepDraft) form.reset();
   if (!keepDraft || changedMode) {
    evidence = structuredClone(capture);
@@ -1118,6 +1137,9 @@ SCRIPT = r'''(() => {
    const data = await loadOptions(controller.signal);
    if (controller.signal.aborted) return;
    token = data.token;
+   sendNotice.textContent = data.send_disabled || '';
+   sendNotice.hidden = !data.send_disabled;
+   if (data.send_disabled) pageCapture.hidden = true;
    recipients = data.recipients;
    showRecipients();
    startCapture();
@@ -1138,12 +1160,12 @@ SCRIPT = r'''(() => {
   event.preventDefault();
   if (send.disabled) return;
   const kind = form.elements.kind.value, recipient = recipientChips.querySelector('input:checked');
-  if (!draftId) {
+  if (!draft) {
    const nonce = Array.from(crypto.getRandomValues(new Uint8Array(16)),
                             byte => byte.toString(16).padStart(2, '0')).join('');
-   draftId = 'r2-' + nonce;
+   draft = 'r2-' + nonce;
   }
-  const payload = {request_id: draftId, kind, recipient_id: recipient.value,
+  const payload = {request_id: draft, kind, recipient_id: recipient.value,
                    words: words.value, ...(ownerPage && {page: ownerPage})};
   setError('');
   setSending(true);
@@ -1178,7 +1200,7 @@ SCRIPT = r'''(() => {
    setSending(false);
   }
   if (saved) {
-   draftId = undefined;
+   draft = undefined;
    close({sent: true, usedCapture});
    dialog.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: saved}));
   } else {
@@ -1188,6 +1210,11 @@ SCRIPT = r'''(() => {
 
  window.reviewNewItem = {open};
  document.addEventListener('click', event => {
+  const listButton = event.target.closest('[data-list-new]');
+  if (listButton) {
+   void open({trigger: listButton, page: 'list'});
+   return;
+  }
   const trigger = event.target.closest('[data-owner-new]');
   const page = trigger?.closest('[data-page-owner]')?.dataset.pageOwner;
   if (page) void open({trigger, page, kind: 'bug'});

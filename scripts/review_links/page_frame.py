@@ -62,7 +62,9 @@ def with_owner(content: bytes, page: str, owner: staff.StaffRow, members: staff.
 HEADING_STYLE = ('.page-heading{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin-bottom:8px}'
                  + '.page-heading>h1{margin:0}'
                  + '.page-heading-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;'
-                 + 'max-width:100%;margin-inline-start:auto}')
+                 + 'max-width:100%;margin-inline-start:auto}'
+                 + '@media(max-width:360px){.page-heading-compact{flex-wrap:nowrap;column-gap:8px}'
+                 + '.page-heading-compact>.page-heading-actions{min-width:0;gap:6px}}')
 
 
 OWNER_STYLE = """<style>
@@ -102,7 +104,7 @@ def icon_svg(name: str) -> str:
     return source[source.index("<svg"):].replace("<svg", '<svg aria-hidden="true" focusable="false"', 1)
 
 
-def title(text: str, page: str, *, action: str = "") -> str:
+def title(text: str, page: str, *, action: str = "", compact_actions: bool = False) -> str:
     """Build the title and refresh status with an optional action beside the title."""
     settings = conf.read_or_repository("console")
     options = {"roundTripLimit": settings.number("status.round_trip_limit_seconds"),
@@ -115,7 +117,8 @@ def title(text: str, page: str, *, action: str = "") -> str:
                         ('Failed', 'triangle-alert'), ('Paused', 'circle-pause')))
     heading = f'<h1 class="page-title">{html.escape(text)}</h1>'
     if action:
-        heading = f'<div class="page-heading">{heading}{HEADING_ACTIONS}{action}</div></div>'
+        layout = "page-heading page-heading-compact" if compact_actions else "page-heading"
+        heading = f'<div class="{layout}">{heading}{HEADING_ACTIONS}{action}</div></div>'
     return (heading
             + '<p class="page-status" data-page-status data-state="Reading" role="status" aria-live="off" '
             + f'data-status-options="{html.escape(json.dumps(options), quote=True)}" data-page-facts>'

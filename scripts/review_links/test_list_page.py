@@ -34,7 +34,7 @@ from scripts.review_links.test_page_question import FakeQuestionTransport, quest
 from scripts.production import change_review, change_routing, delivery_state, investigation, record_store, session_staff, showrunners, staff, the_list
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import console, list_page, page_frame, serve, staff_names
-from scripts.review_links import change_browser, change_page, page_question, question_record
+from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
 from scripts.review_links import review_items, review_page
 from scripts.review_links.test_change_page import BrowserForms
 from scripts.review_links.test_page_frame import assert_status_states
@@ -89,6 +89,120 @@ class ListPageTests(unittest.TestCase):
         self.assertIn('<td class="record-id" data-label="#">', body)
         self.assertIn('.list-table .record-id{white-space:nowrap;overflow-wrap:normal;width:1%}', body)
         self.assertIn('.list-toggle{white-space:nowrap}', body)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_new_item_opens_the_dialog_and_reveals_the_saved_row(self) -> None:
+        root = self.root / "reviews"
+        _ = self.add("An existing List item")
+        initial = list_page.render(root, include_counts=False).decode()
+        item = self.add("A new List item")
+        fresh = list_page.render(root, include_counts=False).decode()
+        setup = r"""<script>
+const created=__KEY__,owner=__OWNER__,fresh=__FRESH__,requests=[];
+let finishRowSave,reads=0;
+window.setInterval=()=>0;
+window.fetch=async (path,options={})=>{
+ if(path===location.pathname){
+  if(options.method==='POST') return new Promise(resolve=>{finishRowSave=resolve;});
+  reads++;
+  return new Response(fresh);
+ }
+ const request=new URL(path,location.href);
+ requests.push([request.pathname+request.search,options.body && JSON.parse(options.body)]);
+ if(request.search==='?page=list') return Response.json({token:'fixture',recipients:[{id:owner,name:'morty'}]});
+ if(options.body && JSON.parse(options.body).page_capture) return Response.json({});
+ return Response.json({id:'Q1',key:'fixture-review-key',list_key:created});
+};
+</script>""".replace("__KEY__", json.dumps(list_page.ListRecord(MORTY.id, item).key)).replace(
+            "__OWNER__", json.dumps(MORTY.id)).replace("__FRESH__", json.dumps(fresh).replace("<", r"\u003c"))
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ const until=(target,test)=>new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{if(test()){observer.disconnect();resolve();}});
+  observer.observe(target,{subtree:true,childList:true,attributes:true});
+  if(test()){observer.disconnect();resolve();}
+ });
+ const button=document.querySelector('.page-heading-actions [data-list-new]');
+ check(button?.textContent==='+New item','The New item button is beside the List title.');
+ const dialog=document.querySelector('#review-new-item');
+ check(document.querySelectorAll('#review-new-item').length===1,'The List mounts one shared dialog.');
+ const existing=document.querySelector('[data-list-item]');
+ existing.querySelector('.list-toggle').click();
+ const tell=existing.querySelector('button[value="tell"]'),form=tell.form;
+ form.elements.words.value='Check the existing item.';
+ form.elements.words.dispatchEvent(new Event('input',{bubbles:true}));
+ form.requestSubmit(tell);
+ check(typeof finishRowSave==='function','A row save is in progress.');
+ const search=document.querySelector('#list-search');
+ search.value='existing';
+ search.dispatchEvent(new Event('input',{bubbles:true}));
+ button.click();
+ check(dialog.open,'The button opens the dialog.');
+ const recipient=()=>dialog.querySelector('[name="recipient_id"]:checked');
+ await until(dialog,recipient);
+ check(recipient().value===owner && recipient().labels[0].textContent==='morty','To selects the List page owner.');
+ check(requests[0][0]==='/console/review/new-item?page=list','The dialog requests List recipients.');
+ dialog.querySelector('[name="include_page"]').click();
+ const words=dialog.querySelector('textarea');
+ words.value='A new List item';
+ words.dispatchEvent(new Event('input',{bubbles:true}));
+ dialog.querySelector('[type="submit"]').click();
+ await until(dialog,()=>!dialog.open);
+ check(reads===0,'The List waits for the row save before it refreshes.');
+ const reply=__ROW_REPLY__;
+ finishRowSave(Response.json(reply.body,{status:reply.status}));
+ const row=()=>document.querySelector('[data-list-item][data-key="'+CSS.escape(created)+'"]');
+ await until(document.body,()=>row() && !row().hidden && !row().querySelector('[data-detail]').hidden);
+ check(!dialog.open,'Send closes the dialog.');
+ const saved=requests.find(([,body])=>body?.words);
+ check(saved?.[0]==='/console/review/new-item' && saved[1].recipient_id===owner && saved[1].page==='list',
+       'Send uses the shared endpoint and the selected List owner.');
+ check(row().textContent.includes('A new List item'),'The filtered List reveals the saved row.');
+ const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
+ document.body.append(result);
+})();
+</script>"""
+        for status, body in ((200, {"item_state": "Working"}), (409, {"reason": "The row save failed."})):
+            with self.subTest(status=status):
+                self.browser_actions(initial, setup, probe.replace("__ROW_REPLY__", json.dumps({
+                    "status": status, "body": body})), virtual_time_ms=3000)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_title_actions_fit_at_320_pixels(self) -> None:
+        owner = replace(MORTY, name="cargo-liner")
+        markup = page_frame.with_owner(list_page.render(self.root / "reviews", include_counts=False),
+                                       "list", owner, staff.StaffSnapshot((owner,)), new_item_dialog.render)
+        probe = """<script>
+(async()=>{
+ const failures=[];
+ try{
+  await document.fonts.ready;
+  const title=document.querySelector('.page-heading h1'), button=document.querySelector('[data-list-new]');
+  const heading=title.parentElement.getBoundingClientRect(), bounds=title.getBoundingClientRect();
+  const line=parseFloat(getComputedStyle(title).lineHeight);
+  if(innerWidth!==320 || Math.abs(bounds.height-line)>1){
+   failures.push('The List title fits on one line at 320 px.');
+  }
+  const controls=[button,document.querySelector('[data-owner-new]'),document.querySelector('.page-owner-name')];
+  if(controls.some(control=>{
+   const box=control.getBoundingClientRect();
+   return box.width<=0 || box.left<bounds.right || box.right>heading.right+1 ||
+          box.top<heading.top || box.bottom>heading.bottom;
+  }) || bounds.height>heading.height || heading.height>button.offsetHeight+1){
+   failures.push('The List controls fit beside the title at 320 px.');
+  }
+  if(button.innerText.trim()!=='+' || button.getAttribute('aria-label')!=='New item' || button.title!=='New item'){
+   failures.push('The narrow New item button shows only + and keeps its name.');
+  }
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        for in_console in (False, True):
+            with self.subTest(in_console=in_console):
+                self.browser_answer_visibility(markup.decode(), "", probe, reload_console=in_console,
+                                               viewport_width=320)
 
     def test_bulk_controls_show_lucide_icons_and_accessible_labels(self) -> None:
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()
@@ -211,7 +325,8 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
             owners = cast(dict[staff.StaffId, str] | None, kwargs.get("owner_options"))
             if owners is not None:
                 owners.update({OWNER.id: OWNER.name, OTHER.id: OTHER.name})
-            return reviews
+            states = review_items.selected_states(cast(str, kwargs.get("show", "all")))
+            return [item for item in reviews if item.state in states]
 
         with patch.object(review_items, "read", side_effect=read_reviews), patch.object(list_page, "counts_strip", return_value=""):
             reviews.append(missing)
@@ -329,8 +444,8 @@ async function inspect(frame){
      history.forward();return;
     }
     check(!doc.body.hasAttribute('data-first-return'),'the second Back loads a new List document');
-    await configureReview('open','Unlinked review');
    }
+   if(stage===2 && !proof) await configureReview('open','Unlinked review');
    const source=stage===keys.length+1 ? doc.querySelector('[data-number="112"]') : row;
    if(source!==row) source.querySelector('.list-toggle').click();
    const links=[...source.querySelector('[data-detail]').querySelectorAll('a')];
@@ -350,6 +465,14 @@ async function inspect(frame){
    ids(doc);
    const visibleRows=()=>[...doc.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
    const visible=visibleRows();
+   if(stage===1){
+    const notice=doc.querySelector('[data-missing-item]');
+    check(notice && !notice.hidden && notice.textContent==='This review is no longer on the Review page.',
+      'a Done review shows a missing-target notice');
+    check(!visible.some(row=>row.dataset.key===keys[1]),'the active Review list excludes the Done review');
+    sessionStorage.setItem('link-stage',String(stage+1));
+    location.href=listUrl;return;
+   }
    if(stage<keys.length){
     const target=visible.find(row=>row.dataset.key===keys[stage]);
     check(!!target && visible.some(row=>row.dataset.key==='change/other/C10'),'the linked card and an unlinked card are shown');
@@ -373,7 +496,7 @@ async function inspect(frame){
      check(doc.querySelector('[data-sort="3"]').parentElement.getAttribute('aria-sort')==='ascending',
        'the generated link keeps the Review sort selected in the controls');
     }
-    if(stage===1){
+    if(stage===2){
      check(selected(doc,'owner')===ownerId,'The jump keeps the matching Owner.');
      check(search.value==='' && selected(doc,'type')==='change','the jump clears conflicting words and keeps the matching type');
     }
@@ -405,10 +528,13 @@ async function inspect(frame){
     sessionStorage.setItem('link-stage',String(stage+1));
     if(stage===0) history.back();else location.href=listUrl;
    }else if(stage===keys.length){
-    check(visible.length===keys.length && visible.every(row=>keys.includes(row.dataset.key)),'the summary shows only linked cards');
-    const done=visible.find(row=>row.dataset.state==='Done');
-    if(done?.querySelector('.list-toggle').getAttribute('aria-expanded')!=='true') done?.querySelector('.list-toggle').click();
-    check(done?.querySelector('.list-toggle').getAttribute('aria-expanded')==='true','the Done card can open in the linked view');
+    const activeKeys=keys.filter((_,index)=>index!==1);
+    check(visible.length===activeKeys.length && visible.every(row=>activeKeys.includes(row.dataset.key)),
+      'the summary shows only active linked cards');
+    const waiting=visible.find(row=>row.dataset.key===keys[2]);
+    if(waiting?.querySelector('.list-toggle').getAttribute('aria-expanded')!=='true') waiting?.querySelector('.list-toggle').click();
+    check(waiting?.querySelector('.list-toggle').getAttribute('aria-expanded')==='true',
+      'the Waiting card can open in the linked view');
     if(proof){await finish();return;}
     const group=doc.querySelector('[data-clear-linked-reviews]');
     check(group && !group.hidden,'the linked group has one visible filter chip');
@@ -561,7 +687,7 @@ if(proof){const keepOpen=new Image();keepOpen.hidden=true;keepOpen.src='/complet
                         destination = list_url + ('&pending=i' if shot == 'reduced' else '')
                         if shot == 'review':
                             destination = '/console/' + console.place_query('review', review_page.PAGE_PATH + '?show=all#'
-                                + urlencode([('key', key) for key in linked_keys] + [('item', reviews[1].key)]))
+                                + urlencode([('key', key) for key in linked_keys] + [('item', reviews[2].key)]))
                         url = f'http://127.0.0.1:{server.server_port}' + destination
                         command = ['firefox', '--headless', '--no-remote', '--profile', str(profile), '--window-size', '1440,1100']
                         if shot in ('clicks', 'reduced'):
@@ -2772,7 +2898,7 @@ observer.observe(original.parentNode,{childList:true});
             self.assertIn('<p data-waiting-note>The producer will answer.</p>', opened)
             self.assertIn('Question Q1 — waiting for an answer</h3>' + asked_time, opened)
             self.assertIn("What changed in &lt;List&gt;?", opened)
-            self.assertNotIn('value="question"', opened)
+            self.assertNotIn('name="action" value="question"', opened)
             self.assertNotIn('aria-label="Unread update"', opened)
             with patch.object(change_page, "send_question", return_value=question_outcome()):
                 list_page.deliver(delivery)
@@ -2782,7 +2908,7 @@ observer.observe(original.parentNode,{childList:true});
         _ = list_page.submit(root, urlencode(fields))
         answered = list_page.render(root).decode().split('<script>', 1)[0]
         self.assertIn('data-waiting-for-answer="false"', answered)
-        self.assertIn('value="question"', answered)
+        self.assertIn('name="action" value="question"', answered)
         self.assertIn('aria-label="Unread update"', answered)
         self.assertIn('value="read">Mark read</button>', answered)
         panel, log = answered.split('<ol class="list-log">', 1)
@@ -4346,7 +4472,9 @@ window.fetch=async(_url,options)=>{
 
     def browser_answer_visibility(self, markup: str, setup: str, probe: str, *,
                                   viewport_height: int | None = None, reload_markup: str = "",
-                                  reload_console: bool = False) -> None:
+                                  reload_console: bool = False, viewport_width: int | None = None) -> None:
+        if viewport_width is not None:
+            probe = '<img hidden src="/complete">' + probe
         page = markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>').encode()
         reloaded = reload_markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>').encode()
         loaded = threading.Event()
@@ -4406,9 +4534,11 @@ window.fetch=async(_url,options)=>{
                 profile = self.root / "answer-profile"
                 profile.mkdir(exist_ok=True)
                 window_height = max(900, (viewport_height or 0) + 32)
+                start_path = frame_url if viewport_width is not None else "/"
                 browser = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
-                    '--window-size', f'1280,{window_height}', '--screenshot', str(self.root / 'answer.png'),
-                    f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=45)
+                    '--window-size', f'{viewport_width or 1280},{window_height}', '--screenshot',
+                    str(self.root / 'answer.png'), f'http://127.0.0.1:{server.server_port}{start_path}'],
+                    capture_output=True, text=True, timeout=45)
                 self.assertEqual(browser.returncode, 0, browser.stderr)
                 self.assertEqual(results, [[]])
             finally:

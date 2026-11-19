@@ -363,7 +363,8 @@ class SubmissionLookup:
 
 @contextmanager
 def _locked_request(address: SubmissionAddress, members: staff.StaffSnapshot | None = None, *,
-                    for_send: bool = False, page: str = "", draft_fingerprint: str = ""
+                    for_send: bool = False, page: str = "", draft_fingerprint: str = "",
+                    list_recipient: staff.StaffId | None = None
                     ) -> Generator[SubmissionLookup]:
     owners = {address.recipient_id}
     while True:
@@ -373,13 +374,16 @@ def _locked_request(address: SubmissionAddress, members: staff.StaffSnapshot | N
             recipient = None
             if page and draft_fingerprint:
                 current = staff.snapshot()
-                recipient = _page_send_recipient(page, current)
+                recipient = _page_send_recipient(page, address.recipient_id, current)
                 if recipient.id not in owners:
                     owners.add(recipient.id)
                     continue
                 target = _draft_address(address.kind, recipient.id, draft_fingerprint, page=page)
 
             hint = _request_hint(target)
+            if list_recipient is not None and not _list_draft_matches(target, hint, list_recipient):
+                yield SubmissionLookup(hint, NoNativeSubmission(), current, target, recipient)
+                return
             if isinstance(hint, NativeSubmissionDestination) and hint.address == target:
                 required = {hint.owner, target.recipient_id}
                 if not owners.issuperset(required):
@@ -402,10 +406,8 @@ def _locked_request(address: SubmissionAddress, members: staff.StaffSnapshot | N
             elif for_send and recipient is None:
                 assert current is not None
                 if page:
-                    resolved = page_owner(page, conf.read_or_repository("console"), current)
-                    if isinstance(resolved, staff.StaffRow):
-                        recipient = resolved
-                        required = {resolved.id}
+                    recipient = _page_send_recipient(page, address.recipient_id, current)
+                    required = {recipient.id}
                 else:
                     required = set(investigation.owner_chain(address.recipient_id, current))
             if not owners.issuperset(required):
@@ -441,7 +443,9 @@ def _write_draft_marker(path: Path, address: SubmissionAddress) -> None:
     atomic_file.write_text_atomic(path, address.request_id + "\n", new_file_mode=0o600)
 
 
-def _saved_draft(lookup: SubmissionLookup) -> LocatedSubmission | None:
+def _saved_draft(lookup: SubmissionLookup, *, list_recipient: staff.StaffId | None = None) -> LocatedSubmission | None:
+    if list_recipient is not None and not _list_draft_matches(lookup.address, lookup.hint, list_recipient):
+        return None
     if isinstance(lookup.native, LocatedSubmission):
         return lookup.native
     if isinstance(lookup.hint, UnreadableRequestFile):
@@ -470,7 +474,47 @@ def _index_older_draft(folder: Path, kind: SubmissionKind, fingerprint: str,
 
 
 def _draft_recipient(address: SubmissionAddress, page: str, members: staff.StaffSnapshot) -> staff.StaffRow:
-    return _page_send_recipient(page, members) if page else _active_recipient(address.recipient_id, members)
+    if page:
+        return _page_send_recipient(page, address.recipient_id, members)
+    return _active_recipient(address.recipient_id, members)
+
+
+def _list_draft_matches(address: SubmissionAddress, hint: RequestFile, recipient: staff.StaffId) -> bool:
+    if address.recipient_id == recipient:
+        return True
+    if isinstance(hint, NativeSubmissionDestination) and hint.address == address:
+        return hint.owner == recipient
+    return isinstance(hint, (NativeSubmissionDestination, UnreadableRequestFile))
+
+
+def _list_draft_order(hint: RequestFile) -> tuple[bool, int]:
+    # A move keeps the native ID. An unreadable receipt can hide a newer match.
+    number = int(hint.id[1:]) if isinstance(hint, NativeSubmissionDestination) else 0
+    return isinstance(hint, UnreadableRequestFile), number
+
+
+def _list_draft_candidates(folder: Path, address: SubmissionAddress,
+                           fingerprint: str) -> dict[SubmissionAddress, RequestFile]:
+    hints: dict[SubmissionAddress, RequestFile] = {}
+    for marker in (folder / "page-list", *folder.glob("page-list-*")):
+        try:
+            previous = _read_draft_marker(marker, address.kind, fingerprint)
+        except (OSError, UnicodeError):
+            if marker.name.startswith("page-list-"):
+                bound = staff.StaffId(marker.name.removeprefix("page-list-"))
+                canonical = _draft_address(address.kind, bound, fingerprint, page="list")
+                # A receipt for the List binding can prove that it belongs to another owner.
+                hint = _request_hint(canonical, receipt_only=True)
+                if (isinstance(hint, NativeSubmissionDestination) and hint.address == canonical
+                        and not _list_draft_matches(canonical, hint, address.recipient_id)):
+                    continue
+            raise
+        if previous is not None and previous not in hints:
+            hints[previous] = _request_hint(previous)
+    candidates = [previous for previous, hint in hints.items()
+                  if _list_draft_matches(previous, hint, address.recipient_id)]
+    candidates.sort(key=lambda previous: _list_draft_order(hints[previous]), reverse=True)
+    return {previous: hints[previous] for previous in candidates}
 
 
 @contextmanager
@@ -478,7 +522,8 @@ def _locked_draft_request(address: SubmissionAddress, members: staff.StaffSnapsh
                           page: str, fingerprint: str) -> Generator[SubmissionLookup]:
     # Lock the content across page and standard Sends.
     folder, existed = _prepare_request_folder(f"r4-{fingerprint}")
-    page_marker = folder / f"page-{page}"
+    list_recipient = address.recipient_id if page == "list" else None
+    page_marker = folder / (f"page-list-{list_recipient}" if list_recipient is not None else f"page-{page}")
     standard = _draft_address(address.kind, address.recipient_id, fingerprint)
     with exclusive(folder / ".lock"):
         indexed = folder / ".indexed"
@@ -487,22 +532,38 @@ def _locked_draft_request(address: SubmissionAddress, members: staff.StaffSnapsh
                 _index_older_draft(folder, address.kind, fingerprint, members)
             atomic_file.write_text_atomic(indexed, "", new_file_mode=0o600)
 
-        previous = _read_draft_marker(page_marker, address.kind, fingerprint) if page else standard
-        if previous is not None:
-            with _locked_request(previous, members, draft_fingerprint=fingerprint) as lookup:
-                if _saved_draft(lookup) is not None:
+        if page == "list":
+            previous_addresses = list(_list_draft_candidates(folder, address, fingerprint))
+        elif page:
+            previous = _read_draft_marker(page_marker, address.kind, fingerprint)
+            previous_addresses = [] if previous is None else [previous]
+        else:
+            previous_addresses = [standard]
+        checked: dict[SubmissionAddress, RequestFile] = {}
+        while True:
+            for previous in previous_addresses:
+                with _locked_request(previous, members, draft_fingerprint=fingerprint,
+                                     list_recipient=list_recipient) as lookup:
+                    checked[previous] = lookup.hint
+                    saved = _saved_draft(lookup, list_recipient=list_recipient)
+                    if saved is None:
+                        continue
+                    if page == "list" and address.recipient_id not in (saved.destination.recipient_id,
+                                                                      saved.destination.owner):
+                        continue
                     if page:
                         atomic_file.sync_folder(folder)
                     yield lookup
                     return
+            previous_addresses = []
 
-        while True:
             recipient = _draft_recipient(address, page, staff.snapshot()).id
             recipient_marker = folder / f"recipient-{recipient}"
             candidate = _read_draft_marker(recipient_marker, address.kind, fingerprint)
-            if candidate is not None and candidate != previous:
-                with _locked_request(candidate, members, draft_fingerprint=fingerprint) as match:
-                    saved = _saved_draft(match)
+            if candidate is not None and candidate not in checked:
+                with _locked_request(candidate, members, draft_fingerprint=fingerprint,
+                                     list_recipient=list_recipient) as match:
+                    saved = _saved_draft(match, list_recipient=list_recipient)
                     if saved is not None and saved.destination.owner == recipient:
                         if _draft_recipient(address, page, staff.snapshot()).id != recipient:
                             continue
@@ -517,6 +578,13 @@ def _locked_draft_request(address: SubmissionAddress, members: staff.StaffSnapsh
                 current = lookup.recipient or _active_recipient(address.recipient_id, lookup.members)
                 if current.id != recipient:
                     continue
+                if list_recipient is not None:
+                    latest = _list_draft_candidates(folder, address, fingerprint)
+                    previous_addresses = [previous for previous, hint in latest.items()
+                                          if checked.get(previous) != hint]
+                    if previous_addresses:
+                        # Release the filing lock before taking the replay locks in order.
+                        continue
                 # Save both bindings before publishing the native item.
                 _write_draft_marker(recipient_marker, lookup.address)
                 if page:
@@ -749,20 +817,29 @@ def page_owner(page: str, settings: conf.ConfigRead, members: staff.StaffSnapsho
     default = staff.StaffId(values.get("owner.default", ""))
     for identity in (designated, default):
         for candidate in investigation.owner_chain(identity, members):
-            row = members.by_id(candidate)
-            if row is None or row.id in members.pending_retire or isinstance(row.exited, staff.Exited):
-                continue
-            if isinstance(row.doc, staff.WrappedDoc) or isinstance(row.worktree, staff.RemovedWorktree):
-                continue
-            if row.kind == "showrunner" and isinstance(row.doc, staff.LiveDoc):
-                return row
-            if row.kind == "producer" and row.id == designated:
+            row = _available_page_owner(candidate, members, allow_producer=candidate == designated)
+            if isinstance(row, staff.StaffRow):
                 return row
     return PageOwnerUnavailable()
 
 
-def _page_send_recipient(page: str, members: staff.StaffSnapshot) -> staff.StaffRow:
-    recipient = page_owner(page, conf.read_or_repository("console"), members)
+def _available_page_owner(identity: staff.StaffId, members: staff.StaffSnapshot, *,
+                          allow_producer: bool) -> staff.StaffRow | PageOwnerUnavailable:
+    row = members.by_id(identity)
+    if row is None or identity in members.pending_retire or isinstance(row.exited, staff.Exited):
+        return PageOwnerUnavailable()
+    if isinstance(row.doc, staff.WrappedDoc) or isinstance(row.worktree, staff.RemovedWorktree):
+        return PageOwnerUnavailable()
+    if row.kind == "showrunner" and isinstance(row.doc, staff.LiveDoc) or row.kind == "producer" and allow_producer:
+        return row
+    return PageOwnerUnavailable()
+
+
+def _page_send_recipient(page: str, bound: staff.StaffId, members: staff.StaffSnapshot) -> staff.StaffRow:
+    if page == "list":
+        recipient = _available_page_owner(bound, members, allow_producer=True)
+    else:
+        recipient = page_owner(page, conf.read_or_repository("console"), members)
     if isinstance(recipient, PageOwnerUnavailable):
         raise SubmissionConflict("The page owner is unavailable. Open New item again.")
     return recipient

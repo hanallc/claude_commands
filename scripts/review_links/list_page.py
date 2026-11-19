@@ -19,11 +19,12 @@ from typing import Literal, NamedTuple, NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, urlencode
 
 from scripts.lib import conf
+from scripts.lib.file_lock import exclusive
 from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, footer_counts, record_store, session_staff, staff, the_list
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 from scripts.review_links import change_browser, change_page, console, page_frame, page_question, record_table, review_link
-from scripts.review_links import review_items, review_page
+from scripts.review_links import new_item_dialog, review_items, review_page
 from scripts.review_links import staff_names
 from scripts.review_links import question_record
 from scripts.statusline import counts_row, rebuild_row
@@ -89,6 +90,26 @@ class ListRecord(NamedTuple):
 
 def page_url() -> str:
     return PAGE_PATH
+
+
+def add_submission(created: review_page.PublishedSubmission) -> ListRecord:
+    """Save the List row once and link it to the native Review item."""
+    keeper = created.saved.owner
+    evidence = review_place((created.saved.key,))
+    folder = the_list.folder(keeper)
+    folder.mkdir(parents=True, exist_ok=True)
+    with exclusive(folder / ".new-item.lock"):
+        item = next((item for item in the_list.records(keeper, include_closed=True)
+                     if any(isinstance(entry.what, the_list.FieldChange) and entry.what.action == "Added"
+                            and entry.what.fields.get("evidence") == evidence for entry in item.log)), None)
+        if item is None:
+            words = created.saved.words
+            title = next(line.strip() for line in words.splitlines() if line.strip())[:120].rstrip()
+            item = the_list.add(keeper, title, owner=keeper, source=the_list.PAGE_SOURCE,
+                                changes={"latest_status": words, "evidence": evidence})
+        if item.state != the_list.ItemState.CLOSED and created.key not in item.reviews:
+            item = the_list.link(keeper, item.id, (created.key,), source=the_list.PAGE_SOURCE)
+        return ListRecord(keeper, item)
 
 
 def records(*, include_closed: bool = False) -> list[ListRecord]:
@@ -868,7 +889,7 @@ def render(root: Path, *, include_counts: bool = True,
                         + f' aria-label="{label}" title="{label}">' + page_frame.icon_svg(icon) + '</button>'
                         for action, label, icon in (("expand", "Expand all", "chevrons-up-down"),
                                                     ("collapse", "Collapse all", "chevrons-down-up")))
-    content = (STYLE + page_frame.title("The List", "list")
+    content = (STYLE + page_frame.title("The List", "list", action=new_item_dialog.title_button("list"), compact_actions=True)
                + f'<div data-list data-refresh-seconds="{seconds}" data-zone="{html.escape(zone.key, quote=True)}"'
                + f' data-closed-keys="{html.escape(json.dumps(closed_keys), quote=True)}"'
                + f' data-park-morning="{morning}" style="--list-log-max-height:{log_max_height}rem">'
@@ -892,7 +913,7 @@ def render(root: Path, *, include_counts: bool = True,
                + '<section data-linked-item hidden><h2 id="list-linked-heading">Linked item outside filters</h2>'
                + '<div class="list-table"><table aria-labelledby="list-linked-heading">' + columns
                + '<thead><tr>' + linked_headers + '</tr></thead></table></div></section>'
-               + counts + '</div><script>' + SCRIPT + '</script>')
+               + counts + '</div>' + new_item_dialog.render() + '<script>' + SCRIPT + '</script>')
     return page_frame.rendered(change_page.document(content, "The List"), started, read_at)
 
 
@@ -982,7 +1003,8 @@ const chipFor=data=>{
 };
 let content=document.querySelector('[data-list]');
 let closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
-let saving=0;
+let saving=0,refreshDeferred=false;
+let createdItem='';
 const drafts=new Map();
 const unparkMessages={
  cleared:'Unparked',
@@ -1123,7 +1145,7 @@ async function markOpenedAnswerRead(item,watch){
    {kind:'failure',message:'Read not confirmed: '+error.message});
  }finally{
   pendingOpenReads.delete(key);saving--;
-  if(saved) void pageRefresh.refresh(true);
+  refreshAfterSave(saved);
  }
 }
 const tableView=createRecordTable({content:()=>content,
@@ -1437,20 +1459,27 @@ function bindFeedbackForm(form){
       }
      }
     }
-    if((saved && item.dataset.waitingForAnswer!=='true') ||
-      (!saved && !refused && (parks || action==='remove'))) void pageRefresh.refresh(true);
+    refreshAfterSave((saved && item.dataset.waitingForAnswer!=='true') ||
+      (!saved && !refused && (parks || action==='remove')));
    }
   });
 }
+function refreshAfterSave(force){
+ refreshDeferred ||= force;
+ if(!saving && (refreshDeferred || createdItem)) void pageRefresh.refresh(true);
+}
 async function refresh(_supersede=false,current=()=>true){
- if(saving || dateTimePickerOpen(content)) return;
+ if(saving){refreshDeferred=true;return;}
+ if(dateTimePickerOpen(content)) return;
+ refreshDeferred=false;
  const response=await fetch(location.pathname,{cache:'no-store'});
  if(!response.ok) throw new Error('HTTP '+response.status);
  const page=new DOMParser().parseFromString(await response.text(),'text/html');
  const fresh=page.querySelector('[data-list]');
  if(!fresh) throw new Error('The page has no list.');
  await tableView.settled();
- if(saving || dateTimePickerOpen(content) || !current()) return;
+ if(saving){refreshDeferred=true;return;}
+ if(dateTimePickerOpen(content) || !current()) return;
  const top=scrollY,field=listOwnsFocus() ? document.activeElement : null;
  const focus=field?.id,start=field?.selectionStart,end=field?.selectionEnd;
  const action=field?.matches('button[name="action"]') ? field.value : '';
@@ -1474,7 +1503,13 @@ async function refresh(_supersede=false,current=()=>true){
   const button=action && row?.querySelector('[data-detail]:not([hidden]) button[name="action"][value="'+CSS.escape(action)+'"]:enabled');
   (button || row?.querySelector('.list-toggle') || content.querySelector('#list-search')).focus({preventScroll:true});
  }
- scrollTo({top,behavior:'instant'});
+ if(createdItem && content.querySelector('[data-list-item][data-key="'+CSS.escape(createdItem)+'"]')){
+  const place=new URL(location.href),fragment=new URLSearchParams(place.hash.slice(1));
+  fragment.set('jump',createdItem);place.hash=fragment.toString();
+  history.replaceState(history.state,'',place);
+  createdItem='';
+  tableView.followItemLink({inheritFilters:true});
+ } else scrollTo({top,behavior:'instant'});
  watchLinkedAnswer();
  return pageRefreshFacts(page);
 }
@@ -1575,6 +1610,11 @@ addEventListener('hashchange',event=>{
  watchLinkedAnswer();
 });
 const pageRefresh=createPageRefresh(refresh,()=>content.dataset.refreshSeconds);
+document.addEventListener('review-item-created',event=>{
+ if(typeof event.detail?.list_key!=='string') return;
+ createdItem=event.detail.list_key;
+ void pageRefresh.refresh(true);
+});
 document.addEventListener('visibilitychange',resumeOpenedAnswerReads);
 window.addEventListener('message',event=>{
  if(event.source===parent && event.origin===location.origin && event.data==='console-shown') resumeOpenedAnswerReads();
