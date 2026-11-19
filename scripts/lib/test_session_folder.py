@@ -2,12 +2,13 @@
 
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-from scripts.lib import session_folder
+from scripts.lib import conf, session_folder, unit_runs
 from scripts.lib.session_folder import Member
 from scripts.message import session_records
 from scripts.production import staff
@@ -16,6 +17,7 @@ from scripts.production import staff
 class SessionFolderTests(unittest.TestCase):
     root: Path = Path()
     former: Path = Path()
+    previous: Path = Path()
     member: Member | None = None
     live: frozenset[str] = frozenset()
 
@@ -24,7 +26,9 @@ class SessionFolderTests(unittest.TestCase):
         base = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.root = base / "session"
         self.former = base / "former"
-        environment = {session_folder.ROOT_ENV: str(self.root), session_folder.FORMER_ROOT_ENV: str(self.former)}
+        self.previous = base / "previous"
+        environment = {session_folder.ROOT_ENV: str(self.root), session_folder.FORMER_ROOT_ENV: str(self.former),
+                       "SESSION_PREVIOUS_ROOT": str(self.previous)}
         _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
         for name in (session_folder.FOLDER_ENV, "TMPDIR"):
             _ = os.environ.pop(name, None)
@@ -39,6 +43,80 @@ class SessionFolderTests(unittest.TestCase):
     def member_of(self, session_id: str) -> Member | None:
         del session_id
         return self.member
+
+    def previous_folder(self, session_id: str = "old-id") -> Path:
+        folder = self.previous / "verify"
+        folder.mkdir(parents=True)
+        session_folder.write_record(folder, {"owner": "m1", "session_id": session_id})
+        session_folder.link(self.previous, session_id, folder)
+        return folder
+
+    def test_natedev_creates_the_configured_root_on_first_use(self) -> None:
+        source = Path(__file__).resolve().parents[2] / "config" / "build_folders.conf"
+        config = self.root.parent / "config"
+        config.mkdir()
+        _ = (config / source.name).write_text(source.read_text().replace("=/session", f"={self.previous}"))
+        with patch.dict(os.environ, {"HOME": str(self.root.parent), "CONF_DIR": str(config),
+                                     session_folder.ROOT_ENV: ""}):
+            _ = os.environ.pop("SESSION_PREVIOUS_ROOT", None)
+            with patch.object(conf, "_local_host_name", return_value="natedev"):
+                self.assertEqual(session_folder.configured_root(), self.root)
+                self.assertEqual(session_folder.launch_folder(Member("m1", "verify"), "new-id"), self.root / "verify")
+                self.assertEqual(session_folder.configured_roots(), (self.root, self.previous))
+            with patch.object(conf, "_local_host_name", return_value="mac"):
+                self.assertEqual(session_folder.configured_roots(), (self.root,))
+        self.assertEqual(self.root.stat().st_mode & 0o777, 0o700)
+
+    def test_lookup_accepts_indexes_in_both_roots(self) -> None:
+        self.root.mkdir()
+        old = self.previous_folder()
+        self.live = frozenset({"old-id"})
+        new = session_folder.launch_folder(Member("m2", "builds"), "new-id")
+        self.assertEqual(session_folder.session_folder("new-id"), new)
+        self.assertEqual(session_folder.session_folder("old-id"), old)
+
+    def test_start_keeps_the_members_former_folder_for_a_staff_open_run(self) -> None:
+        self.root.mkdir()
+        old = self.previous_folder()
+        run = old / "run" / "demo"
+        run.mkdir(parents=True)
+        owner = staff.StaffRow(staff.StaffId("m1"), "unit", "verify", staff.StaffRoot(),
+                               current_session=staff.StaffId("old-id"), run=staff.OpenRun(run))
+        with patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((owner,))):
+            self.assertEqual(session_folder.launch_folder(Member("m1", "verify"), "new-id"), old)
+        self.assertEqual(session_folder.folder_for(self.previous, "new-id"), old)
+        self.assertFalse((self.root / "verify").exists())
+
+    def test_start_keeps_the_members_former_folder_for_a_live_run(self) -> None:
+        self.root.mkdir()
+        old = self.previous_folder()
+        heartbeat = old / "run" / "demo" / unit_runs.HEARTBEAT
+        heartbeat.parent.mkdir(parents=True)
+        heartbeat.touch()
+        with patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())):
+            self.assertEqual(session_folder.launch_folder(Member("m1", "verify"), "next"), old)
+            past = time.time() - unit_runs.LIVE_HEARTBEAT_SECS - 10
+            os.utime(heartbeat, (past, past))
+            self.assertEqual(session_folder.launch_folder(Member("m1", "verify"), "later"), self.root / "verify")
+        self.assertTrue(heartbeat.is_file())
+
+    def test_no_open_run_at_start_leaves_the_former_folder_and_makes_a_new_one(self) -> None:
+        self.root.mkdir()
+        old = self.previous_folder()
+        saved = old / "notes"
+        _ = saved.write_text("keep")
+        source = Path(__file__).resolve().parents[2] / "config" / "build_folders.conf"
+        config = self.root.parent / "config"
+        config.mkdir()
+        _ = (config / source.name).write_text(source.read_text().replace("=/session", f"={self.previous}"))
+        with (patch.dict(os.environ, {"HOME": str(self.root.parent), "CONF_DIR": str(config),
+                                     session_folder.ROOT_ENV: ""}),
+              patch.object(conf, "_local_host_name", return_value="natedev"),
+              patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(()))):
+            self.assertEqual(session_folder.launch_folder(Member("m1", "verify"), "old-id"), self.root / "verify")
+        self.assertEqual(saved.read_text(), "keep")
+        self.assertEqual(session_folder.folder_for(self.root, "old-id"), self.root / "verify")
+        self.assertEqual(session_folder.folder_for(self.previous, "old-id"), old)
 
     def test_no_session_root_makes_nothing(self) -> None:
         self.assertIsNone(session_folder.session_root())

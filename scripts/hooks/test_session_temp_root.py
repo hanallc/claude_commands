@@ -18,7 +18,7 @@ HOOK = Path(__file__).resolve().parent / "session-start-temp-root.py"
 class SessionTempRootTests(unittest.TestCase):
     def run_hook(self, base: Path, payload: object, env_file: Path | None, **extra: str) -> None:
         environment = {**os.environ, "SESSION_FORMER_ROOT": str(base / "former"),
-                       "SESSION_TEMP_ROOT": str(base / "session")}
+                       "SESSION_TEMP_ROOT": str(base / "session"), "SESSION_PREVIOUS_ROOT": str(base / "previous")}
         for name in ("CLAUDE_ENV_FILE", "CLAUDE_SESSION_FOLDER"):
             _ = environment.pop(name, None)
         environment.update(extra)
@@ -57,6 +57,20 @@ class SessionTempRootTests(unittest.TestCase):
             self.assertEqual(os.readlink(base / "session" / ".id" / "abc123-x"), "hana-fix")
             self.assertFalse((base / "former").exists())
             self.assert_exported(env_file, root)
+
+    def test_a_running_session_keeps_the_former_tmpdir(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            (base / "session").mkdir()
+            old = base / "previous" / "verify"
+            old.mkdir(parents=True)
+            _ = (old / ".session.json").write_text(json.dumps({"owner": "m1", "session_id": "live-id"}))
+            (old.parent / ".id").mkdir()
+            (old.parent / ".id" / "live-id").symlink_to(old.name)
+            env_file = base / "env.sh"
+            self.run_hook(base, {"session_id": "live-id", "source": "compact"}, env_file, TMPDIR=str(old))
+            self.assert_exported(env_file, old)
+            self.assertEqual(list((base / "session").iterdir()), [])
 
     def test_a_launcher_folder_is_adopted(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

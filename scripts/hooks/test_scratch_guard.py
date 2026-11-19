@@ -131,6 +131,18 @@ class ScratchGuardTests(unittest.TestCase):
             mkdir.assert_not_called()
         self.assertEqual(stat.S_IMODE(own.stat().st_mode), 0o750)
 
+    def test_a_live_former_session_can_make_a_folder_in_its_tmpdir(self) -> None:
+        previous = self.new_root.parent / "previous"
+        own = previous / "verify"
+        own.mkdir(parents=True)
+        _ = (own / ".session.json").write_text(json.dumps({"owner": "m1", "session_id": "scratch-session"}))
+        (previous / ".id").mkdir()
+        (previous / ".id" / "scratch-session").symlink_to(own.name)
+        with mock.patch.dict(os.environ, {"SESSION_PREVIOUS_ROOT": str(previous)}):
+            self.assertEqual(self.run_hook("mkdir \"$TMPDIR/test-output\"", temp=own), "")
+            self.assert_refused(f"mkdir {previous}/loose", str(previous / "loose"))
+        self.assertFalse(self.session_root.exists())
+
     def test_a_deleted_session_folder_in_the_session_root_is_made_again(self) -> None:
         own = self.new_root / "verify"
         (self.new_root / ".id").mkdir(parents=True)

@@ -95,6 +95,7 @@ except FileNotFoundError:
 import json
 from importlib import import_module
 import os
+import pwd
 import re
 import shutil
 import stat
@@ -110,8 +111,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 from urllib.parse import unquote, urlparse
 
-from scripts.lib import build_folders, conf, copy_record, scratch, unit_runs
+from scripts.lib import build_folders, conf, copy_record, scratch, session_folder, unit_runs
 from scripts.lib.conf import UseConfiguredValue  # noqa: E402
+from scripts.lib.testing_folders import RUN_FOLDER_ENV
 from scripts.lib.python_startup.sitecustomize import dataclass_code_root, dataclass_code_usable  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.message import sessions  # noqa: E402
@@ -132,6 +134,7 @@ SESSION_ENTRY_MIN_BYTES = GIB
 RUN_INTERVAL_SECONDS = HOUR_SECONDS
 LOG_KEEP_SECONDS = 7 * 24 * HOUR_SECONDS
 TMP_ROOT = "/tmp/claude"
+TEST_SWEEP_ENV = "TMP_SWEEP_TEST"
 # Each Claude session's TMPDIR is SESSION_TEMP_ROOT/<session id> (hooks/session-start-temp-root.py),
 # and each run's is <run folder>/RUN_TEMP_NAME; the entries in both are judged with the 4 h rule.
 class SessionTemporaryRoot(Protocol):
@@ -268,10 +271,12 @@ class Roots:
     copies: tuple[str, ...] = ()
     # Dataclass code cache roots; prune_dataclass_code judges each entry of each cache tag folder.
     dataclass_code: tuple[str, ...] = ()
+    former_sessions: tuple[str, ...] = field(default=(), kw_only=True)
     verify_temp_name: re.Pattern[str] = field(default_factory=verify_temp_name, kw_only=True)
 
     def all(self) -> tuple[str, ...]:
-        return self.plain + self.runs + self.projects + self.temp + self.scratch + self.sessions + self.copies
+        return (self.plain + self.runs + self.projects + self.temp + self.scratch + self.sessions
+                + self.former_sessions + self.copies)
 
     def entries(self, root: str, *,
         scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
@@ -378,6 +383,54 @@ class Sweep:
         self.kept.setdefault(reason, []).append(path)
 
 
+def under_test() -> bool:
+    """Detect a test process or a child that a test starts."""
+    return (any(name in sys.modules for name in ("unittest", "pytest"))
+            or any(os.environ.get(name) for name in (TEST_SWEEP_ENV, RUN_FOLDER_ENV, "PYTEST_CURRENT_TEST")))
+
+
+def refuse_live_test_roots(roots: Sequence[str | Path]) -> None:
+    """Refuse live roots before a test can list them."""
+    if not roots or not under_test():
+        return
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+    def absolute(path: str | Path) -> Path:
+        name = os.fspath(path)
+        expanded = home / name[2:] if name.startswith("~/") else Path(name).expanduser()
+        return Path(os.path.abspath(expanded))
+
+    mounts = {Path(name) for name in ("/tmp", "/private/tmp", "/build", "/dev/shm")}
+    live = {Path("/tmp/claude"), Path("/private/tmp/claude"), Path("/session"), home / "session",
+            Path(f"/tmp/claude-{os.getuid()}"), Path(f"/private/tmp/claude-{os.getuid()}"),
+            Path(f"/var/tmp/dataclass-code-{os.getuid()}"), home / nextest_log.DIRECTORY}
+    settings = (Path(__file__).absolute().parents[2] / "config" / "build_folders.conf",
+                home / ".claude" / "config" / "build_folders.conf")
+    temporary = os.environ.get("TMPDIR") or "/tmp"
+    test_folder = os.environ.get(RUN_FOLDER_ENV)
+    if test_folder and absolute(temporary).is_relative_to(absolute(test_folder)):
+        temporary = "/tmp"
+    for file in settings:
+        if file.is_file():
+            live.update(absolute(value.replace("${TMPDIR}", temporary))
+                        for key, value in conf.read(file).values().items() if key.startswith("roots.") and value)
+    live.difference_update(mounts)
+
+    def blocked(path: Path, mount_roots: set[Path], live_roots: set[Path]) -> bool:
+        return (any(path == root or path in root.parents for root in mount_roots)
+                or any(path.is_relative_to(root) or path in root.parents for root in live_roots))
+
+    paths = tuple(absolute(root) for root in roots)
+    for path in paths:
+        if blocked(path, mounts, live):
+            raise ValueError(f"tmp sweep: test cannot use live root {path}")
+    real_mounts = {root.resolve() for root in mounts}
+    real_live = {root.resolve() for root in live} - real_mounts
+    for path in paths:
+        if blocked(path.resolve(), real_mounts, real_live):
+            raise ValueError(f"tmp sweep: test cannot use live root {path}")
+
+
 def default_roots(tmp_root: str = TMP_ROOT, run_roots: Sequence[str] | None = None,
                   session_roots: Sequence[str] | None = None, temp_roots: Sequence[str] | None = None,
                   scratch_roots: Sequence[str] | None = None, wide_roots: Sequence[str] | None = None,
@@ -386,7 +439,13 @@ def default_roots(tmp_root: str = TMP_ROOT, run_roots: Sequence[str] | None = No
     adds the dataclass code cache root. The Mac's /tmp is a link to
     /private/tmp, and lsof prints real paths. The wide root is /tmp alone: $TMPDIR and the Mac's
     temp folder hold app state, and macOS clears its own."""
+    if under_test():
+        project_parents = ("/tmp",) if session_roots is None else session_roots
+        run_parents = ((*session_folder.configured_roots(), unit_runs.RUN_ROOT, unit_runs.FORMER_RUN_ROOT)
+                       if run_roots is None else run_roots)
+        refuse_live_test_roots((tmp_root, *run_parents, *project_parents))
     runs = tuple(str(root) for root in unit_runs.run_roots()) if run_roots is None else run_roots
+    refuse_live_test_roots(runs)
     sessions_at = session_scratch_roots() if session_roots is None else session_roots
     projects = tuple(entry.path for root in sessions_at for entry in listing(os.path.realpath(root))
                      if entry.name.startswith("-") and entry.is_dir(follow_symlinks=False))
@@ -399,12 +458,15 @@ def default_roots(tmp_root: str = TMP_ROOT, run_roots: Sequence[str] | None = No
     session_parent = str(_session_temp.temp_parent()) if SESSION_TEMP_ROOT == _session_temp.ROOT else SESSION_TEMP_ROOT
     session_temp = (session_parent,) if session_temp_roots is None else session_temp_roots
     copies = (copy_record.copies_root(), copy_record.FORMER_COPIES_ROOT) if live else (Path(tmp_root) / "copies",)
+    former_roots = session_folder.configured_roots()[1:] if live else ()
+    refuse_live_test_roots((*session_temp, *former_roots))
+    former_sessions = tuple(os.path.realpath(root) for root in former_roots if root.is_dir())
     return Roots((os.path.realpath(tmp_root),), tuple(os.path.realpath(root) for root in runs), projects,
                  temp_real, tuple(dict.fromkeys(os.path.realpath(root) for root in task_roots if os.path.isdir(root))),
                  tuple(real for root in wide if (real := os.path.realpath(root)) in temp_real),
                  tuple(os.path.realpath(root) for root in session_temp if os.path.isdir(root)),
                  tuple(dict.fromkeys(os.path.realpath(root) for root in copies)),
-                 (dataclass_code_root(),) if live else ())
+                 (dataclass_code_root(),) if live else (), former_sessions=former_sessions)
 
 
 def session_scratch_roots() -> tuple[str, ...]:
@@ -993,6 +1055,17 @@ def owner_reason(entry: os.DirEntry[str], root: str, roots: Roots, live: frozens
         if isinstance(task, copy_record.UnreadableRecord):
             return task.reason
         return ROW_WAITS if isinstance(task, copy_record.Registered) and task.task.startswith("row:") else None
+    if root in roots.former_sessions:
+        if entry.name in (session_folder.INDEX, session_folder.LOCK):
+            return ROOT
+        if live is None:
+            return NO_SESSIONS
+        if entry.is_dir(follow_symlinks=False):
+            holder = session_folder.read_record(Path(entry.path))
+            if holder is None:
+                return UNREADABLE
+            if holder["session_id"] in live:
+                return SESSION_RUNS
     if root in roots.projects or root in roots.sessions:
         if live is None:
             return NO_SESSIONS
@@ -1046,6 +1119,10 @@ class RemovableEntry:
     reason: str = "idle and unused"
 
 
+class FormerSessionEntry(RemovableEntry):
+    """A former session folder that the sweep must check under its root lock."""
+
+
 class ClosedPhaseEntry(RemovableEntry):
     """The phase is closed under a director or session worktree guard."""
 
@@ -1057,6 +1134,7 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
     inspection: scratch.RemoteInspection = scratch.RemoteInspection.LOCAL_ONLY,
 ) -> Iterator[KeptEntry | RemovableEntry]:
     """Apply the ownership, use and idle checks shared by timed and hand cleanup."""
+    refuse_live_test_roots(roots.all())
     from scripts.production import staff
 
     if isinstance(scratch_settings, UseConfiguredValue):
@@ -1065,8 +1143,8 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
         lint_settings = conf.read("lint")
     if not roots.all():
         return
-    # The scan keeps only paths under the roots' common folder (/tmp), which entry_uses then sorts.
-    prefix = os.path.join(os.path.commonpath(roots.all()), "")
+    # Scan once and keep paths below the roots.
+    prefix = tuple(os.path.join(root, "") for root in roots.all())
     paths = process_paths(proc, prefix)
     if isinstance(paths, ProcessUsesUnavailable):
         paths = lsof_paths(prefix)
@@ -1115,6 +1193,12 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
             reason = owner_reason(entry, root, roots, temp_live,
                                   record=pane_use.record if isinstance(pane_use, PaneRunUse) else pane_use,
                                   scratch_settings=scratch_settings)
+            if reason is None and root in roots.former_sessions and isinstance(pane_use, PaneRunUse):
+                try:
+                    if session_folder.holds_run(Path(entry.path), now, pane_use.record):
+                        reason = RunKeepReason.OPEN_RUN.value
+                except (OSError, ValueError):
+                    reason = UNREADABLE
             landed_remote_check = False
             if root in roots.copies and reason is None:
                 state = scratch.lifetime(Path(entry.path), now, scratch_settings=scratch_settings)
@@ -1163,6 +1247,8 @@ def judge_entries(roots: Roots, now: float, proc: str, *,
                 continue
             if root in phase_parents:
                 yield ClosedPhaseEntry(entry.path, root, newest, size, CleanupEndReason.CLOSED_PHASE.value)
+            elif root in roots.former_sessions and entry.is_dir(follow_symlinks=False):
+                yield FormerSessionEntry(entry.path, root, newest, size)
             else:
                 yield RemovableEntry(entry.path, root, newest, size)
 
@@ -1172,6 +1258,31 @@ def remove_entry(entry: RemovableEntry, result: Sweep, dry_run: bool, *,
 ) -> bool:
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
+    if isinstance(entry, FormerSessionEntry) and not dry_run:
+        from scripts.production import staff
+
+        folder = Path(entry.path)
+        try:
+            with session_folder.root_lock(Path(entry.root)):
+                holder = session_folder.read_record(folder)
+                if holder is None or folder.is_symlink():
+                    result.keep(entry.path, UNREADABLE)
+                    return False
+                if session_folder.held_by_another(holder, ""):
+                    result.keep(entry.path, SESSION_RUNS)
+                    return False
+                state = (folder / session_folder.RECORD).stat()
+                if max(state.st_ctime, state.st_mtime) > entry.newest:
+                    result.keep(entry.path, RECENT)
+                    return False
+                if (folder / session_folder.RUN).is_dir() and session_folder.holds_run(
+                        folder, time.time(), staff.local_snapshot()):
+                    result.keep(entry.path, RunKeepReason.OPEN_RUN.value)
+                    return False
+                return remove_idle_entry(entry, result, False, scratch_settings=scratch_settings)
+        except (OSError, ValueError):
+            result.keep(entry.path, UNREADABLE)
+            return False
     return remove_idle_entry(entry, result, dry_run, scratch_settings=scratch_settings)
 
 
@@ -1213,6 +1324,7 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR, *,
     scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> Sweep:
     """Delete every idle entry no process uses, and record why each other entry stays."""
+    refuse_live_test_roots(roots.all() + roots.dataclass_code)
     if isinstance(scratch_settings, UseConfiguredValue):
         scratch_settings = conf.read("scratch")
     if isinstance(lint_settings, UseConfiguredValue):
@@ -1263,10 +1375,8 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR, *,
 
 
 def prune_dataclass_code(root: str, now: float, days: int) -> int:
-    """Remove each cache entry that no process read in days days, then each emptied cache tag folder.
-
-    An old Python's cache tag folder empties and goes by the same rule. Return the count of removed entries.
-    """
+    """Remove old cache entries and return the number of entries removed."""
+    refuse_live_test_roots((root,))
     if not dataclass_code_usable(root, os.getuid()):
         return 0
     limit = now - days * 86400
@@ -1577,6 +1687,7 @@ def summary(result: Sweep, dry_run: bool) -> str:
 
 def remove_expired_nextest_logs(root: Path, now: float, dry_run: bool, result: Sweep) -> None:
     """Remove closed Mac nextest logs after their retention period."""
+    refuse_live_test_roots((root,))
     try:
         folder = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except FileNotFoundError:

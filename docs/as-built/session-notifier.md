@@ -220,10 +220,10 @@ A row without a run produces no health check.
 
 - Every message, `--help` text, comment and docstring under `scripts/` that names a run of `/unit:direct` calls it a "unit run" (`Unit run`, `unit run`, `mid-unit-run`) (user, 2026-10-08); `phase_table.py --help` reads `Show or refresh a unit run's plan phases.` Nothing is called "delegate" (user, 2026-10-20): the directories are `scripts/direct/` and `docs/direct/`, the config is `config/direct.conf`, the variables are `UNIT_*`, the hook module is `scripts/hooks/direct_run.py`, a run's directory is the "unit session directory" (the session-start hook prints `Unit session directory:`), and the agent that receives the work is a "worker". Stored data moves to new names: the history folder is `~/.local/state/unit-history` and the run archive `usage-model/unit-archive` once `unit_runs.py move-history` moves them on each machine; the buildlog field is `unit_session`, renamed in the log files on their next index read; findings record `--caught-by worker`. Until then, and for records already written, these readers keep the old word: the `plan-delegate` and `delegate-archive` folder names, the `plan-delegate` skill in old events, the `delegate_session` field rename, `--caught-by delegate` (accepted and stored as `worker`, and counted in old history), the `delegate.` task names in the history ledger, a phase's `delegated_phase_reservation_state.json`, `/tmp/claude/delegate` and the `delegate-` notifier prefix. The last three go with the old run folder. Two more keep it for good: the old command name `/unit:delegate`, which the model study and the roles audit match in old transcripts and text, and the dated review `docs/direct_footprint_review.md`. The check: `git grep -niwE 'delegates?' -- scripts commands docs ':!docs/plans'`; any hit outside that list breaks the rule.
 
-- **Run folders and staff.** A new run goes in its director's session folder, `/session/<name>/run/<run id>/`
-  (user decision 8, 2026-11-15); before the session root exists it goes in `/tmp/claude/unit/<run id>/`.
-  Each `run` folder in a session folder is a run root, so a run keeps its id.
-  `scripts/lib/unit_runs.py` reads all run roots at each call, the former `delegate` root included.
+- A new run uses the director's session folder, usually `~/session/<name>/run/<run id>/`.
+  A director that retains a former session folder on natedev uses `/session/<name>/run/<run id>/`.
+  If the session has no named folder, the run uses `/tmp/claude/unit/<run id>/`.
+  `scripts/lib/unit_runs.py` reads both named roots and the legacy `unit` and `delegate` roots.
   The director's staff row stores the open run in `run`.
   `prepare_session.sh` sets the pointer.
   `end_session.sh` clears the pointer only while it still names that run.
@@ -306,7 +306,10 @@ An old run cannot clear a pointer that names a newer run.
 `direct_run.active_run` keeps its 12-hour rule for recent writes in the run folder.
 That rule controls turn continuation and does not permit deletion.
 
-### Session folder cutover
+### Legacy scratchpad move
+
+This procedure moves scratchpads from the legacy roots.
+The natedev session root change uses the tmp sweep to remove idle former folders.
 
 Run `scripts/lib/py scripts/lib/session_move.py --dry-run` before the cutover.
 The output gives each source, destination, size, move type, and naming rule.

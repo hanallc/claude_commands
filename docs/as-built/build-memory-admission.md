@@ -1610,7 +1610,27 @@ A failed removal prints a warning and does not fail the merge or the verdict.
 The scratch guard, a `PreToolUse` hook on `Bash` for Claude Code (`settings.json`) and Codex (`codex_hooks.py`), refuses a command that makes a new folder directly in /tmp, `$TMPDIR`, /tmp/claude, ~/rust or ~/rust/scratch (and judges a Write or NotebookEdit file path where its matcher names them): mkdir, mktemp -d, git clone, git worktree add, cp -r/-R/-a, rsync, cargo new/init, and tar extraction into a root. Allowed there: the session scratchpads (`/tmp/claude-<uid>`), `/tmp/claude/unit`, `/tmp/claude/delegate`, `/tmp/claude/session` and both scratch roots; ~/worktrees is no root, and a `make_a_worktree` command is never judged. A heredoc body, a quoted argument and a comment are data. A path the hook cannot follow (a variable other than HOME or TMPDIR, a command substitution, a command inside `bash -c` or ssh) is allowed, and the hourly tmp sweep is the backstop. A `TMPDIR` inside a session scratchpad, a session temp root or a run folder is no root.
 Before its checks, the scratch guard uses the session-start path helper to restore only the input session id's missing temp folder with mode `0700`; an existing folder costs one `os.stat`, a missing or invalid id creates nothing, and a repair error allows the tool call to proceed to the checks.
 
-Each Claude session's `TMPDIR` is `/tmp/claude/session/<session id>`: `hooks/session-start-temp-root.py` makes it at start, resume, clear and compact, and writes `export TMPDIR=...` to `$CLAUDE_ENV_FILE`. A run's workers and `verify.sh --session-dir` use `<run folder>/tmp`. So mktemp, tempfile and Rust `.tmpXXXXXX` folders land there, and the hourly tmp sweep judges each entry with its 4 h rule; the root goes only once its session or director stops, and nothing waits on that. In /tmp and the other temp folders a folder's ctime is no change, since `systemd-tmpfiles-clean` moves it every day (its 26 Oct run kept month-old folders such as `cargo-installQOkrzS` looking fresh to the 7-day rule).
+`build_folders.conf` sets `roots.session=~/session` on both machines.
+The session folder helper creates a missing root with mode `0700` at first use.
+`roots.session_former.natedev=/session` names the former root on natedev.
+The Mac has no former named root.
+
+A live session retains its TMPDIR in the former root.
+At session start, the helper uses the member's folder in the current root if it finds one.
+If the member's former folder holds an open run, the helper retains that folder.
+A staff pointer or a recent run heartbeat identifies an open run.
+Otherwise the helper creates a folder in the current root and leaves the former folder in place.
+The hook exports the selected path through `$CLAUDE_ENV_FILE`.
+It can still use the legacy `/tmp/claude/session/<session id>` path when the current root cannot take folders.
+
+The scratch guard, scratch tool, Disks page and run discovery accept both named roots.
+Only the tmp sweep removes former session folders.
+It checks the session record and protects open runs.
+It applies the normal age, process use and unsaved work checks to ended folders.
+It retains the root's session index and lock.
+A run's workers and `verify.sh --session-dir` use `<run folder>/tmp`.
+The tmp sweep applies the four-hour rule to run temp entries.
+In temp folders it ignores a folder's ctime because `systemd-tmpfiles-clean` changes it.
 
 The daily folder audit (`scripts/lint/folder_audit.py --send`) checks loose folders that can hold work.
 A `nate.jobs` job runs it on natedev and the Mac.

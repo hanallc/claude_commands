@@ -10,6 +10,7 @@ import io
 import fcntl
 import json
 import os
+import pwd
 import select
 import signal
 import socket
@@ -34,7 +35,7 @@ from scripts.message import sessions
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
 
-from scripts.lib import conf, unit_runs
+from scripts.lib import conf, session_folder, unit_runs
 from scripts.herdr import worker_panes
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib.atomic_file import write_text_atomic
@@ -342,13 +343,15 @@ class CopyTests(TmpSweepCase):
         authority.assert_not_called()
 
     def test_default_root_reads_the_current_copies_authority(self) -> None:
+        former = self.tmp.parent / "former copies"
         for name in ("first copies", "second copies"):
             authority_root = self.tmp.parent / name
-            with mock.patch.object(copy_record, "copies_root", return_value=authority_root) as authority:
-                roots = tmp_sweep.default_roots(run_roots=(), session_roots=(), temp_roots=(),
+            with (mock.patch.object(tmp_sweep, "TMP_ROOT", str(self.tmp)),
+                  mock.patch.object(copy_record, "FORMER_COPIES_ROOT", former),
+                  mock.patch.object(copy_record, "copies_root", return_value=authority_root) as authority):
+                roots = tmp_sweep.default_roots(str(self.tmp), run_roots=(), session_roots=(), temp_roots=(),
                                                scratch_roots=(), wide_roots=(), session_temp_roots=())
-            # The live sweep also drains natedev's former copies root.
-            self.assertEqual(roots.copies, (str(authority_root), os.path.realpath(copy_record.FORMER_COPIES_ROOT)))
+            self.assertEqual(roots.copies, (str(authority_root), os.path.realpath(former)))
             authority.assert_called_once_with()
 
     def copy(self, name: str, **fields: object) -> Path:
@@ -1238,7 +1241,57 @@ class TempFolderTests(TmpSweepCase):
         self.assertEqual(roots.temp, (str(self.tmp.parent),))
 
 
+class LiveRootGuardTests(unittest.TestCase):
+    def test_sweep_refuses_live_roots_before_listing(self) -> None:
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        roots = ("/tmp/claude", "/tmp/claude/unit", "/session", "~/session", str(home / "session"),
+                 "/build", "/build/claude/copies", str(home / "rust" / "mirrors"), "/tmp",
+                 f"/var/tmp/dataclass-code-{os.getuid()}", str(home / nextest_log.DIRECTORY))
+        with (mock.patch.object(tmp_sweep, "listing") as listing,
+              mock.patch.object(os, "scandir") as scandir,
+              mock.patch.object(tmp_sweep, "read_pane_runs") as panes,
+              mock.patch.object(tmp_sweep, "remove_entry") as remove):
+            for root in roots:
+                with self.subTest(root=root):
+                    with self.assertRaisesRegex(ValueError, "test cannot use live root"):
+                        _ = tmp_sweep.sweep(False, tmp_sweep.Roots((root,), (), ()), time.time())
+            with (mock.patch.object(unit_runs, "RUN_ROOT", Path("/tmp/claude/unit")),
+                  mock.patch.object(unit_runs, "run_roots") as run_roots,
+                  mock.patch.object(session_folder, "configured_roots", return_value=())):
+                with self.assertRaisesRegex(ValueError, "test cannot use live root /tmp/claude/unit"):
+                    _ = tmp_sweep.default_roots("/unused-test-root", session_roots=())
+            run_roots.assert_not_called()
+        listing.assert_not_called()
+        scandir.assert_not_called()
+        panes.assert_not_called()
+        remove.assert_not_called()
+
+
 class OwnerTests(TmpSweepCase):
+    def test_sweep_judges_ended_former_folders_and_keeps_live_and_open_folders(self) -> None:
+        previous = self.tmp.parent / "previous"
+        ended = write(previous / "ended" / "file").parent
+        live = write(previous / "live" / "file").parent
+        opened = write(previous / "opened" / "run" / "demo" / "file").parents[2]
+        for folder, session_id in ((ended, ENDED_SESSION), (live, LIVE_SESSION), (opened, ENDED_SESSION)):
+            _ = write(folder / ".session.json", json.dumps({"owner": folder.name, "session_id": session_id}))
+        _ = self.open_run(opened / "run" / "demo", ENDED_SESSION)
+        with (mock.patch.dict(os.environ, {"SESSION_TEMP_ROOT": str(self.tmp.parent / "session"),
+                                          "SESSION_PREVIOUS_ROOT": str(previous)}),
+              mock.patch.object(tmp_sweep, "TMP_ROOT", str(self.tmp)),
+              mock.patch.object(unit_runs, "RUN_ROOT", self.unit),
+              mock.patch.object(unit_runs, "FORMER_RUN_ROOT", self.delegate),
+              mock.patch.object(copy_record, "FORMER_COPIES_ROOT", self.tmp / "former-copies"),
+              mock.patch.object(tmp_sweep, "dataclass_code_root", return_value=str(self.tmp / "dataclass-code"))):
+            roots = tmp_sweep.default_roots(str(self.tmp), temp_roots=(), session_roots=(),
+                                            scratch_roots=(), wide_roots=())
+            result = tmp_sweep.sweep(False, roots, self.now, str(self.proc))
+        self.assertIn(str(ended), [entry["path"] for entry in result.deleted])
+        self.assertFalse(ended.exists())
+        self.assertTrue(live.is_dir())
+        self.assertTrue(opened.is_dir())
+        self.assertIn(str(live), result.kept.get(tmp_sweep.SESSION_RUNS, []))
+
     def test_a_run_folder_stays_while_its_director_runs(self) -> None:
         self.now: float = time.time() + 8 * DAY
         live = write(self.unit / "live" / "board.log").parent

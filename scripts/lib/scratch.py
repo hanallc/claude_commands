@@ -739,8 +739,7 @@ def free_name(folder: Path, name: str) -> Path:
 
 
 def in_session_folder(path: Path) -> bool:
-    root = session_folder.session_root()
-    return root is not None and path.parent.parent == root
+    return path.parent.parent in session_folder.configured_roots()
 
 
 def held_in_session(path: Path, task: str) -> bool:

@@ -100,6 +100,19 @@ class ScratchTests(unittest.TestCase):
                               source_commit="a" * 40, copy_commit="b" * 40, target_mode="none",
                               seed_source="", borrows_from="", **details)
 
+    def test_scratch_uses_and_holds_a_folder_in_the_former_session_root(self) -> None:
+        current = self.base / "session"
+        current.mkdir()
+        previous = self.base / "previous"
+        folder = previous / "maker"
+        folder.mkdir(parents=True)
+        session_folder.write_record(folder, {"owner": "maker", "session_id": MAKER_ID})
+        session_folder.link(previous, MAKER_ID, folder)
+        with mock.patch.dict(os.environ, {"SESSION_PREVIOUS_ROOT": str(previous), "TMPDIR": str(folder)}):
+            path = scratch.new("gate:shot", "result")
+            self.assertEqual(path, folder / "result")
+            self.assertIn(str(path), scratch.holds())
+
     def test_a_callers_folder_goes_in_its_session_folder_and_its_task_ends_it(self) -> None:
         sessions = self.base / "session"
         sessions.mkdir()

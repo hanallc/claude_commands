@@ -73,6 +73,23 @@ class ReadSessionsTests(unittest.TestCase):
         self.assertEqual([(row["name"], row["state"]) for row in report["sessions"]] if report else None,
                          [("fps", "ended"), ("lfo", "ended")])
 
+    def test_a_report_includes_folders_in_both_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root, previous = base / "session", base / "previous"
+            for parent, name in ((root, "current"), (previous, "older")):
+                (parent / name).mkdir(parents=True)
+            with (mock.patch.dict(os.environ, {session_folder.ROOT_ENV: str(root),
+                                              "SESSION_PREVIOUS_ROOT": str(previous)}),
+                  mock.patch.object(measure, "read_data", return_value=None),
+                  mock.patch.object(measure, "read_mounts", return_value=()),
+                  mock.patch.object(scratch, "holds", return_value={}),
+                  mock.patch.object(session_records, "read_registry",
+                                    return_value=session_records.RegistryRead((), ()))):
+                report = sessions.session_report()
+        assert report is not None
+        self.assertEqual([row["name"] for row in report["sessions"]], ["current", "older"])
+
     def test_no_session_root_gives_no_report(self) -> None:
         with mock.patch.object(session_folder, "session_root", return_value=None):
             self.assertIsNone(sessions.session_report())
