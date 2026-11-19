@@ -411,10 +411,10 @@ raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
     def batch_record(self) -> Path:
         return Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "checkpoint-batches/production"))
 
-    def interrupt_batch(self, line: str) -> str:
+    def interrupt_batch(self, *lines: str) -> str:
         self.executable(self.bin / "checkpoint-test", STUB + "raise KeyboardInterrupt\n")
         with self.assertRaises(KeyboardInterrupt):
-            _ = self.land_batch([line])
+            _ = self.land_batch(list(lines))
         self.executable(self.bin / "checkpoint-test", STUB)
         return self.git("rev-parse", "HEAD")
 
@@ -430,6 +430,45 @@ raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
         unpublished = self.interrupt_batch(self.batch_line("alpha", "2", commit))
         result = self.land_batch([self.batch_line("alpha", "2", commit, "--shrink")])
         self.assert_batch_requires_reset(result, published, unpublished)
+
+    def test_a_stopped_batch_refuses_a_moved_checkpoint_ref(self) -> None:
+        published = self.git("rev-parse", "HEAD")
+        first = self.checkpoint(content="alpha batch change\n")
+        second = self.beta_checkpoint("src/beta.txt", "beta batch change\n")
+        ref = "refs/tags/beta-checkpoint"
+        _ = self.git("update-ref", ref, second, cwd=self.other)
+        lines = [self.batch_line("alpha", "2", first), self.batch_line("beta", "2", ref)]
+        unpublished = self.interrupt_batch(*lines)
+        self.assertEqual(self.git("rev-parse", "HEAD^2"), second)
+        self.assertEqual(self.git("rev-parse", "HEAD^1^2"), first)
+
+        moved = self.beta_checkpoint("src/beta.txt", "later beta change\n")
+        _ = self.git("update-ref", ref, moved, second, cwd=self.other)
+        result = self.land_batch(lines)
+        self.assert_batch_requires_reset(result, published, unpublished)
+        self.assertIn("input: failed", result.stdout)
+
+    def test_a_batch_record_unlink_error_warns_and_allows_promotion(self) -> None:
+        self.promotions = str(self.promote)
+        self.production_doc()
+        published = self.git("rev-parse", "HEAD")
+        commit = self.checkpoint(content="alpha batch change\n")
+        record = self.batch_record()
+        real_unlink = Path.unlink
+
+        def refuse_record(path: Path, missing_ok: bool = False) -> None:
+            if path == record:
+                raise PermissionError("fixture cannot remove the batch record")
+            real_unlink(path, missing_ok=missing_ok)
+
+        with patch.object(Path, "unlink", refuse_record):
+            result = self.land_batch([self.batch_line("alpha", "2", commit)])
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"batch: warning — {record}", result.stdout)
+        self.assertEqual(result.stdout.count("fixture cannot remove the batch record"), 1)
+        self.assertTrue(record.is_file())
+        _ = self.assert_landed(published, [commit])
 
     def test_a_published_batch_retires_its_record_and_a_new_batch_runs(self) -> None:
         commit = self.checkpoint(content="alpha batch change\n")

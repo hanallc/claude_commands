@@ -26,6 +26,7 @@ import tempfile
 import time
 from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager, redirect_stdout
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePath, PurePosixPath
 from typing import NamedTuple, cast
@@ -1573,6 +1574,20 @@ class MergedBatchItem(NamedTuple):
     paths: tuple[str, ...]
 
 
+@dataclass
+class BatchResumeRecord:
+    path: Path
+    requests: tuple[MergeRequest, ...]
+    retirement_attempted: bool = False
+
+    def retire(self) -> None:
+        self.retirement_attempted = True
+        try:
+            self.path.unlink(missing_ok=True)
+        except OSError as error:
+            checkpoint_gate.report("batch", "warning", f"{self.path}: could not remove the batch record ({error})")
+
+
 class BatchItemStop(Exception):
     """The items that prevent the current unpublished batch from landing."""
 
@@ -1658,7 +1673,8 @@ def bisect_red_batch(reference: MergeRequest, candidates: tuple[MergedBatchItem,
             "run", "failed", str(error), "the showrunner will inspect the failed command")) from error
 
 
-def run_batch_attempt(requests: tuple[MergeRequest, ...], start_tip: str, log: Path, resume_record: Path) -> int:
+def run_batch_attempt(requests: tuple[MergeRequest, ...], start_tip: str, log: Path,
+                      resume_record: BatchResumeRecord) -> int:
     """Merge the ordered items and share their tests, publication, and promotion."""
     items: list[MergedBatchItem] = []
     for index, incoming in enumerate(requests):
@@ -1726,7 +1742,7 @@ def run_batch_attempt(requests: tuple[MergeRequest, ...], start_tip: str, log: P
                     with push_rollback(shared.production, start_tip):
                         publication_started = True
                         tip = publish_checkpoint(shared)
-                    resume_record.unlink(missing_ok=True)
+                    resume_record.retire()
                     promote(shared, tip, local_only=True)
                     for item in items:
                         delete_landed_branch(item.request, item.origin.branch, tip)
@@ -1801,44 +1817,49 @@ def unpushed_merge_sources(checkout: Path, published: str) -> set[str]:
     return {line.split()[1] for line in parents.splitlines()}
 
 
-def batch_has_unpushed_checkpoint(requests: tuple[MergeRequest, ...], sources: set[str]) -> bool:
-    for request in requests:
-        try:
-            resolved = resolved_checkpoint(request)
-        except checkpoint_gate.Stop:
-            continue
-        if resolved.commit in sources:
-            return True
-    return False
-
-
 @contextmanager
-def batch_resume_record(requests: tuple[MergeRequest, ...]) -> Generator[Path]:
-    """Keep the original arguments while a checkpoint from the batch remains unpushed."""
+def batch_resume_record(requests: tuple[MergeRequest, ...]) -> Generator[BatchResumeRecord]:
+    """Keep the ordered arguments and commit hashes while the batch has unpushed merges."""
     production = requests[0].production
     checkout = production.checkout
     filename = f"checkpoint-batches/{production.merge_branch}"
     path = Path(good(git(checkout, "rev-parse", "--path-format=absolute", "--git-path", filename), "batch"))
-    arguments = "\n".join(request.batch_argument_line for request in requests) + "\n"
     upstream = f"refs/remotes/origin/{production.merge_branch}"
     _ = good(git(checkout, "fetch", "origin", f"+refs/heads/{production.merge_branch}:{upstream}"), "batch")
+    entries: list[str] = []
+    pinned_requests: list[MergeRequest] = []
+    commits: set[str] = set()
+    for request in requests:
+        try:
+            pinned = resolved_checkpoint(request)
+        except checkpoint_gate.Stop:
+            # Keep the request for the batch's normal per-item ancestry check.
+            pinned = request
+            commit = ""
+        else:
+            commit = pinned.commit
+            commits.add(commit)
+        entries.append(f"{commit}\t{request.batch_argument_line}")
+        pinned_requests.append(pinned)
+    contents = "\n".join(entries) + "\n"
     sources = unpushed_merge_sources(checkout, upstream)
     if sources:
         try:
             saved = path.read_bytes()
         except FileNotFoundError:
             saved = b""
-        if saved != arguments.encode("utf-8") or not batch_has_unpushed_checkpoint(requests, sources):
+        if saved != contents.encode("utf-8") or sources.isdisjoint(commits):
             raise Refusal("unpushed merges do not have a matching batch record; "
                           + "reset the merge branch to its pushed tip, then start a fresh batch")
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(path, arguments)
+        write_text_atomic(path, contents)
+    record = BatchResumeRecord(path, tuple(pinned_requests))
     try:
-        yield path
+        yield record
     finally:
-        if path.exists() and not unpushed_merge_sources(checkout, upstream):
-            path.unlink(missing_ok=True)
+        if not record.retirement_attempted and not unpushed_merge_sources(checkout, upstream):
+            record.retire()
 
 
 def run_batch(requests: tuple[MergeRequest, ...]) -> int:
@@ -1846,13 +1867,13 @@ def run_batch(requests: tuple[MergeRequest, ...]) -> int:
     requests = tuple(request._replace(cancel_prior=cancel_prior) for request in requests)
     require_merge_branch(requests[0].production)
     with batch_resume_record(requests) as resume_record:
-        return run_recorded_batch(requests, resume_record)
+        return run_recorded_batch(resume_record)
 
 
-def run_recorded_batch(requests: tuple[MergeRequest, ...], resume_record: Path) -> int:
+def run_recorded_batch(resume_record: BatchResumeRecord) -> int:
     """Remove stopped items and their unit's later items before each retry."""
-    production = requests[0].production
-    requests, resumed = resume_merged_items(requests)
+    production = resume_record.requests[0].production
+    requests, resumed = resume_merged_items(resume_record.requests)
     if not requests:
         return resumed
     start_tip = good(git(production.checkout, "rev-parse", "HEAD"), "merge")
