@@ -65,7 +65,7 @@ from scripts.notify import push_texts
 from scripts.notify import push_reference
 from scripts.message import postmaster
 from scripts.notify import silence
-from scripts.message.test_postmaster import FakeClock
+from scripts.message.test_postmaster import MOD_FIXTURE_VERSION, FakeClock, fake_receipt
 from scripts.message import codex_daemon
 from scripts.message.codex_test_support import FakeDaemon, daemon_session_row, receive_frame, reply, write_codex_account
 from scripts.message import roster
@@ -1923,14 +1923,15 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
         _ = self.enterContext(mock.patch.object(send, "_postmaster_recipient", side_effect=select))
 
-    def postmaster_heartbeat(self, clock: FakeClock, identity: str = "worker") -> None:
+    def postmaster_heartbeat(self, clock: FakeClock, identity: str = "worker", *, version: str = MOD_FIXTURE_VERSION) -> None:
         path = self.root / "postmaster" / "heartbeat.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(json.dumps(postmaster.Heartbeat(session_id=identity,
-            at_ms=int(clock.time() * 1000), version="0.1.0", run="1800000000000-test-worker")))
+            at_ms=int(clock.time() * 1000), version=version, run="1800000000000-test-worker")))
 
     def postmaster_mod(self, clock: FakeClock, texts: list[str], *, matching: bool = True,
-                       receipt_delay: float = 0, outcome: postmaster.ModOutcome = "delivered") -> None:
+                       receipt_delay: float = 0, outcome: postmaster.ModOutcome = "delivered",
+                       include_recipient: bool = True) -> None:
         pending: dict[Path, tuple[postmaster.OutboxEntry, float]] = {}
 
         def poll() -> None:
@@ -1947,11 +1948,11 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             for path, (entry, due) in list(pending.items()):
                 if clock.elapsed < due:
                     continue
-                identity = path.stem
-                result = postmaster.OutboxResult(id=identity, outcome=outcome, detail="", session_id=entry["session_id"],
-                    recipient_pid=entry["recipient_pid"], recipient_start=entry["recipient_start"],
-                    sha256=hashlib.sha256(entry["text"].encode()).hexdigest() if matching else "0" * 64,
-                    claimed_ms=int(clock.time() * 1000), finished_ms=int(clock.time() * 1000))
+                result = fake_receipt(entry, outcome, int(clock.time() * 1000), matching=matching)
+                if not include_recipient:
+                    _ = result.pop("session_id")
+                    _ = result.pop("recipient_pid")
+                    _ = result.pop("recipient_start")
                 target = self.root / "postmaster" / "results" / path.name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 _ = target.write_text(json.dumps(result))
@@ -2625,6 +2626,24 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                 attempt.assert_called_once()
                 self.assertEqual((self.log()[-1]["via"], self.log()[-1]["postmaster"]), ("relay", reason))
 
+    def test_old_postmaster_heartbeat_allows_publication_and_an_expired_receipt_relays_once(self) -> None:
+        clock = self.postmaster_clock()
+        self.session("recipient", "Recipient")
+        self.session("worker", "Postmaster")
+        self.postmaster_heartbeat(clock, version="0.1.0")
+        texts: list[str] = []
+        self.postmaster_mod(clock, texts, outcome="expired", include_recipient=False)
+        options = local_options(["--to", "session:recipient", "--from", "Sender",
+                                 "--key", "old-mod", "--repeat-minutes", "30", "--text", "body"])
+        with mock.patch.object(send, "publish_postmaster_entry", wraps=send.publish_postmaster_entry) as publish:
+            self.assertEqual(send.send(options).outcome, "sent")
+            self.assertEqual(send.send(options).outcome, "skipped")
+        publish.assert_called_once()
+        self.assertEqual(len(texts), 1)
+        self.assertEqual(list((self.root / "postmaster" / "outbox").glob("*.json")), [])
+        self.assertEqual(len(self.relayed), 1)
+        self.assertEqual((self.log()[-2]["via"], self.log()[-2]["postmaster"]), ("relay", "expired"))
+
     def test_late_postmaster_receipt_delivers_once_without_a_relay(self) -> None:
         clock = self.postmaster_clock()
         self.session("recipient", "Recipient")
@@ -2947,16 +2966,21 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         clock = self.postmaster_clock()
         self.session("recipient", "Recipient")
         self.session("worker", "Postmaster")
-        for outcome in ("delivered", "failed", "expired", "withdrawn"):
-            with self.subTest(outcome=outcome):
+        cases: list[tuple[postmaster.ModOutcome, bool]] = [
+            ("delivered", True), ("failed", True), ("expired", True), ("withdrawn", True),
+            ("delivered", False), ("failed", False), ("expired", False), ("withdrawn", False),
+        ]
+        for outcome, include_recipient in cases:
+            with self.subTest(outcome=outcome, include_recipient=include_recipient):
                 self.fresh_repeat_history()
                 shutil.rmtree(self.root / "postmaster", ignore_errors=True)
                 self.postmaster_heartbeat(clock)
                 texts: list[str] = []
                 self.postmaster_mod(clock, texts,
                     receipt_delay=postmaster.wait_seconds() + postmaster.claim_grace_seconds() + postmaster.poll_seconds(),
-                    outcome=outcome)
-                options = local_options(["--to", "session:recipient", "--from", "Sender", "--key", f"late-{outcome}", "--text", "body"])
+                    outcome=outcome, include_recipient=include_recipient)
+                key = f"late-{outcome}" if include_recipient else f"late-{outcome}-fieldless"
+                options = local_options(["--to", "session:recipient", "--from", "Sender", "--key", key, "--text", "body"])
                 self.assertEqual(send.send(options).outcome, "failed")
                 clock.elapsed += postmaster.wait_seconds()
                 clock.after_sleep()

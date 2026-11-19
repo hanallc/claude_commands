@@ -326,12 +326,18 @@ def receipt_matches_recipient(result: OutboxResult, conversation: str, pid: int,
             and result.get("recipient_start") == started)
 
 
+def receipt_has_recipient_fields(result: OutboxResult) -> bool:
+    return "session_id" in result or "recipient_pid" in result or "recipient_start" in result
+
+
 def _result(root: Path, entry: OutboxEntry, started: float) -> Attempt | ResultPending:
     read = receipt(root.parent, entry["id"])
     if isinstance(read, ResultPending):
         return read
     seconds = time.monotonic() - started
-    if not receipt_matches_recipient(read, entry["session_id"], entry["recipient_pid"], entry["recipient_start"]):
+    if receipt_has_recipient_fields(read) and not receipt_matches_recipient(
+        read, entry["session_id"], entry["recipient_pid"], entry["recipient_start"]
+    ):
         return DeliveryUnconfirmed(seconds)
     match read["outcome"]:
         case "delivered":

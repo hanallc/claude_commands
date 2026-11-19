@@ -1754,7 +1754,8 @@ def postmaster_claim(states: KeyStates, key: str, recipient: str) -> ClaimGrante
                 return RepeatUnconfirmed(POSTMASTER_UNCONFIRMED)
             return RepeatPending(POSTMASTER_UNCONFIRMED)
         target = pending.get("recipient")
-        if target is not None and (target["kind"] == "relay-process" or "generation" not in target
+        if target is not None and postmaster.receipt_has_recipient_fields(receipt) and (
+                target["kind"] == "relay-process" or "generation" not in target
                 or not postmaster.receipt_matches_recipient(receipt, target["conversation"],
                     target["generation"]["pid"], target["generation"]["started"])):
             return RepeatUnconfirmed(POSTMASTER_UNCONFIRMED)

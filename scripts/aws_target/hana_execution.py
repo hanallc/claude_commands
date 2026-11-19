@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from scripts.buildlog.sync import TransferBytes
 
 _MISSING_BASIS_PREFIX = 'MissingBasis: '
+SOURCE_CHANGED_BEFORE_RESULT_PUBLICATION = 'The caller source changed before result publication'
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,11 @@ class FenceAcknowledgementWindow:
     poll_seconds: int
 
 
+@dataclass(frozen=True)
+class SavedTerminalProofOnly:
+    """Settle with journal evidence and no provider access."""
+
+
 class ExecutionObjects(Protocol):
     """Keep executable publication separate from retriable observations and fences."""
     def boot_control_deadline(self, key: HanaAttemptKey) -> int: ...
@@ -135,8 +141,7 @@ def _read_journal(directory: Path, execution: str) -> dict[str, object]:
             raise ValueError('The Hana prelaunch closure is invalid')
         claim_id = hana_result.string_field(row, 'claim_id')
     else:
-        request = hana_protocol.decode_request(hana_protocol.encode_document(hana_result.object_fields(row['request'])))
-        claim_id = request.key.claim_id
+        claim_id = _journal_request(row).key.claim_id
     if (row.get('version') != 1 or claim_id != execution
             or row.get('phase') not in ('prepared', 'sent', 'acknowledged', 'fenced', 'settled')
             or type(row.get('publication_attempted')) is not bool or type(row.get('command_settled')) is not bool):
@@ -217,8 +222,12 @@ def read_claim_execution(directory: Path, reference: placement.ProviderClaimRefe
 def _journal_attempt(row: dict[str, object]) -> tuple[str, str]:
     if row.get('kind') == 'unpublished':
         return hana_result.string_field(row, 'episode'), hana_result.string_field(row, 'attempt')
-    request = hana_protocol.decode_request(hana_protocol.encode_document(hana_result.object_fields(row['request'])))
+    request = _journal_request(row)
     return request.key.episode, request.key.attempt
+
+
+def _journal_request(row: dict[str, object]) -> hana_protocol.HanaExecutionRequest:
+    return hana_protocol.decode_request(hana_protocol.encode_document(hana_result.object_fields(row['request'])))
 
 
 def settle_unpublished_claim(directory: Path, reference: placement.ProviderClaimReference, *,
@@ -305,6 +314,24 @@ def read_dispatch_observation(directory: Path, request: hana_protocol.HanaExecut
         return _checked_observation(_read_journal(directory, request.key.claim_id), request)
     except (OSError, ValueError, KeyError, TypeError):
         return HanaObservationUnavailable('The Hana command has no checked observation')
+
+
+def dispatch_claim_boot_matches(directory: Path, reference: placement.ProviderClaimReference, generation: str) -> bool:
+    """Require a published dispatch and its retained claim to name the same boot."""
+    from scripts.aws_target.hana_placement import generation_text
+
+    try:
+        row = _read_journal(directory, reference.claim_id)
+        if row['publication_attempted'] is False:
+            return True
+        request = _journal_request(row)
+        return ((request.key.episode, request.key.attempt) == (reference.episode, reference.attempt)
+                and generation == generation_text(request.key.generation)
+                and isinstance(_checked_observation(row, request), hana_protocol.HanaExecutionObservation))
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
 
 
 def prepare_execution(adopted: hana_placement.HanaClaimAdopted, sender: SourceCapture,
@@ -560,13 +587,62 @@ def _settled_dispatch(row: dict[str, object]) -> HanaSettled:
     return HanaSettled(outcome, evidence)
 
 
+def _finish_execution_settlement(directory: Path, request: hana_protocol.HanaExecutionRequest) -> HanaSettlement:
+    """Record claim release after the journal confirms command settlement."""
+    execution = request.key.claim_id
+    with _journal_lock(directory, execution):
+        row = _read_journal(directory, execution)
+        if row['command_settled'] is not True or _journal_request(row) != request:
+            return HanaSettlementPending('The Hana journal has no exact command settlement')
+        settled = _settled_dispatch(row)
+        if row['phase'] != 'settled':
+            row['phase'] = 'settled'
+            _save_journal(directory, execution, row)
+        return settled
+
+
+def replay_execution_settlement(directory: Path, assignment: placement.PlacementAssignment, *,
+                                retained_generation: str | placement.NoProviderClaim, release_claim: Callable[[], bool],
+                                current_source_key: Callable[[], execution_identity.SourceIdentity]) -> HanaSettlement:
+    """Recover the exact assigned dispatch from local proof."""
+    from scripts.aws_target.hana_placement import generation_text
+
+    reference = placement.assigned_claim_reference(assignment)
+    try:
+        row = _read_journal(directory, reference.claim_id)
+        request = _journal_request(row)
+        if ((request.key.episode, request.key.attempt) != (reference.episode, reference.attempt)
+                or request.source_key != assignment.source_key or request.slot != assignment.destination.slot):
+            return HanaSettlementPending('The Hana journal differs from the assignment')
+        if isinstance(retained_generation, placement.NoProviderClaim) and row['command_settled'] is True:
+            settled = _finish_execution_settlement(directory, request)
+        else:
+            if not isinstance(_checked_observation(row, request), hana_protocol.HanaExecutionObservation):
+                return HanaSettlementPending('The Hana journal has no observation for this boot')
+            if isinstance(retained_generation, str) and retained_generation != generation_text(request.key.generation):
+                return HanaSettlementPending('The Hana claim belongs to a different boot')
+            if isinstance(retained_generation, placement.NoProviderClaim):
+                return HanaSettlementPending('The Hana claim is missing before command settlement')
+            settled = settle_execution(directory, request, SavedTerminalProofOnly(), release_claim=release_claim,
+                reason='The Hana command has no accepted result', fence_window=FenceAcknowledgementWindow(0, 1))
+    except (OSError, ValueError, KeyError, TypeError):
+        return HanaSettlementPending('The assigned Hana dispatch journal is unavailable')
+    if (isinstance(settled, HanaSettled) and isinstance(settled.outcome, placement.AttemptCompleted)
+            and current_source_key() != request.source_key):
+        return reject_settled_result(directory, request, SOURCE_CHANGED_BEFORE_RESULT_PUBLICATION)
+    return settled
+
+
+def _fence_acknowledged(observation: hana_protocol.HanaExecutionObservation) -> bool:
+    return observation.fenced and observation.lease_free and (not observation.accepted or observation.terminated)
+
+
 def _await_fence_acknowledgement(request: hana_protocol.HanaExecutionRequest, objects: ExecutionObjects,
                                 window: FenceAcknowledgementWindow) -> hana_protocol.HanaExecutionObservation | HanaSettlementPending:
     while (remaining := window.deadline - time.monotonic()) > 0:
         try:
             observation = objects.observe_execution(request.key, timeout_s=remaining)
-            if (observation.key == request.key and observation.slot == request.slot and observation.fenced
-                    and observation.lease_free and (not observation.accepted or observation.terminated)
+            if (observation.key == request.key and observation.slot == request.slot and _fence_acknowledged(observation)
                     and time.monotonic() <= window.deadline):
                 return observation
         except (OSError, ValueError, RuntimeError, KeyError, TypeError):
@@ -579,7 +655,8 @@ def _await_fence_acknowledgement(request: hana_protocol.HanaExecutionRequest, ob
     return HanaSettlementPending('The Hana fence, command termination, or lease release remains unconfirmed')
 
 
-def settle_execution(directory: Path, request: hana_protocol.HanaExecutionRequest, objects: ExecutionObjects, *,
+def settle_execution(directory: Path, request: hana_protocol.HanaExecutionRequest,
+                     objects: ExecutionObjects | SavedTerminalProofOnly, *,
                      release_claim: Callable[[], bool], reason: str, fence_window: FenceAcknowledgementWindow,
                      cancelled: bool = False, result_transfer_lost: bool = False,
                      admission_refusal: execution_identity.HanaCommandAdmissionRefused | hana_protocol.NoCommandAdmissionRefusal
@@ -589,51 +666,65 @@ def settle_execution(directory: Path, request: hana_protocol.HanaExecutionReques
 
     execution = request.key.claim_id
     try:
+        guest_ended = False
+        refusal = admission_refusal
+        fence_needed = False
         with _journal_lock(directory, execution):
             row = _read_journal(directory, execution)
+            if (isinstance(objects, SavedTerminalProofOnly) and (_journal_request(row) != request
+                    or not isinstance(_checked_observation(row, request), hana_protocol.HanaExecutionObservation))):
+                return HanaSettlementPending('The Hana journal differs from the dispatch')
             if row['phase'] == 'settled':
                 return _settled_dispatch(row)
             resume_fence = row['phase'] == 'fenced'
-            row['phase'] = 'fenced'
-            _save_journal(directory, execution, row)
             published = row['publication_attempted'] is True
             command_settled = row['command_settled'] is True
-        guest_ended = False
-        refusal = admission_refusal
-        if published and not command_settled:
-            observation = _checked_observation(row, request)
-            if isinstance(observation, hana_protocol.HanaExecutionObservation):
-                reported_refusal = hana_protocol.command_admission_refusal(observation)
-                if isinstance(reported_refusal, execution_identity.HanaCommandAdmissionRefused):
-                    refusal = reported_refusal
-            if (not cancelled and 'accepted_result' not in row
-                    and isinstance(observation, hana_protocol.ConfirmedCommandAdmissionRefusal)):
-                evidence = observation.evidence
-            elif (not cancelled and 'accepted_result' not in row and row.get('source_update_attempted') is not True
-                    and isinstance(observation, hana_protocol.HanaCommandObservation) and observation.accepted
-                    and observation.terminated and observation.lease_free and not observation.source_updated
-                    and isinstance(observation.evidence, execution_identity.ExecutionEvidenceUnavailable)
-                    and (isinstance(refusal, execution_identity.HanaCommandAdmissionRefused)
-                         or not (resume_fence or result_transfer_lost))):
-                # The guest records acceptance before launch and refuses duplicate delivery.
-                evidence = observation.evidence
-                guest_ended = True
-            else:
-                fence = hana_protocol.HanaFenceEnvelope(request.key, request.slot, objects.execution_access(request.key))
-                try:
-                    objects.publish_execution(hana_protocol.encode_envelope(fence))
-                except (OSError, ValueError, RuntimeError):
-                    # An earlier PUT attempt can have saved the fence before the final error.
-                    pass
-                observation = _await_fence_acknowledgement(request, objects, fence_window)
-                if isinstance(observation, HanaSettlementPending):
-                    return observation
-                evidence = observation.evidence
-                reported_refusal = hana_protocol.command_admission_refusal(observation)
-                if isinstance(reported_refusal, execution_identity.HanaCommandAdmissionRefused):
-                    refusal = reported_refusal
-        else:
             evidence = hana_protocol.decode_evidence(row['evidence'])
+            if published and not command_settled:
+                observation = _checked_observation(row, request)
+                if isinstance(observation, hana_protocol.HanaExecutionObservation):
+                    reported_refusal = hana_protocol.command_admission_refusal(observation)
+                    if isinstance(reported_refusal, execution_identity.HanaCommandAdmissionRefused):
+                        refusal = reported_refusal
+                if (not cancelled and 'accepted_result' not in row
+                        and isinstance(observation, hana_protocol.ConfirmedCommandAdmissionRefusal)):
+                    evidence = observation.evidence
+                elif (not cancelled and 'accepted_result' not in row and row.get('source_update_attempted') is not True
+                        and isinstance(observation, hana_protocol.HanaCommandObservation) and observation.accepted
+                        and observation.terminated and observation.lease_free and not observation.source_updated
+                        and isinstance(observation.evidence, execution_identity.ExecutionEvidenceUnavailable)
+                        and (isinstance(refusal, execution_identity.HanaCommandAdmissionRefused)
+                             or not (resume_fence or result_transfer_lost or isinstance(objects, SavedTerminalProofOnly)))):
+                    # The guest records acceptance before launch and refuses duplicate delivery.
+                    evidence = observation.evidence
+                    guest_ended = True
+                elif (isinstance(objects, SavedTerminalProofOnly)
+                        and isinstance(observation, hana_protocol.HanaExecutionObservation)
+                        and _fence_acknowledged(observation)):
+                    evidence = observation.evidence
+                else:
+                    fence_needed = True
+            if isinstance(objects, SavedTerminalProofOnly):
+                if command_settled:
+                    _ = _settled_dispatch(row)
+                elif not published or fence_needed or 'outcome' in row:
+                    return HanaSettlementPending('The Hana journal has no exact terminal proof')
+            row['phase'] = 'fenced'
+            _save_journal(directory, execution, row)
+        if fence_needed and not isinstance(objects, SavedTerminalProofOnly):
+            fence = hana_protocol.HanaFenceEnvelope(request.key, request.slot, objects.execution_access(request.key))
+            try:
+                objects.publish_execution(hana_protocol.encode_envelope(fence))
+            except (OSError, ValueError, RuntimeError):
+                # An earlier PUT attempt can have saved the fence before the final error.
+                pass
+            observation = _await_fence_acknowledgement(request, objects, fence_window)
+            if isinstance(observation, HanaSettlementPending):
+                return observation
+            evidence = observation.evidence
+            reported_refusal = hana_protocol.command_admission_refusal(observation)
+            if isinstance(reported_refusal, execution_identity.HanaCommandAdmissionRefused):
+                refusal = reported_refusal
         with _journal_lock(directory, execution):
             row = _read_journal(directory, execution)
             if row['phase'] == 'settled':
@@ -663,11 +754,7 @@ def settle_execution(directory: Path, request: hana_protocol.HanaExecutionReques
             if isinstance(retained, HanaGuestEndedWithoutResult):
                 return HanaGuestEndedClaimRetained(retained.outcome.reason)
             return HanaSettlementPending('The exact Hana lifecycle claim remains retained')
-        with _journal_lock(directory, execution):
-            row = _read_journal(directory, execution)
-            row['phase'] = 'settled'
-            _save_journal(directory, execution, row)
-            return _settled_dispatch(row)
+        return _finish_execution_settlement(directory, request)
     except (OSError, ValueError, RuntimeError, ConnectionError, KeyError, TypeError):
         return HanaSettlementPending('The Hana dispatch or cleanup observation is unavailable')
 
