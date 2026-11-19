@@ -12,6 +12,14 @@
 # invoke_clippy_fix applies fixes; fmt_cargo formats them before invoke_clippy
 # judges the result. Worker verdict keys include this policy file.
 
+find_unused_file_descriptor() {
+    local candidate=$2
+    while [[ -e "/dev/fd/$candidate" || -L "/dev/fd/$candidate" ]]; do
+        candidate=$((candidate + 1))
+    done
+    printf -v "$1" '%s' "$candidate"
+}
+
 # Only the scope supervisor receives checkout handoffs.
 close_checkout_handoffs() {
     local handoff descriptor
@@ -373,7 +381,8 @@ without_progress_frames() {
 buildlog_exec_with_progress() {
     if [[ -n "${MAC_LOG_FD:-}" ]]; then
         local log_fd=$MAC_LOG_FD
-        MAC_LOG_FD="" buildlog_exec_with_progress "$@" {log_fd}>&-
+        [[ "$log_fd" =~ ^[0-9]+$ ]] || return 1
+        eval 'MAC_LOG_FD="" buildlog_exec_with_progress "$@" '"$log_fd"'>&-'
         return $?
     fi
     CARGO_TERM_PROGRESS_WHEN=always \

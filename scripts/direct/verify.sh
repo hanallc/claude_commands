@@ -271,7 +271,7 @@ if [[ -n "$SOURCE_SCOPE_FD$PREPARED_SCOPE_FD" ]]; then
         {
             IFS= read -r "$binding" && IFS= read -r "$timeout"
         } < "/proc/self/fd/$endpoint" || return 125
-        exec {endpoint}<&-
+        eval "exec $endpoint<&-"
     }
     if [[ "$CHECKOUT_BINDINGS_REEXEC" == 0 ]]; then
         [[ -z "$SOURCE_SCOPE_FD" ]] ||
@@ -663,8 +663,11 @@ verify_helper() {
         # shellcheck source=/dev/null
         source "$VERIFY_START_DIR/file_lock.sh" || return 2
         VERIFY_HELPER_STARTED=1
-        local script="$VERIFY_START_DIR/verify_helper.py" input output
+        local script="$VERIFY_START_DIR/verify_helper.py" input output helper_fd
         [[ -f "$script" ]] || return 0
+        if ! declare -F find_unused_file_descriptor >/dev/null; then
+            source "$VERIFY_START_DIR/../lint/invoke.sh" --checkout-handoffs || return 2
+        fi
         VERIFY_HELPER_LOCK="$(mktemp 2>/dev/null)" || return 0
         coproc VERIFY_CALLS {
             close_checkout_handoffs
@@ -673,18 +676,21 @@ verify_helper() {
         VERIFY_HELPER_PID=${VERIFY_CALLS_PID:-}
         input=${VERIFY_CALLS[1]:-}
         output=${VERIFY_CALLS[0]:-}
-        # Move the coprocess pipes so Bash can use them in subshells.
+        # Move both coprocess pipes before a subshell uses them.
         if [[ -n "$input" && -n "$output" ]] &&
-                { exec {input}>&"$input"- && exec {output}<&"$output"-; } 2>/dev/null; then
+                { find_unused_file_descriptor helper_fd 10 &&
+                  eval "exec $helper_fd>&$input-" && input=$helper_fd &&
+                  find_unused_file_descriptor helper_fd 10 &&
+                  eval "exec $helper_fd<&$output-" && output=$helper_fd; } 2>/dev/null; then
             VERIFY_HELPER_INPUT=$input VERIFY_HELPER_OUTPUT=$output
         else
-            if [[ -n "$input" ]]; then exec {input}>&-; fi
-            if [[ -n "$output" ]]; then exec {output}<&-; fi
+            if [[ -n "$input" ]]; then eval "exec $input>&-"; fi
+            if [[ -n "$output" ]]; then eval "exec $output<&-"; fi
         fi
         return 0
     fi
     (
-    local input="" has_input=0 status output errors entry name lock_fd
+    local input="" has_input=0 status output errors entry name lock_fd replied=0
     local names=()
     local forwarded=()
     if [[ "${1:-}" == --stdin ]]; then
@@ -703,7 +709,8 @@ verify_helper() {
                 [[ -z "$entry" ]] || forwarded+=("$entry")
             done
         fi
-        exec {lock_fd}>"$VERIFY_HELPER_LOCK"
+        find_unused_file_descriptor lock_fd 10
+        eval 'exec '"$lock_fd"'>"$VERIFY_HELPER_LOCK"'
         if compgen -V names -e 2>/dev/null && lock_file_descriptor "$lock_fd" 2>/dev/null && (
             printf '%s\0' "$1" "$PWD" "$(( $# - 1 ))" "${@:2}"
             for name in "${names[@]}"; do
@@ -717,18 +724,18 @@ verify_helper() {
             && IFS= read -r -d '' status <&"$VERIFY_HELPER_OUTPUT" \
             && IFS= read -r -d '' output <&"$VERIFY_HELPER_OUTPUT" \
             && IFS= read -r -d '' errors <&"$VERIFY_HELPER_OUTPUT"; then
-            exec {lock_fd}>&-
-            if [[ "$status" =~ ^[0-9]+$ ]]; then
-                printf '%s' "$output"
-                printf '%s' "$errors" >&2
-                return "$status"
-            fi
-        else
-            exec {lock_fd}>&-
+            replied=1
+        fi
+        eval "exec $lock_fd>&-"
+        if (( replied )) && [[ "$status" =~ ^[0-9]+$ ]]; then
+            printf '%s' "$output"
+            printf '%s' "$errors" >&2
+            return "$status"
         fi
     fi
     if [[ -n "${VERIFY_RESULT_ENVIRONMENT_FD:-}" && ${#forwarded[@]} -gt 0 ]]; then
-        exec {VERIFY_RESULT_ENVIRONMENT_FD}< <(printf '%s\0' "${forwarded[@]}")
+        find_unused_file_descriptor VERIFY_RESULT_ENVIRONMENT_FD 10
+        eval 'exec '"$VERIFY_RESULT_ENVIRONMENT_FD"'< <(printf "%s\0" "${forwarded[@]}")'
         export VERIFY_RESULT_ENVIRONMENT_FD
     fi
     if [[ "$has_input" == 1 ]]; then
@@ -1873,8 +1880,8 @@ interrupt_hold_wait() {
                 kill -TERM "$VERIFY_HELPER_PID" 2>/dev/null || true
                 VERIFY_HELPER_PID=""
             fi
-            if [[ -n "${VERIFY_HELPER_INPUT:-}" ]]; then exec {VERIFY_HELPER_INPUT}>&-; fi
-            if [[ -n "${VERIFY_HELPER_OUTPUT:-}" ]]; then exec {VERIFY_HELPER_OUTPUT}<&-; fi
+            if [[ "${VERIFY_HELPER_INPUT:-}" =~ ^[0-9]+$ ]]; then eval "exec $VERIFY_HELPER_INPUT>&-"; fi
+            if [[ "${VERIFY_HELPER_OUTPUT:-}" =~ ^[0-9]+$ ]]; then eval "exec $VERIFY_HELPER_OUTPUT<&-"; fi
             VERIFY_HELPER_INPUT="" VERIFY_HELPER_OUTPUT=""
             PLACEMENT_CLIENT_ACTIVE=0
         else
@@ -1986,13 +1993,11 @@ tree_key() {
     if [[ "$CMD" == lint && -z "${CACHE_DIR:-}" ]]; then
         key_options+=(--without-lint-versions)
     fi
-    (
-        exec {VERIFY_RESULT_ENVIRONMENT_FD}< <(printf '%s\0' ${VERIFY_USER_ENVIRONMENT[@]+"${VERIFY_USER_ENVIRONMENT[@]}"})
-        export VERIFY_RESULT_ENVIRONMENT_FD
-        VERIFY_TEST_BUILD_INPUTS_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/test-build-inputs}" \
-        verify_helper --stdin "$TREE_WATCH_SCRIPT" --key ${key_options[@]+"${key_options[@]}"} ${scope[@]+"${scope[@]}"} ${scripts[@]+"${scripts[@]}"} -- "${words[@]}" \
-            <<< "${GATE_METADATA}"
-    ) 2>/dev/null || true
+    VERIFY_RESULT_ENVIRONMENT_FD=3 \
+    VERIFY_TEST_BUILD_INPUTS_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/test-build-inputs}" \
+    verify_helper --stdin "$TREE_WATCH_SCRIPT" --key ${key_options[@]+"${key_options[@]}"} ${scope[@]+"${scope[@]}"} ${scripts[@]+"${scripts[@]}"} -- "${words[@]}" \
+        3< <(printf '%s\0' ${VERIFY_USER_ENVIRONMENT[@]+"${VERIFY_USER_ENVIRONMENT[@]}"}) \
+        <<< "${GATE_METADATA}" 2>/dev/null || true
 }
 
 set_verdict_keys() {
@@ -2123,10 +2128,18 @@ step_checkout() {
     # A failed move leaves the original descriptor in the variable.
     DOC_COPY_LEASE_FD=${DOC_COPY[1]:-}
     DOC_COPY_REPLY_FD=${DOC_COPY[0]:-}
-    if [[ -z "$DOC_COPY_LEASE_FD" || -z "$DOC_COPY_REPLY_FD" ]] ||
-       ! exec {DOC_COPY_LEASE_FD}>&"$DOC_COPY_LEASE_FD"- ||
-       ! exec {DOC_COPY_REPLY_FD}<&"$DOC_COPY_REPLY_FD"- ||
-       ! IFS= read -r MAC_SOURCE_ROOT <&"$DOC_COPY_REPLY_FD"; then
+    local pipe descriptor=10 direction='>&' moved=0
+    for pipe in DOC_COPY_LEASE_FD DOC_COPY_REPLY_FD; do
+        [[ -n "${!pipe}" ]] || break
+        while [[ -e "/dev/fd/$descriptor" || -L "/dev/fd/$descriptor" ]]; do
+            descriptor=$((descriptor + 1))
+        done
+        eval "exec $descriptor$direction${!pipe}-" || break
+        printf -v "$pipe" '%s' "$descriptor"
+        moved=$((moved + 1))
+        direction='<&'
+    done
+    if (( moved != 2 )) || ! IFS= read -r MAC_SOURCE_ROOT <&"$DOC_COPY_REPLY_FD"; then
         local status=0
         step_close_checkout || status=$?
         if (( status != 0 )); then return "$status"; fi
@@ -2136,12 +2149,12 @@ step_checkout() {
 
 step_close_checkout() {
     local owner=${DOC_COPY_OWNER_PID:-} status=0
-    if [[ -n "${DOC_COPY_LEASE_FD:-}" ]]; then
-        exec {DOC_COPY_LEASE_FD}>&-
+    if [[ "${DOC_COPY_LEASE_FD:-}" =~ ^[0-9]+$ ]]; then
+        eval "exec $DOC_COPY_LEASE_FD>&-"
         DOC_COPY_LEASE_FD=""
     fi
-    if [[ -n "${DOC_COPY_REPLY_FD:-}" ]]; then
-        exec {DOC_COPY_REPLY_FD}<&-
+    if [[ "${DOC_COPY_REPLY_FD:-}" =~ ^[0-9]+$ ]]; then
+        eval "exec $DOC_COPY_REPLY_FD<&-"
         DOC_COPY_REPLY_FD=""
     fi
     if [[ -n "$owner" ]]; then
@@ -2271,8 +2284,8 @@ LINT_COPY_MODE="" LINT_COPY_DIR="" LINT_COPY_TREE="" LINT_COPY_TARGET=""
 LINT_COPY_ARGS=()
 
 close_mac_log() {
-    if [[ -n "${MAC_LOG_FD:-}" ]]; then
-        exec {MAC_LOG_FD}>&-
+    if [[ "${MAC_LOG_FD:-}" =~ ^[0-9]+$ ]]; then
+        eval "exec $MAC_LOG_FD>&-"
         MAC_LOG_FD=""
     fi
 }
@@ -2386,7 +2399,8 @@ try_mac_test() {
     fi
     MAC_LOG_FILE="$(mktemp "$HOLD_WAIT_DIR/mac-output.XXXXXX")"
     # Both tee processes inherit this descriptor before a signal removes the file.
-    exec {MAC_LOG_FD}>>"$MAC_LOG_FILE" || return $?
+    find_unused_file_descriptor MAC_LOG_FD 9
+    eval 'exec '"$MAC_LOG_FD"'>>"$MAC_LOG_FILE"' || { result_status=$?; MAC_LOG_FD=""; return "$result_status"; }
     if [[ "$selected_is_mac" == 1 ]]; then step_state on_mac; else
         step_state on_ssh "$selected_target"
     fi
@@ -2416,8 +2430,9 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             exec "$PY" "$MAC_RUNNER" "${runner_args[@]}"
         fi
         local mac_environment_fd
-        exec {mac_environment_fd}< <(printf '%s\0' "${VERIFY_MAC_ENVIRONMENT[@]}")
-        VERIFY_PY_HELPER=VERIFY_MAC_ENV_PY exec "$PY" -c "$VERIFY_MAC_ENV_PY" "$mac_environment_fd" "$MAC_RUNNER" "${runner_args[@]}"
+        find_unused_file_descriptor mac_environment_fd 10
+        eval 'VERIFY_PY_HELPER=VERIFY_MAC_ENV_PY exec "$PY" -c "$VERIFY_MAC_ENV_PY" "$mac_environment_fd" "$MAC_RUNNER" "${runner_args[@]}" ' \
+            "$mac_environment_fd"'< <(printf "%s\0" "${VERIFY_MAC_ENVIRONMENT[@]}")'
     ) > >(tee -a "/dev/fd/$MAC_LOG_FD") 2> >(tee -a "/dev/fd/$MAC_LOG_FD" >&2) &
     MAC_RUNNER_PID=$!
     MAC_RUNNER_LAUNCHING=0
@@ -3030,7 +3045,7 @@ start_checkout_scope_supervisor() {
     if (( ${#bind_tokens[@]} )); then
         printf '%s\n' "${bind_tokens[@]}" >&"$start_fd" || true
     fi
-    exec {start_fd}>&-
+    eval "exec $start_fd>&-"
 }
 
 run_placed_scope() {
@@ -3110,9 +3125,7 @@ finish_placed_scope() {
 # Serialize release with the supervisor, even if the step shell died.
 # A refusal confirms that the supervisor did not start a scope.
 close_scope_launch() (
-    local release_fd
-    exec {release_fd}<"$PLACEMENT_SCOPE_STATE" || return 1
-    flock -x -w 35 "$release_fd" || return 1
+    flock -x -w 35 8 || return 1
     if [[ ! -s "$PLACEMENT_SCOPE_STATE" ]]; then
         printf 'closed\n' > "$PLACEMENT_SCOPE_STATE"
     else
@@ -3122,7 +3135,7 @@ close_scope_launch() (
             *) return 1 ;;
         esac
     fi
-)
+) 8<"$PLACEMENT_SCOPE_STATE"
 
 settle_placed_scope() {
     if (( ${PLACEMENT_SCOPE_UNRESOLVED:-0} )); then return 125; fi
