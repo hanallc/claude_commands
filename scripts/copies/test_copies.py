@@ -135,8 +135,7 @@ class StandingTests(unittest.TestCase):
         home = self.base / "home"
         home.mkdir()
         self.configuration = self.base / "copies.conf"
-        self.settings = {"root": str(self.base / "configured-gates"),
-                         "owner.verify": "verify",
+        self.settings = {"owner.verify": "verify",
                          "remote_registry": str(self.base / "remote-mirrors"),
                          "wait_seconds": "0.01", "git_timeout_seconds": "10",
                          "guard_timeout_seconds": "10"}
@@ -343,7 +342,6 @@ class StandingTests(unittest.TestCase):
             self.assertEqual(tree, self.gates / 'origin-slot1')
             self.assertEqual(self.git(tree, 'rev-parse', 'HEAD'), base)
             self.assertEqual(build_folders.build_folder_state(tree), 'held')
-            self.assertFalse(Path(self.settings['root']).exists())
             self.assertEqual(list(scratch.registered_copy_paths()), [])
             self.assertEqual(self.git(self.source, 'branch', '--show-current'), 'main')
         self.assertTrue(tree.exists())
@@ -386,7 +384,6 @@ class StandingTests(unittest.TestCase):
                                  merge=copies.MergeRevision("incoming")):
                 self.fail("A conflicting merge must not enter the caller")
         self.assertEqual(list((self.base / "scratch").rglob("checkout")), [])
-        self.assertFalse(Path(self.settings["root"]).exists())
 
     def test_fresh_gates_of_one_owner_overlap_without_reusing_a_tree(self) -> None:
         base = self.fresh_base()
@@ -1494,7 +1491,6 @@ with patch.object(subprocess, 'run', pause_clone):
                     self.assertTrue((tree / '.git').is_file())
                     self.assertTrue((tree / 'tracked.txt').is_file())
                     self.assertEqual(self.lease(tree)['unit'], self.owner_id)
-        self.assertFalse(Path(self.settings['root']).exists())
 
     def test_missing_or_invalid_required_configuration_refuses_before_clone(self) -> None:
         variants = [
@@ -1511,15 +1507,24 @@ with patch.object(subprocess, 'run', pause_clone):
                 result = self.run_cli()
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertFalse(self.gates.exists())
-        for legacy in ("absent", "empty", "relative"):
-            with self.subTest(legacy_root=legacy):
-                settings = {key: value for key, value in self.settings.items() if key != "root"}
-                if legacy != "absent":
-                    settings["root"] = "" if legacy == "empty" else "unused-relative-root"
-                self.write_config(settings)
-                result = self.run_cli()
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertTrue((self.gates / "origin-slot1").is_dir())
+        self.write_config(self.settings)
+        result = self.run_cli()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.gates / "origin-slot1").is_dir())
+
+    def test_copy_roots_use_build_folders_without_a_copies_root_key(self) -> None:
+        scratch_root = self.base / "configured-scratch"
+        workspace_root = self.base / "configured-workspaces"
+        configuration = Path(os.environ["CONF_DIR"]) / "build_folders.conf"
+        _ = configuration.write_text(f"roots.scratch={scratch_root}\nroots.workspace={workspace_root}\n", encoding="utf-8")
+        environment = {key: value for key, value in os.environ.items()
+                       if key not in (copy_record.ROOT_ENV, copy_record.COPIES_ENV)}
+        with mock.patch.dict(os.environ, environment, clear=True):
+            _, settings = copies.config_settings()
+            self.assertNotIn("root", settings)
+            self.assertEqual(copies.load_config().remote_registry, self.base / "remote-mirrors")
+            self.assertEqual(copy_record.root(), scratch_root)
+            self.assertEqual(copy_record.copies_root(), workspace_root)
 
     def test_linked_source_uses_canonical_repository_folder_name(self) -> None:
         linked = self.base / "linked-worktree"
@@ -2158,7 +2163,7 @@ with patch.object(subprocess, 'run', pause_clone):
         gate = self.idle_gate_source()
         with copies.workspace('other-unit', gate, self.head, name='borrower', branch='worker') as tree:
             pass
-        legacy = Path(self.settings['root']) / 'old-gate.removing'
+        legacy = self.base / 'old-gate.removing'
         legacy.mkdir(parents=True)
         _ = (legacy / 'source.txt').write_text('legacy work')
         copies.remove_trees(self.owner_id)
