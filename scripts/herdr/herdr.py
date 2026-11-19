@@ -172,8 +172,19 @@ class AgentBlocked(HerdrFailure):
     """An agent requires user input; nothing is sent in response."""
 
 
-class _CommandNotStarted(HerdrFailure):
+class HerdrCommandNotStarted(HerdrFailure):
     """The transport command did not start."""
+
+
+@dataclass
+class TrackedPromptSubmission:
+    """Check readiness and record whether the prompt may have sent input."""
+
+    check: Callable[[], None]
+    may_have_submitted: bool = field(default=False, init=False)
+
+    def __call__(self) -> None:
+        self.check()
 
 
 class _WrongNativeTarget(HerdrFailure):
@@ -359,6 +370,7 @@ class OpeningPrompt:
     cursor: TranscriptCursor | UnspecifiedPromptTranscript = UnspecifiedPromptTranscript()
     may_type: bool = True
     other_transcripts: tuple[TranscriptCursor, ...] = ()
+    resend_once: bool = False
 
     def prepare_for_launch(self, since: datetime) -> OpeningPrompt:
         """Keep a supplied cursor or position a new cursor before the agent starts."""
@@ -495,6 +507,10 @@ class TranscriptCursor:
             if row.get("type") == "user" and not row.get("isMeta", False) and _prompt_matches(text, _turn_text(row)):
                 return PromptSubmitted(at)
         return PromptNotSubmitted("no matching non-meta user turn after launch")
+
+    def allows_resend(self) -> bool:
+        """Allow a caller to authorize one send when the transcript has a known gap."""
+        return False
 
     def command_rejections(self, text: str) -> int:
         """How many times Claude answered this prompt's slash command with `Unknown command` since launch."""
@@ -1116,7 +1132,7 @@ def unmarked_environment() -> dict[str, str]:
     return child_environment(dict(os.environ))
 
 
-class HerdrLaunchRefused(_CommandNotStarted):
+class HerdrLaunchRefused(HerdrCommandNotStarted):
     """The deadline passed before Herdr started the command."""
 
 
@@ -1134,17 +1150,22 @@ def run_program(argv: list[str], timeout: float = PROGRAM_TIMEOUT_SECONDS, *,
     try:
         env = unmarked_environment() if environment is None else child_environment(environment)
         if not prompt_transport:
-            return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=remaining, env=env)
+            try:
+                return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=remaining, env=env)
+            except UnicodeDecodeError as error:
+                raise HerdrFailure("the Herdr reply cannot be decoded") from error
         process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     except Exception as error:
         if prompt_transport or isinstance(error, OSError):
-            raise _CommandNotStarted(f"{argv[0]}: {error}") from error
+            raise HerdrCommandNotStarted(f"{argv[0]}: {error}") from error
         raise
     with process:
         try:
             stdout, stderr = process.communicate(timeout=max(0.0, deadline - time.monotonic()))
-        except BaseException:
+        except BaseException as error:
             process.kill()
+            if isinstance(error, UnicodeDecodeError):
+                raise HerdrFailure("the Herdr prompt reply cannot be decoded") from error
             raise
         return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
@@ -1713,6 +1734,12 @@ class Herdr:
 
     def pane_row(self, pane: str) -> PaneIdentity | NoPane:
         return next((row for row in self.panes() if row["pane_id"] == pane), NoPane(pane))
+
+    def pane_session_report(self, pane: str, *, deadline: float) -> ReportedAgentSession | NoReportedAgentSession:
+        rows = [row for row in self.listed("pane", deadline=deadline) if row.get("pane_id") == pane]
+        if len(rows) != 1:
+            raise HerdrFailure(f"{self.session}:{pane}: expected one pane report, found {len(rows)}")
+        return checked_pane_session(rows[0])
 
     def panes(self) -> list[PaneIdentity]:
         panes: list[PaneIdentity] = []
@@ -2966,9 +2993,11 @@ class Herdr:
                 result = receipt()
                 if isinstance(result, PromptSubmitted):
                     return result
-                if isinstance(result, TranscriptUnreadable):
+                if isinstance(result, TranscriptUnreadable) and not opening.resend_once:
                     return False
                 composer = self.composer(pane)
+                if opening.resend_once and (isinstance(composer, NoComposer) or composer.text.strip()):
+                    raise HerdrFailure("check that the destination pane is idle and its input is empty", "wrong_target")
                 if isinstance(composer, NoComposer):
                     return False
                 if not composer.text.strip():
@@ -2987,6 +3016,12 @@ class Herdr:
                 if not check_target(session, action=action, place=place, terminal=terminal,
                                     recipient=recipient, pane_info=row, client=self):
                     return False
+                if opening.resend_once:
+                    result = receipt()
+                    if isinstance(result, PromptSubmitted):
+                        return result
+                    if cursor is None or not cursor.allows_resend():
+                        raise HerdrFailure("the transcript does not permit a resend", "wrong_target")
                 if action is _OpeningComposer.DRAFT:
                     self._send_keys(pane, "Enter")
                     return True
@@ -2995,7 +3030,7 @@ class Herdr:
                 typed = draft_pending = True
                 try:
                     self._prompt(pane, text)
-                except _CommandNotStarted:
+                except HerdrCommandNotStarted:
                     typed = False
                     if record is not None:
                         record.path.unlink(missing_ok=True)
@@ -3020,6 +3055,8 @@ class Herdr:
                 screen = ready.screen
                 if isinstance(ready, PromptInputTimedOut):
                     return failure("destination never became ready for input", check_readability=True)
+                if opening.resend_once and not ready.idle:
+                    return failure("check that the destination pane is idle and its input is empty")
             if cursor is None:
                 return failure("caller did not identify the transcript; submit is unproven")
             with operation_deadline.within(deadline):
@@ -3040,6 +3077,9 @@ class Herdr:
                 if remaining > 0:
                     time.sleep(min(pause, remaining))
                     pause = min(pause * 2, START_RETRY_MAX_SECONDS)
+
+            if opening.resend_once:
+                return self._wait_for_submit(receipt, deadline) or failure()
 
             enters = 0
             while True:
@@ -3086,7 +3126,16 @@ class Herdr:
                             pane_info=row, client=self):
             raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
         _ = on_submission()
-        self._prompt(pane, _prepare_prompt(pane, text), proof=proof)
+        prepared = _prepare_prompt(pane, text)
+        transport_started = True
+        try:
+            self._prompt(pane, prepared, proof=proof)
+        except HerdrCommandNotStarted:
+            transport_started = False
+            raise
+        finally:
+            if isinstance(on_submission, TrackedPromptSubmission):
+                on_submission.may_have_submitted = transport_started
 
     def prompt_terminal(self, pane: str, terminal: str, text: str) -> None:
         """Send input to the selected pane terminal."""
@@ -3228,6 +3277,25 @@ def pane_session(row: Mapping[str, object]) -> str:
     return session if isinstance(session, str) else ""
 
 
+def checked_pane_session(row: Mapping[str, object]) -> ReportedAgentSession | NoReportedAgentSession:
+    """Read the pane report and reject malformed session metadata."""
+    report = row.get("agent_session")
+    if report is None:
+        session = row.get("session_id")
+    else:
+        fields = json_object(report, "herdr pane session report")
+        kind, session = fields.get("kind"), fields.get("value")
+        if kind == "pending" and session is None:
+            return NoReportedAgentSession()
+        if kind == "id" and isinstance(session, str) and session:
+            return ReportedAgentSession(session)
+        if "kind" in fields or "value" not in fields:
+            raise HerdrFailure("herdr pane session report is unreadable")
+    if session is None or session == "":
+        return NoReportedAgentSession()
+    return ReportedAgentSession(json_text(session, "herdr pane session report"))
+
+
 class CodexTerminalInputUnavailable(HerdrFailure):
     """A foreground child can hold the pane terminal."""
 
@@ -3289,6 +3357,13 @@ class UnprovedForegroundOwner:
 
 
 @dataclass(frozen=True)
+class ClaudeForegroundWithoutArgv(UnprovedForegroundOwner):
+    """One foreground Claude PID has no readable arguments."""
+
+    pid: int
+
+
+@dataclass(frozen=True)
 class NoForegroundAgent:
     pass
 
@@ -3313,6 +3388,13 @@ class ObservedEmpty:
 class UnknownPaneOwner:
     place: HerdrPlace
     reason: str
+
+
+@dataclass(frozen=True)
+class ClaudePaneWithoutArgv(UnknownPaneOwner):
+    """The pane reports one foreground Claude PID without arguments."""
+
+    pid: int
 
 
 type CheckedPane[Owner] = ProvedMatch[Owner] | ProvedOtherOwner | ObservedEmpty | UnknownPaneOwner
@@ -3401,6 +3483,7 @@ def _prove_foreground_owner(info: dict[str, object], *, for_input: bool
     foreground = _foreground_processes(info)
     claude: list[tuple[dict[str, object], list[str]]] = []
     codex: list[tuple[dict[str, object], list[str]]] = []
+    claude_without_argv: list[dict[str, object]] = []
     missing_argv: set[str] = set()
     for process in foreground:
         arguments = _foreground_arguments(process)
@@ -3409,7 +3492,10 @@ def _prove_foreground_owner(info: dict[str, object], *, for_input: bool
         elif is_claude_process(arguments):
             claude.append((process, arguments))
         elif not arguments:
-            missing_argv.add(_foreground_program(process))
+            program = _foreground_program(process)
+            if program == "claude":
+                claude_without_argv.append(process)
+            missing_argv.add(program)
     if codex or missing_argv.intersection({"codex", "node", "nodejs"}):
         try:
             if not codex:
@@ -3450,8 +3536,16 @@ def _prove_foreground_owner(info: dict[str, object], *, for_input: bool
         except (HerdrFailure, OSError, ValueError) as error:
             return UnprovedForegroundOwner("claude", str(error))
         return UnprovedForegroundOwner("claude", f"expected one foreground claude process, found {len(claude)}")
-    if "claude" in missing_argv:
-        return UnprovedForegroundOwner("claude", "agent argv is unavailable")
+    if claude_without_argv:
+        reason = "agent argv is unavailable"
+        if len(claude_without_argv) == 1:
+            try:
+                pid = _foreground_pid(claude_without_argv[0])
+            except HerdrFailure:
+                return UnprovedForegroundOwner("claude", reason)
+            if sum(process.get("pid") == pid for process in foreground) == 1:
+                return ClaudeForegroundWithoutArgv("claude", reason, pid)
+        return UnprovedForegroundOwner("claude", reason)
     return NoForegroundAgent()
 
 
@@ -3459,6 +3553,8 @@ def pane_foreground(place: HerdrPlace, info: dict[str, object]) -> ForegroundPan
     """Read the foreground evidence before comparing it with a requested owner."""
     try:
         owner = foreground_pane_owner(info)
+        if isinstance(owner, ClaudeForegroundWithoutArgv):
+            return ClaudePaneWithoutArgv(place, owner.reason, owner.pid)
         if isinstance(owner, UnprovedForegroundOwner):
             return UnknownPaneOwner(place, owner.reason)
         if not isinstance(owner, NoForegroundAgent):
