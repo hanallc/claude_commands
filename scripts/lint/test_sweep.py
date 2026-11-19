@@ -2073,36 +2073,54 @@ class FloorTests(SweepCase):
             floors = sweep.filesystem_floors(10 * GIB, [str(target)], lint_settings=conf.read("lint"))
         self.assertTrue(all(str(target) not in floor.targets for floor in floors))
 
-    def test_secondary_floor_uses_configured_percent_and_groups_each_device(self) -> None:
-        base = self.base()
-        first = base / "first"
-        second = base / "second"
-        first.mkdir()
-        second.mkdir()
-        _ = write_config_fixture(conf.path("lint"), "sweep_free_floor_percent=25\n")
+    def test_secondary_floor_uses_configured_floor_and_groups_each_device(self) -> None:
         usage = os.statvfs_result((4096, 4096, 1000, 500, 500, 0, 0, 0, 0, 255))
-        def device(path: str) -> int:
-            return 2 if path == str(second) else 1
-        with (mock.patch.object(sweep, "output_device", side_effect=device),
-              mock.patch.object(os, "statvfs", return_value=usage)):
-            floors = sweep.filesystem_floors(12345, [str(first), str(second)], lint_settings=conf.read("lint"))
-        self.assertEqual([(item.device, item.floor_bytes, item.targets) for item in floors],
-                         [(1, 12345, (str(first),)), (2, 1000 * 4096 // 4, (str(second),))])
-        self.assertEqual([item.root_device for item in floors], [True, False])
-
-    def test_missing_or_bad_floor_percent_refuses_once(self) -> None:
-        for value in ("", "bad", "-1", "101"):
-            with self.subTest(value=value):
+        plain_floor = "# range: 0..\nsweep_build_floor_gib=40.5\n"
+        host_floor = "# range: 0..\nsweep_build_floor_gib.testhost=55\n"
+        for host, overrides, expected in (("testhost", "", 1000 * 4096 // 4),
+                                          ("testhost", plain_floor, int(40.5 * GIB)),
+                                          ("testhost", plain_floor + host_floor, 55 * GIB),
+                                          ("natedev", "", int(733.29 * GIB))):
+            with self.subTest(host=host, overrides=overrides):
                 base = self.base()
-                _ = write_config_fixture(conf.path("lint"), f"sweep_free_floor_percent={value}\n")
+                first = base / "first"
+                second = base / "second"
+                first.mkdir()
+                second.mkdir()
+                _ = write_config_fixture(conf.path("lint"), "sweep_free_floor_percent=25\n" + overrides)
+
+                def device(path: str) -> int:
+                    return 2 if path == str(second) else 1
+
+                with (mock.patch.object(socket, "gethostname", return_value=host),
+                      mock.patch.object(sweep, "output_device", side_effect=device),
+                      mock.patch.object(os, "statvfs", return_value=usage)):
+                    floors = sweep.filesystem_floors(12345, [str(first), str(second)], lint_settings=conf.read("lint"))
+                self.assertEqual([(item.device, item.floor_bytes, item.targets) for item in floors],
+                                 [(1, 12345, (str(first),)), (2, expected, (str(second),))])
+                self.assertEqual([item.root_device for item in floors], [True, False])
+
+    def test_missing_or_bad_secondary_floor_refuses_once(self) -> None:
+        cases = (
+            ("sweep_free_floor_percent", "", ""),
+            ("sweep_free_floor_percent", "bad", ""),
+            ("sweep_free_floor_percent", "-1", ""),
+            ("sweep_free_floor_percent", "101", ""),
+            ("sweep_build_floor_gib", "-1", "# range: 0..\n"),
+            ("sweep_build_floor_gib.testhost", "bad", "# range: 0..\nsweep_build_floor_gib=40\n# range: 0..\n"),
+        )
+        for key, value, prefix in cases:
+            with self.subTest(key=key, value=value):
+                base = self.base()
+                _ = write_config_fixture(conf.path("lint"), f"{prefix}{key}={value}\n")
                 errors = io.StringIO()
-                with (redirect_stderr(errors),
+                with (mock.patch.object(socket, "gethostname", return_value="testhost"), redirect_stderr(errors),
                       mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT) as send):
                     self.assertEqual(self.hold(base, 10 * GIB, [10 * GIB], recorded=True)[0], 2)
                 send.assert_called()
                 cast(mock.Mock, sweep.send_phone_push).assert_not_called()
                 self.assertEqual(len(errors.getvalue().splitlines()), 1)
-                self.assertIn("sweep_free_floor_percent", errors.getvalue())
+                self.assertIn(key, errors.getvalue())
 
     def test_busy_floor_lock_does_not_stop_another_filesystem(self) -> None:
         base = self.base()
