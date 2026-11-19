@@ -104,7 +104,6 @@ color:var(--filter-selected-ink)}
 [data-filter-row] button[data-filter-count="0"][aria-pressed=true]{
 background:color-mix(in srgb,var(--filter-selected-bg) 75%,var(--card))}
 [data-filter-row] b{font-variant-numeric:tabular-nums}[data-filter-row] b:empty{display:none}
-.record-filter-row+[data-list-count]{display:block;margin:8px 0 12px;text-align:right}
 .list-table{border:1px solid var(--line);border-radius:12px;background:var(--card);overflow:hidden}
 .list-table table{width:100%;border-collapse:collapse;table-layout:fixed}
 .list-table th{text-align:left;color:var(--ink-2);font-size:13px;border-bottom:1px solid var(--line)}
@@ -1024,7 +1023,9 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,prepareMenu=
    }
    return;
   }
-  const list=items(),index=list.indexOf(document.activeElement);
+  const list=items();
+ if(!list.length) return;
+ const index=list.indexOf(document.activeElement);
   const next={ArrowDown:index+1,ArrowUp:index-1+list.length,Home:0,End:list.length-1}[event.key];
   if(next===undefined) return;
   event.preventDefault();list[next%list.length].focus();
