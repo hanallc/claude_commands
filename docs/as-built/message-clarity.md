@@ -61,10 +61,10 @@ A pre-tool hook permits one `SendMessage` call with the private address and expe
 The proxy buffers the request until the relay closes its write side.
 Before it writes any bytes, the proxy compares the decoded body with the exact encoding of the approved text.
 The encoder matches the two tag escape passes in Claude Code 2.1.319.
-The sender reports `SENT` when the proxy completes the approved write to the verified recipient.
-The tool stream supplies details about the result, including a different call count, target, payload, or tool ID.
-A refused write or a completed write of different text fails.
-An interrupted write leaves delivery unconfirmed and retains the claim.
+The sender uses the tool ID from the completed proxy write to find the approved call and its result.
+The sender requires a complete forward of the approved text and one explicit success result for that tool ID.
+The sender counts other calls as refusals on the `SENT` line.
+A possible write without confirmed acceptance leaves delivery unconfirmed and retains the claim.
 Claude's socket protocol has no expected conversation field.
 The race window extends from the final registry check until the receiver accepts the request.
 The sender closes its cleanup pipe on exit. The cleanup process removes the private directory.

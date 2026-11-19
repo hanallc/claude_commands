@@ -3304,7 +3304,7 @@ def describe(answer: str) -> str:
 
 @dataclass(frozen=True)
 class CheckedRelayAcceptance:
-    """The proxy completed the approved write to the checked recipient."""
+    """The approved SendMessage call completed on the checked connection."""
 
     tool_use_id: str
     detail: str
@@ -3324,7 +3324,7 @@ class RelayRequestInterrupted:
 
 @dataclass(frozen=True)
 class RelayRequestForwarded:
-    """The proxy wrote the approved request on the checked recipient connection."""
+    """The proxy completed the approved request write."""
 
     tool_use_id: str
     payload: str
@@ -3346,63 +3346,58 @@ class RelayRecipientWrite:
 
 
 def read_relay(observed: RelayTransportResponse, text: str) -> CheckedRelayAcceptance | Result:
-    """Use the proxy forward to decide delivery and the tool stream for details."""
+    """Check the approved call, its result, and the proxy forward together."""
     forward = observed.forward
     if isinstance(forward, RefusedRelayRequest):
         return forward
     if isinstance(forward, RelayRequestInterrupted):
-        return _relay_problem(forward, forward.reason)
-    if isinstance(forward, RelayRequestForwarded) and forward.payload != text:
-        return Result("failed", "the proxy forwarded a different payload")
+        return _unaccepted_relay(forward, forward.reason)
     events = [as_dict(loads(line)) for line in observed.stdout.splitlines()]
     mode = next((as_str(event.get("permissionMode")) for event in events
                  if event.get("type") == "system" and event.get("subtype") == "init"), "unknown")
-
-    def report(detail: str, *, queue_if_unsent: bool = False) -> CheckedRelayAcceptance | Result:
-        if isinstance(forward, RelayRequestForwarded):
-            return CheckedRelayAcceptance(forward.tool_use_id, f"mode {mode}; verbatim; {detail}")
-        return _relay_problem(forward, detail, queue_if_unsent=queue_if_unsent)
-
     sends = [part for event in events if event.get("type") == "assistant"
              for value in as_list(as_dict(event.get("message")).get("content"))
              if (part := as_dict(value)).get("type") == "tool_use" and part.get("name") == "SendMessage"]
-    if len(sends) != 1:
+    if not sends:
         said = next((as_str(event.get("result")) for event in reversed(events) if event.get("type") == "result"), "")
-        reason = f"{len(sends)} SendMessage calls" if sends else f"the relay made no SendMessage call: {one_line(said) or 'no output'}"
-        return report(reason, queue_if_unsent=not sends)
-    call = sends[0]
+        return _unaccepted_relay(forward, f"the relay made no SendMessage call: {one_line(said) or 'no output'}",
+                                 queue_if_unsent=True)
+    if len(sends) == 1:
+        call = sends[0]
+    else:
+        forwarded_calls = [call for call in sends if isinstance(forward, RelayRequestForwarded)
+                           and call.get("id") == forward.tool_use_id]
+        if len(forwarded_calls) != 1:
+            return _unaccepted_relay(forward, f"{len(sends)} SendMessage calls")
+        call = forwarded_calls[0]
     inputs = as_dict(call.get("input"))
     if inputs.get("to") != observed.target or inputs.get("message") != text:
-        return report("SendMessage used a different target or payload")
+        return _unaccepted_relay(forward, "SendMessage used a different target or payload")
     tool_id = as_str(call.get("id"))
     results = [part for event in events if event.get("type") == "user"
                for value in as_list(as_dict(event.get("message")).get("content"))
                if (part := as_dict(value)).get("type") == "tool_result" and part.get("tool_use_id") == tool_id]
     if not tool_id or len(results) != 1:
-        return report("SendMessage did not return one matching result")
+        return _unaccepted_relay(forward, "SendMessage did not return one matching result")
     result = results[0]
     answer = result_text(result.get("content"))
-    success = as_dict(loads(answer)).get("success")
-    failed = result.get("is_error") is True
-    detail = describe(answer)
-    if failed or success is not True:
-        if isinstance(forward, RelayRequestForwarded) and detail:
-            detail = f"SendMessage did not confirm success: {detail}"
-        return report(detail or "SendMessage did not confirm success", queue_if_unsent=failed or success is False)
-    if isinstance(forward, RelayRequestNotForwarded):
-        return Result("failed", "SendMessage has no matching completed proxy forward")
-    if forward.tool_use_id != tool_id:
-        return report("SendMessage used a different tool ID from the proxy forward")
-    return report(detail)
+    if result.get("is_error") is True or as_dict(loads(answer)).get("success") is not True:
+        rejected = result.get("is_error") is True or as_dict(loads(answer)).get("success") is False
+        return _unaccepted_relay(forward, describe(answer) or "SendMessage did not confirm success",
+                                 queue_if_unsent=rejected)
+    if forward != RelayRequestForwarded(tool_id, text):
+        return _unaccepted_relay(forward, "SendMessage has no matching completed proxy forward")
+    detail = f"mode {mode}; verbatim; {describe(answer)}"
+    if len(sends) > 1:
+        detail += f"; {len(sends)} SendMessage calls; the proxy refused {len(sends) - 1}"
+    return CheckedRelayAcceptance(tool_id, detail)
 
 
-def _relay_problem(forward: RelayForward, reason: str, *, queue_if_unsent: bool = False) -> Result:
+def _unaccepted_relay(forward: RelayForward, reason: str, *, queue_if_unsent: bool = False) -> Result:
     if isinstance(forward, RefusedRelayRequest):
         return forward
     if isinstance(forward, RelayRequestNotForwarded):
         return Result("queued" if queue_if_unsent else "failed", reason)
-    if isinstance(forward, RelayRequestForwarded):
-        return Result("sent", f"the proxy forwarded the approved payload; {reason}")
     return UncertainRelayDelivery("failed", f"{reason}; delivery unconfirmed")
 
 
@@ -3974,7 +3969,7 @@ def _bound_relay(message: Message, timeout: float, command: list[str], env: dict
                         forwarding = executor.submit(_forward_relay_socket, listener, peer, stop, attempt,
                                                      approved, payload, write)
                     except RuntimeError as error:
-                        return _relay_problem(write.state, f"cannot start the relay proxy thread: {error}")
+                        return _unaccepted_relay(write.state, f"cannot start the relay proxy thread: {error}")
                     try:
                         result = run([*command, "--settings", settings], relay_prompt(target), timeout, env, Path.home())
                     finally:
@@ -3982,12 +3977,12 @@ def _bound_relay(message: Message, timeout: float, command: list[str], env: dict
                     try:
                         forwarded = forwarding.result()
                     except (OSError, ValueError) as error:
-                        return _relay_problem(write.state, f"cannot forward through the checked socket: {error}")
+                        return _unaccepted_relay(write.state, f"cannot forward through the checked socket: {error}")
         if isinstance(forwarded, unit_lookup.SocketUnavailable):
             return forwarded
         return RelayTransportResponse(*result, target.to, forwarded)
     except (OSError, ValueError) as error:
-        return _relay_problem(write.state, f"cannot relay through the checked socket: {error}")
+        return _unaccepted_relay(write.state, f"cannot relay through the checked socket: {error}")
 
 
 def relay(message: Message, timeout: float) -> Result:
@@ -4045,8 +4040,8 @@ def relay(message: Message, timeout: float) -> Result:
         write_atomic(raw, out + err)
     except OSError as error:
         print(f"message relay log: {error}", file=sys.stderr)
-    if code is None and not isinstance(observed.forward, RelayRequestForwarded):
-        return _relay_problem(observed.forward, f"relay timed out after {timeout:g} s")
+    if code is None:
+        return _unaccepted_relay(observed.forward, f"relay timed out after {timeout:g} s")
     result = read_relay(observed, agent_text(message, via_relay=True))
     if isinstance(result, CheckedRelayAcceptance):
         return Result("sent", result.detail)
