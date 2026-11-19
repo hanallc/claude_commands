@@ -51,6 +51,12 @@ REMOTE_CHECK_SECONDS = 30
 
 def setUpModule() -> None:
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    proc = root / "proc"
+    proc.mkdir()
+    if sys.platform == "linux":
+        pid = str(os.getpid())
+        (proc / pid).symlink_to(Path("/proc") / pid)
+    _ = cast(object, unittest.enterModuleContext(mock.patch.object(scratch, "PROC_ROOT", proc)))
     _ = write_config_fixture(root / "scratch.conf", "\n".join((
         "visible_root=~/rust/repro",
         "holds_file=~/.local/state/scratch/holds.json",
@@ -1294,6 +1300,10 @@ for descriptor in descriptors:
                     try:
                         assert writer.stdout is not None
                         self.assertEqual(writer.stdout.readline(), "ready\n")
+                        pid = str(writer.pid)
+                        entry = scratch.PROC_ROOT / pid
+                        entry.symlink_to(Path("/proc") / pid)
+                        self.addCleanup(entry.unlink)
                         recover = scratch.recovery_state
 
                         def write_after_snapshot(folder: Path, pending: copy_record.Registered,
@@ -1317,32 +1327,89 @@ for descriptor in descriptors:
                             writer.kill()
                             _ = writer.communicate(timeout=10)
 
-    def test_retry_resumes_when_a_crash_left_both_tombstones(self) -> None:
-        source, _ = self.copy_with_published_head("crash-source")
-        path = self.base / "interrupted-worktree"
+    def test_retry_restores_both_folders_when_a_process_entry_is_unreadable(self) -> None:
+        source, _ = self.copy_with_published_head("unreadable-holder")
+        path = self.base / "linked"
         self.git(source, "worktree", "add", "-q", "-b", "side", str(path))
         admin = git_files.at(path).git_dir
         self.stop_removal_after_intent(path, "current")
-        program = """import os
+        entry = scratch.PROC_ROOT / "424242"
+        entry.mkdir()
+        self.addCleanup(entry.rmdir)
+        readlink = os.readlink
+
+        def read(path: str | os.PathLike[str], *, dir_fd: int | None = None) -> str:
+            if Path(path) == entry / "cwd":
+                raise PermissionError(errno.EACCES, "cannot inspect the holder", str(path))
+            return readlink(path, dir_fd=dir_fd)
+
+        with mock.patch.object(os, "readlink", side_effect=read):
+            result = scratch.remove_folder(path)
+        self.assertIsInstance(result, scratch.KeptFolder)
+        assert isinstance(result, scratch.KeptFolder)
+        self.assertIn(str(entry / "cwd"), result.reason)
+        self.assertEqual(git_files.at(path).git_dir, admin)
+        self.assertTrue((admin / "HEAD").is_file())
+        self.assertTrue(scratch.removal_mark(path).is_file())
+
+    def test_retry_ignores_its_own_child_lease_descriptor(self) -> None:
+        path = self.copy(name="child-lease")
+        self.add_saved_work_and_loose_ref(path)
+        child = path / ".git/child"
+        child.mkdir()
+        child.with_suffix(".lock").touch()
+        self.stop_removal_after_intent(path, "current")
+        self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
+        self.assertFalse(path.exists())
+
+    def test_retry_resumes_after_sigkill_with_a_saved_move_plan(self) -> None:
+        program = """import socket
 import sys
 from pathlib import Path
 from unittest.mock import patch
 from scripts.lib import scratch
 
-with patch.object(scratch, "recovery_state", side_effect=lambda *args, **kwargs: os._exit(73)):
+def pause(*args, **kwargs):
+    with socket.socket(fileno=int(sys.argv[2])) as ready:
+        ready.sendall(b"R")
+        ready.recv(1)
+
+with patch.object(scratch, sys.argv[3], side_effect=pause):
     scratch.remove_folder(Path(sys.argv[1]))
 """
-        done = subprocess.run([sys.executable, "-B", "-c", program, str(path)],
-                              capture_output=True, text=True, timeout=20)
-        self.assertEqual(done.returncode, 73, done.stderr)
-        self.assertFalse(path.exists())
-        self.assertFalse(admin.exists())
-        checkout_tombstone, = path.parent.glob(f"{scratch.TOMBSTONE_PREFIX}*")
-        admin_tombstone, = admin.parent.parent.glob(f"{scratch.TOMBSTONE_PREFIX}*")
-        self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
-        self.assertFalse(checkout_tombstone.exists())
-        self.assertFalse(admin_tombstone.exists())
-        self.assertFalse(scratch.removal_mark(path).exists())
+        for boundary in ("move_removal_folders", "check_tombstone_holders"):
+            with self.subTest(boundary=boundary):
+                source, _ = self.copy_with_published_head(f"crash-{boundary}")
+                path = self.base / f"interrupted-{boundary}"
+                self.git(source, "worktree", "add", "-q", "-b", "side", str(path))
+                admin = git_files.at(path).git_dir
+                self.stop_removal_after_intent(path, "current")
+                ready, writer = socket.socketpair()
+                with ready, writer, subprocess.Popen(
+                    [sys.executable, "-B", "-c", program, str(path), str(writer.fileno()), boundary],
+                    pass_fds=(writer.fileno(),), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                ) as child:
+                    writer.close()
+                    try:
+                        ready.settimeout(15)
+                        self.assertEqual(ready.recv(1), b"R")
+                    finally:
+                        child.kill()
+                        _, error = child.communicate(timeout=10)
+                self.assertEqual(child.returncode, -signal.SIGKILL, error)
+                checkout_tombstones = tuple(path.parent.glob(f"{scratch.TOMBSTONE_PREFIX}*"))
+                admin_tombstones = tuple(admin.parent.parent.glob(f"{scratch.TOMBSTONE_PREFIX}*"))
+                if boundary == "check_tombstone_holders":
+                    self.assertFalse(path.exists())
+                    self.assertFalse(admin.exists())
+                    self.assertEqual(len(checkout_tombstones), 1)
+                    self.assertEqual(len(admin_tombstones), 1)
+                self.assertEqual(scratch.remove_folder(path), scratch.RemovedCopy())
+                self.assertFalse(path.exists())
+                self.assertFalse(admin.exists())
+                for tombstone in (*checkout_tombstones, *admin_tombstones):
+                    self.assertFalse(tombstone.exists())
+                self.assertFalse(scratch.removal_mark(path).exists())
 
     def test_fresh_removal_keeps_separate_git_storage(self) -> None:
         _, remote = self.copy_with_published_head("separate-source")

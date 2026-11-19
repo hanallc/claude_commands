@@ -111,9 +111,10 @@ UNTIL_FORMAT = "%Y-%m-%dT%H%MZ"
 ROW_NAME = re.compile(r"[A-Za-z0-9_-]+-C[0-9]+")
 WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 BUSY_REASON = "busy: a lease or .claude-busy lock is held"
-RECORD_LOCKS: ContextVar[dict[tuple[int, int], int]] = ContextVar("scratch_record_locks", default={})
+RECORD_LOCKS: ContextVar[frozenset[tuple[int, int]]] = ContextVar("scratch_record_locks", default=frozenset())
 REMOVAL_VERSION = 2
 TOMBSTONE_PREFIX = ".scratch-tombstone-"
+PROC_ROOT = Path("/proc")
 
 
 class BusyMarkOwnership(Enum):
@@ -392,7 +393,7 @@ def directory_record_lock(path: Path, *, wait: bool,
             if reentered:
                 yield True
                 return
-            token = RECORD_LOCKS.set({**RECORD_LOCKS.get(), identity: descriptor})
+            token = RECORD_LOCKS.set(RECORD_LOCKS.get() | {identity})
             try:
                 yield True
             finally:
@@ -1556,58 +1557,34 @@ def restore_removal_folders(moved: RemovalLocations) -> None:
         _ = rollback.pop_all()
 
 
-def check_tombstone_holders(tombstones: Collection[Path], scope: BusyMarkScope) -> None:
-    """Keep a checkout if a process can still use it through a directory or file."""
+def check_tombstone_holders(tombstones: Collection[Path]) -> None:
+    """Require readable process evidence and no access to the moved folders."""
     roots = {str(path.resolve()) for path in tombstones}
     prefixes = tuple(root + os.sep for root in roots)
-
-    def check(target: str, owner: str) -> None:
-        path = target.removesuffix(" (deleted)")
-        if path in roots or path.startswith(prefixes):
-            raise OSError(f"{owner} still uses {path}")
-
-    owned_descriptors = {str(fd) for fd in (*scope.held.values(), *RECORD_LOCKS.get().values())}
     own_pid = str(os.getpid())
-    if sys.platform == "darwin":
-        try:
-            report = subprocess.run(["lsof", "-nP", "-Fpfn"], capture_output=True, text=True, timeout=10, check=False)
-        except subprocess.TimeoutExpired as error:
-            raise OSError("cannot check tombstone holders with lsof") from error
-        if not report.stdout or report.returncode not in (0, 1):
-            raise OSError("cannot check tombstone holders with lsof")
-        pid = descriptor = ""
-        for line in report.stdout.splitlines():
-            if line.startswith("p"):
-                pid = line[1:]
-                descriptor = ""
-            elif line.startswith("f"):
-                descriptor = line[1:]
-            elif line.startswith("n") and (pid != own_pid or descriptor not in owned_descriptors):
-                check(line[1:], f"pid {pid}")
-        return
 
-    def inspect_link(link: str, owner: str) -> None:
+    def inspect_link(link: str, pid: str) -> None:
         try:
-            target = os.readlink(link)
-        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            target = os.readlink(link).removesuffix(" (deleted)")
+        except (FileNotFoundError, ProcessLookupError):
             return
-        check(target, owner)
+        if target in roots or target.startswith(prefixes):
+            raise OSError(f"pid {pid} still uses {target}")
 
-    with os.scandir("/proc") as processes:
+    with os.scandir(PROC_ROOT) as processes:
         for process in processes:
             if not process.name.isdigit():
                 continue
-            owner = f"pid {process.name}"
             for name in ("cwd", "root"):
-                inspect_link(os.path.join(process.path, name), owner)
-            try:
-                descriptors = os.scandir(os.path.join(process.path, "fd"))
-            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                inspect_link(os.path.join(process.path, name), process.name)
+            if process.name == own_pid:
                 continue
-            with descriptors:
-                for descriptor in descriptors:
-                    if process.name != own_pid or descriptor.name not in owned_descriptors:
-                        inspect_link(descriptor.path, owner)
+            try:
+                with os.scandir(os.path.join(process.path, "fd")) as descriptors:
+                    for descriptor in descriptors:
+                        inspect_link(descriptor.path, process.name)
+            except (FileNotFoundError, ProcessLookupError):
+                continue
 
 
 @dataclass(frozen=True)
@@ -1709,7 +1686,7 @@ def finish_tombstone_removal(path: Path, pending: copy_record.Registered, scope:
     try:
         move_removal_folders(plan, moved)
         try:
-            check_tombstone_holders(plan.locations.values(), scope)
+            check_tombstone_holders(plan.locations.values())
         except OSError as error:
             return KeptFolder(path, str(error))
         state = recovery_state(path, pending, scope, scratch_settings=scratch_settings,
