@@ -19,7 +19,7 @@ from scripts.herdr import herdr
 from scripts.message import review_hold
 from scripts.message.relay_identity import relay_session_name
 from scripts.production.unit_lookup import Place
-from scripts.hooks import hook_dispatch
+from scripts.hooks import hook_dispatch, review_hold_delivery
 from scripts.lib import script_prompts, test_hang_guard
 from scripts.lib.script_envelope import script_prompt
 from scripts.hooks.conversation_pause_test_support import (
@@ -422,12 +422,14 @@ class ConversationPauseTests(ConversationPauseFixture):
         _ = (config / "send.conf").write_text("# range: 0.001..\nreview_hold_idle_minutes=1\n", encoding="utf-8")
         self.environment.update({"CONF_DIR": str(config), "USER_ZONE": "UTC"})
         with patch.dict(os.environ, self.environment):
-            review_hold.set_count(SESSION, 2, at, self.fail)
+            review_hold.set_count(SESSION, 2, at, self.fail,
+                record_keys=review_hold_delivery.record_keys)
 
     def end_review(self, at: int) -> list[str]:
         held: list[str] = []
         with patch.dict(os.environ, self.environment):
-            review_hold.set_count(SESSION, 0, at, held.append)
+            review_hold.set_count(SESSION, 0, at, held.append,
+                record_keys=review_hold_delivery.record_keys)
         return held
 
     def test_native_peer_and_scheduled_prompts_are_saved_before_the_hook_blocks(self) -> None:
@@ -457,23 +459,51 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.assertEqual((reply.returncode, reply.stdout, reply.stderr), (0, "", ""))
         self.assertEqual(self.end_review(103), [])
 
-    def test_idle_release_passes_the_hook_while_the_sender_holds_the_lock(self) -> None:
+    def test_idle_release_leaves_the_pause_reply_available_during_transport(self) -> None:
+        _ = self.create_instance(self.showrunner_timer("demo"))
         self.open_review()
         kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Held update."), now=101))
         self.assertEqual(kept["decision"], "block")
         expired = self.run_prompt(cross_session("Review peer", "After the idle limit."), now=160)
         self.assertEqual((expired.returncode, expired.stdout, expired.stderr), (0, "", ""))
         message = review_hold.ReviewMessage("Later peer", 161, "New update.", "session:later")
-        with patch.dict(os.environ, self.environment), review_hold.route(SESSION, message, urgent=False) as release:
+        with patch.dict(os.environ, self.environment), review_hold.route(SESSION, message, urgent=False,
+                                                           record_keys=review_hold_delivery.record_keys) as release:
             assert isinstance(release, review_hold.ReleasedMessages)
             batch = review_hold.render(release.messages)
             self.assertIn("Held update.", batch)
             self.assertIn("New update.", batch)
             self.assertNotIn("After the idle limit.", batch)
+            typed = self.parsed_reply(self.run_prompt("Continue the review.", now=161))
+            self.assertEqual(typed, {
+                "systemMessage": f"Automatic updates paused while we talk: status reports. {RETURN_SCHEDULE}",
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": PAUSE_CONTEXT,
+                },
+            })
             reply = self.run_prompt(cross_session("Later peer", batch), now=161)
             self.assertEqual((reply.returncode, reply.stdout, reply.stderr), (0, "", ""))
-            release.accepted = True
+            release.accepted_at = 161.0
         self.assertEqual(self.end_review(162), [])
+
+    def test_failed_idle_release_restores_its_messages_before_newer_review_messages(self) -> None:
+        self.open_review()
+        kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Older report."), now=101))
+        self.assertEqual(kept["decision"], "block")
+        pending = review_hold.ReviewMessage("Later peer", 161, "Unsent report.", "session:later")
+        with patch.dict(os.environ, self.environment), review_hold.route(SESSION, pending, urgent=False,
+                                                           record_keys=review_hold_delivery.record_keys) as release:
+            assert isinstance(release, review_hold.ReleasedMessages)
+            self.assertEqual(self.end_review(161), [])
+            review_hold.set_count(SESSION, 2, 162, self.fail,
+                record_keys=review_hold_delivery.record_keys)
+            kept = self.parsed_reply(self.run_prompt(cross_session("Review peer", "Newer report."), now=163))
+            self.assertEqual(kept["decision"], "block")
+        batches = self.end_review(164)
+        self.assertEqual(len(batches), 1)
+        self.assertLess(batches[0].index("Older report."), batches[0].index("Newer report."))
+        self.assertNotIn("Unsent report.", batches[0])
 
     def test_session_start_release_ends_the_hold_before_it_emits_the_list(self) -> None:
         self.open_review()
@@ -487,7 +517,8 @@ class ConversationPauseTests(ConversationPauseFixture):
             self.assertEqual((reply.returncode, reply.stdout, reply.stderr), (0, "", ""))
 
         with patch.dict(os.environ, self.environment):
-            review_hold.deliver_at_session_start(SESSION, receive)
+            review_hold.deliver_at_session_start(SESSION, receive,
+                record_keys=review_hold_delivery.record_keys)
         self.assertEqual(len(batches), 1)
         self.assertIn("Held update.", batches[0])
         self.assertEqual(self.end_review(103), [])
@@ -514,7 +545,8 @@ class ConversationPauseTests(ConversationPauseFixture):
         self.open_review()
         with patch.dict(os.environ, self.environment):
             message = review_hold.ReviewMessage("Review peer", 101, "The checks passed.", "session:peer")
-            with review_hold.route(SESSION, message, urgent=False) as result:
+            with review_hold.route(SESSION, message, urgent=False,
+                     record_keys=review_hold_delivery.record_keys) as result:
                 assert isinstance(result, review_hold.OpenReview)
                 result.keep(message)
             reply = self.parsed_reply(self.run_prompt("Continue review.", now=161))
@@ -526,11 +558,13 @@ class ConversationPauseTests(ConversationPauseFixture):
                     + "1. Review peer\n   Sent: 00:01 UTC\n   Sender native id: session:peer\n   The checks passed.",
                 },
             })
-            review_hold.set_count(SESSION, 1, 162, self.fail)
+            review_hold.set_count(SESSION, 1, 162, self.fail,
+                record_keys=review_hold_delivery.record_keys)
             self.assertEqual(review_hold.item_count(SESSION), 1)
             follow_up = self.run_prompt("Next item.", now=162)
             self.assertEqual((follow_up.returncode, follow_up.stdout, follow_up.stderr), (0, "", ""))
-            review_hold.set_count(SESSION, 0, 162, self.fail)
+            review_hold.set_count(SESSION, 0, 162, self.fail,
+                record_keys=review_hold_delivery.record_keys)
 
     def test_typed_showrunner_prompt_pauses_reports_once(self) -> None:
         instance = self.create_instance(self.showrunner_timer("demo"))

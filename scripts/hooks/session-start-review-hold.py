@@ -10,6 +10,7 @@ import json
 import sys
 from typing import cast
 
+from scripts.hooks import review_hold_delivery
 from scripts.message import review_hold
 
 
@@ -23,7 +24,7 @@ def main() -> None:
     payload = cast(dict[str, object], json.load(sys.stdin))
     session = payload.get("session_id")
     if isinstance(session, str) and session:
-        review_hold.deliver_at_session_start(session, emit)
+        review_hold.deliver_at_session_start(session, emit, record_keys=review_hold_delivery.record_keys)
 
 
 if __name__ == "__main__":

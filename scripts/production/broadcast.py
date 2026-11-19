@@ -29,7 +29,7 @@ from typing import Literal, NamedTuple, cast
 MESSAGE = Path(__file__).resolve().parent.parent / "message"
 from scripts.message import roster  # noqa: E402
 from scripts.lib import names as display_names  # noqa: E402
-from scripts.message import session_send
+from scripts.message import send_result, session_send
 
 SEND = Path(os.environ.get("BROADCAST_SEND") or session_send.SEND_SCRIPT)
 USAGE = ("usage: broadcast.py [--here] --from <your session> (--all TEXT | --showrunners TEXT | [--production SHOWRUNNER] --units TEXT"
@@ -82,7 +82,7 @@ class TopLevel:
 
 
 BroadcastGroup = AllRoles | Showrunners | UnitDirectors | UnitsOfProduction | Agents | Workers | WorkersOfUnit | TopLevel
-Outcome = Literal["sent", "no live session", "NOT sent"]
+Outcome = Literal["sent", "kept", "no live session", "NOT sent"]
 FLAGS: dict[str, BroadcastGroup] = {
     "--all": AllRoles(), "--showrunners": Showrunners(), "--units": UnitDirectors(),
     "--agents": Agents(), "--workers": Workers(), "--top-level": TopLevel(),
@@ -164,11 +164,22 @@ def ending(told: Collection[BroadcastGroup], scope: roster.RosterScope = roster.
     return f"Sent directly to {series(names, 'and')} on {machines}; do not pass it on."
 
 
-def send(session: str, sender: str, text: str, *options: str) -> str:
-    """One message through send.py; the empty string when it was sent, else send.py's own line."""
+def _send(session: str, sender: str, text: str, *options: str) -> tuple[Outcome, str]:
     done = subprocess.run(session_send.send_argv("--to", session, "--from", sender, *options, "--text", text, send_script=SEND),
                           capture_output=True, text=True, check=False)
-    return "" if done.returncode == 0 else (done.stdout or done.stderr).strip() or f"exit {done.returncode}"
+    result = send_result.send_outcome(done.returncode, done.stdout)
+    if isinstance(result, send_result.ConfirmedSendOutcome):
+        if result.header.outcome == "kept":
+            return "kept", "in a review"
+        if result.header.outcome in ("sent", "skipped", "replaced"):
+            return "sent", ""
+    return "NOT sent", (done.stdout or done.stderr).strip() or f"exit {done.returncode}"
+
+
+def send(session: str, sender: str, text: str, *options: str) -> str:
+    """Return a delivery error or an empty string for an accepted message."""
+    outcome, detail = _send(session, sender, text, *options)
+    return detail if outcome == "NOT sent" else ""
 
 
 def _unreachable(entry: roster.RosterEntry, reach: roster.CannotReceiveMessages) -> str:
@@ -202,10 +213,10 @@ def _broadcast(
                 return Delivery(recipient, "no live session", _unreachable(entry, entry.reach))
             case roster.Messageable(address):
                 try:
-                    problem = send(address, sender, f"{text}\n\n{last}", "--here")
+                    outcome, detail = _send(address, sender, f"{text}\n\n{last}", "--here")
                 except OSError as error:
-                    problem = str(error)
-                return Delivery(recipient, "NOT sent" if problem else "sent", problem)
+                    return Delivery(recipient, "NOT sent", str(error))
+                return Delivery(recipient, outcome, detail)
 
     with ThreadPoolExecutor(max_workers=AT_ONCE) as pool:
         return list(pool.map(deliver, chosen))
@@ -220,7 +231,7 @@ def broadcast(
 
 
 def report(deliveries: list[Delivery]) -> bool:
-    """Print one line per recipient; true when every live one has the message."""
+    """Print one line per recipient. Return true when no send failed."""
     for recipient, outcome, detail in deliveries:
         match recipient:
             case PeerOutput(host, line):
@@ -344,9 +355,8 @@ def _remote_broadcast(sender: str, texts: Mapping[BroadcastGroup, str]) -> list[
         return [Delivery(PeerOutput(host, f"NOT sent: {why}"), "NOT sent", "")]
     deliveries: list[Delivery] = []
     for line in done.stdout.splitlines():
-        parts = line.split(" - ", 2)
-        status = parts[2].partition(":")[0] if len(parts) == 3 else ""
-        outcome = cast(Outcome, status) if status in {"sent", "NOT sent", "no live session"} else "no live session"
+        status = line.partition(": ")[0].rpartition(" - ")[2]
+        outcome = cast(Outcome, status) if status in {"sent", "kept", "NOT sent", "no live session"} else "no live session"
         deliveries.append(Delivery(PeerOutput(host, line), outcome, ""))
     for line in done.stderr.splitlines():
         deliveries.append(Delivery(PeerOutput(host, line), "no live session", ""))

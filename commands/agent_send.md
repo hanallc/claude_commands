@@ -40,7 +40,7 @@ Match the pattern against every row that is not `offline`, case-insensitive:
 
 Resolution:
 
-- **One live match**: that is the recipient. Use its bare name; append ` [ref]` only if another live row shares the name.
+- **One live match.** Use its name. If another live row shares the name, use a unique roster address such as `session:<id>`.
 - **Several live matches**: ask in one plain-text line naming each match (name, status, started), recommend the closest name match, and send to the choice in the user’s next message.
 - **No live match**: stop. List the live names from the listing in one short block so the user can re-run with the right one. If the only match is `offline`, say that — an offline session cannot receive.
 - The listing's first line names this session. Never resolve the target to it; if the pattern only matches this session, say so and stop.

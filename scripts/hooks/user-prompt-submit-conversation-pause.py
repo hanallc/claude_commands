@@ -153,10 +153,11 @@ def main() -> None:
             emitted = True
 
         if source is conversation_pause.PromptSource.TYPED:
+            from scripts.hooks import review_hold_delivery
             from scripts.message import review_hold
 
             try:
-                review_hold.record_user_prompt(session_id, now, emit)
+                review_hold.record_user_prompt(session_id, now, emit, record_keys=review_hold_delivery.record_keys)
             except (OSError, ValueError) as error:
                 print(f"review hold: {error}", file=sys.stderr)
         if not emitted:

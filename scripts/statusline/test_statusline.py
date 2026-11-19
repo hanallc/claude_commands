@@ -32,6 +32,7 @@ from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.production import footer_counts, investigation, session_labels, staff
 from scripts.production.issues import ALL_FIELDS, Issue
 from scripts.rebuild import need
+from scripts.hooks import review_hold_delivery
 from scripts.message import review_hold
 from scripts.agents import remote
 from scripts.statusline import adhoc_items, assignment, counts_row, rebuild_row
@@ -574,10 +575,12 @@ class AdhocItemsTests(unittest.TestCase):
                    "CLAUDE_CODE_SESSION_ID": "review-session"}
             first = datetime(2026, 11, 19, 17, 5, tzinfo=timezone.utc).timestamp()
             with patch.dict(os.environ, env):
-                review_hold.set_count("review-session", 3, first, self.fail)
+                review_hold.set_count("review-session", 3, first, self.fail,
+                    record_keys=review_hold_delivery.record_keys)
                 for item in (review_hold.ReviewMessage("Pat · build", first + 60, "Second report.", "codex:pat"),
                              review_hold.ReviewMessage("Lee · test", first, "First report.\nMore detail.", "session:lee")):
-                    with review_hold.route("review-session", item, urgent=False) as result:
+                    with review_hold.route("review-session", item, urgent=False,
+                             record_keys=review_hold_delivery.record_keys) as result:
                         assert isinstance(result, review_hold.OpenReview)
                         result.keep(item)
                 command = [sys.executable, str(Path(adhoc_items.__file__)), "0"]
@@ -603,9 +606,11 @@ class AdhocItemsTests(unittest.TestCase):
                 self.assertTrue(any(command["command"].endswith('/session-start-review-hold.py"')
                                     for command in registered))
                 at = datetime(2026, 11, 19, 16, 20, tzinfo=timezone.utc).timestamp()
-                review_hold.set_count("review-session", 3, at, self.fail)
+                review_hold.set_count("review-session", 3, at, self.fail,
+                    record_keys=review_hold_delivery.record_keys)
                 message = review_hold.ReviewMessage("Drew", at, "A saved report.")
-                with review_hold.route("review-session", message, urgent=False) as result:
+                with review_hold.route("review-session", message, urgent=False,
+                         record_keys=review_hold_delivery.record_keys) as result:
                     assert isinstance(result, review_hold.OpenReview)
                     result.keep(message)
                 command = [sys.executable, str(repo / "scripts/hooks/session-start-review-hold.py")]

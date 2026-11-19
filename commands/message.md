@@ -23,7 +23,7 @@ description: Read agent message rules and delivery.
 - `--urgent` delivers at once into the review. Use it for a point that needs nate before a merge, a loss of data, or a stall.
 - **The first line stands alone.** It is the recipient's preview and the inbox log entry. If it would open mid-thought or with a bare name, open with `Message from <your name>: <gist>`.
 - **Carry the context.** The recipient shares no memory with you: name the repo, worktree, branch, paths, commit or test. No tokens or secrets.
-- **Address by ListAgents name.** Its first line, `This session is <name>`, is you; never send to it. A name that is not in your latest ListAgents fails: call ListAgents once and send again. Two live rows with one name: append the row's ` [ref]`. A ref does not cross machines; to tell sessions apart there, ask each for `hostname` and `pwd`.
+- **Address by ListAgents name.** The first line names your session. Never send to your own session. If a name lookup fails, refresh the list once. If two rows share a name, use a unique roster address such as `session:<id>`.
 - Never poll ListAgents or send "have you answered?". A reply arrives as a `<cross-session-message>` and resumes your turn; answer its wrapper's `from`, except `postmaster` (see Receiving). A relay sender (`quota_alert`, a showrunner timer) cannot be answered.
 
 ## Finding sessions

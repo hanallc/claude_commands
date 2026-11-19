@@ -87,7 +87,7 @@ After every send returns, give the user one short table:
 | `<name>` | busy / idle / shell | sent / failed: `<error>` |
 | `<name>` | offline | skipped |
 
-Then one line restating the problem statement that went out. If any send failed, say what the error was and whether a retry with the ` [ref]` suffix resolved it.
+Restate the problem in one line. Report each send error. For a shared name, retry with a unique roster address such as `session:<id>`.
 
 In **respond mode**, add one line: how many replies are expected and that each will be relayed as it arrives. Then end the turn. Relay each reply per /message: sender, whether the problem applies there, and what they contributed.
 

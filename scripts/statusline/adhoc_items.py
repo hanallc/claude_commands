@@ -24,8 +24,10 @@ def row(session_id: str) -> str:
 
 
 def main() -> None:
+    from scripts.hooks import review_hold_delivery
+
     review_hold.set_count(os.environ["CLAUDE_CODE_SESSION_ID"], int(sys.argv[1]), time.time(),
-                          lambda text: print(text, flush=True))
+                          lambda text: print(text, flush=True), record_keys=review_hold_delivery.record_keys)
 
 
 if __name__ == "__main__":

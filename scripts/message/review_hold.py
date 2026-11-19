@@ -6,8 +6,8 @@ import json
 import re
 import sys
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from contextlib import ExitStack, contextmanager
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -31,6 +31,9 @@ class ReviewMessage:
     key_recipient: str = ""
 
 
+type RecordReleasedKeys = Callable[[tuple[ReviewMessage, ...], str, float], None]
+
+
 class EndedReview(Enum):
     HOLD_ENDED = "the hold ended"
 
@@ -39,13 +42,18 @@ class EndedReview(Enum):
 class ReviewState:
     last_activity: float | EndedReview
     messages: tuple[ReviewMessage, ...] = ()
+    reserved: tuple[ReviewMessage, ...] = ()
+
+
+class UnconfirmedRelease(Enum):
+    NO_RECEIPT = "no delivery receipt"
 
 
 @dataclass
 class ReleasedMessages:
     messages: tuple[ReviewMessage, ...]
     held: tuple[ReviewMessage, ...] = ()
-    accepted: bool = False
+    accepted_at: float | UnconfirmedRelease = UnconfirmedRelease.NO_RECEIPT
 
 
 @dataclass(frozen=True)
@@ -56,7 +64,7 @@ class OpenReview:
     state: ReviewState
 
     def keep(self, message: ReviewMessage) -> None:
-        _write_state(self.path, ReviewState(self.state.last_activity, (*self.state.messages, message)))
+        _write_state(self.path, replace(self.state, messages=(*self.state.messages, message)))
 
 
 class AlreadyKeptForReview:
@@ -96,6 +104,18 @@ def _locked(path: Path) -> Generator[None]:
         yield
 
 
+@contextmanager
+def _delivery_turn(path: Path) -> Generator[bool]:
+    """Give one sender the reservation until it finishes or exits."""
+    with path.with_suffix(".delivery.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+        else:
+            yield True
+
+
 def _last_prompt(path: Path, fallback: float) -> float:
     try:
         return float(path.with_suffix(".prompt").read_text(encoding="utf-8"))
@@ -112,17 +132,23 @@ def _read_state(count: Path, path: Path) -> ReviewState:
     at = value["last_activity"]
     activity = EndedReview.HOLD_ENDED if at is None else float(cast(float, at))
     messages = cast(list[dict[str, str | float]], value["messages"])
-    return ReviewState(activity, tuple(
+    reserved = cast(list[dict[str, str | float]], value.get("reserved", []))
+    return ReviewState(activity, _read_messages(messages), _read_messages(reserved))
+
+
+def _read_messages(messages: list[dict[str, str | float]]) -> tuple[ReviewMessage, ...]:
+    return tuple(
         ReviewMessage(str(item["sender"]), float(item["sent"]), str(item["text"]),
                       str(item.get("native_id", "unavailable")), str(item.get("key", "")),
                       str(item.get("key_recipient", "")))
-        for item in messages))
+        for item in messages)
 
 
 def _write_state(path: Path, state: ReviewState) -> None:
     at = state.last_activity
     record = {"last_activity": None if isinstance(at, EndedReview) else at,
-              "messages": [asdict(item) for item in state.messages]}
+              "messages": [asdict(item) for item in state.messages],
+              "reserved": [asdict(item) for item in state.reserved]}
     write_text_atomic(path, json.dumps(record), new_file_mode=0o600)
 
 
@@ -140,8 +166,7 @@ def keep_native_message(session: str, message: ReviewMessage) -> bool:
         return False
     count = _count_file(session)
     path = _state_file(count)
-    # The sender can hold the lock while it delivers an ended review's list.
-    if not _hold_open(count, _read_state(count, path), message.sent):
+    if not (count.exists() or path.exists()):
         return False
     with _locked(path):
         state = _read_state(count, path)
@@ -181,83 +206,146 @@ def render(messages: tuple[ReviewMessage, ...]) -> str:
     return "Messages from the review\n\n" + "\n\n".join(entries)
 
 
-def set_count(session: str, remaining: int, at: float, emit: Callable[[str], None]) -> None:
+def _end_review(path: Path, state: ReviewState) -> ReviewState:
+    if state.last_activity is EndedReview.HOLD_ENDED:
+        return state
+    ended = replace(state, last_activity=EndedReview.HOLD_ENDED)
+    _write_state(path, ended)
+    return ended
+
+
+def _reserve(path: Path, state: ReviewState, delivery: ExitStack, *, key: str = "") -> tuple[ReviewMessage, ...]:
+    """Move saved messages to the reservation while the review lock is held."""
+    saved = (*state.reserved, *state.messages)
+    held = tuple(item for item in saved if not key or item.key == key)
+    if not held or not delivery.enter_context(_delivery_turn(path)):
+        return ()
+    remaining = tuple(item for item in saved if key and item.key != key)
+    _write_state(path, replace(state, messages=remaining, reserved=held))
+    return held
+
+
+@contextmanager
+def _settle_release(count: Path, path: Path, batch: ReleasedMessages,
+                    record_keys: RecordReleasedKeys) -> Generator[ReleasedMessages]:
+    try:
+        yield batch
+    finally:
+        if batch.held:
+            accepted_at = batch.accepted_at
+            if not isinstance(accepted_at, UnconfirmedRelease) and any(item.key for item in batch.held):
+                try:
+                    record_keys(batch.held, f"session:{count.name}", accepted_at)
+                except (OSError, ValueError) as error:
+                    print(f"review hold: cannot record the delivered keys: {error}", file=sys.stderr)
+            try:
+                with _locked(path):
+                    state = _read_state(count, path)
+                    messages = state.messages
+                    if isinstance(accepted_at, UnconfirmedRelease):
+                        messages = tuple(sorted((*state.reserved, *messages), key=lambda item: item.sent))
+                    if not messages and not _read_count(count):
+                        path.unlink(missing_ok=True)
+                    else:
+                        _write_state(path, replace(state, messages=messages, reserved=()))
+            except OSError as error:
+                print(f"review hold: cannot settle the delivery: {error}", file=sys.stderr)
+
+
+def _emit_saved(count: Path, path: Path, held: tuple[ReviewMessage, ...], at: float,
+                emit: Callable[[str], None], record_keys: RecordReleasedKeys) -> None:
+    if held:
+        with _settle_release(count, path, ReleasedMessages(held, held), record_keys) as batch:
+            emit(render(held))
+            batch.accepted_at = at
+
+
+def set_count(session: str, remaining: int, at: float, emit: Callable[[str], None], *,
+              record_keys: RecordReleasedKeys) -> None:
     count = _count_file(session)
     path = _state_file(count)
-    with _locked(path):
-        state = _read_state(count, path)
-        if remaining > 0:
-            if item_count(session) == 0:
-                _write_state(path, ReviewState(_last_prompt(path, at), state.messages))
-            elif not path.exists():
-                _write_state(path, state)
-            write_text_atomic(count, str(remaining))
-            return
-        count.unlink(missing_ok=True)
-        if state.messages:
-            emit(render(state.messages))
-        path.unlink(missing_ok=True)
+    with ExitStack() as delivery:
+        with _locked(path):
+            state = _read_state(count, path)
+            if remaining > 0:
+                if item_count(session) == 0:
+                    _write_state(path, replace(state, last_activity=_last_prompt(path, at)))
+                elif not path.exists():
+                    _write_state(path, state)
+                write_text_atomic(count, str(remaining))
+                return
+            count.unlink(missing_ok=True)
+            state = _end_review(path, state)
+            held = _reserve(path, state, delivery)
+            if not state.messages and not state.reserved:
+                path.unlink(missing_ok=True)
+        _emit_saved(count, path, held, at, emit, record_keys)
 
 
-def _emit_saved(path: Path, state: ReviewState, emit: Callable[[str], None]) -> None:
-    if state.messages:
-        ended = EndedReview.HOLD_ENDED
-        if state.last_activity is not ended:
-            _write_state(path, ReviewState(ended, state.messages))
-        emit(render(state.messages))
-        _write_state(path, ReviewState(ended))
-
-
-def record_user_prompt(session: str, at: float, emit: Callable[[str], None]) -> None:
+def record_user_prompt(session: str, at: float, emit: Callable[[str], None], *,
+                       record_keys: RecordReleasedKeys) -> None:
     count = _count_file(session)
     path = _state_file(count)
-    with _locked(path):
-        state = _read_state(count, path)
-        previous = state.last_activity
-        if not isinstance(previous, EndedReview):
-            activity = max(previous, at) if _hold_open(count, state, at) else EndedReview.HOLD_ENDED
-            state = ReviewState(activity, state.messages)
-            _write_state(path, state)
-        write_text_atomic(path.with_suffix(".prompt"), repr(at), new_file_mode=0o600)
-        if isinstance(state.last_activity, EndedReview):
-            _emit_saved(path, state, emit)
+    with ExitStack() as delivery:
+        with _locked(path):
+            state = _read_state(count, path)
+            previous = state.last_activity
+            if not isinstance(previous, EndedReview):
+                if _hold_open(count, state, at):
+                    state = replace(state, last_activity=max(previous, at))
+                    _write_state(path, state)
+                else:
+                    state = _end_review(path, state)
+            write_text_atomic(path.with_suffix(".prompt"), repr(at), new_file_mode=0o600)
+            held = _reserve(path, state, delivery) if isinstance(state.last_activity, EndedReview) else ()
+        _emit_saved(count, path, held, at, emit, record_keys)
 
 
-def deliver_at_session_start(session: str, emit: Callable[[str], None]) -> None:
+def deliver_at_session_start(session: str, emit: Callable[[str], None], *, record_keys: RecordReleasedKeys) -> None:
     count = _count_file(session)
     path = _state_file(count)
     if not path.exists():
         return
-    with _locked(path):
-        _emit_saved(path, _read_state(count, path), emit)
+    with ExitStack() as delivery:
+        with _locked(path):
+            state = _read_state(count, path)
+            if not (state.messages or state.reserved):
+                return
+            held = _reserve(path, _end_review(path, state), delivery)
+        _emit_saved(count, path, held, datetime.now(timezone.utc).timestamp(), emit, record_keys)
 
 
 @contextmanager
-def route(session: str, message: ReviewMessage, *, urgent: bool) -> Generator[OpenReview | AlreadyKeptForReview | ReleasedMessages]:
+def route(session: str, message: ReviewMessage, *, urgent: bool,
+          record_keys: RecordReleasedKeys, include_new: bool = True) -> Generator[OpenReview | AlreadyKeptForReview | ReleasedMessages]:
     count = _count_file(session)
     path = _state_file(count)
     if count.exists() or path.exists():
-        with _locked(path):
-            state = _read_state(count, path)
-            activity = state.last_activity
-            if _hold_open(count, state, message.sent):
-                if not urgent:
-                    if message.key and any(item.key == message.key for item in state.messages):
-                        yield AlreadyKeptForReview()
+        with ExitStack() as delivery:
+            with _locked(path):
+                state = _read_state(count, path)
+                if _hold_open(count, state, message.sent):
+                    if include_new and not urgent:
+                        saved = (*state.reserved, *state.messages)
+                        yield (AlreadyKeptForReview() if message.key and any(item.key == message.key for item in saved)
+                               else OpenReview(path, state))
+                        return
+                    held = (_reserve(path, state, delivery, key=message.key)
+                            if include_new and urgent and message.key else ())
+                    messages: tuple[ReviewMessage, ...] = ()
+                else:
+                    held = _reserve(path, _end_review(path, state), delivery)
+                    if not held:
+                        messages = ()
+                    elif not include_new:
+                        messages = held
+                    elif urgent:
+                        messages = (*[item for item in held if not message.key or item.key != message.key], message)
                     else:
-                        yield OpenReview(path, state)
-                    return
-            elif state.messages or not isinstance(activity, EndedReview):
-                _write_state(path, ReviewState(EndedReview.HOLD_ENDED, state.messages))
-                if state.messages:
-                    repeated = message.key and any(item.key == message.key for item in state.messages)
-                    messages = state.messages if repeated and not urgent else (*state.messages, message)
-                    batch = ReleasedMessages(messages, held=state.messages)
+                        repeated = message.key and any(item.key == message.key for item in held)
+                        messages = held if repeated else (*held, message)
+            if held:
+                with _settle_release(count, path, ReleasedMessages(messages, held), record_keys) as batch:
                     yield batch
-                    if batch.accepted:
-                        try:
-                            _write_state(path, ReviewState(EndedReview.HOLD_ENDED))
-                        except OSError as error:
-                            print(f"review hold: cannot clear the delivered list: {error}", file=sys.stderr)
                     return
     yield ReleasedMessages(())

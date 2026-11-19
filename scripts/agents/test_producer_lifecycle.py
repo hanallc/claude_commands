@@ -429,6 +429,17 @@ class ProducerLifecycleTests(unittest.TestCase):
         self.assertEqual(staff.snapshot().by_path("beta"), replace(source, name="beta"))
         self.assertFalse(producer_lifecycle.pending_rename(source.name))
 
+    def test_retirement_records_a_kept_handoff_request(self) -> None:
+        row = self.producer("dwight")
+        _ = self.producer("morty")
+        with patch.object(restart_support, "send_message",
+                          return_value=restart_support.MessageKept(kind="kept", reason="in a review")) as send:
+            for _ in range(2):
+                code, output, errors = command("retire", row.name)
+                self.assertEqual((code, errors), (0, ""), output)
+                self.assertIn("handoff.md exists", output)
+            self.assertEqual(send.call_count, 1)
+
     def test_retirement_requests_handoff_once_moves_open_items_and_restores_the_same_session(self) -> None:
         row, morty = self.producer("dwight"), self.producer("morty")
         owner = fixture_member("showrunner", name="show")
