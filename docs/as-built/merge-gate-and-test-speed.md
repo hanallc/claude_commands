@@ -643,7 +643,7 @@ The daily rule removes these jobs from default gates.
 2. Verify that the promotion checkout uses main and has an eligible recorded tip.
 3. Verify the settings blob and ancestry of `origin/<merge branch>`.
 4. Check edited paths against the target through `promotion_edit_conflict(repo, target)`.
-5. Check live stored state with the target code through `live_state_refusal(repo, target)`.
+5. Check live state and the console with the target code through `check_promotion(repo, target)`.
 6. Record the exact source commit and base for push recovery.
 7. Fast-forward local main and push it.
 8. Fast-forward the Mac through SSH and inspect its printed `ff_rc=` result.
@@ -653,13 +653,73 @@ A private index exposes edits hidden by `assume-unchanged` or `skip-worktree`.
 The live index and edits stay unchanged; untracked files do not count.
 Local, Mac, and checkpoint promotion use this function.
 
-`live_state_refusal` exports the target tree and reads `live_state_checks` from its `config/merge_gate.conf`.
+`check_promotion` exports the target tree.
+The live state check reads `live_state_checks` from that tree's `config/merge_gate.conf`.
 It runs each listed module from that tree as `python3 -m <module> state-check`, within `live_state_check_seconds`.
 A listed module that the tree does not have refuses the promotion, so a rename or deletion cannot stop a check without notice. A tree without `config/merge_gate.conf` or without the `live_state_checks` key has no checks.
 A nonzero exit refuses the promotion before main moves, and names the module and its last error line.
 The checks only read live state. Local and checkpoint promotion run them; the Mac promotion does not.
 The first check is `scripts.build_queue.admission_service`, which reads admission `state.json` as `serve` does.
 It exists because the Phase 44 re-land on 2026-11-14 promoted a strict reader over old-shape rows and stopped the service.
+
+The console check runs before every promotion.
+It exports the promotion base from `origin/main` and checks both trees against the live stores.
+The check requires these files for each console.
+
+- `config/console.conf`
+- `config/review_links.conf`
+- `scripts/review_links/console.py`
+- `scripts/review_links/serve.py`
+
+A tree has no console if it has none of these files or either checker script.
+Two trees without a console pass the check.
+The first console uses an empty base scan.
+Missing required files in a console refuse promotion.
+A legacy console can use the current checker adapter.
+Both trees use the same installed configuration and repository defaults for data settings.
+Each tree supplies its own page settings.
+The selector preserves the recovery rules for each call to `conf.read`.
+The checker reports preparation time and total comparison time.
+Each server binds to loopback. Headless Chrome or Chromium opens the pages.
+The server and its Accounts child use a Python audit hook to deny writes outside the run workspace.
+The hook blocks SQLite connections and records each denial before it raises an exception.
+A recorded denial holds promotion even if both scans record it or the page catches the exception.
+The guard catches accidental writes by checked Python code. It does not provide a sandbox.
+Native child writes are out of scope.
+The guard cannot detect a symbolic link that changes between validation and the write.
+It cannot detect a hard link to an outside file that exists before validation.
+Accounts reads the stored peer counts without starting a fetch.
+Herdr reads pane records without a write lock or publication recovery.
+The server refuses HTTP requests that change data.
+An empty Disks measure request reads current reports. It does not start a measure.
+The check calls the configured URL resolvers, including the Rebuilds resolver.
+It publishes generated AWS, Builds, and Disks pages in the temporary folder.
+The browser uses the generated pages at their usual URLs and reads the live feeds.
+Each attempt renders Accounts again and keeps its own Review snapshot.
+A retry runs only the affected URL resolver again.
+The base and candidate start each paired browser navigation together.
+A live write between the two paired reads can still hide a fault. This case is out of scope.
+The server lists each available page with its path and each unavailable page with its setup fault.
+The check also replays every case in `scripts/review_links/console_cases/<item_key>.json` at its saved URL path, query, fragment, and viewport.
+The commit that fixes a console Bug copies its case to that folder.
+The check reads cases only from the candidate tree and verifies the expected page identity.
+A new notice, script error, or HTTP 5xx holds promotion.
+If the results differ, the base has a fault, or a visit is incomplete, the check makes up to two more attempts.
+A completed slow render supplies page facts. A timeout before those facts makes the visit incomplete.
+The checker records an Accounts child timeout as one render-limit fault.
+The check requires at least one completed pair for each page that both trees have.
+The check retains each candidate fault unless every base attempt completes with the same fault.
+The check matches notices by page and source path when the notice names a source.
+The check matches status faults by component, state, and reason.
+The status text includes the age for diagnostics.
+The adapter adds canonical keys to known base status markup.
+Missing or duplicate keys in the page and its visible frames hold promotion.
+It reports base faults once per affected page as `live console faults (not held)`.
+Any fault during a saved case holds promotion.
+A console refusal asks the operator to repair the console check failure before retrying the checkpoint.
+Browser events cannot extend the response deadline.
+The check closes both sets of server and browser groups before it returns.
+
 A retry can push its recorded local commit when origin/main remains its ancestor and the source still contains it.
 Tree equality alone does not authorize that push.
 The Mac command has a 25-second limit and must print exactly one successful `ff_rc=0` result.

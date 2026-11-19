@@ -25,7 +25,7 @@ def icon_svg(name: str) -> str:
     return source[source.index("<svg"):].replace("<svg", '<svg aria-hidden="true" focusable="false"', 1)
 
 
-def title(text: str, page: str) -> str:
+def title(text: str, page: str, *, component: str = "refresh") -> str:
     """Build the title and its shared refresh status."""
     settings = conf.read_or_repository("console")
     options = {"roundTripLimit": settings.number("status.round_trip_limit_seconds"),
@@ -38,6 +38,7 @@ def title(text: str, page: str) -> str:
                         ('Failed', 'triangle-alert'), ('Paused', 'circle-pause')))
     return (f'<h1 class="page-title">{html.escape(text)}</h1>'
             + '<p class="page-status" data-page-status data-state="Reading" role="status" aria-live="off" '
+            + f'data-status-component="{html.escape(f"{page}.{component}", quote=True)}" '
             + f'data-status-options="{html.escape(json.dumps(options), quote=True)}" data-page-facts>'
             + '<span class="page-status-state">' + icons + '<span data-status-word>Reading…</span></span>'
             + '<span data-status-age hidden></span><span data-status-trip hidden></span>'

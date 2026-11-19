@@ -31,7 +31,7 @@ from scripts.message import sessions
 
 from scripts.production.merge_checkpoint import promote, request_from
 from scripts.production import merge_checkpoint
-from scripts.production import change_review
+from scripts.production import change_review, console_check
 from scripts.production.production_doc import Production, ProductionDocument
 
 # Importable once merge_checkpoint has put scripts/lib on the path.
@@ -68,6 +68,32 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                 self.assertIsInstance(result, merge_checkpoint.PromotionAdvanced if advances
                                       else merge_checkpoint.PromotionAlreadyAtTip)
                 self.assertIn("post-push: warning — post-push hook: failed (exit 9); rerun: retry", output.getvalue())
+
+    def test_checkpoint_promotion_passes_when_neither_tree_has_a_console(self) -> None:
+        self.write(self.checkout, "README.md", "advanced\n")
+        _ = self.git("commit", "-am", "advance production", cwd=self.checkout)
+        _ = self.git("push", "origin", "production", cwd=self.checkout)
+        tip = self.git("rev-parse", "HEAD", cwd=self.checkout)
+        with mock.patch.dict(os.environ, self.env), redirect_stdout(StringIO()) as output:
+            result = merge_checkpoint.promote_local_checkout(self.promote, "production", tip)
+        self.assertIsInstance(result, merge_checkpoint.PromotionAdvanced)
+        self.assertIn("Console check: no console.", output.getvalue())
+        self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), tip)
+
+    def test_unrelated_change_with_console_fault_refuses_checkpoint_promotion(self) -> None:
+        self.write(self.checkout, "README.md", "advanced\n")
+        _ = self.git("commit", "-am", "advance production", cwd=self.checkout)
+        _ = self.git("push", "origin", "production", cwd=self.checkout)
+        tip = self.git("rev-parse", "HEAD", cwd=self.checkout)
+        failure = "RED: console check. The read-only console needs Landlock ABI 3 or later."
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(
+                console_check, "compare_to_main", return_value=failure), self.assertRaises(checkpoint_gate.Stop) as stop:
+            _ = merge_checkpoint.promote_local_checkout(self.promote, "production", tip)
+        self.assertEqual(self.git("diff", "--name-only", "origin/main", tip, cwd=self.checkout), "README.md")
+        self.assertNotEqual(self.git("rev-parse", "main", cwd=self.origin), tip)
+        self.assertEqual(stop.exception.detail, failure)
+        self.assertNotIn("conversion", stop.exception.message)
+        self.assertEqual(stop.exception.message, "resolve the console check failure and rerun this checkpoint")
 
     def assert_completed_handoff_preserves_published_tip(self, *, with_review: bool) -> None:
         review = Path(self.env["HOME"]) / "rust/hanadocs/change-review/change-review - example.md"

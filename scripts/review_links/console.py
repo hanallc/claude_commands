@@ -77,11 +77,17 @@ class ConsolePage:
     items: ItemsFunction | None = None
 
 
-def read_pages() -> tuple[ConsolePage, ...]:
+def read_pages(*, settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> tuple[ConsolePage, ...]:
     """Resolve configured pages in file order without hiding unavailable entries."""
-    values = conf.read("console").values()
-    identities = dict.fromkeys(key.split(".")[1] for key in values
-                               if re.fullmatch(r"page\.[a-z][a-z0-9_-]*\.(label|icon|title|url|items)", key))
+    if isinstance(settings, conf.UseConfiguredValue):
+        settings = conf.read("console")
+    registry_key = re.compile(r"page\.[a-z][a-z0-9_-]*\.(label|icon|title|url|items)")
+    if isinstance(settings.settings, dict):
+        keys = tuple(key for key in settings.settings if registry_key.fullmatch(key))
+        values = settings.values(*keys) if keys else {}
+    else:
+        values = settings.values()
+    identities = dict.fromkeys(key.split(".")[1] for key in values if registry_key.fullmatch(key))
     pages: list[ConsolePage] = []
     for identity in identities:
         prefix = f"page.{identity}."
@@ -100,9 +106,12 @@ def place_query(identity: str, place: str) -> str:
     return "?" + urlencode({"page": identity, PLACE_PREFIX + identity: place})
 
 
-def read_rebuilds() -> AvailablePage | UnavailablePage:
+def read_rebuilds(*, settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                  ) -> AvailablePage | UnavailablePage:
     """Resolve the page that lists open rebuild needs for the rebuild link."""
-    return resolve("rebuilds.url", conf.read("console").values().get("rebuilds.url", ""))
+    if isinstance(settings, conf.UseConfiguredValue):
+        settings = conf.read("console")
+    return resolve("rebuilds.url", settings.values("rebuilds.url").get("rebuilds.url", ""))
 
 
 def resolve(key: str, reference: str) -> AvailablePage | UnavailablePage:

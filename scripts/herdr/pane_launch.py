@@ -470,7 +470,12 @@ def record_directory() -> Path:
     return Path(os.environ.get("HERDR_PANE_RECORD_DIR") or Path.home() / ".local/state/herdr-panes")
 
 
+REVIEW_LINKS_READ_ONLY = "REVIEW_LINKS_READ_ONLY"
+
+
 def read_entries(path: Path) -> dict[str, object]:
+    if os.environ.get(REVIEW_LINKS_READ_ONLY) == "1":
+        return _read_entries(path)
     if not path.parent.exists():
         return {}
     with _publication_lock(path.parent):

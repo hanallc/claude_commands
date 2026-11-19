@@ -98,7 +98,7 @@ def render(root: Path) -> bytes:
     options = ''.join(f'<option value="{html.escape(owner, quote=True)}"{names.style(owner)}>{html.escape(name)}</option>'
                       for owner, name in sorted(owners.items(), key=lambda pair: (pair[1].casefold(), pair[0])))
     seconds = conf.read("review_links").number("page_refresh_seconds")
-    content = (STYLE + page_frame.title("Investigations", "review")
+    content = (STYLE + page_frame.title("Investigations", "review", component="investigations")
                + f'<div data-investigations data-refresh-seconds="{seconds}">'
                + '<div data-filters><label for="investigation-owner">Owner:</label>'
                + f'<select id="investigation-owner"><option value="">All</option>{options}</select>'

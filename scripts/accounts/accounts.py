@@ -6496,6 +6496,9 @@ def _fetch_session_counts() -> int:
     return 0
 
 
+REVIEW_LINKS_READ_ONLY = "REVIEW_LINKS_READ_ONLY"
+
+
 def _start_session_counts_fetch() -> bool:
     """Transfer a nonblocking lock to one detached fetch process."""
     try:
@@ -6549,7 +6552,8 @@ def _machine_role_counts(
     except (OSError, ValueError):
         peer_accounts = {}
         available = False
-    _ = _start_session_counts_fetch()
+    if os.environ.get(REVIEW_LINKS_READ_ONLY) != "1":
+        _ = _start_session_counts_fetch()
     counted: list[StatusRow] = []
     for row in rows:
         local_unknown = row.tool == "claude" and claude_registry_unreadable

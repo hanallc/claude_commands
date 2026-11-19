@@ -740,15 +740,19 @@ def staff_filter(name: Literal["Owner", "Producer"], labels: Mapping[str, str]) 
 
 
 def render(root: Path, *, include_counts: bool = True,
-           status: change_page.DeliveryStatus | Literal["standalone"] = "standalone") -> bytes:
+           status: change_page.DeliveryStatus | Literal["standalone"] = "standalone",
+           assign_review_ids: bool = True) -> bytes:
     started, read_at = time.perf_counter(), time.time()
     members = staff.snapshot()
     names = staff_names.StaffNames(members)
     items = records()
     if status == "standalone":
         status = change_page.DeliveryStatus(root)
-    reviews = ({review.key: review for review in review_items.read(root, members=members)}
-               if any(entry.item.reviews for entry in items) else {})
+    reviews: dict[str, review_items.ReviewItem] = {}
+    if any(entry.item.reviews for entry in items):
+        linked = (review_items.read(root, members=members) if assign_review_ids
+                  else review_items.read(root, members=members, assign_ids=False))
+        reviews = {review.key: review for review in linked}
     zone = user_zone()
     today = datetime.fromtimestamp(read_at, zone)
     secret = change_browser.browser_manifest(change_page.console_folder(root))[0]

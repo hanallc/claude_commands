@@ -2265,10 +2265,12 @@ def recover_question_answers(status: DeliveryStatus) -> None:
 def console_folder(root: Path) -> Path:
     """Create the fixed console folder and its browser token once; later calls keep both."""
     folder = root / CONSOLE_FOLDER
-    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
     target = folder / BROWSER_MANIFEST
     if target.exists():
         return folder
+    if os.environ.get("REVIEW_LINKS_READ_ONLY") == "1":
+        raise FileNotFoundError(f"The console has no browser manifest at {target}.")
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
     manifest: BrowserManifest = {"token": secrets.token_urlsafe(), "initial": ""}
     draft = folder / f"{BROWSER_MANIFEST}.{secrets.token_hex(8)}"
     atomic_file.write_bytes_atomic(draft, json.dumps(manifest).encode(), mode=0o600)

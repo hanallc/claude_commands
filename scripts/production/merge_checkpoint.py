@@ -32,6 +32,7 @@ from typing import NamedTuple, cast
 
 from scripts.lib import build_folders
 from scripts.production import change_review, checkpoint_gate, land_runs
+from scripts.production.gate_modules import GateRefused
 from scripts.worktree import worktrees
 from scripts.lib import land_main, mac_wake, main_publish, main_push_lock, scratch, waiting_rows
 from scripts.production.showrunners import owner_for
@@ -1037,9 +1038,14 @@ def promote_local_checkout(checkout: Path, merge_branch: str, tip: str) -> (
         if conflict := merge_gate.promotion_edit_conflict(checkout, tip, waiting_rows.WAITING_PATHS):
             raise checkpoint_gate.Stop("promote", "failed", conflict,
                        "clear the listed checkout paths and rerun this checkpoint")
-        if refusal := merge_gate.live_state_refusal(checkout, tip):
-            raise checkpoint_gate.Stop("promote", "failed", refusal,
-                       "run the conversion that the refusal names, then rerun this checkpoint")
+        try:
+            merge_gate.check_promotion(checkout, tip)
+        except merge_gate.ConsolePromotionRefused as error:
+            raise checkpoint_gate.Stop("promote", "failed", str(error),
+                       "resolve the console check failure and rerun this checkpoint") from error
+        except GateRefused as error:
+            raise checkpoint_gate.Stop("promote", "failed", str(error),
+                       "run the conversion that the refusal names, then rerun this checkpoint") from error
         contained = not git(checkout, "merge-base", "--is-ancestor", tip, current).returncode
         if not contained and git(checkout, "merge-base", "--is-ancestor", current, tip).returncode:
             raise checkpoint_gate.Stop("promote", "failed", f"{checkout}: main does not fast-forward to {tip}",

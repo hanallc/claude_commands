@@ -155,6 +155,11 @@ class ConfigRead:
             _warning(f"warning: {reason}")
         return UnavailableValue(reason)
 
+    @property
+    def source_missing(self) -> bool:
+        """Report whether the initial file read found no file."""
+        return isinstance(self.settings, _UnreadableFile) and self.settings.missing
+
     def origin(self, key: str, convert: Callable[[str], Result]
                ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
         """Distinguish live values from recovered values without a warning."""

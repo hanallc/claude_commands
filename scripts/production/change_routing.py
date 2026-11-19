@@ -22,7 +22,7 @@ PRODUCER = "Producer"
 
 
 def routing_setting(file: str, key: str, *, sources: list[Path] | None = None) -> str:
-    """Read a routing setting. A collector rejects recovery from an unreadable or invalid source."""
+    """Read a routing setting. A collector recovers only a missing source."""
     settings = conf.read(file)
     if sources is None:
         return settings.text(key)
@@ -30,7 +30,7 @@ def routing_setting(file: str, key: str, *, sources: list[Path] | None = None) -
     result = settings.origin(key, str)
     if isinstance(result, conf.UsableLiveValue):
         return result.value
-    if isinstance(result, conf.RecoveredValue) and not settings.source.exists():
+    if isinstance(result, conf.RecoveredValue) and settings.source_missing:
         return result.value
     raise ValueError(result.reason)
 

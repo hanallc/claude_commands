@@ -13,10 +13,10 @@ from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
-from typing import final, override
+from typing import cast, final, override
 from contextlib import redirect_stdout
 from unittest import mock
-from scripts.production import change_review, merge_gate, staff
+from scripts.production import change_review, console_check, merge_gate, staff
 from scripts.production.staff_test_support import isolated_staff_file
 from scripts.agents import remote
 from scripts.production.gate_modules import GateRefused
@@ -180,7 +180,8 @@ sys.meta_path.insert(0, NoRepositoryModules())
             command = [sys.executable, str(Path(merge_gate.__file__)), "--repo", str(self.checkout),
                        "--merge-branch", "integration", "--promote-only", "--main-repo", str(self.main),
                        "--ssh", str(self.bin / "ssh"), "--production", "quiet"]
-            _ = publish_after_contender(self, self.main, self.origin, command, self.environment, cwd=self.root)
+            result = publish_after_contender(self, self.main, self.origin, command, self.environment, cwd=self.root)
+            self.assertEqual(cast(list[str], result.args)[:2], [sys.executable, str(Path(merge_gate.__file__))])
             self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
 
     def test_promote_only_promotes_the_pushed_merge_branch_without_a_gate(self) -> None:
@@ -189,6 +190,25 @@ sys.meta_path.insert(0, NoRepositoryModules())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.git(self.origin, "rev-parse", "main"))
         self.assertEqual(len([call for call in self.calls() if call["tool"] == "ssh"]), 2)
+
+    def test_direct_promotion_passes_when_neither_tree_has_a_console(self) -> None:
+        args = self.publish_for_promotion()
+        with mock.patch.dict(os.environ, self.environment), redirect_stdout(io.StringIO()) as output:
+            merge_gate.promote(args)
+        self.assertIn("Console check: no console.", output.getvalue())
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
+
+    def test_unrelated_change_with_console_fault_refuses_direct_promotion(self) -> None:
+        args = self.publish_for_promotion()
+        self.assertEqual(self.git(self.checkout, "diff", "--name-only", self.base, self.checkpoint), "unit.txt")
+        failure = "RED: console check. First: Fixture console failed."
+        with mock.patch.dict(os.environ, self.environment), mock.patch.object(
+                console_check, "compare_to_main", return_value=failure), self.assertRaises(
+                    merge_gate.ConsolePromotionRefused) as refused:
+            merge_gate.promote(args)
+        self.assertEqual(str(refused.exception), failure)
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
 
     def test_finished_release_and_live_command_text_do_not_block_promotion(self) -> None:
         args = self.publish_for_promotion()

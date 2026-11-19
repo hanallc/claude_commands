@@ -132,6 +132,14 @@ class ServerMode(Enum):
     LIST_FIXTURE = "List fixture"
 
 
+@dataclass(frozen=True)
+class ReadOnlyConsole:
+    """Serve candidate pages and read live data on loopback."""
+
+    pages: tuple[console.ConsolePage, ...]
+    rebuilds: console.AvailablePage | console.UnavailablePage
+
+
 class ModuleStampUnavailable(Enum):
     UNREADABLE = "unreadable"
 
@@ -300,7 +308,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return None
         if route.path == f"/{change_page.CONSOLE_FOLDER}/":
             try:
-                content = console.render(console.read_pages(), console.read_rebuilds())
+                mode = server.mode
+                content = (console.render(mode.pages, mode.rebuilds) if isinstance(mode, ReadOnlyConsole)
+                           else console.render(console.read_pages(), console.read_rebuilds()))
             except (OSError, ValueError, ImportError) as error:
                 print(f"review-links console: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The console is not available.</p>"))
@@ -375,8 +385,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path == list_page.PAGE_PATH:
             try:
                 with server.list_store_access():
-                    content = list_page.render(root, include_counts=server.mode is ServerMode.LIVE,
-                                               status=server.delivery_status)
+                    content = list_page.render(root, include_counts=server.mode is not ServerMode.LIST_FIXTURE,
+                                               status=server.delivery_status,
+                                               assign_review_ids=not isinstance(server.mode, ReadOnlyConsole))
             except (OSError, ValueError) as error:
                 print(f"review-links list: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The List page is not available.</p>"))
@@ -546,6 +557,15 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         server = cast(ReviewLinksServer, self.server)
+        if isinstance(server.mode, ReadOnlyConsole):
+            if self.headers.get("Content-Length", "0") == "0" and self.is_disks_measure():
+                # The initial Disks request can read reports without starting a measure.
+                now = time.time()
+                target = disks_page.published_generation(disks_page.output_folder())
+                self.disks_measure_response(disks_page.MeasureRequest(disks_page.MeasureStart.CURRENT, target), now)
+            else:
+                self.send_error(405, "This console is read-only")
+            return
         route = urlsplit(self.path)
         if server.mode is ServerMode.LIST_FIXTURE and route.path != list_page.PAGE_PATH:
             self.send_error(404)
@@ -1065,6 +1085,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             self.browser_failure(503, "The measure could not start.", error)
             return
+        self.disks_measure_response(started, now)
+
+    def disks_measure_response(self, measured: disks_page.MeasureRequest, now: float) -> None:
+        """Return the measure state with the current slots and sessions."""
         try:
             report = slots.slot_report(now)
         except (OSError, ValueError) as error:
@@ -1075,7 +1099,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except (OSError, ValueError) as error:
             print(f"review-links disks sessions: {error}", file=sys.stderr)
             folders = None
-        self.json_response(200, {"state": started.state.value, "target": started.target, "slots": report, "sessions": folders})
+        self.json_response(200, {"state": measured.state.value, "target": measured.target, "slots": report, "sessions": folders})
 
     def browser_failure(self, status: int, reason: str, error: Exception) -> None:
         print(f"review-links browser answer: {error}", file=sys.stderr)
@@ -1103,9 +1127,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
 
 
 class ReviewLinksServer(ThreadingHTTPServer):
-    def __init__(self, address: tuple[str, int], root: Path, *, mode: ServerMode = ServerMode.LIVE) -> None:
+    def __init__(self, address: tuple[str, int], root: Path, *, mode: ServerMode | ReadOnlyConsole = ServerMode.LIVE) -> None:
+        if isinstance(mode, ReadOnlyConsole) and address[0] != "127.0.0.1":
+            raise ValueError("The read-only console needs a loopback address.")
         settings = conf.read("review_links")
-        self.mode: ServerMode = mode
+        self.mode: ServerMode | ReadOnlyConsole = mode
         self.store_folder: Path = root.resolve()
         # Use relative paths in the fixture process so a request cannot recreate the store after removal.
         self.root: Path = Path(".") if mode is ServerMode.LIST_FIXTURE else self.store_folder
@@ -1126,6 +1152,8 @@ class ReviewLinksServer(ThreadingHTTPServer):
             _ = sweep_snapshots(self.root, time.time())
         super().__init__(address, ReviewLinksHandler)
         if mode is ServerMode.LIST_FIXTURE:
+            return
+        if isinstance(mode, ReadOnlyConsole):
             return
         recover_changes = change_page.recover_pending
         recover_list = list_page.recover_pending
@@ -1158,7 +1186,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
     @contextmanager
     def list_store_access(self) -> Generator[None]:
         """Keep fixture file access separate from scratch removal."""
-        if self.mode is ServerMode.LIVE:
+        if self.mode is not ServerMode.LIST_FIXTURE:
             yield
             return
         try:
@@ -1184,6 +1212,8 @@ class ReviewLinksServer(ThreadingHTTPServer):
 
     @override
     def service_actions(self) -> None:
+        if isinstance(self.mode, ReadOnlyConsole):
+            return
         if self.mode is ServerMode.LIST_FIXTURE:
             try:
                 present = self.root.samefile(self.store_folder)
