@@ -10,7 +10,7 @@ import secrets
 import sys
 import time
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, tzinfo
 from enum import Enum, StrEnum
@@ -30,6 +30,9 @@ from scripts.review_links import question_record
 from scripts.statusline import counts_row, rebuild_row
 
 PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/list.html"
+COUNTS_QUERY = "counts=1"
+REVIEW_UNAVAILABLE = "Linked review status unavailable"
+COUNTS_AND_LINKS_QUERY = COUNTS_QUERY + "&linked-reviews=1"
 _BOOTSTRAP_FORM_SECRET = secrets.token_bytes(32)
 FIELD_LABELS = {
     "title": "Title", "owner": "Owner", "producer": "Producer", "unit": "Unit", "state": "State",
@@ -374,6 +377,8 @@ def review_summary(item: the_list.ListItem, reviews: Mapping[str, review_items.R
         text = footer_counts.plural(len(ready), kind) + " for you"
     elif waiting:
         text = footer_counts.plural(len(waiting), "review") + " waiting on others"
+    elif not has_all_linked_reviews(item, reviews):
+        text = REVIEW_UNAVAILABLE
     else:
         text = "Reviews done — decide: close, keep or park"
     destinations = tuple(review.key for review in linked if review.type in review_page.TYPES)
@@ -430,16 +435,59 @@ def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff
             + '<ol class="list-log">' + log + '</ol></div></section></div>')
 
 
+class LinkedReviewRead(StrEnum):
+    FROM_DISK = "read from disk"
+    AFTER_RENDER = "read after the first render"
+
+
+type ReviewRecords = Mapping[str, review_items.ReviewItem]
+type ImmediateReviewRecords = ReviewRecords | Literal[LinkedReviewRead.FROM_DISK]
+type ReviewDisplay = ReviewRecords | Literal[LinkedReviewRead.AFTER_RENDER]
+
+
+def has_all_linked_reviews(item: the_list.ListItem, reviews: ReviewRecords) -> bool:
+    return all(identity in reviews for identity in item.reviews)
+
+
 def read_linked_reviews(root: Path, *, members: staff.StaffSnapshot) -> list[review_items.ReviewItem]:
     """Read the Review records without assigning IDs to legacy questions."""
     return review_items.read(root, members=members, assign_ids=False)
 
 
-def review_links(item: the_list.ListItem, reviews: Mapping[str, review_items.ReviewItem], today: datetime) -> str:
+def linked_reviews(root: Path, members: staff.StaffSnapshot, records: ImmediateReviewRecords,
+                   items: Iterable[the_list.ListItem], *, defer_missing: bool = False) -> ReviewRecords:
+    if (records is LinkedReviewRead.FROM_DISK
+            or (not defer_missing and any(not has_all_linked_reviews(item, records) for item in items))):
+        return {review.key: review for review in read_linked_reviews(root, members=members)}
+    return records
+
+
+def review_links(item: the_list.ListItem, reviews: ReviewDisplay, today: datetime) -> str:
     if not item.reviews:
         return ""
+    if reviews is LinkedReviewRead.AFTER_RENDER:
+        return '<div data-list-review-links></div>'
     cards = (review_card(identity, reviews) for identity in item.reviews)
     return '<p>' + review_summary(item, reviews, today) + '</p><p>' + ' · '.join(cards) + '</p>'
+
+
+def render_review_updates(root: Path, members: staff.StaffSnapshot, review_records: ImmediateReviewRecords) -> str:
+    """Render only the linked Review fields for items on the List."""
+    entries = [entry for entry in records() if entry.item.reviews]
+    if not entries:
+        return ""
+    reviews = linked_reviews(root, members, review_records, (entry.item for entry in entries))
+    today = the_list.now()
+    return ''.join(
+        f'<template data-list-review-key="{html.escape(entry.key, quote=True)}"'
+        + f' data-list-review-version="{review_version(entry.item)}">'
+        + '<span data-list-review-summary>' + review_summary(entry.item, reviews, today) + '</span>'
+        + '<div data-list-review-links>' + review_links(entry.item, reviews, today) + '</div></template>'
+        for entry in entries)
+
+
+def review_version(item: the_list.ListItem) -> str:
+    return html.escape(json.dumps((str(item.updated), len(item.log), item.reviews)), quote=True)
 
 
 def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str) -> str:
@@ -462,14 +510,14 @@ def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str) ->
 
 def waiting_details(entry: ListRecord, today: datetime, names: staff_names.StaffNames,
                     unread_answers: frozenset[str], secret: str,
-                    reviews: Mapping[str, review_items.ReviewItem], parking_label: str) -> str:
+                    reviews: ReviewDisplay, parking_label: str) -> str:
     sections = (f'<p data-waiting-note>{WAITING_NOTE}</p><div data-waiting-questions>'
                 + panel_questions(entry.item, today, unread_answers) + '</div>'
                 + review_links(entry.item, reviews, today) + waiting_feedback_form(entry, secret, parking_label))
     return detail_panel(entry, sections, today, names, unread_answers, secret)
 
 
-def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[str, review_items.ReviewItem],
+def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisplay,
             names: staff_names.StaffNames, visibility: the_list.WaitingForAnswer | the_list.QuestionResends,
             unread_answers: frozenset[str], *, parking_label: str) -> str:
     item = entry.item
@@ -495,7 +543,7 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: Mapping[st
 
 
 def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime, index: int, secret: str,
-              reviews: Mapping[str, review_items.ReviewItem], *, parked: bool, open_question: bool,
+              reviews: ReviewDisplay, *, parked: bool, open_question: bool,
               visibility: the_list.WaitingForAnswer | the_list.QuestionResends) -> str:
     item = entry.item
     owner = owner_name(names.members, item.owner)
@@ -543,7 +591,11 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     if parking_label:
         state += '<small data-parked-note>Parked until ' + parking_label + '</small>'
     if item.reviews:
-        state += '<small>' + review_summary(item, reviews, today) + '</small>'
+        if reviews is LinkedReviewRead.AFTER_RENDER:
+            attrs += f' data-list-review-version="{review_version(item)}"'
+            state += f'<small data-list-review-summary="{REVIEW_UNAVAILABLE}">Checking linked reviews…</small>'
+        else:
+            state += '<small data-list-review-summary>' + review_summary(item, reviews, today) + '</small>'
     update = '<span class="list-dot" role="img" aria-label="Unread update"></span>' if unread else '<span aria-label="No unread update">—</span>'
     sent = the_list.sent_to_morty(item)
     if isinstance(sent, datetime):
@@ -616,11 +668,13 @@ class SavedActionState(TypedDict):
     open_question: str
     unread_delivery: NotRequired[str]
     waiting_details_html: NotRequired[str]
+    review_summary_html: NotRequired[str]
     park_request_saved: NotRequired[bool]
 
 
 def saved_action_state(keeper: str, identity: str, *, status: change_page.DeliveryStatus | None = None,
-                       park_request: str = "") -> SavedActionState:
+                       park_request: str = "",
+                       review_records: ImmediateReviewRecords = LinkedReviewRead.FROM_DISK) -> SavedActionState:
     owner = staff.StaffId(keeper)
     item = the_list.load(owner, identity)
     zone = user_zone()
@@ -644,8 +698,15 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
     if waiting:
         members = staff.snapshot()
         names = staff_names.StaffNames(members)
-        reviews = ({review.key: review for review in read_linked_reviews(reading.root, members=members)}
-                   if item.reviews else {})
+        reviews: ReviewRecords = {}
+        if item.reviews:
+            try:
+                reviews = linked_reviews(reading.root, members, review_records, (item,))
+            except (OSError, ValueError, change_review.ChangeReviewError) as error:
+                print(f"review-links List links: {error}", file=sys.stderr)
+                if review_records is not LinkedReviewRead.FROM_DISK:
+                    reviews = review_records
+            saved["review_summary_html"] = review_summary(item, reviews, today)
         saved["waiting_details_html"] = waiting_details(
             ListRecord(owner, item), today.astimezone(zone), names, the_list.unread_answer_ids(item),
             form_secret(reading.root), reviews, parked_until)
@@ -837,8 +898,9 @@ def staff_chips(members: staff.StaffSnapshot, counts: Counter[the_list.ItemOwner
               for label, identity, count in choices)]
 
 
-def render(root: Path, *, include_counts: bool = True,
-           status: change_page.DeliveryStatus | Literal["standalone"] = "standalone") -> bytes:
+def render(root: Path, *, include_counts: bool = True, defer_counts: bool = False,
+           status: change_page.DeliveryStatus | Literal["standalone"] = "standalone",
+           review_records: ReviewRecords | LinkedReviewRead = LinkedReviewRead.FROM_DISK) -> bytes:
     started, read_at = time.perf_counter(), time.time()
     members = staff.snapshot()
     names = staff_names.StaffNames(members)
@@ -851,14 +913,18 @@ def render(root: Path, *, include_counts: bool = True,
             items.append(entry)
     if status == "standalone":
         status = change_page.DeliveryStatus(root)
-    reviews = ({review.key: review for review in read_linked_reviews(root, members=members)}
-               if any(entry.item.reviews for entry in items) else {})
+    reviews: ReviewDisplay = {}
+    if any(entry.item.reviews for entry in items):
+        reviews = (review_records if review_records is LinkedReviewRead.AFTER_RENDER
+                   else linked_reviews(root, members, review_records, (entry.item for entry in items),
+                                       defer_missing=include_counts and defer_counts))
     zone = user_zone()
     today = datetime.fromtimestamp(read_at, zone)
     secret = form_secret(root)
     owners: Counter[the_list.ItemOwner] = Counter()
     producers: Counter[the_list.ItemOwner] = Counter()
     rows: list[str] = []
+    deferred_links = False
     chip_counts: Counter[ListChip] = Counter()
     for index, entry in enumerate(items):
         owners[entry.item.owner] += 1
@@ -868,7 +934,15 @@ def render(root: Path, *, include_counts: bool = True,
         visibility = the_list.question_visibility(entry.keeper, entry.item, status)
         chip_counts[list_chip(entry.item.state, parked=parked, open_question=open_question,
                               unread_delivery=the_list.unread_delivery(entry.item))] += 1
-        rows.append(item_rows(entry, names, today, index, secret, reviews, parked=parked,
+        row_reviews = reviews
+        if entry.item.reviews and (
+            reviews is LinkedReviewRead.AFTER_RENDER
+            or (include_counts and defer_counts and review_records is not LinkedReviewRead.FROM_DISK
+                and not has_all_linked_reviews(entry.item, reviews))
+        ):
+            row_reviews = LinkedReviewRead.AFTER_RENDER
+            deferred_links = True
+        rows.append(item_rows(entry, names, today, index, secret, row_reviews, parked=parked,
                               open_question=open_question, visibility=visibility))
     shows = [record_table.Chip("all", "All", chip_counts.total() - chip_counts[ListChip.PARKED]),
              *(record_table.Chip(chip.value, chip.value.replace("-", " ").capitalize(), chip_counts[chip])
@@ -884,7 +958,15 @@ def render(root: Path, *, include_counts: bool = True,
     card_motion = page_frame.CardMotion.read(settings)
     morning = record_table.clock_minutes(settings, "later_morning")
     log_max_height = settings.whole("list_log_max_height_rem")
-    counts = counts_strip(members, names) if include_counts else ''
+    counts = ''
+    if include_counts:
+        if defer_counts:
+            query = COUNTS_AND_LINKS_QUERY if deferred_links else COUNTS_QUERY
+            timeout_ms = settings.whole("page_request_timeout_seconds") * 1000
+            counts = (f'<div data-list-counts-url="{PAGE_PATH}?{html.escape(query)}"'
+                      + f' data-list-counts-timeout-ms="{timeout_ms}"></div>')
+        else:
+            counts = counts_strip(members, names)
     expansion = ''.join(f'<button type="button" id="list-{action}-all" data-list-expansion="{action}"'
                         + f' aria-label="{label}" title="{label}">' + page_frame.icon_svg(icon) + '</button>'
                         for action, label, icon in (("expand", "Expand all", "chevrons-up-down"),
@@ -1243,6 +1325,11 @@ function bindFeedbackForm(form){
    syncUnread(item,form,confirmed.unread,confirmed.unreadSort);
   };
   const applySavedState=result=>{
+   delete item.dataset.listReviewVersion;
+   if(typeof result.review_summary_html==='string'){
+    const summary=item.querySelector('[data-list-review-summary]');
+    if(summary) summary.innerHTML=result.review_summary_html;
+   }
    if(typeof result.item_state==='string') confirmed.state=result.item_state;
    if(confirmed.state==='Closed'){
     closedKeys.add(key);
@@ -1474,6 +1561,45 @@ function bindFeedbackForm(form){
    }
   });
 }
+let loadingCounts=false;
+async function loadListCounts(){
+ const source=content.querySelector('[data-list-counts-url]');
+ if(!source || loadingCounts) return;
+ const pendingRows=()=>[...content.querySelectorAll('[data-list-review-version]')];
+ const versions=new Map(pendingRows()
+  .map(row=>[row.dataset.key,row.dataset.listReviewVersion]));
+ const wasRequested=row=>versions.get(row.dataset.key)===row.dataset.listReviewVersion;
+ loadingCounts=true;
+ try{
+  const signal=AbortSignal.timeout(Number(source.dataset.listCountsTimeoutMs));
+  const response=await fetch(source.dataset.listCountsUrl,{cache:'no-store',signal});
+  if(!response.ok) return;
+  const markup=await response.text();
+  const footer=content.querySelector('[data-list-counts-url]');
+  if(signal.aborted || !footer) return;
+  footer.innerHTML=markup;
+  const updates=new Map([...footer.querySelectorAll('template[data-list-review-key]')]
+   .map(update=>[update.dataset.listReviewKey,update]));
+  if(updates.size) for(const row of pendingRows().filter(wasRequested)){
+   const update=updates.get(row.dataset.key);
+   if(!update || update.dataset.listReviewVersion!==row.dataset.listReviewVersion) continue;
+   for(const selector of ['[data-list-review-summary]','[data-list-review-links]']){
+    const target=row.querySelector(selector),source=update.content.querySelector(selector);
+    if(target && source) target.replaceChildren(...source.childNodes);
+   }
+   delete row.dataset.listReviewVersion;
+  }
+  for(const update of updates.values()) update.remove();
+ }catch(_){}finally{
+  loadingCounts=false;
+  const pending=pendingRows();
+  for(const row of pending.filter(wasRequested)){
+   const summary=row.querySelector('[data-list-review-summary]');
+   if(summary) summary.textContent=summary.dataset.listReviewSummary;
+  }
+  if(pending.some(row=>!wasRequested(row))) void loadListCounts();
+ }
+}
 async function refresh(_supersede=false,current=()=>true){
  if(saving || dateTimePickerOpen(content)) return;
  const response=await fetch(location.pathname,{cache:'no-store'});
@@ -1492,7 +1618,10 @@ async function refresh(_supersede=false,current=()=>true){
  for(const key of logPositions.keys()) if(!surviving.has(key)) logPositions.delete(key);
  const priorWatches=new Map(watchedAnswers);
  for(const key of priorWatches.keys()) stopWatchingOpenedAnswer(key);
+ const footer=content.querySelector('[data-list-counts-url]'),nextFooter=fresh.querySelector('[data-list-counts-url]');
+ if(footer && nextFooter) nextFooter.replaceChildren(...footer.childNodes);
  content.replaceWith(fresh);content=fresh;
+ void loadListCounts();
  closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
  bindListControls();tableView.replace();
  if(priorWatches.size) for(const item of content.querySelectorAll('[data-list-item]')){
@@ -1617,4 +1746,5 @@ function watchLinkedAnswer(){
  if(row) watchOpenedAnswer(row);
 }
 if(!listReturn) watchLinkedAnswer();
+void loadListCounts();
 })();''')
