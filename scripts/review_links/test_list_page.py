@@ -16,7 +16,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import BinaryIO, cast, override
@@ -1249,6 +1249,25 @@ document.body.append(result);
         self.assertIn('New title &lt;script&gt;', changed)
         self.assertNotIn('<script>New title', changed)
         self.assertIn('New status', changed)
+
+    def test_date_eta_renders_and_sorts_after_a_time_on_the_same_day(self) -> None:
+        day = date(2026, 11, 20)
+        midnight = datetime(2026, 11, 20, tzinfo=user_zone())
+        timed_eta = midnight.replace(hour=15)
+        dated = the_list.add(MORTY.id, "Date ETA", owner=OWNER.id, source="nate", changes={"eta": midnight})
+        timed = the_list.add(MORTY.id, "Time ETA", owner=OWNER.id, source="nate", changes={"eta": timed_eta})
+        path = the_list.folder(MORTY.id) / f"{dated.id}.md"
+        _ = path.write_text(path.read_text().replace(midnight.isoformat(), day.isoformat()))
+        page = list_page.render(self.root / "reviews", include_counts=False).decode()
+        for item, due in ((dated, midnight + timedelta(days=1)), (timed, timed_eta)):
+            row = page.split(f'data-number="{item.number}"', 1)[1].split("</tbody>", 1)[0]
+            if item is dated:
+                with self.subTest(check="display"):
+                    self.assertIn('<td data-label="ETA">2026-11-20</td>', row)
+            with self.subTest(check="sort", item=item.id):
+                encoded = row.split('data-sort-values="', 1)[1].split('"', 1)[0]
+                values = cast(list[object], json.loads(html.unescape(encoded)))
+                self.assertEqual(values[6], [0, due.timestamp()])
 
     def test_linked_reviews_share_one_current_read_and_link_to_the_review_cards(self) -> None:
         def change(identity: str, state: review_items.ReviewState) -> review_items.ReviewItem:

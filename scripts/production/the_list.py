@@ -17,7 +17,7 @@ import threading
 from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
+from datetime import UTC, date, datetime, time, timedelta, timezone, tzinfo
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal, TypedDict, cast
@@ -111,7 +111,7 @@ class UnassignedOwner(StrEnum):
 
 ItemOwner = staff.StaffId | UnassignedOwner
 NextCheck = Timestamp | CheckCondition
-Eta = datetime | EtaRange | EtaStatus | EtaDescription
+Eta = datetime | date | EtaRange | EtaStatus | EtaDescription
 
 
 @dataclass(frozen=True)
@@ -498,7 +498,7 @@ _ETA_INPUT_ERROR = ("Use --eta with Mon D, Mon D HH:MM ZONE, No time yet, Waitin
                     + "For other details, put the reason in --latest-status.")
 
 
-def _cli_eta(text: str) -> datetime | EtaStatus:
+def _cli_eta(text: str) -> datetime | date | EtaStatus:
     if text in _ETA_INPUT_STATUSES:
         return EtaStatus(text)
     match = _ETA_DATE.fullmatch(text)
@@ -518,8 +518,7 @@ def _cli_eta(text: str) -> datetime | EtaStatus:
         raise ListError(_ETA_INPUT_ERROR)
     nearest = min(dates, key=lambda candidate: abs(candidate - today))
     if match[5] is None:
-        midnight = datetime(nearest.year, month, day, tzinfo=zone)
-        return midnight.astimezone(UTC).astimezone(zone)
+        return nearest
     moment = datetime(nearest.year, month, day, int(match[3]), int(match[4]), tzinfo=zone)
     for fold in (0, 1):
         local = moment.replace(fold=fold)
@@ -529,11 +528,21 @@ def _cli_eta(text: str) -> datetime | EtaStatus:
 
 
 def eta_text(value: Eta) -> str:
-    if isinstance(value, datetime):
+    if isinstance(value, (datetime, date)):
         return value.isoformat()
     if isinstance(value, EtaRange):
         return f"{value.earliest.isoformat()}/{value.latest.isoformat()}"
     return value.text if isinstance(value, EtaDescription) else value.value
+
+
+def eta_due(eta: Eta) -> datetime | None:
+    if isinstance(eta, datetime):
+        return eta
+    if isinstance(eta, date):
+        return datetime.combine(eta + timedelta(days=1), time.min, tzinfo=user_zone())
+    if isinstance(eta, EtaRange):
+        return eta.latest
+    return None
 
 
 def _eta_kind(eta: Eta) -> Literal["text", "time or status"]:
@@ -545,6 +554,8 @@ def _read_eta(text: str, kind: str) -> Eta:
         _line(text, "ETA")
         return EtaDescription(text)
     if kind == "time or status":
+        if len(text) == 10 and ISO_TIME.fullmatch(text):
+            return date.fromisoformat(text)
         eta = eta_value(text)
         if not isinstance(eta, EtaDescription):
             return eta

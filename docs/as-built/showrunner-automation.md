@@ -558,14 +558,18 @@ The `the_list.py list` command still shows the item.
 The producer uses `the_list.py answer` to save an answer and mark the item unread.
 Add and update accept `Mon D`, `Mon D HH:MM ZONE`, `No time yet`, `Waiting for nate`, `Paused`, and `Delivered` as an ETA.
 The command selects the date nearest to today in the user's time zone.
-A date alone uses the first valid local instant on that date.
+The record and log store a date-only ETA as an ISO date, such as `2026-11-20`, with kind `time or status`.
+A date-only ETA becomes late at the start of the next day in the user's time zone.
+A time becomes late at that time.
+A range becomes late at its end.
+A status or text description never becomes late.
 Put the reason in `--latest-status`.
 The store still reads ISO times, ranges, text descriptions, `Not asked`, and `Pending` from existing records.
 The `eta_kind` field marks text descriptions as `text` and other estimates as `time or status`.
 The store validates text descriptions as one nonempty line and never parses them as times or ranges.
 Next check accepts a time or a text condition.
 Unknown opened and updated times remain empty.
-Time fields accept offset ISO times; a date alone uses midnight in the user's configured time zone.
+Other time fields accept offset ISO times and read a date as local midnight.
 An empty optional time removes that time.
 
 1. Add an item with `the_list.py add --owner <showrunner staff id> --title <text> --source <source>`.

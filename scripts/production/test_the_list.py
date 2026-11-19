@@ -10,7 +10,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Protocol, cast, final, override
 from unittest.mock import Mock, patch
@@ -124,9 +124,9 @@ class TheListTests(unittest.TestCase):
         zone_name = "America/New_York"
         zone = ZoneInfo(zone_name)
         cases = (
-            ("Nov 19", datetime(2026, 11, 19, tzinfo=zone)),
+            ("Nov 19", date(2026, 11, 19)),
             ("Nov 19 14:30 EST", datetime(2026, 11, 19, 14, 30, tzinfo=zone)),
-            ("Jan 2", datetime(2027, 1, 2, tzinfo=zone)),
+            ("Jan 2", date(2027, 1, 2)),
             ("Jul 4 14:30 EDT", datetime(2026, 7, 4, 14, 30, tzinfo=zone)),
             ("No time yet", "No time yet"),
             ("Waiting for nate", "Waiting for nate"),
@@ -153,14 +153,35 @@ class TheListTests(unittest.TestCase):
                             self.assertEqual((result, output), (1, ""), error)
                             self.assertIn("put the reason in --latest-status", error)
 
-    def test_date_only_eta_uses_the_first_valid_time_when_midnight_is_skipped(self) -> None:
-        with (patch.dict(os.environ, {"USER_ZONE": "America/Havana"}),
-              patch.object(the_list, "now", return_value=datetime(2026, 3, 1, 12, tzinfo=UTC))):
+    def test_date_only_eta_stores_a_plain_date_in_the_record_and_log(self) -> None:
+        with patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
             result = self.command("add", "--title", "Check the ETA", "--owner", RUNNER.id,
-                                  "--source", "nate", "--eta", "Mar 8")
+                                  "--source", "nate", "--eta", "Nov 20")
         self.assertEqual(result, (0, "L1\n", ""))
+        record = (the_list.folder(MORTY.id) / "L1.md").read_text()
+        with self.subTest(where="record"):
+            self.assertIn('\neta: "2026-11-20"\neta_kind: "time or status"\n', record)
+        with self.subTest(where="log"):
+            self.assertIn('"eta": {"value": "2026-11-20", "kind": "time or status"}', record)
         saved = the_list.load(MORTY.id, "L1")
-        self.assertEqual(the_list.eta_text(saved.eta), "2026-03-08T01:00:00-04:00")
+        with self.subTest(where="read"):
+            self.assertEqual(saved.eta, date(2026, 11, 20))
+            self.assertIsInstance(saved.log[0].what, the_list.FieldChange)
+            assert isinstance(saved.log[0].what, the_list.FieldChange)
+            self.assertEqual(saved.log[0].what.fields.get("eta"), saved.eta)
+
+    def test_eta_due_uses_the_next_local_day_for_a_date_and_the_end_of_a_range(self) -> None:
+        cases = (
+            (date(2026, 3, 8), datetime(2026, 3, 9, 4, tzinfo=UTC)),
+            (START, START),
+            (the_list.EtaRange(START, START + timedelta(hours=1)), START + timedelta(hours=1)),
+            (the_list.EtaStatus.PAUSED, None),
+            (the_list.EtaDescription("After the merge"), None),
+        )
+        with patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
+            for eta, expected in cases:
+                with self.subTest(eta=eta):
+                    self.assertEqual(the_list.eta_due(eta), expected)
 
     def test_eta_refuses_other_forms_on_add_and_update(self) -> None:
         item = self.add()
