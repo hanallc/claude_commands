@@ -3125,6 +3125,20 @@ Tests (rows in the existing need tests, each failing first): the 09:07 case (4.6
 
 Risk: between the decay and a second compile, the freed room can admit another step. MemAvailable and the PSI hold still guard that window.
 
+### Phase 44dd — Session folders move to the system disk on natedev  · status: todo
+**From builds (Q518; nate yes 12:26 EST via bob: "yes - you can move /sessions to the system disk"), 2026-11-19:** session and test scratch folders on natedev move from the build disk (/session, a bind of /build/session) to the system disk. Deleting `roots.session.natedev=/session` in config/build_folders.conf is approved. The daily fstrim on /build is not part of this order.
+
+Before measure (4 KiB create, write, fsync, unlink; 200 runs): /session p50 1.61 ms, p90 4.32 ms; the system disk (~/.cache) p50 0.38 ms, p90 1.21 ms.
+
+Work:
+1. Delete `roots.session.natedev`. natedev then uses `roots.session=~/session`. The code makes ~/session (mode 0700) when it is missing.
+2. A new key names /session as the former natedev root (new key; no go needed). The Mac has no former root.
+3. A live session keeps its /session folder until its next start. The session-start hook, the scratch guard, the `.id` lookup, the Disks page and the tmp sweep accept both roots.
+4. At its next start, a session's folder in the former root moves to the new root with the existing `session_move.py` copy, `run` folders included. A folder a live process uses stays.
+5. The tmp sweep judges the former root with its normal rules. No other code deletes there, and no hand delete.
+6. Update the as-built docs for the session root.
+7. After the merge, measure the same p50 in a new session folder.
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
