@@ -22,8 +22,7 @@ except FileNotFoundError:
     pass
 
 from scripts.build_queue.admission_records import process_start_time
-from scripts.direct.verify_checkout_handoff import CheckoutHandoff, receive_checkout_handoffs, send_checkout_descriptors
-from scripts.lib import build_folders, conf, inotify
+from scripts.lib import conf, inotify
 
 
 SCOPE_STOP_TIMEOUT_SECONDS = 10
@@ -32,60 +31,25 @@ POLL_MAX_MILLISECONDS = (1 << 31) - 1
 
 
 @dataclass(frozen=True)
-class InheritedSlotLease:
-    path: Path
+class CheckoutBindingChannel:
     lease_owner: int
-    lock_fd: int
+    address: str
 
 
-@dataclass(frozen=True)
-class CheckoutOwnerChannel:
-    lease_owner: int
-    request_fd: int
-    reply_fd: int
-
-
-@dataclass(frozen=True)
-class SourceCopyLeaseChannel:
-    lease_owner: int
-    request_fd: int
-
-
-CheckoutScopeLease = InheritedSlotLease | CheckoutOwnerChannel | SourceCopyLeaseChannel
-
-
-def checkout_scope_leases(owners: select.poll, deadline: float, cleanup: ExitStack) -> tuple[CheckoutScopeLease, ...]:
-    """Collect each copy lease that the command can use."""
-    leases: list[CheckoutScopeLease] = []
-    address = os.environ.pop("VERIFY_CHECKOUT_CHANNEL", "")
-    handoffs: dict[CheckoutHandoff, int] = {}
-    if address:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as channel:
-            channel.setblocking(False)
-            channel.connect("\0" + address)
-            descriptor = channel.fileno()
-            owners.register(descriptor, select.POLLIN)
-            try:
-                wait_for_checkout_channel(owners, descriptor, deadline, "the checkout descriptor holder did not reply")
-                handoffs = receive_checkout_handoffs(channel, cleanup)
-            finally:
-                owners.unregister(descriptor)
+def checkout_scope_leases() -> tuple[CheckoutBindingChannel, ...]:
+    """Collect the copy owners that must bind the scope."""
+    leases: list[CheckoutBindingChannel] = []
+    source = os.environ.pop("COPIES_CHECKOUT_BIND_ADDRESS", "")
     if os.environ.get("COPIES_RUN_PID") and os.environ.get("COPIES_STEP_SOURCE"):
-        if CheckoutHandoff.SOURCE_CHANNEL not in handoffs:
+        if not source:
             raise ValueError("the source copy has no scope binding channel")
-        leases.append(SourceCopyLeaseChannel(int(os.environ["COPIES_RUN_PID"]), handoffs[CheckoutHandoff.SOURCE_CHANNEL]))
-
-    owner_pid = os.environ.pop("VERIFY_CHECKOUT_OWNER", "")
-    request_fd = os.environ.pop("DOC_COPY_LEASE_FD", "")
-    reply_fd = os.environ.pop("DOC_COPY_REPLY_FD", "")
-    if owner_pid:
-        if request_fd:
-            leases.append(CheckoutOwnerChannel(int(owner_pid), int(request_fd), int(reply_fd)))
-        else:
-            if CheckoutHandoff.PREPARED_LOCK not in handoffs:
-                raise ValueError("the prepared checkout has no inherited lease")
-            leases.append(InheritedSlotLease(Path(os.environ["BUILDLOG_PREPARED_COPY"]), int(owner_pid),
-                                             handoffs[CheckoutHandoff.PREPARED_LOCK]))
+        leases.append(CheckoutBindingChannel(int(os.environ["COPIES_RUN_PID"]), source))
+    owner = os.environ.pop("VERIFY_CHECKOUT_OWNER", "")
+    address = os.environ.pop("VERIFY_CHECKOUT_BIND_ADDRESS", "")
+    if owner:
+        if not address:
+            raise ValueError("the checkout has no scope binding channel")
+        leases.append(CheckoutBindingChannel(int(owner), address))
     return tuple(leases)
 
 
@@ -241,42 +205,25 @@ def wait_for_checkout_confirmation(owners: select.poll, reply: int, deadline: fl
         owners.unregister(reply)
 
 
-def bind_source_copy_scope(checkout: SourceCopyLeaseChannel, request: bytes,
-                           owners: select.poll, deadline: float) -> None:
-    # Each scope gets its own reply, even when commands share a source copy.
-    reader, writer = socket.socketpair()
-    with reader, writer:
-        with socket.socket(fileno=os.dup(checkout.request_fd)) as channel:
-            descriptor = channel.fileno()
-            owners.register(descriptor, select.POLLOUT)
-            try:
-                wait_for_checkout_channel(
-                    owners, descriptor, deadline, "the source copy channel did not accept the checkout scope")
-                try:
-                    send_checkout_descriptors(channel, request, [writer.fileno()])
-                except BlockingIOError as error:
-                    raise ValueError("the source copy channel filled before the checkout scope was sent") from error
-            finally:
-                owners.unregister(descriptor)
-        writer.close()
-        wait_for_checkout_confirmation(owners, reader.fileno(), deadline)
+def send_checkout_scope(channel: socket.socket, request: bytes, owners: select.poll, deadline: float) -> None:
+    descriptor = channel.fileno()
+    owners.register(descriptor, select.POLLOUT)
+    try:
+        wait_for_checkout_channel(owners, descriptor, deadline, "the copy owner did not accept the checkout scope")
+        try:
+            _ = channel.send(request, socket.MSG_DONTWAIT)
+        except BlockingIOError as error:
+            raise ValueError("the copy channel filled before the checkout scope was sent") from error
+    finally:
+        owners.unregister(descriptor)
 
 
-def bind_checkout_scope(checkout: CheckoutScopeLease, scope: Path, owners: select.poll, deadline: float) -> None:
-    owner_start = process_start_time(checkout.lease_owner)
-    if owner_start is None:
-        raise ValueError("the checkout lease owner exited before scope publication")
-    if isinstance(checkout, SourceCopyLeaseChannel):
-        bind_source_copy_scope(checkout, os.fsencode(scope) + b"\n", owners, deadline)
-    elif isinstance(checkout, CheckoutOwnerChannel):
-        _ = os.write(checkout.request_fd, os.fsencode(scope) + b"\n")
-        wait_for_checkout_confirmation(owners, checkout.reply_fd, deadline)
-    else:
-        build_folders.write_checkout_lease(
-            checkout.path, build_folders.CheckoutScopeBinding(scope, checkout.lease_owner),
-            checkout.lock_fd)
-    if process_start_time(checkout.lease_owner) != owner_start:
-        raise ValueError("the checkout lease owner exited during scope publication")
+def bind_checkout_scope(checkout: CheckoutBindingChannel, scope: Path, owners: select.poll, deadline: float) -> None:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as channel:
+        channel.setblocking(False)
+        channel.connect("\0" + checkout.address)
+        send_checkout_scope(channel, os.fsencode(scope) + b"\n", owners, deadline)
+        wait_for_checkout_confirmation(owners, channel.fileno(), deadline)
 
 
 def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
@@ -306,10 +253,10 @@ def run_scoped_step(caller: int, leader: int, release_state: Path, peak: str,
                 raise ValueError("a scope owner exited before launch")
             watch = None
             deadline = 0.0
-            if os.environ.get("VERIFY_CHECKOUT_CHANNEL") or os.environ.get("VERIFY_CHECKOUT_OWNER"):
+            leases = checkout_scope_leases()
+            if leases:
                 seconds = conf.read_or_repository("direct").number("VERIFY_SCOPE_PUBLICATION_SECONDS")
                 deadline = time.monotonic() + seconds
-            leases = checkout_scope_leases(owners, deadline, cleanup)
             lease_owners = {lease.lease_owner for lease in leases} - {caller, leader, supervisor}
             lease_owner_fds = tuple(open_pidfd(owner, cleanup) for owner in lease_owners)
             if leases:

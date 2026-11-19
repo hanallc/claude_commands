@@ -220,29 +220,13 @@
 
 set -euo pipefail
 
-# The source copy owner keeps the lock and accepts scope requests.
-if [[ "${COPIES_RUN_LOCK_FD:-}" =~ ^[0-9]+$ ]]; then
-    exec {COPIES_RUN_LOCK_FD}>&-
-    unset COPIES_RUN_LOCK_FD
-fi
-if [[ "${OSTYPE:-}" == linux* && -n "${COPIES_RUN_BIND_FD:-}${BUILDLOG_PREPARED_COPY_LOCK_FD:-}" ]]; then
+# Close descriptors from callers that still pass checkout locks.
+if [[ -n "${COPIES_RUN_LOCK_FD:-}${COPIES_RUN_BIND_FD:-}${BUILDLOG_PREPARED_COPY_LOCK_FD:-}" ]]; then
     checkout_scripts=${BASH_SOURCE[0]%/*}
     [[ "$checkout_scripts" != "${BASH_SOURCE[0]}" ]] || checkout_scripts=.
     source "$checkout_scripts/../lint/invoke.sh" --checkout-handoffs
-    checkout_python="$(run_without_checkout_handoffs "$checkout_scripts/../lib/py" -S -c 'import sys; print(sys.executable)')"
-    coproc VERIFY_CHECKOUT {
-        exec "$checkout_python" "$checkout_scripts/verify_checkout_handoff.py" "$$"
-    }
-    checkout_reply=${VERIFY_CHECKOUT[0]:-}
-    checkout_input=${VERIFY_CHECKOUT[1]:-}
     close_checkout_handoffs
-    if [[ -z "$checkout_reply" ]] || ! IFS= read -r VERIFY_CHECKOUT_CHANNEL <&"$checkout_reply"; then
-        printf '%s\n' 'verify.sh: cannot start the checkout descriptor holder' >&2
-        exit 2
-    fi
-    exec {checkout_reply}<&- {checkout_input}>&-
 fi
-export -n VERIFY_CHECKOUT_CHANNEL
 
 usage() {
     sed -n '/^# Usage:$/,/^# End usage\./{
@@ -565,7 +549,7 @@ elif [[ -z "${IN_NIX_SHELL:-}" ]]; then
     [[ "$VERIFY_NIX_SCRIPT_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_NIX_SCRIPT_DIR=.
     VERIFY_NIX_SCRIPT_DIR="$(cd -- "$VERIFY_NIX_SCRIPT_DIR" && pwd -P)"
     export VERIFY_NIX_ENV_REEXEC=1
-    VERIFY_CHECKOUT_CHANNEL="${VERIFY_CHECKOUT_CHANNEL:-}" exec "$PY" -S "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/nix_env.py" \
+    exec "$PY" -S "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/nix_env.py" \
         exec "$VERIFY_NIX_SCRIPT_DIR/${BASH_SOURCE[0]##*/}" "$@"
 fi
 unset VERIFY_NIX_ENV_REEXEC
@@ -2046,7 +2030,7 @@ trust = copies.SshSourceTrust(trusted_caller=trusted_linux_source, trusted_root=
                              registered_worktree=nix_env.registered_worktree)
 with copies.checkout_owner_pipes() as pipes, copies.remote_step_source(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4]), trust) as checkout:
     pipes.publish_path(checkout)
-    pipes.request.read(1)
+    pipes.wait_for_publish()
 '
     if [[ -n "$ssh_caller" ]]; then
         VERIFY_PY_HELPER=SSH_SOURCE_PY step_checkout "$PY" -c "$ssh_source_py" "$STEP_COPIES_SCRIPT" "$top" "$tree" "$ssh_caller" || return 2
@@ -2056,7 +2040,10 @@ with copies.checkout_owner_pipes() as pipes, copies.remote_step_source(Path(sys.
 }
 
 step_checkout() {
-    coproc DOC_COPY { exec "$@"; }
+    local checkout_parent=${BASHPID:-$$}
+    coproc DOC_COPY {
+        VERIFY_CHECKOUT_CALLER_PID=$$ VERIFY_CHECKOUT_PARENT_PID=$checkout_parent exec "$@"
+    }
     DOC_COPY_OWNER_PID=$!
     # A failed move leaves the original descriptor in the variable.
     DOC_COPY_LEASE_FD=${DOC_COPY[1]:-}
@@ -2866,10 +2853,11 @@ run_checkout_step() (
         return $?
     fi
     local DOC_COPY_OWNER_PID="" DOC_COPY_LEASE_FD="" DOC_COPY_REPLY_FD="" MAC_SOURCE_ROOT=""
-    local command=() argument_count
+    local command=() argument_count DOC_COPY_BIND_ADDRESS
     step_checkout "$PY" "$STEP_COPIES_SCRIPT" hold --repo "$VERIFY_SLOT_SOURCE" --tree "$VERIFY_SLOT_TREE" \
         --step "$CMD" --capacity-file "$VERIFY_SLOT_CAPACITY_FILE" --bind-scope -- "$@" || return $?
-    if ! IFS= read -r argument_count <&"$DOC_COPY_REPLY_FD" ||
+    if ! IFS= read -r DOC_COPY_BIND_ADDRESS <&"$DOC_COPY_REPLY_FD" ||
+       ! IFS= read -r argument_count <&"$DOC_COPY_REPLY_FD" ||
        [[ ! "$argument_count" =~ ^[1-9][0-9]*$ ]] ||
        ! mapfile -d '' -n "$argument_count" command <&"$DOC_COPY_REPLY_FD" ||
        (( ${#command[@]} != argument_count )) || ! cd -- "$MAC_SOURCE_ROOT"; then
@@ -2897,15 +2885,17 @@ run_placed_scope() {
         export BUILDLOG_RESERVED_STEP
     fi
     local output="$PLACEMENT_SCOPE_STATE.output" supervisor reader status=0
-    local checkout_owner="" peak=${BUILDLOG_PEAK:-$PLACEMENT_SCOPE_STATE.peak}
+    local checkout_owner="" checkout_address="" peak=${BUILDLOG_PEAK:-$PLACEMENT_SCOPE_STATE.peak}
     if [[ -n "${DOC_COPY_LEASE_FD:-}" ]]; then
         checkout_owner=$DOC_COPY_OWNER_PID
+        checkout_address=$DOC_COPY_BIND_ADDRESS
     elif [[ -n "${BUILDLOG_PREPARED_COPY:-}" &&
             "$BUILDLOG_PREPARED_COPY" == "${DOC_REPO_TOP:-${VERIFY_REPO_ROOT:-}}" ]]; then
         checkout_owner=${BUILDLOG_RUN:-}
         checkout_owner=${checkout_owner%%:*}
-        if [[ -z "${VERIFY_CHECKOUT_CHANNEL:-}" || ! "$checkout_owner" =~ ^[1-9][0-9]*$ ]]; then
-            printf 'the prepared checkout has no inherited lease\n' > "$PLACEMENT_SCOPE_STATE"
+        checkout_address=${BUILDLOG_PREPARED_COPY_BIND_ADDRESS:-}
+        if [[ -z "$checkout_address" || ! "$checkout_owner" =~ ^[1-9][0-9]*$ ]]; then
+            printf 'the prepared checkout has no scope binding channel\n' > "$PLACEMENT_SCOPE_STATE"
             return 125
         fi
     fi
@@ -2915,13 +2905,7 @@ run_placed_scope() {
         return 125
     fi
     (
-        if [[ -n "${DOC_COPY_LEASE_FD:-}" ]]; then
-            # Bash closes descriptors copied from a coprocess pipe when it executes Python.
-            exec {DOC_COPY_LEASE_FD}>"/dev/fd/$DOC_COPY_LEASE_FD" \
-                {DOC_COPY_REPLY_FD}<"/dev/fd/$DOC_COPY_REPLY_FD" || exit 125
-            export DOC_COPY_LEASE_FD DOC_COPY_REPLY_FD
-        fi
-        export VERIFY_CHECKOUT_OWNER="$checkout_owner" VERIFY_CHECKOUT_CHANNEL="${VERIFY_CHECKOUT_CHANNEL:-}"
+        export VERIFY_CHECKOUT_OWNER="$checkout_owner" VERIFY_CHECKOUT_BIND_ADDRESS="$checkout_address"
         exec "$PY" "$VERIFY_START_DIR/verify_scoped_step.py" "$$" "$leader" "$PLACEMENT_SCOPE_STATE" \
             "$peak" "$BUILDLOG_SCOPE_SH" "$@"
     ) > "$output" 2>&1 &

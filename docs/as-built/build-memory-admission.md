@@ -264,21 +264,19 @@ Cargo writes to a file. A separate reader sends the file contents to the step lo
 The supervisor can return a shutdown error while a process still has the file open.
 Verify closes the launch before it releases or cancels the grant.
 If shutdown fails, verify reports the error and keeps the reservation for the service to reclaim.
-Before local Cargo starts, the checkout lock holder writes the scope path to the doc checkout lease record.
-For a private checkout, the supervisor asks the copy owner to write the scope and waits for confirmation.
-The copy owner writes the confirmation line in one pipe write.
-The supervisor reads to the end of the line.
-For a prepared checkout, the supervisor writes the scope while it holds the inherited slot lock.
-Verify transfers inherited checkout descriptors to a holder before it starts its helpers.
-The holder exits when Verify exits.
-The scope supervisor receives the descriptors through a local socket.
-The private checkout pipes close on exec.
-The shell duplicates those pipes only in the supervisor launch.
-The copy owner keeps the checkout protocol separate from the streams that its commands inherit.
+Before local Cargo starts, the copy owner writes the scope path to each checkout lease record.
+The same owner protocol binds private slots, prepared slots, and source copies.
+The owner keeps the checkout lock and sends only a confirmation.
+The owner checks `SO_PEERCRED` and the peer's process ancestry before it binds the scope.
+Only the scope supervisor that Verify launched can request the binding.
+The private checkout owner watches Verify and the launch shell by pidfd.
+A child with an open protocol pipe cannot keep the lease after either process exits.
+The copy owner keeps the protocol apart from the streams that its commands inherit.
+The Python shim closes inherited descriptors for its interpreter probe.
 `VERIFY_SCOPE_PUBLICATION_SECONDS` sets the deadline in `config/direct.conf`.
-The deadline covers scope publication, the source copy request, and lease confirmation.
-The supervisor waits for channel capacity and checks for owner exit before it sends the request.
-The source copy request uses a nonblocking datagram send.
+The deadline covers scope publication, the scope request, and lease confirmation.
+The supervisor checks for owner exit and channel capacity before the request.
+The request uses a nonblocking socket send.
 Verify refuses launch if the channel fills after the readiness check.
 The supervisor divides long waits into intervals that fit the kernel's poll limit.
 The supervisor checks the deadline after its last check that the owners are alive.

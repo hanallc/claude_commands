@@ -26,6 +26,7 @@ import unittest
 
 from scripts.lint.memory_test_support import fake_memory_readings
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 VERIFY = Path(__file__).with_name("verify.sh")
 SCRIPTS = VERIFY.parent.parent
@@ -222,6 +223,14 @@ class VerifyDocFixture(unittest.TestCase):
     def git(self, *arguments: str) -> str:
         return subprocess.run(["git", "-C", str(self.repo), *arguments], env=self.environment,
                               capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
+
+    def copies_verify_command(self, *arguments: str) -> tuple[str, ...]:
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        caller = fixture_member("showrunner", name="verify-copy")
+        self.environment["CLAUDE_CODE_SESSION_ID"] = caller.current_session
+        copies = VERIFY.parents[1] / "copies/copies.py"
+        return (sys.executable, str(copies), "run", "--repo", str(self.repo), "--commit", "HEAD", "--",
+                "bash", str(VERIFY), *arguments)
 
     def verify(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["bash", str(VERIFY), "doc", *arguments], cwd=self.repo,

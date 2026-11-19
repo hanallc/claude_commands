@@ -22,6 +22,7 @@ from scripts.agents.remote import local_machine
 from scripts.build_queue import admission_protocol as wire, admission_records, admission_service as service, execution_identity, memory_feed, placement
 from scripts.buildlog import treekey
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+from scripts.copies.scope_bindings import CopyOwnerLaunch, OwnedCheckoutLease, checkout_scope_channel
 from scripts.direct.verify_doc_test_support import CARGO_STUB, VERIFY, VerifyDocFixture
 from scripts.direct.verify_mac_offload_test_support import processes_carrying, reap, wait_for_marker_exit
 from scripts.direct.verify_scope_test_support import use_fixture_scope_readings, write_real_scope_launcher
@@ -248,14 +249,6 @@ with {patches}:
     def test_doc_scope_stop_failure_retains_checkout_and_reservation_after_sidecar_sweep(self) -> None:
         self.assert_doc_retains_checkout_until_scope_empties(interrupt=False, sweep_scope_sidecar=True)
 
-    def copies_verify_command(self, *arguments: str) -> tuple[str, ...]:
-        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
-        caller = fixture_member("showrunner", name="verify-copy")
-        self.environment["CLAUDE_CODE_SESSION_ID"] = caller.current_session
-        copies = VERIFY.parents[1] / "copies/copies.py"
-        return (sys.executable, str(copies), "run", "--repo", str(self.repo), "--commit", "HEAD", "--",
-                "bash", str(VERIFY), *arguments)
-
     def test_copies_run_binds_the_doc_checkout_before_cargo(self) -> None:
         self.assert_doc_retains_checkout_until_scope_empties(
             interrupt=False, command=self.copies_verify_command("doc"))
@@ -391,7 +384,7 @@ from scripts.test_times import task_cpu
 
 original = task_cpu.command_arguments
 observations = []
-source_handoffs = set()
+source_locks = set()
 slot_pipes = set()
 verify_pid = 0
 
@@ -406,11 +399,12 @@ def inspect(pid):
         for fd in (proc / "fd").iterdir():
             with suppress(FileNotFoundError):
                 descriptors[os.fsencode(fd.name)] = os.readlink(fd)
-        if "verify.sh" in names and b"COPIES_RUN_BIND_FD" in environment and not verify_pid:
+        if "verify.sh" in names and b"COPIES_CHECKOUT_BIND_ADDRESS" in environment and not verify_pid:
             verify_pid = pid
-            source_handoffs.update(descriptors[environment[key]] for key in (b"COPIES_RUN_BIND_FD", b"COPIES_RUN_LOCK_FD"))
-        if "verify_scoped_step.py" in names:
-            slot_pipes.update(descriptors[environment[key]] for key in (b"DOC_COPY_LEASE_FD", b"DOC_COPY_REPLY_FD"))
+            source = Path(os.fsdecode(environment[b"COPIES_STEP_SOURCE"])).parent
+            source_locks.add(str(source.with_name(source.name + ".lock")))
+        if verify_pid and "copies.py" in names and "hold" in arguments:
+            slot_pipes.update(descriptors[fd] for fd in (b"0", b"1") if descriptors[fd].startswith("pipe:"))
         if verify_pid:
             observations.append((pid, arguments, names, set(descriptors.values())))
     return arguments
@@ -420,17 +414,15 @@ with patch.object(task_cpu, "command_arguments", inspect):
                            timeout_s=TEST_HANG_GUARD_SECS, output_fd=1)
 if run.status != 0:
     sys.exit(run.status)
-assert source_handoffs and slot_pipes, "the fixture did not see both checkout handoffs"
+assert source_locks and slot_pipes, "the fixture did not see the source lease and checkout pipes"
 assert any("taplo" in names for _, _, names, _ in observations)
 assert any("tee" in names for _, _, names, _ in observations)
 assert any("verify_scoped_step.py" in names for _, _, names, _ in observations)
 assert any("dev_features.py" in names for _, _, names, _ in observations), "the helper fallback did not run"
 leaks = set()
-for pid, arguments, names, descriptors in observations:
-    if pid == verify_pid or "verify_checkout_handoff.py" in names:
-        continue
-    unexpected = descriptors & source_handoffs
-    if "verify_scoped_step.py" not in names and not ("copies.py" in names and "hold" in arguments):
+for _, arguments, names, descriptors in observations:
+    unexpected = descriptors & source_locks
+    if not ("copies.py" in names and "hold" in arguments):
         unexpected |= descriptors & slot_pipes
     if unexpected:
         leaks.add(tuple(map(os.path.basename, arguments[:3])))
@@ -557,12 +549,12 @@ import select
 import time
 from types import SimpleNamespace
 
-bind = verify_scoped_step.bind_source_copy_scope
+send = verify_scoped_step.send_checkout_scope
 poll = verify_scoped_step.poll_checkout_until
 elapsed = 0.0
 clock = SimpleNamespace(monotonic=lambda: time.monotonic() + elapsed)
 
-def bind_full_channel(checkout, request, owners, deadline):
+def send_on_full_channel(channel, request, owners, deadline):
     global elapsed
     sender, receiver = socket.socketpair(type=socket.SOCK_DGRAM)
     with sender, receiver:
@@ -581,13 +573,12 @@ def bind_full_channel(checkout, request, owners, deadline):
                 Path({str(full)!r}).touch()
             return ready
 
-        full_channel = verify_scoped_step.SourceCopyLeaseChannel(checkout.lease_owner, sender.fileno())
         try:
             with patch.object(verify_scoped_step, "poll_checkout_until", fill_after_pollout):
-                bind(full_channel, request, owners, deadline)
+                send(sender, request, owners, deadline)
         finally:
             assert os.get_blocking(sender.fileno()), "the send changed the shared socket flags"
-''', 'patch.object(verify_scoped_step, "bind_source_copy_scope", bind_full_channel), '
+''', 'patch.object(verify_scoped_step, "send_checkout_scope", send_on_full_channel), '
             + 'patch.object(verify_scoped_step, "time", clock)')
         process, log, _ = self.start_doc(command=self.copies_verify_command("doc"))
         wait_until(lambda: full.is_file() or process.poll() is not None, self.root, processes=(process,))
@@ -598,20 +589,29 @@ def bind_full_channel(checkout, request, owners, deadline):
             self.fail("The supervisor did not release the launch lock after the source copy channel filled.")
         output = log.read_text()
         self.assertEqual(status, 125, output)
-        self.assertIn("the source copy channel filled before the checkout scope was sent", output)
+        self.assertIn("the copy channel filled before the checkout scope was sent", output)
         self.assertIn("keeping the reservation", output)
         self.assertFalse(self.events.exists())
         self.assertFalse(self.pass_records())
 
-    def test_doc_refuses_checkout_confirmation_after_the_deadline(self) -> None:
+    def instrument_checkout_confirmation(self, setup: str, patches: str) -> None:
         self.instrument_scope_supervisor('''
+reply_fd = -1
+confirm = verify_scoped_step.wait_for_checkout_confirmation
+
+def track_reply(owners, reply, deadline):
+    global reply_fd
+    reply_fd = reply
+    confirm(owners, reply, deadline)
+''' + setup, patches + ', patch.object(verify_scoped_step, "wait_for_checkout_confirmation", track_reply)')
+
+    def test_doc_refuses_checkout_confirmation_after_the_deadline(self) -> None:
+        self.instrument_checkout_confirmation('''
 import time
 from types import SimpleNamespace
 
 read = os.read
 elapsed = 0
-reply_fd = int(os.environ["DOC_COPY_REPLY_FD"])
-
 def receive_reply(descriptor, size):
     global elapsed
     reply = read(descriptor, size)
@@ -624,15 +624,13 @@ clock = SimpleNamespace(monotonic=lambda: time.monotonic() + elapsed)
         self.assert_doc_publication_timeout()
 
     def test_doc_refuses_launch_when_the_final_owner_check_passes_the_deadline(self) -> None:
-        self.instrument_scope_supervisor('''
+        self.instrument_checkout_confirmation('''
 import select
 import time
 from types import SimpleNamespace
 
 real_poll = select.poll
 elapsed = 0
-reply_fd = int(os.environ["DOC_COPY_REPLY_FD"])
-
 class OwnerPoll:
     def __init__(self):
         self.poller = real_poll()
@@ -667,12 +665,20 @@ clock = SimpleNamespace(monotonic=lambda: time.monotonic() + elapsed)
         self.assertFalse(self.pass_records())
 
     def test_doc_accepts_a_checkout_confirmation_split_across_reads(self) -> None:
-        self.instrument_scope_supervisor('''
+        self.instrument_checkout_confirmation('''
 read = os.read
-reply_fd = int(os.environ["DOC_COPY_REPLY_FD"])
+remaining = b""
 
 def split_reply(descriptor, size):
-    return read(descriptor, min(size, 5) if descriptor == reply_fd else size)
+    global remaining
+    if descriptor != reply_fd:
+        return read(descriptor, size)
+    if remaining:
+        data, remaining = remaining, b""
+        return data
+    data = read(descriptor, size)
+    remaining = data[5:]
+    return data[:5]
 ''', 'patch.object(os, "read", split_reply)')
         result = self.verify()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -753,16 +759,42 @@ with patch.object(os, "replace", owner_exits_before_replace):
         self.assertNotIn("scope", record)
         self.assertFalse(self.events.exists())
 
+    def test_copy_owner_releases_checkout_when_verify_exits_with_a_pipe_open(self) -> None:
+        copies = VERIFY.parents[1] / "copies/copies.py"
+        command = [sys.executable, str(copies), "hold", "--repo", str(self.repo),
+                   "--tree", self.git("write-tree"), "--scratch"]
+        log = self.root / "copy-owner.log"
+        with subprocess.Popen(["cat"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL) as verify, log.open("wb") as errors:
+            environment = {**self.environment, "VERIFY_CHECKOUT_CALLER_PID": str(verify.pid)}
+            copy_owner = subprocess.Popen(command, env=environment, cwd=self.repo, stdin=subprocess.PIPE,
+                                          stdout=subprocess.PIPE, stderr=errors)
+            with copy_owner as owner:
+                assert owner.stdin is not None and owner.stdout is not None
+                try:
+                    readable, _, _ = select.select([owner.stdout], [], [], TEST_HANG_GUARD_SECS)
+                    self.assertTrue(readable, "The copy owner did not publish its checkout")
+                    checkout = Path(os.fsdecode(os.read(owner.stdout.fileno(), 4096).rstrip(b"\n")))
+                    self.assertTrue(checkout.is_absolute(), log.read_text())
+                    self.assertEqual(build_folders.build_folder_state(checkout.parent, wait=False), "held")
+                    verify.kill()
+                    _ = verify.wait(timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(owner.wait(timeout=TEST_HANG_GUARD_SECS), 0, log.read_text())
+                    self.assertFalse(owner.stdin.closed)
+                    self.assertNotEqual(build_folders.build_folder_state(checkout.parent, wait=False), "held")
+                finally:
+                    owner.kill()
+                    verify.kill()
+
     def test_doc_scope_command_does_not_inherit_checkout_pipe(self) -> None:
         _ = self.use_real_scope()
         lease_pipes = self.root / "lease-pipes"
         cargo_pipes = self.root / "cargo-pipes"
         self.install_scope_interpreter(f'''
 from pathlib import Path
-descriptors = (os.environ["DOC_COPY_LEASE_FD"], os.environ["DOC_COPY_REPLY_FD"])
-Path({str(lease_pipes)!r}).write_text("\\n".join(os.readlink(f"/proc/self/fd/{{fd}}") for fd in descriptors))
+if "--bind-scope" in script_arguments:
+    Path({str(lease_pipes)!r}).write_text("\\n".join(os.readlink(f"/proc/self/fd/{{fd}}") for fd in (0, 1)))
 os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
-''')
+''', scripts=("/copies.py",))
         self.executable(self.root / "bin/cargo", CARGO_STUB.replace(
             '    raise SystemExit(int(os.environ.get("TEST_DOC_STATUS", "0")))', f'''
     targets = []
@@ -1103,7 +1135,10 @@ for descriptor in (8, 74):
             self.environment["BUILDLOG_PREPARED_COPY_LOCK_FD"] = str(descriptor)
             self.environment["BUILDLOG_RUN"] = f"{os.getpid()}:{admission_records.process_start_time(os.getpid())}"
             self.environment["TEST_METADATA"] = self.environment["TEST_METADATA"].replace(str(original), str(slot.path))
-            yield slot.path
+            lease = OwnedCheckoutLease(slot.path, descriptor, build_folders.CheckoutLeaseKind.READY_SLOT)
+            with checkout_scope_channel(lease, CopyOwnerLaunch(os.getpid())) as address:
+                self.environment["BUILDLOG_PREPARED_COPY_BIND_ADDRESS"] = address
+                yield slot.path
 
     def assert_doc_uses_the_prepared_copy(self, command: tuple[str, ...]) -> None:
         with self.prepared_doc_slot() as checkout:
@@ -1115,6 +1150,40 @@ for descriptor in (8, 74):
             self.assertEqual(list((self.root / "slots").glob("*-slot*.lease.json")),
                              [build_slots.lease_path(checkout)])
 
+    def test_direnv_cannot_bind_or_receive_a_prepared_checkout_lease(self) -> None:
+        observed = self.root / "direnv-copy-reply"
+        _ = self.environment.pop("IN_NIX_SHELL", None)
+        self.executable(self.root / "bin/direnv", f'''
+import json
+import os
+from pathlib import Path
+import socket
+import sys
+
+if sys.argv[1:] == ["export", "json"]:
+    legacy = os.environ.get("VERIFY_CHECKOUT_CHANNEL", "")
+    address = legacy or os.environ["BUILDLOG_PREPARED_COPY_BIND_ADDRESS"]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as channel:
+        channel.settimeout({TEST_HANG_GUARD_SECS!r})
+        channel.connect("\\0" + address)
+        try:
+            if not legacy:
+                scope = Path({str(self.root)!r}) / f"verify-step-{{os.getpid()}}.scope"
+                _ = channel.send(os.fsencode(scope) + b"\\n")
+            reply = channel.recv(128)
+        except (BrokenPipeError, ConnectionResetError):
+            reply = b""
+    Path({str(observed)!r}).write_bytes(reply)
+    print(json.dumps({{"IN_NIX_SHELL": "impure"}}))
+''')
+        with self.prepared_doc_slot() as checkout:
+            _ = (checkout / ".envrc").write_text("# Use the fixture direnv.\n")
+            descriptor = build_folders.build_folder_lock_fd(checkout)
+            process, log, _ = self.start_doc(pass_fds=(descriptor,))
+            self.assertEqual(process.wait(TEST_HANG_GUARD_SECS), 0, log.read_text())
+            self.assertEqual(observed.read_bytes(), b"", "direnv received a checkout lease response")
+            self.assertEqual(len(self.cargo_calls()), 1)
+
     def test_doc_uses_the_prepared_copy_without_taking_a_second_slot(self) -> None:
         self.assert_doc_uses_the_prepared_copy(DOC_COMMAND)
 
@@ -1122,20 +1191,24 @@ for descriptor in (8, 74):
         self.instrument_scope_supervisor('''
 from pathlib import Path
 
-collect = verify_scoped_step.checkout_scope_leases
+bind = verify_scoped_step.bind_checkout_scope
 
-def inspect_lock(*args):
-    leases = collect(*args)
-    inherited, = (lease for lease in leases if isinstance(lease, verify_scoped_step.InheritedSlotLease))
-''' + check + '''
-    return leases
-''', 'patch.object(verify_scoped_step, "checkout_scope_leases", inspect_lock)')
+def inspect_lock(checkout, scope, owners, deadline):
+    bind(checkout, scope, owners, deadline)
+    tree = Path.cwd()
+    lock = tree.with_name(tree.name + ".lock")
+''' + check, 'patch.object(verify_scoped_step, "bind_checkout_scope", inspect_lock)')
 
     def assert_prepared_lock_on_descriptor(self, descriptor: int) -> None:
         self.inspect_prepared_scope_lock('''
-    tree = Path.cwd()
-    lock = tree.with_name(tree.name + ".lock")
-    assert os.path.samestat(os.fstat(inherited.lock_fd), lock.stat()), "Verify replaced the handed-off checkout lock"
+    for descriptor in Path("/proc/self/fd").iterdir():
+        try:
+            inherited = os.readlink(descriptor)
+        except FileNotFoundError:
+            continue
+        assert inherited != str(lock), "The supervisor inherited the checkout lock"
+    record = __import__("json").loads(lock.with_suffix(".lease.json").read_text())
+    assert record["scope"] == str(scope), "The copy owner did not bind the prepared checkout"
 ''')
         handoff = '''target=$1
 shift
@@ -1185,7 +1258,7 @@ exec "$@"'''
         self.inspect_prepared_scope_lock('''
     import fcntl
     descriptor = int(os.environ["TEST_INDEPENDENT_CHECKOUT_FD"])
-    matches = os.path.samestat(os.fstat(descriptor), os.fstat(inherited.lock_fd))
+    matches = os.path.samestat(os.fstat(descriptor), lock.stat())
     read_only = (fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE) == os.O_RDONLY
     assert matches and read_only, "Verify did not preserve the independent lock file descriptor"
 ''')

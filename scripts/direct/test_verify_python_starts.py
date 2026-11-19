@@ -12,13 +12,16 @@ import subprocess
 import sys
 from typing import override
 import unittest
+from unittest.mock import patch
 
 from scripts.lib.shell_test_support import shell_function, shell_functions
 from scripts.direct.tree_watch_test_support import TreeWatchFixture
+from scripts.direct.verify_doc_test_support import VerifyDocFixture
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
 from scripts.direct.verify_lint_scope_test_support import VERIFY, CARGO_STUB, TAPLO_STUB
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.test_times import task_cpu
 
 
 class VerifyPythonStartsTests(VerifyLintCacheFixture):
@@ -150,6 +153,73 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
                 environment["LINT_CONFIG_FILE"] = str(unreadable)
                 _ = key(unreadable=True)
                 environment["LINT_CONFIG_FILE"] = str(self.config)
+
+
+class VerifyCopyPythonStartsTests(VerifyDocFixture):
+    def test_managed_doc_uses_the_existing_copy_owners_and_scope_supervisor(self) -> None:
+        trace = self.root / "doc-python-starts.tsv"
+        self.environment["VERIFY_PY_TRACE"] = str(trace)
+        command = self.copies_verify_command("doc")
+        extra_starts: set[tuple[str, ...]] = set()
+        arguments = task_cpu.command_arguments
+
+        def observe(pid: int) -> list[str]:
+            argv = arguments(pid)
+            if any(Path(word).name == "verify_checkout_handoff.py" or word == "import sys; print(sys.executable)"
+                   for word in argv):
+                extra_starts.add(tuple(argv))
+            return argv
+
+        log = self.root / "doc-python-starts.log"
+        with log.open("wb") as output, patch.object(task_cpu, "command_arguments", observe):
+            result = task_cpu.measure(command, cwd=self.repo, environment=self.environment,
+                                      timeout_s=TEST_HANG_GUARD_SECS, output_fd=output.fileno())
+        self.assertEqual(result.status, 0, log.read_text())
+        counts = Counter(line.split("\t")[0] for line in trace.read_text().splitlines())
+        self.assertEqual(counts["copies.py"], 2, counts)
+        self.assertEqual(counts["verify_scoped_step.py"], 1, counts)
+        self.assertFalse(extra_starts, extra_starts)
+
+
+class VerifyPythonShimProbeTests(unittest.TestCase):
+    def test_interpreter_probe_does_not_inherit_caller_pipes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            probe_log = root / "probe.json"
+            interpreter = root / "interpreter"
+            _ = interpreter.write_text(f"""#!{sys.executable}
+import json
+import os
+from pathlib import Path
+import sys
+if sys.argv[1:3] == ["-I", "-c"]:
+    descriptors = {{}}
+    for entry in Path("/proc/self/fd").iterdir():
+        try:
+            descriptors[entry.name] = os.readlink(entry)
+        except FileNotFoundError:
+            pass
+    Path({str(probe_log)!r}).write_text(json.dumps(descriptors))
+os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+""")
+            interpreter.chmod(0o755)
+            reader, writer = os.pipe()
+            try:
+                expected = os.readlink(f"/proc/self/fd/{reader}")
+                result = subprocess.run(
+                    [str(VERIFY.parents[1] / "lib/py"), "-c",
+                     "import os,sys; print(sys.stdin.read().strip(), os.readlink(sys.argv[1]))",
+                     f"/proc/self/fd/{reader}"],
+                    input="caller input\n", cwd=root, capture_output=True, text=True,
+                    env={**os.environ, "CLAUDE_PYTHON": str(interpreter)}, pass_fds=(reader, writer),
+                    timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, f"caller input {expected}\n")
+                self.assertEqual(json.loads(probe_log.read_text()), {"0": "/dev/null", "1": "/dev/null", "2": "/dev/null"},
+                                 "The interpreter probe inherited the caller's streams or descriptors")
+            finally:
+                os.close(reader)
+                os.close(writer)
 
 
 class VerifyOutputRootsTests(unittest.TestCase):

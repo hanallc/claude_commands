@@ -8,7 +8,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager, nullcontext, suppress
+from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -23,12 +23,10 @@ import re
 import select
 import shutil
 import signal
-import socket
 import stat
 import subprocess
 import sys
 import tempfile
-from threading import Thread
 import time
 from typing import TYPE_CHECKING, BinaryIO, NoReturn, TextIO, cast, override
 from urllib.parse import unquote, urlsplit
@@ -47,6 +45,7 @@ from scripts.buildlog import treekey
 from scripts.lib.build_slots import SlotGitFailure, source_checkout
 from scripts.lib.build_slots import SlotQueuePosition, NewSlotQueuePosition, NEW_SLOT_QUEUE_POSITION
 from scripts.build_queue import first_step, slot_wait
+from scripts.copies.scope_bindings import CopyOwnerLaunch, OwnedCheckoutLease, VerifyLaunch, checkout_scope_channel
 from scripts.lib.build_steps import StepJob, VerifyCommand, command_job, command_program, read_step_names, verify_command
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.process_failure import failure_detail
@@ -1460,12 +1459,11 @@ def command_tree(owner: str, repo: str | Path, policy: SourcePolicy, command: Se
                 tree = scope.enter_context(standing(owner, source, policy, merge=merge, step=label, command=command,
                     queue_position=admitted.queue_position))
                 admitted.handoff(tree)
-                key = "BUILDLOG_PREPARED_COPY_LOCK_FD"
-                if key in os.environ:
-                    _ = scope.callback(os.environ.__setitem__, key, os.environ[key])
-                else:
-                    _ = scope.callback(os.environ.pop, key, None)
-                os.environ[key] = str(build_folders.build_folder_lock_fd(tree))
+                if sys.platform == "linux":
+                    descriptor = build_folders.build_folder_lock_fd(tree)
+                    lease = OwnedCheckoutLease(tree, descriptor, build_folders.CheckoutLeaseKind.READY_SLOT)
+                    address = scope.enter_context(checkout_scope_channel(lease, CopyOwnerLaunch(os.getpid())))
+                    scope.enter_context(copy_binding_environment(address, descriptor, command))
             else:
                 # OtherCommand has no first queue step to admit.
                 tree = scope.enter_context(standing(owner, repo, policy, merge=merge, step=label, command=command))
@@ -2227,49 +2225,27 @@ def command_tail(command: list[str]) -> list[str]:
     return command[1:] if command[:1] == ["--"] else command
 
 
-def bind_copy_scope(folder: Path, descriptor: int, request: str, kind: build_folders.CheckoutLeaseKind) -> None:
-    scope = Path(request.removesuffix("\n"))
-    if not scope.is_absolute():
-        raise ValueError("the checkout scope path must be absolute")
-    build_folders.write_checkout_lease(folder, build_folders.CheckoutScopeBinding(scope, os.getpid(), kind),
-                                       descriptor)
-
-
-def serve_source_scope_bindings(connection: socket.socket, folder: Path, descriptor: int) -> None:
-    """Bind each scope while the source copy owner holds the lock."""
-    while True:
-        try:
-            request, replies, flags = socket.recv_fds(connection, 4096, 1)[:3]
-        except OSError:
-            return
-        if not request and not replies:
-            return
-        if len(replies) != 1 or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
-            for reply in replies:
-                os.close(reply)
-            continue
-        reply, = replies
-        with os.fdopen(reply, "wb", buffering=0) as confirmation:
-            try:
-                bind_copy_scope(folder, descriptor, os.fsdecode(request), build_folders.CheckoutLeaseKind.SOURCE_COPY)
-                _ = confirmation.write(b"bound\n")
-            except (OSError, ValueError) as error:
-                print(f"copies: cannot confirm the source copy scope: {error}", file=sys.stderr)
-
-
 @contextmanager
-def source_scope_channel(folder: Path, descriptor: int) -> Generator[int]:
-    """Give Verify a request channel instead of using its copy of the lock."""
-    owner, child = socket.socketpair(type=socket.SOCK_DGRAM)
-    with owner, child:
-        worker = Thread(target=serve_source_scope_bindings, args=(owner, folder, descriptor))
-        worker.start()
+def copy_binding_environment(address: str, descriptor: int, command: Sequence[str]) -> Generator[None]:
+    key = "BUILDLOG_PREPARED_COPY_BIND_ADDRESS"
+    inherited = "BUILDLOG_PREPARED_COPY_LOCK_FD"
+    previous = {name: os.environ.get(name) for name in (key, inherited)}
+    os.environ[key] = address
+    with ExitStack() as cleanup:
+        if isinstance(verify_command(command), VerifyCommand):
+            token = COMMAND_LOCKS.set(tuple(fd for fd in COMMAND_LOCKS.get() if fd != descriptor))
+            _ = cleanup.callback(COMMAND_LOCKS.reset, token)
+            _ = os.environ.pop(inherited, None)
+        else:
+            os.environ[inherited] = str(descriptor)
         try:
-            yield child.fileno()
+            yield
         finally:
-            with suppress(OSError):
-                owner.shutdown(socket.SHUT_RDWR)
-            worker.join()
+            for name, value in previous.items():
+                if value is None:
+                    _ = os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
 
 def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, merge: MergePolicy) -> int:
@@ -2290,12 +2266,15 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
                            "COPIES_STEP_OWNER": owner, "COPIES_RUN_PID": str(os.getpid()), "UNIT_DETACHED_RUN": "1"}
             target = tree / environment.setdefault("CARGO_TARGET_DIR", str(tree / "target"))
             source_lock = build_folders.build_folder_lock_fd(tree.parent)
-            environment["COPIES_RUN_LOCK_FD"] = str(source_lock)
-            locks = (*COMMAND_LOCKS.get(), source_lock)
+            locks = COMMAND_LOCKS.get()
             if sys.platform == "linux":
-                channel = scope.enter_context(source_scope_channel(tree.parent, source_lock))
-                environment["COPIES_RUN_BIND_FD"] = str(channel)
-                locks = (*locks, channel)
+                lease = OwnedCheckoutLease(tree.parent, source_lock, build_folders.CheckoutLeaseKind.SOURCE_COPY)
+                environment["COPIES_CHECKOUT_BIND_ADDRESS"] = scope.enter_context(
+                    checkout_scope_channel(lease, CopyOwnerLaunch(os.getpid())))
+            if sys.platform != "linux" or not isinstance(verify_command(command), VerifyCommand):
+                # Other commands can use the source copy without a Verify scope.
+                environment["COPIES_RUN_LOCK_FD"] = str(source_lock)
+                locks = (*locks, source_lock)
             if args.publish:
                 output = tree.parent / "step-output"
                 output.mkdir()
@@ -2459,8 +2438,20 @@ def step_owner(source: Path) -> str:
 
 @dataclass(frozen=True)
 class CheckoutOwnerPipes:
-    request: TextIO
+    request: BinaryIO
     reply: BinaryIO
+    verify_pid: int
+    owner_fds: tuple[int, ...]
+
+    def wait_for_publish(self) -> bool:
+        if not self.owner_fds:
+            return self.request.readline() == b"publish\n"
+        request = self.request.fileno()
+        ready = select.poll()
+        ready.register(request, select.POLLIN)
+        for descriptor in self.owner_fds:
+            ready.register(descriptor, select.POLLIN)
+        return all(descriptor == request for descriptor, _ in ready.poll()) and os.read(request, 8) == b"publish\n"
 
     def publish_path(self, checkout: Path) -> None:
         _ = self.reply.write(os.fsencode(checkout) + b"\n")
@@ -2471,12 +2462,20 @@ class CheckoutOwnerPipes:
 def checkout_owner_pipes() -> Generator[CheckoutOwnerPipes]:
     """Keep the checkout protocol out of the owner's command streams."""
     _ = sys.stdout.flush()
-    with (os.fdopen(os.dup(0), "r") as request, os.fdopen(os.dup(1), "wb") as reply,
-          open(os.devnull, "r+b") as command_stream):
+    verify_pid = int(os.environ.pop("VERIFY_CHECKOUT_CALLER_PID", str(os.getppid())))
+    parent_pid = int(os.environ.pop("VERIFY_CHECKOUT_PARENT_PID", str(os.getppid())))
+    with (os.fdopen(os.dup(0), "rb") as request, os.fdopen(os.dup(1), "wb") as reply,
+          open(os.devnull, "r+b") as command_stream, ExitStack() as cleanup):
+        owner_fds: list[int] = []
+        if sys.platform == "linux":
+            for owner in {verify_pid, parent_pid}:
+                descriptor = os.pidfd_open(owner)
+                _ = cleanup.callback(os.close, descriptor)
+                owner_fds.append(descriptor)
         try:
             _ = os.dup2(command_stream.fileno(), 0)
             _ = os.dup2(command_stream.fileno(), 1)
-            yield CheckoutOwnerPipes(request, reply)
+            yield CheckoutOwnerPipes(request, reply, verify_pid, tuple(owner_fds))
         finally:
             _ = sys.stdout.flush()
             _ = os.dup2(request.fileno(), 0)
@@ -2518,17 +2517,15 @@ def run_slot_step(source: Path, args: CopyArguments, launch: CheckoutOwnerPipes 
             before = publication_candidates(checkout, target, command, paths)
             if isinstance(launch, CheckoutOwnerPipes):
                 words = ["env", *(f"{key}={value}" for key, value in slot.slot_environment.items()), *command]
-                _ = launch.reply.write(os.fsencode(f"{checkout}\n{len(words)}\n"))
-                _ = launch.reply.write(b"\0".join(map(os.fsencode, words)) + b"\0")
-                launch.reply.flush()
-                request = launch.request.readline()
-                if request and request != "publish\n":
-                    bind_copy_scope(checkout, build_folders.build_folder_lock_fd(checkout), request,
-                                    build_folders.CheckoutLeaseKind.READY_SLOT)
-                    _ = os.write(launch.reply.fileno(), b"bound\n")
-                    request = launch.request.readline()
-                if request == "publish\n":
-                    capture_step_files(output, paths, before)
+                lease = OwnedCheckoutLease(checkout, build_folders.build_folder_lock_fd(checkout),
+                                           build_folders.CheckoutLeaseKind.READY_SLOT)
+                bindings = checkout_scope_channel(lease, VerifyLaunch(launch.verify_pid)) if sys.platform == "linux" else nullcontext("")
+                with bindings as address:
+                    _ = launch.reply.write(os.fsencode(f"{checkout}\n{address}\n{len(words)}\n"))
+                    _ = launch.reply.write(b"\0".join(map(os.fsencode, words)) + b"\0")
+                    launch.reply.flush()
+                    if launch.wait_for_publish():
+                        capture_step_files(output, paths, before)
                 return 0
             status = build_folders.run_build_command(command, path=checkout, environment=os.environ,
                                                      pass_fds=COMMAND_LOCKS.get())
@@ -2722,7 +2719,7 @@ def main(argv: list[str] | None = None) -> int:
             with streams as launch, requested_source(source, StagedSource(args.tree), NO_MERGE) as checkout:
                 if isinstance(launch, CheckoutOwnerPipes):
                     launch.publish_path(checkout)
-                    _ = launch.request.read(1)
+                    _ = launch.wait_for_publish()
                 else:
                     return subprocess.run(command, cwd=checkout).returncode
             return 0
