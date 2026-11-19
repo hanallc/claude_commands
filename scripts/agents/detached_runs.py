@@ -18,7 +18,7 @@ try:
 except FileNotFoundError:
     pass
 
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Collection, Generator, Mapping, Sequence
 
 import argparse
 import contextlib
@@ -806,8 +806,15 @@ def worker_runs(runs: Path, worker: str, *, since: float = 0) -> list[RunRecord]
     return found
 
 
-def _registered_runs(runs: Path) -> Generator[RunRecord]:
+def _record_owner(path: Path) -> str:
+    """Read the fixed staff id from a new run name."""
+    return path.stem.partition("@")[2]
+
+
+def _registered_runs(runs: Path, identity: staff.StaffId) -> Generator[RunRecord]:
     for path in _run_record_paths(runs):
+        if (owner := _record_owner(path)) and owner != identity:
+            continue
         raw = worker_lifecycle.read_json_object(path)
         if _is_run_record(raw) and path.name == f"{raw['run_id']}.json":
             yield raw
@@ -831,14 +838,16 @@ def _worker_result_pending(delivery: str) -> bool:
 
 
 def worker_results(runs: Path, worker: staff.StaffRow, *, since: float, pane_dispatch_id: str = "",
-                   ) -> dict[str, float | DeliveryTimeUnknown | WorkerResultDeferred]:
+                   include_legacy_pass: bool = False) -> dict[str, float | DeliveryTimeUnknown | WorkerResultDeferred]:
     """Find finished results that the worker received or still needs."""
     results: dict[str, float | DeliveryTimeUnknown | WorkerResultDeferred] = {}
-    for record in _registered_runs(runs):
-        if (record.get("staff_id") != worker.id or record["started_at"] < since
-                or record["status"] != "finished"
-                or pane_dispatch_id and record.get("pane_dispatch_id") != pane_dispatch_id):
+    for record in _registered_runs(runs, worker.id):
+        if record.get("staff_id") != worker.id or record["started_at"] < since or record["status"] != "finished":
             continue
+        dispatch = record.get("pane_dispatch_id")
+        if pane_dispatch_id and dispatch != pane_dispatch_id:
+            if not include_legacy_pass or (isinstance(dispatch, str) and dispatch):
+                continue
         if _worker_result_pending(record.get("delivery", "")):
             results[record["run_id"]] = WorkerResultDeferred.PENDING
         elif record.get("delivery", "").startswith((f"sent: worker {record['worker']} at ", f"sent: worker {worker.name} at ", "already delivered: ")):
@@ -850,6 +859,7 @@ def worker_results(runs: Path, worker: staff.StaffRow, *, since: float, pane_dis
 class LiveRunReadError:
     path: Path
     error: OSError | ValueError
+    staff_ids: frozenset[staff.StaffId] = frozenset()
 
     @override
     def __str__(self) -> str:
@@ -871,9 +881,12 @@ class LiveRunEvidence:
             unit_runs.report_anomaly(" ".join(f"anomaly: {error}".splitlines()))
 
 
-def live_runs(runs: Path, worker: str) -> list[RunRecord]:
+def live_runs(runs: Path, worker: str, *, identity: str = "") -> list[RunRecord]:
     """Return runs that still block completion."""
-    evidence = _live_runs(runs, lambda raw: raw.get("worker") == worker)
+    def owns(raw: dict[str, object]) -> bool:
+        return raw.get("staff_id") == identity if identity and raw.get("staff_id") else raw.get("worker") == worker
+
+    evidence = _live_runs(runs, owns, frozenset({staff.StaffId(identity)}) if identity else frozenset())
     return evidence.require_readable()
 
 
@@ -885,29 +898,47 @@ def live_runs_for_staff(runs: Path, identities: frozenset[staff.StaffId]) -> lis
 
 def live_run_evidence_for_staff(runs: Path, identities: frozenset[staff.StaffId]) -> LiveRunEvidence:
     """Retain live runs and read errors so callers can distinguish idle from unknown."""
-    return _live_runs(runs, lambda raw: isinstance(identity := raw.get("staff_id"), str) and identity in identities)
+    return _live_runs(runs, lambda raw: isinstance(identity := raw.get("staff_id"), str) and identity in identities,
+                      identities)
 
 
 def live_runs_in_folders(folders: Mapping[Path, frozenset[staff.StaffId]]) -> list[RunRecord]:
     """Read runs that still block completion in the selected folders."""
+    return live_run_evidence_in_folders(folders).require_readable()
+
+
+def live_run_evidence_in_folders(folders: Mapping[Path, frozenset[staff.StaffId]], *,
+                                 staff_names: Mapping[staff.StaffId, str] | None = None) -> LiveRunEvidence:
+    """Read each live record once and identify the workers affected by read errors."""
+    if not folders:
+        return LiveRunEvidence((), ())
     supervisors = detached_run_process.supervisor_records()
-    if isinstance(supervisors, detached_run_process.ProcessTableUnavailable):
-        return [run for folder, identities in folders.items()
-                for run in live_runs_for_staff(folder / DETACHED_RUNS_DIR, identities)]
     named: dict[Path, set[Path]] = {}
-    for path in supervisors:
-        if path.parent.name == DETACHED_RUNS_DIR and path.parent.parent in folders:
-            named.setdefault(path.parent.parent, set()).add(path)
+    if not isinstance(supervisors, detached_run_process.ProcessTableUnavailable):
+        for path in supervisors:
+            if path.parent.name == DETACHED_RUNS_DIR and path.parent.parent in folders:
+                named.setdefault(path.parent.parent, set()).add(path)
     found: list[RunRecord] = []
+    errors: list[LiveRunReadError] = []
     for folder, identities in folders.items():
-        paths = named.get(folder, set())
-        paths.update(marker.with_suffix(".json") for marker in (folder / DETACHED_RUNS_DIR).glob("*" + PENDING_STOP_SUFFIX))
-        for path in sorted(paths):
-            raw = worker_lifecycle.read_json_object(path)
-            if (isinstance(identity := raw.get("staff_id"), str) and identity in identities
-                    and _run_is_pending(path, raw, lambda pid: pid in supervisors.get(path, ()))):
-                found.append(cast(RunRecord, cast(object, raw)))
-    return found
+        directory = folder / DETACHED_RUNS_DIR
+        try:
+            if isinstance(supervisors, detached_run_process.ProcessTableUnavailable):
+                paths = _run_record_paths(directory)
+            else:
+                paths = named.get(folder, set()) | {
+                    marker.with_suffix(".json") for marker in directory.glob("*" + PENDING_STOP_SUFFIX)}
+            evidence = _read_live_runs(
+                sorted(paths), lambda raw: isinstance(identity := raw.get("staff_id"), str) and identity in identities,
+                detached_run_process.supervises if isinstance(supervisors, detached_run_process.ProcessTableUnavailable)
+                else lambda pid, path: pid in supervisors.get(path, ()),
+                identities, staff_names=staff_names, supervised_paths=named.get(folder, set()))
+        except OSError as error:
+            errors.append(LiveRunReadError(directory, error, identities))
+            continue
+        found.extend(evidence.runs)
+        errors.extend(evidence.read_errors)
+    return LiveRunEvidence(tuple(found), tuple(errors))
 
 
 def _recover_indexed_stop(path: Path, raw: dict[str, object]) -> None:
@@ -925,21 +956,58 @@ def _run_is_pending(path: Path, raw: dict[str, object], supervisor_owns: Callabl
     return raw.get("stop_pass_requested") is True
 
 
-def _live_runs(runs: Path, owns: Callable[[dict[str, object]], bool]) -> LiveRunEvidence:
-    """Read each record once and check its owner and supervisor."""
-    found: list[RunRecord] = []
-    errors: list[LiveRunReadError] = []
+def _live_runs(runs: Path, owns: Callable[[dict[str, object]], bool],
+               identities: frozenset[staff.StaffId]) -> LiveRunEvidence:
     try:
         paths = _run_record_paths(runs)
     except OSError as error:
-        return LiveRunEvidence((), (LiveRunReadError(runs, error),))
+        return LiveRunEvidence((), (LiveRunReadError(runs, error, identities),))
+    return _read_live_runs(paths, owns, detached_run_process.supervises, identities)
+
+
+def _read_live_runs(paths: Sequence[Path], owns: Callable[[dict[str, object]], bool],
+                    supervises: Callable[[int, Path], bool], identities: frozenset[staff.StaffId], *,
+                    staff_names: Mapping[staff.StaffId, str] | None = None,
+                    supervised_paths: Collection[Path] = ()) -> LiveRunEvidence:
+    found: list[RunRecord] = []
+    errors: list[LiveRunReadError] = []
     for path in paths:
+        identity = staff.StaffId(_record_owner(path))
+        if identity and identities and identity not in identities:
+            continue
+        affected = frozenset({identity}) if identity else identities
         try:
             raw = worker_lifecycle.read_json_object(path)
-            if owns(raw) and _run_is_pending(path, raw, lambda pid: detached_run_process.supervises(pid, path)):
-                found.append(cast(RunRecord, cast(object, raw)))
+            if not raw and not path.exists():
+                if staff_names is not None and path in supervised_paths:
+                    raise worker_lifecycle.WorkerStateUnreadable(path, "the live supervisor record is missing")
+                continue
         except (OSError, ValueError) as error:
-            errors.append(LiveRunReadError(path, error))
+            errors.append(LiveRunReadError(path, error,
+                                           identities if staff_names is not None and path in supervised_paths else affected))
+            continue
+        owner = raw.get("staff_id")
+        name = raw.get("worker")
+        legacy_owners: tuple[staff.StaffId, ...] = ()
+        if staff_names is not None and not identity and owner in (None, "") and isinstance(name, str) and name:
+            legacy_owners = tuple(member for member in identities if staff_names.get(member) == name)
+            if not legacy_owners:
+                continue
+        if isinstance(owner, str) and owner and not identity:
+            affected = frozenset({staff.StaffId(owner)})
+        try:
+            if staff_names is not None and (identity or not owner or not isinstance(owner, str) or owner in identities):
+                if (not (isinstance(owner, str) and owner or legacy_owners)
+                        or raw.get("status") not in ("running", "finished") or type(raw.get("pid")) is not int
+                        or identity and (owner != identity or not _is_run_record(dict(raw)) or f"{raw.get('run_id')}.json" != path.name)):
+                    raise worker_lifecycle.WorkerStateUnreadable(path, "invalid detached run record")
+            if (legacy_owners or owns(raw)) and _run_is_pending(path, raw, lambda pid: supervises(pid, path)):
+                if legacy_owners:
+                    found.extend(cast(RunRecord, cast(object, {**raw, "staff_id": member})) for member in legacy_owners)
+                else:
+                    found.append(cast(RunRecord, cast(object, raw)))
+        except (OSError, ValueError) as error:
+            errors.append(LiveRunReadError(path, error, affected))
     return LiveRunEvidence(tuple(found), tuple(errors))
 
 
@@ -1012,11 +1080,14 @@ def command_start(args: argparse.Namespace) -> int:
                       + "Or put more files in one run.", file=sys.stderr)
                 return LIVE_RUN_LIMIT_REACHED
             run_id = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}-{secrets.token_hex(2)}"
+            identity = reference or _worker_reference(session_dir, name)
+            if identity and not isinstance(caller, DirectorCaller):
+                run_id += f"@{identity}"
             record_path = runs / f"{run_id}.json"
             log_path = runs / f"{run_id}.log"
             record: RunRecord = {
                 "run_id": run_id, "status": "running", "session_dir": session_dir, "worker": name,
-                "staff_id": reference or _worker_reference(session_dir, name), "label": label, "command": command,
+                "staff_id": identity, "label": label, "command": command,
                 "log": str(log_path), "started_at": time.time(), "pid": 0,
                 "director_dir": director_dir, "done_message_file": done_file, "tree_key": tree_key,
             }
@@ -1239,7 +1310,7 @@ def submit_finished_worker_result(run: Path, worker: staff.StaffRow, *,
                                   worker_input: WorkerResultInput) -> WorkerResultReplay:
     """Submit one waiting result. The next turn can receive the next result."""
     runs = run / DETACHED_RUNS_DIR
-    for record in _registered_runs(runs):
+    for record in _registered_runs(runs, worker.id):
         if (record["status"] != "finished" or record.get("staff_id") != worker.id
                 or not _worker_result_pending(record.get("delivery", ""))):
             continue

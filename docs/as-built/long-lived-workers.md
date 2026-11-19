@@ -43,6 +43,15 @@ Usage reports compare checkpointed phases through the usage store.
 Text, relative paths, and empty values exit 2 before dispatch.
 The old `--summary` option exits 2 and names `--reply-file`.
 Both reply writes and dispatch reply paths use the checked `Arguments.reply_file` value.
+Worker lists and automatic selection check all saved passes for each worker.
+An older pass can hold the worker while it waits for `DONE`.
+Automatic selection skips a held worker even if its pane is idle.
+If all reusable panes are held, the selector can choose a free worker name.
+The launcher checks the selected worker under its lock before it records a new pass or starts compaction.
+Detached run records identify the owner by staff ID.
+Legacy records without a staff ID identify the owner by worker name.
+If a live supervisor names a missing or unreadable record, the check holds the workers that share its run folder.
+Explicit assignments check the current pass.
 The early return prints `compaction runs detached; the prompt follows` with the worker name.
 The pass stays active while the child completes delivery.
 An assignment with no compaction due keeps its attached delivery path.

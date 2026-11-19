@@ -12,7 +12,7 @@ from contextlib import ExitStack, redirect_stderr
 from dataclasses import dataclass, replace
 from enum import Enum, IntEnum
 from importlib import import_module
-from functools import partial
+from functools import cache, partial
 import io
 import json
 import math
@@ -272,7 +272,8 @@ class CurrentPanePass(Enum):
 
 def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
                      run: Path, require_transcript: bool = False,
-                     pane_pass: CurrentPanePass | progress_history.StoppedPassReceipt = CurrentPanePass.CURRENT,
+                     pane_pass: CurrentPanePass | progress_history.StoppedPassReceipt | worker_panes.PassDetachedResults = CurrentPanePass.CURRENT,
+                     require_done: bool = False,
                      ) -> DispatchReceipt:
     """Read the shared receipt and require delivery of detached results."""
     backend = staff.backend(row)
@@ -294,9 +295,15 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
     reply = transcript.receipt
     if isinstance(reply, (DispatchNotSubmitted, DispatchEvidenceUnknown)):
         return reply
-    live = detached_runs.live_runs(directory, row.name)
+    if require_done and isinstance(reply, DispatchSubmitted):
+        return reply
+    live = ([] if isinstance(pane_pass, worker_panes.PassDetachedResults) and pane_pass.live_runs_checked else
+            detached_runs.live_runs(directory, row.name, identity=row.id))
     if isinstance(pane_pass, progress_history.StoppedPassReceipt):
         live = [record for record in live if record.get("pane_dispatch_id") == pane_pass.instance_id]
+    elif isinstance(pane_pass, worker_panes.PassDetachedResults):
+        deliveries = detached_runs.worker_results(directory, row, since=pane_pass.started_at,
+                                                  pane_dispatch_id=pane_pass.instance_id, include_legacy_pass=True)
     else:
         passed = worker_panes.worker_pass(row, run)
         started = passed.get("started_at", 0)
@@ -322,6 +329,10 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
 def completion_close_evidence(row: staff.StaffRow, delivery: progress_history.DispatchDelivery, *,
                               run: Path, reply_file: str) -> worker_panes.CloseAllowed | worker_panes.Kept:
     receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=run, require_transcript=True)
+    return _saved_reply_evidence(receipt, reply_file)
+
+
+def _saved_reply_evidence(receipt: DispatchReceipt, reply_file: str) -> worker_panes.CloseAllowed | worker_panes.Kept:
     if isinstance(receipt, DispatchComplete):
         if not reply_file:
             return worker_panes.Kept("the dispatch has no saved reply path")
@@ -337,14 +348,18 @@ def completion_close_evidence(row: staff.StaffRow, delivery: progress_history.Di
     return worker_panes.Kept("the transcript has no completed dispatch receipt")
 
 
-def detached_reply_hold(row: staff.StaffRow, line: str, completion_id: str, *,
-                        run: Path) -> worker_panes.CloseAllowed | worker_panes.Kept:
-    """Keep a pane when a detached result requires a reply."""
-    receipt = dispatch_receipt(row, line, completion_id, run=run, require_transcript=True)
+def pass_reply_evidence(row: staff.StaffRow, delivery: progress_history.DispatchDelivery, *,
+                        run: Path, reply_file: str, require_completion: bool,
+                        detached_results: worker_panes.PassDetachedResults) -> worker_panes.CloseAllowed | worker_panes.Kept:
+    """Check one pass receipt for detached results and any required DONE."""
+    receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=run,
+                               require_transcript=True, pane_pass=detached_results, require_done=require_completion)
     if isinstance(receipt, DispatchEvidenceUnknown):
         return worker_panes.Kept(f"completion evidence is unavailable: {receipt.reason}")
     if isinstance(receipt, (DispatchWaitingForRuns, DispatchAwaitingReply)):
         return worker_panes.Kept("a detached run result awaits a matching DONE")
+    if require_completion and not isinstance(_saved_reply_evidence(receipt, reply_file), worker_panes.CloseAllowed):
+        return worker_panes.Kept("submitted pass awaits completion")
     return worker_panes.CloseAllowed()
 
 
@@ -992,22 +1007,58 @@ def _role_number(name: str, role: WorkerRole) -> int:
     return int(suffix) if name.startswith(role) and suffix.isdigit() and int(suffix) >= 2 else 0
 
 
-def select_worker(parent: StaffId, role: WorkerRole, record: staff.StaffSnapshot) -> (
+def _worker_detached_work(record: staff.StaffSnapshot, runs: unit_runs.LauncherRunDirectories,
+                          workers: Iterable[StaffId]) -> session_state.RunningDetachedWork:
+    directories = unit_runs.LauncherRunDirectories({identity: runs.by_worker[identity]
+        for identity in workers if identity in runs.by_worker}, runs.by_session)
+    return session_state.running_detached_work(record, worker_runs=directories)
+
+
+def _worker_dispatch_state(row: staff.StaffRow, record: staff.StaffSnapshot, detached: session_state.RunningDetachedWork,
+                           lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE, *,
+                           read: Callable[[Path], dict[str, object]] = worker_panes.run_state,
+                           ) -> worker_panes.WorkerDispatchState:
+    run, *related = detached.launcher_runs.by_worker[row.id]
+    try:
+        return worker_panes.worker_dispatch_state(row, run, lock, detached=detached, record=record,
+                                                  related_runs=related, read=read)
+    except (OSError, ValueError) as error:
+        detail = " ".join(str(error).splitlines())
+        unit_runs.report_anomaly(f"anomaly: {row.name}: {detail}")
+        return worker_panes.DispatchHoldsWorker(detail)
+
+
+def _assignment_runs(record: staff.StaffSnapshot, parent: StaffId, role: WorkerRole, *,
+                     additional: tuple[Path, ...] = ()) -> unit_runs.LauncherRunDirectories:
+    rows = tuple(row for row in record.rows if row.kind != "worker" or (row.reports_to(parent)
+                 and _role_number(row.name, role)))
+    runs = worker_panes.worker_run_directories(replace(record, rows=rows))
+    return unit_runs.LauncherRunDirectories({identity: tuple(dict.fromkeys((*paths, *additional)))
+        for identity, paths in runs.by_worker.items()}, runs.by_session)
+
+
+def select_worker(parent: StaffId, role: WorkerRole, record: staff.StaffSnapshot, *,
+                  runs: unit_runs.LauncherRunDirectories | None = None) -> (
         WorkerName | worker_panes.StartRefused | worker_panes.ProcessUnknownWorker | worker_panes.UncertainWorker):
     """Select a proved idle worker, a resumable worker, or the lowest free name."""
     names = [WorkerName.parse(row.name) for row in record.find(kind="worker", parent=parent)
              if _role_number(row.name, role)]
     candidates = worker_panes.observe_selected(parent, record, names)
     candidates.sort(key=lambda item: _role_number(item.row.name, role))
-    for item in candidates:
-        if isinstance(item, worker_panes.OpenWorker) and item.status in (herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE):
-            return WorkerName.parse(item.row.name)
-        if isinstance(item, (worker_panes.StoppedWorker, worker_panes.ClosedWorker)):
-            return WorkerName.parse(item.row.name)
+    reusable = [item for item in candidates if worker_panes.worker_state(item) == "idle"]
+    if reusable:
+        runs = _assignment_runs(record, parent, role) if runs is None else runs
+        detached = _worker_detached_work(record, runs, (item.row.id for item in reusable))
+        directories = dict.fromkeys(run for paths in detached.launcher_runs.by_worker.values() for run in paths)
+        with progress_history.dispatch_reads(record, directories):
+            for item in reusable:
+                state = _worker_dispatch_state(item.row, record, detached)
+                if not isinstance(state, worker_panes.DispatchHoldsWorker):
+                    return WorkerName.parse(item.row.name)
     for item in candidates:
         if isinstance(item, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
             return item
-    if candidates:
+    if len(candidates) > len(reusable):
         unavailable = ", ".join(item.row.name for item in candidates)
         return worker_panes.StartRefused(worker_panes.StartRefusal.BUSY_ROLE_CHANGE, f"workers unavailable: {unavailable}")
     return _free_name(parent, role, record)
@@ -1042,7 +1093,7 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
            fix_pass: int = 0, activity: str = "", early_ready: Path | SingleStageReview = SINGLE_STAGE_REVIEW,
            policy: worker_panes.UseRolePolicy | worker_panes.LaunchPolicy = worker_panes.UseRolePolicy.CURRENT,
            completion_actions: progress_history.CompletionActions = progress_history.NO_COMPLETION_ACTIONS) -> DispatchSubmission | ExitCode:
-    with ExitStack() as cleanup:
+    with ExitStack() as cleanup, ExitStack() as notices, ExitStack() as operations:
         if not name:
             matched = progress_history.dispatch_worker(session_dir, slot=slot, phase=phase, role=role,
                 prompt=prompt.resolve(), launcher_command=launcher_command,
@@ -1055,11 +1106,7 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
         rows = record.find(kind="worker", parent=parent)
         needs_team = False
         if not name and role in ("impl", "fix", "review", "test"):
-            owner = record.by_id(parent)
-            runs = unit_runs.held(str(owner.current_session) if owner is not None else "",
-                                 os.environ.get("ROSTER_RUN_ROOT"), record=record)
-            with progress_history.dispatch_reads(record, dict.fromkeys([*(Path(run) for run in runs), session_dir])):
-                needs_team = not any(isinstance(worker_panes.dispatch_role(row), str) for row in rows)
+            needs_team = not any(isinstance(worker_panes.dispatch_role(row), str) for row in rows)
         if needs_team:
             names = {row.name for row in rows}
             for default_role in ("impl", "fix", "review", "test"):
@@ -1078,9 +1125,41 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
                           result.cause if isinstance(result, worker_panes.UnpublishedWorker) else result.reason)
                 print(f"anomaly: {default_role}: {detail}", file=sys.stderr)
             record = staff.snapshot()
-        chosen = WorkerName.parse(name) if name else select_worker(parent, role, record)
+        runs = unit_runs.LauncherRunDirectories({}, {}) if name else _assignment_runs(
+            record, parent, role, additional=(session_dir,))
+        chosen = WorkerName.parse(name) if name else select_worker(parent, role, record, runs=runs)
         if not isinstance(chosen, WorkerName):
             return startup_result(WorkerName.parse(role), chosen)
+        hold = (worker_panes.WorkerLockAtUse.ACQUIRE if name else
+                operations.enter_context(worker_panes.worker_lock(parent, chosen)))
+        if isinstance(hold, worker_panes.Kept):
+            print(hold.blocker, file=sys.stderr)
+            return ExitCode.BUSY
+        if isinstance(hold, worker_panes.WorkerLockHold):
+            record = staff.snapshot()
+            row = worker_admission.find_worker(record, parent, chosen.value)
+            if row is not None:
+                if not hold.owns(row):
+                    hold.bind(row)
+                paths = runs.by_worker.get(row.id)
+                if paths is None:
+                    paths = _assignment_runs(record, parent, role, additional=(session_dir,)).by_worker[row.id]
+                refreshed = list(paths)
+                owner = record.parent_of(row)
+                if owner is not None and isinstance(owner.run, staff.OpenRun):
+                    refreshed.append(owner.run.path)
+                linked = progress_history.recorded_dispatch_run(row.id)
+                if isinstance(linked, progress_history.RecordedDispatchRun):
+                    refreshed.append(linked.directory)
+                directories = tuple(dict.fromkeys(refreshed))
+                current = unit_runs.LauncherRunDirectories({row.id: directories}, runs.by_session)
+                detached = _worker_detached_work(record, current, (row.id,))
+                with progress_history.dispatch_reads(record, directories):
+                    state = _worker_dispatch_state(row, record, detached, hold)
+                if isinstance(state, worker_panes.DispatchHoldsWorker):
+                    refusal = worker_panes.StartRefusal.BUSY_ROLE_CHANGE
+                    print(f"{refusal.value}: workers unavailable: {row.name}", file=sys.stderr)
+                    return ExitCode.BUSY
         if chosen.value != slot:
             if completion_actions.status_file:
                 status = Path(completion_actions.status_file)
@@ -1096,7 +1175,8 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
         result = dispatch(parent, chosen, role, prompt, dispatch_id, session_dir=session_dir, slot=chosen.value,
             phase=phase, kind=kind, lens=lens, launcher_command=launcher_command, reply=reply,
             fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, early_ready=early_ready, policy=policy,
-            completion_actions=completion_actions, on_submission=cleanup.pop_all)
+            completion_actions=completion_actions, on_submission=cleanup.pop_all, lock=hold,
+            notices=notices if isinstance(hold, worker_panes.WorkerLockHold) else SEND_NOTICES_AFTER_DISPATCH)
         if result is DispatchSubmission.SUBMITTED:
             _ = cleanup.pop_all()
         return result
@@ -1585,15 +1665,17 @@ def _worker_history_events(path: Path, wanted: WorkerHistoryTargets, *,
 @dataclass(frozen=True)
 class RecordedWorkerDispatches:
     by_worker: dict[StaffId, WorkerDispatchRecord]
-    runs: tuple[Path, ...]
+    by_session: dict[str, list[str]]
 
 
 def _recorded_worker_dispatches(record: staff.StaffSnapshot, *,
-                                 runs: Iterable[Path] | Literal["discover"] = "discover") -> RecordedWorkerDispatches:
+                                 runs: Iterable[Path] | Literal["discover"] = "discover",
+                                 read: Callable[[Path], dict[str, object]] = worker_panes.run_state) -> RecordedWorkerDispatches:
     workers = record.find(kind="worker")
     parents = {parent.id: parent for row in workers if (parent := record.parent_of(row)) is not None}
     if runs == "discover":
-        runs = unit_runs.run_folders(os.environ.get("ROSTER_RUN_ROOT"))
+        runs = [run for root in (os.environ.get("ROSTER_RUN_ROOT"), *worker_panes.parent_run_roots())
+                for run in unit_runs.run_folders(root)]
         for parent in parents.values():
             runs.append(unit_runs.state_dir() / "staff/workers" / parent.id)
             if isinstance(parent.run, staff.OpenRun):
@@ -1618,21 +1700,22 @@ def _recorded_worker_dispatches(record: staff.StaffSnapshot, *,
                 "status": entry.get("status", "active" if entry.get("event_type") == "pass_started" else "unknown")},
                 timestamp)
 
+    by_session: dict[str, list[str]] = {}
     for run in run_paths:
-        path = run / unit_runs.STATE_FILE
         try:
-            value = cast(object, json.loads(path.read_text(encoding="utf-8")))
-        except FileNotFoundError:
-            continue
+            state = read(run)
         except (OSError, ValueError) as error:
-            print(f"anomaly: {path}: {error}", file=sys.stderr)
+            unit_runs.report_anomaly(f"anomaly: {error}")
             continue
-        if not isinstance(value, dict):
+        try:
+            owner = unit_runs.run_owner(state, record)
+        except staff.StaffUnreadable as error:
+            unit_runs.report_anomaly(f"anomaly: {run}: {error}")
             continue
-        state = cast(dict[str, object], value)
         run_ids[run] = state.get("run_id")
-        owner = unit_runs.run_owner(state, record)
         parent_id = owner.id if isinstance(owner, staff.StaffRow) else StaffId("")
+        if isinstance(owner, staff.StaffRow):
+            by_session.setdefault(owner.current_session, []).append(str(run))
         history = state.get("history_file")
         if isinstance(history, str) and history and parent_id in parents:
             histories.setdefault(Path(history).resolve(), {})[run] = {str(row.id).encode(): row
@@ -1657,7 +1740,7 @@ def _recorded_worker_dispatches(record: staff.StaffSnapshot, *,
                 del pending[str(target.id).encode()]
             if not pending:
                 break
-    return RecordedWorkerDispatches(found, run_paths)
+    return RecordedWorkerDispatches(found, by_session)
 
 
 class WorkerFilter(Enum):
@@ -1681,51 +1764,54 @@ def _waiting_on(row: staff.StaffRow, detached: session_state.RunningDetachedWork
 
 def list_all_workers(record: staff.StaffSnapshot, *, selection: WorkerFilter = WorkerFilter.ALL,
                      as_json: bool = True) -> list[dict[str, object]]:
-    dispatches = _recorded_worker_dispatches(record)
-    detached = (session_state.running_detached_work(record, additional_runs=dispatches.runs)
-                if not as_json else session_state.NO_DETACHED_WORK)
+    read = cache(worker_panes.run_state)
+    dispatches = _recorded_worker_dispatches(record, read=read)
+    workers = record.find(kind="worker")
+    directories = worker_panes.worker_run_directories(record, scanned=dispatches.by_session, read=read)
+    detached = _worker_detached_work(record, directories, (row.id for row in workers))
     states = {state.row.id: state for parent_id in dict.fromkeys(
-        row.parent.id for row in record.find(kind="worker") if isinstance(row.parent, staff.ReportsTo))
+        row.parent.id for row in workers if isinstance(row.parent, staff.ReportsTo))
         for state in worker_panes.observe(parent_id, record)} if selection is not WorkerFilter.ALL or not as_json else {}
     listing: list[dict[str, object]] = []
-    for row in record.find(kind="worker"):
-        parent = record.parent_of(row)
-        saved = dispatches.by_worker.get(row.id, WorkerDispatchRecord({}, 0))
-        if parent is None:
-            continue
-        if selection is not WorkerFilter.ALL and (row.id not in states or not _listed_worker(states[row.id], selection)):
-            continue
-        fields = saved.fields
-        status = fields.get("status", "unknown")
-        status = status if isinstance(status, str) else "unknown"
-        activity = fields.get("kind") if status in ("active", "refused") else ""
-        if isinstance(row.exited, staff.Exited):
-            status = "exited"
-        elif isinstance(row.paused, staff.Paused):
-            status = "paused"
-        work = "busy" if status == "active" else "idle" if status in ("completed", "error", "canceled", "interrupted", "paused", "exited") else "unknown"
-        if status == "active":
-            try:
-                run = worker_panes.worker_run(row, record=record)
-                dispatch = (worker_panes.worker_dispatch_state(row, run) if as_json else
-                            worker_panes.worker_dispatch_state(row, run, detached=detached))
-                if isinstance(dispatch, worker_panes.ReleasedWorkerPass):
-                    status, work = dispatch.value, "idle"
-                elif isinstance(dispatch, worker_panes.CompletedWorkerPass):
-                    status, work = "completed", "idle"
-            except (OSError, ValueError) as error:
-                print(f"anomaly: {row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
-        item = _worker_list_row(row, {"manager": parent.name, "state": status, "work": work,
-            "activity": fields.get("activity") or status,
-            **{key: fields.get(key, "unknown" if key == "completion_state" else "")
-               for key in ("dispatch_id", "run_path", "completion_state", "reply_path")}})
-        if not as_json:
-            item["list_activity"] = activity or item["role"]
+    with progress_history.dispatch_reads(record, ()):
+        for row in workers:
+            parent = record.parent_of(row)
+            saved = dispatches.by_worker.get(row.id, WorkerDispatchRecord({}, 0))
+            if parent is None:
+                continue
+            if selection is not WorkerFilter.ALL and (row.id not in states or not _listed_worker(states[row.id], selection)):
+                continue
+            fields = saved.fields
+            status = fields.get("status", "unknown")
+            status = status if isinstance(status, str) else "unknown"
+            activity = fields.get("kind") if status in ("active", "refused") else ""
+            if isinstance(row.exited, staff.Exited):
+                status = "exited"
+            elif isinstance(row.paused, staff.Paused):
+                status = "paused"
+            work = "busy" if status == "active" else "idle" if status in ("completed", "error", "canceled", "interrupted", "paused", "exited") else "unknown"
+            dispatch = _worker_dispatch_state(row, record, detached, read=read)
             observed = states.get(row.id)
-            if observed is not None and isinstance(observed, worker_panes.OpenWorker):
-                item["pane"], item["state"] = _worker_pane_state(observed, detached)
-            item["waiting_on"] = _waiting_on(row, detached)
-        listing.append(item)
+            pane = "-"
+            if not as_json and isinstance(observed, worker_panes.OpenWorker):
+                pane, displayed = _worker_pane_state(observed, dispatch)
+                status = work = displayed
+            elif status not in ("paused", "exited"):
+                if isinstance(dispatch, worker_panes.DispatchHoldsWorker):
+                    status, work = "active", "busy"
+                elif status == "active":
+                    status = dispatch.value if isinstance(dispatch, worker_panes.ReleasedWorkerPass) else "completed"
+                    work = "idle"
+            item = _worker_list_row(row, {"manager": parent.name, "state": status, "work": work,
+                "activity": fields.get("activity") or status,
+                **{key: fields.get(key, "unknown" if key == "completion_state" else "")
+                   for key in ("dispatch_id", "run_path", "completion_state", "reply_path")}})
+            if not as_json:
+                item["list_activity"] = activity or item["role"]
+                if pane != "-":
+                    item["pane"] = pane
+                item["waiting_on"] = _waiting_on(row, detached)
+            listing.append(item)
     if not as_json:
         listing.sort(key=lambda fields: not (StaffId(str(fields["id"])) in states
                      and _open_worker(states[StaffId(str(fields["id"]))])))
@@ -1733,33 +1819,48 @@ def list_all_workers(record: staff.StaffSnapshot, *, selection: WorkerFilter = W
 
 
 def _worker_pane_state(state: worker_panes.WorkerPane,
-                       detached: session_state.RunningDetachedWork) -> tuple[str, str]:
+                       dispatch: worker_panes.WorkerDispatchState) -> tuple[str, str]:
+    row = state.row
+    activity = worker_panes.worker_state(state)
     if isinstance(state, worker_panes.OpenWorker):
-        activity = "starting" if state.status == "starting" else worker_panes.worker_state(state)
-        classified = session_state.classify(state.row, session_state.LiveActivity(activity), detached=detached)
-        return "open", activity if activity == "unknown" and classified == "idle" else classified
+        classified = session_state.classify(row, session_state.LiveActivity(
+            "starting" if state.status == "starting" else activity))
+        if classified in ("paused", "exited", "busy"):
+            return "open", classified
+        if isinstance(dispatch, worker_panes.DispatchHoldsWorker):
+            return "open", "busy"
+        return "open", activity
     if isinstance(state, worker_panes.StoppedWorker):
-        return "open", "exited"
-    if isinstance(state, worker_panes.ClosedWorker):
-        return "closed", "-"
-    return "unknown", "-"
+        pane, displayed = "open", "exited"
+    elif isinstance(state, worker_panes.ClosedWorker):
+        pane, displayed = "closed", "-"
+    else:
+        pane, displayed = "unknown", "-"
+    if isinstance(dispatch, worker_panes.DispatchHoldsWorker) and session_state.staff_state(row) == "active":
+        return pane, "busy"
+    return pane, displayed
 
 
 def list_workers(parent: StaffId, record: staff.StaffSnapshot, *, as_json: bool = True,
                  selection: WorkerFilter = WorkerFilter.ALL) -> list[dict[str, object]]:
     listing: list[dict[str, object]] = []
-    detached = session_state.running_detached_work(record)
+    rows = tuple(row for row in record.rows if row.kind != "worker" or row.reports_to(parent))
+    directories = worker_panes.worker_run_directories(replace(record, rows=rows))
+    detached = _worker_detached_work(record, directories, directories.by_worker)
     observed = _read_workers(next(row for row in record.rows if row.id == parent), record,
                              scanned=detached.launcher_runs.by_session)
     dispatches = (_recorded_worker_dispatches(record, runs=observed.runs)
-                  if as_json else RecordedWorkerDispatches({}, ()))
-    with progress_history.dispatch_reads(record, observed.runs):
+                  if as_json else RecordedWorkerDispatches({}, {}))
+    runs = dict.fromkeys((*observed.runs, *(path for paths in directories.by_worker.values() for path in paths)))
+    with progress_history.dispatch_reads(record, runs):
         states = observed.states if as_json else sorted(observed.states, key=lambda state: not _open_worker(state))
         for state in states:
             if not _listed_worker(state, selection):
                 continue
-            pane, displayed_state = _worker_pane_state(state, detached)
-            work = displayed_state if isinstance(state, worker_panes.OpenWorker) else worker_panes.worker_state(state)
+            dispatch_state = _worker_dispatch_state(state.row, record, detached)
+            pane, displayed_state = _worker_pane_state(state, dispatch_state)
+            work = (displayed_state if isinstance(state, worker_panes.OpenWorker) or displayed_state == "busy"
+                    else worker_panes.worker_state(state))
             facts: dict[str, object] = {"state": type(state).__name__, "work": work}
             if as_json:
                 saved = dispatches.by_worker.get(state.row.id, WorkerDispatchRecord({}, 0)).fields

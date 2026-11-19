@@ -2118,6 +2118,16 @@ class WorkerPaneTests(StaffTestCase):
             self.assertIsInstance(worker_panes.can_close(opened), worker_panes.Kept)
             self.assertIsInstance(self.start(role="review"), worker_panes.StartRefused)
 
+            path = run / unit_runs.STATE_FILE
+            state = cast(dict[str, object], json.loads(path.read_text()))
+            passes = cast(dict[str, dict[str, object]], state["pass"])
+            passes["newer-slot"] = {"worker_id": opened.row.id, "instance_id": "newer-pass",
+                                    "started_at": 1, "status": "completed"}
+            write_text_atomic(path, json.dumps(state))
+            self.reply_to_dispatch(opened.row, "newer-pass")
+            self.assertIsInstance(worker_panes.can_close(opened), worker_panes.CloseAllowed)
+            self.assertIsInstance(self.start(role="review"), worker_panes.OpenWorker)
+
     def test_failed_unpublished_close_reports_one_anomaly(self) -> None:
         for failure in (False, OSError("TEST close failed\nsecond line")):
             with self.subTest(failure=failure):
