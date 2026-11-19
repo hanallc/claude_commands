@@ -26,7 +26,7 @@ import tempfile
 import time
 from typing import TYPE_CHECKING, Literal, cast, override
 
-from scripts.lib import git_files
+from scripts.lib import build_folder_lock, git_files
 from scripts.lib.boot_identity import boot_identity
 
 if TYPE_CHECKING:
@@ -326,83 +326,30 @@ def build_folder_path(spec: BuildFolderSpec) -> Path:
     return path
 
 
-@contextmanager
-def _folder_parent(path: Path, root: Path, *, create: bool) -> Generator[int]:
-    """Open each parent below the root without following directory links."""
-    canonical = root.resolve()
-    if create:
-        canonical.mkdir(parents=True, exist_ok=True)
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    directory = os.open(canonical, flags)
-    try:
-        for component in path.parent.relative_to(root).parts:
-            if create:
-                try:
-                    os.mkdir(component, dir_fd=directory)
-                except FileExistsError:
-                    pass
-            child = os.open(component, flags, dir_fd=directory)
-            previous = directory
-            directory = child
-            os.close(previous)
-        yield directory
-    finally:
-        os.close(directory)
-
-
 _locks: dict[int, Path] = {}
 # A folder's lock file, lease record, or unfinished lease record.
 _METADATA = re.compile(r"(.+)\.(?:lock|lease\.json(?:\.[0-9a-f]{16}\.tmp)?)")
 
-def _open_lock(path: Path, directory: int, *, create: bool) -> int:
-    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
-    if create:
-        flags |= os.O_CREAT
-    descriptor = os.open(path.name + ".lock", flags, 0o600, dir_fd=directory)
-    try:
-        inode = os.fstat(descriptor)
-        # Another process can remove the lock after this open; _lock_current refuses a lock with no link.
-        if not stat.S_ISREG(inode.st_mode) or inode.st_nlink > 1:
-            raise ValueError("a build folder lock must be a regular file with one link")
-        return descriptor
-    except BaseException:
-        os.close(descriptor)
-        raise
+
+def _probe_timing(*, wait: bool = True) -> build_folder_lock.ProbeTiming:
+    if not wait:
+        return build_folder_lock.ProbeTiming(0.0, 0.0)
+    settings = _settings()
+    return build_folder_lock.ProbeTiming(settings.number("locks.probe_wait_seconds"),
+                                        settings.number("locks.probe_retry_seconds"))
 
 
 def _take_lock(descriptor: int, mode: int, *, wait: bool = True) -> bool:
-    """Try the lock until the configured probe wait ends, or once when wait is False."""
-    deadline = retry = 0.0
-    if wait:
-        settings = _settings()
-        deadline = time.monotonic() + settings.number("locks.probe_wait_seconds")
-        retry = settings.number("locks.probe_retry_seconds")
-    while True:
-        try:
-            fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
-            return True
-        except BlockingIOError:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return False
-            time.sleep(min(retry, remaining))
-
-
-def _lock_current(path: Path, directory: int, descriptor: int) -> bool:
-    try:
-        return os.path.samestat(os.fstat(descriptor), os.stat(path.name + ".lock", dir_fd=directory,
-                                                            follow_symlinks=False))
-    except FileNotFoundError:
-        return False
+    return build_folder_lock.take_lock(descriptor, mode, _probe_timing(wait=wait))
 
 
 def build_folder_state(path: Path, *, wait: bool = True) -> Literal["held", "free"]:
     """Check whether a lock or a populated scope holds the folder."""
     try:
-        with _folder_parent(path, path.parent, create=False) as directory:
+        with build_folder_lock.folder_parent(path, path.parent, create=False) as directory:
             while True:
                 try:
-                    descriptor = _open_lock(path, directory, create=False)
+                    descriptor = build_folder_lock.open_lock(path, directory, create=False)
                 except FileNotFoundError:
                     _ = claim_free_build_folder(path, directory, MissingFolderLock.ABSENT, wait=wait)
                     return "free"
@@ -501,7 +448,7 @@ def claim_free_build_folder(path: Path, directory: int, descriptor: int | Missin
     """Take the current lock and require an empty scope. The caller closes the lock."""
     if isinstance(descriptor, int):
         acquired = _take_lock(descriptor, mode, wait=wait)
-        if not _lock_current(path, directory, descriptor):
+        if not build_folder_lock.lock_current(path, directory, descriptor):
             raise BuildFolderLockChanged(errno.EWOULDBLOCK, "build folder lock changed", str(path))
         if not acquired:
             raise BlockingIOError(errno.EWOULDBLOCK, "build folder is held", str(path))
@@ -563,8 +510,8 @@ def _write_lease(path: Path, directory: int, spec: BuildFolderSpec | CheckoutSco
 
 def write_checkout_lease(path: Path, binding: CheckoutScopeBinding, descriptor: int) -> None:
     """Bind the scope while this process holds the checkout lock."""
-    with _folder_parent(path, path.parent, create=False) as directory:
-        if not _lock_current(path, directory, descriptor) or not _take_lock(descriptor, fcntl.LOCK_EX, wait=False):
+    with build_folder_lock.folder_parent(path, path.parent, create=False) as directory:
+        if not build_folder_lock.lock_current(path, directory, descriptor) or not _take_lock(descriptor, fcntl.LOCK_EX, wait=False):
             raise ValueError(f"{path}: the checkout lock is missing")
         _write_lease(path, directory, binding)
 
@@ -640,10 +587,10 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                         else build_folder_path(allocation))
                 directory = directories.get(path.parent)
                 if directory is None:
-                    directory = parents.enter_context(_folder_parent(path, spec.parent,
+                    directory = parents.enter_context(build_folder_lock.folder_parent(path, spec.parent,
                         create=stable or not isinstance(original, UniqueBuildFolder)))
                     directories[path.parent] = directory
-                descriptor = _open_lock(path, directory, create=True)
+                descriptor = build_folder_lock.open_lock(path, directory, create=True)
                 made_inode: os.stat_result | None = None
                 new_folder = False
                 new_branch_start = ""
@@ -930,7 +877,7 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
                      create: bool = False) -> FolderRemovalLease:
     """Hold the lock if it is free. The stack owns the descriptor."""
     try:
-        descriptor = _open_lock(path, directory, create=create)
+        descriptor = build_folder_lock.open_lock(path, directory, create=create)
     except FileNotFoundError:
         descriptor = MissingFolderLock.ABSENT
     if isinstance(descriptor, int):
@@ -985,7 +932,7 @@ def folder_removal_lease(path: Path, *, children: bool = False, wait: bool = Tru
     folder = path.with_name(metadata[1]) if metadata else path
     with ExitStack() as stack:
         try:
-            directory = stack.enter_context(_folder_parent(folder, folder.parent, create=False))
+            directory = stack.enter_context(build_folder_lock.folder_parent(folder, folder.parent, create=False))
             lease = _hold_free_lease(folder, directory, stack, wait=wait)
             if not isinstance(lease, RefusedRemovalLease):
                 if metadata is not None:
@@ -1031,7 +978,7 @@ def slot_build_folder(spec: BuildFolderSpec) -> Generator[Path]:
         yield path
     finally:
         try:
-            with _folder_parent(path, spec.parent, create=False) as directory:
+            with build_folder_lock.folder_parent(path, spec.parent, create=False) as directory:
                 _write_lease(path, directory, spec, released=True)
         finally:
             _release_build_folder(path)
@@ -1043,11 +990,11 @@ def remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary:
     with ExitStack() as parents:
         try:
             directory = dir_fd if dir_fd is not None else parents.enter_context(
-                _folder_parent(path, path.parent, create=False))
+                build_folder_lock.folder_parent(path, path.parent, create=False))
         except FileNotFoundError:
             # An absent parent has no folder or metadata to lock.
             return cleanup() is not False
-        descriptor = _open_lock(path, directory, create=True)
+        descriptor = build_folder_lock.open_lock(path, directory, create=True)
         try:
             try:
                 _ = claim_free_build_folder(path, directory, descriptor, wait=wait)
@@ -1085,7 +1032,7 @@ def release_removed_folder(path: Path) -> FolderPairRelease:
         return FolderPairRelease.PARENT_LINK
     with ExitStack() as stack:
         try:
-            directory = stack.enter_context(_folder_parent(path, Path(path.anchor), create=False))
+            directory = stack.enter_context(build_folder_lock.folder_parent(path, Path(path.anchor), create=False))
         except FileNotFoundError:
             return FolderPairRelease.PARENT_ABSENT
         if _folder_exists(path, directory):
@@ -1134,7 +1081,7 @@ def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
     """Remove free allocations in a parent reserved for temporary maker folders.
     With wait False, a held folder costs one lock try, not the probe wait."""
     try:
-        with _folder_parent(parent / "entry", parent, create=False) as directory:
+        with build_folder_lock.folder_parent(parent / "entry", parent, create=False) as directory:
             names: set[str] = set()
             for entry in os.listdir(directory):
                 match = _METADATA.fullmatch(entry)
@@ -1171,7 +1118,7 @@ def _claim_tool_folder(tool: str, parent: Path | None, allocate: Callable[[Build
             number += 1
         except FileExistsError:
             path = build_folder_path(spec)
-            with _folder_parent(path, root, create=False) as directory:
+            with build_folder_lock.folder_parent(path, root, create=False) as directory:
                 leftover = _lease_owner_ended(path, directory) and _remove_free(path, directory, wait=False)
             if not leftover:
                 number += 1

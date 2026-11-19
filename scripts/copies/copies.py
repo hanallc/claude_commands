@@ -268,7 +268,7 @@ def _private_index_git(source: Path, index: Path, *arguments: str) -> bytes:
     except subprocess.TimeoutExpired as error:
         raise PreparationError(f"git {' '.join(arguments)} in {source}: timed out after {timeout:g} seconds") from error
     if result.returncode:
-        raise PreparationError(result.stderr.decode(errors="replace"))
+        raise PreparationError(result.stderr.decode(errors="replace").strip() or f"Git exited with status {result.returncode}")
     return result.stdout
 
 
@@ -288,7 +288,7 @@ def staged_tree(source: Path, *, include_worktree: bool = False) -> str:
             for row in git(source, "ls-tree", "-rz", tree).split(b"\0"):
                 if row.startswith(b"160000 ") and row.split(b"\t", 1)[1] not in head_links:
                     path = os.fsdecode(row.split(b"\t", 1)[1])
-                    raise PreparationError(f"NestedRepository: {path}: new Git links cannot supply working files")
+                    raise NestedRepository(f"NestedRepository: {path}: new Git links cannot supply working files")
         return tree
 
 
@@ -311,7 +311,7 @@ def capture_source(source: Path) -> str:
     if (staged_tree(source, include_worktree=True) != tree or not before
             or treekey.tree_key(str(source)) != before or staged_tree(source) != index
             or commit_at(source, "HEAD") != head):
-        raise PreparationError("SourceChanged: inputs changed during source capture")
+        raise SourceChangedDuringCapture("SourceChanged: inputs changed during source capture")
     return git(source, "-c", "user.name=copies.py", "-c", "user.email=copies@localhost",
                "commit-tree", tree, data=b"copies: source snapshot\n").decode().strip()
 
@@ -345,6 +345,14 @@ class PreparationError(CopyError):
     """Uncommitted changes or a merge could not be applied to the gate commit."""
 
     exit_code: int = 3
+
+
+class NestedRepository(PreparationError):
+    """The worktree adds a Git link that cannot supply working files."""
+
+
+class SourceChangedDuringCapture(PreparationError):
+    """The source changed before capture could verify its snapshot."""
 
 
 class PostUseError(CopyError):

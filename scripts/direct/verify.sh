@@ -2381,7 +2381,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else step_state waiting_ssh; fi
             return
             ;;
-        failed)
+        failed|prelaunch_failed)
             close_mac_log
             rm -f "$MAC_LOG_FILE"
             MAC_LOG_FILE=""

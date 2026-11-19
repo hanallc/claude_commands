@@ -104,7 +104,7 @@ result = Path(arguments[arguments.index("--result") + 1])
 ''' + ASSIGNED_RUNNER_SETUP + '''
 if "--assignment-file" in arguments:
     fixture_outcome = placement.AttemptDeclined("no_tests")
-    fixture_evidence = placement.ExecutionEvidenceUnavailable("the private command has ended", time.time())
+    fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private command has ended", time.time())
     fixture_cleanup_confirmed = True
 with (Path(os.environ["TEST_RUNNER_STATE"]) / "runner-events.jsonl").open("a") as output:
     output.write(json.dumps({"args": sys.argv[1:], "token_held": False, "at": time.time()}) + "\\n")

@@ -62,7 +62,7 @@ def change(args: RequestedValueChange) -> int:
         print(f"already {args.key}={args.value}")
     else:
         print(f"live now: {args.key}={args.value}")
-        if args.file == "hana_aws":
+        if args.file in ("hana_aws", "build_targets", "build_folders"):
             from scripts.aws_target import hana_render
 
             if hana_render.affects_guest_config(args.key, source):

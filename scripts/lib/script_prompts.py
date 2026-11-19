@@ -6,16 +6,18 @@ The configured count limit removes the oldest evidence and records its cause.
 from __future__ import annotations
 
 import hashlib
-import fcntl
+import math
 import os
 import json
 import socket
+import time
 import uuid
 from datetime import datetime, timezone
 from collections.abc import Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-
+from scripts.agents import worker_lifecycle
 from scripts.lib import conf
 
 
@@ -30,17 +32,30 @@ def _path(pane: str, text: str) -> Path:
 
 
 @contextmanager
-def locked() -> Generator[None]:
+def locked(deadline: float = math.inf) -> Generator[None]:
     folder = root()
     folder.mkdir(parents=True, exist_ok=True)
     with (folder / ".lock").open("a") as stream:
-        fcntl.flock(stream, fcntl.LOCK_EX)
+        try:
+            worker_lifecycle.acquire_flock(stream, deadline=deadline)
+        except worker_lifecycle.OperationDeadlineExpired as error:
+            raise TimeoutError("script prompt record lock deadline elapsed") from error
         yield
 
 
 def _matching(pane: str, text: str) -> list[Path]:
     path = _path(pane, text)
     return [*([path] if path.is_file() else []), *root().glob(path.name + ".*")]
+
+
+def _oldest_first(paths: list[Path]) -> list[Path]:
+    records: list[tuple[int, Path]] = []
+    for path in paths:
+        try:
+            records.append((path.stat().st_mtime_ns, path))
+        except FileNotFoundError:
+            continue
+    return [path for _, path in sorted(records)]
 
 
 def _evict(path: Path) -> None:
@@ -53,20 +68,44 @@ def _evict(path: Path) -> None:
         _ = stream.write(json.dumps(event) + "\n")
         stream.flush()
         os.fsync(stream.fileno())
-    path.unlink()
+    path.unlink(missing_ok=True)
 
 
 def record(pane: str, text: str) -> None:
-    if not text.lstrip().startswith("/"):
-        return
+    if text.lstrip().startswith("/"):
+        prepared = prepare_record(pane, text, deadline=math.inf)
+        prepared.publish()
+        prepared.trim()
+
+
+@dataclass(frozen=True)
+class PreparedRecord:
+    path: Path
+    limit: int
+    deadline: float
+
+    def publish(self) -> None:
+        with locked(self.deadline):
+            self._check_deadline()
+            self.path.touch()
+
+    def trim(self) -> None:
+        with locked(self.deadline):
+            records = _oldest_first([item for item in root().iterdir() if item.name != ".lock"])
+            for old in records[:max(0, len(records) - self.limit)]:
+                self._check_deadline()
+                _evict(old)
+
+    def _check_deadline(self) -> None:
+        if time.monotonic() >= self.deadline:
+            raise TimeoutError("script prompt record deadline elapsed")
+
+
+def prepare_record(pane: str, text: str, *, deadline: float) -> PreparedRecord:
+    """Prepare the record without writing it or evicting another record."""
+    path = _path(pane, text)
     limit = conf.read("script_prompts").whole("max_records")
-    with locked():
-        records = sorted((item for item in root().iterdir() if item.name != ".lock"),
-                         key=lambda item: (item.stat().st_mtime_ns, item.name))
-        while len(records) >= limit:
-            _evict(records.pop(0))
-        path = _path(pane, text)
-        path.with_name(path.name + "." + uuid.uuid4().hex).touch()
+    return PreparedRecord(path.with_name(path.name + "." + uuid.uuid4().hex), limit, deadline)
 
 
 def typed_by_script(pane: str, text: str) -> bool:
@@ -82,8 +121,11 @@ def typed_here(text: str) -> bool:
     with locked():
         matched = False
         for identity in set(identities) - {""}:
-            paths = _matching(identity, text)
-            if paths:
-                min(paths, key=lambda path: path.stat().st_mtime_ns).unlink()
+            for path in _oldest_first(_matching(identity, text)):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    continue
                 matched = True
+                break
         return matched

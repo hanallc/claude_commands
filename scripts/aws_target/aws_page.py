@@ -1,4 +1,4 @@
-"""Publish the AWS page: the spend totals and the spot_table tables as data for the admin console."""
+"""Publish the spend, prices, quotas and run data for the AWS console page."""
 from __future__ import annotations
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
@@ -17,7 +17,7 @@ from datetime import UTC, datetime, timedelta
 from html import escape
 from pathlib import Path
 from statistics import median
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 from scripts.aws_target import config as aws_config, console_help, ledger, spend as aws_spend, spot_table
 from scripts.lib import conf
@@ -35,8 +35,7 @@ def region_filter_key(region: str) -> tuple[int, str]:
     return (REGION_GROUPS.index(group) if group in REGION_GROUPS else len(REGION_GROUPS), region)
 
 
-class TableData(TypedDict):
-    title: str
+class TableRowsData(TypedDict):
     headers: list[str]
     right: list[int]
     rows: list[list[str]]
@@ -45,6 +44,10 @@ class TableData(TypedDict):
     values: list[list[float | None]]
     # [row, column] cells of a type that the region does not sell.
     not_sold: list[list[int]]
+
+
+class TableData(TableRowsData):
+    title: str
 
 
 class EstimateData(TypedDict):
@@ -63,8 +66,8 @@ class RunCostData(TypedDict):
     label: str
     explanation: str
     tables: list[TableData]
-    # The estimate of each type and region: the price tables of the Cost per gate view.
-    prices: list[TableData]
+    # Keep the standard Gate table at index 0 for pages that are already open.
+    prices: list[TableRowsData]
     # The summary for each candidate estimate, cheapest first; the page shows the first in the chosen regions.
     estimates: list[EstimateData]
     no_estimate: str
@@ -93,19 +96,24 @@ class PageData(TypedDict):
     # Every region a table shows, for the region filter.
     regions: list[str]
     snapshot: list[SnapshotLine]
-    prices: list[TableData]
+    prices: list[TableRowsData]
     placement_scores: TableData
-    quotas: list[TableData]
+    quotas: list[TableRowsData]
+    cached_spot_status: dict[str, Literal['read failed', 'old']]
     runs: list[RunCostData]
     hours: TableData
     hours_note: str
 
 
-def table_data(table: spot_table.Table) -> TableData:
-    return {'title': table.title, 'headers': list(table.headers), 'right': sorted(table.right),
+def table_rows_data(table: spot_table.Table) -> TableRowsData:
+    return {'headers': list(table.headers), 'right': sorted(table.right),
             'rows': [list(row) for row in table.rows], 'region_axis': table.region_axis,
             'values': [[float(value) if value is not None else None for value in row] for row in table.values],
             'not_sold': [list(cell) for cell in sorted(table.not_sold)]}
+
+
+def table_data(table: spot_table.Table) -> TableData:
+    return {'title': table.title, **table_rows_data(table)}
 
 
 def placement_score_table(regions: Sequence[str], readings: Sequence[ledger.SpotPlacementReading],
@@ -162,7 +170,7 @@ def placement_score_table(regions: Sequence[str], readings: Sequence[ledger.Spot
 
 
 def without_prices(table: spot_table.Table) -> spot_table.Table:
-    """A run table without the Spot price and estimate columns, which the page's price tables show."""
+    """Omit the Spot price and estimate that the Prices and quotas card shows."""
     keep = [index for index, header in enumerate(table.headers)
             if header not in (spot_table.SPOT_HEADER, spot_table.ESTIMATE_HEADER)]
     return replace(table, headers=tuple(table.headers[index] for index in keep),
@@ -208,12 +216,14 @@ def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
         'spend': spend,
         'regions': sorted(regions, key=region_filter_key),
         'snapshot': [{'region': region, 'text': text} for region, text in tables.snapshot_rows],
-        'prices': [table_data(table) for table in tables.prices],
+        'prices': [table_rows_data(table) for table in tables.prices],
         'placement_scores': table_data(placement),
-        'quotas': [table_data(table) for table in tables.quotas],
+        'quotas': [table_rows_data(table) for table in tables.quotas],
+        'cached_spot_status': {read.region: 'read failed' if read.failure else 'old'
+                               for read in tables.regions if read.failure or read.stale},
         'runs': [{'scope': costs.scope.name, 'label': costs.scope.label, 'explanation': costs.explanation,
                   'tables': [table_data(without_prices(table)) for table in costs.tables],
-                  'prices': [table_data(table) for table in costs.prices],
+                  'prices': [table_rows_data(costs.gate_prices)],
                   'estimates': [{'region': entry.region, 'summary': costs.summary_of(entry)} for entry in costs.estimates],
                   'no_estimate': costs.summary_of(None),
                   'refused': table_data(costs.refused), 'launched': table_data(costs.launched)}

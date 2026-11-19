@@ -118,7 +118,7 @@ def cancel(signum, _frame):
     child.wait(timeout=int(os.environ["TEST_HANG_GUARD_SECS"]))
     if "--assignment-file" in arguments:
         fixture_outcome = placement.AttemptCancelled("the source tree changed")
-        fixture_evidence = placement.ExecutionEvidenceUnavailable("the private child has ended", time.time())
+        fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private child has ended", time.time())
         fixture_cleanup_confirmed = True
     (root / "mac-cancelled").write_text(str(signum))
     raise SystemExit(128 + signum)
