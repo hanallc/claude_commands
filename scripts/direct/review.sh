@@ -165,6 +165,7 @@ write_review_status() {
 }
 
 # Validate the review and read its run owner before the reviewer starts.
+# Fixes recorded under a new owner name during setup stay pending for the next pass.
 FAST_TRACK_UNIT=""
 if [[ -f "${PROGRESS_STATE}" ]]; then
   RUN_OWNER_OPTION=()
@@ -290,7 +291,7 @@ bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" header "${BEAT_TAG} (${AGENT_FAMI
 # A broad pass reviews the exact pending snapshot it receives. New pushes made
 # during this pass stay pending for the next pass.
 FAST_TRACK_COMMITS=()
-FAST_TRACK_SCRIPT="${SCRIPT_DIR}/../production/fast_track_review.py"
+FAST_TRACK_SCRIPT="${SCRIPT_DIR}/../production/fast_track.py"
 if [[ -n "${FAST_TRACK_UNIT}" ]]; then
   FAST_TRACK_DIFF="${ARTIFACT_DIR}/review_fast_track_${PASS_INDEX}.diff"
   # One atomic snapshot for every lens and retry of this phase's broad pass.
@@ -299,15 +300,7 @@ if [[ -n "${FAST_TRACK_UNIT}" ]]; then
     if [[ ! -f "${FAST_TRACK_DIFF}" ]]; then
       SNAPSHOT_TEMP="${FAST_TRACK_DIFF}.$$.tmp"
       trap 'rm -f "${SNAPSHOT_TEMP}"' EXIT
-      (
-        cd "${WORKING_DIR}"
-        STATE_DIR="${FAST_TRACK_STATE_DIR-$HOME/.local/state/fast-track}"
-        if [[ -n "${STATE_DIR}" && ! -e "${STATE_DIR}" && ! -L "${STATE_DIR}" ]]; then
-          git rev-parse --show-toplevel >/dev/null
-        else
-          "$PY" "${FAST_TRACK_SCRIPT}" --pending --unit "${FAST_TRACK_UNIT}"
-        fi
-      ) > "${SNAPSHOT_TEMP}"
+      (cd "${WORKING_DIR}" && "$PY" "${FAST_TRACK_SCRIPT}" --pending --unit "${FAST_TRACK_UNIT}") > "${SNAPSHOT_TEMP}"
       mv "${SNAPSHOT_TEMP}" "${FAST_TRACK_DIFF}"
     fi
   ) 9>"${FAST_TRACK_DIFF}.lock"

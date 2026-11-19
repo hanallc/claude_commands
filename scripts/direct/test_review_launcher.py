@@ -143,7 +143,9 @@ exec bash "''' + str(agent_exec) + '''" "$@"
         environment["FAST_TRACK_REVIEW_PROMPT"] = str(self.root / "received-fast-track-prompt.md")
         return environment
 
-    def prepare_fast_track_review(self, name: str) -> tuple[Path, dict[str, str], str]:
+    def prepare_fast_track_review(
+        self, name: str, *, subdirectory_fix: bool = False,
+    ) -> tuple[Path, dict[str, str], str]:
         session = self.start_implementation(name)
         self.finish_implementation(session)
         with (patch.dict(os.environ, {"STAFF_CONFIG": str(self.root / "staff.conf")}),
@@ -152,7 +154,13 @@ exec bash "''' + str(agent_exec) + '''" "$@"
             assert owner is not None
             _ = staff.rename(owner.id, "alpha")
         _ = (self.working_dir / "fast-fix.txt").write_text(f"already pushed fast fix {name}\n")
-        for arguments in (["add", "fast-fix.txt"],
+        changed_paths = ["fast-fix.txt"]
+        if subdirectory_fix:
+            subdirectory = self.working_dir / "nested"
+            subdirectory.mkdir()
+            _ = (subdirectory / "fast-fix.txt").write_text("already pushed nested fix\n")
+            changed_paths.append("nested/fast-fix.txt")
+        for arguments in (["add", "--", *changed_paths],
                           ["-c", "user.name=Review Test", "-c", "user.email=review@example.invalid",
                            "commit", "-m", "fast-track(alpha): repair the sample"]):
             _ = subprocess.run(["git", *arguments], cwd=self.working_dir, check=True, capture_output=True,
@@ -177,16 +185,28 @@ exec bash "''' + str(agent_exec) + '''" "$@"
                 (self.root / "fast-track-state/records.jsonl").read_text().splitlines()]
 
     def test_each_broad_review_receives_pending_fast_fix_diffs_and_marks_the_snapshot(self) -> None:
-        for lens in ("contract", "adversary"):
-            with self.subTest(lens=lens):
-                session, environment, tip = self.prepare_fast_track_review("fast-track-" + lens)
-                result = subprocess.run(self.review_command(session, lens, ""), env=environment,
+        for lens, subdirectory in (("contract", False), ("adversary", False), ("contract", True)):
+            with self.subTest(lens=lens, subdirectory=subdirectory):
+                name = "fast-track-subdirectory" if subdirectory else "fast-track-" + lens
+                session, environment, tip = self.prepare_fast_track_review(name, subdirectory_fix=subdirectory)
+                if subdirectory:
+                    _ = subprocess.run(["git", "config", "--local", "diff.relative", "true"],
+                                       cwd=self.working_dir, env=environment, check=True, capture_output=True,
+                                       timeout=TEST_HANG_GUARD_SECS)
+                    with patch.object(self, "working_dir", self.working_dir / "nested"):
+                        command = self.review_command(session, lens, "")
+                else:
+                    command = self.review_command(session, lens, "")
+                result = subprocess.run(command, env=environment,
                                         capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 prompt = Path(environment["FAST_TRACK_REVIEW_PROMPT"]).read_text()
                 self.assertIn(tip, prompt)
                 self.assertIn("diff --git a/fast-fix.txt b/fast-fix.txt", prompt)
                 self.assertIn("+already pushed fast fix", prompt)
+                if subdirectory:
+                    self.assertIn("diff --git a/nested/fast-fix.txt b/nested/fast-fix.txt", prompt)
+                    self.assertIn("+already pushed nested fix", prompt)
                 row, = self.fast_track_review_rows()
                 self.assertEqual(row["review"], "reviewed")
                 self.assertIn(lens, str(row["review_pass"]))
@@ -209,7 +229,7 @@ exec bash "''' + str(agent_exec) + '''" "$@"
         self.assertIsNone(shutil.which("perl", path=environment["PATH"]))
         calls = session / "snapshot-calls"
         release = session / "snapshot-release"
-        script = self.root / "scripts/production/fast_track_review.py"
+        script = self.root / "scripts/production/fast_track.py"
         entry = 'if __name__ == "__main__":'
         _ = script.write_text(script.read_text().replace(entry,
             "from scripts.direct.wait_for_test_state import wait_for_file\n\n"
