@@ -1175,25 +1175,77 @@ def _launch_slot(passes: dict[str, dict[str, object]], slot: str, launcher_comma
                      and pass_recorder.worker_launcher(cast(list[str], saved), pass_recorder.string(passed.get("worker_name"))) == launcher_command))), slot)
 
 
+@dataclass(frozen=True)
+class DispatchWork:
+    """The launch kind and review or fix details of a requested assignment."""
+
+    kind: str
+    lens: str
+    fix_pass: int
+
+
+class DispatchWorkAtUse(Enum):
+    RECORDED = "match only the launcher and prompt"
+
+
 def dispatch_worker(session_dir: Path, *, slot: str, phase: str, role: staff.WorkerRole,
                     prompt: Path, launcher_command: list[str],
+                    work: DispatchWork | DispatchWorkAtUse = DispatchWorkAtUse.RECORDED,
                     ) -> pass_recorder.MatchedDispatch | pass_recorder.NoMatchedDispatch | pass_recorder.ActiveDispatchPromptConflict:
     """Find the worker for this dispatch retry without changing recorder state."""
-    if not pass_recorder.state_path(session_dir).is_file():
-        return pass_recorder.NoMatchedDispatch()
-    state = pass_recorder.read_state(session_dir)
+    selected = select_dispatch(session_dir, slot=slot, phase=phase, role=role, prompt=prompt,
+                               launcher_command=launcher_command, work=work,
+                               target=DispatchTargetAtUse.FROM_LAUNCHER)
+    if isinstance(selected, pass_recorder.ActiveDispatchPromptConflict):
+        return selected
+    return selected.action if isinstance(selected.action, pass_recorder.MatchedDispatch) else pass_recorder.NoMatchedDispatch()
+
+
+def _dispatch_fields(role: staff.WorkerRole, prompt: Path,
+                     work: DispatchWork | DispatchWorkAtUse) -> dict[str, object]:
+    fields: dict[str, object] = {"kind": role, "prompt_file": str(prompt)}
+    if isinstance(work, DispatchWork):
+        fields.update(dispatch_kind=work.kind, lens=work.lens, fix_pass=work.fix_pass)
+    return fields
+
+
+class DispatchTargetAtUse(Enum):
+    FROM_LAUNCHER = "find the worker from the saved launcher command"
+
+
+def select_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.WorkerRole,
+                    prompt: Path, launcher_command: list[str], work: DispatchWork | DispatchWorkAtUse,
+                    target: staff.WorkerName | DispatchTargetAtUse,
+                    ) -> pass_recorder.DispatchSelection | pass_recorder.ActiveDispatchPromptConflict:
+    """Select the pass before worker recovery can change the slot."""
+    state = pass_recorder.read_state(session_dir) if pass_recorder.state_path(session_dir).is_file() else {}
     passes = pass_recorder.pass_slots(state)
-    slot = _launch_slot(passes, slot, launcher_command)
+    if isinstance(target, DispatchTargetAtUse):
+        slot = _launch_slot(passes, slot, launcher_command)
+    previous = passes.get(slot)
     recorded_phase = pass_recorder.open_phase_named(state, phase)
-    if recorded_phase is None:
-        recorded_phase = pass_recorder.object_dict(passes.get(slot, {}).get("phase"))
-        if recorded_phase is None or pass_recorder.string(recorded_phase.get("id")) != phase:
-            return pass_recorder.NoMatchedDispatch()
-    return pass_recorder.dispatch_match(
-        passes.get(slot), recorded_phase,
-        {"kind": role, "prompt_file": str(prompt), "launcher_command": launcher_command},
-        launcher_command, dispatch_owned=True,
-    )
+    match_phase = recorded_phase
+    if match_phase is None and previous is not None:
+        saved_phase = pass_recorder.object_dict(previous.get("phase"))
+        if saved_phase is not None and pass_recorder.string(saved_phase.get("id")) == phase:
+            match_phase = saved_phase
+    match = (pass_recorder.dispatch_match(previous, match_phase, _dispatch_fields(role, prompt, work),
+                             launcher_command, dispatch_owned=True)
+             if match_phase is not None else pass_recorder.NoMatchedDispatch())
+    if isinstance(match, pass_recorder.ActiveDispatchPromptConflict):
+        return match
+    action: pass_recorder.MatchedDispatch | pass_recorder.NewAssignment = pass_recorder.NewAssignment()
+    if isinstance(match, pass_recorder.MatchedDispatch) and (isinstance(target, DispatchTargetAtUse) or match.worker_name == target.value):
+        action = match
+    return pass_recorder.DispatchSelection(slot, phase, pass_recorder.string((recorded_phase or {}).get("instance_id")),
+                                           pass_recorder.dispatch_predecessor(passes, slot), action)
+
+
+def validate_dispatch_selection(session_dir: Path, selection: pass_recorder.DispatchSelection) -> None:
+    """Check a selected completed retry while holding the recorder lock."""
+    with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        pass_recorder.validate_dispatch_selection(pass_recorder.read_state(session_dir), selection, selection.slot, selection.phase_id)
 
 
 @dataclass(frozen=True)
@@ -1269,7 +1321,9 @@ CALLED_AGENT_NOT_RECORDED = CalledAgent("unknown", "unknown", "unset")
 def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.WorkerRole,
                    worker_name: str, worker_id: staff.StaffId, launcher_command: list[str], prompt: Path, kind: str, lens: str,
                    fix_cause: str = "", fix_pass: int = 0, activity: str = "",
-                   called: CalledAgent = CALLED_AGENT_NOT_RECORDED) -> str:
+                   called: CalledAgent = CALLED_AGENT_NOT_RECORDED,
+                   selection: pass_recorder.DispatchSelection | pass_recorder.SelectDispatchAtRecorder =
+                   pass_recorder.SelectDispatchAtRecorder.SELECT) -> str:
     """Record a published worker's dispatch and return its durable pass id."""
     if role not in staff.WORKER_ROLES:
         raise ValueError(f"Unknown worker role: {role}")
@@ -1284,7 +1338,7 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
     with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
-            pass_recorder.start_pass(args)
+            pass_recorder.start_pass(args, selection)
             _link_dispatch_state(worker_id, session_dir)
             return pass_recorder.string(pass_recorder.pass_slots(pass_recorder.read_state(session_dir))[slot]["instance_id"])
         finally:

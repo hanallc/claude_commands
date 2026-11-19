@@ -20,6 +20,7 @@ import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from functools import cache
 from pathlib import Path
 from typing import Literal, NamedTuple, NoReturn, TypedDict, cast
@@ -893,6 +894,11 @@ class MatchedDispatch:
 
 
 @dataclass(frozen=True)
+class ContinueDispatchStage(MatchedDispatch):
+    """Submit the saved next stage of the same pass."""
+
+
+@dataclass(frozen=True)
 class NoMatchedDispatch:
     """No saved dispatch matches the requested assignment."""
 
@@ -915,7 +921,7 @@ class DispatchPromptRefused(RuntimeError):
 
 def dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
                     fields: dict[str, object], launcher_command: list[str], *,
-                    dispatch_owned: bool, allow_stage_two: bool = False,
+                    dispatch_owned: bool,
                     ) -> MatchedDispatch | NoMatchedDispatch | ActiveDispatchPromptConflict:
     if active is None or pass_phase_instance(active) != string(phase.get("instance_id")):
         return NoMatchedDispatch()
@@ -927,8 +933,17 @@ def dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
                        else cast(object, saved_command))
     same_launcher = bool(launcher_command) and (launcher_command == saved_command or (
         active.get("status") in ("active", "refused") and launcher_command == current_command))
-    stage_two = (allow_stage_two and same_launcher
-                 and fields.get("prompt_file") != active.get("prompt_file"))
+    stage_two = False
+    if dispatch_owned and fields.get("prompt_file") != active.get("prompt_file"):
+        delivery = dispatch_delivery(active)
+        prompt = json.dumps(fields.get("prompt_file"))
+        instance = string(active.get("instance_id"))
+        stage_two = (same_launcher and active.get("status") in ("active", "refused") and active.get("kind") == "review"
+                     and bool(instance and delivery.early_ready) and delivery.completion_id == f"{instance}-2"
+                     and delivery.line.startswith("Stage 2: ")
+                     and f"Read the unchanged prompt file {prompt}. " in delivery.line)
+        if not stage_two:
+            return NoMatchedDispatch()
     if dispatch_owned and not stage_two:
         try:
             digest = hashlib.sha256(Path(string(fields.get("prompt_file"))).read_bytes()).hexdigest()
@@ -946,10 +961,62 @@ def dispatch_match(active: dict[str, object] | None, phase: dict[str, object],
     if active.get("status") not in ("active", "refused") and not (
             dispatch_owned and active.get("status") == "completed" and same_launcher):
         return NoMatchedDispatch()
-    return MatchedDispatch(string(active.get("worker_name")), string(active.get("instance_id")))
+    matched = ContinueDispatchStage if stage_two else MatchedDispatch
+    return matched(string(active.get("worker_name")), string(active.get("instance_id")))
 
 
-def start_pass(args: argparse.Namespace) -> None:
+class VacantDispatchSlot(Enum):
+    EMPTY = "the slot has no recorded pass"
+
+
+@dataclass(frozen=True)
+class DispatchPredecessor:
+    instance_id: str
+    phase_instance_id: str
+    completion_id: str
+
+
+@dataclass(frozen=True)
+class NewAssignment:
+    """Open a new pass after the selected predecessor."""
+
+
+@dataclass(frozen=True)
+class DispatchSelection:
+    slot: str
+    phase_id: str
+    phase_instance_id: str
+    predecessor: DispatchPredecessor | VacantDispatchSlot
+    action: MatchedDispatch | NewAssignment
+
+
+class SelectDispatchAtRecorder(Enum):
+    SELECT = "select the pass under the recorder lock"
+
+
+class DispatchSelectionChanged(ValueError):
+    """The slot or phase no longer matches the worker's selection."""
+
+
+def dispatch_predecessor(passes: dict[str, dict[str, object]], slot: str) -> DispatchPredecessor | VacantDispatchSlot:
+    if slot not in passes:
+        return VacantDispatchSlot.EMPTY
+    passed = passes[slot]
+    return DispatchPredecessor(string(passed.get("instance_id")), pass_phase_instance(passed),
+                               dispatch_delivery(passed).completion_id)
+
+
+def validate_dispatch_selection(state: dict[str, object], selection: DispatchSelection,
+                                slot: str, phase: str) -> None:
+    current_phase = open_phase_named(state, phase)
+    if (slot != selection.slot or phase != selection.phase_id
+            or string((current_phase or {}).get("instance_id")) != selection.phase_instance_id
+            or dispatch_predecessor(pass_slots(state), slot) != selection.predecessor):
+        raise DispatchSelectionChanged(f"Slot {slot} or phase {phase} changed during dispatch")
+
+
+def start_pass(args: argparse.Namespace,
+               selection: DispatchSelection | SelectDispatchAtRecorder = SelectDispatchAtRecorder.SELECT) -> None:
     if not _launcher_owned() and not getattr(args, "dispatch_owned", False):
         raise SystemExit(f"start-pass is the launcher's to record. {PASS_OWNERSHIP_RULE}")
     session_dir = argument_session_dir(args)
@@ -977,10 +1044,11 @@ def start_pass(args: argparse.Namespace) -> None:
         if not state.get(unit_runs.OWNER_FIELD):
             state[unit_runs.OWNER_FIELD] = worker.parent.id
             inferred_owner = True
-    # A phase running beside the current one names itself, so its pass is not stamped with
-    # the current phase's.
-    phase, launch_check = _checked_launch(args, state, session_dir)
     launcher_command = _launcher_arguments(optional_arg(args, "launcher_command"))
+    if isinstance(selection, DispatchSelection):
+        validate_dispatch_selection(state, selection, team_slot, optional_arg(args, "phase_id"))
+    # Name the phase when more than one phase is open.
+    phase, launch_check = _checked_launch(args, state, session_dir)
     launcher_pid = arg_integer(args, "launcher_pid", os.getppid())
     dispatch_fields: dict[str, object] = {
         "kind": pass_kind,
@@ -993,10 +1061,15 @@ def start_pass(args: argparse.Namespace) -> None:
     }
     active = pass_slots(state).get(team_slot)
     match = dispatch_match(active, phase, dispatch_fields, launcher_command,
-                            dispatch_owned=bool(getattr(args, "dispatch_owned", False)),
-                            allow_stage_two=bool(getattr(args, "dispatch_owned", False)))
+                           dispatch_owned=bool(getattr(args, "dispatch_owned", False)))
     if isinstance(match, ActiveDispatchPromptConflict):
         raise DispatchPromptRefused(match)
+    if isinstance(selection, DispatchSelection):
+        action = selection.action
+        if isinstance(action, MatchedDispatch) and (match != action or active is None
+                or active.get("worker_id") != dispatch_fields["worker_id"]):
+            raise DispatchSelectionChanged(f"Pass {action.instance_id} changed during dispatch")
+        match = action
     if active is not None and isinstance(match, MatchedDispatch):
         changed = inferred_owner or active.get("launcher_pid") != launcher_pid
         active["launcher_pid"] = launcher_pid

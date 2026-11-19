@@ -20,6 +20,7 @@ from types import MappingProxyType
 from typing import Literal, cast, override
 from unittest import mock
 
+from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import OwningSession
 from scripts.build_hold import build_hold, hold_enforcer, override_guard
 from scripts.build_queue import admission_service, admission_records, placement
@@ -118,7 +119,7 @@ class HoldEnforcerTests(unittest.TestCase):
         paths = claim_state.StatePaths(self.root / 'hana-claims')
         paths.directory.mkdir()
         record: claim_state.RemoteJobClaim = {
-            'claim_id': placement.assigned_claim_id('fixture-episode', 'fixture-attempt'),
+            'claim_id': execution_identity.assigned_claim_id('fixture-episode', 'fixture-attempt'),
             'episode': 'fixture-episode', 'attempt': 'fixture-attempt',
             'submitting_session': 'other', 'pid': 701, 'proc_start': '11000', 'what': 'Hana check',
             'worktree': str(self.root), 'since': '2026-11-16T12:00:00+00:00', 'remote_host': 'fixture-hana',
@@ -157,9 +158,9 @@ class HoldEnforcerTests(unittest.TestCase):
         claim, = claim_state.read_claims(paths)
         assignment = placement.PlacementAssignment('fixture-episode', 'fixture-attempt',
             placement.PlacementDestination('ssh', target.name, 'fixture-hana', claim.scope, 1),
-            placement.SourceKeyKnown('fixture-source'),
+            execution_identity.SourceKeyKnown('fixture-source'),
             placement.SubmittingOwner(store.host_name(), 700, '11000'), OwningSession('other'), 100)
-        key = placement.attempt_key(assignment.episode, assignment.attempt)
+        key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         state = admission_service.ServiceState({}, {}, {}, admission_records.ReadyToStart())
         state.current_assignments[assignment.episode] = key
         for match in (True, False):
@@ -210,9 +211,9 @@ class HoldEnforcerTests(unittest.TestCase):
         claim, = claim_state.read_claims(paths)
         assignment = placement.PlacementAssignment('fixture-episode', 'fixture-attempt',
             placement.PlacementDestination('ssh', target.name, 'fixture-hana', claim.scope, 1),
-            placement.SourceKeyKnown('fixture-source'),
+            execution_identity.SourceKeyKnown('fixture-source'),
             placement.SubmittingOwner(store.host_name(), 700, '11000'), OwningSession('other'), 100)
-        key = placement.attempt_key(assignment.episode, assignment.attempt)
+        key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         state = admission_service.ServiceState({}, {}, {}, admission_records.ReadyToStart())
         state.current_assignments[assignment.episode] = key
         state.assignments[key] = admission_records.SavedPlacementAssignment(assignment)
@@ -221,7 +222,7 @@ class HoldEnforcerTests(unittest.TestCase):
             (self.holders / 'holder').unlink()
 
         for module, operation in ((target_config, 'read_execution_transport'),
-                (placement, 'attempt_key'), (placement, 'assigned_claim_id')):
+                (execution_identity, 'attempt_key'), (execution_identity, 'assigned_claim_id')):
             for error_type in (OSError, ValueError):
                 with self.subTest(operation=operation, error=error_type.__name__):
                     self.write_holder()
@@ -778,9 +779,9 @@ class HoldEnforcerTests(unittest.TestCase):
                         raise OSError("private stop record is full")
                     record_build(build, holder, proc_root, action, stopped_run=stopped_run)
 
-                def save_reason(path: Path, text: str) -> None:
-                    write_text_atomic(path, text)
-                    if path == record and "stop_reason" in text and outcome == "identity change":
+                def stage_reason(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
+                    write_text_atomic(path, text, new_file_mode=new_file_mode)
+                    if "stop_reason" in text and outcome == "identity change":
                         _ = self.process(10, "editor", start=12_000)
 
                 def signal_group(pid: int, signum: int) -> None:
@@ -793,7 +794,7 @@ class HoldEnforcerTests(unittest.TestCase):
                     self.assertIn("gate-owner", cycle["recipients"])
 
                 with mock.patch.object(hold_enforcer, "record_build", side_effect=save_stop), \
-                     mock.patch.object(detached_runs, "write_text_atomic", side_effect=save_reason):
+                     mock.patch.object(detached_runs, "write_text_atomic", side_effect=stage_reason):
                     if outcome.startswith("shared"):
                         before = record.read_bytes()
                         rows = self.rows()
@@ -831,6 +832,8 @@ class HoldEnforcerTests(unittest.TestCase):
                         self.assertIsInstance(result, expected)
                 if outcome == "stopped":
                     self.assertEqual(signals, [(10, signal.SIGTERM)])
+                    saved = cast(dict[str, object], json.loads(record.read_text()))
+                    self.assertEqual(saved["stop_reason"], "stopped for timed test; run again after the release")
                 else:
                     self.assertEqual(signals, [])
                     self.assertEqual([row for row in self.rows() if row["action"] == "stopped"], [])
@@ -926,7 +929,7 @@ class HoldEnforcerTests(unittest.TestCase):
 
                 def signal_group(pid: int, signum: int) -> None:
                     saved = cast(dict[str, object], json.loads(record.read_text()))
-                    self.assertEqual(saved["stop_reason"], "stopped for timed test; run again after the release")
+                    self.assertNotIn("stop_reason", saved)
                     signals.append((pid, signum))
 
                 with mock.patch.object(detached_runs, "command_group", wraps=detached_runs.command_group) as read_group:
@@ -942,6 +945,8 @@ class HoldEnforcerTests(unittest.TestCase):
                 if current:
                     self.assertIsInstance(result, hold_enforcer.StoppedRun)
                     self.assertEqual(signals, [(10, signal.SIGTERM)])
+                    saved = cast(dict[str, object], json.loads(record.read_text()))
+                    self.assertEqual(saved["stop_reason"], "stopped for timed test; run again after the release")
                 else:
                     self.assertIsInstance(result, hold_enforcer.RunIdentityChanged)
                     self.assertEqual(signals, [])

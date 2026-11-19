@@ -12,6 +12,7 @@ import sys
 from typing import cast
 from unittest import mock
 
+from scripts.build_queue import execution_identity
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
 from scripts.build_queue import admission_protocol as wire, placement
 from scripts.build_queue.admission_test_support import caller_provider_controls
@@ -179,7 +180,7 @@ steps_path.write_text(json.dumps(steps))
         assert isinstance(refusal.claim, placement.ProviderClaimReference)
         self.assertEqual(refusal.claim.claim_id, first["adopted_claim_ids"][0])
         self.assertNotEqual(refusal.claim.episode, refusal.assignment.episode)
-        saved = self.admission.server.assignments[placement.attempt_key(
+        saved = self.admission.server.assignments[execution_identity.attempt_key(
             refusal.assignment.episode, refusal.assignment.attempt)]
         self.assertEqual(saved.provider, refusal.claim)
         self.assertIsInstance(saved.state, placement.ClosedAssignment)
@@ -280,7 +281,7 @@ raise SystemExit(status)
                 self.assertEqual(self.local_runs(), [])
                 self.assertEqual(meminfo.read_text(), "MemAvailable: 0 kB\n")
                 with self.admission.loop_turn():
-                    saved = self.admission.server.assignments[placement.attempt_key(episode, assignment.attempt)]
+                    saved = self.admission.server.assignments[execution_identity.attempt_key(episode, assignment.attempt)]
                     self.assertIsInstance(saved.permission, placement.PermissionAvailable)
                     self.assertEqual(self.admission.server.placement_requests[episode].since, original_since)
                     peer = self.admission.connect(submitted)

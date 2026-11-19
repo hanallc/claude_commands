@@ -6,20 +6,22 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 import fcntl
-import inspect
 import json
 import math
 import os
 from pathlib import Path
 import re
+import subprocess
 import tempfile
 import time
-from typing import ClassVar, cast
+from typing import TYPE_CHECKING, ClassVar, cast
 
-from scripts.lib import conf
+if TYPE_CHECKING:
+    from scripts.lib import conf
 
 
 CONTROL = Path('/var/lib/hana-aws')
+IMAGE_RUNTIME = Path('/var/lib/hana-runtime')
 DATA = Path('/var/lib/hana')
 PERMIT = Path('/run/hana-aws/work-permit.json')
 GENERATION = Path('/run/hana-aws/generation')
@@ -27,6 +29,19 @@ BOOT_ID = Path('/proc/sys/kernel/random/boot_id')
 WORK_SLICE = 'hana-work.slice'
 # NixOS gives a raw unit no system PATH; the guest programs run systemctl and systemd-run from here.
 SYSTEM_BIN = '/run/current-system/sw/bin'
+
+
+@dataclass(frozen=True)
+class PermitWindow:
+    enabled: bool
+    permit_max_seconds: int
+
+
+def read_permit_window(configuration: conf.ConfigRead, *, recover_invalid: bool = True) -> PermitWindow:
+    from scripts.lib import conf
+
+    return PermitWindow(configuration.value('enabled', conf.on_off, recover_invalid=recover_invalid),
+                        configuration.value('permit_max_seconds', conf.positive_whole, recover_invalid=recover_invalid))
 
 
 @dataclass(frozen=True)
@@ -55,15 +70,15 @@ def decode_settings(values: Mapping[str, object]) -> SafetySettings:
     return SafetySettings(enabled, **numbers)
 
 
-def read_settings(configuration: conf.ConfigRead) -> SafetySettings:
+def read_settings(configuration: conf.ConfigRead, *, recover_invalid: bool = True) -> SafetySettings:
     """Read Hana settings without reading deployment or credential files."""
-    enabled = configuration.text('enabled')
-    if enabled not in ('on', 'off'):
-        raise ValueError('enabled must be on or off')
-    values: dict[str, object] = {'enabled': enabled == 'on'}
-    for key in ('guard_grace_seconds', 'watchdog_check_seconds', 'permit_max_seconds', 'step_cpu_limit',
+    from scripts.lib import conf
+
+    permit = read_permit_window(configuration, recover_invalid=recover_invalid)
+    values: dict[str, object] = {'enabled': permit.enabled, 'permit_max_seconds': permit.permit_max_seconds}
+    for key in ('guard_grace_seconds', 'watchdog_check_seconds', 'step_cpu_limit',
                 'step_memory_gib', 'mount_timeout_seconds'):
-        values[key] = configuration.whole(key)
+        values[key] = configuration.value(key, conf.positive_whole, recover_invalid=recover_invalid)
     return decode_settings(values)
 
 
@@ -343,6 +358,8 @@ class CommandAdmissionRefusalCode(StrEnum):
     ADMISSION_DISABLED = 'admission-disabled'
     DATA_NOT_MOUNTED = 'data-not-mounted'
     PERMIT_REJECTED = 'permit-rejected'
+    RUNTIME_ABI_MISMATCH = 'runtime-abi-mismatch'
+    PRE_COMMAND_FAILED = 'pre-command-failed'
 
 
 class GuestAdmissionDisabled(ValueError):
@@ -365,6 +382,13 @@ class GuestPermitRefused(ValueError):
     def __init__(self, reason: PermitRefusal) -> None:
         super().__init__(f'The Hana permit is not fresh: {reason}')
         self.reason: PermitRefusal = reason
+
+
+class GuestRuntimeAbiMismatch(ValueError):
+    code: ClassVar[CommandAdmissionRefusalCode] = CommandAdmissionRefusalCode.RUNTIME_ABI_MISMATCH
+
+    def __init__(self, requested: int, installed: int) -> None:
+        super().__init__(f'The Hana runtime ABI {requested} differs from the image ABI {installed}')
 
 
 def admit_command[StartedCommand](settings: SafetySettings, command: tuple[str, ...], directory: Path,
@@ -442,41 +466,25 @@ class GuestFile:
 
 
 def guest_program() -> str:
-    """Use the gate guest's source-rendering idiom without copying decision logic."""
-    definitions = (SafetySettings, decode_settings, WorkPermit, PermitRefusal, NoWorkPermit, read_permit,
-                   check_permit, fresh_permit,
-                   GuestPaths, guest_lock, atomic_record, PermitDeadline, FirstPermitRead, PermitDeadlineUnreadable,
-                   read_deadline, observe_permit, bound_permit, write_permit, GuardAction, guard_action,
-                   WatchdogAction, watchdog_action, check_deadline, stop_work, _command_arguments, CommandAdmissionRefusalCode,
-                   GuestAdmissionDisabled, GuestDataNotMounted, GuestPermitRefused, admit_command, read_identity, run_safety)
-    header = ('from __future__ import annotations\n'
-              'from collections.abc import Callable, Generator, Mapping\nfrom contextlib import contextmanager\n'
-              'from dataclasses import asdict, dataclass\n'
-              'from enum import StrEnum\nfrom pathlib import Path\nfrom typing import ClassVar, cast\n'
-              'import fcntl, json, math, os, re, subprocess, sys, tempfile, time\n')
-    constants = ''.join(f'{name} = Path({str(value)!r})\n' for name, value in (
-        ('CONTROL', CONTROL), ('DATA', DATA), ('PERMIT', PERMIT), ('GENERATION', GENERATION), ('BOOT_ID', BOOT_ID)))
-    program = header + constants + f'WORK_SLICE = {WORK_SLICE!r}\n'
-    for definition in definitions:
-        program += inspect.getsource(definition) + '\n'
-        if definition is GuestPaths:
-            program += 'GUEST_PATHS = GuestPaths(PERMIT.parent, BOOT_ID)\n'
-    program += '''
-Permit = WorkPermit | NoWorkPermit
-BoundPermit = PermitDeadline | PermitRefusal
-PreviousDeadline = PermitDeadline | FirstPermitRead | PermitDeadlineUnreadable
-
-def main():
-    values = json.loads((CONTROL / 'safety.json').read_text())
-    settings = decode_settings(values)
-    def run(command):
-        subprocess.run(command, check=True, timeout=settings.watchdog_check_seconds)
-    run_safety(sys.argv[1], settings, run=run)
-
+    """Load safety from the installed image closure."""
+    return f'''import sys
+sys.path.insert(0, {str(IMAGE_RUNTIME)!r})
+from scripts.aws_target.hana_guest import installed_main
 if __name__ == '__main__':
-    main()
+    installed_main(sys.argv[1])
 '''
-    return program
+
+
+def installed_main(mode: str) -> None:
+    raw = cast(object, json.loads((CONTROL / 'safety.json').read_text()))
+    if not isinstance(raw, dict):
+        raise ValueError('Hana safety settings must be an object')
+    settings = decode_settings(cast(dict[str, object], raw))
+
+    def run(command: list[str]) -> None:
+        _ = subprocess.run(command, check=True, timeout=settings.watchdog_check_seconds)
+
+    run_safety(mode, settings, run=run)
 
 
 def render_files(settings: SafetySettings, *, device: Path, tool_setup: Path | None = None) -> tuple[GuestFile, ...]:
@@ -486,7 +494,7 @@ def render_files(settings: SafetySettings, *, device: Path, tool_setup: Path | N
             continue
         if not re.fullmatch(r'/[A-Za-z0-9_./-]+', str(path)) or '..' in path.parts:
             raise ValueError('Expected an absolute device or setup path')
-    prefix = f'{SYSTEM_BIN}/python3 {CONTROL}/safety.py'
+    prefix = f'{SYSTEM_BIN}/python3 -I {CONTROL}/safety.py'
     guard = f'''[Unit]
 Description=Hana boot permit guard
 DefaultDependencies=no

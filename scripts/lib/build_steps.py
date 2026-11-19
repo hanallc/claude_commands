@@ -2,13 +2,13 @@
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-import os
 from pathlib import Path, PurePath
 from types import MappingProxyType
 
 from scripts.build_queue.admission_jobs import StepJob as StepJob
 from scripts.buildlog.parse import CARGO_BUILD_VERBS
 from scripts.lib import conf
+from scripts.lib.proc_text import read_proc_text
 from scripts.message.owner_role import OwnerRole
 
 
@@ -118,10 +118,11 @@ RECORDED_VERBS = VERIFY_VERBS | CARGO_BUILD_VERBS | {"cargo", "fmt", "sweep", "t
 QUEUE_STEP_DISPLAY = {"run": "cargo run", "gate": "merge gate", "test-modules": "test named"}
 SHORT_OWNER_STEPS = {"gate": "merge", "test-affected": "targeted",
                      "merge-gate": "merge", "targeted-test": "targeted"}
+MERGE_GATE_PROGRAMS = ("gate.py", "merge_gate.py")
 GATE_PROGRAMS = {
-    "gate": ("gate.py", "merge_gate.py"),
-    "test-affected": ("gate.py", "merge_gate.py", "targeted_test.py"),
-    "merge-gate": ("merge_gate.py",),
+    "gate": MERGE_GATE_PROGRAMS,
+    "test-affected": (*MERGE_GATE_PROGRAMS, "targeted_test.py"),
+    "merge-gate": MERGE_GATE_PROGRAMS,
     "targeted-test": ("targeted_test.py",),
 }
 GATE_SCRIPTS = frozenset(script for programs in GATE_PROGRAMS.values() for script in programs)
@@ -228,14 +229,14 @@ def copies_run_command(argv: Sequence[str]) -> CopiesRunCommand | OtherCommand:
 
 def process_arguments(process: Path) -> list[str]:
     """Read the arguments of a process from procfs."""
-    return [os.fsdecode(word) for word in (process / "cmdline").read_bytes().split(b"\0") if word]
+    return [word for word in read_proc_text(process / "cmdline").split("\0") if word]
 
 
 def live_process_arguments(process: Path, start_time: str) -> list[str] | CommandUnreadable:
     """Read arguments from the recorded process lifetime."""
     try:
         argv = process_arguments(process)
-        fields = (process / "stat").read_text().rsplit(") ", 1)[1].split()
+        fields = read_proc_text(process / "stat").rsplit(") ", 1)[1].split()
         if fields[19] == start_time and fields[0] not in ("Z", "X"):
             return argv
     except (OSError, ValueError, IndexError) as error:
@@ -273,11 +274,11 @@ def command_job(argv: Sequence[str]) -> StepJob | OtherCommand:
     if isinstance(program, OtherCommand):
         return program
     name, arguments = program
-    if name == "targeted_test.py" or (name in {"gate.py", "merge_gate.py"} and "--affected" in arguments):
+    if name == "targeted_test.py" or (name in MERGE_GATE_PROGRAMS and "--affected" in arguments):
         return _test_job(arguments, affected=True)
     if name == "verify.sh":
         return _verify_step(arguments)
-    if name not in {"gate.py", "merge_gate.py"}:
+    if name not in MERGE_GATE_PROGRAMS:
         return OTHER_COMMAND
     branch = _option(arguments, "--merge-branch")
     if "--nightly" in arguments:

@@ -1681,6 +1681,41 @@ class AccountsTests(unittest.TestCase):
             json.dumps({"oauthAccount": {"emailAddress": login}}), encoding="utf-8",
         )
 
+    def test_weekly_quota_uses_the_current_sign_in_instead_of_the_saved_directory_login(self) -> None:
+        original = "original@example.invalid"
+        changed = "changed@example.invalid"
+        self.login_directory("claude1", original, note_label="claude1")
+        now = datetime.now(timezone.utc)
+        reset = now + timedelta(days=1)
+        stored = usage_store.UsageReadings()
+        for login, left in ((original, 4), (changed, 9)):
+            stored[login] = usage_store.StoredUsage(
+                weekly=usage_store.StoredWindow(left=left, resets=reset.isoformat(), at=now.isoformat()))
+        identity = accounts.account_dir("claude1") / ".claude.json"
+        stored.directory_logins[f"Claude:{identity.parent}"] = original
+        sessions = accounts.LocalRoleSessions({}, {}, (), (), (), False, frozenset())
+        with (patch.object(usage_store, "load", return_value=stored),
+              patch.object(accounts, "_read_local_role_sessions", return_value=sessions)):
+            expected_cases: tuple[tuple[str, dict[str, accounts.WeeklyQuota]], ...] = (
+                (original, {"claude1": accounts.WeeklyQuota(4, reset)}),
+                ("", {}),
+                (changed, {"claude1": accounts.WeeklyQuota(9, reset)}),
+            )
+            for login, expected in expected_cases:
+                with self.subTest(signed_in=bool(login), changed=login == changed):
+                    if login:
+                        self.write_identity("claude1", login)
+                    else:
+                        _ = identity.write_text("{}", encoding="utf-8")
+                    reading = accounts.read_status(source=accounts.StoredUsageOnly())
+                    row = next(row for row in reading.rows if row.label == "claude1")
+                    if expected:
+                        self.assertEqual(row.weekly_left_percent, expected["claude1"].left)
+                        self.assertEqual(row.resets_at, reset)
+                    else:
+                        self.assertIsInstance(row.weekly_left_percent, accounts.StatusUnavailable)
+                    self.assertEqual(accounts.stored_weekly_quotas(now), expected)
+
     def logged_in(self) -> account.Account:
         return account.Account("claude", "owner@example.invalid", "claude2")
 
@@ -9820,6 +9855,37 @@ class PickerTests(unittest.TestCase):
                 self.assertFalse(accounts.roles_history_file().exists())
                 process.assert_not_called()
 
+
+
+class StoredWeeklyQuotaTests(unittest.TestCase):
+    def test_quota_lookup_reads_both_tools_and_skips_an_ended_window(self) -> None:
+        now = datetime(2026, 11, 18, tzinfo=timezone.utc)
+        reset = now + timedelta(days=1)
+        left = usage_store.StoredWindow(left=4, resets=reset.isoformat(), at=now.isoformat())
+        ended = usage_store.StoredWindow(left=0, resets=now.isoformat(), at=now.isoformat())
+        stored = usage_store.UsageReadings()
+        stored.update({"fixture-claude": usage_store.StoredUsage(weekly=left),
+                       "codex:fixture-codex": usage_store.StoredUsage(weekly=left),
+                       "fixture-ended": usage_store.StoredUsage(weekly=ended)})
+        stored.directory_logins.update({"Claude:/fixture/.claude1": "fixture-claude",
+                                        "Claude:/fixture/.claude2": "fixture-ended",
+                                        "Codex:/fixture/.codex": "codex:fixture-codex"})
+        claude = [accounts.AccountStatus(f"~/.{label}", Path(f"/fixture/.{label}"), True, True, True,
+                   label, login, "", (), (), accounts.McpServerDifferences())
+                  for label, login in (("claude1", "fixture-claude"), ("claude2", "fixture-ended"))]
+        home = Path("/fixture/.codex")
+        codex = [accounts.CodexStatus("~/.codex", home, True, True, "codex1", "fixture-codex", "workers", (), ())]
+        configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = write_config_fixture(configuration / "accounts.conf", "usage_stale_minutes=10\n")
+        with (patch.dict(os.environ, {"CONF_DIR": str(configuration)}),
+              patch.object(accounts, "_status_workers_account", return_value=accounts.CodexWorkersAccount("codex1", home)),
+              patch.object(accounts, "account_statuses", return_value=claude),
+              patch.object(accounts, "codex_statuses", return_value=codex),
+              patch.object(agent_accounts, "codex_credits_setting", return_value=agent_accounts.CreditsOff()),
+              patch.object(usage_store, "load", return_value=stored) as load):
+            quotas = accounts.stored_weekly_quotas(now)
+        load.assert_called_once_with()
+        self.assertEqual(quotas, {"claude1": accounts.WeeklyQuota(4, reset), "codex1": accounts.WeeklyQuota(4, reset)})
 
 
 class SharedStatusDocumentTests(unittest.TestCase):

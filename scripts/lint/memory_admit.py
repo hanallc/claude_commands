@@ -38,6 +38,7 @@ from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
 from scripts.build_targets.target_config import ANY_ELIGIBLE_TARGET, MacOnly, PinnedTarget
 from scripts.build_hold.override_guard import require_shared_state_write
 from scripts.lib import conf
+from scripts.lib.proc_text import read_proc_text as _read_proc_text
 
 from scripts.lib.test_phase import (
     CallRecord,
@@ -304,8 +305,10 @@ def waiter_state(row: Waiter) -> QueuedWaiter | TokenWaitingWaiter:
     return QueuedWaiter(row)
 
 
-def first_queued_waiter(rows: Iterable[Waiter]) -> QueuedWaiter | NoWaiter:
+def first_queued_waiter(rows: Iterable[Waiter], pending_remote_starts: frozenset[str]) -> QueuedWaiter | NoWaiter:
     for row in rows:
+        if records.waiter_owner(row) in pending_remote_starts:
+            return QueuedWaiter(row)
         state = waiter_state(row)
         if isinstance(state, QueuedWaiter):
             return state
@@ -586,6 +589,7 @@ class UsableAdmissionConfiguration:
     progress_profile_rank: int
     peak_history_share_percent: int
     progress_profile_sweep_seconds: float
+    remote_start_hold_seconds: int
 
 
 @dataclass(frozen=True)
@@ -603,11 +607,12 @@ def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdm
             progress_profile_rank = settings.whole("progress_profile_rank")
             peak_history_share_percent = settings.whole("peak_history_share_percent")
             progress_profile_sweep_seconds = settings.number("progress_profile_sweep_seconds")
+            remote_start_hold_seconds = settings.whole("remote_start_hold_seconds")
         config = records.read_memory_config(report=False)
         return UsableAdmissionConfiguration(replace(config,
             diagnostics=(*config.diagnostics, *records.configuration_diagnostics(messages))),
             cloud_gate_slots, cloud_gate_stale_pushes, progress_profile_rank, peak_history_share_percent,
-            progress_profile_sweep_seconds)
+            progress_profile_sweep_seconds, remote_start_hold_seconds)
     except conf.Unusable as error:
         return UnusableAdmissionConfiguration(str(error))
 
@@ -940,7 +945,7 @@ def process_memory(source: set[int] | PopulatedStepScope, proc: Path = PROC) -> 
     for child in sorted(source):
         path = proc / str(child) / "status"
         try:
-            contents = path.read_text().splitlines()
+            contents = _read_proc_text(path).splitlines()
         except OSError as error:
             use = (AnonymousRunUse(0) if error.errno in (errno.ENOENT, errno.ESRCH) else
                    RunUseUnavailable(f"{path}: {error.strerror or error}"))
@@ -1130,7 +1135,7 @@ def member_programs(members: Iterable[int], proc: Path, *, skip_unreadable: bool
     programs: dict[int, str] = {}
     for pid in members:
         try:
-            programs[pid] = (proc / str(pid) / "comm").read_text().strip()
+            programs[pid] = _read_proc_text(proc / str(pid) / "comm").strip()
         except OSError as error:
             if not skip_unreadable and error.errno != errno.ENOENT:
                 raise
@@ -1239,7 +1244,7 @@ class SwapInHistory:
         """Return swap-in bytes between the newest and oldest samples inside the window."""
         check_memory_reading(path)
         try:
-            rows = [line.split() for line in path.read_text().splitlines()]
+            rows = [line.split() for line in _read_proc_text(path).splitlines()]
             counters = [parts for parts in rows if parts and parts[0] == "pswpin"]
             if len(counters) != 1 or len(counters[0]) != 2 or not counters[0][1].isdecimal():
                 raise ValueError("expected one nonnegative pswpin page count")
@@ -1247,7 +1252,7 @@ class SwapInHistory:
             page_size = int(os.sysconf("SC_PAGE_SIZE"))
             if window_seconds < 1 or page_size < 1:
                 raise ValueError("the swap-in window and page size must be positive")
-        except (OSError, UnicodeError, ValueError) as error:
+        except (OSError, ValueError) as error:
             return ReadingUnavailable(f"{path}: swap-in reading unavailable: {error}")
         if self.samples and (pages < self.samples[-1].pages or now < self.samples[-1].at):
             self.samples.clear()
@@ -1261,7 +1266,7 @@ def read_meminfo(path: Path) -> HostMemory:
     check_memory_reading(path)
     values: dict[str, int] = {}
     try:
-        text = path.read_text()
+        text = _read_proc_text(path)
     except (OSError, UnicodeError) as error:
         raise ValueError(f"cannot read MemAvailable from {path}") from error
     for line in text.splitlines():
@@ -1283,7 +1288,7 @@ def read_pressure(host: HostMemory = NO_HOST_SWAP, *, policy: AdmissionPolicy) -
     path = Path(os.environ.get("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory"))
     check_memory_reading(path)
     try:
-        for line in path.read_text().splitlines():
+        for line in _read_proc_text(path).splitlines():
             parts = line.split()
             if parts and parts[0] in ("full", "some"):
                 value = next(float(part.removeprefix("avg10=")) for part in parts[1:] if part.startswith("avg10="))
@@ -1383,7 +1388,7 @@ def waiter_label(row: Waiter) -> str:
     process = Path("/proc") / str(row["pid"])
     try:
         folder = (process / "cwd").readlink().name
-        argv = (process / "cmdline").read_bytes().decode(errors="replace").split("\0")
+        argv = _read_proc_text(process / "cmdline").split("\0")
         caller = "verify" if any(item.endswith("/verify.sh") for item in argv) else Path(argv[0]).name
         return f"{folder} ({caller} pid {row['pid']})"
     except (OSError, IndexError):
@@ -1698,7 +1703,7 @@ class QueueIdentityReader:
             current = self.processes[current].parent
         if not step:
             try:
-                argv = (self.proc / str(pid) / "cmdline").read_bytes().decode(errors="replace").split("\0")
+                argv = _read_proc_text(self.proc / str(pid) / "cmdline").split("\0")
                 verb = next((item for item in argv if item in ("test", "lint", "check", "build", "doc", "clippy")), "build")
                 step = verb
             except OSError:
@@ -1993,7 +1998,7 @@ def inputs_room(inputs: QueueInputs, policy: AdmissionPolicy) -> MemoryRoom | Re
 
 def head_policy(inputs: QueueInputs, now: float, policy: AdmissionPolicy, next_start: NextStartAt) -> HeadPolicy:
     ordered = ranked_queue_waiters(inputs)
-    candidate = first_queued_waiter(row for _, row in ordered)
+    candidate = first_queued_waiter((row for _, row in ordered), inputs.pending_remote_starts)
     queued_head: QueuedHead | NoQueuedHead = QueuedHead(candidate.waiter) if isinstance(candidate, QueuedWaiter) else NoQueuedHead()
     safety = policy.safety_bytes
     returned_claims: set[str] = set()
@@ -2056,7 +2061,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
     decisions: list[WaiterAdmission] = []
     clear = isinstance(inputs.pressure, NoPressureHold)
     due = not isinstance(inputs.spacing, NextStartAt) or now >= inputs.spacing.at
-    local_head = first_queued_waiter(row for _, row in ordered if can_use_natedev(row))
+    local_head = first_queued_waiter((row for _, row in ordered if can_use_natedev(row)), inputs.pending_remote_starts)
     head_owner = records.waiter_owner(local_head.waiter) if isinstance(local_head, QueuedWaiter) else ""
     head_can_start_alone = not inputs.reservations and all(
         not slot_in_force(slot, inputs.now)
@@ -2083,7 +2088,8 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         extra = max(0, need - held)
         reused = claim is not None
         within = reused and need <= held
-        state = waiter_state(row)
+        remote_start_pending = owner in inputs.pending_remote_starts
+        state = QueuedWaiter(row) if remote_start_pending else waiter_state(row)
         fresh = not estimate_expired(row, now, policy)
         local_route = can_use_natedev(row)
         local = local_route and isinstance(state, QueuedWaiter)
@@ -2101,7 +2107,9 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
         room_passes = not isinstance(basis, DoesNotFit)
         spacing = (inputs.spacing.at if isinstance(inputs.spacing, NextStartAt) and not due else
                    next_start.at if new_started and now < next_start.at else 0.0)
-        ready = local and fresh and (within or readable and clear and room_passes) and (reused or not spacing)
+        wait = inputs.local_waits.get(owner)
+        ready = (local and wait is None and not remote_start_pending and fresh
+                 and (within or readable and clear and room_passes) and (reused or not spacing))
         gpu_step = gpu.holds(row.get("repository_name", ""), row.get("step", ""))
         gpu_wait = GpuSlotWait(gpu_used, gpu.slots) if gpu_step and gpu_used >= gpu.slots else GpuSlotFree()
         order_hold: NoOrderHold | HeldBehindHead = NoOrderHold()
@@ -2189,6 +2197,8 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
         owner = records.waiter_owner(row)
         first = head_owner == owner
         within = isinstance(decision.room.basis, WithinSlot)
+        remote_start_pending = owner in inputs.pending_remote_starts
+        local_wait = inputs.local_waits.get(owner)
         if isinstance(entry.state, TokenWaitingWaiter) and not isinstance(entry.cargo_folder, placement.CargoFolderWait):
             reason: WaitReason = entry.state
         else:
@@ -2206,6 +2216,10 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy) -> 
                     cause = StartSpacingWait(decision.starts_at)
                 else:
                     cause = queue_order_reason(decision, RecordedQueueIdentities())
+            elif remote_start_pending:
+                cause = BehindHead("remote startup", row["since"], "")
+            elif isinstance(local_wait, placement.EvidenceNeeded):
+                cause = ReadingUnavailable(local_wait.reason)
             elif estimate_expired(row, now, policy):
                 cause = EstimateExpired(row.get("estimated_at", now))
             else:

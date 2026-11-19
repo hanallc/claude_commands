@@ -1,8 +1,10 @@
 """Test Hana guest safety without a controller, systemd manager, or AWS calls."""
 from __future__ import annotations
 
+from contextlib import redirect_stderr
 from dataclasses import asdict, replace
 import fcntl
+import io
 import json
 import os
 from pathlib import Path
@@ -84,6 +86,17 @@ mount_timeout_seconds=15
     def guard(self, permit: guest.Permit, elapsed: float) -> guest.GuardAction:
         return guest.guard_action(self.settings, self.observe(permit),
                                   boot_elapsed=elapsed, clock=self.clock, uptime=self.uptime)
+
+    def test_guard_grace_recovers_the_committed_value_after_a_zero_override(self) -> None:
+        committed = self.config_path.read_text()
+        _ = self.config_path.write_text(committed + '# whole: 0..\nguard_grace_seconds.testhost=0\n')
+        with (mock.patch('socket.gethostname', return_value='testhost'),
+              mock.patch.object(conf, '_committed_files', return_value=iter((committed,))),
+              redirect_stderr(io.StringIO()) as warnings):
+            settings = guest.read_settings(conf.read(self.config_path))
+
+        self.assertEqual(settings.guard_grace_seconds, self.settings.guard_grace_seconds)
+        self.assertIn(f"{self.config_path}: guard_grace_seconds='0'", warnings.getvalue())
 
     def test_guard_releases_only_a_fresh_permit(self) -> None:
         _ = self.permit.write_text(json.dumps(asdict(self.fresh())))
@@ -230,7 +243,7 @@ mount_timeout_seconds=15
         self.assertIn('ConditionPathIsMountPoint=' + str(guest.DATA), files['hana-tools.service'].content)
         self.assertEqual(files['safety.py'].mode, 0o600)
         self.assertEqual(files['safety.json'].mode, 0o600)
-        receiver = hana_receiver.render_files(hana_receiver.ReceiverSettings(10, 1, 83))[-1].content
+        receiver = hana_receiver.render_files(hana_receiver.ReceiverSettings(10, 1, 83, 1048576, 120, 23))[-1].content
         for unit in (guard, files['hana-watchdog.service'].content, receiver):
             self.assertIn('Environment=PATH=' + guest.SYSTEM_BIN + '\n', unit)
 
@@ -247,8 +260,12 @@ mount_timeout_seconds=15
         settings = control / 'safety.json'
         _ = settings.write_text(json.dumps(asdict(self.settings)))
         program = self.root / 'safety.py'
-        _ = program.write_text(guest.guest_program().replace(str(guest.CONTROL), str(control))
-                               .replace(str(guest.PERMIT), str(self.permit)))
+        image = self.root / 'image'
+        module = image / 'scripts/aws_target/hana_guest.py'
+        module.parent.mkdir(parents=True)
+        _ = module.write_text(Path(guest.__file__).read_text().replace(str(guest.CONTROL), str(control))
+                              .replace(str(guest.PERMIT), str(self.permit)))
+        _ = program.write_text(guest.guest_program().replace(str(guest.IMAGE_RUNTIME), str(image)))
         binary = self.root / 'bin'
         binary.mkdir()
         systemctl = binary / 'systemctl'
