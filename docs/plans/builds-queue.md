@@ -2987,6 +2987,7 @@ Lead: `offload.py` `submit_direct_placement` sends `local.profile` from `admissi
 **From 44cn (impl4, 2026-11-18):** admission charges and progress profiles count the step's sccache compiler jobs. The historical peak sampler (`scripts/lint/invoke.sh:248`) reads only the step cgroup `.max`, so a step that compiles through sccache records a low peak, and its next estimate is low.
 1. Show the undercount with a test that replays a compiling step under sccache.
 2. Make the recorded peak include the step's compiler jobs, with the same rule admission uses.
+3. **From 44cn pass 4 (F006, minor):** the head-stall compiler warning mixes two samples (`scripts/build_queue/head_stall.py:133`). Two compiler environments are unreadable at capture, and one compiler exits before the alert: the warning counts one. Make the warning read the same capture as the holder values.
 
 ### Phase 44cg — A memory wait fixture gives the same result under load  · status: todo
 **From builds, 2026-11-18 18:3x:** queue's next item after 44cf.
@@ -3000,6 +3001,16 @@ Work:
 
 **Second case (builds, from aws, 2026-11-18):** on c50a38369 a slot-wait test got `RepositorySlotReady` where it expects `RepositorySlotWaiting`. It failed 1 time in 903 modules and passed alone. That change does not touch queue code. Run the same loaded loop for this test. If both failures have one cause, fix them in this phase. Otherwise make a separate phase after 44cg for this case.
 
+
+### Phase 44cr — A repository slot wait test gives the same result under load  · status: todo
+**From 44cg (impl4, 2026-11-19):** the second 44cg case has a separate cause, so it gets its own phase (44cg plan rule).
+
+Case: `test_finite_wait_names_the_repository_held_slots_and_maximum_key` got `RepositorySlotReady()` where it expects a wait. Under lock churn the test reported `held slots: none` while `/proc/<pid>/fdinfo` still listed the lock. The service reads `/proc/locks` to decide slot availability (`scripts/build_queue/admission_service.py:2523`).
+
+Work:
+1. Replay the miss with a test: a held slot lock that `/proc/locks` does not list in one read.
+2. Name the cause: a kernel read race, or a gap in how the service reads `/proc/locks`.
+3. Fix the slot check so a held lock never reads as free. No retry loop; the check reads a source that cannot miss a held lock.
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
