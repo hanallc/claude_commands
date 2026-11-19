@@ -27,7 +27,7 @@ from xml.etree import ElementTree
 
 from scripts.accounts import accounts
 from scripts.agents.remote import local_machine
-from scripts.lib import atomic_file, conf, process_start
+from scripts.lib import atomic_file, conf, file_lock, process_start
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.user_zone import user_zone
 from scripts.message import send_result
@@ -191,7 +191,7 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         ready = review_items.ReviewItem("change/sdlc/C1830", "sdlc/C1830", review_items.ReviewType.CHANGE,
             OWNER.id, OWNER.id, "Check the linked change", review_items.ReviewState.OPEN,
             review_items.ReviewTimes(NOW, NOW), (), (), source)
-        reviews = [ready, replace(ready, key="change/hana/P10", id="hana/P10", state=review_items.ReviewState.DONE),
+        reviews = [ready, replace(ready, key="change/sdlc/C1829", id="sdlc/C1829", state=review_items.ReviewState.WAITING),
                    replace(ready, key="change/sdlc/C1831", id="sdlc/C1831", state=review_items.ReviewState.WAITING),
                    replace(ready, key="change/sdlc/C1832", id="sdlc/C1832",
                            times=review_items.ReviewTimes(NOW, NOW, datetime.now(UTC) + timedelta(days=1)))]
@@ -208,11 +208,9 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         reviews.append(replace(ready, key="change/builds/C17", id="builds/C17", title="Check a build",
                                owner=OTHER.id, source_unit=OTHER.id))
 
-        def read_reviews(*_args: object, **kwargs: object) -> list[review_items.ReviewItem]:
-            owners = cast(dict[staff.StaffId, str] | None, kwargs.get("owner_options"))
-            if owners is not None:
-                owners.update({OWNER.id: OWNER.name, OTHER.id: OTHER.name})
-            return reviews
+        def read_reviews(_root: Path, *, show: str = "all", **_kwargs: object) -> list[review_items.ReviewItem]:
+            states = review_items.selected_states(show)
+            return [review for review in reviews if review.state in states]
 
         with patch.object(review_items, "read", side_effect=read_reviews), patch.object(list_page, "counts_strip", return_value=""):
             reviews.append(missing)
@@ -407,9 +405,9 @@ async function inspect(frame){
     if(stage===0) history.back();else location.href=listUrl;
    }else if(stage===keys.length){
     check(visible.length===keys.length && visible.every(row=>keys.includes(row.dataset.key)),'the summary shows only linked cards');
-    const done=visible.find(row=>row.dataset.state==='Done');
-    if(done?.querySelector('.list-toggle').getAttribute('aria-expanded')!=='true') done?.querySelector('.list-toggle').click();
-    check(done?.querySelector('.list-toggle').getAttribute('aria-expanded')==='true','the Done card can open in the linked view');
+    const waiting=visible.find(row=>row.dataset.key===keys[1]);
+    if(waiting?.querySelector('.list-toggle').getAttribute('aria-expanded')!=='true') waiting?.querySelector('.list-toggle').click();
+    check(waiting?.querySelector('.list-toggle').getAttribute('aria-expanded')==='true','the Waiting card can open in the linked view');
     if(proof){await finish();return;}
     const group=doc.querySelector('[data-clear-linked-reviews]');
     check(group && !group.hidden,'the linked group has one visible filter chip');
@@ -1578,7 +1576,7 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
                       + '<button name="action" value="tell" disabled>Tell morty</button></div>', words)
         self.assertIn("!words.value.trim()", list_page.SCRIPT)
         self.assertIn("words.addEventListener('input',retain)", list_page.SCRIPT)
-        self.assertIn("buttons.forEach(button=>button.disabled=false);syncTell()", list_page.SCRIPT)
+        self.assertIn("setCardSubmitting(form,false,item);syncTell()", list_page.SCRIPT)
         self.assertIn('rows="4"', words)
 
     def test_record_fields_share_the_markdown_formatter(self) -> None:
@@ -2106,6 +2104,9 @@ window.fetch=async(_path,options={})=>{
   check(row('105').dataset.unread==='true' && row('105').querySelector('.list-dot') &&
    refused.querySelector('[value="read"]'),'a refused Remove restores the unread controls');
   check(refused.querySelector('[data-send-status]').textContent==='Not saved: The fixture refuses this close.','a refused Remove shows its reason');
+  const restore=document.querySelector('[data-record-motion]')?.getAnimations({subtree:true}) ?? [];
+  for(const animation of restore) animation.finish();
+  await Promise.allSettled(restore.map(animation=>animation.finished));
   check(!refused.querySelector('[value="remove"]').disabled,'a refused Remove enables another attempt');
   refused.elements.until.value='2026-12-03';const parked=submit('105','park');
   check(row('105').hidden,'Park hides the row before the response');
@@ -2242,6 +2243,7 @@ window.fetch=async(_path,options={})=>{
  const first=requests[0];
  check(first?.get('until')==='2026-12-04T00:30:00.000Z','The first save sends the chosen instant');
  losePost();await flush();
+ await finishRowMotion();
  now=Date.parse('2026-12-05T13:00:00Z');
  toggle.click();
  check(time.value==='19:30' && !save.disabled,'The picker retains and enables the expired retry');
@@ -2575,10 +2577,12 @@ window.fetch=async(_path,options={})=>{
  check(!document.querySelector('[data-number="2"]'),'A Closed record with a parking time has no row.');
  show('parked');
  const unpark=form.querySelector('[value=unpark]');
+ await finishRowMotion();
  submit('remove');
  check(unpark.hidden,'Remove hides Unpark immediately.');
  finishPost({reason:'Fixture refuses Remove'});await flush();
  check(!unpark.hidden,'A refusal restores Unpark.');
+ await finishRowMotion();
  submit('remove');
  finishPost({item_state:'Closed',parked:'true',unread:'false'});await flush();
  check(unpark.hidden && row.dataset.parked==='true','A confirmed Remove leaves Unpark hidden.');
@@ -2631,8 +2635,10 @@ observer.observe(original.parentNode,{childList:true});
  const park=submit('park');
  check(park.id!==tell.id,'Park uses its own request ID');
  finishPost({reason:'Fixture refuses Park'});await flush();
+ await finishRowMotion();
  check(submit('park').id!==park.id,'a refused Park leaves no unconfirmed request');
  finishPost({reason:'Fixture refuses Park again'});await flush();
+ await finishRowMotion();
  form.elements.until.value='';
  const retry=submit('tell');
  check(retry.id===tell.id && retry.token===tell.token,'Tell retains its signed ID across refusals');
@@ -2647,12 +2653,15 @@ observer.observe(original.parentNode,{childList:true});
         self.browser_action_sequence('''
  form.elements.until.value='2026-12-03';
  const first=submit('park');losePost();await flush();
+ await finishRowMotion();
  form.elements.until.value='2026-12-04';
  const second=submit('park');losePost();await flush();
+ await finishRowMotion();
  check(first.id!==second.id,'each Park date gets its own request ID');
  const remove=submit('remove');
  check(remove.id!==second.id,'Remove uses its own request ID');
  finishPost({item_state:'Closed',parked:'true',unread:'false'});await flush();
+ await finishRowMotion();
  for(const [date,original] of [['2026-12-03',first],['2026-12-04',second]]){
   form.elements.until.value=date;
   const retry=submit('park');
@@ -3015,10 +3024,59 @@ observer.observe(original.parentNode,{childList:true});
         send.assert_called_once()
         self.assertEqual(the_list.load(MORTY.id, item.id), current)
 
+    def test_startup_reuses_the_list_question_key_after_a_result_write_failure(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Check the repair")
+        asked = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check passed?")), status)
+        assert isinstance(asked, list_page.ListQuestionDelivery)
+        delivery = asked.delivery
+        assert isinstance(delivery, change_page.PageQuestionSend)
+        path = status.path(delivery.page, delivery.row)
+        transport = FakeQuestionTransport()
+        publish = change_page.publish_question_attempt
+
+        def lose_result(path: Path, record: delivery_state.QuestionAttempt) -> None:
+            if record.state is delivery_state.QuestionSendState.SENT:
+                raise OSError("Cannot save the result.")
+            publish(path, record)
+
+        with patch.object(change_page, "send_question", side_effect=transport.send):
+            with (patch.object(change_page, "publish_question_attempt", side_effect=lose_result),
+                  self.assertRaisesRegex(OSError, "Cannot save the result")):
+                list_page.deliver(asked)
+            sending = change_page.read_question_attempt(path)
+            self.assertEqual(sending.state, delivery_state.QuestionSendState.SENDING)
+            for _ in range(2):
+                change_page.recover_review_messages(change_page.DeliveryStatus(root))
+        self.assertEqual(transport.calls, [sending.message_id] * 2)
+        self.assertEqual(len(transport.receipts), 1)
+        saved = change_page.read_question_attempt(path)
+        self.assertEqual(saved.state, delivery_state.QuestionSendState.SENT)
+        self.assertEqual(saved.attempt_id, sending.attempt_id)
+
+    def test_a_failed_list_question_alerts_the_item_showrunner(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Ask about the repair", owner=OTHER.id)
+        asked = list_page.submit(root, urlencode(self.fields(item, "question", words="Which check passed?")))
+        refused = question_outcome("refused", "List keeper is offline.")
+        with (patch.object(change_page, "send_question", return_value=refused) as send,
+              patch.object(change_page, "send_to_staff") as alert,
+              patch.object(change_page, "review_alert_showrunners") as fallback,
+              patch.object(time, "sleep")):
+            list_page.deliver(asked)
+        self.assertEqual(send.call_count, conf.read("review_links").whole("delivery_tries"))
+        self.assertTrue(all(call.args[0] == MORTY.id for call in send.call_args_list))
+        alert.assert_called_once()
+        self.assertEqual(alert.call_args.args[0], OTHER.id)
+        self.assertIn("Which check passed?", cast(str, alert.call_args.args[2]))
+        fallback.assert_not_called()
+
     def test_question_result_write_failure_leaves_the_saved_question_available_for_resend(self) -> None:
         root = self.root / "reviews"
         status = change_page.DeliveryStatus(root)
         first_jobs: dict[str, the_list.ListItem] = {}
+        locks: dict[str, Path] = {}
         for number in (1, 2):
             item = self.add(f"Recovery question {number}", number=number)
             asked = list_page.submit(root, urlencode(self.fields(item, "question", words=f"Which check {number}?")), status)
@@ -3028,6 +3086,7 @@ observer.observe(original.parentNode,{childList:true});
             assert isinstance(delivery.job, change_page.QuestionJob)
             self.assertEqual(item.id, delivery.job.record.source.item_id)
             first_jobs[delivery.job.record.message_id] = item
+            locks[delivery.job.record.message_id] = Path(cast(str, delivery.job.lock.name))
             _ = delivery.job.release()
             _ = the_list.update(MORTY.id, item.id, {"latest_status": "A newer result arrived."}, source="morty")
         recovering = change_page.DeliveryStatus(root)
@@ -3056,7 +3115,8 @@ observer.observe(original.parentNode,{childList:true});
         with (patch.object(change_page, "publish_question_attempt", side_effect=fail_first_result),
               patch.object(change_page, "send_question", side_effect=send)):
             change_page.recover_review_messages(recovering)
-            change_page.recover_review_messages(change_page.DeliveryStatus(root))
+            with file_lock.exclusive(locks[lost[0]]):
+                change_page.recover_review_messages(change_page.DeliveryStatus(root))
         self.assertEqual(len(transport.calls), 2)
         self.assertEqual(len(transport.receipts), 2)
 
@@ -3462,6 +3522,7 @@ observer.observe(original.parentNode,{childList:true});
  check(row.hidden,'Remove immediately hides the row in Working');
  losePost();await flush();
  check(!row.hidden && row.dataset.state==='Working','the lost response restores the Working row');
+ await finishRowMotion();
  check(submit('remove').id===remove.id,'the exact Remove retry uses the same ID');
  show('blocked');
  finishPost({reason:'Fixture refuses Remove'});await flush();
@@ -3590,7 +3651,7 @@ observer.observe(original.parentNode,{childList:true});
  submit('remove');
  const exit=animation();
  if(!exit) throw new Error('Remove must animate the exit.');
- exit.pause();exit.currentTime=100;
+ exit.pause();exit.currentTime=exit.effect.getTiming().duration/2;
  check(row.hidden && updateKey()===0 && first()==='2','Remove clears the Update key during the exit');
  finishPost({reason:'Fixture refuses Remove'});await flush();
  const restore=animation();
@@ -3679,7 +3740,7 @@ observer.observe(original.parentNode,{childList:true});
  const top=element=>element.getBoundingClientRect().top;
  const start=top(next),first=top(row);
  const motion=()=>document.querySelector('[data-record-motion]');
- const sample=(animation,time)=>{animation.pause();animation.currentTime=time;};
+ const halfway=animation=>{animation.pause();animation.currentTime=animation.effect.getTiming().duration/2;};
  submit('remove');
  check(row.hidden && requests.length===1,'Remove starts the POST and hides the record in the same turn');
  const leaving=motion();
@@ -3687,7 +3748,7 @@ observer.observe(original.parentNode,{childList:true});
  const exit=leaving?.getAnimations({subtree:true})[0];
  check(exit,'Remove starts the shared animation');
  if(!exit) throw new Error('No exit animation');
- sample(exit,100);
+ halfway(exit);
  const opacity=Number(getComputedStyle(exit.effect.target).opacity);
  check(opacity>0 && opacity<1,'the row fades before it disappears');
  check(top(next)<start && top(next)>first,'the next row moves up during the fade');
@@ -3697,13 +3758,14 @@ observer.observe(original.parentNode,{childList:true});
  const restored=motion()?.getAnimations({subtree:true})[0];
  check(!row.hidden && restored,'the refusal restores the row with an animation');
  if(!restored) throw new Error('No restore animation');
- sample(restored,100);
+ halfway(restored);
  check(top(next)<start && top(next)>first,'the next row moves down during restore');
+ form.requestSubmit(form.querySelector('[value="remove"]'));
+ check(!row.hidden && requests.length===1,'A second Remove during the fade sends no POST.');
+ restored.finish();await flush();
  submit('remove');
- const secondExit=motion()?.getAnimations({subtree:true})[0];
- check(row.hidden && secondExit && secondExit!==restored,'a second Remove reverses the restore');
- secondExit?.finish();await flush();
- check(!motion() && Math.abs(top(next)-first)<2,'the second Remove leaves the final layout intact');
+ await finishRowMotion();
+ check(!motion() && Math.abs(top(next)-first)<2,'Remove works after the fade ends.');
  finishPost({item_state:'Closed',unread:'false'});await flush();
  show('all');
  check(row.hidden && !motion(),'a filter change keeps the Closed item hidden');
@@ -3742,10 +3804,12 @@ observer.observe(original.parentNode,{childList:true});
  check(!row.hidden && restored && restored!==firstExit,'a lost Mark read response slides the row back');
  check(form.querySelector('[data-send-status]').textContent==='Save not confirmed: Fixture lost response',
   'the restored item shows the failure reason');
+ await finishRowMotion();
  check(!form.querySelector('[value="read"]').disabled,'the restored item can retry Mark read');
  check(submit('read').id===read.id,'the exact Mark read retry uses the same ID');
  finishPost({unread:'true'});await flush();
  check(!row.hidden && row.dataset.unread==='true','a newer unread update returns the row to Unread');
+ await finishRowMotion();
  form.elements.words.value='Send the update.';
  form.elements.words.dispatchEvent(new Event('input'));
  submit('tell');
@@ -4350,9 +4414,25 @@ window.fetch=async(_url,options)=>{
         fragment = urlencode({"item": f"{MORTY.id}/{item.id}"})
         setup = """<script>
 const fragment='#FRAGMENT',reads=[];
-if(LINK_ON_LOAD) history.replaceState(null,'',fragment);
-let receivedRead;
+const seenEntries=[],NativeIntersectionObserver=window.IntersectionObserver;
+window.IntersectionObserver=class extends NativeIntersectionObserver{
+ constructor(callback,options){
+  super((entries,observer)=>{
+   if(options?.threshold) for(const entry of entries) seenEntries.push([
+    entry.target.parentElement.dataset.question,entry.isIntersecting,entry.intersectionRatio,document.visibilityState
+   ]);
+   callback(entries,observer);
+  },options);
+ }
+};
+let receivedRead,receivedFirstAnswer;
 const postedRead=new Promise(resolve=>{receivedRead=resolve;});
+const firstAnswerSeen=new Promise(resolve=>{receivedFirstAnswer=resolve;});
+const unobserveAnswer=IntersectionObserver.prototype.unobserve;
+IntersectionObserver.prototype.unobserve=function(answer){
+ unobserveAnswer.call(this,answer);
+ if(answer.matches('[data-question="Q1"] > p:last-child')) receivedFirstAnswer();
+};
 window.fetch=async(_url,options)=>{
  if(options?.method!=='POST') return new Response('',{status:503});
  reads.push(new URLSearchParams(options.body));
@@ -4381,22 +4461,34 @@ window.fetch=async(_url,options)=>{
    observer.observe(target);
   });
   const paint=()=>new Promise(resolve=>parent.requestAnimationFrame(()=>parent.requestAnimationFrame(resolve)));
+  const showAnswer=async answer=>{
+   scrollTo({top:scrollY+answer.getBoundingClientRect().top-16,behavior:'instant'});
+   await paint();
+  };
+  const requireEvent=(event,message)=>{
+   let timer;
+   const deadline=new Promise((_,reject)=>{
+    timer=setTimeout(()=>reject(new Error(message+' '+JSON.stringify({count:reads.length,seenEntries}))),20000);
+   });
+   return Promise.race([event,deadline]).finally(()=>clearTimeout(timer));
+  };
   check(!row.hidden && !detail.hidden,'The item link opens the row');
-  first.scrollIntoView({block:'start',behavior:'instant'});
+  document.body.style.paddingBottom='100vh';
   await paint();
+  await showAnswer(first);
   check((await sample(first)).intersectionRect.height>0,'The first answer enters the viewport');
+  await requireEvent(firstAnswerSeen,'The List did not record the first visible answer within 20 seconds.');
   check(!(await sample(second)).isIntersecting && second.getBoundingClientRect().top>innerHeight,
    'The second answer starts below the viewport');
   check(!reads.length && panel.querySelectorAll('.question-unread').length===2,
    'The first answer alone leaves both answers unread');
-  document.body.style.paddingBottom='100vh';
-  second.scrollIntoView({block:'start',behavior:'instant'});
+  await showAnswer(second);
   check((await sample(second)).intersectionRect.height>0 && first.getBoundingClientRect().bottom<0,
    'The second answer enters the viewport after the first leaves it');
-  await Promise.race([postedRead,new Promise(resolve=>setTimeout(resolve,2000))]);
+  await requireEvent(postedRead,'The List did not send the signed read within 20 seconds.');
   check(reads.length===1 && reads[0].get('action')==='read' &&
    reads[0].get('request')===panel.dataset.openReadRequest && reads[0].get('token')===panel.dataset.openReadToken,
-   'The last answer to enter the viewport sends one signed read');
+   'The last answer to enter the viewport sends one signed read. '+JSON.stringify({count:reads.length,seenEntries}));
  }catch(error){failures.push(String(error));}
  await parent.fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
@@ -4404,12 +4496,13 @@ window.fetch=async(_url,options)=>{
         for link_on_load in (True, False):
             with self.subTest(link_on_load=link_on_load):
                 enabled = str(link_on_load).lower()
-                self.browser_answer_visibility(markup, setup.replace('LINK_ON_LOAD', enabled),
-                                               probe.replace('LINK_ON_LOAD', enabled), viewport_height=1120)
+                self.browser_answer_visibility(markup, setup, probe.replace('LINK_ON_LOAD', enabled),
+                                               viewport_height=1120,
+                                               console_fragment="#" + fragment if link_on_load else "")
 
     def browser_answer_visibility(self, markup: str, setup: str, probe: str, *,
                                   viewport_height: int | None = None, reload_markup: str = "",
-                                  reload_console: bool = False) -> None:
+                                  reload_console: bool = False, console_fragment: str = "") -> None:
         page = markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>').encode()
         reloaded = reload_markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>').encode()
         loaded = threading.Event()
@@ -4417,11 +4510,14 @@ window.fetch=async(_url,options)=>{
         frame_path = "/page"
         frame_url = frame_path
         console_shell = b""
-        if reload_console:
+        if reload_console or console_fragment:
             frame_path = list_page.PAGE_PATH
             listing = console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage(frame_path))
             console_shell = console.render((listing,), console.UnavailablePage())
-            frame_url = "/console/?" + urlencode({"page": "list", "at.list": frame_path + "#show=working"})
+            place = frame_path + (console_fragment or "#show=working")
+            frame_url = "/console/?" + urlencode({"page": "list", "at.list": place})
+            if console_fragment:
+                console_shell = console_shell.replace(b"</body>", b'<img hidden src="/complete"></body>')
         host_page = (f'<!doctype html><style>iframe{{border:0;width:100%;height:{height}}}'
                      + 'iframe[hidden]{display:block;visibility:hidden}</style>'
                      + f'<iframe src="{html.escape(frame_url)}"></iframe><img hidden src="/complete">').encode()
@@ -4469,9 +4565,10 @@ window.fetch=async(_url,options)=>{
                 profile = self.root / "answer-profile"
                 profile.mkdir(exist_ok=True)
                 window_height = max(900, (viewport_height or 0) + 32)
+                destination = frame_url if console_fragment else "/"
                 browser = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
                     '--window-size', f'1280,{window_height}', '--screenshot', str(self.root / 'answer.png'),
-                    f'http://127.0.0.1:{server.server_port}/'], capture_output=True, text=True, timeout=45)
+                    f'http://127.0.0.1:{server.server_port}{destination}'], capture_output=True, text=True, timeout=45)
                 self.assertEqual(browser.returncode, 0, browser.stderr)
                 self.assertEqual(results, [[]])
             finally:
@@ -5003,7 +5100,8 @@ window.fetch=async(_path,options={})=>{
         self.assertEqual(the_list.feedback_requests(the_list.load(MORTY.id, item.id)),
                          {key: replace(value, state="sent") for key, value in the_list.feedback_requests(saved).items()})
         delivery = list_page.submit(root, urlencode(self.fields(item, "remove")))
-        def fail_message(recipient: staff.StaffId, _sender: str, _message: str) -> None:
+        def fail_message(recipient: staff.StaffId, _sender: str, _message: str, *, key: str) -> None:
+            self.assertTrue(key.startswith("review:"))
             if recipient == MORTY.id:
                 raise RuntimeError("fixture offline")
         with (patch.object(change_page, "send_to_staff", side_effect=fail_message) as send,
@@ -5087,7 +5185,8 @@ window.fetch=async(_path,options={})=>{
         other = self.add("Mark this item read")
         delivery = list_page.submit(root, urlencode(self.fields(item, "tell", words="Keep these words.")))
         entered, release = threading.Event(), threading.Event()
-        def send(_recipient: staff.StaffId, _sender: str, _message: str) -> None:
+        def send(_recipient: staff.StaffId, _sender: str, _message: str, *, key: str) -> None:
+            self.assertTrue(key.startswith("review:"))
             entered.set()
             if not release.wait(TEST_HANG_GUARD_SECS):
                 raise RuntimeError("the test did not release delivery")
@@ -5479,6 +5578,8 @@ try{
   check(posts.at(-1).get('action')===action && posts.at(-1).get('id')==='L106','signed feedback '+action);
   check(posts.at(-1).get('token').length===64,'the form carries its token');
   check(form.elements.request.value!==requestIds.at(-1),'success renews the request without refresh');
+  const motions=[...document.querySelectorAll('[data-record-motion]')].flatMap(node=>node.getAnimations({subtree:true}));
+  await Promise.allSettled(motions.map(animation=>animation.finished));
   if(action==='tell'){
    check(form.elements.words.value==='New draft during send','a newer draft survives the send');
    check(!form.querySelector('[value="tell"]').disabled,'the newer draft enables Tell morty after delivery');

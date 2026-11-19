@@ -36,7 +36,7 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from collections.abc import Callable, Generator, Iterator
-from typing import Literal, Self, TextIO, TypedDict, cast, final, override
+from typing import BinaryIO, Literal, Self, TextIO, TypedDict, cast, final, override
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
@@ -45,6 +45,7 @@ from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role
 from scripts.accounts.nix_env_fake import FakeShellRefusal, fake_nix_loader, imports_with_nix_loader, installed_program
 from scripts.lib import atomic_file, conf, file_lock, unit_runs
 from scripts.lib.test_models_registry import write_registry
+from scripts.lib import models_registry
 from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_worker
 from scripts.agents import stop_resume
@@ -925,6 +926,94 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(rows[0].role_counts_by_machine[peer], {})
         self.assertEqual(rows[0].models_by_role, {})
         self.assertEqual(problems, (f"{peer}: Claude session registry unreadable. Claude session counts are unknown.",))
+
+    def test_model_cells_name_counted_sessions_from_the_existing_scan(self) -> None:
+        from scripts.herdr import pane_launch
+        from scripts.production import session_staff
+        from scripts.production.staff_test_support import fixture_worker
+
+        showrunner = fixture_member("showrunner", name="suite-runner")
+        unit = fixture_member("unit", name="suite-unit", parent=showrunner.id)
+        registry_named = replace(fixture_member("unit", name="registry-unit", parent=showrunner.id), name="")
+        unnamed = replace(fixture_member("unit", name="unnamed-unit", parent=showrunner.id), name="")
+        worker = fixture_worker("suite-worker", unit.id)
+        producer = fixture_member("producer", name="suite-producer")
+        members = (producer, showrunner, unit, registry_named, unnamed, worker)
+        lives = [sessions.SessionRecord(pid=900 + index, sessionId=member.current_session,
+            name=registry_name, messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], status="busy")
+            for index, (member, registry_name) in enumerate(zip(members,
+                ("old-producer", "old-runner", "old-unit", "A registry name", "", "old-worker"), strict=True))]
+        folder = self.home / ".claude1"
+        known = accounts.ObservedSessionModel("claude-opus-5-5", "high")
+        observe = cast(Callable[..., accounts.LocalRoleSessions], getattr(accounts, "_read_local_role_sessions"))
+        count = cast(Callable[..., tuple[tuple[accounts.StatusRow, ...], tuple[str, ...]]],
+                     getattr(accounts, "_count_role_sessions"))
+        configuration = models_registry.LaunchSettings("claude", known.model, known.effort, "")
+        with (patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(members)) as staff_read,
+              patch.object(sessions, "running_sessions", return_value=lives),
+              patch.object(sessions, "read_registry", wraps=sessions.read_registry) as registry_read,
+              patch.object(pane_launch, "record_directory", return_value=self.root / "no-launches"),
+              patch.object(session_staff, "pane_parents", return_value=()),
+              patch.object(session_state, "running_detached_work", return_value=session_state.NO_DETACHED_WORK),
+              patch.object(accounts, "producer_settings", return_value=configuration),
+              patch.object(accounts, "_session_config_dir", return_value=account.ConfiguredClaudeFolder(folder)),
+              patch.object(accounts.SessionModelReader, "claude", side_effect=[
+                  known, known, known, known, accounts.SessionModelUnknown(), known]) as model_read):
+            observed = observe({}, include_models=True)
+        staff_read.assert_called_once_with()
+        registry_read.assert_called_once_with(dependencies=ANY)
+        self.assertEqual(model_read.call_count, len(members))
+        row = replace(SharedStatusDocumentTests().row(), label="claude1", tool="claude", folder=str(folder))
+        rows, _ = count((row,), observed)
+        board = accounts.models_board(accounts.StatusReading(rows, (), (), timezone.utc, datetime.now(timezone.utc)), {})
+        short_id = unnamed.current_session[:8]
+        model, unknown, total = board.rows
+        self.assertEqual(model.get("session_names"), {
+            "producers": (producer.name,), "showrunners": (showrunner.name,), "units": ("A registry name", unit.name),
+            "workers": (worker.name,), "total": ("A registry name", producer.name, showrunner.name, unit.name, worker.name),
+        })
+        self.assertEqual(unknown.get("session_names"), {"units": (short_id,), "total": (short_id,)})
+        self.assertEqual(total.get("session_names", {}).get("units"),
+                         tuple(sorted((unit.name, "A registry name", short_id), key=str.casefold)))
+
+        with patch.object(accounts, "_local_session_counts", return_value=observed), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(accounts.main(["session-counts-read"]), 0)
+        machine = "mac" if remote.other_machine() == "natedev" else "natedev"
+        published = decode_session_counts(output.getvalue(), machine)
+        self.assertEqual(published.get("models", {}).get("claude1", {}).get("units"), [
+            {"model": known.model, "effort": known.effort, "count": 2, "names": [unit.name, "A registry name"]},
+        ])
+        self.assertEqual(published.get("unknown_model_names"), {"claude1": {"units": [short_id]}})
+
+    def test_peer_model_cells_name_remote_sessions_and_count_names_missing_from_older_documents(self) -> None:
+        now = datetime.now(timezone.utc)
+        row = replace(SharedStatusDocumentTests().row(), label="claude1", tool="claude", roles=("units",),
+                      role_counts=(accounts.RoleSessionCounts(0, 0, 0, 0),))
+        counts = {"busy": 3, "idle": 0, "paused": 0, "exited": 0, "total": 3}
+        model = {"model": "claude-opus-5-5", "effort": "high", "count": 2}
+        cases: tuple[tuple[dict[str, object], list[tuple[str, ...]]], ...] = (
+            ({"models": {"claude1": {"units": [{**model, "names": ["hana-unit"]}]}},
+              "unknown_model_names": {"claude1": {"units": ["other-unit"]}}},
+             [("hana-unit (mac)", "1 more on mac"), ("other-unit (mac)",),
+              ("hana-unit (mac)", "other-unit (mac)", "1 more on mac")]),
+            ({"models": {"claude1": {"units": [model]}}},
+             [("2 more on mac",), ("1 more on mac",), ("3 more on mac",)]),
+            ({}, [("3 more on mac",), ("3 more on mac",)]),
+            ({"models": {"claude1": {"units": [{**model, "names": ["hana-unit", "\ud800"]}]}},
+              "unknown_model_names": {"claude1": {"units": ["\udfff"]}}},
+             [("hana-unit (mac)", "1 more on mac"), ("1 more on mac",),
+              ("hana-unit (mac)", "2 more on mac")]),
+        )
+        with patch.object(remote, "other_machine", return_value="mac"):
+            for payload, names in cases:
+                with self.subTest(payload=payload):
+                    _ = session_counts_cache().parent.mkdir(parents=True, exist_ok=True)
+                    _ = session_counts_cache().write_text(json.dumps({"machine": "mac", "at": now.isoformat(),
+                        "accounts": {"claude1": {"units": counts}}, **payload}), encoding="utf-8")
+                    combined = machine_role_counts((row,), now)
+                    board = accounts.models_board(accounts.StatusReading(combined.rows, (), (), timezone.utc, now), {})
+                    self.assertEqual([line.get("session_names", {}).get("units") for line in board.rows], names)
+                    self.assertEqual([line.get("session_names", {}).get("total") for line in board.rows], names)
 
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_partial_move_counts_actual_accounts_and_stopped_members_once(self) -> None:
@@ -9854,6 +9943,292 @@ class PickerTests(unittest.TestCase):
                 self.assertFalse(accounts.roles_history_file().exists())
                 process.assert_not_called()
 
+
+
+@final
+class SessionModelReaderTests(unittest.TestCase):
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.home = Path()
+        self.settings = Path()
+        self.claude = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.settings = self.home / "config/accounts.conf"
+        _ = write_config_fixture(self.settings)
+        self.claude = self.home / "projects/fixture/session.jsonl"
+        self.claude.parent.mkdir(parents=True)
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "CONF_DIR": str(self.settings.parent), "XDG_CACHE_HOME": str(self.home / "cache"),
+        })))
+
+    @staticmethod
+    def claude_turn(model: str) -> bytes:
+        return (json.dumps({"type": "assistant", "message": {"model": model}, "effort": "high"}) + "\n").encode()
+
+    @staticmethod
+    def output(size: int) -> bytes:
+        return (json.dumps({"type": "response_item", "text": "x" * size}) + "\n").encode()
+
+    @contextmanager
+    def transcript_reads(self) -> Generator[list[tuple[int, int]]]:
+        reads: list[tuple[int, int]] = []
+        open_path = Path.open
+
+        @contextmanager
+        def open_file(path: Path, mode: str = "r", buffering: int = -1, encoding: str | None = None,
+                      errors: str | None = None, newline: str | None = None) -> Generator[object]:
+            if path != self.claude or mode != "rb":
+                with open_path(path, mode, buffering, encoding, errors, newline) as stream:
+                    yield cast(object, stream)
+                return
+            with open_path(path, "rb") as stream:
+                tracked = MagicMock(wraps=stream)
+
+                def read(size: int) -> bytes:
+                    reads.append((stream.tell(), size))
+                    return stream.read(size)
+
+                cast(MagicMock, tracked.read).side_effect = read
+                yield tracked
+
+        with patch.object(Path, "open", open_file):
+            yield reads
+
+    def test_codex_model_reader_finds_a_turn_beyond_128_kib(self) -> None:
+        identity = "12345678-1234-4234-8234-123456789abc"
+        path = self.home / "archived_sessions" / f"rollout-fixture-{identity}.jsonl"
+        path.parent.mkdir()
+        turn = b'{"type":"turn_context","payload":{"model":"gpt-6.2-astra","effort":"xhigh"}}\n'
+        _ = path.write_bytes(turn + self.output(256 * 1024))
+        self.assertEqual(accounts.SessionModelReader().codex(self.home, identity),
+                         accounts.ObservedSessionModel("gpt-6.2-astra", "xhigh"))
+
+    def test_claude_model_reader_finds_an_assistant_row_beyond_128_kib(self) -> None:
+        _ = self.claude.write_bytes(self.claude_turn("claude-opus-5-5") + self.output(256 * 1024))
+        self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"),
+                         accounts.ObservedSessionModel("claude-opus-5-5", "high"))
+
+    def test_model_reader_stops_at_the_configured_scan_limit(self) -> None:
+        _ = write_config_fixture(self.settings, "session_model_scan_kib=256\n")
+        turn = self.claude_turn("claude-opus-5-5")
+        tail = self.output(300 * 1024)
+        _ = self.claude.write_bytes(turn + tail)
+        with self.transcript_reads() as reads:
+            self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"), accounts.SessionModelUnknown())
+        self.assertEqual(sum(size for _, size in reads), 256 * 1024)
+
+        _ = self.claude.write_bytes(turn)
+        self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"),
+                         accounts.ObservedSessionModel("claude-opus-5-5", "high"))
+        with self.claude.open("ab") as stream:
+            _ = stream.write(tail)
+        self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"), accounts.SessionModelUnknown())
+
+    def test_model_reader_reads_only_appended_bytes_and_finds_the_newer_turn(self) -> None:
+        original = self.output(160 * 1024) + self.claude_turn("claude-opus-5-5")
+        _ = self.claude.write_bytes(original)
+        old_model = accounts.ObservedSessionModel("claude-opus-5-5", "high")
+        with self.transcript_reads() as reads:
+            self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"), old_model)
+        self.assertEqual(reads, [(len(original) - 16 * 1024, 16 * 1024)])
+
+        noise = self.output(10)
+        with self.claude.open("ab") as stream:
+            _ = stream.write(noise)
+        with self.transcript_reads() as reads:
+            self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"), old_model)
+        self.assertEqual(reads, [(len(original), len(noise))])
+
+        newer = self.claude_turn("claude-opus-5-6")
+        with self.claude.open("ab") as stream:
+            _ = stream.write(newer)
+        new_model = accounts.ObservedSessionModel("claude-opus-5-6", "high")
+        with self.transcript_reads() as reads:
+            self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"), new_model)
+        self.assertEqual(reads, [(len(original) + len(noise), len(newer))])
+        with self.transcript_reads() as reads:
+            self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"), new_model)
+        self.assertEqual(reads, [])
+
+    def test_model_reader_scans_a_replaced_or_truncated_transcript_again(self) -> None:
+        tail = self.output(256 * 1024)
+        first = self.claude_turn("claude-opus-5-5")
+        second = self.claude_turn("claude-opus-5-6")
+        _ = self.claude.write_bytes(tail + first)
+        self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"),
+                         accounts.ObservedSessionModel("claude-opus-5-5", "high"))
+
+        old = self.claude.stat()
+        replacement = self.claude.with_suffix(".new")
+        _ = replacement.write_bytes(second + tail)
+        os.utime(replacement, ns=(old.st_atime_ns, old.st_mtime_ns))
+        _ = replacement.replace(self.claude)
+        self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"),
+                         accounts.ObservedSessionModel("claude-opus-5-6", "high"))
+
+        _ = self.claude.write_bytes(first)
+        self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"),
+                         accounts.ObservedSessionModel("claude-opus-5-5", "high"))
+
+    def test_model_reader_keeps_a_damaged_complete_row_unknown(self) -> None:
+        prefix = self.output(160 * 1024) + self.claude_turn("claude-opus-5-5")
+        newest = self.claude_turn("claude-opus-5-6")
+        damaged = newest[:-3] + b"\n"
+        _ = self.claude.write_bytes(prefix + damaged)
+        self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"), accounts.SessionModelUnknown())
+        with self.claude.open("ab") as stream:
+            _ = stream.write(newest[:-3])
+        self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"), accounts.SessionModelUnknown())
+        with self.claude.open("ab") as stream:
+            _ = stream.write(newest[-3:])
+        with self.transcript_reads() as reads:
+            self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"),
+                             accounts.ObservedSessionModel("claude-opus-5-6", "high"))
+        self.assertEqual(reads, [(len(prefix) + len(damaged), len(newest))])
+
+    def test_status_model_cache_survives_a_new_process(self) -> None:
+        _ = self.claude.write_bytes(self.claude_turn("claude-opus-5-5") + self.output(256 * 1024))
+        program = """
+from pathlib import Path
+import sys
+from unittest.mock import patch
+
+from scripts.accounts import accounts
+
+with accounts.SessionModelReader.status_scan(include_models=True) as reader:
+    if sys.argv[2] == "warm":
+        with patch.object(accounts, "_model_tail_lines", side_effect=AssertionError("warm scan read the transcript")):
+            result = reader.claude(Path(sys.argv[1]), "session")
+    else:
+        result = reader.claude(Path(sys.argv[1]), "session")
+    assert result == accounts.ObservedSessionModel("claude-opus-5-5", "high"), result
+"""
+        cache = self.home / "cache/claude/session-models.json"
+        for scan in ("cold", "warm", "damaged"):
+            with self.subTest(scan=scan):
+                if scan == "damaged":
+                    _ = cache.write_bytes(b'{"version":1,"entries":[{}]}')
+                result = subprocess.run([sys.executable, "-c", program, str(self.home), scan],
+                                        capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(cache.is_file())
+                self.assertEqual(cache.stat().st_mode & 0o777, 0o600)
+
+    def test_model_reader_skips_a_damaged_output_row_with_a_model_marker(self) -> None:
+        prior = self.claude_turn("claude-opus-5-5")
+        damaged = b'{"type":"response_item","text":"assistant",\n'
+        _ = self.claude.write_bytes(prior + damaged)
+        self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"),
+                         accounts.ObservedSessionModel("claude-opus-5-5", "high"))
+
+    def test_model_reader_skips_the_already_scanned_part_of_a_long_unfinished_row(self) -> None:
+        _ = write_config_fixture(self.settings, "session_model_scan_kib=128\n")
+        prior = self.claude_turn("claude-opus-5-5")
+        partial = b'{"type":"response_item","text":"' + b"x" * (256 * 1024)
+        _ = self.claude.write_bytes(prior + partial)
+        self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"), accounts.SessionModelUnknown())
+
+        with self.claude.open("ab") as stream:
+            _ = stream.write(b"x")
+        with self.transcript_reads() as reads:
+            self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"), accounts.SessionModelUnknown())
+        self.assertEqual(reads, [(len(prior) + len(partial), 1)])
+
+        appended = b'"}\n' + self.claude_turn("claude-opus-5-6")
+        with self.claude.open("ab") as stream:
+            _ = stream.write(appended)
+        with self.transcript_reads() as reads:
+            self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"),
+                             accounts.ObservedSessionModel("claude-opus-5-6", "high"))
+        self.assertEqual(reads, [(len(prior) + len(partial) + 1, len(appended))])
+
+    def test_model_reader_rejects_a_longer_rewrite_with_the_same_inode(self) -> None:
+        first = self.claude_turn("claude-opus-5-5")
+        second = self.claude_turn("claude-opus-5-6")
+        tail = self.output(128 * 1024)
+        _ = self.claude.write_bytes(first + tail)
+        inode = self.claude.stat().st_ino
+        self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"),
+                         accounts.ObservedSessionModel("claude-opus-5-5", "high"))
+
+        _ = self.claude.write_bytes(second + tail + self.output(12))
+        self.assertEqual(self.claude.stat().st_ino, inode)
+        self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"),
+                         accounts.ObservedSessionModel("claude-opus-5-6", "high"))
+
+    def test_model_reader_keeps_a_complete_row_at_the_scan_limit(self) -> None:
+        _ = write_config_fixture(self.settings, "session_model_scan_kib=128\n")
+        turn = self.claude_turn("claude-opus-5-5")
+        tail = self.output(128 * 1024 - len(turn) - len(self.output(0)))
+        self.assertEqual(len(turn) + len(tail), 128 * 1024)
+        _ = self.claude.write_bytes(self.output(20) + turn + tail)
+        self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"),
+                         accounts.ObservedSessionModel("claude-opus-5-5", "high"))
+
+
+    def test_damaged_codex_model_row_can_start_with_a_timestamp(self) -> None:
+        identity = "12345678-1234-4234-8234-123456789abc"
+        path = self.home / "archived_sessions" / f"rollout-fixture-{identity}.jsonl"
+        path.parent.mkdir()
+        prior = b'{"type":"turn_context","payload":{"model":"gpt-6.2-astra","effort":"xhigh"}}\n'
+        damaged = b'{"timestamp":"2026-11-18T12:00:00Z","type":"turn_context","payload":{"model":\n'
+        _ = path.write_bytes(prior + damaged)
+        self.assertEqual(accounts.SessionModelReader().codex(self.home, identity), accounts.SessionModelUnknown())
+
+    def test_model_reader_keeps_the_scan_when_the_transcript_grows(self) -> None:
+        initial = self.claude_turn("claude-opus-5-5")
+        appended = self.claude_turn("claude-opus-5-6")
+        _ = self.claude.write_bytes(initial)
+        original = cast(Callable[[BinaryIO, int], str], getattr(accounts, "_model_file_edge"))
+
+        def append_after_edge(stream: BinaryIO, size: int) -> str:
+            edge = original(stream, size)
+            with self.claude.open("ab") as writer:
+                _ = writer.write(appended)
+            return edge
+
+        with patch.object(accounts, "_model_file_edge", side_effect=append_after_edge):
+            self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"),
+                             accounts.ObservedSessionModel("claude-opus-5-5", "high"))
+        with self.transcript_reads() as reads:
+            self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"),
+                             accounts.ObservedSessionModel("claude-opus-5-6", "high"))
+        self.assertEqual(reads, [(len(initial), len(appended))])
+
+    def test_status_model_cache_drops_an_oversized_entry(self) -> None:
+        _ = write_config_fixture(self.settings, "session_model_cache_entries=1\n")
+        _ = self.claude.write_bytes(self.claude_turn("claude-opus-5-5"))
+        effort = "x" * (40 * 1024)
+        oversized = self.claude.with_name("oversized.jsonl")
+        turn = json.dumps({"type": "assistant", "message": {"model": "claude-opus-5-6"}, "effort": effort})
+        _ = oversized.write_text(turn + "\n")
+        expected = accounts.ObservedSessionModel("claude-opus-5-5", "high")
+        with accounts.SessionModelReader.status_scan(include_models=True) as reader:
+            self.assertEqual(reader.claude(self.home, "session"), expected)
+            self.assertEqual(reader.claude(self.home, "oversized"), accounts.SessionModelUnknown())
+        cache = self.home / "cache/claude/session-models.json"
+        self.assertLessEqual(cache.stat().st_size, 32 * 1024 + 64)
+        with (accounts.SessionModelReader.status_scan(include_models=True) as reader,
+              patch.object(accounts, "_model_tail_lines", side_effect=AssertionError("warm scan read the transcript"))):
+            self.assertEqual(reader.claude(self.home, "session"), expected)
+
+    def test_model_reader_checks_a_rewritten_model_between_matching_edges(self) -> None:
+        prefix, suffix = self.output(128), self.output(128 * 1024)
+        original = self.claude_turn("claude-opus-5-5")
+        replacement = self.claude_turn("claude-opus-5-6")
+        _ = self.claude.write_bytes(prefix + original + suffix)
+        self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"),
+                         accounts.ObservedSessionModel("claude-opus-5-5", "high"))
+        with self.claude.open("r+b") as stream:
+            _ = stream.seek(len(prefix))
+            _ = stream.write(replacement)
+            _ = stream.seek(0, os.SEEK_END)
+            _ = stream.write(self.output(12))
+        self.assertEqual(accounts.SessionModelReader().claude(self.home, "session"),
+                         accounts.ObservedSessionModel("claude-opus-5-6", "high"))
 
 
 class StoredWeeklyQuotaTests(unittest.TestCase):
