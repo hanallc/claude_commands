@@ -15,7 +15,8 @@ class LandingWaitTextTests(unittest.TestCase):
         reason = records.LandingWait()
         decision = records.AdmissionDecision("hold", 1, 0, 0, 0)
         head = records.HeadAdmissionStatus(decision, 1, 2, cause=reason)
-        text = "waits for natemerge's merge test"
+        text = ("Waits for natedev: natemerge's integrate job runs there, "
+                + "and no other target can take this test now.")
         self.assertEqual(records.reason_phrase(reason, ()), text)
         self.assertEqual(records.reason_phrase(head, ()), text)
         self.assertEqual(records.head_wait_text(head, ZoneInfo("UTC")), f"head: {text}")

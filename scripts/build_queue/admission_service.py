@@ -1289,6 +1289,7 @@ class WaitingAdmission:
     last_sent: float = float("-inf")
     continuation_claim: records.ContinuationSlot | NoContinuationClaim = NoContinuationClaim()
     landing: LandingTest | OrdinaryTest = OrdinaryTest()
+    merge_route_retry_at: float = float("inf")
 
 
 @dataclass
@@ -2509,12 +2510,29 @@ class AdmissionServer:
             row.get("step", ""), row.get("folder", ""), row["since"], row["need"], decision.reason, row.get("unit", ""))
             for (_, row), decision in zip(inputs.ordered, result.rows, strict=True))
         positions = {row.owner: position for position, row in enumerate(result.rows, 1)}
+        next_merge_route_retry = float("inf")
+        rerouted: set[str] = set()
+        observed_at = self.clock.monotonic()
         for position, decision in enumerate(result.rows, 1):
             episode = by_owner[decision.owner]
             if episode in self.waiters:
                 waiting = self.waiters[episode]
                 reason = decision.reason
                 cause = reason.cause if isinstance(reason, records.HeadAdmissionStatus) else reason
+                profile = waiting.request.profile
+                if isinstance(cause, records.LandingWait) and isinstance(profile, records.ProgramProfile) and profile.retry_merge_route:
+                    if waiting.merge_route_retry_at == float("inf"):
+                        waiting.merge_route_retry_at = observed_at + self.configuration.merge_test_reroute_seconds
+                    if observed_at >= waiting.merge_route_retry_at:
+                        # Remove the waiter before the client can start a remote request.
+                        self._drop_waiter(episode, return_claim=True)
+                        rerouted.add(decision.owner)
+                        self.persist()
+                        reason = records.LandingWait(retry_route=True)
+                    else:
+                        next_merge_route_retry = min(next_merge_route_retry, waiting.merge_route_retry_at)
+                else:
+                    waiting.merge_route_retry_at = float("inf")
                 order = decision.decision.order_hold
                 text = (f"behind #{positions[records.waiter_owner(order.waiter)]}"
                         if isinstance(cause, records.BehindHead) and isinstance(order, records.HeldBehindHead)
@@ -2527,6 +2545,7 @@ class AdmissionServer:
                     waiting.last_reply, waiting.last_sent = reply, inputs.now
         for position, (episode, reason) in enumerate(ci_holds.items(), len(result.rows) + 1):
             waiting = self.waiters[episode]
+            waiting.merge_route_retry_at = float("inf")
             decision = records.AdmissionDecision("hold", waiting.row["need"], 0, 0, 0, free_passes=False)
             reply = wire.Wait(reason, position, "", reason_phrase(reason, ()),
                 self._wait_snapshot(waiting, decision, inputs, config, reason, records.NoHolder(), head_label, head_need))
@@ -2535,9 +2554,15 @@ class AdmissionServer:
                 waiting.last_reply, waiting.last_sent = reply, inputs.now
         interval = (config.waiting_pass_seconds if self.waiters or self.repository_slot_waiters or any(self._placement_waiting(request)
                     for request in self.placement_requests.values()) else config.running_pass_seconds)
-        self.next_pass = self.clock.monotonic() + interval
+        self.next_pass = min(self.clock.monotonic() + interval, next_merge_route_retry)
         if starts or cloud_started:
             self.next_pass = self.clock.monotonic()
+        if rerouted:
+            inputs = replace(inputs, ordered=[(path, row) for path, row in inputs.ordered
+                if records.waiter_owner(row) not in rerouted], landing_waiters=inputs.landing_waiters - rerouted,
+                slots=tuple(self.slots.values()))
+            self.last_inputs = inputs
+            self.last_result = gate.admission_pass(inputs, inputs.now, policy, resolved_order=True)
         try:
             ordered, priority = self._queue_order()
             queue_snapshot.write_queue_snapshot(self.state_dir,
@@ -4828,7 +4853,9 @@ done
         if connection.finished:
             return
         connection.sending += self.reply_bytes(reply, version=connection.version)
-        connection.finished = not isinstance(reply, (wire.Wait, wire.BuildHistoryReply, wire.RepositorySlotWaiting))
+        connection.finished = (not isinstance(reply, (wire.Wait, wire.BuildHistoryReply, wire.RepositorySlotWaiting))
+                               or isinstance(reply, wire.Wait) and isinstance(reply.reason, records.LandingWait)
+                               and reply.reason.retry_route)
         if connection.finished:
             self._drop_deferred_requests(connection)
         self.epoll.modify(connection.socket.fileno(), select.EPOLLOUT if connection.finished

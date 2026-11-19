@@ -880,16 +880,63 @@ class LandingWaitTests(unittest.TestCase):
     ALL_TESTS: ClassVar[StepJob] = StepJob("test-all")
     INTEGRATE: ClassVar[StepJob] = StepJob("integrate")
 
-    def configure_wait(self, fixture: AdmissionFixture, *, enabled: bool = True) -> None:
+    def configure_wait(self, fixture: AdmissionFixture, *, enabled: bool = True, retry_seconds: float = 2) -> None:
         value = "on" if enabled else "off"
         _ = write_config_fixture(fixture.root / "build_admission.conf",
-            f"# one of: on, off\n{gate.MERGE_TEST_WAIT_KEY}={value}\nwaiting_pass_seconds=1\n")
+            f"# one of: on, off\n{gate.MERGE_TEST_WAIT_KEY}={value}\nwaiting_pass_seconds=1\n"
+            + f"# range: 5e-324..\n{gate.MERGE_TEST_REROUTE_KEY}={retry_seconds}\n")
 
     def gate_request(self, fixture: AdmissionFixture, job: StepJob | GateJobNotRecorded = ALL_TESTS,
                      *, step: str = "merge-gate", repository: str = "claude_commands") -> wire.AdmitRequest:
         request = fixture.request(need=GIB, step=step)
         assert isinstance(request.profile, records.StepProfile)
         return replace(request, identity=replace(request.identity, job=job), profile=replace(request.profile, repo=repository))
+
+    def reroutable_gate(self, fixture: AdmissionFixture, job: StepJob = ALL_TESTS) -> wire.AdmitRequest:
+        request = self.gate_request(fixture, job)
+        sizing = records.HistoryPeakSizing(GIB, records.FirstProgramPeak(GIB), fixture.clock.now())
+        return replace(request, profile=records.ProgramProfile("merge-gate", "claude_commands",
+            str(fixture.root), sizing, retry_merge_route=True))
+
+    def test_only_a_local_merge_hold_ends_the_wait_at_the_route_interval(self) -> None:
+        with AdmissionFixture() as fixture:
+            self.configure_wait(fixture, retry_seconds=2.5)
+            _ = only_admitted(fixture.server.handle_request(self.gate_request(fixture, self.INTEGRATE)))
+            request = self.reroutable_gate(fixture)
+            peer = fixture.connect(request)
+            first, = peer.replies()
+            assert isinstance(first, wire.Wait)
+            self.assertEqual(first.text, records.LANDING_WAIT_TEXT)
+            fixture.clock.advance(2)
+            _ = fixture.run_pass()
+            self.assertIn(request.episode, fixture.server.waiters)
+            self.assertEqual(fixture.server.next_pass, fixture.clock.monotonic() + 0.5)
+
+            fixture.clock.advance(0.5)
+            _ = fixture.run_pass()
+            reply, = peer.replies()
+            assert isinstance(reply, wire.Wait)
+            self.assertEqual(reply.reason, records.LandingWait(retry_route=True))
+            self.assertNotIn(request.episode, fixture.server.waiters)
+            self.assertNotIn(request.episode, fixture.server.reservations)
+            self.assertNotIn(request.owner.pid, fixture.queue_pids())
+
+    def test_memory_wait_and_integrate_wait_do_not_retry_the_route(self) -> None:
+        for job in (self.ALL_TESTS, self.INTEGRATE):
+            with self.subTest(job=job), AdmissionFixture() as fixture:
+                self.configure_wait(fixture)
+                if job == self.INTEGRATE:
+                    _ = only_admitted(fixture.server.handle_request(self.gate_request(fixture, self.INTEGRATE)))
+                fixture.free(0)
+                fixture.hold_starts()
+                request = self.reroutable_gate(fixture, job)
+                first, = fixture.connect(request).replies()
+                assert isinstance(first, wire.Wait)
+                self.assertNotEqual(first.text, records.LANDING_WAIT_TEXT)
+
+                fixture.clock.advance(4)
+                _ = fixture.run_pass()
+                self.assertIn(request.episode, fixture.server.waiters)
 
     def test_landing_test_checks_the_land_session_and_the_socket_peer_owner(self) -> None:
         merge_member = staff.StaffRow(gate.NATEMERGE_STAFF_ID, "producer", "natemerge", staff.StaffRoot(),
@@ -934,7 +981,7 @@ class LandingWaitTests(unittest.TestCase):
                 reply, = fixture.server.handle_request(request)
                 self.assertIsInstance(reply, wire.Wait)
                 assert isinstance(reply, wire.Wait)
-                self.assertEqual(reply.text, "waits for natemerge's merge test")
+                self.assertEqual(reply.text, records.LANDING_WAIT_TEXT)
                 self.assertEqual(wire.parse_reply(wire.encode_reply(reply)), reply)
                 with mock.patch("sys.stderr", new_callable=io.StringIO) as errors:
                     client.WaitOutput()(reply)
@@ -1025,10 +1072,10 @@ class LandingWaitTests(unittest.TestCase):
             merge = self.gate_request(fixture, self.INTEGRATE)
             _ = only_admitted(fixture.server.handle_request(merge))
             fixture.allow_next_start()
-            request = self.gate_request(fixture)
+            request = self.reroutable_gate(fixture)
             self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
             self.configure_wait(fixture, enabled=False)
-            fixture.clock.advance(1)
+            fixture.clock.advance(4)
             _ = fixture.run_pass()
             self.assertIn(request.episode, fixture.server.reservations)
             self.assertIn(merge.episode, fixture.server.reservations)

@@ -594,6 +594,7 @@ class UsableAdmissionConfiguration:
     progress_profile_sweep_seconds: float
     remote_start_hold_seconds: int
     hold_for_merge_test: bool = False
+    merge_test_reroute_seconds: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -602,6 +603,7 @@ class UnusableAdmissionConfiguration:
 
 
 MERGE_TEST_WAIT_KEY = "claude_commands_tests_wait_for_landing"
+MERGE_TEST_REROUTE_KEY = "claude_commands_reroute_seconds"
 
 
 def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdmissionConfiguration:
@@ -616,11 +618,13 @@ def read_admission_configuration() -> UsableAdmissionConfiguration | UnusableAdm
             progress_profile_sweep_seconds = settings.number("progress_profile_sweep_seconds")
             remote_start_hold_seconds = settings.whole("remote_start_hold_seconds")
             hold_for_merge_test = settings.value(MERGE_TEST_WAIT_KEY, conf.on_off, default=False)
+            merge_test_reroute_seconds = settings.value(MERGE_TEST_REROUTE_KEY, float, default=60.0)
         config = records.read_memory_config(report=False)
         return UsableAdmissionConfiguration(replace(config,
             diagnostics=(*config.diagnostics, *records.configuration_diagnostics(messages))),
             cloud_gate_slots, cloud_gate_stale_pushes, progress_profile_rank, peak_history_share_percent,
-            progress_profile_sweep_seconds, remote_start_hold_seconds, hold_for_merge_test)
+            progress_profile_sweep_seconds, remote_start_hold_seconds, hold_for_merge_test,
+            merge_test_reroute_seconds)
     except conf.Unusable as error:
         return UnusableAdmissionConfiguration(str(error))
 

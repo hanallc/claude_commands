@@ -981,8 +981,12 @@ class NatedevHeld:
 class LandingWait:
     """Natemerge's merge test holds this step on natedev."""
 
+    retry_route: bool = False
 
-LANDING_WAIT_TEXT = "waits for natemerge's merge test"
+
+LANDING_WAIT_TEXT = (
+    "Waits for natedev: natemerge's integrate job runs there, and no other target can take this test now."
+)
 
 
 HeadCause = (MemoryPressure | PressureUnavailable | ReadingUnavailable | StartSpacingWait | NeedsMemory | EstimateExpired
@@ -1346,6 +1350,7 @@ class ProgramProfile:
     repo: str
     worktree: str
     sizing: HistoryPeakSizing
+    retry_merge_route: bool = field(default=False, kw_only=True)
 
     @property
     def step(self) -> str:

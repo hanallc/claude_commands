@@ -74,6 +74,35 @@ class QueuePlaceRefused(Exception):
     """The program cannot acquire or keep its queue place."""
 
 
+class RetryMergeTestRoute(Exception):
+    """The service removed the local waiter so the gate can retry its route."""
+
+
+@dataclass(frozen=True)
+class NoMergeTestRoute:
+    """The program waits for local admission only."""
+
+
+NO_MERGE_TEST_ROUTE = NoMergeTestRoute()
+
+
+@dataclass(frozen=True)
+class FirstLocalQueueEntry:
+    """The gate has yet to request a local place."""
+
+
+@dataclass
+class MergeTestRoute:
+    """Keep the first local arrival across route attempts."""
+
+    arrival: float | FirstLocalQueueEntry = FirstLocalQueueEntry()
+
+    def queue_since(self) -> float:
+        if isinstance(self.arrival, FirstLocalQueueEntry):
+            self.arrival = time.time()
+        return self.arrival
+
+
 def no_hold_wait() -> None:
     pass
 
@@ -477,7 +506,7 @@ QueueRequest = RefreshedRequest | wire.ServiceEstimateRequest
 QueueReply = wire.Admitted | wire.LaunchAdmitted | wire.Refused | admission_client.LeftQueue
 
 
-def request_place(request: QueueRequest | RefreshedLaunch, output: admission_client.WaitOutput, *,
+def request_place(request: QueueRequest | RefreshedLaunch, output: Callable[[wire.Wait], None], *,
                   before_check: Callable[[], None] = no_hold_wait) -> QueueReply:
     """Send a queue request and wait for its answer.
 
@@ -506,9 +535,15 @@ class HeldReservation:
 def held_reservation(request: QueueRequest, *,
                      before_check: Callable[[], None] = no_hold_wait) -> Generator[HeldReservation]:
     """Wait for admission, then release the grant with the holder's status."""
-    # service_admit sets the service estimate timing on the output.
     output = admission_client.WaitOutput()
-    reply = request_place(request, output, before_check=before_check)
+
+    def observe(reply: wire.Wait) -> None:
+        output(reply)
+        if isinstance(reply.reason, admission_records.LandingWait) and reply.reason.retry_route:
+            output.end_status()
+            raise RetryMergeTestRoute()
+
+    reply = request_place(request, observe, before_check=before_check)
     if isinstance(reply, wire.Refused):
         raise QueuePlaceRefused(reply.reason)
     if not isinstance(reply, wire.Admitted):
@@ -524,7 +559,8 @@ def held_reservation(request: QueueRequest, *,
 @contextmanager
 def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False,
                 sizing: admission_records.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK,
-                before_check: Callable[[], None] = no_hold_wait) -> Generator[QueuePlace]:
+                before_check: Callable[[], None] = no_hold_wait,
+                merge_route: MergeTestRoute | NoMergeTestRoute = NO_MERGE_TEST_ROUTE) -> Generator[QueuePlace]:
     """Use full commands for purpose selection; retain named batch reservations.
 
     A complete Cargo command sizes from its step history, as each Cargo step does.
@@ -563,11 +599,13 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
         if purpose == ProgramPurpose.BATCH:
             assert not isinstance(estimate, ConfiguredFirstPeak)
             profile = (estimate if isinstance(estimate, admission_records.InferFromArgv) else
-                       admission_records.ProgramProfile(name, str(Path.home() / ".claude"), str(repo.resolve()), estimate))
+                       admission_records.ProgramProfile(name, str(Path.home() / ".claude"), str(repo.resolve()), estimate,
+                           retry_merge_route=isinstance(merge_route, MergeTestRoute)))
             start = admission_records.process_start_time(pid)
             if start is None:
                 raise QueuePlaceRefused("owner no longer exists")
-            owner, episode, since = wire.Owner(pid, start), uuid.uuid4().hex, time.time()
+            owner, episode = wire.Owner(pid, start), uuid.uuid4().hex
+            since = merge_route.queue_since() if isinstance(merge_route, MergeTestRoute) else time.time()
             def refresh() -> wire.AdmitRequest:
                 return admission_client.step_request(list(arguments) or [name], str(repo), owner, since, str(sidecar), episode, profile)
             grant = reservation.enter_context(held_reservation(RefreshedRequest(refresh), before_check=before_check))

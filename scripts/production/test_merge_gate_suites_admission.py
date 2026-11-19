@@ -24,6 +24,7 @@ from scripts.lib import build_folders
 from scripts.production.gate_modules import GateRefused
 from scripts.build_queue import queue_place as queue, admission_client as client, admission_protocol as wire, admission_service as service
 from scripts.build_queue import progress_profile as progress, step_estimator
+from scripts.build_queue.admission_jobs import StepJob
 from scripts.build_queue.queue_fixture import fixture_reservation
 from scripts.build_queue.admission_test_support import only_admitted, FakeClock, wait_reply, snapshot_with_head_cause
 from scripts.lint import memory_admit
@@ -72,6 +73,95 @@ class ServiceGateFixture(GateSuitesFixture):
 
 @final
 class SharedGateAdmissionTests(ServiceGateFixture):
+    def check_merge_route_retry(self, *, accepts: bool) -> None:
+        from scripts.aws_target import cloud_gate
+
+        interval = 2.5
+        self.configure_gate(f"# one of: on, off\n{memory_admit.MERGE_TEST_WAIT_KEY}=on\n"
+            + f"# range: 5e-324..\n{memory_admit.MERGE_TEST_REROUTE_KEY}={interval}\n")
+        fixture = self.admission
+        local_result = merge_gate.GateRun((), 1, 0, selection_certified=True)
+        remote_result = merge_gate.GateRun((), 2, 0, selection_certified=True)
+        start = admission_records.process_start_time(os.getpid())
+        assert start is not None
+        owner = wire.Owner(os.getpid(), start)
+        with fixture.loop_turn():
+            merge = fixture.request(need=admission_records.GIB, step="merge-gate")
+            integrate = only_admitted(fixture.server.handle_request(
+                replace(merge, identity=replace(merge.identity, job=StepJob("integrate")))))
+            fixture.allow_next_start()
+            competitor = fixture.request(step="nextest")
+        assert isinstance(competitor.profile, admission_records.StepProfile)
+        competitor = replace(competitor, profile=replace(competitor.profile, repo="claude_commands"))
+        entries: list[wire.AdmitRequest] = []
+        attempts = 0
+        show_wait = client.WaitOutput.__call__
+
+        def observe(output: client.WaitOutput, reply: wire.Wait) -> None:
+            show_wait(output, reply)
+            cause = reply.reason.cause if isinstance(reply.reason, admission_records.HeadAdmissionStatus) else reply.reason
+            self.assertIsInstance(cause, admission_records.LandingWait)
+            assert isinstance(cause, admission_records.LandingWait)
+            if cause.retry_route:
+                return
+            with fixture.loop_turn():
+                local, = (waiting.request for waiting in fixture.server.waiters.values()
+                          if waiting.request.owner == owner)
+                assert isinstance(local, wire.AdmitRequest)
+                if entries and entries[-1].episode == local.episode:
+                    return
+                entries.append(local)
+                if len(entries) == 1:
+                    fixture.clock.advance(interval)
+                else:
+                    self.assertEqual(local.since, entries[0].since)
+                    self.assertEqual(fixture.queue_pids(), [owner.pid, competitor.owner.pid])
+                    fixture.release(integrate)
+                    fixture.allow_next_start()
+                _ = fixture.run_pass()
+
+        def route(_repo: Path, **_options: object) -> merge_gate.GateRun | str:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return "AWS is busy"
+            self.assertEqual(attempts, 2)
+            with fixture.loop_turn():
+                self.assertEqual(len(entries), 1)
+                self.assertNotIn(entries[0].episode, fixture.server.waiters)
+                self.assertNotIn(entries[0].episode, fixture.server.reservations)
+                if accepts:
+                    remote = replace(fixture.request(owner=owner, step="merge-gate"), place=wire.CloudPlace("aws"))
+                    grant = only_admitted(fixture.server.handle_request(remote))
+                    fixture.release(grant)
+                    fixture.release(integrate)
+                    return remote_result
+                later = replace(competitor, since=entries[0].since + 0.1)
+                self.assertIsInstance(fixture.server.handle_request(later)[0], wire.Wait)
+                return "AWS is still busy"
+
+        def local(repo: Path, *_args: object, merge_route: queue.MergeTestRoute, **_options: object) -> merge_gate.GateRun:
+            with merge_gate.gate_reservation(repo, self.state, merge_gate.BuildHoldWait(), merge_route=merge_route) as place:
+                place.status = 0
+            return local_result
+
+        repository = admission_records.RepositoryIdentity("fixture-repository", "claude_commands")
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(step_estimator, "git_identity", return_value=(repository, "merge")),
+              mock.patch.object(client.WaitOutput, "__call__", new=observe),
+              mock.patch.object(cloud_gate, "route", side_effect=route),
+              mock.patch.object(merge_gate, "run_suites", side_effect=local)):
+            run = merge_gate.run_gate_suites(self.checkout)
+        self.assertEqual(run, remote_result if accepts else local_result)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(len(entries), 1 if accepts else 2)
+
+    def test_route_retries_on_aws_after_the_gate_leaves_the_local_queue(self) -> None:
+        self.check_merge_route_retry(accepts=True)
+
+    def test_route_refusal_returns_the_gate_to_its_original_arrival_place(self) -> None:
+        self.check_merge_route_retry(accepts=False)
+
     @gate_suites("lib", "hooks")
     def test_suite_progress_counts_type_jobs_and_clears_the_counter_for_reruns(self) -> None:
         self.write(self.state / "fail-first-lib", "fail")
@@ -208,7 +298,8 @@ class SharedGateAdmissionTests(ServiceGateFixture):
                 place.observe(123 * 1024 * 1024, 123 * 1024 * 1024)
                 place.status = 0
             acquire.assert_called_once_with("merge-gate", self.checkout,
-                before_check=client.AdmissionHoldCheck(hold.wait_until_free, hold.admits))
+                before_check=client.AdmissionHoldCheck(hold.wait_until_free, hold.admits),
+                merge_route=queue.NoMergeTestRoute())
             before_check.assert_called_once_with()
         self.assert_gate_released()
         row, = self.gate_history()

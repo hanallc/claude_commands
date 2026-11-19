@@ -81,7 +81,8 @@ from scripts.build_queue import admission_records  # noqa: E402
 from scripts.build_queue import progress_profile
 from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E402
 from scripts.build_queue.queue_place import (  # noqa: E402
-    QueuePlace, QueuePlaceRefused, queue_place, suite_scope_prefix,
+    NO_MERGE_TEST_ROUTE, MergeTestRoute, NoMergeTestRoute, QueuePlace, QueuePlaceRefused, RetryMergeTestRoute,
+    queue_place, suite_scope_prefix,
 )
 
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
@@ -461,13 +462,23 @@ def tell_memory_stop(repo: Path, job: RunningGateJob, limit_gib: float,
 @contextmanager
 def gate_reservation(repo: Path, temporary: Path, hold: BuildHoldWait, *,
                      type_dirs: Sequence[str] = (),
-                     mode: SuiteMode = SuiteMode.MERGE_GATE) -> Generator[QueuePlace]:
+                     mode: SuiteMode = SuiteMode.MERGE_GATE,
+                     merge_route: MergeTestRoute | NoMergeTestRoute = NO_MERGE_TEST_ROUTE) -> Generator[QueuePlace]:
     if not temporary.is_dir():
         raise GateRefused(f"gate temporary directory is missing: {temporary}")
+    program: str | Sequence[str] = (mode.value, "--type-dirs", *type_dirs) if type_dirs else mode.value
+    before_check = AdmissionHoldCheck(hold.wait_until_free, hold.admits)
     try:
-        program: str | Sequence[str] = (mode.value, "--type-dirs", *type_dirs) if type_dirs else mode.value
-        with queue_place(program, repo,
-                         before_check=AdmissionHoldCheck(hold.wait_until_free, hold.admits)) as place:
+        with ExitStack() as reservation:
+            while True:
+                try:
+                    place = reservation.enter_context(queue_place(program, repo, before_check=before_check,
+                                                                 merge_route=merge_route))
+                except RetryMergeTestRoute:
+                    if hold.admits():
+                        raise
+                else:
+                    break
             yield place
     except QueuePlaceRefused as error:
         raise GateRefused(str(error)) from error
@@ -1382,6 +1393,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                mode: SuiteMode = SuiteMode.MERGE_GATE,
                machine: SharedMachine | WholeMachine = SHARED_MACHINE,
                selected: AllModules | SelectedModules = ALL_MODULES,
+               merge_route: MergeTestRoute | NoMergeTestRoute = NO_MERGE_TEST_ROUTE,
                time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit = gate_record.READ_GATE_TIME_LIMIT) -> GateRun:
     shared = isinstance(machine, SharedMachine)
     if shared:
@@ -1524,7 +1536,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     with ((gate_recovery(repo) if shared else private_gate_recovery(repo, tmpfs)) as recovery, record_on_abort(),
           gate_temporary(recovery, mode.value, tmpfs) as temporary,
           ExitStack() as module_folders,
-          (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode) if hold is not None else nullcontext(None)) as reservation,
+          (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode, merge_route=merge_route)
+           if hold is not None else nullcontext(None)) as reservation,
           (shared_cpu_pool() if shared else nullcontext(NoSharedCPU())) as cpu_pool):
         # The wall time and the time limit start here, after the queue admits the gate.
         began = time.monotonic()
@@ -2445,33 +2458,39 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
     if absent:
         raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
     cloud = cast(CloudGateRoute, cast(object, import_module('scripts.aws_target.cloud_gate')))
-    selected: AllModules | TreeSelection = ALL_MODULES
-    if mode is SuiteMode.TARGETED_TEST and not full:
-        try:
-            tree, dirty = cloud.working_tree(repo)
-        except affected_modules.GraphError as error:
-            raise GateRefused(str(error)) from error
-        tested_tree = (UnrecordableTestTree("checkout is dirty", tuple(sorted(dirty))) if dirty
-                       else CleanTestTree(tree, checked_git(repo, "rev-parse", "HEAD")))
-        modules = discover_test_modules(repo)
-        selection, ledger = select_targeted_modules(repo, tested_tree, modules)
-        paths = selection.modules if isinstance(selection, AffectedSelection) else tuple(path for _, path in modules)
-        selected = TreeSelection(tuple(str(path.relative_to(repo)) for path in paths), tree)
-        if isinstance(selection, AffectedSelection) and not selection.modules:
-            if type_dirs:
-                return run_suites(repo, type_dirs, module_time_limit_s, mode=mode)
-            reused = ledger.reuse()
-            if not reused:
-                ledger.record_pass(selection)
-            record_gate_run(ledger, (), (), {}, {}, started_at=time.time(), wall_s=0.0,
-                            hold_wait_s=0.0, selection=selection, reused=reused, reason="", status=0,
-                            max_jobs=0, peak_mib=0.0, cap_mib=0.0, aborted=False, mode=mode)
-            return GateRun((), 0.0, 0.0, selection_certified=True)
-    outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s, selected=selected)
-    if isinstance(outcome, str):
+    merge_route = MergeTestRoute()
+    while True:
+        selected: AllModules | TreeSelection = ALL_MODULES
+        if mode is SuiteMode.TARGETED_TEST and not full:
+            try:
+                tree, dirty = cloud.working_tree(repo)
+            except affected_modules.GraphError as error:
+                raise GateRefused(str(error)) from error
+            tested_tree = (UnrecordableTestTree("checkout is dirty", tuple(sorted(dirty))) if dirty
+                           else CleanTestTree(tree, checked_git(repo, "rev-parse", "HEAD")))
+            modules = discover_test_modules(repo)
+            selection, ledger = select_targeted_modules(repo, tested_tree, modules)
+            paths = selection.modules if isinstance(selection, AffectedSelection) else tuple(path for _, path in modules)
+            selected = TreeSelection(tuple(str(path.relative_to(repo)) for path in paths), tree)
+            if isinstance(selection, AffectedSelection) and not selection.modules:
+                if type_dirs:
+                    return run_suites(repo, type_dirs, module_time_limit_s, mode=mode)
+                reused = ledger.reuse()
+                if not reused:
+                    ledger.record_pass(selection)
+                record_gate_run(ledger, (), (), {}, {}, started_at=time.time(), wall_s=0.0,
+                                hold_wait_s=0.0, selection=selection, reused=reused, reason="", status=0,
+                                max_jobs=0, peak_mib=0.0, cap_mib=0.0, aborted=False, mode=mode)
+                return GateRun((), 0.0, 0.0, selection_certified=True)
+        outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s, selected=selected)
+        if not isinstance(outcome, str):
+            remote = outcome
+            break
         print('Cloud gate uses natedev: ' + outcome, flush=True)
-        return run_suites(repo, type_dirs, module_time_limit_s, full=full, mode=mode)
-    remote = outcome
+        try:
+            return run_suites(repo, type_dirs, module_time_limit_s, full=full, mode=mode, merge_route=merge_route)
+        except RetryMergeTestRoute:
+            continue
     if not type_dirs or remote.time_limit_report:
         return remote
     local = run_suites(repo, type_dirs, module_time_limit_s, full=True,

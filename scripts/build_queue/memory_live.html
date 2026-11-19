@@ -820,8 +820,10 @@ function stepTooltip(key, data) {
   if (row.priority_entries?.length) rows.push(staffField('Priority', row.priority_entries.map(entry => entry.unit)));
   if (waiting) {
     if (row.place) rows.push(field('Place in line', row.place));
-    rows.push(field('Waits for', row.kind === 'cloud' ? 'AWS slot' :
-      row.kind === 'repository-slot' ? 'build slot' : row.why || 'its turn'), ...routeFields(row));
+    const waitField = row.why === "natemerge's merge test" ? field('Reason', row.reason)
+      : field('Waits for', row.kind === 'cloud' ? 'AWS slot' :
+          row.kind === 'repository-slot' ? 'build slot' : row.why || 'its turn');
+    rows.push(waitField, ...routeFields(row));
     if (!['cloud', 'repository-slot'].includes(row.kind)) {
       if (row.head_room?.unavailable) return [stepTitle(row, 'unavailable')];
       let free = row.free ?? queueCapMemory(data).free / GIB;

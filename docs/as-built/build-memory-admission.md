@@ -103,10 +103,18 @@ Running steps continue.
 The service reads the setting for each admission pass.
 Set `claude_commands_tests_wait_for_landing=off` to disable the rule.
 
-Held tests keep their arrival order.
-The `verify.sh` wait line and the Builds page show "waits for natemerge's merge test".
-The next admission pass checks for a local merge test again.
+The wait line and the Builds page show this reason.
+
+> Waits for natedev: natemerge's integrate job runs there, and no other target can take this test now.
+
+The admission service checks for a local merge test each pass.
 The default interval is one second while steps wait (`waiting_pass_seconds`).
+The service removes a gate from the local queue after `claude_commands_reroute_seconds` in this hold.
+The default is 60 seconds.
+The gate then calls the same cloud route that it used before the local wait.
+If the route declines, the gate requests local admission with its first arrival time.
+A wait for memory, a slot, or a build hold does not retry the route.
+An `integrate` job does not enter this hold.
 
 ### Placement status
 
