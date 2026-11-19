@@ -187,9 +187,23 @@ def _director_line(marked: unit_lookup.LabeledSession, level: str, check: bool) 
 
 def director_lines(every: unit_lookup.LabeledProductions, level: str, check: bool) -> list[str]:
     """Return one line per running unit director in every production."""
-    lines = [_director_line(marked, level, check)
-             for production_name in sorted(every.units) for _, marked in sorted(every.units[production_name].items())
-             if not isinstance(marked.claude, unit_lookup.ClaudeNotRunning)]
+    lines: list[str] = []
+    for production in sorted(every.units.keys() | every.members.keys()):
+        names = every.units.get(production, {}).keys() | set(every.members.get(production, ()))
+        for name in sorted(names):
+            match every.checked_unit(production, name):
+                case unit_lookup.ProvedLiveUnit(owner=unit_lookup.LabeledSession() as pane):
+                    if isinstance(pane.claude, unit_lookup.LiveClaude):
+                        lines.append(_director_line(pane, level, check))
+                    else:
+                        lines.append(f"{name}: skipped — Codex owns the pane")
+                case unit_lookup.ProvedLiveUnit():
+                    lines.append(f"{name}: skipped — the live director has no proved herdr pane")
+                case unit_lookup.ProvedAbsentUnit():
+                    pass
+                case unit_lookup.UnknownUnit(reason=reason):
+                    lines.append(f"{name}: skipped — cannot tell whether Claude runs: {reason}")
+    lines.extend(f"unit directors unknown: {reason}" for reason in every.failures)
     return lines or ["no unit director is running"]
 
 

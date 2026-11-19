@@ -101,10 +101,9 @@ UNRECORDED_MODULE_RESERVATION_MIB = 640
 DEFAULT_MODULE_TIME_LIMIT_S = 1800
 RERUN_LIMIT = 8
 RELEASE_LOCK_WAIT_S = 60
-# basedpyright resolves bpy (Blender's interpreter only) and PIL (a PEP 723 dependency) from this
-# type-check-only venv, so the full tree reports 0/0. The stub date matches the 2026-08-23 sweep;
-# later dates report new diagnostics in bake_textures.py.
-TYPECHECK_REQUIREMENTS = ("pillow==13.0.0", "fake-bpy-module==20260822")
+# basedpyright resolves bpy with these Blender stubs.
+# Later versions report diagnostics in bake_textures.py.
+TYPECHECK_REQUIREMENTS = ("fake-bpy-module==20260822",)
 NIGHTLY_TYPE_DIRS = ("scripts",)
 NIGHTLY_TYPE_DIAGNOSTIC_LINES = 20
 # An unrecorded type job keeps its own fallback; recorded jobs all use one margin.
@@ -2766,7 +2765,7 @@ def _sweep_nightly_slots() -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments and arguments[0] in {"nightly-assigned", "nightly-check"}:
-        nightly_parser = argparse.ArgumentParser(prog=f"merge_gate.py {arguments[0]}")
+        nightly_parser = argparse.ArgumentParser(prog=f"merge_gate.py {arguments[0]}", allow_abbrev=False)
         if arguments[0] == "nightly-assigned":
             _ = nightly_parser.add_argument("--unit", required=True)
             _ = nightly_parser.add_argument("--result", default="")
@@ -2779,7 +2778,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
             print(f"REFUSED: {error}", file=sys.stderr, flush=True)
             return 1
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     add_suite_arguments(parser)
     for name in ("merge-branch", "unit-branch", "checkpoint", "previous-checkpoint", "unit", "phase"):
         _ = parser.add_argument(f"--{name}", default="")

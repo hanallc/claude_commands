@@ -1,6 +1,7 @@
 """The fixed queue stays one row per step and explains waits once."""
 from __future__ import annotations
 
+from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_records
 
 from scripts.lint.memory_test_support import write_pressure_reading
@@ -19,7 +20,7 @@ from unittest import mock
 from scripts.build_queue import queue_view, queue_evidence
 from scripts.build_queue import admission_service as service
 from scripts.build_queue import admission_protocol as wire, cloud_progress, progress_profile
-from scripts.build_queue import placement
+from scripts.build_queue.admission_wire import CloudGroup
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue.queue_fixture import NOW, QueueFixture
 from scripts.lint import memory_admit as gate
@@ -28,10 +29,26 @@ from scripts.message import unit_labels
 from scripts.build_queue.queue_fixture import write_memory_config
 
 
+def queue_model(fixture: QueueFixture) -> queue_view.QueueModel:
+    """Read step labels from the queue fixture."""
+    _ = (fixture.root / "build_steps.conf").write_text(
+        "names.targeted-test=targeted test\n"
+        + "names.merge-gate=merge gate\n"
+        + "prose.merge-gate=merge gate\n"
+        + "owned.targeted-test={unit} targeted\n"
+        + "owned.merge-gate={unit} merge\n"
+        + "owned.showrunner-merge-gate=showrunner merge\n"
+        + "owned.default={unit} {step}\n",
+        encoding="utf-8",
+    )
+    with mock.patch.dict(os.environ, {"CONF_DIR": str(fixture.root)}):
+        return fixture.model()
+
+
 class RecordedOwnerQueueTests(unittest.TestCase):
     def test_repository_slot_wait_is_shown_without_a_memory_need(self) -> None:
         with QueueFixture() as fixture:
-            model = fixture.model()
+            model = queue_model(fixture)
             base = model.reading
             slot = wire.RepositorySlotRow(wire.Owner(701001, "start"),
                 wire.Identity("slot-session", "slot-showrunner", "gate", "proof", "slot-unit"),
@@ -56,7 +73,7 @@ class RecordedOwnerQueueTests(unittest.TestCase):
             worker = fixture_member("worker", name="impl", parent=unit.id)
             current = fixture_runtime_id("owner-after-session-restart")
             worker = staff.update_current_session(worker.current_session, staff.native_id(current))
-            model = fixture.model()
+            model = queue_model(fixture)
             for source, owner, ran_by in (("detached", worker, unit_labels.Runner.WORKER),
                                           ("systemd", unit, unit_labels.Runner.UNIT_DIRECTOR)):
                 with self.subTest(source=source), mock.patch.dict(os.environ, {
@@ -89,7 +106,7 @@ class RecordedOwnerQueueTests(unittest.TestCase):
         from scripts.production.staff_test_support import isolated_staff_file
 
         with QueueFixture() as fixture, isolated_staff_file(fixture.root / "staff.json", {}):
-            model = fixture.model()
+            model = queue_model(fixture)
             for reference in ("", "missing-staff-row"):
                 with self.subTest(reference=reference), mock.patch.dict(os.environ, {
                     "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "", "CLAUDE_SESSION_NAME": "",
@@ -108,14 +125,14 @@ class RecordedOwnerQueueTests(unittest.TestCase):
 def with_converted_executions(reading: admission_records.QueueRead) -> admission_records.QueueRead:
     """Keep a local charge beside host-scoped executions with equal process values."""
     local = reading.view.running[0]
-    local = replace(local, execution=placement.ObservedExecution(
-        placement.ProcessExecution("local-host", "local-generation", 900, "equal-start")), assignment_host="local-host")
+    local = replace(local, execution=execution_identity.ObservedExecution(
+        execution_identity.ProcessExecution("local-host", "local-generation", 900, "equal-start")), assignment_host="local-host")
     remote = tuple(replace(local, session_id=f"remote-{host}", session_name=f"remote-{host}",
         promise=0, measured=admission_records.RemoteMemoryUnavailable("remote memory is unavailable"), pid=900,
-        execution=placement.ObservedExecution(placement.ProcessExecution(host, "remote-generation", 900, "equal-start")),
+        execution=execution_identity.ObservedExecution(execution_identity.ProcessExecution(host, "remote-generation", 900, "equal-start")),
         assignment_host=host) for host in ("fixture-mac", "fixture-ssh"))
     uncertain = replace(remote[0], session_id="remote-uncertain", session_name="remote-uncertain",
-        pid=admission_records.PidNotRecorded(), execution=placement.ExecutionEvidenceUnavailable("transport unavailable", NOW),
+        pid=admission_records.PidNotRecorded(), execution=execution_identity.ExecutionEvidenceUnavailable("transport unavailable", NOW),
         assignment_host="uncertain-mac")
     explained = tuple(admission_records.ExplainedRunningStep(step, admission_records.AdmissionTimeNotRecorded(),
         0, 0, 0, owner=f"remote-{index}") for index, step in enumerate((*remote, uncertain)))
@@ -534,6 +551,45 @@ class MacQueueViewTests(unittest.TestCase):
             self.assertNotIn("private raw error", path.read_text())
 
 
+class CloudQueueViewTests(unittest.TestCase):
+    def test_group_waits_sort_by_trial_start_before_a_newer_single_request(self) -> None:
+        model, _fixture = self.cloud_model()
+        reading = model.reading
+        assert isinstance(reading, wire.CloudQueueRead)
+        single = reading.cloud[1]
+        for trial_started in (single.since - 30, single.since):
+            with self.subTest(trial_started=trial_started):
+                grouped = replace(single, owner=wire.Owner(700003, "300"), since=single.since + 30,
+                    place=wire.CloudPlace("aws", CloudGroup("older", 2, trial_started, wire.Owner(700004, "400"))))
+                waiting = queue_view.waiting_builds(replace(model, reading=replace(reading, cloud=(single, grouped))))
+                self.assertEqual([row for row in waiting if isinstance(row, wire.CloudRow)], [grouped, single])
+
+    def test_cloud_rows_use_session_owner_labels(self) -> None:
+        model, _fixture = self.cloud_model()
+        reading = model.reading
+        assert isinstance(reading, wire.CloudQueueRead)
+        row = reading.cloud[0]
+        director = unit_labels.make_labels("panes", unit_labels.NoShowrunner(), unit_labels.DirectsUnit("panes"))
+        runner = unit_labels.make_labels("builds", unit_labels.RunsProduction("builds"), unit_labels.NoDirector())
+        for owner in (director, runner, UnitLabels("worker", "sdlc", "panes")):
+            with self.subTest(owner=owner):
+                labeled = replace(model, labels={row.identity.session_id: owner})
+                self.assertEqual(queue_view.cloud_step_labels(row, labeled), owner)
+        missing = replace(model, labels={})
+        self.assertEqual(queue_view.cloud_step_labels(row, missing), UnitLabels(
+            row.identity.name, unit_labels.OWNER_NOT_RECORDED, unit_labels.OWNER_NOT_RECORDED))
+
+    def cloud_model(self) -> tuple[queue_view.QueueModel, QueueFixture]:
+        fixture = self.enterContext(QueueFixture(captured=False))
+        empty_mac_reading(fixture)
+        write_memory_config(fixture.root / "build_admission.conf",
+            cloud_gate_slots="1", cloud_gate_stale_pushes="3")
+        _ = (fixture.root / "cloud_gate.conf").write_text(
+            "[cloud_gate]\n# range: 5e-324..\nlog_push_s=5\n")
+        model = queue_model(fixture)
+        return replace(model, reading=cloud_reading(model.reading)), fixture
+
+
 class QueueViewFixtureTests(unittest.TestCase):
     fixture: QueueFixture = cast(QueueFixture, cast(object, None))
     @override
@@ -582,7 +638,7 @@ class QueueViewTests(QueueViewFixtureTests):
         reservation = cast(dict[str, object], json.loads(self.fixture.reservation.read_text()))
         reservation["repo"] = ""
         self.fixture.write_json(self.fixture.reservation, reservation)
-        reading = self.fixture.model().reading
+        reading = queue_model(self.fixture).reading
         encoded = wire.encode_reply(wire.ViewReply(reading))
         # Remove only the new optional field from the complete service reply.
         def without_project(value: object) -> object:
@@ -611,7 +667,7 @@ class QueueViewTests(QueueViewFixtureTests):
     def service_model(self, fixture: AdmissionFixture) -> queue_view.QueueModel:
         reply, = fixture.server.handle_request(wire.ViewRequest())
         assert isinstance(reply, wire.ViewReply)
-        return replace(self.fixture.model(), reading=reply.reading)
+        return replace(queue_model(self.fixture), reading=reply.reading)
 
 
     def test_unit_override_survives_restart_and_matches_priority(self) -> None:

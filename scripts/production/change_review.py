@@ -27,19 +27,22 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from enum import Enum
 from functools import cached_property
 from pathlib import Path
 from typing import TypeVar, cast
+from zoneinfo import ZoneInfo
 
-from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atomic  # noqa: E402
-from scripts.lib import build_folders, scratch, unit_runs  # noqa: E402
+from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_text_atomic  # noqa: E402
+from scripts.lib import build_folders, conf, scratch, unit_runs  # noqa: E402
 from scripts.direct.progress_history import load_events  # noqa: E402
 from scripts.lib import urgency, file_lock  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -47,7 +50,7 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production import issues  # noqa: E402
 from scripts.production.proposals_folder import owner_docs, scope_docs  # noqa: E402
 from scripts.production import change_routing, delivery_state, session_staff, showrunner_tree, showrunners, staff, unit_config, unit_lookup
-from scripts.production.production_doc import Refusal, production_field
+from scripts.production.production_doc import ProductionDocument, Refusal, production_field
 from scripts.review_links import image_store, review_events, review_later
 from scripts.agents import remote
 
@@ -443,6 +446,18 @@ def read(path: Path) -> str:
     return path.read_text(encoding="utf-8") if path.exists() else BODY
 
 
+def review_list_source(path: Path) -> Path:
+    """Resolve a review list path and reject existing paths that are not files."""
+    source = path.resolve()
+    try:
+        mode = source.stat().st_mode
+    except FileNotFoundError:
+        return source
+    if not stat.S_ISREG(mode):
+        raise ChangeReviewError(f"{source}: the review list must be a regular file")
+    return source
+
+
 def list_file(showrunner: str, *, sources: list[Path] | None = None) -> Path:
     """The list of the top-level showrunner called `showrunner`."""
     folder = lists_directory() if sources is None else lists_directory(sources=sources)
@@ -553,7 +568,8 @@ def _print_warning(message: str) -> None:
 
 
 def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], Result],
-          what: Callable[[Result], str], *, report_warning: Callable[[str], None] = _print_warning) -> Result:
+          what: Callable[[Result], str], *, report_warning: Callable[[str], None] = _print_warning,
+          publish: Callable[[Path, str], None] | None = None) -> Result:
     """Change the list's lines under the lock, then write and commit them.
 
     A change that raises an error writes nothing. The lock is the list's directory.
@@ -563,7 +579,6 @@ def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], 
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     with _list_lock(path):
-        # Writers always take the list lock before the image reference lock.
         with _image_reference_lock():
             text = path.read_text(encoding="utf-8") if path.exists() else skeleton(path, production, day)
             lines = text.splitlines(keepends=True)
@@ -571,7 +586,7 @@ def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], 
             if lines != text.splitlines(keepends=True):
                 _sort(path, lines)
                 _stamp(path, lines, production, day)
-                write_text_atomic(path, "".join(lines))
+                (publish or write_text_atomic)(path, "".join(lines))
         _commit([path], f"{_owner(path)} {what(result)}", report_warning=report_warning)
         return result
 
@@ -593,9 +608,13 @@ def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str],
             raise ChangeReviewError(reason)
         return result.stdout.strip()
 
-    if git("rev-parse", "--is-inside-work-tree").stdout.strip() != "true":
-        return
     try:
+        probe = git("rev-parse", "--is-inside-work-tree")
+        if probe.stdout.strip() != "true":
+            reason = probe.stderr.strip()
+            if probe.returncode and "not a git repository" not in reason:
+                raise ChangeReviewError(reason or "git could not read the list directory")
+            return
         root = Path(checked("rev-parse", "--show-toplevel"))
         folder = root
         blobs = [(str(path.resolve().relative_to(root)),
@@ -622,7 +641,7 @@ def _commit(paths: Sequence[Path], what: str, *, report_warning: Callable[[str],
                 if attempt == 4 or git("rev-parse", "--verify", "-q", "HEAD").stdout.strip() == head:
                     raise ChangeReviewError(updated.stderr.strip() or "git update-ref failed")
     except (ChangeReviewError, OSError) as error:
-        reason = str(error).splitlines()[0]
+        reason = next(iter(str(error).splitlines()), type(error).__name__)
         report_warning(f"change review: {paths[0]} written but not committed: {reason}; the next write commits it")
 
 
@@ -765,6 +784,7 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
                   else str(producer) if isinstance(producer, str) else row_production(owner, record)
                   for change, owner, producer in zip(changes, row_owners, row_producers)]
     unregistered: set[str] = set()
+    pending_rows: list[str] = []
 
     def write(lines: list[str]) -> list[str]:
         existing = _changes("".join(lines)) if any(isinstance(change, PublicationChange) for change in changes) else []
@@ -814,6 +834,7 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
                                      IMAGE: row_images[index]})
                 for offset, index in enumerate(selected)]
         _insert(lines, end, rows)
+        pending_rows.extend(rows)
         unregistered.update(change.unit_name for index in selected
                             if isinstance(change := changes[index], PublicationChange)
                             and isinstance(change.producer, UnknownProducer) and change.unit_name)
@@ -828,7 +849,14 @@ def append_rows(path: Path, changes: Sequence[Visible | PublicationChange], day:
             return f"add {named}"
         return f"{'row' if len(ids) == 1 else 'rows'} {named} from {merged}"
 
-    rows = _edit(path, production, day, write, what)
+    def publish(path: Path, text: str) -> None:
+        try:
+            write_text_atomic(path, text)
+        except AtomicDurabilityUnconfirmed as error:
+            visible = [WrittenReviewRow(path, row) for row in pending_rows]
+            raise ReviewListDurabilityUnconfirmed(path, visible, error) from error
+
+    rows = _edit(path, production, day, write, what, publish=publish)
     for name in sorted(unregistered):
         print(f"change review: no staff row for unit {name}; Producer stays empty")
     return rows
@@ -1504,14 +1532,48 @@ def backfill(path: Path, tree: Tree, write: bool) -> tuple[dict[str, str], dict[
     return filled, untraced
 
 
+_held_review_locks: ContextVar[frozenset[Path]] = ContextVar("held_review_locks", default=frozenset())
+
+
 @contextmanager
 def _list_lock(path: Path) -> Generator[None]:
-    descriptor = os.open(path.parent, os.O_RDONLY)
+    folder = path.parent.resolve()
+    held = _held_review_locks.get()
+    if folder in held:
+        yield
+        return
+    descriptor = os.open(folder, os.O_RDONLY)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield
+        token = _held_review_locks.set(held | {folder})
+        try:
+            yield
+        finally:
+            _held_review_locks.reset(token)
     finally:
         os.close(descriptor)
+
+
+@contextmanager
+def review_delivery_lock(root: Path) -> Generator[None]:
+    lock = root.resolve() / ".review-link-delivery.lock"
+    held = _held_review_locks.get()
+    if lock in held:
+        yield
+        return
+    with file_lock.exclusive(lock):
+        token = _held_review_locks.set(held | {lock})
+        try:
+            yield
+        finally:
+            _held_review_locks.reset(token)
+
+
+@contextmanager
+def checked_review_write(path: Path, root: Path, check: Callable[[], Result]) -> Generator[Result]:
+    """Check a Review card while holding its list and delivery locks."""
+    with review_delivery_lock(root), _list_lock(path):
+        yield check()
 
 
 @contextmanager
@@ -1670,8 +1732,34 @@ def row_merge(cells: dict[str, str]) -> RecordedMerge | MergeNotRecorded:
     return RecordedMerge(text) if text else MergeNotRecorded()
 
 
+def _move_to_reviewed(path: Path, lines: list[str], cells: dict[str, str], verdict: str, day: date) -> None:
+    """Write a closed row with its merge, history and recorded production."""
+    identity = staff.initial_snapshot()
+    member = identity.by_id(staff.StaffId(_plain(cells.get(PRODUCTION, ""))))
+    if member is not None:
+        parent = identity.by_id(member.parent.id) if member.kind == "unit" and isinstance(member.parent, staff.ReportsTo) else member
+        cells[PRODUCTION] = _cell(parent.name if parent is not None else member.name)
+    if not any(line.strip() == REVIEWED for line in lines):
+        reviewed_rows = list[str](("\n" + BODY[BODY.index(REVIEWED):]).splitlines(keepends=True))
+        _insert(lines, len(lines), reviewed_rows)
+    _add_column(path, lines, REVIEWED, "Merged")
+    for column in ("Review log", IMAGE):
+        if cells.get(column):
+            _add_column(path, lines, REVIEWED, column)
+    if member is not None:
+        _add_column(path, lines, REVIEWED, PRODUCTION)
+    if PRODUCER in cells:
+        _add_column(path, lines, REVIEWED, PRODUCER)
+    if cells.get(KIND):
+        for column in (KIND, CHECK, PRODUCTION):
+            _add_column(path, lines, REVIEWED, column)
+    reviewed, top, _ = _table(path, lines, REVIEWED)
+    _insert(lines, top, [_row(path, reviewed, {**dict.fromkeys(reviewed, ""), **cells,
+                                               "Verdict": _cell(verdict), "Date": day.isoformat()})])
+
+
 def _verdict_write(
-    path: Path, row: str, verdict: str, day: date,
+    path: Path, row: str, verdict: str, day: date, *, superseded: str = '',
 ) -> RowWrite[VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict]:
     """Record a verdict once. Retain its merge and the result of an earlier write."""
     removed_image = ""
@@ -1694,30 +1782,9 @@ def _verdict_write(
         if image:
             removed_image = image
             cells[IMAGE] = ""
-        identity = staff.initial_snapshot()
-        member = identity.by_id(staff.StaffId(_plain(cells.get(PRODUCTION, ""))))
-        if member is not None:
-            parent = identity.by_id(member.parent.id) if member.kind == "unit" and isinstance(member.parent, staff.ReportsTo) else member
-            cells[PRODUCTION] = _cell(parent.name if parent is not None else member.name)
-        if not any(line.strip() == REVIEWED for line in lines):
-            reviewed_rows = list[str](("\n" + BODY[BODY.index(REVIEWED):]).splitlines(keepends=True))
-            _insert(lines, len(lines), reviewed_rows)
-        _add_column(path, lines, REVIEWED, "Merged")
-        if cells.get("Review log"):
-            _add_column(path, lines, REVIEWED, "Review log")
-        if member is not None:
-            _add_column(path, lines, REVIEWED, PRODUCTION)
-        if PRODUCER in cells:
-            _add_column(path, lines, REVIEWED, PRODUCER)
-        # Page rows retain their description and proof in the same record after
-        # answering. Older lists keep their existing Reviewed table shape.
-        if cells.get(KIND):
-            for column in (KIND, CHECK, PRODUCTION):
-                _add_column(path, lines, REVIEWED, column)
-        reviewed, top, _ = _table(path, lines, REVIEWED)
-        _insert(lines, top, [_row(path, reviewed, {**dict.fromkeys(reviewed, ""), **cells, "#": row,
-                                                   "Verdict": _cell(verdict), "Date": day.isoformat(),
-                                                   "Merged": cells.get("Merged", "")})])
+        if superseded:
+            append_row_review_log(cells, superseded, "nate", datetime.now().astimezone(user_zone()))
+        _move_to_reviewed(path, lines, cells, verdict, day)
         return VerdictRecorded(row_merge(cells))
 
     def after() -> None:
@@ -1730,12 +1797,76 @@ def _verdict_write(
 def record_verdict(
     path: Path, row: str, verdict: str, day: date, production: Path, *,
     report_warning: Callable[[str], None] = _print_warning,
+    publish: Callable[[Path, str], None] | None = None, superseded: str = '',
+    commit_warning: Callable[[str], None] | None = None,
 ) -> VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict:
-    """Record a verdict once and remove its image when no review row uses it."""
-    change = _verdict_write(path, row, verdict, day)
-    result = _edit(path, production, day, change.write, lambda _: f"verdict {row}", report_warning=report_warning)
-    change.after()
+    """Record a verdict once and remove its image when no row uses it."""
+    change = _verdict_write(path, row, verdict, day, superseded=superseded)
+    result = _edit(path, production, day, change.write, lambda _: f"verdict {row}",
+                   report_warning=commit_warning or report_warning, publish=publish)
+    try:
+        change.after()
+    except Exception as error:
+        report_warning(f"{path} {row}: the verdict is saved. Image cleanup failed: {error}")
     return result
+
+
+def withdraw_row(path: Path, row: str, words: str, stamp: datetime, production: Path) -> bool:
+    """Close a row as withdrawn and keep its earlier verdict in the log."""
+    prefix = "Withdrawn: "
+    event = review_events.ReviewLog(stamp, "nate", prefix + _words("reason", words))
+    verdict = "withdrawn"
+
+    def write(lines: list[str]) -> bool:
+        for section in (SECTION, REVIEWED):
+            if not any(line.strip() == section for line in lines):
+                continue
+            columns, first, end = _table(path, lines, section)
+            index = next((index for index in range(first, end) if lines[index].startswith(f"| {row} |")), None)
+            if index is None:
+                continue
+            cells = dict(zip(columns, _cells(lines[index])))
+            events = review_events.decode(_plain(cells.get("Review log", "")))
+            previous = _plain(cells.get("Verdict", ""))
+            if previous == verdict:
+                for earlier in reversed(events):
+                    if earlier.who == event.who and earlier.words.startswith(prefix):
+                        if earlier.words == event.words:
+                            return False
+                        raise ChangeReviewError(f"{row} is already withdrawn")
+            try:
+                slots = change_routing.delivery_slots(delivery, strict=True)
+            except (OSError, ValueError) as error:
+                raise ChangeReviewError(f"{row}: cannot read its verdict delivery record: {error}") from error
+            if isinstance(slots.verdict, delivery_state.DeliveryIntent):
+                raise ChangeReviewError(f"{row} has a pending verdict message. Withdraw it after delivery.")
+            if previous:
+                previous_date = _plain(cells.get("Date", ""))
+                try:
+                    previous_time = datetime.fromisoformat(previous_date)
+                    if previous_time.tzinfo is None:
+                        previous_time = previous_time.replace(tzinfo=stamp.tzinfo)
+                except ValueError:
+                    previous_time = stamp
+                    previous = f"Previous verdict ({previous_date or 'date unavailable'}) — {previous}"
+                events = (*events, review_events.ReviewLog(previous_time, event.who, previous))
+            cells["Review log"] = _cell(review_events.encode((*events, event)))
+            if section == SECTION:
+                del lines[index]
+                _move_to_reviewed(path, lines, cells, verdict, stamp.date())
+            else:
+                _add_column(path, lines, REVIEWED, "Review log")
+                reviewed, _, _ = _table(path, lines, REVIEWED)
+                cells.update({"Verdict": verdict, "Date": stamp.date().isoformat()})
+                lines[index] = _row(path, reviewed, cells) + "\n"
+            return True
+        raise RowNotListed(f"{row} is not on the change review list")
+
+    root = change_routing.review_root()
+    root.mkdir(parents=True, exist_ok=True)
+    delivery = change_routing.delivery_path(root, path, row)
+    with review_delivery_lock(root):
+        return _edit(path, production, stamp.date(), write, lambda _: f"withdraw {row}")
 
 
 def review_rows(path: Path) -> list[dict[str, str]]:
@@ -1819,6 +1950,12 @@ def _review_snapshots(paths: Iterable[Path], *, sources: list[Path] | None = Non
     return snapshots
 
 
+def append_row_review_log(cells: dict[str, str], words: str, who: str, now: datetime) -> None:
+    events = review_events.decode(_plain(cells.get("Review log", "")))
+    event = review_events.ReviewLog(now, who, words)
+    cells["Review log"] = _cell(review_events.encode(review_events.append(events, event)))
+
+
 def _append_review_log(path: Path, lines: list[str], row: str, event: review_events.ReviewLog) -> None:
     for section in (SECTION, REVIEWED):
         if not any(line.strip() == section for line in lines):
@@ -1830,8 +1967,7 @@ def _append_review_log(path: Path, lines: list[str], row: str, event: review_eve
         columns, first, end = _table(path, lines, section)
         index = next(index for index in range(first, end) if lines[index].startswith(f"| {row} |"))
         cells = dict(zip(columns, _cells(lines[index])))
-        events = review_events.decode(_plain(cells.get("Review log", "")))
-        cells["Review log"] = _cell(review_events.encode(review_events.append(events, event)))
+        append_row_review_log(cells, event.words, event.who, event.time)
         lines[index] = _row(path, columns, cells)+"\n"
         return
 
@@ -1869,8 +2005,143 @@ def end_row_scratch(path: Path, row: str) -> list[str]:
         result = scratch.end(f"row:{_owner(path)}-{row}")
         return ([f"removed {folder}" for folder in result]
                 + [f"kept {folder.path}: {folder.reason}" for folder in result.kept])
-    except (scratch.ScratchError, OSError) as error:
+    except (conf.Unusable, scratch.ScratchError, OSError) as error:
         return [f"scratch not removed: {error}"]
+
+
+class VerdictDurabilityUnconfirmed(RuntimeError):
+    """The visible verdict needs a directory sync or a Git commit."""
+
+    def __init__(self, cleanup: PendingVerdictCleanup, reason: str) -> None:
+        super().__init__(f"{cleanup.path} {cleanup.row}: {reason}")
+        self.cleanup: PendingVerdictCleanup = cleanup
+
+
+@dataclass(frozen=True)
+class NoVerdictCleanup:
+    """The verdict has no scratch cleanup left."""
+
+
+NO_VERDICT_CLEANUP = NoVerdictCleanup()
+VERDICT_CLEANUP_PREFIX = ".review-link-scratch-"
+
+
+@dataclass(frozen=True)
+class WaitSupersessionDestination:
+    """The production and log selected before a verdict replaces a wait."""
+
+    owner: staff.StaffId
+    document: ProductionDocument
+
+    def fields(self) -> dict[str, str]:
+        doc = self.document
+        return {'owner':self.owner, 'doc':str(doc.doc), 'name':doc.name, 'merge_branch':doc.merge_branch,
+                'checkout':str(doc.checkout), 'log':str(doc.log), 'zone':str(doc.zone)}
+
+    @classmethod
+    def from_fields(cls, fields: dict[str, str]) -> WaitSupersessionDestination:
+        return cls(staff.StaffId(fields['owner']), ProductionDocument(
+            Path(fields['doc']), fields['name'], fields['merge_branch'], Path(fields['checkout']),
+            Path(fields['log']), ZoneInfo(fields['zone'])))
+
+
+@dataclass(frozen=True)
+class NoSavedWaitLogDestination:
+    """The intent has no saved destination, including intents from older versions."""
+
+
+NO_SAVED_WAIT_LOG_DESTINATION = NoSavedWaitLogDestination()
+
+
+@dataclass(frozen=True)
+class PendingVerdictCleanup:
+    """Remove the saved row's scratch folders after the response."""
+
+    path: Path
+    row: str
+    intent: Path
+    verdict: str = ''
+    feature_review: str = ''
+    superseded_wait: str = ''
+    wait_log: WaitSupersessionDestination | NoSavedWaitLogDestination = NO_SAVED_WAIT_LOG_DESTINATION
+    require_git_commit: bool = True
+
+    @classmethod
+    def for_row(cls, root: Path, path: Path, row: str) -> PendingVerdictCleanup:
+        name = change_routing.delivery_name(path.resolve(), row)
+        return cls(path, row, root / name.replace('.review-link-delivery-', VERDICT_CLEANUP_PREFIX, 1))
+
+    @classmethod
+    def load(cls, intent: Path, expected_directory: Path | None = None) -> PendingVerdictCleanup:
+        """Read the exact list, row and verdict from a private cleanup record."""
+        with os.fdopen(os.open(intent, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), encoding='utf-8') as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                raise ChangeReviewError(f"{intent}: scratch cleanup record must be private")
+            fields = cast(dict[str, object], json.load(source))
+        path = Path(cast(str, fields['list']))
+        row = _row_id('row', cast(str, fields['row']))
+        if path != review_list_source(path) or (expected_directory is not None and path.parent != expected_directory):
+            raise ChangeReviewError(f"{intent}: invalid scratch cleanup source")
+        cleanup = replace(cls.for_row(intent.parent, path, row),
+                          verdict=_words('verdict', cast(str, fields['verdict'])),
+                          feature_review=cast(str, fields.get('feature_review', '')),
+                          superseded_wait=cast(str, fields.get('superseded_wait', '')),
+                          require_git_commit=fields.get('require_git_commit') is not False)
+        if cleanup.intent != intent:
+            raise ChangeReviewError(f"{intent}: invalid scratch cleanup source")
+        if 'wait_log' in fields:
+            cleanup = replace(cleanup, wait_log=WaitSupersessionDestination.from_fields(
+                cast(dict[str, str], fields['wait_log'])))
+        if fields.get('supersedes_wait') is True and not cleanup.superseded_wait:
+            from scripts.review_links import review_events
+            for saved in review_snapshot(path).reviewed:
+                if saved['#'] == row and saved['Verdict'] == cleanup.verdict:
+                    events = review_events.decode(saved.get('Review log', ''))
+                    reason = next((event.words for event in reversed(events)
+                                   if event.words.startswith('Review ')
+                                   and event.words.endswith(' before the answer arrived.')), '')
+                    cleanup = replace(cleanup, superseded_wait=reason)
+                    break
+        return cleanup
+
+    def commit_failed(self, reason: str) -> None:
+        raise VerdictDurabilityUnconfirmed(self, reason)
+
+    def sync(self) -> None:
+        try:
+            sync_folder(self.path.parent)
+        except OSError as error:
+            raise VerdictDurabilityUnconfirmed(self, f'directory sync failed: {error}') from error
+
+    def confirm_durability(self) -> None:
+        """Confirm the visible verdict before recovery performs its closeout."""
+        self.sync()
+        _commit([self.path], f'{_owner(self.path)} verdict {self.row}',
+                report_warning=self.commit_failed if self.require_git_commit else _print_warning)
+
+    def save(self) -> None:
+        fields: dict[str, object] = {
+            'list':str(self.path.resolve()), 'row':self.row, 'verdict':self.verdict,
+            'feature_review':self.feature_review, 'superseded_wait':self.superseded_wait}
+        if not self.require_git_commit:
+            fields['require_git_commit'] = False
+        if isinstance(self.wait_log, WaitSupersessionDestination):
+            fields['wait_log'] = self.wait_log.fields()
+        write_text_atomic(self.intent, json.dumps(fields)+'\n', new_file_mode=0o600)
+
+    def finish(self, closeout: Callable[[PendingVerdictCleanup], None]) -> list[str]:
+        try:
+            with file_lock.exclusive(self.intent.parent/'.review-link-scratch.lock'):
+                if not self.intent.exists():
+                    return []
+                closeout(self.load(self.intent, self.path.parent.resolve()))
+                lines = end_row_scratch(self.path, self.row)
+                if not any(line.startswith('scratch not removed:') for line in lines):
+                    self.intent.unlink(missing_ok=True)
+                return lines
+        except Exception as error:
+            return [f"{self.path} {self.row}: the verdict is saved. Verdict follow-up failed: {error}"]
 
 
 @dataclass(frozen=True)
@@ -1879,6 +2150,7 @@ class VerdictSaved:
 
     lines: list[str]
     warnings: list[str] = field(default_factory=list)
+    cleanup: PendingVerdictCleanup | NoVerdictCleanup = NoVerdictCleanup()
 
 
 @dataclass(frozen=True)
@@ -1943,7 +2215,6 @@ def _cleared_validation(delivery: Path) -> str:
     fields = cast(dict[str, object], json.loads(delivery.read_text()))
     # A null slot prevents older fields from restoring the completed validation.
     fields["validation"] = None
-    _ = fields.pop("handed_at", None)
     return json.dumps(fields)+"\n"
 
 
@@ -1951,7 +2222,9 @@ def _validation_fault_output(shown: str) -> list[str]:
     return [f"{shown}: the check found a problem. The change returned to Open."]
 
 
-def save_verdict(path: Path, row: str, verdict: str, production: Path, *, validation_id: str = '') -> VerdictSaved | VerdictRefused:
+def save_verdict(path: Path, row: str, verdict: str, production: Path, *, validation_id: str = '',
+                 cleanup: PendingVerdictCleanup | NoVerdictCleanup = NO_VERDICT_CLEANUP,
+                 superseded: str = '') -> VerdictSaved | VerdictRefused:
     """Check the exchange and save the verdict under the same delivery lock."""
     verdict = _words("verdict", verdict)
     local_row = _row_id("row", row.rpartition("/")[2])
@@ -1960,8 +2233,10 @@ def save_verdict(path: Path, row: str, verdict: str, production: Path, *, valida
     root = change_routing.review_root()
     root.mkdir(parents=True, exist_ok=True)
     delivery = change_routing.delivery_path(root, path, local_row)
-    with file_lock.exclusive(root / '.review-link-delivery.lock'):
+    with review_delivery_lock(root):
         slots = change_routing.delivery_slots(delivery)
+        if superseded and isinstance(cleanup, PendingVerdictCleanup):
+            slots = replace(slots, validation=delivery_state.NoDelivery(), question=delivery_state.NoQuestion())
         try:
             _require_verdict_exchange(slots, verdict, validation_id)
         except ChangeReviewError as error:
@@ -1974,13 +2249,29 @@ def save_verdict(path: Path, row: str, verdict: str, production: Path, *, valida
             with clear_change_later(path, local_row):
                 write_text_atomic(delivery, cleared)
             return VerdictSaved(_validation_fault_output(shown), warnings)
-        result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append)
-    return _verdict_output(path, local_row, shown, verdict, result, warnings)
+        def publish(target: Path, text: str) -> None:
+            assert isinstance(cleanup, PendingVerdictCleanup)
+            mode = stat.S_IMODE(target.stat().st_mode)
+            with prepared_replacement(target, text, mode=mode) as temporary:
+                os.replace(temporary, target)
+                try:
+                    cleanup.sync()
+                except VerdictDurabilityUnconfirmed:
+                    cleanup.sync()
+
+        if isinstance(cleanup, NoVerdictCleanup):
+            result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append)
+        else:
+            result = record_verdict(path, local_row, verdict, today(), production, report_warning=warnings.append,
+                                    publish=publish, superseded=superseded,
+                                    commit_warning=cleanup.commit_failed if cleanup.require_git_commit else warnings.append)
+    return _verdict_output(path, local_row, shown, verdict, result, warnings, cleanup=cleanup)
 
 
 def _verdict_output(path: Path, local_row: str, shown: str, verdict: str,
                     result: VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict,
-                    warnings: list[str]) -> VerdictSaved | VerdictRefused:
+                    warnings: list[str], *,
+                    cleanup: PendingVerdictCleanup | NoVerdictCleanup = NO_VERDICT_CLEANUP) -> VerdictSaved | VerdictRefused:
     """Make verdict output and end the row's scratch folders after its write."""
     lines: list[str] = []
     if isinstance(result, VerdictConflict):
@@ -1991,7 +2282,12 @@ def _verdict_output(path: Path, local_row: str, shown: str, verdict: str,
         lines.append(f"{shown} already has this verdict ({result.day}); the list is unchanged")
     merged = result.merged.text if isinstance(result.merged, RecordedMerge) else "not recorded"
     lines.append(f"{shown} landed" if lands(verdict) else f"{shown} returns to its unit (merged {merged})")
-    lines.extend(end_row_scratch(path, local_row))
+    if isinstance(cleanup, PendingVerdictCleanup):
+        return VerdictSaved(lines, warnings, cleanup)
+    try:
+        lines.extend(end_row_scratch(path, local_row))
+    except Exception as error:
+        warnings.append(f"{path} {local_row}: the verdict is saved. Scratch cleanup failed: {error}")
     return VerdictSaved(lines, warnings)
 
 
@@ -2135,10 +2431,38 @@ def _foreign_merges(repo: Path, refs: Mapping[Path, str], production: Path,
     return frozenset(foreign)
 
 
+@dataclass(frozen=True)
+class WrittenReviewRow:
+    list_path: Path
+    markdown: str
+
+
+class ReviewListWriteFailed(ChangeReviewError):
+    """A list write failed after zero or more rows were saved."""
+
+    def __init__(self, list_path: Path, rows: list[WrittenReviewRow], error: Exception) -> None:
+        super().__init__(str(error))
+        self.list_path: Path = list_path
+        self.written_rows: tuple[WrittenReviewRow, ...] = tuple(rows)
+
+
+class ReviewListDurabilityUnconfirmed(ReviewListWriteFailed):
+    """The new rows are visible after the write, but the directory sync failed."""
+
+
 def list_ready(repo: Path, production: Path, merge_branch: str, *,
                review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
                selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
                known_producer: KnownMergeProducer | UnknownProducer = UNKNOWN_PRODUCER) -> list[str]:
+    """Return the Markdown for the rows written to the review lists."""
+    return [row.markdown for row in list_ready_rows(repo, production, merge_branch, review_list=review_list,
+                                                   record=record, selection=selection, known_producer=known_producer)]
+
+
+def list_ready_rows(repo: Path, production: Path, merge_branch: str, *,
+                    review_list: Path | None = None, record: staff.StaffSnapshot | None = None,
+                    selection: ReadinessScan | CompletedStep = _READINESS_SCAN,
+                    known_producer: KnownMergeProducer | UnknownProducer = UNKNOWN_PRODUCER) -> list[WrittenReviewRow]:
     """Add live changes on origin/main, or release one completed step of one merge."""
     repo = repo.expanduser().resolve()
     try:
@@ -2173,7 +2497,7 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
     outside = _reviewed_merge_refs_by_doc(repo, lambda: outside_docs, record=record)
     outside_refs = set(outside.values())
     foreign = _foreign_merges(repo, outside, production, merge_branch, record)
-    rows: list[str] = []
+    rows: list[WrittenReviewRow] = []
     matched_step = False
     recorded = checkpoint_producers(record)
     for entry in merges:
@@ -2258,9 +2582,15 @@ def list_ready(repo: Path, production: Path, merge_branch: str, *,
                 selected = [change for change in changes if isinstance(change.item.readiness, AfterStep)
                             and change.item.readiness.step == selection.step]
             stamp = now()
-            rows.extend(append_rows(path, selected, stamp.date(), short, owner_doc, record=record, repo=repo,
-                                    on_hold=note if isinstance(selection, ReadinessScan) else None,
-                                    merge_changes=merge_changes[path], added_at=stamp, on_image_problem=image_problem))
+            try:
+                written = append_rows(path, selected, stamp.date(), short, owner_doc, record=record, repo=repo,
+                                      on_hold=note if isinstance(selection, ReadinessScan) else None,
+                                      merge_changes=merge_changes[path], added_at=stamp, on_image_problem=image_problem)
+            except ReviewListDurabilityUnconfirmed as error:
+                raise ReviewListDurabilityUnconfirmed(path, [*rows, *error.written_rows], error) from error
+            except (ChangeReviewError, OSError, UnicodeError) as error:
+                raise ReviewListWriteFailed(path, rows, error) from error
+            rows.extend(WrittenReviewRow(path, row) for row in written)
     if isinstance(selection, CompletedStep) and not matched_step:
         raise ChangeReviewError(f"{selection.merged}: no change waits for step {selection.step!r}; no row added")
     return rows
@@ -2299,6 +2629,7 @@ class CommandLine(argparse.Namespace):
     see: str = ""
     row: str = ""
     verdict: str = ""
+    reason: str = ""
     validation: str = ""
     kind: str = ""
     production: str = ""
@@ -2552,26 +2883,25 @@ def batch(file: Path) -> list[str]:
     items[0].path.parent.mkdir(parents=True, exist_ok=True)
     root.mkdir(parents=True, exist_ok=True)
     after: list[Callable[[], list[str]]] = []
-    with file_lock.exclusive(root / ".review-link-delivery.lock"), _list_lock(items[0].path):
-        with _image_reference_lock():
-            original: dict[Path, str] = {}
-            lines_by_path: dict[Path, list[str]] = {}
-            for item in items:
-                try:
-                    if item.path not in original:
-                        original[item.path] = read(item.path)
-                        lines_by_path[item.path] = original[item.path].splitlines(keepends=True)
-                    after.append(item.write(lines_by_path[item.path]))
-                except (ChangeReviewError, OSError) as error:
-                    raise ChangeReviewError(f"batch item {item.index}: {error}") from error
-            changed = {path: lines for path, lines in lines_by_path.items()
-                       if lines != original[path].splitlines(keepends=True)}
-            for path, lines in changed.items():
-                _sort(path, lines)
-                for production in dict.fromkeys(item.production for item in items if item.path == path):
-                    _stamp(path, lines, production, day)
-            for path, lines in changed.items():
-                write_text_atomic(path, "".join(lines))
+    with review_delivery_lock(root), _list_lock(items[0].path), _image_reference_lock():
+        original: dict[Path, str] = {}
+        lines_by_path: dict[Path, list[str]] = {}
+        for item in items:
+            try:
+                if item.path not in original:
+                    original[item.path] = read(item.path)
+                    lines_by_path[item.path] = original[item.path].splitlines(keepends=True)
+                after.append(item.write(lines_by_path[item.path]))
+            except (ChangeReviewError, OSError) as error:
+                raise ChangeReviewError(f"batch item {item.index}: {error}") from error
+        changed = {path: lines for path, lines in lines_by_path.items()
+                   if lines != original[path].splitlines(keepends=True)}
+        for path, lines in changed.items():
+            _sort(path, lines)
+            for production in dict.fromkeys(item.production for item in items if item.path == path):
+                _stamp(path, lines, production, day)
+        for path, lines in changed.items():
+            write_text_atomic(path, "".join(lines))
         owners: dict[str, int] = {}
         for item in items:
             owner = _owner(item.path)
@@ -2594,6 +2924,7 @@ ACTION_OPTIONS: dict[str, tuple[str, ...]] = {
     "mark-important": ("list", "production", "row"),
     "set-kind": ("list", "production", "row", "kind"),
     "verdict": ("list", "production", "row", "verdict", "validation"),
+    "withdraw": ("list", "production", "row", "reason"),
     "list-path": ("production",),
     "showrunner": ("production",),
     "backfill-production": ("list", "write"),
@@ -2678,6 +3009,13 @@ def _run(options: CommandLine) -> int:
                 print(line)
             if isinstance(result, VerdictRefused):
                 return 1
+        case "withdraw":
+            target = _row_option(options)
+            shown = row_display_id(target.path, target.row)
+            written = withdraw_row(target.path, target.row, options.reason, now(), production_doc(options.production))
+            print(f"{shown} withdrawn" if written else f"{shown} already withdrawn")
+            for line in end_row_scratch(target.path, target.row):
+                print(line)
         case "list-path":
             print(production_list(options.production))
         case "showrunner":
@@ -2715,12 +3053,12 @@ def _run(options: CommandLine) -> int:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    _ = parser.add_argument("action", choices=("check", "list-ready", "live", "add", "edit", "show", "verdict",
+    _ = parser.add_argument("action", choices=("check", "list-ready", "live", "add", "edit", "show", "verdict", "withdraw",
                                                    "mark-important", "set-kind", "list-path", "showrunner",
                                                    "backfill-production", "image", "batch"))
     _ = parser.add_argument("--repo", default=".")
     for name in ("checkpoint", "previous", "merge-branch", "list", "merged", "step", "change", "check", "see",
-                 "row", "verdict", "validation", "production", "urgency", "due", "after", "kind", "image", "output", "file"):
+                 "row", "verdict", "reason", "validation", "production", "urgency", "due", "after", "kind", "image", "output", "file"):
         _ = parser.add_argument(f"--{name}", default="")
     _ = parser.add_argument("--write", action="store_true")
     _ = parser.add_argument("--hold", action="append")

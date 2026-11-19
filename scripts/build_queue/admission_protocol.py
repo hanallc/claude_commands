@@ -11,9 +11,6 @@ from scripts.build_queue.admission_code import (
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import cloud_progress, progress_profile
 from scripts.build_queue.placement import (
-    SourceKeyKnown as SourceKeyKnown,
-    SourceKeyUnavailable as SourceKeyUnavailable,
-    SourceIdentity as SourceIdentity,
     ClaimHolderIdentity as ClaimHolderIdentity,
     ClaimHolderUnconfirmed as ClaimHolderUnconfirmed,
     TokenRequired as TokenRequired,

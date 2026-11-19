@@ -188,6 +188,15 @@ def _restart(label: str, identity: str, source: str) -> str:
         if member is None:
             return f"{identity}: unknown staff member"
         identity = member.current_session
+        parent = record.parent_of(member)
+        if member.kind == "unit" and parent is not None:
+            match live_units.listing_in(parent.name, _fresh_units()).checked_unit(member.name):
+                case unit_lookup.UnknownUnit(reason=reason):
+                    return reason
+                case unit_lookup.ProvedLiveUnit():
+                    return ""
+                case unit_lookup.ProvedAbsentUnit():
+                    pass
         live = sessions.session_liveness(identity)
         if isinstance(live, sessions.SessionLivenessUnknown):
             return live.reason
@@ -246,18 +255,19 @@ _recovery_observations: ContextVar[Callable[[], unit_lookup.LabeledProductions]]
 def _live_account(production_name: str, unit: str) -> str:
     from scripts.accounts import accounts
 
-    for found in live_units.units_in(production_name, _recovery_observations.get()()):
-        if found.unit != unit or found.session is None:
-            continue
-        claude = found.session.claude
-        if isinstance(claude, unit_lookup.ClaudeUnknown):
-            raise OSError(claude.reason)
-        if isinstance(claude, unit_lookup.LiveClaude):
-            identity = account.process_config_dir(claude.pid)
+    observed = live_units.listing_in(production_name, _recovery_observations.get()())
+    match observed.checked_unit(unit):
+        case unit_lookup.ProvedLiveUnit(owner=unit_lookup.LabeledSession(claude=unit_lookup.LiveClaude(pid=pid))) | unit_lookup.ProvedLiveUnit(owner=unit_lookup.LiveClaude(pid=pid)):
+            identity = account.process_config_dir(pid)
             if not isinstance(identity, account.ConfiguredClaudeFolder):
                 raise OSError("the restarted session's account is unreadable")
             return accounts.claude_config_label(identity.path)
-    return ""
+        case unit_lookup.ProvedLiveUnit():
+            raise OSError("the live owner is not Claude")
+        case unit_lookup.ProvedAbsentUnit():
+            return ""
+        case unit_lookup.UnknownUnit(reason=reason):
+            raise OSError(reason)
 
 
 def _recovery_result(job: RecoveryJob, now: datetime) -> RecoveryStillRunning | RecoveryFinished:
@@ -312,12 +322,21 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
         retained = dict(state)
         for runner in runners:
             try:
-                for found in live_units.units_in(runner["name"], unit_observations()):
+                @cache
+                def fresh_production() -> live_units.UnitListing:
+                    return live_units.listing_in(runner["name"], _recovery_observations.get()())
+
+                for found in live_units.listing_in(runner["name"], unit_observations()).units:
                     unit = found.unit
                     try:
                         source = sources.get((runner["name"], unit))
                         if source is None:
                             continue
+                        owner = found.owner
+                        if not isinstance(owner, unit_lookup.ProvedLiveUnit):
+                            owner = fresh_production().checked_unit(unit)
+                        if isinstance(owner, unit_lookup.UnknownUnit):
+                            raise OSError(owner.reason)
                         if isinstance(source, NoRecovery):
                             if not dry_run:
                                 key = source.session_id
@@ -327,14 +346,13 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
                                 _ = state.pop(key, None)
                                 _ = retained.pop(key, None)
                             continue
-                        claude = found.session.claude if found.session is not None else unit_lookup.ClaudeNotRunning()
-                        if not isinstance(claude, unit_lookup.LiveClaude):
-                            # One fresh recovery observation for all absent units.
-                            current = {item.unit: item for item in live_units.units_in(runner["name"], _recovery_observations.get()())}
-                            found = current.get(unit)
-                            if found is None:
-                                raise OSError(f"{unit}: unit liveness is unavailable")
-                            claude = found.session.claude if found.session is not None else unit_lookup.ClaudeNotRunning()
+                        match owner:
+                            case unit_lookup.ProvedLiveUnit(owner=unit_lookup.LabeledSession(claude=unit_lookup.LiveClaude() as live)) | unit_lookup.ProvedLiveUnit(owner=unit_lookup.LiveClaude() as live):
+                                claude = live
+                            case unit_lookup.ProvedLiveUnit():
+                                raise OSError("the live owner is not Claude")
+                            case unit_lookup.ProvedAbsentUnit():
+                                claude = unit_lookup.ClaudeNotRunning()
                         if isinstance(claude, unit_lookup.LiveClaude):
                             outage = state.get(claude.session_id)
                             restored = ""
@@ -355,11 +373,6 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
                                 continue
                         key = source.session["session_id"]
                         outage = state.get(key)
-                        if isinstance(claude, unit_lookup.ClaudeUnknown):
-                            if key in state:
-                                retained[key] = state[key]
-                            lines.append(f"watchdog: {unit}: {claude.reason}")
-                            continue
                         if outage is None:
                             outage = DownOutage(first_seen=now.isoformat())
                             retained[key] = outage

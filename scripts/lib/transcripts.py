@@ -48,6 +48,14 @@ def transcript_paths(root: Path, pattern: str = "**/*.jsonl") -> list[Path]:
     return sorted(found.values(), key=str)
 
 
+def claude_transcript_candidates(config_dir: Path, session_id: str) -> Generator[Path]:
+    """Yield one logical path per project. Report directory read errors to the caller."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", session_id):
+        raise ValueError("invalid Claude session ID")
+    for project in (config_dir / "projects").iterdir():
+        yield project / f"{session_id}.jsonl"
+
+
 def transcript_stems(root: Path) -> list[str]:
     """Name each plain or compressed transcript under root once, without a path for each file."""
     stems: dict[str, None] = {}
@@ -63,14 +71,18 @@ def distinct_files(paths: Iterable[Path]) -> list[Path]:
     return sorted({path.resolve() for path in paths})
 
 
+def transcript_source(path: Path) -> Path:
+    if path.suffix != ".zst" and not path.exists():
+        compressed = path.with_suffix(path.suffix + ".zst")
+        if compressed.exists():
+            return compressed
+    return path
+
+
 @contextmanager
 def open_transcript(path: Path) -> Generator[BinaryIO]:
     """Keep decompression outside memory and permit existing readers to seek."""
-    source = path
-    if source.suffix != ".zst" and not source.exists():
-        compressed = source.with_suffix(source.suffix + ".zst")
-        if compressed.exists():
-            source = compressed
+    source = transcript_source(path)
     if source.suffix != ".zst":
         with source.open("rb") as stream:
             yield stream

@@ -73,6 +73,10 @@ class FakeEc2:
     launch_on_execute: bool = False
     launch_on_delete: bool = False
     count: int = 0
+    launch_tokens: dict[str, str] = field(default_factory=dict)
+    hidden_launch_reads: int = 0
+    hidden_volume_reads: int = 0
+    image: str = 'fixture-image'
 
     def launch(self, *, tagged: bool, request: str = '') -> str:
         self.count += 1
@@ -128,14 +132,18 @@ class FakeEc2:
             return subprocess.CompletedProcess(list(arguments), 1, '', 'fixture failure')
         value: dict[str, object] = {}
         if operation == 'describe-instances':
+            if self.hidden_launch_reads and any(item.startswith('Name=client-token,') for item in rest):
+                self.hidden_launch_reads -= 1
+                return subprocess.CompletedProcess(list(arguments), 0, '{"Reservations":[]}', '')
             value = {'Reservations': [{'Instances': [
-                {'InstanceId': key, 'SpotInstanceRequestId': row.request, 'State': {'Name': row.state},
+                {'InstanceId': key, 'ImageId': self.image, 'SpotInstanceRequestId': row.request, 'State': {'Name': row.state},
                  'Tags': [{'Key': name, 'Value': tag} for name, tag in row.tags.items()]}
-                for key, row in self.boxes.items() if self.matches(rest, row)]}]}
+                for key, row in self.boxes.items() if self.matches(rest, key, row)]}]}
         elif operation == 'describe-spot-instance-requests':
             ids = rest[1:] if rest[0] == '--spot-instance-request-ids' else []
             value = {'SpotInstanceRequests': [
-                {'SpotInstanceRequestId': key, 'Type': row.kind, 'State': row.state, 'InstanceId': row.instance}
+                {'SpotInstanceRequestId': key, 'Type': row.kind, 'State': row.state, 'InstanceId': row.instance,
+                 'InstanceInterruptionBehavior': 'stop' if row.kind == 'persistent' else 'terminate'}
                 for key, row in self.requests.items()
                 if (key in ids if ids else row.tags.get(TAG[0]) == TAG[1])]}
         elif operation == 'cancel-spot-instance-requests':
@@ -193,6 +201,13 @@ class FakeEc2:
                 value = {'StackEvents': self.deleted_events}
             else:
                 return subprocess.CompletedProcess(list(arguments), 255, '', 'ValidationError: Stack does not exist')
+        elif operation == 'describe-volumes':
+            if self.hidden_volume_reads:
+                self.hidden_volume_reads -= 1
+                return subprocess.CompletedProcess(list(arguments), 0, '{"Volumes":[]}', '')
+            tags = dict(item.removeprefix('Name=tag:').split(',Values=') for item in rest[1:])
+            value = {'Volumes': [{'VolumeId': key, 'State': row.state} for key, row in self.disks.items()
+                                 if all(row.tags.get(name) == tag for name, tag in tags.items())]}
         elif operation == 'delete-volume':
             if self.disks.get(rest[1], Disk('', {})).state != 'available':
                 return subprocess.CompletedProcess(list(arguments), 255, '', 'InvalidVolume.NotFound or in use')
@@ -212,14 +227,17 @@ class FakeEc2:
             raise AssertionError('Unexpected fake AWS operation: ' + operation)
         return subprocess.CompletedProcess(list(arguments), 0, json.dumps(value), '')
 
-    @staticmethod
-    def matches(arguments: list[str], row: Box) -> bool:
+    def matches(self, arguments: list[str], instance: str, row: Box) -> bool:
         for item in arguments[1:]:
             name, _, values = item.removeprefix('Name=').partition(',Values=')
             allowed = values.split(',')
             if name == 'instance-state-name' and row.state not in allowed:
                 return False
             if name == 'spot-instance-request-id' and row.request not in allowed:
+                return False
+            if name == 'instance-id' and instance not in allowed:
+                return False
+            if name == 'client-token' and self.launch_tokens.get(instance) not in allowed:
                 return False
             if name.startswith('tag:') and row.tags.get(name.removeprefix('tag:')) not in allowed:
                 return False
@@ -262,6 +280,13 @@ class SpotEndTests(CostFixture):
         self.assertEqual(spot_end.end_boxes(self.api(fake), TAG), 1)
         self.assertEqual((fake.live_requests(), fake.live_boxes()), ([], []))
 
+    def test_end_boxes_finds_an_untagged_request_from_the_box(self) -> None:
+        fake = FakeEc2()
+        box = fake.launch(tagged=True)
+        fake.requests[fake.boxes[box].request].tags.clear()
+        self.assertEqual(spot_end.end_boxes(self.api(fake), TAG), 1)
+        self.assertEqual((fake.live_requests(), fake.live_boxes()), ([], []))
+
     def test_a_failed_cancel_terminates_nothing(self) -> None:
         fake = FakeEc2(fail='cancel-spot-instance-requests')
         _ = fake.launch(tagged=True)
@@ -286,7 +311,9 @@ class SpotEndTests(CostFixture):
 
     def change(self, fake: FakeEc2, keep: str = '') -> None:
         subject = self.subject(fake)
-        subject._hana_stack_change(self.api(fake), self.hana_settings(), self.root / 'template.json',  # pyright: ignore[reportPrivateUsage]
+        template = self.root / 'template.json'
+        _ = template.write_text('{"Resources":{}}')
+        subject._hana_stack_change(self.api(fake), self.hana_settings(), template,  # pyright: ignore[reportPrivateUsage]
                                    {'DeploymentId': TAG[1]}, keep=keep)
 
     def test_a_failed_create_leaves_no_request_box_disk_bucket_or_stack(self) -> None:

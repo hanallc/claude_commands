@@ -1,4 +1,4 @@
-"""Publish the AWS page: the spend totals and the spot_table tables as data for the admin console."""
+"""Publish the spend, prices, quotas and run data for the AWS console page."""
 from __future__ import annotations
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
@@ -6,16 +6,20 @@ except FileNotFoundError:
     pass
 
 import argparse
+from collections import defaultdict
+from collections.abc import Sequence
 import json
 import os
+import sys
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from html import escape
 from pathlib import Path
-from typing import TypedDict
+from statistics import median
+from typing import Literal, TypedDict
 
-from scripts.aws_target import config as aws_config, console_help, quota_requests, spend as aws_spend, spot_table
+from scripts.aws_target import config as aws_config, console_help, ledger, quota_requests, spend as aws_spend, spot_table
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.review_links import console_theme, page_frame, review_link
@@ -31,8 +35,7 @@ def region_filter_key(region: str) -> tuple[int, str]:
     return (REGION_GROUPS.index(group) if group in REGION_GROUPS else len(REGION_GROUPS), region)
 
 
-class TableData(TypedDict):
-    title: str
+class TableRowsData(TypedDict):
     headers: list[str]
     right: list[int]
     rows: list[list[str]]
@@ -41,6 +44,10 @@ class TableData(TypedDict):
     values: list[list[float | None]]
     # [row, column] cells of a type that the region does not sell.
     not_sold: list[list[int]]
+
+
+class TableData(TableRowsData):
+    title: str
 
 
 class EstimateData(TypedDict):
@@ -59,8 +66,8 @@ class RunCostData(TypedDict):
     label: str
     explanation: str
     tables: list[TableData]
-    # The estimate of each type and region: the price tables of the Cost per gate view.
-    prices: list[TableData]
+    # Keep the standard Gate table at index 0 for pages that are already open.
+    prices: list[TableRowsData]
     # The summary for each candidate estimate, cheapest first; the page shows the first in the chosen regions.
     estimates: list[EstimateData]
     no_estimate: str
@@ -89,22 +96,81 @@ class PageData(TypedDict):
     # Every region a table shows, for the region filter.
     regions: list[str]
     snapshot: list[SnapshotLine]
-    prices: list[TableData]
-    quotas: list[TableData]
+    prices: list[TableRowsData]
+    placement_scores: TableData
+    quotas: list[TableRowsData]
+    cached_spot_status: dict[str, Literal['read failed', 'old']]
     runs: list[RunCostData]
     hours: TableData
     hours_note: str
 
 
-def table_data(table: spot_table.Table) -> TableData:
-    return {'title': table.title, 'headers': list(table.headers), 'right': sorted(table.right),
+def table_rows_data(table: spot_table.Table) -> TableRowsData:
+    return {'headers': list(table.headers), 'right': sorted(table.right),
             'rows': [list(row) for row in table.rows], 'region_axis': table.region_axis,
             'values': [[float(value) if value is not None else None for value in row] for row in table.values],
             'not_sold': [list(cell) for cell in sorted(table.not_sold)]}
 
 
+def table_data(table: spot_table.Table) -> TableData:
+    return {'title': table.title, **table_rows_data(table)}
+
+
+def placement_score_table(regions: Sequence[str], readings: Sequence[ledger.SpotPlacementReading],
+                          now: int) -> spot_table.Table:
+    columns = (
+        (ledger.SpotPlacementTypeSet.GATE_32_VCPU, 8, '32 vCPU (8 boxes)'),
+        (ledger.SpotPlacementTypeSet.ALL_GATE_TYPES, 8, 'All types (8 boxes)'),
+        (ledger.SpotPlacementTypeSet.ALL_GATE_TYPES, 20, 'All types (20 boxes)'),
+    )
+    displayed = {(types, boxes) for types, boxes, _ in columns}
+    first = now - ledger.SPOT_PLACEMENT_RETENTION_SECONDS
+    locations: set[ledger.SpotPlacementLocation] = {ledger.SpotPlacementRegion(region) for region in regions}
+    current_types: dict[ledger.SpotPlacementTypeSet, tuple[str, ...]] = {}
+    attempts: dict[tuple[ledger.SpotPlacementScope, ledger.SpotPlacementTypeSet, int, str],
+                   ledger.SpotPlacementReading] = {}
+    scores: defaultdict[tuple[ledger.SpotPlacementLocation, ledger.SpotPlacementTypeSet, int],
+                        list[tuple[int, int]]] = defaultdict(list)
+    for reading in sorted(readings, key=lambda row: row.at, reverse=True):
+        if not first <= reading.at <= now:
+            continue
+        request = reading.request
+        if (request.type_set, request.boxes) not in displayed:
+            continue
+        if current_types.setdefault(request.type_set, request.instance_types) != request.instance_types:
+            continue
+        for region in request.regions:
+            locations.add(ledger.SpotPlacementRegion(region))
+            _ = attempts.setdefault((request.scope, request.type_set, request.boxes, region), reading)
+        if isinstance(reading, ledger.SpotPlacementSample):
+            for entry in reading.scores:
+                locations.add(entry.location)
+                scores[entry.location, request.type_set, request.boxes].append((reading.at, entry.score))
+
+    def cell(location: ledger.SpotPlacementLocation, types: ledger.SpotPlacementTypeSet, boxes: int) -> str:
+        zonal = isinstance(location, ledger.SpotPlacementZone)
+        if zonal and boxes != 8:
+            return 'Not sampled'
+        scope = ledger.SpotPlacementScope.ZONE if zonal else ledger.SpotPlacementScope.REGION
+        attempt = attempts.get((scope, types, boxes, location.region))
+        observed = scores.get((location, types, boxes), [])
+        if not observed:
+            return f'Missing ({attempt.reason})' if isinstance(attempt, ledger.SpotPlacementFailure) else 'Missing'
+        at, latest = observed[0]
+        stale = now - at >= 2 * 3600 or (attempt is not None and attempt.at > at)
+        prefix = 'Stale: ' if stale else ''
+        return f'{prefix}{latest} / {median(score for _, score in observed):g} / {len(observed)}'
+
+    rows = tuple((place.region, place.zone_id if isinstance(place, ledger.SpotPlacementZone) else 'Region',
+                  *(cell(place, types, boxes) for types, boxes, _ in columns))
+                 for place in sorted(locations, key=lambda place: (region_filter_key(place.region),
+                                     place.zone_id if isinstance(place, ledger.SpotPlacementZone) else '')))
+    headers = ('Region', 'Location', *(label for _, _, label in columns))
+    return spot_table.Table('Spot placement scores', headers, frozenset(range(2, len(headers))), rows, 'rows')
+
+
 def without_prices(table: spot_table.Table) -> spot_table.Table:
-    """A run table without the Spot price and estimate columns, which the page's price tables show."""
+    """Omit the Spot price and estimate that the Prices and quotas card shows."""
     keep = [index for index, header in enumerate(table.headers)
             if header not in (spot_table.SPOT_HEADER, spot_table.ESTIMATE_HEADER)]
     return replace(table, headers=tuple(table.headers[index] for index in keep),
@@ -139,20 +205,25 @@ def spend_data(spend: aws_spend.Spend | aws_config.MeasurementUnavailable, now: 
     return {'unavailable': '', 'tiles': tiles, 'forecast': forecast}
 
 
-def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int) -> PageData:
+def page_data(tables: spot_table.SpotTables, spend: SpendData, now: int,
+              placement_readings: Sequence[ledger.SpotPlacementReading] = ()) -> PageData:
     # The billed hours table can add a region that is no longer a candidate.
-    regions = dict.fromkeys((*(read.region for read in tables.regions), *tables.hours.headers[1:]))
+    placement = placement_score_table(tuple(read.region for read in tables.regions), placement_readings, now)
+    regions = dict.fromkeys((*(row[0] for row in placement.rows), *tables.hours.headers[1:]))
     return {
         'read_at': now,
         'render_seconds': 0.0,
         'spend': spend,
         'regions': sorted(regions, key=region_filter_key),
         'snapshot': [{'region': region, 'text': text} for region, text in tables.snapshot_rows],
-        'prices': [table_data(table) for table in tables.prices],
-        'quotas': [table_data(table) for table in tables.quotas],
+        'prices': [table_rows_data(table) for table in tables.prices],
+        'placement_scores': table_data(placement),
+        'quotas': [table_rows_data(table) for table in tables.quotas],
+        'cached_spot_status': {read.region: 'read failed' if read.failure else 'old'
+                               for read in tables.regions if read.failure or read.stale},
         'runs': [{'scope': costs.scope.name, 'label': costs.scope.label, 'explanation': costs.explanation,
                   'tables': [table_data(without_prices(table)) for table in costs.tables],
-                  'prices': [table_data(table) for table in costs.prices],
+                  'prices': [table_rows_data(costs.gate_prices)],
                   'estimates': [{'region': entry.region, 'summary': costs.summary_of(entry)} for entry in costs.estimates],
                   'no_estimate': costs.summary_of(None),
                   'refused': table_data(costs.refused), 'launched': table_data(costs.launched)}
@@ -219,7 +290,12 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     today = datetime.fromtimestamp(now, UTC).date().isoformat()
     read = aws_spend.read_spend(settings_path or conf.path('aws_target'), directory, now, today)
     spend = spend_data(read, now, configuration.whole('spend_pace_days'))
-    data = page_data(spot_table.spot_tables(directory, now, settings_path=settings_path), spend, now)
+    try:
+        placement = ledger.read_spot_placement_scores(directory)
+    except (OSError, ValueError, KeyError) as error:
+        print(f'aws_page: Spot placement scores unavailable: {type(error).__name__}', file=sys.stderr)
+        placement = ()
+    data = page_data(spot_table.spot_tables(directory, now, settings_path=settings_path), spend, now, placement)
     source = console_theme.with_theme(Path(__file__).with_name(PAGE_NAME).read_text(encoding='utf-8'))
     requests = waiting_quota_requests(directory)
     # A '</' in a cell must not end the script element.

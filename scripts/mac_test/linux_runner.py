@@ -26,6 +26,7 @@ import time
 from typing import TYPE_CHECKING, BinaryIO, NotRequired, TypedDict, cast
 import uuid
 
+from scripts.lib import process_stat
 from scripts.lib.dev_shell import (
     ShellEnvironment as ShellEnvironment,
     exports_are_valid as exports_are_valid,
@@ -98,7 +99,8 @@ def execution_descriptors() -> tuple[int, ...]:
 
 
 def capture_leased_command(command: list[str], execution: LeasedSlotExecution,
-                           environment: Mapping[str, str], output_max_bytes: int, *, timeout_s: float) -> LeasedCommandResult:
+                           environment: Mapping[str, str], output_max_bytes: int, *, timeout_s: float,
+                           extra_descriptors: tuple[int, ...] = ()) -> LeasedCommandResult:
     """Capture bounded output while every child retains the maker lease."""
     if output_max_bytes <= 0 or not math.isfinite(timeout_s) or timeout_s <= 0:
         raise ValueError('The command output bound and deadline must be positive')
@@ -106,7 +108,7 @@ def capture_leased_command(command: list[str], execution: LeasedSlotExecution,
     deadline = started + timeout_s
     output = [bytearray(), bytearray()]
     child = subprocess.Popen(command, cwd=execution.slot.path, env=dict(environment),
-            pass_fds=tuple(dict.fromkeys((*execution_descriptors(), *execution.descriptors))),
+            pass_fds=tuple(dict.fromkeys((*execution_descriptors(), *execution.descriptors, *extra_descriptors))),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     assert child.stdout is not None and child.stderr is not None
     try:
@@ -149,9 +151,12 @@ def capture_leased_command(command: list[str], execution: LeasedSlotExecution,
                                started_at, time.time(), time.monotonic() - started)
 
 
+CARGO_START_ERROR = 'The guest could not start Cargo because the executable is missing from the prepared PATH'
+
+
 def run_slot(execution: LeasedSlotExecution, argv: tuple[str, ...], environment: Mapping[str, str], *,
              shell: ShellEnvironment, compiler_version: str, free_floor_gib: float,
-             output_max_bytes: int, timeout_s: float) -> LeasedCommandResult:
+             output_max_bytes: int, timeout_s: float, build_start_fd: int = -1) -> LeasedCommandResult:
     """Check shell and compiler parity before running the exact judgment command."""
     slot = execution.slot
     descriptor = build_folders.build_folder_lock_fd(slot.path)
@@ -180,6 +185,8 @@ def run_slot(execution: LeasedSlotExecution, argv: tuple[str, ...], environment:
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
             '.leased-step-', build_folders.ExplicitBuildParent(slot.path))) as stage:
         started = stage / 'started'
+        report_start = f"printf '\\n' >&{build_start_fd} || exit 75\n" if build_start_fd >= 0 else ''
+        close_report = f' {build_start_fd}>&-' if build_start_fd >= 0 else ''
         assignments = ' '.join(f'{name}={shlex.quote(value)}' for name, value in
                                {**environment, **slot.env, 'CARGO_TARGET_DIR': str(slot.path / 'target')}.items())
         script = (shell_environment_script(shell)
@@ -189,12 +196,17 @@ def run_slot(execution: LeasedSlotExecution, argv: tuple[str, ...], environment:
             + f'[[ "$actual" == {shlex.quote("rustc " + compiler_version)} '
             + f'|| "$actual" == {shlex.quote("rustc " + compiler_version + " ")}* ]] || exit 75\n'
             + f'export {assignments}\n'
+            + 'cargo=$(type -P -- cargo) && [[ -x "$cargo" && ! -d "$cargo" ]] || '
+            + f'{{ printf "%s\\n" {shlex.quote(CARGO_START_ERROR)} >&2; exit 127; }}\n'
             + f': > {shlex.quote(str(started))} || exit 75\n'
-            + 'exec ' + shlex.join(argv))
+            + report_start + f'exec -a cargo -- "$cargo" {shlex.join(argv[1:])}{close_report}')
         result = capture_leased_command(['bash', '-e', '-c', script], execution,
-                                        command_environment, output_max_bytes, timeout_s=timeout_s)
+                                        command_environment, output_max_bytes, timeout_s=timeout_s,
+                                        extra_descriptors=(build_start_fd,) if build_start_fd >= 0 else ())
         if not started.exists():
-            raise ValueError('The guest shell or compiler parity check failed')
+            reason = (CARGO_START_ERROR if result.stderr.endswith((CARGO_START_ERROR + '\n').encode())
+                      else 'The guest shell or compiler parity check failed')
+            raise ValueError(reason)
         return result
 
 
@@ -289,11 +301,6 @@ def read_slot_run(marker: Path) -> SlotRun | UnmarkedSlot:
     return lease
 
 
-def process_fields(pid: int, proc_root: Path = PROC_ROOT) -> list[str]:
-    """Read stat fields after the process name, which can contain spaces."""
-    return (proc_root / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()
-
-
 @dataclass(frozen=True)
 class SlotProcessSelection:
     """Confirmed slot processes and evidence that prevents release."""
@@ -326,7 +333,7 @@ class ProcessIdentity:
 
 
 def process_identity(pid: int, proc_root: Path) -> ProcessIdentity:
-    fields = process_fields(pid, proc_root)
+    fields = process_stat.process_fields(pid, proc_root)
     status = (proc_root / str(pid) / 'status').read_text()
     uid = re.search(r'^Uid:\s+(\d+)\b', status, re.MULTILINE)
     if uid is None:
@@ -416,7 +423,7 @@ def select_slot_processes(mirror: Path, proc_root: Path = PROC_ROOT, *,
         if denied and pid not in selected and not isinstance(lease, UnmarkedSlot):
             # Confirm that missing evidence does not belong to an exited process.
             try:
-                if process_fields(pid, proc_root)[0] in ('Z', 'X'):
+                if process_stat.process_fields(pid, proc_root)[0] in ('Z', 'X'):
                     continue
             except (FileNotFoundError, ProcessLookupError):
                 continue
@@ -469,7 +476,7 @@ def slot_run(mirror: Path, *, require_boot_identity: bool = False) -> Generator[
         raise SlotStartupRefused('an earlier run still has unresolved ownership') from error
     pid = os.getpid()
     token = uuid.uuid4().hex
-    lease: SlotRun = {'pid': pid, 'start_time': int(process_fields(pid)[19]),
+    lease: SlotRun = {'pid': pid, 'start_time': int(process_stat.process_fields(pid)[19]),
                       'process_group': os.getpgrp(), 'token': token, 'boot_id': boot_identity()}
     marker = mirror / '.linux-run.json'
     with marker.open('x') as output:

@@ -309,21 +309,45 @@ def nightly_production(*, resolver: RowResolver | None = None) -> NightlyProduct
     return found[0]
 
 
-def live_unit(production: NightlyProduction, *, resolver: RowResolver) -> LiveClaude | None:
+@dataclass(frozen=True)
+class NightlyUnitLivenessUnknown:
+    reason: str
+
+
+@dataclass(frozen=True)
+class NightlyUnitWithoutSocket:
+    """The running unit has no usable messaging socket."""
+
+
+@dataclass(frozen=True)
+class NightlyUnitNotLive:
+    """The selected unit has no running session."""
+
+
+def live_unit(production: NightlyProduction, *, resolver: RowResolver
+              ) -> LiveClaude | NightlyUnitWithoutSocket | NightlyUnitLivenessUnknown | NightlyUnitNotLive:
     """Find the configured unit through its native session identity."""
     from scripts.production import session_staff
-    from scripts.message import sessions
+    from scripts.message import session_records
 
     if isinstance(production.selection, NightlyUnitNotSelected):
-        return None
+        return NightlyUnitNotLive()
     row = resolver.record.by_id(production.selection.unit.id)
     if row is None:
-        return None
-    for current in sessions.live_sessions():
-        if current["sessionId"] == row.current_session:
+        return NightlyUnitNotLive()
+    registry = session_records.enumerate_running_sessions()
+    if isinstance(registry, session_records.RunningSessionDiscoveryFailed):
+        return NightlyUnitLivenessUnknown(registry.reason)
+    matches = [current for current in registry.records if current["sessionId"] == row.current_session]
+    for current in matches:
+        if session_records.messaging_socket_exists(current):
             return session_staff.LiveClaude(current["name"], current["sessionId"],
-                                           current["messagingSocketPath"], current["pid"])
-    return None
+                                            current["messagingSocketPath"], current["pid"])
+    if matches:
+        return NightlyUnitWithoutSocket()
+    if registry.unreadable:
+        return NightlyUnitLivenessUnknown(session_records.registry_unreadable_reason(registry.unreadable))
+    return NightlyUnitNotLive()
 
 
 def tonight(day: date) -> list[str]:
@@ -341,7 +365,7 @@ def tonight(day: date) -> list[str]:
     lines: list[str] = []
     try:
         claude = live_unit(production, resolver=resolver)
-        if claude is None:
+        if isinstance(claude, NightlyUnitNotLive):
             plan = selection.config.plan
             launch = (["--permanent"] if isinstance(plan, unit_config.PermanentPlan) else
                       ["--standby"] if isinstance(plan, unit_config.StandbyPlan) else
@@ -355,7 +379,11 @@ def tonight(day: date) -> list[str]:
             claude = live_unit(production, resolver=resolver)
     except OSError as error:
         return [f"skipped: units unreadable: {error}"]
-    if claude is None:
+    if isinstance(claude, NightlyUnitLivenessUnknown):
+        return [*lines, f"{selection.unit.name}: {claude.reason}"]
+    if isinstance(claude, NightlyUnitWithoutSocket):
+        return [*lines, f"{selection.unit.name}: the running unit has no usable messaging socket"]
+    if isinstance(claude, NightlyUnitNotLive):
         return [*lines, f"{selection.unit.name}: no live Claude has the unit's recorded identity"]
     sent = subprocess.run(session_send.send_argv("--to", f"uds:{claude.socket}", "--from", "nightly-review timer",
                                             "--key", f"nightly-{day.isoformat()}", "--text", job(day)),

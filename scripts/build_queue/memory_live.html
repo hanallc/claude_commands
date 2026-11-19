@@ -288,7 +288,9 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .wrow.wait .row-memory { align-self: start; margin-top: 6px; }
 .wrow.room::after { content: ""; position: absolute; bottom: 0; left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
 .walk-chart .queue-head { display: flex; align-items: flex-end; padding-bottom: 3px; box-sizing: border-box; }
-.queue-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.queue-title { display: flex; min-width: 0; white-space: nowrap; }
+.queue-title > :first-child { overflow: hidden; text-overflow: ellipsis; }
+.queue-title > :last-child { flex: none; white-space: pre; }
 .wrow.room::before { content: ""; position: absolute; top: var(--divider-top, 0px); left: 0; width: 100%; border-top: 1px solid var(--line); pointer-events: none; }
 .walk-table tr.wait { color: var(--ink-2); }
 .walk-table { min-width: 0; width: max-content; max-width: 100%; }
@@ -471,7 +473,7 @@ body.queue-unavailable .card { display: none; }
   </section>
 
   <section class="card">
-    <div class="walk-head"><span class="section-head" data-tip="walkhead">Running, in start order</span><span class="walk-sum num" id="walk-sum" data-tip="walksum"></span><div class="walk-tokens num" data-tip="tokens"><span>Tokens</span><dl id="walk-tokens"></dl></div></div>
+    <div class="walk-head"><span class="section-head" id="walk-title" data-tip="walkhead">Running, in start order</span><span class="walk-sum num" id="walk-sum" data-tip="walksum"></span><div class="walk-tokens num" data-tip="tokens"><span>Tokens</span><dl id="walk-tokens"></dl></div></div>
     <div class="walk-scroll"><div class="walk" id="walk"></div></div>
     <p class="pressure-reason" id="cap-reason"></p>
     <div class="walk-key">
@@ -780,7 +782,8 @@ function ciRow(row) { return row.ci || !!row.ci_label; }
 const STEP_TABLE_HEADERS = {target: "Target", duration: "Dur", waiting: "Waiting"};
 function ownerText(text) {
   const shown = publicText(text || '');
-  return /not recorded/.test(shown) || shown === '—' ? '' : shown;
+  return /not recorded/.test(shown) || /^(?:session:)?[a-f0-9]{8}(?:-?[a-f0-9]{4}){3}-?[a-f0-9]{12}$/i.test(shown)
+    ? '' : shown;
 }
 function stageText(row) {
   if (row.kind === "cloud") return row.stage || "—";
@@ -798,21 +801,22 @@ function doneText(row) {
 function ownerFields(row) {
   const fields = [staffField('Showrunner', [ownerText(row.showrunner)])];
   if (row.runner === 'worker') fields.push(staffField('Worker', [ownerText(row.worker)]));
+  if (row.caller) fields.push(field('Caller', row.caller));
   return fields.filter(row => row.value);
 }
 function stepDisplayName(row) {
   return row.kind === "repository-slot" && row.detail ? `${row.name} · ${row.detail}` : row.name;
 }
-function rowTitle(row) {
-  if (ciRow(row)) return row.ci_label || `hana CI · ${row.detail || row.name}`;
+function olderStepTitle(row) {
+  if (ciRow(row)) return {unit: '', step: row.ci_label || `hana CI · ${row.detail || row.name}`};
   const unit = ownerText(row.unit);
   const name = publicText(stepDisplayName(row) || '');
-  return unit && !name.startsWith(unit+' ') && !name.startsWith(unit+' · ') ? `${unit} · ${name}`
-    : unit && name.startsWith(unit+' ') ? `${unit} · ${name.slice(unit.length+1)}` : name;
+  const step = unit && name.startsWith(unit + ' ') ? name.slice(unit.length).replace(/^\s*·\s*|^\s+/, '') : name;
+  return {unit, step};
 }
 function stepTitle(row, value) {
-  const title = rowTitle(row), unit = ownerText(row.unit);
-  return unit && !ciRow(row) ? staffTitle(unit, value, title.slice(unit.length)) : field(title, value, 'title');
+  const {unit, step} = row.title ?? olderStepTitle(row);
+  return unit ? staffTitle(unit, value, ' · ' + step) : field(step, value, 'title');
 }
 function becauseRows(reason, parts) {
   if (!reason) return [];
@@ -950,10 +954,10 @@ function tipText(key, data) {
 }
 function sentence(text) { return text ? text[0].toUpperCase() + text.slice(1) : ""; }
 function targetOwner(row) {
-  const roles = [["Unit", row.unit], ["Showrunner", row.showrunner]]
-    .filter(([, name]) => name && name !== "—");
-  if (roles.length) return roles.map(([label, name]) => label + ' ' + staffName(publicText(name))).join(' · ');
-  return row.holder ? 'Holder ' + staffName(publicText(row.holder)) : 'Owner not recorded';
+  const roles = [["Unit", ownerText(row.unit)], ["Showrunner", ownerText(row.showrunner)]].filter(([, name]) => name);
+  if (roles.length) return roles.map(([label, name]) => label + ' ' + staffName(name)).join(' · ');
+  const holder = ownerText(row.holder);
+  return holder ? 'Holder ' + staffName(holder) : '';
 }
 function renderTargets(rows) {
   const box = $("targets");
@@ -984,7 +988,8 @@ function visibleDetail(row) {
   return publicText(row.detail || "");
 }
 function publicText(text) {
-  return memoryText(text.split(" · ").filter(part => part.trim() && part.trim() !== "—" && !/\.(slice|service)\b/.test(part)).join(" · "));
+  return memoryText(text.split(" · ").filter(part => part.trim() && part.trim() !== "—"
+    && part.trim() !== "owner not recorded" && !/\.(slice|service)\b/.test(part)).join(" · "));
 }
 function publicParts(parts) {
   const shown = [];
@@ -1004,6 +1009,8 @@ function publicParts(parts) {
   return shown;
 }
 function rowOwner(row, waiting = false) {
+  if (row.caller) return row.caller;
+  if (row.kind === "repository-slot") return "";
   if (ciRow(row)) return (row.ci_label || "").split(" · ")[0];
   if (macRow(row)) return publicText(row.showrunner || "");
   if (row.kind !== "cloud" && !waiting && (!row.queued || row.between_steps)) {
@@ -1479,6 +1486,8 @@ function renderWalk(d) {
         `<td class="tokens">${Number.isInteger(tokens) ? tokens : "—"}</td>`) + '</tr>');
   };
   const ordered = [...d.walk.filter(row => row.kind === "cloud" || macRow(row) || row.queued && !row.ci), ...d.walk.filter(row => row.ci && row.admitted)];
+  const runningCount = ordered.filter(row => row.kind !== "mac-unavailable").length;
+  $("walk-title").textContent = `Running, in start order (${runningCount})`;
   const rows = [];
   if (d.ram.build_tools_bytes > 0) {
     cells("", "Build tools", "", null, "", null, "tools", "tools");
@@ -1487,7 +1496,7 @@ function renderWalk(d) {
   rows.push(...ordered.map(r => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
     cells(stageText(r),
-      r.name, idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", r.pid, r.machine, r.vcpus, `row:${r.key}`, "", doneText(r), r.slot, r.tokens);
+      stepDisplayName(r), idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", r.pid, r.machine, r.vcpus, `row:${r.key}`, "", doneText(r), r.slot, r.tokens);
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${r.key}" data-run="${r.key}">${stepLabel(r)}` +
       (r.kind === "cloud" ? cloudStatus(r, `row:${r.key}`) : rowMemory(`row:${r.key}`)) + `</div>`;
   }));
@@ -1495,24 +1504,23 @@ function renderWalk(d) {
   const columnClasses = ["place", "done", "step", "duration", "pid", "machine", "vcpus", "slot", "tokens"];
   tableRows.push(`<tr class="room" data-tip="room">${columnClasses.map(column => `<td class="${column}"></td>`).join("")}</tr>`);
   rows.push(`<div class="wrow room">${rowLabel("Free")}` + rowMemory("room") + `</div>`);
-  if (d.waiters.length) {
-    const units = d.queued_priority_units || [];
-    const title = !units.length ? "Queued, in order of submission"
-      : units.length === 1 ? `Queued, ${units[0]} first, then in submission order`
-      : `Queued, ${units.join(" followed by ")} and then in submission order`;
-    tableRows.push(`<tr class="queue-head">${columns("#", STEP_TABLE_HEADERS.waiting)}</tr>`);
-    const titleHtml = !units.length ? esc(title) : units.length === 1 ? `Queued, ${roleName(units[0])} first, then in submission order`
-      : `Queued, ${units.map(unit=>roleName(unit)).join(' followed by ')} and then in submission order`;
-    rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}">${titleHtml}</span></div>`);
-  }
+  const waitingCount = d.waiters.length;
+  if (waitingCount) tableRows.push(`<tr class="queue-head">${columns("#", STEP_TABLE_HEADERS.waiting)}</tr>`);
+  const units = waitingCount ? d.queued_priority_units || [] : [];
+  const title = !units.length ? "Queued, in order of submission"
+    : units.length === 1 ? `Queued, ${units[0]} first, then in submission order`
+    : `Queued, ${units.join(" followed by ")} and then in submission order`;
+  const titleHtml = !units.length ? esc(title) : units.length === 1 ? `Queued, ${roleName(units[0])} first, then in submission order`
+    : `Queued, ${units.map(unit=>roleName(unit)).join(' followed by ')} and then in submission order`;
+  rows.push(`<div class="walk-chart-head queue-head"><span class="queue-title section-head" title="${esc(title)}"><span>${titleHtml}</span><span> (${waitingCount})</span></span></div>`);
   let localPosition = 0;
   d.waiters.forEach((w, i) => {
     const place = w.kind === "cloud" ? "cloud" : String(++localPosition);
-    cells(place, stepDisplayName(w), ago(w.since, d.read_at), w.pid, w.machine ? [w.machine] : w.targets || [], null, `wait:${w.key}`, `wait${i === 0 ? " wait-first" : ""}`);
     const tip = `wait:${w.key}`;
+    cells(place, stepDisplayName(w), ago(w.since, d.read_at), w.pid, w.machine ? [w.machine] : w.targets || [], null, tip, `wait${i === 0 ? " wait-first" : ""}`);
     const note = w.why === "the build in the same Cargo folder" ? w.reason : "";
     rows.push(`<div class="wrow wait${i === 0 ? " wait-first" : ""}${w.kind === "cloud" ? " cloud-work" : ""}" data-tip="${tip}">${stepLabel(w, true, note)}` +
-      (w.kind === "cloud" ? cloudStatus(w, `wait:${w.key}`) : rowMemory(`wait:${w.key}`)) +
+      (w.kind === "cloud" ? cloudStatus(w, tip) : rowMemory(tip)) +
       `</div>`);
   });
   if (hasCap(d)) rows.push(`<div class="walk-bud" style="left:calc(var(--amt) + var(--gap) + (100% - var(--amt) - var(--gap)) * ${capEnd(d)})"></div>`);
@@ -1704,7 +1712,7 @@ function placeMemoryBars(d) {
   const box = (left, size, className, tip = "") => size > 0
     ? `<div class="b ${className}" ${tip ? `data-tip="${tip}"` : ""} style="left:${left}px;width:${size}px"></div>` : "";
   // A local bar stops at the cap line; a bar that the cap cuts shows a cap-colored end.
-  const chartEdge = !hasCap(d) ? width : progressEnd;
+  const chartEdge = hasCap(d) ? width * capEnd(d) : width;
   const capBox = (left, size, className) => {
     const drawn = Math.min(size, chartEdge - left);
     return box(left, drawn, drawn < size ? `${className} over-cap` : className);

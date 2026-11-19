@@ -4,7 +4,7 @@ Each herdr session has one file under `~/.local/state/herdr-panes`.
 The file keeps the account, flags, and environment for each pane. Staff supplies each unit folder.
 The Claude SessionStart hook records Claude launches.
 The normal herdr start path records Codex launches after it proves the foreground process.
-The seed command records plain Codex clients through their tab's staff row.
+The seed command records the proved native owner of each pane.
 
 Stored member references use fixed staff ids.
 Runtime observations prove the current conversation before a stop or resume.
@@ -357,14 +357,13 @@ def running_launch(record: sessions.SessionRecord, place: herdr.HerdrPlace, cwd:
     return entry
 
 
-def _conversation_of(config_dir: str, pid: int) -> str:
-    """The conversation id Claude keeps for its own process, `<config>/sessions/<pid>.json`."""
-    try:
-        value = cast(object, json.loads((Path(config_dir) / "sessions" / f"{pid}.json").read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        return ""
-    session_id = cast(dict[str, object], value).get("sessionId") if isinstance(value, dict) else None
-    return session_id if isinstance(session_id, str) else ""
+def _account_local_conversation(config_dir: str, pid: int) -> str:
+    """Read the account-local registry entry for the proved Claude PID."""
+    value = cast(object, json.loads((Path(config_dir) / "sessions" / f"{pid}.json").read_text(encoding="utf-8")))
+    identity = cast(dict[str, object], value).get("sessionId") if isinstance(value, dict) else None
+    if not isinstance(identity, str) or not identity:
+        raise ValueError(f"no conversation id for {pid}")
+    return identity
 
 
 def seed(session: str, *, select: Callable[[herdr.PaneIdentity], bool] | None = None) -> int:
@@ -378,45 +377,39 @@ def seed(session: str, *, select: Callable[[herdr.PaneIdentity], bool] | None = 
             continue
         context = f"herdr {session}:{pane_id} process info"
         info = herdr.json_object(client.result("pane", "process-info", "--pane", pane_id).get("process_info"), context)
-        processes = [herdr.json_object(item, context) for item in herdr.json_items(info.get("foreground_processes"), context)]
-        found = [item for item in processes
-                 if isinstance(argv := item.get("argv"), list)
-                 and (herdr.is_claude_process([str(part) for part in cast(list[object], argv)])
-                      or herdr.is_codex_process([str(part) for part in cast(list[object], argv)]))]
-        if not found:
+        owner = herdr.foreground_pane_owner(info)
+        if isinstance(owner, herdr.NoForegroundAgent):
             continue
-        arguments = [str(part) for part in cast(list[object], found[0].get("argv"))]
-        kind: Literal["claude", "codex"] = "codex" if herdr.is_codex_process(arguments) else "claude"
-        pid = found[0].get("pid")
-        if isinstance(pid, bool) or not isinstance(pid, int):
-            print(f"{pane_id}: no {kind} process id")
+        if isinstance(owner, herdr.UnprovedForegroundOwner):
+            print(f"{pane_id}: {owner.reason}")
             continue
-        if kind == "codex":
+        if isinstance(owner, herdr.ProvedClaudeForeground):
+            pid = owner.pid
+            started = sessions.process_start(pid)
+            if not started:
+                print(f"{pane_id}: process start is unavailable for {pid}")
+                continue
             try:
-                observed = herdr.native_process(pid, "codex")
+                environment = _process_environment(pid)
+                config_dir = environment.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+                session_id = _account_local_conversation(config_dir, pid)
             except (OSError, ValueError):
                 print(f"{pane_id}: no conversation id for {pid}")
                 continue
-            session_id, started, environment = observed.identity.id, observed.started, observed.environment
+            if sessions.process_start(pid) != started:
+                print(f"{pane_id}: process start changed for {pid}")
+                continue
         else:
             try:
-                environment = _process_environment(pid)
-            except (OSError, ValueError) as error:
-                print(f"{pane_id}: cannot read the environment of {pid}: {error}")
+                native = herdr.read_foreground_pane_owner(owner, pane)
+                session_id = native.current_identity
+                started, environment = native.started, native.environment
+            except (OSError, ValueError, herdr_types.HerdrFailure):
+                print(f"{pane_id}: no conversation id for {owner.pid}")
                 continue
-            config_dir = environment.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
-            session_id = _conversation_of(config_dir, pid)
-            started = sessions.process_start(pid)
-        if not session_id:
-            print(f"{pane_id}: no conversation id for {pid}")
-            continue
-        cwd = found[0].get("cwd")
-        entry = launch(pane_id, session_id, cwd if isinstance(cwd, str) else "", environment, arguments, kind=kind)
-        entry["pid"] = pid
-        if not started:
-            print(f"{pane_id}: process start is unavailable for {pid}")
-            continue
-        entry["proc_start"] = started
+        cwd = owner.cwd if isinstance(owner.cwd, str) else ""
+        entry = launch(pane_id, session_id, cwd, environment, owner.arguments, kind=owner.kind)
+        entry.update(pid=owner.pid, proc_start=started)
         write(session, entry)
         print(f"{pane_id}: {pane.get('label') or ''} {session_id}")
     return 0

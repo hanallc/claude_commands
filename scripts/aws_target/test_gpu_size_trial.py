@@ -28,6 +28,7 @@ from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.build_hold import build_hold
 from scripts.build_targets import build_targets
 from scripts.lib import conf
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import merge_gate
 from scripts.production.gate_modules import GateRefused
@@ -173,7 +174,7 @@ elif name == 'cargo':
         guest = folder / 'guest.py'
         _ = guest.write_text(trial.guest_program().replace(
             "root = Path('/var/lib/gpu-size-trial')", 'root = Path(' + repr(str(folder)) + ')', 1))
-        result = subprocess.run([sys.executable, str(guest)], capture_output=True, text=True, timeout=10,
+        result = subprocess.run([sys.executable, str(guest)], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
             env={**os.environ, 'PATH': str(tools) + os.pathsep + os.environ.get('PATH', ''),
                  'GPU_TRIAL_CARGO': str(tools / 'cargo')})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -253,7 +254,8 @@ elif name == 'cargo':
             with self.subTest(version=version, device=device):
                 manifest['nextest'] = 'cargo-nextest ' + version
                 trial.write_json(folder / 'manifest.json', manifest)
-                result = subprocess.run([sys.executable, str(guest)], capture_output=True, text=True, timeout=10,
+                result = subprocess.run([sys.executable, str(guest)], capture_output=True, text=True,
+                    timeout=TEST_HANG_GUARD_SECS,
                                         env={**environment, 'FIXTURE_VULKAN': device,
                                              'FIXTURE_NEXTEST_VERSION': manifest['nextest']})
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -1126,6 +1128,9 @@ class FakeGpuAws:
             reply = {'SpotPriceHistory': [{'InstanceType': size, 'AvailabilityZone': region + 'a',
                 'SpotPrice': str(price),
                 'Timestamp': datetime.fromtimestamp(self.now, UTC).isoformat()}]}
+        elif service == 's3' and operation == 'cp':
+            self.objects[arguments[8].split('/', 3)[3]] = b'fixture large upload'
+            reply = {}
         elif operation == 'put-object':
             key = arguments[arguments.index('--key') + 1]
             self.objects[key] = Path(arguments[arguments.index('--body') + 1]).read_bytes()
@@ -1262,6 +1267,14 @@ gpu_size_trial_spot_max_usd_per_hour={"g6.xlarge":0.81,"g6.2xlarge":0.98}
     def execute(self) -> None:
         with redirect_stdout(StringIO()):
             self.worker.execute(self.folder, self.deployment)
+
+    def test_upload_uses_s3_cp_at_the_multipart_limit(self) -> None:
+        payload = self.folder / 'large-payload'
+        with payload.open('wb') as stream:
+            _ = stream.truncate(5 * 1024**3)
+        self.worker.upload('fixture-bucket', 'large-payload', payload, 5)
+        self.assertEqual(self.fake.events, ['cp'])
+        self.assertIn('large-payload', self.fake.objects)
 
     def nextest_cli(self, types: tuple[str, ...], arguments: tuple[str, ...]) -> tuple[int, str, str]:
         self.fake.manifest['tree'] = 'b' * 40
