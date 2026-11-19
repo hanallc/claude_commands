@@ -7,6 +7,7 @@ import json
 import re
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
@@ -443,9 +444,34 @@ document.addEventListener('click',event=>{
 });
 })();'''
 
-# Both pages use these durations and complete a cancelled motion before the next motion.
-MOTION_SCRIPT = r'''function createCardMotion(){
- const fadeOutMs=180, fadeInMs=270;
+
+CARD_SUBMIT_SCRIPT = r'''function cardSubmitBlocked(form,fading=false){
+ return !form.isConnected || Boolean(form.dataset.sending) || fading;
+}
+function setCardSubmitting(form,submitting,controls=form){
+ if(submitting) form.dataset.sending='true';else delete form.dataset.sending;
+ controls.querySelectorAll('button').forEach(button=>button.disabled=submitting);
+}
+'''
+
+
+@dataclass(frozen=True)
+class CardMotion:
+    fade_out_ms: int
+    fade_in_ms: int
+
+    @classmethod
+    def read(cls, settings: conf.ConfigRead) -> CardMotion:
+        return cls(settings.whole("card_fade_out_ms"), settings.whole("card_fade_in_ms"))
+
+    def attributes(self) -> str:
+        return f'data-card-fade-out-ms="{self.fade_out_ms}" data-card-fade-in-ms="{self.fade_in_ms}"'
+
+
+# Complete a cancelled motion before the next motion starts.
+MOTION_SCRIPT = r'''function createCardMotion(content){
+ const fadeOutMs=()=>Number(content().dataset.cardFadeOutMs);
+ const fadeInMs=()=>Number(content().dataset.cardFadeInMs);
  const reduced=()=>matchMedia('(prefers-reduced-motion: reduce)').matches;
  let generation=0, animations=[], commit=()=>{}, pending=Promise.resolve();
  function finish(){
@@ -464,12 +490,12 @@ MOTION_SCRIPT = r'''function createCardMotion(){
    element.scrollIntoView({block:'start',behavior:reduced() ? 'instant' : 'smooth'});
  }
  function fadeIn(target){
-  return play(target,[{opacity:0,transform:'translateY(4px)'},{opacity:1,transform:'none'}],fadeInMs);
+  return play(target,[{opacity:0,transform:'translateY(4px)'},{opacity:1,transform:'none'}],fadeInMs());
  }
  async function fadeCard(previous,target,reveal,alwaysScroll=false){
   finish();const operation=generation;commit=reveal;
   if(reduced()){finish();scroll(target,alwaysScroll);return;}
-  if(previous?.isConnected) await play(previous,[{opacity:1},{opacity:0}],fadeOutMs);
+  if(previous?.isConnected) await play(previous,[{opacity:1},{opacity:0}],fadeOutMs());
   if(operation!==generation) return;
   commit=()=>{};reveal();scroll(target,alwaysScroll);
   if(target?.isConnected) await fadeIn(target);
@@ -497,11 +523,11 @@ MOTION_SCRIPT = r'''function createCardMotion(){
    card.remove();removed();
    if(!reduced()) siblings.forEach((item,index)=>{
     const offset=tops[index]-item.getBoundingClientRect().top;
-    if(offset) void play(item,[{transform:`translateY(${offset}px)`},{transform:'none'}],fadeInMs);
+    if(offset) void play(item,[{transform:`translateY(${offset}px)`},{transform:'none'}],fadeInMs());
    });
   };
   commit=()=>{card.remove();removed();};
-  if(!reduced()) await play(card,[{opacity:1},{opacity:0}],fadeOutMs);
+  if(!reduced()) await play(card,[{opacity:1},{opacity:0}],fadeOutMs());
   if(operation!==generation) return;
   commit=()=>{};closeGap();
  }

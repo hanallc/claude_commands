@@ -186,6 +186,11 @@ class ImageReference:
     file: str
 
 
+class PageRecipient(StrEnum):
+    PAGE_OWNER = "page-owner"
+    LIST_OWNER = "list-owner"
+
+
 @dataclass(frozen=True)
 class NewItemRequest:
     request_id: str
@@ -196,6 +201,7 @@ class NewItemRequest:
     images: tuple[PastedImage, ...] = ()
     page: str = ""
     page_state: BugPageState | None = None
+    page_recipient: PageRecipient = PageRecipient.PAGE_OWNER
 
 
 @dataclass(frozen=True)
@@ -448,6 +454,12 @@ def read_request(value: object, *, has_capture: bool = False) -> NewItemRequest:
     if page and (page not in page_frame.OWNER_PAGES or kind == SubmissionKind.PROPOSAL):
         raise SubmissionError("Open the New item dialog from a page owner.")
     try:
+        page_recipient = PageRecipient(data.get("page_recipient", PageRecipient.PAGE_OWNER))
+    except ValueError as error:
+        raise SubmissionError("Select a recipient from the New item dialog.") from error
+    if not page and page_recipient != PageRecipient.PAGE_OWNER:
+        raise SubmissionError("Select a recipient from the New item dialog.")
+    try:
         evidence = read_evidence(data.get("evidence"))
     except SubmissionError:
         if not (page and has_capture):
@@ -469,7 +481,7 @@ def read_request(value: object, *, has_capture: bool = False) -> NewItemRequest:
         _text(data.get("request_id"), "Request ID", MAX_REQUEST_ID_LENGTH), kind,
         staff.StaffId(_text(data.get("recipient_id"), "Recipient ID", 128)),
         _text(data.get("words"), "Your words", MAX_WORDS_LENGTH),
-        evidence, images, page, page_state)
+        evidence, images, page, page_state, page_recipient)
 
 
 def read_image_reference(value: object) -> ImageReference:
@@ -772,7 +784,7 @@ SCRIPT = r'''(() => {
  const fields = [...form.querySelectorAll('fieldset'), words, includePage, dialog.querySelector('[data-close]'),
                  dialog.querySelector('[data-cancel]')];
  let launcher, opening, evidence, token, recipients, images = [], sending = false;
- let draft, keepDraft = false, ownerPage = '';
+ let draft, keepDraft = false, ownerPage = '', pageOwnerId = '';
  let captureSession, bugPageState;
 
  function node(tag, text = '', css = '') {
@@ -847,13 +859,14 @@ SCRIPT = r'''(() => {
   if (!recipients) return;
   const selected = recipientChips.querySelector('input:checked')?.value;
   const available = recipients.filter(recipient => form.elements.kind.value !== 'proposal' || recipient.proposal);
+  const choice = available.some(recipient => recipient.id === selected) ? selected : pageOwnerId;
   recipientChips.replaceChildren();
   for (const recipient of available) {
    const chip = node('label', '', 'new-item-chip'), input = node('input');
    input.type = 'radio';
    input.name = 'recipient_id';
    input.value = recipient.id;
-   input.checked = ownerPage ? available.length === 1 : recipient.id === selected;
+   input.checked = recipient.id === choice;
    const face = node('span', recipient.name);
    face.setAttribute('data-button-face', '');
    chip.append(input, face);
@@ -1141,6 +1154,7 @@ SCRIPT = r'''(() => {
    sendNotice.hidden = !data.send_disabled;
    if (data.send_disabled) pageCapture.hidden = true;
    recipients = data.recipients;
+   pageOwnerId = ownerPage ? data.page_owner ?? (recipients.length === 1 ? recipients[0].id : '') : '';
    showRecipients();
    startCapture();
    updateSend();
@@ -1166,7 +1180,8 @@ SCRIPT = r'''(() => {
    draft = 'r2-' + nonce;
   }
   const payload = {request_id: draft, kind, recipient_id: recipient.value,
-                   words: words.value, ...(ownerPage && {page: ownerPage})};
+                   words: words.value, ...(ownerPage && {page: ownerPage,
+                    ...(recipient.value !== pageOwnerId && {page_recipient: 'list-owner'})})};
   setError('');
   setSending(true);
   let saved, usedCapture;

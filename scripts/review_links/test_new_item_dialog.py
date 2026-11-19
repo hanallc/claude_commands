@@ -15,6 +15,7 @@ from typing import Literal, cast, override
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
+from scripts.agents.remote import local_machine
 from scripts.production import investigation, staff
 from scripts.review_links import console_theme, new_item_dialog, page_frame, review_submissions
 from scripts.review_links.test_review_submissions import EVIDENCE, OWNER, PNG, identify_fixture_image
@@ -22,7 +23,9 @@ from scripts.review_links.test_review_submissions import EVIDENCE, OWNER, PNG, i
 ENDPOINT = "/console/review/new-item"
 RECIPIENTS = [{"id": str(OWNER), "name": "builds", "proposal": True}] + [
     {"id": name, "name": name, "proposal": False}
-    for name in ("cargo-liner", "hana", "natedev", "sdlc", "spacetime", "brain", "dwight", "morty")]
+    for name in ("cargo-liner", "hana", "natedev", "sdlc", "spacetime", "brain", "dwight")]
+LIST_PRODUCER = staff.StaffId("fixture-list-producer")
+RECIPIENTS.append({"id": str(LIST_PRODUCER), "name": "morty", "proposal": False})
 OTHER_RECIPIENT = staff.StaffId("cargo-liner")
 FORM_TOKEN = "fixture-form-token"
 RESTARTED_TOKEN = "fixture-after-restart"
@@ -172,6 +175,8 @@ function untilError() {
    check(document.activeElement.value === 'question' && evidence.hidden && !textarea.value &&
          dialog.querySelector('[data-previews]').hidden, 'Reopen clears the sent draft and accepts empty evidence.');
    const to = () => [...dialog.querySelectorAll('[name="recipient_id"]')];
+   const morty = () => to().find(input => input.nextElementSibling.textContent === 'morty');
+   check(morty()?.value === 'fixture-list-producer', 'The standard dialog offers morty.');
    const kinds = dialog.querySelector('[name="kind"][value="proposal"]');
    to()[1].click();
    kinds.click();
@@ -236,7 +241,9 @@ function untilError() {
    const json = (value, status = 200) => Promise.resolve(new Response(JSON.stringify(value), {status}));
    window.fetch = (url, options) => {
     if (url === ownerEndpoint) {
-     return json({token:'owner-token', recipients:[{id:'builds-staff', name:'builds', proposal:false}]});
+     return json({token:'owner-token', page_owner:'builds-staff', recipients:[
+      {id:'builds-staff', name:'builds', proposal:false},
+      {id:'fixture-list-producer', name:'morty', proposal:false}]});
     }
     if (url !== '/console/review/new-item' || options?.method !== 'POST') return originalFetch(url, options);
     const payload = JSON.parse(options.body);
@@ -261,7 +268,8 @@ function untilError() {
    async function openOwner() {
     await open({page:'builds', kind:'question', evidence:{kind:'none'}});
     check(checkbox.checked && !checkbox.closest('label').hidden, 'The page checkbox is checked on open.');
-    check(to().length === 1 && to()[0].checked && to()[0].value === 'builds-staff', 'The owner is selected.');
+    check(to().length === 2 && to()[0].checked && to()[0].value === 'builds-staff', 'The page owner is selected.');
+    check(morty() && !morty().checked, 'The page dialog also offers morty.');
     check(to()[0].nextElementSibling.hasAttribute('data-button-face'), 'The owner chip uses the shared button style.');
     const shown = [...dialog.querySelectorAll('[data-kind]:not([hidden])')].map(chip=>chip.textContent.trim());
     check(shown.join(',') === 'Bug,Question,Feedback', 'The owner dialog has the three requested types.');
@@ -366,6 +374,14 @@ function untilError() {
    const secondReport = (await sendOwner()).detail;
    check(firstReport.id !== secondReport.id, 'F015 files a new item after a confirmed Send.');
    check(firstReportRequest.request_id !== ownerPosts.at(-1).request_id, 'F015 starts a new draft ID after success.');
+   await openOwner();
+   morty().click();
+   dialog.querySelector('[name="kind"][value="investigation"]').click();
+   type('Check the queue for morty.');
+   await sendSaved();
+   check(ownerPosts.at(-1).recipient_id === 'fixture-list-producer' &&
+         ownerPosts.at(-1).page_recipient === 'list-owner', 'Send keeps the selected List owner.');
+
    const listPosts = [];
    let listOwner = 'first-owner';
    window.fetch = (url, options) => {
@@ -732,7 +748,10 @@ class NewItemDialogTests(unittest.TestCase):
         recipient = staff.StaffRow(OWNER, "producer", "builds", staff.StaffRoot(), current_session=OWNER)
         other = staff.StaffRow(OTHER_RECIPIENT, "producer", "cargo-liner", staff.StaffRoot(),
                                current_session=OTHER_RECIPIENT)
-        snapshot = staff.StaffSnapshot((recipient, other))
+        morty = staff.StaffRow(LIST_PRODUCER, "producer", "morty", staff.StaffRoot(),
+                               doc=staff.LiveDoc(local_machine(), temporary / "unavailable.md"),
+                               current_session=staff.StaffId("fixture-morty-session"))
+        snapshot = staff.StaffSnapshot((recipient, other, morty))
         _ = self.enterContext(patch.object(staff, "snapshot", return_value=snapshot))
         _ = self.enterContext(patch.object(review_submissions, "_identify_image", autospec=True,
                                            side_effect=identify_fixture_image))
@@ -740,7 +759,8 @@ class NewItemDialogTests(unittest.TestCase):
         for fixture in fixtures.values():
             configuration = fixture.root / "config"
             configuration.mkdir(parents=True)
-            _ = (configuration / "console.conf").write_text(f"page.builds.owner={OWNER}\n")
+            _ = (configuration / "console.conf").write_text(
+                f"page.builds.owner={OWNER}\npage.list.owner={morty.id}\n")
         capture_dialogs(temporary / "dialog.png", fixtures)
         for width, fixture in fixtures.items():
             with self.subTest(width=width), patch.dict(os.environ, fixture.environment()):
@@ -755,6 +775,8 @@ class NewItemDialogTests(unittest.TestCase):
                     assert isinstance(evidence, new_item_dialog.PageDataEvidence)
                     self.assertEqual(evidence.title, title)
                 replacement, = investigation.records(OTHER_RECIPIENT)
+                for_morty, = investigation.records(LIST_PRODUCER)
+                self.assertEqual((for_morty.owner, for_morty.question), (morty.id, "Check the queue for morty."))
                 self.assertEqual(original.question, "The first item before replacement.")
                 self.assertEqual((replacement.id, replacement.question), ("I4", "The replacement item."))
                 self.assertEqual(fixture.recipient_reads, 8)
@@ -762,10 +784,10 @@ class NewItemDialogTests(unittest.TestCase):
                 self.assertEqual(expired["token"], FORM_TOKEN)
                 self.assertEqual(refreshed, {**expired, "token": RESTARTED_TOKEN})
                 self.assertEqual(reopened, refreshed)
-                self.assertEqual(len(owner_sends), 8)
+                self.assertEqual(len(owner_sends), 9)
                 owner_ids = [post["request_id"] for post in owner_sends]
                 self.assertEqual(owner_ids[:6:2], owner_ids[1:6:2])
-                self.assertEqual(len({expired["request_id"], *owner_ids[:6:2], *owner_ids[6:]}), 6)
+                self.assertEqual(len({expired["request_id"], *owner_ids[:6:2], *owner_ids[6:]}), 7)
                 first, retry = fixture.posts[:2]
                 self.assertEqual(first, retry)
                 self.assertEqual(first.kind, review_submissions.SubmissionKind.BUG)

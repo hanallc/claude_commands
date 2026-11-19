@@ -23,7 +23,7 @@ from unittest import mock
 from urllib.request import Request
 
 from scripts.build_queue import execution_identity
-from scripts.aws_target import hana_protocol
+from scripts.aws_target import hana_protocol, hana_render
 from scripts.aws_target import hana_guest as guest, hana_receiver as receiver
 from scripts.aws_target import hana_result, hana_runner as runner, hana_source as source
 from scripts.aws_target.hana_placement import HanaHostGeneration
@@ -370,6 +370,77 @@ with mock.patch('socket.gethostname', return_value='aws-hana'):
                               result.stdout)
         self.assertEqual((slot_root / 'hana-slot1/tracked').read_text(), 'committed\n')
         self.assertFalse(cargo.exists() or shell.exists())
+
+    def test_isolated_runtime_writes_a_refusal_for_input_import_and_runtime_errors(self) -> None:
+        runtime = self.root / 'runtime'
+        for file in hana_render.runtime_files(Path(__file__).resolve().parents[2], self.fixture.configuration):
+            path = runtime / file.path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _ = path.write_bytes(file.content)
+            path.chmod(file.mode)
+        source_module = runtime / 'scripts/aws_target/hana_source.py'
+        source_text = source_module.read_text()
+        runner_module = runtime / 'scripts/aws_target/hana_runner.py'
+        runner_text = runner_module.read_text()
+        request = cast(object, json.loads(hana_protocol.encode_request(self.request)))
+        fixture_message = 'The source worker failed at /private/credentials with fixture-private-text'
+
+        for case, action, expected, diagnostic in (
+            ('arguments', 'execute', 'The Hana runner refused its arguments', 'The verified bundle range is invalid'),
+            ('input', 'execute', 'The Hana runner stopped: ValueError', 'Invalid Hana integer: output_max_bytes'),
+            ('missing-dependency', 'execute', 'The Hana runner stopped: ImportError', "cannot import name 'hana_source'"),
+            ('missing-runner', 'execute', 'The Hana runner stopped: ImportError', "cannot import name 'hana_runner'"),
+            ('runtime-error', 'execute', 'The Hana runner stopped: RuntimeError', fixture_message),
+            ('runtime-error', 'source-update', 'The Hana runner stopped: RuntimeError', fixture_message),
+            ('broken-string', 'execute', 'The Hana runner stopped: UnprintableError', '<exception str() failed>'),
+            ('broken-stderr', 'execute', 'The Hana runner stopped: RuntimeError', None),
+        ):
+            with self.subTest(case=case, action=action), self.fixture.verified_bundle(self.manifest) as bundle:
+                if case == 'missing-dependency':
+                    source_module.unlink()
+                else:
+                    _ = source_module.write_text(source_text)
+                if case == 'missing-runner':
+                    runner_module.unlink()
+                else:
+                    script = runner_text
+                    if case == 'runtime-error':
+                        operation = 'materialize_and_run' if action == 'execute' else 'materialize_source_update'
+                        script += f'\ndef {operation}(*args, **kwargs):\n    raise RuntimeError({fixture_message!r})\n'
+                    if case == 'broken-string':
+                        script += (
+                            '\nclass UnprintableError(Exception):\n'
+                            + '    def __str__(self):\n        raise RuntimeError("fixture-private-text")\n'
+                            + '\ndef materialize_and_run(*args, **kwargs):\n    raise UnprintableError()\n')
+                    if case == 'broken-stderr':
+                        script += (
+                            '\nclass UnwritableStderr:\n'
+                            + '    def write(self, text):\n        raise OSError("The diagnostic write failed")\n'
+                            + '    def flush(self):\n        pass\n'
+                            + '\ndef materialize_and_run(*args, **kwargs):\n'
+                            + '    sys.stderr = UnwritableStderr()\n    raise RuntimeError("fixture failure")\n')
+                    _ = runner_module.write_text(script)
+                fields = {'action': action, 'request': request}
+                if case != 'input':
+                    fields['output_max_bytes'] = 1024
+                size = 0 if case == 'arguments' else bundle.size
+                result = subprocess.run([sys.executable, '-IB', str(runtime / 'runner.py'),
+                    '--bundle-fd', str(bundle.descriptor), '--bundle-offset', str(bundle.offset),
+                    '--bundle-size', str(size), '--command-timeout-s', '600'],
+                    input=json.dumps(fields).encode(), pass_fds=(bundle.descriptor,), capture_output=True,
+                    cwd=runtime, env={**os.environ, 'CONF_DIR': str(runtime / 'config')},
+                    timeout=TEST_HANG_GUARD_SECS, check=False)
+                self.assertEqual(result.returncode, 0)
+                if diagnostic is None:
+                    self.assertEqual(result.stderr, b'')
+                else:
+                    self.assertIn(diagnostic.encode(), result.stderr)
+                    if case != 'arguments':
+                        self.assertIn(b'Traceback (most recent call last):', result.stderr)
+                outcome = (hana_protocol.decode_source_outcome(result.stdout) if action == 'source-update'
+                    else hana_protocol.decode_outcome(result.stdout))
+                assert isinstance(outcome, (hana_protocol.HanaExecutionRefused, hana_protocol.HanaSourceUpdateRefused))
+                self.assertEqual(outcome.reason, expected)
 
     def test_shell_failure_and_compiler_mismatch_start_no_cargo(self) -> None:
         cargo = self.root / 'cargo-started'

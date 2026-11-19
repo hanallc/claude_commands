@@ -294,6 +294,8 @@ def _submission_fingerprint(request: NewItemRequest, words: str, uploads: tuple[
     payload: list[object] = [request.kind, words, asdict(request.evidence), _image_fingerprints(uploads)]
     if request.page:
         payload.append(request.page)
+    if request.page_recipient == new_item_dialog.PageRecipient.LIST_OWNER:
+        payload.append(request.page_recipient)
     return _fingerprint(payload)
 
 
@@ -364,7 +366,8 @@ class SubmissionLookup:
 @contextmanager
 def _locked_request(address: SubmissionAddress, members: staff.StaffSnapshot | None = None, *,
                     for_send: bool = False, page: str = "", draft_fingerprint: str = "",
-                    list_recipient: staff.StaffId | None = None
+                    list_recipient: staff.StaffId | None = None,
+                    page_recipient: new_item_dialog.PageRecipient = new_item_dialog.PageRecipient.PAGE_OWNER
                     ) -> Generator[SubmissionLookup]:
     owners = {address.recipient_id}
     while True:
@@ -374,7 +377,7 @@ def _locked_request(address: SubmissionAddress, members: staff.StaffSnapshot | N
             recipient = None
             if page and draft_fingerprint:
                 current = staff.snapshot()
-                recipient = _page_send_recipient(page, address.recipient_id, current)
+                recipient = _send_recipient(address, page, current, page_recipient)
                 if recipient.id not in owners:
                     owners.add(recipient.id)
                     continue
@@ -406,7 +409,7 @@ def _locked_request(address: SubmissionAddress, members: staff.StaffSnapshot | N
             elif for_send and recipient is None:
                 assert current is not None
                 if page:
-                    recipient = _page_send_recipient(page, address.recipient_id, current)
+                    recipient = _send_recipient(address, page, current, page_recipient)
                     required = {recipient.id}
                 else:
                     required = set(investigation.owner_chain(address.recipient_id, current))
@@ -473,12 +476,6 @@ def _index_older_draft(folder: Path, kind: SubmissionKind, fingerprint: str,
                     _write_draft_marker(marker, address)
 
 
-def _draft_recipient(address: SubmissionAddress, page: str, members: staff.StaffSnapshot) -> staff.StaffRow:
-    if page:
-        return _page_send_recipient(page, address.recipient_id, members)
-    return _active_recipient(address.recipient_id, members)
-
-
 def _list_draft_matches(address: SubmissionAddress, hint: RequestFile, recipient: staff.StaffId) -> bool:
     if address.recipient_id == recipient:
         return True
@@ -519,11 +516,17 @@ def _list_draft_candidates(folder: Path, address: SubmissionAddress,
 
 @contextmanager
 def _locked_draft_request(address: SubmissionAddress, members: staff.StaffSnapshot | None, *,
-                          page: str, fingerprint: str) -> Generator[SubmissionLookup]:
+                          page: str, fingerprint: str,
+                          page_recipient: new_item_dialog.PageRecipient) -> Generator[SubmissionLookup]:
     # Lock the content across page and standard Sends.
     folder, existed = _prepare_request_folder(f"r4-{fingerprint}")
     list_recipient = address.recipient_id if page == "list" else None
-    page_marker = folder / (f"page-list-{list_recipient}" if list_recipient is not None else f"page-{page}")
+    marker = f"page-{page}"
+    if list_recipient is not None:
+        marker += f"-{list_recipient}"
+    elif page_recipient == new_item_dialog.PageRecipient.LIST_OWNER:
+        marker += f"-recipient-{address.recipient_id}"
+    page_marker = folder / marker
     standard = _draft_address(address.kind, address.recipient_id, fingerprint)
     with exclusive(folder / ".lock"):
         indexed = folder / ".indexed"
@@ -557,7 +560,7 @@ def _locked_draft_request(address: SubmissionAddress, members: staff.StaffSnapsh
                     return
             previous_addresses = []
 
-            recipient = _draft_recipient(address, page, staff.snapshot()).id
+            recipient = _send_recipient(address, page, staff.snapshot(), page_recipient).id
             recipient_marker = folder / f"recipient-{recipient}"
             candidate = _read_draft_marker(recipient_marker, address.kind, fingerprint)
             if candidate is not None and candidate not in checked:
@@ -565,7 +568,7 @@ def _locked_draft_request(address: SubmissionAddress, members: staff.StaffSnapsh
                                      list_recipient=list_recipient) as match:
                     saved = _saved_draft(match, list_recipient=list_recipient)
                     if saved is not None and saved.destination.owner == recipient:
-                        if _draft_recipient(address, page, staff.snapshot()).id != recipient:
+                        if _send_recipient(address, page, staff.snapshot(), page_recipient).id != recipient:
                             continue
                         if page:
                             _write_draft_marker(page_marker, match.address)
@@ -573,7 +576,8 @@ def _locked_draft_request(address: SubmissionAddress, members: staff.StaffSnapsh
                         return
 
             target = _draft_address(address.kind, recipient, fingerprint) if page else standard
-            with _locked_request(target, members, for_send=True, page=page, draft_fingerprint=fingerprint) as lookup:
+            with _locked_request(target, members, for_send=True, page=page, draft_fingerprint=fingerprint,
+                                 page_recipient=page_recipient) as lookup:
                 assert lookup.members is not None
                 current = lookup.recipient or _active_recipient(address.recipient_id, lookup.members)
                 if current.id != recipient:
@@ -798,6 +802,8 @@ def sent_question_scope(owner: staff.StaffId, members: staff.StaffSnapshot) -> u
 
 
 def _submission_owner_is_active(row: staff.StaffRow, members: staff.StaffSnapshot) -> bool:
+    if row.kind == "producer" and (row.id in members.pending_retire or isinstance(row.exited, staff.Exited)):
+        return False
     if _has_remote_document(row):
         return (isinstance(row.doc, staff.LiveDoc) and not isinstance(row.worktree, staff.RemovedWorktree)
                 and not isinstance(row.exited, staff.Exited) and row.id not in members.pending_retire)
@@ -825,7 +831,7 @@ def page_owner(page: str, settings: conf.ConfigRead, members: staff.StaffSnapsho
 
 def _available_page_owner(identity: staff.StaffId, members: staff.StaffSnapshot, *,
                           allow_producer: bool) -> staff.StaffRow | PageOwnerUnavailable:
-    row = members.by_id(identity)
+    row = members.rows_by_id.get(identity)
     if row is None or identity in members.pending_retire or isinstance(row.exited, staff.Exited):
         return PageOwnerUnavailable()
     if isinstance(row.doc, staff.WrappedDoc) or isinstance(row.worktree, staff.RemovedWorktree):
@@ -835,9 +841,30 @@ def _available_page_owner(identity: staff.StaffId, members: staff.StaffSnapshot,
     return PageOwnerUnavailable()
 
 
-def _page_send_recipient(page: str, bound: staff.StaffId, members: staff.StaffSnapshot) -> staff.StaffRow:
+def list_producer(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | PageOwnerUnavailable:
+    """Find the active producer that owns the List."""
+    configured = settings.origin("page.list.owner", str)
+    if isinstance(configured, conf.UnavailableValue):
+        return PageOwnerUnavailable()
+    row = members.rows_by_id.get(staff.StaffId(configured.value))
+    if (row is None or row.kind != "producer" or row.id in members.pending_retire
+            or isinstance(row.exited, staff.Exited) or isinstance(row.doc, staff.WrappedDoc)
+            or isinstance(row.worktree, staff.RemovedWorktree)):
+        return PageOwnerUnavailable()
+    return row
+
+
+def _send_recipient(address: SubmissionAddress, page: str, members: staff.StaffSnapshot,
+                    choice: new_item_dialog.PageRecipient) -> staff.StaffRow:
+    if not page:
+        return _active_recipient(address.recipient_id, members)
+    if choice == new_item_dialog.PageRecipient.LIST_OWNER:
+        producer = list_producer(conf.read_or_repository("console"), members)
+        if isinstance(producer, staff.StaffRow) and producer.id == address.recipient_id:
+            return producer
+        raise SubmissionConflict("The List owner is unavailable. Open New item again.")
     if page == "list":
-        recipient = _available_page_owner(bound, members, allow_producer=True)
+        recipient = _available_page_owner(address.recipient_id, members, allow_producer=True)
     else:
         recipient = page_owner(page, conf.read_or_repository("console"), members)
     if isinstance(recipient, PageOwnerUnavailable):
@@ -848,9 +875,14 @@ def _page_send_recipient(page: str, bound: staff.StaffId, members: staff.StaffSn
 def _active_recipient(identity: staff.StaffId, members: staff.StaffSnapshot) -> staff.StaffRow:
     row = _recipient(identity, members)
     for candidate in investigation.owner_chain(identity, members):
-        member = members.by_id(candidate)
-        if (member is not None and member.kind in ("showrunner", "producer")
-                and _submission_owner_is_active(member, members)):
+        member = members.rows_by_id.get(candidate)
+        if member is None or member.kind not in ("showrunner", "producer"):
+            continue
+        if member.kind == "producer":
+            producer = list_producer(conf.read_or_repository("console"), members)
+            if member == producer:
+                return member
+        if _submission_owner_is_active(member, members):
             return member
     raise SubmissionConflict(f"{row.name} has finished; choose another recipient")
 
@@ -882,9 +914,10 @@ def proposal_folder(recipient: staff.StaffRow) -> Path | NoNativeFolder:
 def recipient_options(members: staff.StaffSnapshot) -> list[RecipientOption]:
     """List active recipients and indicate who can receive proposals."""
     options: list[RecipientOption] = []
+    producer = list_producer(conf.read_or_repository("console"), members)
     for row in (*staff.active(members, "showrunner"), *staff.active(members, "producer")):
         try:
-            active = _submission_owner_is_active(row, members)
+            active = row == producer or _submission_owner_is_active(row, members)
         except OSError:
             continue
         if not active:
@@ -958,6 +991,8 @@ def submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None = Non
     kind = read_kind(request.kind)
     if request.page and (request.page not in page_frame.OWNER_PAGES or kind == SubmissionKind.PROPOSAL):
         raise SubmissionError("Open the New item dialog from a page owner.")
+    if not request.page and request.page_recipient != new_item_dialog.PageRecipient.PAGE_OWNER:
+        raise SubmissionError("Select a recipient from the New item dialog.")
     is_draft = DRAFT_ID.fullmatch(request_id) is not None
     if request_id.startswith(("r2-", "r3-", "r4-", "r5-")) and not is_draft:
         raise SubmissionError("Invalid draft request ID.")
@@ -987,8 +1022,10 @@ def submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None = Non
                     _check_same_request(found.destination, request, payload_hash)
                     return _complete_receipt(folder, found.destination, receipt, found.record)
 
-        locked = (_locked_draft_request(address, members, page=request.page, fingerprint=payload_hash)
-                  if is_draft else _locked_request(address, members, for_send=True, page=request.page))
+        locked = (_locked_draft_request(address, members, page=request.page, fingerprint=payload_hash,
+                                       page_recipient=request.page_recipient)
+                  if is_draft else _locked_request(address, members, for_send=True, page=request.page,
+                                                  page_recipient=request.page_recipient))
         with locked as lookup:
             hint, located, current = lookup.hint, lookup.native, lookup.members
             if is_draft:

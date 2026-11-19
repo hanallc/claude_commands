@@ -1486,7 +1486,8 @@ class ReviewPageTests(unittest.TestCase):
   const stale=form('page-owner/C4');
   const conflictVersion=document.querySelector('[data-review]').dataset.version;
   stale.requestSubmit(stale.querySelector('button[value=works]'));
-  await until(()=>!row('page-owner/C4') && document.querySelector('[data-review]').dataset.version!==conflictVersion,
+  await until(()=>!row('page-owner/C4') && !stale.dataset.sending &&
+   document.querySelector('[data-review]').dataset.version!==conflictVersion,
    'the refreshed view without the completed row');
   const conflictNotice=document.querySelector('[data-review-notice]');
   check(document.querySelector('[data-review]').dataset.show==='open' &&
@@ -2345,15 +2346,16 @@ window.fetch=async(url,options)=>{
     'F003: a legacy investigation reset clears both owner constraints and shows the All rows');
   translated.remove();
   chooseType('question');chooseOwner(ownerChips().find(button=>button.dataset.ownerName==='page-owner')?.dataset.ownerChip);
+  const questionOwner=selectedOwner().dataset.ownerChip;
+  const hasEmptyOwnerSelection=()=>ownerChips().length===2 && ownerChips()[0].textContent==='All 0' &&
+   selectedOwner().dataset.ownerChip===questionOwner && selectedOwner().textContent==='page-owner 0';
   const question=document.querySelector('[data-type="question"]');question.querySelector('.list-toggle').click();await readyReviewCard(question);
   const form=question.querySelector('[data-review-form]');form.elements.feedback.value='Use this layout.';
   form.querySelector('[value="answer"]').click();await new Promise(resolve=>nativeTimeout(resolve,1100));
-  check(ownerChips().length===1 && ownerChips()[0].textContent==='All 0' && !question.isConnected &&
-    count('all').textContent==='0',
+  check(hasEmptyOwnerSelection() && !question.isConnected && count('all').textContent==='0',
     'A save removes the completed question from the Owner and State counts.');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();await flush();
-  check(ownerChips().length===1 && ownerChips()[0].textContent==='All 0' &&
-    count('all').textContent==='0',
+  check(hasEmptyOwnerSelection() && count('all').textContent==='0',
     'Refresh keeps the completed question out of the counts.');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
@@ -2875,6 +2877,15 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 self.assertIn('<label class="later-time">Time<input type="text" inputmode="numeric" autocomplete="off" data-later-time></label>',form)
                 self.assertIn('value="later">Save',form)
                 self.assertNotIn('value="skip"',form)
+
+    def test_review_render_reads_card_motion_settings(self) -> None:
+        before = review_page.build_snapshot(self.root)
+        settings = self.fixture.temporary / "config/review_links.conf"
+        _ = write_config_fixture(settings, "card_fade_out_ms=365\ncard_fade_in_ms=725\n")
+        after = review_page.build_snapshot(self.root)
+        self.assertNotEqual(after.version, before.version)
+        self.assertIn(b'data-card-fade-out-ms="365" data-card-fade-in-ms="725"', after.render())
+        self.assertIn(b'"cardFadeOutMs": 365, "cardFadeInMs": 725', after.index_response())
 
     def test_later_presets_read_their_settings(self) -> None:
         for minutes, label in ((1,'In 1 minute'),(90,'In 90 minutes'),(60,'In 1 hour'),(120,'In 2 hours')):
@@ -3461,24 +3472,27 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         markup = page.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
         self.assertEqual(firefox_probe_results(markup.encode()), [[]])
 
-    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
-    def test_new_bug_opens_after_refresh_and_keeps_the_matching_owner_filter(self) -> None:
+    def new_item_filter_page(self, kind: new_item_dialog.SubmissionKind, *, matches_filters: bool = False) -> bytes:
         owner = self.ready_submission_recipient()
         _ = self.question('Keep this question')
         cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
         before = cache.get()
-        created = cache.create_submission(self.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id))
+        request = self.submission_request(kind, owner.id)
+        if matches_filters:
+            request = replace(request, words='Keep this question too.')
+        created = cache.create_submission(request)
         fresh = cache.get()
         values = {
-            'owner': owner.id, 'key': created.key, 'id': created.saved.id,
+            'owner': owner.id, 'key': created.key, 'id': created.saved.id, 'kind': kind,
+            'words': request.words, 'matches': matches_filters,
             'body': fresh.body(created.key).decode(), 'snapshot': cast(object, json.loads(fresh.index_response())),
         }
         setup = r'''<script>
 const fixture=FIXTURE, nativeFetch=fetch;
 let sent=false;
-history.replaceState(null,'','#'+new URLSearchParams({
- owner:fixture.owner,type:'question',show:'open',q:'keep this question'
-}));
+const selection={owner:fixture.owner,type:fixture.matches?fixture.kind:'question',
+ show:fixture.matches?'all':'open',q:'keep this question'};
+history.replaceState(null,'','#'+new URLSearchParams(selection));
 window.fetch=async(url,options={})=>{
  const route=new URL(url,location.href);
  if(route.pathname==='/console/review/new-item'){
@@ -3486,7 +3500,7 @@ window.fetch=async(url,options={})=>{
    sent=true;
    return Response.json({id:fixture.id,key:fixture.key,version:fixture.snapshot.version});
   }
-  return Response.json({token:'fixture',recipients:[{id:fixture.owner,name:'page-owner'}]});
+  return Response.json({token:'fixture',recipients:[{id:fixture.owner,name:'page-owner',proposal:true}]});
  }
  if(sent && route.searchParams.has('body')) return new Response(fixture.body,{
   headers:{'X-Review-Version':fixture.snapshot.version}
@@ -3501,7 +3515,7 @@ window.fetch=async(url,options={})=>{
  const review=document.querySelector('[data-review]'), dialog=document.querySelector('#review-new-item');
  const params=()=>new URLSearchParams(location.hash.slice(1));
  try {
-  const previous=history.length;
+  const previous=history.length, previousHash=location.hash;
   check(params().get('owner')===fixture.owner, 'The original owner filter is active.');
   const recipients=dialog.querySelector('[data-recipients]');
   const ready=new Promise(resolve=>{
@@ -3513,33 +3527,53 @@ window.fetch=async(url,options={})=>{
   });
   document.querySelector('[data-review-new]').click();
   if(!dialog.open) throw new Error('New must open the dialog.');
-  dialog.querySelector('[name="kind"][value="bug"]').click();
+  dialog.querySelector('[name="kind"][value="'+fixture.kind+'"]').click();
   (await ready).click();
   const words=dialog.querySelector('[name="words"]');
-  words.value='Check the Bug record.';
+  words.value=fixture.words;
   words.dispatchEvent(new Event('input',{bubbles:true}));
   const refreshed=new Promise(resolve=>review.addEventListener('review-refreshed',resolve,{once:true}));
   dialog.querySelector('[type="submit"]').click();
   await refreshed;
   const row=review.querySelector('[data-key="'+CSS.escape(fixture.key)+'"]');
-  check(row?.dataset.type==='bug' && !row.hidden && row.querySelector('[data-detail]').hidden===false,
-        'The refreshed index reveals and opens the new Bug.');
-  check(params().get('item')===fixture.key && params().get('show')==='all' &&
-        !params().get('type') && !params().get('q') && params().get('owner')===fixture.owner,
-        'The jump keeps the matching owner and clears the filters that hide the new Bug.');
-  check(history.length===previous+1, 'The jump adds one history entry.');
-  if(history.length===previous+1){
-   const restored=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
-   history.back();
-   await restored;
-   check(params().get('type')==='question' && params().get('show')==='open' &&
-         params().get('q')==='keep this question', 'Back restores the former filters.');
+  check(Object.entries(selection).every(([key,value])=>params().get(key)===value),
+        'Send keeps every filter in the address.');
+  check(review.querySelector('[data-show-chip][aria-pressed="true"]').dataset.showChip===selection.show &&
+   review.querySelector('[data-type-chip][aria-pressed="true"]').dataset.typeChip===selection.type &&
+   review.querySelector('[data-owner-chip][aria-pressed="true"]').dataset.ownerChip===selection.owner &&
+   review.querySelector('#list-search').value===selection.q,'Send keeps each selected control.');
+  if(fixture.matches){
+   check(row && !row.querySelector('[data-detail]').hidden,'The new item opens when it matches the filters.');
+   check(history.length===previous+1,'Opening the item adds one history entry.');
+   if(history.length===previous+1){
+    const restored=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+    history.back();
+    await restored;
+    check(location.hash===previousHash && !params().has('item') &&
+     review.querySelector('[data-key="'+CSS.escape(fixture.key)+'"] [data-detail]').hidden,
+     'Back restores the previous filters and closes the new item.');
+   }
+  }else{
+   check(!row && history.length===previous,'Send keeps a hidden item outside the view.');
+   check(review.querySelector('[data-review-notice]').textContent==='Saved '+fixture.id+'.',
+         'A hidden item has a save confirmation.');
   }
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
         markup = before.render().decode().replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>', 1)
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        return markup.encode()
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_new_items_keep_every_review_filter(self) -> None:
+        for kind in new_item_dialog.SubmissionKind:
+            with self.subTest(kind=kind):
+                self.assertEqual(firefox_probe_results(self.new_item_filter_page(kind)), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_new_item_opens_when_it_matches_every_review_filter(self) -> None:
+        page = self.new_item_filter_page(new_item_dialog.SubmissionKind.QUESTION, matches_filters=True)
+        self.assertEqual(firefox_probe_results(page), [[]])
 
     def test_the_reader_counts_only_for_you_across_all_five_stores(self) -> None:
         _ = self.investigation()
@@ -3882,14 +3916,18 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
    const clip=motion()?.querySelector('.record-motion-clip'),exit=clip?.getAnimations()[0];
    if(!exit) throw new Error('The shared exit animation is missing.');
    check(motion().querySelector('[data-detail]:not([hidden])'),'The motion copy includes the open card.');
-   check(exit.effect.getTiming().duration===200,'The motion lasts 200 ms.');
+   check(exit.effect.getTiming().duration===Number(document.querySelector('[data-review]').dataset.cardFadeOutMs),
+    'The card uses the configured fade time.');
    exit.pause();exit.currentTime=0;
    const initialOpacity=Number(getComputedStyle(clip).opacity);
    check(Math.abs(top(next)-start)<2,'The next card starts in its original position.');
-   exit.currentTime=100;
+   exit.currentTime=exit.effect.getTiming().duration/2;
    const opacity=Number(getComputedStyle(clip).opacity);
    check(opacity>0 && opacity<initialOpacity,'The motion copy fades before it disappears.');
    check(top(next)<start && top(next)>first,'The next card moves up during the fade.');
+   const submitter=form.querySelector('button[value="'+action+'"]');
+   form.dispatchEvent(new SubmitEvent('submit',{cancelable:true,submitter}));
+   check(posts.length===1,'A second submit during the fade sends no POST.');
    exit.finish();await exit.finished;
    check(!motion() && Math.abs(top(next)-first)<2,'The next card fills the gap when the copy leaves.');
   }
@@ -3897,7 +3935,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         cases = [(action, False) for action in ('works', 'not works', 'validate', 'question', 'feedback', 'later')]
-        for action, reduced in [*cases, ('question', True)]:
+        for action, reduced in [*cases, ('later', True)]:
             with self.subTest(action=action, reduced_motion=reduced):
                 markup = source.replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
                 markup = markup.replace('REDUCED', json.dumps(reduced)).replace('ACTION', json.dumps(action))
@@ -3927,7 +3965,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  check(clip && near(top(clip),before),'The tall copy starts at the original position.');
  check(next.isConnected && near(top(next),following),'The visible next card keeps its position.');
  const exit=clip.getAnimations()[0];
- exit.currentTime=100;dispatchEvent(new Event('scroll'));await frame();
+ halfway(exit);dispatchEvent(new Event('scroll'));await frame();
  check(near(top(clip),before),'The shrinking copy keeps its place after a redraw.');
  check(next.isConnected && top(next)<following,'The next card stays mounted while it moves up.');
  const saveTop=scrollY,height=clip.getBoundingClientRect().height,key=row.dataset.key;
@@ -3976,7 +4014,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  form.querySelector('[data-later-toggle]').click();
  form.querySelector('[data-later-preset="soon"]').click();
  const clip=copy(panel),exit=clip.getAnimations()[0];
- exit.currentTime=100;
+ halfway(exit);
  const position=top(clip);
  posts.get(row.dataset.key)({ok:true,json:async()=>({answer:'later',state:'Open',later:Date.now()+3600000})});
  await frame();
@@ -3986,27 +4024,67 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  if(CANCEL) document.querySelector('[data-sort="3"]').click();
  else exit.finish();
  await frame();
- check(!copy(panel) && selected()?.dataset.ownerChip==='' && owner.hidden,
-  'The Owner filter resets when the fade ends or the redraw cancels it.');
- check(rows().length===1 && rows()[0].dataset.key==='builds/C1' && posts.size===1,
-  'The deferred save hides the card and shows the other owner’s card after one POST.');
+ check(!copy(panel) && selected()===owner && !owner.hidden,
+  'The Owner filter stays selected after the fade.');
+ check(!rows().length && posts.size===1,'Later hides the last card in this view.');
  check(postCount===1,'Later sends exactly one POST.');
 """.replace('CANCEL', json.dumps(cancel)))
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_review_card_submits_keep_every_filter(self) -> None:
+        _ = self.question('Keep this question')
+        source = browser_markup(self.root)
+        for kind, outcome, state in (
+            ('question', 'answer', 'Done'),
+            ('change', 'works', 'Done'),
+            ('change', 'not works', 'Done'),
+            ('change', 'feedback', 'Validating'),
+            ('change', 'question', 'Validating'),
+            ('change', 'validate', 'Validating'),
+        ):
+            with self.subTest(outcome=outcome):
+                settings = json.dumps({'kind': kind, 'outcome': outcome, 'state': state})
+                self.check_card_motion(source, 'const action='+settings+r""";
+ const initial=rows().find(row=>row.dataset.type===action.kind);
+ const filters={type:action.kind,show:'open',owner:initial.dataset.owner,q:initial.dataset.number};
+ history.replaceState(null,'','#'+new URLSearchParams(filters));
+ dispatchEvent(new HashChangeEvent('hashchange'));
+ const row=rows().find(row=>row.dataset.key===initial.dataset.key);
+ const form=await openCard(row);
+ form.elements.feedback.value='Save these words.';
+ form.requestSubmit(form.querySelector('[value="'+action.outcome+'"]'));
+ const clip=copy(panelId(row));
+ const motion=clip?.getAnimations()[0];
+ if(!motion || !posts.has(row.dataset.key)) throw new Error('The save must start the fade.');
+ posts.get(row.dataset.key)({ok:true,json:async()=>({answer:'saved',state:action.state,later:0})});
+ motion.finish();await frame();
+ if(action.state==='Done') check(!rows().some(item=>item.dataset.key===row.dataset.key),
+  'The completed item leaves Review.');
+ const place=new URLSearchParams(location.hash.slice(1));
+ check(Object.entries(filters).every(([key,value])=>place.get(key)===value),
+  'The card submit keeps every filter in the address.');
+ check(document.querySelector('[data-type-chip][aria-pressed="true"]').dataset.typeChip===filters.type &&
+  document.querySelector('[data-show-chip][aria-pressed="true"]').dataset.showChip===filters.show &&
+  document.querySelector('[data-owner-chip][aria-pressed="true"]').dataset.ownerChip===filters.owner &&
+  document.querySelector('#list-search').value===filters.q,'The card submit keeps each selected control.');
+""")
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_refused_card_reverses_above_the_next_departing_card(self) -> None:
         self.check_card_motion(browser_markup(self.root), r"""
  const [first,second,next]=rows(),firstPanel=panelId(first),secondPanel=panelId(second);
  const firstForm=await openCard(first);send(firstForm);
- const firstClip=copy(firstPanel);firstClip.getAnimations()[0].currentTime=100;
+ const firstClip=copy(firstPanel);halfway(firstClip.getAnimations()[0]);
  const secondForm=await openCard(second);send(secondForm);
- const secondClip=copy(secondPanel);secondClip.getAnimations()[0].currentTime=100;
+ const secondClip=copy(secondPanel);halfway(secondClip.getAnimations()[0]);
  const height=firstClip.getBoundingClientRect().height,opacity=Number(getComputedStyle(firstClip).opacity);
  const following=top(next);
  posts.get(first.dataset.key)({ok:false,json:async()=>({reason:'Try again.'})});
  await frame();
  const restored=copy(firstPanel);
  check(restored && restored!==firstClip,'The refused card reverses its fade.');
+ check(restored?.getAnimations()[0]?.effect.getTiming().duration===
+   Number(document.querySelector('[data-review]').dataset.cardFadeInMs),'The return uses the configured duration.');
  check(restored && top(restored)<top(secondClip),'The first card returns above the departing second card.');
  check(restored && near(restored.getBoundingClientRect().height,height) &&
    near(Number(getComputedStyle(restored).opacity),opacity,0.01),'The reverse starts at the current height and opacity.');
@@ -4020,10 +4098,10 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  const firstKey=first.dataset.key;
  send(await openCard(first));
  const firstExit=copy(firstPanel).getAnimations()[0];
- firstExit.currentTime=100;
+ halfway(firstExit);
  send(await openCard(second));
  const secondClip=copy(secondPanel),secondExit=secondClip.getAnimations()[0];
- secondExit.currentTime=100;
+ halfway(secondExit);
  posts.get(firstKey)({ok:false,json:async()=>({reason:'Try again.'})});
  await frame();
  const returning=copy(firstPanel),returnFade=returning.getAnimations()[0];
@@ -4050,7 +4128,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  check([first,row,next].every(node=>node.dataset.state==='Open'),'Three open cards are sorted by State.');
  send(await openCard(row));
  const clip=copy(panel),exit=clip.getAnimations()[0];
- exit.currentTime=100;
+ halfway(exit);
  const position=top(clip),following=top(next);
  check(top(first)<position && position<following,'The departing card starts between its neighbors.');
  posts.get(row.dataset.key)({ok:true,json:async()=>({answer:'works',state:'Done',later:0})});
@@ -4115,6 +4193,7 @@ Element.prototype.animate=function(...args){
  const frame=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
  const rows=()=>[...document.querySelectorAll('[data-list-item]')];
  const top=node=>node.getBoundingClientRect().top;
+ const halfway=animation=>{animation.currentTime=animation.effect.getTiming().duration/2;};
  const near=(a,b,tolerance=2)=>Math.abs(a-b)<tolerance;
  const panelId=row=>row.querySelector('.list-toggle').getAttribute('aria-controls');
  const copy=panel=>document.querySelector('.record-motion-clip [aria-controls="'+CSS.escape(panel)+'"]')?.closest('.record-motion-clip');
@@ -4259,7 +4338,8 @@ window.fetch=(url,options={})=>{
     const index=JSON.parse(content.querySelector('[data-review-index]').textContent);
     snapshot={index,version:'handoff-publication-pending',facts:pageRefreshFacts()};
    }
-   finishSave();await saved;await refreshed;
+   finishSave();await saved;
+   await refreshed;
    const target=row(key),item=new URLSearchParams(location.hash.slice(1)).get('item');
    if(action==='validate'){
     if(item!==key || content.dataset.version!==snapshot.version || row(key))
@@ -4331,7 +4411,7 @@ window.fetch=(url,options={})=>{
    ?.closest('.record-motion-clip');
   const exit=clip?.getAnimations()[0];
   if(!exit) throw new Error('The Question must fade during the save.');
-  exit.pause();exit.currentTime=100;
+  exit.pause();exit.currentTime=exit.effect.getTiming().duration/2;
   const back=afterHash('Back');history.back();await back;
   if(item()!==change) failures.push('Back restores the pending Change link.');
   if(REFUSE_QUESTION){
@@ -4342,7 +4422,7 @@ window.fetch=(url,options={})=>{
    Element.prototype.animate=function(keyframes,options){
     const motion=animate.call(this,keyframes,options);
     if(this.classList.contains('record-motion-clip') && keyframes.at(-1).opacity===1){
-     motion.pause();motion.currentTime=100;returning={clip:this,motion};
+     motion.pause();motion.currentTime=motion.effect.getTiming().duration/2;returning={clip:this,motion};
     }
     return motion;
    };
@@ -4501,11 +4581,12 @@ window.fetch=(url,options={})=>{
      CSS.escape(row.querySelector('.list-toggle').getAttribute('aria-controls'))+'"]')?.closest('.record-motion-clip');
     const exit=clip?.getAnimations()[0];
     if(!exit) throw new Error('The Change must fade during the save.');
-    exit.pause();exit.currentTime=100;
+    const midpoint=exit.effect.getTiming().duration/2;
+    exit.pause();exit.currentTime=midpoint;
     await follow({show:'all',owner});
     finishVerdict();
     await saved;
-    check(clip.isConnected && exit.currentTime===100 && !change(key),
+    check(clip.isConnected && exit.currentTime===midpoint && !change(key),
      'The link waits for the fade after the save.');
     if(clip.isConnected){
      exit.finish();await exit.finished;
