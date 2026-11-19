@@ -17,7 +17,7 @@ from scripts.direct import assign, phase_table
 from scripts.direct.assign_claude_test_support import direct_launcher_helpers
 from scripts.direct.findings_test_support import invoke_findings
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
-from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
+from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.test_models_registry import write_registry
@@ -193,24 +193,19 @@ def assignment_environment(bytecode_setting: str) -> Generator[None]:
     config = Path(os.environ["CONF_DIR"])
     for stem, settings in ASSIGNMENT_SETTINGS.items():
         _ = (config / f"{stem}.conf").write_text(settings)
-    git_config = write_fixture_git_config(config)
     cache = Path.home() / ".cache"
     seed_interpreter_cache(cache)
     environment = {
+        **fixture_git_environment(config),
         "CLAUDE_PYTHON": "", "XDG_CACHE_HOME": str(cache),
         "PYTHONDONTWRITEBYTECODE": bytecode_setting,
         "STAFF_CONFIG": str(config / "staff.conf"),
         "COPIES_CONFIG": str(config / "copies.conf"),
         "LINT_CONFIG_FILE": str(config / "lint.conf"),
         "USER_ZONE": "America/New_York",
-        "GIT_CONFIG_GLOBAL": str(git_config), "GIT_CONFIG_NOSYSTEM": "1",
         "PROCESS_TABLE_PS": "sh -c :",
     }
-    with patch.dict(os.environ), patch.object(process_table, "PS", ["sh", "-c", ":"]):
-        for name in tuple(os.environ):
-            if name.startswith("GIT_"):
-                del os.environ[name]
-        os.environ.update(environment)
+    with patch.dict(os.environ, environment, clear=True), patch.object(process_table, "PS", ["sh", "-c", ":"]):
         yield
 
 
