@@ -199,6 +199,7 @@ class VerifyDocFixture(unittest.TestCase):
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
         })
         private = private_slot_config(self.root, repository=self.repo.name)
+        _ = write_config_fixture(Path(private.environment["COPIES_CONFIG"]), "git_timeout_seconds=600\n")
         configuration = Path(self.environment["CONF_DIR"])
         _ = shutil.copy2(private.settings, configuration / "build_folders.conf")
         self.environment.update({key: value for key, value in private.environment.items() if key != "CONF_DIR"})

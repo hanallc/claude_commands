@@ -2008,9 +2008,28 @@ finish_tree_watch() {
     TREE_WATCH_DIR=""
 }
 
+# Match the checkout selection for Python on standard input.
+doc_staged_helper() {
+    local folder script="$VERIFY_START_DIR/doc_step.py"
+    folder=$(pwd -P) || return
+    while :; do
+        if [[ -f "${folder%/}/scripts/lib/py" ]]; then
+            if [[ "$folder" != "${VERIFY_START_DIR%/*/*}" ]]; then
+                VERIFY_PY_HELPER=DOC_STEP_PY "$PY" - "$script" "$@" < "$script"
+                return
+            fi
+            break
+        fi
+        [[ "$folder" != / ]] || break
+        folder=${folder%/*}
+        folder=${folder:-/}
+    done
+    verify_helper "$script" "$@"
+}
+
 # Read the staged tree through the copy owner's private index.
 doc_tree() {
-    verify_helper "$VERIFY_START_DIR/doc_step.py" "${1:-tree}" "$DOC_REPO_TOP"
+    doc_staged_helper "${1:-tree}" "$DOC_REPO_TOP"
 }
 
 doc_checkout() {
@@ -2078,7 +2097,7 @@ step_close_checkout() {
 }
 
 doc_record() {
-    verify_helper "$VERIFY_START_DIR/doc_step.py" record "$DOC_REPO_TOP" "$DOC_TREE" "$BUILDLOG_CALL_ID"
+    doc_staged_helper record "$DOC_REPO_TOP" "$DOC_TREE" "$BUILDLOG_CALL_ID"
 }
 
 # note_event OUTCOME WAIT WALL BUILD SAVED STATUS: this call's one record in

@@ -2,16 +2,19 @@
 """Read the staged tree and record a doc pass."""
 from __future__ import annotations
 
+from pathlib import Path
+import sys
+
+_script = sys.argv.pop(1) if __name__ == "__main__" and sys.argv[0] == "-" else __file__
 try:
-    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+    with (Path(_script).parent / "../lib/package_root.py").open() as _package_root:
+        exec(_package_root.read(), {"__file__": _package_root.name})
 except FileNotFoundError:
     pass
 
 from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
-import sys
 import tempfile
 import time
 
