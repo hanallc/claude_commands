@@ -5426,3 +5426,25 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - impl: the test module, its support and any scratch.py cause.
 
 **Acceptance gate:** 40 loaded runs pass; basedpyright clean on changed files; the full suite is green.
+
+### Phase 379 — the Mac run test halves its AWS CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `production/test_mac_run.py` uses half its AWS gate CPU (42.4 s median, 44.2 s wall, 20 tests on 2026-11-19).
+
+**Spec:**
+- AWS rank 9 on 2026-11-19 01:46 EST. Ranks above it have phases, or are verify.sh modules for phase 375. Phase 342 measured 26.1 CPU s on a pair; gate medians since then are 35-60 CPU s. Slowest kept tests: `test_a_signal_leaves_the_cleanup_to_the_mac_and_the_next_run`, `test_successful_clone_cleanup_removes_both_registry_records`, `test_old_mirror_cleanup_removes_the_clone_and_both_registry_records`.
+- Phase 342 named the largest cost left: 59 local `copies.py` starts (7.2 CPU s).
+1. Measure with `module_cost.py --tests 20 --commands 20` like the gate: fresh TMPDIR on /tmp, bytecode on. Name the top commands and fixtures and their CPU share. Count the Git and `copies.py` starts and say which ones each test needs.
+2. Cut the cost at its cause: repeated repository or registry setup, Python starts, or polling. Share setup per class where the tests stay independent. Replace fixed waits with an event the test drives.
+3. Name any cause in `mac_run` or `copies.py` production code; fix it there when it also costs production runs.
+- Every assertion remains. Tests read no /tune-changeable value. No lazy imports, no copies, no signal handlers.
+
+**Files:** scripts/production/test_mac_run.py; its test support; the mac_run production code only when the cost lives there.
+
+**Workers:** 1 writer. One module and its subject.
+- impl: the test module, its support and any production cause.
+
+**Acceptance gate:** an AWS pair (3 rounds) shows the median CPU at half or less, or a floor result with its cause; the module passes 20 times under load in a 2 GB scope; the full suite is green.
