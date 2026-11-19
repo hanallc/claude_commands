@@ -4,19 +4,24 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
+import shutil
 import stat
 import subprocess
 import sys
+from collections import OrderedDict
 from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from itertools import chain
 from pathlib import Path
+from threading import Lock
 from typing import NamedTuple, cast
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_bytes_atomic, write_text_atomic
 from scripts.lib.file_lock import exclusive
+from scripts.lib import git_files
 from scripts.agents.remote import local_machine
 from scripts.production import issues, staff
 from scripts.production.issues import ALL_FIELDS, Issue, header_fields, source_paths
@@ -84,13 +89,140 @@ def issues_folder(doc: Path, *, lines: list[str] | None = None) -> Path | None:
     return folder if folder.is_absolute() else doc.parent.parent.parent / folder
 
 
-def historical_issue_folders(doc: Path) -> Iterator[Path]:
-    """Read previous Proposals settings from the document's Git history."""
-    if not os.environ.get("GIT_DIR"):
-        root = next((folder for folder in doc.resolve().parents
-                     if (folder / ".git").exists() or (folder / "HEAD").is_file() and (folder / "objects").is_dir()), None)
-        if root is None or root.name == ".git" and (root / "objects").is_dir():
+FileStamp = tuple[int, int, int, int, int, int]
+MISSING_STAMP: FileStamp = (0, 0, 0, 0, 0, 0)
+
+
+def file_stamp(path: Path) -> FileStamp:
+    """Stamp a file without its access time."""
+    try:
+        status = path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return MISSING_STAMP
+    return (status.st_mode, status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns)
+
+
+@dataclass(frozen=True)
+class _FolderHistory:
+    query: Path
+    environment: tuple[tuple[str, str], ...]
+    stamps: dict[Path, FileStamp]
+    folders: tuple[Path, ...]
+
+
+_history_cache: OrderedDict[Path, _FolderHistory] = OrderedDict()
+_history_lock = Lock()
+_HISTORY_LIMIT = 128
+_INCLUDE_SECTION = re.compile(r"^\[\s*include(?:if)?(?=[.\s\]])", re.IGNORECASE)
+_INCLUDE_PATH = re.compile(r"^path\s*=\s*(.*)$", re.IGNORECASE)
+_HISTORY_OVERRIDES = ("GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_SHALLOW_FILE",
+                      "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES")
+
+
+def _config_includes(path: Path) -> Iterator[Path]:
+    """Track every include, including paths under conditions that currently fail."""
+    text = path.read_text(encoding="utf-8-sig", errors="surrogateescape")
+    include = False
+    for line in text.replace("\\\n", "").split("\n"):
+        line = line.strip()
+        if line.startswith("["):
+            include = _INCLUDE_SECTION.match(line) is not None
+            line = line.rpartition("]")[2].lstrip()
+        if not include or (match := _INCLUDE_PATH.fullmatch(line)) is None:
+            continue
+        value = match[1]
+        if re.search(r"\\[ntb]", value) or "%(" in value:
+            raise ValueError("The Git include path needs Git to expand it.")
+        lexer = shlex.shlex(value, posix=True)
+        lexer.whitespace = ""
+        lexer.whitespace_split = True
+        lexer.commenters = "#;"
+        location = "".join(lexer).strip()
+        if location:
+            yield path.parent / Path(location).expanduser()
+
+
+def _history_inputs(root: Path, doc: Path, sources: list[Path] | None) -> dict[Path, FileStamp]:
+    stamps: dict[Path, FileStamp] = {}
+
+    def track(path: Path) -> FileStamp:
+        if path not in stamps:
+            if sources is not None:
+                sources.append(path)
+            stamps[path] = file_stamp(path)
+        return stamps[path]
+
+    def track_tree(path: Path) -> None:
+        if not stat.S_ISDIR(track(path)[0]):
             return
+        if path.is_symlink():
+            raise ValueError("Git must read the linked ref directory.")
+        for child in path.iterdir():
+            if not child.name.endswith(".lock"):
+                track_tree(child)
+
+    # A new nested checkout changes the repository that Git finds.
+    for parent in doc.parents:
+        if parent == root:
+            break
+        _ = track(parent / ".git")
+    marker = root / ".git"
+    if marker.exists():
+        if not marker.is_dir() or marker.is_symlink():
+            _ = track(marker)
+        checkout = git_files.at(root)
+        git_dir, common = checkout.git_dir, checkout.common_dir
+        _ = track(git_dir / "commondir")
+        if git_files.at(root) != checkout:
+            raise ValueError("The Git directory changed during the read.")
+    else:
+        _ = track(marker)
+        git_dir = common = root
+    for name in ("packed-refs", "shallow", "info/grafts"):
+        _ = track(common / name)
+
+    worktrees = common / "worktrees"
+    directories = {common, git_dir}
+    if stat.S_ISDIR(track(worktrees)[0]):
+        directories.update(path for path in worktrees.iterdir() if path.is_dir())
+    for directory in directories:
+        for name in ("HEAD", "gitdir"):
+            _ = track(directory / name)
+        for name in ("refs", "reftable"):
+            track_tree(directory / name)
+
+    global_config = os.environ.get("GIT_CONFIG_GLOBAL")
+    system_config = os.environ.get("GIT_CONFIG_SYSTEM")
+    xdg_config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    configs = [common / "config", git_dir / "config.worktree"]
+    configs.extend([doc.parent / global_config] if global_config else
+                   [doc.parent / xdg_config / "git/config", Path.home() / ".gitconfig"])
+    if system_config:
+        configs.append(doc.parent / system_config)
+    else:
+        configs.append(Path("/etc/gitconfig"))
+        if executable := shutil.which("git"):
+            configs.append(Path(executable).resolve().parent.parent / "etc/gitconfig")
+    seen: set[Path] = set()
+    while configs:
+        config = Path(os.path.abspath(configs.pop()))
+        if config in seen:
+            continue
+        seen.add(config)
+        if stat.S_ISREG(track(config)[0]):
+            configs.extend(_config_includes(config))
+    return stamps
+
+
+def _stamps_match(stamps: Mapping[Path, FileStamp]) -> bool:
+    try:
+        return all(file_stamp(path) == stamp for path, stamp in stamps.items())
+    except OSError:
+        return False
+
+
+def _read_folder_history(doc: Path) -> tuple[Path, ...] | None:
     try:
         result = subprocess.run(["git", "-C", str(doc.parent), "log", "--all", "--follow", "--format=", "--no-ext-diff",
                                  "--no-textconv", "-p", "--", doc.name], capture_output=True, text=True, timeout=5)
@@ -99,12 +231,60 @@ def historical_issue_folders(doc: Path) -> Iterator[Path]:
     if result.returncode != 0:
         if "not a git repository" not in result.stderr:
             raise OSError(f"Cannot read folder history for {doc}: {result.stderr.strip()}")
-        return
+        return None
     prefix = f"- **{PROPOSALS_FIELD}:**"
+    folders: list[Path] = []
     for line in result.stdout.split("\n"):
         if line.startswith(("+" + prefix, "-" + prefix)):
             if (folder := issues_folder(doc, lines=[line[1:]])) is not None:
-                yield folder
+                folders.append(folder)
+    return tuple(folders)
+
+
+def historical_issue_folders(doc: Path, *, sources: list[Path] | None = None) -> Iterator[Path]:
+    """Reuse successful Git history until a repository input changes."""
+    if os.environ.get("GIT_DIR"):
+        yield from _read_folder_history(doc) or ()
+        return
+    resolved = doc.resolve()
+    query = doc.absolute()
+    environment = tuple(sorted((key, value) for key, value in os.environ.items()
+                               if key.startswith("GIT_") or key in ("HOME", "PATH", "XDG_CONFIG_HOME")))
+    with _history_lock:
+        cached = _history_cache.get(resolved)
+        if cached is not None:
+            _history_cache.move_to_end(resolved)
+    if cached is not None and cached.query == query and cached.environment == environment:
+        if sources is not None:
+            sources.extend(cached.stamps)
+        if _stamps_match(cached.stamps):
+            yield from cached.folders
+            return
+
+    root = next((folder for folder in resolved.parents
+                 if (folder / ".git").exists() or (folder / "HEAD").is_file() and (folder / "objects").is_dir()), None)
+    if root is None or root.name == ".git" and (root / "objects").is_dir():
+        return
+    stamps: dict[Path, FileStamp] = {}
+    command_includes = any(key.startswith("GIT_CONFIG_KEY_") and value.lower().startswith(("include.", "includeif."))
+                           or key == "GIT_CONFIG_PARAMETERS" and re.search(r"\binclude(?:if)?\.", value, re.IGNORECASE)
+                           for key, value in environment)
+    if not command_includes and not any(os.environ.get(name) for name in _HISTORY_OVERRIDES):
+        try:
+            stamps = _history_inputs(root, resolved, sources)
+        except (OSError, RuntimeError, ValueError):
+            # Git still reports the original result or error when metadata cannot be stamped.
+            pass
+    folders = _read_folder_history(doc)
+    if folders is None:
+        return
+    if stamps and _stamps_match(stamps):
+        with _history_lock:
+            _history_cache[resolved] = _FolderHistory(query, environment, stamps, folders)
+            _history_cache.move_to_end(resolved)
+            if len(_history_cache) > _HISTORY_LIMIT:
+                _ = _history_cache.popitem(last=False)
+    yield from folders
 
 
 def known_folders(kind: RecordKind, owner: staff.StaffId, current: Iterable[Path] = (),
@@ -146,7 +326,7 @@ def known_folders(kind: RecordKind, owner: staff.StaffId, current: Iterable[Path
                         raise
             if include_history:
                 try:
-                    roots.extend(historical_issue_folders(document))
+                    roots.extend(historical_issue_folders(document, sources=sources))
                 except (OSError, UnicodeError):
                     if strict and require_document:
                         raise
