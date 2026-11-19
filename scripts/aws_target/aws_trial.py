@@ -7,12 +7,13 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Callable, Sequence
-from contextlib import ExitStack, redirect_stdout
+from contextlib import redirect_stdout
 from dataclasses import asdict, dataclass
 from decimal import Decimal
 from datetime import UTC, datetime
 import json
 import multiprocessing
+import os
 import re
 import sys
 from multiprocessing.process import BaseProcess
@@ -35,7 +36,6 @@ from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings, account_settings_path, gate_deployment, gate_regions
 from scripts.lib import conf
 from scripts.build_queue.admission_jobs import StepJob
-from scripts.lib.process_group import send_process_group
 from scripts.lib import cancellation
 from scripts.build_targets import target_config
 from scripts.production.gate_modules import GateRefused
@@ -87,36 +87,24 @@ def checked_git(repo: Path, *arguments: str) -> str:
 
 
 def network_git(repo: Path, *arguments: str) -> str:
-    """Bound network Git calls and stop their process groups on cancellation."""
+    """Bound network Git calls and stop their process groups when the call ends."""
     command = ['git', '-C', str(repo), *arguments]
     timeout = cloud_gate.settings().number('git_network_timeout_s')
-    mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
-    # Git must start with the caller's signal mask.
-    launch = [sys.executable, '-I', '-S', '-c',
-              'import os, signal, sys\n'
-              + 'signal.pthread_sigmask(signal.SIG_SETMASK, map(int, sys.argv[1].split()))\n'
-              + 'os.execvp(sys.argv[2], sys.argv[2:])',
-              ' '.join(str(int(number)) for number in mask), *command]
-    with ExitStack() as cleanup:
-        process: subprocess.Popen[str] | None = None
-        try:
-            with cancellation.defer_cleanup_signals():
-                process = cleanup.enter_context(subprocess.Popen(
-                    launch, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True))
-            output, errors = process.communicate(timeout=timeout)
-        except BaseException:
-            if process is not None:
-                with cancellation.defer_cleanup_signals():
-                    try:
-                        send_process_group(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    # Cancellation can interrupt communicate before it initializes its state.
-                    _ = process.wait()
-            raise
+    process: subprocess.Popen[str] | None = None
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, start_new_session=True)
+        output, errors = process.communicate(timeout=timeout)
         if process.returncode:
             raise subprocess.CalledProcessError(process.returncode, command, output=output, stderr=errors)
         return output.strip()
+    finally:
+        if process is not None:
+            with cancellation.defer_cleanup_signals(), process:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
 def trial_request(repo: Path, base: str, changed: str, modules: Sequence[str], rounds: int) -> PairedTrialRequest:
