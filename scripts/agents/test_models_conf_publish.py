@@ -346,8 +346,22 @@ class RegistryPublishingTests(RegistryFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout
 
-    def edit(self, operation: str = "agents_set_row direct.impl gpt-b:max") -> subprocess.CompletedProcess[str]:
-        return self.bash(operation)
+    def edit(self, operation: str = "") -> subprocess.CompletedProcess[str]:
+        if operation:
+            return self.bash(operation)
+        return self.command(sys.executable, "-c", '''
+import os
+import sys
+from scripts.lib import models_registry, registry_rows
+
+base = models_registry.edit_base(os.environ)
+row = registry_rows.RowChange("direct.codex", "impl", "impl=gpt-b:max")
+after = registry_rows.replay(base.text, [row], additive_catalog=False)
+try:
+    models_registry.store_registry(base.path, base.text, after, "set direct.impl to gpt-b:max")
+except OSError as error:
+    sys.exit(str(error))
+''')
 
     def dirty_state(self) -> tuple[str, str, str]:
         return (self.git("diff", "--", "dirty.txt", "staged.txt"),
