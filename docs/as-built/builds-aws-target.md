@@ -748,6 +748,9 @@ The guest writes `finish` after the last run.
 It publishes the current stage before each run through the existing per-run log transfer.
 The final transfer includes `finish` and the last result rows.
 These transfers include `boot.log`, `gate.log`, and `timeline.log`.
+The gate box passes signed URLs to curl in private files. A transfer failure reports the stage, curl exit code, and HTTP status.
+The bootstrap removes each known signed URL and its query from the result records and logs it sends.
+Older paired candidates can send logs directly. The bootstrap cannot filter those uploads.
 The upload count and measured result fields remain unchanged.
 
 `cloud_gate.log_cloud_progress` reads stages for both paired trials and merge gates.
