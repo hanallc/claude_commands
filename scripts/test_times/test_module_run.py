@@ -24,6 +24,7 @@ from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message.process_test_support import OwnedTestProcesses
+from scripts.production import gate
 from scripts.test_times.gate_record import ModuleTimes
 from scripts.test_times.module_run import FixtureMeasure, TestMeasure
 
@@ -761,8 +762,6 @@ class ParentDeath(unittest.TestCase):
                 self.assertNotIn("Traceback", stderr)
 
     def test_gate_parent_death_before_bootstrap_stops_the_module(self) -> None:
-        from scripts.production import merge_gate
-
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         processes = OwnedTestProcesses()
         self.addCleanup(processes.finish)
@@ -771,7 +770,7 @@ class ParentDeath(unittest.TestCase):
         source = fr"""import os, signal, subprocess, sys
 reader, writer = os.pipe()
 prefix = 'import os; os.write(' + str(writer) + ', b"R"); os.close(' + str(writer) + '); os.read(0, 1)\n'
-child = subprocess.Popen([sys.executable, '-c', prefix + {merge_gate.SUITE_BOOTSTRAP!r},
+child = subprocess.Popen([sys.executable, '-c', prefix + {gate.SUITE_BOOTSTRAP!r},
     sys.executable, '-c', 'import signal; signal.pause()'],
     env={{**os.environ, 'GATE_PARENT_PID': str(os.getpid())}},
     stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

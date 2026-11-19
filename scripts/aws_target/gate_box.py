@@ -225,9 +225,8 @@ GUEST_TRANSFERS = f'''import json, os, subprocess, tempfile, time
 from collections.abc import Mapping
 {inspect.getsource(signed_urls)}
 gate_record_filter = {GATE_RECORD_FILTER!r}
-transfer_retries = {BOX_CURL_RETRY!r} if (
-    gate_request.get('task') != 'paired' and gate_request.get('mode') in ('merge-gate', 'targeted-test')
-) else ()
+# The controller validates the suite mode before it sends the request.
+transfer_retries = {BOX_CURL_RETRY!r} if gate_request.get('task') != 'paired' and 'mode' in gate_request else ()
 ''' + r'''secret_file = root / 'transfer-secrets'
 try:
     descriptor = os.open(secret_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

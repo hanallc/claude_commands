@@ -285,7 +285,7 @@ subprocess.run = fail_log_put
     def test_candidate_accepts_the_new_suite_mode_values(self) -> None:
         for mode in gate.SuiteMode:
             with self.subTest(mode=mode):
-                self.production_boot_stubs(('',), mode=mode, wire=False)
+                self.production_boot_stubs(('transient result upload',), mode=mode, wire=False)
 
     def test_candidate_without_entry_point_publishes_named_refusal(self) -> None:
         self.production_boot_stubs(('',), candidate_change='missing')
@@ -369,9 +369,10 @@ def run_guest(root, links, result):
     raise subprocess.CalledProcessError(22, ['curl', url])
 ''')
                 _ = (root / 'source.py').write_text(gate_box.GUEST)
+                request_mode = mode.wire if wire else mode.value
                 _ = (root / 'request.json').write_text(json.dumps({
                     'clone_url': 'https://example.invalid/repo.git', 'origin_main': 'b' * 40, 'modules': [],
-                    'mode': 'merge-gate',
+                    'mode': request_mode,
                     'head': 'e' * 40, 'dirty_paths': ['scripts/fixture/test_one.py']}))
                 stub = '#!' + sys.executable + '\n' + r'''import json, os, pathlib, shutil, signal, subprocess, sys
 from urllib.parse import urlsplit
@@ -418,6 +419,11 @@ elif name == 'curl':
     assert args[args.index('--write-out') + 1] == '%{http_code}'
     if destination.endswith('/result.json'):
         fail('result upload', url)
+        if os.environ['FAIL_STAGE'] == 'transient result upload':
+            event('result upload failed')
+            if not retries:
+                sys.exit(7)
+            event('result upload retried')
     if '-X' not in args:
         fail('tools ready', url)
         if destination.endswith('/attempt.json'):
@@ -473,7 +479,7 @@ else:
                     command.chmod(0o700)
                 (tools / 'python3').symlink_to(sys.executable)
                 links = {'production': 'true', 'gate_time_limit_s': '2.5', 'expires': '1800000000', 'step': 'size', 'region': 'us-west-2',
-                         'attempt': 'attempt', 'commit': 'a' * 40, 'tree': 'c' * 40, 'mode': mode.wire if wire else mode.value,
+                         'attempt': 'attempt', 'commit': 'a' * 40, 'tree': 'c' * 40, 'mode': request_mode,
                          'origin': 'https://example.invalid/repo.git', 'guest': 'https://fixture.invalid/requests/attempt.guest.py',
                          'source': 'https://fixture.invalid/source/snapshot.bundle',
                          'request': 'https://fixture.invalid/requests/attempt.json',
@@ -509,8 +515,8 @@ else:
                 results = [ledger.mapping(cast(object, json.loads(ledger.text(row, 'body'))))
                            for row in uploads if ledger.text(row, 'destination').endswith(('/result.json', '/boot-error.json'))]
                 self.assertTrue(results, log + reply.stderr)
-                expected_error = failure not in ('', 'final log upload', 'shell log signal') or candidate_change in (
-                    'missing', 'old transfer')
+                passed = failure in ('', 'final log upload', 'shell log signal', 'transient result upload')
+                expected_error = not passed or candidate_change in ('missing', 'old transfer')
                 self.assertEqual(results[-1]['verdict'], 'error' if expected_error else 'pass', log)
                 if candidate_change == 'old transfer':
                     error = ledger.text(results[-1], 'error')
@@ -530,7 +536,7 @@ else:
                 if failure == 'shell log signal':
                     self.assertTrue((root / 'signaled').exists())
                     self.assertIn('PUT log failed (curl exit 143, HTTP 000)', log)
-                elif failure and failure != 'final log upload':
+                elif not passed:
                     self.assertIn('error', results[-1])
                 if failure in ('source download', 'timings download', 'final log upload'):
                     field = 'log_error' if failure == 'final log upload' else 'error'
@@ -554,7 +560,7 @@ else:
                         self.assertIn('GET request failed (curl exit 7, HTTP 403)', log)
                 else:
                     self.assertTrue(all(row['retries'] == 2 for row in uploads))
-                if not failure and candidate_change not in ('missing', 'old transfer'):
+                if failure in ('', 'transient result upload') and candidate_change not in ('missing', 'old transfer'):
                     self.assertEqual((root / 'received-limit').read_text(), '2.5')
                     self.assertEqual((root / 'received-mode').read_text(), mode.value)
                     self.assertEqual(reply.returncode, 0, log + reply.stderr)
@@ -570,6 +576,11 @@ else:
                     for line in lines:
                         self.assertRegex(line, r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ stage=')
                     trace = (root / 'trace').read_text().splitlines()
+                    if failure == 'transient result upload':
+                        self.assertEqual([event for event in trace if event.startswith('result upload ')],
+                                         ['result upload failed', 'result upload retried'])
+                        self.assertEqual([row['destination'] for row in uploads if row['destination'] == links['result']],
+                                         [links['result']])
                     self.assertIn('fetch ' + links['commit'], trace)
                     record = ledger.mapping(results[-1]['record'])
                     self.assertEqual(record['head'], 'e' * 40)

@@ -1946,7 +1946,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                 result['gate'] = gate_box.encode_run(run)
                 # An older box names the step merge-gate; the store keeps the new name.
                 result['record'] = gate_box.completion_record(run, 'attempt', 'commit', 'tree', 'fixture-guest',
-                                                             self.now, self.now + 3, 'gate')
+                                                             self.now, self.now + 3, 'merge-gate')
                 _ = destination.write_text('{"interrupted":')
                 cloud_gate.save(self.folder / cloud_gate.RESULT_FILE, result)
                 with (mock.patch.dict(os.environ, {'BUILDLOG_DIR': str(buildlog)}),
