@@ -2705,6 +2705,10 @@ window.fetch=async(url,options)=>{
     def test_filter_counts_share_the_complete_index(self) -> None:
         _ = self.question()
         _ = self.investigation(False)
+        parked = investigation.file(self.fixture.unit.id, 'Later count fixture', 'Read the log.',
+                                    waiting_why='The owner checks the log.')
+        deadline = datetime(2099, 1, 1, tzinfo=user_zone())
+        review_later.save(f'investigation/{parked.owner}/{parked.id}', deadline)
         _ = review_page.submit(self.root, self.body('page-owner/C1', 'works'), self.status)
         pages = {show: browser_markup(self.root, show=show) for show, _ in review_page.SHOWS}
         setup = r"""<script>
@@ -2733,6 +2737,27 @@ window.fetch=async(url,options)=>{
   await flush();
   check(!document.querySelector('[data-list-count]'),'The Show chips replace the right count text.');
   check(counts('[data-show-chip]')==='4|3|1|0','The index counts states outside the rendered view.');
+  const allCount=show('all').querySelector('b');
+  const nativeNow=Date.now,deadline=Date.parse(LATER_DEADLINE);
+  let crossedDeadline=false;
+  try{
+   Date.now=()=>deadline-1;
+   Object.defineProperty(allCount,'textContent',{configurable:true,set(value){
+    delete this.textContent;
+    this.textContent=value;
+    Date.now=()=>deadline;
+    crossedDeadline=true;
+   }});
+   search('Later count fixture');
+   check(crossedDeadline && counts('[data-show-chip]')==='0|0|0|0',
+    'State counts add up when a Later item becomes eligible after the All count.');
+   search('Later count fixture');
+   check(counts('[data-show-chip]')==='1|0|1|0','The next render counts the Waiting item.');
+  }finally{
+   delete allCount.textContent;
+   Date.now=nativeNow;
+   search('');
+  }
   const ownerChip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
   const selectedOwner=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]');
   const builder=document.querySelector('[data-type="change"]').dataset.sourceOwner;
@@ -2784,7 +2809,7 @@ window.fetch=async(url,options)=>{
   check(counts('[data-show-chip]')==='2|1|0|1','A refresh replaces an unsaved entry in the index.');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/result',{method:'POST',body:JSON.stringify(failures)});
-})();</script>"""
+})();</script>""".replace('LATER_DEADLINE', json.dumps(deadline.isoformat()))
         for width in (1440, 390):
             with self.subTest(width=width):
                 base = pages['open'].replace('<head>', '<head>'+setup, 1)

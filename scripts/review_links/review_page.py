@@ -1276,10 +1276,13 @@ const view=createRecordTable({content:()=>content,single:true,
    button.hidden=Boolean(id) && id!==owner && !eligibleOwners.some(entry=>matchesOwner(entry,id));
    button.querySelector('b').textContent=shownOwners.filter(entry=>matchesOwner(entry,id)).length;
   });
+  const eligible=matching({type,owner,query,sourceOwner,keys});
+  const stateCounts=new Map();
+  for(const {state} of eligible) stateCounts.set(state,(stateCounts.get(state) ?? 0)+1);
   content.querySelectorAll('[data-show-chip]').forEach(button=>{
    const show=button.dataset.showChip;
    button.hidden=type==='response' && show==='Validating';
-   const count=matching({type,owner,query,sourceOwner,keys,show}).length;
+   const count=show==='all' ? eligible.length : stateCounts.get(show==='open' ? 'Open' : show) ?? 0;
    button.querySelector('b').textContent=count;
    button.toggleAttribute('data-empty-count',count===0);
   });
