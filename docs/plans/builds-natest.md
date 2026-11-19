@@ -5252,3 +5252,47 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - impl: the tests, their support and any sweep cause.
 
 **Acceptance gate:** the 4 tests pass 20 times while a live `verify.sh` runs in another worktree; the full suite is green.
+
+### Phase 371 — copies tests share one read-only source repository per class  · status: todo
+**Depends on:** Phase 369
+
+#### Work Order
+
+**Goal:** `copies/test_copies.py` prepares one read-only source repository per test class and copies it with hard links, in place of a fresh clone per test.
+
+**Spec:**
+- Builds approved on 2026-11-19 (point 4 of the phase 369 proposal). After phase 369 the module makes about 9,800 Git starts in 141 tests; AWS median 32.1 CPU s.
+1. Build the source repository once in `setUpClass`. Mark it read-only. A test that changes the source gets its own hard-link copy (`cp -al` or `os.link`), never the shared one.
+2. Keep each test independent: no test sees another test's refs, config or files.
+3. Measure Git starts and an AWS pair (3 rounds) against phase 369's result.
+- Every assertion remains. Tests read no /tune-changeable value. No lazy imports, no copies of logic, no signal handlers.
+
+**Files:** scripts/copies/test_copies.py; its test support.
+
+**Workers:** 1 writer.
+- impl: the test module and its support.
+
+**Acceptance gate:** an AWS pair shows lower median CPU than phase 369; 20 loaded runs pass in a 2 GB scope; the full suite is green.
+
+### Phase 372 — copies.py reads repository state once per operation  · status: todo
+**Depends on:** Phase 371
+**Blocked by:** verify 43h merges (builds, ~01:45 EST 2026-11-19); send builds the changed file list before the writer starts.
+
+#### Work Order
+
+**Goal:** each `copies.py` operation reads repository state into one typed snapshot and passes it down, with fewer Git calls in production and tests.
+
+**Spec:**
+- Builds approved on 2026-11-19 (point 3 of the phase 369 proposal). Repeated checkout lookups in `build_slots` come first.
+1. One snapshot type holds refs, config values and the HEAD commit and tree for one repository.
+2. A call that writes to the repository refreshes the snapshot. No read is cached past a write that can change it.
+3. Git keeps its own rules (URL rewrite, credentials, encoding): read through Git, never reimplement them.
+4. Measure Git starts and an AWS pair for test_copies.py and the build_slots tests.
+- Every assertion remains. Tests read no /tune-changeable value. No lazy imports, no copies, no signal handlers.
+
+**Files:** scripts/copies/copies.py; scripts/lib/build_slots.py (or the build_slots module); their tests.
+
+**Workers:** 1 writer.
+- impl: copies.py, build_slots and their tests.
+
+**Acceptance gate:** fewer Git starts per operation; an AWS pair shows lower median CPU; the full suite is green.
