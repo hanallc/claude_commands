@@ -4319,6 +4319,7 @@ window.fetch=async(_url,options)=>{
   });
   const paint=()=>new Promise(resolve=>parent.requestAnimationFrame(()=>parent.requestAnimationFrame(resolve)));
   check(!row.hidden && !detail.hidden,'The item link opens the row');
+  document.body.style.paddingBottom='100vh';
   first.scrollIntoView({block:'start',behavior:'instant'});
   await paint();
   check((await sample(first)).intersectionRect.height>0,'The first answer enters the viewport');
@@ -4326,7 +4327,6 @@ window.fetch=async(_url,options)=>{
    'The second answer starts below the viewport');
   check(!reads.length && panel.querySelectorAll('.question-unread').length===2,
    'The first answer alone leaves both answers unread');
-  document.body.style.paddingBottom='100vh';
   second.scrollIntoView({block:'start',behavior:'instant'});
   check((await sample(second)).intersectionRect.height>0 && first.getBoundingClientRect().bottom<0,
    'The second answer enters the viewport after the first leaves it');

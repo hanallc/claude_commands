@@ -239,6 +239,46 @@ class ReviewPageTests(unittest.TestCase):
         self.assertTrue({item.key for item in published} <= open_keys)
         self.assertEqual(review_items.investigations(self.fixture.production, staff.snapshot()), 2)
 
+    def test_page_feedback_uses_the_native_review_reply_and_keeps_its_data(self) -> None:
+        owner = self.ready_submission_recipient()
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        request = self.submission_request(new_item_dialog.SubmissionKind.INVESTIGATION, owner.id)
+        evidence = new_item_dialog.PageDataEvidence("The List", (("Item", "State"), ("The console", "Open <1>")))
+        created = cache.create_submission(replace(request, evidence=evidence))
+        self.assertEqual(created.saved.details.evidence, evidence)
+        card = cache.get().body(created.key)
+        self.assertIn(b'Page data', card)
+        self.assertIn(b'Open &lt;1&gt;', card)
+        answered = change_page.answer_item(created.saved.key, 'The display is correct.', created.saved.reply_token, self.status)
+        self.assertTrue(answered)
+        self.assertIn(created.key, {item.key for item in review_items.read_open(self.root)})
+
+    def test_bug_card_shows_captured_page_state_and_screenshot(self) -> None:
+        import base64
+
+        from scripts.review_links.test_review_submissions import PNG
+
+        owner = self.ready_submission_recipient()
+        _ = write_config_fixture(conf.path("console"), f"page.review.owner={owner.id}\n")
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        evidence = new_item_dialog.PageDataEvidence("Review", (("Page", "Console"),))
+        state = new_item_dialog.BugPageState(
+            "http://127.0.0.1/console/review.html#owner=builds", new_item_dialog.PageViewport(1280, 800, True),
+            2.4, ("Could not load brain.",), (), "Type All · State Open · Owner <builds>", True)
+        request = self.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id)
+        created = cache.create_submission(replace(request, page="review", evidence=evidence, page_state=state))
+        self.assertNotIn(b"Screenshot of Review", cache.get().body(created.key))
+        self.assertTrue(cache.attach_page_screenshot(created.saved, base64.b64decode(PNG)))
+        snapshot = review_page.build_snapshot(self.root)
+        self.assertEqual(snapshot.records[created.key].state, review_items.ReviewState.WAITING)
+        card = snapshot.body(created.key).decode()
+        self.assertIn('<h4>Page state</h4>', card)
+        self.assertIn('<dt>Page</dt><dd>Review</dd>', card)
+        self.assertIn('<dt>Filters</dt><dd>Type All · State Open · Owner &lt;builds&gt;</dd>', card)
+        self.assertIn('<dt>Render time</dt><dd>2.40 s</dd><dt>Errors</dt><dd>1 error line</dd>', card)
+        self.assertIn(f'id={review_submissions.PAGE_SCREENSHOT.id}" loading="lazy" alt="Screenshot of Review"', card)
+        self.assertIn('<figcaption>Screenshot of Review</figcaption>', card)
+
     def test_moved_reports_display_the_original_source_unit(self) -> None:
         owner = self.ready_submission_recipient()
         unit = self.fixture.unit
@@ -3759,6 +3799,37 @@ window.fetch=async(url)=>{
 </script>'''
         markup = markup.replace('</body>', probe + '</body>')
         self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_review_owner_and_new_share_the_title_line(self) -> None:
+        owner = replace(self.ready_submission_recipient(), name='Review and console delivery')
+        markup = page_frame.with_owner(review_page.build_snapshot(self.root).page, 'review', owner,
+                                       staff.StaffSnapshot((owner,)), new_item_dialog.render)
+        probe = b'''<script>
+(async()=>{
+ const failures=[];
+ try{
+  const title=document.querySelector('h1.page-title'), row=title.closest('.page-heading');
+  const name=document.querySelector('.page-owner-name'), owner=document.querySelector('[data-owner-new]');
+  const button=document.querySelector('[data-review-new]');
+  const bounds=element=>element.getBoundingClientRect(), center=box=>(box.top+box.bottom)/2;
+  await document.fonts.ready;
+  for(const width of [1280,390]){
+   frameElement.style.width=width+'px';
+   const t=bounds(title), n=bounds(name), o=bounds(owner), b=bounds(button), r=bounds(row);
+   const beside=Math.abs(center(t)-center(b))<=1;
+   if(innerWidth!==width || !row.contains(owner) || !row.contains(button) ||
+      Math.abs(center(o)-center(b))>1 || Math.abs(center(n)-center(b))>1 ||
+      Math.abs((o.left-n.right)-(b.left-o.right))>1 || o.left<n.right+4 ||
+      n.left<r.left-1 || Math.abs(b.right-r.right)>1 ||
+      (beside ? n.left<t.right+4 : width===1280 || b.top<t.bottom+4)){
+    failures.push('The title and both controls must fit at '+width+' px.');
+   }
+  }
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+        self.assertEqual(firefox_probe_results(markup.replace(b'</body>', probe + b'</body>')), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_clears_the_review_save_notice(self) -> None:
