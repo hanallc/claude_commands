@@ -97,11 +97,10 @@ The question form for every question to the user is defined by this import:
 ---
 
 <Throughout>
-- **Time.** Before writing any time, run
+- **Time.** Write no present time. Write only future times, such as an ETA.
+  The tools add the present time. To convert a past or future time, run
   `~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py time <ISO or HH:MM>
-  --production <showrunner name>`. For the current time, pass `"$(date -Iseconds)"`.
-  Use its `HH:MM <zone>` output. Give every time in `ZONE` only, never UTC
-  (user, 2026-10-02).
+  --production <showrunner name>`. Use its `HH:MM <zone>` output in `ZONE` (user, 2026-10-02).
 - **Log.** Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py
   log "<event>" --production <showrunner name>` for each event. Add
   `--state SHOWRUNNER_STATE` once that file exists. The command writes
