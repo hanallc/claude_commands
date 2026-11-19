@@ -302,10 +302,11 @@ def status_table(rows: list[tuple[str, ...]], *, machines: bool, show_plan_eta: 
 
 
 class CensusView(NamedTuple):
-    """Worker rows from one census."""
+    """Worker and session rows with machine reachability from one census."""
 
     workers: dict[staff.StaffId, tuple[census.CensusWorker, ...]]
-    shell_sessions: frozenset[str] = frozenset()
+    sessions: dict[str, list[census.CensusSession]]
+    unreached_machines: frozenset[str]
 
 
 def census_view(read: census.Census | census.CensusFailed) -> CensusView | census.CensusFailed:
@@ -314,9 +315,12 @@ def census_view(read: census.Census | census.CensusFailed) -> CensusView | censu
     workers: dict[staff.StaffId, list[census.CensusWorker]] = {}
     for worker in read.workers:
         workers.setdefault(worker.parent_staff_id, []).append(worker)
-    # Shell rows can indicate possible work without proving its owner or activity.
-    return CensusView({parent: tuple(rows) for parent, rows in workers.items()},
-                      frozenset(row.session for row in read.sessions if row.shells))
+    sessions: dict[str, list[census.CensusSession]] = {}
+    for row in read.sessions:
+        sessions.setdefault(row.session, []).append(row)
+    unreached_machines = frozenset(row.name for row in read.machines
+                                  if row.reachability is census.CensusMachineReachability.NOT_REACHED)
+    return CensusView({parent: tuple(rows) for parent, rows in workers.items()}, sessions, unreached_machines)
 
 
 def _checked_activity(unit: live_units.LiveUnit) -> str:
@@ -329,19 +333,37 @@ def _checked_activity(unit: live_units.LiveUnit) -> str:
             return ""
 
 
-def _unverified_shell_work(view: CensusView | census.CensusFailed, unit: live_units.LiveUnit) -> bool:
-    if _checked_activity(unit) == "shell":
-        return True
+class UnprovedDirectorShellWork(NamedTuple):
+    """The evidence cannot confirm the director's shell work."""
+
+
+def _director_shells(view: CensusView | census.CensusFailed, unit: live_units.LiveUnit,
+                     machine: str) -> tuple[census.CensusShell, ...] | UnprovedDirectorShellWork:
     if isinstance(view, census.CensusFailed):
-        return False
+        return UnprovedDirectorShellWork() if isinstance(unit.owner, unit_lookup.ProvedLiveUnit) else ()
+    if machine in view.unreached_machines and (unit.machine == machine or isinstance(unit.owner, unit_lookup.ProvedLiveUnit)):
+        return UnprovedDirectorShellWork()
+
     match unit.owner:
-        case unit_lookup.ProvedLiveUnit(owner=unit_lookup.LiveClaude(session_id=conversation)):
-            return conversation in view.shell_sessions
-        case unit_lookup.ProvedLiveUnit(owner=unit_lookup.LabeledSession(
-                identity=unit_lookup.LiveSession(id=conversation))):
-            return conversation in view.shell_sessions
+        case (unit_lookup.ProvedLiveUnit(owner=unit_lookup.LiveClaude(session_id=conversation))
+              | unit_lookup.ProvedLiveUnit(owner=unit_lookup.LabeledSession(
+                  identity=unit_lookup.LiveSession(id=conversation)))):
+            generation = unit.owner.generation
         case _:
-            return isinstance(unit.member, staff.StaffRow) and unit.member.current_session in view.shell_sessions
+            conversation = unit.member.current_session if isinstance(unit.member, staff.StaffRow) else ""
+            generation = session_staff.NoProvedProcessGeneration()
+
+    candidates = view.sessions.get(conversation, [])
+    if isinstance(generation, session_staff.ProvedProcessGeneration):
+        process = census.CensusProcessIdentity(generation.pid, generation.started)
+        matches = [row for row in candidates if row.machine == machine and row.process == process]
+        if matches:
+            shells = tuple(shell for row in matches for shell in row.shells)
+            if shells or _checked_activity(unit) != "shell":
+                return shells
+    if candidates or _checked_activity(unit) == "shell":
+        return UnprovedDirectorShellWork()
+    return ()
 
 
 def director_status(unit: live_units.LiveUnit) -> str:
@@ -1641,6 +1663,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         return wait_states[key]
 
     machines = display_cells.machine_column([unit.machine for unit in units])
+    owner_machine = remote.local_machine()
     no_workers = quota_state.no_worker_mode()
     states: list[UnitBoardState] = []
     table_rows: list[tuple[str, ...]] = []
@@ -1740,6 +1763,11 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         tasks = tuple(task for phase in phases if isinstance(open_sent[phase.phase], NoSentWork)
                       for task in phase_tasks(phase, run_events, unit=unit.unit, workers=workers, snapshot=snapshot,
                                                now=now, zone=zone))
+        shells = _director_shells(view, unit, owner_machine)
+        shell_work_unproved = isinstance(shells, UnprovedDirectorShellWork)
+        if not shell_work_unproved:
+            tasks += tuple(TaskLine(shell.name.strip() or "Unnamed background command",
+                                    "Runs in the background", "running") for shell in shells)
         tasks += tuple(TaskLine(wait.target, unit_wait_state(wait, now=now, zone=zone), "unit_wait")
                        for wait in waits if wait.target not in merge.wait_targets | next_item.wait_targets)
         open_instances = {phase.instance_id for phase in phases}
@@ -1755,7 +1783,7 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         states.append(UnitBoardState(unit.unit, machines[index] if machines else "", tasks, next_item, merge,
                                      fallback, bool(hold), busy, bool(phases), readable,
                                      isinstance(view, census.CensusFailed), no_workers, past_tasks(facts), current_work,
-                                     owner=unit.owner, director_work_unknown=_unverified_shell_work(view, unit)))
+                                     owner=unit.owner, director_work_unknown=shell_work_unproved))
     buckets = ("working", "waiting to merge", "waiting on other work", "idle", "unknown")
     counts = {bucket: sum(state.bucket == bucket for state in states) for bucket in buckets}
     summary = " · ".join(f"{bucket} {counts[bucket]}" for bucket in buckets if bucket != "unknown" or counts[bucket])

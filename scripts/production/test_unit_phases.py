@@ -85,7 +85,7 @@ def typed_record(plan: Path, *statuses: str) -> phase_table.PhaseRecord:
     return phase_table.PhaseRecord(plan, now, current, rows, phase_table.UnknownFinish())
 
 
-LOCAL = census.Census((census.CensusMachine("natedev", True),), (), ())
+LOCAL = census.Census((census.CensusMachine("natedev", census.CensusMachineReachability.REACHED),), (), ())
 
 
 def session_of(member: staff.StaffRow, status: str | None) -> census.CensusSession:
@@ -103,14 +103,8 @@ def tiles(*, sessions: Sequence[census.CensusSession] = (),
     return LOCAL._replace(sessions=tuple(sessions), workers=tuple(workers))
 
 
-def census_for(units: Sequence[live_units.LiveUnit]) -> census.Census:
-    """List each recorded unit that is not exited, with the status word of its live classification."""
-    return tiles(sessions=[session_of(selected.member, selected.status) for selected in units
-                           if isinstance(selected.member, staff.StaffRow) and selected.status != "exited"])
-
-
 def table_of(units: list[live_units.LiveUnit], records: dict[str, object], repository: Path) -> str:
-    return unit_phases.table(units, records, columns=1000, census_read=census_for(units), repository=repository)
+    return unit_phases.table(units, records, columns=1000, census_read=LOCAL, repository=repository)
 
 
 class DetailRow(NamedTuple):
@@ -393,7 +387,7 @@ class UnitPhasesTests(unittest.TestCase):
         members = [self.member(name) for name in ("zulu", "Beta", "alpha")]
         selected = [unit(row.name, live(row.name)) for row in members]
         selected[1] = selected[1]._replace(machine="mac")
-        rendered = unit_phases.table(selected, {}, repository=self.root, census_read=census_for(selected))
+        rendered = unit_phases.table(selected, {}, repository=self.root, census_read=LOCAL)
         self.assertEqual([line for line in rendered.splitlines() if line.startswith("**")],
                          ["**alpha** (natedev) — idle", "**Beta** (mac) — idle", "**zulu** (natedev) — idle"])
         self.assertEqual(rendered.count("\n\n"), 7)
@@ -737,7 +731,8 @@ class UnitPhasesTests(unittest.TestCase):
             (LOCAL, listed, "unknown"),
             (LOCAL, listed._replace(machine=""), "unknown"),
             (LOCAL, mac, "unknown"),
-            (LOCAL._replace(machines=(census.CensusMachine("natedev", False),)), listed, "unknown"),
+            (LOCAL._replace(machines=(census.CensusMachine("natedev", census.CensusMachineReachability.NOT_REACHED),)),
+             listed, "unknown"),
             (failed, listed, "unknown")]
         for read, selected, expected in cases:
             with self.subTest(read=read, machine=selected.machine):
@@ -774,7 +769,7 @@ class UnitPhasesTests(unittest.TestCase):
                                      else "Waits for build queue; holder not recorded")
                         self.assertIn(("Now", "Check delivery (work)", state + "; since 17:58"), detail_rows(rendered, "style"))
 
-    def test_notes_omit_unverified_background_commands_and_name_a_sent_checkpoint(self) -> None:
+    def test_notes_name_verified_background_commands_and_a_sent_checkpoint(self) -> None:
         member = self.member("shells")
         now = datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp()
         read = tiles(sessions=[census.CensusSession(member.current_session, "busy", (
@@ -786,6 +781,139 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertNotIn("Nothing to do", rendered)
         self.assertNotIn("Run the AWS gate", rendered)
         self.assertNotIn("Watch CI", rendered)
+
+        machine = remote.local_machine()
+        other_machine = "natedev" if machine == "mac" else "mac"
+        generation = session_staff.ProvedProcessGeneration(321, "30352793")
+        claude = live("shells")._replace(session_id=member.current_session, pid=generation.pid, activity="shell")
+        selected = unit("shells", claude)
+        codex = unit_lookup.LabeledSession("shells", unit_lookup.ClaudeUnknown("no Claude registry record"),
+            HerdrPlace("codex", "w1:p1"), process=session_staff.ProvedCodexPaneProcess(generation.pid, "codex"),
+            identity=unit_lookup.LiveSession(member.current_session), generation=generation)
+        verified = read.sessions[0]._replace(machine=machine,
+            process=census.CensusProcessIdentity(generation.pid, generation.started))
+        pid_mismatch = verified._replace(process=census.CensusProcessIdentity(322, generation.started))
+        start_mismatch = verified._replace(process=census.CensusProcessIdentity(generation.pid, "30352794"))
+        machine_mismatch = verified._replace(machine=other_machine)
+        stale_shell = machine_mismatch._replace(shells=(census.CensusShell("Old command", None),))
+        pair_absent = verified._replace(process=census.CensusProcessUnreported())
+        for owner in (unit_lookup.ProvedLiveUnit(claude, generation), unit_lookup.ProvedLiveUnit(codex)):
+            for case, sessions, matches in (
+                    ("match", (verified,), True),
+                    ("mixed", (stale_shell, verified), True),
+                    ("PID mismatch", (pid_mismatch,), False),
+                    ("start mismatch", (start_mismatch,), False),
+                    ("machine mismatch", (machine_mismatch,), False),
+                    ("pair absent", (pair_absent,), False),
+                    ("old census", read.sessions, False)):
+                with self.subTest(owner=type(owner.owner).__name__, case=case):
+                    output = unit_phases.table([selected._replace(owner=owner)], {}, repository=self.root,
+                        now=now, zone=ZoneInfo("UTC"), census_read=tiles(sessions=sessions))
+                    rows = detail_rows(output, "shells")
+                    if matches:
+                        self.assertIn("working 1", output.splitlines()[0])
+                        self.assertIn(("Now", "Run the AWS gate", "Runs in the background"), rows)
+                        self.assertIn(("Also", "Watch CI", "Runs in the background"), rows)
+                    else:
+                        self.assertIn("idle 0 · unknown 1", output.splitlines()[0])
+                        self.assertIn(("Now", "Not recorded", "Director shell work cannot be verified"), rows)
+                        self.assertNotIn("Run the AWS gate", output)
+                        self.assertNotIn("Watch CI", output)
+                    self.assertNotIn("Old command", output)
+                    self.assertNotIn("Nothing to do", output)
+
+        empty_match = verified._replace(shells=())
+        for case, sessions, idle in (
+                ("empty match", (empty_match,), True),
+                ("empty match beside stale work", (stale_shell, empty_match), True),
+                ("empty PID mismatch", (pid_mismatch._replace(shells=()),), False),
+                ("empty start mismatch", (start_mismatch._replace(shells=()),), False),
+                ("empty machine mismatch", (machine_mismatch._replace(shells=()),), False),
+                ("empty pair absent", (pair_absent._replace(shells=()),), False),
+                ("empty legacy row", (read.sessions[0]._replace(shells=()),), False)):
+            with self.subTest(case=case):
+                idle_owner = unit_lookup.ProvedLiveUnit(claude._replace(activity="idle"), generation)
+                output = unit_phases.table([selected._replace(owner=idle_owner)], {}, repository=self.root,
+                    now=now, zone=ZoneInfo("UTC"), census_read=tiles(sessions=sessions))
+                rows = detail_rows(output, "shells")
+                if idle:
+                    self.assertIn("idle 1", output.splitlines()[0])
+                    self.assertIn(("Now", "Nothing to do", "No plan or queued work"), rows)
+                else:
+                    self.assertIn("idle 0 · unknown 1", output.splitlines()[0])
+                    self.assertIn(("Now", "Not recorded", "Director shell work cannot be verified"), rows)
+                    self.assertNotIn("Nothing to do", output)
+                self.assertNotIn("Old command", output)
+
+        with self.subTest(case="empty match with checked shell activity"):
+            output = unit_phases.table([selected._replace(owner=unit_lookup.ProvedLiveUnit(claude, generation))], {},
+                repository=self.root, now=now, zone=ZoneInfo("UTC"), census_read=tiles(sessions=(empty_match,)))
+            self.assertIn("idle 0 · unknown 1", output.splitlines()[0])
+            self.assertIn(("Now", "Not recorded", "Director shell work cannot be verified"),
+                          detail_rows(output, "shells"))
+            self.assertNotIn("Nothing to do", output)
+
+        with self.subTest(case="blank shell name"):
+            blank_name = verified._replace(shells=(census.CensusShell(" \t ", None),))
+            output = unit_phases.table([selected._replace(owner=unit_lookup.ProvedLiveUnit(claude, generation))], {},
+                repository=self.root, now=now, zone=ZoneInfo("UTC"), census_read=tiles(sessions=(blank_name,)))
+            self.assertIn(("Now", "Unnamed background command", "Runs in the background"),
+                          detail_rows(output, "shells"))
+
+        # A half pair fails parsing before the board can use any shell rows.
+        half_pair = census.parse(json.dumps({
+            "schema": 2, "machines": [], "workers": [],
+            "sessions": [{"session": member.current_session, "machine": machine, "pid": generation.pid,
+                          "shells": [{"name": "Run the AWS gate"}]}],
+        }))
+        self.assertIsInstance(half_pair, census.CensusFailed)
+        output = unit_phases.table([selected._replace(owner=unit_lookup.ProvedLiveUnit(claude, generation))], {},
+            repository=self.root, now=now, zone=ZoneInfo("UTC"), census_read=half_pair)
+        self.assertIn("idle 0 · unknown 1", output.splitlines()[0])
+        self.assertNotIn("Run the AWS gate", output)
+        self.assertNotIn("Nothing to do", output)
+
+        paused = replace(member, paused=staff.Paused("2026-11-15T17:00:00+00:00", "showrunner", "review the board"))
+        idle_owner = unit_lookup.ProvedLiveUnit(claude._replace(activity="idle"), generation)
+        paused_unit = selected._replace(member=paused, owner=idle_owner, lifecycle="paused")
+        for evidence, count in ((tiles(sessions=(empty_match,)), "idle 1"), (half_pair, "idle 0 · unknown 1")):
+            with self.subTest(case="paused with live owner", census_failed=isinstance(evidence, census.CensusFailed)):
+                output = unit_phases.table([paused_unit], {}, repository=self.root, now=now, zone=ZoneInfo("UTC"),
+                    census_read=evidence)
+                self.assertIn(count, output.splitlines()[0])
+                self.assertNotIn("Nothing to do", output)
+
+        local_row = {"session": member.current_session, "machine": machine,
+                     "pid": generation.pid, "process_start": generation.started}
+        machine_cases: tuple[tuple[str, bool, list[dict[str, object]], str], ...] = (
+            ("local timeout", False, [], "idle 0 · unknown 1"),
+            ("remote timeout with no local commands", True, [{**local_row, "shells": []}], "idle 1"),
+            ("remote timeout with a local command", True,
+             [{**local_row, "shells": [{"name": "Run the AWS gate"}]}], "working 1"))
+        for case, local_reached, sessions, count in machine_cases:
+            evidence = census.parse(json.dumps({
+                "schema": 2, "workers": [], "sessions": sessions,
+                "machines": [{"name": machine, "reachable": local_reached,
+                              "error": None if local_reached else "timed out"},
+                             {"name": other_machine, "reachable": not local_reached,
+                              "error": "timed out" if local_reached else None}],
+            }))
+            assert isinstance(evidence, census.Census)
+            directors = [selected._replace(owner=idle_owner), paused_unit]
+            if not local_reached:
+                directors.append(selected._replace(owner=unit_lookup.ProvedAbsentUnit()))
+            for director in directors:
+                with self.subTest(case=case, lifecycle=director.lifecycle, owner=type(director.owner).__name__):
+                    output = unit_phases.table([director], {}, repository=self.root, now=now, zone=ZoneInfo("UTC"),
+                        census_read=evidence)
+                    self.assertIn(count, output.splitlines()[0])
+                    rows = detail_rows(output, "shells")
+                    if not local_reached:
+                        self.assertIn(("Now", "Not recorded", "Director shell work cannot be verified"), rows)
+                        self.assertNotIn("Nothing to do", output)
+                    if case == "remote timeout with a local command":
+                        self.assertIn(("Now", "Run the AWS gate", "Runs in the background"), rows)
+
         for resource, reason, holder, expected in (
                 ("memory", "memory admission", {"state": "NamedHolder", "resource_kind": "memory", "resource": "build",
                             "holder": {"state": "UnitHolder", "unit": "builder"}},
@@ -2286,7 +2414,7 @@ class UnitPhasesTests(unittest.TestCase):
                     self.assertEqual(units[0].status, expected)
                     self.assertEqual(units[0].machine, machine)
                     output = unit_phases.table(units, {}, repository=self.root, snapshot=snapshot,
-                                               census_read=tiles(sessions=[session_of(member, expected)]))
+                                               census_read=LOCAL)
                     if machine == "mac":
                         self.assertIn("**first** (mac) — idle", output)
                         self.assertIn("**second** (—) — idle", output)
@@ -2570,7 +2698,6 @@ class UnitPhasesTests(unittest.TestCase):
         with (patch.dict("os.environ", {"CLAUDE_CODE_SESSION_ID": "caller"}),
               patch.object(showrunners, "own_name", return_value="show") as found,
               patch.object(live_units, "read_units", return_value=live_units.UnitListing([unit("a", live("a"))], ())),
-              patch.object(census, "read", return_value=census_for([unit("a", live("a"))])),
               patch.object(unit_phases, "production_records", return_value={}),
               contextlib.redirect_stdout(out)):
             self.assertEqual(unit_phases.main([]), 0)
@@ -2662,7 +2789,6 @@ class UnitPhasesTests(unittest.TestCase):
                 units = [unit("a", live("a"))]
                 output = io.StringIO()
                 with (patch.object(live_units, "read_units", return_value=live_units.UnitListing(units, ())),
-                      patch.object(census, "read", return_value=census_for(units)),
                       patch.object(unit_phases, "production_records", return_value={}),
                       patch.object(style_units, "table") as tickets, contextlib.redirect_stdout(output)):
                     self.assertEqual(unit_phases.main(["--production", "show"]), 0)
