@@ -52,6 +52,14 @@ from scripts.feature_log import feature_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
+ROLE_COLOR_CONFIG = (
+    "role.showrunner=#a379fd\n"
+    "role.unit-director=#ffaf02\n"
+    "role.producer=#90fe42\n"
+    "role.worker=#ff0404\n"
+)
+
+
 @dataclass(frozen=True)
 class HttpReply:
     status: int
@@ -70,7 +78,9 @@ def setUpModule() -> None:
         + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n"
         + "rebuilds.url=python:scripts.review_links.change_page:rebuilds_url\n")
     _ = write_config_fixture(configuration / "scratch.conf", "record_lock_attempts=3\n")
-    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
+    _ = (configuration / "statusline.conf").write_text(ROLE_COLOR_CONFIG, encoding="utf-8")
+    _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {
+        "CONF_DIR": str(configuration), "USER_ZONE": "America/New_York"})))
 
 
 class ReviewLinksServerTests(unittest.TestCase):
@@ -1556,6 +1566,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_list_serves_linked_items_with_a_producer_directory_document(self) -> None:
         case = self.review_fixture(changes=2)
+        _ = conf.path("statusline").write_text(ROLE_COLOR_CONFIG, encoding="utf-8")
         directory = self.root.parent / "brain"
         directory.mkdir()
         producer = fixture_member("producer", name="brain", doc=staff.LiveDoc(local_machine(), directory))
@@ -2011,6 +2022,78 @@ class ReviewLinksServerTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 _ = self.post(images.PAGE_PATH, 'fixture-question')
             self.assertTrue(completed.wait(TEST_HANG_GUARD_SECS))
+
+    def test_quota_clear_changes_the_nav_until_an_escalation_or_reset(self) -> None:
+        from scripts.accounts import accounts
+
+        reset = datetime.now(timezone.utc) + timedelta(days=1)
+        quotas = {"claude1": accounts.WeeklyQuota(9, reset), "codex1": accounts.WeeklyQuota(4, reset)}
+        path = "/console/for-you.json?view=console"
+        state = accounts_page.quota_state(self.root)
+
+        def clear(label: str, level: str, at: datetime | None) -> int:
+            form = urlencode({"quota_account": label, "quota_level": level,
+                              "quota_reset": at.isoformat() if at is not None else ""})
+            return self.post(accounts_page.PAGE_PATH, form)[0]
+
+        def nav() -> dict[str, str]:
+            reply = self.request(path)
+            self.assertEqual(reply.status, 200)
+            return cast(dict[str, dict[str, str]], json.loads(reply.body))["accounts_quota"]
+
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(accounts, "stored_weekly_quotas", return_value=quotas),
+              patch.object(console, "for_you_payload", return_value={"available": True, "count": 0, "entries": []})):
+            self.assertEqual(nav(), {"level": "urgent", "name": "Urgent: 4% left"})
+            for body in ("quota_account=codex1&quota_level=urgent",
+                         "quota_account=codex1&quota_account=claude1&quota_level=urgent&quota_reset=",
+                         "quota_account=codex1&quota_level=invalid&quota_reset=",
+                         "quota_account=codex1&quota_level=urgent&quota_reset=invalid"):
+                with self.subTest(body=body):
+                    self.assertEqual(self.post(accounts_page.PAGE_PATH, body)[0], 400)
+                    self.assertFalse(state.exists())
+            self.assertEqual(clear("codex1", "urgent", reset), 200)
+            self.assertEqual(nav(), {"level": "warning", "name": "Warning: 9% left"})
+            self.assertEqual(clear("claude1", "warning", reset), 200)
+            self.assertEqual(nav(), {"level": "none", "name": ""})
+            self.assertEqual(json.loads(state.read_text()), {
+                "claude1": {"level": "warning", "reset": reset.isoformat()},
+                "codex1": {"level": "urgent", "reset": reset.isoformat()},
+            })
+            quotas["codex1"] = accounts.WeeklyQuota(7, reset)
+            self.assertEqual(nav(), {"level": "none", "name": ""})
+            quotas["claude1"] = accounts.WeeklyQuota(5, reset)
+            self.assertEqual(nav(), {"level": "urgent", "name": "Urgent: 5% left"})
+            self.assertEqual(clear("claude1", "urgent", reset), 200)
+            quotas["codex1"] = accounts.WeeklyQuota(7, reset + timedelta(days=7))
+            self.assertEqual(nav(), {"level": "warning", "name": "Warning: 7% left"})
+
+            next_reset = reset + timedelta(days=7)
+            self.assertEqual(clear("codex1", "warning", next_reset), 200)
+            for observed_reset in (accounts.StatusUnavailable(), next_reset):
+                with self.subTest(reset_read=isinstance(observed_reset, datetime)):
+                    quotas["codex1"] = accounts.WeeklyQuota(4, observed_reset)
+                    if not isinstance(observed_reset, datetime):
+                        self.assertEqual(nav(), {"level": "urgent", "name": "Urgent: 4% left"})
+                        self.assertEqual(clear("codex1", "urgent", None), 200)
+                        self.assertEqual(json.loads(state.read_text())["codex1"]["reset"], next_reset.isoformat())
+                    self.assertEqual(nav(), {"level": "none", "name": ""})
+
+            for contents in (b"{", b"[]", b'{"codex1":{"level":"urgent","reset":"invalid"}}'):
+                with self.subTest(contents=contents):
+                    _ = state.write_bytes(contents)
+                    reply = self.request(path)
+                    self.assertEqual(reply.status, 200)
+                    self.assertEqual(json.loads(reply.body), {
+                        "available": True, "count": 0, "entries": [],
+                        "accounts_quota": {"level": "none", "name": ""},
+                    })
+                    form = urlencode({"quota_account": "codex1", "quota_level": "urgent",
+                                      "quota_reset": next_reset.isoformat()})
+                    code, body = self.post(accounts_page.PAGE_PATH, form)
+                    self.assertEqual(code, 503)
+                    self.assertEqual(json.loads(body), {"reason": f"Invalid quota clear state in {state}."})
+                    self.assertEqual(state.read_bytes(), contents)
 
     def test_accounts_post_saves_and_clears_a_producers_next_move(self) -> None:
         from scripts.accounts import accounts, next_moves

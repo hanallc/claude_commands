@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Literal, TypeGuard, cast
 from urllib.parse import quote
 
 
+from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state
@@ -2020,8 +2021,6 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
         assignment = saved.assignment
     session = claim_state.submitting_session(session)
     if not isinstance(assignment, UnassignedClaim):
-        from scripts.build_queue import placement
-
         destination = assignment.destination
         if destination.target != (args.target or "mac") or destination.provider not in ("mac", "ssh"):
             return 12
@@ -2031,7 +2030,7 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
         if not args.from_pid:
             args.episode, args.attempt = assignment.episode, assignment.attempt
             if not args.claim_id:
-                args.claim_id = placement.assigned_claim_id(assignment.episode, assignment.attempt)
+                args.claim_id = execution_identity.assigned_claim_id(assignment.episode, assignment.attempt)
         session = assignment.session
     else:
         scope = target_claim_scope(paths, args.worktree)
