@@ -3332,7 +3332,8 @@ sys.exit(7)
                     rows = [{'DesiredValue': 130, 'Status': 'FUTURE_STATUS', 'Created': hours_ago},
                             {'DesiredValue': 128, 'Status': 'PENDING', 'Created': day_ago.timestamp()}]
                 elif (region, code) == (other, 'L-3819A6DF'):
-                    rows = [{'DesiredValue': 4, 'Status': 'PENDING',
+                    rows = [{'DesiredValue': 8, 'Status': 'APPROVED', 'Created': self.now - 7 * 86400},
+                            {'DesiredValue': 4, 'Status': 'PENDING', 'Created': None,
                              'LastUpdated': day_ago.isoformat().replace('+00:00', 'Z')}]
                 reply = {'RequestedQuotas': rows}
             return subprocess.CompletedProcess(arguments, 0, json.dumps(reply), '')

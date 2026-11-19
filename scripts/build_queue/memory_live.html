@@ -1126,6 +1126,18 @@ function programSwatch(series) { return `<span class="program-swatch ${series}" 
 function programValue(series, label, value) {
   return `<dt>${programSwatch(series)}${label}</dt><dd>${value}</dd>`;
 }
+function programValues(live, past, hanaDuration = null) {
+  const last = live.segments.at(-1)?.at(-1);
+  const current = last ? ramAmount(last[1]) : live.state === 'not_started' ? 'Not started' : 'No samples';
+  const currentName = last && live.state !== 'sampling' ? 'This run, last sample' : 'This run now';
+  return [
+    ['live', currentName, current],
+    ...(past?.peak ? [['past', 'Past run peak', ramAmount(past.peak[1])]] : []),
+    ...(past?.above_half_reserve_ms != null
+      ? [['past', 'Past run time above half the reserve', programSeconds(past.above_half_reserve_ms)]] : []),
+    ...(hanaDuration != null ? [['past', 'Past run, hana crate', programSeconds(hanaDuration)]] : []),
+  ];
+}
 function programPhaseChart(name, live, past, reserve, bands, axisEnd, scale, memoryMax) {
   const plotTop = bands.length ? 20 : 9;
   const base = bands.length ? 79 : 67;
@@ -1181,18 +1193,14 @@ function programMemoryPhase(name, live, past, reserve, bands, hanaDuration, memo
     reserve?.source === 'past' ? 'The line shows the past reserve.' :
       (reserve && past?.reserve_bytes != null && reserve.bytes !== past.reserve_bytes ? 'The line shows this run’s reserve.' : ''),
   ].filter(Boolean).join(' ');
-  const current = last ? ramAmount(last[1]) : live.state === 'not_started' ? 'Not started' : 'No samples';
-  const currentName = last && live.state !== 'sampling' ? 'This run, last sample' : 'This run now';
+  const values = programValues(live, past, bands.length ? hanaDuration : null);
   return `<section class="program-phase">
     <div class="program-heading"><h2>${name}</h2>${last ? `<span>${programSeconds(live.duration_ms)} elapsed</span>` : ''}</div>
     ${programPhaseChart(name, live, past, reserve, bands, axisEnd, scale, memoryMax)}
     <div class="program-times"><span>0 s</span><span>time</span><span>${programSeconds(axisEnd)}</span></div>
     ${caption ? `<p>${caption}</p>` : ''}
     <dl class="program-values">
-      ${programValue('live', currentName, current)}
-      ${past?.peak ? programValue('past', 'Past run peak', ramAmount(past.peak[1])) : ''}
-      ${past?.above_half_reserve_ms != null ? programValue('past', 'Past run time above half the reserve', programSeconds(past.above_half_reserve_ms)) : ''}
-      ${bands.length ? programValue('past', 'Past run, hana crate', programSeconds(hanaDuration)) : ''}
+      ${values.map(([series, label, value]) => programValue(series, label, value)).join('')}
     </dl>
   </section>`;
 }
@@ -1494,7 +1502,13 @@ function buildStepEvidence(key, data, row, cells, tooltip, limits) {
   const memory = queueCapMemory(shown);
   const gib = bytes => recorded(bytes) ? shownBytes(bytes) / GIB : null;
   const clip = (text, limit) => text.length <= limit ? text : [...text].slice(0, limit).join('');
-  const clippedTip = tooltip.slice(0, limits.tipEntries + 1).map((entry, index) => {
+  const trace = row.program_memory;
+  const programRows = trace ? [
+    ['Compile', programValues(trace.live.compile, trace.past?.compile,
+      trace.past?.hana_crate_bands?.length ? trace.past.hana_compile_ms : null)],
+    ['Test', programValues(trace.live.test, trace.past?.test)],
+  ].flatMap(([phase, values]) => groupRows(values.map(([, label, value]) => field(`${phase} · ${label}`, value)))) : [];
+  const clippedTip = [...tooltip.slice(0, limits.tipEntries + 1 - programRows.length), ...programRows].map((entry, index) => {
     const label = clip(entry.label, index ? limits.label : limits.title);
     const value = clip(entry.value, index ? limits.text : limits.title);
     return {...entry, label, value,

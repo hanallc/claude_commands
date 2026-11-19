@@ -332,6 +332,30 @@ class MemoryHoverTests(unittest.TestCase):
                 preview = ElementTree.fromstring(cast(str, rendered["preview"]))
                 self.assertEqual(preview.findtext("dd[@class='caption']"), caption[:limits["text"]])
 
+    def test_new_item_evidence_includes_the_values_from_both_program_memory_charts(self) -> None:
+        row = program_memory_row(program_memory_fixture(started=True))
+        rendered = cast(dict[str, object], self.page_expression(
+            "(() => {const capture = buildStepEvidence('row:hana', data, data.walk[0], [], "
+            + "tooltipRows('row:hana', data), " + json.dumps(new_item_dialog.BUILD_EVIDENCE_LIMITS)
+            + "); return {evidence:capture.evidence, preview:tipRowsHtml(capture.clippedTip)};})()",
+            {"read_at": 400, "walk": [row]}, walk=True))
+        evidence = new_item_dialog.read_evidence(rendered["evidence"])
+        assert isinstance(evidence, new_item_dialog.BuildStepEvidence)
+        expected = (
+            ("Compile · This run, last sample", "4.0 GiB"),
+            ("Compile · Past run peak", "7.0 GiB"),
+            ("Compile · Past run time above half the reserve", "4 s"),
+            ("Compile · Past run, hana crate", "4 s"),
+            ("Test · This run now", "2.0 GiB"),
+            ("Test · Past run peak", "2.0 GiB"),
+            ("Test · Past run time above half the reserve", "0 s"),
+        )
+        self.assertEqual(evidence.tip[-len(expected):], tuple(new_item_dialog.TipField(*pair) for pair in expected))
+        preview = ElementTree.fromstring(cast(str, rendered["preview"]))
+        self.assertEqual([element.text for element in list(preview)[-2 * len(expected):]],
+                         [text for pair in expected for text in pair])
+        self.assertIsNone(preview.find(".//svg"))
+
     def test_a_token_wait_is_the_stage_of_its_running_row(self) -> None:
         row = memory_tests.ProgressKeepAsideTests.reservation("nextest", need=4 * GIB)
         memory = admission_records.MeasuredMemory(9 * GIB, anonymous=admission_records.AnonymousRunUse(GIB))

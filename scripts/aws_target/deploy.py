@@ -10,7 +10,7 @@ import argparse
 import base64
 from configparser import ConfigParser
 from io import StringIO
-from collections.abc import Callable, Generator, Iterable, Sequence
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -389,6 +389,11 @@ def quota_targets(home: str) -> tuple[tuple[tuple[str, ...], str, int, str], ...
 
 def quota_display_name(label: str) -> str:
     return 'Standard Spot' if label == 'Spot' else label
+
+
+def _quota_request_timestamp(request: Mapping[str, object]) -> float:
+    created = request.get('Created')
+    return quota_requests.timestamp(request.get('LastUpdated') if created is None else created)
 
 
 def _quota_request_age(created: float, now: float) -> str:
@@ -2726,8 +2731,8 @@ class Deployment:
                         ready.append(region)
                     history = target.call('list-requested-service-quota-change-history-by-quota',
                         '--service-code', 'ec2', '--quota-code', code, service='service-quotas')
-                    requests = sorted(ledger.rows(history, 'RequestedQuotas'), key=lambda row:
-                        quota_requests.timestamp(row.get('Created', row.get('LastUpdated'))), reverse=True)
+                    requests = sorted(ledger.rows(history, 'RequestedQuotas'),
+                                      key=_quota_request_timestamp, reverse=True)
                     open_requests: list[quota_requests.OpenQuotaRequest] = []
                     for request in requests:
                         status = ledger.text(request, 'Status')
@@ -2739,7 +2744,7 @@ class Deployment:
                     histories[region, code] = tuple(open_requests)
                     if requests:
                         newest = requests[0]
-                        created = quota_requests.timestamp(newest.get('Created', newest.get('LastUpdated')))
+                        created = _quota_request_timestamp(newest)
                         age = _quota_request_age(created, now)
                         status = ledger.text(newest, 'Status')
                         asked = quota_requests.format_asked_vcpus(newest['DesiredValue'])
