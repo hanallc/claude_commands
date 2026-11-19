@@ -252,10 +252,10 @@ class QueueRunTests(unittest.TestCase):
             self.assertFalse((root / "watcher-start").exists())
             with mock.patch.dict(os.environ, environment):
                 paths = mac_test.state_paths()
-                mac_test.settle_retained_mac_claims(paths, mac_test.config_path())
+                _ = mac_test.settle_retained_mac_claims(paths, mac_test.config_path())
                 self.assertEqual(len(mac_test.read_claims(paths)), 1)
                 (root / "children-ended").touch()
-                mac_test.settle_retained_mac_claims(paths, mac_test.config_path())
+                _ = mac_test.settle_retained_mac_claims(paths, mac_test.config_path())
                 self.assertEqual(mac_test.read_claims(paths), ())
 
     def test_queue_retains_capacity_while_the_remote_attempt_runs(self) -> None:
@@ -303,7 +303,7 @@ class QueueRunTests(unittest.TestCase):
             with mock.patch.dict(os.environ, environment):
                 paths = mac_test.state_paths()
                 self.assertEqual(len(mac_test.read_claims(paths)), 1)
-                mac_test.settle_retained_mac_claims(paths, mac_test.config_path())
+                _ = mac_test.settle_retained_mac_claims(paths, mac_test.config_path())
                 self.assertEqual(mac_test.read_claims(paths), ())
 
             later = subprocess.run(self.command(root), capture_output=True, text=True, env=environment,
@@ -414,7 +414,7 @@ class QueueRunTests(unittest.TestCase):
                     with mock.patch.dict(os.environ, environment):
                         paths = mac_test.state_paths()
                         self.assertEqual(len(mac_test.read_claims(paths)), 1)
-                        mac_test.settle_retained_mac_claims(paths, mac_test.config_path())
+                        _ = mac_test.settle_retained_mac_claims(paths, mac_test.config_path())
                         self.assertEqual(mac_test.read_claims(paths), ())
                 if signum != signal.SIGINT:
                     # The next run cleans the state of a run that ended without local cleanup.

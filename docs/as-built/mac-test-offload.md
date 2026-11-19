@@ -22,9 +22,11 @@ The `buildlog` CLI retains coordination state, hold intervals, and detailed Mac 
 `max_active_builds` in `config/mac_test.conf` sets the capacity for each managed Mac target.
 The initial limit is one build across repositories.
 A live `Runner.Worker` on the Mac counts as one Hana CI build.
-The admission service reads CI activity once per SSH host in each evidence pass.
-The service keeps the observation time when it shares a reading across placement requests.
-A standalone claim reads CI activity before it takes the state lock.
+The admission service groups registered Mac targets by their configured SSH address.
+Each host pass reads CI once for the placement keys due at its start.
+The service dates the evidence at the start of that pass.
+New keys wait for the next pass and its new CI read.
+The shared settlement step reads CI before a standalone claim takes the state lock.
 An unreadable CI result keeps new agent builds waiting.
 A queue grant reserves a claim under the same lock that a standalone claim uses.
 The runner adopts that claim in place.
@@ -103,7 +105,13 @@ A PID alone cannot release another attempt.
   `verify.sh` passes its repository root with `--repo-root`.
 - `block --holder KEY --for TEXT [--hours N] [--showrunner NAME]` stores the holder key and the native session from `owning_session.owning_session()`. The build-hold command supplies the fixed staff ID. A block admits its recorded session’s claims; a block without a session refuses every caller. The block uses `block_hours`, with a limit of `block_max_hours`. It warns the holder `block_warn_minutes` before expiry. A repeat block keeps `since`. `unblock --holder KEY` matches only the stored key. Status lines show the current staff name when the key resolves.
 - **CI switch.** `block` turns the repository variable `ci_variable` (hana's `MACOS_CI`) off through `gh` and records a `ci` word: `off_by_this_block`, `off_before`, `not_configured`, `still_on`, `off_unconfirmed`. Unblock and expiry turn it back on only for `off_by_this_block` and `off_unconfirmed`, and list per branch the CI runs that skipped macOS meanwhile, with the `gh workflow run` line to rerun them. The report uses one paged REST list and one GraphQL request for the newest 200 runs; missing or partial job data produces a report error. A lift that cannot turn the switch back on keeps the block, messages the holder hourly and keeps trying. Expiry records that failure as `ExpiredBlockLiftFailed(gh_error_line)` on `SettleOutcome.expired_block_lift_failure` (otherwise `NO_EXPIRED_BLOCK_LIFT_FAILURE`), apart from `ci_problem`; while it lasts `status` prints `The block is past its time limit but could not lift: CI's Mac switch could not be turned back on (<gh line>). Run github-warmup, then unblock.`, and `block` names the same `gh` line. A new `ci` word goes into `CiSwitch`, `decoded_ci`, `ci_needs_restore` and `ci_may_still_be_on`.
-- **Pending until idle.** A block is pending while any claim is live (it waits on the oldest one's `what`), or while `ci_activity` reads busy: a queued or in-progress run of `ci_workflow` is busy until it lists a job named `ci_job` with status `completed`. A pending block says `a CI run may still use the Mac`; the stored `waiting_on` kind is `ci_job`.
+- **Pending until idle.** The shared settlement step checks retained claims and reads live CI activity.
+  The block waits for the oldest live claim outside the holder session.
+  A live `Runner.Worker` keeps the block pending with `waiting_on` kind `ci_mac_job`.
+  An unreadable CI result keeps the block pending with kind `ci_unknown`.
+  If the Mac is idle, `ci_activity` checks queued and in-progress runs of `ci_workflow` when `ci_repo` is set.
+  The block waits with kind `ci_job` until the run lists `ci_job` with status `completed`.
+  The block activates when these checks show no work.
 - **The message.** The block sends one free message with key `mac-free-<since>`. A staff holder receives it through the fixed staff ID. A holder outside staff uses the recorded session socket or given key. The message states which work ended and that the block remains active. A send.py exit status of 0 or 1 counts as delivery.
 - Every `gh` call is bounded by `gh_timeout_s`; the send and the session lookup by 30 s (`MAC_TEST_MESSAGE_TIMEOUT_S`). An empty `ci_repo` turns every `gh` call off.
 - `/build:mac` accepts `block <why>`, `unblock`, `status`, and `audit`.

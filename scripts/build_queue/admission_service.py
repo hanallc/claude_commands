@@ -143,34 +143,6 @@ def _provider_configuration() -> ProviderConfiguration:
     return ProviderConfiguration() if current is None else current
 
 
-@dataclass(frozen=True)
-class MacCiObservation:
-    """A CI reading and the time its probe started."""
-
-    activity: MacCiActivity
-    observed_at: float
-
-
-class MacCiEvidencePass:
-    """Share CI observations by SSH host during one evidence pass."""
-
-    def __init__(self) -> None:
-        self.by_host: dict[str, MacCiObservation] = {}
-
-    def read(self, configuration: conf.ConfigRead, clock: Clock) -> MacCiObservation:
-        try:
-            host = configuration.text("host")
-        except conf.Unusable:
-            return MacCiObservation(MacCiActivity.UNKNOWN, clock.now())
-        if host not in self.by_host:
-            observed_at = clock.now()
-            self.by_host[host] = MacCiObservation(mac_ci.read_mac_ci_activity(configuration), observed_at)
-        return self.by_host[host]
-
-
-_MAC_CI_EVIDENCE_PASS: ContextVar[MacCiEvidencePass] = ContextVar("mac_ci_evidence_pass")
-
-
 CARGO_CAPTURE_ROOT = Path("/tmp/cargo-tile")
 READING_ALERT_KEY = "build-admission-reading"
 
@@ -885,17 +857,27 @@ class DispatchEvidence:
     observed_at: float
 
 
+@dataclass(frozen=True)
+class DueHostEvidencePass:
+    """The subscriptions due when the worker starts a pass."""
+
+    started_at: float
+    subscriptions: tuple[tuple[placement.HostEvidenceKey, object], ...]
+
+
 class HostEvidenceWorker:
-    """One target reader publishes evidence without blocking the service loop."""
+    """Publish evidence for one source outside the service loop."""
 
     def __init__(self, key: placement.HostEvidenceKey,
                  probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence],
-                 clock: Clock, wake: int, interval: float) -> None:
+                 clock: Clock, wake: int, interval: float, *,
+                 mac_host: mac_ci.MacSshHost | mac_ci.UnsharedMacCi = mac_ci.UNSHARED_MAC_CI) -> None:
         self.key: placement.HostEvidenceKey = key
         self.probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] = probe
         self.clock: Clock = clock
         self.wake: int = wake
         self.interval: float = interval
+        self.mac_host: mac_ci.MacSshHost | mac_ci.UnsharedMacCi = mac_host
         self.lock: threading.Lock = threading.Lock()
         self.observations: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
         self.dispatch_probes: dict[str, DispatchEvidenceProbe] = {}
@@ -949,7 +931,7 @@ class HostEvidenceWorker:
         self.requested.set()
 
     def expedite(self, key: placement.HostEvidenceKey) -> None:
-        """Probe this key before every other due key."""
+        """Give this key priority for the next pass."""
         with self.lock:
             if key not in self.due:
                 return
@@ -967,16 +949,13 @@ class HostEvidenceWorker:
                     _ = self.dispatch_observations.pop(attempt, None)
         self.requested.set()
 
-    def _next_ready(self, now: float) -> tuple[placement.HostEvidenceKey, object] | float | None:
-        """Return the earliest due key and its subscription, or the delay until a key is due.
-
-        Select the next key after each probe so an expedited key can run next.
-        """
-        ready = min(((due, order, key) for order, (key, due) in enumerate(self.due.items()) if due <= now),
-                    default=None)
-        if ready is not None:
-            return ready[2], self.subscriptions[ready[2]]
-        return max(0.0, min(self.due.values()) - now) if self.due else None
+    def _ready_pass(self, now: float) -> DueHostEvidencePass:
+        """Capture the subscriptions due at the start of a pass."""
+        started_at = self.clock.now()
+        due = sorted((key for key, deadline in self.due.items() if deadline <= now), key=self.due.__getitem__)
+        if isinstance(self.mac_host, mac_ci.UnsharedMacCi):
+            due = due[:1]
+        return DueHostEvidencePass(started_at, tuple((key, self.subscriptions[key]) for key in due))
 
     def _read(self) -> None:
         while not self.stopped.is_set():
@@ -984,34 +963,29 @@ class HostEvidenceWorker:
             with self.lock:
                 if self.stopped.is_set():
                     return
-                ready = self._next_ready(time.monotonic())
-            if not isinstance(ready, tuple):
-                _ = self.requested.wait(ready)
-            elif not self._probe_pass(*ready):
+                now = time.monotonic()
+                ready = self._ready_pass(now)
+                delay = min(self.due.values()) - now if self.due and not ready.subscriptions else None
+            if not ready.subscriptions:
+                _ = self.requested.wait(delay)
+            elif not self._probe_pass(ready):
                 return
 
-    def _probe_pass(self, key: placement.HostEvidenceKey, subscription: object) -> bool:
-        """Share CI readings until no key is due or a probed key is due again."""
-        token = _MAC_CI_EVIDENCE_PASS.set(MacCiEvidencePass())
-        probed: set[placement.HostEvidenceKey] = set()
-        try:
-            while True:
-                if not self._probe(key, subscription):
-                    return False
-                probed.add(key)
+    def _probe_pass(self, ready: DueHostEvidencePass) -> bool:
+        """Read only the subscriptions captured at the start of the pass."""
+        with mac_ci.evidence_pass(self.mac_host):
+            for key, subscription in ready.subscriptions:
                 with self.lock:
                     if self.stopped.is_set():
                         return False
-                    ready = self._next_ready(time.monotonic())
-                if not isinstance(ready, tuple) or ready[0] in probed:
-                    return True
-                key, subscription = ready
-        finally:
-            _MAC_CI_EVIDENCE_PASS.reset(token)
+                    if self.subscriptions.get(key) is not subscription:
+                        continue
+                if not self._probe(key, subscription, ready.started_at):
+                    return False
+        return True
 
-    def _probe(self, key: placement.HostEvidenceKey, subscription: object) -> bool:
+    def _probe(self, key: placement.HostEvidenceKey, subscription: object, observed_at: float) -> bool:
         """Probe one key and publish its evidence. Return False when the worker stops."""
-        observed_at = self.clock.now()
         try:
             evidence = self.probe(key)
             if evidence.key != key:
@@ -1071,7 +1045,7 @@ class PlacementHold:
 
 @dataclass(frozen=True)
 class HostEvidenceReader:
-    """Retain each policy key while one target worker owns the probes."""
+    """Keep one policy key on its evidence worker."""
 
     key: placement.HostEvidenceKey
     worker: HostEvidenceWorker
@@ -1451,7 +1425,7 @@ class AdmissionServer:
         self.host_probe: Callable[[placement.HostEvidenceKey], placement.HostEvidence] = (
             host_probe if host_probe is not None else self._read_host_evidence)
         self.host_readers: dict[placement.HostEvidenceKey, HostEvidenceReader] = {}
-        self.host_targets: dict[tuple[str, str], HostEvidenceWorker] = {}
+        self.host_targets: dict[tuple[str, str] | mac_ci.MacSshHost, HostEvidenceWorker] = {}
         self.background_local_evidence: bool = host_probe is None
         self.host_observations: dict[placement.HostEvidenceKey, placement.HostEvidence] = {}
         self.host_requests: dict[placement.HostEvidenceKey, wire.PlacementRequest] = {}
@@ -3022,17 +2996,28 @@ class AdmissionServer:
             keys[identity] = key
         return key
 
+    def _host_evidence_source(self, key: placement.HostEvidenceKey) -> tuple[str, str] | mac_ci.MacSshHost:
+        """Group Mac evidence by the configured SSH address."""
+        destination = key.destination
+        if destination.provider in ("mac", "ssh"):
+            configuration = _provider_configuration()
+            target = configuration.target(destination.target, key.settings)
+            if isinstance(target, target_config.SshTarget) and target.platform == "macos":
+                return mac_ci.MacSshHost(configuration.read(target.settings).text("host"))
+        return destination.provider, destination.target
+
     def _host_evidence_reader(self, key: placement.HostEvidenceKey, interval: float) -> HostEvidenceReader:
-        """Keep host and dispatch readings on the same target worker."""
+        """Keep host and dispatch readings on the same worker."""
         if key not in self.host_readers:
             timeout = 0.0 if key.destination.provider == "local" else self._host_probe_timeout(key)
             previous = self.host_observations.get(key)
-            target = (key.destination.provider, key.destination.target)
-            reader = self.host_targets.get(target)
+            source = self._host_evidence_source(key)
+            reader = self.host_targets.get(source)
             if reader is None:
                 reader = HostEvidenceWorker(key, lambda current: self.host_probe(current), self.clock,
-                    self.reading_events, interval)
-                self.host_targets[target] = reader
+                    self.reading_events, interval,
+                    mac_host=source if isinstance(source, mac_ci.MacSshHost) else mac_ci.UNSHARED_MAC_CI)
+                self.host_targets[source] = reader
             else:
                 reader.request(key)
             self.host_readers[key] = HostEvidenceReader(key, reader, timeout)
@@ -3098,13 +3083,8 @@ class AdmissionServer:
                 return hana_placement.read_evidence(key, request, transport=transport, workload=configuration)
         paths = claim_state.state_paths(destination.target)
         ci = MacCiActivity.UNCHECKED
-        observed_at = self.clock.now()
         if isinstance(target, target_config.SshTarget) and target.platform == "macos":
-            mac_test.settle_retained_mac_claims(paths, target.settings)
-            evidence_pass = _MAC_CI_EVIDENCE_PASS.get(None) or MacCiEvidencePass()
-            observation = evidence_pass.read(configuration, self.clock)
-            ci = observation.activity
-            observed_at = min(observed_at, observation.observed_at)
+            ci = mac_test.settle_retained_mac_claims(paths, target.settings, configuration=configuration)
         sent = request.constraints.command_kind
         kind = recorded_step_kind(request.profile.step) if isinstance(sent, placement.CommandKindNotSent) else sent
         eligibility: placement.HostEligibility
@@ -3169,7 +3149,7 @@ class AdmissionServer:
                 session, record["remote_host"], record.get("instance_generation", "")))
             executions.append((reference, self._observe_provider_execution(request, destination, reference,
                 record["remote_host"], record.get("instance_generation", ""), configuration)))
-        return placement.FreshHostEvidence(key, observed_at, generation, eligibility, tuple(adopted),
+        return placement.FreshHostEvidence(key, self.clock.now(), generation, eligibility, tuple(adopted),
             tuple(cleanup), tuple(executions), holder, diagnostic, mac_ci=ci)
 
     def _observe_provider_execution(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
@@ -3599,10 +3579,18 @@ done
                                     and (pair[1].provider != "local" or pair[0] in self.waiters
                                          or pair[0] not in self.current_assignments)}
         needed = set(self.placement_host_keys.values())
+        retired: set[mac_ci.MacSshHost] = set()
         for key in set(self.host_readers) - needed:
             reader = self.host_readers.pop(key)
             reader.worker.remove(key)
             _ = self.host_observations.pop(key, None)
+            if isinstance(reader.worker.mac_host, mac_ci.MacSshHost):
+                retired.add(reader.worker.mac_host)
+        if retired:
+            active_workers = {reader.worker for reader in self.host_readers.values()}
+            for host in retired:
+                if self.host_targets[host] not in active_workers:
+                    self.host_targets.pop(host).close()
         for key in self.host_requests.keys() - self.host_readers.keys():
             if key not in needed or not isinstance(self.host_observations.get(key), placement.FreshHostEvidence):
                 _ = self.host_requests.pop(key, None)
@@ -4013,7 +4001,7 @@ done
                         held: list[PlacementHold], holds: dict[tuple[str, placement.PlacementDestination], float]) -> bool:
         """Keep a destination for an older request whose last reading predates this request's reading.
 
-        The older request's key is probed next. The hold ends when that probe answers, or after one probe time.
+        The worker gives the older key priority. The hold ends when its probe answers or the hold expires.
         """
         key = self.placement_host_keys.get((request.episode, destination))
         observed_at = self.host_evidence(key).observed_at if key is not None else self.clock.now()

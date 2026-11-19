@@ -303,7 +303,7 @@ def drain_identities(
     candidates.update(process.identity for process in processes.values()
                       if is_runner_worker(process.command)
                       or is_runner_worker(process.executable)
-                      or process.argv and is_runner_worker(process.argv[0]))
+                      or process.argv and is_runner_worker(Path(process.argv[0]).name))
     return tuple(process.identity for process in processes.values()
                  if process.identity in candidates and not any(
                      parent.identity in candidates for parent in build_hold.audit_ancestors(process, processes)))

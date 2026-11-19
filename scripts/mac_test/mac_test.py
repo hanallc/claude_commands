@@ -1610,8 +1610,10 @@ def claim_needs_settlement(paths: StatePaths, record: claim_state.RemoteClaim) -
             or offload.pending_start_path(paths.target, claim_state.claim_identity(record)).exists())
 
 
-def settle_retained_mac_claims(paths: StatePaths, settings: Path) -> None:
-    """Retry settlement for each retained Mac claim with an exact identity."""
+def settle_retained_mac_claims(paths: StatePaths, settings: Path, *,
+                              configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                              ) -> MacCiActivity:
+    """Settle exact retained claims and read CI activity before a capacity check."""
     with locked(paths.lock):
         claims = read_claims(paths)
     for claim in claims:
@@ -1621,6 +1623,7 @@ def settle_retained_mac_claims(paths: StatePaths, settings: Path) -> None:
                 _ = release_exact_claims(paths, record["pid"], claim_state.claim_identity(record), str(settings))
             except (OSError, ValueError):
                 continue
+    return mac_ci.read_mac_ci_activity(configuration if isinstance(configuration, conf.ConfigRead) else conf.read(settings))
 
 
 def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
@@ -1883,8 +1886,7 @@ def full_settle(
         ci = MacCiActivity.IDLE
         if paths.platform == "macos":
             settings = config_path(paths.target if paths.registry_selected else "")
-            settle_retained_mac_claims(paths, settings)
-            ci = mac_ci.read_mac_ci_activity(conf.read(settings))
+            ci = settle_retained_mac_claims(paths, settings)
         with locked(paths.lock):
             claims = live_claims(paths)
         waiting_claims = tuple(claim for claim in claims if not claim_belongs_to_block(claim.record, block))
@@ -2269,8 +2271,7 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
             # claim_once reports unreadable state after it reads the claims under the lock.
             ci = MacCiActivity.UNKNOWN
             with suppress(ClaimStateUnreadable):
-                settle_retained_mac_claims(paths, settings)
-                ci = mac_ci.read_mac_ci_activity(conf.read(settings))
+                ci = settle_retained_mac_claims(paths, settings)
         with locked(paths.lock):
             attempt = (adopt_wait_claim(args, paths, scope, session=session) if args.from_pid
                        else claim_once(args, paths, scope, session=session, reserve_wait=not watch_claim,

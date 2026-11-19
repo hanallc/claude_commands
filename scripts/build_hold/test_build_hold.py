@@ -6,6 +6,7 @@ import json
 import io
 import fcntl
 import os
+import pwd
 import re
 import signal
 import socket
@@ -2398,6 +2399,14 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         if not (directory / "cwd").is_symlink():
             (directory / "cwd").symlink_to(self.scratch)
         return directory
+
+    def test_ci_lineage_requires_the_exact_comm_name(self) -> None:
+        worker = self.process(10, "x/Runner.Worker")
+        _ = self.process(20, "cargo", parent=10)
+        with mock.patch.object(pwd, "getpwuid", side_effect=KeyError):
+            self.assertFalse(build_hold.ci_process(20, "200", self.proc))
+            _ = (worker / "comm").write_text("Runner.Worker\n")
+            self.assertTrue(build_hold.ci_process(20, "200", self.proc))
 
     def admission(self, pid: int, start: str) -> None:
         fixture = self.admission_fixture

@@ -463,7 +463,8 @@ def build_origin(pid, processes):
             words = shlex.split(processes[cursor]["command"])
         except ValueError:
             return "unknown"
-        if words and (is_runner_worker(words[0]) or Path(words[0]).name == "Runner.Listener"):
+        name = Path(words[0]).name if words else ""
+        if is_runner_worker(name) or name == "Runner.Listener":
             return "ci"
         cursor = processes[cursor]["parent"]
     return "non-ci"
