@@ -580,6 +580,81 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
         self.assertEqual(firefox_probe_results(page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_model_counts_show_session_names_on_hover_and_focus(self) -> None:
+        model = accounts.ObservedSessionModel("claude-opus-5-5", "low")
+        high = accounts.ObservedSessionModel(model.model, "high")
+        earlier = accounts.ObservedSessionModel("claude-fable-5-1", "low")
+        names = ['alpha & "beta"', "hana-unit (mac)", "zeta"]
+        fixture = replace(status_row("claude1"), roles=("units", "workers"),
+                          role_counts=(accounts.RoleSessionCounts(4, 0, 0, 0), accounts.UnknownRoleCounts()),
+                          models_by_role={"units": Counter({model: 3, high: 1})},
+                          model_names_by_role={"units": {model: accounts.ModelSessionNames(names[::-1]),
+                                                         high: accounts.ModelSessionNames(["high-unit"])}})
+        reading = accounts.StatusReading((fixture,), (), (), timezone.utc, AT)
+        with patch.object(accounts, "read_status", return_value=reading):
+            page = accounts_page.page().decode()
+        refreshed = replace(fixture,
+                            role_counts=(accounts.RoleSessionCounts(6, 0, 0, 0), accounts.UnknownRoleCounts()),
+                            models_by_role={"units": Counter({earlier: 1, model: 3, high: 2})},
+                            model_names_by_role={"units": {**fixture.model_names_by_role["units"],
+                                earlier: accounts.ModelSessionNames(["fable-unit"]),
+                                high: accounts.ModelSessionNames(["high-unit", "new-unit"])}})
+        with patch.object(accounts, "read_status", return_value=replace(reading, rows=(refreshed,))):
+            fresh = accounts_page.AccountsRender(accounts_page.page(), .1, 200).with_recent_times((.1,)).decode()
+        setup = MENU_SETUP.replace("FRESH_PAGE", json.dumps(fresh).replace("</", "<\\/"))
+        probe = r"""<script>
+(async()=>{
+const failures=[], check=(ok,label)=>{if(!ok) failures.push(label);};
+const flush=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+try{
+ frameElement.style.width='800px';frameElement.style.height='520px';await flush();
+ const table=document.querySelector('table[aria-label="Models"]');
+ const [model,high,total]=table.tBodies[0].rows;
+ const count=model.cells[7], tooltip=document.querySelector('.model-tooltip');
+ const names=['alpha & "beta"','hana-unit (mac)','zeta'];
+ count.scrollIntoView({block:'center'});
+ check(count.textContent==='3','the cell contains only the count');
+ check(count.tabIndex===0 && !count.hasAttribute('title'),'the tooltip cell supports focus');
+ check(names.every(name=>count.getAttribute('aria-label')?.includes(name)),'the accessible name includes every session');
+ check(model.cells[3].tabIndex<0 && !model.cells[3].dataset.modelSessions,'zero has no tooltip');
+ check(total.cells[7].tabIndex<0 && !total.cells[7].dataset.modelSessions,'unknown has no tooltip');
+ count.dispatchEvent(new PointerEvent('pointerover',{bubbles:true}));
+ check(!tooltip.hidden && tooltip.textContent===names.join('\n'),'hover shows one line per name in order');
+ count.dispatchEvent(new PointerEvent('pointerout',{bubbles:true}));
+ check(tooltip.hidden,'leaving the count hides its tooltip');
+ count.focus({preventScroll:true});
+ check(document.activeElement===count,'keyboard focus reaches the count');
+ // The screenshot frame sets the active element without sending a focus event.
+ count.dispatchEvent(new FocusEvent('focusin',{bubbles:true}));
+ check(!tooltip.hidden && tooltip.textContent===names.join('\n'),'focus shows the same tooltip');
+ const tip=tooltip.getBoundingClientRect(), bounds=table.getBoundingClientRect();
+ check(tip.left>=Math.max(0,bounds.left) && tip.right<=Math.min(innerWidth,bounds.right)+1 &&
+   tip.top>=Math.max(0,bounds.top) && tip.bottom<=Math.min(innerHeight,bounds.bottom)+1,
+   'the tooltip stays inside the visible table');
+ document.documentElement.dataset.theme='light';
+ check(getComputedStyle(tooltip).backgroundColor==='rgb(25, 35, 57)','the light tooltip uses the console color');
+ document.documentElement.dataset.theme='dark';
+ check(getComputedStyle(tooltip).backgroundColor==='rgb(228, 234, 244)','the dark tooltip uses the console color');
+ const other=high.cells[5];
+ count.dispatchEvent(new PointerEvent('pointerover',{bubbles:true}));
+ other.focus({preventScroll:true});
+ other.dispatchEvent(new FocusEvent('focusin',{bubbles:true}));
+ check(document.activeElement===other && !tooltip.hidden && tooltip.textContent==='high-unit',
+   'focus on a second cell takes priority over the earlier hover');
+ document.dispatchEvent(new Event('visibilitychange'));await flush();
+ const rows=document.querySelector('table[aria-label="Models"]').tBodies[0].rows;
+ const restored=rows[2].cells[5];
+ check(!other.isConnected && restored.textContent==='2' && document.activeElement===restored &&
+   !tooltip.hidden && tooltip.textContent==='high-unit\nnew-unit',
+   'refresh restores focus and the tooltip for the same model, effort and column');
+}catch(error){failures.push(String(error));}
+realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        page = page.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
+        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_models_table_sorts_and_previews_and_saves_a_model_color(self) -> None:
         opus = "claude-opus-5-5"
         models = (accounts.ObservedSessionModel(opus, "low"),

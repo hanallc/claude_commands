@@ -382,7 +382,7 @@ class StatusBoardTests(unittest.TestCase):
         options = accounts.SessionModelOptions("gpt-6.2-sol", "high")
         for label, transcript, compressed, expected in (
             ("hidden turn", turn + "\n" + json.dumps({"type": "response_item", "text": "x" * (128 * 1024)}),
-             False, accounts.SessionModelUnknown()),
+             False, accounts.ObservedSessionModel("gpt-6.2-astra", "xhigh")),
             ("missing effort", json.dumps({"type": "turn_context", "payload": {"model": options.model}}),
              False, accounts.SessionModelUnknown()),
             ("before first turn", '{"type":"session_meta"}', False,
