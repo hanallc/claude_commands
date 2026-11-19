@@ -46,3 +46,24 @@
   2. Existing recovery rows in test_merge_gate_suites_signals.py pass.
   3. basedpyright on both files: zero errors and zero warnings.
   4. `TMPDIR=/tmp ~/.claude/scripts/lib/py -m unittest scripts.production.test_merge_gate_suites_signals` passes 20 loaded runs.
+
+### Phase 384 — the stall watch test halves its AWS CPU  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** production/test_stall_watch.py uses half its AWS gate CPU (AWS rank 22: 28.4 CPU s, 125 tests, 55.5 s wall; slowest test 10.3 s) with every assertion kept.
+- **Spec:**
+  1. Measure like the gate with module_cost.py (`--tests 20 --commands 20`), fresh TMPDIR on /tmp, bytecode on.
+  2. Cut the cost at its cause: fixed waits become events the test drives; repeated process starts and Git calls become one shared fixture where tests only read it.
+  3. Change stall_watch.py only when the same cost also hits production runs, and keep its safety order unchanged.
+  4. Tests read no /tune-changeable value; pin each config value the fixture reads. Fixture Git commands use `git_test_support.fixture_git_environment`.
+  5. If the floor is above half, report the floor and an architecture proposal.
+- **Files:** `scripts/production/test_stall_watch.py`; `scripts/production/stall_watch.py` only for a production cause.
+- **Workers:** 1 writer. One test module.
+  - impl: test_stall_watch.py (and stall_watch.py if needed).
+- **Constraints from prior phases:** AWS account blocked: measure locally until builds says AWS works. When a production change brings new safety gaps in review, restore the parent production file and keep the test savings.
+- **Acceptance gate:**
+  1. Local module_cost.py CPU at most half of the base.
+  2. 20 loaded runs pass, TMPDIR=/tmp, 2 GB scope.
+  3. basedpyright zero errors and warnings on changed files.
+  4. Full natedev gate passes (review_links reds that also occur on base do not count).
