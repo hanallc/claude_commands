@@ -5889,12 +5889,54 @@ const count=value=>Number(chip(value).querySelector('b').textContent);
 const staffCount=(name,value)=>Number(staffChip(name,value).dataset.filterCount);
 const unread=()=>document.getElementById('list-unread');
 const bulk=action=>document.querySelector('.list-table-tools [data-list-expansion="'+action+'"]');
+const searchField=()=>document.getElementById('list-search');
+const clearFilter=()=>document.querySelector('[data-clear-filter-words]');
+const border=()=>getComputedStyle(searchField()).borderTopColor;
+const query=()=>new URLSearchParams(location.hash.slice(1)).get('q');
 const search=value=>new Promise(done=>{
- const field=document.getElementById('list-search');
+ const field=searchField();
  field.addEventListener('filterchange',done,{once:true});field.value=value;field.dispatchEvent(new Event('input'));
 });
 try{
  await flush();
+ const reloadKey='list-filter-clear-reload',saved=sessionStorage.getItem(reloadKey);
+ if(saved===null){
+  const emptyBorder=border();
+  check(searchField().autocomplete==='off' && !clearFilter().getClientRects().length,
+   'The empty filter hides Clear filter and disables autocomplete.');
+  check(getComputedStyle(searchField()).paddingInlineEnd==='10px','The empty filter leaves room for its placeholder.');
+  await search('console');
+  searchField().blur();
+  check(getComputedStyle(searchField()).paddingInlineEnd==='44px','The active filter leaves room for Clear filter.');
+  check(border()!==emptyBorder && border()===getComputedStyle(chip('all')).backgroundColor &&
+   clearFilter().getClientRects().length===1 && !clearFilter().matches(':hover,:focus') &&
+   document.activeElement!==searchField(),'The field with words uses the chip accent and shows Clear filter without focus or hover.');
+  select('owner',OWNER);
+  check(shownNumbers()==='106' && query()==='console','The Owner chip keeps the words.');
+  select('producer',MORTY);
+  check(shownNumbers()==='106' && query()==='console','The Producer chip keeps the words.');
+  show('working');
+  check(shownNumbers()==='106' && query()==='console','The Show chip keeps the words.');
+  select('owner','all');select('producer','all');show('all');
+  sessionStorage.setItem(reloadKey,JSON.stringify({emptyBorder,failures:[...failed,...errors]}));
+  location.reload();
+  return;
+ }
+ sessionStorage.removeItem(reloadKey);
+ const {emptyBorder,failures}=JSON.parse(saved);
+ failed.push(...failures);
+ check(searchField().value==='console' && query()==='console' && visible().length===2 &&
+  border()!==emptyBorder && clearFilter().getClientRects().length===1,'Reload restores the filter from the address.');
+ searchField().value='auto';
+ dispatchEvent(new Event('pageshow'));await flush();
+ check(searchField().value==='console' && query()==='console','Silent browser restoration cannot change the address filter.');
+ clearFilter().click();
+ check(!searchField().value && !query() && visible().length===5 && document.activeElement===searchField() &&
+  border()===emptyBorder && !clearFilter().getClientRects().length,'Clear filter removes the words and returns all five rows.');
+ await search('console');
+ searchField().dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',cancelable:true,bubbles:true}));
+ check(!searchField().value && !query() && visible().length===5 && border()===emptyBorder &&
+  !clearFilter().getClientRects().length,'Escape removes the words and returns all five rows.');
  const tools=document.querySelector('.list-table-tools'),table=tools.nextElementSibling;
  const countLine=tools.querySelector('[data-list-count]');
  const bounds=element=>element.getBoundingClientRect();

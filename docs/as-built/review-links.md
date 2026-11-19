@@ -794,6 +794,11 @@ Owner and Producer list staff in name order after All and omit every trailing `-
 If the resulting name is empty, the chip shows the original staff ID.
 The address keeps the original staff IDs, including `all` when it identifies a staff member.
 The words box sits beside the Producer chips and wraps below them when space is limited.
+When the box contains text, it uses the same accent as a selected chip and shows the Clear filter button.
+Click Clear filter or press Escape in the box to remove the words.
+The other filters stay selected.
+The address stores the words as `q` and restores them on reload.
+The List ignores form text that the browser restores without an input event.
 The chip order is All, Needs me, Morty answering, Working, Blocked, and Parked.
 The List excludes Closed records from rows, filters, and counts.
 Parked includes every non-Closed item with an active park.
