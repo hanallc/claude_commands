@@ -13,7 +13,6 @@ from decimal import Decimal
 from datetime import UTC, datetime
 import json
 import multiprocessing
-import os
 import re
 import sys
 from multiprocessing.process import BaseProcess
@@ -36,6 +35,7 @@ from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings, account_settings_path, gate_deployment, gate_regions
 from scripts.lib import conf
 from scripts.build_queue.admission_jobs import StepJob
+from scripts.lib.process_group import send_process_group
 from scripts.lib import cancellation
 from scripts.build_targets import target_config
 from scripts.production.gate_modules import GateRefused
@@ -98,7 +98,7 @@ def network_git(repo: Path, *arguments: str) -> str:
             if process.returncode is None:
                 with cancellation.defer_cleanup_signals():
                     try:
-                        os.killpg(process.pid, signal.SIGKILL)
+                        send_process_group(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
                     _ = process.wait()
