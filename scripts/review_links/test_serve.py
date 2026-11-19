@@ -260,9 +260,11 @@ class ReviewLinksServerTests(unittest.TestCase):
                 with self.subTest(kind=kind):
                     delivered.clear()
                     request = case.submission_request(kind, owner.id)
+                    evidence = EVIDENCE if kind == new_item_dialog.SubmissionKind.BUG else replace(
+                        EVIDENCE, memory=replace(EVIDENCE.memory, free_for_next_gib=None, queue_cap_gib=None))
+                    request = replace(request, evidence=evidence)
                     if kind == new_item_dialog.SubmissionKind.BUG:
-                        request = replace(request, evidence=EVIDENCE,
-                                          images=(new_item_dialog.PastedImage('image/png', PNG),))
+                        request = replace(request, images=(new_item_dialog.PastedImage('image/png', PNG),))
                     body = json.dumps({**asdict(request), 'token': token}).encode()
                     if kind == new_item_dialog.SubmissionKind.BUG:
                         with ThreadPoolExecutor(max_workers=2) as workers:
@@ -281,6 +283,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     snapshot = cache.get()
                     origin = review_items.submission_origin(snapshot.records[saved['key']])
                     assert isinstance(origin, new_item_dialog.ReviewSubmission)
+                    self.assertEqual(origin.evidence, evidence)
                     self.assertNotIn(origin.reply_token.encode(), replies[0].body + snapshot.payload + snapshot.page)
                     if kind == new_item_dialog.SubmissionKind.BUG:
                         self.assertNotIn(EVIDENCE.title.encode(), snapshot.payload)

@@ -18,6 +18,7 @@ from scripts.lint.memory_test_support import admission_policy_fixture
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import test_hang_guard
 from scripts.review_links import page_frame
+from scripts.review_links import new_item_dialog
 from scripts.production import staff
 from scripts.review_links import staff_names
 GIB = admission_records.GIB
@@ -274,6 +275,62 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(row[1].get("class"), "done")
                 self.assertEqual(row[1].text, expected)
                 self.assertEqual(root.findtext(".//tr[@data-tip='row:fixture-run-1']/td[@class='done']"), "—")
+
+    def test_running_and_waiting_steps_each_have_an_accessible_new_item_button(self) -> None:
+        data = {"total": 64, "cap": 48, "taken": 4, "read_at": 200,
+                "walk": [{"name": "Running <gate>", "queued": True},
+                         {"name": "Mac nextest", "kind": "mac-build"},
+                         {"name": "Mac offline", "kind": "mac-unavailable"},
+                         {"name": "hana CI", "ci": True, "admitted": True}],
+                "waiters": [{"name": "Queued gate", "since": 100}]}
+        rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
+        root = ElementTree.fromstring(f"<root>{rendered}</root>")
+        buttons = root.findall(".//button[@class='row-add']")
+        self.assertEqual([button.get("aria-label") for button in buttons],
+                         ["New item for Running <gate>", "New item for Mac nextest",
+                          "New item for hana CI", "New item for Queued gate"])
+        rows = root.findall(".//tr")
+        self.assertEqual([row[-1].find("button") for row in rows if row[-1].find("button") is not None], buttons)
+        self.assertTrue(all(row[-1].get("class") == "row-action" for row in rows))
+        for button in buttons:
+            icon = button.find("{http://www.w3.org/2000/svg}svg")
+            assert icon is not None
+            self.assertEqual(icon.get("class"), "lucide lucide-plus")
+
+    def test_new_item_evidence_uses_the_readings_memory_and_tooltip(self) -> None:
+        limits = new_item_dialog.BUILD_EVIDENCE_LIMITS
+        long_title = "t" * (limits["title"] - 1) + "🚀 shortened"
+        long_caption = "c" * (limits["text"] - 1) + "🚀 shortened"
+        cases = ((31, 31.0, "Builds gate", "Test all modules"),
+                 ("unavailable", None, "Builds gate", "Test all modules"),
+                 (31, 31.0, long_title, long_caption))
+        for cap, expected, title, caption in cases:
+            with self.subTest(cap=cap, title_length=len(title)):
+                step = {"name": title, "queued": True, "showrunner": "builds", "started_at": 100,
+                        "used": 3, "reserved": 2, "about": caption, "changes": "main",
+                        "about_parts": [{"kind": "text", "text": caption}]}
+                rendered = cast(dict[str, object], self.page_expression(
+                    "(() => {const capture = buildStepEvidence('row:fixture-run-0', data, data.walk[0], "
+                    + "[{label:'Pid',value:'123'}], tooltipRows('row:fixture-run-0', data), "
+                    + json.dumps(limits) + "); return {evidence:capture.evidence, preview:tipRowsHtml(capture.clippedTip)};})()",
+                    {"cap": cap, "read_at": 200, "walk": [step]}, walk=True))
+                evidence = new_item_dialog.read_evidence(rendered["evidence"])
+                assert isinstance(evidence, new_item_dialog.BuildStepEvidence)
+                self.assertEqual(evidence.step_id, "fixture-run-0")
+                self.assertEqual(evidence.owner, "builds")
+                self.assertEqual(evidence.captured_at, "1970-01-01T00:03:20.000Z")
+                self.assertEqual(evidence.title, title[:limits["title"]])
+                self.assertEqual(evidence.tip_title, evidence.title)
+                self.assertEqual(evidence.cells, (new_item_dialog.BuildCell("Pid", "123"),))
+                self.assertEqual(evidence.memory.queue_cap_gib, expected)
+                self.assertEqual(evidence.memory.free_for_next_gib, 18.0)
+                self.assertIn(new_item_dialog.MemorySegment("Build tools", 2, new_item_dialog.MemoryTone.TOOLS),
+                              evidence.memory.segments)
+                self.assertIn(new_item_dialog.TipCaption(caption[:limits["text"]]), evidence.tip)
+                self.assertIn(new_item_dialog.TipField("Changes", "main"), evidence.tip)
+                self.assertIn(new_item_dialog.TipField("Uses", "3.0 GiB"), evidence.tip)
+                preview = ElementTree.fromstring(cast(str, rendered["preview"]))
+                self.assertEqual(preview.findtext("dd[@class='caption']"), caption[:limits["text"]])
 
     def test_a_token_wait_is_the_stage_of_its_running_row(self) -> None:
         row = memory_tests.ProgressKeepAsideTests.reservation("nextest", need=4 * GIB)
@@ -679,7 +736,7 @@ class MemoryHoverTests(unittest.TestCase):
                 assert table is not None
                 headers = table.findall("./thead/tr/th")
                 self.assertEqual([cell.text for cell in headers],
-                                 ["Stage", "Done", "Step", "Dur", "Pid", "Target", "vCPU", "Slot", "Tokens"])
+                                 ["Stage", "Done", "Step", "Dur", "Pid", "Target", "vCPU", "Slot", "Tokens", None])
                 self.assertEqual(table.findall(".//*[@class='stage']"), [])
                 for index, expected in enumerate(("building", "testing", "—", "testing", "—", "testing", "—", "building")):
                     row = table.find(f"./tbody/tr[@data-tip='row:fixture-run-{index}']")
@@ -687,24 +744,24 @@ class MemoryHoverTests(unittest.TestCase):
                     self.assertEqual(row[0].get("class"), "place")
                     self.assertEqual(row[0].text, expected)
                     self.assertEqual(row.findtext("td[@class='slot']"), "2" if index == 0 else "3" if index == 2 else "—")
-                    self.assertEqual(row[-1].get("class"), "tokens")
-                    self.assertEqual(row[-2].get("class"), "slot")
-                    self.assertEqual(row[-3].get("class"), "vcpus")
+                    self.assertEqual([cell.get("class") for cell in row[-4:]],
+                                     ["vcpus", "slot", "tokens", "row-action"])
                 queue_headers = table.findall("./tbody/tr[@class='queue-head']")
                 spacers = root.findall("./div[@class='walk-chart']/div[@class='walk-chart-head queue-head']")
                 self.assertEqual(len(queue_headers), int(waiting))
                 self.assertEqual(len(spacers), 1)
                 if waiting:
-                    self.assertEqual([cell.text for cell in queue_headers[0]],
-                                     ["#", "Done", "Step", "Waiting", "Pid", "Target", "vCPU"])
-                    self.assertTrue(all(cell.get("scope") == "col" for cell in queue_headers[0]))
+                    columns = queue_headers[0].findall("th")
+                    self.assertEqual([cell.text for cell in columns],
+                                     ["#", "Done", "Step", "Waiting", "Pid", "Target", "vCPU", None])
+                    self.assertTrue(all(cell.get("scope") == "col" for cell in columns))
                     for index, expected in enumerate(("1", "cloud", "2")):
                         row = table.find(f"./tbody/tr[@data-tip='wait:fixture-wait-{index}']")
                         assert row is not None
                         self.assertEqual(row[0].text, expected)
                         self.assertIsNone(row.find("td[@class='slot']"))
                 for row in table.findall("./tbody/tr"):
-                    self.assertEqual(len(row), len(headers) - 2 * int(row.get("class", "").startswith(("wait", "queue-head"))))
+                    self.assertEqual(sum(int(cell.get("colspan", "1")) for cell in row), len(headers))
 
     def test_ci_row_requires_a_running_job_and_preserves_the_used_total(self) -> None:
         for state in ("idle", "waiting", "unmatched", "busy", "unreadable"):
@@ -1079,7 +1136,8 @@ process.stdout.write(JSON.stringify(steps));
         functions = html[html.index("function field("):html.index("const tip =")]
         constants = ""
         if walk:
-            functions += html[html.index("function renderWalk(d)"):html.index("function fitAxisLabels()")]
+            start = html.index("function rowAdd(")
+            functions += html[start:html.index("document.addEventListener('click'", start)]
             functions += html[html.index("function esc(s)"):html.index("const consoleHidden =")]
             constants += """
 const elements = new Map();

@@ -71,7 +71,7 @@ from scripts.lib import build_slots, conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.proc_text import read_proc_text
 from scripts.lib.user_zone import user_zone
-from scripts.review_links import console_theme, page_frame, review_link
+from scripts.review_links import console_theme, new_item_dialog, page_frame, review_link
 from scripts.review_links import staff_names
 
 if TYPE_CHECKING:
@@ -259,6 +259,7 @@ def publish_page(configuration: FeedConfiguration) -> None:
     page = page_frame.template(source, "Builds", "builds").replace(
         "__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(configuration.interval_seconds))
     page = page.replace('</head>', staff_names.script({}) + '</head>', 1)
+    page = page.replace("<!-- NEW_ITEM_DIALOG -->", new_item_dialog.render(), 1)
     write_text_atomic(configuration.output_folder / PAGE_NAME, page, new_file_mode=0o644)
 
 

@@ -298,8 +298,9 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk-table thead tr, .walk-table tbody tr.queue-head { height: 30px; }
 .walk-table tbody tr { height: 44px; }
 .walk-table .step { display: none; }
-.walk-table th, .walk-table td { padding: 3px 12px 3px 0; border-bottom: 0; white-space: nowrap; text-align: left; }
-.walk-table th:last-child, .walk-table td:last-child { padding-right: 0; }
+.walk-table th, .walk-table td { padding: 3px var(--column-gap, 12px) 3px 0; border-bottom: 0; white-space: nowrap; text-align: left; }
+.walk-table :is(.tokens, .action-spacer, .row-action), .walk-table :is(.queue-head, .wait) .vcpus { padding-right: 0; }
+.walk-table .row-action { padding-left: var(--column-gap, 12px); padding-right: 4px; }
 .walk-table tbody th { color: inherit; font-weight: 400; }
 .walk-table tr.queue-head th { color: var(--ink-2); font-weight: 600; vertical-align: bottom; }
 .walk-table .duration { width: var(--duration); min-width: var(--duration); }
@@ -307,6 +308,13 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .slot, .walk-table .tokens { font-variant-numeric: tabular-nums; }
 .walk-table .duration, .walk-table .pid, .walk-table .vcpus, .walk-table .slot, .walk-table .tokens { text-align: right; }
 .walk-table .done { text-align: right; font-variant-numeric: tabular-nums; }
+.row-add { display: grid; place-items: center; width: 22px; height: 22px;
+  padding: 0; border: 1px solid var(--line); border-radius: 5px; background: var(--card); color: var(--ink-2); cursor: pointer; }
+.row-add:is(:hover, :focus-visible) { color: var(--accent); border-color: currentColor; }
+.row-add svg { width: 14px; height: 14px; }
+#review-new-item .tip { width: 100%; min-width: 0; max-width: none; grid-template-columns: minmax(0, auto) minmax(0, 1fr);
+  font-size: 0.75rem; }
+#review-new-item .tip :is(dt, dd) { white-space: pre-wrap; overflow-wrap: anywhere; }
 .walk-table th.duration, .walk-table th.done, .walk-table th.pid, .walk-table th.vcpus, .walk-table th.slot, .walk-table th.tokens { text-align: left; }
 .walk-table .cell-text { display: block; max-width: 8rem; overflow: hidden; text-overflow: ellipsis; }
 /* A waiting step's targets wrap inside the Target column, so a queued row never moves the table columns. */
@@ -328,7 +336,7 @@ h3 { margin: 12px 0 4px; font-size: 0.88rem; font-weight: 600; }
 .walk.measuring .walk-table, .walk.measuring .walk-table table { max-width: none; }
 .walk.measuring .step { display: none; }
 /* Use smaller column gaps to keep room for the chart in a narrow pane. */
-.walk.tight .walk-table th:not(:last-child), .walk.tight .walk-table td:not(:last-child) { padding-right: 8px; }
+.walk.tight .walk-table { --column-gap: 8px; }
 .queue-error { display: none; min-height: 60vh; align-items: center; justify-content: center; text-align: center; font-size: 1.1rem; }
 body.queue-unavailable .queue-error { display: flex; }
 body.queue-unavailable .card { display: none; }
@@ -509,6 +517,7 @@ body.queue-unavailable .card { display: none; }
   </section>
 </main>
 <div id="tip" role="tooltip"></div>
+<!-- NEW_ITEM_DIALOG -->
 <script>
 let latest = null;
 // shared:step-tip:start — the step tooltip rows and their HTML; the Disks page uses this code too (disks_page.shared_step_tip).
@@ -1231,7 +1240,7 @@ function captureReportView() {
   const candidates = [...document.querySelectorAll('.wrow[data-tip], main > section[id]')];
   const anchor = [tipRow, focusedRow].find(inView) || candidates.find(element => inView(element) && element.getBoundingClientRect().top >= 0);
   return {anchor: selector(anchor), top: anchor?.getBoundingClientRect().top,
-    focus: active !== document.body ? selector(focus) : '',
+    focus: active?.matches?.('.row-add') ? selector(focus) + ' .row-add' : active !== document.body ? selector(focus) : '',
     details: [...document.querySelectorAll('details')].map(element => [selector(element), element.open])};
 }
 function restoreReportView(view) {
@@ -1468,40 +1477,79 @@ function placeLimitLabels() {
 }
 window.addEventListener("resize", placeLimitLabels);
 
+function rowAdd(name) {
+  return `<button type="button" class="row-add" aria-label="New item for ${esc(name)}"><svg class="lucide lucide-plus" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M5 12h14"/><path d="M12 5v14"/></svg></button>`;
+}
+function buildStepEvidence(key, data, row, cells, tooltip, limits) {
+  const shown = shownReading(data);
+  const memory = queueCapMemory(shown);
+  const gib = bytes => recorded(bytes) ? shownBytes(bytes) / GIB : null;
+  const clip = (text, limit) => text.length <= limit ? text : [...text].slice(0, limit).join('');
+  const clippedTip = tooltip.slice(0, limits.tipEntries + 1).map((entry, index) => {
+    const label = clip(entry.label, index ? limits.label : limits.title);
+    const value = clip(entry.value, index ? limits.text : limits.title);
+    return {...entry, label, value,
+      ...(label === entry.label ? {} : {labelParts: undefined, labelStaffName: undefined}),
+      ...(value === entry.value ? {} : {valueParts: undefined, valueStaffNames: undefined})};
+  });
+  const [title, ...entries] = clippedTip;
+  const evidence = {
+    kind: 'build-step', captured_at: new Date(data.read_at * 1000).toISOString(), step_id: row.key,
+    title: clip(row.name, limits.title), owner: clip(rowOwner(row, key.startsWith('wait:')), limits.title),
+    cells: cells.map(cell => ({label: clip(cell.label, limits.label), value: clip(cell.value, limits.text)})),
+    memory: {
+      free_for_next_gib: gib(memory.free), queue_cap_gib: hasCap(shown) ? shown.cap : null,
+      segments: RAM_BLOCKS.flatMap(([block, label, amount, group]) => {
+        const value = gib(amount(shown.ram));
+        const tone = block === 'tools' ? 'tools' : group === 'builds' || block === 'reserved' ? 'build'
+          : block === 'room' ? 'free' : group === 'free' ? 'system' : 'other';
+        return value > 0 ? [{label, gib: value, tone}] : [];
+      }),
+    },
+    tip_title: title.label, tip_status: title.value,
+    tip: entries.map(entry => entry.kind === 'caption' || entry.kind === 'long'
+      ? {kind: entry.kind === 'caption' ? 'caption' : 'detail', text: entry.value}
+      : {kind: 'field', label: entry.label, value: entry.value}),
+  };
+  return {evidence, clippedTip};
+}
 function renderWalk(d) {
   const scale = d.total;
   const pct = (v) => `${v / scale * 100}%`;
   const tableRows = [];
+  const actionSpacer = '<td class="action-spacer" colspan="2"></td>';
   const columns = (place, duration, running = false) => `<th scope="col" class="place">${place}</th><th scope="col" class="done">Done</th><th scope="col" class="step">Step</th><th scope="col" class="duration">${duration}</th>` +
     `<th scope="col" class="pid">Pid</th><th scope="col" class="machine">${STEP_TABLE_HEADERS.target}</th><th scope="col" class="vcpus">vCPU</th>` +
-    (running ? '<th scope="col" class="slot">Slot</th><th scope="col" class="tokens">Tokens</th>' : "");
-  const cells = (place, name, duration, pid, machine, vcpus, tip, className = "", done = "—", slot = "—", tokens = "—") => {
+    (running ? '<th scope="col" class="slot">Slot</th><th scope="col" class="tokens">Tokens</th>' : actionSpacer) +
+    '<th scope="col" class="row-action"></th>';
+  const cells = (place, name, duration, pid, machine, vcpus, tip, className = "", done = "—", slot = "—", tokens = "—", actionable = true) => {
+    const add = actionable ? rowAdd(name) : "";
     tableRows.push(`<tr class="${className}" data-tip="${tip}" tabindex="0"><td class="place">${esc(place)}</td><td class="done">${esc(done)}</td><th scope="row" class="step"><span class="cell-text">${esc(name)}</span></th>` +
       `<td class="duration">${esc(duration || "—")}</td><td class="pid">${typeof pid === "number" ? pid : "—"}</td>` +
       (Array.isArray(machine)
         // A waiting step lists the machines that can take it, each in its machine color.
         ? `<td class="machine" data-machine="${esc(machine.join(" or "))}"><span class="wait-target">${machine.map(target => `<span class="machine" data-machine="${esc(target)}">${esc(target)}</span>`).join(" or ") || "—"}</span></td>`
         : `<td class="machine" data-machine="${esc(machine || "")}">${esc(machine || "—")}</td>`) + `<td class="vcpus">${typeof vcpus === "number" ? vcpus : className.startsWith("wait") ? "" : "—"}</td>` +
-      (className.startsWith("wait") ? "" : `<td class="slot">${Number.isInteger(slot) && slot > 0 ? slot : "—"}</td>` +
-        `<td class="tokens">${Number.isInteger(tokens) ? tokens : "—"}</td>`) + '</tr>');
+      (className.startsWith("wait") ? actionSpacer : `<td class="slot">${Number.isInteger(slot) && slot > 0 ? slot : "—"}</td>` +
+        `<td class="tokens">${Number.isInteger(tokens) ? tokens : "—"}</td>`) + `<td class="row-action">${add}</td></tr>`);
   };
   const ordered = [...d.walk.filter(row => row.kind === "cloud" || macRow(row) || row.queued && !row.ci), ...d.walk.filter(row => row.ci && row.admitted)];
   const runningCount = ordered.filter(row => row.kind !== "mac-unavailable").length;
   $("walk-title").textContent = `Running, in start order (${runningCount})`;
   const rows = [];
   if (d.ram.build_tools_bytes > 0) {
-    cells("", "Build tools", "", null, "", null, "tools", "tools");
+    cells("", "Build tools", "", null, "", null, "tools", "tools", "—", "—", "—", false);
     rows.push(`<div class="wrow tools" data-tip="tools">${rowLabel("Build tools")}` + rowMemory("tools") + `</div>`);
   }
   rows.push(...ordered.map(r => {
     const idleCI = r.ci && visibleDetail(r) === "idle";
     cells(stageText(r),
-      stepDisplayName(r), idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", r.pid, r.machine, r.vcpus, `row:${r.key}`, "", doneText(r), r.slot, r.tokens);
+      stepDisplayName(r), idleCI ? "" : r.started_at ? ago(r.started_at, d.read_at) : r.state || "", r.pid, r.machine, r.vcpus, `row:${r.key}`, "", doneText(r), r.slot, r.tokens, r.kind !== "mac-unavailable");
     return `<div class="wrow${r.kind === "cloud" ? " cloud-work" : ""}" data-tip="row:${r.key}" data-run="${r.key}">${stepLabel(r)}` +
       (r.kind === "cloud" ? cloudStatus(r, `row:${r.key}`) : rowMemory(`row:${r.key}`)) + `</div>`;
   }));
   // The table row only holds the place of the chart room row beside it; its value shows in the chart.
-  const columnClasses = ["place", "done", "step", "duration", "pid", "machine", "vcpus", "slot", "tokens"];
+  const columnClasses = ["place", "done", "step", "duration", "pid", "machine", "vcpus", "slot", "tokens", "row-action"];
   tableRows.push(`<tr class="room" data-tip="room">${columnClasses.map(column => `<td class="${column}"></td>`).join("")}</tr>`);
   rows.push(`<div class="wrow room">${rowLabel("Free")}` + rowMemory("room") + `</div>`);
   const waitingCount = d.waiters.length;
@@ -1546,6 +1594,30 @@ function renderWalk(d) {
   fitLabels();
 }
 
+document.addEventListener('click', event => {
+  const button = event.target.closest('.row-add');
+  if (!button || !latest) return;
+  const dialog = $('review-new-item');
+  if (!dialog || dialog.open) return;
+  const tableRow = button.closest('tr');
+  const key = tableRow.dataset.tip;
+  const row = stepRow(key, latest);
+  if (!row) return;
+  const headers = key.startsWith('wait:') ? tableRow.parentElement.querySelector('.queue-head')
+    : tableRow.closest('table').tHead.rows[0];
+  const cells = Array.from(tableRow.cells).flatMap((cell, i) => cell.matches('.step, .action-spacer, .row-action') ? []
+    : [{label: headers.cells[i].textContent, value: cell.textContent.trim()}]);
+  const {open, evidenceLimits} = window.reviewNewItem;
+  const {evidence, clippedTip} = buildStepEvidence(key, latest, row, cells, tooltipRows(key, latest), evidenceLimits);
+  const preview = document.createElement('template');
+  preview.innerHTML = tipRowsHtml(clippedTip);
+  hideTip();
+  dialog.addEventListener('close', () => {
+    if (!button.isConnected) document.querySelector(`tr[data-tip="${CSS.escape(key)}"] .row-add`)?.focus({preventScroll: true});
+  }, {once: true});
+  open({trigger: button, recipientName: 'builds', evidence, tipPreview: preview.content.firstElementChild});
+});
+
 function fitAxisLabels() {
   for (const axis of document.querySelectorAll(".ticks")) {
     const bounds = axis.getBoundingClientRect();
@@ -1585,8 +1657,11 @@ function fitWalkDetails() {
   walk.style.minWidth = "";
   walk.classList.add("measuring");
   const capFraction = capEnd(latest);
+  // Keep the chart and data column positions. The action uses the same horizontal scroll as the table.
+  const action = table.querySelector("thead .row-action");
+  const dataWidth = () => table.getBoundingClientRect().width - action.getBoundingClientRect().width;
   function measure(labelWidth) {
-    const neededWidth = table.getBoundingClientRect().width + TABLE_CAP_GAP;
+    const neededWidth = dataWidth() + TABLE_CAP_GAP;
     root.style.setProperty("--amt", labelWidth);
     const fullTrackWidth = walk.getBoundingClientRect().right - track.getBoundingClientRect().left;
     const reservedWidth = capFraction > 0
@@ -1657,7 +1732,7 @@ function fitWalkDetails() {
     walk.style.minWidth = `${Math.ceil(walk.getBoundingClientRect().width + added)}px`;
     fit = measure(labelWidth);
   }
-  const naturalWidth = table.getBoundingClientRect().width;
+  const naturalWidth = dataWidth();
   root.style.setProperty("--details", `${fit.reservedWidth}px`);
   // The top bar shares the chart scale; in a pane where the chart scrolls sideways it uses the card width.
   root.style.setProperty("--bar-details", `${shortBy > 0 ? 0 : fit.reservedWidth}px`);

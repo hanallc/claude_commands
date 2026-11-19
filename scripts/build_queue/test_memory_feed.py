@@ -46,7 +46,7 @@ from scripts.build_queue.scope_activity import (RunningServiceJob, IdleService, 
                                                 ScopeProcess, ScopeProcesses)
 from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import atomic_file, build_folders, build_slots, conf, test_hang_guard
-from scripts.review_links import console_theme, page_frame, review_link, test_serve
+from scripts.review_links import console_theme, new_item_dialog, page_frame, review_link, test_serve
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, command_job, read_step_names
 from scripts.message import unit_labels
@@ -484,7 +484,8 @@ class MemoryFeedTests(unittest.TestCase):
         page = console_theme.with_theme(Path(memory_feed.__file__).with_name("memory_live.html").read_text())
         self.assertIn(console_theme.TOKENS, page)
         return (page_frame.template(page, "Builds", "builds").replace("__MEMORY_FEED_INTERVAL_SECONDS__", json.dumps(seconds))
-                .replace('</head>', staff_names.script({}) + '</head>', 1))
+                .replace('</head>', staff_names.script({}) + '</head>', 1)
+                .replace("<!-- NEW_ITEM_DIALOG -->", new_item_dialog.render(), 1))
 
     def test_converted_rows_show_their_hosts_without_charging_remote_memory_locally(self) -> None:
         baseline = reservation_reading()
@@ -534,8 +535,10 @@ class MemoryFeedTests(unittest.TestCase):
                 ci_keys.add(memory_feed.step_key(memory_feed.build_ci_row(0.0, 0.0, cgroup)))
         self.assertEqual(len(ci_keys), 2)
         html = self.expected_page()
-        functions = html[html.index("function field("):html.index("const tip =")]
-        render = html[html.index("function renderWalk("):html.index("function fitAxisLabels(")]
+        tooltip = html.index("function field(")
+        functions = html[tooltip:html.index("const tip = document.getElementById", tooltip)]
+        start = html.index("function rowAdd(")
+        render = html[start:html.index("document.addEventListener('click'", start)]
         escape = html[html.index("function esc("):html.index("const consoleHidden =")]
         javascript = "globalThis.window=globalThis;" + staff_names.script({})[8:-9] + functions + render + escape + """
 const elements = new Map();
@@ -582,6 +585,7 @@ process.stdout.write(JSON.stringify({
                     place = (str(row.get("stage") or progress.get("phase", "—")) if kind == "row" else
                              "cloud" if row.get("kind") == "cloud" else str(local_position))
                     self.assertIn(f'<td class="place">{place}</td>', cell)
+                    self.assertRegex(cell, r'<td class="row-action"><button type="button" class="row-add"[^>]*>.*</button></td>$')
                     self.assertIn(f'<td class="pid">{row["pid"]}</td>', cell)
                     machine = str(row.get("machine") or "")
                     if kind == "wait":
@@ -1109,7 +1113,9 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(response.status, 200)
         self.assertNotIn(response.getheader("X-Frame-Options", "").upper(), ("DENY",))
         self.assertNotIn("frame-ancestors 'none'", response.getheader("Content-Security-Policy", "").lower())
-        self.assertEqual(response.read().decode(), self.expected_page())
+        page = response.read().decode()
+        self.assertEqual(page, self.expected_page())
+        self.assertEqual(page.count('<dialog id="review-new-item"'), 1)
 
     def test_start_publishes_the_page_before_the_first_queue_reading(self) -> None:
         def view() -> admission_records.QueueRead:
