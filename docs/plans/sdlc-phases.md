@@ -1315,7 +1315,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Result:** `review_regime.py add` requires `--checkpoint`, and two rows match only when unit, plan, phase and checkpoint match; the start-time match is gone. Older ledger rows with no checkpoint stay as history rows that report and watch still read, and no new row matches them. On main 49b3cd5da (hash a31f4cbff).
 
-### Phase 81 — A new registry row goes after its section's last key  · status: todo
+### Phase 81 — A new registry row goes after its section's last key  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -1335,6 +1335,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Acceptance gate:**
 1. The new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
+
+**Result:** `registry_rows.replay` inserts a new row directly after the last key of its section, and a new section at the end of the file. Comments and blank lines after the last key stay below the new row. `bob=` in `config/models.conf` now follows `dwight=`. On main bec23322d (hash 96accc3fa).
 
 ### Phase 82 — A producer sets the state and check time of its own List items  · status: todo
 **Depends on:** none
