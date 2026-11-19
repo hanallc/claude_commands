@@ -190,6 +190,7 @@ from scripts.lib import file_lock
 from scripts.lib.file_lock import PROC_LOCKS as PROC_LOCKS
 from scripts.lib import build_folders, conf
 from scripts.lib.cargo_target_config import (
+    NoCargoManifest,
     cargo_build_folder,
     cargo_folder_settings,
     cargo_home_folder,
@@ -1426,7 +1427,7 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
             next((argument for argument in argv[1:] if not argument.startswith("-")), "")) == "verify.sh")
         if verify or NEXTEST_ARG in argv[1:2] or command == f"cargo-{NEXTEST_ARG}":
             runner = "verify.sh" if verify else "cargo-nextest"
-            for target in workspace_targets(argv, cwd, os.path.join(base, "environ"), owners):
+            for target in workspace_targets(argv, cwd, os.path.join(base, "environ"), owners, verify_runner=verify):
                 if target in checked:
                     _ = found.setdefault(target, TargetUse(pid, f"runs {runner} in {cwd}"))
     return {target: found[target] for target in owners if target in found}
@@ -1645,7 +1646,8 @@ def floor_holders(busy: Mapping[str, TargetUse | LockHeld | BuildHoldTarget | No
     return sorted(holders, key=lambda holder: (-holder.bytes, holder.path))
 
 
-def workspace_targets(argv: list[str], cwd: str, environ: str, targets: Sequence[str]) -> list[str]:
+def workspace_targets(argv: list[str], cwd: str, environ: str, targets: Sequence[str], *,
+                      verify_runner: bool) -> list[str]:
     """Resolve Cargo's artifact and intermediate folders through one busy check."""
     try:
         with open(environ, "rb") as handle:
@@ -1658,6 +1660,8 @@ def workspace_targets(argv: list[str], cwd: str, environ: str, targets: Sequence
     try:
         chosen = {cargo_build_folder(setting, argv, cwd, cargo_home) if key == "build-dir"
                   else os.path.realpath(setting.base / setting.value) for key, setting in settings.items()}
+    except NoCargoManifest:
+        return [] if verify_runner else list(targets)
     except (OSError, ValueError):
         return list(targets)
     owners = targets if isinstance(targets, TargetOwnerIndex) else TargetOwnerIndex(targets)
