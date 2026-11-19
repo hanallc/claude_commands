@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 import unittest
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +17,7 @@ from scripts.direct import assign, phase_table
 from scripts.direct.assign_claude_test_support import direct_launcher_helpers
 from scripts.direct.findings_test_support import invoke_findings
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
+from scripts.lib import build_folders
 from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
@@ -28,6 +29,11 @@ from scripts.agents import remote
 
 ROOT = Path(__file__).resolve().parents[2]
 ASSIGN = ROOT / "scripts/direct/assign.sh"
+
+GIT_LOCATION_VARIABLES = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CEILING_DIRECTORIES",
+)
 
 ASSIGNMENT_SETTINGS = {
     "direct": """\
@@ -188,8 +194,8 @@ def invoke_assignment(arguments: list[str], environment: dict[str, str]) -> subp
 
 
 @contextmanager
-def assignment_helpers(bytecode_setting: str) -> Generator[None]:
-    """Keep helper parsers and handlers in the fixture process."""
+def assignment_environment(bytecode_setting: str) -> Generator[None]:
+    """Pin settings and release the fixture's style folder locks."""
     config = Path(os.environ["CONF_DIR"])
     for stem, settings in ASSIGNMENT_SETTINGS.items():
         _ = (config / f"{stem}.conf").write_text(settings)
@@ -208,7 +214,29 @@ def assignment_helpers(bytecode_setting: str) -> Generator[None]:
         "PROCESS_TABLE_PS": "sh -c :",
     }
     with (patch.dict(os.environ, environment), patch.object(process_table, "PS", ["sh", "-c", ":"]),
-          direct_launcher_helpers()):
+          ExitStack() as style_locks):
+        for name in GIT_LOCATION_VARIABLES:
+            _ = os.environ.pop(name, None)
+        allocate_folder = build_folders.create_build_folder
+        release_folder = cast(Callable[[Path], None], getattr(build_folders, "_release_build_folder"))
+
+        def allocate(request: build_folders.BuildFolderRequest | build_folders.BuildFolderSpec) -> Path:
+            path = allocate_folder(request)
+            if (isinstance(request, build_folders.UniqueBuildFolder)
+                    and isinstance(request.parent, build_folders.ExplicitBuildParent)
+                    and request.parent.path.name == "style"
+                    and path.is_relative_to(config.parent)):
+                _ = style_locks.callback(release_folder, path)
+            return path
+
+        with patch.object(build_folders, "create_build_folder", allocate):
+            yield
+
+
+@contextmanager
+def assignment_helpers(bytecode_setting: str) -> Generator[None]:
+    """Keep helper parsers and handlers in the fixture process."""
+    with assignment_environment(bytecode_setting), direct_launcher_helpers():
         run_process = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
 
         def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:

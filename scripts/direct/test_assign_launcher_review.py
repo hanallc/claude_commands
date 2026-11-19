@@ -5,6 +5,8 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+import unittest
 from pathlib import Path
 from collections.abc import Callable
 from typing import cast, final, override
@@ -16,12 +18,59 @@ from scripts.direct import assign, progress_history, recorder_state
 from scripts.production import staff, worker
 from scripts.herdr import turn_end, worker_panes
 from scripts.production.cli_fixture import invoke_cli
-from scripts.direct.assign_launcher_test_support import ROOT, read_object
+from scripts.direct.assign_launcher_test_support import (
+    GIT_LOCATION_VARIABLES, ROOT, AssignLauncherFixture, assignment_environment, read_object,
+)
+from scripts.lib import build_folders, unit_runs
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.git_test_support import commit_repository
+from scripts.lib.git_test_support import commit_repository, write_fixture_git_config
+from scripts.lint import style_review
 
 setUpModule = codex_fixture.setUpModule
 
+
+@final
+class AssignmentFixtureIsolationTests(unittest.TestCase):
+    def test_commits_keep_the_inherited_git_repository_unchanged(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        sentinel = root / "sentinel"
+        git_dir = sentinel / ".git"
+        environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+        environment.update(GIT_CONFIG_GLOBAL=str(write_fixture_git_config(root)), GIT_CONFIG_NOSYSTEM="1")
+        _ = subprocess.run(["git", "init", "-q", str(sentinel)], env=environment, check=True, capture_output=True)
+        write_text_atomic(sentinel / "tracked", "Sentinel contents.\n")
+        head = commit_repository(sentinel, "Create the sentinel.", env=environment)
+        index = (git_dir / "index").read_bytes()
+        locations = dict.fromkeys(GIT_LOCATION_VARIABLES, str(git_dir))
+        locations["GIT_WORK_TREE"] = str(sentinel)
+        locations["GIT_INDEX_FILE"] = str(git_dir / "index")
+        locations["GIT_OBJECT_DIRECTORY"] = str(git_dir / "objects")
+        case = AssignLauncherFixture("runTest")
+        with patch.dict(os.environ, locations):
+            try:
+                case.setUp()
+                self.assertTrue(set(GIT_LOCATION_VARIABLES).isdisjoint(os.environ))
+                write_text_atomic(case.project / "fixture.txt", "Private work.\n")
+                case.commit_project("Record private work.")
+            finally:
+                case.doCleanups()
+        current = subprocess.check_output(["git", "-C", str(sentinel), "rev-parse", "HEAD"],
+                                          env=environment, text=True).strip()
+        self.assertEqual(current, head)
+        self.assertEqual((git_dir / "index").read_bytes(), index)
+        self.assertEqual((sentinel / "tracked").read_text(), "Sentinel contents.\n")
+
+    def test_fixture_context_releases_the_style_folder_lock(self) -> None:
+        descriptors = Path("/dev/fd")
+        before = len(list(descriptors.iterdir()))
+        case = AssignLauncherFixture("runTest")
+        try:
+            case.setUp()
+            folder = style_review.start(case.project, "HEAD", case.session_dir / "phases/7", case.prompt, "review")
+            self.assertIn(build_folders.build_folder_lock_fd(folder), build_folders.held_build_folder_descriptors())
+        finally:
+            case.doCleanups()
+        self.assertEqual(len(list(descriptors.iterdir())), before)
 
 
 @final
@@ -30,10 +79,10 @@ class PaneAstraReviewTests(HeldRolePaneCase):
 
     @override
     def setUp(self) -> None:
+        bytecode_setting = os.environ.get("PYTHONDONTWRITEBYTECODE", "")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_BIN": sys.executable})))
         super().setUp()
-        from scripts.lib import unit_runs
-
+        _ = self.enterContext(assignment_environment(bytecode_setting))
         _ = self.enterContext(patch.object(unit_runs, "ASTRA_RUN_ROOT", self.panes.root))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"ASTRA_REVIEW_DIR": str(self.panes.root)})))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""})))
@@ -62,6 +111,7 @@ class PaneAstraReviewTests(HeldRolePaneCase):
             os.environ.copy(), ROOT)
 
     def test_named_review_done_records_the_status_style_and_one_notice(self) -> None:
+        write_text_atomic(Path(os.environ["LINT_CONFIG_FILE"]), "style_review=on\n")
         project = self.panes.root / "project"
         project.mkdir()
         _ = subprocess.run(["git", "init", "-q", str(project)], check=True, capture_output=True)
@@ -104,6 +154,9 @@ class PaneAstraReviewTests(HeldRolePaneCase):
                     saved = read_object(case.run_dir / "phases/8/style_review_state.json")
                     self.assertEqual(saved["state"], "complete")
                     self.assertEqual(saved["in_flight"], False)
+                    directory = Path(str(saved["input_directory"]))
+                    self.assertTrue((directory / "assignment.md").read_text())
+                    self.assertEqual((directory / "style-review-additions.txt").read_text(), "+The next design.\n")
 
     def assert_review_lifetime(self, failed: bool) -> None:
         records: list[dict[str, object]] = []
