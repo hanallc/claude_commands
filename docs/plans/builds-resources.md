@@ -2921,26 +2921,18 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 
 **Files:** `scripts/aws_target/aws_trial.py`, `scripts/aws_target/cloud_gate.py`, `scripts/aws_target/test_cloud_gate.py`, `scripts/aws_target/test_aws_trial.py`, `scripts/build_queue/admission_service.py`.
 
-### Phase 159 — The floor pass deletes build output whose workspace is gone before it cuts a live worktree  · status: in review
-**Source:** item 88, bob (producer) go 2026-11-18 19:40 EST, through builds. Order: after the Hana AWS work and the Nov 19 cleanup.
-**Cause:** on 11-18, 18 build folders under `/build/cargo` had no workspace (89.2 GiB; largest `scratch/p37w-de072c` 33.9 GiB and `hana_catalyst-inspectors-prefs` 29.1 GiB). The floor take orders by last use only, so it cut live worktree output while these folders stayed. A workspace removed by hand or by `folder_audit.py` leaves its build folder; `worktree_delete` cleans it.
+### Phase 159 — The floor pass deletes build output whose workspace is gone before it cuts a live worktree  · status: done
+**Source:** item 88, bob (producer) go 2026-11-18 19:40 EST, through builds. On 11-18, 18 folders under `/build/cargo` had no workspace (89.2 GiB) while the floor take cut live worktree output by last use.
 
-#### Work Order
-
-**Goal:** each floor pass first deletes, whole, every build folder whose workspace is gone, then takes from live targets as before.
-
-**Spec:**
-1. A build folder maps to its workspace through the mirror links under `roots.cargo_paths.<host>` (`/build/paths`). On 11-18: `home/natepiano/rust`, `home/natepiano/worktrees` and `build/slot` link to `/build/cargo`; `build/claude/scratch` links to `/build/cargo/scratch`. So `/build/cargo/<name>` serves `~/rust/<name>`, `~/worktrees/<name>` or `/build/slot/<name>`, and `/build/cargo/scratch/<name>` serves `/build/claude/scratch/<name>`; any other `/build/paths<path>` serves `<path>`. Read the links at run time, not from literals. A folder is an orphan only when no workspace it can serve exists.
-2. A folder is an orphan when no mapped workspace exists, no process uses it (`process_uses()`), and `lock_trees()` gets every Cargo lock in it without a wait.
-3. The floor pass takes orphans first, whole, under their Cargo locks, before any live target. Each one writes a `sweep_trim` row with cause `orphan take`.
-4. Slots (`roots.slots.<host>`) are never orphans: a slot's workspace is the slot folder.
-5. Add no new tool and no new config key unless a value must be tunable; a new key needs no user go.
-
-**Files:** `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py` (new tests at the end), `scripts/buildlog/record.py` (the cause value), `docs/as-built/build-memory-admission.md`.
-
-**Workers:** `1 writer + 1 tester`.
-
-**Acceptance gate:** under the floor, an orphan goes before a live target that is older; an orphan with a held Cargo lock or a process stays; a folder of a live `~/worktrees` workspace stays; a slot stays; above the floor, nothing goes. Run test_sweep, test_tmp_sweep and the buildlog record tests.
+#### As-built
+- Under the floor, the pass first takes whole orphan folders, then live targets by last use. Above the floor nothing goes.
+- An orphan is a `/build/cargo` folder with no workspace through the mirror links under `roots.cargo_paths.<host>`, read from the live `build_folders` settings only. Unreadable live settings take no orphan and print one line.
+- An orphan also has no process use (cwd, exe, maps, cargo-nextest or verify.sh workspace, open descriptors), no nested target marker, no mount point, and lies on the filesystem under its floor. A process the sweep cannot read (PermissionError) is skipped, as for live targets; a `/proc` that cannot be listed keeps the folder.
+- Under the Cargo locks, the pass rechecks, renames the orphan to a detached sibling, records the detached path in the trim intent, then deletes it. Recovery deletes only the detached path, after a process check. Discovery hides only the exact detached name format.
+- A second filesystem reads free space through its highest folder on the same device, so a take does not break the reading.
+- Each take writes a `sweep_trim` row with cause "orphan take".
+- Accepted (review): a workspace created between the last check and the rename costs one rebuild; a project quota could make the probe read more space than a target can use (natedev has no quota mounts).
+- Row ebfeb01c8, stacked on the Phase 170 row c0c1e5e07 (shares `sweep.py` lines with the Phase 169 row). Tests in both layouts, 0 failures: 7 modules; types 0.
 
 ### Phase 160 — The Phase 156 gate-time price card merges with main  · status: done
 
