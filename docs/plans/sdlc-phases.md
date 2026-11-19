@@ -1552,6 +1552,36 @@ The test server joins its request handlers before fixture cleanup and gives each
 ### Phase 90 — A merge takes a moved main with no retest when the new main commits change only disjoint non-code files  · status: dropped
 **Result (2026-11-19):** dropped with no merge. bob stopped it at 18:18 EST for the user's side (item 140 (a)). The case that started it, a settings.json commit on main, still retests under the rule. The rule passes only 29 of 554 main moves in 7 days. Review also found that the "non-code" files hold test inputs. The branch `sdlc-phases-90` stays off the merge line. A direct push to main still asks natemerge for a gap first.
 
+### Phase 91 — A direct config or settings push to main waits for a gap in the land line  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a decision by bob and builds, sent by sdlc at 18:19 EST Nov 19. Name: gappush. It replaces phase 90. Each command that pushes a config or settings commit direct to main takes its place in natemerge's land line. It pushes only in a gap between two items. Until this merges, a direct main push asks natemerge for a gap first.
+
+**Spec:**
+1. Put the change in the shared publish path from phase 40 (`live_settings.publish` and the main push lock), not in each caller. It covers each direct main push path:
+   - `tune.py` and `zone.py` (`live_settings.publish`);
+   - the notes timer (`agent_notes_job.py` through `publish_waiting`);
+   - registry rows (`models_registry.publish_pending`);
+   - any settings.json or settings-journal commit path that the writer finds.
+2. The live value still changes at once on natedev and on the Mac. Only the main commit and the push wait for the gap.
+3. A gap is a time when no land runs and no line item is ahead of the push. When the line is empty and no land runs, the push goes at once.
+4. Otherwise the push takes a place in the land line (`land_queue.py`). The runner's `next` runs the push in that place, between two lands. The runner needs no change.
+5. A push that waits shows where it waits: `land_queue.py list` names it, and the caller's reply names its place. It does not block the caller's turn.
+6. The push cleans up after itself: its line item goes when it runs, and an item whose changes another publish already pushed does nothing and goes.
+7. Add no new check or refusal beyond the wait. Ask sdlc first if one seems needed.
+8. Tests write their own fixture repos and line state. One case each: an empty line pushes at once; a running land makes the push wait; a line item ahead makes the push wait; `next` runs the push between two items; a published change leaves no line item.
+
+**Files:** `scripts/lib/live_settings.py`, `scripts/lib/main_push_lock.py`, `scripts/lib/models_registry.py`, `scripts/production/land_queue.py`, their tests, `docs/as-built/merge-gate-and-test-speed.md` (Land line).
+
+**Workers:** 1 writer.
+
+**Order:** after phase 89. Tests run only when natemerge allows them.
+
+**Acceptance gate:**
+1. The five cases pass. basedpyright: 0 errors, 0 warnings. Full gate green.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
