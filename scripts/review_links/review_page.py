@@ -1087,9 +1087,12 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
 
 STYLE = '''<style>
 main:has(>[data-review]){max-width:1124px}
-[data-review]{display:grid;grid-template-columns:minmax(0,1fr) 300px;align-items:center;column-gap:16px}
-[data-review]>:is(.page-heading,.review-queue){grid-column:1/-1;min-width:0}
+[data-review]{display:flex;flex-wrap:wrap;align-items:center;column-gap:16px}
+[data-review]>:is(.page-heading,.review-queue){flex:0 0 100%;min-width:0}
 [data-review]>:is(.page-status,.record-filter-words){margin:0}
+[data-review]>.page-status{flex:1 1 0;min-width:0}
+[data-review]>.page-status>[data-status-reason]{white-space:normal;overflow-wrap:anywhere;min-width:0}
+[data-review]>.record-filter-words{flex:0 0 300px}
 .review-queue{margin-top:12px}
 .review-title{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .review-new span{font-size:1.2em;line-height:1}
@@ -1132,7 +1135,7 @@ background:var(--card);color:var(--ink)}.review-actions .primary{background:var(
 .review-handoff>.staff-name{display:inline-block;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;vertical-align:bottom}
 @media(max-width:960px){[data-review] .list-row td:last-child::before{content:'Age: '}
 .review-panel{grid-template-columns:1fr;padding:0 14px 16px}}
-@media(max-width:800px){[data-review]{grid-template-columns:minmax(0,1fr)}
+@media(max-width:800px){[data-review]>:is(.page-status,.record-filter-words){flex-basis:100%}
 [data-review]>.record-filter-words{margin-top:8px}
 [data-review]>.record-filter-words input{width:100%}}
 @media(max-width:480px){[data-review] .record-filter-row{grid-template-columns:minmax(0,1fr)}}
