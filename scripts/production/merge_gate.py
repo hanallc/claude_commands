@@ -1449,7 +1449,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     runner = module_runner(repo)
     tmpfs = build_folders.tmpfs_temporary_parent()
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
-        raise GateRefused(f"the test runner requires writable tmpfs at {tmpfs}")
+        raise GateRefused(f"the test runner requires a writable gate folder at {tmpfs}")
     # Remove the free test folders that a run ended by a signal left; a held folder costs one lock try.
     build_folders.sweep_temporary_build_folders(gate_test_parent(tmpfs), wait=False)
     hold = BuildHoldWait() if shared else None
