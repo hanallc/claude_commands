@@ -51,14 +51,21 @@ from scripts.direct.findings_test_support import invoke_findings
 from scripts.direct.recorder_fixture import invoke_recorder
 
 
-def unit(name: str, claude: unit_lookup.Claude | None) -> live_units.LiveUnit:
+def unit(name: str, claude: unit_lookup.Claude | None, *, activity: str = "") -> live_units.LiveUnit:
     member = next((row for row in staff.snapshot().rows if row.kind == "unit" and row.name == name),
                   session_state.UnrecordedStaff())
-    activity = (session_state.LiveActivity("idle") if isinstance(claude, unit_lookup.LiveClaude)
-                else session_state.NoLiveSession())
+    if isinstance(claude, unit_lookup.LiveClaude):
+        if isinstance(member, staff.StaffRow):
+            claude = claude._replace(session_id=member.current_session)
+        if activity:
+            claude = claude._replace(activity=activity)
+    observed_activity = (session_state.LiveActivity(claude.activity) if isinstance(claude, unit_lookup.LiveClaude)
+                         else session_state.NoLiveSession())
     observed = unit_lookup.LabeledSession(name, claude, HerdrPlace(f"label-of-{name}", "w1:p1")) if claude is not None else None
     machine = member.worktree.machine if isinstance(member, staff.StaffRow) and isinstance(member.worktree, staff.PresentWorktree) else ""
-    return live_units.LiveUnit(name, observed, status=session_state.classify(member, activity), member=member, machine=machine)
+    owner = session_staff.checked_unit_owner(observed)
+    return live_units.LiveUnit(name, observed, status=session_state.classify(member, observed_activity), member=member,
+                               machine=machine, owner=owner, lifecycle=session_state.staff_state(member))
 
 
 def live(name: str) -> unit_lookup.LiveClaude:
@@ -257,12 +264,14 @@ class UnitPhasesTests(unittest.TestCase):
         return path
 
     def blocks(self, members: Sequence[staff.StaffRow], records: dict[str, object], *,
-               workers: Sequence[census.CensusWorker] = (), statuses: Sequence[str] = (), columns: int = 1000) -> str:
-        return unit_phases.table([unit(row.name, live(row.name)) for row in members], records, repository=self.root,
+               workers: Sequence[census.CensusWorker] = (), statuses: Sequence[str] = (), columns: int = 1000,
+               census_failure: census.CensusFailed | None = None) -> str:
+        units = [unit(row.name, live(row.name), activity=statuses[index] if statuses else "")
+                 for index, row in enumerate(members)]
+        return unit_phases.table(units, records, repository=self.root,
             now=datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp(), zone=ZoneInfo("UTC"),
             columns=columns,
-            census_read=tiles(workers=workers, sessions=[session_of(row, statuses[index] if statuses else "idle")
-                                                       for index, row in enumerate(members)]))
+            census_read=census_failure or tiles(workers=workers))
 
     def git(self, *args: str) -> str:
         return subprocess.run(["git", "-C", str(self.root), *args], check=True, capture_output=True,
@@ -282,13 +291,18 @@ class UnitPhasesTests(unittest.TestCase):
                         unit_lookup.ClaudeUnknown("no records")):
             with self.subTest(session=session):
                 rendered = table_of([unit(member.name, session)], {}, self.root)
-                status = "idle" if isinstance(session, unit_lookup.LiveClaude) else "exited"
+                status = "unknown" if isinstance(session, unit_lookup.LiveClaude | unit_lookup.ClaudeUnknown) else "exited"
+                unknown_owner = isinstance(session, unit_lookup.ClaudeUnknown)
+                count = "idle 0 · unknown 1" if unknown_owner else "idle 1"
+                heading = "unknown" if unknown_owner else "idle"
+                detail = (["| Now | Not recorded | Director's current step not recorded |",
+                           "| Next | Not recorded | The director has not chosen the next task |"]
+                          if unknown_owner else ["| Now | Nothing to do | No plan or queued work |"])
                 self.assertEqual(rendered.splitlines(), [
-                    "working 0 · waiting to merge 0 · waiting on other work 0 · idle 1 · 1 units", "",
+                    f"working 0 · waiting to merge 0 · waiting on other work 0 · {count} · 1 units", "",
                     "| Unit | Director |", "| --- | --- |", f"| namecheck | {status} |", "",
-                    "**namecheck** — idle", "",
-                    "| Item | Work | State |", "| --- | --- | --- |",
-                    "| Now | Nothing to do | No plan or queued work |"])
+                    f"**namecheck** — {heading}", "",
+                    "| Item | Work | State |", "| --- | --- | --- |", *detail])
 
     def test_empty_units_are_idle_for_busy_and_idle_directors_without_a_next_row(self) -> None:
         member = self.member("empty")
@@ -335,13 +349,21 @@ class UnitPhasesTests(unittest.TestCase):
         member = self.member("director")
         _ = self.write_run(member, "director", [("work", "Check delivery")], [
             self.phase_event("activity_started", "work", activity_text="checks delivery")])
-        for status in ("idle", "busy"):
+        for status, expected in (("", "unknown"), ("idle", "idle"), ("busy", "busy")):
             with self.subTest(status=status):
                 rendered = self.blocks([member], {}, statuses=[status])
                 self.assertIn("| Unit | Director |", rendered)
-                self.assertIn(f"| director | {status} |", rendered)
+                self.assertIn(f"| director | {expected} |", rendered)
                 self.assertIn("**director** — working", rendered)
                 self.assertNotIn("| Status |", rendered)
+
+    def test_census_failure_preserves_checked_director_activity(self) -> None:
+        member = self.member("director")
+        for status in ("idle", "busy"):
+            with self.subTest(status=status):
+                rendered = self.blocks([member], {}, statuses=[status],
+                                       census_failure=census.CensusFailed("census unavailable"))
+                self.assertIn(f"| director | {status} |", rendered)
 
     def test_narrow_director_column_keeps_the_recorded_status_word(self) -> None:
         for title in ("Director", "Status"):
@@ -894,30 +916,33 @@ class UnitPhasesTests(unittest.TestCase):
         self.assertIn("one · 2m elapsed", rendered)
         self.assertIn("two · 2m elapsed", rendered)
 
-    def test_status_comes_from_the_census_session_or_the_scanned_machines(self) -> None:
+    def test_status_requires_checked_presence_and_activity(self) -> None:
         owner = fixture_member("showrunner", name="status-owner")
         member = fixture_member("unit", name="listed", parent=owner.id,
             worktree=staff.PresentWorktree(remote.local_machine(), self.root))
         listed = unit("listed", live("listed"))
         mac = listed._replace(machine="mac")
         unrecorded = unit("unrecorded", live("unrecorded"))
+        absent = listed._replace(session=None, status="exited", owner=unit_lookup.ProvedAbsentUnit())
+        standalone = listed._replace(session=None, status="busy", owner=unit_lookup.ProvedLiveUnit(live("listed")))
         failed = census.CensusFailed("census exited 2: bad config")
         cases: list[tuple[census.Census | census.CensusFailed, live_units.LiveUnit, str]] = [
-            (tiles(sessions=[session_of(member, "busy")]), listed, "busy"),
-            (tiles(sessions=[session_of(member, "paused")]), mac, "paused"),
-            (tiles(sessions=[session_of(member, None)]), listed, "—"),
-            (tiles(sessions=[census.CensusSession("listed-id", "busy")]), listed, "exited"),
-            (tiles(sessions=[census.CensusSession("unrecorded-id", "idle")]), unrecorded, "idle"),
-            (LOCAL, unrecorded._replace(session=None), "exited"),
-            (LOCAL, listed, "exited"),
-            (LOCAL, listed._replace(machine=""), "exited"),
-            (LOCAL, mac, "—"),
-            (LOCAL._replace(machines=(census.CensusMachine("natedev", False),)), listed, "—"),
-            (failed, listed, "—")]
+            (tiles(sessions=[session_of(member, "busy")]), listed, "unknown"),
+            (tiles(sessions=[session_of(member, "paused")]), mac, "unknown"),
+            (tiles(sessions=[session_of(member, None)]), listed, "unknown"),
+            (tiles(sessions=[census.CensusSession("listed-id", "busy")]), listed, "unknown"),
+            (tiles(sessions=[census.CensusSession("unrecorded-id", "idle")]), unrecorded, "unknown"),
+            (tiles(sessions=[session_of(member, "busy")]), absent, "exited"),
+            (tiles(sessions=[session_of(member, "exited")]), listed, "unknown"),
+            (tiles(sessions=[session_of(member, "paused")]), standalone, "busy"),
+            (LOCAL, listed, "unknown"),
+            (LOCAL, listed._replace(machine=""), "unknown"),
+            (LOCAL, mac, "unknown"),
+            (LOCAL._replace(machines=(census.CensusMachine("natedev", False),)), listed, "unknown"),
+            (failed, listed, "unknown")]
         for read, selected, expected in cases:
             with self.subTest(read=read, machine=selected.machine):
-                view = unit_phases.census_view(read)
-                self.assertEqual(unit_phases.census_status(view, selected), expected)
+                self.assertEqual(unit_phases.director_status(selected), expected)
 
     def test_resource_waits_held_by_the_same_unit_count_as_working(self) -> None:
         member = self.member("style")
@@ -950,15 +975,18 @@ class UnitPhasesTests(unittest.TestCase):
                                      else "Waits for build queue; holder not recorded")
                         self.assertIn(("Now", "Check delivery (work)", state + "; since 17:58"), detail_rows(rendered, "style"))
 
-    def test_notes_name_background_commands_and_a_sent_checkpoint(self) -> None:
+    def test_notes_omit_unverified_background_commands_and_name_a_sent_checkpoint(self) -> None:
         member = self.member("shells")
         now = datetime(2026, 11, 15, 18, tzinfo=UTC).timestamp()
         read = tiles(sessions=[census.CensusSession(member.current_session, "busy", (
             census.CensusShell("Run the AWS gate", now - 720), census.CensusShell("Watch CI", None)))])
         rendered = unit_phases.table([unit("shells", live("shells"))], {}, repository=self.root, now=now, zone=ZoneInfo("UTC"), census_read=read)
-        self.assertIn("**shells** — working", rendered)
-        self.assertIn(("Now", "Run the AWS gate", "Runs; the director waits for its result"), detail_rows(rendered, "shells"))
-        self.assertIn(("Also", "Watch CI", "Runs; the director waits for its result"), detail_rows(rendered, "shells"))
+        self.assertIn("idle 0 · unknown 1", rendered.splitlines()[0])
+        self.assertIn("**shells** — unknown", rendered)
+        self.assertIn(("Now", "Not recorded", "Director shell work cannot be verified"), detail_rows(rendered, "shells"))
+        self.assertNotIn("Nothing to do", rendered)
+        self.assertNotIn("Run the AWS gate", rendered)
+        self.assertNotIn("Watch CI", rendered)
         for resource, reason, holder, expected in (
                 ("memory", "memory admission", {"state": "NamedHolder", "resource_kind": "memory", "resource": "build",
                             "holder": {"state": "UnitHolder", "unit": "builder"}},
@@ -2499,8 +2527,7 @@ class UnitPhasesTests(unittest.TestCase):
 
     def test_unknown_unit_status_precedes_the_census(self) -> None:
         marked = live_units.LiveUnit("example", None, status="unknown", owner=unit_lookup.UnknownUnit("pane list denied"))
-        view = unit_phases.CensusView({}, frozenset({remote.local_machine()}), {})
-        self.assertEqual(unit_phases.census_status(view, marked), "unknown")
+        self.assertEqual(unit_phases.director_status(marked), "unknown")
 
     def test_unreadable_anomaly_repeat_key_reports_one_line_without_a_send(self) -> None:
         sender = Mock()
@@ -2598,7 +2625,7 @@ class UnitPhasesTests(unittest.TestCase):
         sender.assert_not_called()
         self.assertEqual(staff.by_id(member.id), member)
 
-    def test_census_failure_shows_no_status_or_workers_and_one_anomaly(self) -> None:
+    def test_census_failure_preserves_director_presence_and_reports_workers_unknown(self) -> None:
         doc = self.root / "production.md"
         _ = doc.write_text(f"# Production\n- **Merge branch:** main\n- **Showrunner checkout:** {self.root}\n- **Log:** log.md\n")
         owner = fixture_member("showrunner", name="failed-owner", doc=staff.LiveDoc("natedev", doc))
@@ -2618,7 +2645,7 @@ class UnitPhasesTests(unittest.TestCase):
         table_end = max(index for index, line in enumerate(lines) if line.startswith("| "))
         self.assertEqual(lines[:table_end + 1], [
             "working 0 · waiting to merge 0 · waiting on other work 0 · idle 0 · unknown 1 · 1 units", "",
-            "| Unit |", "| --- |", "| member |", "",
+            "| Unit | Director |", "| --- | --- |", "| member | exited |", "",
             "**member** — unknown", "",
             "| Item | Work | State |", "| --- | --- | --- |",
             "| Now | Not recorded | Workers unavailable; who runs cannot be determined |",
@@ -2844,7 +2871,7 @@ class UnitPhasesTests(unittest.TestCase):
                 tickets.assert_not_called()
                 self.assertEqual(output.getvalue(),
                     "working 0 · waiting to merge 0 · waiting on other work 0 · idle 1 · 1 units\n\n"
-                    + "| Unit | Director |\n| --- | --- |\n| a | idle |\n\n"
+                    + "| Unit | Director |\n| --- | --- |\n| a | unknown |\n\n"
                     + "**a** — idle\n\n| Item | Work | State |\n| --- | --- | --- |\n"
                     + "| Now | Nothing to do | No plan or queued work |\n")
 

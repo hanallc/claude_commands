@@ -14,6 +14,7 @@ from typing import cast, override
 from unittest import mock
 from urllib.parse import urlsplit
 
+from scripts.aws_target import hana_protocol
 from scripts.aws_target import aws_target, hana_box as box, hana_guest, hana_provider as provider, hana_receiver, deploy, ledger
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture
@@ -39,6 +40,7 @@ class FakeAws:
     status: str = 'instance-stopped-by-user'
     ownership: str = IDENTITY.deployment
     objects: dict[str, dict[str, object]] = field(default_factory=dict)
+    uploaded_objects: dict[str, bytes] = field(default_factory=dict)
     calls: list[tuple[str, str, float]] = field(default_factory=list)
     environments: list[dict[str, str]] = field(default_factory=list)
 
@@ -86,7 +88,9 @@ class FakeAws:
                 if self.puts_before_timeout == 0:
                     raise subprocess.TimeoutExpired('fixture put', timeout)
                 self.puts_before_timeout -= 1
-                self.objects[key] = ledger.mapping(cast(object, json.loads(Path(arguments[arguments.index('--body') + 1]).read_text())))
+                content = Path(arguments[arguments.index('--body') + 1]).read_bytes()
+                self.uploaded_objects[key] = content
+                self.objects[key] = ledger.mapping(cast(object, json.loads(content)))
                 if self.put_error_after_save:
                     return subprocess.CompletedProcess(list(arguments), 1, '', self.put_error_after_save)
             elif key in self.objects:
@@ -196,19 +200,21 @@ class HanaProviderTests(CostFixture):
         self.assertEqual([op for _, op, _ in self.fake.calls].count('stop-instances'), 2)
 
     def test_execution_objects_use_the_exact_boot_and_scoped_policy(self) -> None:
-        from scripts.aws_target import hana_execution, test_hana_execution as fixtures
+        from scripts.aws_target import test_hana_execution as fixtures
 
         fixture = fixtures.HanaExecutionTests()
         request = fixture.request
         access = self.provider.execution_access(request.key)
-        envelope = hana_execution.HanaCommandEnvelope(request,
+        envelope = hana_protocol.HanaCommandEnvelope(request,
             hana_guest.WorkPermit(access.expires_at, '3', request.key.generation.boot_id), access)
-        self.provider.publish_execution(envelope)
+        content = hana_protocol.encode_envelope(envelope)
+        self.provider.publish_execution(content)
         prefix = 'control/' + request.key.generation.deployment + '/' + request.key.generation.start_token
         self.assertEqual(self.fake.objects[prefix + '/command.json']['action'], 'execute')
+        self.assertEqual(self.fake.uploaded_objects[prefix + '/command.json'], content)
         observation = fixture.objects.observe_execution(request.key)
         observation_key = urlsplit(access.observation_url).path.lstrip('/')
-        self.fake.objects[observation_key] = ledger.mapping(cast(object, json.loads(hana_execution.encode_observation(observation))))
+        self.fake.objects[observation_key] = ledger.mapping(cast(object, json.loads(hana_protocol.encode_observation(observation))))
         for timeout in (3, 15):
             with self.subTest(timeout=timeout):
                 self.assertEqual(self.provider.observe_execution(request.key, timeout_s=timeout), observation)
@@ -276,7 +282,7 @@ class HanaProviderTests(CostFixture):
                     if saved:
                         self.assertEqual(self.fake.objects[fence_key]['action'], 'fence')
                         self.fake.objects[observation_key] = ledger.mapping(
-                            cast(object, json.loads(execution.encode_observation(observation))))
+                            cast(object, json.loads(hana_protocol.encode_observation(observation))))
 
                 window = execution.FenceAcknowledgementWindow(1002.5, 1)
                 with (mock.patch.object(time, 'monotonic', side_effect=lambda: current),
@@ -297,11 +303,11 @@ class HanaProviderTests(CostFixture):
                     self.assertTrue(execution.claim_dispatch_pending(fixture.root, fixture.reference))
 
     def test_execution_observation_rejects_oversized_objects(self) -> None:
-        from scripts.aws_target import hana_execution, test_hana_execution as fixtures
+        from scripts.aws_target import test_hana_execution as fixtures
 
         fixture = fixtures.HanaExecutionTests()
         key = urlsplit(self.provider.execution_access(fixture.key).observation_url).path.lstrip('/')
-        self.fake.objects[key] = {'oversized': 'x' * (hana_execution.CONTROL_MAX_BYTES + 1)}
+        self.fake.objects[key] = {'oversized': 'x' * (hana_protocol.CONTROL_MAX_BYTES + 1)}
         with self.assertRaises(provider.ProviderPending):
             _ = self.provider.observe_execution(fixture.key)
 

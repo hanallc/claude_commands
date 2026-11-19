@@ -52,7 +52,6 @@ An addressed reviewer's lens comes from dispatch evidence.
 - On natedev, `check` takes about 1.4 s wall and 7.5 s CPU at load 51, and 5.13 s wall at load 150. Wall time follows load, so record the load with each time.
 - A reword of a file with a kept context fails the repository test until that file's kept text in `role_terms.toml` is refreshed.
 - Stored record fields and addresses that hold a retired word are kept contracts. `role_terms.toml` lists each one, and a change to one adds a kept context in the same change.
-- `banned_words_lib.py --diff` waits on stdin unless run with `</dev/null`.
 - `Job` values equal their first display name, so key and display text look the same. Code uses the key.
 - The broadcast line is a contract with its readers: `zone.py` counts ` - sent\b`, and the Codex winddown tests parse it. Change them together.
 - A config edit does not retitle a live tab. Fixtures pass a config path or patch `runtime_names`, and never read the live config.

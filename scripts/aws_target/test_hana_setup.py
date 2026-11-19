@@ -274,7 +274,10 @@ class HanaSetupTests(CostFixture):
         _ = hana_image.save(self.state, hana_image.RegisteredImage('nixos-hana-fixture', 'ami-fixture-reviewed',
             '000000000000', 'vpc-fixture', 'subnet-fixture', aws.digest))
 
-        def checks(_timeout: int, _interval: int) -> Generator[float]:
+        def checks(_timeout: int, _interval: int, *, check_at_deadline: bool = False) -> Generator[float]:
+            if check_at_deadline:
+                yield self.clock()
+                return
             for _ in range(12):
                 self.clock.advance(1)
                 yield self.clock()
@@ -321,6 +324,7 @@ class HanaSetupTests(CostFixture):
                 self.assert_root_replaced(aws, output)
                 self.assertEqual(remote.read_record(self.state / 'hana/setup.json')['version'], version)
                 aws.calls.clear()
+                text_setting(self.workload, 'execution_shell', 'ci')
                 self.assertTrue(subject.hana_setup(approve_resources=True))
                 self.assertTrue(output.getvalue().endswith('Hana image is current.\n'))
                 self.assertTrue(all(call.startswith('describe-') for call in aws.calls))
@@ -646,7 +650,7 @@ class HanaSetupTests(CostFixture):
 
     def test_root_replacement_preflight_refuses_without_a_mutation(self) -> None:
         for case, message in (
-                ('busy', 'must be stopped'), ('claim', 'lifecycle is busy'), ('registration', 'no verified image'),
+                ('busy', 'must be stopped'), ('claim', 'lifecycle is still busy'), ('registration', 'no verified image'),
                 ('boot', 'incompatible'), ('digest', 'did not confirm the registered Hana guest digest'),
                 ('volume', 'retained Hana data attachment'), ('identity', 'registration differs')):
             with self.subTest(case=case), self.root_replacement() as (subject, aws, output):
@@ -670,7 +674,10 @@ class HanaSetupTests(CostFixture):
                 _ = lifecycle.write_text(json.dumps(row))
                 with self.assertRaisesRegex(ValueError, message):
                     _ = subject.hana_setup(approve_resources=True)
-                self.assertEqual(output.getvalue(), '')
+                if case == 'claim':
+                    self.assertIn('waiting up to', output.getvalue())
+                else:
+                    self.assertEqual(output.getvalue(), '')
                 self.assertFalse(hana_replacement_record.held(self.state))
                 self.assertTrue(all(call.startswith('describe-') for call in aws.calls))
 

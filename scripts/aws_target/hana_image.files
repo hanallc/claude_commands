@@ -1,0 +1,10 @@
+scripts/aws_target/__init__.py
+scripts/aws_target/hana_generation.py
+scripts/aws_target/hana_guest.py
+scripts/aws_target/hana_payload.py
+scripts/aws_target/hana_protocol.py
+scripts/aws_target/hana_receiver.py
+scripts/aws_target/hana_result.py
+scripts/build_queue/execution_identity.py
+scripts/lib/build_folder_lock.py
+scripts/lib/process_stat.py

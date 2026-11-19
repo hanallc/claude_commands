@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.build_queue import execution_identity
 from scripts.lib.checkout_test_support import copy_runtime, write_python_tool
 
 from collections.abc import Callable, Sequence
@@ -409,8 +410,8 @@ class OffloadCommandFixture(unittest.TestCase):
         destination = placement.PlacementDestination(provider, target, host, scope, 1 if provider == "ssh" else 0)
         local = admission.request(owner=owner, episode=uuid.uuid4().hex, step=verb)
         source_key = treekey.tree_key(str(repository))
-        source = (placement.SourceKeyKnown(source_key) if source_key is not None
-                  else placement.SourceKeyUnavailable("the fixture has no tree key"))
+        source = (execution_identity.SourceKeyKnown(source_key) if source_key is not None
+                  else execution_identity.SourceKeyUnavailable("the fixture has no tree key"))
         constraints = placement.PlacementConstraints(source, ("cargo", verb), str(repository), "hana",
             session_owner.owning_session(self.environment if environment is None else environment),
             (placement.PlacementCandidate(destination),), placement.PinnedHost(target))

@@ -567,6 +567,8 @@ class InventoryTests(ShutdownTestCase):
         self.make_git_checkout()
         self.make_command_stand_ins()
         self.make_sessions(socket_path)
+        self.herdr_process(self.director_pid, DIRECTOR_SHELL_PID, ["/fixture/claude"], {})
+        self.herdr_process(DESKTOP_PID, DESKTOP_SHELL_PID, ["/fixture/claude"], {})
         for config_dir in (self.target_config, self.other_config):
             (config_dir / "projects").symlink_to(self.home / ".claude/projects", target_is_directory=True)
         self.make_production_state()
@@ -980,6 +982,13 @@ elif "comm=" in joined:
         self.assertEqual(inventory.parse_inventory(json.dumps(found)), found)
         self.assertEqual(shutdown._host_text(desktop["host"]), "herdr writing")  # pyright: ignore[reportPrivateUsage]
 
+    def test_unreadable_herdr_placement_stays_unknown_in_inventory(self) -> None:
+        with patch.object(herdr, "herdr_place_of", return_value=herdr.UnprovedHerdrPlacement("placement denied")):
+            found = inventory.inventory(TARGET_LOGIN)
+        desktop = next(session for session in found["sessions"] if session["session_id"] == DESKTOP_ID)
+        self.assertEqual(desktop["host"], {"kind": "unknown"})
+        self.assertEqual(inventory.parse_inventory(json.dumps(found)), found)
+
     def test_herdr_inventory_records_attached_clients_and_defaults_unreadable_clients_to_detached(self) -> None:
         self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "writing", "server"], {})
         self.herdr_process(DESKTOP_PID, 71_001, ["/bin/claude"], {"HERDR_PANE_ID": "w1:p1"})
@@ -1036,10 +1045,12 @@ elif "comm=" in joined:
         rows = cast(dict[str, list[object]], json.loads(os.environ["SHUTDOWN_TEST_PARENT_ROWS"]))
         rows[str(self.director_pid)] = [supervisor_pid, "claude"]
         rows[str(supervisor_pid)] = [DIRECTOR_SHELL_PID, "python3"]
+        read_bytes = Path.read_bytes
+
         def cmdline(path: Path) -> bytes:
             if path == Path(f"/proc/{supervisor_pid}/cmdline"):
                 return b"python3\0/tmp/relaunch.py\0run\0--\0claude\0"
-            raise FileNotFoundError(path)
+            return read_bytes(path)
         for refresh in (True, False):
             with (
                 self.subTest(refresh=refresh),
@@ -1056,7 +1067,14 @@ elif "comm=" in joined:
 
 
     def test_ghostty_shell_parent_is_not_a_supervisor(self) -> None:
-        with patch.object(Path, "read_bytes", side_effect=FileNotFoundError):
+        read_bytes = Path.read_bytes
+
+        def no_supervisor_command(path: Path) -> bytes:
+            if path.name == "cmdline":
+                raise FileNotFoundError(path)
+            return read_bytes(path)
+
+        with patch.object(Path, "read_bytes", autospec=True, side_effect=no_supervisor_command):
             found = inventory.inventory(TARGET_LOGIN, only=frozenset({DIRECTOR_ID}))
         owner = next(item for item in found["sessions"] if item["session_id"] == DIRECTOR_ID)
         host = owner["host"]

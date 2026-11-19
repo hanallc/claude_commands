@@ -380,6 +380,9 @@ One row can open its card in place.
 `record_table.py` supplies the table styles, filters, sorting and open-row controls for Review and The List.
 When a Review action removes a card, the shared table keeps a copy of the row and its open details in place.
 The copy fades and collapses in 200 ms, and the rows below slide up during that time.
+The Review page can restore a pending card after the user scrolls one viewport.
+The redraw that restores this card waits for all row animations to end.
+When Later hides the last card for an owner, the Owner filter resets after the fade ends.
 A save can change the card's sort values. The copy keeps its previous values until the fade ends.
 If the request fails, the row slides back into view and the current card stays selected.
 If the fade is still in progress, the return starts at the copy's current height and opacity.
@@ -732,18 +735,18 @@ User decisions come first, then unread updates, then the earliest next check.
 A column button sorts its values; a second click reverses that order.
 
 The List starts with All selected in the Owner, Producer, and Show rows.
-Owner and Producer list staff in name order after All and omit the `-unit` suffix from names.
+Owner and Producer list staff in name order after All and omit every trailing `-unit` from names.
+If the resulting name is empty, the chip shows the original staff ID.
 The address keeps the original staff IDs, including `all` when it identifies a staff member.
 The words box sits beside the Producer chips and wraps below them when space is limited.
-The chip order is All, Needs me, Morty answering, Working, Blocked, Parked, and Closed.
-Morty answering includes all items with an open question, including parked items and items that need Resend.
-The other status chips contain items with no open question.
+The chip order is All, Needs me, Morty answering, Working, Blocked, and Parked.
+The List excludes Closed records from rows, filters, and counts.
+Morty answering includes items with an open question that are outside Parked, including items that need Resend.
 Needs me includes unparked items in Waiting for nate or Delivered.
 Working includes unparked items in New or Working.
 Blocked includes unparked items in Blocked or Paused.
-Parked includes items with a future parking time in states other than Done and Closed.
-Closed includes items in Done or Closed, even when they have a future parking time.
-Each item belongs to one status category. The six counts add up to All.
+Parked includes every non-Closed item with a future parking time.
+All excludes items in Parked and includes Done items.
 The Unread only switch limits the visible items and chip counts to unread items.
 Each chip count reflects the words box and the filters in the other rows.
 The “need you” total uses the Needs me chip count.
@@ -757,7 +760,8 @@ Each button applies the current text in the words box before it selects the item
 Hidden items keep their open or closed state.
 
 A link under Links opens the target item in the console.
-The table changes Show to All if the target is outside the current view.
+The table can change Show to All to reveal the target.
+A link to an item in Parked selects Parked.
 The table clears each filter that excludes the target and keeps each filter that matches it.
 The table scrolls to the target and highlights it briefly.
 The table leaves a gap below the sticky status banner when it shows.
@@ -829,8 +833,9 @@ The Owner menu includes record owners without a current staff row.
 The Producer menu beside it lists each producer that a record names.
 An address with a producer that no record names shows all producers.
 The State column shows the saved state of each item.
-Closing an item clears its unread mark. A later answer can mark it unread again.
-An older address with `show=done` opens the Closed view.
+Closing an item clears its unread mark.
+An older address with `show=closed`, `show=done`, or `state=Closed` opens All.
+A link to a Closed item shows “Item #N is closed.”
 An older address with `show=unread` turns on Unread only.
 The search field matches the item number, owner name, title, or state words.
 Numbers can include `L` or `#`.
@@ -895,6 +900,8 @@ The POST response includes the current unread state.
 The form keeps its signed update until a page refresh shows a new snapshot.
 The page clears the dot and Mark read button when that state is false.
 It restores both controls when the response reports a new unread update.
+Mark read, Park until, and Remove release the link to the item.
+If the item stops matching the filters, it starts to fade as soon as the user submits the action.
 If the read write fails, the question or feedback remains saved and the sender can deliver it.
 The store keeps the unread update if the read write fails or a newer update exists.
 Tell morty shows “sent to morty; update remains unread” in both cases.
@@ -933,17 +940,33 @@ The panel shows each open question with its asked time.
 The waiting row keeps its log after Ask saves.
 A link opens a filtered-out question or read item in a separate section and preserves the current filters.
 The section does not change the results count.
+The List address preserves a linked item outside the filters when the console reloads.
+It counts in its current status chip.
+Close the linked item or change a filter to dismiss the section.
 An open question adds a Morty answering note below the saved state.
 Morty runs `the_list.py answer L<N> --question <id> --text "<answer>"` to save an answer.
-The answer adds one record event and marks the item unread, including when the item is Closed.
+The answer adds one record event and marks the item unread.
+Closing an item moves each open question to a “Question closed with item” log entry.
+The entry keeps the question ID, words, and time.
+The question no longer accepts answers or retries.
+Older Closed records stay in the store in their original format.
+Question delivery checks the current List record under the same lock that Close uses.
+The check runs before the first send and each retry.
+A close preserves the delivery result of a send already in progress.
+The sender checks the item again before it sends a failure alert.
+A read error during retry authorization preserves the confirmed failure and reports the read error separately.
+Startup recovery skips Closed items.
+A new Ask on a Closed item is refused.
+A retry of a saved Ask returns its saved result without sending again.
 After the last answer, the next refresh returns the row to its status chip.
-Parked shows the item after the last answer if its parking time is still active.
+The item stays in Parked while its parking time is active.
 A signed Unpark request from an earlier page can clear parking while the item waits for an answer.
-That request keeps the item in Morty answering and shows its confirmation next to Show.
+That request moves the item to Morty answering and shows its confirmation next to Show.
 An unread answer appears in the panel with the question, both times, and an Unread mark.
 Mark read clears the signed update shown by the form.
 Opening an individual row with an unread answer uses the same signed read operation.
 The List sends this request after the text of each unread answer enters the viewport while the row is open.
+This rule also applies to direct links and to answers that appear in linked details after refresh.
 The tab and console frame must also be visible.
 Expand all leaves answers unread.
 A newer update stays unread if it arrives before the read saves.
@@ -996,16 +1019,16 @@ When Unpark clears parking and removes the row from Parked, the page shows “It
 The page shows confirmations for hidden rows next to the Show filter.
 It keeps one confirmation per hidden row after overlapping Unpark requests.
 Focus moves from **Unpark** to the Parked filter and brings the filter and confirmation into view.
-In All, the row stays expanded and focus moves from **Unpark** to its item number.
+If All is active when Unpark saves, the row stays expanded and its item number can receive focus.
 After Unpark, the item's saved state sets its status chip.
 The shared item writer saves the action and its pending notice in one locked write.
 The notice tells morty which action nate completed.
 The existing sender delivers the notice with its retry and alert rules.
 A delivery failure does not reverse the completed item action.
 Tell morty sends the user's words without changing the item's state or parking time.
-Remove moves the item to Closed at once.
-Park moves an item to Parked at once when its state is outside Closed.
-With Unread only on, the row leaves the view when the user presses Mark read, Ask question, Tell morty, or Remove.
+Remove hides the item at once and closes it when the save succeeds.
+Park moves an item to Parked at once.
+With Unread only on, the row leaves the view when the user presses Mark read, Ask question, or Tell morty.
 The row returns when the server reports an unread update and the row matches the current filters.
 The shared table fades and collapses the row and its open details when an action hides them.
 The request starts without waiting for the animation.
@@ -1021,7 +1044,7 @@ The restored row slides back into view.
 After a Park refusal, the page returns focus to **Park until** only if the document body has focus and the control is visible and enabled.
 Each row keeps its own inline failure notice.
 The List uses the same rules as Review for notices above the table.
-If Remove or Park loses its response, the page keeps the row in its new view and reports that the save is unconfirmed.
+If Remove or Park loses its response, the page restores the confirmed row and reports that the save is unconfirmed.
 A new action uses a new request ID, even if the previous response did not arrive.
 The page keeps each unconfirmed request ID for an exact retry, even after another action.
 An HTTP 5xx response to Ask question leaves the request unconfirmed.
@@ -1056,6 +1079,8 @@ Delivery is at least once; a crash after a send but before its saved result can 
 The Update cell shows “sent to morty” with its time until the next log entry from morty.
 The page retains draft words, dates, actions, request IDs, and tokens during a refresh.
 An unchanged retry uses its saved request ID and token after a lost response.
+After a lost Park or Remove response, the List reads the current item before it restores the row.
+For Park, it checks the receipt for the exact request even when the item already has a parking time.
 Changed feedback uses the fresh signed request from the page.
 A successful send clears the saved request ID and only the text that the user sent.
 Each successful POST returns a fresh signed request ID for the next action.

@@ -20,6 +20,7 @@ import unittest
 from unittest import mock
 from typing import TextIO, cast, override
 
+from scripts.build_queue import execution_identity
 from scripts.aws_target import hana_placement as hana
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_queue import admission_protocol as wire, admission_records as records, admission_service as service, placement
@@ -73,7 +74,7 @@ def placement_request(fixture: AdmissionFixture, *, session: placement.Submittin
     local = fixture.request(since=since)
     local = replace(local, run=wire.RunIdentity(local.owner.pid, local.owner.start_time))
     destination = placement.PlacementDestination("mac", "mac", "fixture-mac", RepositoryScope("hana"))
-    constraints = placement.PlacementConstraints(placement.SourceKeyKnown("source-a"), ("cargo", "nextest", "run"), "hana", "hana", session,
+    constraints = placement.PlacementConstraints(execution_identity.SourceKeyKnown("source-a"), ("cargo", "nextest", "run"), "hana", "hana", session,
                                                  (placement.PlacementCandidate(destination),))
     owner = placement.SubmittingOwner(fixture.server.host, local.owner.pid, local.owner.start_time)
     return wire.PlacementRequest(local.episode, owner, local.since, local.profile, constraints,
@@ -234,7 +235,7 @@ class CargoFolderTests(unittest.TestCase):
             holder = scoped_cargo_request(fixture, folder)
             grant, = fixture.connect(holder).replies()
             assert isinstance(grant, wire.LocalPlacementGranted)
-            key = placement.attempt_key(holder.episode, grant.assignment.attempt)
+            key = execution_identity.attempt_key(holder.episode, grant.assignment.attempt)
             fixture.end_owner(wire.Owner(holder.owner.pid, holder.owner.start_time))
             _ = fixture.run_pass()
             self.assertIsInstance(fixture.server.assignments[key].state, placement.ClosedAssignment)
@@ -402,9 +403,9 @@ class CargoFolderTests(unittest.TestCase):
             claim = adopt_assignment(fixture, older, assigned.assignment)
             authorized, = fixture.connect(consume_permission("remote-authorized", assigned.assignment, claim)).replies()
             self.assertIsInstance(authorized, wire.FirstAuthorization)
-            execution = placement.ProcessExecution(assigned.assignment.destination.host, "host-generation-a", 700001, "start")
+            execution = execution_identity.ProcessExecution(assigned.assignment.destination.host, "host-generation-a", 700001, "start")
             _ = fixture.connect(wire.ExecutionReport("remote-started", assigned.assignment, claim,
-                placement.ObservedExecution(execution), placement.AttemptRunning())).replies()
+                execution_identity.ObservedExecution(execution), placement.AttemptRunning())).replies()
             fixture.allow_next_start()
             _ = fixture.run_pass()
             self.assertEqual(set(fixture.caller_reservations()), {later.episode})
@@ -743,7 +744,7 @@ class PlacementTests(unittest.TestCase):
                 granted, = fixture.connect(request).replies()
                 self.assertIsInstance(granted, wire.LocalPlacementGranted)
                 assert isinstance(granted, wire.LocalPlacementGranted)
-                key = placement.attempt_key(granted.assignment.episode, granted.assignment.attempt)
+                key = execution_identity.attempt_key(granted.assignment.episode, granted.assignment.attempt)
                 self.assertIsInstance(fixture.server.assignments[key].permission, placement.PermissionConsumed)
                 if ending == "release":
                     fixture.release(granted.grant)
@@ -834,7 +835,7 @@ class PlacementTests(unittest.TestCase):
                     _ = publish_candidate(fixture, head, placement.TemporaryExclusion("busy"))
                     before_authorization = ending in ("busy before authorization", "busy with stale local evidence")
                     refusal = (wire.ClaimFailure("mac-busy", remote, "busy") if before_authorization
-                        else wire.ExecutionReport("mac-busy", remote, claim, placement.ExecutionNotStarted(),
+                        else wire.ExecutionReport("mac-busy", remote, claim, execution_identity.ExecutionNotStarted(),
                             placement.PrelaunchRefused("busy"), placement.DispatchPathSettled()))
                     refused, = fixture.connect(refusal).replies()
                     assert isinstance(refused, wire.DispatchStatus)
@@ -881,11 +882,11 @@ class PlacementTests(unittest.TestCase):
                     continue
 
                 if ending == "confirmed":
-                    execution = placement.ProcessExecution(remote.destination.host, "host-generation-a", 700001, "start")
+                    execution = execution_identity.ProcessExecution(remote.destination.host, "host-generation-a", 700001, "start")
                     key = fixture.server.host_evidence_key(head, remote.destination)
                     evidence = fixture.provider_evidence[key]
                     assert isinstance(evidence, placement.FreshHostEvidence)
-                    confirmed = replace(evidence, executions=((claim, placement.ObservedExecution(execution)),))
+                    confirmed = replace(evidence, executions=((claim, execution_identity.ObservedExecution(execution)),))
                     fixture.provider_evidence[key] = confirmed
                     fixture.server.publish_host_evidence(confirmed)
                 elif ending in ("time limit", "time limit with slot"):
@@ -947,7 +948,7 @@ class PlacementTests(unittest.TestCase):
                     reply, = fixture.connect(retry).replies()
                     self.assertIsInstance(reply, wire.Assignment)
                 else:
-                    key = placement.attempt_key(remote.episode, remote.attempt)
+                    key = execution_identity.attempt_key(remote.episode, remote.attempt)
                     del fixture.server.assignments[key]
                     _ = fixture.run_pass()
 
@@ -1071,12 +1072,12 @@ class PlacementTests(unittest.TestCase):
                 if stale_absence:
                     fixture.clock.advance(1)
                 report = (wire.ClaimFailure("retained-claim-refused", original, reason, claim) if foreign_claim
-                    else wire.ExecutionReport("prelaunch-refused", original, claim, placement.ExecutionNotStarted(),
+                    else wire.ExecutionReport("prelaunch-refused", original, claim, execution_identity.ExecutionNotStarted(),
                         placement.PrelaunchRefused(reason), placement.DispatchPathSettled()))
                 reported_at = fixture.clock.now()
                 _ = fixture.connect(report).replies()
                 if stale_absence:
-                    closed = fixture.server.assignments[placement.attempt_key(original.episode, original.attempt)]
+                    closed = fixture.server.assignments[execution_identity.attempt_key(original.episode, original.attempt)]
                     self.assertIsInstance(closed.state, placement.ClosedAssignment)
                     self.assertEqual(closed.provider, claim)
                     self.assertIsInstance(fixture.connect(request).replies()[-1], wire.PlacementWait)
@@ -1084,18 +1085,18 @@ class PlacementTests(unittest.TestCase):
                     _ = publish_candidate(fixture, request)
                     _ = fixture.run_pass()
                 if delayed_absence:
-                    closed = fixture.server.assignments[placement.attempt_key(original.episode, original.attempt)]
+                    closed = fixture.server.assignments[execution_identity.attempt_key(original.episode, original.attempt)]
                     self.assertIsInstance(closed.state, placement.ClosedAssignment)
                     self.assertEqual(closed.provider, claim)
                     self.assertIsInstance(fixture.connect(request).replies()[-1], wire.PlacementWait)
                     fixture.restart()
                     self.assertIsInstance(fixture.connect(request).replies()[-1], wire.PlacementWait)
-                    self.assertEqual(fixture.server.assignments[placement.attempt_key(
+                    self.assertEqual(fixture.server.assignments[execution_identity.attempt_key(
                         original.episode, original.attempt)].provider, claim)
                     fixture.clock.advance(7)
                     _ = publish_candidate(fixture, request)
                     _ = fixture.run_pass()
-                saved = fixture.server.assignments[placement.attempt_key(original.episode, original.attempt)]
+                saved = fixture.server.assignments[execution_identity.attempt_key(original.episode, original.attempt)]
                 self.assertIsInstance(saved.state, placement.ClosedAssignment)
                 self.assertEqual(saved.retry, placement.RetryAt(reported_at + delay))
                 places = dict(fixture.server.run_places)
@@ -1132,7 +1133,7 @@ class PlacementTests(unittest.TestCase):
                 if reason == "repo":
                     claim = adopt_assignment(fixture, request, assigned)
                     _ = fixture.server.handle_request(wire.ExecutionReport("settings-refused", assigned,
-                        claim, placement.ExecutionNotStarted(), placement.PrelaunchRefused(reason),
+                        claim, execution_identity.ExecutionNotStarted(), placement.PrelaunchRefused(reason),
                         placement.DispatchPathSettled()))
                 else:
                     _ = fixture.server.handle_request(wire.ClaimFailure("settings-refused", assigned, reason))
@@ -1169,7 +1170,7 @@ class PlacementTests(unittest.TestCase):
             _ = publish_candidate(fixture, request)
             assigned = assignment_for(fixture, request)
             _ = fixture.server.handle_request(wire.ClaimFailure("old-off-refusal", assigned, "off"))
-            key = placement.attempt_key(assigned.episode, assigned.attempt)
+            key = execution_identity.attempt_key(assigned.episode, assigned.attempt)
             path = fixture.state_dir / "state.json"
             state = cast(dict[str, object], json.loads(path.read_text()))
             assignments = cast(dict[str, dict[str, object]], state["assignments"])
@@ -1225,7 +1226,7 @@ class PlacementTests(unittest.TestCase):
                 restored = publish_candidate(fixture, request)
                 self.assertEqual(restored.key.configuration_generation, original.key.configuration_generation)
                 _ = fixture.run_pass()
-                key = placement.attempt_key(assigned.episode, assigned.attempt)
+                key = execution_identity.attempt_key(assigned.episode, assigned.attempt)
                 self.assertEqual(fixture.server.assignments[key].state, placement.ClosedAssignment("off"))
                 replacement = assignment_for(fixture, request)
                 self.assertNotEqual(replacement.attempt, assigned.attempt)
@@ -1265,7 +1266,7 @@ class PlacementTests(unittest.TestCase):
                 (placement.CandidateEligibility(assigned.destination, placement.FixedExclusion("off")),))
             self.assertEqual(len(fixture.server.assignments), 2)
             for attempt, evidence in ((assigned, enabled), (replacement, disabled)):
-                saved = fixture.server.assignments[placement.attempt_key(attempt.episode, attempt.attempt)]
+                saved = fixture.server.assignments[execution_identity.attempt_key(attempt.episode, attempt.attempt)]
                 self.assertEqual(saved.refusal_settings, records.RefusalSettings(evidence.key.configuration_generation))
 
     def test_settled_repo_decline_waits_for_a_settings_change(self) -> None:
@@ -1280,9 +1281,9 @@ class PlacementTests(unittest.TestCase):
             claim = adopt_assignment(fixture, request, assigned)
             self.assertEqual(fixture.server.handle_request(consume_permission("repo-consume", assigned, claim)),
                 [wire.FirstAuthorization(assigned, claim)])
-            _ = fixture.connect(wire.ExecutionReport("repo-decline", assigned, claim, placement.ExecutionNotStarted(),
+            _ = fixture.connect(wire.ExecutionReport("repo-decline", assigned, claim, execution_identity.ExecutionNotStarted(),
                 placement.AttemptDeclined("repo"), placement.DispatchPathSettled())).replies()
-            key = placement.attempt_key(assigned.episode, assigned.attempt)
+            key = execution_identity.attempt_key(assigned.episode, assigned.attempt)
             for pass_number in range(3):
                 with self.subTest(pass_number=pass_number):
                     fixture.clock.advance(1)
@@ -1322,7 +1323,7 @@ class PlacementTests(unittest.TestCase):
                 self.assertIsInstance(fixture.connect(wire.ViewRequest()).replies()[0], wire.ViewReply)
                 denied, = fixture.server.handle_request(request)
                 self.assertIsInstance(denied, wire.PlacementWait)
-            key = placement.attempt_key(assigned.episode, assigned.attempt)
+            key = execution_identity.attempt_key(assigned.episode, assigned.attempt)
             saved = service.read_state(fixture.state_dir).assignments[key]
             self.assertEqual(saved.state, placement.ClosedAssignment("off"))
             self.assertIsInstance(saved.terminal_report, placement.TerminalAttemptReport)
@@ -1339,7 +1340,7 @@ class PlacementTests(unittest.TestCase):
                 _ = fixture.connect(consume_permission("consume-completed", assignment, claim)).replies()
                 _ = publish_candidate(fixture, request)
                 _ = fixture.connect(wire.ExecutionReport("completed", assignment, claim,
-                    placement.ExecutionNotStarted(), placement.AttemptCompleted(status),
+                    execution_identity.ExecutionNotStarted(), placement.AttemptCompleted(status),
                     placement.DispatchPathSettled())).replies()
                 fixture.restart()
                 reply, = fixture.connect(request).replies()
@@ -1357,9 +1358,9 @@ class PlacementTests(unittest.TestCase):
             claim = adopt_assignment(fixture, request, assignment)
             authorized, = fixture.connect(consume_permission("consume-declined", assignment, claim)).replies()
             self.assertIsInstance(authorized, wire.FirstAuthorization)
-            _ = fixture.connect(wire.ExecutionReport("declined", assignment, claim, placement.ExecutionNotStarted(),
+            _ = fixture.connect(wire.ExecutionReport("declined", assignment, claim, execution_identity.ExecutionNotStarted(),
                 placement.AttemptDeclined("no_tests"), placement.DispatchPathSettled())).replies()
-            key = placement.attempt_key(assignment.episode, assignment.attempt)
+            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
             fixture.clock.advance(1)
             # The release evidence arrives after the pass that settles reports.
             with mock.patch.object(fixture.server, "_settle_attempt_reports"):
@@ -1390,7 +1391,7 @@ class PlacementTests(unittest.TestCase):
                 _ = publish_candidate(fixture, request)
                 if pending == "settled-loss-stale-evidence":
                     fixture.clock.advance(1)
-                report = wire.ExecutionReport("empty-scan", assignment, claim, placement.ExecutionNotStarted(),
+                report = wire.ExecutionReport("empty-scan", assignment, claim, execution_identity.ExecutionNotStarted(),
                     outcome, placement.DispatchPathSettled() if pending == "settled-loss-stale-evidence"
                     else placement.DispatchPathPending(pending))
                 _ = fixture.connect(report).replies()
@@ -1399,7 +1400,7 @@ class PlacementTests(unittest.TestCase):
                         fixture.restart()
                     waiting, = fixture.connect(request).replies()
                     self.assertIsInstance(waiting, wire.PlacementWait)
-                    saved = fixture.server.assignments[placement.attempt_key(assignment.episode, assignment.attempt)]
+                    saved = fixture.server.assignments[execution_identity.attempt_key(assignment.episode, assignment.attempt)]
                     self.assertEqual(saved.assignment, assignment)
                     self.assertIsInstance(saved.state, placement.CurrentAssignment)
                     reply, = fixture.connect(consume_permission(f"repeat-{restart}", assignment, claim)).replies()
@@ -1484,10 +1485,10 @@ class PlacementTests(unittest.TestCase):
                         self.assertIsInstance(reply, wire.DispatchStatus if coordinator_ends else wire.FirstAuthorization)
                         self.assertEqual(transferred.path.read_bytes(), before)
                         if not coordinator_ends:
-                            saved = fixture.server.assignments[placement.attempt_key(assignment.episode, assignment.attempt)]
+                            saved = fixture.server.assignments[execution_identity.attempt_key(assignment.episode, assignment.attempt)]
                             self.assertEqual(saved.holder, holder)
                         if ending in ("adapter-ended", "adapter-release-interrupted"):
-                            key = placement.attempt_key(assignment.episode, assignment.attempt)
+                            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
                             saved = fixture.server.assignments[key]
                             self.assertIsNone(coordinator.poll())
                             fixture.clock.advance(1)
@@ -2283,7 +2284,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 request = replace(request, constraints=replace(request.constraints, command_kind=kind))
                 _ = publish_candidate(fixture, request)
                 assignment = assignment_for(fixture, request)
-                key = placement.attempt_key(assignment.episode, assignment.attempt)
+                key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
                 # mac_queue_run returns the placement this way after each run.
                 reply, = fixture.server.handle_request(wire.CancelPlacement(
                     "return", request.episode, request.owner, "the Mac run ended with status 0"))
@@ -2374,7 +2375,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                     def durable_authorization(reply: wire.Reply) -> wire.Reply:
                         if isinstance(reply, wire.FirstAuthorization):
                             state = service.read_state(fixture.state_dir)
-                            key = placement.attempt_key(assignment.episode, assignment.attempt)
+                            key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
                             self.assertIsInstance(state.assignments[key].permission, placement.PermissionConsumed)
                             start = records.process_start_time(os.getpid())
                             self.assertIsNotNone(start)
@@ -2429,9 +2430,14 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                         assert isinstance(reply, wire.DispatchStatus)
                         self.assertEqual(reply.assignment, assignment)
                         self.assertIsInstance(reply.permission, placement.PermissionConsumed)
+                        self.assertEqual(reply.reason, "launch permission was already consumed")
 
     def test_closed_unknown_and_changed_assignments_never_receive_authorization(self) -> None:
-        for case in ("closed", "unknown", "source", "owner", "claim"):
+        for case, reason in (("closed", "the attempt is closed: busy"), ("unknown", "unknown attempt"),
+                             ("source", "the request differs from the saved assignment"),
+                             ("owner", "the request differs from the saved assignment"), ("claim", "the exact claim is not adopted"),
+                             ("stale", "adoption evidence is stale: provider evidence expired"),
+                             ("unavailable", "adoption evidence is unavailable: claim read failed")):
             with self.subTest(case=case), PlacementFixture() as fixture:
                 request = placement_request(fixture)
                 _ = publish_candidate(fixture, request)
@@ -2447,7 +2453,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                     assignment = replace(assignment, attempt="unknown-old-attempt")
                     claim = replace(claim, attempt=assignment.attempt)
                 elif case == "source":
-                    assignment = replace(assignment, source_key=placement.SourceKeyKnown("obsolete-source"))
+                    assignment = replace(assignment, source_key=execution_identity.SourceKeyKnown("obsolete-source"))
                 elif case == "owner":
                     assignment = replace(assignment, owner=replace(assignment.owner, host="another-coordinator"))
                 elif case == "claim":
@@ -2455,8 +2461,16 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 for restart in (False, True):
                     if restart:
                         fixture.restart()
+                    if case in ("stale", "unavailable"):
+                        key = fixture.server.host_evidence_key(request, assignment.destination)
+                        evidence = (placement.StaleHostEvidence(key, fixture.clock.now() - 20, "provider evidence expired")
+                            if case == "stale" else placement.HostEvidenceUnavailable(key, fixture.clock.now(), "claim read failed"))
+                        fixture.provider_evidence[key] = evidence
+                        fixture.server.publish_host_evidence(evidence)
                     reply, = fixture.server.handle_request(consume_permission(f"consume-{restart}", assignment, claim))
                     self.assertIsInstance(reply, wire.DispatchStatus)
+                    assert isinstance(reply, wire.DispatchStatus)
+                    self.assertEqual(reply.reason, reason)
                 if case in ("source", "owner", "claim") or case.startswith("generation-"):
                     claim = (replace(claim, claim_id="claim-a") if case.startswith("generation-")
                              else adopt_assignment(fixture, request, original))
@@ -2490,12 +2504,12 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 claim = adopt_assignment(fixture, request, assignment)
                 reply, = fixture.server.handle_request(consume_permission("consume", assignment, claim))
                 self.assertIsInstance(reply, wire.FirstAuthorization)
-                executions = tuple(placement.ProcessExecution(host, "generation-a", 700001, "equal-start")
+                executions = tuple(execution_identity.ProcessExecution(host, "generation-a", 700001, "equal-start")
                                    for host in ("fixture-mac", "second-host"))
                 self.assertEqual(len(set(executions)), 2)
                 for execution in executions:
                     _ = fixture.server.handle_request(wire.ExecutionReport(
-                        f"report-{execution.host}", assignment, claim, placement.ObservedExecution(execution)))
+                        f"report-{execution.host}", assignment, claim, execution_identity.ObservedExecution(execution)))
                 fixture.restart()
             self.assertTrue(watched.call_args_list)
             self.assertEqual({call.args[0] for call in watched.call_args_list}, {request.owner.pid})
