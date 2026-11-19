@@ -1117,6 +1117,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                     self.assertIn("<div data-accounts>", page)
                     self.assertIn(console_theme.CSS, page)
                     self.assertIn(page_frame.STYLE, page)
+                    self.assertEqual(page.count(page_frame.BUTTON_STATES), 1)
                     self.assertIn('<h1 class="page-title">Accounts</h1>', page)
                     self.assertIn("'console-shown'", page)
                     self.assertIn(f'data-refresh-seconds="{float(seconds)}"', page)

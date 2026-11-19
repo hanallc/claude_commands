@@ -496,7 +496,7 @@ border-radius:4px;background:var(--card)}
 .color-picker input[type=text]{box-sizing:border-box;width:100%;padding:8px;margin-bottom:12px;border-radius:6px;
 background:var(--bg);color:var(--ink);border:1px solid var(--line)}
 .color-actions{display:flex;gap:8px}.color-actions button{flex:1;padding:7px;border:1px solid var(--line);border-radius:6px;
-background:var(--bg);color:var(--ink);cursor:pointer}.color-actions button:hover{background:var(--hover)}
+background:var(--bg);color:var(--ink);cursor:pointer}
 .color-actions button:disabled{opacity:.5;cursor:default}
 .color-save-error{color:var(--error);overflow-wrap:anywhere}
 .color-swatch:focus-visible,.color-picker :focus-visible{outline:2px solid var(--accent);outline-offset:3px}
@@ -505,7 +505,7 @@ background:var(--bg);color:var(--ink);cursor:pointer}.color-actions button:hover
 .next-cell{white-space:nowrap}.next-muted{color:var(--ink-2)}
 .next-button{display:inline-flex;vertical-align:middle;margin-left:5px;padding:2px;border:0;border-radius:4px;
 background:transparent;color:var(--ink-2);cursor:pointer}
-.next-button:hover,.next-button:focus-visible{background:var(--hover)}
+.next-button:focus-visible{background:var(--hover)}
 .next-button svg,.next-minus svg{width:14px;height:14px;vertical-align:middle}
 .move-menu button[aria-checked=true]{background:var(--hover)}
 .move-menu{position:fixed;margin:0;padding:6px;width:max-content;min-width:220px;max-width:calc(100vw - 16px);box-sizing:border-box;
@@ -515,7 +515,7 @@ font-size:.86rem;font-variant-numeric:tabular-nums}
 .move-title{padding:6px 10px 8px;margin-bottom:4px;color:var(--ink-2);border-bottom:1px solid var(--line)}
 .move-menu button{display:flex;justify-content:space-between;gap:24px;width:100%;padding:6px 10px;border:0;border-radius:6px;
 background:none;color:inherit;font:inherit;text-align:left;cursor:pointer}
-.move-menu button:hover,.move-menu button:focus-visible{background:var(--hover);outline:none}
+.move-menu button:focus-visible{background:var(--hover);outline:none}
 .move-name{font-weight:600}.move-left{color:var(--ink-2)}.move-left.warning{color:var(--warning)}.move-left.error{color:var(--error)}
 .move-empty{padding:6px 10px;color:var(--ink-3)}
 .quota-icon{display:inline-grid;place-items:center;vertical-align:middle;width:22px;height:22px;margin:-3px 5px -3px 0;

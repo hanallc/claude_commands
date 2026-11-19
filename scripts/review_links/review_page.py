@@ -978,9 +978,9 @@ color:var(--ink);border:1px solid var(--line);border-radius:8px;resize:vertical}
 .list-log span{white-space:pre-wrap}
 .review-actions [data-later-menu] [role=menuitem]{display:flex;justify-content:space-between;align-items:center;gap:24px;width:100%;
 min-height:32px;padding:5px 10px;border:0;border-radius:6px;background:none;color:var(--ink);text-align:left}
-.review-actions [data-later-menu] [role=menuitem]:is(:hover,:focus){background:var(--accent);color:#fff;outline:none}
+.review-actions [data-later-menu] [role=menuitem]:focus{background:var(--accent);color:#fff;outline:none}
 [data-later-menu] small{font-size:12px;color:var(--ink-3)}
-[data-later-menu] [role=menuitem]:is(:hover,:focus) small{color:inherit;opacity:.85}
+[data-later-menu] [role=menuitem]:focus small{color:inherit;opacity:.85}
 [data-later-menu] hr{border:0;border-top:1px solid var(--line);margin:5px 4px}
 [data-later-menu][data-choosing]>:is([role=menuitem],hr){display:none}
 .review-actions button{margin:0;font:inherit;min-height:40px;padding:6px 14px;border:1px solid var(--ink-3);border-radius:8px;

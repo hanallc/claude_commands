@@ -262,6 +262,7 @@ function untilError() {
     await open({page:'builds', kind:'question', evidence:{kind:'none'}});
     check(checkbox.checked && !checkbox.closest('label').hidden, 'The page checkbox is checked on open.');
     check(to().length === 1 && to()[0].checked && to()[0].value === 'builds-staff', 'The owner is selected.');
+    check(to()[0].nextElementSibling.hasAttribute('data-button-face'), 'The owner chip uses the shared button style.');
     const shown = [...dialog.querySelectorAll('[data-kind]:not([hidden])')].map(chip=>chip.textContent.trim());
     check(shown.join(',') === 'Bug,Question,Feedback', 'The owner dialog has the three requested types.');
    }
@@ -387,7 +388,7 @@ def fixture_page(width: int, *, photo: bool) -> bytes:
              .replace("__DISPLAY_WORDS__", json.dumps(DISPLAY_WORDS)))
     return (f'<!doctype html><html lang="en" data-theme="dark"><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1"><title>Builds</title>'
-            f'<style>{console_theme.CSS}</style>{SHELL}{new_item_dialog.render()}<script>{probe}</script>').encode()
+            f'<style>{console_theme.CSS}{page_frame.BUTTON_STATES}</style>{SHELL}{new_item_dialog.render()}<script>{probe}</script>').encode()
 
 
 BUG_PROBE = r"""
@@ -648,6 +649,7 @@ class NewItemDialogTests(unittest.TestCase):
         self.assertEqual(markup.count('<dialog id="review-new-item"'), 1)
         self.assertIn('name="words" rows="4"', markup)
         self.assertEqual(markup.count('type="radio" name="kind"'), 4)
+        self.assertEqual(markup.count('<span data-button-face>'), 4)
         self.assertIn('data-kind="bug"', markup)
         self.assertIn('<svg aria-hidden="true"', markup)
         self.assertLess(markup.index('data-evidence'), markup.index('name="words"'))

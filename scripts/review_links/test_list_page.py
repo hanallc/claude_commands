@@ -33,7 +33,7 @@ from scripts.message import send_result
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
 from scripts.production import change_review, change_routing, delivery_state, investigation, session_staff, showrunners, staff, the_list
 from scripts.production.update_registration import QuestionStaff
-from scripts.review_links import console, list_page, serve, staff_names
+from scripts.review_links import console, list_page, page_frame, serve, staff_names
 from scripts.review_links import change_browser, change_page, page_question, question_record
 from scripts.review_links import review_items, review_page
 from scripts.review_links.test_change_page import BrowserForms
@@ -1177,6 +1177,7 @@ document.body.append(result);
             "blocked_by": (the_list.ItemDependency(105, "The status page reaches main"),)}, source="morty")
         markup = list_page.render(self.root / "reviews").decode()
         body = without_role_colors(markup)
+        self.assertEqual(body.count(page_frame.BUTTON_STATES), 1)
         self.assertEqual(body.count('<tbody data-list-item'), 6)
         for label in list_page.HEADERS:
             self.assertIn(label + '<span data-sort-mark', body)
@@ -3786,12 +3787,13 @@ window.fetch=async(_url,options)=>{
    observer.observe(target);
   });
   check(!row.hidden && !detail.hidden,'The item link opens the row');
+  document.body.style.paddingBottom='100vh';
+  first.scrollIntoView({block:'start',behavior:'instant'});
   check((await sample(first)).intersectionRect.height>0,'The first answer enters the viewport');
   check(!(await sample(second)).isIntersecting && second.getBoundingClientRect().top>innerHeight,
    'The second answer starts below the viewport');
   check(!reads.length && panel.querySelectorAll('.question-unread').length===2,
    'The first answer alone leaves both answers unread');
-  document.body.style.paddingBottom='100vh';
   second.scrollIntoView({block:'start',behavior:'instant'});
   check((await sample(second)).intersectionRect.height>0 && first.getBoundingClientRect().bottom<0,
    'The second answer enters the viewport after the first leaves it');
@@ -4821,10 +4823,12 @@ try{
  check(selectedFilter('producer')==='staff:'+DWIGHT && visible().map(row=>row.dataset.number).join(',')==='105',
    'an address restores the producer filter');
  location.hash=new URLSearchParams({show:'all',producer:'missing'});await flush();
- check(selectedFilter('producer')==='all' && visible().length===6,'an unknown producer shows all items');
- location.hash=new URLSearchParams({show:'unread',state:'Working',owner:OWNER,q:'106'});await flush();
- check(selectedShow()==='working' && selectedFilter('owner')==='staff:'+OWNER && unread().checked &&
-  visible().map(row=>row.dataset.number).join(',')==='106','An old address restores the Show and Owner chips, switch and search.');
+  check(selectedFilter('producer')==='all' && visible().length===6,'an unknown producer shows all items');
+  const restoredOldAddress=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+  location.hash=new URLSearchParams({show:'unread',state:'Working',owner:OWNER,q:'106'});
+  await restoredOldAddress;
+  check(selectedShow()==='working' && selectedFilter('owner')==='staff:'+OWNER && unread().checked &&
+   visible().map(row=>row.dataset.number).join(',')==='106','An old address restores the Show and Owner chips, switch and search.');
 
  for(const target of rows().filter(row=>['Done','Closed'].includes(row.dataset.state) || row.dataset.parked==='true')){
   location.hash=new URLSearchParams({item:target.dataset.key});await flush();

@@ -172,6 +172,7 @@ class ConsoleTests(unittest.TestCase):
         self.assertIsInstance(pages[4].destination, console.UnavailablePage)
         markup = ConsoleMarkup()
         source = console.render(pages, console.UnavailablePage()).decode()
+        self.assertEqual(source.count(page_frame.BUTTON_STATES), 1)
         markup.feed(source)
         self.assertEqual(markup.pages, ["review", "list", "images", "disks", "builds", "aws", "accounts"])
         self.assertIn('data-page="rebuilds"\ndata-url="" data-title', source)
