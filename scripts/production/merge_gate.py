@@ -79,11 +79,8 @@ from scripts.lib import scratch  # noqa: E402
 from scripts.test_times import gate_record
 from scripts.build_queue import admission_records  # noqa: E402
 from scripts.build_queue import progress_profile
-from scripts.build_queue.admission_client import AdmissionHoldCheck  # noqa: E402
-from scripts.build_queue.queue_place import (  # noqa: E402
-    NO_MERGE_TEST_ROUTE, MergeTestRoute, NoMergeTestRoute, QueuePlace, QueuePlaceRefused, RetryMergeTestRoute,
-    queue_place, suite_scope_prefix,
-)
+from scripts.build_queue.admission_client import AdmissionHoldCheck, CloudRouteTaken, NO_ROUTE_CHECK, NoRouteCheck  # noqa: E402
+from scripts.build_queue.queue_place import QueuePlace, QueuePlaceRefused, queue_place, suite_scope_prefix  # noqa: E402
 
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
 TEST_HERDR_BIN = "/nonexistent/herdr"
@@ -468,22 +465,13 @@ def tell_memory_stop(repo: Path, job: RunningGateJob, limit_gib: float,
 def gate_reservation(repo: Path, temporary: Path, hold: BuildHoldWait, *,
                      type_dirs: Sequence[str] = (),
                      mode: SuiteMode = SuiteMode.MERGE_GATE,
-                     merge_route: MergeTestRoute | NoMergeTestRoute = NO_MERGE_TEST_ROUTE) -> Generator[QueuePlace]:
+                     route_again: Callable[[], None] | NoRouteCheck = NO_ROUTE_CHECK) -> Generator[QueuePlace]:
     if not temporary.is_dir():
         raise GateRefused(f"gate temporary directory is missing: {temporary}")
     program: str | Sequence[str] = (mode.value, "--type-dirs", *type_dirs) if type_dirs else mode.value
-    before_check = AdmissionHoldCheck(hold.wait_until_free, hold.admits)
+    before_check = AdmissionHoldCheck(hold.wait_until_free, hold.admits, route_again)
     try:
-        with ExitStack() as reservation:
-            while True:
-                try:
-                    place = reservation.enter_context(queue_place(program, repo, before_check=before_check,
-                                                                 merge_route=merge_route))
-                except RetryMergeTestRoute:
-                    if hold.admits():
-                        raise
-                else:
-                    break
+        with queue_place(program, repo, before_check=before_check) as place:
             yield place
     except QueuePlaceRefused as error:
         raise GateRefused(str(error)) from error
@@ -1398,7 +1386,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                mode: SuiteMode = SuiteMode.MERGE_GATE,
                machine: SharedMachine | WholeMachine = SHARED_MACHINE,
                selected: AllModules | SelectedModules = ALL_MODULES,
-               merge_route: MergeTestRoute | NoMergeTestRoute = NO_MERGE_TEST_ROUTE,
+               route_again: Callable[[], None] | NoRouteCheck = NO_ROUTE_CHECK,
                time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit = gate_record.READ_GATE_TIME_LIMIT) -> GateRun:
     shared = isinstance(machine, SharedMachine)
     if shared:
@@ -1542,7 +1530,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     with ((gate_recovery(repo) if shared else private_gate_recovery(repo, tmpfs)) as recovery, record_on_abort(),
           gate_temporary(recovery, mode.value, tmpfs) as temporary,
           ExitStack() as module_folders,
-          (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode, merge_route=merge_route)
+          (gate_reservation(repo, temporary, hold, type_dirs=type_dirs, mode=mode, route_again=route_again)
            if hold is not None else nullcontext(None)) as reservation,
           (shared_cpu_pool() if shared else nullcontext(NoSharedCPU())) as cpu_pool):
         # The wall time and the time limit start here, after the queue admits the gate.
@@ -2455,6 +2443,19 @@ class CloudGateRoute(Protocol):
     def working_tree(self, repo: Path) -> tuple[str, set[str]]: ...
 
 
+class CloudGateCompleted(CloudRouteTaken):
+    """Return the AWS result and close the unused local admission connection."""
+
+    def __init__(self, run: GateRun) -> None:
+        super().__init__("the AWS gate completed")
+        self.run: GateRun = run
+
+
+@dataclass(frozen=True)
+class OnlyLocalTypes:
+    """The selection needs a local type check and has no test modules."""
+
+
 def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                     module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S, *,
                     full: bool = False,
@@ -2464,8 +2465,8 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
     if absent:
         raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
     cloud = cast(CloudGateRoute, cast(object, import_module('scripts.aws_target.cloud_gate')))
-    merge_route = MergeTestRoute()
-    while True:
+
+    def route() -> GateRun | str | OnlyLocalTypes:
         selected: AllModules | TreeSelection = ALL_MODULES
         if mode is SuiteMode.TARGETED_TEST and not full:
             try:
@@ -2480,7 +2481,7 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
             selected = TreeSelection(tuple(str(path.relative_to(repo)) for path in paths), tree)
             if isinstance(selection, AffectedSelection) and not selection.modules:
                 if type_dirs:
-                    return run_suites(repo, type_dirs, module_time_limit_s, mode=mode)
+                    return OnlyLocalTypes()
                 reused = ledger.reuse()
                 if not reused:
                     ledger.record_pass(selection)
@@ -2488,15 +2489,28 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
                                 hold_wait_s=0.0, selection=selection, reused=reused, reason="", status=0,
                                 max_jobs=0, peak_mib=0.0, cap_mib=0.0, aborted=False, mode=mode)
                 return GateRun((), 0.0, 0.0, selection_certified=True)
-        outcome = cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s, selected=selected)
-        if not isinstance(outcome, str):
-            remote = outcome
-            break
+        return cloud.route(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s, selected=selected)
+
+    def check_route_again() -> None:
+        try:
+            outcome = route()
+        except (OSError, subprocess.SubprocessError) as error:
+            raise GateRefused(str(error)) from error
+        if isinstance(outcome, GateRun):
+            raise CloudGateCompleted(outcome)
+        if isinstance(outcome, str):
+            print('Cloud gate uses natedev: ' + outcome, flush=True)
+
+    outcome = route()
+    if isinstance(outcome, OnlyLocalTypes):
+        return run_suites(repo, type_dirs, module_time_limit_s, mode=mode)
+    if isinstance(outcome, str):
         print('Cloud gate uses natedev: ' + outcome, flush=True)
         try:
-            return run_suites(repo, type_dirs, module_time_limit_s, full=full, mode=mode, merge_route=merge_route)
-        except RetryMergeTestRoute:
-            continue
+            return run_suites(repo, type_dirs, module_time_limit_s, full=full, mode=mode, route_again=check_route_again)
+        except CloudGateCompleted as completed:
+            outcome = completed.run
+    remote = outcome
     if not type_dirs or remote.time_limit_report:
         return remote
     local = run_suites(repo, type_dirs, module_time_limit_s, full=True,

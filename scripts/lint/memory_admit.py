@@ -2190,7 +2190,7 @@ def admission_walk(inputs: QueueInputs, ordered: list[tuple[Path, RankedWaiter]]
             first_for_folder[folder] = records.stored_waiter(row)
         can_start = (ready and not folder_busy and isinstance(gpu_wait, GpuSlotFree)
                      and isinstance(order_hold, NoOrderHold))
-        admitted = can_start and not landing_wait
+        admitted = can_start and not landing_wait and owner not in inputs.cloud_route_waiters
         decision = AdmissionDecision("admit" if admitted else "hold",
             extra + kept + safety, kept, safety, used,
             NO_PRESSURE_HOLD if within else inputs.pressure,
@@ -2291,6 +2291,8 @@ def admission_pass(inputs: QueueInputs, now: float, policy: AdmissionPolicy, *, 
                     cause = queue_order_reason(decision, RecordedQueueIdentities())
             elif remote_start_pending:
                 cause = BehindHead("remote startup", row["since"], "")
+            elif owner in inputs.cloud_route_waiters:
+                cause = BehindHead("AWS route check", row["since"], "")
             elif isinstance(local_wait, placement.EvidenceNeeded):
                 cause = ReadingUnavailable(local_wait.reason)
             elif estimate_expired(row, now, policy):

@@ -33,6 +33,13 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, Exchang
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_route_notice_has_its_own_reply_type(self) -> None:
+        from scripts.build_queue import admission_wire as status_wire
+
+        reply = wire.RouteAgain()
+        self.assertEqual(wire.parse_reply(wire.encode_reply(reply)), reply)
+        self.assertEqual(status_wire.parse_reply(wire.encode_reply(reply)), reply)
+
     def test_placement_status_round_trips_without_launch_permission(self) -> None:
         from scripts.build_queue import admission_wire as status_wire
         from scripts.build_queue.test_placement import placement_request

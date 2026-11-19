@@ -981,8 +981,6 @@ class NatedevHeld:
 class LandingWait:
     """Natemerge's merge test holds this step on natedev."""
 
-    retry_route: bool = False
-
 
 LANDING_WAIT_TEXT = (
     "Waits for natedev: natemerge's integrate job runs there, and no other target can take this test now."
@@ -1273,6 +1271,7 @@ class QueueInputs:
     pending_remote_starts: frozenset[str] = field(default=frozenset(), kw_only=True)
     local_waits: dict[str, placement.EvidenceNeeded] = field(default_factory=dict, kw_only=True)
     landing_waiters: frozenset[str] = field(default=frozenset(), kw_only=True)
+    cloud_route_waiters: frozenset[str] = field(default=frozenset(), kw_only=True)
 
     def __post_init__(self) -> None:
         orders = {waiter_owner(row): (waiter_priority(row) if isinstance(row.get("order"), (PriorityUnit, NormalOrder))
@@ -1350,7 +1349,7 @@ class ProgramProfile:
     repo: str
     worktree: str
     sizing: HistoryPeakSizing
-    retry_merge_route: bool = field(default=False, kw_only=True)
+    receive_route_notices: bool = field(default=False, kw_only=True)
 
     @property
     def step(self) -> str:

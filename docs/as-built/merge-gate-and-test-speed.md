@@ -311,8 +311,9 @@ This record changes no selection and refuses no run.
 `--type-dirs` (alias `--type-dir`) defaults to no folders.
 `--tests-only --module <suite>/<module>` runs the named modules.
 Use one `--module` option for each module.
-Named runs use the whole machine without admission, holds, a time limit or a gate record.
-They do not certify a tree.
+Only natemerge's verified landing runs named modules with `WholeMachine`.
+Other callers take a shared queue place and can wait behind a local integrate job.
+Both paths skip the gate record and pass ledger.
 The gate reruns a failed module alone.
 `--module` requires `--tests-only`.
 

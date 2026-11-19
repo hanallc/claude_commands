@@ -7,7 +7,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Generator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -414,9 +414,22 @@ def _no_attempt_hook() -> None:
 
 
 @dataclass(frozen=True)
+class NoRouteCheck:
+    """The caller waits for local admission without checking AWS again."""
+
+
+NO_ROUTE_CHECK = NoRouteCheck()
+
+
+class CloudRouteTaken(Exception):
+    """The caller has an AWS result and can release the local place."""
+
+
+@dataclass(frozen=True)
 class AdmissionHoldCheck:
     wait_until_free: Callable[[], None]
     admits: Callable[[], bool]
+    route_again: Callable[[], None] | NoRouteCheck = NO_ROUTE_CHECK
 
     def __call__(self) -> None:
         self.wait_until_free()
@@ -690,6 +703,25 @@ def _acquire(request: wire.Request, on_wait: Callable[[wire.Wait], None],
                                 _ = release(reply.reservation, 1, reply.cleanup_timing)
                             raise
                         return reply
+                    if isinstance(reply, wire.RouteAgain):
+                        if not (isinstance(request, wire.AdmitRequest) and isinstance(attempt, AdmissionHoldCheck)
+                                and not isinstance(attempt.route_again, NoRouteCheck)):
+                            raise CheckerFailure("unexpected route notice")
+                        try:
+                            if attempt.admits():
+                                attempt.route_again()
+                        except CloudRouteTaken:
+                            # EOF confirms that the service released the local place.
+                            with suppress(OSError):
+                                connection.settimeout(configuration.silence_seconds)
+                                connection.shutdown(socket.SHUT_WR)
+                                _ = connection.recv(1)
+                            raise
+                        # Resume the same wait after the AWS check declines.
+                        last_valid = CLOCK.monotonic()
+                        connection.settimeout(configuration.silence_seconds)
+                        connection.sendall(wire.encode_request(request).encode())
+                        continue
                     if not isinstance(reply, wire.Wait):
                         raise CheckerFailure("invalid admission answer")
                     if isinstance(cause, records.EstimateExpired) and cause.estimated_at <= answered_expiry:
