@@ -266,6 +266,7 @@ def render(status: change_page.DeliveryStatus) -> bytes:
     names = staff_names.StaffNames(members)
     settings = conf.read("review_links")
     rows = settings.whole("feedback_rows")
+    card_motion = page_frame.CardMotion.read(settings)
     waiting: list[str] = []
     cards: list[str] = []
     refresh_needed = False
@@ -283,6 +284,7 @@ def render(status: change_page.DeliveryStatus) -> bytes:
                + f'<p hidden data-image-waiting role="status">{waiting_text}</p>'
                + '<div data-image-layout><nav data-image-groups aria-label="Image groups"></nav>'
                + f'<div><div data-images data-script="{SCRIPT_VERSION}" data-refresh-seconds="{refresh_seconds}"'
+               + f' {card_motion.attributes()}'
                + f' data-answer-refresh-seconds="{answer_refresh_seconds}" data-waiting-images="{" ".join(waiting)}">'
                + f'{"".join(cards)}</div><p hidden data-empty></p></div></div>'
                + '<noscript>Enable JavaScript to answer on an image.</noscript>'
@@ -442,13 +444,13 @@ color:inherit;text-decoration:none;overflow-wrap:anywhere}
 [data-images] article:not(.pair),[data-empty]{max-width:680px;margin-inline:auto}}
 </style>"""
 
-SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.MOTION_SCRIPT + r"""(() => {
-const motion = createCardMotion();
+SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.CARD_SUBMIT_SCRIPT + page_frame.MOTION_SCRIPT + r"""(() => {
 const empty = document.querySelector('[data-empty]');
 const groups = document.querySelector('[data-image-groups]');
 const layout = document.querySelector('[data-image-layout]');
 const waiting = document.querySelector('[data-image-waiting]');
 let list = document.querySelector('[data-images]');
+const motion = createCardMotion(() => list);
 let sending = 0;
 let refreshRequest = 0;
 const refreshSeconds = () => list.dataset.refreshSeconds;
@@ -492,6 +494,7 @@ function showGroups() {
 function bind(root) {
   root.querySelectorAll('form[data-image-form]').forEach(form => form.addEventListener('submit', async event => {
     event.preventDefault();
+    if (cardSubmitBlocked(form)) return;
     const question = event.submitter?.value === 'question';
     const feedback = event.submitter?.value === 'feedback', status = form.querySelector('[data-image-status]');
     delete status.dataset.refreshFailed;
@@ -503,16 +506,15 @@ function bind(root) {
       status.textContent = 'Enter feedback first.';
       return;
     }
-    // The card fades before removal; a failed request restores the card.
+    // Remove the card after the fade. Restore the card if the request fails.
     const card = form.closest('article'), home = card.parentNode, next = card.nextSibling;
     const body = new URLSearchParams(new FormData(form, event.submitter));
     status.textContent = '';
     let postFailed = false;
+    setCardSubmitting(form, true);
     sending++;
-    if (!question) await motion.removeCard(card, apply);
-    const buttons = [...form.querySelectorAll('button')];
-    buttons.forEach(button => button.disabled = true);
     try {
+      if (!question) await motion.removeCard(card, apply);
       const response = await fetch(location.pathname, {method: 'POST', body});
       if (!response.ok) {
         const reason = await response.json().then(body => body.reason, () => '');
@@ -539,7 +541,7 @@ function bind(root) {
       apply();
     } finally {
       sending--;
-      buttons.forEach(button => button.disabled = false);
+      setCardSubmitting(form, false);
       if (question && !postFailed) void pageRefresh.refresh(true);
       else void refresh().catch(error => {
         if (postFailed) return;
