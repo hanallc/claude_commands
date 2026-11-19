@@ -88,3 +88,24 @@
   2. 20 loaded runs of the module and the support callers pass, TMPDIR=/tmp, 2 GB scope.
   3. basedpyright zero errors and warnings on changed files.
   4. Full natedev gate passes (reds that also occur on base do not count).
+
+### Phase 386 — the Mac fixture reachability probe has no time limit to lose  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** Mac offload fixture tests pick the same target under any machine load; test_verify_mac_result_paths passes in the full gate.
+- **Spec:**
+  1. Defect (builds, reproduced by verify on main fb9e72058 with a forced timeout): `verify_mac_offload_test_support.py` `provider()` (near line 1075) runs the fake `ssh` stub with `timeout=1`. Under load the stub start passes 1 s, `TimeoutExpired` marks the Mac unreachable, natedev is selected, and `self.runner_events()[0]` raises IndexError.
+  2. Fix at the cause: the fixture decides reachability from fixture state that the test controls, not from a timed process start. The fake `ssh` stub stays for verify.sh's own calls.
+  3. A test that wants an unreachable Mac sets that state explicitly. Keep every existing row's meaning.
+  4. Add a test row: the reachability answer is the same when the stub would be slow (for example, a stub that sleeps past the old limit), and the Mac is selected.
+  5. Every module that imports verify_mac_offload_test_support.py keeps passing. The probe no longer starts a process, so report the CPU change of the family.
+- **Files:** `scripts/direct/verify_mac_offload_test_support.py`; the test row in `scripts/direct/test_verify_mac_fixture.py` or `test_verify_mac_result_paths.py`.
+- **Workers:** 1 writer. One fixture and one row.
+  - impl: both files.
+- **Constraints from prior phases:** Tests read no /tune-changeable value. Phase 375 (verify family) waits on the verify 43h merge; do not touch its files.
+- **Acceptance gate:**
+  1. The new row fails on base with the slow stub and passes on the fix.
+  2. 20 loaded runs of every module that imports the support file pass, TMPDIR=/tmp, 2 GB scope.
+  3. basedpyright zero errors and warnings on changed files.
+  4. Full natedev gate passes (reds that also occur on base do not count).
