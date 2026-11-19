@@ -12,7 +12,7 @@ from typing import override
 from unittest import mock
 
 from scripts.direct import runner_result, verify_helper
-from scripts.direct.runner_result import UnusableRunnerResult, UsableRunnerResult, read_result
+from scripts.direct.runner_result import KillEvidence, UnusableRunnerResult, UsableRunnerResult, read_result
 
 
 class RunnerResultTests(unittest.TestCase):
@@ -136,19 +136,30 @@ class RunnerResultTests(unittest.TestCase):
         target.unlink()
         self.assertIsInstance(read_result(self.path, 0, True), UnusableRunnerResult)
 
-    def test_main_writes_result_fields_and_the_kill_flag(self) -> None:
+    def test_main_writes_result_fields(self) -> None:
         self.write("mac=passed\nfetch=\n")
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(runner_result.main([str(self.path), "0", "1"]), 0)
-        self.assertEqual(output.getvalue(), "passed\n\n\n\n\n\n\n0\n")
+        self.assertEqual(output.getvalue(), "passed\n\n\n\n\n\n\nunknown\n")
         self.write("mac=declined\nreason=busy\nseconds=2\nholder=owner\nfetch=fetched\nfix=fixed\nbuild_target_directory=/target\n")
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(runner_result.main([str(self.path), "75", "0"]), 0)
-        self.assertEqual(output.getvalue(), "declined\nbusy\n2\nowner\nfetched\nfixed\n/target\n0\n")
-        self.write("mac=failed\nkill_diagnostic=1\n")
-        with redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(runner_result.main([str(self.path), "101", "1"]), 0)
-        self.assertEqual(output.getvalue(), "failed\n\n\n\nfailed\n\n\n1\n")
+        self.assertEqual(output.getvalue(), "declined\nbusy\n2\nowner\nfetched\nfixed\n/target\nunknown\n")
+
+    def test_failed_mac_result_keeps_all_kill_evidence_states(self) -> None:
+        for field, evidence in (
+            ("kill_diagnostic=1\n", KillEvidence.KILLED),
+            ("kill_diagnostic=0\n", KillEvidence.NOT_KILLED),
+            ("", KillEvidence.UNKNOWN),
+            ("kill_diagnostic=invalid\n", KillEvidence.UNKNOWN),
+        ):
+            with self.subTest(field=field):
+                self.write("mac=failed\n" + field)
+                self.assertEqual(read_result(self.path, 101, True),
+                                 UsableRunnerResult("failed", kill_evidence=evidence))
+                with redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(runner_result.main([str(self.path), "101", "1"]), 0)
+                self.assertEqual(output.getvalue(), f"failed\n\n\n\nfailed\n\n\n{evidence}\n")
 
     def test_main_returns_failure_without_result_fields(self) -> None:
         with redirect_stdout(io.StringIO()) as output:
@@ -186,7 +197,7 @@ verify_helper() { return "$HELPER_STATUS"; }
         call = verify_helper.HelperCall(str(Path(runner_result.__file__)), str(self.root),
                                         [str(self.path), "0", "1"], dict(os.environ), "", [])
         self.assertEqual(verify_helper.run_call(call, {call.program: program}),
-                         ("0", "passed\n\n\n\nfailed\n\n\n0\n", ""))
+                         ("0", "passed\n\n\n\nfailed\n\n\nunknown\n", ""))
         self.path.unlink()
         self.assertEqual(verify_helper.run_call(call, {call.program: program}), ("1", "", ""))
 

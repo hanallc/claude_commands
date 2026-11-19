@@ -734,9 +734,10 @@ STEP_TARGET_TABLE=""
 HOLD_LINT=0
 
 # Status 101 permits repairs for lint findings and compile errors.
-# A kill or a lint hold prevents repairs.
+# A kill, unknown kill evidence, or a lint hold prevents repairs.
 first_judgment_permits_repair() {
-    [[ "$HOLD_LINT" == 0 && "$1" == 101 && "${RUN_LAST_ATTEMPT_KILLED:-0}" == 0 ]] && ! grep -qE "process didn.t exit successfully:.*signal:" "$2"
+    [[ "$HOLD_LINT" == 0 && "$1" == 101 && "${RUN_LAST_ATTEMPT_KILL_EVIDENCE:-not_killed}" == not_killed ]] \
+        && ! grep -qE "process didn.t exit successfully:.*signal:" "$2"
 }
 
 publish_step_state() {
@@ -778,7 +779,7 @@ step_was_killed_for_memory() {
     local log=$1 started=$2 ended=$3 diagnostic status=0
     diagnostic="$(memory_kill_in_journal "$started" "$ended" "$log")" || status=$?
     # A kill diagnostic prevents a verdict even when the journal cannot confirm an OOM.
-    if [[ "$diagnostic" == 1 ]]; then RUN_LAST_ATTEMPT_KILLED=1; fi
+    if [[ "$diagnostic" == 1 ]]; then RUN_LAST_ATTEMPT_KILL_EVIDENCE=killed; fi
     return "$status"
 }
 
@@ -876,7 +877,7 @@ run_step() {
         fi
         (( admission == 0 )) || return "$admission"
     fi
-    RUN_LAST_ATTEMPT_KILLED=0
+    RUN_LAST_ATTEMPT_KILL_EVIDENCE=not_killed
     step_log="$(mktemp "${HOLD_WAIT_DIR:-${TMPDIR:-/tmp}}/step-output.XXXXXX")"
     if buildlog_step_compiles "$@"; then
         if [[ "${CMD:-}" == doc && -n "${DOC_REPO_TOP:-}" && "${BUILDLOG_PREPARED_COPY:-}" != "$DOC_REPO_TOP" ]]; then
@@ -956,7 +957,7 @@ run_step() {
         if [[ -n "${TREE_WATCH_DIR:-}" ]]; then cancel_tree_run; fi
         step_state local_noncompiling
         if [[ "$status" == 0 ]]; then
-            RUN_LAST_ATTEMPT_KILLED=0
+            RUN_LAST_ATTEMPT_KILL_EVIDENCE=not_killed
             rm -f "$step_log"
             return 0
         fi
@@ -995,12 +996,12 @@ run_step() {
             return "$status"
         fi
         ended="$(date '+%Y-%m-%d %H:%M:%S %z')"
-        RUN_LAST_ATTEMPT_KILLED=0
+        RUN_LAST_ATTEMPT_KILL_EVIDENCE=not_killed
         if ! step_was_killed_for_memory "$step_log" "$started" "$ended"; then
             rm -f "$step_log"
             return "$status"
         fi
-        RUN_LAST_ATTEMPT_KILLED=1
+        RUN_LAST_ATTEMPT_KILL_EVIDENCE=killed
         if [[ -n "${MEM_KILL_FILE:-}" ]]; then
             printf x >> "$MEM_KILL_FILE"
         fi
@@ -2274,7 +2275,7 @@ try_mac_test() {
     trap 'forward_mac_runner_signal HUP 129' HUP
     REMOTE_BUILD_TARGET_DIR=""
     local runner_status result_status result_text="" result_word="" result_reason="" mac_owns_watch=0
-    local result_seconds="" result_holder="" result_fetch=failed result_usable=0 result_killed=0 name
+    local result_seconds="" result_holder="" result_fetch=failed result_usable=0 result_kill_evidence=unknown name
     MAC_FIX_RESULT=""
     local runner_root=${STEP_REMOTE_REPO_ROOT:-${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}}
     local runner_args=(run --repo-root "$runner_root"
@@ -2398,7 +2399,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             IFS= read -r result_fetch || true
             IFS= read -r MAC_FIX_RESULT || true
             IFS= read -r REMOTE_BUILD_TARGET_DIR || true
-            IFS= read -r result_killed || true
+            IFS= read -r result_kill_evidence || true
         } <<< "$result_text"
     else
         result_status=$?
@@ -2454,7 +2455,11 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             return
             ;;
         failed|prelaunch_failed)
-            RUN_LAST_ATTEMPT_KILLED=${result_killed:-0}
+            if [[ "$selected_is_mac" == 1 ]]; then
+                RUN_LAST_ATTEMPT_KILL_EVIDENCE=${result_kill_evidence:-unknown}
+            else
+                RUN_LAST_ATTEMPT_KILL_EVIDENCE=not_killed
+            fi
             exec 9>&-
             rm -f "$MAC_LOG_FILE"
             MAC_LOG_FILE=""
@@ -3458,7 +3463,7 @@ lint_failure_is_the_tree() {
     # Usage errors, sandbox failures, lost tokens, and signals give no verdict.
     (( status != 2 && status != 3 && status != 125 && status < 128 )) || return 1
     [[ "$status" != "${TREE_CHANGED_STATUS:-}" ]] || return 1
-    (( ${RUN_LAST_ATTEMPT_KILLED:-0} == 0 )) || return 1
+    [[ "${RUN_LAST_ATTEMPT_KILL_EVIDENCE:-not_killed}" == not_killed ]] || return 1
     (( $# == 0 )) || return 0
     [[ "$CMD" == lint ]] || return 1
     (( CLIPPY_FIX_LIMIT_REACHED == 0 && PLACEMENT_FAILED == 0 )) || return 1

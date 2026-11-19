@@ -155,6 +155,12 @@ if "--check" in sys.argv and (Path(os.environ["TEST_RUNNER_STATE"]) / "runner-ev
         _ = self.repair_lint_on_mac(status=101)
         self.assert_lint_runs_again()
 
+    def test_final_mac_clippy_without_kill_evidence_preserves_status_without_a_verdict(self) -> None:
+        self.environment["TEST_RUNNER_OMIT_KILL_DIAGNOSTIC_VERB"] = "clippy"
+        self.set_verb_answer("clippy", "failed", 101)
+        _ = self.repair_lint_on_mac(status=101)
+        self.assert_lint_runs_again()
+
     def test_final_mac_clippy_finding_still_caches(self) -> None:
         self.set_verb_answer("clippy", "failed", 101)
         _ = self.repair_lint_on_mac(status=1)

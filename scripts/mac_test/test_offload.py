@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 from scripts.build_queue import execution_identity
-from scripts.direct.runner_result import UsableRunnerResult, read_result
+from scripts.direct.runner_result import KillEvidence, UsableRunnerResult, read_result
 from scripts.lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
 from scripts.mac_test import eligibility, nextest_log, offload, claim_state
@@ -1349,8 +1349,8 @@ class OffloadCommandTests(OffloadCommandFixture):
                         decoded = read_result(self.result_path, status, selected_is_mac=True)
                         self.assertIsInstance(decoded, UsableRunnerResult)
                         assert isinstance(decoded, UsableRunnerResult)
-                        self.assertEqual((decoded.word, decoded.reason, decoded.kill_diagnostic_seen),
-                                         ("failed", "", False))
+                        self.assertEqual((decoded.word, decoded.reason, decoded.kill_evidence),
+                                         ("failed", "", KillEvidence.NOT_KILLED))
                     else:
                         self.assert_wire("failed", "")
 

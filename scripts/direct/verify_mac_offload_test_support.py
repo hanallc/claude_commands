@@ -737,14 +737,17 @@ elif mode == "directory":
     result.unlink(missing_ok=True)
     result.mkdir()
 else:
+    kill_diagnostic = ""
+    if mode == "failed" and verb != os.environ.get("TEST_RUNNER_OMIT_KILL_DIAGNOSTIC_VERB"):
+        killed = int(verb == os.environ.get("TEST_RUNNER_KILLED_VERB"))
+        kill_diagnostic = f"kill_diagnostic={killed}\n"
     result.write_text(
         "mac=" + mode + "\n"
         + "reason=" + reason + "\n"
         + "seconds=" + os.environ.get("TEST_RUNNER_SECONDS", "3.25") + "\n"
         + ("fetch=" + os.environ["TEST_RUNNER_FETCH"] + "\n" if "TEST_RUNNER_FETCH" in os.environ else "")
         + ("fix=" + fix + "\n" if fix else "")
-        + ("kill_diagnostic=1\n" if mode == "failed" and verb
-           and verb == os.environ.get("TEST_RUNNER_KILLED_VERB") else ""),
+        + kill_diagnostic,
         encoding="utf-8",
     )
 if mode == "declined":
