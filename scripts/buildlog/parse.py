@@ -399,6 +399,7 @@ def test_results(lines: list[str]) -> NextestResults:
     """
     tests: dict[tuple[str, str], TestRow] = {}
     unfinished: set[tuple[str, str]] = set()
+    completed = 0
     summaries: list[Summary] = []
     for line in lines:
         found = SUMMARY.match(line)
@@ -426,6 +427,7 @@ def test_results(lines: list[str]) -> NextestResults:
             unfinished.add(name)
         else:
             unfinished.discard(name)
+            completed += 1
         attempt = int(attempt_text) if attempt_text else 1
         if attempt >= row["attempts"]:
             row["attempts"] = attempt
@@ -444,7 +446,7 @@ def test_results(lines: list[str]) -> NextestResults:
             row["status"] = "flaky"
         if row["status"] != "passed" or row["attempts"] > 1 or row["slow"] or (row["duration_s"] or 0) > slow_test_s:
             rows.append(row)
-    complete = bool(summaries and not unfinished and len(tests) == summaries[0]["run"])
+    complete = bool(summaries and not unfinished and completed == len(tests) == summaries[0]["run"])
     return NextestResults(rows, summaries, {"by_binary": names, "complete": complete})
 
 

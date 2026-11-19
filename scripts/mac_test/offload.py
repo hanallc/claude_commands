@@ -2811,6 +2811,20 @@ def run_hana_offload(controller: ProcessController, transport: hana_placement.Ha
     return claimed_run(controller, transport, request, repository, started)
 
 
+@contextmanager
+def hana_recording(description: str) -> Generator[None]:
+    """Report a write failure without changing the Hana result."""
+    try:
+        yield
+    except OffloadInterrupted:
+        raise
+    except Exception as error:  # noqa: BLE001 -- recording does not determine the command status
+        message = f"Could not record {description}: {error}"
+        store.note_error(message)
+        with suppress(OSError):
+            print(message, file=sys.stderr)
+
+
 def hana_claimed_run(controller: ProcessController, transport: hana_placement.HanaControlTransport,
                      request: OffloadRequest, repository: KnownRepository, started: float, *,
                      staging: ExitStack) -> MacOffloadResult:
@@ -3090,8 +3104,9 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
     if not isinstance(settlement, execution.HanaSettled):
         detail = f'{reason}. {settlement.reason}' if result_transfer_lost else settlement.reason
         return LostMacRun(elapsed_seconds(started), detail)
-    execution.record_attempt_charge(lifecycle.directory, prepared, evidence.traffic.transfers,
-                                    remote_started_at, time.time())
+    with hana_recording("the Hana attempt charge"):
+        execution.record_attempt_charge(lifecycle.directory, prepared, evidence.traffic.transfers,
+                                        remote_started_at, time.time())
     context = record.HanaStepContext(request.target, request.verb, repository.key, str(request.repo_root), '',
                                      dict(request.environment))
     if isinstance(accepted, hana_result.AcceptedHanaResult):
@@ -3100,15 +3115,8 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
         else:
             evidence.completion = 'confirmed'
             result = accepted.result
-            try:
+            with hana_recording("the accepted Hana result"):
                 _ = record.publish_hana_result(accepted, prepared.link, context)
-            except OffloadInterrupted:
-                raise
-            except Exception as error:  # noqa: BLE001 -- recording does not determine the command status
-                message = f"Could not record the accepted Hana result: {error}"
-                store.note_error(message)
-                with suppress(OSError):
-                    print(message, file=sys.stderr)
             _ = sys.stdout.buffer.write(result.stdout)
             _ = sys.stderr.buffer.write(result.stderr)
             return PassedOnTarget(result.execution_seconds) if result.status == 0 else FailedOnTarget(result.status, result.execution_seconds)
@@ -3125,9 +3133,11 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
     if evidence.launch_authorized:
         placement_file = os.environ.get('BUILDLOG_PLACEMENT_FILE', '')
         if placement_file:
-            record.save_hana_fallback_link(Path(placement_file), prepared.key, prepared.link)
-        _ = record.publish_hana_loss(prepared.key, prepared.link, context, transport.host,
-                                    remote_started_at, time.time(), reason)
+            with hana_recording("the Hana fallback link"):
+                record.save_hana_fallback_link(Path(placement_file), prepared.key, prepared.link)
+        with hana_recording("the settled Hana loss"):
+            _ = record.publish_hana_loss(prepared.key, prepared.link, context, transport.host,
+                                        remote_started_at, time.time(), reason)
     if isinstance(rejected.outcome, execution_identity.HanaCommandAdmissionRefused):
         return HanaCommandAdmissionRefused(reason, elapsed_seconds(started))
     if isinstance(rejected, execution.HanaGuestEndedWithoutResult):

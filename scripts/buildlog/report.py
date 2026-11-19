@@ -8,7 +8,6 @@ appear as one scratch caller in each kind's table.
 from __future__ import annotations
 
 import json
-import os
 import re
 import sqlite3
 from collections.abc import Callable, Sequence
@@ -16,7 +15,6 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from enum import Enum
 from decimal import Decimal
-from pathlib import Path
 import time
 from typing import Literal, NamedTuple, cast
 
@@ -2390,8 +2388,6 @@ def aws_section(connection: sqlite3.Connection, day: str) -> list[str]:
         notes.append(comparison.source)
     except (OSError, ValueError, ArithmeticError, KeyError) as error:
         notes.append(f'Gate type comparison unavailable: {error}.')
-    proof_path = Path(os.environ.get("BUILDLOG_HANA_GPU_PROOF", str(store.root() / "hana-nextest-proof.csv")))
-    lines.extend(aws_report.hana_nextest_gpu_lines(connection, day_range(day), proof_path))
     return [*lines, *(f'- {note}' for note in notes), '']
 
 

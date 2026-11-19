@@ -841,6 +841,8 @@ class IndexTests(unittest.TestCase):
         self.write(self.host_file,
                    step("complete", step="nextest", **parse.log_facts("nextest", passed + summary)),
                    step("hidden", step="nextest", **parse.log_facts("nextest", summary)),
+                   step("duplicate", step="nextest", **parse.log_facts("nextest", passed + passed + summary)),
+                   step("failed", step="nextest", status=101, **parse.log_facts("nextest", passed + summary)),
                    step("partial", step="nextest", **parse.log_facts("nextest", passed + partial)),
                    step("retry", step="nextest", **parse.log_facts("nextest", retry + summary)),
                    step("missing-proof", step="nextest", **parse.log_facts(
@@ -852,14 +854,14 @@ class IndexTests(unittest.TestCase):
         classes = index.NextestGpuClass
         with closing(index.read_only()) as database:
             proof = {("hana", "tests::fast"): classes.NO_GPU}
-            for step_id, expected in (("complete", classes.NO_GPU), ("legacy", classes.NO_GPU),
-                                      ("hidden", classes.UNKNOWN), ("partial", classes.UNKNOWN),
-                                      ("retry", classes.UNKNOWN), ("missing-proof", classes.UNKNOWN)):
-                with self.subTest(step_id=step_id):
-                    self.assertEqual(index.nextest_gpu_class(database, step_id, proof), expected)
-            proof["hana", "tests::fast"] = classes.GPU
-            self.assertEqual(index.nextest_gpu_class(database, "complete", proof), classes.GPU)
-            self.assertEqual(index.nextest_gpu_class(database, "partial", proof), classes.GPU)
+            for verdict in (classes.NO_GPU, classes.GPU):
+                proof["hana", "tests::fast"] = verdict
+                self.assertEqual(index.nextest_gpu_class(database, "complete", proof), verdict)
+                for step_id in ("legacy", "hidden", "duplicate", "failed", "partial", "retry"):
+                    with self.subTest(step_id=step_id, verdict=verdict):
+                        self.assertEqual(index.nextest_gpu_class(database, step_id, proof), classes.UNKNOWN)
+            proof["hana", "tests::fast"] = classes.NO_GPU
+            self.assertEqual(index.nextest_gpu_class(database, "missing-proof", proof), classes.UNKNOWN)
 
     def cargo_build_rows(self, *commands: list[str]) -> list[tuple[object, ...]]:
         self.write(self.host_file, *(step(f"build-{number:03}", argv=argv) for number, argv in enumerate(commands)))

@@ -966,35 +966,31 @@ class NextestGpuClass(StrEnum):
 def nextest_gpu_class(connection: sqlite3.Connection, step_id: str,
                       proof: Mapping[tuple[str, str], NextestGpuClass]) -> NextestGpuClass:
     """Classify a step with proof keyed by nextest binary ID and test name."""
-    step = cast(tuple[object, object, object] | None, connection.execute(
-        "SELECT observed_tests, tests_run, argv FROM steps WHERE id = ? AND step = 'nextest'", (step_id,),
+    step = cast(tuple[object, object, object, object] | None, connection.execute(
+        "SELECT observed_tests, tests_run, argv, status FROM steps WHERE id = ? AND step = 'nextest'", (step_id,),
     ).fetchone())
     if step is None:
         return NextestGpuClass.UNKNOWN
-    saved, ran, argv_json = step
-    if isinstance(argv_json, str):
-        try:
+    saved, ran, argv_json, status = step
+    if status != 0 or not isinstance(saved, str):
+        return NextestGpuClass.UNKNOWN
+    try:
+        if isinstance(argv_json, str):
             argv = cast(list[str], json.loads(argv_json))
             if not parse.nextest_status_is_trusted(argv, {}):
                 return NextestGpuClass.UNKNOWN
-        except (ValueError, AttributeError, TypeError):
+        observed = cast(parse.ObservedNextestTests, json.loads(saved))
+        if observed["complete"] is not True:
             return NextestGpuClass.UNKNOWN
-    if isinstance(saved, str):
-        try:
-            observed = cast(parse.ObservedNextestTests, json.loads(saved))
-            names = {(binary, test) for binary, tests in observed["by_binary"].items() for test in tests}
-            complete = observed["complete"] is True
-        except (ValueError, AttributeError, KeyError, TypeError):
-            return NextestGpuClass.UNKNOWN
-    else:
-        names = set(cast(list[tuple[str, str]], connection.execute(
-            "SELECT binary, test FROM tests WHERE step_id = ?", (step_id,),
-        ).fetchall()))
-        complete = True
+        names = [(binary, test) for binary, tests in observed["by_binary"].items() for test in tests]
+    except (ValueError, AttributeError, KeyError, TypeError):
+        return NextestGpuClass.UNKNOWN
+    if len(names) != ran or len(set(names)) != len(names):
+        return NextestGpuClass.UNKNOWN
     classes = {proof.get(name, NextestGpuClass.UNKNOWN) for name in names}
     if NextestGpuClass.GPU in classes:
         return NextestGpuClass.GPU
-    if complete and len(names) == ran and classes == {NextestGpuClass.NO_GPU}:
+    if classes == {NextestGpuClass.NO_GPU}:
         return NextestGpuClass.NO_GPU
     return NextestGpuClass.UNKNOWN
 
