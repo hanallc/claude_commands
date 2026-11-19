@@ -2,7 +2,18 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+import subprocess
+from typing import cast, override
 import unittest
+from unittest.mock import patch
+
+from scripts.build_queue import admission_protocol as wire
+from scripts.build_queue.admission_test_support import caller_admission
+from scripts.copies.copies_test_support import copies_environment
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
 from scripts.direct import verify_lint_scope_test_support as support
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB as CARGO_STUB
@@ -66,6 +77,169 @@ class VerifyLintScopeTests(support.VerifyLintScopeFixture):
         self.assertEqual(self.calls("doc"), [])
         self.assert_workspace_taplo_check()
 
+
+
+BATCH_CARGO_STUB = CARGO_STUB.replace(
+    '    print(os.environ["TEST_METADATA"])',
+    '''    metadata = json.loads(os.environ["TEST_METADATA"].replace(os.environ["PACKAGE_ROOT"], str(Path.cwd())))
+    for package in metadata["packages"]:
+        package["dependencies"] = []
+    metadata["target_directory"] = str(Path.cwd() / "target")
+    print(json.dumps(metadata))''',
+).replace(
+    'elif arguments[:1] not in',
+    r'''elif arguments[:1] == ["nextest"]:
+    if arguments[1:] == ["--version"]:
+        raise SystemExit(0)
+    taplo_calls = [
+        json.loads(line)["args"] for line in
+        Path(os.environ["TEST_TAPLO_EVENTS"]).read_text().splitlines()
+    ] if Path(os.environ["TEST_TAPLO_EVENTS"]).exists() else []
+    expression = arguments[arguments.index("-E") + 1]
+    if Path.cwd() != Path(os.environ["PACKAGE_ROOT"]):
+        assert expression == "package(sample) & test(=regression)", expression
+        assert Path("src/regression.rs").is_file(), Path.cwd()
+        assert " { 1 }" in Path("src/lib.rs").read_text()
+        raise SystemExit(int(os.environ["TEST_BASELINE_STATUS"]))
+    assert any("--check" not in args for args in taplo_calls), taplo_calls
+    raise SystemExit(int(os.environ.get("TEST_SAMPLE_STATUS", "0")) if expression == "package(sample)" else 0)
+elif arguments[:1] not in''',
+)
+
+
+class VerifyBatchTests(support.VerifyLintScopeFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.write_executable(self.root / "bin" / "cargo", BATCH_CARGO_STUB)
+        self.environment["CARGO_MAKEFLAGS"] = "--jobserver-auth=fixture"
+        self.use_real_git()
+        path = self.root / "other" / "Cargo.toml"
+        path.parent.mkdir()
+        _ = path.write_text('[package]\nname = "other"\nversion = "0.1.0"\n')
+        examples = self.root / "examples"
+        examples.mkdir()
+        for name in ("plain", "featured"):
+            _ = (examples / f"{name}.rs").write_text("fn main() {}\n")
+        self.run_git("add", "-f", str(path), "examples/plain.rs", "examples/featured.rs")
+        self.run_git("-c", "user.name=Batch fixture", "-c", "user.email=batch@example.invalid",
+                     "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "Add test packages")
+        metadata = cast(support.CargoWorkspaceMetadata, json.loads(self.environment["TEST_METADATA"]))
+        metadata["workspace_members"].append("other-id")
+        metadata["packages"].append({
+            "name": "other", "id": "other-id", "features": {}, "manifest_path": str(path), "targets": [],
+        })
+        self.environment["TEST_METADATA"] = json.dumps(metadata)
+        self.enable_batch_session()
+
+    def enable_batch_session(self) -> None:
+        session = self.root / "session"
+        session.mkdir()
+        self.environment["UNIT_RUN_DIR"] = str(session)
+
+    def batch(self, *flags: str, lint_scope: str = "packages") -> subprocess.CompletedProcess[str]:
+        return self.invoke_verify(
+            "batch", "--packages", "sample,other", "--lint", lint_scope, *flags, cwd=self.root,
+        )
+
+    def batch_lines(self, result: subprocess.CompletedProcess[str]) -> list[str]:
+        return [line for line in result.stdout.splitlines() if line.startswith("verify.sh batch ")]
+
+    def fail_first(self, *, status: int) -> None:
+        options = copies_environment(self.root / "batch-copies", repository=self.root.name)
+        folders = Path(self.environment["CONF_DIR"]) / "build_folders.conf"
+        _ = folders.write_bytes((Path(options["CONF_DIR"]) / folders.name).read_bytes())
+        self.environment.update({name: value for name, value in options.items()
+                                 if name not in ("HOME", "CONF_DIR")})
+        _ = self.enterContext(isolated_staff_file(self.root / "batch-staff.json", self.environment))
+        parent = fixture_member("showrunner", name="builds")
+        member = fixture_member("unit", name="batch-fixture", parent=parent.id)
+        self.environment["CLAUDE_CODE_SESSION_ID"] = member.current_session
+        self.environment["TEST_BASELINE_STATUS"] = str(status)
+        phase = Path(self.environment["UNIT_RUN_DIR"]) / "phases" / "fixture"
+        phase.mkdir(parents=True)
+        self.environment["VERIFY_BATCH_PHASE_DIR"] = str(phase)
+        baseline = self.git_output("rev-parse", "HEAD")
+        _ = (phase / "phase_baseline").write_text(baseline)
+        _ = (phase / "regression-tests").write_text("sample regression\n")
+        regression = self.root / "src" / "regression.rs"
+        _ = regression.write_text("#[test] fn regression() {}\n")
+        self.run_git("add", "-f", str(regression))
+        _ = (phase / "regression.patch").write_text(self.git_output("diff", "--binary", "HEAD", "--", str(regression)))
+        _ = (self.root / "src" / "lib.rs").write_text("pub fn value() -> u8 { 2 }\n")
+        self.run_git("add", "-f", "src/lib.rs")
+
+    def git_output(self, *arguments: str) -> str:
+        return subprocess.run(["git", *arguments], cwd=self.root, env=self.environment, text=True,
+                              capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS).stdout
+
+    def test_batch_orders_format_package_tests_and_workspace_lint(self) -> None:
+        result = self.batch(lint_scope="workspace")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.batch_lines(result), [
+            "verify.sh batch format workspace green cached=no",
+            "verify.sh batch test sample green cached=no",
+            "verify.sh batch test other green cached=no",
+            "verify.sh batch lint workspace green cached=no",
+            "verify.sh batch result green",
+        ])
+        stages = [args[0] for args in self.cargo_calls()
+                  if args[:2] in (["+nightly", "fmt"], ["nextest", "run"]) and "--version" not in args
+                  or args[0] in ("mend", "clippy")]
+        self.assertEqual(stages[0:4], ["+nightly", "nextest", "nextest", "mend"])
+        self.assertEqual(stages[-1], "clippy")
+
+    def test_batch_runs_all_packages_after_a_failure_and_names_the_failed_package(self) -> None:
+        self.environment["TEST_SAMPLE_STATUS"] = "100"
+        result = self.batch()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("verify.sh batch test sample red cached=no", result.stdout)
+        self.assertIn("verify.sh batch test other green cached=no", result.stdout)
+        self.assertIn("verify.sh batch lint sample,other green cached=no", result.stdout)
+
+    def test_batch_rejects_a_lint_edit_after_tests(self) -> None:
+        self.environment["TEST_EDIT_DURING"] = "mend"
+        result = self.batch()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("verify.sh batch lint sample,other red cached=no (tests stale)", result.stdout)
+
+    def test_batch_reports_the_cache_result_of_each_package_and_lint(self) -> None:
+        first = self.batch()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        second = self.batch()
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIn("verify.sh batch test sample green cached=yes", second.stdout)
+        self.assertIn("verify.sh batch test other green cached=yes", second.stdout)
+        self.assertIn("verify.sh batch lint sample,other green cached=yes", second.stdout)
+        self.assertNotIn(["run"], [call[:1] for call in self.calls("nextest")])
+        self.assertFalse(self.clippy_ran())
+
+    def test_batch_refuses_a_regression_that_passed_on_the_baseline(self) -> None:
+        self.fail_first(status=0)
+        result = self.batch("--fail-first")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("verify.sh batch fail-first sample red cached=no (fail-first passed on baseline)", result.stdout)
+        self.assertIn("verify.sh batch test sample green cached=no", result.stdout)
+
+    def test_batch_places_baseline_copy_and_all_current_steps_under_one_run(self) -> None:
+        self.fail_first(status=100)
+        admission = caller_admission(self, self.root, self.environment)
+        with patch.object(admission.server, "handle_request", wraps=admission.server.handle_request) as observe:
+            result = self.batch("--fail-first")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("verify.sh batch fail-first sample green cached=no", result.stdout)
+        self.assertTrue((self.root / "batch-copies" / "slots" / "case-slot1").is_dir())
+        placements = [request for call in observe.call_args_list
+                      if isinstance(request := cast(wire.Request, call.args[0]), wire.PlacementRequest)]
+        first_requests = list({request.episode: request for request in reversed(placements)}.values())[::-1]
+        self.assertEqual([request.constraints.package for request in first_requests], [
+            "sample", "sample", "other", "sample", "sample",
+        ])
+        self.assertIn("copies-source", first_requests[0].identity.folder)
+        self.assertEqual(first_requests[1].identity.folder, str(self.root))
+        self.assertIsInstance(first_requests[0].run, wire.RunIdentity)
+        self.assertEqual({request.run for request in placements}, {first_requests[0].run})
+        self.assertNotEqual(first_requests[0].constraints.source_key, first_requests[1].constraints.source_key)
 
 
 if __name__ == "__main__":

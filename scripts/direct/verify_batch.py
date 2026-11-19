@@ -1,0 +1,273 @@
+"""Run the verification steps under the queue identity of verify.sh."""
+
+from __future__ import annotations
+
+if __name__ == "__main__":
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+
+import argparse
+from collections.abc import Sequence
+from dataclasses import dataclass
+from enum import Enum
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+from types import FrameType
+from typing import final
+
+from scripts.buildlog import treekey
+from scripts.direct import recorder_state
+from scripts.lib.cancellation import CANCELLATION_SIGNALS
+from scripts.lib.process_group import send_process_group
+
+
+class LintScope(Enum):
+    WORKSPACE = "workspace"
+    PACKAGES = "packages"
+
+
+class NoBaselineProof(Enum):
+    SKIP = "skip"
+
+
+@dataclass(frozen=True)
+class RegressionCase:
+    package: str
+    test: str
+
+
+@dataclass(frozen=True)
+class BaselineProof:
+    revision: str
+    patch: Path
+    cases: tuple[RegressionCase, ...]
+
+
+@dataclass(frozen=True)
+class BatchStepResult:
+    status: int
+    cached: bool
+
+    def show(self, step: str, scope: str, detail: str = "") -> bool:
+        passed = self.status == 0 and not detail
+        verdict = "green" if passed else "red"
+        cache = "yes" if self.cached else "no"
+        reason = f" ({detail})" if detail else ""
+        print(f"verify.sh batch {step} {scope} {verdict} cached={cache}{reason}", flush=True)
+        return passed
+
+
+@final
+class BatchInterrupted(Exception):
+    def __init__(self, status: int) -> None:
+        super().__init__(status)
+        self.status = status
+
+
+@final
+class BatchCommands:
+    """Run one child at a time and let it close its grants on cancellation."""
+
+    def __init__(self, verify: Path, route: Sequence[str]) -> None:
+        self.verify = verify
+        self.route = route
+        self.environment = {**os.environ, "UNIT_DETACHED_RUN": "1"}
+        _ = self.environment.pop("UNIT_DETACHED_RECORD", None)
+        self.interrupted = 0
+        for sig in CANCELLATION_SIGNALS:
+            _ = signal.signal(sig, self.interrupt)
+
+    def interrupt(self, signum: int, _frame: FrameType | None) -> None:
+        self.interrupted = signum
+
+    def run(self, command: Sequence[str], changes: dict[str, str]) -> int:
+        if self.interrupted:
+            raise BatchInterrupted(128 + self.interrupted)
+        with subprocess.Popen(command, env={**self.environment, **changes}, stdin=subprocess.DEVNULL,
+                              start_new_session=True) as child:
+            def forward(signum: int, frame: FrameType | None) -> None:
+                self.interrupt(signum, frame)
+                try:
+                    send_process_group(child.pid, signum)
+                except ProcessLookupError:
+                    pass
+
+            for sig in CANCELLATION_SIGNALS:
+                _ = signal.signal(sig, forward)
+            try:
+                if self.interrupted:
+                    forward(self.interrupted, None)
+                status = child.wait()
+            finally:
+                for sig in CANCELLATION_SIGNALS:
+                    _ = signal.signal(sig, self.interrupt)
+        if self.interrupted:
+            raise BatchInterrupted(128 + self.interrupted)
+        return status if status >= 0 else 128 - status
+
+    def verify_step(self, step: str, args: Sequence[str], cache_hit: Path,
+                    *, format_packages: str = "") -> BatchStepResult:
+        cache_hit.unlink(missing_ok=True)
+        status = self.run(["bash", str(self.verify), *args, *self.route], {
+            "VERIFY_BATCH_STEP": step, "VERIFY_BATCH_CACHE_HIT": str(cache_hit),
+            "VERIFY_BATCH_LINT_PACKAGES": format_packages,
+        })
+        return BatchStepResult(status, cache_hit.is_file())
+
+
+def phase_directory() -> Path:
+    """Select the open phase, or use the caller's explicit phase directory."""
+    if explicit := os.environ.get("VERIFY_BATCH_PHASE_DIR"):
+        return Path(explicit).resolve()
+    session = os.environ.get("UNIT_RUN_DIR") or os.environ.get("UNIT_SESSION_DIR")
+    if session:
+        phases = recorder_state.read_open_phase_ids(Path(session))
+        if len(phases) == 1:
+            from scripts.direct.phase_reservation import phase_directory as recorded_phase_directory
+
+            return recorded_phase_directory(Path(session), phases[0]).resolve()
+    raise ValueError("--fail-first needs one open phase or VERIFY_BATCH_PHASE_DIR")
+
+
+def baseline_proof(packages: tuple[str, ...], fail_first: bool) -> BaselineProof | NoBaselineProof:
+    if not fail_first:
+        return NoBaselineProof.SKIP
+    phase = phase_directory()
+    revision = (phase / "phase_baseline").read_text().strip()
+    if not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", revision):
+        raise ValueError("phase_baseline must contain the full commit id")
+    patch = phase / "regression.patch"
+    if not patch.is_file() or patch.stat().st_size == 0:
+        raise ValueError(f"{patch}: supply a patch that contains only regression tests")
+    cases: list[RegressionCase] = []
+    for row in (phase / "regression-tests").read_text().splitlines():
+        if not row.strip():
+            continue
+        fields = row.split()
+        if len(fields) != 2 or fields[0] not in packages or not re.fullmatch(r"[A-Za-z0-9_:]+", fields[1]):
+            raise ValueError(f"invalid regression-tests row {row!r}; use a batch package and a test name")
+        case = RegressionCase(*fields)
+        if case in cases:
+            raise ValueError(f"duplicate regression-tests row {row!r}")
+        cases.append(case)
+    if not cases:
+        raise ValueError("regression-tests must name at least one regression")
+    return BaselineProof(revision, patch, tuple(cases))
+
+
+# Nextest uses 100 when a test ran and failed. Build and setup failures use other statuses.
+NEXTEST_TEST_FAILED = 100
+
+
+def run_baseline_tests(commands: BatchCommands, cases: Sequence[RegressionCase], cache_hit: Path) -> int:
+    passed = True
+    for case in cases:
+        result = commands.verify_step("fail-first", ("test", case.package, "--filter", case.test, "--no-cache"),
+                                      cache_hit)
+        if result.status == NEXTEST_TEST_FAILED:
+            verdict, reason = BatchStepResult(0, False), ""
+        else:
+            verdict = result
+            reason = "fail-first passed on baseline" if result.status == 0 else f"baseline exit {result.status}"
+        if not verdict.show("fail-first", case.package, reason):
+            passed = False
+    return int(not passed)
+
+
+def run_baseline_copy(commands: BatchCommands, repo: Path, plan: BaselineProof, scratch: Path) -> bool:
+    done = scratch / "baseline-done"
+    apply_patch = 'git apply --index -- "$1" || exit 2; shift; exec "$@"'
+    cases = [f"{case.package}={case.test}" for case in plan.cases]
+    script = Path(__file__).resolve()
+    copies = script.parents[1] / "copies" / "copies.py"
+    # The baseline gets the copy's target directory.
+    command = ["env", "-u", "CARGO_TARGET_DIR", "-u", "CARGO_BUILD_BUILD_DIR",
+               sys.executable, str(copies), "run", "--repo", str(repo), "--commit", plan.revision,
+               "--", "bash", "-c", apply_patch, "regression-patch", str(plan.patch),
+               sys.executable, str(script), "--baseline", str(commands.verify), str(done), *cases,
+               "--", *commands.route]
+    status = commands.run(command, {})
+    if not done.is_file():
+        scope = ",".join(dict.fromkeys(case.package for case in plan.cases))
+        return BatchStepResult(status, False).show("fail-first", scope, f"baseline copy exit {status}")
+    return status == 0
+
+
+def run_batch(commands: BatchCommands, repo: Path, packages: tuple[str, ...],
+              lint: LintScope, baseline: BaselineProof | NoBaselineProof, scratch: Path) -> int:
+    passed = True
+    if isinstance(baseline, BaselineProof):
+        passed = run_baseline_copy(commands, repo, baseline, scratch)
+    scope = ",".join(packages) if lint is LintScope.PACKAGES else lint.value
+    lint_args = ("lint", packages[0]) if lint is LintScope.PACKAGES else ("lint",)
+    format_packages = scope if lint is LintScope.PACKAGES else ""
+    hit = scratch / "cache-hit"
+    if not commands.verify_step("format", lint_args, hit, format_packages=format_packages).show("format", scope):
+        passed = False
+
+    before_tests = treekey.tree_key(str(repo))
+    stale = before_tests is None
+    for package in packages:
+        test = commands.verify_step("test", ("test", package), hit)
+        if not test.show("test", package):
+            passed = False
+        stale |= treekey.tree_key(str(repo)) != before_tests
+    finish = commands.verify_step("lint", lint_args, hit, format_packages=format_packages)
+    stale |= treekey.tree_key(str(repo)) != before_tests
+    if not finish.show("lint", scope, "tests stale" if stale else ""):
+        passed = False
+    print("verify.sh batch result " + ("green" if passed else "red"), flush=True)
+    return int(not passed)
+
+
+class BatchOptions(argparse.Namespace):
+    packages: str = ""
+    lint: str = ""
+    fail_first: bool = False
+
+
+def main(argv: list[str]) -> int:
+    split = len(argv) - 1 - argv[::-1].index("--")
+    args, route = argv[:split], argv[split + 1:]
+    if args[0] == "--baseline":
+        try:
+            _, verify, marker, *cases = args
+            done = Path(marker)
+            result = run_baseline_tests(BatchCommands(Path(verify), route),
+                                        [RegressionCase(*case.split("=", 1)) for case in cases],
+                                        done.with_name("baseline-cache-hit"))
+            done.touch()
+            return result
+        except BatchInterrupted as error:
+            return error.status
+    repo, verify, recorder, *words = args
+    try:
+        parser = argparse.ArgumentParser(prog="verify.sh batch", allow_abbrev=False)
+        _ = parser.add_argument("--packages", required=True)
+        _ = parser.add_argument("--lint", required=True, choices=[scope.value for scope in LintScope])
+        _ = parser.add_argument("--fail-first", action="store_true")
+        options = parser.parse_args(words, namespace=BatchOptions())
+        packages = tuple(options.packages.split(","))
+        if len(set(packages)) != len(packages) or not all(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]*", p) for p in packages):
+            raise ValueError("--packages needs distinct package names separated by commas")
+        baseline = baseline_proof(packages, options.fail_first)
+        with tempfile.TemporaryDirectory(prefix="verify-batch-") as directory:
+            status = run_batch(BatchCommands(Path(verify), route), Path(repo), packages, LintScope(options.lint),
+                               baseline, Path(directory))
+    except (OSError, ValueError) as error:
+        print(f"verify.sh batch: {error}", file=sys.stderr)
+        status = 2
+    except BatchInterrupted as error:
+        status = error.status
+    if record := os.environ.get("UNIT_DETACHED_RECORD"):
+        _ = subprocess.run([sys.executable, recorder, "record-exit", record, str(status), "--pid", str(os.getpid())],
+                           check=False)
+    return status
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

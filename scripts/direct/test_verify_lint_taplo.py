@@ -111,6 +111,7 @@ class VerifyLintScopeTests(support.VerifyLintScopeFixture):
         """Run the production sequence with the fixture tools and a controlled copy return."""
         functions = shell_functions(
             support.VERIFY, "workspace_taplo", "run_lint_held_sequence", "run_lint_sequence",
+            "lint_format_scope", "run_lint_format",
         )
         script = "set -euo pipefail\n" + functions + r'''
 run() { "$@"; }

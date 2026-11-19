@@ -337,15 +337,12 @@ if __name__ == "__main__":
 
     def use_real_toml_tools(self) -> None:
         """Keep the lint fixture, replacing only its Git and Taplo stubs."""
-        for name in ("git", "taplo"):
-            executable = shutil.which(name)
-            if executable is None:
-                self.fail(f"fixture requires {name}")
-            source = f"import os, sys\nos.execv({executable!r}, [{executable!r}, *sys.argv[1:]])\n"
-            if name == "taplo":
-                results = self.root / TAPLO_RESULTS_FILE
-                _ = results.write_bytes(b"")
-                source = f"executable = {executable!r}\nresults = {str(results)!r}\n" + r'''
+        executable = shutil.which("taplo")
+        if executable is None:
+            self.fail("fixture requires taplo")
+        results = self.root / TAPLO_RESULTS_FILE
+        _ = results.write_bytes(b"")
+        source = f"executable = {executable!r}\nresults = {str(results)!r}\n" + r'''
 import json
 from pathlib import Path
 import subprocess
@@ -363,10 +360,17 @@ with Path(results).open("a", encoding="utf-8") as output:
 sys.stderr.buffer.write(result.stderr)
 raise SystemExit(128 + signal if signal else result.returncode)
 '''
-            self.write_executable(
-                self.root / "bin" / name,
-                source,
-            )
+        self.write_executable(self.root / "bin" / "taplo", source)
+        self.use_real_git()
+
+    def use_real_git(self) -> None:
+        executable = shutil.which("git")
+        if executable is None:
+            self.fail("fixture requires Git")
+        self.write_executable(
+            self.root / "bin" / "git",
+            f"import os, sys\nos.execv({executable!r}, [{executable!r}, *sys.argv[1:]])\n",
+        )
         shutil.rmtree(self.root / ".git")
         self.run_git("init", "--quiet", "--initial-branch=main")
         # Logs and caches change during lint. Keep the untracked unit config

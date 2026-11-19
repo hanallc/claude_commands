@@ -71,7 +71,9 @@ LATE_ROW_MARGIN = timedelta(days=1)
 
 VERIFY_PACKAGE_PREDICATE = r"package\(([A-Za-z0-9_-]+)\)"
 
-VERIFY_NAME_PREDICATE = r"test\([A-Za-z0-9_:]+\)"
+VERIFY_TEST_NAME = r"=?[A-Za-z0-9_:]+"
+
+VERIFY_NAME_PREDICATE = rf"test\({VERIFY_TEST_NAME}\)"
 
 VERIFY_NAME_UNION = rf"\(\s*{VERIFY_NAME_PREDICATE}(?:\s*\|\s*{VERIFY_NAME_PREDICATE})+\s*\)"
 
@@ -80,7 +82,7 @@ VERIFY_FILTER_SELECTION = re.compile(
 
 VERIFY_PACKAGE_SELECTION = re.compile(rf"\s*{VERIFY_PACKAGE_PREDICATE}\s*")
 
-VERIFY_TEST_NAMES = re.compile(r"\btest\(([A-Za-z0-9_:]+)\)")
+VERIFY_TEST_NAMES = re.compile(rf"\btest\(({VERIFY_TEST_NAME})\)")
 
 TEST_PREDICATE = re.compile(r"\btest\s*\(")
 

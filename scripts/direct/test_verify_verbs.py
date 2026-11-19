@@ -30,7 +30,7 @@ class VerifyVerbTests(VerifyLintCacheFixture):
             self.assertLess(len(line), 80, line)
         commands, flags = missing.stderr.split("Commands:\n", 1)[1].split("\nFlags:\n", 1)
         self.assertEqual([line.split()[0] for line in commands.splitlines()], [
-            "check", "test", "lint", "doc", "example", "build", "final",
+            "check", "test", "lint", "batch", "doc", "example", "build", "final",
             "help",
         ])
         self.assertEqual([line.split()[0] for line in flags.splitlines()], [
@@ -41,7 +41,7 @@ class VerifyVerbTests(VerifyLintCacheFixture):
 
     def test_each_command_has_separate_help(self) -> None:
         for command in (
-            "check", "test", "lint", "doc", "example", "build", "final",
+            "check", "test", "lint", "batch", "doc", "example", "build", "final",
             "help", "example-test",
         ):
             with self.subTest(command=command):

@@ -135,6 +135,7 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
             "take_local_placement", "apply_placement_outcome",
             "sync_token_state", "acquire_token", "record_token_wait", "build_hold_wait_local",
             "run_lint_sequence", "run_lint_held_sequence", "run_lint_judgment",
+            "lint_format_scope", "run_lint_format",
             "read_metadata", "load_metadata", "workspace_taplo",
             "lint_copy_begin", "lint_rewrite", "lint_copy_return", "lint_copy_drop", "lint_fix_tree_key",
         )

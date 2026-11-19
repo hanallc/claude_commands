@@ -13,6 +13,7 @@ Omit the package for the whole workspace. Give at most one positional word after
 | only the tests whose name contains `<name>`, while iterating | `bash ~/.claude/scripts/direct/verify.sh test [<package>] --filter <name> [--filter <name> …]` |
 | only ignored tests, with optional name filters | `bash ~/.claude/scripts/direct/verify.sh test [<package>] [--filter <name> …] --run-ignored only` |
 | a test that cannot pass on macOS | `bash ~/.claude/scripts/direct/verify.sh test [<package>] --local "<why it cannot pass on macOS>"` |
+| package tests and lint in one run | `bash ~/.claude/scripts/direct/verify.sh batch --packages a,b,c --lint workspace\|packages [--fail-first]` |
 | phase lint checks under <PhaseChecks/> | `bash ~/.claude/scripts/direct/verify.sh lint [<package>] [--check]` |
 | staged workspace rustdoc | `bash ~/.claude/scripts/direct/verify.sh doc [<package>]` |
 | example checks | `bash ~/.claude/scripts/direct/verify.sh example [<package>] [--name <name>]` |
@@ -38,6 +39,27 @@ Builds can run on any eligible target. A remote build prints `binary: <target>:<
 Use `--local "<why>"` for a Linux-only test or a binary that must run on natedev.
 Name the Linux requirement or the local launch. A reservation reason is refused. Use `/build:mac block <why>` for a Mac hold.
 Before CI, either machine can answer a test, including merge gates.
+
+### Batch verification
+
+Use one batch for the package tests and lint in an edit round.
+Name the packages in test order. Use `--lint workspace` to format all workspace members.
+Use `--lint packages` to format the named members and any other changed members.
+Mend and Clippy still check the workspace.
+
+1. With `--fail-first`, run the named regression tests in a private copy of `phase_baseline`.
+2. Apply rustfmt and Taplo fixes before the current package tests.
+3. Run each package test in order, including packages after a failed test.
+4. Run lint and report `tests stale` if the tree changed after the format step.
+
+For `--fail-first`, put `regression.patch` in the phase directory. Include only the regression tests in the patch.
+Put one `package test_name` per line in `regression-tests`. Use the exact name of each regression test.
+Select an explicit phase directory with `VERIFY_BATCH_PHASE_DIR` when the session has several open phases.
+Each named test must fail on the baseline. A pass or a failure before the test runs makes the batch red.
+
+The batch prints the verdict and cache use for each step. It succeeds only when all steps pass.
+Each compiling step keeps its own estimate and target choice under one queue identity.
+A remote route or an expired continuation can still cause a wait.
 
 Rules:
 

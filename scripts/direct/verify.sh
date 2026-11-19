@@ -8,6 +8,7 @@
 #   check [<package>]      check workspace libraries and binaries
 #   test [<package>]       run package tests; try the Mac, else natedev
 #   lint [<package>]       repair and format code; check TOML and run Clippy
+#   batch                  format, test packages, then run lint
 #   doc [<package>]        document the staged workspace; deny warnings
 #   example [<package>]    run Clippy on examples on an eligible target
 #   build [<package>]      build binaries on an eligible target; print paths
@@ -104,6 +105,20 @@
 # Do not save a result if edits change the tree after judgment.
 # Do not save a result from a run that a signal or a hold stop ends.
 # --no-cache ignores saved results.
+# End help.
+#
+# Help batch:
+# Usage: verify batch --packages a,b,c --lint workspace|packages [--fail-first]
+#
+# Format with rustfmt and Taplo, then test each package in order.
+# Run mend and Clippy for the workspace after the tests.
+# With --lint packages, format the named and changed packages.
+# With --lint workspace, format all packages.
+# With --fail-first, test the phase_baseline with the regression patch first.
+# Print the result of each step and one result for the batch.
+# An edit after the tests makes the batch fail with "tests stale".
+# Keep the queue place between steps. Each step uses its own grant and route.
+# Use --no-cache to ignore saved results.
 # End help.
 #
 # Help doc:
@@ -427,7 +442,7 @@ case "${1:-}" in
     help)
         if [[ $# -eq 2 ]]; then
             case "$2" in
-                check|test|lint|doc|example|build|final|example-test|help)
+                check|test|lint|batch|doc|example|build|final|example-test|help)
                     command_help "$2"; exit 0 ;;
             esac
         fi
@@ -1359,7 +1374,7 @@ print_built_binaries() {
 
 NEXTEST_ARGS=()
 compose_nextest_args() {
-    local ignored_only=0
+    local ignored_only=0 test_match=""
     set -- "${ARGS[@]}"
     PKG="${1:-}"
     shift
@@ -1393,9 +1408,10 @@ compose_nextest_args() {
     if [[ ${#FILTERS[@]} -gt 0 ]]; then
         # Any of the names: & binds tighter than |, so a union of two or
         # more goes in parentheses.
-        FILTER="test(${FILTERS[0]})"
+        if [[ "${VERIFY_BATCH_STEP:-}" == fail-first ]]; then test_match="="; fi
+        FILTER="test($test_match${FILTERS[0]})"
         for name in "${FILTERS[@]:1}"; do
-            FILTER+=" | test($name)"
+            FILTER+=" | test($test_match$name)"
         done
         if [[ ${#FILTERS[@]} -gt 1 ]]; then
             FILTER="($FILTER)"
@@ -1460,7 +1476,7 @@ fi
 
 CMD="${1:-}"
 case "$CMD" in
-    check|test|lint|doc|build|example|final|example-test) ;;
+    check|test|lint|batch|doc|build|example|final|example-test) ;;
     *) usage; exit 2 ;;
 esac
 
@@ -1503,6 +1519,21 @@ fi
 
 
 parse_routing_arguments "$@"
+if [[ "$CMD" == batch ]]; then
+    if [[ ${#MAC_ENV_NAMES[@]} -gt 0 || "$MAC_FETCH_GIVEN" == 1 ]]; then
+        echo 'verify.sh: --env and --fetch require a single test call.' >&2
+        exit 2
+    fi
+    batch_route=()
+    if [[ "$NO_CACHE" == 1 ]]; then batch_route+=(--no-cache); fi
+    if [[ -n "$PINNED_TARGET" ]]; then batch_route+=(--target "$PINNED_TARGET"); fi
+    if [[ "$MAC_ONLY" == 1 ]]; then batch_route+=(--mac "$MAC_REASON"); fi
+    if [[ "$LOCAL_ONLY" == 1 ]]; then batch_route+=(--local "$LOCAL_REASON"); fi
+    if [[ -n "${VERIFY_HELPER_INPUT:-}" ]]; then exec 70>&- 71<&-; fi
+    exec "$PY" "$VERIFY_START_DIR/verify_batch.py" "$VERIFY_REPO_ROOT" \
+        "$VERIFY_START_DIR/verify.sh" "$DETACHED_RUNS_SCRIPT" "${ARGS[@]}" \
+        -- ${batch_route[@]+"${batch_route[@]}"}
+fi
 parse_command_arguments "${ARGS[@]}"
 set -- ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}
 if [[ "$CMD" == final && -z "$VERIFY_PACKAGE" && -z "$PINNED_TARGET" && "$MAC_ONLY" == 0 && "$LOCAL_ONLY" == 0 ]]; then
@@ -1829,7 +1860,9 @@ CACHE_DIR=""
 if [[ -n "${CACHE_SESSION_DIR}" && ( "$CMD" == test || "$CMD" == lint ) ]]; then
     CACHE_DIR="${CACHE_SESSION_DIR}/verify_cache"
 fi
-if [[ ${#MAC_ENV_NAMES[@]} -gt 0 || "$MAC_FETCH_GIVEN" == 1 ]]; then CACHE_DIR=""; fi
+if [[ ${#MAC_ENV_NAMES[@]} -gt 0 || "$MAC_FETCH_GIVEN" == 1 || "${VERIFY_BATCH_STEP:-}" == format ]]; then
+    CACHE_DIR=""
+fi
 if [[ "$CMD" == test ]]; then
     for VERIFY_ENV_ENTRY in ${VERIFY_TEST_ENVIRONMENT[@]+"${VERIFY_TEST_ENVIRONMENT[@]}"}; do
         MAC_ENV_NAMES+=("${VERIFY_ENV_ENTRY%%=*}")
@@ -2149,7 +2182,8 @@ note_event() {
     CALL_NOTED=1
     collect_hold_wait
     [[ -f "${BUILDLOG_RECORD:-}" ]] || return 0
-    local outcome=$1 wait=$2 wall=$3 build=$4 saved=$5 status=$6 cached=0
+    local outcome=$1 wait=$2 wall=$3 build=$4 saved=$5 status=$6 cached=0 verb=$CMD
+    if [[ "${VERIFY_BATCH_STEP:-}" == format ]]; then verb=format; fi
     if [[ -n "${CACHE_DIR}" ]]; then
         cached=1
     fi
@@ -2171,7 +2205,7 @@ note_event() {
         BUILDLOG_MAC_COPY="$BUILDLOG_MAC_COPY" BUILDLOG_MAC_COPY_S="$BUILDLOG_MAC_COPY_S" \
         BUILDLOG_MAC_COPY_COUNT="$BUILDLOG_MAC_COPY_COUNT" BUILDLOG_MAC_COPY_NATEDEV_S="$BUILDLOG_MAC_COPY_NATEDEV_S" BUILDLOG_PACKAGE="${VERIFY_PACKAGE:-}" \
         verify_helper "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
-        "$build" "$saved" "${SECONDS}" "$CMD" ${VERIFY_PACKAGE:+"$VERIFY_PACKAGE"} ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"} \
+        "$build" "$saved" "${SECONDS}" "$verb" ${VERIFY_PACKAGE:+"$VERIFY_PACKAGE"} ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"} \
         </dev/null >/dev/null 2>&1 || true
 }
 
@@ -2807,9 +2841,10 @@ placement_once() {
     local token=none reply line route="" status=0 monitor=0 refresh_source=${1:-0}
     local LINT_QUEUE_LEAVE_HOOK=${LINT_QUEUE_LEAVE_HOOK:-} BUILDLOG_MAC_IDLE_HOOK=""
     if [[ -z "${COPIES_STEP_SOURCE:-}" || "${STEP_WRITES_TREE:-0}" == 1 ]]; then LINT_QUEUE_LEAVE_HOOK=""; fi
-    # A step with its own slot can leave its grant without a memory handoff.
+    # A standalone copy releases its grant when it leaves its slot.
+    # A batch uses the same run identity on the baseline and current trees.
     local BUILDLOG_RUN=${BUILDLOG_RUN:-}
-    if [[ -n "${COPIES_STEP_SOURCE:-${VERIFY_SLOT_SOURCE:-}}" ]]; then BUILDLOG_RUN=""; fi
+    if [[ -n "${COPIES_STEP_SOURCE:-${VERIFY_SLOT_SOURCE:-}}" && -z "${VERIFY_BATCH_STEP:-}" ]]; then BUILDLOG_RUN=""; fi
     export BUILDLOG_RUN
     if [[ -z "$PLACEMENT_EPISODE" ]]; then
         PLACEMENT_STEP_NUMBER=$((PLACEMENT_STEP_NUMBER + 1))
@@ -3311,6 +3346,7 @@ cache_lookup() {
         record+=.fail outcome=replayed word=FAIL
     fi
     [[ -n "${outcome}" ]] || return 1
+    if [[ -n "${VERIFY_BATCH_CACHE_HIT:-}" ]]; then : > "$VERIFY_BATCH_CACHE_HIT"; fi
     LOOKUP_STATUS="$(sed -n 's/^status=//p' "${record}")"
     LOOKUP_STATUS="${LOOKUP_STATUS:-0}"
     note_event "${outcome}" "${SECONDS}" 0 0 "$(sed -n 's/^saved_s=//p' "${record}")" \
@@ -4197,10 +4233,12 @@ if [[ -n "${ACTIVITY_SESSION_DIR}" \
     # the invocation itself: "verify.sh test hana" names both the command that
     # ran and the script to open when a gate misbehaves, where a bare
     # "test hana" answered neither.
+    ACTIVITY_VERB=$CMD
+    if [[ "${VERIFY_BATCH_STEP:-}" == format ]]; then ACTIVITY_VERB=format; fi
     if verify_helper "${PROGRESS_HISTORY}" start-activity \
         --session-dir "${ACTIVITY_SESSION_DIR}" \
         --label "Verification" \
-        --activity "verify.sh ${CMD}${*:+ $*}" >/dev/null 2>&1; then
+        --activity "verify.sh ${ACTIVITY_VERB}${*:+ $*}" >/dev/null 2>&1; then
         ACTIVITY_ACTIVE=1
         finish_activity() {
             local status=$1
@@ -4463,9 +4501,8 @@ run_mac_lint_fix() {
         return 1
     fi
     # Format the returned files with natedev's rustfmt, then judge this tree.
-    lint_copy_begin
-    lint_rewrite fmt_cargo --all
-    lint_copy_return || exit 1
+    local FMT_SCOPE=(--all)
+    run_lint_format rustfmt
     if [[ -n "${RUN_LOG}" ]]; then
         set_verdict_keys
     fi
@@ -4476,10 +4513,8 @@ run_lint_held_sequence() {
     local STEP_FORCE_MAC=${1:-0}
     LINT_HELD_CLIPPY_FAILED=0
     # Format locally; the Mac judges the resulting tree without fixes.
-    lint_copy_begin
-    lint_rewrite fmt_cargo --all
-    workspace_taplo
-    lint_copy_return || exit 1
+    local FMT_SCOPE=(--all)
+    run_lint_format fix-toml
     workspace_taplo --check || exit "$?"
     lint_status=0
     if lint_config_enabled mend; then
@@ -4509,6 +4544,31 @@ run_lint_held_sequence() {
         finish_tree_watch
     fi
     return 0
+}
+
+lint_format_scope() {
+    local member changed package
+    local packages=()
+    if [[ -z "$PKG" ]]; then
+        FMT_SCOPE=(--all)
+        return
+    fi
+    IFS=, read -r -a packages <<< "${VERIFY_BATCH_LINT_PACKAGES:-$PKG}"
+    FMT_SCOPE=()
+    for package in "${packages[@]}"; do FMT_SCOPE+=(-p "$package"); done
+    changed="$(read_metadata | VERIFY_PY_HELPER=CHANGED_MEMBERS_PY "$PY" -c "$CHANGED_MEMBERS_PY")"
+    while IFS= read -r member; do
+        if [[ -n "$member" && ",${VERIFY_BATCH_LINT_PACKAGES:-$PKG}," != *",$member,"* ]]; then
+            FMT_SCOPE+=(-p "$member")
+        fi
+    done <<< "$changed"
+}
+
+run_lint_format() {
+    lint_copy_begin
+    lint_rewrite fmt_cargo "${FMT_SCOPE[@]}"
+    if [[ "$1" == fix-toml ]]; then workspace_taplo; fi
+    lint_copy_return || exit 1
 }
 
 run_lint_sequence() {
@@ -4618,28 +4678,12 @@ run_lint_sequence() {
     else
         lint_config_skip_notice mend "cargo mend --all-targets --workspace --fix"
     fi
-    # fmt compiles nothing, so it stays on the phase's own work: this
-    # package and every member that differs from HEAD once mend has run.
-    # Covering them all is what lets one lint record answer for each
-    # package (tree_key).
-    if [[ -z "$PKG" ]]; then
-        FMT_SCOPE=(--all)
-    else
-        FMT_SCOPE=(-p "$PKG")
-        FMT_MEMBERS="$(read_metadata \
-        | VERIFY_PY_HELPER=CHANGED_MEMBERS_PY "$PY" -c "$CHANGED_MEMBERS_PY")"
-        while IFS= read -r member; do
-            if [[ -n "$member" && "$member" != "$PKG" ]]; then
-                FMT_SCOPE+=(-p "$member")
-            fi
-        done <<< "$FMT_MEMBERS"
-    fi
+    # Format the selected packages and each member that mend changed.
+    lint_format_scope
     if [[ -z "$PKG" ]] && lint_config_enabled fmt; then
         echo 'style-lint: rustfmt start'
     fi
-    lint_copy_begin
-    lint_rewrite fmt_cargo "${FMT_SCOPE[@]}"
-    lint_copy_return || exit 1
+    run_lint_format rustfmt
     if [[ -z "$PKG" ]] && lint_config_enabled fmt; then
         echo 'style-lint: rustfmt passed'
     fi
@@ -4704,6 +4748,11 @@ case "$CMD" in
         [[ $# -eq 0 ]] || { usage; exit 2; }
         if [[ -n "$PKG" ]]; then require_member "$PKG"; fi
         require_taplo
+        if [[ "${VERIFY_BATCH_STEP:-}" == format ]]; then
+            lint_format_scope
+            run_lint_format fix-toml
+            exit 0
+        fi
         run_lint_sequence
         ;;
     doc)

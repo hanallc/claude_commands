@@ -86,6 +86,27 @@ Lint does not run rustdoc.
 Its form is `verify.sh lint [<package>] [--check] [routing flags]`.
 No package means the whole workspace. `--features` and `lint --workspace` refuse with exit 2.
 
+### `batch`
+
+`verify.sh batch --packages a,b,c --lint workspace|packages [--fail-first]` runs package tests and lint under one queue identity.
+The batch process owns `BUILDLOG_RUN` for its lifetime. Each child uses the existing admission path and releases its grant.
+The baseline copy forwards the batch identity when the test submits placement. The request still carries the copy's source key.
+Standalone copy commands keep their existing release behavior.
+
+1. If requested, use `copies.py run` to open the recorded baseline in a private copy.
+2. Apply the phase's test-only `regression.patch` in that copy.
+3. Run each test listed in `regression-tests`. Nextest status 100 proves a test failed.
+4. Run rustfmt and Taplo in the current tree without a memory grant.
+5. Run the existing full test verb for every named package, even after a failure.
+6. Run the existing lint verb with workspace or package formatting scope.
+
+The format step uses the lint copy and return path for repositories that configure berth.
+Mend and Clippy use the normal lint checks and repair rules.
+The batch compares the tree key after each test and after lint with the key after formatting.
+A changed or unreadable key makes the lint row red with `tests stale`.
+The test and lint children report cache hits from the existing cache lookup.
+The format step and baseline failures run fresh.
+
 ### The hook
 
 The gate catches the commit forms an agent writes in ordinary use. It is not a shell interpreter and does not stop deliberate hiding, such as a commit inside a script file, an alias or a function defined in an earlier call. Where it cannot read a command that holds checkpoint text, it refuses.
