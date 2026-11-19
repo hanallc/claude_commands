@@ -1416,7 +1416,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
 
 ### Phase 85 — send.py prints FAILED only when delivery failed  · status: todo
-**Depends on:** phase 84 on main
+**Depends on:** phase 84 (fb52e3dc7)
 
 #### Work Order
 
@@ -1432,7 +1432,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Workers:** 1 writer.
 
-**Order:** first on the console batch line after phase 84 is on main. Branch from main.
+**Order:** branch from the phase 84 hash fb52e3dc7 (sdlc showrunner, 06:35 EST Nov 19). The showrunner orders it after the console batch.
 
 **Acceptance gate:**
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
