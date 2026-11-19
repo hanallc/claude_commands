@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 from contextlib import ExitStack, redirect_stdout
+import errno
 import io
 import json
 import os
@@ -12,6 +13,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import tempfile
 from typing import cast, final
 from unittest import mock
 from scripts.lib import build_folders
@@ -148,6 +150,30 @@ sys.stdin.read(1)
                     self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
                     self.assertFalse(recovery.path.exists())
                 self.assertEqual(list(directory.glob("*.json")), [])
+
+    def test_recovery_clears_the_record_when_the_token_pool_is_full(self) -> None:
+        self.supply_jobserver(b"Q")
+        recovery = merge_gate.GateRecovery(self.state / "dead-gate.json", str(self.checkout),
+                                           0, "ended-owner")
+        with mock.patch.dict(os.environ, self.environment, clear=True), \
+                tempfile.TemporaryDirectory(prefix="merge-gate-", dir="/dev/shm") as folder:
+            path = Path(folder)
+            self.write(path / "module-output", "unfinished")
+            recovery.folders.append(folder)
+            descriptor = os.open(self.environment["BUILDLOG_JOBSERVER_FIFO"], os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                recovery.tokens.append(recovery.token(descriptor, b"Q"))
+            finally:
+                os.close(descriptor)
+            recovery.save()
+            with mock.patch.object(os, "write",
+                                   side_effect=OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))) as write:
+                recovery.recover()
+            self.assertEqual(write.call_count, 1)
+            self.assertEqual(recovery.tokens, [])
+            self.assertFalse(recovery.path.exists())
+            self.assertFalse(path.exists())
+            self.assertEqual(self.jobserver_tokens(), b"Q")
 
     def test_module_timeout_removes_fixture_and_nested_gate_folders(self) -> None:
         parent = self.root / "nested-temporary"
