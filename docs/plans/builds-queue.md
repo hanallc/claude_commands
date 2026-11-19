@@ -2910,6 +2910,15 @@ Work: find where the row name comes from, and why a showrunner session id gives 
 2. After the new code sends READY, it prints one line that names the source hash.
 3. Add no new config key. A test checks both lines with a private socket.
 
+### Phase 44ch — The legacy copies.root key is gone  · status: todo
+**From builds, 2026-11-18 19:2x:** the user's go (typed 19:12 EST 11-18, via bob and builds): "approved: Go for all, start at 06:00 EST (recommended): both steps run on Nov 19, and the Nov 20 deletes follow with no more questions." This is cutover step 3 on Nov 19. builds places the hash on the merge line after step 2 ends. Copy `/session/queue/rootdel`, branch `builds-queue-44ch` from main 9446deda6.
+
+Work:
+1. Delete the `root=` key and its comment from `config/copies.conf`.
+2. Remove each test use of the `root` setting in `scripts/copies/test_copies.py`. Keep each test's other assertions.
+3. Correct `docs/as-built/copies.md:123`.
+4. A test proves that `copies.py` and `copy_record` read no `root` key.
+
 ### Phase 44cg — A memory wait fixture gives the same result under load  · status: todo
 **From builds, 2026-11-18 18:3x:** queue's next item after 44cf.
 
