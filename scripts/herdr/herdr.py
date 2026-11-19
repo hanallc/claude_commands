@@ -370,6 +370,7 @@ class OpeningPrompt:
     cursor: TranscriptCursor | UnspecifiedPromptTranscript = UnspecifiedPromptTranscript()
     may_type: bool = True
     other_transcripts: tuple[TranscriptCursor, ...] = ()
+    resend_once: bool = False
 
     def prepare_for_launch(self, since: datetime) -> OpeningPrompt:
         """Keep a supplied cursor or position a new cursor before the agent starts."""
@@ -506,6 +507,10 @@ class TranscriptCursor:
             if row.get("type") == "user" and not row.get("isMeta", False) and _prompt_matches(text, _turn_text(row)):
                 return PromptSubmitted(at)
         return PromptNotSubmitted("no matching non-meta user turn after launch")
+
+    def allows_resend(self) -> bool:
+        """Allow a caller to authorize one send when the transcript has a known gap."""
+        return False
 
     def command_rejections(self, text: str) -> int:
         """How many times Claude answered this prompt's slash command with `Unknown command` since launch."""
@@ -2988,9 +2993,11 @@ class Herdr:
                 result = receipt()
                 if isinstance(result, PromptSubmitted):
                     return result
-                if isinstance(result, TranscriptUnreadable):
+                if isinstance(result, TranscriptUnreadable) and not opening.resend_once:
                     return False
                 composer = self.composer(pane)
+                if opening.resend_once and (isinstance(composer, NoComposer) or composer.text.strip()):
+                    raise HerdrFailure("check that the destination pane is idle and its input is empty", "wrong_target")
                 if isinstance(composer, NoComposer):
                     return False
                 if not composer.text.strip():
@@ -3009,6 +3016,12 @@ class Herdr:
                 if not check_target(session, action=action, place=place, terminal=terminal,
                                     recipient=recipient, pane_info=row, client=self):
                     return False
+                if opening.resend_once:
+                    result = receipt()
+                    if isinstance(result, PromptSubmitted):
+                        return result
+                    if cursor is None or not cursor.allows_resend():
+                        raise HerdrFailure("the transcript does not permit a resend", "wrong_target")
                 if action is _OpeningComposer.DRAFT:
                     self._send_keys(pane, "Enter")
                     return True
@@ -3042,6 +3055,8 @@ class Herdr:
                 screen = ready.screen
                 if isinstance(ready, PromptInputTimedOut):
                     return failure("destination never became ready for input", check_readability=True)
+                if opening.resend_once and not ready.idle:
+                    return failure("check that the destination pane is idle and its input is empty")
             if cursor is None:
                 return failure("caller did not identify the transcript; submit is unproven")
             with operation_deadline.within(deadline):
@@ -3062,6 +3077,9 @@ class Herdr:
                 if remaining > 0:
                     time.sleep(min(pause, remaining))
                     pause = min(pause * 2, START_RETRY_MAX_SECONDS)
+
+            if opening.resend_once:
+                return self._wait_for_submit(receipt, deadline) or failure()
 
             enters = 0
             while True:
