@@ -318,10 +318,13 @@ The real run checks again after it writes the session index and just before it s
 If that check finds a live source, the next run can reuse its index entry.
 Both modes continue with other candidates and return status 0 if they only skip live entries before copying.
 Both modes check the source, its parent, the destination, and the session index before they print each move.
+The source check reads file contents, symbolic link targets, and metadata.
 Both modes keep entries that fail these checks and continue in the same order.
 A destination conflict found during these checks counts as a refusal.
 The command returns status 1 if it records a refusal.
 An error at or after the first write to the session index or the journal stops the real run.
+A source that becomes live before journal publication is an exception.
+If the journal names a live source, the run keeps the journal and returns status 1.
 The dry run reads the session index and folder records without creating a preview directory.
 It reads compressed transcripts through a pipe.
 The command checks the scratchpad copy after it scans the source for deletion.

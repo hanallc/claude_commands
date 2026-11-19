@@ -1,9 +1,10 @@
 """Check the cutover with private roots and one live process."""
 from __future__ import annotations
 
-from collections.abc import Generator, Sequence
+from collections.abc import Generator
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import ctypes
+import errno
 import io
 import json
 import os
@@ -18,7 +19,6 @@ import unittest
 from unittest import mock
 from typing import cast, override
 
-from scripts.disks import measure
 from scripts.lib import copy_record, scratch, session_folder, session_move
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.transcript_test_support import compressed_copy
@@ -156,14 +156,15 @@ class SessionMoveTests(unittest.TestCase):
         last = self.leaf("c-movable")
         for source in (first, refused, last):
             _ = self.index(source.name, "demo")
-        tree_size = session_move.tree_size
+        scan = session_move.read_manifest
+        refused_info = refused.stat()
 
-        def size(source: Path, mounts: Sequence[measure.Mount], fd: int) -> int:
-            if source == refused:
+        def read(fd: int, identities: session_move.EntryIdentities | None = None) -> session_move.TreeManifest:
+            if os.path.samestat(os.fstat(fd), refused_info):
                 raise PermissionError("cannot read scratchpad")
-            return tree_size(source, mounts, fd)
+            return scan(fd, identities)
 
-        with mock.patch.object(session_move, "tree_size", side_effect=size):
+        with mock.patch.object(session_move, "read_manifest", side_effect=read):
             dry_status, dry_output, dry_errors = self.invoke("--dry-run")
             real_status, real_output, real_errors = self.invoke()
 
@@ -177,6 +178,37 @@ class SessionMoveTests(unittest.TestCase):
         self.assertIn(str(first), real_output.splitlines()[0])
         self.assertIn(str(last), real_output.splitlines()[1])
         self.assertTrue(refused.is_dir())
+
+    def test_unreadable_file_refuses_the_source_before_printing_or_writing(self) -> None:
+        refused = self.leaf("a-unreadable")
+        movable = self.leaf("b-movable")
+        target = self.index(movable.name, "demo") / self.claude / self.project / movable.name
+        refused_info = refused.stat()
+        open_file = os.open
+
+        def deny_source_file(name: str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+            if name == "draft.md" and dir_fd is not None and os.path.samestat(os.fstat(dir_fd), refused_info):
+                raise PermissionError(errno.EACCES, "cannot open source file", name)
+            return open_file(name, flags, mode, dir_fd=dir_fd)
+
+        with (mock.patch.object(os, "open", side_effect=deny_source_file),
+              mock.patch.object(session_move, "transcript_cwd", return_value=str(self.base / "unindexed"))):
+            dry_status, dry_output, dry_errors = self.invoke("--dry-run")
+            real_status, real_output, real_errors = self.invoke()
+
+        self.assertNotIn(f" {refused} -> ", dry_output)
+        self.assertEqual(real_status, 1, real_errors)
+        self.assertEqual(dry_status, real_status)
+        self.assertEqual(dry_errors, real_errors)
+        self.assertIn(f"kept {refused}: [Errno {errno.EACCES}] cannot open source file", real_errors)
+        self.assertEqual(dry_output.replace("would move", "moved"), real_output)
+        self.assertEqual(real_output.splitlines()[-1],
+                         "session_move: moved 1 folders (0.00 GiB), kept 0 live, refused 1 other")
+        self.assertFalse((self.root / session_folder.INDEX / refused.name).is_symlink())
+        self.assertFalse((self.root / "unindexed").exists())
+        self.assertEqual((refused / "draft.md").read_bytes(), b"scratch content\n")
+        self.assertFalse(movable.exists())
+        self.assertEqual((target / "draft.md").read_bytes(), b"scratch content\n")
 
     def test_index_mount_refuses_each_candidate_before_printing(self) -> None:
         first = self.leaf("a-unindexed")

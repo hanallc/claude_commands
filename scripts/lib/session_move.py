@@ -492,12 +492,10 @@ def tree_entries(fd: int, mount: int, relative: Path = TREE_ROOT) -> Iterator[tu
             yield path, fd, info, kind
 
 
-def tree_size(root: Path, mounts: Sequence[measure.Mount], fd: int) -> int:
+def check_source_mounts(root: Path, mounts: Sequence[measure.Mount]) -> None:
     for mount in mounts:
         if mount.point == root or mount.point.is_relative_to(root):
             raise MoveRefused(f"{mount.point}: entry is on another mount")
-    return sum(info.st_size for _, _, info, kind in tree_entries(fd, mount_identity(fd))
-               if kind is not HashedEntry.DIRECTORY)
 
 
 EntryIdentities = dict[Path, os.stat_result]
@@ -791,6 +789,11 @@ class CopyInProgress:
 
 
 @dataclass(frozen=True)
+class CopyFromValidatedSource(CopyInProgress):
+    source_manifest: TreeManifest
+
+
+@dataclass(frozen=True)
 class AllCopyAttributes:
     """An earlier journal verifies all attributes in the copy."""
 
@@ -958,7 +961,8 @@ def prepare_copy(job: MoveJournal, journal: int, source: int, session_pids: froz
             if not job.source.matches(os.fstat(original)):
                 raise MoveRefused("source changed before the copy")
             unlink_at(journal, PARTIAL_FILE)
-            expected = read_manifest(original)
+            expected = (job.state.source_manifest if isinstance(job.state, CopyFromValidatedSource)
+                        else read_manifest(original))
             existing = read_manifest(staged)
             copy_tree(original, staged, existing, expected, journal)
             attributes = SourceAttributeNames({
@@ -1085,7 +1089,11 @@ class ValidatedCopy:
     move: PlannedCopy
     destination: SessionDestination
     source_identity: FolderIdentity
-    size_bytes: int
+    source_manifest: TreeManifest
+
+    @property
+    def size_bytes(self) -> int:
+        return sum(entry.size_bytes for entry in self.source_manifest.values())
 
 
 def validate_copy(leaf: ScratchpadLeaf, roots: MoveRoots, root_fd: int, names: DestinationNames,
@@ -1098,16 +1106,17 @@ def validate_copy(leaf: ScratchpadLeaf, roots: MoveRoots, root_fd: int, names: D
     with source_parent(roots, move) as source:
         with child_directory(source, move.source.name, mount=mount_identity(source)) as original:
             identity = FolderIdentity.of(os.fstat(original))
-            size = tree_size(move.source, mounts, original)
+            check_source_mounts(move.source, mounts)
+            manifest = read_manifest(original)
     check_destination(root_fd, roots.sessions, move.target, destinations)
-    return ValidatedCopy(move, name, identity, size)
+    return ValidatedCopy(move, name, identity, manifest)
 
 
 def start_copy(validated: ValidatedCopy, names: DestinationNames,
                roots: MoveRoots, root_fd: int, session_pids: frozenset[int]) -> int:
     mount = mount_identity(root_fd)
     move = validated.move
-    job = MoveJournal(move, validated.source_identity, CopyInProgress())
+    job = MoveJournal(move, validated.source_identity, CopyFromValidatedSource(validated.source_manifest))
     writes = CopyWriteState()
     try:
         names.remember(validated.destination, root_fd, mount, writes)
