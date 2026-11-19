@@ -3036,23 +3036,14 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 - `workspace_targets(..., verify_runner=)`: on `NoCargoManifest`, a verify.sh runner holds no workspace target; a cargo-nextest runner keeps every target busy, as on main. Other unreadable state keeps every target busy.
 - Row ee6d82130 on main 764582979. Tests in both layouts, 0 failures: 10 suites; types 0.
 
-### Phase 168 — One lint.conf key sets the /build disk floor  · status: todo
-**Source:** builds, 2026-11-19 04:3x EST: natedev ruled that the /build floor should be 300 GiB, not `sweep_free_floor_percent=20` (733.3 GiB). The value change needs the user's go. This phase only makes it one key and keeps today's value.
+### Phase 168 — One lint.conf key sets the /build disk floor  · status: done
+**Source:** builds, 2026-11-19 04:3x EST: natedev ruled that the /build floor should be 300 GiB, not `sweep_free_floor_percent=20` (733.3 GiB). The value change needs the user's go; this phase only adds the key at today's value.
 
-#### Work Order
-
-**Goal:** one lint.conf key sets the free-space floor of each filesystem other than the home disk.
-
-**Spec:**
-1. New key `sweep_build_floor_gib.<host>`, else `sweep_build_floor_gib`, read through the same host lookup as `sweep_free_floor_gib`.
-2. With neither key set, the floor stays `sweep_free_floor_percent` x the filesystem size.
-3. lint.conf sets `sweep_build_floor_gib.natedev=733.29`, which equals 20 percent of /build today.
-
-**Base:** main `764582979`.
-
-**Files:** `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py`, `config/lint.conf`.
-
-**Acceptance gate:** new rows in the percent-floor test pass; test_sweep and test_tmp_sweep pass; types 0.
+#### As-built
+- `BUILD_FLOOR_KEY = "sweep_build_floor_gib"`. `floor_setting_key(keys, base, host)` gives `<base>.<host>` when set, else `<base>`; `floor_bytes` (home floor) and `filesystem_floors` share it.
+- `filesystem_floors`: a filesystem other than the home disk uses `sweep_build_floor_gib[.<host>]` in GiB when set, else `sweep_free_floor_percent` x its size. A value that is not a live non-negative number is unusable.
+- lint.conf: `sweep_build_floor_gib.natedev=733.29` after `sweep_free_floor_percent`; 3.2 MiB above the old 20 percent byte floor (accepted in review). The 300 GiB change is `/tune lint sweep_build_floor_gib.natedev 300`, only on the user's go.
+- Row 116e24ea0 on main 764582979 (same tree as 96a8d6a67, which had no Change-Review line). Tests in both layouts, 0 failures: 11 suites; types 0.
 
 ### Phase 169 — The disk floor sweep sends one notice for each holder, not one for each target  · status: todo
 **Source:** builds, 2026-11-19 04:2x EST: from 04:08 to 04:30 EST the sweep sent more than 150 messages to devtools (session 33c5eac0), about one each 10 s. Each one named the same pid 3179104 and one target.
