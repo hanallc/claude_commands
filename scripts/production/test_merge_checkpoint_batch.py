@@ -448,6 +448,45 @@ raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
         self.assert_batch_requires_reset(result, published, unpublished)
         self.assertIn("input: failed", result.stdout)
 
+    def test_a_stopped_batch_resumes_after_fetching_a_later_checkpoint(self) -> None:
+        for submit_ref in (False, True):
+            with self.subTest(submit_ref=submit_ref):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                published = self.git("rev-parse", "HEAD")
+                first = self.checkpoint(content="alpha batch change\n")
+                _ = self.git("update-ref", "refs/heads/alpha-checkpoint", first, cwd=self.origin)
+                _ = self.git("update-ref", "refs/heads/alpha-branch", published, cwd=self.origin)
+                writer = self.root / "beta-writer"
+                _ = self.git("clone", "-b", "beta-branch", str(self.origin), str(writer))
+                self.write(writer, "src/beta.txt", "beta batch change\n")
+                _ = self.git("add", "src/beta.txt", cwd=writer)
+                _ = self.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m",
+                             "beta work\n\nChange-Review: none — fixture code only", cwd=writer)
+                second = self.git("rev-parse", "HEAD", cwd=writer)
+                _ = self.git("push", "origin", "beta-branch", "HEAD:refs/heads/beta-checkpoint", cwd=writer)
+                absent = subprocess.run(["git", "cat-file", "-e", f"{second}^{{commit}}"], cwd=self.checkout,
+                                        env=self.env, capture_output=True, text=True, check=False,
+                                        timeout=TEST_HANG_GUARD_SECS)
+                self.assertNotEqual(absent.returncode, 0)
+                checkpoint = "refs/remotes/origin/beta-checkpoint" if submit_ref else second
+                lines = [self.batch_line("alpha", "2", first), self.batch_line("beta", "2", checkpoint)]
+
+                unpublished = self.interrupt_batch(*lines)
+                self.assertEqual(self.git("rev-parse", "HEAD^2"), second)
+                self.assertEqual(self.git("rev-parse", "HEAD^1^2"), first)
+                self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), published)
+                saved = self.batch_record().read_text(encoding="utf-8").splitlines()
+
+                result = self.land_batch(lines)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(saved, [f"{first}\t{lines[0]}", f"{second}\t{lines[1]}"])
+                for unit in ("alpha", "beta"):
+                    self.assertIn(f"batch: resume — {unit} phase 2 is already merged", result.stdout)
+                self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), unpublished)
+                self.assertFalse(self.batch_record().exists())
+
     def test_a_batch_record_unlink_error_warns_and_allows_promotion(self) -> None:
         self.promotions = str(self.promote)
         self.production_doc()

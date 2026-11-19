@@ -1574,11 +1574,55 @@ class MergedBatchItem(NamedTuple):
     paths: tuple[str, ...]
 
 
+class PendingCheckpointRef(NamedTuple):
+    pass
+
+
+@dataclass
+class BatchResumeItem:
+    request: MergeRequest
+    commit: str | PendingCheckpointRef
+
+    @property
+    def checkpoint_request(self) -> MergeRequest:
+        return self.request._replace(commit=self.commit) if isinstance(self.commit, str) else self.request
+
+    def record_line(self, commit: str | PendingCheckpointRef) -> str:
+        identity = commit if isinstance(commit, str) else "pending-ref"
+        return f"{identity}\t{self.request.batch_argument_line}\n"
+
+
 @dataclass
 class BatchResumeRecord:
     path: Path
-    requests: tuple[MergeRequest, ...]
+    items: tuple[BatchResumeItem, ...]
     retirement_attempted: bool = False
+
+    def contents(self) -> str:
+        return "".join(item.record_line(item.commit) for item in self.items)
+
+    def matches(self, saved: bytes, sources: set[str]) -> bool:
+        lines = saved.splitlines(keepends=True)
+        if len(lines) != len(self.items):
+            return False
+        matching_commits: set[str] = set()
+        for line, item in zip(lines, self.items, strict=True):
+            if line == item.record_line(item.commit).encode("utf-8"):
+                if isinstance(item.commit, str):
+                    matching_commits.add(item.commit)
+            elif line != item.record_line(PendingCheckpointRef()).encode("utf-8"):
+                return False
+        return not sources.isdisjoint(matching_commits)
+
+    def resolve(self, item: BatchResumeItem) -> MergeRequest:
+        resolved = resolved_checkpoint(item.checkpoint_request)
+        if isinstance(item.commit, str):
+            return resolved
+        contents = "".join(entry.record_line(resolved.commit if entry is item else entry.commit)
+                           for entry in self.items)
+        write_text_atomic(self.path, contents)
+        item.commit = resolved.commit
+        return resolved
 
     def retire(self) -> None:
         self.retirement_attempted = True
@@ -1673,13 +1717,13 @@ def bisect_red_batch(reference: MergeRequest, candidates: tuple[MergedBatchItem,
             "run", "failed", str(error), "the showrunner will inspect the failed command")) from error
 
 
-def run_batch_attempt(requests: tuple[MergeRequest, ...], start_tip: str, log: Path,
+def run_batch_attempt(requests: tuple[BatchResumeItem, ...], start_tip: str, log: Path,
                       resume_record: BatchResumeRecord) -> int:
     """Merge the ordered items and share their tests, publication, and promotion."""
     items: list[MergedBatchItem] = []
     for index, incoming in enumerate(requests):
         try:
-            request = resolved_checkpoint(incoming)
+            request = resume_record.resolve(incoming)
             origin = ancestry(request)
             if origin.already_merged:
                 raise checkpoint_gate.Stop("ancestry", "held", "the batch item is already merged",
@@ -1783,26 +1827,27 @@ def later_item_stop(cause: MergeRequest, step: str, state: str) -> checkpoint_ga
                                 f"resolve {label}, then resend this checkpoint")
 
 
-def resume_merged_items(requests: tuple[MergeRequest, ...]) -> tuple[tuple[MergeRequest, ...], int]:
+def resume_merged_items(record: BatchResumeRecord) -> tuple[tuple[BatchResumeItem, ...], int]:
     """Resume each merged item through the single route, and return the items still to merge.
 
     A merged item's unit drops its later items when the resume fails, as a stopped batch item does.
     """
-    remaining: list[MergeRequest] = []
+    remaining: list[BatchResumeItem] = []
     status = 0
     failed: dict[str, MergeRequest] = {}
-    for request in requests:
+    for item in record.items:
+        request = item.checkpoint_request
         cause = failed.get(request.unit.staff_id)
         if cause is not None:
             status = report_checkpoint_stop(request, later_item_stop(cause, "ancestry", "failed"))
             continue
         try:
-            resolved = resolved_checkpoint(request)
+            resolved = record.resolve(item)
         except checkpoint_gate.Stop:
-            remaining.append(request)
+            remaining.append(item)
             continue
         if not merged(resolved):
-            remaining.append(request)
+            remaining.append(item)
             continue
         checkpoint_gate.report("batch", "resume", f"{request.unit.name} phase {request.phase} is already merged")
         resumed = run(resolved)
@@ -1826,35 +1871,34 @@ def batch_resume_record(requests: tuple[MergeRequest, ...]) -> Generator[BatchRe
     path = Path(good(git(checkout, "rev-parse", "--path-format=absolute", "--git-path", filename), "batch"))
     upstream = f"refs/remotes/origin/{production.merge_branch}"
     _ = good(git(checkout, "fetch", "origin", f"+refs/heads/{production.merge_branch}:{upstream}"), "batch")
-    entries: list[str] = []
-    pinned_requests: list[MergeRequest] = []
-    commits: set[str] = set()
+    hash_length = len(good(git(checkout, "rev-parse", upstream), "batch"))
+    items: list[BatchResumeItem] = []
     for request in requests:
-        try:
-            pinned = resolved_checkpoint(request)
-        except checkpoint_gate.Stop:
-            # Keep the request for the batch's normal per-item ancestry check.
-            pinned = request
-            commit = ""
+        commit: str | PendingCheckpointRef
+        if len(request.commit) == hash_length and re.fullmatch(r"[0-9a-fA-F]+", request.commit):
+            commit = request.commit.lower()
         else:
-            commit = pinned.commit
-            commits.add(commit)
-        entries.append(f"{commit}\t{request.batch_argument_line}")
-        pinned_requests.append(pinned)
-    contents = "\n".join(entries) + "\n"
+            try:
+                commit = resolved_checkpoint(request).commit
+            except checkpoint_gate.Stop:
+                commit = PendingCheckpointRef()
+        items.append(BatchResumeItem(request, commit))
+    record = BatchResumeRecord(path, tuple(items))
+    contents = record.contents()
     sources = unpushed_merge_sources(checkout, upstream)
     if sources:
         try:
             saved = path.read_bytes()
         except FileNotFoundError:
             saved = b""
-        if saved != contents.encode("utf-8") or sources.isdisjoint(commits):
+        if not record.matches(saved, sources):
             raise Refusal("unpushed merges do not have a matching batch record; "
                           + "reset the merge branch to its pushed tip, then start a fresh batch")
+        if saved != contents.encode("utf-8"):
+            write_text_atomic(path, contents)
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, contents)
-    record = BatchResumeRecord(path, tuple(pinned_requests))
     try:
         yield record
     finally:
@@ -1872,13 +1916,14 @@ def run_batch(requests: tuple[MergeRequest, ...]) -> int:
 
 def run_recorded_batch(resume_record: BatchResumeRecord) -> int:
     """Remove stopped items and their unit's later items before each retry."""
-    production = resume_record.requests[0].production
-    requests, resumed = resume_merged_items(resume_record.requests)
+    production = resume_record.items[0].request.production
+    requests, resumed = resume_merged_items(resume_record)
     if not requests:
         return resumed
     start_tip = good(git(production.checkout, "rev-parse", "HEAD"), "merge")
     merge_in_progress_at_start = git(production.checkout, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0
-    log = requests[0].scratch / f"merge_{requests[0].commit[:7]}_test.log"
+    first = requests[0].checkpoint_request
+    log = first.scratch / f"merge_{first.commit[:7]}_test.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     _ = log.write_text("", encoding="utf-8")
     while requests:
@@ -1888,14 +1933,15 @@ def run_recorded_batch(resume_record: BatchResumeRecord) -> int:
             dropped = dict.fromkeys(error.indices, error.stop)
             dropped.update(error.item_stops)
             if error.stop.state in ("held", "failed"):
-                for index, request in enumerate(requests):
+                for index, item in enumerate(requests):
+                    request = item.checkpoint_request
                     for cause_index in sorted(error.indices):
-                        cause = requests[cause_index]
+                        cause = requests[cause_index].checkpoint_request
                         if index > cause_index and request.unit.staff_id == cause.unit.staff_id and index not in dropped:
                             dropped[index] = later_item_stop(cause, error.stop.step, error.stop.state)
                             break
             for index in sorted(dropped):
-                _ = report_checkpoint_stop(requests[index], dropped[index])
+                _ = report_checkpoint_stop(requests[index].checkpoint_request, dropped[index])
             if error.stop.state not in ("held", "failed"):
                 return checkpoint_gate.TREE_CHANGED_STATUS if error.stop.state == "cancelled" else 1
             reset_batch(production, start_tip, merge_in_progress_at_start=merge_in_progress_at_start)
