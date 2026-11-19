@@ -2694,7 +2694,7 @@ Goal: no queue fixture calls bare `mkdtemp`, `git clone` or `git worktree add`. 
 **Restart:** the admission service and the memory feed read the new key at use. A service restart needs builds' go and the user's go.
 **Built:** checkpoint 5ff3631f2 on origin branch `builds-queue-reserveshare-cp`, sent to builds 2026-11-17 09:46 EST. The review found one minor defect: a small shortage rounded to 0.0 GiB and hid the alert. A short reserve now shows at least 0.1 GiB missing. Proof image 57bbedb2a910.
 
-### Phase 44ax — A run takes its build slot only when the queue lets its first step start  · status: todo
+### Phase 44ax — A run takes its build slot only when the queue lets its first step start  · status: done
 **Depends on:** nothing; urgent. builds gave the go on 2026-11-17 10:50 EST. ETA 2026-11-17 14:30 EST.
 **User words (C1816, via builds):** "this is a waste of resources - and if we have many items in line even worse - this has to be an urgent fix as only running builds should take slots - of course if they are multi-step they should hold their slot so they go faster!"
 **Cause:** `copies.py run` takes a slot (`standing` → `build_slots.take_slot`) and prepares the tree before its command asks the memory queue. A run holds its slot for all of its memory wait.
@@ -2711,7 +2711,7 @@ Goal: no queue fixture calls bare `mkdtemp`, `git clone` or `git worktree add`. 
 **Work Order:** `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44ax/work_order.md`. Clone `/session/queue/slotorder`, branch `builds-queue-slotorder`.
 **Built:** checkpoint 2e49fd46c on origin branch `builds-queue-slotorder-cp2`, sent to builds 2026-11-17. It replaces 654dcfcf0, which was red at merge: the Hana render list lacked `first_step.py`, and `first_step` asked for its place outside `queue_place`. A private source copy keeps the repository identity and writes no objects into the source. Three review passes closed five findings. Proof image c1b4e8f2ddc5.
 
-### Phase 44ay — The other slot users take their slot after admission too  · status: todo
+### Phase 44ay — The other slot users take their slot after admission too  · status: done
 **Depends on:** 44ax. builds asked for it at once after 44ax, so two orders do not stay in place.
 Move the other `copies.standing` callers to the 44ax order with the same code: merge_gate nightly, ci_points, fast_track, waiting.py, style crate_run, bump_gate, simplify_daily and rust_release. A caller whose work is not one queue step keeps the old order and says why in a comment.
 
@@ -2767,7 +2767,7 @@ Move the other `copies.standing` callers to the 44ax order with the same code: m
 
 **Work Order:** `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44bf/work_order.md`.
 
-### Phase 44bg — The doc verb takes its copy slot only after admission  · status: todo
+### Phase 44bg — The doc verb takes its copy slot only after admission  · status: done
 **From the 44ax live check, 2026-11-17:** a direct `verify.sh doc` call held a copy slot through `copies.py hold` while it waited for admission. Three review rounds on a design with a handoff between two processes found new blockers each time (attempts: `phases/44bg/attempts.md`). The design is now the plain order in one verify.sh process: ask admission, then take the slot and check out the staged tree, then run Cargo under the grant it holds. The source key before checkout is sha256 of the staged tree id plus a newline, the key the checkout has. Hash due 18:15 EST.
 
 **Work Order:** `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44bg/work_order.md`.
@@ -2783,7 +2783,7 @@ Move the other `copies.standing` callers to the 44ax order with the same code: m
 
 **Work Order:** `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44bj/work_order.md`.
 
-### Phase 44bk — A lint repair keeps the grant its judgment got  · status: todo
+### Phase 44bk — A lint repair keeps the grant its judgment got  · status: done
 **From the 15:33 queue stall, 2026-11-17:** the head `praxis mend` got its grant after 101.8 minutes, then verify.sh cancelled the judgment grant and asked again for the repair; another step became head 12 seconds later. The repair now runs under the judgment grant after owner, tree and need checks. Hash due 17:45 EST.
 
 **Work Order:** `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/phases/44bk/work_order.md`.
@@ -2803,19 +2803,19 @@ A refused or failed release gives a nonzero exit, and the caller cancels the res
 ### Phase 44bn — A memory sample counts only after cargo starts  · status: todo
 **From the 44bf design review, 2026-11-17:** when no populated cargo scope exists, the regular sampler measures the owner's process tree (memory_admit.py:1033). The CI cargo front waits for its grant before it starts cargo (ci_cargo_front.py:150), so a sample can record the front's own memory as a build peak and lower the next estimate. A sample counts toward the build peak only after the run shows that cargo started. After 44bf merges.
 
-### Phase 44bo — A refreshed estimate reaches the waiting row, and the service CPU drops  · status: todo
+### Phase 44bo — A refreshed estimate reaches the waiting row, and the service CPU drops  · status: done
 **From builds, 2026-11-17 20:5x (go, before 44bi and 44bj):** the queue head pid 2278897 (`queue_place.py` → `cargo build -p cargo-mend`) waited 110 minutes as EstimateExpired. Its estimate was 65 minutes old and `build_history_current` was false, and no refresh reached its waiting row. Its owner restarted it at 20:57 and the queue moved. The admission service used 85% CPU on average after the 19:37 restart; the old process used 35%. Find both causes on a copy of the live state, never on the live service. Then fix both.
 
-### Phase 44bp — A settings refusal and a gone owner no longer keep a step off hana-aws  · status: todo
+### Phase 44bp — A settings refusal and a gone owner no longer keep a step off hana-aws  · status: done
 **From builds, 2026-11-17 22:1x (go, before the rest of 44bo; Hana on AWS is the user's first priority tonight):** the Hana check in /session/organon/p55r (pid 696552) waited 65 minutes on natedev while hana-aws was free. At 21:07:53 its hana-aws attempt got `PrelaunchRefused 'off'`. `placement.retry_decision` makes `off` and `repo` `DoNotRetry` (placement.py:535), and `_target_retry` (admission_service.py:2918) then excludes that target for the whole life of the step. A refusal `off` or `repo` now excludes the target only until the provider settings generation changes. Second defect, if a pass does not close it: the p17 check (pid 345295) left the queue with `owner_gone` at 22:1x, but its hana-aws assignment stayed `CurrentAssignment` ("not consumed") and held the box. An assignment whose owner is gone closes on the next pass.
 
-### Phase 44br — The walk protects every memory-held row ahead, not only the head  · status: todo
+### Phase 44br — The walk protects every memory-held row ahead, not only the head  · status: done
 **From builds, 2026-11-17 22:5x (the user's rule: no backfill; order 44bp, 44br, 44bq):** pid 4072421 (hana_catalyst build, 7.6 GiB, joined 20:49:27) started at 20:53:48 while pid 3347702 (hana nextest, 13.9 GiB, joined 20:35:36) waited until 22:21:26. `admission_walk` (scripts/lint/memory_admit.py:2033-2036) reserves only the head's need (`checked_room = remaining - protected_need`), so a later row starts whenever it fits after the head. From 20:35 to 22:21, 13 later steps started before 3347702. The walk now reserves the need of every waiting row ahead that is held for memory. A row starts only when the room covers it and every memory-held row ahead of it. A row held for another reason (GPU slot, other target, cargo token, estimate refresh) does not block rows behind it. The hash message states the measured effect on a copy of the live state (which rows wait longer, which start sooner) and how the rule treats merge gates of 0 GiB.
 
-### Phase 44bq — The queue runs one step per Cargo build folder  · status: todo
+### Phase 44bq — The queue runs one step per Cargo build folder  · status: done
 **From verify 43h, 2026-11-17 22:4x (builds agreed the design; the user's rule: "if you get into the running that shoudl mean you have a cargo token to use", and no lock per unit):** verify removes the unit cargo token from build, test, lint, final and fmt, so the memory grant is the only gate. The queue takes over the one-build-per-folder rule. `PlacementConstraints.cargo_folder` is a tagged value: `CargoFolder(path)` with an absolute, resolved path, or `NoCargoFolder`. A missing field decodes to `NoCargoFolder` (no folder rule), so old verify.sh copies and other callers keep working. A relative path is a malformed request. The queue runs at most one step per (destination host, path). A second step for the same folder waits in the queue, holds no memory, and its wait reason reads "waits for the build in the same Cargo folder". Remote targets keep their per-target slot rule. This merges before verify 43h (verify ETA 05:00 EST 11-18). One dark shot of the wait reason for the change row.
 
-### Phase 44bs — Every queue row shows a real name  · status: todo
+### Phase 44bs — Every queue row shows a real name  · status: done
 **From the user, 2026-11-18 00:1x:** "it should be IMPOSSIBLE for their to be someth8ing in our queue that cdoes not have a name". Two rows showed "bash" with a raw session id and the showrunner "hana": they were `copies.py run -- bash -c "… verify.sh test hana …"` calls from the startup and widget units that waited for a Hana build folder. A row names its step (the verify.sh verb and package, for example "test hana") and its unit (startup, widget). No row shows a shell or interpreter name or a raw session id. One dark shot.
 
 ### Phase 44bt — A build folder is held only while its step runs  · status: todo
@@ -2872,7 +2872,7 @@ A refused or failed release gives a nonzero exit, and the caller cancels the res
 3. The latency limits stay as they were.
 4. Built in `/session/queue/slowreply`. Measured on dd06b6802: release 132/343 ms median/max (blocked evidence), 152/374 ms (Hana).
 
-### Phase 44ca — A process name with bytes that are not UTF-8 does not stop the queue  · status: todo
+### Phase 44ca — A process name with bytes that are not UTF-8 does not stop the queue  · status: done
 **Source:** 10 live crashes on 2026-11-18 at `memory_admit.py` `process_memory` (`path.read_text()`, UnicodeDecodeError 0xff).
 1. `scripts/lib/proc_text.py` `read_proc_text` reads every `/proc` text file with replacement for bad bytes.
 2. All `/proc` reads in the queue, the memory feed, the scope activity and the build log use it.
@@ -2880,7 +2880,7 @@ A refused or failed release gives a nonzero exit, and the caller cancels the res
 4. `scripts/lib/proc_text.py` is one more line in `hana_render.files`; tell builds and aws.
 5. Built in `/session/queue/procdecode`. Builds places it right after the Hana items.
 
-### Phase 44cd — A head that waits on a busy Mac keeps its natedev place  · status: todo
+### Phase 44cd — A head that waits on a busy Mac keeps its natedev place  · status: done
 **Source:** builds, 2026-11-18. Slot 6 (joined 11:59) was admitted at 13:09:45 ahead of the head (joined 11:24). The queue offered the head to the Mac 32 times; each offer closed "busy". While an offer was open, the natedev line skipped the head.
 1. An open remote assignment keeps the head's natedev place until the remote target confirms execution.
 2. The hold ends when the remote target confirms, reports busy, passes its time limit, or the caller dies. After busy, the row is head again in its old place.
