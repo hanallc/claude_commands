@@ -24,7 +24,7 @@ import time
 from typing import BinaryIO, TypedDict, Unpack
 
 from scripts.lib import build_folders, atomic_file, conf
-from scripts.buildlog import store
+from scripts.lib.build_folders import program_starts as program_starts
 from scripts.build_queue import admission_records
 from scripts.build_queue import step_estimator
 from scripts.lint import memory_admit
@@ -205,10 +205,6 @@ class ProgramStart:
     sidecar: str = ""
 
 
-def program_starts() -> Path:
-    return store.root() / "program-starts"
-
-
 def read_program_start(record: Path) -> ProgramStart | None:
     try:
         return wire.parse_record(record.read_text(), ProgramStart)
@@ -281,11 +277,11 @@ def cleanup_queue_place_folders(kept_sidecars: set[Path]) -> None:
             continue
         if admission_records.process_start_time(int(fields[0])) == fields[1]:
             continue
-        if path / "program.cgroup" in kept_sidecars:
+        if path / build_folders.QUEUE_PROGRAM_SIDECAR in kept_sidecars:
             continue
         try:
             if not path.is_symlink() and path.is_dir() and path.stat().st_uid == os.getuid():
-                remove_program_folder(path)
+                _ = build_folders.reclaim_build_folder(path, wait=False)
         except FileNotFoundError:
             pass
 
@@ -323,7 +319,7 @@ def cleanup_program_starts(configuration: admission_records.MemoryConfig | wire.
                 if published is not None and published.scope:
                     stop_scope(Path(published.scope), deadline, configuration.program_sample_seconds)
             path.unlink(missing_ok=True)
-        except (CleanupUnresolved, OSError) as error:
+        except (CleanupUnresolved, OSError, ValueError) as error:
             if record.sidecar:
                 kept.add(Path(record.sidecar))
             print(f"UNRESOLVED: recovery kept {path}: {error}", file=sys.stderr)
@@ -697,7 +693,7 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
     with recoverable_tool_folder("queue-place", keep=lambda: keep_folder or
                                  isinstance(grant, HeldReservation) and not grant.released) as temporary, \
             ExitStack() as reservation:
-        sidecar = temporary / "program.cgroup"
+        sidecar = temporary / build_folders.QUEUE_PROGRAM_SIDECAR
         atomic_file.atomic_sample(sidecar, "")
         if purpose == ProgramPurpose.BATCH:
             assert not isinstance(estimate, ConfiguredFirstPeak)

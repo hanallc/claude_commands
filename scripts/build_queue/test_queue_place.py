@@ -1338,6 +1338,12 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                                 pass
 
     def test_allocation_keeps_a_dead_holders_folder_until_the_scope_is_empty(self) -> None:
+        self.assert_pending_scope_keeps_folder(legacy=False)
+
+    def test_allocation_keeps_a_legacy_sidecar_until_recovery_checks_the_scope(self) -> None:
+        self.assert_pending_scope_keeps_folder(legacy=True)
+
+    def assert_pending_scope_keeps_folder(self, *, legacy: bool) -> None:
         with QueuePlaceFixture() as fixture:
             with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
                                   stdin=subprocess.PIPE) as holder:
@@ -1360,18 +1366,36 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
 
             record = queue.program_starts() / "old.json"
             record.parent.mkdir(parents=True, exist_ok=True)
-            _ = record.write_text(wire.encode_record(queue.ProgramStart(owner, owner, str(scope), sidecar=str(sidecar))))
+            encoded = wire.encode_record(queue.ProgramStart(owner, owner, str(scope), sidecar=str(sidecar)))
+            fields = cast(dict[str, object], json.loads(encoded))
+            if legacy:
+                del fields["sidecar"]
+                del fields["ready"]
+            _ = record.write_text(json.dumps(fields))
             expired = wire.RunnerExecutionTiming(program_sample_seconds=0.1, program_stop_seconds=0,
                                                  peak_wave_seconds=1)
-            self.assertEqual(queue.cleanup_program_starts(expired), {sidecar})
+            self.assertEqual(queue.cleanup_program_starts(expired), set() if legacy else {sidecar})
             with build_folders.tool_folder("queue-place", parent) as current:
                 self.assertNotEqual(current, old)
                 self.assertEqual(sidecar.read_text(), f"{scope}\n")
 
+            if legacy:
+                prefix = build_folders.FOLDER_PREFIXES["queue-place"]
+                legacy_folder = parent / f"{prefix}{owner.pid}-{owner.start_time}-fixture"
+                legacy_folder.mkdir()
+                legacy_sidecar = legacy_folder / build_folders.QUEUE_PROGRAM_SIDECAR
+                _ = legacy_sidecar.write_text(f"{scope}\n")
+                with mock.patch.dict(os.environ, {"TMPDIR": str(parent)}):
+                    queue.cleanup_queue_place_folders(set())
+                self.assertEqual(legacy_sidecar.read_text(), f"{scope}\n")
+                _ = members.write_text("invalid\n")
+                self.assertEqual(queue.cleanup_program_starts(expired), set())
             build_folders.sweep_temporary_build_folders(parent, wait=False)
             self.assertTrue(sidecar.is_file())
             self.assertTrue(record.is_file())
             _ = members.write_text("")
+            with build_folders.tool_folder("queue-place", parent) as current:
+                self.assertNotEqual(current, old)
             self.assertEqual(queue.cleanup_program_starts(expired), set())
             self.assertFalse(record.exists())
             with build_folders.tool_folder("queue-place", parent) as current:

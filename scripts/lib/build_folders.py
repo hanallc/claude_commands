@@ -38,6 +38,7 @@ MKDTEMP_SUFFIX_PATTERN = r"[a-z0-9_]{8}"
 LEGACY_MKTEMP_SUFFIX_PATTERN = r"[A-Za-z0-9]{6}"
 BUSY = ".claude-busy"
 RECOVERY_MARKER = ".build-folder-recovery"
+QUEUE_PROGRAM_SIDECAR = "program.cgroup"
 GATE_RECOVERY_TOOL = "merge-gate-recovery"
 _GATE_RECOVERY_FOLDER = re.compile(re.escape(GATE_RECOVERY_TOOL) + r"(?:-[0-9]+)?")
 REMOVAL_RECORD_PREFIX = ".scratch-removing-"
@@ -795,6 +796,40 @@ def gate_recovery_folder(name: str) -> bool:
     return _GATE_RECOVERY_FOLDER.fullmatch(name) is not None
 
 
+def program_starts() -> Path:
+    """Locate program recovery records under the build log root."""
+    override = os.environ.get("BUILDLOG_DIR")
+    root = Path(override) if override else Path.home() / ".local/state/buildlog"
+    return root / "program-starts"
+
+
+def _legacy_program_recovery_pending() -> bool:
+    """Keep queue sidecars when a scoped record cannot identify its sidecar."""
+    records = program_starts()
+    try:
+        entries = os.listdir(records)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    for name in entries:
+        if not name.endswith(".json"):
+            continue
+        try:
+            record = cast(object, json.loads((records / name).read_text()))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            return True
+        if not isinstance(record, dict):
+            return True
+        fields = cast(dict[str, object], record)
+        scope, sidecar = fields.get("scope"), fields.get("sidecar", "")
+        if not isinstance(scope, str) or not isinstance(sidecar, str) or (scope and not sidecar):
+            return True
+    return False
+
+
 def _recovery_marker_present(directory: int) -> bool:
     """A linked marker keeps the folder while its recovery record exists."""
     try:
@@ -804,14 +839,19 @@ def _recovery_marker_present(directory: int) -> bool:
     return True
 
 
+def _folder_needs_recovery(folder: str, directory: int) -> bool:
+    return (_recovery_marker_present(directory)
+            or (gate_recovery_folder(folder) and _folder_exists(Path("run.json"), directory))
+            or (_folder_exists(Path(QUEUE_PROGRAM_SIDECAR), directory) and _legacy_program_recovery_pending()))
+
+
 def _recovery_record_present(folder: str, directory: int) -> bool:
     try:
         descriptor = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
     except (FileNotFoundError, NotADirectoryError):
         return False
     try:
-        return (_recovery_marker_present(descriptor)
-                or (gate_recovery_folder(folder) and _folder_exists(Path("run.json"), descriptor)))
+        return _folder_needs_recovery(folder, descriptor)
     finally:
         os.close(descriptor)
 
@@ -823,8 +863,10 @@ def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True) -> bo
             raise error
 
     for top, folders, files, directory in os.fwalk(path, follow_symlinks=False, onerror=unreadable):
-        if ((RECOVERY_MARKER in files and _recovery_marker_present(directory))
-                or (gate_recovery_folder(Path(top).name) and "run.json" in files)):
+        folder = Path(top).name
+        has_record = (RECOVERY_MARKER in files or QUEUE_PROGRAM_SIDECAR in files
+                      or ("run.json" in files and gate_recovery_folder(folder)))
+        if has_record and _folder_needs_recovery(folder, directory):
             return False
         for name in files:
             stem = name.removesuffix(".lock")
@@ -991,6 +1033,15 @@ def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
         return True
 
     return remove_build_folder(path, cleanup, dir_fd=directory, wait=wait)
+
+
+def reclaim_build_folder(path: Path, *, wait: bool) -> bool:
+    """Remove a free folder when no recovery record protects it."""
+    try:
+        with build_folder_lock.folder_parent(path, path.parent, create=False) as directory:
+            return _remove_free(path, directory, wait=wait)
+    except FileNotFoundError:
+        return True
 
 
 def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
