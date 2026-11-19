@@ -136,6 +136,7 @@ __PAGE_TITLE__
   </details>
 </section>
 <section class="card" id="placement-scores"></section>
+<section class="card" id="gate-time-price"></section>
 <section class="card" id="runs">
   <div class="card-head">
     <h2>Cost per run</h2>
@@ -150,10 +151,16 @@ __PAGE_TITLE__
 <section class="card" id="hours"></section>
 </main>
 <script id="aws-prices-data" type="application/json">__AWS_PRICES_DATA__</script>
+<script id="aws-gate-time-data" type="application/json">__AWS_GATE_TIME_DATA__</script>
 <script>
 "use strict";
 __PAGE_REFRESH_SCRIPT__
-let data = JSON.parse(document.getElementById("aws-prices-data").textContent);
+function readAwsPage(page) {
+  const prices = JSON.parse(page.getElementById("aws-prices-data").textContent);
+  const gateTime = JSON.parse(page.getElementById("aws-gate-time-data").textContent);
+  return {...prices, regions: gateTime.regions, gateTimePrice: gateTime.table};
+}
+let data = readAwsPage(document);
 const REGIONS_KEY = "aws-prices-regions";
 const NOTHING_SHOWN = "Nothing to show in the chosen regions.";
 const NO_REGION = "No region chosen.";
@@ -464,6 +471,8 @@ function drawScope() {
 function draw() {
   drawPrices();
   drawPlacementScores();
+  fill(document.getElementById("gate-time-price"), data.gateTimePrice,
+    "Compare the lowest estimated run cost for each box size. Box times include boot and can use runs from other regions.");
   fill(document.getElementById("hours"), data.hours, data.hours_note);
   drawScope();
   markOverflow();
@@ -514,6 +523,7 @@ for (const group of scopeFilters) {
 // The geography row above it groups the regions by the first word of their names, in the order of the region list.
 function chipRow(id, labels) {
   const row = document.getElementById(id);
+  row.replaceChildren();
   const chip = (label, className) => {
     const button = element("button", label, className);
     button.type = "button";
@@ -526,11 +536,6 @@ function chipRow(id, labels) {
   return {all, each, none};
 }
 const geographyOf = region => region.split("-", 1)[0];
-const geographies = [...new Set(data.regions.map(geographyOf))];
-const geographyRow = chipRow("geographies", geographies);
-const regionRow = chipRow("regions", data.regions);
-const regionChips = regionRow.each;
-regionChips.forEach((chip, index) => { chip.dataset.region = data.regions[index]; });
 // A geography is pressed when all its regions are chosen, and mixed when some are.
 function geographyState(geography) {
   const regions = data.regions.filter(region => geographyOf(region) === geography);
@@ -539,47 +544,66 @@ function geographyState(geography) {
 }
 function showRegions(next) {
   shown = next;
-  for (const row of [geographyRow, regionRow]) {
-    row.all.setAttribute("aria-pressed", String(shown.size === data.regions.length));
-    row.none.setAttribute("aria-pressed", String(shown.size === 0));
-  }
-  geographyRow.each.forEach((chip, index) => chip.setAttribute("aria-pressed", geographyState(geographies[index])));
-  for (const chip of regionChips) chip.setAttribute("aria-pressed", String(shown.has(chip.dataset.region)));
+  markRegions();
   draw();
   remember(REGIONS_KEY, JSON.stringify([...shown]));
 }
-for (const row of [geographyRow, regionRow]) {
-  row.all.addEventListener("click", () => showRegions(new Set(data.regions)));
-  row.none.addEventListener("click", () => showRegions(new Set()));
-}
-// A geography chip chooses all its regions, or clears them when all are already chosen.
-geographyRow.each.forEach((chip, index) => chip.addEventListener("click", () => {
-  const geography = geographies[index];
-  const next = new Set(shown);
-  const choose = geographyState(geography) !== "true";
-  for (const region of data.regions) if (geographyOf(region) === geography) { if (choose) next.add(region); else next.delete(region); }
-  showRegions(next);
-}));
-for (const chip of regionChips) {
-  chip.addEventListener("click", () => {
+function configureRegionFilter() {
+  const geographies = [...new Set(data.regions.map(geographyOf))];
+  const geographyRow = chipRow("geographies", geographies);
+  const regionRow = chipRow("regions", data.regions);
+  for (const row of [geographyRow, regionRow]) {
+    row.all.addEventListener("click", () => showRegions(new Set(data.regions)));
+    row.none.addEventListener("click", () => showRegions(new Set()));
+  }
+  geographyRow.each.forEach((chip, index) => chip.addEventListener("click", () => {
+    const geography = geographies[index];
     const next = new Set(shown);
-    if (next.has(chip.dataset.region)) next.delete(chip.dataset.region); else next.add(chip.dataset.region);
+    const choose = geographyState(geography) !== "true";
+    for (const region of data.regions) if (geographyOf(region) === geography) { if (choose) next.add(region); else next.delete(region); }
     showRegions(next);
+  }));
+  regionRow.each.forEach((chip, index) => {
+    const region = data.regions[index];
+    chip.dataset.region = region;
+    chip.addEventListener("click", () => {
+      const next = new Set(shown);
+      if (next.has(region)) next.delete(region); else next.add(region);
+      showRegions(next);
+    });
   });
+  return () => {
+    for (const row of [geographyRow, regionRow]) {
+      row.all.setAttribute("aria-pressed", String(shown.size === data.regions.length));
+      row.none.setAttribute("aria-pressed", String(shown.size === 0));
+    }
+    geographyRow.each.forEach((chip, index) => chip.setAttribute("aria-pressed", geographyState(geographies[index])));
+    for (const chip of regionRow.each) chip.setAttribute("aria-pressed", String(shown.has(chip.dataset.region)));
+  };
 }
 
+let markRegions = configureRegionFilter();
 let saved = [];
 try { saved = JSON.parse(remembered(REGIONS_KEY) || "[]"); } catch (error) { saved = []; }
 const known = Array.isArray(saved) ? data.regions.filter(region => saved.includes(region)) : [];
 showRegions(new Set(known.length ? known : data.regions));
-async function loadAws(supersede=false,current=()=>true){
- const response=await fetch(location.pathname,{cache:'no-store'});
- if(!response.ok) throw new Error('HTTP '+response.status);
- const page=new DOMParser().parseFromString(await response.text(),'text/html');
- const next=JSON.parse(page.querySelector('#aws-prices-data').textContent);
- if(!current()) return;data=next;
- drawSpend();draw();
- return {readAt:data.read_at,renderSeconds:data.render_seconds};
+async function loadAws(supersede = false, current = () => true) {
+  const response = await fetch(location.pathname, {cache: "no-store"});
+  if (!response.ok) throw new Error("HTTP " + response.status);
+  const page = new DOMParser().parseFromString(await response.text(), "text/html");
+  const next = readAwsPage(page);
+  if (!current()) return;
+  const allShown = shown.size === data.regions.length;
+  const regionsChanged = next.regions.join() !== data.regions.join();
+  data = next;
+  if (regionsChanged) {
+    shown = new Set(allShown ? data.regions : data.regions.filter(region => shown.has(region)));
+    markRegions = configureRegionFilter();
+    markRegions();
+  }
+  drawSpend();
+  draw();
+  return {readAt: data.read_at, renderSeconds: data.render_seconds};
 }
 createPageRefresh(loadAws,()=>0,()=>'',{readAt:data.read_at,renderSeconds:data.render_seconds});
 </script>
