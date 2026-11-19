@@ -1,4 +1,4 @@
-"""Show questions, changes, investigations, proposals and efficiencies in one review table."""
+"""Show Review items from their native stores in one table."""
 from __future__ import annotations
 
 import html
@@ -14,7 +14,7 @@ import secrets
 import time
 from datetime import datetime
 from pathlib import Path
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, parse_qsl, urlencode
 from zoneinfo import ZoneInfo
@@ -35,12 +35,15 @@ NEW_ITEM_PATH = '/console/review/new-item'
 ATTACHMENT_PATH = '/console/review/attachment'
 HEADERS = ('Id', 'Type', 'Owner', 'Item', 'State', 'Age')
 TYPES = tuple(ReviewType)
+WIRE_TYPES = tuple(kind for kind in TYPES if kind != ReviewType.RESPONSE)
+TYPE_CHIPS = (*review_items.QUESTION_TYPES, *(kind for kind in TYPES if kind not in review_items.QUESTION_TYPES))
 ICONS = {ReviewType.QUESTION: 'circle-help', ReviewType.CHANGE: 'diff', ReviewType.INVESTIGATION: 'microscope',
-         ReviewType.PROPOSAL: 'lamp', ReviewType.EFFICIENCY: 'zap', ReviewType.BUG: 'bug'}
+         ReviewType.PROPOSAL: 'lamp', ReviewType.EFFICIENCY: 'zap', ReviewType.BUG: 'bug', ReviewType.RESPONSE: 'inbox'}
 INDEX_STATES = (ReviewState.OPEN, ReviewState.WAITING, ReviewState.VALIDATING)
 SHOWS = (('open', 'Open'), (ReviewState.VALIDATING, ReviewState.VALIDATING), ('all', 'All'))
 LABELS = {ReviewType.QUESTION: 'Questions', ReviewType.CHANGE: 'Changes', ReviewType.INVESTIGATION: 'Investigations',
-          ReviewType.PROPOSAL: 'Proposals', ReviewType.EFFICIENCY: 'Efficiencies', ReviewType.BUG: 'Bugs'}
+          ReviewType.PROPOSAL: 'Proposals', ReviewType.EFFICIENCY: 'Efficiencies', ReviewType.BUG: 'Bugs',
+          ReviewType.RESPONSE: 'Responses'}
 LATER_PRESETS = (('soon', ''), ('evening', 'This evening'), ('morning', 'Tomorrow morning'), ('week', 'Next week'))
 # Weekday names in the order of the browser's getUTCDay.
 WEEKDAYS = ('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday')
@@ -93,12 +96,15 @@ def index_json(entries: list[ReviewIndexEntry]) -> str:
         (entry['owner'], entry['ownerName'], entry['ownerHtml']),
         (entry['sourceOwner'], entry['sourceName'], entry['sourceHtml'])))
     references = {pair: at for at,pair in enumerate(names)}
-    rows = [[entry['key'], '' if entry['id']==entry['key'] else entry['id'], TYPES.index(entry['type']),
+    # Older Review tabs read the Question type and ignore the Response flag.
+    rows = [[entry['key'], '' if entry['id']==entry['key'] else entry['id'],
+             WIRE_TYPES.index(ReviewType.QUESTION if entry['type'] == ReviewType.RESPONSE else entry['type']),
              references[(entry['owner'],entry['ownerName'],entry['ownerHtml'])],
              references[(entry['sourceOwner'],entry['sourceName'],entry['sourceHtml'])],
              entry['title'], INDEX_STATES.index(entry['state']), entry['filed'], entry['updated'],
              entry['hiddenUntil'], '' if entry['urgency']=='normal' else entry['urgency'],
-             *([entry.get('handoff'), entry['waitingWhy']] if 'waitingWhy' in entry
+             *([entry.get('handoff'), entry.get('waitingWhy'), True] if entry['type'] == ReviewType.RESPONSE
+               else [entry.get('handoff'), entry['waitingWhy']] if 'waitingWhy' in entry
                else [entry['handoff']] if 'handoff' in entry else [])] for entry in entries]
     return json.dumps({'n':list(names),'r':rows},ensure_ascii=False,separators=(',',':')).replace(
         '&','\\u0026').replace('<','\\u003c').replace('>','\\u003e')
@@ -699,7 +705,7 @@ def waiting_change(item: ReviewItem) -> bool:
 
 
 def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, revision: str, *,
-         soon: str = "In 1 hour", validator: str = '') -> str:
+         soon: str = "In 1 hour", owner: str = '', validator: str = '') -> str:
     fields = {'row': item.key, 'token': change_browser.row_token(browser, item.key), 'revision': revision}
     hidden = ''.join(f'<input type="hidden" name="{key}" value="{html.escape(value, quote=True)}">' for key, value in fields.items())
     closes: list[str] = []
@@ -707,7 +713,11 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
     labels = {'answer': 'Answer', 'works': 'Works', 'not works': 'Does not work', 'validate': 'Ask showrunner to check',
               'question': 'Ask question', 'feedback': 'Send feedback', 'read': 'Mark read',
               'approve': 'Approve', 'decline': 'Decline'}
-    if validator:
+    if item.type == ReviewType.RESPONSE:
+        if not item.actions:
+            return ''
+        labels.update(read='Got it', question='Ask a follow-up')
+    elif validator:
         labels['question'] = 'Ask a question'
     for index, action in enumerate(item.actions):
         button = f'<button name="outcome" value="{action}"'+(' class="primary"' if index == 0 and not validator else '')+'>'+labels[action]+'</button>'
@@ -716,7 +726,8 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
     heading = (page_frame.ReturningActionHeading.SENDS_TO_SHOWRUNNER if item.type == ReviewType.CHANGE
                else page_frame.ReturningActionHeading.ITEM_RETURNS)
     later = ''
-    if item.state not in (ReviewState.DONE, ReviewState.VALIDATING) and not waiting_change(item):
+    if (item.state not in (ReviewState.DONE, ReviewState.VALIDATING)
+            and item.type != ReviewType.RESPONSE and not waiting_change(item)):
         presets = ''.join(f'<button type="button" role="menuitem" tabindex="-1" data-later-preset="{key}">'
                           +f'<span>{html.escape(label or soon)}</span><small></small></button>' for key, label in LATER_PRESETS)
         later = ('<button type="button" aria-haspopup="menu" aria-expanded="false" data-later-toggle>Later <span aria-hidden="true">▾</span></button>'
@@ -726,16 +737,25 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
     words = ''
     if closes or returns or later:
         field = 'words-'+html.escape(item.key, quote=True)
-        placeholder = ('Ask the validator about this item.' if validator
-                       else 'Type your words. They go with the button that you press.')
+        if item.type == ReviewType.RESPONSE:
+            placeholder = 'Type your words for Ask a follow-up.'
+        elif validator:
+            placeholder = 'Ask the validator about this item.'
+        else:
+            placeholder = 'Type your words. They go with the button that you press.'
         words = (f'<label for="{field}">Your words</label><textarea id="{field}" name="feedback" rows="{words_rows}" '
                  + f'placeholder="{placeholder}"></textarea>')
-    actions = page_frame.review_action_groups(''.join(closes), ''.join(returns), later, returning_heading=heading)
-    if validator:
-        actions = ('<div class="review-actions"><div class="review-action-group"><span>Sends to '
-                   +html.escape(validator)+'</span><div>'+''.join(returns)+'</div></div></div>')
-    return ('<form method="post" data-review-form>'+hidden+words+actions
-            + '<span role="status" data-send-status></span></form>')
+    if item.type == ReviewType.RESPONSE:
+        groups = ('<div class="review-actions"><div class="review-action-group"><span>Closes the item</span><div>'
+                  +''.join(closes)+'</div></div><div class="review-action-group"><span>Sends to '
+                  +html.escape(owner)+'</span><div>'+''.join(returns)+'</div></div></div>')
+    elif validator:
+        groups = ('<div class="review-actions"><div class="review-action-group"><span>Sends to '
+                  +html.escape(validator)+'</span><div>'+''.join(returns)+'</div></div></div>')
+    else:
+        groups = page_frame.review_action_groups(''.join(closes), ''.join(returns), later, returning_heading=heading)
+    return ('<form method="post" data-review-form>'+hidden+words+groups
+            +'<span role="status" data-send-status></span></form>')
 
 
 def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
@@ -745,7 +765,15 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
     validator = owner if item.state == ReviewState.VALIDATING and isinstance(source, review_items.ChangeSource) else ''
     handoff = ''
     exchange = ''
-    if isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
+    response = item.response
+    if response is not None:
+        timestamp = ''
+        if response.answered_at is not None:
+            time = review_items.aware(response.answered_at, inputs.zone).astimezone(inputs.zone)
+            timestamp = f'<time datetime="{time.isoformat()}">{time:%b %d at %H:%M %Z}</time>'
+        body = (section('You asked', response.question)+'<section class="response-answer"><h3>Answer from '
+                +names.html(item.owner, owner)+'</h3>'+timestamp+change_browser.answer_html(response.answer)+'</section>')
+    elif isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
         question = source.record.item
         ask = question['parts']['ask'] if 'parts' in question else change_browser.question_text(question)[0]
         # The lead shows the ask. Keep the shared body renderer from repeating it.
@@ -799,16 +827,19 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
     else:
         body = ''
     logs = ''.join('<li><time datetime="'+entry.time.isoformat()+'">'
-        +entry.time.astimezone(inputs.zone).strftime('%b %d %H:%M')+'</time><span>'+html.escape(entry.words)
-        +' <small>— '+names.html(entry.who)+'</small></span></li>' for entry in reversed(item.log))
+        +entry.time.astimezone(inputs.zone).strftime('%b %d %H:%M')+'</time><span>'
+        +html.escape('Answered' if response is not None and entry.time == response.answered_at
+                     and entry.who == item.owner and entry.words == 'Answer: '+response.answer else entry.words)
+        +' <small>— '+names.html(entry.who, owner if response is not None and entry.who == item.owner else entry.who)
+        +'</small></span></li>' for entry in reversed(item.log))
+    footer = ('' if response is not None else '<p class="review-source">Owner: '+names.html(item.owner, owner)
+              +' · Source: '+names.html(item.source_unit, review_items.name(item.source_unit, inputs.members))+'</p>')
     fallback = '<section data-title-fallback hidden><h3>Item</h3><p>'+html.escape(item.title)+'</p></section>'
     body += inputs.assets.get('submission:'+item.key, '')
     return ('<div class="list-panel review-panel '+item.type+'"><div>'+fallback+handoff+'<div data-review-body>'+body+'</div></div><div><section><h3>Log · newest first</h3>'
             +'<ol class="list-log">'+logs+'</ol></section>'+exchange+'</div>'
             +form(item, inputs.browser, inputs.words_rows, record_revision(item, inputs.assets), soon=inputs.soon_label,
-                  validator=validator)
-            +'<p class="review-source">Owner: '+names.html(item.owner, owner)+' · Source: '
-            +names.html(item.source_unit, review_items.name(item.source_unit, inputs.members))+'</p></div>')
+                  owner=owner, validator=validator)+footer+'</div>')
 
 
 def owner_name(item: ReviewItem, members: staff.StaffSnapshot) -> str:
@@ -837,7 +868,7 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
     chips += ('<button type="button" data-type-chip="investigations" aria-pressed="false" hidden>'
               'Investigations and Bugs <b></b></button>')
     chips += ''.join('<button id="review-type-'+kind+'" type="button" data-type-chip="'+kind+'" aria-pressed="false">'+icon(kind)+LABELS[kind]
-                     +' <b></b></button>' for kind in TYPES)
+                     +' <b></b></button>' for kind in TYPE_CHIPS)
     shows = ''.join('<button id="review-show-'+value.lower().replace(' ', '-')+'" type="button" data-show-chip="'
                     +value+'" aria-pressed="'+str(value == show).lower()+'">'+label
                     +' <b></b></button>' for value, label in SHOWS)
@@ -877,6 +908,24 @@ def review_fields(body: str) -> dict[str, list[str]]:
     return fields
 
 
+def submit_response(item: ReviewItem, outcome: str, words: str, status: change_page.DeliveryStatus,
+                    verify_revision: Callable[[], ReviewItem]
+                    ) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
+    source = item.source
+    if outcome not in item.actions or not isinstance(source, review_items.QuestionSource):
+        raise question_record.AnswerRefused('Choose an action on this card.')
+    scope = review_submissions.sent_question_scope(item.owner, staff.snapshot())
+    if outcome == 'read':
+        with update_registration.outstanding_lock(update_registration.outstanding_path(scope)):
+            _ = verify_revision()
+            update_registration.review_sent_question(source.record, scope, 'read', '', '')
+        return change_page.NoMessageDelivery(), 'got it'
+    words = new_item_dialog.read_words(words, 'Your words')
+    delivery, _ = review_actions.sent_question_action(item, source.record, scope, 'question', words, status,
+                                                      verify_revision=verify_revision)
+    return delivery, 'follow-up sent'
+
+
 def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list[str]],
                     status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
     key, token, outcome, words = (fields[field][0] for field in ('row', 'token', 'outcome', 'feedback'))
@@ -899,6 +948,8 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
         return current
 
     item = validate()
+    if item.type == ReviewType.RESPONSE:
+        return submit_response(item, outcome, words, status, validate)
     if waiting_change(item) or (item.state == ReviewState.VALIDATING and outcome != 'question'):
         raise change_page.ChangeHandoffRefused(change_page.WITH_SHOWRUNNER)
     if outcome == 'later':
@@ -955,6 +1006,19 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
     if not secrets.compare_digest(fields['token'][0],change_browser.row_token(browser,key)):
         raise question_record.AnswerRefused('row or page token does not match this page')
     outcome, words = fields['outcome'][0], fields['feedback'][0]
+    if key.startswith('question/'):
+        question_item = next((item for item in review_items.read(root, kinds=review_items.QUESTION_TYPES)
+                              if item.key == key), None)
+        if question_item is not None and question_item.type == ReviewType.RESPONSE:
+            def validate_response() -> ReviewItem:
+                current = review_items.read_current(root, question_item, staff.snapshot())
+                if current != question_item:
+                    raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
+                return current
+
+            return submit_response(question_item, outcome, words, status, validate_response)
+    else:
+        question_item = None
     if outcome == 'later' or key.startswith(('investigation/', 'proposal/', 'efficiency/')):
         item = next((item for item in review_items.read(root) if item.key == key), None)
         if item is None:
@@ -977,9 +1041,7 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
         return delivery, answer
     _ = fields.pop('later',None)
     _ = fields.pop('revision',None)
-    item = None
-    if key.startswith('question/'):
-        item = next((item for item in review_items.read(root, kinds=(ReviewType.QUESTION,)) if item.key == key), None)
+    item = question_item
     if item is not None and item.state == ReviewState.WAITING:
         if outcome not in item.actions:
             raise question_record.AnswerRefused('choose an action on this card')
@@ -1015,8 +1077,9 @@ background:var(--card);border:1px solid var(--line);border-radius:999px;color:va
 #review-show-validating[data-empty-count]{opacity:.55}
 .review-icon{display:inline-flex;vertical-align:middle;margin-right:5px}.review-icon svg{width:18px;height:18px}
 .question{--type-color:#b99aff}.change{--type-color:#62b7ef}.investigation{--type-color:#30c1ad}
-.proposal{--type-color:#f27ab8}.efficiency{--type-color:#a3d63a}.bug{--type-color:#ed876b}
+.proposal{--type-color:#f27ab8}.efficiency{--type-color:#a3d63a}.bug{--type-color:#ed876b}.response{--type-color:#edc46d}
 .review-icon{color:var(--type-color)}.review-panel{border-left-color:var(--type-color);grid-template-columns:1.25fr 1fr;padding:0 20px 18px 58px;gap:4px 28px}
+.response-answer time{display:block;margin-bottom:8px;color:var(--ink-3);font-size:12px}
 .review-panel [data-review-form]{grid-column:1/-1;border-top:1px solid var(--line);padding-top:12px;margin-top:10px}
 [data-review-form] label{display:block;font-weight:600;margin-bottom:6px}
 [data-review-form] textarea{display:block;box-sizing:border-box;width:100%;font:inherit;padding:9px 12px;background:var(--bg);
@@ -1066,13 +1129,13 @@ const drafts=new Map(),saved=new Map(),bodies=new Map(),bodyRequests=new Map();
 const pendingSaves=new Map();
 const scrollDepartures=new Set();
 const savedVerdictsKey='review-saved-verdicts:'+location.pathname;
-const kinds=['question','change','investigation','proposal','efficiency','bug'],states=['Open','Waiting','Validating'];
+const kinds=''' + json.dumps(WIRE_TYPES) + ''',states=''' + json.dumps(INDEX_STATES) + r''';
 let index=readIndex(JSON.parse(content.querySelector('[data-review-index]').textContent));
 let focusAfterLoad=null,firstRequest=firstReviewCard;
 let deferredLink=null,revealCreated=null;
 function indexEntry(payload,row,at){
  const owner=payload.n[row[3]],source=payload.n[row[4]];
- return {key:row[0],id:row[1] || row[0],type:kinds[row[2]],owner:owner[0],sourceOwner:source[0],
+ return {key:row[0],id:row[1] || row[0],type:row[13]?'response':kinds[row[2]],owner:owner[0],sourceOwner:source[0],
   ownerName:owner[1],sourceName:source[1],title:row[5],state:states[row[6]],filed:row[7],updated:row[8],
    hiddenUntil:row[9],ownerHtml:owner[2],sourceHtml:source[2],urgency:row[10] || 'normal',handoff:row[11],
    waitingWhy:row[12],order:at+row[6]*payload.r.length};
@@ -1137,6 +1200,7 @@ function savedEntry(key,result){
  if(result.state==='Done'){index.delete(key);return;}
  const entry=index.get(key);if(!entry) return;
  entry.state=result.state;entry.hiddenUntil=result.later;
+ if(result.type) entry.type=result.type;
 }
 function snapshotPrecedesSave(entry,result){
  return entry?.state===result.previousState && entry.updated===result.updated;
@@ -1162,6 +1226,7 @@ const view=createRecordTable({content:()=>content,single:true,
  place:params=>{
   reviewPlace(params);
   if(params.get('show')==='Waiting') params.set('show','all');
+  if(params.get('type')==='response' && params.get('show')==='Validating') params.set('show','open');
  },
  persistLinkedTarget:true,
  missingItem:()=> 'This review is no longer on the Review page.',
@@ -1192,6 +1257,7 @@ const view=createRecordTable({content:()=>content,single:true,
   });
   content.querySelectorAll('[data-show-chip]').forEach(button=>{
    const show=button.dataset.showChip;
+   button.hidden=type==='response' && show==='Validating';
    const count=matching({type,owner,query,sourceOwner,keys,show}).length;
    button.querySelector('b').textContent=count;
    button.toggleAttribute('data-empty-count',count===0);
@@ -1355,6 +1421,7 @@ function bindForm(row){
     const waitState=outcome==='validate' ? 'Validating' : 'Waiting';
     const marker={updated:row.dataset.updated,previousState:row.dataset.state,
      handed,state:result.state ?? (handed || outcome==='question' ? waitState : outcome==='later' ? row.dataset.state : 'Done'),
+     type:result.type,
      later:result.later ?? (outcome==='later' ? Date.parse(data.get('later')) : 0),
      question:outcome==='question',
      closes:!handed && !['question','later'].includes(outcome),awaitingSnapshot:true};
@@ -1426,6 +1493,10 @@ function bindLater(form,pick){
   summaryPrefix:'Hides until ',prepareMenu});
 }
 function bind(){view.replace(false);}
+content.addEventListener('click',event=>{
+ if(content.dataset.show==='Validating' && event.target.closest('[data-type-chip="response"]'))
+  document.getElementById('review-show-open').click();
+},true);
 function revealNewItem(){
  if(!revealCreated || !index.has(revealCreated.key)) return false;
  const {key,id}=revealCreated;

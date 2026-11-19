@@ -124,6 +124,7 @@ class ReviewType(StrEnum):
     PROPOSAL = 'proposal'
     EFFICIENCY = 'efficiency'
     BUG = 'bug'
+    RESPONSE = 'response'
 
 
 class ReviewState(StrEnum):
@@ -134,6 +135,7 @@ class ReviewState(StrEnum):
 
 
 REVIEW_TYPES = tuple(ReviewType)
+QUESTION_TYPES = (ReviewType.QUESTION, ReviewType.RESPONSE)
 INVESTIGATION_TYPES = (ReviewType.INVESTIGATION, ReviewType.BUG)
 REVIEW_STATES = tuple(ReviewState)
 PROPOSAL_STATE_FIELDS = frozenset(("status", "stage", "unit", "style_answer", "style_answer_words", "proposed_by", "production_id", "record_type",
@@ -295,6 +297,7 @@ class ReviewItem:
     value: tuple[float, ...] = ()
     text: str = ''
     waiting_why: str = ''
+    response: review_submissions.QuestionResponse | None = None
 
     def for_you(self, now: datetime) -> bool:
         """Count Open records whose next action belongs to the user."""
@@ -586,11 +589,14 @@ def question_item(record: update_registration.QuestionRecord, members: staff.Sta
     state = question_state(record)
     after = fields.get('after','')
     later = moment(after) if after else NoLaterTime()
-    logs = [ReviewLog(filed, name(asker, members), 'Asked')]
     saved_log = review_events.decode(fields.get('review_log', ''))
+    response = review_submissions.question_response(record, saved_log)
+    logs = [ReviewLog(filed, name(asker, members), 'Asked') if response is None
+            else ReviewLog(filed, 'you', 'Asked from New item')]
     words = {entry.words.casefold() for entry in saved_log}
-    for exchange in fields.get('followups', []):
-        if not any((prefix+exchange['followup']).casefold() in words for prefix in ('question: ','followup: ')):
+    for position, exchange in enumerate(fields.get('followups', [])):
+        if (response is None or position != 0) and not any(
+                (prefix+exchange['followup']).casefold() in words for prefix in ('question: ','followup: ')):
             logs.append(ReviewLog(filed,'nate',exchange['followup']))
         if ('Answer: '+exchange['reply']).casefold() not in words:
             logs.append(ReviewLog(filed,name(asker,members),exchange['reply']))
@@ -609,11 +615,13 @@ def question_item(record: update_registration.QuestionRecord, members: staff.Sta
             review_id = ''
     identity = name(owner, members)+'/'+review_id if review_id else ''
     opened = update_registration.OpenItem(name(owner, members), parsed, name(asker, members) if asker else '')
-    return ReviewItem(key, identity, ReviewType.QUESTION, owner, asker, fields['text'], state,
+    kind = ReviewType.QUESTION if response is None else ReviewType.RESPONSE
+    actions = ('answer', 'feedback', 'question') if response is None else ('read', 'question')
+    return ReviewItem(key, identity, kind, owner, asker, fields['text'], state,
         ReviewTimes(filed, logs[-1].time, later), tuple(logs),
-        ('answer', 'feedback', 'question') if state != ReviewState.DONE and not unowned else (), source, entry.urgency, '',
+        actions if state != ReviewState.DONE and not unowned else (), source, entry.urgency, '',
         update_registration.question_queue_name(owner), entry.key, entry.after, entry.value, opened.line(),
-        review_events.waiting_why(fields.get('waiting_why', '')))
+        review_events.waiting_why(fields.get('waiting_why', '')), response)
 
 
 def store_paths(folders: tuple[Path, ...], sources: list[Path] | None) -> Iterator[Path]:
@@ -639,6 +647,7 @@ def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
                    owners: tuple[staff.StaffRow, ...] = (), sources: list[Path] | None = None,
                    include_unowned: bool = True, assign_ids: bool = False,
                    states: tuple[ReviewState, ...] = REVIEW_STATES,
+                   kinds: tuple[ReviewType, ...] = QUESTION_TYPES,
                    owner_options: dict[staff.StaffId, str] | None = None,
                    selection: ReviewSelection = ALL_RECORDS) -> list[ReviewItem]:
     identities = update_registration.QuestionStaff.for_record(members)
@@ -662,7 +671,8 @@ def question_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
             return
         item = (question_item(record, members, unowned=unowned, assign_ids=True) if assign_ids
                 else question_item(record, members, unowned=unowned))
-        found.append(item)
+        if item.type in kinds:
+            found.append(item)
 
     scopes: dict[Path, list[staff.StaffId]] = {}
     unowned_ids: set[staff.StaffId] = set()
@@ -1139,8 +1149,9 @@ def read_current(root: Path, item: ReviewItem, members: staff.StaffSnapshot) -> 
     selection = ExactReviewRecord(source_path(item), item.key, item.owner, prerequisite)
     if isinstance(source, ProposalSource) and 'review_submission' in source.record.fields:
         return read_sent_proposal(selection, source.record, members)
+    kinds = QUESTION_TYPES if item.type in QUESTION_TYPES else (item.type,)
     try:
-        records = project(root, members, (item.type,), REVIEW_STATES, None, [], selection)
+        records = project(root, members, kinds, REVIEW_STATES, None, [], selection)
     except FileNotFoundError:
         records = []
     for record in records:
@@ -1240,8 +1251,9 @@ def project(root: Path, members: staff.StaffSnapshot, kinds: tuple[ReviewType, .
     documents = tuple(dict.fromkeys(doc for member in members.rows if isinstance(member.doc, staff.LiveDoc)
                                     if (doc := record_store.local_document(member)) is not None))
     items: list[ReviewItem] = []
-    if ReviewType.QUESTION in kinds:
-        items.extend(question_items(members,documents,states=states,owner_options=owner_options,
+    question_kinds = tuple(kind for kind in kinds if kind in QUESTION_TYPES)
+    if question_kinds:
+        items.extend(question_items(members,documents,states=states,kinds=question_kinds,owner_options=owner_options,
                                    sources=sources,selection=selection,assign_ids=assign_ids))
     if ReviewType.CHANGE in kinds:
         items.extend(change_items(root,members,states=states,owner_options=owner_options,sources=sources,selection=selection))
@@ -1304,10 +1316,11 @@ def _read_kind(kind: ReviewType, scope: Path | staff.StaffRow, members: staff.St
     else:
         documents = tuple(proposals_folder.scope_docs(scope,below,record=members))
         owner = scope
-    if kind == ReviewType.QUESTION:
+    if kind in QUESTION_TYPES:
         owners = (scope,) if isinstance(scope,staff.StaffRow) else tuple(member for member in members.rows
             if member.kind == 'showrunner' and isinstance(member.doc,(staff.LiveDoc,staff.WrappedDoc)) and member.doc.path in documents)
-        return question_items(members,documents,owners=owners,sources=sources,include_unowned=False,states=states)
+        return question_items(members,documents,owners=owners,sources=sources,include_unowned=False,states=states,
+                              kinds=QUESTION_TYPES if kind == ReviewType.QUESTION else (kind,))
     if kind in INVESTIGATION_TYPES:
         owners_ids = tuple(member.id for doc in documents for member in
             (unit_lookup.doc_owner(doc,members),*unit_lookup.doc_units(doc,members))) if documents else (cast(staff.StaffRow,owner).id,)
@@ -1404,7 +1417,7 @@ def next_queue(kind: str, scope: Path | staff.StaffRow, below: bool, members: st
     elif kind == 'change':
         assert isinstance(scope,Path)
         queue = change_queue_name(scope,members,change_review.scope_list(scope,record=members),below)
-    elif kind == 'question':
+    elif kind in ('question', 'response'):
         owner = scope if isinstance(scope,staff.StaffRow) else unit_lookup.doc_owner(scope,members)
         queue = update_registration.question_queue_name(owner.id,below)
     elif kind == 'proposal':
