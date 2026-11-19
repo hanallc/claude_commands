@@ -1549,31 +1549,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. A fixture review session gets no delivery while its count is above 0, gets one oldest-first list at 0, and gets an urgent message at once. basedpyright: 0 errors, 0 warnings. Full gate green.
 
-### Phase 90 — A merge takes a moved main with no retest when the new main commits change only disjoint non-code files  · status: todo
-**Depends on:** none
-
-#### Work Order
-
-**Goal:** bob's item 140, decision (a) by builds, sent by sdlc at 17:55 EST Nov 19. Name: mainmoved. Today `tested_main_push` in `merge_checkpoint.py` skips the retest only when each new main commit is a settings commit (`settings_commits_only`, nate 2026-11-14). Every other main move retests the group.
-
-**Spec:**
-1. When main moved after the tested base, read the commits on origin/main since then. Skip the retest when each of them:
-   - changes no file that the group changes; and
-   - changes only non-code files: `config/*.conf`, `settings.json`, `docs/`.
-2. A `settings.json` change that touches the `"hooks"` block is code, because hooks run during tests (sdlc). Retest in that case.
-3. The settings-commit rule of 2026-11-14 stays true under the new rule.
-4. Otherwise retest as today.
-5. The merge record names the main commits taken with no retest.
-6. Tests write their own fixture repos. One case for each condition: disjoint non-code commits (no retest); a shared file (retest); a code file (retest); a `settings.json` hooks change (retest). Add rows to existing tests.
-
-**Files:** `scripts/production/merge_checkpoint.py`, its existing tests, `docs/as-built/` if it names the settings-commit rule.
-
-**Workers:** 1 writer.
-
-**Order:** after phase 89's code. Tests run only when natemerge allows them.
-
-**Acceptance gate:**
-1. The four cases pass. basedpyright: 0 errors, 0 warnings. Full gate green.
+### Phase 90 — A merge takes a moved main with no retest when the new main commits change only disjoint non-code files  · status: dropped
+**Result (2026-11-19):** dropped with no merge. bob stopped it at 18:18 EST for the user's side (item 140 (a)). The case that started it, a settings.json commit on main, still retests under the rule. The rule passes only 29 of 554 main moves in 7 days. Review also found that the "non-code" files hold test inputs. The branch `sdlc-phases-90` stays off the merge line. A direct push to main still asks natemerge for a gap first.
 
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
