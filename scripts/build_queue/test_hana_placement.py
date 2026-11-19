@@ -860,3 +860,142 @@ class HanaQueueTests(unittest.TestCase):
             refresh()
             self.assertTrue(fixture.server.pass_stale)
             self.assertEqual(fixture.server.host_observations[key], updated)
+
+
+class HanaGpuQueueTests(unittest.TestCase):
+    def test_pinned_route_reports_settled_refusal_without_local_fallback(self) -> None:
+        from contextlib import redirect_stderr
+        from io import StringIO
+        import os
+        from pathlib import Path
+        import subprocess
+
+        from scripts.aws_target import gpu_size_trial
+        from scripts.build_targets import build_targets
+        from scripts.buildlog import treekey
+        from scripts.copies import copies
+        from scripts.direct.runner_result import UsableRunnerResult, read_result
+        from scripts.direct.step_selection import Pinned
+
+        with PlacementFixture() as fixture:
+            settings = fixture.root / 'cloud_gate.conf'
+            repository = 'https://github.com/fixture/hana'
+            _ = settings.write_text('execution_transport=hana-gpu\nhana_gpu_route_enabled=on\n'
+                + f'hana_gpu_repository={repository}\nhana_gpu_instance_types=g6.2xlarge\n'
+                + 'hana_gpu_selections=hana_mimesis_tools:shader_variants\n# range: 1..60\napi_timeout_s=30\n')
+            _ = (fixture.root / 'build_targets.conf').write_text(
+                'targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n'
+                + 'pinned_targets=hana-gpu\nkind.hana-gpu=ssh\nplatform.hana-gpu=linux\n'
+                + 'settings.hana-gpu=cloud_gate.conf\n')
+            account = target_config.ssh_target_state_directory('aws')
+            account.mkdir(parents=True)
+            _ = (account / 'gate-deployment.json').write_text('{"gpu_instance_types":["g6.2xlarge"]}')
+            pid = os.getpid()
+            start = process_start.process_start(pid)
+            assert isinstance(start, process_start.Started)
+            fixture.proc.register(wire.Owner(pid, start.start))
+            initial = placement_request(fixture)
+            package = 'hana_mimesis_tools'
+            command = ('cargo', 'nextest', 'run', '--no-fail-fast', '--workspace', '--test', 'shader_variants',
+                       '-E', 'package(hana_mimesis_tools)')
+            source = execution_identity.SourceKeyKnown('source-a')
+            reason = 'GPU result could not be collected'
+            result_path = fixture.root / 'verify-result'
+
+            with (mock.patch.object(eligibility, 'repository_identity',
+                    return_value=eligibility.KnownRepository('hana', repository)),
+                    mock.patch.object(treekey, 'tree_key', return_value=source.key),
+                    mock.patch.object(copies, 'capture_source', return_value='captured')):
+                constraints = build_targets.fixed_placement_constraints(
+                    fixture.root, package, 'test', command, initial.constraints.session, source,
+                    selection=Pinned('hana-gpu'))
+                request = replace(initial, owner=placement.SubmittingOwner(fixture.server.host, pid, start.start),
+                    run=wire.RunIdentity(pid, start.start), constraints=constraints, route=target_config.PinnedTarget('hana-gpu'))
+                self.assertEqual(constraints.selection, placement.PinnedHost('hana-gpu'))
+                candidate, = constraints.candidates
+                self.assertEqual(candidate.eligibility, placement.AllowedHost())
+                _ = publish_candidate(fixture, request)
+                assignment = assignment_for(fixture, request)
+                self.assertEqual(assignment.destination.target, 'hana-gpu')
+                key = fixture.server.host_evidence_key(request, assignment.destination)
+
+                def publish_evidence(evidence: placement.HostEvidence) -> None:
+                    fixture.provider_evidence[key] = evidence
+                    fixture.server.publish_host_evidence(evidence)
+
+                def fresh_evidence() -> placement.FreshHostEvidence:
+                    evidence = fixture.read_host_evidence(key)
+                    assert isinstance(evidence, placement.FreshHostEvidence)
+                    return evidence
+
+                evidence_expired = False
+
+                def consume(message: wire.ConsumePermission) -> wire.FirstAuthorization | wire.DispatchStatus:
+                    nonlocal evidence_expired
+                    if not evidence_expired:
+                        evidence_expired = True
+                        assert isinstance(message.holder, placement.ClaimHolderIdentity)
+                        ineligible = replace(fresh_evidence(), eligibility=placement.FixedExclusion('fixture policy'))
+                        self.assertIn(placement.AdoptedProviderClaim(message.claim, message.holder,
+                            assignment.session, assignment.destination.host, ineligible.generation), ineligible.claims)
+                        publish_evidence(ineligible)
+                        denied = fixture.connect(replace(message, request_id='gpu-ineligible')).replies()[-1]
+                        assert isinstance(denied, wire.DispatchStatus)
+                        self.assertIsInstance(denied.permission, placement.PermissionAvailable)
+                        self.assertEqual(denied.reason, 'The Hana GPU step is no longer eligible')
+
+                        stale = placement.StaleHostEvidence(key, fixture.clock.now(), 'provider evidence expired')
+                        publish_evidence(stale)
+                        refused = fixture.connect(message).replies()[-1]
+                        assert isinstance(refused, wire.DispatchStatus)
+                        self.assertIsInstance(refused.permission, placement.PermissionAvailable)
+                        self.assertEqual(refused.reason, 'adoption evidence is unavailable or stale')
+                        return refused
+                    publish_evidence(fresh_evidence())
+                    answer = fixture.connect(message).replies()[-1]
+                    self.assertIsInstance(answer, wire.FirstAuthorization)
+                    assert isinstance(answer, wire.FirstAuthorization)
+                    return answer
+
+                def decline(_repo: Path, _commit: str, _request: gpu_size_trial.HanaGpuNextestRequest, *,
+                            launch: gpu_size_trial.AssignedHanaGpuLaunch) -> gpu_size_trial.HanaGpuNextestResult:
+                    launch.before_service()
+                    gpu_size_trial.confirm_assigned_gpu_service(launch.trial)
+                    folder = gpu_size_trial.trial_root() / launch.trial
+                    receipt = gpu_size_trial.cleanup_receipt(folder)
+                    receipt.parent.mkdir(parents=True)
+                    _ = receipt.write_text('{"trial":"' + launch.trial + '"}')
+                    raise ValueError(reason)
+
+                def report(message: wire.ExecutionReport) -> wire.DispatchStatus:
+                    self.assertEqual(message.outcome, placement.AttemptDeclined(reason))
+                    self.assertEqual(message.path, placement.DispatchPathSettled())
+                    self.assertFalse(hana_placement_adapter.gpu_claim_pending('hana-gpu', message.claim.claim_id)
+                                     if isinstance(message.claim, placement.ProviderClaimReference) else True)
+                    publish_evidence(fresh_evidence())
+                    answer = fixture.connect(message).replies()[-1]
+                    assert isinstance(answer, wire.DispatchStatus)
+                    return answer
+
+                with (mock.patch.object(admission_client, 'consume_permission', new=consume),
+                      mock.patch.object(admission_client, 'report_execution', new=report),
+                      mock.patch.object(gpu_size_trial, 'run_nextest', new=decline),
+                      redirect_stderr(StringIO())):
+                    status = hana_placement.run_gpu_assignment(assignment, fixture.root, package, command, result_path)
+                self.assertEqual(status, gpu_size_trial.NEXTEST_INFRASTRUCTURE_EXIT)
+                result = read_result(result_path, status, False)
+                assert isinstance(result, UsableRunnerResult)
+                self.assertEqual((result.word, result.reason), ('declined', reason))
+                reply = fixture.connect(request).replies()[-1]
+                assert isinstance(reply, wire.DispatchStatus)
+                self.assertEqual(reply.state, placement.ClosedAssignment(reason))
+
+            shell = Path(__file__).resolve().parents[1] / 'direct/verify.sh'
+            script = shell.read_text()
+            start_at = script.index('pinned_target_refuse()')
+            stop_at = script.index('\nmac_only_refuse()', start_at)
+            pinned_refusal = script[start_at:stop_at] + (
+                'note_event() { :; }\nPINNED_TARGET=hana-gpu\npinned_target_refuse "$1"')
+            refused = subprocess.run(['bash', '-c', pinned_refusal, 'verify.sh', result.reason],
+                                     capture_output=True, text=True, timeout=5)
+            self.assertEqual((refused.returncode, refused.stderr), (2, f'verify.sh: target hana-gpu refused: {reason}\n'))
