@@ -1,7 +1,7 @@
 """Check inactive Hana placement with private journals and fake provider evidence."""
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, redirect_stderr
 from dataclasses import replace
@@ -15,7 +15,7 @@ import select
 import subprocess
 import sys
 import threading
-from typing import cast, override
+from typing import cast, final, override
 from unittest import mock
 
 from scripts.build_queue import execution_identity
@@ -29,7 +29,7 @@ from scripts.build_queue import admission_protocol as wire, admission_records as
 from scripts.buildlog import store
 from scripts.lib import conf, process_start
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.mac_test import claim_state, eligibility
+from scripts.mac_test import claim_state, eligibility, mac_test
 from scripts.build_hold.owning_session import OwningSession
 
 
@@ -612,3 +612,260 @@ with hana_command_lock(directory) as access:
             assert isinstance(claims, build_hold.LiveClaims)
             self.assertEqual(claims.remote_waiters, frozenset())
             self.assertEqual(claims.identities, frozenset({build_hold.ProcessIdentity(self.holder.pid, self.holder.start_time)}))
+
+
+@final
+class HanaGpuPlacementTests(CostFixture):
+    package = 'hana_mimesis_tools'
+    command = ('cargo', 'nextest', 'run', '--profile', 'ci', '--no-fail-fast', '--workspace',
+               '--test', 'shader_variants', '-E', 'package(hana_mimesis_tools)')
+    assignment: placement.PlacementAssignment
+    gpu_settings = Path()
+    account_dir = Path()
+    trials = Path()
+    grants = Path()
+
+    def __init__(self, methodName: str = 'runTest') -> None:
+        super().__init__(methodName)
+        self.assignment = placement.PlacementAssignment('', '', placement.PlacementDestination(
+            'ssh', 'hana-gpu', 'hana-gpu', claim_state.WHOLE_MAC), execution_identity.SourceKeyUnavailable('fixture'),
+            placement.SubmittingOwner('', 0, ''), OwningSession('fixture-session'), 0)
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.gpu_settings = self.root / 'cloud_gate.conf'
+        self.account_dir = self.root / 'targets/aws'
+        self.trials = self.root / 'trials'
+        gpu_target = target_config.SshTarget('hana-gpu', 'linux', self.gpu_settings)
+        _ = self.gpu_settings.write_text(
+            'execution_transport=hana-gpu\nhana_gpu_route_enabled=on\n'
+            + f'hana_gpu_repository={KEY}\nhana_gpu_instance_types=g4dn.2xlarge g6.2xlarge\n'
+            + 'hana_gpu_selections=hana_mimesis_tools:shader_variants\n# range: 1..60\napi_timeout_s=30\n')
+        self.account_dir.mkdir(parents=True)
+        self.grants = self.account_dir / 'gate-deployment.json'
+        _ = self.grants.write_text(json.dumps({'gpu_instance_types': ['g4dn.2xlarge', 'g6.2xlarge']}))
+        _ = (self.root / 'build_targets.conf').write_text(
+            'targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n'
+            + 'pinned_targets=hana-gpu\nkind.hana-gpu=ssh\nplatform.hana-gpu=linux\n'
+            + f'settings.hana-gpu={gpu_target.settings}\n')
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {'CONF_DIR': str(self.root)})))
+        _ = self.enterContext(mock.patch.object(eligibility, 'repository_identity',
+            return_value=eligibility.KnownRepository('hana', KEY)))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {'BUILD_TARGETS_STATE_DIR': str(self.account_dir.parent)})))
+        pid = os.getpid()
+        process = process_start.process_start(pid)
+        assert isinstance(process, process_start.Started)
+        self.assignment = placement.PlacementAssignment('episode', 'attempt',
+            placement.PlacementDestination('ssh', 'hana-gpu', 'hana-gpu', claim_state.RepositoryScope('hana', KEY, 1), 1),
+            execution_identity.SourceKeyKnown('source'), placement.SubmittingOwner(store.host_name(), pid, process.start),
+            OwningSession('fixture-session'), 0)
+
+    def candidate(self, *, command: tuple[str, ...] = command) -> placement.PlacementCandidate:
+        from scripts.direct.step_selection import Pinned
+
+        constraints = build_targets.fixed_placement_constraints(
+            self.root, self.package, 'test', command, self.assignment.session, self.assignment.source_key,
+            selection=Pinned('hana-gpu'))
+        return next(candidate for candidate in constraints.candidates if candidate.destination.target == 'hana-gpu')
+
+    def test_admits_only_the_pinned_configured_test_in_one_slot(self) -> None:
+        candidate = self.candidate()
+        self.assertEqual(candidate.eligibility, placement.AllowedHost())
+        self.assertEqual(candidate.destination, self.assignment.destination)
+        routed = build_targets.fixed_placement_constraints(
+            self.root, self.package, 'test', self.command, self.assignment.session, self.assignment.source_key)
+        self.assertEqual([item.destination.target for item in routed.candidates], ['natedev'])
+        for command in (self.command[:-3] + ('another_test', *self.command[-2:]), (*self.command, '--run-ignored', 'only')):
+            self.assertEqual(self.candidate(command=command).eligibility,
+                             placement.FixedExclusion(adapter.GPU_SELECTION_REQUIRED))
+
+    def test_refuses_when_setup_is_off_or_missing_a_type(self) -> None:
+        grants = self.grants.read_text()
+        _ = self.grants.write_text(json.dumps({'gpu_instance_types': ['g6.2xlarge']}))
+        self.assertEqual(self.candidate().eligibility, placement.FixedExclusion(adapter.GPU_SETUP_REQUIRED))
+        _ = self.grants.write_text(grants)
+        _ = self.gpu_settings.write_text(self.gpu_settings.read_text().replace('enabled=on', 'enabled=off'))
+        self.assertEqual(self.candidate().eligibility, placement.FixedExclusion(adapter.GPU_SETUP_REQUIRED))
+
+    def run_fake_gpu(self, code: int | str, *, confirm_cleanup: bool = True, refuse_start: bool = False,
+                     report_unavailable: bool = False, refuse_release: bool = False
+                     ) -> tuple[int, str, str, wire.ExecutionReport]:
+        from contextlib import redirect_stdout
+        from scripts.aws_target import gpu_size_trial
+        from scripts.build_queue import admission_client
+        from scripts.buildlog import treekey
+        from scripts.copies import copies
+
+        claim_id = execution_identity.assigned_claim_id(self.assignment.episode, self.assignment.attempt)
+        reference = placement.ProviderClaimReference('ssh', 'hana-gpu', self.assignment.destination.scope,
+                                                      claim_id, self.assignment.episode, self.assignment.attempt)
+        reports: list[wire.ExecutionReport] = []
+        result = self.root / 'gpu-result'
+        stdout, stderr = StringIO(), StringIO()
+        real_run = gpu_size_trial.run_nextest
+        real_unlink = Path.unlink
+        claim_path = mac_test.claim_path(claim_state.state_paths('hana-gpu'), self.assignment.destination.scope)
+
+        def unlink(path: Path, missing_ok: bool = False) -> None:
+            if refuse_release and path == claim_path:
+                raise PermissionError('The fixture cannot remove the GPU claim')
+            real_unlink(path, missing_ok=missing_ok)
+
+        def run(repo: Path, commit: str, request: gpu_size_trial.HanaGpuNextestRequest, *,
+                launch: gpu_size_trial.AssignedHanaGpuLaunch) -> gpu_size_trial.HanaGpuNextestResult:
+            self.assertEqual((repo, commit, request.arguments, launch.trial),
+                             (self.root, 'captured', self.command[3:], claim_id))
+            if refuse_start:
+                def refuse(_folder: Path, _directory: Path, _settings: Path,
+                           _execute: Callable[[Sequence[str]], int], *, assigned: bool) -> int:
+                    self.assertTrue(assigned)
+                    launch.before_service()
+                    self.assertFalse(gpu_size_trial.assigned_gpu_cleanup_pending(claim_id))
+                    return 1
+
+                with (mock.patch.object(gpu_size_trial, 'prepare_locked'),
+                      mock.patch.object(gpu_size_trial, 'start_service', new=refuse)):
+                    return real_run(repo, commit, request, launch=launch)
+            launch.before_service()
+            self.assertFalse(gpu_size_trial.assigned_gpu_cleanup_pending(claim_id))
+            gpu_size_trial.confirm_assigned_gpu_service(claim_id)
+            self.assertTrue(gpu_size_trial.assigned_gpu_cleanup_pending(claim_id))
+            if confirm_cleanup:
+                receipt = gpu_size_trial.cleanup_receipt(self.trials / claim_id)
+                receipt.parent.mkdir(parents=True)
+                _ = receipt.write_text(json.dumps({'trial': claim_id}))
+            if isinstance(code, str):
+                raise ValueError(code)
+            return gpu_size_trial.HanaGpuNextestResult('cloud-attempt', commit, 'tree', code, 'output\n', 'diagnostics\n')
+
+        def report(request: wire.ExecutionReport) -> wire.DispatchStatus:
+            reports.append(request)
+            self.assertIn('outcome=', result.read_text())
+            if report_unavailable:
+                self.assertEqual(stdout.getvalue(), 'output\n')
+                self.assertEqual(stderr.getvalue(), 'diagnostics\n')
+                raise wire.AdmissionUnavailable('fixture queue outage')
+            state = (placement.ClosedAssignment('completed')
+                     if isinstance(request.outcome, placement.AttemptCompleted)
+                     and isinstance(request.path, placement.DispatchPathSettled)
+                     else placement.CurrentAssignment())
+            return wire.DispatchStatus(self.assignment, state, placement.PermissionConsumed(0))
+
+        with (mock.patch.object(treekey, 'tree_key', return_value='source'),
+                mock.patch.object(copies, 'capture_source', return_value='captured'),
+                mock.patch.object(gpu_size_trial, 'run_nextest', new=run),
+                mock.patch.object(gpu_size_trial, 'trial_root', return_value=self.trials),
+                mock.patch.object(admission_client, 'consume_permission', return_value=wire.FirstAuthorization(
+                    self.assignment, reference)),
+                mock.patch.object(admission_client, 'report_execution', new=report),
+                mock.patch.object(Path, 'unlink', new=unlink),
+                redirect_stdout(stdout), redirect_stderr(stderr)):
+            status = adapter.run_gpu_assignment(self.assignment, self.root, self.package, self.command, result)
+        self.assertIn('outcome=', result.read_text())
+        self.assertEqual(adapter.gpu_claim_pending('hana-gpu', claim_id), refuse_release or not confirm_cleanup)
+        self.assertEqual(len(reports), 1)
+        return status, stdout.getvalue(), stderr.getvalue(), reports[0]
+
+    def test_returns_the_pass_or_fail_status_and_output(self) -> None:
+        from scripts.aws_target import gpu_size_trial
+
+        for code in (0, 100):
+            with self.subTest(code=code):
+                status, stdout, stderr, report = self.run_fake_gpu(code)
+                self.assertEqual((status, stdout, stderr), (code, 'output\n', 'diagnostics\n'))
+                self.assertEqual(report.outcome, placement.AttemptCompleted(code))
+                self.assertEqual(report.path, placement.DispatchPathSettled())
+                with mock.patch.object(gpu_size_trial, 'trial_root', return_value=self.trials):
+                    folder = self.trials / execution_identity.assigned_claim_id(self.assignment.episode, self.assignment.attempt)
+                    receipt = gpu_size_trial.cleanup_receipt(folder)
+                    receipt.unlink()
+                    receipt.parent.rmdir()
+
+    def test_reports_infrastructure_refusal_after_cleanup(self) -> None:
+        status, stdout, stderr, report = self.run_fake_gpu('Spot capacity unavailable')
+        self.assertEqual((status, stdout), (125, ''))
+        self.assertIn('Spot capacity unavailable', stderr)
+        self.assertEqual(report.outcome, placement.AttemptDeclined('Spot capacity unavailable'))
+        self.assertEqual(report.path, placement.DispatchPathSettled())
+
+    def test_retains_capacity_when_cleanup_has_no_confirmation(self) -> None:
+        status, stdout, _, report = self.run_fake_gpu('The GPU service ended', confirm_cleanup=False)
+        self.assertEqual((status, stdout), (125, ''))
+        self.assertEqual(report.outcome, placement.AttemptOutcomeUnavailable('The GPU service ended'))
+        self.assertEqual(report.path, placement.DispatchPathPending('The GPU service ended'))
+
+    def test_reconciled_termination_releases_the_retained_slot(self) -> None:
+        from scripts.aws_target import gpu_size_trial
+        from scripts.aws_target.controller_lock import control_lock
+
+        _ = self.run_fake_gpu('Unconfirmed termination', confirm_cleanup=False)
+        claim = execution_identity.assigned_claim_id(self.assignment.episode, self.assignment.attempt)
+        destination = self.assignment.destination
+        transport = target_config.read_execution_transport(target_config.configured_ssh_target(destination.target))
+        from scripts.build_targets.execution_transport import HanaGpuNextestTransport
+        assert isinstance(transport, HanaGpuNextestTransport)
+        key = placement.HostEvidenceKey(destination, self.assignment.session, self.command, 'fixture',
+            package=self.package, command_kind='test')
+        constraints = placement.PlacementConstraints(self.assignment.source_key, self.command, str(self.root),
+            self.package, self.assignment.session, (self.candidate(),), placement.PinnedHost(destination.target),
+            command_kind='test')
+        profile = records.StepProfile(self.package, 'nextest', 'source', records.ExpectedPeak(1024, 'fallback', 0))
+        request = wire.PlacementRequest(self.assignment.episode, self.assignment.owner, 0, profile, constraints)
+        book = ledger.CostLedger(self.account_dir)
+        worker_lock = self.account_dir / 'gpu-size-trial'
+        booking = ledger.GateReservation('cloud-attempt', 10, 20, Decimal(1), Decimal(0),
+            state=ledger.GateRunning('i-fixture'), trial=ledger.GateTrialBudget(claim, Decimal(2)),
+            mode='gpu-size-trial', instance_type='g6.2xlarge', region='us-east-1')
+        closed = replace(booking, state=ledger.GateTerminated(25, 'i-fixture'))
+        other_trial = replace(closed, attempt='unrelated', trial=ledger.GateTrialBudget('another-trial', Decimal(2)))
+
+        with (mock.patch.object(process_start, 'process_start', return_value=process_start.Gone()),
+                mock.patch.object(gpu_size_trial, 'trial_root', return_value=self.trials)):
+            with control_lock(worker_lock), book.transaction() as state:
+                state.gate_reservations = [other_trial]
+            self.assertTrue(adapter.read_gpu_evidence(transport, key, request).cleanup_claims)
+            with book.transaction() as state:
+                state.gate_reservations.append(booking)
+            self.assertTrue(adapter.read_gpu_evidence(transport, key, request).cleanup_claims)
+            with control_lock(worker_lock):
+                with book.transaction() as state:
+                    state.gate_reservations = [other_trial, closed]
+                self.assertTrue(adapter.read_gpu_evidence(transport, key, request).cleanup_claims)
+            evidence = adapter.read_gpu_evidence(transport, key, request)
+            self.assertFalse(evidence.cleanup_claims)
+            self.assertEqual(evidence.eligibility, placement.AllowedHost())
+            self.assertFalse(adapter.gpu_claim_pending(destination.target, claim))
+
+    def test_refused_service_start_releases_its_slot(self) -> None:
+        from scripts.direct.runner_result import UsableRunnerResult, read_result
+
+        for refuse_release, expected in (
+            (False, placement.DispatchPathSettled()),
+            (True, placement.DispatchPathPending('The Hana GPU claim release remains pending')),
+        ):
+            with self.subTest(refuse_release=refuse_release):
+                self.assignment = replace(self.assignment, attempt=f'refusal-{refuse_release}')
+                status, stdout, stderr, report = self.run_fake_gpu(
+                    'unused', refuse_start=True, refuse_release=refuse_release)
+                self.assertEqual((status, stdout), (75, ''))
+                reason = 'The Hana GPU service did not start (status 1)'
+                self.assertIn(reason, stderr)
+                self.assertEqual(report.outcome, execution_identity.HanaCommandAdmissionRefused(reason))
+                self.assertEqual(report.evidence, execution_identity.ExecutionNotStarted())
+                self.assertEqual(report.path, expected)
+                result = read_result(self.root / 'gpu-result', status, False)
+                assert isinstance(result, UsableRunnerResult)
+                self.assertEqual((result.word, result.reason), ('hana_command_admission_refused', reason))
+
+    def test_pending_claim_release_preserves_the_test_verdict_and_output(self) -> None:
+        status, stdout, stderr, report = self.run_fake_gpu(100, refuse_release=True)
+        self.assertEqual((status, stdout, stderr), (100, 'output\n', 'diagnostics\n'))
+        self.assertEqual(report.outcome, placement.AttemptCompleted(100))
+        self.assertEqual(report.path, placement.DispatchPathPending('The Hana GPU claim release remains pending'))
+
+    def test_queue_outage_preserves_the_test_verdict_and_output(self) -> None:
+        status, stdout, stderr, report = self.run_fake_gpu(100, report_unavailable=True)
+        self.assertEqual((status, stdout), (100, 'output\n'))
+        self.assertEqual(stderr, 'diagnostics\nHana GPU queue report failed: fixture queue outage\n')
+        self.assertEqual(report.outcome, placement.AttemptCompleted(100))

@@ -284,6 +284,7 @@ class ReviewRepairsTests(unittest.TestCase):
     def browser(self, markup: str, probe: str, place: str = '/', width: int = 1440) -> list[str]:
         results: list[list[str]] = []
         complete = threading.Event()
+        probe_timeout = 60
         case = self.case
         markup=markup.replace('<head>','<head><script>'+test_review_page.BODY_READY_SCRIPT+'</script>',1)
         document = markup.replace('</body>','<img hidden src="/complete"><script>'+probe+'</script></body>').encode()
@@ -291,6 +292,13 @@ class ReviewRepairsTests(unittest.TestCase):
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
                 route = urlsplit(self.path)
+                if route.path == '/complete':
+                    if complete.wait(probe_timeout):
+                        self.send_response(204)
+                        self.end_headers()
+                    else:
+                        self.send_error(504, 'The Review probe did not report a result.')
+                    return
                 if route.path in ('/console/changes.html', '/console/questions.html', '/console/investigations.html'):
                     self.send_response(303)
                     self.send_header('Location', review_page.legacy_url(route.path, route.query))
@@ -320,9 +328,7 @@ class ReviewRepairsTests(unittest.TestCase):
                 if snapshot is not None and 'body' in fields:
                     self.send_header('X-Review-Version', snapshot.version)
                 self.end_headers()
-                if self.path == '/complete':
-                    _ = complete.wait(25)
-                elif snapshot is not None:
+                if snapshot is not None:
                     if 'body' in fields:
                         _ = self.wfile.write(snapshot.body(fields['body'][0]))
                     elif 'index' in fields:
@@ -337,12 +343,19 @@ class ReviewRepairsTests(unittest.TestCase):
             def do_POST(self) -> None:
                 body = self.rfile.read(int(self.headers['Content-Length']))
                 if self.path == '/action':
-                    delivery,answer = review_page.submit(case.root,body.decode(),case.status)
-                    change_page.deliver(delivery,case.status)
+                    cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+                    saved = cache.save(body.decode(), case.status)
+                    result: dict[str, object] = {'answer': saved.answer, 'version': saved.version}
+                    if isinstance(saved.item, review_items.ReviewItem):
+                        later = saved.item.times.later
+                        result.update(state=saved.item.state, later=0 if isinstance(later, review_items.NoLaterTime)
+                                      else later.timestamp()*1000)
+                    delivery = change_page.finish_verdict_cleanup(saved.delivery, case.status)
+                    change_page.deliver(delivery, case.status)
                     self.send_response(200)
                     self.send_header('Content-Type','application/json')
                     self.end_headers()
-                    _ = self.wfile.write(json.dumps({'answer':answer}).encode())
+                    _ = self.wfile.write(json.dumps(result).encode())
                     return
                 results.append(cast(list[str],json.loads(body)))
                 complete.set()
@@ -360,12 +373,13 @@ class ReviewRepairsTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory(dir=self.case.fixture.temporary) as profile:
                     done = subprocess.run(['firefox','--headless','--no-remote','--profile',profile,
                         '--window-size',f'{width},1100','--screenshot',str(self.case.fixture.temporary/'repair.png'),
-                        f'http://127.0.0.1:{server.server_port}'+place],capture_output=True,text=True,timeout=35)
+                        f'http://127.0.0.1:{server.server_port}'+place],capture_output=True,text=True,
+                        timeout=probe_timeout+30)
                 self.assertEqual(done.returncode,0,done.stderr)
             finally:
                 server.shutdown()
                 thread.join(5)
-        self.assertEqual(len(results),1)
+        self.assertEqual(len(results),1,'The Review probe must post one result.')
         return results[0]
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
@@ -623,7 +637,9 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
         ready = self.case.investigation()
         markup = review_page.render(self.case.root).decode()
         setup = '''<script>const nativeFetch=fetch;window.setInterval=()=>0;
-window.fetch=(url,options={})=>{
+let allowReviewRefresh=Promise.resolve();
+window.fetch=async(url,options={})=>{
+ if(options.method!=='POST') await allowReviewRefresh;
  return nativeFetch(options.method==='POST'?'/action':'/fresh'+new URL(url,location.href).search,options);
 };</script>'''
         markup = markup.replace('<head>','<head>'+setup,1)
@@ -678,8 +694,17 @@ window.fetch=(url,options={})=>{
   check(!row('C2') || row('C2').hidden,'A passed check stays out of All.');
   row('C3').querySelector('.list-toggle').click();await readyReviewCard(row('C3'));
   const [openBeforeWorks,validatingBeforeWorks,allBeforeWorks]=counts();
-  const third=row('C3').querySelector('form');await save(third,'works');
-  check(!row('C3') || row('C3').hidden,'F010: Works leaves All');
+  let resumeRefresh;
+  allowReviewRefresh=new Promise(resolve=>{resumeRefresh=resolve;});
+  try{
+   const third=row('C3').querySelector('form');await save(third,'works');
+   check(!row('C3') || row('C3').hidden,'F010: Works leaves All');
+   const [open,validating,all]=counts();
+   check(open===openBeforeWorks-1 && validating===validatingBeforeWorks && all===allBeforeWorks-1,
+    'F010: Save removes the completed item from the Open and All counts before refresh.');
+   await show('open');
+   check(!row('C3') || row('C3').hidden,'F010: Save removes the completed item from Open before refresh.');
+  }finally{resumeRefresh();}
   for(let pass=0;pass<2;pass++){
    await refresh();
    for(const choice of ['open','Validating','all']){
@@ -707,13 +732,14 @@ window.fetch=(url,options={})=>{
   location.hash=new URLSearchParams({owner:UNIT_OWNER,show:'open',type:'investigation'});
   await new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
   const investigation=document.querySelector('[data-key="'+keys.at(-1)+'"]');
-  investigation.querySelector('.list-toggle').click();await readyReviewCard(investigation);await save(investigation.querySelector('form'),'read');
-  await refresh();
   const ownerChip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
   const selectedOwner=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]');
+  check(selectedOwner()===ownerChip(UNIT_OWNER),'The investigation owner starts selected.');
+  investigation.querySelector('.list-toggle').click();await readyReviewCard(investigation);await save(investigation.querySelector('form'),'read');
+  await refresh();
   check(selectedOwner().dataset.ownerChip===UNIT_OWNER && selectedOwner().textContent===UNIT_NAME+' 0' &&
-    ownerChip('').textContent==='All 0',
-   'The selected owner remains with zero after its last Open row disappears.');
+    ownerChip('').textContent==='All 0' && counts()[0]===0,
+   'Review keeps the selected Owner with zero after its last Open row disappears.');
   check(!document.querySelector('[data-list-item]:not([hidden])'),'the selected type and Show still have no rows');
   await show('all');
   check(ownerChip('').textContent==='All 0' && counts().every(count=>count===0) &&
@@ -799,10 +825,14 @@ window.fetch=(url,options={})=>{
  const failures=[];
  try{
   const frame=[...document.querySelectorAll('iframe')].find(frame=>!frame.hidden);
-  if(!frame.contentDocument.querySelector('[data-review]')) await new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+  const count=value=>frame.contentDocument.querySelector('[data-show-chip="'+value+'"] b')?.textContent;
+  const deadline=performance.now()+8000;
+  while(!count('open') || !count('all')){
+   if(performance.now()>deadline) throw new Error('F012: Review did not populate the filtered counts.');
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
   const page=frame.contentDocument;
   const rows=[...page.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
-  const count=value=>page.querySelector('[data-show-chip="'+value+'"] b').textContent;
   if(page.querySelector('[data-show-chip][aria-pressed="true"]').dataset.showChip!=='open' ||
    page.querySelector('[data-owner-chip][aria-pressed="true"]').dataset.ownerChip!==INVESTIGATION_OWNER ||
    rows.length!==1 || rows[0].dataset.key!==READY_KEY || rows[0].dataset.sourceOwner!==INVESTIGATION_OWNER ||

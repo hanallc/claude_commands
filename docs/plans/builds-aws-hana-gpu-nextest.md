@@ -120,4 +120,17 @@ The guest arms shutdown before downloading its inputs. The Hana expiry tag and g
 
 The worker selects only types listed in the saved deployment record.
 Gate setup refreshes older records and checks access for every saved GPU type.
-Add the build queue and `verify.sh` route after the pinned live proof.
+
+## 8. Work order B2 implementation
+
+The queue and `verify.sh` support one pinned `hana-gpu` slot. The configured pilot is `hana_mimesis_tools:shader_variants`.
+The executor captures the assigned source and delegates the nextest run to Work Order A.
+A completed test returns its original status and both output streams.
+A claim remains pending after the GPU service starts until it confirms cleanup.
+Cancellation stops the assigned service and runs its cleanup.
+A settled infrastructure refusal releases the slot.
+The pinned caller sees the cause and exits with status 2.
+
+The route starts disabled. Set `hana_gpu_route_enabled=on` after the gate setup GPU probe succeeds.
+The route also checks the gate deployment record for the configured GPU types.
+The live pinned run remains the proof for target order changes.
