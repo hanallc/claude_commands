@@ -23,7 +23,7 @@ from collections import defaultdict
 from collections.abc import Callable, Collection, Generator, Iterable, Mapping
 from contextlib import contextmanager, redirect_stderr
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum
 from functools import cache
@@ -306,6 +306,8 @@ def _config_digest() -> str:
 
 PASS_OWNER_ENV = "UNIT_PASS_OWNER"
 PASS_OWNER_TOKEN = "launcher"
+ASSIGN_PASS_ID_ENV = "UNIT_ASSIGN_PASS_ID"
+ASSIGN_STATUS_FILE_ENV = "UNIT_ASSIGN_STATUS_FILE"
 
 PASS_OWNERSHIP_RULE = (
     "Pass lifecycle belongs to the launchers. assign.py and the "
@@ -2142,11 +2144,18 @@ def _start_pass(args: argparse.Namespace,
                 or active.get("worker_id") != dispatch_fields["worker_id"]):
             raise DispatchSelectionChanged(f"Pass {action.instance_id} changed during dispatch")
         match = action
+    status_file = _optional_arg(args, "assign_status_file")
+    if status_file:
+        status_file = str(worker_artifact(Path(status_file), os.environ.get(TEAM_SLOT_ENV, team_slot), team_slot))
     if active is not None and isinstance(match, MatchedDispatch):
         changed = inferred_owner or active.get("launcher_pid") != launcher_pid
         active["launcher_pid"] = launcher_pid
         if launcher_command and not active.get("launcher_command"):
             active["launcher_command"] = launcher_command
+            changed = True
+        if (status_file and active.get("status") == "active" and not active.get("assign_status_file")
+                and not dispatch_delivery(active).line and isinstance(hook_completion(active), NoHookCompletion)):
+            active["assign_status_file"] = status_file
             changed = True
         if changed:
             _write_state(session_dir, state)
@@ -2159,9 +2168,10 @@ def _start_pass(args: argparse.Namespace,
     if owner_id:
         state[unit_runs.OWNER_FIELD] = owner_id
     _refresh_main_identity(session_dir, state)
+    assign_pass_id = _optional_arg(args, "assign_pass_id")
     current_pass: dict[str, object] = {
         **dispatch_fields,
-        "instance_id": str(uuid.uuid4()),
+        "instance_id": assign_pass_id or str(uuid.uuid4()),
         "activity": _arg_string(args, "activity"),
         "started_at": now,
         "called_task": _arg_string(args, "called_task"),
@@ -2176,6 +2186,8 @@ def _start_pass(args: argparse.Namespace,
     }
     if getattr(args, "dispatch_owned", False):
         current_pass["prompt_digest"] = hashlib.sha256(Path(_optional_arg(args, "prompt_file")).read_bytes()).hexdigest()
+    if status_file:
+        current_pass["assign_status_file"] = status_file
     slots = _pass_slots(state)
     slots[team_slot] = current_pass
     _write_state(session_dir, state)
@@ -2195,6 +2207,8 @@ def _start_pass(args: argparse.Namespace,
     event["config_digest"] = _config_digest()
     event["team_slot"] = team_slot
     _append_event(state, event)
+    if status_file:
+        write_text_atomic(Path(status_file), "running\n")
     # The reviewer this pass belongs to has been rendering as an armed row since
     # its early launch; its real window supersedes that one rather than joining
     # it, so the marker retires here instead of leaving two review rows.
@@ -2299,6 +2313,8 @@ def begin_dispatch(session_dir: Path, *, slot: str, phase: str, role: staff.Work
         prompt_file=str(prompt), activity=activity or f"{role} dispatch", called_task=f"worker.{role}",
         called_family=called.family, called_model=called.model, called_effort=called.effort,
         fix_pass=fix_pass, fix_cause=fix_cause, dispatch_kind=kind, lens=lens, dispatch_owned=True,
+        assign_pass_id=os.environ.get(ASSIGN_PASS_ID_ENV, "") if kind == "assign" else "",
+        assign_status_file=os.environ.get(ASSIGN_STATUS_FILE_ENV, "") if kind == "assign" else "",
     )
     session_dir.mkdir(parents=True, exist_ok=True)
     with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
@@ -2323,6 +2339,63 @@ def complete_dispatch(session_dir: Path, slot: str, instance_id: str, *,
                 _ = _close_slot_pass(session_dir, state, slot, status, plan_history.now_epoch())
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+class AssignmentLaunchExit(Enum):
+    SUBMITTED = "submission accepted"
+    FAILED = "failure leaves the pass open"
+    CLOSE_FAILED_PASS = "failure closes the pass"
+
+
+class AssignmentLaunchNotRecorded(Enum):
+    NO_PASS = "the launcher opened no current pass"
+
+
+@dataclass(frozen=True)
+class RecordedAssignmentLaunch:
+    slot: str
+    failure_recorded: bool
+
+
+def _assignment_pass_slot(passes: dict[str, dict[str, object]], instance_id: str) -> str | AssignmentLaunchNotRecorded:
+    return next((slot for slot, passed in passes.items() if passed.get("instance_id") == instance_id),
+                AssignmentLaunchNotRecorded.NO_PASS)
+
+
+def record_assignment_launch_exit(run: Path, instance_id: str, outcome: AssignmentLaunchExit,
+                                  ) -> RecordedAssignmentLaunch | AssignmentLaunchNotRecorded:
+    """Find the exact launch and record any failure under the recorder lock."""
+    with (run / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not _state_path(run).is_file():
+            return AssignmentLaunchNotRecorded.NO_PASS
+        state = _read_state(run)
+        passes = _pass_slots(state)
+        slot = _assignment_pass_slot(passes, instance_id)
+        if isinstance(slot, AssignmentLaunchNotRecorded):
+            return slot
+        passed = passes[slot]
+        if (outcome is AssignmentLaunchExit.SUBMITTED or passed.get("status") not in ("active", "refused", "error")
+                or isinstance(hook_completion(passed), HookCompletion)):
+            return RecordedAssignmentLaunch(slot, failure_recorded=False)
+        if status_file := _string(passed.get("assign_status_file")):
+            write_text_atomic(Path(status_file), "error\n")
+        if outcome is AssignmentLaunchExit.CLOSE_FAILED_PASS:
+            _ = _close_slot_pass(run, state, slot, "error", plan_history.now_epoch())
+        return RecordedAssignmentLaunch(slot, failure_recorded=True)
+
+
+def restore_submitted_assignment_status(run: Path, instance_id: str) -> None:
+    """Restore running status for the active pass after confirmed submission."""
+    with (run / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        passes = _pass_slots(_read_state(run, resolve_staff=False))
+        slot = _assignment_pass_slot(passes, instance_id)
+        if isinstance(slot, str):
+            passed = passes[slot]
+            if passed.get("status") == "active" and isinstance(hook_completion(passed), NoHookCompletion):
+                if status_file := _string(passed.get("assign_status_file")):
+                    write_text_atomic(Path(status_file), "running\n")
 
 
 @dataclass(frozen=True)
@@ -2368,6 +2441,10 @@ def _update_dispatch(session_dir: Path, instance_id: str, key: str, value: objec
                 changed = True
         for passed in _pass_slots(state).values():
             if passed.get("instance_id") == instance_id:
+                if isinstance(value, DispatchDelivery):
+                    if status_file := _string(passed.get("assign_status_file")):
+                        value = replace(value, actions=replace(value.actions, status_file=status_file))
+                    value = asdict(value)
                 if passed.get(key) != value:
                     passed[key] = value
                     changed = True
@@ -2382,7 +2459,7 @@ def worker_artifact(path: Path, slot: str, worker: str) -> Path:
 
 
 def save_dispatch_delivery(session_dir: Path, instance_id: str, delivery: DispatchDelivery) -> None:
-    _update_dispatch(session_dir, instance_id, "delivery", asdict(delivery))
+    _update_dispatch(session_dir, instance_id, "delivery", delivery)
 
 
 def dispatch_delivery(passed: dict[str, object]) -> DispatchDelivery:

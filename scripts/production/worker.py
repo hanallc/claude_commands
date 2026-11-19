@@ -522,7 +522,8 @@ class AttachedCompaction(Enum):
     RUN = "run compaction in this process"
 
 
-def _accept_dispatch(parent: StaffId, row: staff.StaffRow, run: Path) -> None:
+def _accept_dispatch(parent: StaffId, row: staff.StaffRow, run: Path, instance: str) -> None:
+    progress_history.restore_submitted_assignment_status(run, instance)
     handoff = worker_admission.dispatch_record(run, row.name)
     if handoff.state in (worker_admission.SwitchState.CREATION_INTENT_RECORDED,
                          worker_admission.SwitchState.DISPATCH_IN_FLIGHT):
@@ -749,7 +750,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         if result is DispatchSubmission.SUBMITTED:
             submitted()
         if result is DispatchSubmission.SUBMITTED and not deferred:
-            _accept_dispatch(parent, started.row, session_dir)
+            _accept_dispatch(parent, started.row, session_dir, instance)
         return result
 
 
@@ -930,7 +931,7 @@ def finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: str
                     raise herdr_types.HerdrFailure(f"{row.name}: worker state is unavailable; no prompt sent")
                 result = dispatch_turn(parent, current, _client(), delivery.line, delivery.completion_id, run=run)
                 if result is DispatchSubmission.SUBMITTED:
-                    _accept_dispatch(parent, row, run)
+                    _accept_dispatch(parent, row, run, instance)
                     return result
         detail = diagnostics.getvalue().strip() or f"dispatch failed with exit {int(result)}"
         print(detail, file=sys.stderr)

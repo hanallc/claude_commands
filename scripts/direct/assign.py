@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal, NoReturn, cast, final, overload
+from uuid import uuid4
 
 from scripts.astra import astra_roles
 from scripts.herdr import herdr_types
@@ -465,8 +466,15 @@ def launcher_command() -> list[str]:
     return ["bash", str(SCRIPTS / "assign.sh"), *sys.argv[1:]]
 
 
+@dataclass(frozen=True)
+class AssignmentLaunch:
+    code: int
+    slot: str
+    failure_recorded: bool = False
+
+
 def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
-                  role: str, paths: list[str], env: dict[str, str]) -> int:
+                  role: str, paths: list[str], env: dict[str, str]) -> AssignmentLaunch:
     """Send the assignment through the shared worker command."""
     directory = phase_reservation.phase_directory(run, phase)
     directory.mkdir(parents=True, exist_ok=True)
@@ -491,8 +499,9 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
         message = style.directory / "prompt.md"
     env["UNIT_RUN_DIR"] = str(run)
     env["UNIT_TEAM_ROLE"] = slot
-    if role != "review" and not assign_claude.claim_phase(run, phase, Path(args.cwd).expanduser().resolve(), log, status, slot, env):
-        return 1
+    if role != "review" and not assign_claude.claim_phase(run, phase, Path(args.cwd).expanduser().resolve(),
+            log, assign_claude.UnclaimedPhaseStatus.PRESERVE, slot, env):
+        return AssignmentLaunch(1, slot)
     command = [PYTHON, str(SCRIPTS / "../production/worker.py"), "assign", role, str(message),
                "--session-dir", str(run), "--phase", phase, "--slot", slot, "--kind", "assign", "--reply", str(reply),
                "--lens", args.lens, "--fix-cause", args.fix_cause,
@@ -507,49 +516,50 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     number = sum(entry.get("event_type") == "pass_started" for entry in recorded_passes(run)) + 1
     write_text_atomic(directory / f"dispatch_{number}_paths.json",
                       json.dumps({"worker": slot, "round": number, "paths": paths}))
-    actions = progress_history.CompletionActions(str(summary), str(status), args.reply_file,
-        str(style.directory) if isinstance(style, StyleAssignment) else "",
+    actions = progress_history.CompletionActions(summary_file=str(summary), report_file=args.reply_file,
+        style_directory=str(style.directory) if isinstance(style, StyleAssignment) else "",
         resolve_fix=role == "fix" and env.get("UNIT_RESOLVES_ROUND") == "1", review_pass=args.pass_number)
     command += ["--launcher-command", json.dumps(launcher), "--completion-actions", json.dumps(asdict(actions))]
-    matched = progress_history.dispatch_worker(run, slot=slot, phase=phase, role=cast(staff.WorkerRole, role),
-        prompt=message, launcher_command=launcher)
-    recorded = progress_history.launch_slot(run, slot, launcher)
-    if not (isinstance(matched, progress_history.MatchedDispatch)
-            and progress_history.dispatch_completed(run, recorded, matched.instance_id)):
-        write_text_atomic(status, "running\n")
+    instance = str(uuid4())
+    worker_env = {**env, progress_history.ASSIGN_PASS_ID_ENV: instance,
+                  progress_history.ASSIGN_STATUS_FILE_ENV: str(status)}
     _ = call(["bash", str(SCRIPTS / "board.sh"), "post", str(run), slot, "register",
               f"role={role}; status in {status}"], env)
     _ = call(["bash", str(SCRIPTS / "../agents/heartbeat.sh"), str(run / "heartbeat.log"),
               "header", slot, role], env, check=False)
-    previous_pass = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(recorded))
     with log.open("a") as output:
         offset = output.tell()
-        result = subprocess.run(command, env=env, text=True, stdout=output, stderr=subprocess.STDOUT)
+        result = subprocess.run(command, env=worker_env, text=True, stdout=output, stderr=subprocess.STDOUT)
     with log.open() as output:
         _ = output.seek(offset)
         for line in output:
             if line.rstrip().endswith(staff_worker.COMPACTION_STARTED_TEXT):
                 print(line, end="")
-    selected = progress_history.launch_slot(run, slot, launcher)
-    passed = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(selected))
+    outcome = progress_history.AssignmentLaunchExit.SUBMITTED
+    if result.returncode:
+        outcome = (progress_history.AssignmentLaunchExit.CLOSE_FAILED_PASS if result.returncode in (1, 2)
+                   else progress_history.AssignmentLaunchExit.FAILED)
+    recorded = progress_history.record_assignment_launch_exit(run, instance, outcome)
+    selected, failure_recorded = slot, False
+    if isinstance(recorded, progress_history.RecordedAssignmentLaunch):
+        selected, failure_recorded = recorded.slot, recorded.failure_recorded
+    elif not result.returncode:
+        selected = progress_history.launch_slot(run, slot, launcher)
     if selected != slot:
-        status = progress_history.worker_artifact(status, slot, selected)
         target_log = progress_history.worker_artifact(log, slot, selected)
         _ = log.replace(target_log)
         write_text_atomic(directory / f"dispatch_{number}_paths.json",
                           json.dumps({"worker": selected, "round": number, "paths": paths}))
     if result.returncode:
-        write_text_atomic(status, "error\n")
-        if result.returncode in (1, 2) and passed.get("instance_id") != previous_pass.get("instance_id"):
-            passed = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(selected))
-            progress_history.complete_dispatch(run, selected, text(passed.get("instance_id")), status="error")
-            if role == "fix" and env.get("UNIT_RESOLVES_ROUND") == "1":
-                env["UNIT_PASS_OWNER"] = "launcher"
-                failed = AssignmentResult(args, run, phase, role, selected, env, style_assignment=style)
-                _ = finish_repair(failed, result.returncode)
+        if (failure_recorded and outcome is progress_history.AssignmentLaunchExit.CLOSE_FAILED_PASS
+                and role == "fix" and env.get("UNIT_RESOLVES_ROUND") == "1"):
+            env["UNIT_PASS_OWNER"] = "launcher"
+            failed = AssignmentResult(args, run, phase, role, selected, env, style_assignment=style)
+            _ = finish_repair(failed, result.returncode)
         _ = call(["bash", str(SCRIPTS / "board.sh"), "post", str(run), selected, "blocked",
                   f"role={role}; exit {result.returncode}; log {log}"], env)
-    return staff_worker.DispatchSubmission.SUBMITTED if result.returncode == 0 else result.returncode
+    code = result.returncode or staff_worker.DispatchSubmission.SUBMITTED
+    return AssignmentLaunch(code, selected, failure_recorded)
 
 
 
@@ -851,14 +861,10 @@ def main() -> int:
     checked = call(check, env, check=False)
     if checked.returncode:
         return 3 if checked.returncode == 3 else 2
-    slot = args.to or args.new_worker or role
-    before = object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(
-        progress_history.launch_slot(run, slot, launcher_command()))
-    code = execute_herdr(args, run, phase, prompt, role, paths, env)
-    selected = progress_history.launch_slot(run, slot, launcher_command())
-    if code == 2 or (code == 1 and env.get("UNIT_RESOLVES_ROUND") != "1" and object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(selected) != before):
-        end_failed_launch(run, selected, env)
-    return submission_result(code)
+    result = execute_herdr(args, run, phase, prompt, role, paths, env)
+    if result.code == 2 or (result.code == 1 and result.failure_recorded and env.get("UNIT_RESOLVES_ROUND") != "1"):
+        end_failed_launch(run, result.slot, env)
+    return submission_result(result.code)
 
 
 if __name__ == "__main__":
