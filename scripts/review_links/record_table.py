@@ -490,10 +490,11 @@ function animateRow(table,item,showRow,previousItem=item){
  copyTable.append(columns.cloneNode(true),copy);clip.append(copyTable);cell.append(clip);
  item.after(spacer);
  if(showRow) item.classList.add('record-motion-source');
+ const duration=Number(showRow ? content.dataset.cardFadeInMs : content.dataset.cardFadeOutMs);
  const animation=clip.animate([
   {height:(heightBefore ?? (showRow ? 0 : height))+'px',opacity:opacityBefore},
   {height:(showRow ? height : 0)+'px',opacity:Number(showRow)},
- ],{duration:200,easing:'ease-in-out',fill:'both'});
+ ],{duration,easing:'ease-in-out',fill:'both'});
  const finished=animation.finished.then(()=>{
   if(rowMotion.get(item)?.animation!==animation) return;
   stopMotion(item);
@@ -563,7 +564,7 @@ function apply(write=true,layout={}){
  options.beforeApply?.();
  applyRows(write,layout);
 }
-function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false,top}={}){
+function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=false,pushPlace=false,top}={}){
  const previousReveal=revealedLinkedItem;
  const motion=animate && !matchMedia('(prefers-reduced-motion: reduce)').matches;
  if(!motion) for(const item of rowMotion.keys()) stopMotion(item);
@@ -583,7 +584,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,pushPlace=false
  const previousOwner=owner,previousShow=show,previousFilters={...filters};
  owner=options.resolveOwner?.(owner) ?? owner;
  const search=query.trim().toLowerCase();
- owner=options.selectOwner?.({owner,type,query:search,keys}) ?? owner;
+ if(normalizeOwner) owner=options.selectOwner?.({owner,type,query:search,keys}) ?? owner;
  owner=filterSelection('owner').set(owner);
  if(previousOwner && !owner) sourceOwner='';
  show=filterSelection('show').set(show);
@@ -711,7 +712,7 @@ function restorePlace(event){
  // A changed fragment sends hashchange after popstate.
  if(event?.type==='popstate' && location.hash!==placeHash) return;
  const top=place();
- apply(false,{top});
+ apply(false,{top,normalizeOwner:!history.state?.recordTable});
  if(Number.isFinite(top)) scrollTo({top,behavior:'instant'});
 }
 function saveDeparturePlace(){
@@ -720,7 +721,7 @@ function saveDeparturePlace(){
   writePlace(false,scrollY);
  }else history.replaceState({recordTable:{opened:[...opened],linkedItem,revealedLinkedItem,top:scrollY}},'');
 }
-function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false}={}){
+function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,preserveFilters=false}={}){
  if(pushPlace) saveDeparturePlace();
  const target=itemWithKey(key);
  linkedItem=options.missingItem ? key : '';
@@ -729,7 +730,7 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false}={}
   if(options.single) opened.clear();
   opened.add(key);
   const selection=currentSelection();
-  if(!canRevealLinked(target,selection) && !matches(target,selection)){
+  if(!preserveFilters && !canRevealLinked(target,selection) && !matches(target,selection)){
    const targetShow=options.requiredShow?.(target.dataset) ?? 'all';
    const unfiltered=currentSelection({owner:'',show:targetShow,query:'',type:'',sourceOwner:'',filters:{}});
    if(!keepMatchingFilters || owner && !matches(target,{...unfiltered,owner})) owner='';
@@ -743,7 +744,7 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false}={}
   }
  }
  if(options.mount && target) revealKey=key;
- apply(true,{pushPlace});
+ apply(true,{pushPlace,normalizeOwner:!preserveFilters});
  const mountedTarget=options.mount ? mounted.get(key) : target;
  if(!mountedTarget){
   content.querySelector('[data-missing-item]')?.scrollIntoView({block:'nearest',behavior:'instant'});
@@ -778,8 +779,8 @@ function setRowsExpanded(items,expanded){
 }
 function bind(){
  if(boundRoots.has(content)) return;boundRoots.add(content);
- const changePlace=()=>apply(true,{dismissMissingItem:true});
- const changeFilter=()=>{if(sharedWords()) query=words().value;changePlace();};
+ const changePlace=(normalizeOwner=false)=>apply(true,{dismissMissingItem:true,normalizeOwner});
+ const changeFilter=()=>{if(sharedWords()) query=words().value;changePlace(true);};
  content.querySelector('[data-clear-linked-reviews]')?.addEventListener('click',()=>{
   keys.clear();changeFilter();words().focus({preventScroll:true});
  });
@@ -809,10 +810,17 @@ function bind(){
   if(expanded && !item.hidden) options.itemOpened?.(item);
  });
  content.querySelectorAll('[data-type-chip]').forEach(button=>button.addEventListener('click',()=>{
-  type=button.dataset.typeChip;changePlace();
+  type=button.dataset.typeChip;changeFilter();
  }));
 }
 return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,saveDeparturePlace,get linkedItem(){return linkedItem;},
+ revealMatchingItem(key){
+  const target=itemWithKey(key);
+  const selection=currentSelection({query:words().value.trim().toLowerCase()});
+  if(!target || !matches(target,selection)) return false;
+  jump(key,{preserveFilters:true});
+  return true;
+ },
  setShownExpanded(expanded){
   const currentQuery=words().value;
   if(query!==currentQuery){
@@ -850,6 +858,7 @@ return {place,apply,bind,opened,restorePlace,drawWindow,followItemLink,saveDepar
  showActionResult,
  actionNotice(item){return actionNotices.get(item.dataset.key)?.message ?? '';},
  applyAction(){apply(false,{animate:true});},
+ rowFading(key){return [...rowMotion.keys()].some(item=>item.dataset.key===key);},
  async rowSettled(item){while(rowMotion.has(item)) await rowMotion.get(item).finished;},
  get hasActiveRowAnimations(){return rowMotion.size>0;},
  settled(){return Promise.all([...rowMotion.values()].map(motion=>motion.finished));},

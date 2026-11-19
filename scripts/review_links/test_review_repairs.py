@@ -268,6 +268,7 @@ class ReviewRepairsTests(unittest.TestCase):
     def browser(self, markup: str, probe: str, place: str = '/', width: int = 1440) -> list[str]:
         results: list[list[str]] = []
         complete = threading.Event()
+        probe_timeout = 60
         case = self.case
         markup=markup.replace('<head>','<head><script>'+test_review_page.BODY_READY_SCRIPT+'</script>',1)
         document = markup.replace('</body>','<img hidden src="/complete"><script>'+probe+'</script></body>').encode()
@@ -275,6 +276,13 @@ class ReviewRepairsTests(unittest.TestCase):
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
                 route = urlsplit(self.path)
+                if route.path == '/complete':
+                    if complete.wait(probe_timeout):
+                        self.send_response(204)
+                        self.end_headers()
+                    else:
+                        self.send_error(504, 'The Review probe did not report a result.')
+                    return
                 if route.path in ('/console/changes.html', '/console/questions.html', '/console/investigations.html'):
                     self.send_response(303)
                     self.send_header('Location', review_page.legacy_url(route.path, route.query))
@@ -304,9 +312,7 @@ class ReviewRepairsTests(unittest.TestCase):
                 if snapshot is not None and 'body' in fields:
                     self.send_header('X-Review-Version', snapshot.version)
                 self.end_headers()
-                if self.path == '/complete':
-                    _ = complete.wait(25)
-                elif snapshot is not None:
+                if snapshot is not None:
                     if 'body' in fields:
                         _ = self.wfile.write(snapshot.body(fields['body'][0]))
                     elif 'index' in fields:
@@ -351,12 +357,13 @@ class ReviewRepairsTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory(dir=self.case.fixture.temporary) as profile:
                     done = subprocess.run(['firefox','--headless','--no-remote','--profile',profile,
                         '--window-size',f'{width},1100','--screenshot',str(self.case.fixture.temporary/'repair.png'),
-                        f'http://127.0.0.1:{server.server_port}'+place],capture_output=True,text=True,timeout=35)
+                        f'http://127.0.0.1:{server.server_port}'+place],capture_output=True,text=True,
+                        timeout=probe_timeout+30)
                 self.assertEqual(done.returncode,0,done.stderr)
             finally:
                 server.shutdown()
                 thread.join(5)
-        self.assertEqual(len(results),1)
+        self.assertEqual(len(results),1,'The Review probe must post one result.')
         return results[0]
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
@@ -448,7 +455,7 @@ window.fetch=(url,options)=>{
         self.assertEqual(self.browser(test_review_page.browser_markup(self.case.root), probe, place), [])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
-    def test_refresh_focuses_all_when_the_focused_owner_is_excluded(self) -> None:
+    def test_refresh_keeps_the_selected_owner_and_focus_without_matches(self) -> None:
         without_owner = test_review_page.browser_markup(self.case.root)
         ready = self.case.investigation()
         before = test_review_page.browser_markup(self.case.root)
@@ -468,25 +475,26 @@ window.fetch=(url,options)=>options?.method==='POST' ? nativeFetch(url,options) 
  const chip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
  const owner=chip(OWNER);
  owner.focus();
- check(document.activeElement===owner && owner.getAttribute('aria-pressed')==='true',
-  'The selected owner starts focused.');
+ check(document.activeElement===owner && owner.getAttribute('aria-pressed')==='true' &&
+  owner.querySelector('b').textContent==='1','The selected Owner starts focused with one match.');
  const previous=document.querySelector('[data-review]');
  const refreshed=new Promise(resolve=>previous.addEventListener('review-refreshed',resolve,{once:true}));
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  await refreshed;
  const replacement=chip(OWNER),all=chip('');
- check(HIDDEN ? replacement?.hidden : !replacement,'The fresh page excludes the owner.');
- check(all.getAttribute('aria-pressed')==='true' && !new URLSearchParams(location.hash.slice(1)).get('owner'),
-  'A refresh with no matching owner selects All.');
- check(document.activeElement===all,'Expected focus on All, got '+(document.activeElement.id || document.activeElement.tagName)+'.');
+ check(replacement?.getAttribute('aria-pressed')==='true' && !replacement.hidden &&
+  replacement.querySelector('b').textContent==='0' && all.querySelector('b').textContent==='0' &&
+  !document.querySelector('[data-list-item]:not([hidden])'),'Refresh keeps the selected Owner visible with zero matches.');
+ check(new URLSearchParams(location.hash.slice(1)).get('owner')===OWNER,'The address keeps the selected Owner.');
+ check(document.activeElement===replacement,'Refresh keeps focus on the selected Owner.');
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();'''
         place = '/#'+urlencode({'owner':ready.owner, 'show':'open', 'type':'investigation'})
-        for hidden, fresh in ((False, without_owner), (True, with_hidden_owner)):
-            with self.subTest(hidden=hidden):
+        for reason, fresh in (('owner absent', without_owner), ('last row deferred', with_hidden_owner)):
+            with self.subTest(reason=reason):
                 script = setup.replace('FRESH', json.dumps(fresh).replace('</', '<\\/'))
                 markup = before.replace('<head>', '<head>'+script, 1)
-                check = probe.replace('HIDDEN', json.dumps(hidden)).replace('OWNER', json.dumps(str(ready.owner)))
+                check = probe.replace('OWNER', json.dumps(str(ready.owner)))
                 self.assertEqual(self.browser(markup, check, place), [])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
@@ -590,8 +598,12 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
    !new URLSearchParams(location.hash.slice(1)).get('owner'),
    'F007: an owner without the selected type resets to All and hides its chip');
   await show('open');type('investigation');chooseOwner(UNIT_OWNER);search('no matching title');
-  check(selectedOwner().dataset.ownerChip==='' && ownerChips().length===1 && ownerChip('').textContent==='All 0',
-   'F007: words remove owners without matching rows and reset the selection');
+  const owner=ownerChip(UNIT_OWNER);
+  owner.focus();
+  await refresh();
+  check(selectedOwner()===owner && document.activeElement===owner && ownerChips().length===2 &&
+   owner.querySelector('b').textContent==='0' && ownerChip('').textContent==='All 0' && count('open')===0,
+   'F007: refresh keeps the selected Owner and its focus when the search has no matches.');
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();'''
@@ -708,8 +720,9 @@ window.fetch=async(url,options={})=>{
   check(selectedOwner()===ownerChip(UNIT_OWNER),'The investigation owner starts selected.');
   investigation.querySelector('.list-toggle').click();await readyReviewCard(investigation);await save(investigation.querySelector('form'),'read');
   await refresh();
-  check(selectedOwner()===ownerChip('') && ownerChip('').textContent==='All 0' && counts()[0]===0,
-   'Review selects All when the owner loses its last Open row.');
+  check(selectedOwner().dataset.ownerChip===UNIT_OWNER && selectedOwner().textContent===UNIT_NAME+' 0' &&
+    ownerChip('').textContent==='All 0' && counts()[0]===0,
+   'Review keeps the selected Owner with zero after its last Open row disappears.');
   check(!document.querySelector('[data-list-item]:not([hidden])'),'the selected type and Show still have no rows');
   await show('all');
   check(ownerChip('').textContent==='All 0' && counts().every(count=>count===0) &&
@@ -719,7 +732,8 @@ window.fetch=async(url,options={})=>{
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();'''
         probe = probe.replace('QUESTION_KEYS',json.dumps([question,'page-owner/C1',*decisions,f'investigation/{ready.owner}/{ready.id}']))
-        probe = probe.replace('UNIT_OWNER', json.dumps(str(ready.owner)))
+        probe = probe.replace('UNIT_OWNER', json.dumps(str(ready.owner))).replace(
+            'UNIT_NAME', json.dumps(review_items.name(ready.owner, staff.snapshot())))
         self.assertEqual(self.browser(markup,probe),[])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
