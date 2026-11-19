@@ -3263,7 +3263,6 @@ done
                     if submitted is None or not isinstance(self.last_usable_configuration, records.MemoryConfig):
                         return True
                     reference = placement.assigned_claim_reference(saved.assignment)
-                    source_root = Path(submitted.constraints.repository)
 
                     def read_dispatch() -> placement.DispatchPathState | wire.ExecutionReport:
                         from scripts.aws_target.hana_execution import HanaSettled, claim_dispatch_pending
@@ -3277,8 +3276,7 @@ done
                                      or isinstance(report.path, placement.DispatchPathPending))):
                             if saved.provider != reference or destination.host != transport.host:
                                 return placement.DispatchPathPending('The Hana claim differs from the assignment')
-                            recovered = recover_assigned_execution(saved.assignment, saved.holder, controller,
-                                current_source_key=lambda: offload.hana_source_key(source_root))
+                            recovered = recover_assigned_execution(saved.assignment, saved.holder, controller)
                             if isinstance(recovered, HanaSettled):
                                 outcome = report.outcome if isinstance(report, placement.TerminalAttemptReport) else recovered.outcome
                                 evidence = (execution_identity.ExecutionNotStarted()

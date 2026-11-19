@@ -634,6 +634,7 @@ class Message:
     stamp: SenderStamp = UnavailableSender()
     claude_attempt: ClaudeDeliveryAttempt | NoClaudeDeliveryAttempt = field(
         default=NoClaudeDeliveryAttempt(), compare=False, repr=False)
+    sent_header: str = field(default_factory=lambda: sent_line(now()), compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.shown_sender:
@@ -751,6 +752,10 @@ class Result(NamedTuple):
 
 class PaneTextDelivered(Result):
     """The observed worker pane accepted the text input."""
+
+
+class WorkerMessageUnconfirmed(Result):
+    """The ordinary message may have reached the worker pane."""
 
 
 class WorkerResultNotSubmitted(Result):
@@ -2576,7 +2581,8 @@ def recover_socket_queues(registry: sessions.RegistryRead, at: datetime) -> tupl
             message = Message(target.address, entry["from"], entry["summary"],
                               f"Stuck message from {entry['time']}:\n" + entry["text"], identity,
                               entry.get("shown_sender", entry["from"]),
-                              stamp=read_sender_stamp(entry.get("sender_native_id", "unavailable")))
+                              stamp=read_sender_stamp(entry.get("sender_native_id", "unavailable")),
+                              sent_header=queued_sent_line(entry["time"]))
             plan = _claude_delivery_plan(message, mailbox, registry, records)
             if not isinstance(plan, RelayAttempt):
                 reason = plan.failure.reason if isinstance(plan, ClaudeRoutingFailed) else "no live receiver"
@@ -2757,7 +2763,8 @@ def pending(to: str | CodexQueueOwner | None, *, emit: bool = False,
         entries = sorted([*unkeyed_or_legacy, *newest.values()], key=lambda entry: entry["time"])
         text = "\n\n".join(stamped_text(
             f"Queued message {index} of {len(entries)}, from {entry['from']} at {entry['time']}:"
-            + shown_sender_line(entry["from"], entry.get("shown_sender", entry["from"])),
+            + shown_sender_line(entry["from"], entry.get("shown_sender", entry["from"]))
+            + queued_sent_line(entry["time"]),
             "\n" + entry["text"].rstrip(), read_sender_stamp(entry.get("sender_native_id", "unavailable")))
             for index, entry in enumerate(entries, 1))
         if emit and text:
@@ -4816,6 +4823,24 @@ def shown_sender_line(sender: str, display: str) -> str:
     return f"\nShown sender: {display}" if display != sender else ""
 
 
+def sent_line(at: datetime) -> str:
+    try:
+        zone = user_zone()
+    except (OSError, ValueError) as error:
+        print(f"send.py: Sent line omitted: {one_line(str(error))}", file=sys.stderr)
+        return ""
+    local = at.astimezone(zone)
+    return f"\nSent: {local:%H:%M} {local.tzname() or zone.key}"
+
+
+def queued_sent_line(stored_time: str) -> str:
+    try:
+        at = datetime.fromisoformat(stored_time)
+        return sent_line(at) if at.utcoffset() is not None else ""
+    except (OverflowError, ValueError):
+        return ""
+
+
 MESSAGE_LINE_BREAK = re.compile(r"\r\n|[\n\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
 
 
@@ -4835,7 +4860,8 @@ def agent_text(message: Message, *, via_relay: bool = False) -> str:
     """Format caller text and add the sending machine's display and native stamp."""
     first, separator, rest = quote_sender_lines(message.text).partition("\n")
     sender = relay_session_name(message.sender) if via_relay else message.sender
-    return stamped_text(first + shown_sender_line(sender, message.shown_sender), separator + rest, message.stamp)
+    return stamped_text(first + shown_sender_line(sender, message.shown_sender) + message.sent_header,
+                        separator + rest, message.stamp)
 
 
 def delivered_text(message: Message, entry_id: str) -> str:
@@ -4844,7 +4870,8 @@ def delivered_text(message: Message, entry_id: str) -> str:
     shown = shown_sender_line(message.sender, message.shown_sender)
     if shown:
         shown = "\n" + MESSAGE_LINE_BREAK.sub(" ", shown.removeprefix("\n"))
-    return stamped_text(f"{name}: {summary}{shown}\nTag: {entry_id[:8]}", "\n\n" + message.text, message.stamp)
+    return stamped_text(f"{name}: {summary}{shown}{message.sent_header}\nTag: {entry_id[:8]}",
+                        "\n\n" + message.text, message.stamp)
 
 
 def send(options: Options) -> Result:
@@ -4856,7 +4883,7 @@ def send(options: Options) -> Result:
     if not isinstance(options.recipient_identity, LogicalRecipientIdentity):
         return _send(options, membership=membership)
     identity = Message(options.recipient_identity.name, options.sender or default_sender(),
-                       options.summary or "", "", options.key)
+                       options.summary or "", "", options.key, sent_header="")
     with delivery_turn(identity) as acquired:
         if not acquired:
             return Result("retry", f"key {options.key!r} has a delivery in progress; retry")
@@ -4905,55 +4932,82 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
         return Result("failed", f"{worker.name}: worker holder is unavailable")
     if not reason:
         state = next((item for item in worker_panes.observe(holder.id, membership) if item.row.id == worker.id), None)
-        wait_for_idle = (isinstance(receipt, WorkerResultReceipt) and receipt.wait_for_idle
-                         and isinstance(state, worker_panes.OpenWorker) and state.status == herdr.AgentStatus.WORKING)
-        if isinstance(state, worker_panes.OpenWorker) and (state.status.idle or wait_for_idle):
-            client = herdr.Herdr(herdr.shared_session())
+        if isinstance(state, worker_panes.OpenWorker):
             attempting_input = False
+            ordinary_states = (herdr.AgentStatus.WORKING, herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE)
 
             def require_idle() -> None:
                 nonlocal attempting_input
-                readiness = client.readiness(state.pane)
+                readiness = prompt_client.readiness(state.pane)
                 if not (readiness["agent_status"].idle and readiness["interactive_ready"]):
                     raise herdr_types.HerdrFailure("worker is not ready for input")
-                if isinstance(receipt, WorkerResultReceipt):
-                    _ = receipt.before_input()
+                assert isinstance(receipt, WorkerResultReceipt)
+                _ = receipt.before_input()
                 attempting_input = True
 
-            try:
-                if wait_for_idle:
-                    _ = client.wait_turn_end(state.pane, int(timeout * 1000))
-                if isinstance(selection, FixedStaffLookup):
-                    current = _current_staff_session(selection, ExpectedStaffSession(worker.current_session))
-                    if isinstance(current, RecipientLookupFailed):
-                        return Result("failed", current.reason)
-                client.prompt(state.pane, text, target=str(worker.current_session),
-                              proof=herdr.SubmitStarts(int(timeout * 1000)), on_submission=require_idle)
-                if isinstance(receipt, OrdinaryWorkerMessage):
-                    return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
-            except (herdr_types.HerdrFailure, OSError) as error:
-                reason = str(error)
-                # Herdr wraps a failure to launch its prompt command in HerdrFailure.
-                launch_error = error.__cause__ if isinstance(error, herdr_types.HerdrFailure) else error
-                if isinstance(receipt, WorkerResultReceipt) and (
-                        not attempting_input or isinstance(error, herdr.HerdrLaunchRefused)
-                        or isinstance(launch_error, OSError) and cast(object, launch_error.filename) == client.binary):
-                    return WorkerResultNotSubmitted("retry", reason)
+            def check_message_status() -> None:
+                status = prompt_client.readiness(state.pane)["agent_status"]
+                if status not in ordinary_states:
+                    raise herdr_types.HerdrFailure(f"worker is {status.value}")
+
+            submission = herdr.TrackedPromptSubmission(check_message_status)
+
             if isinstance(receipt, WorkerResultReceipt):
+                wait_for_idle = receipt.wait_for_idle and state.status == herdr.AgentStatus.WORKING
+                can_prompt = state.status.idle or wait_for_idle
+                on_submission = require_idle
+            else:
+                wait_for_idle = False
+                can_prompt = state.status in ordinary_states
+                on_submission = submission
+
+            if can_prompt:
+                ordinary_address = (isinstance(receipt, OrdinaryWorkerMessage)
+                                    and not isinstance(selection, FixedStaffLookup))
+                prepared_client = None if ordinary_address else herdr.Herdr(herdr.shared_session())
                 try:
-                    if receipt.received(worker, membership):
+                    prompt_client = prepared_client if prepared_client is not None else herdr.Herdr(herdr.shared_session())
+                    if wait_for_idle:
+                        _ = prompt_client.wait_turn_end(state.pane, int(timeout * 1000))
+                    if isinstance(selection, FixedStaffLookup):
+                        current = _current_staff_session(selection, ExpectedStaffSession(worker.current_session))
+                        if isinstance(current, RecipientLookupFailed):
+                            return Result("failed", current.reason)
+                    prompt_client.prompt(state.pane, text, target=str(worker.current_session),
+                                         proof=herdr.SubmitStarts(int(timeout * 1000)), on_submission=on_submission)
+                    if isinstance(receipt, OrdinaryWorkerMessage):
                         return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
-                except (OSError, ValueError) as error:
-                    reason = f"worker transcript is unavailable: {error}"
-                return WorkerResultUnconfirmed("retry", reason or "the worker transcript has no result receipt")
+                except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
+                    reason = str(error)
+                    if isinstance(receipt, OrdinaryWorkerMessage):
+                        if submission.may_have_submitted:
+                            return WorkerMessageUnconfirmed("failed",
+                                f"worker message delivery unconfirmed: {reason}. "
+                                + "The message may already have arrived. Do not resend it.")
+                    elif isinstance(error, (herdr_types.HerdrFailure, OSError)):
+                        launch_error = error.__cause__ if isinstance(error, herdr_types.HerdrFailure) else error
+                        if (not attempting_input or isinstance(error, herdr.HerdrLaunchRefused)
+                                or isinstance(launch_error, OSError)
+                                and prepared_client is not None
+                                and cast(object, launch_error.filename) == prepared_client.binary):
+                            return WorkerResultNotSubmitted("retry", reason)
+                    else:
+                        raise
+                if isinstance(receipt, WorkerResultReceipt):
+                    try:
+                        if receipt.received(worker, membership):
+                            return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
+                    except (OSError, ValueError) as error:
+                        reason = f"worker transcript is unavailable: {error}"
+                    return WorkerResultUnconfirmed("retry", reason or "the worker transcript has no result receipt")
+            else:
+                reason = f"worker is {state.status.value}"
+                if isinstance(receipt, WorkerResultReceipt) and state.status != herdr.AgentStatus.BLOCKED:
+                    return Result("retry", reason)
         elif state is None:
             reason = "worker observation is unavailable"
         elif isinstance(state, (worker_panes.ProcessUnknownWorker, worker_panes.UncertainWorker)):
             reason = state.reason
-        elif isinstance(state, worker_panes.OpenWorker):
-            reason = f"worker is {state.status.value}"
-            if isinstance(receipt, WorkerResultReceipt) and state.status != herdr.AgentStatus.BLOCKED:
-                return Result("retry", reason)
         elif isinstance(state, worker_panes.StoppedWorker):
             reason = "worker is stopped"
         else:
@@ -5062,7 +5116,9 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     key = user_emergency_key(sender, summary) if emergency and options.key is None else options.key
     display = (options.shown_sender.text if isinstance(options.shown_sender, ShownSender)
                else sender_shown_name(sender, stamp, observed) if options.to != USER else sender)
-    message = Message(destination, sender, summary, text, key, display, options.human, stamp)
+    started = now()
+    message = Message(destination, sender, summary, text, key, display, options.human, stamp,
+                      sent_header=sent_line(started))
     claude_route = isinstance(route, (ClaudeRecipient, QueuedStaffRecipient))
     if claude_route and fixed:
         assert isinstance(mailbox, StaffClaudeRecipient)
@@ -5096,7 +5152,6 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
     stable = (StableRecipient(options.recipient_identity.name)
               if isinstance(options.recipient_identity, LogicalRecipientIdentity) else attempt_recipient)
     legacy_aliases = () if typed_recipient else (destination, stable.value)
-    started = now()
     order = new_queue_order() if options.to != USER else LEGACY_QUEUE_ORDER
     # An emergency push repeats on the phone until the user acknowledges it, it is retired, or it
     # expires: with no --repeat-minutes, a send with its key inside that lifetime is skipped.
@@ -5281,7 +5336,8 @@ def _send(options: Options, *, membership: staff.StaffSnapshot) -> Result:
         # An undelivered emergency releases its claim for a later attempt.
         # Other queued or kept messages retain their claims until delivery.
         if (key is not None and not refused and not unproved_claude and held is None
-                and isinstance(claim_result, ClaimGranted) and not isinstance(result, UncertainRelayDelivery)
+                and isinstance(claim_result, ClaimGranted)
+                and not isinstance(result, (UncertainRelayDelivery, WorkerMessageUnconfirmed))
                 and ((emergency and result.outcome != "sent")
                      or result.outcome in {"failed", "refused", "held", "pending"})):
             forget_sent(key, attempt_recipient.value, started)

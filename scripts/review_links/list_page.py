@@ -165,9 +165,9 @@ def field_html(field: str, value: object, today: datetime, names: staff_names.St
     return html.escape(cast(str, value)) or "Not recorded"
 
 
-def log_source_html(source: str, names: staff_names.StaffNames, clock: str = "") -> str:
+def log_source_html(source: str, names: staff_names.StaffNames) -> str:
     label = names.html(source, owner_name(names.members, staff.StaffId(source)))
-    return " <small>— " + label + (", " + html.escape(clock) if clock else "") + "</small>"
+    return " <small>— " + label + "</small>"
 
 
 def time_html(moment: datetime, today: datetime) -> str:
@@ -180,8 +180,7 @@ def log_row(index: str, moment: datetime, body: str, today: datetime) -> str:
 
 def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, names: staff_names.StaffNames) -> str:
     content = change.what
-    clock = change.time.astimezone(today.tzinfo).strftime("%H:%M %Z")
-    by = log_source_html(the_list.source_without_clock(change.source), names, clock)
+    by = log_source_html(the_list.source_without_clock(change.source), names)
     if isinstance(content, the_list.FieldChange):
         heading = content.action + by
         fields = ''.join(f'<dt>{FIELD_LABELS[field]}</dt><dd>{field_html(field, value, today, names)}</dd>'
@@ -236,13 +235,11 @@ def item_log_html(item: the_list.ListItem, today: datetime, names: staff_names.S
         if answer is None or identity in unread_answers:
             continue
         asked = datetime.fromisoformat(question.asked_at).astimezone(UTC)
-        answered = datetime.fromisoformat(answer.answered_at).astimezone(UTC)
         question_body = "Question " + html.escape(identity) + log_source_html("nate", names)
         entry = answer_entries.get(identity)
+        answered = entry.time if entry is not None else datetime.fromisoformat(answer.answered_at).astimezone(UTC)
         source = the_list.source_without_clock(entry.source) if entry is not None else item.producer
-        logged_at = entry.time if entry is not None else answered
-        clock = logged_at.astimezone(today.tzinfo).strftime("%H:%M %Z")
-        answer_body = "Answer" + log_source_html(source, names, clock)
+        answer_body = "Answer" + log_source_html(source, names)
         rows.append((asked, log_row(f"{identity}-asked", asked,
                                    question_body + change_browser.question_paragraphs(question.words), today)))
         rows.append((answered, log_row(f"{identity}-answered", answered,
