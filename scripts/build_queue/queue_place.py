@@ -8,7 +8,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum, auto
@@ -306,6 +306,11 @@ def cleanup_program_starts(configuration: admission_records.MemoryConfig | wire.
             continue
         deadline = time.monotonic() + configuration.program_stop_seconds
         try:
+            if record.sidecar:
+                # Records from older launches may have no folder marker.
+                marker = Path(record.sidecar).with_name(build_folders.RECOVERY_MARKER)
+                with suppress(FileExistsError, FileNotFoundError):
+                    marker.symlink_to(path.absolute())
             if record.scope:
                 stop_scope(Path(record.scope), deadline, configuration.program_sample_seconds)
             else:
@@ -454,6 +459,8 @@ class QueuePlace:
         directory = program_starts()
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         record = directory / (uuid.uuid4().hex + ".json")
+        self.sidecar.with_name(build_folders.RECOVERY_MARKER).symlink_to(record.absolute())
+        atomic_file.sync_folder(self.sidecar.parent)
         wrapper = [sys.executable, str(Path(__file__).resolve())]
         holder = wire.Owner(holder_pid, holder_start)
         read_fd, write_fd = os.pipe()

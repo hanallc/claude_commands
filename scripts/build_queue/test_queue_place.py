@@ -25,6 +25,7 @@ from unittest import mock
 from scripts.build_queue import queue_place as queue, admission_client as client, admission_service as service, admission_protocol as wire
 from scripts.build_queue.admission_test_support import AdmissionFixture, Exchange, FakeClock, ScriptedTransport
 from scripts.build_queue.queue_fixture import write_process
+from scripts.lib import build_folders
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.build_queue import admission_records as records, step_estimator
@@ -859,6 +860,8 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                         self.assertFalse(saved.ready)
                         self.assertEqual(saved.program.pid, place.program.process.pid)
                         self.assertEqual(saved.sidecar, str(place.sidecar))
+                        marker = place.sidecar.with_name(build_folders.RECOVERY_MARKER)
+                        self.assertEqual(marker.readlink(), place.program.record.absolute())
                         raise RuntimeError("sampler start failed")
 
                     with self.assertRaisesRegex(RuntimeError, "sampler start failed"), \
@@ -1333,6 +1336,47 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
                                 send_process_group(program_pid, signal.SIGKILL)
                             except ProcessLookupError:
                                 pass
+
+    def test_allocation_keeps_a_dead_holders_folder_until_the_scope_is_empty(self) -> None:
+        with QueuePlaceFixture() as fixture:
+            with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                                  stdin=subprocess.PIPE) as holder:
+                start = records.process_start_time(holder.pid)
+                assert start is not None
+                owner = wire.Owner(holder.pid, start)
+                _ = holder.communicate(timeout=3)
+                self.assertEqual(holder.returncode, 0)
+
+            scope = fixture.root / "scope"
+            scope.mkdir()
+            members = scope / "cgroup.procs"
+            _ = members.write_text(f"{owner.pid}\n")
+            parent = fixture.root / "tools"
+            spec = build_folders.BuildFolderSpec(kind="tool", parent=parent, purpose="queue-place",
+                                                suffix_length=0, owner_pid=owner.pid)
+            with build_folders.leased_build_folder(spec) as old:
+                sidecar = old / "program.cgroup"
+                _ = sidecar.write_text(f"{scope}\n")
+
+            record = queue.program_starts() / "old.json"
+            record.parent.mkdir(parents=True, exist_ok=True)
+            _ = record.write_text(wire.encode_record(queue.ProgramStart(owner, owner, str(scope), sidecar=str(sidecar))))
+            expired = wire.RunnerExecutionTiming(program_sample_seconds=0.1, program_stop_seconds=0,
+                                                 peak_wave_seconds=1)
+            self.assertEqual(queue.cleanup_program_starts(expired), {sidecar})
+            with build_folders.tool_folder("queue-place", parent) as current:
+                self.assertNotEqual(current, old)
+                self.assertEqual(sidecar.read_text(), f"{scope}\n")
+
+            build_folders.sweep_temporary_build_folders(parent, wait=False)
+            self.assertTrue(sidecar.is_file())
+            self.assertTrue(record.is_file())
+            _ = members.write_text("")
+            self.assertEqual(queue.cleanup_program_starts(expired), set())
+            self.assertFalse(record.exists())
+            with build_folders.tool_folder("queue-place", parent) as current:
+                self.assertEqual(current, old)
+                self.assertFalse(sidecar.exists())
 
     @unittest.skipUnless(hasattr(os, "fork"), "owner death lifecycle needs fork")
     def test_owner_gone_keeps_a_populated_scope_then_finalizes_once_when_empty(self) -> None:

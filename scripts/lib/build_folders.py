@@ -795,13 +795,22 @@ def gate_recovery_folder(name: str) -> bool:
     return _GATE_RECOVERY_FOLDER.fullmatch(name) is not None
 
 
+def _recovery_marker_present(directory: int) -> bool:
+    """A linked marker keeps the folder while its recovery record exists."""
+    try:
+        _ = os.stat(RECOVERY_MARKER, dir_fd=directory)
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def _recovery_record_present(folder: str, directory: int) -> bool:
     try:
         descriptor = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
     except (FileNotFoundError, NotADirectoryError):
         return False
     try:
-        return (_folder_exists(Path(RECOVERY_MARKER), descriptor)
+        return (_recovery_marker_present(descriptor)
                 or (gate_recovery_folder(folder) and _folder_exists(Path("run.json"), descriptor)))
     finally:
         os.close(descriptor)
@@ -814,7 +823,8 @@ def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True) -> bo
             raise error
 
     for top, folders, files, directory in os.fwalk(path, follow_symlinks=False, onerror=unreadable):
-        if RECOVERY_MARKER in files or (gate_recovery_folder(Path(top).name) and "run.json" in files):
+        if ((RECOVERY_MARKER in files and _recovery_marker_present(directory))
+                or (gate_recovery_folder(Path(top).name) and "run.json" in files)):
             return False
         for name in files:
             stem = name.removesuffix(".lock")
