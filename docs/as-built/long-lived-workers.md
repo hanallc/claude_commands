@@ -220,6 +220,7 @@ Unavailable completion evidence keeps the restart entry.
 Pane closure alone keeps the restart entry.
 Completion removes the entry after it saves the final result.
 Restore reports incomplete recovery if pane closure fails.
+Restore reports the worker name and reason when completion recovery keeps its pane.
 The next restore retries closure without sending the completion notice again.
 The hook records closure diagnostic delivery separately from the diagnostic text.
 A later recovery retries an undelivered diagnostic with the same delivery key.
@@ -714,15 +715,24 @@ The stop holds the worker lock, then the admission lock, then the recorder lock.
 The stop checks the shared receipt for DONE before it cancels the pass.
 The recorder saves a verified DONE through normal completion.
 The recorder saves the canceled status, stopped outcome, reason, and notice in one state write.
-Assign can reuse the worker when its pane is idle.
+Assign can reuse the idle worker while the stopped pass waits for another DONE.
+Restore keeps the stopped pane open while a detached result waits for another DONE.
 `worker.py answer` reports `no active pass`.
 The turn hook sends the director one stopped notice with the worker name and phase.
 The recorder retains the notice for delivery after another pass replaces the stopped pass.
 The turn hook uses the shared receipt to save a late DONE reply and keep the stopped outcome.
 The receipt checks detached results that belong to the stopped pass.
 A result received after DONE requires another matching DONE.
+The turn hook records the saved reply path when the stopped pass is still current.
+After the notice is recorded, the hook locks the worker and checks the pass again.
+It refreshes the saved file from the latest verified reply.
+The normal close path requires a current idle state for a stopped pass with a live agent.
+After it releases the worker lock, the hook records a close refusal and sends the reason to the director.
+The hook releases the worker lock before it retries undelivered close refusals, including refusals from replaced passes.
+The notice lock prevents duplicate delivery.
 The recorder retains the original prompt and reply path after a replacement pass starts.
 If the Stop event has no DONE marker, the hook uses each unsaved receipt to check the transcript for its DONE marker.
+The hook records an unreadable archived reply in `turn-end-ignored.jsonl` and continues with the current pass.
 A run without a pane pass uses the ordinary result delivery.
 A newer run of the same command suppresses the older orphan result.
 A repeated stop sends no additional signal or notice.
@@ -829,7 +839,10 @@ A missing pane record does not prove that a worker has ended.
 
 Staff worker addresses use `worker:<parent>/<worker>`.
 Message selection resolves the fixed staff id and current session.
-Pane delivery uses the observed pane and current holder.
+Ordinary messages can go to a verified worker pane with status `working`, `idle`, or `done`.
+For a worker address, the holder receives the message and cause if the pane is unavailable.
+The sender also uses the holder if it confirms that submission failed before input.
+If the pane may have received the message, the sender reports unconfirmed delivery and stops.
 Daemon sessions retain their `codex:<thread>` route.
 
 ## Retirement and resume
@@ -981,7 +994,18 @@ The scan can exclude a different PID before it reads the foreground owner's conv
 A unit report records the staff lifecycle and current owner evidence separately. A unit can have a recorded pause or exit while the current owner is unknown. The watchdog preserves the outage and any recovery result when the owner is unknown. A direct resume checks current owner evidence for a unit in a production. Demotion selects a launch mode only after a fresh owner check.
 
 The unit list takes the status and address from the checked owner. It leaves the pane address blank for a standalone owner.
-The unit report uses activity from the same registry entry as the checked owner.
+The unit report uses activity from the current record that matches the checked PID, process start, and conversation.
+The unit board uses the checked owner for presence.
+The board marks an unknown owner as unknown in the summary, Director column, and detail heading.
+Census session rows contain no PID or process start.
+The board omits command names and shell waits from these rows.
+The board shows unknown director work when shell rows indicate possible work and other records do not establish the work state.
+The board uses checked owner activity when the census is readable.
+It shows idle for explicit registry idle.
+It shows unknown director activity when the census is unreadable or the checked evidence does not show activity.
+Proved absence remains visible when the census is unreadable.
+The live unit ID collection retains unknown units and scan failures.
+The inventory reports unreadable placement as unknown.
 Worker director lookup checks the staff member's current conversation.
 It returns `UnknownUnitDirector` when it cannot establish ownership.
 A standalone Claude director needs a recorded process start and matching native identity.

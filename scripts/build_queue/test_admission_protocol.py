@@ -1,6 +1,7 @@
 """The wire transports admission's domain records without another representation."""
 from __future__ import annotations
 
+from scripts.build_queue import execution_identity
 from scripts.lib import test_phase
 
 from scripts.build_queue import snapshot_codec as codec
@@ -77,8 +78,8 @@ class ProtocolTests(unittest.TestCase):
                     self.assertIsInstance(parsed.run, wire.NoRun)
                     self.assertIsInstance(parsed.prerequisite, placement.TokenNotRequired)
                     self.assertIsInstance(parsed.purpose, placement.NormalStep)
-                    self.assertEqual(parsed.constraints.source_key, placement.SourceKeyKnown(old_source) if old_source
-                        else placement.SourceKeyUnavailable("older request has no source key"))
+                    self.assertEqual(parsed.constraints.source_key, execution_identity.SourceKeyKnown(old_source) if old_source
+                        else execution_identity.SourceKeyUnavailable("older request has no source key"))
             assignment = placement.PlacementAssignment(current.episode, "older-attempt",
                 current.constraints.candidates[0].destination, current.constraints.source_key,
                 current.owner, current.constraints.session, current.since)
@@ -97,13 +98,13 @@ class ProtocolTests(unittest.TestCase):
             assert isinstance(parsed_consume, wire.ConsumePermission)
             self.assertIsInstance(parsed_consume.holder, placement.ClaimHolderUnconfirmed)
             report = cast(dict[str, object], json.loads(wire.encode_request(wire.ExecutionReport(
-                "older-report", assignment, claim, placement.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now())))))
+                "older-report", assignment, claim, execution_identity.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now())))))
             report_data = cast(dict[str, object], report["data"])
             report_data["outcome"] = ""
             del report_data["path"]
             parsed_report = wire.parse_request(json.dumps(report))
             assert isinstance(parsed_report, wire.ExecutionReport)
-            self.assertIsInstance(parsed_report.evidence, placement.ExecutionEvidenceUnavailable)
+            self.assertIsInstance(parsed_report.evidence, execution_identity.ExecutionEvidenceUnavailable)
             self.assertIsInstance(parsed_report.outcome, placement.AttemptOutcomeUnavailable)
             self.assertIsInstance(parsed_report.path, placement.DispatchPathPending)
 
@@ -171,11 +172,11 @@ class ProtocolTests(unittest.TestCase):
                 wire.ClaimFailure("foreign-claim", assignment, "busy",
                     replace(claim, episode="previous-episode", attempt="previous-attempt")),
                 wire.ConsumePermission("consume", assignment, claim),
-                wire.ExecutionReport("report", assignment, claim, placement.ExecutionNotStarted()),
-                wire.ExecutionReport("report-observed", assignment, claim, placement.ObservedExecution(
-                    placement.ProcessExecution("fixture-mac", "generation-a", 42, "remote-start"))),
+                wire.ExecutionReport("report", assignment, claim, execution_identity.ExecutionNotStarted()),
+                wire.ExecutionReport("report-observed", assignment, claim, execution_identity.ObservedExecution(
+                    execution_identity.ProcessExecution("fixture-mac", "generation-a", 42, "remote-start"))),
                 wire.ExecutionReport("report-unavailable", assignment, claim,
-                    placement.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now())),
+                    execution_identity.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now())),
                 wire.ConsumePermission("consume-child", assignment, claim, holder=coordinator_holder(assignment)),
                 wire.PrerequisiteReport("token-held", request.episode, request.owner, placement.TokenHeld()),
                 wire.CancelPlacement("cancel", request.episode, request.owner, "caller ended"),
@@ -185,14 +186,14 @@ class ProtocolTests(unittest.TestCase):
             requests.append(replace(request, local=wire.LocalAdmissionUnavailable("old caller")))
             requests.append(replace(request, purpose=placement.SpeculativeCopy("local-parent", fixture.clock.now())))
             for outcome, evidence, path in (
-                (placement.AttemptRunning(), placement.ObservedExecution(
-                    placement.ProcessExecution("fixture-mac", "generation-a", 42, "remote-start")),
+                (placement.AttemptRunning(), execution_identity.ObservedExecution(
+                    execution_identity.ProcessExecution("fixture-mac", "generation-a", 42, "remote-start")),
                     placement.DispatchPathPending("start child runs")),
-                (placement.AttemptCompleted(17), placement.ExecutionNotStarted(), placement.DispatchPathSettled()),
-                (placement.PrelaunchRefused("disk"), placement.ExecutionNotStarted(), placement.DispatchPathSettled()),
-                (placement.AttemptCancelled("caller ended"), placement.ExecutionNotStarted(), placement.DispatchPathSettled()),
+                (placement.AttemptCompleted(17), execution_identity.ExecutionNotStarted(), placement.DispatchPathSettled()),
+                (placement.PrelaunchRefused("disk"), execution_identity.ExecutionNotStarted(), placement.DispatchPathSettled()),
+                (placement.AttemptCancelled("caller ended"), execution_identity.ExecutionNotStarted(), placement.DispatchPathSettled()),
                 (placement.AttemptOutcomeUnavailable("unreachable"),
-                    placement.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now()),
+                    execution_identity.ExecutionEvidenceUnavailable("unreachable", fixture.clock.now()),
                     placement.DispatchPathPending("start child has no result")),
             ):
                 requests.append(wire.ExecutionReport("typed-outcome", assignment, claim, evidence, outcome, path))

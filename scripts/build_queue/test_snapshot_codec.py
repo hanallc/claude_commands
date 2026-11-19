@@ -10,6 +10,7 @@ from typing import Literal, NotRequired, TypedDict, cast, get_args
 import unittest
 from unittest import mock
 
+from scripts.build_queue import execution_identity
 from scripts.build_targets import target_config
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import snapshot_codec as codec
@@ -63,6 +64,8 @@ def pinned_snapshot_reader(revision: str = "7fdfd9a6a") -> Generator[tuple[Calla
             for dependency in ("snapshot_codec", "placement", "admission_records"):
                 source = source.replace("from scripts.build_queue import " + dependency + " as ",
                                         "import _pinned_" + dependency + " as ")
+                source = source.replace(f"from scripts.build_queue import {dependency}\n",
+                                        f"import _pinned_{dependency} as {dependency}\n")
             for dependency in ("admission_wire", "placement"):
                 source = source.replace("from scripts.build_queue." + dependency + " import (",
                                         "from _pinned_" + dependency + " import (")
@@ -187,7 +190,7 @@ class SnapshotCodecTests(unittest.TestCase):
 
             remote = records.RunningStep("remote-session", "remote build", "test", "/private", 0,
                 records.RemoteMemoryUnavailable("the provider has no memory reading"), pid=records.PidNotRecorded(),
-                execution=placement.ExecutionEvidenceUnavailable("no remote process", 100), assignment_host="fixture-mac")
+                execution=execution_identity.ExecutionEvidenceUnavailable("no remote process", 100), assignment_host="fixture-mac")
             snapshot = replace(service_snapshot(), running=(remote,))
             with self.subTest(message="Phase 44 snapshot"):
                 raw = codec.snapshot_value(snapshot)
@@ -213,7 +216,7 @@ class SnapshotCodecTests(unittest.TestCase):
                     self.assertEqual(type(parse_reply(text)).__name__, type(reply).__name__)
 
             destination = placement.PlacementDestination("mac", "mac", "fixture-mac", WholeMacScope())
-            for source in (placement.SourceKeyKnown("source-a"), placement.SourceKeyUnavailable("no source")):
+            for source in (execution_identity.SourceKeyKnown("source-a"), execution_identity.SourceKeyUnavailable("no source")):
                 assignment = placement.PlacementAssignment("episode", "attempt", destination, source,
                     placement.SubmittingOwner("fixture-local", 42, "start"), NoOwningSession(), 100)
                 claim = placement.ProviderClaimReference("mac", "mac", destination.scope, "claim", "episode", "attempt")
@@ -224,7 +227,7 @@ class SnapshotCodecTests(unittest.TestCase):
                         self.assertEqual(wire.parse_reply(text), reply)
                         parsed_assignment = cast(object, getattr(parse_reply(text), "assignment"))
                         self.assertEqual(cast(str, getattr(parsed_assignment, "source_key")),
-                                         source.key if isinstance(source, placement.SourceKeyKnown) else "")
+                                         source.key if isinstance(source, execution_identity.SourceKeyKnown) else "")
 
     def test_every_snapshot_reply_keeps_remote_rows_out_of_the_pinned_memory_union(self) -> None:
         from scripts.build_queue.queue_fixture import head_reading
@@ -357,7 +360,7 @@ class SnapshotCodecTests(unittest.TestCase):
         destination = placement.PlacementDestination("ssh", "mac", "fixture-mac", RepositoryScope("hana"))
         profile = records.StepProfile("hana", "zsh", "tree", records.ExpectedPeak(GIB, "measured", 5), estimated_at=1000.0)
         for kind in (*placement.MAC_RUN_KINDS, "test", placement.CommandKindNotSent()):
-            constraints = placement.PlacementConstraints(placement.SourceKeyKnown("source-a"), ("/bin/zsh", "-c", "true"),
+            constraints = placement.PlacementConstraints(execution_identity.SourceKeyKnown("source-a"), ("/bin/zsh", "-c", "true"),
                 "/repo/hana", "hana", NoOwningSession(), (placement.PlacementCandidate(destination),), command_kind=kind)
             request = wire.PlacementRequest("episode-a", placement.SubmittingOwner("natedev", 42, "100"), 1000.0,
                                             profile, constraints)

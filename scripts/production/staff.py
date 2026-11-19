@@ -1266,6 +1266,24 @@ def _remote_row(arguments: list[str]) -> StaffRow:
     return StaffRow.from_json(_remote(arguments))
 
 
+def producer_creation_registry(action: str, name: str, marker: str = "", profile: str = "") -> str:
+    """Use the staff owner for shared producer creation marker operations."""
+    if not is_owner():
+        result = _remote(["producer-creation", action, f"--name={name}",
+                          f"--marker={marker}", f"--profile={profile}"])
+        if not isinstance(result, str):
+            raise StaffUnreadable("invalid producer creation response")
+        return result
+    edit = cast(Callable[[str, str, str, str], str],
+                import_module("scripts.agents.producer_creation").owner_registry_action)
+    try:
+        return edit(action, name, marker, profile)
+    except ValueError as error:
+        raise StaffRefused(str(error)) from error
+    except OSError as error:
+        raise StaffUnreadable(str(error)) from error
+
+
 def _all_rows() -> list[StaffRow]:
     return list(_load().rows) if is_owner() else _rows(_remote(["show"]))
 
@@ -2226,6 +2244,8 @@ class _MoveCommand(Protocol):
 
 
 class _Arguments:
+    creation_action: str = ""
+    marker: str = ""
     profile: str = ""
     hold_record: str = ""
     home: str = ""
@@ -2319,6 +2339,12 @@ def _parser() -> argparse.ArgumentParser:
     _ = producer_retirement.add_argument("target")
     _ = producer_retirement.add_argument("--profile", required=True)
     _ = producer_retirement.add_argument("--json", action="store_true")
+    creation = verbs.add_parser("producer-creation", help=argparse.SUPPRESS)
+    _ = creation.add_argument("creation_action", choices=("read", "claim", "finish"))
+    _ = creation.add_argument("--name", required=True)
+    _ = creation.add_argument("--marker", default="")
+    _ = creation.add_argument("--profile", default="")
+    _ = creation.add_argument("--json", action="store_true")
     for command in ("promote-unit", "demote-showrunner"):
         director = verbs.add_parser(command, help=argparse.SUPPRESS)
         _ = director.add_argument("target")
@@ -2455,6 +2481,10 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
 
 
 def _main(arguments: _Arguments) -> int:
+    if arguments.verb == "producer-creation":
+        print(json.dumps(producer_creation_registry(arguments.creation_action, arguments.name,
+                                                    arguments.marker, arguments.profile)))
+        return 0
     if arguments.verb == "move":
         if arguments.destination is not None:
             if arguments.parent is not None:

@@ -38,7 +38,7 @@ from scripts.message import send_budget, send
 from scripts.lib.process_failure import failure_detail
 from scripts.lib import conf
 from scripts.whoami import agent_accounts, quota_state
-from scripts.production.live_units import live_unit_ids as live_unit_ids
+from scripts.production.live_units import LiveUnitIds, live_unit_ids as live_unit_ids
 from scripts.message.sessions import live_sessions
 
 NOTIFIER = Path(os.environ.get("CODEX_WINDDOWN_NOTIFIER") or broadcast.MESSAGE / "notifier.sh")
@@ -200,12 +200,17 @@ def current_counts() -> Counter[str]:
     return counts
 
 
-def listed(session: str, units: list[str], counts: Mapping[str, int]) -> dict[str, int]:
+def listed(session: str, units: list[str], counts: Mapping[str, int], *, complete: bool = True) -> dict[str, int]:
     """A showrunner's lines: every unit director, and itself when it runs agents or has no units."""
     rows = {unit: counts.get(unit, 0) for unit in units}
-    if not rows or counts.get(session, 0):
+    if (complete and not rows) or counts.get(session, 0):
         rows[session] = counts.get(session, 0)
     return rows
+
+
+def unit_observation_lines(runner: str, units: LiveUnitIds) -> tuple[str, ...]:
+    return (*[f"{name} - unknown - {owner.reason}" for name, owner in sorted(units.unknown.items())],
+            *[f"{runner} - unavailable - {reason}" for reason in units.failures])
 
 
 def _read_active_projection(answer: object) -> ActiveProjection | ProjectionNotRequested:
@@ -292,11 +297,11 @@ def projected(unit: str, held: Mapping[str, Projection], now: float) -> str:
 
 
 def render(heading: str, rows: Mapping[str, int], held: Mapping[str, Projection], now: float,
-           names: Mapping[str, str] = NO_DISPLAY_NAMES) -> str:
+           names: Mapping[str, str] = NO_DISPLAY_NAMES, *, unknown: tuple[str, ...] = ()) -> str:
     lines = [f"{names.get(identity, identity)} - {rows[identity]}"
              + (f" - {projected(identity, held, now)}" if rows[identity] else "")
              for identity in sorted(rows, key=lambda identity: names.get(identity, identity).casefold())]
-    return "\n".join([heading, "", "```", *lines, "```"])
+    return "\n".join([heading, "", "```", *lines, *unknown, "```"])
 
 
 def clock(zone: str) -> str:
@@ -475,11 +480,11 @@ def count(session: str) -> int:
     with quiet_notice_state() as state:
         counts = current_counts()
         observation = _observe_quiet_count(counts.total(), state)
-    rows = listed(session, units, counts)
-    held = refresh(session, units, rows, time.time())
+    rows = listed(session, units.proved_ids, counts, complete=not (units.unknown or units.failures))
+    held = refresh(session, units.proved_ids, rows, time.time())
     announce_quiet(observation)
     print(render(f"Codex agents, {clock(runner['zone'])}", rows, held, time.time(),
-                 {row.id: row.name for row in record.rows}))
+                 {row.id: row.name for row in record.rows}, unknown=unit_observation_lines(runner["name"], units)))
     return 0
 
 
@@ -510,16 +515,18 @@ def status() -> int:
     rows: dict[str, int] = {name: number for name, number in counts.items() if number}
     discovered = showrunners.registered_showrunners()
     record = staff.snapshot()
+    unknown: list[str] = []
     for runner in discovered:
         owner = send.staff_named(runner["name"], record)
         units = live_unit_ids(runner)
+        unknown.extend(unit_observation_lines(runner["name"], units))
         if isinstance(owner, staff.StaffRow):
-            rows.update(listed(str(owner.id), units, counts))
+            rows.update(listed(str(owner.id), units.proved_ids, counts, complete=not (units.unknown or units.failures)))
     counting = ", ".join(row.name if (row := record.by_id(staff.StaffId(name.removeprefix(INSTANCE)))) is not None
                          else name.removeprefix(INSTANCE) for name in instances())
     print(f"Wind-down: {'on for ' + counting if counting else 'off'}")
     print(render("Codex agents on this machine", rows, read_projections(), time.time(),
-                 {row.id: row.name for row in record.rows}))
+                 {row.id: row.name for row in record.rows}, unknown=tuple(unknown)))
     _ = showrunners.require_complete(discovered)
     return 0
 

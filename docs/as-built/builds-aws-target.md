@@ -192,21 +192,34 @@ It passes when every region passes.
 `scripts/aws_target/hana_guest.py` renders safety files for the kept Hana box.
 `config/hana_aws.conf` supplies the image's admission setting, safety timing, and resource values.
 
-`scripts/aws_target/hana_render.py` renders both the safety files and the receiver files from this repository's configuration.
-It writes nine files by base name and applies each `GuestFile` mode.
-Without `tool_setup`, `hana_guest.render_files()` omits `hana-tools.service`.
-Phase F2 supplies the tool setup service.
+`scripts/aws_target/hana_render.py` renders the safety and receiver entry points, settings, and systemd units.
+It applies each rendered file's mode.
+The image keeps `safety.py`, `receiver.py`, `safety.json`, `receiver.json`, and their units.
+It installs the Python closure in `scripts/aws_target/hana_image.files` under `/var/lib/hana-runtime`.
+That closure supplies the root receiver, the safety code, and the unprivileged bootstrap.
+NixOS supplies `hana-tools.service`, the runner environment, the compiler version, and the approved slot settings.
 
-The NixOS build uses the renderer from its pinned `claude-commands` input.
-`hana_render` puts the guest transfer limit in `receiver.json` and copies the receiver code into the image.
-Update that NixOS input and build the Hana image to install a guest transfer change.
-The box must boot from that image to use the change.
-`scripts/aws_target/hana_render.files` lists the files for the NixOS `lib.fileset` filter.
-The filter excludes unrelated repository changes from the image inputs.
-The NixOS integration replaces the manually copied guest files.
-The image installs the rendered settings and guest code.
+The NixOS build runs the renderer from its pinned `claude-commands` input.
+The NixOS image requires these integration changes.
+
+1. Update the `claude-commands` pin to include the per-run runtime change.
+2. Include the paths listed in `scripts/aws_target/hana_image.files` and these seven files in the renderer input filter.
+   - `config/build_folders.conf`
+   - `config/build_targets.conf`
+   - `config/hana_aws.conf`
+   - `scripts/aws_target/hana_image.files`
+   - `scripts/aws_target/hana_render.py`
+   - `scripts/lib/conf.py`
+   - `scripts/lib/conf_reads.py`
+3. Install the rendered `runtime/` at `/var/lib/hana-runtime`.
+4. Append the approved roots and capacity to the rendered `runtime/config/build_folders.conf`.
+5. Put the approved `# whole:` limit directly above each capacity setting.
+6. Give the bootstrap write access to `/var/lib/hana/tmp`.
+7. Provide Python 3.13 or newer for the bootstrap.
+8. Remove `CONF_DIR` from `runner-environment`.
+
+Root and the bootstrap read the installed `build_folders.conf`.
 User data supplies the boot descriptor and signed control access.
-A change to guest admission requires a rebuilt image and a box provisioned from that image.
 
 Run this command from the repository root:
 
@@ -214,7 +227,7 @@ Run this command from the repository root:
 python3 -E -m scripts.aws_target.hana_render --device /dev/sdf <out_dir>
 ```
 
-`-E` ignores `PYTHONPATH`, so the listed files alone supply the imports.
+`-E` ignores `PYTHONPATH`.
 
 The boot guard waits for a fresh permit within `guard_grace_seconds` from boot.
 It has no ordering or requirement dependency on the data disk, network, or tool setup.
@@ -508,27 +521,17 @@ The launch template sets `DeleteOnTermination` on the root disk. AWS deletes eac
 
 ### Hana image freshness
 
-`hana_render` hashes the paths, modes, and bytes of the rendered guest files.
-It adds this digest to the rendered `safety.json` that the image installs during activation.
-The digest excludes its own field.
-The renderer copies only the Hana settings used by the guest.
+`hana_render` hashes the paths, modes, and bytes of the rendered image files.
+It adds the digest to the rendered `safety.json`.
+Safety settings, receiver settings, the command timeout, and the slot probe settings affect the digest.
+The renderer selects overrides by the Hana alias in `hana_aws.conf` and writes plain keys.
+The renderer rejects invalid slot probe settings before it computes the digest.
+NixOS supplies the approved slot roots and capacity, compiler version, and runner environment.
+Those NixOS settings take effect with a new image.
 
-- Safety reads `enabled`, `guard_grace_seconds`, `watchdog_check_seconds`, and `permit_max_seconds`.
-- The guest also reads `step_cpu_limit`, `step_memory_gib`, and `mount_timeout_seconds`.
-- The receiver reads `aws_timeout_s` and `control_poll_seconds`.
-- The runner reads `execution_shell` and `free_floor_gib`.
-- Source materialization reads `source_max_bytes`, `source_download_timeout_s`, `source_git_timeout_s`, and `source_allowed_environment`.
-
-The renderer writes the resolved values under plain keys.
-The renderer selects overrides by the Hana target alias in `hana_aws.conf`.
-The renderer and runner use one list of timeout keys from `build_targets.conf`.
-The digest covers the guest files that this repository renders.
-NixOS sets the slot settings, compiler version, and runner environment outside those files.
-Changes to those NixOS settings take effect when a new image uses them.
-
-The guest uses `enabled` as an independent admission switch in addition to the live permit.
-Removing the guest switch would avoid an image rebuild for this setting.
-That change would leave an already issued permit usable until the guest revokes it or it expires.
+An edit to a runtime-only file leaves the image digest unchanged.
+The receiver still uses `enabled` as an independent image admission switch.
+This split requires one image replacement before the box accepts a combined payload.
 
 `hana-image` reads the digest from the renderer output in the built image's Nix derivation closure.
 Registration requires the build derivation and the renderer output to be present in the local store.
@@ -536,6 +539,7 @@ The registered image description and the local registration record carry the sam
 Setup records the digest for the instance after EC2 confirms its image identity.
 Registering another image does not refresh the digest of an existing instance.
 A missing or mismatched digest makes the deployed image stale.
+An invalid image setting also makes the deployed image stale.
 
 The queue excludes a stale Hana box before assignment.
 The controller checks the image before accepting a claim, starting the box, or granting command permission.
@@ -545,7 +549,7 @@ The build and target status report this message.
 
 > The Hana image is stale. Run deploy.py hana-setup --plan to review replacement.
 
-After it saves an effective guest setting, `tune.py` reports this message.
+After it saves an effective image setting, `tune.py` reports this message.
 
 > The Hana image is now stale. Build and register a current Hana image.
 
@@ -1433,13 +1437,12 @@ Both capture paths refuse new Git links with `NestedRepository`.
 The sender refuses unexpected ignored inputs, credential paths, Git links, and disallowed environment variables.
 It sends no ignored files, HOME, or target output.
 
-When capture raises `SourceRefused`, offload reports the cause and ends the build before any command runs.
-This applies to pinned builds and builds that the queue places on Hana.
+When source preparation fails before the command starts, offload reports the cause as a typed admission refusal.
+The queue records `DoNotRetry` and the build runs locally.
 If the runner cannot release the claim, the queue worker releases it after the runner exits and the lifecycle operation ends.
-A source change during capture returns status 75 with `source_changed` and requests a fresh placement.
-A Git command failure reports its cause and returns status 75 with `runner`.
 
-A frozen `SourceManifest` carries the repository key, private commit, bundle digest, signed URL, basis commits, command, features, environment, and toolchain digest.
+A frozen `SourceManifest` carries the payload digest, signed URL, and runtime ABI.
+It also carries the repository key, private commit, basis commits, command, features, environment, and toolchain digest.
 Its JSON fits the receiver's 65536-byte control limit.
 Each repository retains a bounded list of guest-acknowledged commits.
 Each snapshot commit has no parent, so bundles exclude the caller's Git history and deleted credential blobs.
@@ -1450,13 +1453,13 @@ A typed `MissingBasis` answer clears that repository's basis before a complete b
 `AwsSourceObjects` implements the typed object boundary through the existing provider.
 It uses conditional `PutObject` and signed `GetObject` access under `source/<deployment>/`.
 The scaler policy grants only `s3:PutObject` and `s3:GetObject` for that deployment's source prefix.
-The sender bounds the 1 GiB source bundle upload with `source_upload_timeout_s` (300 seconds).
+The sender bounds the 1 GiB payload upload with `source_upload_timeout_s` (300 seconds).
 Credential export uses `aws_timeout_s` (10 seconds).
 The guest receives no AWS credentials.
 
-`hana_source.materialize` bounds the download, verifies sha256 and Git prerequisites, checks the advertised commit, and fetches verified objects.
-Curl enforces the total download timeout and maximum file size.
-The guest bounds the source bundle download with `source_download_timeout_s` (120 seconds).
+The bootstrap downloads the payload with curl and verifies its SHA-256.
+The image sets the maximum file size and `source_download_timeout_s` (120 seconds).
+`hana_source.materialize` verifies Git prerequisites, checks the advertised commit, and fetches verified objects.
 The data disk retains one bare mirror for each repository under `/var/lib/hana/mirrors`.
 The shared maker allocates mirror metadata and temporary bundle files.
 `build_slots.take_slot` supplies the only working checkout and retains its lease through the caller's context.
@@ -1465,9 +1468,9 @@ The slot's `rust-toolchain.toml` digest must equal the manifest before execution
 
 The guest must use host name `aws-hana`.
 Admission requires `roots.slots.aws-hana`, `slots.aws-hana.hana.max`, and `slots.aws-hana.hana.max_bytes`.
-Those values remain unset until the user approves them.
-The guest image needs Git, curl, Python, `hana_source`, and the shared maker, slot, rescue, and configuration modules.
-Phase F2 will deliver manifests and execute commands with inherited slot locks.
+The image supplies these approved values and includes Git, curl, and Python.
+The per-run runtime supplies the source, maker, slot, rescue, and configuration modules.
+The runner retains inherited slot locks through command execution.
 
 ## Hana result transport
 
@@ -1496,8 +1499,29 @@ It polls after every fence PUT attempt, including when S3 returns an error statu
 The sender retains the claim if the window ends before it confirms the fence, command termination, and lease release.
 The offload reports a loss if the transfer cannot fit, times out, or the guest cannot confirm its PUT.
 The offload requires an accepted result before it reports a build verdict.
-The sender also works with older guests.
-Older guests upload results with the 10-second control timeout.
+
+## Hana runtime per run
+
+The sender packages its runner files and the full or delta Git bundle in one uncompressed archive.
+`scripts/aws_target/hana_render.files` lists the Python files for the run.
+The archive also holds the runner entry point, resolved config, and the runtime ABI marker.
+The existing conditional PUT sends the archive once.
+The signed GET and SHA-256 cover the entire archive.
+Complete-source repair reuses the captured runtime with a full Git bundle.
+
+The receiver checks the declared ABI before it starts the unit.
+A mismatch reports both versions through `HanaCommandAdmissionRefused`.
+Compatibility with versions that predate the ABI depends on the image freshness guard before command publication.
+Automatic placement can continue locally after settlement.
+A pinned target reports the refusal.
+
+The image bootstrap verifies the payload and its ABI inside the unprivileged command unit.
+It gives the runner the verified local Git bundle.
+The runner reads the per-run shell, disk floor, Git timeout, environment rules, and maker settings.
+The bootstrap applies the image's approved roots, slot capacity, and probe timing.
+The runner uses the image's command timeout.
+The result uses the same stdout contract.
+Systemd removes the per-run runtime filesystem when the unit ends.
 
 ## Hana placement adapter
 
@@ -1527,6 +1551,16 @@ Permit renewals retain that generation.
 F1 receives `HanaClaimPending`, `HanaClaimAdopted`, `HanaClaimRefused`, `HanaClaimRetained`, or `HanaClaimResourcesHeld` from `claim_assigned()`.
 `HanaClaimResourcesHeld` means a resource command holds Hana and prevents a new claim.
 Only an adopted claim can request the queue's first launch authorization.
+At authorization, the queue reads the exact Hana claim and lifecycle row from local files.
+These reads take no provider locks and make no AWS calls.
+The queue checks the claim, holder, session, host, boot generation, and active permit.
+The queue also checks the estimated memory peak against the Hana memory limit.
+Before publication, the sender reports a source, holder, authorization, permit, or journal refusal with its cause.
+If the queue refuses authorization, the sender uses the queue's reason.
+The queue reports whether adoption evidence is stale or unavailable and includes the reason.
+If release fails, the sender reports pending settlement and the queue keeps the assignment.
+The runner returns the confirmed guest refusal with its original reason and records that cleanup remains unconfirmed.
+The runner also returns an accepted command result with its output and exit status while claim release remains pending.
 `release_assigned()` requires F1's durable command settlement before lifecycle and target claim release.
 An exact guest observation can settle an accepted execution that ended without a compiler result.
 The observation must confirm termination and lease release, and the sender must have issued no source update.
@@ -1534,13 +1568,25 @@ The sender uses the guest cause when it is available.
 If the guest requests a source basis or reports a pending result, the sender uses its own cause.
 For other confirmed departures, the sender attempts to release the claim without another fence observation.
 The sender requires a fence acknowledgement after a result transfer loss or when it resumes an unsettled fence.
-The sender uses the refusal code from a new image to report `HanaCommandAdmissionRefused`.
-For the old image, the sender recognizes only the exact reason `The data mount and a fresh permit are required`.
+The sender uses the refusal code to report `HanaCommandAdmissionRefused`.
+An unsupported runtime ABI uses this same refusal and records `DoNotRetry`.
 The refusal proves the command did not start.
 The sender reports the refusal before claim cleanup.
 The controller checks whether the holder exited in every lifecycle state, including after a Spot interruption.
 An unresolved start still requires provider recovery.
 The next Hana evidence read can remove the detached target claim.
+The admission service checks saved current assignments on each queue pass, including after a restart.
+For a dead local holder, the Hana evidence worker can replay exact terminal proof from the dispatch journal.
+The journal, guest observation, and retained claim must identify the same boot.
+The worker uses the normal settlement path to release the claim and record settlement.
+Recovery preserves a saved pending report's outcome and sends that report as settled after claim release.
+The sender checks the current source when it accepts a result.
+If fencing or claim release remains pending, the sender reports the accepted completion with `DispatchPathPending`.
+Recovery uses the result decision from the journal.
+The queue consumes the settled execution report on its loop thread and closes the assignment.
+If the service restarts after claim release, it can read the settled journal and finish the report.
+If the journal confirms command settlement and the claim is gone, recovery completes any unfinished journal write and sends the report.
+Missing proof or proof for a different dispatch keeps the assignment current.
 The queue excludes Hana for the refused build and continues in the configured candidate order.
 For a different build, the queue needs provider evidence at or after the refusal report before it can assign the same scope.
 For a pinned build, `verify.sh` prints one line with the refusal cause and exits with status 2.

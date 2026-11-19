@@ -196,7 +196,9 @@ The unit lookup requires a recorded process start and a matching native conversa
 For a pane, the lookup also requires proof of the foreground PID.
 A failed native check or a missing recorded start leaves ownership unknown.
 Inherited marks can identify candidates for the report.
-The lookup publishes a messaging socket only after a successful connection.
+The lookup takes the socket path from the current record for the proved PID and process start.
+It rejects a different path in the snapshot.
+It checks the connected peer PID and verifies the process start before and after the connection.
 A proved Claude owner can have no messaging address.
 The lookup combines pane and standalone proofs for each conversation before it selects an owner.
 Repeated proofs for the same PID and process start count as one owner.
@@ -204,3 +206,6 @@ A single proved owner takes precedence over incomplete evidence.
 Proofs for different processes or process starts leave the owner unknown.
 
 Process placement can prove a Herdr pane, prove that a process is outside Herdr, or report an unknown placement. The bulk scan retains read failures. A cache miss requires a PID lookup before Codex can use its process arguments.
+
+An action clears the pane evidence in the enclosing report before report reads resume.
+Two Darwin processes that hold one Herdr listener cause a placement scan failure.

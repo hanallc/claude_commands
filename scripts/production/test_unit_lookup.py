@@ -974,6 +974,8 @@ print(observed.row.id)
                                         workers.LiveUnitDirector(row.current_session, proved_pid))
 
     def test_distinct_standalone_owners_conflict_in_every_order(self) -> None:
+        from scripts.message import send
+
         row = unit_membership("show", "trunk")
         self.hosts({})
         pids = os.getpid(), fake_unit_host.live_pid(self)
@@ -987,6 +989,13 @@ print(observed.row.id)
             with self.subTest(pids=[entry.record["pid"] for entry in candidates]):
                 self.assert_owner_views(row, candidates, unit_lookup.UnknownUnit(reason),
                                         workers.UnknownUnitDirector(reason))
+                with mock.patch.object(sessions, "read_registry", return_value=sessions.RegistryRead(candidates, ())):
+                    for address in (f"session:{row.current_session}", f"uds:{first.record['messagingSocketPath']}"):
+                        message = send.Message(address, "fixture", "Preview", "body", None)
+                        registry = sessions.read_registry()
+                        mailbox = send.ConversationRecipient(send.machine(), row.current_session)
+                        plan = send.relay_plan(message, registry, sessions.running_records(registry), staff.snapshot(), mailbox)
+                        self.assertEqual(plan, send.ClaudeRoutingFailed(unit_lookup.SocketUnavailable(reason)))
         live = LiveClaude("first", row.current_session, first.record["messagingSocketPath"], pids[0])
         self.assert_owner_views(row, (first, first), unit_lookup.ProvedLiveUnit(live),
                                 workers.LiveUnitDirector(row.current_session, pids[0]))
@@ -1010,13 +1019,77 @@ print(observed.row.id)
                 self.assert_owner_views(row, sessions.read_registry().entries, unit_lookup.UnknownUnit(reason),
                                         workers.UnknownUnitDirector(reason))
 
-    def test_claude_address_requires_a_listener(self) -> None:
+    def test_claude_address_requires_a_listener_owned_by_the_proved_pid(self) -> None:
         path = str(Path(self.enterContext(short_socket_directory())) / "listener.sock")
+        pid = os.getpid()
+        started = sessions.process_start(pid)
+        assert started is not None
+        other = fake_unit_host.live_pid(self)
+        other_start = sessions.process_start(other)
+        assert other_start is not None
         with socket.socket(socket.AF_UNIX) as listener:
             listener.bind(path)
             listener.listen()
-            self.assertEqual(unit_lookup._check_claude_address(path), unit_lookup.CheckedSocket(path))  # pyright: ignore[reportPrivateUsage]
-        self.assertIsInstance(unit_lookup._check_claude_address(path), unit_lookup.SocketUnavailable)  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(unit_lookup._check_claude_address(path, pid, started),  # pyright: ignore[reportPrivateUsage]
+                             unit_lookup.CheckedSocket(path))
+            self.assertIsInstance(unit_lookup._check_claude_address(path, other, other_start),  # pyright: ignore[reportPrivateUsage]
+                                  unit_lookup.SocketUnavailable)
+        self.assertIsInstance(unit_lookup._check_claude_address(path, pid, started),  # pyright: ignore[reportPrivateUsage]
+                              unit_lookup.SocketUnavailable)
+
+    def test_stale_registry_socket_keeps_the_owner_and_uses_current_activity(self) -> None:
+        from scripts.production import census, live_units, staff_sources, unit_phases
+
+        row = unit_membership("show", "trunk")
+        run = self.root / "owner-check"
+        run.mkdir()
+        _ = (run / workers.STATE).write_text(json.dumps({"owner_staff_id": row.id}))
+        pid = os.getpid()
+        self.hosts({})
+        self.process(pid, 1, ["claude"])
+        self.claude("trunk", "", session_id=row.current_session)
+        before = sessions.read_session(self.records / f"{pid}.json")
+        assert isinstance(before, dict)
+        stale = str(Path(self.enterContext(short_socket_directory())) / "previous.sock")
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(stale)
+            listener.listen()
+            old = before.copy()
+            old["messagingSocketPath"] = stale
+            old["status"] = "idle"
+            current = before.copy()
+            current["status"] = "busy"
+            _ = (self.records / f"{pid}.json").write_text(json.dumps(current))
+            with mock.patch.object(sessions, "read_registry", return_value=sessions.RegistryRead(
+                    (sessions.RegistryObservation(old, {}),), ())):
+                listing = live_units.read_units("show", check=staff_sources.CodexProcessThreads().check)
+                owner = listing.checked_unit(row.name)
+                self.assertEqual(owner, unit_lookup.checked_unit("show", row.name))
+                rendered = unit_phases.table(listing.units, {}, repository=self.root, census_read=census.Census(
+                    (), (census.CensusSession(row.current_session, "paused"),), ()))
+                self.assertIn("| trunk | busy |", rendered)
+                self.assertEqual(workers.live_unit_director(run), workers.LiveUnitDirector(row.current_session, pid))
+        self.assertEqual(owner, unit_lookup.ProvedLiveUnit(LiveClaude("trunk", row.current_session, "", pid, "busy")))
+        self.assertEqual(listing.units[0].status, "busy")
+
+    def test_socket_allocation_failure_keeps_the_proved_claude_owner(self) -> None:
+        row = unit_membership("show", "trunk")
+        pid = os.getpid()
+        self.hosts({})
+        self.process(pid, 1, ["claude"])
+        self.claude("trunk", "", session_id=row.current_session)
+        with mock.patch.object(socket, "socket", side_effect=OSError("too many open files")):
+            owner = unit_lookup.checked_conversation(row.current_session)
+        self.assertEqual(owner, unit_lookup.ProvedLiveUnit(LiveClaude("trunk", row.current_session, "", pid)))
+
+    def test_current_registry_socket_owned_by_another_pid_remains_unavailable(self) -> None:
+        row = unit_membership("show", "trunk")
+        pid = fake_unit_host.live_pid(self)
+        self.hosts({})
+        self.process(pid, 1, ["claude"])
+        self.claude("trunk", "", session_id=row.current_session, pid=pid)
+        owner = unit_lookup.checked_conversation(row.current_session)
+        self.assertEqual(owner, unit_lookup.ProvedLiveUnit(LiveClaude("trunk", row.current_session, "", pid)))
 
     def record(self, name: str, worktree: Path, started: float, *later: str) -> Path:
         """Write the record of a /unit:direct run in `worktree`, as the recorder would."""

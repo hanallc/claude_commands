@@ -90,18 +90,18 @@ if needs_repair and not (Path(os.environ["PACKAGE_ROOT"]) / "local-repair").exis
     result.write_text("mac=failed\nseconds=0\n")
     if "--assignment-file" in arguments:
         fixture_outcome = placement.AttemptCompleted(101)
-        fixture_evidence = placement.ExecutionEvidenceUnavailable("the private command has ended", time.time())
+        fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private command has ended", time.time())
         fixture_cleanup_confirmed = True
     raise SystemExit(101)
 if "--assignment-file" in arguments:
     fixture_outcome = placement.AttemptCompleted(0)
-    fixture_evidence = placement.ExecutionEvidenceUnavailable("the private command has ended", time.time())
+    fixture_evidence = execution_identity.ExecutionEvidenceUnavailable("the private command has ended", time.time())
     fixture_cleanup_confirmed = True
 if "--assignment-file" in arguments and os.environ.get("TEST_STEP_REFUSAL"):
     reason = os.environ["TEST_STEP_REFUSAL"]
     fixture_outcome = (placement.AttemptDeclined(reason) if reason == "lost"
                        else placement.PrelaunchRefused(reason))
-    fixture_evidence = placement.ExecutionNotStarted()
+    fixture_evidence = execution_identity.ExecutionNotStarted()
 Path(words[words.index("--result") + 1]).write_text("mac=passed\nseconds=0\n")
 '''
 

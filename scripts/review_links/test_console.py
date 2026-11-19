@@ -23,7 +23,7 @@ from scripts.lib import conf
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import investigation, staff
 from scripts.production.change_routing import UnavailableProduction
-from scripts.review_links import change_browser, change_page, console, for_you, investigations_page, review_link
+from scripts.review_links import change_browser, change_page, console, for_you, investigations_page, page_frame, review_link
 
 
 class ConsoleMarkup(HTMLParser):
@@ -161,6 +161,7 @@ class ConsoleTests(unittest.TestCase):
         self.assertIsInstance(pages[4].destination, console.UnavailablePage)
         markup = ConsoleMarkup()
         source = console.render(pages, console.UnavailablePage()).decode()
+        self.assertEqual(source.count(page_frame.BUTTON_STATES), 1)
         markup.feed(source)
         self.assertEqual(markup.pages, ["review", "list", "images", "disks", "builds", "aws", "accounts"])
         self.assertIn('data-page="rebuilds"\ndata-url="" data-title', source)

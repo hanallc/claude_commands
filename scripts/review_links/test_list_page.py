@@ -32,14 +32,14 @@ from xml.etree import ElementTree
 
 from scripts.accounts import accounts
 from scripts.agents.remote import local_machine
-from scripts.lib import conf, process_start
+from scripts.lib import atomic_file, conf, process_start
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message import send_result
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
-from scripts.production import change_review, change_routing, delivery_state, investigation, session_staff, showrunners, staff, the_list
+from scripts.production import change_review, change_routing, delivery_state, investigation, record_store, session_staff, showrunners, staff, the_list
 from scripts.production.update_registration import QuestionStaff
-from scripts.review_links import console, list_page, serve, staff_names
+from scripts.review_links import console, list_page, page_frame, serve, staff_names
 from scripts.review_links import change_browser, change_page, page_question, question_record
 from scripts.review_links import review_items, review_page
 from scripts.review_links.test_change_page import BrowserForms
@@ -535,7 +535,7 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         ready = review_items.ReviewItem("change/sdlc/C1830", "sdlc/C1830", review_items.ReviewType.CHANGE,
             OWNER.id, OWNER.id, "Check the linked change", review_items.ReviewState.OPEN,
             review_items.ReviewTimes(NOW, NOW), (), (), source)
-        reviews = [ready, replace(ready, key="change/hana/P10", id="hana/P10", state=review_items.ReviewState.DONE),
+        reviews = [ready, replace(ready, key="change/hana/P10", id="hana/P10", state=review_items.ReviewState.WAITING),
                    replace(ready, key="change/sdlc/C1831", id="sdlc/C1831", state=review_items.ReviewState.WAITING),
                    replace(ready, key="change/sdlc/C1832", id="sdlc/C1832",
                            times=review_items.ReviewTimes(NOW, NOW, datetime.now(UTC) + timedelta(days=1)))]
@@ -543,7 +543,7 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         linked_keys = tuple(review.key for review in reviews)
         _ = the_list.link(MORTY.id, item.id, linked_keys, source="morty")
         missing = replace(ready, key="change/sdlc/C1833", id="sdlc/C1833")
-        missing_item = self.add("Review removed after rendering", number=112)
+        missing_item = self.add("Review closed after rendering", number=112)
         _ = the_list.link(MORTY.id, missing_item.id, (missing.key,), source="morty")
         for number in range(1, 16):
             _ = self.add(f"List fixture {number}", number=number)
@@ -556,12 +556,15 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
             owners = cast(dict[staff.StaffId, str] | None, kwargs.get("owner_options"))
             if owners is not None:
                 owners.update({OWNER.id: OWNER.name, OTHER.id: OTHER.name})
-            return reviews
+            show = kwargs.get("show", "all")
+            assert isinstance(show, str)
+            states = review_items.selected_states(show)
+            return [review for review in reviews if review.state in states]
 
         with patch.object(review_items, "read", side_effect=read_reviews), patch.object(list_page, "counts_strip", return_value=""):
             reviews.append(missing)
             listing = list_page.render(self.root / "reviews")
-            _ = reviews.pop()
+            reviews[-1] = replace(missing, state=review_items.ReviewState.DONE)
             review = review_page.build_snapshot(self.root / "reviews")
             reviews[0] = replace(ready, times=review_items.ReviewTimes(NOW, NOW, datetime.now(UTC) + timedelta(days=1)))
             parked_review = review_page.build_snapshot(self.root / "reviews")
@@ -751,9 +754,10 @@ async function inspect(frame){
     if(stage===0) history.back();else location.href=listUrl;
    }else if(stage===keys.length){
     check(visible.length===keys.length && visible.every(row=>keys.includes(row.dataset.key)),'the summary shows only linked cards');
-    const done=visible.find(row=>row.dataset.state==='Done');
-    if(done?.querySelector('.list-toggle').getAttribute('aria-expanded')!=='true') done?.querySelector('.list-toggle').click();
-    check(done?.querySelector('.list-toggle').getAttribute('aria-expanded')==='true','the Done card can open in the linked view');
+    const waiting=visible.find(row=>row.dataset.state==='Waiting');
+    if(waiting?.querySelector('.list-toggle').getAttribute('aria-expanded')!=='true') waiting?.querySelector('.list-toggle').click();
+    check(waiting?.querySelector('.list-toggle').getAttribute('aria-expanded')==='true',
+      'the Waiting card can open in the linked view');
     if(proof){await finish();return;}
     const group=doc.querySelector('[data-clear-linked-reviews]');
     check(group && !group.hidden,'the linked group has one visible filter chip');
@@ -928,7 +932,7 @@ if(proof){const keepOpen=new Image();keepOpen.hidden=true;keepOpen.src='/complet
         _ = the_list.update(MORTY.id, other_producer.id, {"producer": DWIGHT.id}, source="morty")
         _ = the_list.update(MORTY.id, source.id, {"related_to": (29,),
             "blocked_by": (the_list.ItemDependency(30, "The blocker is complete."),)}, source="morty")
-        records = list_page.records()
+        records = list_page.records(include_closed=True)
         for index, entry in enumerate(records):
             if entry.item.id == source.id:
                 records[index] = list_page.ListRecord(entry.keeper, replace(entry.item, related_to=(2, 29, 31, 99), unread_since=NOW))
@@ -1018,11 +1022,12 @@ frame.addEventListener('load',async()=>{
   const missing=doc.querySelector('[data-missing-item]');
   check(doc===frame.contentDocument,'the click stays inside the same console frame');
   check(consolePlace()===win.location.href,'the console recorded '+consolePlace()+' instead of '+win.location.href);
-  if(number==='99'){
-   check(!missing.hidden && missing.textContent==='Item #99 is not on the List' && inView(missing),'the missing message is in view');
+  if(number==='99' || number==='29'){
+   const message=number==='29' ? 'Item #29 is closed' : 'Item #99 is not on the List';
+   check(!target && !missing.hidden && missing.textContent===message && inView(missing),'the item notice is in view');
   }else{
    const title=target.querySelector('.list-row');
-   const fallback=['closed','repeat','producer','open','pending-words','unread-words','proof'].includes(scenario);
+   const fallback=['producer','open','pending-words','unread-words'].includes(scenario);
    check(selected('show')===(fallback ? 'all' : 'working'),'the view after the click is '+selected('show'));
    check(!target.hidden && expanded(target),'the target is visible and open');
    check(inView(title),'the target row is outside the viewport at '+title.getBoundingClientRect().top);
@@ -1034,7 +1039,7 @@ frame.addEventListener('load',async()=>{
    }
   }
   const expected=originalFilters.slice();
-  if(['closed','producer','open','pending-words'].includes(scenario)) expected[0]='all';
+  if(['producer','open','pending-words'].includes(scenario)) expected[0]='all';
   if(scenario==='producer') expected[1]='all';
   if(['open','unread-words'].includes(scenario) || pendingWords) expected[2]='';
   check(filters().every((value,index)=>value===expected[index]),'the jump keeps each matching filter: '+JSON.stringify(filters()));
@@ -1376,7 +1381,7 @@ document.body.append(result);
  log(1).scrollTop=239;
  const before=firstVisible(log(1));
  const show=value=>document.querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]').click();
- show('closed');
+ show('blocked');
  check(row(1).hidden,'The filter hides the expanded row.');
  await refresh();
  await refresh();
@@ -1474,6 +1479,7 @@ document.body.append(result);
         _ = self.enterContext(patch.object(the_list, "now", return_value=NOW))
         _ = self.enterContext(patch.object(time, "time", return_value=NOW.timestamp()))
         _ = self.enterContext(patch.object(rebuild_row, "read", return_value=rebuild_row.RebuildAnswer((), False)))
+        _ = change_page.console_folder(self.root / "reviews")
 
     def add(self, title: str, state: the_list.ItemState = the_list.ItemState.WORKING, *,
             owner: the_list.ItemOwner = OWNER.id, number: int | the_list.NextNumber = the_list.NextNumber.AVAILABLE,
@@ -1503,7 +1509,8 @@ document.body.append(result);
             "blocked_by": (the_list.ItemDependency(105, "The status page reaches main"),)}, source="morty")
         markup = list_page.render(self.root / "reviews").decode()
         body = without_role_colors(markup)
-        self.assertEqual(body.count('<tbody data-list-item'), 6)
+        self.assertEqual(body.count(page_frame.BUTTON_STATES), 1)
+        self.assertEqual(body.count('<tbody data-list-item'), 5)
         for label in list_page.HEADERS:
             self.assertIn(label + '<span data-sort-mark', body)
         controls = body.split('data-record-filters>', 1)[1].split('<p data-missing-item', 1)[0]
@@ -1514,33 +1521,32 @@ document.body.append(result);
         shows = controls.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
         self.assertEqual(re.findall(r'data-filter-value="([^"]+)"[^>]*>([^<]+)<b>', shows),
                          [("all", "All"), ("needs-me", "Needs me"), ("morty-answering", "Morty answering"),
-                          ("working", "Working"), ("blocked", "Blocked"), ("parked", "Parked"), ("closed", "Closed")])
+                          ("working", "Working"), ("blocked", "Blocked"), ("parked", "Parked")])
         self.assertIn('role="switch" id="list-unread" value="1">Unread only</label>', controls)
         owners = controls.split('data-filter-row="owner"', 1)[1].split('</div>', 1)[0]
         producers = controls.split('data-filter-row="producer"', 1)[1].split('</div>', 1)[0]
         chip = r'data-filter-value="([^"]+)"[^>]*>([^<]+)<b>(\d+)</b>'
         self.assertEqual(re.findall(chip, owners),
-                         [('all', 'All', '6'), (f'staff:{OTHER.id}', 'builds', '1'), (f'staff:{OWNER.id}', 'sdlc', '5')])
+                         [('all', 'All', '5'), (f'staff:{OTHER.id}', 'builds', '1'), (f'staff:{OWNER.id}', 'sdlc', '4')])
         self.assertEqual(re.findall(chip, producers),
-                         [('all', 'All', '6'), (f'staff:{DWIGHT.id}', 'dwight', '1'), (f'staff:{MORTY.id}', 'morty', '5')])
+                         [('all', 'All', '5'), (f'staff:{DWIGHT.id}', 'dwight', '1'), (f'staff:{MORTY.id}', 'morty', '4')])
         self.assertEqual(body.count('<td data-label="Producer">dwight</td>'), 1)
-        self.assertEqual(body.count('<td data-label="Producer">morty</td>'), 5)
+        self.assertEqual(body.count('<td data-label="Producer">morty</td>'), 4)
         self.assertIn(f'data-producer="{DWIGHT.id}"', body)
-        for text in ('Latest status', 'Done when', 'Log · newest first', 'Links', 'Closing words',
+        for text in ('Latest status', 'Done when', 'Log · newest first', 'Links',
                      'Check overdue', '14:00 EST', '15:00 EST'):
             self.assertIn(text, body)
         self.assertNotIn('<h3>Evidence</h3>', body)
         self.assertEqual(the_list.load(MORTY.id, items[0].id).evidence, items[0].evidence)
-        self.assertEqual(body.count('<form method="post" data-feedback-form>'), 6)
+        self.assertEqual(body.count('<form method="post" data-feedback-form>'), 5)
         self.assertEqual(body.count('value="read">Mark read</button>'), 5)
         self.assertEqual([entry.item.number for entry in list_page.records()],
-                         [item.number for item in sorted(the_list.records(MORTY.id, include_closed=True), key=the_list.order)])
-        closed = body.split(f'data-key="{MORTY.id}/L54"', 1)[1].split('</tbody>', 1)[0]
-        self.assertNotIn('Check overdue', closed)
-        self.assertNotIn('value="read">Mark read</button>', closed)
+                         [item.number for item in sorted(the_list.records(MORTY.id), key=the_list.order)])
+        self.assertNotIn(f'data-key="{MORTY.id}/L54"', body)
+        self.assertNotIn('<h3>Closing words</h3>', body)
+        _ = the_list.reopen(MORTY.id, "L54", source="nate")
         with patch.dict(list_page.FIELD_LABELS, {"closing_words": "Recorded closing words"}):
             renamed = list_page.render(self.root / "reviews").decode()
-        self.assertIn("<h3>Recorded closing words</h3>", renamed)
         self.assertIn("<dt>Recorded closing words</dt>", renamed)
         _ = the_list.update(MORTY.id, "L106", {"title": "New title <script>", "latest_status": "New status"}, source="morty")
         changed = list_page.render(self.root / "reviews").decode()
@@ -1584,7 +1590,7 @@ document.body.append(result);
         paths = [the_list.folder(MORTY.id) / f"{item.id}.md" for item in items]
         before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
         root = self.root / "reviews"
-        with patch.object(review_items, "read", return_value=reviews) as read, patch.object(list_page, "counts_strip", return_value=""):
+        with patch.object(list_page, "read_linked_reviews", return_value=reviews) as read, patch.object(list_page, "counts_strip", return_value=""):
             body = list_page.render(root).decode()
         read.assert_called_once_with(root, members=staff.snapshot())
         for item, (identities, expected) in zip(items, cases):
@@ -1629,6 +1635,165 @@ document.body.append(result);
         self.assertIn("Reviews done — decide: close, keep or park", first)
         self.assertNotIn("2 changes for you", first)
         self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
+
+    def test_live_change_and_delivered_state_return_parked_items_to_needs_me(self) -> None:
+        root = self.root / "reviews"
+        doc = self.root / "sdlc.md"
+        listing = self.root / f"{change_review.PREFIX}sdlc.md"
+        _ = doc.write_text(f'# Production\n- **Change review:** `{listing}`\n')
+        _ = listing.write_text(change_review.BODY)
+        members = staff.StaffSnapshot((MORTY, replace(OWNER, doc=staff.LiveDoc(local_machine(), doc))))
+        parking = the_list.ParkUntilDelivered.DELIVERED
+        first, second = self.add("Publish this change"), self.add("Record this delivery")
+        first_key, second_key = "sdlc/C1", "sdlc/C2"
+        _ = the_list.link(MORTY.id, first.id, (first_key,), source="morty")
+        _ = the_list.link(MORTY.id, second.id, (second_key,), source="morty")
+        first = the_list.park(MORTY.id, first.id, parking, source="nate")
+        second = the_list.park(MORTY.id, second.id, parking, source="nate")
+        with (patch.object(staff, "snapshot", return_value=members),
+              patch.object(change_review, "lists_directory", return_value=self.root)):
+            before = list_page.render(root, include_counts=False).decode()
+            self.assertEqual(before.count('data-parked="delivered"'), 2)
+            self.assertEqual(before.count('>Parked until delivered<'), 4)
+            self.assertEqual(list_page.waiting_updates(console.NewsRequest(root)), frozenset())
+            self.assertEqual(the_list.load(MORTY.id, first.id), first)
+            self.assertEqual(the_list.load(MORTY.id, second.id), second)
+            second = the_list.update(MORTY.id, second.id, {"state": the_list.ItemState.DELIVERED}, source="morty")
+            self.assertIs(second.parked_until, the_list.NoTimestamp.UNSET)
+            self.assertEqual(second.log[-1].what, the_list.UnparkedForDelivery(the_list.ItemDelivered.RECORDED))
+            self.assertEqual(the_list.load(MORTY.id, first.id), first)
+            rows = "| C1 | Publish this change | | Read C1 |\n| C2 | Record this delivery | | Read C2 |\n"
+            _ = listing.write_text(change_review.BODY.replace("\n## Reviewed", rows + "\n## Reviewed"))
+            manifest = root / change_page.CONSOLE_FOLDER / change_browser.MANIFEST
+            manifest.unlink()
+            with (patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending"),
+                  patch.object(record_store, "write_text_atomic", wraps=atomic_file.write_text_atomic) as save,
+                  serve.ReviewLinksServer(("127.0.0.1", 0), root, initialize_review=True) as server):
+                server.review_cache.synchronize()
+                self.assertTrue(manifest.is_file())
+                self.assertEqual(the_list.load(MORTY.id, first.id).log[-1].what,
+                                 the_list.UnparkedForDelivery(the_list.LinkedChangeDelivered(first_key)))
+                server.review_cache.invalidate()
+                server.review_cache.synchronize()
+                save.assert_called_once()
+            after = list_page.render(root, include_counts=False).decode()
+            first = the_list.load(MORTY.id, first.id)
+            self.assertEqual(first.state, the_list.ItemState.DELIVERED)
+            self.assertIs(first.parked_until, the_list.NoTimestamp.UNSET)
+            self.assertEqual(first.log[-1].what, the_list.UnparkedForDelivery(the_list.LinkedChangeDelivered(first_key)))
+            chip = 'data-filter-value="needs-me"'
+            self.assertRegex(after, chip + r'[^>]*data-filter-count="2"')
+            for item, key in ((first, first_key), (second, second_key)):
+                self.assertEqual(item.unread_since, NOW)
+                self.assertEqual(item.reviews, (key,))
+                row = after.split(f'data-key="{MORTY.id}/{item.id}"', 1)[1].split('</tbody>', 1)[0]
+                self.assertIn('data-state="Delivered" data-unread="true" data-parked="false"', row)
+                place = review_page.PAGE_PATH + '?show=all#' + urlencode({"show": "open", "jump": key})
+                link = html.escape('/console/' + console.place_query('review', place), quote=True)
+                self.assertIn(f'href="{link}"', row)
+            self.assertEqual(len(list_page.waiting_updates(console.NewsRequest(root))), 2)
+            self.assertEqual(the_list.load(MORTY.id, first.id), first)
+            self.assertEqual(the_list.load(MORTY.id, second.id), second)
+
+    def test_stale_ready_change_keeps_a_newer_park_and_a_change_that_is_no_longer_ready(self) -> None:
+        root = self.root / "reviews"
+        doc = self.root / "sdlc.md"
+        listing = self.root / f"{change_review.PREFIX}sdlc.md"
+        _ = doc.write_text(f'# Production\n- **Change review:** `{listing}`\n')
+        rows = "| C1 | Publish this change | | Read C1 |\n"
+        _ = listing.write_text(change_review.BODY.replace("\n## Reviewed", rows + "\n## Reviewed"))
+        members = staff.StaffSnapshot((MORTY, replace(OWNER, doc=staff.LiveDoc(local_machine(), doc))))
+        item = self.add("Keep the new park")
+        key = "sdlc/C1"
+        parking = the_list.ParkUntilDelivered.DELIVERED
+        _ = the_list.link(MORTY.id, item.id, (key,), source="morty")
+        first = the_list.park(MORTY.id, item.id, parking, source="nate")
+        with (patch.object(staff, "snapshot", return_value=members),
+              patch.object(change_review, "lists_directory", return_value=self.root)):
+            snapshot = review_page.build_snapshot(root)
+            self.assertTrue(snapshot.records[key].for_you(NOW))
+            _ = the_list.unpark(MORTY.id, first.id, source="nate")
+            second = the_list.park(MORTY.id, first.id, parking, source="nate")
+            with patch.object(list_page, "records", return_value=[list_page.ListRecord(MORTY.id, first)]):
+                serve.release_delivery_parks(root, snapshot)
+            self.assertEqual(the_list.load(MORTY.id, first.id), second)
+            _ = listing.write_text(change_review.BODY)
+            serve.release_delivery_parks(root, snapshot)
+            self.assertEqual(the_list.load(MORTY.id, first.id), second)
+
+    def test_list_readers_leave_a_ready_park_and_a_fresh_root_unchanged(self) -> None:
+        root = self.root / "fresh"
+        item = self.add("Keep the park until the owner releases it")
+        source = review_items.ChangeSource(self.root / "changes.md", {"#": "C1"},
+            change_routing.ChangeAssignment(change_routing.ShowrunnerOwnChange(OWNER.id, OWNER.name), self.root / "sdlc.md"),
+            delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery()))
+        ready = review_items.ReviewItem("sdlc/C1", "C1", review_items.ReviewType.CHANGE,
+            OWNER.id, OWNER.id, "Read the change", review_items.ReviewState.OPEN,
+            review_items.ReviewTimes(NOW, NOW), (), (), source)
+        _ = the_list.link(MORTY.id, item.id, (ready.key,), source="morty")
+        parked = the_list.park(MORTY.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
+        with (patch.object(review_items, "read", return_value=[ready]) as read,
+              patch.object(the_list, "_save", side_effect=OSError("The store is read-only.")) as save):
+            before = list_page.render(root, include_counts=False).decode()
+            self.assertIn("Parked until delivered", before)
+            self.assertFalse(root.exists())
+            self.assertEqual(list_page.waiting_updates(console.NewsRequest(root)), frozenset())
+            read.assert_called_once()
+            save.assert_not_called()
+        self.assertEqual(the_list.load(MORTY.id, item.id), parked)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_waiting_item_shows_the_park_actions_and_unread_delivery_uses_needs_me(self) -> None:
+        root = self.root / "reviews"
+        status = change_page.DeliveryStatus(root)
+        item = self.add("Wait for an answer during delivery", number=1)
+        source = review_items.ChangeSource(self.root / "changes.md", {"#": "C1"},
+            change_routing.ChangeAssignment(change_routing.ShowrunnerOwnChange(OWNER.id, OWNER.name), self.root / "sdlc.md"),
+            delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery()))
+        review = review_items.ReviewItem("sdlc/C1", "C1", review_items.ReviewType.CHANGE,
+            OWNER.id, OWNER.id, "Read the change", review_items.ReviewState.OPEN,
+            review_items.ReviewTimes(NOW, NOW), (), (), source)
+        _ = the_list.link(MORTY.id, item.id, (review.key,), source="morty")
+        with patch.object(change_page, "send_question", return_value=question_outcome()):
+            delivery = list_page.submit(root, urlencode(self.fields(item, "question", words="What changed?")), status)
+            list_page.deliver(delivery)
+        parking = the_list.ParkUntilDelivered.DELIVERED
+        _ = the_list.park(MORTY.id, item.id, parking, source="morty")
+        with patch.object(review_items, "read", return_value=[review]):
+            before = list_page.render(root, include_counts=False, status=status).decode()
+            pending = list_page.saved_action_state(MORTY.id, item.id, status=status).get("waiting_details_html", "")
+            self.assertIn("Parked until delivered", pending)
+            self.assertIn('value="unpark"', pending)
+            self.assertNotIn(' hidden>Unpark', pending)
+            self.assertIn('data-list-review-link="">C1</a>', pending)
+            _ = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.DELIVERED}, source="morty")
+            after = list_page.render(root, include_counts=False, status=status).decode()
+            self.assertRegex(after, r'data-filter-value="needs-me"[^>]*data-filter-count="1"')
+        setup = "<script>window.fetch=()=>Promise.reject(new Error('Fixture does not send requests'));</script>"
+        self.browser_actions(before, setup, r"""<script>
+const failures=[];
+const row=document.querySelector('[data-number="1"]');
+document.getElementById('filter-show-parked').click();
+row.querySelector('.list-toggle').click();
+const unpark=row.querySelector('[value="unpark"]');
+if(row.hidden || !unpark?.getClientRects().length) failures.push('The waiting row shows Unpark in Parked');
+if(!row.querySelector('[data-list-review-link]')) failures.push('The waiting row shows its change link');
+const result=document.createElement('p');result.id='probe-results';
+result.textContent=JSON.stringify(failures);document.body.append(result);
+</script>""", reduced_motion=True)
+        self.browser_actions(after, setup, r"""<script>
+const failures=[];
+const row=document.querySelector('[data-number="1"]');
+document.getElementById('filter-show-needs-me').click();
+if(row.hidden || !row.querySelector('.list-dot')) failures.push('Needs me shows the unread delivery');
+row.querySelector('.list-toggle').click();
+if(!row.querySelector('[value="read"]') || !row.querySelector('[data-list-review-link]'))
+ failures.push('The waiting row shows Mark read and its change link');
+document.getElementById('filter-show-morty-answering').click();
+if(!row.hidden) failures.push('Morty answering excludes the unread delivery');
+const result=document.createElement('p');result.id='probe-results';
+result.textContent=JSON.stringify(failures);document.body.append(result);
+</script>""", reduced_motion=True)
 
     def test_unlinked_rows_do_not_read_the_review_stores(self) -> None:
         _ = self.add("Work without reviews")
@@ -1700,18 +1865,17 @@ document.body.append(result);
         names = (("latest_status", "Status"), ("done_when", "Completion"), ("next_step", "Next"))
 
         def text(heading: str) -> str:
-            return f"## {heading}\n\n**{heading} field:** Ready.\n- One\n- Two"
+            return f"## {heading}\n\n**{heading} field:** Ready.\n- One\n- Two\n\n1. First\n2. Second"
 
         _ = the_list.update(MORTY.id, item.id, {"latest_status": text("Status"), "done_when": text("Completion"),
             "evidence": text("Evidence"), "next_step": text("Next")}, source="morty")
-        _ = the_list.close(MORTY.id, item.id, "## Closing\n\n**Closing field:** Closed.\n1. First\n2. Second", source="nate")
         body = list_page.render(self.root / "reviews").decode()
         next_step = body.split('<td data-label="Next step">', 1)[1].split('</td>', 1)[0]
         details = body.split('<div class="list-panel"><div>', 1)[1].split('<section class="list-log-panel"><h3>Log · newest first', 1)[0]
         self.assertNotIn('<h3>Evidence</h3>', details)
         self.assertNotIn('<h2>Evidence</h2>', details)
         self.assertEqual(the_list.load(MORTY.id, item.id).evidence, text("Evidence"))
-        for _, heading in (*names, ("closing_words", "Closing")):
+        for _, heading in names:
             rendered = next_step if heading == "Next" else details
             self.assertIn(f'<h2>{heading}</h2>', rendered)
             self.assertIn(f'<strong>{heading} field:</strong>', rendered)
@@ -1772,11 +1936,7 @@ check(chip('all').querySelector('b').textContent==='1','All counts only the unre
 check(visible().map(row=>row.dataset.number).join() === '1','the Unread view shows only the open item');
 check(document.querySelector('[data-list-count]').textContent.endsWith(' · 1 unread'),'the page total counts one unread item');
 unread.click();
-chip('closed').click();
-const closed=visible()[0];
-check(closed?.dataset.number==='2','the closed record remains in Closed');
-check(closed?.querySelector('[aria-label="No unread update"]'),'the closed record has no unread dot');
-check(!closed?.querySelector('[value="read"]'),'the closed record has no Mark read button');
+check(!chip('closed') && !document.querySelector('[data-number="2"]'),'Closed has no chip or row.');
 const result=document.createElement('p');result.id='probe-results';result.textContent=JSON.stringify(failures);
 document.body.append(result);
 </script>'''
@@ -1818,23 +1978,24 @@ document.body.append(result);
                                                     "--text", "The gate passed."]), 0)
         markup = list_page.render(root, status=status, include_counts=False).decode()
         controls = markup.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
-        self.assertEqual(re.findall(r'data-filter-count="(\d+)"', controls), ["20", "2", "3", "2", "3", "6", "4"])
+        self.assertEqual(re.findall(r'data-filter-count="(\d+)"', controls), ["10", "2", "2", "2", "3", "8"])
         probe = '''<script>
 const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
 const chips=[...document.querySelectorAll('[data-filter-row="show"] button')];
 const unread=document.getElementById('list-unread');
 const total=document.querySelector('[data-list-count]');
 const entries=[
- ['all',Array.from({length:20},(_,index)=>index+1),[1,3,4,6,9,11,13,15,18,19,20]],
- ['needs-me',[4,5],[4]],['morty-answering',[17,18,19],[18,19]],['working',[1,2],[1]],['blocked',[3,7,20],[3,20]],
- ['parked',[9,10,11,12,13,15],[9,11,13,15]],['closed',[6,8,14,16],[6]],
+ ['all',[1,2,3,4,5,6,7,17,19,20],[1,3,4,6,19,20]],
+ ['needs-me',[4,5],[4]],['morty-answering',[17,19],[19]],['working',[1,2],[1]],['blocked',[3,7,20],[3,20]],
+ ['parked',[9,10,11,12,13,14,15,18],[9,11,13,15,18]],
 ];
 const count=button=>Number(button.dataset.filterCount);
 const visible=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')]
  .map(row=>Number(row.dataset.number)).sort((a,b)=>a-b);
 for(const onlyUnread of [false,true]){
  if(unread.checked!==onlyUnread) unread.click();
- check(count(chips[0])===chips.slice(1).reduce((sum,button)=>sum+count(button),0),'The six counts sum to All.');
+ check(count(chips[0])===1+chips.slice(1).filter(button=>button.dataset.filterValue!=='parked')
+  .reduce((sum,button)=>sum+count(button),0),'The counts outside Parked and the unparked Done item sum to All.');
  check(total.textContent.includes(' · '+count(chips[1])+' need you · '),'The total equals the Needs me count.');
  entries.forEach(([name,all,unreadItems],index)=>{
   const expected=onlyUnread ? unreadItems : all;
@@ -1849,13 +2010,18 @@ const expand=number=>row(number).querySelector('.list-toggle').click();
 const detail=number=>row(number).querySelector('[data-detail]:not([hidden])');
 unread.click();
 chips[2].click();
-expand(17);expand(18);expand(19);
+expand(17);expand(19);
 check(!row(17).hidden && detail(17)?.querySelector('[data-waiting-note]'),
  'The unparked item shows the waiting note in Morty answering.');
-check(!row(18).hidden && row(18).dataset.parked==='true' && detail(18)?.querySelector('[data-waiting-note]'),
- 'The parked item shows the waiting note in Morty answering.');
 check(!row(19).hidden && detail(19)?.querySelector('[value="resend-Q1"]'),
  'The failed question stays in Morty answering with Resend.');
+chips[5].click();expand(18);
+const waitingPanel=detail(18);
+check(!row(18).hidden && waitingPanel?.querySelector('[data-waiting-note]') &&
+ waitingPanel.querySelector('[data-parked-detail]').getClientRects().length &&
+ waitingPanel.querySelector('[value="unpark"]').getClientRects().length &&
+ !row(18).querySelector('[data-parked-note]').getClientRects().length,
+ 'The parked item shows one parking note, the waiting note, and Unpark in its panel.');
 chips[4].click();
 document.getElementById('list-expand-all').click();
 const answer=detail(20)?.querySelector('.list-panel [data-question="Q1"]');
@@ -2024,6 +2190,21 @@ document.body.append(result);
             send.assert_called_once()
             self.assertEqual(the_list.load(MORTY.id, item.id), saved)
 
+    def test_park_until_delivered_reuses_the_receipt_after_delivery(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Keep this work parked until delivery")
+        fields = self.fields(item, "park", until="delivered")
+        _ = list_page.submit(root, urlencode(fields))
+        parked = the_list.load(MORTY.id, item.id)
+        self.assertIs(parked.parked_until, the_list.ParkUntilDelivered.DELIVERED)
+        self.assertEqual(list_page.saved_action_state(MORTY.id, item.id)["parked_until"], "delivered")
+        self.assertEqual(the_list.feedback_requests(parked)[fields["request"]].parked_until, parked.parked_until)
+        with self.assertRaisesRegex(the_list.ListError, "different parking"):
+            _ = list_page.submit(root, urlencode({**fields, "until": "2026-12-03"}))
+        delivered = the_list.update(MORTY.id, item.id, {"state": the_list.ItemState.DELIVERED}, source="morty")
+        _ = list_page.submit(root, urlencode(fields))
+        self.assertEqual(the_list.load(MORTY.id, item.id), delivered)
+
     def test_refused_remove_and_notice_write_failure_keep_the_item(self) -> None:
         item = self.add("Keep this item when Remove fails")
         root = self.root / "reviews"
@@ -2183,8 +2364,8 @@ window.fetch=async(_path,options={})=>{
  const submit=(number,action)=>{const form=row(number).querySelector('form');form.requestSubmit(form.querySelector('[value="'+action+'"]'));return form;};
  try{
   for(const [query,expected] of [['105','105'],['L105','105'],['#105','105'],['BUILDS','105'],
-    ['Straße','106'],['WORKING','105,106'],['Waiting','58'],['Parked','41'],['Closed','54']]){
-   await choose('all',query);check(visible()===expected,'words filter: '+query);
+    ['Straße','106'],['WORKING','105,106'],['Waiting','58'],['Parked','41'],['Closed','']]){
+   await choose(query==='Parked' ? 'parked' : 'all',query);check(visible()===expected,'words filter: '+query);
   }
   await choose('working','106');row('106').querySelector('.list-toggle').click();
   const removed=submit('106','remove');
@@ -2195,7 +2376,7 @@ window.fetch=async(_path,options={})=>{
   submit('106','remove');check(requests.length===1,'a second Remove press sends nothing');
   finishPost({item_state:'Closed',parked:'false'});await flush();await flush();
   check(row('106').hidden,'Remove stays outside Working after success');
-  await choose('closed','106');check(visible()==='106','Remove updates the Closed view');
+  await choose('all','106');check(visible()==='','Remove keeps the item out of All');
   check(row('106').querySelector('.list-state').textContent==='Closed','Remove updates the state text');
   await choose('working','105');row('105').querySelector('.list-toggle').click();
   const refused=submit('105','remove');check(row('105').hidden,'a refused Remove hides the row while pending');
@@ -2258,6 +2439,57 @@ window.fetch=async(_path,options={})=>{
  await flush();
  check(row.querySelector('[data-parked-note]').textContent==='Parked until 2026-12-03 19:30 EST',
   'The row shows the saved time');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_parks_until_delivered_with_one_post(self) -> None:
+        self.browser_action_sequence(r"""
+ const toggle=form.querySelector('[data-later-toggle]');
+ const menu=form.querySelector('[data-later-menu]');
+ const preset=menu.querySelector('[data-later-preset]');
+ toggle.click();
+ check(menu.firstElementChild===preset && preset.textContent==='Until delivered','The preset comes first');
+ check(!menu.querySelector('[data-later-custom]').hidden,'The date controls stay open below the preset');
+ preset.click();
+ check(menu.hidden && requests.length===1,'One click closes the menu and posts once');
+ check(requests[0]?.get('action')==='park' && requests[0].get('until')==='delivered','The POST uses the delivery value');
+ finishPost({item_state:'Working',parked:'true',parked_until:'delivered'});
+ await flush();
+ check(row.hidden,'All hides the item until delivery');
+ check(document.querySelector('#filter-show-all b').textContent==='0' &&
+  document.querySelector('#filter-show-parked b').textContent==='1','The counts include the item only in Parked');
+ check(document.querySelector('[data-hidden-action-status]').textContent==='Item #1 parked until delivered.',
+  'The page confirms the parking action beside Show');
+ show('working');
+ check(row.hidden,'Working hides the item until delivery');
+ show('parked');
+ check(!row.hidden && !form.querySelector('[value="unpark"]').hidden,'Parked shows the item and Unpark');
+ check(form.querySelector('[data-parked-detail]').textContent==='Parked until delivered','The panel shows the condition');
+ check(row.querySelector('[data-parked-note]').textContent==='Parked until delivered','The state cell has the condition');
+ submit('unpark');
+ finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'});
+ await flush();
+ check(row.hidden,'Unpark removes the item from Parked');
+ show('working');
+ check(!row.hidden,'Unpark returns the item to Working');
+""", reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_park_preset_skips_menu_navigation(self) -> None:
+        self.browser_action_sequence(r"""
+ const errors=[];
+ addEventListener('error',event=>errors.push(event.message));
+ const toggle=form.querySelector('[data-later-toggle]');
+ toggle.click();
+ const preset=form.querySelector('[data-later-preset]');
+ preset.focus();
+ for(const key of ['ArrowUp','ArrowDown','Home','End']){
+  const event=new KeyboardEvent('keydown',{key,bubbles:true,cancelable:true});
+  preset.dispatchEvent(event);
+  check(!event.defaultPrevented && document.activeElement===preset,'The dialog skips menu navigation for '+key);
+ }
+ check(errors.length===0,'The keys cause no JavaScript errors');
+ check(requests.length===0,'Navigation sends no POST');
 """)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -2329,6 +2561,8 @@ window.fetch=async(_path,options={})=>{
  save.click();
  const first=requests[0];
  losePost();await flush();
+ for(const animation of document.getAnimations()) animation.finish();
+ await flush();
  now=Date.parse('2026-12-15T13:00:00Z');
  toggle.click();
  const entry=grid.querySelector('button:not(:disabled)[tabindex="0"]');
@@ -2428,6 +2662,7 @@ window.fetch=async(_path,options={})=>{
  const rectangle=element=>element.getBoundingClientRect();
  const near=(a,b)=>Math.abs(a-b)<1;
  for(const item of [row,other]){
+  show(item===row ? 'parked' : 'all');
   const pick=selector=>item.querySelector(selector);
   const box=rectangle(pick('textarea'));
   const remove=rectangle(pick('[value=remove]')),park=rectangle(pick('[data-later-toggle]'));
@@ -2462,9 +2697,11 @@ window.fetch=async(_path,options={})=>{
  form.elements.until.value='2026-12-03';
  submit('park');
  finishPost({item_state:'Working',parked:'true',parked_until:'2026-12-03'});await flush();
+ show('parked');
  document.querySelector('[data-sort="3"]').click();
  unpark.focus();
  submit('unpark');
+ show('all');
  finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'});await flush();
  check(!row.hidden && !row.querySelector('[data-detail]').hidden,'Unpark in All keeps the row open');
  check(document.querySelector('[data-list-item]')===row,'Unpark preserves the item order by title');
@@ -2606,7 +2843,7 @@ window.fetch=async(_path,options={})=>{
                 self.browser_action_sequence(viewport_steps, reduced_motion=True, add_item=False, window_size=window_size)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
-    def test_browser_hides_unpark_for_closed_items_and_updates_the_state_sort_key(self) -> None:
+    def test_browser_remove_hides_unpark_and_updates_the_state_sort_key(self) -> None:
         active = self.add("Active parked item", number=1)
         closed = self.add("Closed parked item", number=2)
         for item in (active, closed):
@@ -2614,10 +2851,8 @@ window.fetch=async(_path,options={})=>{
         _ = the_list.close(MORTY.id, closed.id, "Removed from the List.", source="nate")
         self.browser_action_sequence('''
  show('all');
- const closed=document.querySelector('[data-number="2"]');
- closed.querySelector('.list-toggle').click();
- check(closed.dataset.parked==='true' && closed.querySelector('[value=unpark]').hidden,
-       'A rendered Closed row can have a parking time and hides Unpark.');
+ check(!document.querySelector('[data-number="2"]'),'A Closed record with a parking time has no row.');
+ show('parked');
  const unpark=form.querySelector('[value=unpark]');
  submit('remove');
  check(unpark.hidden,'Remove hides Unpark immediately.');
@@ -2710,11 +2945,15 @@ observer.observe(original.parentNode,{childList:true});
         self.browser_action_sequence('''
  show('all');
  submit('remove');
- check(!row.hidden,'the row stays visible in All during Remove');
- row.querySelector('.list-row').click();
- check(row.querySelector('[data-detail]').hidden,'the user can close the details while waiting');
+ check(row.hidden,'the row leaves All during Remove');
+ check(document.querySelector('[data-record-motion]'),'Remove starts its exit animation');
+ await finishRowMotion();
  losePost();await flush();
- check(row.dataset.unread==='false' && !row.querySelector('.list-dot'),'a lost Remove keeps the row read');
+ await finishRowMotion();
+ check(!row.hidden && row.dataset.unread==='true' && row.querySelector('.list-dot'),
+  'a lost Remove restores the row and unread mark');
+ row.querySelector('.list-row').click();
+ check(row.querySelector('[data-detail]').hidden,'the user can close the details after a lost response');
  const hiddenStatus=document.querySelector('[data-hidden-action-status]');
  check(!hiddenStatus.hidden && hiddenStatus.textContent==='Item 1: Save not confirmed: Fixture lost response',
   'the table shows the lost response while the details are closed');
@@ -2733,7 +2972,9 @@ observer.observe(original.parentNode,{childList:true});
         self.browser_action_sequence('''
  show('all');
  submit('remove');
+ await finishRowMotion();
  losePost();await flush();
+ await finishRowMotion();
  const above=document.querySelector('[data-hidden-action-status]');
  const inline=form.querySelector('[data-send-status]');
  const message='Save not confirmed: Fixture lost response';
@@ -2758,8 +2999,8 @@ observer.observe(original.parentNode,{childList:true});
  second.querySelector('.list-toggle').click();
  for(const item of [row,second]){
   submit('remove',item.querySelector('form'));
-  item.querySelector('.list-row').click();
   losePost();await flush();
+  item.querySelector('.list-row').click();
  }
  const status=document.querySelector('[data-hidden-action-status]');
  const message=number=>'Item '+number+': Save not confirmed: Fixture lost response';
@@ -3425,7 +3666,7 @@ observer.observe(original.parentNode,{childList:true});
  check(needsMe.dataset.filterCount==='0' && staffChip('owner',row.dataset.owner).dataset.filterCount==='1',
   'Needs me excludes the saved row and Owner includes it.');
  check(staffChip('producer',row.dataset.producer).dataset.filterCount==='2','Producer counts the saved row.');
- for(const view of ['needs-me','blocked','parked','closed','working']){
+ for(const view of ['needs-me','blocked','parked','working']){
   show(view);check(row.hidden,view+' hides the saved row');
  }
  location.hash=new URLSearchParams({show:'working',item:row.dataset.key}).toString();
@@ -3444,6 +3685,22 @@ observer.observe(original.parentNode,{childList:true});
     def test_browser_unpark_replay_keeps_a_waiting_item_hidden(self) -> None:
         item = self.add("Check the parked item", number=1)
         _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=7), source="morty")
+        with self.subTest(outcome="newer parking remains active"):
+            self.browser_action_sequence('''
+ show('parked');
+ const chip=document.querySelector('[data-filter-row="show"] [data-filter-value="parked"]');
+ submit('unpark');
+ finishPost({parked:'true',parked_until:'2026-11-26',waiting_for_answer:'true',
+  open_question:'true',unpark_outcome:'cleared_newer_parking_active'});
+ await flush();
+ check(!row.hidden && chip.dataset.filterCount==='1','The newer parking keeps the waiting item in Parked.');
+ check(row.querySelector('[data-waiting-note]') && row.dataset.waitingForAnswer==='true',
+  'The parked row shows that the producer will answer.');
+ check(row.querySelector('[data-parked-note]').textContent==='Parked until 2026-11-26',
+  'The parked row shows the newer time.');
+ show('all');
+ check(row.hidden,'The newer parking keeps the waiting item out of All.');
+''', reduced_motion=True, add_item=False)
         self.browser_action_sequence('''
  show('parked');
  const chip=document.querySelector('[data-filter-row="show"] [data-filter-value="parked"]');
@@ -3452,11 +3709,11 @@ observer.observe(original.parentNode,{childList:true});
  check(!row.hidden && chip.dataset.filterCount==='1','Parked includes the item before the question.');
  unpark.focus();
  submit('unpark');
- finishPost({parked:'true',waiting_for_answer:'true',open_question:'true',unpark_outcome:'cleared_newer_parking_active'});
+ finishPost({parked:'false',parked_until:'',waiting_for_answer:'true',open_question:'true',unpark_outcome:'cleared'});
  await flush();
  check(row.hidden && chip.dataset.filterCount==='0','The waiting item leaves Parked and its count.');
  check(document.activeElement===chip,'The Parked filter receives focus.');
- check(!status.hidden && status.textContent.includes('A newer parking time is active'),
+ check(!status.hidden && status.textContent==='Item #1 unparked.',
   'Show keeps the Unpark confirmation for the waiting item.');
  location.hash=new URLSearchParams({show:'parked',item:row.dataset.key}).toString();
  await flush();
@@ -3476,14 +3733,14 @@ observer.observe(original.parentNode,{childList:true});
  const remove=submit('remove');
  check(row.hidden,'Remove immediately hides the row in Working');
  losePost();await flush();
- show('closed');
- check(!row.hidden,'the unconfirmed row appears in Closed');
+ check(!row.hidden && row.dataset.state==='Working','the lost response restores the Working row');
  check(submit('remove').id===remove.id,'the exact Remove retry uses the same ID');
+ show('blocked');
  finishPost({reason:'Fixture refuses Remove'});await flush();
  const hiddenStatus=document.querySelector('[data-hidden-action-status]');
  check(row.hidden && hiddenStatus.getClientRects().length>0 &&
   hiddenStatus.textContent==='Item 1: Not saved: Fixture refuses Remove',
-  'the refusal is visible when the Closed filter hides the restored row');
+  'the refusal is visible when the Blocked filter hides the restored row');
  show('working');
  check(!row.hidden && row.dataset.state==='Working','the refusal restores the confirmed row to Working');
  const notice=form.querySelector('[data-send-status]');
@@ -3491,6 +3748,84 @@ observer.observe(original.parentNode,{childList:true});
   'the refusal is visible on the restored row');
  check(hiddenStatus.hidden,'the page hides the extra notice when the restored row is visible');
 ''')
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_reads_the_saved_item_after_a_lost_park_or_remove_response(self) -> None:
+        self.browser_action_sequence('''
+ show('working');
+ let finishReadback,readKey;
+ readback=key=>{readKey=key;return new Promise(resolve=>{finishReadback=resolve;});};
+ form.elements.until.value='2026-12-03';
+ const park=submit('park');
+ losePost();await flush();
+ check(row.hidden && readKey===row.dataset.key,'Park waits for the current item before restoring the row.');
+ finishReadback({item_state:'Working',unread:'true',parked:'true',parked_until:'2026-12-03',park_request_saved:true});
+ await flush();
+ check(row.hidden,'The saved Park stays out of Working.');
+ show('parked');
+ check(!row.hidden && row.querySelector('[data-parked-note]').textContent==='Parked until 2026-12-03',
+  'Parked shows the saved parking time.');
+ check(submit('park').id===park.id,'The exact Park retry uses the original request ID.');
+ finishPost({item_state:'Working',parked:'true',parked_until:'2026-12-03'});await flush();
+ submit('remove');losePost();await flush();
+ finishReadback({item_state:'Closed',unread:'false',parked:'true',parked_until:'2026-12-03'});
+ await flush();
+ show('all');
+ check(row.hidden && row.dataset.state==='Closed','The saved Remove stays closed after readback.');
+''', reduced_motion=True)
+        for action in ("park", "park-until-delivered"):
+            with self.subTest(action=action, failed_readback=True):
+                self.browser_action_sequence('''
+ show('working');
+ refreshMarkup=document.documentElement.outerHTML;
+ form.elements.until.value='2026-12-03';
+ let readRequest;
+ readback=(key,request)=>{
+  readRequest=request;
+  throw new Error('The item read failed.');
+ };
+ const park=submit(PARK_ACTION);
+ check(row.hidden,'The pending park hides the row from Working.');
+ losePost();await flush();
+ check(readRequest===park.id,'The item read uses the original request ID.');
+ const refreshed=document.querySelector('[data-number="1"]');
+ check(refreshed!==row && !refreshed.hidden && refreshed.dataset.parked==='false',
+  'The immediate refresh restores the unparked row to Working.');
+'''.replace('PARK_ACTION', json.dumps(action)), reduced_motion=True, add_item=False)
+        item = the_list.load(MORTY.id, "L1")
+        _ = the_list.park(MORTY.id, item.id, NOW + timedelta(days=1), source="morty")
+        _ = the_list.mark_read(MORTY.id, item.id, source="nate")
+        for action in ("park", "park-until-delivered"):
+            for saved in (False, True):
+                with self.subTest(action=action, park_request_saved=saved):
+                    self.browser_action_sequence('''
+ location.hash=new URLSearchParams({show:'parked',unread:'1',item:row.dataset.key}).toString();
+ await flush();
+ const linked=document.querySelector('[data-linked-item]');
+ const isLinked=()=>!linked.hidden && linked.contains(row) && !row.querySelector('[data-detail]').hidden;
+ check(isLinked(),'The read item starts linked under Parked with Unread only on.');
+ const saved=PARK_RECEIPT;
+ const action=PARK_ACTION;
+ const previous='2026-11-17 13:00 EST';
+ const until=saved && action==='park-until-delivered' ? 'delivered' : previous;
+ readback=(key,request)=>{
+  check(key===row.dataset.key && request===park.id,'The read uses the exact Park request ID.');
+  return {item_state:'Working',unread:'false',parked:'true',parked_until:until,
+   park_request_saved:saved};
+ };
+ form.elements.until.value='2026-12-03';
+ const park=submit(action);
+ check(!isLinked(),'Park releases the link at submission.');
+ losePost();await flush();
+ check(isLinked()===!saved,'Only a missing receipt restores the link.');
+ if(!saved){
+  check(row.querySelector('[data-parked-note]').textContent==='Parked until '+previous,
+   'The restored row shows the previous saved parking time.');
+  check(submit(action).id===park.id,'The restored row keeps the exact Park request ID.');
+  finishPost({reason:'Fixture refuses Park'});await flush();
+ }
+'''.replace('PARK_RECEIPT', json.dumps(saved)).replace('PARK_ACTION', json.dumps(action)),
+                                                 reduced_motion=True, add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_remove_updates_the_unread_sort_before_refresh(self) -> None:
@@ -3554,50 +3889,48 @@ observer.observe(original.parentNode,{childList:true});
 """)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
-    def test_browser_shows_unread_answer_on_a_closed_item(self) -> None:
-        item = self.add("Check the result after closure", number=1)
-        root = self.root / "reviews"
-        status = change_page.DeliveryStatus(root)
-        with patch.object(change_page, "send_question", return_value=question_outcome()):
-            list_page.deliver(list_page.submit(root, urlencode(
-                self.fields(item, "question", words="Which check passed?")), status))
-        _ = the_list.close(MORTY.id, item.id, "The report is retired.", source="nate")
-        with (patch.object(staff, "caller_identity", return_value=MORTY.current_session),
-              redirect_stdout(io.StringIO())):
-            self.assertEqual(the_list.main(["answer", item.id, "--question", "Q1",
-                                            "--text", "The gate passed."]), 0)
-        self.browser_action_sequence(r"""
- show('closed');onlyUnread();
- check(!row.hidden && row.querySelector('.list-dot') && form.querySelector('[value="read"]'),
-  'Closed with Unread only shows the answer and Mark read.');
- check(document.getElementById('filter-show-closed').dataset.filterCount==='1' &&
-  !row.querySelector('[data-open-question-note]'),'The answer counts in Closed and clears the question note.');
- const answer=row.querySelector('.list-panel [data-question="Q1"]');
- check(answer?.querySelectorAll('time[datetime]').length===2 &&
-  answer.querySelector('.question-unread')?.textContent==='Unread' &&
-  answer.textContent.includes('The gate passed.') && !row.querySelector('[data-log-index="Q1-answered"]'),
-  'The Closed answer stays in the panel with both times until read.');
- submit('read');finishPost({item_state:'Closed',unread:'false',open_question:'false'});await flush();
- check(row.hidden && document.getElementById('filter-show-closed').dataset.filterCount==='0',
-  'Mark read removes the item from Unread only.');
-""", add_item=False, reduced_motion=True, bulk_expand=True)
-        current = the_list.load(MORTY.id, item.id)
-        _ = list_page.submit(root, urlencode(self.fields(current, "read")), status)
-        read = the_list.load(MORTY.id, item.id)
-        self.assertIs(read.state, the_list.ItemState.CLOSED)
-        self.assertIs(the_list.unread_update(read), the_list.NoUnreadUpdate.ABSENT)
-        panel, log = list_page.render(root, include_counts=False, status=status).decode().split('<ol class="list-log">', 1)
-        self.assertNotIn('data-question="Q1"', panel)
-        self.assertIn('data-log-index="Q1-asked"', log)
-        self.assertIn('data-log-index="Q1-answered"', log)
+    def test_browser_excludes_a_legacy_closed_item_with_a_waiting_question(self) -> None:
+        _ = self.add("Open item", number=1)
+        item = self.add("Closed with a waiting question", number=2, owner=OTHER.id)
+        closed = the_list.close(MORTY.id, item.id, "The report is retired.", source="nate")
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        question = question_record.Question("Q1", NOW.isoformat(), "Is this working?")
+        stored = path.read_text().replace("\n---\n", "\nquestions: "
+                                         + json.dumps(json.dumps([question_record.stored(question)])) + "\n---\n", 1)
+        _ = path.write_text(stored)
+        self.assertEqual(the_list.load(MORTY.id, item.id), replace(closed, questions=(question,)))
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        self.assertNotIn("Closed with a waiting question", markup)
+        self.assertNotIn(f'data-filter-value="staff:{OTHER.id}"', markup)
+        self.browser_bulk_expansion(r'''
+ const selected=()=>document.querySelector('[data-filter-row="show"] [aria-pressed="true"]');
+ const count=()=>document.querySelector('[data-list-count]').textContent;
+ const navigate=async params=>{
+  const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+  location.hash=new URLSearchParams(params);
+  await changed;
+ };
+ check(!chip('show','closed'),'Show has no Closed chip.');
+ check(chip('show','morty-answering').dataset.filterCount==='0','The closed question does not count.');
+ check(count()==='1 of 1 items shown · 0 need you · 1 unread','The totals count the open item.');
+ for(const params of [{show:'closed'},{state:'Closed'}]){
+  await navigate(params);
+  check(selected().dataset.filterValue==='all' && count().startsWith('1 of 1'),'A legacy address selects All.');
+ }
+ await navigate({item:rows[0].dataset.key.replace(/L1$/,'L2')});
+ const notice=document.querySelector('[data-missing-item]');
+ check(!notice.hidden && notice.textContent==='Item #2 is closed','A closed item link shows one line.');
+ check(count().startsWith('1 of 1'),'The closed link does not change the count.');
+''')
+        self.assertEqual(path.read_text(), stored)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_park_refusal_restores_unread_after_a_lost_remove(self) -> None:
         self.browser_action_sequence("""
  const original=JSON.parse(row.dataset.sortValues)[7];
- submit('remove');losePost();await flush();
- show('closed');
- check(!row.hidden && row.dataset.unread==='false','the unconfirmed Closed row is read');
+ submit('remove');await finishRowMotion();
+ losePost();await flush();await finishRowMotion();
+ check(!row.hidden && row.dataset.unread==='true','a lost Remove restores the unread update.');
  form.elements.until.value='2026-12-03';
  submit('park');
  finishPost({reason:'Fixture refuses Park'});await flush();
@@ -3606,7 +3939,7 @@ observer.observe(original.parentNode,{childList:true});
  check(row.querySelector('.list-dot') && form.querySelector('[value="read"]'),
   'the refusal restores the unread controls');
  check(JSON.parse(row.dataset.sortValues)[7]===original,'the refusal restores the Update sort key');
-""", reduced_motion=True)
+""")
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_remove_collapses_and_refusal_restores_the_row(self) -> None:
@@ -3644,8 +3977,8 @@ observer.observe(original.parentNode,{childList:true});
  secondExit?.finish();await flush();
  check(!motion() && Math.abs(top(next)-first)<2,'the second Remove leaves the final layout intact');
  finishPost({item_state:'Closed',unread:'false'});await flush();
- show('closed');
- check(!row.hidden && !motion(),'a filter change shows the row at once');
+ show('all');
+ check(row.hidden && !motion(),'a filter change keeps the Closed item hidden');
 """)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -3691,6 +4024,57 @@ observer.observe(original.parentNode,{childList:true});
  check(row.hidden && motion(),'Tell morty starts the fade before the response in Unread');
  finishPost({unread:'false'});await flush();
  check(row.hidden,'Tell morty keeps the row outside Unread after confirmation');
+""", add_item=False)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_explicit_actions_release_open_rows_from_unread_only(self) -> None:
+        _ = self.add("Check the current result", number=1)
+        _ = self.add("Keep the next result in view", number=2)
+        for actions in (("park", "read"), ("read", "park"), ("read",)):
+            with self.subTest(actions=actions):
+                self.browser_action_sequence("const actions=" + json.dumps(actions) + r""";
+ const linked=document.querySelector('[data-linked-item]');
+ const follow=async()=>{
+  const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+  location.hash=new URLSearchParams({show:'all',unread:'1',item:row.dataset.key});
+  await changed;
+ };
+ onlyUnread();
+ await follow();
+ for(const action of actions){
+  if(action==='read' && row.dataset.parked==='true') show('parked');
+  if(action==='park' && row.dataset.unread==='false'){
+   await follow();
+   check(!linked.hidden && linked.contains(row),'The read item opens through its link outside Unread only.');
+  }
+  check(!row.hidden && !row.querySelector('[data-detail]').hidden,'The action starts with open details.');
+  const section=row.closest('[data-linked-item]');
+  form.elements.until.value='2026-12-03';
+  submit(action);
+  check(row.hidden && (section || document).querySelector('[data-record-motion]'),
+   action+' starts the fade in the same table before the response.');
+  if(section) check(!section.hidden,'The linked section stays visible during its fade.');
+  const parked=action==='park' || row.dataset.parked==='true';
+  finishPost({unread:action==='read' ? 'false' : 'true',parked:String(parked),
+   parked_until:parked ? '2026-12-03' : ''});
+  await flush();
+  for(const animation of document.getAnimations()) animation.finish();
+  await flush();
+  check(row.hidden && linked.hidden,'After '+action+' the item stays outside the active filters.');
+  check(!history.state.recordTable.linkedItem,'The action releases the link.');
+ }
+ if(actions.includes('park')){
+  onlyUnread(false);
+  for(const view of ['all','needs-me','morty-answering','working','blocked']){
+   show(view);
+   check(row.hidden,'The parked row is absent from '+view+'.');
+  }
+  show('parked');
+  const note=row.querySelector('[data-detail]').hidden ?
+   row.querySelector('[data-parked-note]') : form.querySelector('[data-parked-detail]');
+  check(!row.hidden && note.textContent==='Parked until 2026-12-03' && note.getClientRects().length>0,
+   'Parked shows the row and its parking note.');
+ }
 """, add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
@@ -3790,6 +4174,108 @@ observer.observe(original.parentNode,{childList:true});
  check(section.hidden && results.contains(target) && !target.hidden && count.textContent.startsWith('2 of 2'),
   'The read item rejoins the results when Unread only is off.');
 """, add_item=False, reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_refresh_keeps_a_linked_delivered_item_after_its_answer(self) -> None:
+        root = self.root / "reviews"
+        source = self.add("Follow the delivered item", number=1)
+        target = self.add("Check the delivered item", the_list.ItemState.DELIVERED, number=2)
+        _ = the_list.update(MORTY.id, source.id, {"related_to": (2,)}, source="morty")
+        _ = the_list.update(MORTY.id, target.id, {
+            "latest_status": "\n\n".join(f"Check {n} passed." for n in range(55))}, source="morty")
+        with patch.object(change_page, "send_question", return_value=question_outcome()):
+            list_page.deliver(list_page.submit(root, urlencode(self.fields(
+                target, "question", words="Which check passed?"))))
+        with patch.object(list_page, "counts_strip", return_value=""):
+            before = list_page.render(root).decode()
+            with (
+                patch.object(staff, "caller_identity", return_value=MORTY.current_session),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(the_list.main(["answer", target.id, "--question", "Q1", "--text", "The gate passed."]), 0)
+            answered = list_page.render(root).decode()
+        setup = r"""<script>
+if(!history.state?.recordTable && !location.hash) history.replaceState(null,'','#show=working');
+const snapshot=SNAPSHOT;
+window.fetch=async(_url,options)=>{
+ if(options?.method==='POST') throw new Error('The answer is below the viewport.');
+ return new Response(snapshot);
+};
+</script>""".replace('SNAPSHOT', json.dumps(answered).replace("<", r"\u003c"))
+        probe = """<script>
+(async()=>{
+ const stateKey='list-link-reload';
+ const {stage,failures=[]}=JSON.parse(sessionStorage.getItem(stateKey) ?? '{}');
+ const check=(ok,message)=>{if(!ok) failures.push(message);};
+ const consoleReload=RELOAD_CONSOLE;
+ try{
+  const source=document.querySelector('[data-number="1"]');
+  const row=()=>document.querySelector('[data-number="2"]');
+  const section=()=>document.querySelector('[data-linked-item]');
+  const chip=name=>document.getElementById('filter-show-'+name);
+  const expanded=item=>!item.querySelector('[data-detail]').hidden;
+  const linked=item=>!section().hidden && section().contains(item) && !item.hidden && expanded(item);
+  const framePlace=()=>location.pathname+location.search+location.hash;
+  const consolePlace=()=>new URL(parent.location.href).searchParams.get('at.list');
+  const reload=async next=>{
+   if(consoleReload){
+    if(consolePlace()!==framePlace()) await new Promise(resolve=>{
+     parent.addEventListener('message',function recorded(event){
+      if(event.source!==window || consolePlace()!==framePlace()) return;
+      parent.removeEventListener('message',recorded);resolve();
+     });
+    });
+    const savedPlace=new URL(consolePlace(),location.href);
+    const reveal=new URLSearchParams(savedPlace.hash.slice(1)).get('reveal');
+    check(reveal===(next==='answered' ? '1' : null),'The console address tracks the revealed item.');
+   }
+   sessionStorage.setItem(stateKey,JSON.stringify({stage:next,failures}));
+   (consoleReload ? parent.location : location).reload();
+  };
+  if(stage==='dismissed'){
+   check(section().hidden && !expanded(row()),'The reload keeps the dismissed link closed.');
+  }else if(stage==='answered'){
+   check(linked(row()) && chip('working').getAttribute('aria-pressed')==='true',
+    'The reload keeps the answered item linked under Working.');
+   chip('all').click();
+   check(section().hidden && !expanded(row()),'Changing the filter dismisses the link after reload.');
+   await reload('dismissed');
+   return;
+  }else{
+  source.querySelector('.list-toggle').click();
+  source.querySelector('a[data-record-jump]').click();
+  const waiting=row();
+  check(linked(waiting) && chip('morty-answering').dataset.filterCount==='1',
+   'The link opens the waiting item outside Working and counts it in Morty answering.');
+  const replaced=new Promise(resolve=>{
+   const observer=new MutationObserver(()=>{
+    if(waiting.isConnected) return;
+    observer.disconnect();resolve();
+   });
+   observer.observe(document.body,{childList:true,subtree:true});
+  });
+  document.dispatchEvent(new Event('visibilitychange'));
+  await replaced;
+  const answered=row();
+  check(linked(answered) && answered.querySelector('[data-question="Q1"]').textContent.includes('The gate passed.'),
+   'Refresh keeps the linked details open and shows the answer.');
+  check(chip('working').getAttribute('aria-pressed')==='true' &&
+   chip('needs-me').dataset.filterCount==='1' && chip('morty-answering').dataset.filterCount==='0' &&
+   document.querySelector('[data-list-count]').textContent.startsWith('1 of 2'),
+   'The item counts in Needs me and stays outside the Working results.');
+  chip('working').click();
+  check(linked(answered),'The selected filter keeps the link open.');
+  await reload('answered');
+  return;
+  }
+ }catch(error){failures.push(String(error));}
+ await parent.fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        for reload_console in (False, True):
+            with self.subTest(reload_console=reload_console):
+                self.browser_answer_visibility(before, setup, probe.replace("RELOAD_CONSOLE", json.dumps(reload_console)),
+                                               reload_markup=answered, reload_console=reload_console)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_restores_ask_focus_after_a_failed_post(self) -> None:
@@ -4082,6 +4568,53 @@ window.fetch=async(_url,options)=>{
         self.browser_answer_visibility(markup, setup, probe)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_browser_direct_answer_link_reads_once_in_a_720_pixel_viewport(self) -> None:
+        with patch.object(list_page, "counts_strip", return_value=""):
+            item, markup = self.render_unread_answer()
+        markup = markup.replace('<section class="page-question" data-question="Q1">',
+                                '<div id="answer-spacer" style="height:1800px"></div>'
+                                + '<section class="page-question" data-question="Q1">', 1)
+        fragment = urlencode({"item": f"{MORTY.id}/{item.id}"})
+        setup = """<script>
+history.replaceState(null,'','#FRAGMENT');
+const reads=[];
+window.fetch=async(_url,options)=>{
+ if(options?.method!=='POST') return new Response('',{status:503});
+ reads.push(new URLSearchParams(options.body));
+ return new Response(JSON.stringify({unread:'false'}));
+};
+</script>""".replace('FRAGMENT', fragment)
+        probe = """<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ try{
+  const panel=document.querySelector('[data-detail]:not([hidden]) .list-panel');
+  const answer=panel.querySelector('[data-question="Q1"] p:last-child');
+  const spacer=document.getElementById('answer-spacer');
+  spacer.style.height=(spacer.offsetHeight+1800-answer.getBoundingClientRect().top)+'px';
+  const sample=()=>new Promise(resolve=>{
+   const observer=new IntersectionObserver(([entry])=>{observer.disconnect();resolve(entry);});
+   observer.observe(answer);
+  });
+  check(innerHeight===720 && Math.abs(answer.getBoundingClientRect().top-1800)<=1,
+   'Expected a 720 pixel viewport and answer at 1,800 pixels. Got '+innerHeight+' and '+answer.getBoundingClientRect().top+'.');
+  check(!(await sample()).isIntersecting && reads.length===0,'The offscreen answer sends no read.');
+  answer.scrollIntoView({block:'center',behavior:'instant'});
+  check((await sample()).intersectionRect.height>0 && reads.length===1 &&
+   reads[0].get('action')==='read' && reads[0].get('token')===panel.dataset.openReadToken,
+   'Scrolling to the answer sends one signed read.');
+  scrollTo({top:0,behavior:'instant'});
+  await sample();
+  answer.scrollIntoView({block:'center',behavior:'instant'});
+  check((await sample()).intersectionRect.height>0 && reads.length===1,
+   'Scrolling to the answer again sends no second read.');
+ }catch(error){failures.push(String(error));}
+ await parent.fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        self.browser_answer_visibility(markup, setup, probe, viewport_height=720)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_item_link_waits_for_every_unread_answer(self) -> None:
         item, markup = self.render_unread_answer(questions_and_answers=(
             ("Which checks passed?", "\n".join(f"Check {number} passed." for number in range(65))),
@@ -4090,9 +4623,12 @@ window.fetch=async(_url,options)=>{
         setup = """<script>
 const fragment='#FRAGMENT',reads=[];
 if(LINK_ON_LOAD) history.replaceState(null,'',fragment);
+let receivedRead;
+const postedRead=new Promise(resolve=>{receivedRead=resolve;});
 window.fetch=async(_url,options)=>{
  if(options?.method!=='POST') return new Response('',{status:503});
  reads.push(new URLSearchParams(options.body));
+ receivedRead();
  return new Response(JSON.stringify({unread:'true'}));
 };
 </script>""".replace('FRAGMENT', fragment)
@@ -4115,7 +4651,10 @@ window.fetch=async(_url,options)=>{
    const observer=new IntersectionObserver(([entry])=>{observer.disconnect();resolve(entry);});
    observer.observe(target);
   });
+  const paint=()=>new Promise(resolve=>parent.requestAnimationFrame(()=>parent.requestAnimationFrame(resolve)));
   check(!row.hidden && !detail.hidden,'The item link opens the row');
+  first.scrollIntoView({block:'start',behavior:'instant'});
+  await paint();
   check((await sample(first)).intersectionRect.height>0,'The first answer enters the viewport');
   check(!(await sample(second)).isIntersecting && second.getBoundingClientRect().top>innerHeight,
    'The second answer starts below the viewport');
@@ -4125,6 +4664,7 @@ window.fetch=async(_url,options)=>{
   second.scrollIntoView({block:'start',behavior:'instant'});
   check((await sample(second)).intersectionRect.height>0 && first.getBoundingClientRect().bottom<0,
    'The second answer enters the viewport after the first leaves it');
+  await Promise.race([postedRead,new Promise(resolve=>setTimeout(resolve,2000))]);
   check(reads.length===1 && reads[0].get('action')==='read' &&
    reads[0].get('request')===panel.dataset.openReadRequest && reads[0].get('token')===panel.dataset.openReadToken,
    'The last answer to enter the viewport sends one signed read');
@@ -4136,19 +4676,31 @@ window.fetch=async(_url,options)=>{
             with self.subTest(link_on_load=link_on_load):
                 enabled = str(link_on_load).lower()
                 self.browser_answer_visibility(markup, setup.replace('LINK_ON_LOAD', enabled),
-                                               probe.replace('LINK_ON_LOAD', enabled))
+                                               probe.replace('LINK_ON_LOAD', enabled), viewport_height=1120)
 
-    def browser_answer_visibility(self, markup: str, setup: str, probe: str) -> None:
+    def browser_answer_visibility(self, markup: str, setup: str, probe: str, *,
+                                  viewport_height: int | None = None, reload_markup: str = "",
+                                  reload_console: bool = False) -> None:
         page = markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>').encode()
-        console_page = b"""<!doctype html>
-<style>iframe{border:0;width:100%;height:calc(100vh - 24px)}
-iframe[hidden]{display:block;visibility:hidden}</style>
-<iframe></iframe><img hidden src="/complete">
-<script>
-// Lay out the iframe before the List starts observing its answers.
+        reloaded = reload_markup.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>').encode()
+        loaded = threading.Event()
+        height = f"{viewport_height}px" if viewport_height is not None else "calc(100vh - 24px)"
+        frame_path = "/page"
+        frame_url = frame_path
+        console_shell = b""
+        if reload_console:
+            frame_path = list_page.PAGE_PATH
+            listing = console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage(frame_path))
+            console_shell = console.render((listing,), console.UnavailablePage())
+            frame_url = "/console/?" + urlencode({"page": "list", "at.list": frame_path + "#show=working"})
+        host_page = (f'<!doctype html><style>iframe{{border:0;width:100%;height:{height}}}'
+                     + 'iframe[hidden]{display:block;visibility:hidden}</style>'
+                     + f'<iframe data-src="{html.escape(frame_url)}"></iframe><img hidden src="/complete">'
+                     + """<script>
+// Set the frame size before the List starts its observers.
 const frame=document.querySelector('iframe');
-requestAnimationFrame(()=>requestAnimationFrame(()=>{frame.src='/page';}));
-</script>"""
+requestAnimationFrame(()=>requestAnimationFrame(()=>{frame.src=frame.dataset.src;}));
+</script>""").encode()
         results: list[list[str]] = []
         complete = threading.Event()
 
@@ -4158,12 +4710,25 @@ requestAnimationFrame(()=>requestAnimationFrame(()=>{frame.src='/page';}));
                 if self.path == '/complete':
                     _ = complete.wait(TEST_HANG_GUARD_SECS)
                     self.json_response(200, {})
+                elif self.path == frame_path:
+                    self.html_response(200, reloaded if reloaded and loaded.is_set() else page)
+                    loaded.set()
+                elif console_shell and urlsplit(self.path).path == "/console/":
+                    self.html_response(200, console_shell)
+                elif self.path == "/":
+                    self.html_response(200, host_page)
                 else:
-                    self.html_response(200, page if self.path == '/page' else console_page)
+                    self.send_error(404)
                 return None
 
             @override
             def do_POST(self) -> None:
+                if self.path == "/console/news":
+                    self.json_response(200, {"new": []})
+                    return
+                if self.path != "/results":
+                    self.send_error(404)
+                    return
                 results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
                 self.json_response(200, {})
                 complete.set()
@@ -4177,7 +4742,8 @@ requestAnimationFrame(()=>requestAnimationFrame(()=>{frame.src='/page';}));
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
-                browser = self.firefox_view(f'http://127.0.0.1:{server.server_port}/', None, 1280, 900, complete)
+                window_height = max(900, (viewport_height or 0) + 32)
+                browser = self.firefox_view(f'http://127.0.0.1:{server.server_port}/', None, 1280, window_height, complete)
                 self.assertEqual(browser.returncode, 0, browser.stderr)
                 self.assertEqual(results, [[]])
             finally:
@@ -4372,9 +4938,15 @@ const change=async path=>{
             markup = list_page.render(self.root / "reviews").decode()
         markup = re.sub(r'data-refresh-seconds="[^"]+"', 'data-refresh-seconds="0"', markup, count=1)
         setup = '''<script>
-const requests=[];let finishPost,losePost,refreshMarkup;
-window.fetch=async(_path,options={})=>{
+const requests=[],itemSnapshots=new Map();let finishPost,losePost,refreshMarkup,readback;
+window.fetch=async(path,options={})=>{
  if(options.method!=='POST'){
+  const query=new URL(path,location.href).searchParams;
+  if(query.has('item-state')){
+   const key=query.get('keeper')+'/'+query.get('item-state');
+   return {ok:true,json:async()=>readback ? readback(key,query.get('park-request')) : {
+    ...itemSnapshots.get(key),park_request_saved:false}};
+  }
   if(refreshMarkup===undefined) throw new Error('Fixture refresh refused');
   return {ok:true,text:async()=>refreshMarkup};
  }
@@ -4400,6 +4972,16 @@ window.fetch=async(_path,options={})=>{
  const show=value=>document.querySelector('[data-filter-row="show"] [data-filter-value="'+value+'"]').click();
  const onlyUnread=(on=true)=>{const control=document.getElementById('list-unread');if(control.checked!==on) control.click();};
  const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
+ const finishRowMotion=async()=>{
+  const motions=document.querySelectorAll('[data-record-motion]');
+  for(const motion of motions) for(const animation of motion.getAnimations({subtree:true})) animation.finish();
+  await flush();
+ };
+ for(const item of document.querySelectorAll('[data-list-item]')) itemSnapshots.set(item.dataset.key,{
+  item_state:item.dataset.state,parked:item.dataset.parked,unread:item.dataset.unread,
+  unread_sort:JSON.parse(item.dataset.sortValues)[7],open_question:item.dataset.openQuestion,
+  waiting_for_answer:item.dataset.waitingForAnswer,
+ });
  try{
   document.querySelector('OPEN_CONTROL').click();
 ''' + steps + '''
@@ -4475,12 +5057,15 @@ window.fetch=async(_path,options={})=>{
                     self.assertEqual(item.log[-2 if action == "tell" else -1].what, feedback)
                     self.assertEqual(the_list.sent_to_morty(item), NOW)
                     body = list_page.render(root).decode()
-                    self.assertIn("sent to morty, 13:00 EST", without_role_colors(body))
-                    self.assertIn('data-feedback-form', body)
-                    log = body.split('<ol class="list-log">', 1)[1].split("</ol>", 1)[0]
-                    self.assertIn("Feedback for morty", log)
-                    self.assertIn(html.escape(words.splitlines()[0]), log)
-                    self.assertNotIn(fields["request"], log)
+                    if action == "remove":
+                        self.assertNotIn(f'data-key="{MORTY.id}/{item.id}"', body)
+                    else:
+                        self.assertIn("sent to morty, 13:00 EST", without_role_colors(body))
+                        self.assertIn('data-feedback-form', body)
+                        log = body.split('<ol class="list-log">', 1)[1].split("</ol>", 1)[0]
+                        self.assertIn("Feedback for morty", log)
+                        self.assertIn(html.escape(words.splitlines()[0]), log)
+                        self.assertNotIn(fields["request"], log)
                     list_page.deliver(delivery)
                     self.assertEqual(send.call_args.args[0], MORTY.id)
                     expected = "List page: nate's words for item 106\n" + words if action == "tell" else words
@@ -4690,9 +5275,9 @@ window.fetch=async(_path,options={})=>{
             alerted = the_list.load(MORTY.id, item.id)
             latest = tuple(the_list.feedback_requests(alerted).values())[-1]
             self.assertEqual((latest.state, latest.alerted_to), ("alerted", "sdlc"))
-            self.assertIn("not sent; sdlc told", without_role_colors(list_page.render(root).decode()))
+            self.assertNotIn("not sent; sdlc told", without_role_colors(list_page.render(root).decode()))
             self.assertEqual(the_list.mark_read(MORTY.id, item.id, source="morty"), alerted)
-            self.assertIn("not sent; sdlc told", without_role_colors(list_page.render(root).decode()))
+            self.assertNotIn("not sent; sdlc told", without_role_colors(list_page.render(root).decode()))
         self.assertEqual(the_list.load(MORTY.id, item.id).state, the_list.ItemState.CLOSED)
 
     def test_failed_alert_keeps_feedback_pending_for_post_and_startup_retries(self) -> None:
@@ -4857,6 +5442,33 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
             with self.subTest(width=width):
                 self.browser_actions(markup, "", probe, window_size=(width, 900))
 
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_staff_chips_strip_repeated_suffixes_and_keep_empty_name_ids(self) -> None:
+        for number, identity in enumerate((OTHER.id, staff.StaffId("-unit")), start=1):
+            item = self.add(f"Item {number}", owner=identity, number=number)
+            _ = the_list.update(MORTY.id, item.id, {"producer": identity}, source="morty")
+        _ = (self.root / "staff.json").write_text(json.dumps({"schema": 1, "rows": [
+            member.to_json() for member in (MORTY, OWNER, replace(OTHER, name="builds-unit-unit"))]}))
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        probe = """<script>
+const failures=[];
+for(const [number,label] of [['1','builds'],['2','-unit']]){
+ const row=document.querySelector('[data-number="'+number+'"]'),id=row.dataset.owner;
+ for(const name of ['owner','producer']){
+  const chip=document.querySelector('[data-filter-row="'+name+'"] [data-filter-value="staff:'+id+'"]');
+  if(chip.textContent!==label+'1') failures.push('The '+name+' chip shows '+label+' and its count.');
+  chip.click();
+ }
+ const place=new URLSearchParams(location.hash.slice(1));
+ if(row.hidden || place.get('owner')!==id || place.get('producer')!==id)
+  failures.push('Both filters use the original staff ID '+id+'.');
+ for(const name of ['owner','producer']) document.getElementById('filter-'+name+'-all').click();
+}
+const result=document.createElement('p');result.id='probe-results';
+result.textContent=JSON.stringify(failures);document.body.append(result);
+</script>"""
+        self.browser_actions(markup, "", probe)
+
     def browser(self, markup: str) -> None:
         setup = r'''<script>
 const nativeFetch=fetch, nativeTimeout=setTimeout, errors=[], reads=[],posts=[];
@@ -4876,7 +5488,8 @@ window.fetch=async(_path,options={})=>{
    row.dataset.unread='false';row.querySelector('.list-dot')?.remove();row.querySelector('[value="read"]')?.remove();
    original=page.documentElement.outerHTML;
   }
-  const result={ok:true,status:200,json:async()=>({state:'sent',unread:'false'})};
+  const result={ok:true,status:200,json:async()=>({state:'sent',unread:'false',
+   ...(fields.get('action')==='remove' ? {item_state:'Closed'} : {})})};
   if(holdPost) return await new Promise(resolve=>finishPost=()=>resolve(result));
   return result;
  }
@@ -4939,7 +5552,7 @@ try{
  check(near(expand.left,bounds(table).left) && near(shown.right,bounds(table).right) &&
        near(center(expand),center(collapse)) && near(center(expand),center(shown)) && expand.right<collapse.left,
        'The two buttons and the right-aligned count share one row.');
- check(countLine.textContent.startsWith('6 of 6 items shown') && countLine.getAttribute('role')==='status',
+ check(countLine.textContent.startsWith('4 of 5 items shown') && countLine.getAttribute('role')==='status',
        'The count in the row reports the visible items.');
  for(const action of ['expand','collapse']){
   const button=bulk(action),box=bounds(button),icon=bounds(button.querySelector('svg'));
@@ -4962,29 +5575,28 @@ try{
    check(label.getClientRects().length===1,'the desktop header fits on one line: '+header.textContent);
   }
  }
- check(visible().map(row=>row.dataset.number).join(',')==='58,105,106,41,63,54','The default order in All.');
+ check(visible().map(row=>row.dataset.number).join(',')==='58,105,106,63','The default order in All.');
  document.querySelector('[data-sort="0"]').click();
- check(visible().map(row=>row.dataset.number).join(',')==='41,54,58,63,105,106','the number sort is numeric');
+ check(visible().map(row=>row.dataset.number).join(',')==='58,63,105,106','the number sort is numeric');
  document.querySelector('[data-sort="0"]').click();
- check(visible().map(row=>row.dataset.number).join(',')==='106,105,63,58,54,41','a second click reverses the sort');
+ check(visible().map(row=>row.dataset.number).join(',')==='106,105,63,58','a second click reverses the sort');
  for(let column=1;column<8;column++){
   document.querySelector('[data-sort="'+column+'"]').click();
   check(document.querySelector('[data-sort="'+column+'"]').parentElement.getAttribute('aria-sort')==='ascending','sort column '+column);
  }
  show('needs-me');check(visible().length===1 && visible()[0].dataset.number==='58','Needs me');
  show('all');unread().click();
- check(visible().map(row=>row.dataset.number).sort().join() === '105,106,41,63','Unread excludes the closed item');
+ check(visible().map(row=>row.dataset.number).sort().join() === '105,106,63','Unread in All excludes parked items.');
  unread().click();
  show('parked');check(visible().length===1 && visible()[0].dataset.number==='41','Parked');
- show('closed');
- check(visible().map(row=>row.dataset.number).sort().join()==='54,63','Closed includes Done and Closed.');
- show('all');check(visible().length===6,'All');
+ check(!chip('closed'),'Show has no Closed chip.');
+ show('all');check(visible().length===4,'All');
  show('working');
  const showRow=chip('working').closest('[data-filter-row]');
  const showValues=filterControl.buttons(showRow).map(button=>button.dataset.filterValue);
  filterControl.setVisible(showRow,showValues.filter(value=>value!=='working'));
  dispatchEvent(new PopStateEvent('popstate'));
- check(selectedShow()==='all' && visible().length===6,'Hiding Working selects All and shows all six items.');
+ check(selectedShow()==='all' && visible().length===4,'Hiding Working selects All and shows four items.');
  check(new URLSearchParams(location.hash.slice(1)).get('show')==='all','the address records the fallback to All');
  filterControl.setVisible(showRow,showValues);
  const theme=document.documentElement.dataset.theme;
@@ -5018,14 +5630,14 @@ try{
  if(theme===undefined) delete document.documentElement.dataset.theme;
  else document.documentElement.dataset.theme=theme;
  select('producer','all');select('owner','all');show('all');
- select('owner',OWNER);check(visible().length===5,'Owner');
+ select('owner',OWNER);check(visible().length===3,'Owner');
  check(selectedFilter('owner')==='staff:'+OWNER && new URLSearchParams(location.hash.slice(1)).get('owner')===OWNER,
   'The address keeps the selected owner.');
  select('owner','all');
  select('producer',DWIGHT);check(visible().map(row=>row.dataset.number).join(',')==='105','Producer');
  check(new URLSearchParams(location.hash.slice(1)).get('producer')===DWIGHT,'the address keeps the producer');
  select('producer','all');
- check(visible().length===6 && !new URLSearchParams(location.hash.slice(1)).has('producer'),'All producers');
+ check(visible().length===4 && !new URLSearchParams(location.hash.slice(1)).has('producer'),'All producers');
  check(['show','owner','producer'].every(name=>filterRow(name).querySelector('button').dataset.filterValue==='all'),
   'Each filter row starts with All.');
  show('working');
@@ -5042,8 +5654,7 @@ try{
  check(zeroStaff.every(button=>button.dataset.filterCount==='0' && !button.hidden && !button.disabled &&
   Number(getComputedStyle(button).opacity)<1 && button.getBoundingClientRect().width>0),
   'The zero staff chips stay visible, enabled and dimmed.');
- show('closed');
- check(visible().map(row=>row.dataset.number).sort().join()==='54,63','Closed replaces the Blocked selection.');
+
  show('working');select('owner',OWNER);select('producer',DWIGHT);
  check(visible().length===0 && staffCount('owner','all')===1 && staffCount('producer','all')===1 && count('all')===0,
   'Each count ignores only its own filter.');
@@ -5116,7 +5727,7 @@ try{
  check(retryForm.elements.words.value==='' && retryForm.querySelector('[value="tell"]').disabled,'a successful send clears the box and disables Tell morty');
  realFeedback=false;failRefresh=true;
  const requestIds=[];
- for(const action of ['read','remove','park','tell']){
+ for(const action of ['read','park','tell','remove']){
   const row=rows().find(row=>row.dataset.number==='106'),form=row.querySelector('form');
   form.elements.until.value='2026-12-03';form.elements.words.value='Explain this simply';
   requestIds.push(form.elements.request.value);
@@ -5134,7 +5745,8 @@ try{
    check(form.elements.words.value==='New draft during send','a newer draft survives the send');
    check(!form.querySelector('[value="tell"]').disabled,'the newer draft enables Tell morty after delivery');
   }
-  check(!rows().find(row=>row.dataset.number==='106').querySelector('[data-detail]').hidden,'feedback keeps the row open');
+  if(action==='remove') check(row.hidden,'Remove hides the item after the save');
+  else check(!row.querySelector('[data-detail]').hidden,'feedback keeps the row open');
  }
  check(new Set(requestIds).size===4,'each new action uses a fresh request');
  realFeedback=true;failRefresh=false;
@@ -5142,31 +5754,34 @@ try{
  await flush();await flush();await flush();await flush();
  realFeedback=false;failRefresh=true;
  location.hash=new URLSearchParams({show:'closed',sort:'#',dir:'desc'});await flush();
- check(visible().map(row=>row.dataset.number).join(',')==='63,54','Hash navigation restores Closed and the sort order.');
+ check(visible().map(row=>row.dataset.number).join(',')==='106,105,63,58' && selectedShow()==='all','An old Closed address opens All in the requested sort order.');
  location.hash=new URLSearchParams({show:'done'});await flush();
- check(selectedShow()==='closed' && visible().map(row=>row.dataset.number).sort().join()==='54,63',
-  'An old Done address opens Closed.');
+ check(selectedShow()==='all' && visible().map(row=>row.dataset.number).sort().join()==='105,106,58,63',
+  'An old Done address opens All.');
  location.hash=new URLSearchParams({show:'all',producer:DWIGHT});await flush();
  check(selectedFilter('producer')==='staff:'+DWIGHT && visible().map(row=>row.dataset.number).join(',')==='105',
    'an address restores the producer filter');
  location.hash=new URLSearchParams({show:'all',producer:'missing'});await flush();
- check(selectedFilter('producer')==='all' && visible().length===6,'an unknown producer shows all items');
- location.hash=new URLSearchParams({show:'unread',state:'Working',owner:OWNER,q:'106'});await flush();
+ check(selectedFilter('producer')==='all' && visible().length===4,'An unknown producer clears the Producer filter.');
+ const restoredOldAddress=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+ location.hash=new URLSearchParams({show:'unread',state:'Working',owner:OWNER,q:'106'});
+ await restoredOldAddress;
  check(selectedShow()==='working' && selectedFilter('owner')==='staff:'+OWNER && unread().checked &&
   visible().map(row=>row.dataset.number).join(',')==='106','An old address restores the Show and Owner chips, switch and search.');
 
- for(const target of rows().filter(row=>['Done','Closed'].includes(row.dataset.state) || row.dataset.parked==='true')){
+ for(const target of rows().filter(row=>row.dataset.state==='Done' || row.dataset.parked==='true')){
   location.hash=new URLSearchParams({item:target.dataset.key});await flush();
   check(!target.hidden && !target.querySelector('[data-detail]').hidden,'an item link shows '+target.dataset.state);
-  check(selectedShow()==='all' && selectedFilter('owner')==='all' && !unread().checked &&
-    selectedFilter('producer')==='all' && document.getElementById('list-search').value==='','an item link clears filters');
+  check(selectedShow()===(target.dataset.number==='41' ? 'parked' : 'all') &&
+    selectedFilter('owner')==='all' && !unread().checked && selectedFilter('producer')==='all' &&
+    document.getElementById('list-search').value==='','An item link selects Show and clears the other filters.');
  }
  const retained=rows().find(row=>row.dataset.number==='106');
  location.hash=new URLSearchParams({item:retained.dataset.key,owner:retained.dataset.owner,show:'working',q:'106',sort:'#',dir:'desc'});await flush();
  check(selectedFilter('owner')==='staff:'+retained.dataset.owner && selectedShow()==='working' &&
    document.getElementById('list-search').value==='106','an address with an open item keeps its filters');
  check(!retained.hidden && !retained.querySelector('[data-detail]').hidden,'an address restores its open item');
- check(document.querySelectorAll('[data-feedback-form]').length===6,'each row has feedback controls');
+ check(document.querySelectorAll('[data-feedback-form]').length===5,'each row has feedback controls');
  check(document.documentElement.scrollWidth<=innerWidth,'the page has no horizontal overflow');
  check((innerWidth<960)===(FIXTURE_WIDTH<960),'the browser uses the requested layout');
  if(FIXTURE_WIDTH<960){

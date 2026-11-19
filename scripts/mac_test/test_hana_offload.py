@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack, nullcontext, redirect_stdout
 from dataclasses import replace
+from functools import partial
 from io import BytesIO, StringIO
 import json
 import os
@@ -17,11 +18,12 @@ import unittest
 from unittest import mock
 
 from scripts.aws_target import admin_secrets, deploy, hana_box as box, hana_execution as execution, hana_placement as hana
-from scripts.aws_target import hana_placement_adapter, hana_result, hana_source, hana_transport, test_hana_execution as fixtures
+from scripts.aws_target import hana_placement_adapter, hana_protocol, hana_result, hana_source, hana_transport, test_hana_execution as fixtures
 from scripts.aws_target.controller_lock import HanaCommandAccess, hana_command_lock
 from scripts.aws_target.hana_guest import CommandAdmissionRefusalCode
 from scripts.aws_target.ledger_test_support import install_hana_spending_settings, numeric_settings
 from scripts.build_hold import override_guard
+from scripts.build_queue import execution_identity
 from scripts.build_queue import admission_client, admission_protocol as wire, admission_service, placement
 from scripts.build_queue import test_placement as queue_fixtures
 from scripts.build_targets import target_config
@@ -31,6 +33,9 @@ from scripts.direct import runner_result
 from scripts.lib import process_start
 from scripts.lint.memory_test_support import config_environment
 from scripts.mac_test import eligibility, offload
+
+
+RELEASE_BLOCKED = hana.HanaClaimReleaseRefused('The Hana lifecycle operation observe is pending')
 
 
 @final
@@ -96,7 +101,7 @@ source_allowed_environment=RUSTFLAGS
         _ = stack.enter_context(mock.patch.object(hana, 'validate_assignment', return_value=self.transport))
         _ = stack.enter_context(mock.patch.object(hana, 'controller_for', return_value=self.lifecycle))
         _ = stack.enter_context(mock.patch.object(hana, 'claim_assigned', return_value=self.fixture.adopted))
-        _ = stack.enter_context(mock.patch.object(hana, 'release_assigned', return_value=True))
+        _ = stack.enter_context(mock.patch.object(hana, 'release_assigned', return_value=hana.HanaClaimReleased()))
         snapshot = box.HanaLifecycleEvidence(box.DeploymentIdentity('deployment', 'instance', 'spot', 'us-east-2'),
             box.Lifecycle.READY, box.VerifiedBoot('boot', 'start'), box.NoOperation(),
             box.DeliveredPermit(3, 1800, self.fixture.key.claim_id),
@@ -104,7 +109,8 @@ source_allowed_environment=RUSTFLAGS
         _ = stack.enter_context(mock.patch.object(self.lifecycle, 'inspect', return_value=snapshot))
         _ = stack.enter_context(mock.patch.object(self.lifecycle, 'permission', return_value=self.fixture.permission))
         _ = stack.enter_context(mock.patch.object(process_start, 'process_start', return_value=process_start.Started('holder-start')))
-        _ = stack.enter_context(mock.patch.object(hana_transport.SourceSender, 'prepare', return_value=self.fixture.manifest))
+        _ = stack.enter_context(mock.patch.object(hana_transport.SourceSender, 'prepare',
+                                                 return_value=(self.fixture.manifest, lambda: None)))
         _ = stack.enter_context(mock.patch.object(offload, 'hana_source_key', return_value=self.fixture.source_key))
         _ = stack.enter_context(mock.patch('scripts.build_queue.admission_client.consume_permission',
             return_value=wire.FirstAuthorization(self.fixture.assignment, self.fixture.reference)))
@@ -122,13 +128,105 @@ source_allowed_environment=RUSTFLAGS
                                   eligibility.KnownRepository('hana', 'github.com/natepiano/hana'), time.monotonic())
 
     def test_accepted_compiler_result_uses_the_existing_result_adapter_after_settlement(self) -> None:
-        with self.context(), mock.patch.object(record, 'publish_hana_result') as publish:
-            outcome = self.run_claimed()
-        self.assertIsInstance(outcome, offload.PassedOnTarget)
-        publish.assert_called_once()
-        self.assertEqual(self.output.getvalue(), b'compiler output')
-        self.assertIsInstance(self.controller.pending, offload.SettledDispatchOperations)
-        self.assertEqual(self.controller.attempt_evidence.cleanup, 'confirmed')
+        root = self.root
+        for compiler_status, problem, fault in (
+            (0, '', ''), (0, 'release', ''), (7, 'release', ''), (7, 'fence', ''),
+            (0, '', 'the Hana result'), (7, 'fence', 'the Hana result'), (7, '', 'the Hana attempt charge'),
+            (7, 'release', 'the placement report'), (0, '', 'the attempt'),
+        ):
+            with (self.subTest(compiler_status=compiler_status, problem=problem, fault=fault),
+                  tempfile.TemporaryDirectory(dir=root) as folder):
+                self.root = Path(folder)
+                self.controller = offload.ProcessController()
+                self.fixture.objects = fixtures.FakeExecutionObjects(self.fixture.request, terminated=True, lease_free=True,
+                                                                     fail_fence=problem == 'fence')
+                self.lifecycle = box.HanaController(self.root, self.root / 'account.conf', self.transport.settings,
+                    cast(box.HanaProvider, cast(object, self.fixture.objects)))
+                self.output, self.error = BytesIO(), BytesIO()
+                self.check_accepted_compiler_result(compiler_status, problem=problem, fault=fault)
+
+    def check_accepted_compiler_result(self, compiler_status: int, *, problem: str, fault: str) -> None:
+        completed = self.fixture.command_result(compiler_status)
+        result = offload.ResultFile(self.root / 'runner.result')
+        request = replace(self.request, result=result)
+        argv = ['offload', 'run', '--repo-root', str(self.root), '--call-id', 'call']
+        release_result = RELEASE_BLOCKED if problem == 'release' else hana.HanaClaimReleased()
+        clock = 1000.0
+        writes: list[str] = []
+
+        def advance(seconds: float) -> None:
+            nonlocal clock
+            clock += seconds
+
+        def assert_delivered() -> None:
+            self.assertEqual(self.output.getvalue(), completed.stdout)
+            self.assertEqual(self.error.getvalue(), completed.stderr)
+            decoded = runner_result.read_result(result.path, compiler_status, selected_is_mac=False)
+            assert isinstance(decoded, runner_result.UsableRunnerResult), decoded
+            self.assertEqual((decoded.word, decoded.reason), ('passed' if compiler_status == 0 else 'failed', ''))
+
+        def write_record(name: str, *_arguments: object) -> None:
+            assert_delivered()
+            writes.append(name)
+            if name == fault:
+                raise OSError('The fixture record write failed')
+
+        def run(*_arguments: object) -> offload.MacOffloadResult:
+            return self.run_claimed()
+
+        with (self.context(),
+              mock.patch.object(self.fixture.objects, 'execution_result', return_value=hana_result.encode_result(completed)),
+              mock.patch.object(hana, 'release_assigned', return_value=release_result) as release,
+              mock.patch.object(record, 'publish_hana_result', side_effect=partial(write_record, 'the Hana result')),
+              mock.patch.object(record, 'publish_hana_loss') as loss,
+              mock.patch.object(admission_client, 'report_execution',
+                                side_effect=partial(write_record, 'the placement report')) as report,
+              mock.patch.object(execution, 'record_attempt_charge', side_effect=partial(write_record, 'the Hana attempt charge')),
+              mock.patch.object(time, 'monotonic', side_effect=lambda: clock),
+              mock.patch.object(time, 'sleep', side_effect=advance),
+              mock.patch.object(sys, 'argv', argv),
+              mock.patch.object(sys.stderr, 'write') as stderr,
+              mock.patch.object(offload, 'request_from_arguments', return_value=request),
+              mock.patch.object(offload, 'run_offload', side_effect=run),
+              mock.patch.object(offload, 'ProcessController', return_value=self.controller),
+              mock.patch.object(offload, 'interrupt_handlers', return_value=nullcontext()),
+              mock.patch.object(offload, 'restore_ignored_interrupt_default'),
+              mock.patch.object(offload, 'persist_attempt', side_effect=partial(write_record, 'the attempt')),
+              mock.patch.object(hana, 'read_execution_transport', return_value=self.transport),
+              mock.patch.object(override_guard, 'refuse_overrides')):
+            status = offload.main()
+        self.assertEqual(status, compiler_status)
+        assert_delivered()
+        self.assertEqual(release.call_count, int(problem != 'fence'))
+        self.assertEqual(writes, ['the Hana result', 'the Hana attempt charge', 'the placement report', 'the attempt'])
+        loss.assert_not_called()
+        report.assert_called_once()
+        sent = cast(wire.ExecutionReport, report.call_args.args[0])
+        self.assertEqual(sent.outcome, placement.AttemptCompleted(compiler_status))
+        cleanup_pending = problem in ('fence', 'release')
+        messages: list[str] = []
+        if cleanup_pending:
+            reason = (RELEASE_BLOCKED.reason if problem == 'release'
+                      else 'The Hana fence, command termination, or lease release remains unconfirmed')
+            self.assertEqual(sent.path, placement.DispatchPathPending(reason))
+            messages.append(f'offload: Hana cleanup pending. {reason}')
+        else:
+            self.assertEqual(sent.path, placement.DispatchPathSettled())
+        if fault:
+            messages.append(f'offload: Cannot record {fault} (OSError).')
+        self.assertEqual(stderr.call_args_list, [call for message in messages for call in (mock.call(message), mock.call('\n'))])
+        self.assertIsInstance(self.controller.pending,
+                              offload.PendingHanaOperation if cleanup_pending else offload.SettledDispatchOperations)
+        evidence = self.controller.attempt_evidence
+        self.assertEqual(evidence.completion, 'confirmed')
+        self.assertEqual(evidence.cleanup, 'unconfirmed' if cleanup_pending else 'confirmed')
+        self.assertEqual(execution.execution_command_settled(self.root, self.fixture.key.claim_id), problem != 'fence')
+        self.assertEqual(execution.claim_dispatch_pending(self.root, self.fixture.reference), cleanup_pending)
+
+    def finish_claimed(self, outcome: offload.MacOffloadResult,
+                       result: offload.ResultDestination = offload.NO_RESULT_FILE) -> int:
+        with (mock.patch.object(offload, 'report_placement_result'), mock.patch.object(offload, 'persist_attempt')):
+            return offload.finish_offload(self.controller, replace(self.request, result=result), outcome, time.monotonic())
 
     def test_accepted_result_releases_the_claim_during_account_prepare(self) -> None:
         install_hana_spending_settings(self.transport.settings)
@@ -139,10 +237,10 @@ source_allowed_environment=RUSTFLAGS
             self.assertIsInstance(self.lifecycle.request(self.fixture.key.claim_id, assigned=True), box.ClaimCommitted)
         account = deploy.Deployment(self.lifecycle.settings_path, self.root, self.root / 'output')
         inspect = self.lifecycle.inspect
-        released: list[bool] = []
+        released: list[hana.HanaClaimRelease] = []
 
         def release_while_preparing(assignment: placement.PlacementAssignment, holder: placement.ClaimHolderIdentity,
-                                    lifecycle: box.HanaController) -> bool:
+                                    lifecycle: box.HanaController) -> hana.HanaClaimRelease:
             def finish_claim(*_arguments: object) -> deploy.PreparedDeployment:
                 with mock.patch.object(lifecycle, 'inspect', wraps=inspect):
                     self.assertIsInstance(lifecycle.inspect(), box.HanaResourcesHeld)
@@ -166,9 +264,10 @@ source_allowed_environment=RUSTFLAGS
                 mock.patch.object(hana, 'release_assigned', side_effect=release_while_preparing),
                 mock.patch.object(record, 'publish_hana_result') as publish):
             outcome = self.run_claimed()
+            self.assertEqual(self.finish_claimed(outcome), 0)
 
         self.assertIsInstance(outcome, offload.PassedOnTarget)
-        self.assertEqual(released, [True])
+        self.assertEqual(released, [hana.HanaClaimReleased()])
         self.assertIsInstance(self.lifecycle.claim_status(self.fixture.key.claim_id), box.ClaimRefused)
         publish.assert_called_once()
 
@@ -257,30 +356,81 @@ route_test
         report.assert_called_once()
         sent = cast(wire.ExecutionReport, report.call_args.args[0])
         self.assertEqual(sent.claim, self.fixture.reference)
-        self.assertEqual(sent.outcome, placement.HanaCommandAdmissionRefused(box.HANA_CLAIM_BUSY))
-        self.assertIsInstance(sent.evidence, placement.ExecutionNotStarted)
+        self.assertEqual(sent.outcome, execution_identity.HanaCommandAdmissionRefused(box.HANA_CLAIM_BUSY))
+        self.assertIsInstance(sent.evidence, execution_identity.ExecutionNotStarted)
         self.assertIsInstance(sent.path, placement.DispatchPathSettled)
 
-    def test_stale_image_before_publication_reports_the_box_fault(self) -> None:
-        with (self.context(), mock.patch.object(self.lifecycle, 'permission',
-                    return_value=box.ClaimRefused(placement.HANA_IMAGE_STALE)),
-                mock.patch.object(hana, 'release_assigned', return_value=False) as release,
-                mock.patch.object(admission_client, 'report_execution') as report):
+    def test_prelaunch_refusal_reports_the_fault_without_publishing_a_command(self) -> None:
+        root = self.root
+        oversized = 'SourceUploadBound: archive exceeds its size bound'
+        for case, release_succeeds in (('stale image', True), ('stale image', False),
+                                       ('oversized archive', True), ('oversized archive', False),
+                                       ('consume refusal', True), ('consume refusal', False),
+                                       ('pending renewal', False)):
+            with (self.subTest(case=case, release_succeeds=release_succeeds), tempfile.TemporaryDirectory(dir=root) as folder):
+                self.root = Path(folder)
+                self.controller = offload.ProcessController()
+                self.lifecycle = box.HanaController(self.root, self.root / 'account.conf', self.transport.settings,
+                    cast(box.HanaProvider, cast(object, self.fixture.objects)))
+                detail = oversized if case == 'oversized archive' else ''
+                reason = 'The Hana payload could not be prepared: ' + detail if detail else placement.HANA_IMAGE_STALE
+                if case == 'pending renewal':
+                    reason = 'The claim, boot identity, or delivered permit is stale'
+                elif case == 'consume refusal':
+                    reason = 'the exact claim is not adopted'
+                self.assert_prelaunch_refusal(reason, oversized=detail, release_succeeds=release_succeeds,
+                                              renewal_pending=case == 'pending renewal', consume_refused=case == 'consume refusal')
+
+    def assert_prelaunch_refusal(self, reason: str, *, oversized: str, release_succeeds: bool,
+                                 renewal_pending: bool, consume_refused: bool) -> None:
+        uploaded = False
+
+        def upload() -> None:
+            nonlocal uploaded
+            uploaded = True
+
+        def permission(*_args: object) -> box.CommandPermission | box.ClaimRefused:
+            return box.ClaimRefused(reason) if uploaded else self.fixture.permission
+
+        with (self.context() as context,
+              mock.patch.object(hana, 'release_assigned', return_value=hana.HanaClaimReleased() if release_succeeds else RELEASE_BLOCKED) as release,
+              mock.patch.object(admission_client, 'report_execution') as report):
+            if oversized:
+                _ = context.enter_context(mock.patch.object(hana_transport.SourceSender, 'prepare',
+                    side_effect=hana_protocol.SourceRefused(oversized)))
+            elif consume_refused:
+                _ = context.enter_context(mock.patch.object(admission_client, 'consume_permission',
+                    return_value=wire.DispatchStatus(self.fixture.assignment, placement.CurrentAssignment(),
+                                                    placement.PermissionAvailable(), reason)))
+            elif renewal_pending:
+                _ = context.enter_context(mock.patch.object(hana_transport.SourceSender, 'prepare',
+                    return_value=(self.fixture.manifest, upload)))
+                _ = context.enter_context(mock.patch.object(self.lifecycle, 'permission', side_effect=permission))
+            else:
+                _ = context.enter_context(mock.patch.object(self.lifecycle, 'permission',
+                    return_value=box.ClaimRefused(reason)))
             outcome = self.run_claimed()
             offload.report_placement_result(self.controller, self.request, outcome)
-        release.assert_not_called()
+        release.assert_called_once()
         report.assert_called_once()
         sent = cast(wire.ExecutionReport, report.call_args.args[0])
-        self.assertEqual(sent.outcome, placement.HanaCommandAdmissionRefused(placement.HANA_IMAGE_STALE))
-        self.assertIsInstance(sent.path, placement.DispatchPathSettled)
-        self.assertIsInstance(sent.evidence, placement.ExecutionNotStarted)
-        self.assertTrue(execution.claim_admission_refused(self.root, self.fixture.reference))
+        self.assertEqual(sent.outcome, execution_identity.HanaCommandAdmissionRefused(reason))
+        assert isinstance(sent.outcome, execution_identity.HanaCommandAdmissionRefused)
+        self.assertIsInstance(sent.path, placement.DispatchPathSettled if release_succeeds else placement.DispatchPathPending)
+        self.assertIsInstance(sent.evidence, execution_identity.ExecutionNotStarted)
+        self.assertEqual(execution.claim_admission_refused(self.root, self.fixture.reference), release_succeeds)
+        self.assertEqual(execution.claim_dispatch_pending(self.root, self.fixture.reference), not release_succeeds)
         assert isinstance(outcome, offload.HanaCommandAdmissionRefused)
-        self.assertEqual(outcome.reason, placement.HANA_IMAGE_STALE)
-        settled = self.controller.hana_settlement
-        assert isinstance(settled, execution.HanaSettled)
-        self.assertEqual(settled.outcome, placement.HanaCommandAdmissionRefused(placement.HANA_IMAGE_STALE))
+        self.assertEqual(outcome.reason, reason)
+        if release_succeeds:
+            settled = self.controller.hana_settlement
+            assert isinstance(settled, execution.HanaSettled)
+            self.assertEqual(settled.outcome, execution_identity.HanaCommandAdmissionRefused(reason))
+        else:
+            self.assertIsInstance(self.controller.hana_settlement, offload.NoHanaSettlement)
         self.assertEqual(self.fixture.objects.envelopes, [])
+        self.assertEqual(placement.retry_decision(self.fixture.assignment.destination, sent.outcome, 1000),
+                         placement.DoNotRetry(reason))
         result_path = self.root / 'result'
         with (mock.patch.dict(os.environ, {'BUILDLOG_PINNED_TARGET': self.request.target}),
                 mock.patch.object(eligibility, 'configured_ssh_target', return_value=target_config.SshTarget(
@@ -288,12 +438,80 @@ route_test
                 mock.patch('sys.stdout', new_callable=StringIO) as output):
             self.assertEqual(offload.write_result(outcome, offload.ResultFile(result_path), target=self.request.target), 75)
         self.assertEqual(output.getvalue(), '')
-        self.assertIn(f'reason={placement.HANA_IMAGE_STALE}\n', result_path.read_text())
+        self.assertIn(f'reason={reason}\n', result_path.read_text())
+        if renewal_pending:
+            self.assertTrue(uploaded)
+            released = execution.settle_execution(self.root, self.fixture.request, self.fixture.objects,
+                release_claim=hana.HanaClaimReleased, reason='Replay the command settlement',
+                fence_window=execution.FenceAcknowledgementWindow(0, 1))
+            self.assertEqual(released, execution.HanaAdmissionRefusalSettled(
+                execution_identity.HanaCommandAdmissionRefused(reason), execution_identity.ExecutionNotStarted()))
+            self.assertFalse(execution.claim_dispatch_pending(self.root, self.fixture.reference))
+
+    def test_invalid_control_documents_refuse_before_the_archive_or_command_upload(self) -> None:
+        root = self.root
+        for case in ('request size', 'request binding', 'envelope reserve', 'envelope size', 'envelope access'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory(dir=root) as folder:
+                self.root = Path(folder)
+                self.controller = offload.ProcessController()
+                self.lifecycle = box.HanaController(self.root, self.root / 'account.conf', self.transport.settings,
+                    cast(box.HanaProvider, cast(object, self.fixture.objects)))
+                self.assert_control_refusal(case)
+
+    def assert_control_refusal(self, case: str) -> None:
+        manifest = self.fixture.manifest
+        original = self.request
+        access = self.fixture.objects.execution_access(self.fixture.key)
+        bound = 'The Hana control document exceeds its protocol bound'
+        if case in ('request size', 'envelope reserve'):
+            word = 'x' * (32769 if case == 'request size' else 30000)
+            self.request = replace(self.request, nextest_words=(word,))
+            manifest = replace(manifest, argv=('cargo', 'check', word))
+            self.assertLess(len(manifest.encode()), hana_protocol.CONTROL_MAX_BYTES)
+            if case == 'envelope reserve':
+                _ = hana_protocol.encode_request(replace(self.fixture.request, manifest=manifest, argv=manifest.argv))
+            cause = bound
+        elif case == 'request binding':
+            manifest = replace(manifest, argv=('cargo', 'clippy'))
+            cause = 'The Hana source, command, or attempt binding differs'
+        elif case == 'envelope size':
+            access = replace(access, result_url=access.result_url + 'x' * hana_protocol.CONTROL_MAX_BYTES)
+            cause = bound
+        else:
+            access = replace(access, result_url='invalid')
+            cause = 'The Hana publication URL is invalid'
+        upload = mock.Mock()
+        with (self.context(),
+              mock.patch.object(hana_transport.SourceSender, 'prepare', return_value=(manifest, upload)),
+              mock.patch.object(self.fixture.objects, 'execution_access', return_value=access),
+              mock.patch.object(self.lifecycle, 'permission', return_value=self.fixture.permission) as permission,
+              mock.patch.object(admission_client, 'consume_permission',
+                                return_value=wire.FirstAuthorization(self.fixture.assignment, self.fixture.reference)) as consume,
+              mock.patch.object(execution, 'settle_execution', wraps=execution.settle_execution) as settle_dispatch,
+              mock.patch.object(hana, 'release_assigned', return_value=hana.HanaClaimReleased()) as release,
+              mock.patch.object(self.fixture.objects, 'observe_execution') as observe):
+            outcome = self.run_claimed()
+        self.request = original
+        assert isinstance(outcome, offload.HanaCommandAdmissionRefused)
+        self.assertIn(cause, outcome.reason)
+        self.assertTrue(execution.claim_admission_refused(self.root, self.fixture.reference))
+        self.assertEqual(self.fixture.objects.envelopes, [])
+        upload.assert_not_called()
+        if case in ('envelope size', 'envelope access'):
+            consume.assert_called_once()
+            permission.assert_called_once()
+            settle_dispatch.assert_called_once()
+        else:
+            consume.assert_not_called()
+            permission.assert_not_called()
+            settle_dispatch.assert_not_called()
+        release.assert_called_once()
+        observe.assert_not_called()
 
     def test_stale_image_at_claim_reports_a_settled_refusal(self) -> None:
         cause = placement.HANA_IMAGE_STALE
         with (self.context(), mock.patch.object(hana, 'claim_assigned', return_value=hana.HanaClaimRefused(cause)),
-                mock.patch.object(hana, 'release_assigned') as release,
+                mock.patch.object(hana, 'release_assigned', return_value=hana.HanaClaimReleased()) as release,
                 mock.patch.object(admission_client, 'report_execution') as report):
             outcome = self.run_claimed()
             offload.report_placement_result(self.controller, self.request, outcome)
@@ -302,31 +520,63 @@ route_test
         report.assert_called_once()
         sent = cast(wire.ExecutionReport, report.call_args.args[0])
         self.assertEqual(sent.claim, self.fixture.reference)
-        self.assertEqual(sent.outcome, placement.HanaCommandAdmissionRefused(cause))
-        self.assertIsInstance(sent.evidence, placement.ExecutionNotStarted)
+        self.assertEqual(sent.outcome, execution_identity.HanaCommandAdmissionRefused(cause))
+        self.assertIsInstance(sent.evidence, execution_identity.ExecutionNotStarted)
         self.assertIsInstance(sent.path, placement.DispatchPathSettled)
         self.assertTrue(execution.claim_admission_refused(self.root, self.fixture.reference))
-        release.assert_not_called()
+        release.assert_called_once()
         self.assertEqual(self.fixture.objects.envelopes, [])
+
+    def test_claim_refusal_replay_requires_release_of_the_previous_claim(self) -> None:
+        refusal = execution_identity.HanaCommandAdmissionRefused(placement.HANA_IMAGE_STALE)
+        claim = hana.HanaClaimRefused('The Hana attempt already has a settled command path')
+        root = self.root
+        for cancelled in (False, True):
+            with self.subTest(cancelled=cancelled), tempfile.TemporaryDirectory(dir=root) as folder:
+                self.root = Path(folder)
+                self.controller = offload.ProcessController()
+                self.lifecycle = box.HanaController(self.root, self.root / 'account.conf', self.transport.settings,
+                    cast(box.HanaProvider, cast(object, self.fixture.objects)))
+                release_result = hana.HanaClaimReleased() if cancelled else RELEASE_BLOCKED
+                saved = execution.settle_unpublished_claim(self.root, self.fixture.reference,
+                    release_claim=lambda: release_result, reason=refusal, cancelled=cancelled)
+                self.assertIsInstance(saved, execution.HanaSettled if cancelled else execution.HanaSettlementPending)
+                self.assertIsInstance(self.controller.attempt_evidence.provider, placement.NoProviderClaim)
+                with (self.context(), mock.patch.object(hana, 'claim_assigned', return_value=claim),
+                      mock.patch.object(hana, 'release_assigned', return_value=RELEASE_BLOCKED) as release):
+                    outcome = self.run_claimed()
+                if cancelled:
+                    assert isinstance(outcome, offload.DeclinedMacRun)
+                    self.assertEqual((outcome.reason, outcome.detail), ('state', claim.reason))
+                    release.assert_not_called()
+                else:
+                    assert isinstance(outcome, offload.HanaCommandAdmissionRefused)
+                    self.assertEqual(outcome.reason, refusal.reason)
+                    release.assert_called_once()
+                    self.assertIsInstance(self.controller.pending, offload.PendingHanaOperation)
+                self.assertEqual(execution.claim_dispatch_pending(self.root, self.fixture.reference), not cancelled)
+                self.assertFalse(execution.claim_admission_refused(self.root, self.fixture.reference))
 
     def test_nonzero_compiler_status_remains_a_terminal_failure(self) -> None:
         with self.context(), mock.patch.object(self.fixture.objects, 'execution_result',
                 return_value=hana_result.encode_result(self.fixture.command_result(1))), \
                 mock.patch.object(record, 'publish_hana_result') as publish:
             outcome = self.run_claimed()
+            self.assertEqual(self.finish_claimed(outcome), 1)
         self.assertIsInstance(outcome, offload.FailedOnTarget)
         assert isinstance(outcome, offload.FailedOnTarget)
         self.assertEqual(outcome.status, 1)
         publish.assert_called_once()
 
-    def test_source_refusal_releases_the_claim_and_ends_the_build(self) -> None:
+    def test_source_refusal_releases_the_claim_for_fallback(self) -> None:
         cause = 'IgnoredInput: remove the ignored path'
+        reason = 'The Hana payload could not be prepared: ' + cause
         assigned = replace(self.request, result=offload.ResultFile(self.root / 'result'))
         repository = eligibility.KnownRepository('hana', 'github.com/natepiano/hana')
 
         def run(runner: offload.ProcessController, transport: hana.HanaControlTransport,
                 placed: offload.OffloadRequest, started: float) -> offload.MacOffloadResult:
-            return offload.hana_claimed_run(runner, transport, placed, repository, started)
+            return offload.claimed_run(runner, transport, placed, repository, started)
 
         for request in (assigned, replace(assigned, placement=offload.DirectOffloadRequest())):
             with self.subTest(request=request.placement):
@@ -346,30 +596,31 @@ route_test
                     submit = patches.enter_context(mock.patch.object(offload, 'submit_direct_placement', side_effect=[assigned]))
                     claim = patches.enter_context(mock.patch.object(hana, 'claim_assigned', return_value=self.fixture.adopted))
                     capture = patches.enter_context(mock.patch.object(hana_transport.SourceSender, 'prepare',
-                        side_effect=hana_source.SourceRefused(cause)))
-                    release = patches.enter_context(mock.patch.object(hana, 'release_assigned', return_value=True))
+                        side_effect=hana_protocol.SourceRefused(cause)))
+                    release = patches.enter_context(mock.patch.object(hana, 'release_assigned', return_value=hana.HanaClaimReleased()))
                     report = patches.enter_context(mock.patch.object(admission_client, 'report_execution'))
                     _ = patches.enter_context(mock.patch.object(admission_client, 'cancel_placement'))
                     _ = patches.enter_context(mock.patch.object(offload, 'persist_attempt'))
                     status = offload.main()
-                self.assertEqual(status, 1)
+                self.assertEqual(status, 75)
                 self.assertEqual(submit.call_count, int(isinstance(request.placement, offload.DirectOffloadRequest)))
                 claim.assert_called_once()
                 capture.assert_called_once()
                 release.assert_called_once()
                 report.assert_called_once()
                 sent = cast(wire.ExecutionReport, report.call_args.args[0])
-                self.assertEqual(sent.outcome, placement.PrelaunchRefused(cause))
+                self.assertEqual(sent.outcome, execution_identity.HanaCommandAdmissionRefused(reason))
                 self.assertIsInstance(sent.path, placement.DispatchPathSettled)
-                self.assertIsInstance(sent.evidence, placement.ExecutionNotStarted)
+                self.assertIsInstance(sent.evidence, execution_identity.ExecutionNotStarted)
                 self.assertFalse(execution.claim_dispatch_pending(directory, self.fixture.reference))
                 self.assertEqual(self.fixture.objects.envelopes, [])
                 self.assertEqual(output.getvalue().splitlines(), [
-                    'mac_test: The build did not run on configured-target. '
-                    + 'Fix the Hana source refusal (IgnoredInput: remove the ignored path) and run the build again.'])
-                self.assertIn('outcome=prelaunch_failed', (self.root / 'result').read_text())
+                    f'mac_test: The Hana command did not start on configured-target. {reason}'])
+                result = runner_result.read_result(self.root / 'result', status, False)
+                assert isinstance(result, runner_result.UsableRunnerResult)
+                self.assertEqual((result.word, result.reason), ('hana_command_admission_refused', reason))
 
-    def test_source_change_inside_capture_returns_a_usable_retry_result(self) -> None:
+    def test_source_change_inside_capture_returns_a_usable_refusal(self) -> None:
         def changed_capture(*_args: object, **_options: object) -> str:
             return copies.capture_source(self.root)
 
@@ -382,15 +633,16 @@ route_test
             outcome = self.run_claimed()
             status = offload.write_result(outcome, offload.ResultFile(report), target=self.request.target)
         self.assertEqual(status, 75)
-        self.assertIsInstance(outcome, offload.DeclinedMacRun)
+        self.assertIsInstance(outcome, offload.HanaCommandAdmissionRefused)
         result = runner_result.read_result(report, status, False)
         assert isinstance(result, runner_result.UsableRunnerResult)
-        self.assertEqual((result.word, result.reason), ('declined', 'source_changed'))
+        self.assertEqual((result.word, result.reason),
+                         ('hana_command_admission_refused', 'SourceChanged: inputs changed during source capture'))
         self.assertEqual(self.controller.attempt_evidence.cleanup, 'confirmed')
         self.assertEqual(self.fixture.objects.envelopes, [])
 
     def test_killed_capture_git_ends_the_attempt_with_a_runner_fault(self) -> None:
-        limits = hana_source.SourceLimits(1024, 2, 2, ())
+        limits = hana_protocol.SourceLimits(2, ())
 
         def killed_git(*_args: object, **_options: object) -> str:
             return hana_source.git(self.root, limits, 'bundle', 'create', 'source.bundle')
@@ -404,7 +656,7 @@ route_test
             outcome = self.run_claimed()
             status = offload.write_result(outcome, offload.ResultFile(report), target=self.request.target)
         self.assertEqual(status, 75)
-        self.assertIn('reason=runner\n', report.read_text())
+        self.assertIn('outcome=hana_command_admission_refused\n', report.read_text())
         self.assertIn('The Hana source capture failed', output.getvalue())
         self.assertIn('SIGKILL', output.getvalue())
         self.assertEqual(self.controller.attempt_evidence.cleanup, 'confirmed')
@@ -418,7 +670,7 @@ route_test
         self.assertEqual(self.error.getvalue(), b'')
         report = self.root / 'transfer-loss.json'
         with redirect_stdout(StringIO()) as printed:
-            status = offload.write_result(outcome, offload.ResultFile(report), verb='check', target=self.request.target)
+            status = self.finish_claimed(outcome, offload.ResultFile(report))
         self.assertEqual(status, 75)
         self.assertIn('outcome=lost', report.read_text())
         self.assertIn(reason, printed.getvalue())
@@ -440,7 +692,7 @@ route_test
         monotonic = time.monotonic()
         boot_deadline = int(time.time()) + 250
         observation = replace(self.fixture.objects.observe_execution(self.fixture.key), accepted=True,
-            evidence=placement.ExecutionEvidenceUnavailable('The command result is pending', 1000))
+            evidence=execution_identity.ExecutionEvidenceUnavailable('The command result is pending', 1000))
         fence_reads: list[float] = []
 
         def advance(seconds: float) -> None:
@@ -455,7 +707,7 @@ route_test
             observe = self.fixture.objects.observe_execution
 
             def observe_near_deadline(key: hana_result.HanaAttemptKey, *,
-                                      timeout_s: float | None = None) -> execution.HanaCommandObservation:
+                                      timeout_s: float | None = None) -> hana_protocol.HanaCommandObservation:
                 if not self.fixture.objects.fenced:
                     advance(80)
                     return observation
@@ -474,7 +726,7 @@ route_test
         loss.assert_called_once()
         self.assertEqual([read_at - fence_reads[0] for read_at in fence_reads], [0, 1, 2])
         self.assertEqual([type(value) for value in self.fixture.objects.envelopes],
-                         [execution.HanaCommandEnvelope, execution.HanaFenceEnvelope])
+                         [hana_protocol.HanaCommandEnvelope, hana_protocol.HanaFenceEnvelope])
 
     def test_result_upload_timeout_reports_without_downloading_a_result(self) -> None:
         self.assert_upload_loss('HanaResultUploadTimedOut: The result upload exceeded 83 s (result_transfer_timeout_s)')
@@ -485,11 +737,11 @@ route_test
     def assert_upload_loss(self, reason: str) -> None:
         objects = self.fixture.objects
         observation = replace(objects.observe_execution(self.fixture.key), accepted=True,
-            evidence=placement.ExecutionEvidenceUnavailable(reason, 1000))
+            evidence=execution_identity.ExecutionEvidenceUnavailable(reason, 1000))
         observe = objects.observe_execution
 
         def upload_failed(key: hana_result.HanaAttemptKey, *,
-                          timeout_s: float | None = None) -> execution.HanaCommandObservation:
+                          timeout_s: float | None = None) -> hana_protocol.HanaCommandObservation:
             return observe(key, timeout_s=timeout_s) if objects.fenced else observation
 
         with (self.context(), mock.patch.object(objects, 'observe_execution', side_effect=upload_failed),
@@ -502,39 +754,39 @@ route_test
         publish.assert_not_called()
         loss.assert_called_once()
 
-    def test_source_change_during_settlement_reports_loss_instead_of_completion(self) -> None:
+    def test_source_change_during_settlement_preserves_the_accepted_result(self) -> None:
         from scripts.build_queue import admission_client
 
         with self.context(), mock.patch.object(offload, 'hana_source_key', return_value=self.fixture.source_key) as source, \
                 mock.patch.object(record, 'publish_hana_result') as publish, \
                 mock.patch.object(record, 'publish_hana_loss') as loss, \
-                mock.patch.object(admission_client, 'report_execution') as report:
-            def release(*_: object) -> bool:
-                source.return_value = placement.SourceKeyKnown('changed-source')
-                return True
+                mock.patch.object(admission_client, 'report_execution') as report, \
+                mock.patch.object(offload, 'persist_attempt'):
+            def release(*_: object) -> hana.HanaClaimRelease:
+                source.return_value = execution_identity.SourceKeyKnown('changed-source')
+                return hana.HanaClaimReleased()
 
             with mock.patch.object(hana, 'release_assigned', side_effect=release):
                 outcome = self.run_claimed()
-            offload.report_placement_result(self.controller, self.request, outcome)
-            replay = execution.replay_accepted_result(self.root, self.fixture.request, self.transport.host,
-                                                       lambda: self.fixture.source_key)
-        self.assertIsInstance(outcome, offload.LostMacRun)
+            self.assertEqual(offload.finish_offload(self.controller, self.request, outcome, time.monotonic()), 0)
+            replay = execution.replay_accepted_result(self.root, self.fixture.request)
+        self.assertIsInstance(outcome, offload.PassedOnTarget)
         sent = cast(wire.ExecutionReport, report.call_args.args[0])
-        self.assertIsInstance(sent.outcome, placement.AttemptDeclined)
+        self.assertEqual(sent.outcome, placement.AttemptCompleted(0))
         self.assertIsInstance(sent.path, placement.DispatchPathSettled)
-        self.assertIsInstance(replay, hana_result.RejectedHanaResult)
+        self.assertIsInstance(replay, hana_result.AcceptedHanaResult)
         row = hana_result.object_fields(cast(object, json.loads(
             execution.execution_path(self.root, self.fixture.key.claim_id).read_text())))
-        self.assertEqual(hana_result.object_fields(row['outcome'])['kind'], 'declined')
-        publish.assert_not_called()
-        loss.assert_called_once()
+        self.assertEqual(hana_result.object_fields(row['outcome'])['kind'], 'completed')
+        publish.assert_called_once()
+        loss.assert_not_called()
 
     def test_replaced_result_creates_no_final_row_or_verify_cache(self) -> None:
         stale = replace(self.fixture.command_result(), key=replace(self.fixture.key, attempt='replaced'))
         placement_path = self.root / 'assignment.json'
         objects = self.fixture.objects
         observation = replace(objects.observe_execution(self.fixture.key), accepted=True,
-            evidence=placement.ExecutionEvidenceUnavailable(execution.COMMAND_RESULT_PENDING, 1000))
+            evidence=execution_identity.ExecutionEvidenceUnavailable(hana_protocol.COMMAND_RESULT_PENDING, 1000))
         with self.context(), mock.patch.object(self.fixture.objects, 'execution_result', return_value=hana_result.encode_result(stale)), \
                 mock.patch.object(objects, 'observe_execution', return_value=observation), \
                 mock.patch.object(record, 'publish_hana_result') as publish, \
@@ -542,8 +794,7 @@ route_test
                 mock.patch.dict(os.environ, {'BUILDLOG_PLACEMENT_FILE': str(placement_path)}):
             outcome = self.run_claimed()
             result_file = self.root / 'verify-result.json'
-            status = offload.write_result(outcome, offload.ResultFile(result_file), offload.NO_PRIOR_MAC_DECLINE,
-                'check', self.request.target, self.controller.attempt_evidence)
+            status = self.finish_claimed(outcome, offload.ResultFile(result_file))
         self.assertIsInstance(outcome, offload.LostMacRun)
         self.assertEqual(status, 75)
         decoded = runner_result.read_result(result_file, status, selected_is_mac=False)
@@ -558,16 +809,16 @@ route_test
         with self.context(), mock.patch.object(record, 'publish_hana_result') as publish, \
                 mock.patch.object(record, 'publish_hana_loss'):
             _ = execution.dispatch_execution(self.root, self.fixture.request, self.fixture.adopted, self.fixture.objects,
+                upload_source=lambda: None,
                 consume=lambda request: wire.FirstAuthorization(self.fixture.assignment, self.fixture.reference),
                 current_permission=lambda: self.fixture.permission,
                 current_source_key=lambda: self.fixture.source_key)
             _ = execution.settle_execution(self.root, self.fixture.request, self.fixture.objects,
-                release_claim=lambda: True, reason='The original owner cancelled the attempt',
+                release_claim=hana.HanaClaimReleased, reason='The original owner cancelled the attempt',
                 fence_window=execution.FenceAcknowledgementWindow(time.monotonic() + 113, 1))
             outcome = self.run_claimed()
             result_file = self.root / 'fenced-result.json'
-            status = offload.write_result(outcome, offload.ResultFile(result_file), offload.NO_PRIOR_MAC_DECLINE,
-                'check', self.request.target, self.controller.attempt_evidence)
+            status = self.finish_claimed(outcome, offload.ResultFile(result_file))
         self.assertEqual(status, 75)
         self.assertIn('outcome=lost', result_file.read_text())
         publish.assert_not_called()
@@ -587,7 +838,7 @@ route_test
         from scripts.build_queue import admission_client
 
         self.controller.hana_settlement = execution.HanaSettled(placement.AttemptCancelled('The user cancelled'),
-                                                               placement.ExecutionNotStarted())
+                                                               execution_identity.ExecutionNotStarted())
         self.controller.attempt_evidence.provider = self.fixture.reference
         with mock.patch.object(admission_client, 'report_execution') as report:
             offload.report_placement_result(self.controller, self.request, offload.LostMacRun(1))
@@ -642,19 +893,19 @@ route_test
         pending = hana.HanaClaimPending(self.fixture.reference,
             box.WorkClaim(self.fixture.key.claim_id, 'claim-token', 900), 0)
         with self.context(), mock.patch.object(hana, 'claim_assigned', return_value=pending), \
-                mock.patch.object(hana, 'release_assigned', return_value=False), \
+                mock.patch.object(hana, 'release_assigned', return_value=RELEASE_BLOCKED), \
                 mock.patch.object(admission_client, 'report_execution') as report:
             outcome = self.run_claimed()
             offload.report_placement_result(self.controller, self.request, outcome)
-        self.assertIsInstance(outcome, offload.DeclinedMacRun)
+        assert isinstance(outcome, offload.HanaCommandAdmissionRefused)
         sent = cast(wire.ExecutionReport, report.call_args.args[0])
-        self.assertIsInstance(sent.outcome, placement.PrelaunchRefused)
+        self.assertEqual(sent.outcome, execution_identity.HanaCommandAdmissionRefused(outcome.reason))
         self.assertIsInstance(sent.path, placement.DispatchPathPending)
-        self.assertIsInstance(sent.evidence, placement.ExecutionNotStarted)
+        self.assertIsInstance(sent.evidence, execution_identity.ExecutionNotStarted)
         self.assertTrue(execution.claim_dispatch_pending(self.root, self.fixture.reference))
         self.assertEqual(self.fixture.objects.envelopes, [])
 
-    def test_failed_fence_prevents_result_publication_after_compiler_completion(self) -> None:
+    def test_failed_fence_keeps_a_command_without_an_accepted_result_pending(self) -> None:
         self.fixture.objects.fail_fence = True
         monotonic = time.monotonic()
 
@@ -662,7 +913,9 @@ route_test
             nonlocal monotonic
             monotonic += seconds
 
+        mismatched = replace(self.fixture.command_result(), argv=('cargo', 'clippy'))
         with (self.context(), mock.patch.object(record, 'publish_hana_result') as publish,
+              mock.patch.object(self.fixture.objects, 'execution_result', return_value=hana_result.encode_result(mismatched)),
               mock.patch.object(time, 'monotonic', side_effect=lambda: monotonic),
               mock.patch.object(time, 'sleep', side_effect=advance) as pause):
             outcome = self.run_claimed()
@@ -673,16 +926,32 @@ route_test
 
     def test_terminal_guest_refusal_supplies_one_cause_to_the_pinned_runner(self) -> None:
         root = self.root
-        for refusal_in_fence_ack in (False, True):
-            with self.subTest(refusal_in_fence_ack=refusal_in_fence_ack), tempfile.TemporaryDirectory(dir=root) as folder:
+        disabled = 'Hana command admission is disabled on the guest'
+        installed_abi = hana_protocol.RUNTIME_ABI
+        requested_abi = installed_abi + 1
+        abi_reason = f'The Hana runtime ABI {requested_abi} differs from the image ABI {installed_abi}'
+        for code, reason, abi, refusal_in_fence_ack, release_succeeds in (
+            (CommandAdmissionRefusalCode.ADMISSION_DISABLED, disabled, installed_abi, False, True),
+            (CommandAdmissionRefusalCode.ADMISSION_DISABLED, disabled, installed_abi, True, True),
+            (CommandAdmissionRefusalCode.ADMISSION_DISABLED, disabled, installed_abi, False, False),
+            (CommandAdmissionRefusalCode.ADMISSION_DISABLED, disabled, installed_abi, True, False),
+            (CommandAdmissionRefusalCode.PRE_COMMAND_FAILED, abi_reason, requested_abi, False, True),
+            (CommandAdmissionRefusalCode.PRE_COMMAND_FAILED, abi_reason, requested_abi, False, False),
+        ):
+            with (self.subTest(code=code, refusal_in_fence_ack=refusal_in_fence_ack, release_succeeds=release_succeeds),
+                  tempfile.TemporaryDirectory(dir=root) as folder):
                 self.root = Path(folder)
                 self.fixture = fixtures.HanaExecutionTests()
+                self.fixture.manifest = replace(self.fixture.manifest, runtime_abi=abi)
+                self.fixture.request = replace(self.fixture.request, manifest=self.fixture.manifest)
                 self.controller = offload.ProcessController()
                 self.lifecycle = box.HanaController(self.root, self.root / 'account.conf', self.transport.settings,
                     cast(box.HanaProvider, cast(object, self.fixture.objects)))
-                self.assert_terminal_guest_refusal(refusal_in_fence_ack=refusal_in_fence_ack)
+                self.assert_terminal_guest_refusal(code, reason, refusal_in_fence_ack=refusal_in_fence_ack,
+                                                   release_succeeds=release_succeeds)
 
-    def assert_terminal_guest_refusal(self, *, refusal_in_fence_ack: bool) -> None:
+    def assert_terminal_guest_refusal(self, code: CommandAdmissionRefusalCode, reason: str, *,
+                                      refusal_in_fence_ack: bool, release_succeeds: bool) -> None:
         queue = self.enterContext(queue_fixtures.PlacementFixture())
         _ = self.enterContext(mock.patch.object(admission_service, 'HostEvidenceWorker', queue_fixtures.ManualEvidenceWorker))
         target = target_config.SshTarget(self.request.target, 'linux', self.transport.settings)
@@ -694,41 +963,48 @@ route_test
         _ = queue_fixtures.publish_candidate(queue, submitted)
         assigned = queue_fixtures.assignment_for(queue, submitted)
         claim = placement.assigned_claim_reference(assigned)
-        provider_claim = placement.AdoptedProviderClaim(claim, queue_fixtures.coordinator_holder(assigned),
-            assigned.session, assigned.destination.host, hana.generation_text(self.fixture.adopted.generation))
-        key = queue.server.host_evidence_key(submitted, assigned.destination)
-        evidence = placement.FreshHostEvidence(key, queue.clock.now(), provider_claim.generation,
-                                               placement.AllowedHost(), (provider_claim,))
-        queue.provider_evidence[key] = evidence
-        queue.server.publish_host_evidence(evidence)
-        authorization, = queue.connect(queue_fixtures.consume_permission('consume', assigned, claim)).replies()
+        holder = queue_fixtures.coordinator_holder(assigned)
+        generation = self.fixture.adopted.generation
+        now = int(self.lifecycle.clock())
+        work_claim = box.WorkClaim(claim.claim_id, 'fixture-token', now, active=True)
+        snapshot = box.HanaLifecycleEvidence(
+            box.DeploymentIdentity(generation.deployment, 'fixture-instance', 'fixture-spot', 'us-east-2'),
+            box.Lifecycle.READY, box.VerifiedBoot(generation.boot_id, generation.start_token), box.NoOperation(),
+            box.DeliveredPermit(3, now + 1800, claim.claim_id), (work_claim,), now)
+        with (mock.patch.dict(os.environ, {'BUILD_TARGETS_STATE_DIR': str(self.root / 'targets')}),
+              mock.patch.object(hana_placement_adapter, 'validate_assignment', return_value=self.transport),
+              mock.patch.object(hana_placement_adapter, 'controller_for', return_value=self.lifecycle),
+              mock.patch.object(self.lifecycle, 'request', return_value=box.ClaimCommitted(work_claim)),
+              mock.patch.object(self.lifecycle, 'read_saved_lifecycle', return_value=snapshot)):
+            adopted = hana_placement_adapter.claim_assigned(assigned, holder, self.lifecycle)
+            assert isinstance(adopted, hana.HanaClaimAdopted), adopted
+            authorization, = queue.connect(queue_fixtures.consume_permission('consume', assigned, claim)).replies()
         self.assertEqual(authorization, wire.FirstAuthorization(assigned, claim))
         self.fixture.assignment, self.fixture.reference = assigned, claim
-        self.fixture.adopted = replace(self.fixture.adopted, reserved=placement.ReservedHost(assigned, provider_claim))
+        self.fixture.adopted = adopted
         self.fixture.key = replace(self.fixture.key, episode=assigned.episode, attempt=assigned.attempt, claim_id=claim.claim_id)
         self.fixture.request = replace(self.fixture.request, key=self.fixture.key,
                                        link=replace(self.fixture.request.link, episode=assigned.episode))
         self.fixture.permission = replace(self.fixture.permission, execution=claim.claim_id)
 
-        reason = 'Hana command admission is disabled on the guest'
         objects = self.fixture.objects
         objects.request = self.fixture.request
         objects.fail_fence = not refusal_in_fence_ack
-        observation = replace(objects.observe_execution(self.fixture.key), accepted=True, terminated=True, lease_free=True,
-                              evidence=placement.ExecutionEvidenceUnavailable(reason, 1000),
-                              refusal_code=CommandAdmissionRefusalCode.ADMISSION_DISABLED)
+        observation = hana_protocol.ConfirmedCommandAdmissionRefusal(
+            self.fixture.key, self.fixture.request.slot, False, 1000, reason, code)
         monotonic = time.monotonic()
         boot_deadline = int(time.time()) + 200
         publish = objects.publish_execution
 
-        def publish_near_deadline(envelope: execution.HanaExecutionEnvelope) -> None:
+        def publish_near_deadline(content: bytes) -> None:
             nonlocal monotonic
-            publish(envelope)
-            if refusal_in_fence_ack and isinstance(envelope, execution.HanaCommandEnvelope):
+            publish(content)
+            envelope = hana_protocol.decode_envelope(content)
+            if refusal_in_fence_ack and isinstance(envelope, hana_protocol.HanaCommandEnvelope):
                 monotonic += 90
 
         def observe_refusal(key: hana_result.HanaAttemptKey, *,
-                            timeout_s: float | None = None) -> execution.HanaCommandObservation:
+                            timeout_s: float | None = None) -> hana_protocol.ConfirmedCommandAdmissionRefusal:
             self.assertEqual(key, observation.key)
             self.assertEqual(objects.fenced, refusal_in_fence_ack)
             self.assertEqual(timeout_s is not None, refusal_in_fence_ack)
@@ -741,11 +1017,16 @@ route_test
                 '--call-id', 'call', '--target', target.name, '--assignment-file', str(assignment_file), '--result', str(result.path)]
         send_report = admission_client.report_execution
 
-        def report_while_claimed(request: wire.ExecutionReport) -> wire.DispatchStatus:
-            snapshot = self.lifecycle.inspect()
-            assert isinstance(snapshot, box.HanaLifecycleEvidence)
-            self.assertEqual([item.execution for item in snapshot.claims], [claim.claim_id])
-            self.assertTrue(execution.claim_admission_refused(self.root, claim))
+        def release_claim(assignment: placement.PlacementAssignment, _holder: placement.ClaimHolderIdentity,
+                          lifecycle: box.HanaController) -> hana.HanaClaimRelease:
+            self.assertEqual(assignment, assigned)
+            self.assertIs(lifecycle, self.lifecycle)
+            self.assertTrue(execution.execution_command_settled(self.root, claim.claim_id))
+            return hana.HanaClaimReleased() if release_succeeds else RELEASE_BLOCKED
+
+        def report_after_release(request: wire.ExecutionReport) -> wire.DispatchStatus:
+            release.assert_called_once()
+            self.assertEqual(execution.claim_admission_refused(self.root, claim), release_succeeds)
             return send_report(request)
 
         with (self.context(),
@@ -762,10 +1043,10 @@ route_test
               mock.patch.object(objects, 'publish_execution', side_effect=publish_near_deadline),
               mock.patch.object(objects, 'observe_execution', side_effect=observe_refusal) as observe,
               mock.patch.object(objects, 'execution_result') as fetch,
-              mock.patch.object(hana, 'release_assigned', return_value=False) as release,
+              mock.patch.object(hana, 'release_assigned', side_effect=release_claim) as release,
               mock.patch.object(record, 'publish_hana_loss') as loss,
               mock.patch.object(record, 'ssh_attempt'),
-              mock.patch.object(admission_client, 'report_execution', side_effect=report_while_claimed) as report,
+              mock.patch.object(admission_client, 'report_execution', side_effect=report_after_release) as report,
               mock.patch.dict(os.environ, {'BUILDLOG_PINNED_TARGET': target.name}),
               redirect_stdout(StringIO()) as text):
             status = offload.main()
@@ -774,26 +1055,34 @@ route_test
         decoded = runner_result.read_result(result.path, status, selected_is_mac=False)
         assert isinstance(decoded, runner_result.UsableRunnerResult)
         self.assertEqual((decoded.word, decoded.reason), ('hana_command_admission_refused', reason))
-        self.assertIsInstance(self.controller.pending, offload.PendingHanaOperation)
+        self.assertIsInstance(self.controller.pending,
+                              offload.SettledDispatchOperations if release_succeeds else offload.PendingHanaOperation)
         self.assertTrue(execution.execution_command_settled(self.root, self.fixture.key.claim_id))
-        self.assertTrue(execution.claim_admission_refused(self.root, self.fixture.reference))
-        self.assertFalse(execution.claim_dispatch_pending(self.root, self.fixture.reference))
-        release.assert_not_called()
+        self.assertEqual(execution.claim_admission_refused(self.root, self.fixture.reference), release_succeeds)
+        self.assertEqual(execution.claim_dispatch_pending(self.root, self.fixture.reference), not release_succeeds)
+        release.assert_called_once()
         fetch.assert_not_called()
         report.assert_called_once()
         sent = cast(wire.ExecutionReport, report.call_args.args[0])
-        self.assertEqual(sent.outcome, placement.HanaCommandAdmissionRefused(reason))
-        self.assertIsInstance(sent.evidence, placement.ExecutionNotStarted)
-        self.assertIsInstance(sent.path, placement.DispatchPathSettled)
-        saved = queue.server.assignments[placement.attempt_key(assigned.episode, assigned.attempt)]
-        self.assertEqual(saved.state, placement.ClosedAssignment(reason))
+        self.assertEqual(sent.outcome, execution_identity.HanaCommandAdmissionRefused(reason))
+        self.assertIsInstance(sent.evidence, execution_identity.ExecutionNotStarted)
+        path = (placement.DispatchPathSettled() if release_succeeds
+                else placement.DispatchPathPending(RELEASE_BLOCKED.reason))
+        self.assertEqual(sent.path, path)
+        cleanup = 'confirmed' if release_succeeds else 'unconfirmed'
+        self.assertIn(f'cleanup={cleanup}', result.path.read_text().splitlines())
+        saved = queue.server.assignments[execution_identity.attempt_key(assigned.episode, assigned.attempt)]
+        self.assertEqual(saved.state, placement.ClosedAssignment(reason) if release_succeeds else placement.CurrentAssignment())
         self.assertEqual(saved.retry, placement.DoNotRetry(reason))
-        envelopes: list[type[execution.HanaExecutionEnvelope]] = [execution.HanaCommandEnvelope]
+        envelopes: list[type[hana_protocol.HanaExecutionEnvelope]] = [hana_protocol.HanaCommandEnvelope]
         if refusal_in_fence_ack:
-            envelopes.append(execution.HanaFenceEnvelope)
+            envelopes.append(hana_protocol.HanaFenceEnvelope)
         self.assertEqual([type(envelope) for envelope in objects.envelopes], envelopes)
         observe.assert_called_once()
-        loss.assert_called_once()
+        if release_succeeds:
+            loss.assert_called_once()
+        else:
+            loss.assert_not_called()
 
     def test_repair_flags_and_mend_profiles_never_claim_the_hana_target(self) -> None:
         repository = eligibility.KnownRepository('hana', 'github.com/natepiano/hana')
@@ -809,30 +1098,79 @@ route_test
             claim.assert_not_called()
 
     def test_missing_basis_repairs_the_captured_commit_without_another_command(self) -> None:
+        root = self.root
+        for case in ('repaired', 'sender refusal', 'publication refused', 'guest refusal'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory(dir=root) as folder:
+                self.root = Path(folder)
+                self.request = replace(self.request, repo_root=self.root)
+                self.fixture = fixtures.HanaExecutionTests()
+                self.controller = offload.ProcessController()
+                self.lifecycle = box.HanaController(self.root, self.root / 'account.conf', self.transport.settings,
+                    cast(box.HanaProvider, cast(object, self.fixture.objects)))
+                self.assert_source_repair(case)
+
+    def assert_source_repair(self, case: str) -> None:
         from scripts.aws_target.hana_source import MissingBasis
 
         self.fixture.manifest = replace(self.fixture.manifest, basis_commits=('d' * 40,))
         self.fixture.request = replace(self.fixture.request, manifest=self.fixture.manifest)
-        self.fixture.objects.request = self.fixture.request
-        self.fixture.objects.missing_basis = True
+        objects = self.fixture.objects
+        objects.request = self.fixture.request
+        objects.missing_basis = True
+        objects.terminated = True
+        objects.lease_free = True
         complete = replace(self.fixture.manifest, basis_commits=(), bundle_sha256='e' * 64)
-        with self.context(), mock.patch.object(hana_transport.SourceSender, 'retry_complete', return_value=complete) as retry, \
-                mock.patch.object(hana_transport.SourceSender, 'acknowledge') as acknowledge, \
-                mock.patch.object(record, 'publish_hana_result') as publish, \
-                mock.patch.object(record, 'publish_hana_loss') as loss, mock.patch.object(time, 'sleep'):
+        cause = 'The payload exceeds its size bound'
+        observe = objects.observe_execution
+
+        def observe_repair(key: hana_result.HanaAttemptKey, *,
+                           timeout_s: float | None = None) -> hana_protocol.HanaExecutionObservation:
+            observation = observe(key, timeout_s=timeout_s)
+            if case == 'guest refusal' and observation.source_updated:
+                return hana_protocol.ConfirmedCommandAdmissionRefusal(
+                    key, observation.slot, observation.fenced, observation.observed_at, cause,
+                    CommandAdmissionRefusalCode.PRE_COMMAND_FAILED)
+            return observation
+
+        with (self.context() as context,
+              mock.patch.object(hana_transport.SourceSender, 'retry_complete', return_value=(complete, lambda: None),
+                  side_effect=hana_protocol.SourceRefused(cause) if case == 'sender refusal' else None) as retry,
+              mock.patch.object(hana_transport.SourceSender, 'acknowledge') as acknowledge,
+              mock.patch.object(objects, 'observe_execution', side_effect=observe_repair) as observed,
+              mock.patch.object(objects, 'execution_result') as result,
+              mock.patch.object(record, 'publish_hana_result') as publish,
+              mock.patch.object(record, 'publish_hana_loss') as loss,
+              mock.patch.object(time, 'sleep') as sleep):
+            if case == 'publication refused':
+                _ = context.enter_context(mock.patch.object(execution, 'publish_source_update', return_value=False))
             outcome = self.run_claimed()
+            self.assertEqual(self.finish_claimed(outcome), 75)
         retry.assert_called_once_with(self.root, self.fixture.manifest,
-            MissingBasis(self.fixture.manifest.repository, self.fixture.manifest.basis_commits))
-        acknowledge.assert_called_once()
+            MissingBasis(self.fixture.manifest.repository, self.fixture.manifest.basis_commits), staging=mock.ANY)
+        result.assert_not_called()
         publish.assert_not_called()
         loss.assert_called_once()
-        self.assertIsInstance(outcome, offload.LostMacRun)
-        self.assertEqual(sum(isinstance(envelope, execution.HanaCommandEnvelope)
-                             for envelope in self.fixture.objects.envelopes), 1)
-        self.assertEqual(sum(isinstance(envelope, execution.HanaSourceUpdateEnvelope)
-                             for envelope in self.fixture.objects.envelopes), 1)
+        if case == 'repaired':
+            acknowledge.assert_called_once()
+            self.assertIsInstance(outcome, offload.LostMacRun)
+        else:
+            acknowledge.assert_not_called()
+            reason = 'The Hana full-payload repair failed: ' + cause if case == 'sender refusal' else cause
+            if case == 'publication refused':
+                reason = 'The Hana full-payload repair failed: The Hana source update was not published'
+                observed.assert_called_once()
+                sleep.assert_not_called()
+            assert isinstance(outcome, offload.HanaCommandAdmissionRefused)
+            self.assertEqual(outcome.reason, reason)
+            self.assertFalse(execution.claim_dispatch_pending(self.root, self.fixture.reference))
+            self.assertTrue(execution.claim_admission_refused(self.root, self.fixture.reference))
+            self.assertNotIn(hana_protocol.HanaFenceEnvelope, [type(envelope) for envelope in objects.envelopes])
+        self.assertEqual(sum(isinstance(envelope, hana_protocol.HanaCommandEnvelope)
+                             for envelope in objects.envelopes), 1)
+        updates = sum(isinstance(envelope, hana_protocol.HanaSourceUpdateEnvelope) for envelope in objects.envelopes)
+        self.assertEqual(updates, 1 if case in ('repaired', 'guest refusal') else 0)
 
-    def test_failed_git_in_source_update_settles_the_attempt_as_lost(self) -> None:
+    def test_failed_git_in_source_update_settles_the_attempt_as_refused(self) -> None:
         self.fixture.manifest = replace(self.fixture.manifest, basis_commits=('d' * 40,))
         self.fixture.request = replace(self.fixture.request, manifest=self.fixture.manifest)
         self.fixture.objects.request = self.fixture.request
@@ -841,9 +1179,10 @@ route_test
         with (self.context(), mock.patch.object(hana_transport.SourceSender, 'retry_complete', side_effect=error),
                 mock.patch.object(record, 'publish_hana_loss') as loss):
             outcome = self.run_claimed()
-        assert isinstance(outcome, offload.LostMacRun)
-        self.assertIn('The Hana source update publication is unresolved', outcome.detail)
-        self.assertIn('SIGKILL', outcome.detail)
+            self.assertEqual(self.finish_claimed(outcome), 75)
+        assert isinstance(outcome, offload.HanaCommandAdmissionRefused)
+        self.assertIn('The Hana source update publication is unresolved', outcome.reason)
+        self.assertIn('SIGKILL', outcome.reason)
         self.assertEqual(self.controller.attempt_evidence.cleanup, 'confirmed')
         loss.assert_called_once()
 
