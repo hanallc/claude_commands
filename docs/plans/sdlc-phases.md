@@ -1453,7 +1453,11 @@ The test server joins its request handlers before fixture cleanup and gives each
 5. A rerun of the same stopped batch keeps today's resume.
 6. Add rows to the existing tests: a move-shaped stop of the starting session leaves the run live; a changed batch over unpushed merges refuses with the step; the same batch resumes.
 
-**Files:** `scripts/production/merge_checkpoint.py`, its tests, the starting route the cause names, `docs/as-built/` where it states the merge run rules.
+**Cause (impl, 10:05 EST):** the showrunner fallback in `commands/showrunner/produce.md` ran merge_checkpoint.py as a background Bash task. The account move stops the Claude process, and its task cleanup stopped the run.
+
+**Design:** `detached_runs.py start` accepts a showrunner caller, with the unit director route (run folder, own process session, record, result through send.py). The produce.md fallback starts merge_checkpoint.py through `detached_runs.py start`.
+
+**Files:** `scripts/production/merge_checkpoint.py`, its tests, `scripts/agents/detached_runs.py`, `test_detached_runs.py`, `commands/showrunner/produce.md`, `docs/as-built/` where it states the merge run and detached caller rules.
 
 **Workers:** 1 writer.
 
