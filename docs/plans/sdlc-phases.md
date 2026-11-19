@@ -1496,6 +1496,33 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. The new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
 
+### Phase 88 — Merges run no type check; the nightly type check sends each red to its author  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the user (Review page, 15:34 EST Nov 19, via sdlc): "i want no type checks done on merges - i want type checks done in the nightly type check and handed out to whomever changed the code that broke it - to fix it". Name: notypemerge.
+
+**Spec:**
+1. Remove every type check from the merge paths:
+   - the `basedpyright` command in the Merge tests field of `docs/plans/sdlc-production.md` and `docs/plans/natedev-production.md`;
+   - the `basedpyright` step in `fast_track.py`;
+   - the `--type-dirs` option of `merge_gate.py`. The nightly run keeps its type check through `NIGHTLY_TYPE_DIRS`.
+2. `docs/production_format.md` and `commands/producer/to_production.md` say that Merge tests name no type check.
+3. The nightly type check finds the author of each type red. It blames the diagnostic line and maps the commit to the unit whose merge brought it in.
+4. The nightly run sends each author unit its own diagnostics and records the fix as assigned. A diagnostic with no author keeps today's path: sdlc assigns it.
+5. Update the as-built docs in the same commit.
+6. Add rows to existing tests; add no new test module.
+
+**Files:** `scripts/production/merge_gate.py`, `scripts/production/fast_track.py`, their existing tests, the two production docs, `docs/production_format.md`, `commands/producer/to_production.md`, `docs/as-built/`.
+
+**Workers:** 1 writer.
+
+**Order:** before the item 121 work (sdlc). Tests run only when natemerge allows them. builds removes the `--type-dirs` readers in `first_step.py` and `memory_admit.py` after this merges.
+
+**Acceptance gate:**
+1. No merge path runs basedpyright. The nightly run still type checks `scripts`. basedpyright: 0 errors, 0 warnings. Full gate green.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
