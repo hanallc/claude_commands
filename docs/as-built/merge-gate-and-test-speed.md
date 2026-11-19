@@ -715,11 +715,11 @@ A batch can contain one item.
 
 1. Take the production merge lock once. While it holds the lock, `land_runs.landing` records every item's commit, so the units board says `waiting on running checkpoint`; a single land records its one commit the same way.
    Each item that lands or stops adds a row to `land_results.jsonl` (`land_runs.record_result`); the board shows the newest row of a checkpoint that has not landed.
-2. Record each item's argument line and checkpoint identity in Git's internal directory, in batch order.
+2. Fetch the origin branches and resolve every item to a commit before writing the record or starting a merge.
+   Refuse the batch and name the item if it cannot resolve to a commit.
+   Record each item's argument line and resolved commit in Git's internal directory, in batch order.
    Normalize shell quoting and keep the argument order.
-   Store a submitted full hash even when Git has yet to fetch its object.
-   Mark a ref as pending until it resolves. Save the resolved hash before merging the item.
-   Resume unpushed merges only when the arguments and saved hashes match and an unpushed checkpoint belongs to the batch.
+   Resume unpushed merges only when the arguments and resolved commits match the record and an unpushed checkpoint belongs to the batch.
    If the record is missing or differs, reset the merge branch to its pushed tip.
    Then start a fresh batch. Remove the record after the push or when the batch ends without unpushed merges.
    If record removal fails, report a warning and continue.

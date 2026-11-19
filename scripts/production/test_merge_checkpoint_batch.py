@@ -448,6 +448,63 @@ raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
         self.assert_batch_requires_reset(result, published, unpublished)
         self.assertIn("input: failed", result.stdout)
 
+    def test_a_stopped_batch_refuses_a_moved_ref_for_an_item_that_has_not_merged(self) -> None:
+        published = self.git("rev-parse", "HEAD")
+        first = self.checkpoint(content="alpha batch change\n")
+        second = self.beta_checkpoint("src/beta.txt", "beta batch change\n")
+        remote_ref = "refs/heads/beta-checkpoint"
+        ref = "refs/remotes/origin/beta-checkpoint"
+        _ = self.git("update-ref", remote_ref, second, cwd=self.origin)
+        lines = [self.batch_line("alpha", "2", first), self.batch_line("beta", "2", ref)]
+        merge = merge_checkpoint.merge
+
+        def stop_after_first_merge(request: merge_checkpoint.MergeRequest) -> str:
+            self.assertEqual(request.commit, first)
+            _ = merge(request)
+            raise KeyboardInterrupt
+
+        with (patch.object(merge_checkpoint, "merge", side_effect=stop_after_first_merge),
+              self.assertRaises(KeyboardInterrupt)):
+            _ = self.land_batch(lines)
+        unpublished = self.git("rev-parse", "HEAD")
+        self.assertEqual(self.git("rev-parse", "HEAD^2"), first)
+
+        moved = self.beta_checkpoint("src/beta.txt", "later beta change\n")
+        _ = self.git("update-ref", remote_ref, moved, second, cwd=self.origin)
+        _ = self.git("fetch", "origin", f"{remote_ref}:{ref}")
+        result = self.land_batch(lines)
+        self.assert_batch_requires_reset(result, published, unpublished)
+        self.assertIn("input: failed", result.stdout)
+
+    def test_a_stopped_batch_resumes_an_annotated_tag_object(self) -> None:
+        commit = self.checkpoint(content="alpha batch change\n")
+        _ = self.git("tag", "-a", "-m", "Checkpoint", "alpha-checkpoint", commit, cwd=self.unit)
+        tag = self.git("rev-parse", "refs/tags/alpha-checkpoint", cwd=self.unit)
+        self.assertNotEqual(tag, commit)
+        line = self.batch_line("alpha", "2", tag)
+        unpublished = self.interrupt_batch(line)
+        self.assertEqual(self.git("rev-parse", "HEAD^2"), commit)
+
+        result = self.land_batch([line])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("batch: resume — alpha phase 2 is already merged", result.stdout)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), unpublished)
+
+    def test_an_unresolvable_item_refuses_the_batch_before_any_merge(self) -> None:
+        published = self.git("rev-parse", "HEAD")
+        first = self.checkpoint(content="alpha batch change\n")
+        missing = "refs/tags/absent-beta-checkpoint"
+        lines = [self.batch_line("alpha", "2", first), self.batch_line("beta", "2", missing)]
+
+        with patch.object(merge_checkpoint, "merge", wraps=merge_checkpoint.merge) as merge:
+            result = self.land_batch(lines)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertRegex(result.stdout, rf"input: failed.*beta phase 2.*{missing}")
+        merge.assert_not_called()
+        self.assertEqual(self.git("rev-parse", "HEAD"), published)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), published)
+        self.assertFalse(self.batch_record().exists())
+
     def test_a_stopped_batch_resumes_after_fetching_a_later_checkpoint(self) -> None:
         for submit_ref in (False, True):
             with self.subTest(submit_ref=submit_ref):
