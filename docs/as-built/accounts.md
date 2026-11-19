@@ -456,7 +456,12 @@ The Accounts entry shows the most urgent active icon during the console count re
 The row, the sidebar and Clear use stored weekly readings for accounts that are currently signed in.
 Select a row icon to read the alert and clear it for that account.
 Clear keeps the percentage color and stores the cleared level and reset time on the server.
-A cleared warning can return as urgent. A new weekly reset time makes the alert eligible again.
+A cleared warning can return as urgent. A cleared urgent alert hides both levels.
+The page, sidebar, and Clear use the same rule to identify a weekly window.
+Two reset times name the same window when they differ by less than `accounts_quota_same_window_seconds`.
+The setting starts at 3600 seconds in `config/review_links.conf`.
+The clear record survives a page refresh and a server restart.
+After the weekly reset, a low reading in the new window can show an alert again.
 If a reading has no reset time, Clear keeps the last reset time in the account's clear record.
 The server keeps the clear records in `console/.accounts-quota-cleared.json` under the review root.
 If the file is malformed, the table shows the problem, the sidebar hides the icon and Clear refuses to write.
