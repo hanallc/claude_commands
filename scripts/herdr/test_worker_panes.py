@@ -939,8 +939,8 @@ class WorkerPaneTests(StaffTestCase):
         if not state.exists():
             run.mkdir(exist_ok=True)
             write_text_atomic(state, json.dumps({"owner_staff_id": self.parent.id, "working_dir": str(self.root),
-                "phase": {"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase", "started_at": 1,
-                          "status": "active"}, "pass": {}, "events": [],
+                "open_phases": [{"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase", "started_at": 1,
+                                 "status": "active"}], "pass": {}, "events": [],
                 "history_file": str(run / "history.jsonl"),
                 "main_agent": {"session_id": self.parent.current_session, "family": "claude",
                                "model": "fixture", "effort": "high"}}))
@@ -1003,7 +1003,9 @@ class WorkerPaneTests(StaffTestCase):
                 _ = progress_history.begin_dispatch(run, slot="impl", phase=phase, role="impl",
                     worker_name=row.name, worker_id=row.id, launcher_command=[], prompt=prompt, kind="impl", lens="")
                 before = self.staff_state()
-                if operation in {"finish-phase", "finish-run"}:
+                if operation == "finish-phase":
+                    self.record_command(operation, "--phase-id", phase, "--status", "completed", at=3)
+                elif operation == "finish-run":
                     self.record_command(operation, "--status", "completed", at=3)
                 else:
                     self.record_command("finish-pass", "--status", "interrupted", "--orphaned-launcher", at=3)

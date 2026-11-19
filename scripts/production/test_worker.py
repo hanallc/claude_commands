@@ -362,7 +362,7 @@ class WorkerCommandTests(unittest.TestCase):
         atomic_file.write_text_atomic(self.prompt, "Read the source and preserve its behavior.\n")
         self.reply = self.run_dir / "reply.md"
         atomic_file.write_text_atomic(self.run_dir / "progress_history_state.json", json.dumps({
-            "phase": {"id": "8", "title": "Workers", "instance_id": "phase-eight", "status": "active", "started_at": 1},
+            "open_phases": [{"id": "8", "title": "Workers", "instance_id": "phase-eight", "status": "active", "started_at": 1}],
             "pass": {}, "events": [], "project": {}, "unit": "unit",
             "history_file": str(self.run_dir / "history.jsonl"),
             "owner_staff_id": self.fixture.parent.id,
@@ -503,22 +503,24 @@ class WorkerCommandTests(unittest.TestCase):
                     completed.append((dispatch_id, reply))
                 state_path = self.run_dir / unit_runs.STATE_FILE
                 state = cast(dict[str, object], json.loads(state_path.read_text()))
-                phase = cast(dict[str, object], state["phase"])
+                phase = cast(list[dict[str, object]], state["open_phases"])[0]
                 with (self.run_dir / "history.jsonl").open("a") as history:
                     _ = history.write(json.dumps({"padding": "x" * worker.WORKER_HISTORY_BYTES}) + "\n")
-                for placement in ("current", "parked", "closed", "reopened"):
-                    state["open_phases"] = [phase] if placement == "parked" else []
-                    state["phase"] = ({"id": "9", "instance_id": "phase-nine", "status": "active"}
-                                      if placement == "parked" else
-                                      {**phase, "status": "completed"} if placement == "closed" else
-                                      {**phase, "instance_id": f"new-phase-eight-{launcher}"} if placement == "reopened" else phase)
+                for placement in ("current", "parallel", "closed", "reopened"):
+                    state["open_phases"] = {
+                        "current": [phase],
+                        "parallel": [phase, {"id": "9", "instance_id": "phase-nine", "status": "active"}],
+                        "closed": [],
+                        "reopened": [{**phase, "instance_id": f"new-phase-eight-{launcher}"}],
+                    }[placement]
+                    state["phase"] = {**phase, "status": "completed"} if placement in ("closed", "reopened") else {}
                     atomic_file.write_text_atomic(state_path, json.dumps(state))
                     before = state_path.read_bytes(), len(self.fixture.world.launches)
                     for attempt in range(2):
                         with self.subTest(placement=placement, attempt=attempt):
                             code, output, errors = self.command("restore")
                             self.assertEqual((code, errors), (0, ""))
-                            replies = expected if placement in ("current", "parked") else []
+                            replies = expected if placement in ("current", "parallel") else []
                             self.assertEqual(output.splitlines(), ["unit: workers unchanged", *replies])
                     self.assertEqual((state_path.read_bytes(), len(self.fixture.world.launches)), before)
                 self.assertEqual(self.agent.submitted, [])

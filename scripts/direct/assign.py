@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
@@ -27,7 +28,7 @@ from scripts.astra import astra_roles
 from scripts.herdr import herdr_types
 from scripts.agents import worker_lifecycle
 from scripts.lib.process_failure import failure_detail
-from scripts.direct import assign_claude, phase_reservation, progress_history, simplify_daily
+from scripts.direct import assign_claude, phase_reservation, progress_history, recorder_state, simplify_daily
 from scripts.production import staff, worker_admission
 from scripts.lib import conf, models_registry, unit_runs
 from scripts.herdr import herdr, side_pane, worker_panes
@@ -93,7 +94,9 @@ def text(value: object) -> str:
 
 
 def read_object(path: Path) -> dict[str, object]:
-    return worker_lifecycle.read_worker_state(path)
+    state = worker_lifecycle.read_worker_state(path)
+    recorder_state.require_current_shape(path, state)
+    return state
 
 
 
@@ -225,8 +228,11 @@ def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -
     if not state_path.exists():
         _ = call([PYTHON, PROGRESS, "start-run", "--session-dir", str(run), "--working-dir", str(cwd)], env)
     state = read_object(state_path)
-    stored_phase = object_map(state.get("phase"))
-    phase = args.phase or text(stored_phase.get("id")) or "1"
+    phases = recorder_state.open_phases(state)
+    stored_phase = (next((item for item in phases if item.get("id") == args.phase), None)
+                    if args.phase else recorder_state.only_open_phase(state))
+    last_finished = object_map(state.get("phase")) if not phases else {}
+    phase = args.phase or text((stored_phase or last_finished).get("id")) or "1"
     if phase != "ad hoc" and (not re.fullmatch(r"[A-Za-z0-9_.-]+", phase) or phase in (".", "..")):
         refuse(f"invalid phase id: {phase}")
     try:
@@ -234,10 +240,10 @@ def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -
     except staff.StaffUnreadable as error:
         print(f"assign.sh: {error}", file=sys.stderr)
         raise SystemExit(3) from error
-    if not run_open or not stored_phase:
+    if not run_open or not (phases or last_finished):
         identity = next((match for line in prompt.read_text().splitlines()
                          if (match := re.match(r"^Phase (\S+) — (.*)$", line))), None)
-        title = identity.group(2).strip() if identity else text(stored_phase.get("title")) or "Assignment"
+        title = identity.group(2).strip() if identity else text((stored_phase or last_finished).get("title")) or "Assignment"
         _ = call([PYTHON, PROGRESS, "start-phase", "--session-dir", str(run), "--phase-id", phase,
                   "--phase-title", title], env)
     return run, phase
@@ -289,8 +295,8 @@ class AssignmentResult:
 
 def recorded_phase(run: Path, phase_id: str) -> tuple[dict[str, object], dict[str, object]]:
     state = read_object(run / "progress_history_state.json")
-    phase = next((object_map(candidate) for candidate in cast(list[object], state.get("open_phases", []))
-                  if object_map(candidate).get("id") == phase_id), object_map(state.get("phase")))
+    phase = next((item for item in recorder_state.open_phases(state) if item.get("id") == phase_id),
+                 dict[str, object]())
     return state, phase
 
 
@@ -510,7 +516,9 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
     actions = progress_history.CompletionActions(str(summary), str(status), args.reply_file,
         str(style.directory) if isinstance(style, StyleAssignment) else "",
         resolve_fix=role == "fix" and env.get("UNIT_RESOLVES_ROUND") == "1", review_pass=args.pass_number)
-    command += ["--launcher-command", json.dumps(launcher), "--completion-actions", json.dumps(asdict(actions))]
+    instance = uuid.uuid4()
+    command += ["--launcher-command", json.dumps(launcher), "--completion-actions", json.dumps(asdict(actions)),
+                "--new-pass-instance-id", str(instance)]
     matched = progress_history.dispatch_worker(run, slot=slot, phase=phase, role=cast(staff.WorkerRole, role),
         prompt=message, launcher_command=launcher)
     recorded = progress_history.launch_slot(run, slot, launcher)
@@ -521,7 +529,6 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
               f"role={role}; status in {status}"], env)
     _ = call(["bash", str(SCRIPTS / "../agents/heartbeat.sh"), str(run / "heartbeat.log"),
               "header", slot, role], env, check=False)
-    previous_pass = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(recorded))
     with log.open("a") as output:
         offset = output.tell()
         result = subprocess.run(command, env=env, text=True, stdout=output, stderr=subprocess.STDOUT)
@@ -531,7 +538,6 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
             if line.rstrip().endswith(staff_worker.COMPACTION_STARTED_TEXT):
                 print(line, end="")
     selected = progress_history.launch_slot(run, slot, launcher)
-    passed = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(selected))
     if selected != slot:
         status = progress_history.worker_artifact(status, slot, selected)
         target_log = progress_history.worker_artifact(log, slot, selected)
@@ -540,12 +546,11 @@ def execute_herdr(args: Arguments, run: Path, phase: str, prompt: Path,
                           json.dumps({"worker": selected, "round": number, "paths": paths}))
     if result.returncode:
         write_text_atomic(status, "error\n")
-        if result.returncode in (1, 2) and passed.get("instance_id") != previous_pass.get("instance_id"):
-            passed = object_map(object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(selected))
-            progress_history.complete_dispatch(run, selected, text(passed.get("instance_id")), status="error")
-            if role == "fix" and env.get("UNIT_RESOLVES_ROUND") == "1":
+        if result.returncode in (1, 2):
+            failed_slot = progress_history.fail_launch_pass(run, instance)
+            if failed_slot is not None and role == "fix" and env.get("UNIT_RESOLVES_ROUND") == "1":
                 env["UNIT_PASS_OWNER"] = "launcher"
-                failed = AssignmentResult(args, run, phase, role, selected, env, style_assignment=style)
+                failed = AssignmentResult(args, run, phase, role, failed_slot, env, style_assignment=style)
                 _ = finish_repair(failed, result.returncode)
         _ = call(["bash", str(SCRIPTS / "board.sh"), "post", str(run), selected, "blocked",
                   f"role={role}; exit {result.returncode}; log {log}"], env)
@@ -773,47 +778,6 @@ def recorded_passes(run: Path) -> list[dict[str, object]]:
     return passes
 
 
-def pass_start_count(run: Path, slot: str) -> int:
-    return sum(entry.get("event_type") == "pass_started" and entry.get("team_slot") == slot
-               for entry in recorded_passes(run))
-
-
-def end_failed_launch(run: Path, slot: str, env: dict[str, str]) -> None:
-    """End a sole failed dispatch without changing its exit code."""
-    try:
-        passes = recorded_passes(run)
-        if any(entry.get("status") in ("active", "refused", "completed") for entry in passes):
-            return
-        if any(entry.get("team_slot") != slot for entry in passes):
-            return
-        record = staff.local_snapshot()
-        parent = worker_admission.parent(record, run=run)
-        members = record.find(kind="worker", parent=parent.id)
-        own = {text(entry.get("worker_id")) for entry in passes}
-        for path in run.glob("impl_worker_*.json"):
-            entry = read_object(path)
-            if entry.get("slot") == slot:
-                own.add(text(entry.get("staff_id")))
-        own.update(row.id for row in members if row.name == slot)
-        if {row.id for row in members} - own:
-            return
-        held = unit_runs.held(staff.runtime_id(), env.get("UNIT_RUN_ROOT"), record=record)
-        if {Path(folder).resolve() for folder in held} != {run}:
-            return
-        commands = ([PYTHON, PROGRESS, "finish-run", "--session-dir", str(run), "--status", "error"],
-                    ["bash", str(SCRIPTS / "end_session.sh")])
-        ended = True
-        for command in commands:
-            result = call(command, env, capture=True, check=False)
-            if result.returncode:
-                print(f"assign.sh: {failure_detail(result)}", file=sys.stderr)
-                ended = False
-        if ended:
-            print(f"assign.sh: run ended: {run}; its only worker failed at launch without a completed pass", file=sys.stderr)
-    except Exception as error:
-        print(f"assign.sh: unable to end failed run {run}: {error}", file=sys.stderr)
-
-
 def submission_result(result: int) -> int:
     """Publish the named native submission outcome at the command boundary."""
     if result is staff_worker.DispatchSubmission.SUBMITTED:
@@ -851,15 +815,11 @@ def main() -> int:
     checked = call(check, env, check=False)
     if checked.returncode:
         return 3 if checked.returncode == 3 else 2
-    slot = args.to or args.new_worker or role
-    before = object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(
-        progress_history.launch_slot(run, slot, launcher_command()))
-    code = execute_herdr(args, run, phase, prompt, role, paths, env)
-    selected = progress_history.launch_slot(run, slot, launcher_command())
-    if code == 2 or (code == 1 and env.get("UNIT_RESOLVES_ROUND") != "1" and object_map(read_object(run / unit_runs.STATE_FILE).get("pass")).get(selected) != before):
-        end_failed_launch(run, selected, env)
-    return submission_result(code)
+    return submission_result(execute_herdr(args, run, phase, prompt, role, paths, env))
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except recorder_state.OldRecorderState as error:
+        raise SystemExit(str(error)) from error

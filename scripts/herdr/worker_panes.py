@@ -628,8 +628,13 @@ def worker_run_directories(record: staff.StaffSnapshot, *, scanned: dict[str, li
                                   (*runs, *recorded, fallback))
         runs, first, shared = parents[parent.id]
         dispatched = linked[row.id].directory if row.id in linked else None
-        selected = (_worker_run_in(row, runs, dispatched, first, record=record, read=read) if parent is not row
-                    else worker_run(row, record=record, scanned=scanned))
+        try:
+            selected = (_worker_run_in(row, runs, dispatched, first, record=record, read=read) if parent is not row
+                        else worker_run(row, record=record, scanned=scanned))
+        except recorder_state.OldRecorderState as error:
+            print(error, file=sys.stderr)
+            # Detached records prove their worker by staff id.
+            selected = first
         found[row.id] = tuple(dict.fromkeys((selected, *shared, *((dispatched,) if dispatched is not None else ()))))
     return unit_runs.LauncherRunDirectories(found, scanned)
 
@@ -673,8 +678,14 @@ def _worker_run_in(member: staff.StaffRow, runs: Sequence[Path], linked: Path | 
                    record: staff.StaffSnapshot, read: Callable[[Path], dict[str, object]]) -> Path:
     """Select the parent run or linked run that holds the worker's newest pass."""
     candidates = dict.fromkeys((*runs, *(() if linked is None else (linked,)), fallback))
-    passes = [(run, passed) for run in candidates if (passed := _pass_in(member, read(run), record))]
+    passes = [(run, passed) for run in candidates if (passed := _pass_in(member, _run_state(run, read), record))]
     return max(passes, key=lambda item: _pass_started_at(item[1]))[0] if passes else fallback
+
+
+def _run_state(run: Path, read: Callable[[Path], dict[str, object]] = run_state) -> dict[str, object]:
+    state = read(run)
+    recorder_state.require_current_shape(run / recorder_state.STATE_FILENAME, state)
+    return state
 
 
 def _passes(state: dict[str, object]) -> list[dict[str, object]]:
@@ -693,7 +704,7 @@ def worker_pass(row: staff.StaffRow, run: Path, *,
                 record: staff.StaffSnapshot | None = None) -> dict[str, object]:
     """Select the fixed participant after checking its current staff parent."""
     record = staff.local_snapshot() if record is None else record
-    return _pass_in(row, run_state(run), record)
+    return _pass_in(row, _run_state(run), record)
 
 
 def _pass_in(row: staff.StaffRow, fields: dict[str, object], record: staff.StaffSnapshot) -> dict[str, object]:
@@ -868,7 +879,7 @@ def worker_dispatch_state(row: staff.StaffRow, run: Path,
         passes = []
     else:
         passes = [(directory, item) for directory in dict.fromkeys((run, *related_runs))
-                  for item in _worker_passes_in(row, read(directory), record)]
+                  for item in _worker_passes_in(row, _run_state(directory, read), record)]
     if not passes:
         latest = progress_history.last_dispatch(row.id)
         if (not isinstance(latest, progress_history.RecordedDispatch)
@@ -1763,6 +1774,9 @@ def main(arguments: list[str] | None = None) -> int:
             return ExitCode.REFUSED
         account = DestinationWorkerAccount(args.account) if args.account else ConfiguredWorkerAccount.CURRENT
         return _result(start_or_resume(owner.id, name, cast(WorkerRole, args.role), account=account))
+    except recorder_state.OldRecorderState as error:
+        print(error, file=sys.stderr)
+        return ExitCode.UNCERTAIN
     except (staff.StaffUnreadable, staff.StaffRefused, OSError, ValueError, herdr_types.HerdrFailure) as error:
         print(f"anomaly: {error}; correct the evidence and retry", file=sys.stderr)
         return ExitCode.UNCERTAIN

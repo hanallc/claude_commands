@@ -8,7 +8,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Callable, Generator, Iterable
-from contextlib import ExitStack, redirect_stderr
+from contextlib import ExitStack, redirect_stderr, suppress
 from dataclasses import dataclass, replace
 from enum import Enum, IntEnum
 from importlib import import_module
@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 import subprocess
 import sys
+import uuid
 from typing import Literal, Protocol, cast, final
 
 from scripts.agents import detached_runs, pane_record, worker_lifecycle
@@ -636,6 +637,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
              on_submission: Callable[[], object] = lambda: None,
              lock: worker_panes.WorkerLockHold | worker_panes.WorkerLockAtUse = worker_panes.WorkerLockAtUse.ACQUIRE,
              notices: ExitStack | SendNoticesAfterDispatch = SEND_NOTICES_AFTER_DISPATCH,
+             new_pass_instance_id: uuid.UUID | None = None,
              ) -> DispatchSubmission | ExitCode:
     """Record the hook destinations, submit one prompt, and return at once."""
     prompt = prompt.resolve()
@@ -730,7 +732,7 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
             instance = progress_history.begin_dispatch(session_dir, slot=slot, phase=phase, role=role,
                 worker_name=name.value, worker_id=started.row.id, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
                 fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, called=launched_agent(started.row),
-                selection=selection)
+                new_pass_instance_id=new_pass_instance_id, selection=selection)
         except progress_history.DispatchPromptRefused as refused:
             return _prompt_conflict(refused.conflict)
         except progress_history.DispatchSelectionChanged as error:
@@ -925,6 +927,8 @@ def finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: str
     diagnostics = io.StringIO()
     result: DispatchSubmission | ExitCode = ExitCode.UNCERTAIN
     try:
+        with suppress(OSError, ValueError):
+            _ = recorder_state.read_state(run / recorder_state.STATE_FILENAME)
         with redirect_stderr(diagnostics):
             record = staff.snapshot()
             row = record.by_id(identity)
@@ -953,6 +957,9 @@ def finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: str
             _ = _dispatch_failure_step(identity, "notice", lambda: _dispatch_notice(
                 parent, identity, run, instance, passed, "uncertain", detail))
             return result
+    except recorder_state.OldRecorderState as error:
+        print(str(error), file=sys.stderr)
+        return ExitCode.UNCERTAIN
     except (Exception, SystemExit) as error:
         result = ExitCode.UNCERTAIN
         detail = diagnostics.getvalue().strip()
@@ -1092,7 +1099,8 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
            reply: Path | ReplyBesidePrompt = REPLY_BESIDE_PROMPT, dispatch_id: str = "", fix_cause: str = "",
            fix_pass: int = 0, activity: str = "", early_ready: Path | SingleStageReview = SINGLE_STAGE_REVIEW,
            policy: worker_panes.UseRolePolicy | worker_panes.LaunchPolicy = worker_panes.UseRolePolicy.CURRENT,
-           completion_actions: progress_history.CompletionActions = progress_history.NO_COMPLETION_ACTIONS) -> DispatchSubmission | ExitCode:
+           completion_actions: progress_history.CompletionActions = progress_history.NO_COMPLETION_ACTIONS,
+           new_pass_instance_id: uuid.UUID | None = None) -> DispatchSubmission | ExitCode:
     with ExitStack() as cleanup, ExitStack() as notices, ExitStack() as operations:
         if not name:
             matched = progress_history.dispatch_worker(session_dir, slot=slot, phase=phase, role=role,
@@ -1176,6 +1184,7 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
             phase=phase, kind=kind, lens=lens, launcher_command=launcher_command, reply=reply,
             fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, early_ready=early_ready, policy=policy,
             completion_actions=completion_actions, on_submission=cleanup.pop_all, lock=hold,
+            new_pass_instance_id=new_pass_instance_id,
             notices=notices if isinstance(hold, worker_panes.WorkerLockHold) else SEND_NOTICES_AFTER_DISPATCH)
         if result is DispatchSubmission.SUBMITTED:
             _ = cleanup.pop_all()
@@ -1569,14 +1578,11 @@ def _finished_worker_results(holder: staff.StaffRow, record: staff.StaffSnapshot
             continue
         if unit_runs.run_owner(state, record) != holder:
             continue
-        open_ids = set(recorder_state.open_phase_ids(state))
-        if not open_ids:
+        recorder_state.require_current_shape(run / unit_runs.STATE_FILE, state)
+        open_instances = {str(phase["id"]): str(phase.get("instance_id", ""))
+                          for phase in recorder_state.open_phases(state) if isinstance(phase.get("id"), str)}
+        if not open_instances:
             continue
-        parked = state.get(recorder_state.OPEN_PHASES_KEY, [])
-        phases = [*(cast(list[object], parked) if isinstance(parked, list) else []), state.get("phase")]
-        open_instances = {str(phase.get("id")): str(phase.get("instance_id", ""))
-                          for raw in phases if isinstance(raw, dict)
-                          for phase in (cast(dict[str, object], raw),) if phase.get("id") in open_ids}
         history = state.get("history_file")
         entries = [*(_worker_history_events(Path(history), wanted, complete=True)
                      if isinstance(history, str) and history else ()), *_pass_records(state)]
@@ -1597,7 +1603,7 @@ def _finished_worker_results(holder: staff.StaffRow, record: staff.StaffSnapshot
                 continue
             fields = _dispatch_fields(str(run), entry)
             dispatch_id = fields["dispatch_id"]
-            if not isinstance(phase_id, str) or phase_id not in open_ids or not isinstance(dispatch_id, str) or not dispatch_id:
+            if not isinstance(phase_id, str) or phase_id not in open_instances or not isinstance(dispatch_id, str) or not dispatch_id:
                 continue
             stamp = entry.get("finished_at", entry.get("timestamp_epoch", 0))
             results[run, dispatch_id] = FinishedWorkerResult(row.name, phase_id, dispatch_id,
@@ -1716,8 +1722,11 @@ def _recorded_worker_dispatches(record: staff.StaffSnapshot, *,
         parent_id = owner.id if isinstance(owner, staff.StaffRow) else StaffId("")
         if isinstance(owner, staff.StaffRow):
             by_session.setdefault(owner.current_session, []).append(str(run))
+        if parent_id not in parents:
+            continue
+        recorder_state.require_current_shape(run / recorder_state.STATE_FILENAME, state)
         history = state.get("history_file")
-        if isinstance(history, str) and history and parent_id in parents:
+        if isinstance(history, str) and history:
             histories.setdefault(Path(history).resolve(), {})[run] = {str(row.id).encode(): row
                 for row in workers if row.parent == staff.ReportsTo(parent_id)}
         entries = _pass_records(state)
@@ -1947,6 +1956,7 @@ class Arguments(argparse.Namespace):
     completion_actions: str = ""
     json: bool = False
     all_parents: bool = False
+    new_pass_instance_id: uuid.UUID | None = None
     selection: WorkerFilter = WorkerFilter.OPEN
 
 
@@ -1983,6 +1993,7 @@ def main(arguments: list[str] | None = None) -> int:
     _ = assignment.add_argument("--fix-pass", "--pass", type=int, default=0)
     _ = assignment.add_argument("--launcher-command", required=True, help="JSON list of launcher arguments")
     _ = assignment.add_argument("--completion-actions", default="{}")
+    _ = assignment.add_argument("--new-pass-instance-id", type=uuid.UUID, help=argparse.SUPPRESS)
     finishing = commands.add_parser("finish-dispatch", help=argparse.SUPPRESS)
     for flag in ("parent", "worker-id", "session-dir", "dispatch-id"):
         _ = finishing.add_argument("--" + flag, required=True)
@@ -2037,12 +2048,16 @@ def main(arguments: list[str] | None = None) -> int:
                 launcher_command=_launcher_arguments(args.launcher_command), fix_cause=args.fix_cause,
                 fix_pass=args.fix_pass, activity=args.activity,
                 early_ready=Path(args.early_ready) if args.early_ready else SINGLE_STAGE_REVIEW, policy=policy,
-                completion_actions=progress_history.dispatch_delivery({"delivery": {"actions": cast(object, json.loads(args.completion_actions))}}).actions)
+                completion_actions=progress_history.dispatch_delivery({"delivery": {"actions": cast(object, json.loads(args.completion_actions))}}).actions,
+                new_pass_instance_id=args.new_pass_instance_id)
         if isinstance(code, DispatchSubmission):
             print("submitted")
         elif code == ExitCode.OK:
             print("done")
         return code
+    except recorder_state.OldRecorderState as error:
+        print(str(error), file=sys.stderr)
+        return ExitCode.UNCERTAIN
     except (staff.StaffUnreadable, staff.StaffRefused, herdr_types.HerdrFailure, OSError, ValueError) as error:
         print(f"anomaly: {' '.join(str(error).splitlines())}", file=sys.stderr)
         return ExitCode.UNCERTAIN

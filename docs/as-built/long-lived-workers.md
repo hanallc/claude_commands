@@ -461,27 +461,12 @@ A later assignment retains the worker identity and selects its current native se
 A prompt names its expected HEAD and asks the worker to read the current tree.
 Review prompts retain the Three Gods sentence and the Type Design Contract.
 
-`assign.py.end_failed_launch` ends a failed launch's run only when these conditions hold:
-
-1. No recorded pass has status `completed`.
-2. Every recorded pass belongs to the failed recorder slot.
-3. No other worker appears in the roster, launch records or native staff children.
-4. The director holds only that run.
-
-The native worker command must return exit 2.
-Exits 3 through 8 retain the run.
-A Claude launch must add its slot's `pass_started` event before a failed return qualifies.
-The held Codex path requires an error from its worker process.
-A signal that interrupts the launcher does not reach this cleanup call.
-Each recorder slot counts separately, including a pass without a worker name.
-Cleanup records `finish-run --status error`, then calls `end_session.sh`.
-Both commands use `call(check=False)`.
-Cleanup errors preserve the launch exit code.
+A failed launch keeps the run open.
+The launcher records failure only for the pass that it started.
+A retry without `--session-dir` uses the current run from the run pointer or the environment.
+The director records `finish-run` and calls `end_session.sh` when the run ends.
 The phase reservation stays until a checkpoint releases it.
 `prepare_session.sh` and `end_session.sh` select `CODEX_THREAD_ID` before `CLAUDE_CODE_SESSION_ID`, as `staff.runtime_id()` does.
-A retry without `--session-dir` uses a current marker or run environment when available.
-Otherwise `prepare_session.sh` creates a new run.
-An explicit run folder retains its existing retry behavior.
 
 ### Choosing a worker for a review
 
