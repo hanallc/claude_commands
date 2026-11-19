@@ -12,7 +12,8 @@ Cover every `claude_commands` test and its descendants across all productions an
 | Outside access | Block host services, credential sockets, and external network access. Allow approved private fixtures. | The systemd network prototype added 12.590 ms to the service median. The Bubblewrap cost for this wall is pending. |
 
 On natedev, Bubblewrap with all three walls and seccomp took 40.309 ms per launch at the median. Direct start took 5.013 ms.
-The 35.296 ms difference is about 31 seconds of summed launch time for 867 modules. The integrated gate time is pending.
+The 35.296 ms difference gives about 31 seconds of total added launch time if the 867 modules start in sequence.
+The integrated gate time is pending.
 Mac guest costs and AWS launch costs are pending. The measured Mac times cover only `sandbox-exec`.
 The [code phases](#code-phases-and-eta) total 53–88 worker hours, or about 7–11 workdays in sequence. Queue time can extend the schedule.
 
@@ -111,7 +112,7 @@ Record the wrapper's host PID and start time. Extend phase 383 recovery, which c
 Keep the launcher waiting until the gate records its placement. Authorize Bubblewrap after the existing cancellation deferral ends.
 If the setup channel closes before approval, exit before starting Bubblewrap.
 If a gate cannot use its phase 44df scope, try existing admission with a verified job cgroup and the same controls.
-A single-scope job can use its admitted scope with those limits. The survey requires its assigned scope.
+A single job can use its admitted scope with separate keeper and job leaves. The survey requires its assigned scope.
 [Queue scope](../../scripts/build_queue/queue_place.py#L88), [Phase 44df scope design](/session/queue-impl6/landcpu/scripts/build_queue/queue_place.py#L137)
 
 The launcher inherits the gate's spawn mask. Exec trusted GNU `env --default-signal` with Bubblewrap's absolute path as its command.
@@ -119,15 +120,22 @@ GNU `env` clears the mask and restores default dispositions. Bubblewrap unblocks
 Add no signal handlers, masks, or disposition changes in new Python or shell code, including fixtures.
 On cancellation, timeout, or failed setup, write `1` to the verified job's `cgroup.kill`.
 Use the same stop if the monitor exits with live cgroup members. `SIGKILL` reaches descendants that use `setsid()`.
-Reap the launcher. Require `cgroup.events` to show `populated 0` before release after normal exit, forced stop, or crash recovery.
-Keep the cgroup available until the gate or recovery records that proof. Keep the lease if verification fails.
+Close the job leaf to new processes and reap the launcher.
+Require `cgroup.events` to show `populated 0` after normal exit, forced stop, or crash recovery.
+Start a trusted keeper in the delegated scope. Keep its lifetime independent of the gate process and its pipes.
+After a gate crash, the keeper holds the scope while recovery stops remaining jobs and checks their cgroups.
+For each job, record `populated 0` in durable state before removing the job leaf or releasing its lease.
+Bind the proof to the boot ID, scope invocation identity, and job leaf.
+The keeper accepts an explicit release from the gate or recovery through a private control channel.
+Send the release only after closing the scope to new jobs and recording proof for every job.
+If the scope disappears before proof is recorded, retain the leases. A missing path alone does not prove teardown.
 Require the same proof in the folder sweeper, even when a crash closes the lease lock.
 Release gate admission after every job and the keeper have exited. Keep cgroup controls and the user manager outside the guard.
 [GNU env implementation](https://github.com/coreutils/coreutils/blob/v9.10/src/env.c#L751-L754), [Bubblewrap exec](https://github.com/containers/bubblewrap/blob/v0.11.2/bubblewrap.c#L3370-L3392), [Gate recovery](../../scripts/production/merge_gate.py#L700)
 
 ### Outside access
 
-Use `--unshare-net` with no external interface. Permit private Unix fixture sockets by default.
+Use `--unshare-net` with no external interface. Permit only private Unix fixture sockets in the default profile.
 Allow IPv4 and IPv6 for the private loopback profile. Keep abstract Unix sockets in the private network namespace.
 Hide the host system bus, user bus, credential agents, service sockets, session sockets, and network mounts.
 A read-only mount can still expose a usable socket. Block other socket families, `io_uring`, and kernel keyring access.
@@ -140,7 +148,7 @@ The protected runner owns the policy outside the tested checkout. Read capabilit
 | Request | Runner grant |
 | --- | --- |
 | No extra need | Private files, processes, and Unix fixture sockets. |
-| `PrivateLoopbackFixture` | IPv4 and IPv6 within the isolated network namespace or guest. Create the server in the same sandbox. |
+| `PrivateLoopbackFixture` | Grant isolated IPv4 and IPv6 only to modules with survey evidence of need. Create the server in the same sandbox. |
 | `PrivateMountFixture` | A guest-owned mount fixture or a separately validated private namespace profile. Keep the same file, PID, and egress limits. |
 | `PrivateServiceManagerFixture` | A disposable guest with its own real systemd and cgroups. Permit changes only to that manager. |
 | `ScopedIntegrationRequest` | A dedicated fixture endpoint or controller operation for named actions and resources. Use a short expiry and dedicated credentials for that fixture. |
@@ -270,12 +278,18 @@ Require a result for every entry before reporting an empty violation list. Give 
 ### Compatibility survey runner
 
 Use the existing [survey runner](/session/natest-impl5/guard-walls/probe_walls.py) outside the candidate checkout.
-The survey stages an independent checkout of the exact base. It runs one module at a time with private loopback.
-Compare its test counts, errors, and skips with the recorded base. Repeat new errors under the guard and record the required resource or syscall.
-Classify modules that require the private loopback grant. Treat any new skip as a loss of coverage.
+The survey stages an independent checkout of the exact base. Run each module first with the default profile.
+Rerun only modules with failures due to denied network access. Use the private loopback profile for those reruns.
+Record the failing operation and the results of both attempts. Grant loopback only where the rerun resolves the network failure.
+Compare test counts, errors, and skips with the recorded base. Treat any new skip as a loss of coverage.
+For other failures, record the resource or syscall that the module requires.
 
 The runner reserves a merge-gate place and verifies the assigned scope and memory grant under `builds.slice`.
-It uses 512 tasks, an eight-hour survey deadline, a 15-minute module deadline, 1 GiB of temp space, and 64 MiB of shared memory per module.
+Use the shared `start_gate_job()` launcher for every attempt. Start one module at a time.
+On timeout or cancellation, use the shared cgroup stop path. Verify `populated 0` before starting the next module or a rerun.
+Stop the survey and mark it incomplete if the supervisor cannot prove that the module cgroup is empty.
+Use a 512-task limit, 1 GiB of temp space, and 64 MiB of shared memory per module.
+Set an eight-hour survey deadline and a 15-minute module deadline.
 The supervisor checks the count record from a separate pipe against the child status.
 Exit 5 counts as empty only if the record gives zero tests, failures, errors, and skips. Missing or invalid counts fail the module.
 Drain logs in chunks of up to 8 KiB. Retain up to 8 KiB from each end of a module's log.
@@ -289,6 +303,8 @@ Stop retaining bytes at 16 MiB. Keep draining until exit or timeout. Record the 
 | Python startup and module runner | Startup uses the supplied lease. The module runner watches namespace PID 1. No host PID reaches either reader. |
 | Gate exits before scope registration | Closing the setup channel stops the launcher before Bubblewrap starts. |
 | Gate or monitor exits during setup | Recovery stops any remaining members before releasing the lease. |
+| Gate crashes after the last job exits | The keeper holds the scope until recovery records `populated 0`. |
+| Survey module times out | The supervisor uses the shared stop path. It verifies `populated 0` before starting another module. |
 | Cancellation or timeout with a `setsid()` descendant | Reap the launcher and verify that PID 1 and the descendant exited before releasing the lease. |
 | Startup after the existing deferred spawn | Read the signal state at first exec. `SIGTERM`, `SIGHUP`, and `SIGINT` have default dispositions and the mask is empty. |
 
