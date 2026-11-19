@@ -182,10 +182,11 @@ class VerifyWorkspaceFormTests(FinalPassFixture):
         self.environment["BUILDLOG_OFF"] = "0"
         result = self.verify("final", "sample")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("check --workspace --all-targets --features extra", self.calls_made())
-        calls = [call for call in self.calls_made() if call.startswith("nextest run ")]
-        self.assertEqual(len(calls), 1)
-        self.assertIn("--workspace --tests -E package(sample)", calls[0])
+        calls = self.calls_made()
+        self.assertIn("check --workspace --all-targets --features extra", calls)
+        build, run = [call for call in calls if call.startswith(("nextest list ", "nextest run "))]
+        self.assertEqual(build, "nextest list --message-format=json --workspace --tests -E package(sample) --features extra")
+        self.assertTrue(run.startswith("nextest run -E package(sample) --binaries-metadata "), run)
         self.assertEqual([row["package"] for row in self.recorded_calls()], ["sample"])
         self.assertEqual(self.pass_files(), [])
 

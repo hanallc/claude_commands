@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 
 from scripts.direct.verify_mac_offload_test_support import stub_build_tool_path
+from scripts.lib.cargo_output_test_support import EMPTY_NEXTEST_LIST_JSON
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -116,7 +117,7 @@ if [ "$1" = metadata ]; then
     exit 0
 fi
 printf "%s\n" "$*" >> "$CARGO_CALLS"
-if [ "$1 $2" = "nextest run" ]; then
+if [ "$1 $2" = "nextest run" ] || [ "$1 $2" = "nextest list" ]; then
     case " $* " in
         *" --lib "*)
             python3 - <<'PY' || exit $?
@@ -145,6 +146,8 @@ case "$1 $2" in
 esac
 case "$1 $2" in
     "check --workspace") exit "$FAKE_CHECK_EXIT" ;;
+''' + f"""    "nextest list") printf '%s\\n' '{EMPTY_NEXTEST_LIST_JSON}'; exit 0 ;;
+""" + r'''
     "nextest --version"|"nextest run"|"+nightly fmt") exit 0 ;;
     *) echo "Unexpected cargo call: $*" >&2; exit 99 ;;
 esac

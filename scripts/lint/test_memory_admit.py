@@ -38,7 +38,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.lint import memory_admit as gate, tmp_sweep
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
-from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
+from scripts.lib.cargo_output_test_support import EMPTY_NEXTEST_LIST_JSON, fake_cargo_output_roots
 from scripts.lib import conf
 from scripts.build_queue.scope_activity import IdleService, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob, LiveBuildRun, NoLiveBuildRun
 from scripts.build_queue import progress_profile as progress
@@ -5430,6 +5430,7 @@ class QueueLeaveTests(unittest.TestCase):
         _ = config.write_text('lint_config_enabled() { return 0; }\nlint_config_skip_notice() { :; }\n')
         self.environment = {**os.environ, **gate_isolation_environment(self.root),
                             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"), "HOME": str(self.root),
+                            "TMPDIR": str(self.root),
                             "BUILDLOG_DIR": str(self.root / "log"), "BUILDLOG_MEMINFO": str(self.meminfo),
                             "BUILDLOG_SCOPE": "0", "BUILDLOG_SYNC": "1", "LINT_SKIP_SWEEP": "1",
                             "LINT_CONFIG_READER": str(config),
@@ -5542,10 +5543,17 @@ class QueueLeaveTests(unittest.TestCase):
         self.assertFalse(self.ran.exists())
         self.assertEqual(self.reservations(), [])
 
-    def nextest_step(self, ran_args: Path, reservation: Path) -> str:
-        return ('LINT_TEST_WIDTH=logical; cargo() { [[ "$*" == "nextest --version" ]] && return 0; '
-                + f'printf "%s\\n" "$*" > "{ran_args}"; "$TEST_PY" "$TEST_CAPTURE_WIDTH" > "{reservation}"; }}; '
-                + 'run_nextest --workspace')
+    def install_nextest_cargo(self, calls: Path, ran_args: Path, reservation: Path) -> None:
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        cargo = bin_dir / "cargo"
+        _ = cargo.write_text("#!/usr/bin/env bash\n"
+            + '[[ "$*" == "nextest --version" ]] && exit 0\n'
+            + f'printf "%s\\n" "$*" >> "{calls}"\n'
+            + f"""if [[ "$1 $2" == "nextest list" ]]; then printf '%s\\n' '{EMPTY_NEXTEST_LIST_JSON}'; exit 0; fi\n"""
+            + f'printf "%s\\n" "$*" > "{ran_args}"; "$TEST_PY" "$TEST_CAPTURE_WIDTH" > "{reservation}"\n')
+        cargo.chmod(0o755)
+        self.environment["PATH"] = f"{bin_dir}{os.pathsep}{self.environment['PATH']}"
 
     def test_a_waiting_run_takes_tokens_once_admitted_and_reserves_their_width(self) -> None:
         pool, calls = self.root / "pool", self.root / "cargo-calls"
@@ -5554,16 +5562,7 @@ class QueueLeaveTests(unittest.TestCase):
         keeper = os.open(pool, os.O_RDWR | os.O_NONBLOCK)
         self.addCleanup(os.close, keeper)
         _ = os.write(keeper, bytes(6))
-        bin_dir = self.root / "bin"
-        bin_dir.mkdir()
-        cargo = bin_dir / "cargo"
-        _ = cargo.write_text("#!/usr/bin/env bash\n"
-            + '[[ "$*" == "nextest --version" ]] && exit 0\n'
-            + f'printf "%s\\n" "$*" >> "{calls}"\n'
-            + '[[ " $* " == *" --no-run "* ]] && exit 0\n'
-            + f'printf "%s\\n" "$*" > "{ran_args}"; "$TEST_PY" "$TEST_CAPTURE_WIDTH" > "{reservation}"\n')
-        cargo.chmod(0o755)
-        self.environment["PATH"] = f"{bin_dir}{os.pathsep}{self.environment['PATH']}"
+        self.install_nextest_cargo(calls, ran_args, reservation)
         self.environment["CARGO_MAKEFLAGS"] = f"--jobserver-auth=fifo:{pool}"
         free = (f'[[ -e "{calls}" ]] && echo built >> "{waited}"; echo waited >> "{waited}"; '
                 + 'printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO";')
@@ -5573,16 +5572,17 @@ class QueueLeaveTests(unittest.TestCase):
         self.assertEqual(result.stdout.splitlines()[-1].split("|")[:2], ["0", "Granted"])
         # The memory wait comes before the build, and the build before the tokens.
         self.assertEqual(waited.read_text().splitlines(), ["waited"])
-        self.assertEqual(calls.read_text().splitlines(), ["nextest run --no-run --workspace",
-                                                          "nextest run --test-threads 6 --workspace"])
+        build, run = calls.read_text().splitlines()
+        self.assertEqual(build, "nextest list --message-format=json --workspace")
+        self.assertTrue(run.startswith("nextest run --test-threads 6 --binaries-metadata "), run)
         self.assertEqual(json.loads(reservation.read_text())["test_threads"], 6)
         self.assertEqual(len(os.read(keeper, 64)), 6)
 
     def test_full_width_nextest_run_reports_threads_and_load_after_admission(self) -> None:
         ran_args, reservation = self.root / "args", self.root / "reservation"
+        self.install_nextest_cargo(self.root / "cargo-calls", ran_args, reservation)
         free = 'printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO";'
-        step = ('nextest_logical_cores() { LINT_LOGICAL_CORES=12; }; '
-                + self.nextest_step(ran_args, reservation))
+        step = 'nextest_logical_cores() { LINT_LOGICAL_CORES=12; }; LINT_TEST_WIDTH=logical; run_nextest --workspace'
         result = self.run_step(None, free, step)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines()[-1].split("|")[:2], ["0", "Granted"])

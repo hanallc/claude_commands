@@ -8,6 +8,7 @@ from scripts.build_queue.admission_test_support import caller_admission, caller_
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.mac_test import claim_state, eligibility
 from scripts.lib.berth_test_support import write_unconfigured_berth
+from scripts.lib.cargo_output_test_support import EMPTY_NEXTEST_LIST_JSON
 from scripts.lib.checkout_test_support import python_tool_source, write_python_tool
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 
@@ -340,6 +341,9 @@ if arguments[:1] == ["metadata"]:
     raise SystemExit(0)
 if arguments[:2] == ["nextest", "--version"]:
     raise SystemExit(0)
+if arguments[:2] == ["nextest", "list"]:
+''' + f"    print({EMPTY_NEXTEST_LIST_JSON!r})\n" + r'''
+    raise SystemExit(0)
 if arguments[:2] == ["nextest", "run"] and os.environ.get("TEST_CARGO_HOLD") == "1":
     # A natedev step still compiling: a cargo line, then a wait for
     # cargo-release (tests start) or SIGTERM (a Mac copy won).
@@ -387,6 +391,7 @@ if [ "$#" = 3 ] && [ "$1:$2:$3" = '+nightly:fmt:--version' ]; then
     printf 'cargo fixture 1.0\n'
     exit 0
 fi
+if [ "${1:-}:${2:-}" = nextest:list ]; then python_reply "$@"; fi
 if [ "${1:-}:${2:-}" = nextest:run ] && [ "${TEST_CARGO_HOLD:-}" = 1 ]; then
     python_reply "$@"
 fi
