@@ -157,7 +157,6 @@ class RosterTests(unittest.TestCase):
         config = self.root / "showrunners.json"
         _ = config.write_text(json.dumps({
             "threshold_percent": 2,
-            "repeat_minutes": 30,
             "stall_minutes": 5,
             "faults_to": "runner",
             "always": [],
