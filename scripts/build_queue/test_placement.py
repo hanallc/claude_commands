@@ -1844,8 +1844,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
     def test_idle_hana_preview_uses_the_recovered_permit(self) -> None:
         from scripts.aws_target import hana_box, hana_spend
 
-        with (PlacementFixture() as fixture,
-              mock.patch.object(hana_box.HanaController, "image_is_current", return_value=True)):
+        with PlacementFixture() as fixture:
             settings, request = self.idle_hana(fixture)
             good = settings.read_text()
             self.commit_settings(settings)
@@ -1858,7 +1857,9 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 self.assertEqual(expires - now, spending.settings.permit_max_seconds)
                 return hana_spend.StartAffordable(expires)
 
-            with (redirect_stderr(warnings), mock.patch.object(hana_spend.HanaSpending, "preview_start",
+            with (redirect_stderr(warnings),
+                  mock.patch.object(hana_box.HanaController, "image_is_current", return_value=True),
+                  mock.patch.object(hana_spend.HanaSpending, "preview_start",
                                                                autospec=True, side_effect=preview) as start):
                 evidence = self.read_target(fixture, request)
                 assert isinstance(evidence, placement.FreshHostEvidence), evidence
