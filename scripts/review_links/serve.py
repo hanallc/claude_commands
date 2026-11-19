@@ -514,6 +514,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.review_response(owned, 'text/html; charset=utf-8', prepared if owned is content else b'')
             return None
         if route.path == list_page.PAGE_PATH:
+            fields = parse_qs(route.query)
+            if "item-state" in fields:
+                self.list_action_state(fields)
+                return None
             try:
                 with server.list_store_access():
                     content = list_page.render(root, include_counts=server.mode is ServerMode.LIVE,
@@ -1144,6 +1148,23 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         else:
             cast(ReviewLinksServer, self.server).accounts_cache = AccountsPageCache()
             self.json_response(200, {"state": "saved"})
+
+    def list_action_state(self, fields: dict[str, list[str]]) -> None:
+        """Read the current item after an action response is lost."""
+        server = cast(ReviewLinksServer, self.server)
+        try:
+            (identity,) = fields["item-state"]
+            (keeper,) = fields.get("keeper", [])
+            (park_request,) = fields.get("park-request", [""])
+            with server.list_store_access():
+                current = list_page.saved_action_state(keeper, identity, status=server.delivery_status,
+                                                       park_request=park_request)
+        except ValueError as error:
+            self.browser_failure(400, "The List item is unavailable.", error)
+        except OSError as error:
+            self.browser_failure(503, "The List item cannot be read. Try again.", error)
+        else:
+            self.json_response(200, current)
 
     def list_post(self) -> None:
         """Save List feedback before the shared sender starts."""
