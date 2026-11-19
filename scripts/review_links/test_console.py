@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 from html.parser import HTMLParser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from dataclasses import replace
+import subprocess
+import threading
 import json
 import os
 from pathlib import Path
@@ -9,16 +13,17 @@ import shutil
 import tempfile
 from types import SimpleNamespace
 import unittest
-from typing import cast, override
+from typing import Literal, cast, override
 from unittest.mock import patch
 
 from scripts.aws_target import aws_page
 from scripts.build_queue import memory_feed
 from scripts.disks import disks_page
 from scripts.lib import conf
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import investigation, staff
 from scripts.production.change_routing import UnavailableProduction
-from scripts.review_links import change_browser, change_page, console, investigations_page, review_link
+from scripts.review_links import change_browser, change_page, console, for_you, investigations_page, page_frame, review_link
 
 
 class ConsoleMarkup(HTMLParser):
@@ -48,6 +53,22 @@ class ConsoleTests(unittest.TestCase):
         for stem in ("console", "review_links", "change_review"):
             _ = shutil.copyfile(Path(__file__).resolve().parents[2] / f"config/{stem}.conf",
                                 self.configuration / f"{stem}.conf")
+        _ = write_config_fixture(self.configuration / "console.conf",
+            "page.accounts.label=Accounts\npage.accounts.title=Accounts\npage.accounts.icon=users\n"
+            + "page.accounts.url=python:scripts.review_links.accounts_page:page_url\n"
+            + "page.aws.label=AWS\npage.aws.title=AWS\npage.aws.icon=cloud\n"
+            + "page.aws.url=python:scripts.aws_target.aws_page:page_url\n"
+            + "page.builds.icon=hammer\npage.builds.label=Builds\npage.builds.title=Builds\n"
+            + "page.builds.url=python:scripts.build_queue.memory_feed:page_url\n"
+            + "page.disks.label=Disks\npage.disks.title=Disks\npage.disks.icon=hard-drive\n"
+            + "page.disks.url=python:scripts.disks.disks_page:page_url\n"
+            + "page.images.label=Images\npage.images.title=Images\npage.images.icon=image\n"
+            + "page.images.url=python:scripts.review_links.images:page_url\n"
+            + "page.list.label=List\npage.list.icon=list-checks\npage.list.title=The List\n"
+            + "page.list.url=python:scripts.review_links.list_page:page_url\n"
+            + "page.review.label=Review\npage.review.icon=inbox\npage.review.title=Review\n"
+            + "page.review.url=python:scripts.review_links.review_page:page_url\n"
+            + "rebuilds.url=python:scripts.review_links.change_page:rebuilds_url\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(self.configuration), "REVIEW_LINKS_ROOT": str(self.root / "snapshots"),
             "REVIEW_LINKS_HOST": "127.0.0.1", "STAFF_FILE": str(self.root / "staff.json"),
@@ -66,14 +87,14 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(markup.pages, ["accounts", "aws", "builds", "disks", "images", "list", "review"])
         self.assertEqual(markup.sources, [])
         # Each page has its own icon and a hidden new mark; the menu button has one more mark.
-        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 19)
+        self.assertEqual(source.count('aria-hidden="true" focusable="false"'), 23)
         self.assertEqual(source.count('class="lucide lucide-sparkle"'), 8)
         self.assertEqual(source.count('<span class="new-mark" hidden>'), 7)
         self.assertIn('<span class="new-mark" id="menu-new" hidden>', source)
         self.assertIn('data-news="/console/news"', source)
         self.assertIn("showNews();\n    loadNews();\n    if (navigate && phone.matches) collapse(true);", source)
         self.assertIn("const value = fresh.has(entry.dataset.page) && !entry.hasAttribute('aria-current');", source)
-        self.assertIn("function refresh() { loadRebuilds(); loadNews(); }", source)
+        self.assertIn("function refresh() { loadRebuilds(); loadNews(); actions.refresh(); }", source)
         base = f"/{change_page.CONSOLE_FOLDER}"
         changes = f"{base}/review.html"
         self.assertIn(f'data-url="{changes}" data-title="Review"', source)
@@ -140,6 +161,7 @@ class ConsoleTests(unittest.TestCase):
         self.assertIsInstance(pages[4].destination, console.UnavailablePage)
         markup = ConsoleMarkup()
         source = console.render(pages, console.UnavailablePage()).decode()
+        self.assertEqual(source.count(page_frame.BUTTON_STATES), 1)
         markup.feed(source)
         self.assertEqual(markup.pages, ["review", "list", "images", "disks", "builds", "aws", "accounts"])
         self.assertIn('data-page="rebuilds"\ndata-url="" data-title', source)
@@ -159,8 +181,10 @@ class ConsoleTests(unittest.TestCase):
         self.assertIn('aria-label="Builds — Not available"', console.render(pages, console.read_rebuilds()).decode())
 
     def test_url_functions_cannot_put_an_external_page_in_the_frame(self) -> None:
+        port = 8123
+        _ = write_config_fixture(self.configuration / "review_links.conf", f"server_port={port}\n")
         for path in ("https://example.invalid/page", "//example.invalid/page", "/../outside", "/%2e%2e/outside",
-                     "http://127.0.0.1:1/page", "https://127.0.0.1:8765/page"):
+                     "http://127.0.0.1:1/page", f"https://127.0.0.1:{port}/page"):
             with self.subTest(path=path), patch.object(memory_feed, "page_url", return_value=path, create=True):
                 pages = console.read_pages()
                 self.assertIsInstance(pages[2].destination, console.UnavailablePage)
@@ -177,7 +201,7 @@ class ConsoleTests(unittest.TestCase):
         root = self.root / "snapshots"
         owner = staff.StaffId("orphan-owner")
         self.assertEqual(console.news(root, pages, "changes"), ())
-        item = investigation.file(owner, "Find the cause", "Why?")
+        item = investigation.file(owner, "Find the cause", "Why?", waiting_why='The owner must complete the investigation.')
         self.assertEqual(console.news(root, pages, "changes"), ())
         ready = investigation.answer(owner, item.id, "Found it.")
         self.assertEqual(investigations_page.waiting_investigations(console.NewsRequest(root)),
@@ -227,6 +251,300 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(read.call_count, 1)
         seen = cast(dict[str, list[str]], json.loads((self.root / "snapshots" / change_page.CONSOLE_FOLDER / console.SEEN_NAME).read_text()))
         self.assertEqual((seen["changes"], seen["questions"]), (["a/C1"], ["question/q1"]))
+
+
+class ForYouNotifierTests(unittest.TestCase):
+    'Use fixture snapshots for the notifier and browser controls.'
+
+    @staticmethod
+    def action(key: str = "action/fixture", status: Literal["open", "done", "withdrawn", "unknown"] = "open") -> for_you.ForYouRow:
+        return for_you.ForYouRow(key, "action", "Restore GitHub access", "github-warmup", "natedev",
+                                 "/fixture", "sdlc", "Login needs your browser.", "Release check", "",
+                                 status, "manual", "")
+
+    def test_notifier_counts_each_open_row_and_limits_the_panel_to_two_entries(self) -> None:
+        rows = (self.action(), replace(self.action("rebuild/mac"), kind="rebuild", machine="mac"),
+                self.action("action/third"), replace(self.action("action/done"), status="done"))
+        with patch.object(for_you, "read", return_value=for_you.ForYouSnapshot(rows, ())):
+            result = console.for_you_payload()
+        self.assertTrue(result["available"])
+        assert result["available"] is True
+        self.assertEqual(result["count"], 3)
+        self.assertEqual(len(result["entries"]), 2)
+        self.assertEqual(result["entries"][1]["machine"], "mac")
+        self.assertEqual(result["entries"][0]["href"],
+                         "?page=review&at.review=%2Fconsole%2Freview.html%3Ftype%3Dfor-you%26show%3Dopen%26item%3Daction%252Ffixture")
+
+    def test_zero_and_unavailable_counts_have_distinct_answers(self) -> None:
+        for failures, available in (((), True), ((for_you.UnavailableSource("fixture", "Read failed."),), False)):
+            with self.subTest(available=available), patch.object(for_you, "read", return_value=for_you.ForYouSnapshot((), failures)):
+                answer = console.for_you_payload()
+                self.assertEqual(answer["available"], available)
+                self.assertEqual(answer, {"available": True, "count": 0, "entries": []} if available else {"available": False})
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for notifier controls.")
+    def test_notifier_controls_on_desktop_and_phone(self) -> None:
+        for width in (1400, 390, 681, 700, 715, 716):
+            with self.subTest(width=width):
+                assert_notifier_browser(self, width)
+
+
+def assert_notifier_browser(case: unittest.TestCase, width: int) -> None:
+    'Exercise the real shell with controlled reads, timers, and clipboard writes.'
+    settings = Path(__file__).resolve().parents[2] / "config"
+    pages = (console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage("/page")),
+             console.ConsolePage("review", "Review", "inbox", "Review", console.AvailablePage("/console/review.html")),
+             console.ConsolePage("accounts", "Accounts", "users", "Accounts", console.AvailablePage("/accounts")))
+    with patch.dict(os.environ, {"CONF_DIR": str(settings)}):
+        source = console.render(pages, console.UnavailablePage()).decode()
+    setup = r'''<script>
+const nativeFetch=window.fetch.bind(window),timers=new Map();
+let mode='failed',reads=0,visibility='visible',copied='',finishRead;
+let accountsQuota={level:'urgent',name:'Urgent: 4% left'};
+Object.defineProperty(document,'visibilityState',{get:()=>visibility});
+window.setInterval=(run,ms)=>{const id=timers.size+1;timers.set(id,{run,ms});return id;};
+window.clearInterval=id=>timers.delete(id);
+const entries=[{key:'rebuild/natedev',kind:'rebuild',title:'Apply the new console settings',command:'rebuild',
+ machine:'natedev',requested_by:'watcher',href:'?page=review&at.review=%2Fconsole%2Freview.html%3Ftype%3Dfor-you%26show%3Dopen%26item%3Drebuild%252Fnatedev'},
+ {key:'action/demo',kind:'action',title:'Restore GitHub access',command:'github-warmup',machine:'mac',requested_by:'sdlc',href:'?page=review&at.review=%2Fconsole%2Freview.html%3Ftype%3Dfor-you%26show%3Dopen%26item%3Daction%252Fdemo'}];
+Object.defineProperty(navigator,'clipboard',{value:{writeText:async text=>{copied=text;}}});
+window.fetch=async(url,options)=>{
+ if(String(url).includes('for-you.json')){reads++;if(mode==='failed') throw Error('Read failed.');
+  const unavailable=mode==='unavailable' || mode==='http-unavailable';
+  const payload=unavailable ? {available:false} : {available:true,count:mode==='zero'?0:2,entries:mode==='zero'?[]:entries};
+  payload.accounts_quota=accountsQuota;
+  const status=mode==='http-unavailable' ? 503 : 200;
+  const answer={status,ok:status===200,json:async()=>payload};
+  if(mode==='delayed') return new Promise(resolve=>{finishRead=()=>resolve(answer);});
+  return answer;}
+ if(options?.method==='POST') return new Response('{"new":[]}');
+ return nativeFetch(url,options);
+};
+</script>'''
+    probe = r'''<script>
+(async()=>{
+const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+const flush=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+try{
+ await flush();
+ const trigger=[...document.querySelectorAll('[data-for-you-toggle]')].find(node=>node.getBoundingClientRect().width);
+ const panel=document.querySelector('#action-popover'),shell=document.querySelector('.shell');
+ check(Boolean(trigger),'a visible notifier exists');
+ if(!trigger) throw Error('Missing notifier.');
+ check(trigger.dataset.state==='unavailable' && trigger.textContent.includes('?'),'the first failed read shows unavailable');
+ mode='good';trigger.click();await flush();
+ check(!panel.hidden && trigger.getAttribute('aria-expanded')==='true','the button opens the panel');
+ check(trigger.textContent.includes('2') && panel.querySelectorAll('article').length===2,'the count and two entries appear');
+ check(panel.textContent.includes('natedev') && panel.textContent.includes('mac'),'the entries name each machine');
+ check(panel.getBoundingClientRect().right<=innerWidth && panel.getBoundingClientRect().left>=0,'the panel fits the viewport');
+ check(document.documentElement.scrollWidth===innerWidth,'the shell has no horizontal overflow');
+ const copy=panel.querySelector('[data-copy-code]');copy.focus();copy.click();await flush();
+ check(copied==='rebuild' && copy.getAttribute('aria-label')==='Copied','Copy writes the command');
+ const code=panel.querySelector('code'),selection=getSelection(),range=document.createRange();
+ range.selectNodeContents(code);selection.removeAllRanges();selection.addRange(range);
+ mode='good';dispatchEvent(new Event('focus'));await flush();
+ check(document.activeElement===copy && selection.toString()==='rebuild','refresh keeps focus and command selection');
+ entries[0].command='rebuild --new';dispatchEvent(new Event('focus'));await flush();
+ check(document.activeElement===copy && selection.toString()==='rebuild' && code.textContent==='rebuild','changed entries wait for the focused selection');
+ selection.removeAllRanges();trigger.focus();await flush();
+ check(panel.querySelector('code').textContent==='rebuild --new','released commands receive the pending refresh');
+ const note=panel.querySelector('.panel-note');
+ const crossCode=panel.querySelector('code');
+ selection.setBaseAndExtent(note.firstChild,0,crossCode.firstChild,crossCode.textContent.length);
+ const selected=selection.toString();
+ entries[0].command='rebuild --later';dispatchEvent(new Event('focus'));await flush();
+ check(selected.includes('rebuild --new') && selection.toString()===selected &&
+  panel.querySelector('code')===crossCode,'a selection from the panel note into a command survives refresh');
+ selection.removeAllRanges();await flush();
+ check(panel.querySelector('code').textContent==='rebuild --later','releasing a cross-entry selection applies the update');
+ const heading=panel.querySelector('[data-panel-count]');
+ for(const result of ['zero','unavailable','http-unavailable']){
+  mode='good';dispatchEvent(new Event('focus'));await flush();
+  const start=heading.firstChild,end=panel.querySelector('code').firstChild;
+  selection.setBaseAndExtent(start,0,end,end.length);
+  const text=selection.toString(), count=result==='zero'?'0':'?';
+  mode=result;dispatchEvent(new Event('focus'));await flush();
+  check(trigger.querySelector('b').textContent===count,result+' updates the badge during selection');
+  check(text.startsWith('2') && text.endsWith('rebuild --later') && selection.toString()===text &&
+   selection.anchorNode===start && selection.focusNode===end,result+' preserves the panel count and command selection');
+  selection.removeAllRanges();await flush();
+  check(heading.textContent===count && panel.querySelectorAll('article').length===0 &&
+   note.textContent===(result==='zero'?'No actions required.':'The action count is unavailable.'),
+   result+' updates the panel after selection ends');
+ }
+ mode='good';dispatchEvent(new Event('focus'));await flush();
+ mode='failed';dispatchEvent(new Event('focus'));await flush();
+ check(trigger.dataset.state==='stale' && trigger.textContent.includes('2'),'a failed read keeps the last count and marks it stale');
+ if(innerWidth<=680){
+  const toggle=document.querySelector('#mobile-nav-toggle');
+  const initial=shell.classList.contains('collapsed');
+  for(const collapsed of [true,false]){
+   if(shell.classList.contains('collapsed')!==collapsed) toggle.click();
+   const badge=trigger.querySelector('b');
+   check(badge.getBoundingClientRect().width>0 && getComputedStyle(badge).outlineStyle==='dotted',
+    'the phone badge shows stale with '+(collapsed?'closed':'open')+' navigation');
+  }
+  if(shell.classList.contains('collapsed')!==initial) toggle.click();
+ }
+ mode='unavailable';dispatchEvent(new Event('focus'));await flush();
+ check(trigger.dataset.state==='unavailable' && trigger.querySelector('b').textContent==='?' &&
+  panel.querySelectorAll('article').length===0,'an unavailable count clears the previous number and entries');
+ visibility='hidden';document.dispatchEvent(new Event('visibilitychange'));const before=reads;
+ for(const timer of timers.values()) timer.run();await flush();
+ check(reads===before && timers.size===0,'hidden pages stop timed reads');
+ mode='good';visibility='visible';document.dispatchEvent(new Event('visibilitychange'));await flush();
+ check(reads>before && timers.size>0,'visibility resumes reads and the timer');
+ const completed=reads;dispatchEvent(new MessageEvent('message',{origin:location.origin,source:document.querySelector('iframe').contentWindow,data:'for-you-completed'}));await flush();
+ check(reads>completed,'completion refreshes actions');
+ const frame=document.querySelector('iframe');
+ const queued=reads;mode='delayed';dispatchEvent(new Event('focus'));
+ check(reads===queued+1 && typeof finishRead==='function','the fixture starts one blocked read');
+ const completion={origin:location.origin,source:frame.contentWindow,data:'for-you-completed'};
+ dispatchEvent(new MessageEvent('message',completion));
+ dispatchEvent(new MessageEvent('message',completion));
+ check(reads===queued+1,'completion does not start a concurrent read');
+ mode='zero';finishRead();await flush();
+ check(reads===queued+2 && trigger.dataset.state==='quiet','completion queues one read after a read in progress');
+ mode='good';dispatchEvent(new Event('focus'));await flush();
+ const collapsed=shell.classList.contains('collapsed');
+ const frameButton=frame.contentDocument.querySelector('button');
+ frameButton.focus();
+ check(document.activeElement===frame && frame.contentDocument.activeElement===frameButton,'focus enters the page frame');
+ frameButton.dispatchEvent(new frame.contentWindow.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
+ await flush();
+ check(panel.hidden && document.activeElement===trigger,'Escape in the page frame closes the panel and restores focus');
+ check(shell.classList.contains('collapsed')===collapsed,'frame Escape preserves sidebar state');
+ if(panel.hidden) trigger.click();
+ trigger.focus();
+ trigger.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
+ check(panel.hidden && document.activeElement===trigger,'Escape in the shell closes the panel and restores focus');
+ check(shell.classList.contains('collapsed')===collapsed,'shell Escape preserves sidebar state');
+ await flush();
+ mode='zero';trigger.click();await flush();
+ check(trigger.dataset.state==='quiet' && trigger.textContent.includes('0'),'zero uses a quiet visible notifier');
+ check(panel.textContent.includes('No actions required.'),'the empty panel names the zero state');
+ mode='http-unavailable';dispatchEvent(new Event('focus'));await flush();
+ check(trigger.dataset.state==='unavailable' && trigger.querySelector('b').textContent==='?',
+  'an explicit HTTP 503 replaces a known zero');
+ mode='zero';dispatchEvent(new Event('focus'));await flush();
+ mode='unavailable';dispatchEvent(new Event('focus'));await flush();
+ check(trigger.dataset.state==='unavailable' && trigger.querySelector('b').textContent==='?',
+  'an unavailable count replaces a known zero');
+ mode='good';dispatchEvent(new Event('focus'));await flush();
+ const link=panel.querySelector('[data-for-you-card]');
+ check(new URL(link.href).searchParams.get('at.list')==='/page?filter=mine','the card href keeps the saved List location');
+ link.click();await flush();
+ const url=new URL(location.href),place=new URL(url.searchParams.get('at.review'),location.origin);
+ check(url.searchParams.get('page')==='review' && place.searchParams.get('type')==='for-you' &&
+ place.searchParams.get('item')==='rebuild/natedev','a card opens Review with the reserved parameters and key');
+ check(panel.hidden,'a card closes the panel');
+ check(url.searchParams.get('at.list')==='/page?filter=mine' && url.searchParams.get('extra')==='kept',
+  'opening a card preserves unrelated console parameters');
+ trigger.click();await flush();
+ panel.querySelector('footer a').click();await flush();
+ const footerURL=new URL(location.href),footerPlace=new URL(footerURL.searchParams.get('at.review'),location.origin);
+ check(footerURL.searchParams.get('at.list')==='/page?filter=mine' && footerURL.searchParams.get('extra')==='kept' &&
+  footerPlace.searchParams.get('type')==='for-you' && !footerPlace.searchParams.has('item'),
+  'opening the footer preserves unrelated parameters and clears the card key');
+ if(innerWidth>680){document.getElementById('nav-toggle').click();await flush();
+  check(trigger.getBoundingClientRect().width>0 && trigger.querySelector('b').getBoundingClientRect().width>0,'collapsed navigation keeps the icon and badge');
+  trigger.click();await flush();
+  const bounds=panel.getBoundingClientRect();
+  check(bounds.width>0 && bounds.left>=0 && bounds.right<=innerWidth,'the panel fits beside collapsed navigation');
+  check(document.documentElement.scrollWidth===innerWidth,'collapsed navigation has no horizontal overflow');}
+ if(innerWidth===1400){
+  const badge=document.querySelector('[data-page=accounts] #nav-quota');
+  check(!badge.hidden && badge.getBoundingClientRect().width>0 && badge.getAttribute('aria-label')==='Urgent: 4% left',
+   'the collapsed Accounts entry shows the urgent icon and its accessible name');
+  if(shell.classList.contains('collapsed')) document.getElementById('nav-toggle').click();
+  accountsQuota={level:'warning',name:'Warning: 9% left'};
+  dispatchEvent(new Event('focus'));await flush();
+  check(badge.getBoundingClientRect().width>0 && badge.querySelector('.lucide-triangle-alert')
+   && !badge.querySelector('.lucide-octagon-alert'),'the next count read changes the open entry to warning');
+  accountsQuota={level:'none',name:''};
+  dispatchEvent(new Event('focus'));await flush();
+  check(badge.hidden,'the next count read removes the last alert');
+  const fixture=document.createElement('iframe');
+  fixture.style.cssText='position:fixed;left:0;top:0;width:716px;height:800px;border:0';
+  const bookmark='/console/?page=investigations&at.investigations='+
+   encodeURIComponent('/console/investigations.html?show=all#showrunner=builds&q=shard');
+  fixture.src=bookmark;
+  await new Promise(resolve=>{fixture.addEventListener('load',resolve,{once:true});document.body.append(fixture);});
+  const layout=fixture.contentDocument;
+  const opened=new URL(fixture.contentWindow.location.href);
+  const reviewFrame=layout.querySelector('iframe[title="Review"]');
+  const filters=new URLSearchParams(new URL(reviewFrame.src).hash.slice(1));
+  check(opened.searchParams.get('page')==='review' && filters.get('type')==='investigations' &&
+   filters.get('show')==='all' && filters.get('source-owner')==='builds' && filters.get('q')==='shard',
+   'the legacy Console bookmark opens the combined filter and preserves its filters');
+  const sidebar=layout.querySelector('.shell'),toggle=layout.querySelector('#nav-toggle');
+  const box=layout.querySelector('#action-popover');
+  const button=layout.querySelector('.for-you-slot button');
+  button.click();
+  for(const collapsed of [false,true]){
+   if(sidebar.classList.contains('collapsed')!==collapsed) toggle.click();
+   for(let width=681;width<=716;width++){
+    fixture.style.width=width+'px';
+    const bounds=box.getBoundingClientRect();
+    check(bounds.width>0 && bounds.left>=0 && bounds.right<=width,
+     'the panel fits at '+width+' px with '+(collapsed?'collapsed':'expanded')+' navigation');
+   }
+  }
+  fixture.style.width='390px';
+  await flush();
+  const mobile=layout.querySelector('.mobile-header [data-for-you-toggle]');
+  layout.dispatchEvent(new fixture.contentWindow.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
+  check(box.hidden && layout.activeElement===mobile,'Escape restores focus to the visible button after resizing');
+  fixture.remove();
+ }
+}catch(error){failures.push(String(error));}
+await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>'''
+    layout = source.replace('</head>', setup + '</head>')
+    page = layout.replace('</body>', probe + '<img hidden src="/complete"></body>').encode()
+    results: list[list[str]] = []
+    complete = threading.Event()
+
+    class Probe(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            if self.path == '/complete':
+                _ = complete.wait(35)
+            elif self.path.startswith('/console/?page=investigations'):
+                _ = self.wfile.write(layout.encode())
+            elif self.path.startswith('/?'):
+                _ = self.wfile.write(page)
+            else:
+                _ = self.wfile.write(b'<!doctype html><title>Fixture</title><button>Fixture control</button>')
+
+        def do_POST(self) -> None:
+            results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+            self.send_response(204)
+            self.end_headers()
+            complete.set()
+
+        @override
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    with tempfile.TemporaryDirectory() as temporary, ThreadingHTTPServer(('127.0.0.1', 0), Probe) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            profile = Path(temporary) / 'profile'
+            profile.mkdir()
+            _ = (profile / 'user.js').write_text('user_pref("ui.systemUsesDarkTheme",1);')
+            result = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+                                     '--window-size', f'{width},800', '--screenshot', str(Path(temporary) / 'page.png'),
+                                     f'http://127.0.0.1:{server.server_port}/?page=list&at.list=%2Fpage%3Ffilter%3Dmine&extra=kept'],
+                                    capture_output=True, text=True, timeout=40)
+            case.assertEqual(result.returncode, 0, result.stderr)
+        finally:
+            server.shutdown()
+            thread.join(5)
+    case.assertEqual(results, [[]])
 
 
 if __name__ == "__main__":

@@ -78,10 +78,9 @@ def check_units(child: Production, record: staff.StaffSnapshot) -> None:
         raise Refusal(f"{child.name}: unmerged branches: {', '.join(unmerged)}")
 
 
-def live_session(session: str, record: staff.StaffSnapshot) -> unit_lookup.LabeledSession | unit_lookup.NoSession:
-    """Read the live pane for the exact retained conversation."""
-    return next((item for item in unit_lookup.observed_session_labels(record=record)
-                 if isinstance(item.claude, unit_lookup.LiveClaude) and item.claude.session_id == session), unit_lookup.NoSession())
+def live_session(session: str, record: staff.StaffSnapshot) -> unit_lookup.UnitOwner:
+    """Check the exact retained conversation for resume or attach."""
+    return unit_lookup.checked_conversation(session, record=record)
 
 
 def child_plan(child: Production, plan: Path) -> Path:
@@ -114,9 +113,13 @@ def checked(parent: Production, name: str, plan: Path | unit_config.PlanDefault,
         saved = unit_config.read(child.checkout, cleanup=False)
         port = unit_config.default_port(child.checkout, saved.port if isinstance(saved, unit_config.UnitConfig) else port)
     add_unit.require_merge_branch(parent)
-    marked = live_session(row.current_session, record)
-    if isinstance(marked, unit_lookup.NoSession) or not isinstance(marked.claude, unit_lookup.LiveClaude):
-        raise Refusal(f"{name}: cannot read the live pane")
+    match live_session(row.current_session, record):
+        case unit_lookup.ProvedLiveUnit(owner=unit_lookup.LabeledSession(claude=unit_lookup.LiveClaude() as claude) as marked):
+            pass
+        case unit_lookup.UnknownUnit(reason=reason):
+            raise Refusal(f"{name}: {reason}")
+        case unit_lookup.ProvedAbsentUnit() | unit_lookup.ProvedLiveUnit():
+            raise Refusal(f"{name}: cannot read the live pane")
     worktree = child.checkout
     relative_plan = plan.relative_to(child.checkout).as_posix()
     if not plan.is_file():
@@ -127,9 +130,9 @@ def checked(parent: Production, name: str, plan: Path | unit_config.PlanDefault,
         branch = add_unit.git(child, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
         raise Refusal(f"plan {relative_plan} is committed only on {branch}; "
                       + f"commit it on {child.merge_branch} or keep it untracked")
-    promote_showrunner.check_director(name, marked, marked.claude, worktree, skip_path=plan)
+    promote_showrunner.check_director(name, marked, claude, worktree, skip_path=plan)
     check_units(child, record)
-    return Demotion(parent, child, marked, marked.claude, worktree, child.merge_branch, plan, port, unit_type)
+    return Demotion(parent, child, marked, claude, worktree, child.merge_branch, plan, port, unit_type)
 
 
 def saved_request(parent: Production, fields: dict[str, object]) -> Demotion:
@@ -215,6 +218,16 @@ def unit_document(request: Demotion) -> None:
 
 
 def launch(request: Demotion) -> int:
+    session = request.claude.session_id
+    match live_session(session, staff.snapshot()):
+        case unit_lookup.ProvedAbsentUnit():
+            flag = "--resume"
+        case unit_lookup.ProvedLiveUnit(owner=unit_lookup.LabeledSession(claude=unit_lookup.LiveClaude())):
+            flag = "--resume" if add_unit.pending_opening(request.parent, request.child.name, session) else "--attach"
+        case unit_lookup.ProvedLiveUnit():
+            raise OSError("cannot prove a live Claude pane for the retained session")
+        case unit_lookup.UnknownUnit(reason=reason):
+            raise OSError(reason)
     plan = request.plan.relative_to(request.worktree)
     config = unit_config.read(request.worktree, cleanup=False)
     desired = (unit_config.UnitConfig(unit_config.PlanFile(plan), request.port, ())
@@ -223,9 +236,6 @@ def launch(request: Demotion) -> int:
     _ = unit_config.write(request.worktree, desired)
     target = accounts.account_for_group_launch("unit", resume=True)
     port = ["--port", str(request.port.number)] if isinstance(request.port, unit_config.AppPort) else []
-    session = request.claude.session_id
-    flag = "--resume" if (isinstance(live_session(session, staff.snapshot()), unit_lookup.NoSession)
-                         or add_unit.pending_opening(request.parent, request.child.name, session)) else "--attach"
     return add_unit.main(["--production", request.parent.name, request.child.name, "--plan", str(plan),
                           "--unit-type", request.unit_type,
                           flag, session, "--cwd", str(request.worktree), "--config-dir", str(target.dir), *port])
@@ -342,9 +352,10 @@ def _main(argv: list[str]) -> int:
     _ = parser.add_argument("--port", type=int)
     _ = parser.add_argument("--unit-type", choices=staff.UNIT_TYPES)
     args = parser.parse_args(argv)
+    name = cast(str, args.child)
+    staff.validate_unit_name_for_write(name)
     record = staff.snapshot()
     parent = read_production(showrunners.own_name(), record=record)
-    name = cast(str, args.child)
     path = record_path(parent, name)
     plan = cast(Path | unit_config.PlanDefault, args.plan)
     raw_port = cast(int | None, args.port)

@@ -77,12 +77,17 @@ class DispatchWaitingForRuns:
     reply: DispatchSubmitted | DispatchComplete | DispatchAwaitingReply
 
 
+class NoMatchingDone(Enum):
+    UNRECORDED = "the transcript has no matching DONE for this stage"
+
+
 @dataclass(frozen=True)
 class DispatchAwaitingReply:
-    """A detached result has no worker reply yet."""
+    """A detached result requires a new matching DONE."""
 
-    last_reply: str = ""
-    runs: tuple[str, ...] = ()
+    last_reply: str
+    runs: tuple[str, ...]
+    matching_done: DispatchComplete | NoMatchingDone
 
 
 DispatchReceipt = (DispatchNotSubmitted | DispatchSubmitted | DispatchComplete | DispatchEvidenceUnknown
@@ -113,10 +118,15 @@ class FinalReply:
     """Accept the final message after the exact question."""
 
 
+class DoneTimeUnknown(Enum):
+    UNRECORDED = "the transcript does not record a DONE time"
+
+
 @dataclass(frozen=True)
 class TranscriptReceipt:
     receipt: DispatchNotSubmitted | DispatchSubmitted | DispatchComplete | DispatchEvidenceUnknown | DispatchAwaitingReply
     received_runs: frozenset[str]
+    done_at: float | DoneTimeUnknown = DoneTimeUnknown.UNRECORDED
 
 
 @dataclass(frozen=True)
@@ -124,18 +134,34 @@ class DispatchPrompt:
     """Find the saved dispatch prompt without rebuilding its command or path."""
 
     dispatch_id: str
+    include_stage_two: bool = False
+
+
+def _prompt_names_completion(text: str, completion_id: str) -> bool:
+    return (f"End your final reply with DONE {completion_id}." in text
+            or f"End your final reply with this line alone: DONE {completion_id}\n" in text)
+
+
+NO_LATE_RESULT_IDS: frozenset[str] = frozenset()
 
 
 def transcript_receipt(entries: Iterable[str | dict[str, object] | worker_admission.TornTranscriptRecord],
-                       line: str | DispatchPrompt, completion: DoneReply | FinalReply) -> TranscriptReceipt:
+                       line: str | DispatchPrompt, completion: DoneReply | FinalReply, *,
+                       stop_at_done: bool = False, accept_late_done: bool = False,
+                       late_result_ids: frozenset[str] = NO_LATE_RESULT_IDS) -> TranscriptReceipt:
     """Read prompt acceptance and its reply through the shared transcript parser."""
     submitted = False
     responding = False
     incomplete = False
+    done_at: float | DoneTimeUnknown = DoneTimeUnknown.UNRECORDED
     received: set[str] = set()
     reply: DispatchSubmitted | DispatchComplete | DispatchAwaitingReply = DispatchSubmitted()
+    completion_id = completion.dispatch_id if isinstance(completion, DoneReply) else ""
+    second_stage = (worker_panes.stage_two_completion_id(line.dispatch_id)
+                    if isinstance(line, DispatchPrompt) and line.include_stage_two else "")
     try:
         for entry in entries:
+            fields = entry if isinstance(entry, dict) else {}
             if isinstance(entry, worker_admission.TornTranscriptRecord):
                 incomplete = True
                 continue
@@ -150,41 +176,61 @@ def transcript_receipt(entries: Iterable[str | dict[str, object] | worker_admiss
                 results = {part.removeprefix("Detached run: ") for part in text.splitlines()
                            if part.startswith("Detached run: ")}
                 received.update(results)
+                if second_stage and completion_id != second_stage and _prompt_names_completion(text, second_stage):
+                    completion_id = second_stage
+                    reply = DispatchSubmitted()
                 if (text in (line.strip(), script_prompt(line).strip()) if isinstance(line, str) else
-                        any(f"End your final reply with DONE {identity}." in text
-                            or f"End your final reply with this line alone: DONE {identity}\n" in text for identity in
-                            (line.dispatch_id, worker_panes.stage_two_completion_id(line.dispatch_id)))):
+                        _prompt_names_completion(text, completion_id)):
                     submitted = True
                     responding = True
-                    reply = DispatchSubmitted()
+                    if isinstance(reply, DispatchSubmitted):
+                        reply = DispatchSubmitted()
                 elif isinstance(completion, FinalReply):
                     responding = False
                     reply = DispatchSubmitted()
                 elif "Read the unchanged prompt file" in text and any(instruction in text for instruction in (
                         "End your final reply with DONE ", "End your final reply with this line alone: DONE ")):
                     responding = False
-                elif submitted and responding and results:
-                    reply = DispatchAwaitingReply(
-                        reply.last_reply if isinstance(reply, DispatchAwaitingReply) else reply.reply,
-                        tuple(sorted(results.union(reply.runs if isinstance(reply, DispatchAwaitingReply) else ()))))
-            elif (responding or isinstance(line, DispatchPrompt)) and entry.startswith("assistant:\n"):
+                elif submitted:
+                    if not responding:
+                        results.intersection_update(late_result_ids)
+                    if not results:
+                        continue
+                    if isinstance(reply, DispatchAwaitingReply):
+                        reply = replace(reply, runs=tuple(sorted(results.union(reply.runs))))
+                    else:
+                        matching_done = reply if isinstance(reply, DispatchComplete) else NoMatchingDone.UNRECORDED
+                        reply = DispatchAwaitingReply(reply.reply, tuple(sorted(results)), matching_done)
+            elif (responding or isinstance(line, DispatchPrompt) or accept_late_done and submitted
+                  ) and entry.startswith("assistant:\n"):
                 text = entry.removeprefix("assistant:\n")
                 if isinstance(completion, FinalReply):
                     complete = bool(text.strip())
                 else:
-                    complete = worker_admission.reply_ends_dispatch(text, completion.dispatch_id)
-                    if isinstance(line, DispatchPrompt):
-                        complete = complete or worker_admission.reply_ends_dispatch(
-                            text, worker_panes.stage_two_completion_id(completion.dispatch_id))
+                    if second_stage and worker_admission.reply_ends_dispatch(text, second_stage):
+                        completion_id = second_stage
+                    complete = worker_admission.reply_ends_dispatch(text, completion_id)
+                if accept_late_done and not responding and not complete:
+                    continue
+                if complete and stop_at_done and isinstance(completion, DoneReply):
+                    return TranscriptReceipt(DispatchComplete(text), frozenset(received))
                 if complete and isinstance(line, DispatchPrompt):
                     submitted = True
-                if not (isinstance(line, DispatchPrompt) and isinstance(reply, DispatchComplete)):
-                    reply = DispatchComplete(text) if complete else DispatchSubmitted(text)
+                    responding = True
+                if complete:
+                    reply = DispatchComplete(text)
+                    at = rollouts.parse_timestamp(fields.get("timestamp"))
+                    done_at = at.timestamp() if at is not None else DoneTimeUnknown.UNRECORDED
+                    incomplete = False
+                elif isinstance(reply, DispatchAwaitingReply):
+                    reply = replace(reply, last_reply=text)
+                elif isinstance(completion, FinalReply) or isinstance(reply, DispatchSubmitted):
+                    reply = DispatchSubmitted(text)
     except (OSError, ValueError) as error:
         return TranscriptReceipt(DispatchEvidenceUnknown(str(error)), frozenset(received))
-    if incomplete and not submitted:
+    if incomplete:
         return TranscriptReceipt(DispatchEvidenceUnknown("worker transcript has incomplete records"), frozenset(received))
-    return TranscriptReceipt(reply if submitted else DispatchNotSubmitted(), frozenset(received))
+    return TranscriptReceipt(reply if submitted else DispatchNotSubmitted(), frozenset(received), done_at)
 
 
 def consultation_reply(client: herdr.Herdr, pane: str, source: Path, question: str) -> str:
@@ -209,42 +255,97 @@ def consultation_reply(client: herdr.Herdr, pane: str, source: Path, question: s
             raise ValueError("no review was written")
 
 
-def _receipt_records(row: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend
-                     ) -> Generator[dict[str, object] | worker_admission.TornTranscriptRecord]:
+def _receipt_records(row: staff.StaffRow, backend: staff.ClaudeBackend | staff.CodexBackend, *,
+                     require_transcript: bool = False) -> Generator[dict[str, object] | worker_admission.TornTranscriptRecord]:
     try:
         source = worker_admission.transcript_source(row, backend)
     except ValueError as error:
-        if isinstance(backend, staff.ClaudeBackend) and str(error) == "no source transcript found":
+        if not require_transcript and isinstance(backend, staff.ClaudeBackend) and str(error) == "no source transcript found":
             return
         raise
     yield from worker_admission.transcript_records(source)
 
 
-def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *, run: Path) -> DispatchReceipt:
+class CurrentPanePass(Enum):
+    CURRENT = "read the current pane pass"
+
+
+def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
+                     run: Path, require_transcript: bool = False,
+                     pane_pass: CurrentPanePass | progress_history.StoppedPassReceipt = CurrentPanePass.CURRENT,
+                     ) -> DispatchReceipt:
     """Read the shared receipt and require delivery of detached results."""
     backend = staff.backend(row)
     if isinstance(backend, staff.BackendUnavailable):
         return DispatchEvidenceUnknown("worker transcript backend is unavailable")
-    transcript = transcript_receipt(_receipt_records(row, backend), line, DoneReply(dispatch_id))
+    def records() -> Generator[dict[str, object] | worker_admission.TornTranscriptRecord]:
+        return _receipt_records(row, backend, require_transcript=require_transcript)
+
+    directory = run / worker_lifecycle.DETACHED_RUNS_DIR
+    if isinstance(pane_pass, progress_history.StoppedPassReceipt):
+        deliveries = detached_runs.worker_results(directory, row, since=0, pane_dispatch_id=pane_pass.instance_id)
+        transcript = transcript_receipt(records(), line, DoneReply(dispatch_id), accept_late_done=True,
+                                        late_result_ids=frozenset(deliveries))
+    else:
+        deliveries = {}
+        transcript = transcript_receipt(records(), line, DoneReply(dispatch_id))
     if isinstance(transcript.receipt, DispatchNotSubmitted):
-        transcript = transcript_receipt(_receipt_records(row, backend), DispatchPrompt(dispatch_id), DoneReply(dispatch_id))
+        transcript = transcript_receipt(records(), DispatchPrompt(dispatch_id), DoneReply(dispatch_id))
     reply = transcript.receipt
     if isinstance(reply, (DispatchNotSubmitted, DispatchEvidenceUnknown)):
         return reply
-    received = transcript.received_runs
-    passed = worker_panes.worker_pass(row, run)
-    started = passed.get("started_at", 0)
-    since = float(started) if isinstance(started, (int, float)) else 0
-    directory = run / worker_lifecycle.DETACHED_RUNS_DIR
-    pending = detached_runs.delivered_worker_results(directory, row.name, since=since) - received
     live = detached_runs.live_runs(directory, row.name)
-    pending.update(record["run_id"] for record in live)
+    if isinstance(pane_pass, progress_history.StoppedPassReceipt):
+        live = [record for record in live if record.get("pane_dispatch_id") == pane_pass.instance_id]
+    else:
+        passed = worker_panes.worker_pass(row, run)
+        started = passed.get("started_at", 0)
+        since = float(started) if isinstance(started, (int, float)) else 0
+        deliveries = detached_runs.worker_results(directory, row, since=since)
+    unseen = deliveries.keys() - transcript.received_runs
+    pending = unseen.union(record["run_id"] for record in live)
     if isinstance(reply, DispatchAwaitingReply):
         pending.update(reply.runs)
-    if pending and not live and isinstance(reply, DispatchComplete):
-        return replace(reply, anomalies=tuple(
-            f"run {run_id} finished, but its result is not in the transcript" for run_id in sorted(pending)))
+    if unseen and isinstance(reply, DispatchComplete):
+        done_at = transcript.done_at
+        after_done = tuple(sorted(run_id for run_id in unseen if not (
+            isinstance(done_at, float) and isinstance(delivered_at := deliveries[run_id], (int, float))
+            and delivered_at < done_at)))
+        if after_done:
+            reply = DispatchAwaitingReply(reply.reply, after_done, reply)
+        elif not live:
+            return replace(reply, anomalies=tuple(
+                f"run {run_id} finished, but its result is not in the transcript" for run_id in sorted(unseen)))
     return DispatchWaitingForRuns(tuple(sorted(pending)), bool(live), reply) if pending else reply
+
+
+def completion_close_evidence(row: staff.StaffRow, delivery: progress_history.DispatchDelivery, *,
+                              run: Path, reply_file: str) -> worker_panes.CloseAllowed | worker_panes.Kept:
+    receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=run, require_transcript=True)
+    if isinstance(receipt, DispatchComplete):
+        if not reply_file:
+            return worker_panes.Kept("the dispatch has no saved reply path")
+        try:
+            saved = Path(reply_file).read_text(encoding="utf-8")
+        except OSError as error:
+            return worker_panes.Kept(f"the dispatch reply is unavailable: {error}")
+        if saved.rstrip() == receipt.reply.rstrip():
+            return worker_panes.CloseAllowed()
+        return worker_panes.Kept("the saved reply differs from the dispatch receipt")
+    if isinstance(receipt, DispatchEvidenceUnknown):
+        return worker_panes.Kept(f"completion evidence is unavailable: {receipt.reason}")
+    return worker_panes.Kept("the transcript has no completed dispatch receipt")
+
+
+def detached_reply_hold(row: staff.StaffRow, line: str, completion_id: str, *,
+                        run: Path) -> worker_panes.CloseAllowed | worker_panes.Kept:
+    """Keep a pane when a detached result requires a reply."""
+    receipt = dispatch_receipt(row, line, completion_id, run=run, require_transcript=True)
+    if isinstance(receipt, DispatchEvidenceUnknown):
+        return worker_panes.Kept(f"completion evidence is unavailable: {receipt.reason}")
+    if isinstance(receipt, (DispatchWaitingForRuns, DispatchAwaitingReply)):
+        return worker_panes.Kept("a detached run result awaits a matching DONE")
+    return worker_panes.CloseAllowed()
 
 
 def _client() -> herdr.Herdr:
@@ -308,10 +409,14 @@ def _compact_before_dispatch(client: herdr.Herdr, current: worker_panes.OpenWork
     if not isinstance(plan, CompactionRequired):
         return
     deadline = time.monotonic() + conf.read("direct").number("WORKER_COMPACT_SECONDS")
-    _agent_command(client, current, "compact", deadline=deadline)
-    ended = client.wait_turn_end(current.pane, max(0, int((deadline - time.monotonic()) * 1000)))
-    if isinstance(ended, herdr.WaitTimedOut):
-        raise herdr_types.HerdrFailure("compaction did not finish before the compaction bound", "timeout")
+    try:
+        _agent_command(client, current, "compact", deadline=deadline)
+        ended = client.wait_turn_end(current.pane, max(0, int((deadline - time.monotonic()) * 1000)))
+        timed_out = isinstance(ended, herdr.WaitTimedOut)
+    except herdr_types.HerdrFailure as error:
+        if error.code != "timeout":
+            raise
+        timed_out = True
     source = worker_admission.transcript_source(current.row, plan.backend)
     with open_transcript(source) as stream:
         _ = stream.seek(plan.offset)
@@ -321,6 +426,8 @@ def _compact_before_dispatch(client: herdr.Herdr, current: worker_panes.OpenWork
             record = rollouts.decode_rollout(line.decode("utf-8"))
             if record is not None and rollouts.is_compaction(record):
                 return
+    if timed_out:
+        raise herdr_types.HerdrFailure("compaction did not finish before the compaction bound", "timeout")
     raise herdr_types.HerdrFailure("compaction has no transcript proof", "not_submitted")
 
 
@@ -462,6 +569,48 @@ def _prompt_conflict(conflict: progress_history.ActiveDispatchPromptConflict) ->
     return ExitCode.BUSY
 
 
+def _selection_changed(error: progress_history.DispatchSelectionChanged) -> ExitCode:
+    print(f"{error}; no prompt sent", file=sys.stderr)
+    return ExitCode.BUSY
+
+
+class CloseCompletedPane(Enum):
+    CLOSE = "close the completed pane"
+
+
+class KeepCompletedPane(Enum):
+    KEEP = "refresh the saved reply for an explicit retry"
+
+
+@dataclass(frozen=True)
+class ReuseCompletedPane:
+    held_role: str
+
+
+class CompletionRecovery(Enum):
+    NO_PENDING_NOTICE = "no pending completion notice"
+    RECOVERED = "completion recovery finished"
+    PENDING_CLOSE = "completion has pending pane cleanup"
+    WAITING_ON_RUNS = "the completion waits for a detached run"
+    WAITING_ON_REPLY = "a detached run result awaits a matching DONE"
+
+
+class CompletionNotices(Protocol):
+    def completion_notice_delivered(self, passed: dict[str, object]) -> bool: ...
+
+    def recover_completion(self, row: staff.StaffRow, parent: staff.StaffRow, run: Path,
+                           hold: worker_panes.WorkerLockHold, *, record: staff.StaffSnapshot,
+                           pane: CloseCompletedPane | ReuseCompletedPane | KeepCompletedPane = CloseCompletedPane.CLOSE,
+                           ) -> CompletionRecovery: ...
+
+    def repeat_completion_notice(self, worker_name: str, parent: staff.StaffRow, run: Path,
+                                 passed: dict[str, object]) -> Callable[[], None]: ...
+
+
+def _completion_notices() -> CompletionNotices:
+    return cast(CompletionNotices, cast(object, import_module("scripts.herdr.turn_end")))
+
+
 def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, dispatch_id: str = "", *,
              session_dir: Path, slot: str, phase: str, kind: str, launcher_command: list[str],
              lens: str = "", reply: Path | ReplyBesidePrompt = REPLY_BESIDE_PROMPT, fix_cause: str = "",
@@ -481,28 +630,62 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         if isinstance(hold, worker_panes.Kept):
             print(hold.blocker, file=sys.stderr)
             return ExitCode.BUSY
-        matched = progress_history.dispatch_worker(session_dir, slot=slot, phase=phase, role=role,
-            prompt=prompt, launcher_command=launcher_command)
-        if isinstance(matched, progress_history.ActiveDispatchPromptConflict):
-            return _prompt_conflict(matched)
-        row = worker_admission.find_worker(staff.snapshot(), parent, name.value)
+        selection = progress_history.select_dispatch(session_dir, slot=slot, phase=phase, role=role,
+            prompt=prompt, launcher_command=launcher_command, work=progress_history.DispatchWork(kind, lens, fix_pass),
+            target=name)
+        if isinstance(selection, progress_history.ActiveDispatchPromptConflict):
+            return _prompt_conflict(selection)
+        matched = selection.action
+        completion_notices = _completion_notices()
+        record = staff.snapshot()
+        row = worker_admission.find_worker(record, parent, name.value)
+        recovered = CompletionRecovery.NO_PENDING_NOTICE
+        if row is not None and (owner := record.parent_of(row)) is not None:
+            recorded = progress_history.recorded_dispatch_run(row.id)
+            if isinstance(recorded, progress_history.RecordedDispatchRun):
+                previous = worker_panes.worker_pass(row, recorded.directory, record=record)
+                same_pass = (isinstance(matched, progress_history.MatchedDispatch)
+                             and matched.instance_id == previous.get("instance_id"))
+                if same_pass:
+                    pane = (KeepCompletedPane.KEEP if completion_notices.completion_notice_delivered(previous)
+                            else CloseCompletedPane.CLOSE)
+                else:
+                    pane = ReuseCompletedPane(completion_actions.held_role)
+                awaiting_hook = (same_pass and previous.get("status") in ("active", "refused")
+                                 and isinstance(progress_history.hook_completion(previous), progress_history.NoHookCompletion))
+                try:
+                    if not awaiting_hook:
+                        recovered = completion_notices.recover_completion(row, owner, recorded.directory, hold,
+                                                                         record=record, pane=pane)
+                except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
+                        staff.StaffRefused, staff.StaffUnreadable) as error:
+                    print(f"anomaly: {row.name}: pending completion notice for pass {previous.get('instance_id')}: {error}",
+                          file=sys.stderr)
+                    return ExitCode.UNCERTAIN
+                if recovered in (CompletionRecovery.WAITING_ON_RUNS, CompletionRecovery.WAITING_ON_REPLY):
+                    print(f"{row.name}: {recovered.value}", file=sys.stderr)
+                    return ExitCode.BUSY
+                if recovered is CompletionRecovery.PENDING_CLOSE:
+                    return ExitCode.UNCERTAIN
         if (isinstance(matched, progress_history.MatchedDispatch) and matched.worker_name == name.value
-                and row is not None and worker_panes.worker_pass(row, session_dir).get("status") == "completed"):
-            delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, session_dir))
-            receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=session_dir)
-            if isinstance(receipt, DispatchComplete):
-                save_reply(Path(delivery.reply_file), receipt.reply)
-            repeat = cast(Callable[[str, staff.StaffRow, Path, dict[str, object]], Callable[[], None]],
-                          import_module("scripts.herdr.turn_end").repeat_completion_notice)
-            _ = notice_delivery.callback(repeat(row.name, worker_admission.parent(staff.snapshot(), run=session_dir), session_dir,
-                                           worker_panes.worker_pass(row, session_dir)))
-            return DispatchSubmission.SUBMITTED
-        if row is not None:
-            owner = staff.snapshot().parent_of(row)
-            if owner is not None:
-                finish_late = cast(Callable[[staff.StaffRow, staff.StaffRow, worker_panes.WorkerLockHold, str], Callable[[], None]],
-                                   import_module("scripts.herdr.turn_end").finish_late_completion)
-                _ = notice_delivery.callback(finish_late(row, owner, hold, completion_actions.held_role))
+                and row is not None):
+            passed = worker_panes.worker_pass(row, session_dir)
+            retired = recovered is CompletionRecovery.RECOVERED and staff.snapshot().by_id(row.id) is None
+            if retired or (passed.get("instance_id") == matched.instance_id and passed.get("status") == "completed"):
+                try:
+                    progress_history.validate_dispatch_selection(session_dir, selection)
+                except progress_history.DispatchSelectionChanged as error:
+                    return _selection_changed(error)
+                if recovered is CompletionRecovery.RECOVERED:
+                    return DispatchSubmission.SUBMITTED
+                delivery = progress_history.dispatch_delivery(passed)
+                receipt = dispatch_receipt(row, delivery.line, delivery.completion_id, run=session_dir)
+                if isinstance(receipt, DispatchComplete):
+                    save_reply(Path(delivery.reply_file), receipt.reply)
+                _ = notice_delivery.callback(completion_notices.repeat_completion_notice(
+                    row.name, worker_admission.parent(staff.snapshot(), run=session_dir), session_dir,
+                    worker_panes.worker_pass(row, session_dir)))
+                return DispatchSubmission.SUBMITTED
         if isinstance(started, StartAtDispatch):
             before = rows_before_launch()
             current_start = worker_panes.start_or_resume(parent, name, role, lock=hold, policy=policy)
@@ -531,9 +714,12 @@ def dispatch(parent: StaffId, name: WorkerName, role: WorkerRole, prompt: Path, 
         try:
             instance = progress_history.begin_dispatch(session_dir, slot=slot, phase=phase, role=role,
                 worker_name=name.value, worker_id=started.row.id, launcher_command=launcher_command, prompt=prompt, kind=kind, lens=lens,
-                fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, called=launched_agent(started.row))
+                fix_cause=fix_cause, fix_pass=fix_pass, activity=activity, called=launched_agent(started.row),
+                selection=selection)
         except progress_history.DispatchPromptRefused as refused:
             return _prompt_conflict(refused.conflict)
+        except progress_history.DispatchSelectionChanged as error:
+            return _selection_changed(error)
         if dispatch_id and dispatch_id not in (instance, worker_panes.stage_two_completion_id(instance)):
             print("dispatch id differs from the recorder pass", file=sys.stderr)
             return ExitCode.REFUSED
@@ -781,10 +967,20 @@ def finish_dispatch(parent: StaffId, identity: StaffId, run: Path, instance: str
             notify = cast(Callable[[str], None], import_module("scripts.herdr.turn_end").run_finished)
             notify(str(row.current_session))
 
-    _ = _dispatch_failure_step(identity, "pass end", end_pass)
-    completion_saved = _dispatch_failure_step(identity, "hook completion", lambda: progress_history.save_hook_completion(
-        run, instance, progress_history.HookCompletion("error", str(path), (detail,))))
-    reply_saved = _dispatch_failure_step(identity, "error reply", lambda: save_reply(path, detail))
+    with ExitStack() as operations:
+        row = staff.snapshot().by_id(identity)
+        if row is not None:
+            hold = operations.enter_context(worker_panes.worker_lock(parent, WorkerName.parse(row.name), blocking=True))
+            if isinstance(hold, worker_panes.Kept):
+                print(hold.blocker, file=sys.stderr)
+                return ExitCode.BUSY
+            current = worker_panes.worker_pass(row, run)
+            if current.get("instance_id") != instance or current.get("status") != "active":
+                return result
+        _ = _dispatch_failure_step(identity, "pass end", end_pass)
+        completion_saved = _dispatch_failure_step(identity, "hook completion", lambda: progress_history.save_hook_completion(
+            run, instance, progress_history.HookCompletion("error", str(path), (detail,))))
+        reply_saved = _dispatch_failure_step(identity, "error reply", lambda: save_reply(path, detail))
     _ = _dispatch_failure_step(identity, "notice", notice)
     return result
 
@@ -849,7 +1045,8 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
     with ExitStack() as cleanup:
         if not name:
             matched = progress_history.dispatch_worker(session_dir, slot=slot, phase=phase, role=role,
-                prompt=prompt.resolve(), launcher_command=launcher_command)
+                prompt=prompt.resolve(), launcher_command=launcher_command,
+                work=progress_history.DispatchWork(kind, lens, fix_pass))
             if isinstance(matched, progress_history.ActiveDispatchPromptConflict):
                 return _prompt_conflict(matched)
             if isinstance(matched, progress_history.MatchedDispatch):
@@ -905,27 +1102,52 @@ def assign(parent: StaffId, role: WorkerRole, prompt: Path, *, session_dir: Path
         return result
 
 
+def _refuse_answer(name: WorkerName, reason: str, code: ExitCode = ExitCode.REFUSED) -> ExitCode:
+    print(f"{name.value}: {reason}. Use assign.sh for new work.", file=sys.stderr)
+    return code
+
+
 def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
-    record = staff.snapshot()
-    row = worker_admission.find_worker(record, parent, name.value)
-    if row is None:
-        print(f"{name.value}: no worker staff row", file=sys.stderr)
-        return ExitCode.REFUSED
-    state = worker_panes.observe_worker(parent, row, record)
-    if not isinstance(state, worker_panes.OpenWorker):
-        return ExitCode.UNCERTAIN
-    client = _client()
-    backend = record.backends.get(row.id, staff.BACKEND_UNAVAILABLE)
-    if state.status is herdr.AgentStatus.BLOCKED and isinstance(backend, staff.CodexBackend):
-        client.answer_question(state.pane, text, target=str(row.current_session))
-    else:
+    with worker_panes.worker_lock(parent, name) as hold:
+        if isinstance(hold, worker_panes.Kept):
+            return _refuse_answer(name, hold.blocker, ExitCode.BUSY)
+        record = staff.snapshot()
+        row = worker_admission.find_worker(record, parent, name.value)
+        if row is None:
+            print(f"{name.value}: no worker staff row", file=sys.stderr)
+            return ExitCode.REFUSED
         run = worker_panes.worker_run(row, record=record)
-        if isinstance(progress_history.active_dispatch(row.id, run), progress_history.ActiveDispatch):
-            delivery = progress_history.dispatch_delivery(worker_panes.worker_pass(row, run, record=record))
-            if delivery.completion_id:
-                text += "\n" + _done_instruction(delivery.completion_id)
-        client.prompt(state.pane, text, target=str(row.current_session))
-    return ExitCode.OK
+        active = progress_history.active_dispatch(row.id, run)
+        if isinstance(active, progress_history.ActiveDispatchUnavailable):
+            return _refuse_answer(name, "the active pass is unavailable", ExitCode.UNCERTAIN)
+        if isinstance(active, progress_history.NoActiveDispatch):
+            return _refuse_answer(name, "no active pass")
+        passed = worker_panes.worker_pass(row, run, record=record)
+        delivery = progress_history.dispatch_delivery(passed)
+        if passed.get("instance_id") != active.instance_id or not all((delivery.line, delivery.completion_id, delivery.reply_file)):
+            return _refuse_answer(name, "the active pass has no saved delivery")
+
+        backend = record.backends.get(row.id, staff.BACKEND_UNAVAILABLE)
+        if isinstance(backend, staff.BackendUnavailable):
+            return _refuse_answer(name, "the worker transcript is unavailable", ExitCode.UNCERTAIN)
+        receipt = transcript_receipt(_receipt_records(row, backend), delivery.line, DoneReply(delivery.completion_id),
+                                     stop_at_done=True).receipt
+        if isinstance(receipt, DispatchComplete):
+            return _refuse_answer(name, "the active pass already has a DONE reply")
+        if isinstance(receipt, DispatchEvidenceUnknown):
+            return _refuse_answer(name, "the worker transcript is unavailable", ExitCode.UNCERTAIN)
+        if isinstance(receipt, DispatchNotSubmitted):
+            return _refuse_answer(name, "the transcript does not show acceptance of the active pass")
+
+        state = worker_panes.observe_worker(parent, row, record)
+        if not isinstance(state, worker_panes.OpenWorker):
+            return ExitCode.UNCERTAIN
+        client = _client()
+        if state.status is herdr.AgentStatus.BLOCKED and isinstance(backend, staff.CodexBackend):
+            client.answer_question(state.pane, text, target=str(row.current_session))
+        else:
+            client.prompt(state.pane, text + "\n" + _done_instruction(delivery.completion_id), target=str(row.current_session))
+        return ExitCode.OK
 
 
 def end(parent: StaffId, name: WorkerName, *,
@@ -957,7 +1179,7 @@ def resume_receipt(row: staff.StaffRow, dispatch: progress_history.ActiveDispatc
     if isinstance(backend, staff.BackendUnavailable):
         return DispatchEvidenceUnknown("worker transcript backend is unavailable")
     return transcript_receipt(worker_admission.conversation_entries(row, backend, set()),
-        DispatchPrompt(dispatch.instance_id), DoneReply(dispatch.instance_id)).receipt
+        DispatchPrompt(dispatch.instance_id, include_stage_two=True), DoneReply(dispatch.instance_id)).receipt
 
 
 def resume_step(row: staff.StaffRow, dispatch: progress_history.ActiveDispatch
@@ -1100,17 +1322,8 @@ class NotRestored:
 
 def not_restored(row: staff.StaffRow, record: staff.StaffSnapshot, *,
                  runs: dict[str, list[str]] | None = None) -> NotRestored | None:
-    """Read why restore would not start this worker; None when it would, or when a read fails."""
-    if quota_state.no_worker_mode() and isinstance(staff.backend(row), staff.CodexBackend):
-        return NotRestored("Codex worker in no-worker mode")
-    try:
-        run = worker_panes.worker_run(row, record=record, scanned=runs)
-        active = progress_history.active_dispatch(row.id, run)
-        detached = detached_runs.resume_context(run / worker_lifecycle.DETACHED_RUNS_DIR, row.name)
-    except (OSError, ValueError, staff.StaffRefused):
-        return None
-    if isinstance(active, progress_history.NoActiveDispatch) and not detached:
-        return NotRestored("worker with no active dispatch")
+    """Route every worker to restore before restart removes its saved entry."""
+    del row, record, runs
     return None
 
 
@@ -1120,6 +1333,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
             started_panes: dict[StaffId, str] | Literal["discard"] = "discard",
             runs: dict[str, list[str]] | None = None,
             codex: herdr.CodexConversations | herdr.CodexLaunchRead = herdr.CodexLaunchRead.CURRENT) -> ExitCode:
+    completion_notices = _completion_notices()
     record = staff.snapshot() if record is None else record
     holder = next(row for row in record.rows if row.id == parent)
     changed = False
@@ -1153,9 +1367,18 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                     if isinstance(hold, worker_panes.Kept):
                         outcome = ExitCode.REFUSED
                         continue
+                    run = worker_panes.worker_run(state.row, record=record, scanned=runs)
+                    recovery = completion_notices.recover_completion(state.row, holder, run, hold, record=record)
+                    if recovery is CompletionRecovery.RECOVERED:
+                        changed = True
+                        continue
+                    if recovery in (CompletionRecovery.PENDING_CLOSE, CompletionRecovery.WAITING_ON_RUNS,
+                                    CompletionRecovery.WAITING_ON_REPLY):
+                        print(f"{state.row.name}: {recovery.value}", file=sys.stderr)
+                        outcome = ExitCode.UNCERTAIN
+                        continue
                     if isinstance(state, worker_panes.OpenWorker) and not state.status.idle:
                         continue
-                    run = worker_panes.worker_run(state.row, record=record, scanned=runs)
                     active = progress_history.active_dispatch(state.row.id, run)
                     if isinstance(active, progress_history.ActiveDispatchUnavailable):
                         print(f"anomaly: {state.row.name}: {active.reason}", file=sys.stderr)
@@ -1203,7 +1426,8 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         outcome = code
                     else:
                         _ = cleanup.pop_all()
-            except (herdr_types.HerdrFailure, OSError, ValueError) as error:
+            except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError,
+                    staff.StaffRefused, staff.StaffUnreadable) as error:
                 print(f"anomaly: {state.row.name}: {' '.join(str(error).splitlines())}", file=sys.stderr)
                 outcome = ExitCode.UNCERTAIN
     if outcome == ExitCode.OK:

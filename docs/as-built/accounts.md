@@ -145,12 +145,14 @@ The [trust guide](../accounts.md#trusted-worktrees) describes configured project
 ## Role map and launch selection
 
 Natedev owns the role map for both machines.
-The map contains the Claude groups `units` and `showrunners`, the Codex `workers` account, and an optional timed Claude worker route.
-Both Claude groups may select the same account.
+The map contains the Claude groups `units`, `showrunners`, and `producers`.
+It also contains the Codex `workers` account and an optional timed Claude worker route.
+Claude groups can share an account.
 Codex producers use the workers account.
-Claude producers use the showrunners account.
+Claude producers use the producers account when it has a selection.
+They use the showrunners account until the first producers selection.
 `[producers]` in `config/models.conf` selects each producer's family, model, and effort.
-An absent selection stays unconfigured until an explicit move selects it.
+An explicit move saves a group selection.
 Status, launch, and preview reads never create a selection.
 
 | State | Location |
@@ -251,7 +253,7 @@ These include closed workers without an active dispatch, workers without a curre
 A group move validates the destination before changing the selection or stopping members.
 It selects the account for future launches and moves live members on other accounts.
 A workers swap also selects eligible Codex producers.
-A showrunners group move also selects eligible Claude producers.
+A producers group move selects only eligible Claude producers.
 `eligible_producers` requires active, local, unpaused staff rows with valid settings for the requested family.
 `producer_settings` returns `LaunchSettings` or `InvalidProducerSettings`.
 One `settings_report_scope` limits each producer's invalid-settings warning to one per operation.
@@ -260,6 +262,8 @@ Only proof that the producer runs on the target permits a skip.
 Unreadable live account evidence prevents the stop, start, and home change.
 The [producer launch contract](shutdown-and-restart.md#producer-launch-and-admission) defines the shared move and publication checks.
 An empty group can still select its account.
+The preview and move report an incomplete member list when the Claude registry is unreadable.
+The move saves the group selection and limits session moves to members with live evidence.
 Each member has an independent result.
 A single-session move refuses a grouped session and names the group operation.
 The move path creates no ready mark, conductor, follow command, or cancellation step.
@@ -417,8 +421,106 @@ A second schedule caller prints `already claimed by <id>` and exits with code 0.
 `StatusReading` separates stored facts from their display.
 `StatusDocument` carries account rows, the board, problems, and session input paths.
 The `board` is `accounts.status_board()`: the table the console Accounts page draws.
+`accounts.models_board()` groups the same role counts by full model ID and effort.
+The reader finds the Claude transcript by session ID across project folders.
+Claude model and effort come from the latest real assistant message.
+Codex model and effort come from the latest `turn_context`.
+The model reader scans a plain file backward in 16 KiB blocks until it finds the newest model row.
+`session_model_scan_kib` in `config/accounts.conf` limits the scan.
+The default is 8192 KiB. The setting accepts 128 to 32768 KiB.
+The reader checks one byte before the range to detect a row that starts at the limit.
+A damaged complete model row gives `unknown`. The reader skips damaged output rows.
+An unfinished last row can leave an earlier model in effect.
+A scan that reaches the limit without a model row gives `unknown`.
+
+A status scan loads the plain transcript cache once and saves changes atomically.
+The cache file is `$XDG_CACHE_HOME/claude/session-models.json`.
+If `XDG_CACHE_HOME` is unset, the reader uses `~/.cache`.
+The cache retains the largest transcripts up to `session_model_cache_entries`.
+The cache drops entries whose encoded fields exceed 32 KiB.
+A missing or damaged cache starts a fresh scan.
+Unchanged transcripts need no reads. On growth, the reader checks hashes at both ends of the old content.
+The reader also checks the cached model row before it reuses that row.
+A rewrite that preserves the sampled edges and the cached model row can escape detection.
+If the hashes match, the reader checks new bytes and any unfinished row within the scan range.
+If the file grows during the scan, the next scan reads the bytes from that append.
+If an unfinished row starts before the range, the reader checks only the new bytes.
+The reader uses a cached model row only while the row remains in range.
+The reader scans again after replacement or truncation.
+For a compressed file, the reader streams the records and caches the result in the process.
+The compressed cache evicts the least recently used result at `session_model_cache_entries`.
+A missing Claude transcript gives `unknown`.
+Live process options apply when the reader can establish that no turn was recorded.
+The peer count document carries model counts and session names by account and role.
+The Models table puts the remainder of each role count in the `unknown` row.
+Hover over a positive count or focus it to see the session names in order.
+The tooltip uses the staff name or the Claude registry name.
+If neither name is available, the tooltip uses the first eight characters of the session ID.
+The tooltip includes the machine for each peer session.
+An older peer count adds a line such as `2 more on mac` for sessions without names.
 `config/statusline.conf` holds each account color under `account.<label>`.
-`ROLE_COLOR_KEYS` names the role color of each role group: units `role.unit-director`, showrunners `role.showrunner`, workers `role.worker`.
+`ROLE_COLOR_KEYS` maps each role group to its color key:
+
+1. Units use `role.unit-director`.
+2. Showrunners use `role.showrunner`.
+3. Workers use `role.worker`.
+4. Producers use `role.producer`.
+
+The producers role has a separate row under each account it uses.
+Producer rows follow the other role rows for that account.
+`account_details_in_row_order` accepts the complete rows in display order.
+It shows account details only on the first row of each consecutive account run.
+The account details include the dot, label, swatch, allowance, reset, credits, and credits setting.
+A separated row shows the account details again.
+A lone producer row shows all account details.
+The helper preserves the complete input rows for later sorts.
+The Accounts page shows a Lucide warning triangle or urgent octagon beside the weekly percentage.
+`accounts_quota_warning_percent` and `accounts_quota_urgent_percent` in `config/review_links.conf` start at 10 and 5.
+The warning value must be greater than the urgent value.
+The Accounts entry shows the most urgent active icon during the console count refresh.
+The row, the sidebar and Clear use stored weekly readings for accounts that are currently signed in.
+Select a row icon to read the alert and clear it for that account.
+Clear keeps the percentage color and stores the cleared level and reset time on the server.
+A cleared warning can return as urgent. A cleared urgent alert hides both levels.
+The page, sidebar, and Clear use the same rule to identify a weekly window.
+Two reset times name the same window when they differ by less than `accounts_quota_same_window_seconds`.
+The setting starts at 3600 seconds in `config/review_links.conf`.
+The clear record survives a page refresh and a server restart.
+After the weekly reset, a low reading in the new window can show an alert again.
+If a reading has no reset time, Clear keeps the last reset time in the account's clear record.
+The server keeps the clear records in `console/.accounts-quota-cleared.json` under the review root.
+If the file is malformed, the table shows the problem, the sidebar hides the icon and Clear refuses to write.
+Each named header on the Accounts page has a sort control.
+The first selection sets the order for that column.
+
+1. Account sorts by label and then by role order.
+2. Left sorts by the full quota value, least first, then by account and role order.
+3. Role sorts by role name and then by account.
+4. Next sorts by the target account name.
+5. Busy, idle, paused, exited, and total sort by count, largest first.
+6. Resets sorts by the reset time, soonest first.
+7. Credits sorts by the full balance, largest first. An unlimited balance comes first.
+8. Enabled puts accounts with credits enabled first.
+
+The role order is units, showrunners, workers, producers, spare, and no role.
+The default sort uses account order.
+Missing values stay last in both directions.
+Next cells without a target stay last in both directions.
+Blank enabled cells also stay last in both directions.
+Clicking the selected header reverses its order.
+Enter performs the same action on a focused header.
+Each sort arrow uses the gap beside its label without adding column width.
+`account_board_sort_orders` prepares both directions and uses `account_details_in_row_order` for each order.
+The browser moves the existing rows and restores the account details for each consecutive account run.
+The total row stays last.
+Sorting preserves the total values.
+Browser storage keeps each viewer's choice through refreshes and page visits.
+A failed storage read or an unknown saved column uses the default sort.
+Failed storage writes keep the current choice for the open page.
+The shipped value of `role.producer` is `pink`.
+`role_colors` reads the current settings for the Accounts board and the console name renderer.
+`staff_role_color` maps a staff row through those keys and `account_color`.
+Unknown or invalid colors use the normal text color.
 The value accepts a color name or a six-digit hex color.
 A board span with a valid configured color carries its key as `color_key`; the role check mark is a separate span.
 Configured accounts and role groups have a color swatch on the console Accounts page.
@@ -426,9 +528,30 @@ The swatch opens a color chooser with Try, Save, and Cancel.
 Try changes every label and swatch of that key locally without a request.
 Cancel or Escape restores the saved color.
 Save publishes the color through this checkout's `scripts/lib/tune.py` and refreshes the board.
+Save records the value and its order in the settings journal before it writes the live value.
+Natedev issues the orders from a persistent counter. The published commit carries them in `config/settings-orders.json`.
+Each pull holds the journal lock from the ancestry check through restore.
+The Mac accepts an SSH live write only when its order is greater than the accepted order.
+The journal retains the accepted order after the tree includes that order and the pending value clears.
+Restore changes only the keys with pending values in the live files.
+The move marker records the plan before Git changes the checkout and records each completed Git step.
+At the source commit, recovery reverses the recorded changes and keeps separate staged edits.
+At the target commit, recovery completes the planned writes if the files still match their recorded versions.
+If recovery cannot account for a change, it keeps the marker and gives the command to inspect the file.
+When you remove a key by hand in Git, keep its entry in `config/settings-orders.json`.
+A peer commit with the saved value and no order still needs a commit that records the order.
+A host added later whose name matches a model ID suffix makes that model's color key a host override.
 The page pauses refresh while the chooser is open.
-A board line of a selected Claude group (`units` or `showrunners`) carries `group`: its account and group.
-The Accounts page opens its next move menu on a right click of that line.
+A board line of a selected Claude group carries its account and group.
+The Accounts page adds a `next` column after the role color swatch.
+Each next cell belongs to its role row and moves with that row when sorted.
+A selected Claude group shows its first target, or `none`, and an arrow button opens its move menu.
+A selected Codex workers line shows its first target, or `auto`, without a button.
+Other lines show a minus icon; the total cell stays empty.
+`StatusReading.first_next_moves` distinguishes first targets from an unavailable read with its reason.
+One queue read supplies the first targets for the Accounts page and the upcoming list for the text and JSON status output.
+Off the role-map host, first targets are unavailable.
+The menu marks the current target and can remove the group's first entry.
 Its `stale_at` is the next local midnight, when its reset text changes.
 The text table appends `Login ends` in the user's zone, with the same date format as `Weekly resets`.
 Each JSON account exports `login_ends_at` as an ISO 8601 UTC string, or null for an unknown date or Codex.
@@ -461,8 +584,12 @@ The accounts board has no activity column, the same as the cargo-handler account
 The activity of each session shows only in the cargo-handler tiles, from `cargo-handler census --json`.
 An older peer's document holds waiting within busy and starting within idle, with separate `starting` and `waiting` fields.
 The decoder moves that peer's `starting` count from idle to busy.
-Claude producers count under `showrunners` with the same hold and activity rules.
-Without a live session, they count on the selected showrunners account.
+Claude and Codex producers count under `producers` with the same hold and activity rules.
+A live producer counts on the account from its process environment.
+Without a live Claude session, producers count on their launch account.
+Without a live Codex session, producers count on their recorded home or the selected workers account.
+Claude producers use the producers move group.
+Codex producers retain their workers move group.
 `session-counts-read` prints the same live count document without publishing a file.
 Peer counts use the shared role-map transport in a detached fetch.
 One claim prevents concurrent fetches.

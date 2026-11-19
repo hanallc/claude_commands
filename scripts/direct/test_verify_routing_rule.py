@@ -54,9 +54,9 @@ printf '%s\n' "${ARGS[@]}"
                 return subprocess.run(["bash", "--noprofile", "--norc", "-c", parser, "verify-parser", *words],
                                       cwd=directory, capture_output=True, text=True, check=False,
                                       timeout=TEST_HANG_GUARD_SECS)
-            build = parse("build", "style_reader", "--release", "--attached")
+            build = parse("build", "sample", "--release", "--attached")
             self.assertEqual(build.returncode, 0, build.stderr)
-            self.assertEqual(build.stdout.splitlines(), ["style_reader", "--release"])
+            self.assertEqual(build.stdout.splitlines(), ["sample", "--release"])
             lint = parse("lint", "sample", "--attached")
             self.assertEqual(lint.returncode, 2)
             self.assertIn("--attached is a build flag", lint.stderr)

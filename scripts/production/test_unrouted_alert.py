@@ -20,6 +20,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.production import change_routing, staff, unrouted_alert
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production.staff_test_support import fixture_member, production_staff_record
 
 
@@ -36,8 +37,7 @@ class UnroutedAlertTests(unittest.TestCase):
         source_config = Path(__file__).resolve().parents[2] / "config/change_review.conf"
         _ = (self.root / "change_review.conf").write_text(source_config.read_text())
         self.config = self.root / "review_links.conf"
-        source = Path(__file__).resolve().parents[2] / "config/review_links.conf"
-        _ = self.config.write_text(source.read_text().replace("unrouted_alert_recipient=natedev", "unrouted_alert_recipient=alert-owner"))
+        _ = write_config_fixture(self.config, "unrouted_alert_recipient=alert-owner\nunrouted_alert_retry_seconds=60\n")
         self.row = {"#": "C8", "Change": "A broken producer"}
 
     def notify(self, reason: str = "conflict") -> None:
@@ -75,11 +75,12 @@ assert 'send' not in sys.modules
             self.assertIsNot(cast(dict[str, object], json.loads(path.read_text())).get("sent"), True)
 
     def test_a_missing_retry_setting_reports_one_error_without_sending_or_marking_sent(self) -> None:
-        _ = self.config.write_text(self.config.read_text().replace("unrouted_alert_retry_seconds=60", ""))
+        _ = self.config.write_text("\n".join(line for line in self.config.read_text().splitlines()
+                                           if line.partition("=")[0].strip() != "unrouted_alert_retry_seconds") + "\n")
         self.assert_pending_alert_failure()
 
     def test_an_unusable_recipient_reports_one_error_and_keeps_the_alert_pending(self) -> None:
-        _ = self.config.write_text(self.config.read_text().replace("unrouted_alert_recipient=alert-owner", "unrouted_alert_recipient="))
+        _ = write_config_fixture(self.config, "unrouted_alert_recipient=\n")
         self.assert_pending_alert_failure()
 
     def test_an_unwritable_state_folder_reports_one_error_without_sending(self) -> None:
@@ -209,7 +210,7 @@ assert 'send' not in sys.modules
         with patch.object(time, "time", return_value=110), patch.object(unrouted_alert, "send_message") as send:
             self.notify()
             send.assert_not_called()
-            _ = self.config.write_text(self.config.read_text().replace("unrouted_alert_retry_seconds=60", "unrouted_alert_retry_seconds=5"))
+            _ = write_config_fixture(self.config, "unrouted_alert_retry_seconds=5\n")
             self.notify()
         send.assert_called_once()
 

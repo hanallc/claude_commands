@@ -20,12 +20,14 @@ from types import MappingProxyType
 from typing import Literal, cast, override
 from unittest import mock
 
+from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import OwningSession
-from scripts.build_hold import build_hold, hold_enforcer
+from scripts.build_hold import build_hold, hold_enforcer, override_guard
 from scripts.build_queue import admission_service, admission_records, placement
 from scripts.buildlog import store
 from scripts.agents import detached_runs
 from scripts.build_targets import target_config
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.mac_test import claim_state
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
@@ -64,8 +66,12 @@ class HoldEnforcerTests(unittest.TestCase):
         boot = self.proc / "sys/kernel/random/boot_id"
         boot.parent.mkdir(parents=True)
         _ = boot.write_text("test-boot\n")
+        configuration = self.root / "config"
+        environment = config_environment(configuration)
+        _ = write_config_fixture(configuration / "build_targets.conf", "default_target=natedev\n")
         self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "CONF_DIR": str(self.root / "config"), "BUILD_HOLD_DIR": str(self.holders),
+            **environment,
+            "HOME": str(self.root), "BUILD_HOLD_DIR": str(self.holders),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "BUILD_HOLD_ENFORCER_DIR": str(self.root / "enforcer"),
             "VERIFY_STEPS_DIR": str(self.root / "steps"),
@@ -113,7 +119,7 @@ class HoldEnforcerTests(unittest.TestCase):
         paths = claim_state.StatePaths(self.root / 'hana-claims')
         paths.directory.mkdir()
         record: claim_state.RemoteJobClaim = {
-            'claim_id': placement.assigned_claim_id('fixture-episode', 'fixture-attempt'),
+            'claim_id': execution_identity.assigned_claim_id('fixture-episode', 'fixture-attempt'),
             'episode': 'fixture-episode', 'attempt': 'fixture-attempt',
             'submitting_session': 'other', 'pid': 701, 'proc_start': '11000', 'what': 'Hana check',
             'worktree': str(self.root), 'since': '2026-11-16T12:00:00+00:00', 'remote_host': 'fixture-hana',
@@ -152,9 +158,9 @@ class HoldEnforcerTests(unittest.TestCase):
         claim, = claim_state.read_claims(paths)
         assignment = placement.PlacementAssignment('fixture-episode', 'fixture-attempt',
             placement.PlacementDestination('ssh', target.name, 'fixture-hana', claim.scope, 1),
-            placement.SourceKeyKnown('fixture-source'),
+            execution_identity.SourceKeyKnown('fixture-source'),
             placement.SubmittingOwner(store.host_name(), 700, '11000'), OwningSession('other'), 100)
-        key = placement.attempt_key(assignment.episode, assignment.attempt)
+        key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         state = admission_service.ServiceState({}, {}, {}, admission_records.ReadyToStart())
         state.current_assignments[assignment.episode] = key
         for match in (True, False):
@@ -205,9 +211,9 @@ class HoldEnforcerTests(unittest.TestCase):
         claim, = claim_state.read_claims(paths)
         assignment = placement.PlacementAssignment('fixture-episode', 'fixture-attempt',
             placement.PlacementDestination('ssh', target.name, 'fixture-hana', claim.scope, 1),
-            placement.SourceKeyKnown('fixture-source'),
+            execution_identity.SourceKeyKnown('fixture-source'),
             placement.SubmittingOwner(store.host_name(), 700, '11000'), OwningSession('other'), 100)
-        key = placement.attempt_key(assignment.episode, assignment.attempt)
+        key = execution_identity.attempt_key(assignment.episode, assignment.attempt)
         state = admission_service.ServiceState({}, {}, {}, admission_records.ReadyToStart())
         state.current_assignments[assignment.episode] = key
         state.assignments[key] = admission_records.SavedPlacementAssignment(assignment)
@@ -216,7 +222,7 @@ class HoldEnforcerTests(unittest.TestCase):
             (self.holders / 'holder').unlink()
 
         for module, operation in ((target_config, 'read_execution_transport'),
-                (placement, 'attempt_key'), (placement, 'assigned_claim_id')):
+                (execution_identity, 'attempt_key'), (execution_identity, 'assigned_claim_id')):
             for error_type in (OSError, ValueError):
                 with self.subTest(operation=operation, error=error_type.__name__):
                     self.write_holder()
@@ -288,6 +294,17 @@ class HoldEnforcerTests(unittest.TestCase):
     def table(self) -> dict[int, build_hold.AuditProcess]:
         return hold_enforcer.read_processes(self.proc, self.uid, self.root / "cgroup")
 
+    def write_detached_run(self, path: Path, *, command_started: bool) -> None:
+        record: detached_runs.RunRecord = {
+            "run_id": path.stem, "status": "running", "session_dir": str(self.root),
+            "worker": "gate-owner", "staff_id": "", "label": "fixture gate",
+            "command": ["bash", "verify.sh", "check"], "log": str(path.with_suffix(".log")),
+            "started_at": 100.0, "pid": 100, "director_dir": "", "done_message_file": "",
+        }
+        if command_started:
+            record.update(command_group=10, command_started="11000")
+        _ = path.write_text(json.dumps(record))
+
     def decisions(self, enforcer_pid: int = 999) -> tuple[hold_enforcer.BuildDecision, ...]:
         return hold_enforcer.decide_builds(self.table(), build_hold.natedev_holds(self.holders).in_force,
                                           self.uid, enforcer_pid, self.claimed)
@@ -301,6 +318,24 @@ class HoldEnforcerTests(unittest.TestCase):
             call_id, pid, step_record.process_start(pid), self.root, "check", step_record.WorkspacePackages(),
             step_record.AnyTarget(("mac", "natedev"), ("mac",)), state, "2026-10-28T12:00:00+00:00",
         ))
+
+    def stopped_worker_lineages(self) -> tuple[tuple[str, dict[str, str], dict[str, str], tuple[str, ...]], ...]:
+        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        director = fixture_member("showrunner", name="stop-director")
+        run = self.root / "director-run"
+        _ = staff.set_run(director.id, staff.OpenRun(run))
+        owner = director.current_session
+        unit = {"UNIT_SESSION_DIR": str(run)}
+        return (
+            ("Codex command", {**unit, "CODEX_THREAD_ID": "t1", "CLAUDE_CODE_SESSION_ID": owner},
+             {"CLAUDE_CODE_SESSION_ID": "farther"}, (owner, "codex:t1")),
+            ("Codex ancestor", unit, {"CODEX_THREAD_ID": "t1", "CLAUDE_CODE_SESSION_ID": "farther"},
+             (owner, "codex:t1")),
+            ("Claude ancestor", unit, {"CLAUDE_CODE_SESSION_ID": "claude-worker"}, (owner, "claude-worker")),
+            ("agent is owner", {**unit, "CLAUDE_CODE_SESSION_ID": owner}, {"CODEX_THREAD_ID": "farther"}, (owner,)),
+            ("no agent", unit, {}, (owner,)),
+            ("lone Codex", {"CODEX_THREAD_ID": "t1"}, {}, ("codex:t1",)),
+        )
 
     def test_drain_command_keeps_working_runs_and_waits_without_stopping(self) -> None:
         from scripts.build_targets import build_targets
@@ -717,11 +752,16 @@ class HoldEnforcerTests(unittest.TestCase):
                          argv=("python3", "detached_runs.py", "supervise", str(record)))
         holder, = build_hold.natedev_holds(self.holders).in_force
         record_build = hold_enforcer.record_build
-        for outcome in ("record failure", "identity change", "no command group", "stopped"):
+        for outcome in ("shared holders", "shared releases", "shared run record",
+                        "record failure", "identity change", "no command group", "stopped"):
             with self.subTest(outcome=outcome):
+                record = (self.root / ".local/state/build-hold-enforcer/run.json"
+                          if outcome == "shared run record" else self.root / "detached-run.json")
+                record.parent.mkdir(parents=True, exist_ok=True)
+                _ = self.process(100, "python3", start=10_000,
+                                 argv=("python3", "detached_runs.py", "supervise", str(record)))
                 # The command leads its own group; a record without one has not started its command.
-                command = {} if outcome == "no command group" else {"command_group": 10, "command_started": "11000"}
-                _ = record.write_text(json.dumps({"pid": 100, "status": "running", **command}))
+                self.write_detached_run(record, command_started=outcome != "no command group")
                 _ = self.process(10, "bash", parent=100, argv=("bash", "verify.sh", "check"), session="gate-owner")
                 table = self.table()
                 classified = hold_enforcer.classify_drain_runs(table, frozenset(), build_hold.LiveClaims(frozenset()))
@@ -739,9 +779,9 @@ class HoldEnforcerTests(unittest.TestCase):
                         raise OSError("private stop record is full")
                     record_build(build, holder, proc_root, action, stopped_run=stopped_run)
 
-                def save_reason(path: Path, text: str) -> None:
-                    write_text_atomic(path, text)
-                    if path == record and "stop_reason" in text and outcome == "identity change":
+                def stage_reason(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
+                    write_text_atomic(path, text, new_file_mode=new_file_mode)
+                    if "stop_reason" in text and outcome == "identity change":
                         _ = self.process(10, "editor", start=12_000)
 
                 def signal_group(pid: int, signum: int) -> None:
@@ -750,12 +790,32 @@ class HoldEnforcerTests(unittest.TestCase):
                     self.assertEqual([row["stopped_run"] for row in self.rows() if row["action"] == "stopped"],
                                      [{"pid": 10, "proc_start": "11000"}])
                     cycle = build_hold.read_cycle()
-                    assert cycle is not None
+                    assert not isinstance(cycle, build_hold.NoCycle)
                     self.assertIn("gate-owner", cycle["recipients"])
 
                 with mock.patch.object(hold_enforcer, "record_build", side_effect=save_stop), \
-                     mock.patch.object(detached_runs, "write_text_atomic", side_effect=save_reason):
-                    if outcome == "record failure":
+                     mock.patch.object(detached_runs, "write_text_atomic", side_effect=stage_reason):
+                    if outcome.startswith("shared"):
+                        before = record.read_bytes()
+                        rows = self.rows()
+                        environment = ({"BUILD_HOLD_DIR": str(self.root / ".local/state/build-hold")}
+                                       if outcome == "shared holders" else
+                                       {"BUILD_HOLD_RELEASE_DIR": str(self.root / ".local/state/build-hold-release")}
+                                       if outcome == "shared releases" else {})
+                        with mock.patch.object(override_guard, "user_home", return_value=self.root), \
+                             mock.patch.dict(os.environ, environment), \
+                             self.assertRaises(override_guard.SharedStateWriteRefused):
+                            _ = hold_enforcer.stop_waiting_run(
+                                run, holder, table, self.proc, signal_group=signal_group,
+                                signal_process=lambda pid, signum: signals.append((pid, signum)),
+                                supervisor_args=lambda pid, proc_root: ("python3", "detached_runs.py", "supervise", str(record)),
+                            )
+                        self.assertEqual(events, [])
+                        self.assertEqual(signals, [])
+                        self.assertEqual(record.read_bytes(), before)
+                        self.assertEqual(self.rows(), rows)
+                        continue
+                    elif outcome == "record failure":
                         with self.assertRaisesRegex(OSError, "private stop record is full"):
                             _ = hold_enforcer.stop_waiting_run(
                                 run, holder, table, self.proc, signal_group=signal_group,
@@ -772,11 +832,46 @@ class HoldEnforcerTests(unittest.TestCase):
                         self.assertIsInstance(result, expected)
                 if outcome == "stopped":
                     self.assertEqual(signals, [(10, signal.SIGTERM)])
+                    saved = cast(dict[str, object], json.loads(record.read_text()))
+                    self.assertEqual(saved["stop_reason"], "stopped for timed test; run again after the release")
                 else:
                     self.assertEqual(signals, [])
                     self.assertEqual([row for row in self.rows() if row["action"] == "stopped"], [])
                     saved = cast(dict[str, object], json.loads(record.read_text()))
                     self.assertNotIn("stop_reason", saved)
+
+        for index, (label, environment, ancestor_environment, recipients) in enumerate(self.stopped_worker_lineages()):
+            with self.subTest(agent=label):
+                started = 12_000 + index * 10
+                cycle = build_hold.read_cycle()
+                assert not isinstance(cycle, build_hold.NoCycle)
+                cycle["recipients"], cycle["entries"] = {}, []
+                build_hold.save_cycle(cycle)
+                _ = self.process(40, "worker", start=10_000, environment=ancestor_environment)
+                _ = self.process(10, "bash", parent=40, start=started,
+                                 argv=("bash", "verify.sh", "check"), environment=environment)
+                table = self.table()
+                run = hold_enforcer.WaitingRun(table[10], build_hold.audit_owner(
+                    table[10], build_hold.audit_ancestors(table[10], table)))
+                self.assertEqual(run.owner, OwningSession("t1" if label == "lone Codex" else recipients[0]))
+                worker_signals: list[tuple[int, int]] = []
+                register = build_hold.register_wait
+                with mock.patch.object(build_hold, "register_wait", wraps=register) as registration:
+                    def signal_worker(pid: int, signum: int) -> None:
+                        saved = build_hold.read_cycle()
+                        assert not isinstance(saved, build_hold.NoCycle)
+                        self.assertCountEqual(saved["recipients"], recipients)
+                        self.assertEqual([call.args[0] for call in registration.call_args_list], list(recipients))
+                        worker_signals.append((pid, signum))
+
+                    result = hold_enforcer.stop_waiting_run(
+                        run, holder, table, self.proc, signal_process=signal_worker,
+                        signal_group=lambda pid, signum: self.fail(f"unexpected group signal {pid} {signum}"),
+                    )
+                self.assertIsInstance(result, hold_enforcer.StoppedRun)
+                self.assertEqual(worker_signals, [(10, signal.SIGTERM)])
+                if label == "lone Codex":
+                    self.assertEqual(self.rows()[-1]["session"], "t1")
 
     def test_drain_skips_a_reused_pid_before_a_stop(self) -> None:
         _ = self.process(10, "bash", argv=("bash", "verify.sh", "check"), session="gate-owner")
@@ -809,15 +904,17 @@ class HoldEnforcerTests(unittest.TestCase):
         assert isinstance(run, hold_enforcer.WaitingRun)
         holder, = build_hold.natedev_holds(self.holders).in_force
         read_supervisor_args = hold_enforcer.supervisor_args
-        for argument, current, prefix in ((str(record), False, ("python3",)), (str(record), True, ("python3",)),
-                                           (record.name, True, ("python3",)),
-                                           (str(record), False, ("python3", "unrelated.py"))):
-            with self.subTest(record_argument=argument, supervisor_current=current, supervisor_prefix=prefix):
+        for argument, current, prefix, changes in ((str(record), False, ("python3",), False),
+                                                   (str(record), True, ("python3",), False),
+                                                   (record.name, True, ("python3",), False),
+                                                   (str(record), False, ("python3", "unrelated.py"), False),
+                                                   (str(record), True, ("python3",), True)):
+            with self.subTest(record_argument=argument, supervisor_current=current, supervisor_prefix=prefix,
+                              group_changes_after_check=changes):
                 _ = self.process(100, "python3", start=10_000,
                                  argv=("python3", "detached_runs.py", "supervise", argument))
                 table = self.table()
-                _ = record.write_text(json.dumps({"pid": 100, "status": "running",
-                                                  "command_group": 10, "command_started": "11000"}))
+                self.write_detached_run(record, command_started=True)
                 signals: list[tuple[int, int]] = []
                 inspected: list[int] = []
 
@@ -832,18 +929,24 @@ class HoldEnforcerTests(unittest.TestCase):
 
                 def signal_group(pid: int, signum: int) -> None:
                     saved = cast(dict[str, object], json.loads(record.read_text()))
-                    self.assertEqual(saved["stop_reason"], "stopped for timed test; run again after the release")
+                    self.assertNotIn("stop_reason", saved)
                     signals.append((pid, signum))
 
-                result = hold_enforcer.stop_waiting_run(
-                    run, holder, table, self.proc, supervisor_args=supervisor_args,
-                    signal_process=lambda pid, signum: self.fail(f"unexpected process signal {pid} {signum}"),
-                    signal_group=signal_group,
-                )
+                with mock.patch.object(detached_runs, "command_group", wraps=detached_runs.command_group) as read_group:
+                    if changes:
+                        group = detached_runs.CommandGroup(10, "11000")
+                        read_group.side_effect = [group, group, detached_runs.CommandGroup(20, "12000")]
+                    result = hold_enforcer.stop_waiting_run(
+                        run, holder, table, self.proc, supervisor_args=supervisor_args,
+                        signal_process=lambda pid, signum: self.fail(f"unexpected process signal {pid} {signum}"),
+                        signal_group=signal_group,
+                    )
                 self.assertIn(100, inspected)
                 if current:
                     self.assertIsInstance(result, hold_enforcer.StoppedRun)
                     self.assertEqual(signals, [(10, signal.SIGTERM)])
+                    saved = cast(dict[str, object], json.loads(record.read_text()))
+                    self.assertEqual(saved["stop_reason"], "stopped for timed test; run again after the release")
                 else:
                     self.assertIsInstance(result, hold_enforcer.RunIdentityChanged)
                     self.assertEqual(signals, [])
@@ -996,7 +1099,7 @@ class HoldEnforcerTests(unittest.TestCase):
                              + "You get a notice at the release; run it again then.\n")
             self.assertEqual(self.rows()[0]["action"], "stopped")
             cycle = build_hold.read_cycle()
-            assert cycle is not None
+            assert not isinstance(cycle, build_hold.NoCycle)
             self.assertIn("other", cycle["recipients"])
             sent.append((pid, signum))
             if signum == signal.SIGTERM and pid != 30:
@@ -1015,6 +1118,36 @@ class HoldEnforcerTests(unittest.TestCase):
         stopper.kill_survivors(self.table(), build_hold.natedev_holds(self.holders).in_force, 999, self.claimed)
         self.assertEqual(sent[-1], (30, signal.SIGKILL))
         self.assertEqual(len(sent), 4)
+
+        for index, (label, environment, ancestor_environment, recipients) in enumerate(self.stopped_worker_lineages()):
+            with self.subTest(agent=label):
+                started = 12_000 + index * 10
+                cycle = build_hold.read_cycle()
+                assert not isinstance(cycle, build_hold.NoCycle)
+                cycle["recipients"], cycle["entries"] = {}, []
+                build_hold.save_cycle(cycle)
+                _ = self.process(40, "worker", start=10_000, environment=ancestor_environment)
+                _ = self.process(30, "cargo", parent=40, start=started, argv=("cargo", "check"), environment=environment)
+                _ = self.process(20, "rustc", parent=30, start=started + 1)
+                _ = self.process(10, "linker", parent=20, start=started + 2)
+                decision = next(item for item in self.decisions() if item.process.identity.pid == 30)
+                assert isinstance(decision, hold_enforcer.WouldStopBuild)
+                self.assertEqual(decision.owner, OwningSession("t1" if label == "lone Codex" else recipients[0]))
+                signals: list[tuple[int, int]] = []
+                register = build_hold.register_wait
+                with mock.patch.object(build_hold, "register_wait", wraps=register) as registration:
+                    def signal_worker(pid: int, signum: int) -> None:
+                        saved = build_hold.read_cycle()
+                        assert not isinstance(saved, build_hold.NoCycle)
+                        self.assertCountEqual(saved["recipients"], recipients)
+                        self.assertEqual([call.args[0] for call in registration.call_args_list], list(recipients))
+                        signals.append((pid, signum))
+
+                    stopper = hold_enforcer.StopBuildsAndTests(self.proc, signal_process=signal_worker, register=registration)
+                    stopper.stop(decision, self.table(), build_hold.natedev_holds(self.holders).in_force, 999, self.claimed)
+                self.assertEqual(signals, [(30, signal.SIGTERM), (20, signal.SIGTERM), (10, signal.SIGTERM)])
+                if label == "lone Codex":
+                    self.assertEqual(self.rows()[-1]["session"], "t1")
 
     def test_codex_mac_idle_cargo_and_claude_unittest_and_reparented_worker_test_are_stopped(self) -> None:
         _ = self.process(10, "codex", start=100, environment={"CODEX_THREAD_ID": "codex-worker"})

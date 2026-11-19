@@ -58,7 +58,7 @@ from scripts.whoami.quota_alert import (AgentNote, alert, blocked, current_sessi
 from scripts.whoami.run_out import READINGS_LOG
 from scripts.whoami import usage_store
 from scripts.maintenance.schedule import ScheduleBusy, locked_history, schedule_directory
-from scripts.maintenance.settings import positive, usage_only_interval
+from scripts.maintenance.settings import positive, usage_only_intervals
 from scripts.lib.user_zone import user_zone
 
 
@@ -506,7 +506,7 @@ def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path | NoWor
     except accounts.AccountsError as error:
         messages.append(f"roles: {error}")
         groups = None
-    group_roles: tuple[tuple[accounts.ClaudeGroup, str], ...] = (("showrunners", "showrunner"), ("units", "unit"))
+    group_roles: tuple[tuple[accounts.ClaudeGroup, str], ...] = (("showrunners", "showrunner"), ("units", "unit"), ("producers", "producer"))
     sessions = session_table.live_sessions(os.environ)
     machines_seen: dict[str, str] = {}
     if isinstance(sessions, session_table.SessionsUnread):
@@ -581,7 +581,9 @@ def usage_only(*, poll_seconds: float = 0) -> None:
     """Read each due account, then start renewal without waiting for a probe."""
     from scripts.accounts import accounts, refusal_watch
 
-    interval = usage_only_interval() - poll_seconds / 2
+    intervals = usage_only_intervals()
+    claude_interval = intervals.claude_seconds - poll_seconds / 2
+    codex_interval = intervals.codex_seconds - poll_seconds / 2
     with locked_history(schedule_directory("usage-only")) as history:
         if isinstance(history, ScheduleBusy):
             print(f"already claimed by {history.owner_id}")
@@ -590,9 +592,9 @@ def usage_only(*, poll_seconds: float = 0) -> None:
             selection = accounts.claude_account_selection(usage_only=True)
             workers_home = resolve_workers_home()
             logins = claude_note_logins(note_file.read_notes())
-            with usage_store.read_cadence(interval):
+            with usage_store.read_cadence(claude_interval):
                 refreshed = refresh_usage(selection, workers_home, logins,
-                    schedule=ScheduledUsageReads(history, interval))
+                    schedule=ScheduledUsageReads(history, claude_interval, codex_interval))
     for line in refreshed.messages:
         print(line)
     try:

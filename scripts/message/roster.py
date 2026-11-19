@@ -1234,10 +1234,17 @@ def _unit_workers(
         if parents:
             from scripts.herdr import worker_panes
 
-            observations = (worker_panes.observe_parents(parents, membership,
-                                selection=worker_panes.SelectedWorkerRows(frozenset(row.id for row in selected_workers)))
-                            if isinstance(participants, MessageParticipants)
-                            else worker_panes.observe_parents(parents, membership))
+            try:
+                observations = (worker_panes.observe_parents(parents, membership,
+                                    selection=worker_panes.SelectedWorkerRows(frozenset(row.id for row in selected_workers)))
+                                if isinstance(participants, MessageParticipants)
+                                else worker_panes.observe_parents(parents, membership))
+            except (OSError, ValueError, herdr_types.HerdrFailure, subprocess.SubprocessError) as error:
+                _problem(problems, "pane workers", error)
+                observations = {parent.id: [
+                    worker_panes.UncertainWorker(row, str(error)) for row in selected_workers
+                    if row.parent == staff.ReportsTo(parent.id)
+                ] for parent in parents}
             scanned = worker_panes.parent_run_index(membership)
             for parent in parents:
                 run = worker_panes.worker_run(parent, record=membership, scanned=scanned)
@@ -1249,7 +1256,8 @@ def _unit_workers(
                         {key: item.showrunner for key, item in claude_entries.items()})
                     worker_threads.add(row.current_session)
                     existing = claude_entries.get(row.current_session)
-                    if not isinstance(backend, staff.CodexBackend) and existing is not None:
+                    if (isinstance(state, worker_panes.OpenWorker)
+                            and not isinstance(backend, staff.CodexBackend) and existing is not None):
                         entries.append(replace(existing, role="worker", director=director, showrunner=showrunner))
                         continue
                     if isinstance(state, worker_panes.OpenWorker):
@@ -1334,7 +1342,7 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: li
 def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
                        worker_threads: Iterable[str] = (), membership: staff.StaffSnapshot | None = None,
                        participants: AllRosterSessions | MessageParticipants = ALL_ROSTER_SESSIONS) -> Roster:
-    """Use the reported session or the pane process to address Codex."""
+    """Use the proved foreground Codex process for pane roster entries."""
     from scripts.herdr import herdr
 
     membership = staff.initial_snapshot() if membership is None else membership
@@ -1351,15 +1359,14 @@ def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
         for production in productions:
             _problem(problems, f"unit hosts for {production} were not read", error)
         return Roster(entries, problems)
-    processes = herdr.herdr_processes()
-    cwds = {process.place: process.cwd for process in processes}
-    codex_processes = {process.place: process for process in processes if process.command == "codex"}
     from scripts.herdr import worker_panes
 
+    worker_ids = frozenset(worker_threads)
     for session in sessions:
         name = session["name"]
+        client = herdr.Herdr(name)
         try:
-            agents = worker_panes.agent_inventory(herdr.Herdr(name))
+            agents = worker_panes.agent_inventory(client)
         except herdr_types.HerdrFailure as error:
             _problem(problems, f"herdr session {name}", error)
             continue
@@ -1367,33 +1374,46 @@ def _herdr_codex_panes(machine: str, productions: Iterable[str] = (), *,
             if agent.get("agent") != "codex":
                 continue
             pane = agent["pane_id"]
-            report = agent["agent_session"]
             thread: CodexThread | NoCodexThread = NoCodexThread()
-            if isinstance(report, herdr.ReportedAgentSession):
-                thread = CodexThread(report.session_id)
-            else:
-                try:
-                    thread = CodexThread(herdr.Herdr(name).native_pane_process(
-                        pane, "codex", herdr.PROGRAM_TIMEOUT_SECONDS).current_identity)
-                except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
-                    pass
-            if isinstance(participants, MessageParticipants) and (
-                    not isinstance(thread, CodexThread) or thread.thread_id not in participants.native_ids):
-                continue
-            process = codex_processes.get(HerdrPlace(name, pane))
-            if process is not None and process.marks.get("CODEX_THREAD_ID", "") in worker_threads:
+            attribution: AccountLabel | AccountUnread = AccountUnread("foreground Codex owner is unknown")
+            status, cwd = "unknown", ""
+            try:
+                info = herdr.json_object(client.result("pane", "process-info", "--pane", pane).get("process_info"),
+                                         "roster pane process info")
+                owner = herdr.foreground_pane_owner(info)
+                if isinstance(owner, herdr.ProvedCodexForeground):
+                    status = str(agent["agent_status"])
+                    cwd = owner.cwd if isinstance(owner.cwd, str) else ""
+                    report = agent["agent_session"]
+                    try:
+                        row = ({"pane_id": pane, "session_id": report.session_id}
+                               if isinstance(report, herdr.ReportedAgentSession) else client.pane_row(pane))
+                        native = herdr.read_foreground_pane_owner(owner, {} if isinstance(row, herdr.NoPane) else row)
+                    except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+                        attribution = _process_account(owner.pid, "codex")
+                    else:
+                        thread = CodexThread(native.current_identity)
+                        home = native.environment.get("CODEX_HOME")
+                        attribution = _codex_home_account(Path(home) if home is not None else Path.home() / ".codex")
+            except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+                pass
+            if isinstance(thread, CodexThread):
+                if thread.thread_id in worker_ids:
+                    continue
+                if isinstance(participants, MessageParticipants) and thread.thread_id not in participants.native_ids:
+                    continue
+            elif isinstance(participants, MessageParticipants):
                 continue
             entries.append(RosterEntry(
                 machine=machine, kind="codex", role="freestanding",
                 name=(member.name if isinstance(thread, CodexThread)
                       and (member := membership.by_current_session(thread.thread_id)) is not None else ""),
-                status=str(agent["agent_status"]),
+                status=status,
                 reach=(Messageable(f"codex:{thread.thread_id}") if isinstance(thread, CodexThread)
                        else CannotReceiveMessages("interactive Codex in a herdr pane")),
-                thread=thread, pane=HerdrPlace(name, pane),
-                cwd=cwds.get(HerdrPlace(name, pane), ""),
+                thread=thread, pane=HerdrPlace(name, pane), cwd=cwd,
                 showrunner=NoShowrunner(), director=NoDirector(), assignment=NotAWorker(),
-                account=_process_account(process.pid, "codex") if process else AccountUnread("pane process not found"),
+                account=attribution,
             ))
     return Roster(entries, problems)
 
@@ -1419,8 +1439,9 @@ def _read_local_roster(environment: Mapping[str, str], *, membership: staff.Staf
     warnings: list[str] = []
     machine = machine_name()
     directory = sessions.sessions_dir()
-    if directory in registry.unreadable:
-        _problem(problems, "Claude session records", f"cannot list {directory}")
+    for path in registry.unreadable:
+        reason = f"cannot list {path}" if path == directory else f"cannot read {path}"
+        _problem(problems, "Claude session records", reason)
     newest: dict[str, SessionRecord] = {}
     for record in sessions.running_records(registry):
         _ = newest.setdefault(record["sessionId"], record)

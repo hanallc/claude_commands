@@ -11,7 +11,7 @@ The hierarchy connects the user's product choices to work in separate repository
 | Role | Responsibility | Contract |
 | --- | --- | --- |
 | User, the executive producer | Decides product direction, scope changes, and irreversible actions. | [Decision criteria](../decision_criteria.md) |
-| Producer | Runs its own named job through shared producer management. | `commands/producer/morty.md`, `commands/producer/brain.md`, `commands/producer/dwight.md` |
+| Producer | Runs its own named job through shared producer management. | `commands/producer/produce.md`; morty also loads `commands/producer/morty.md` |
 | Showrunner | Coordinates units, resolves dependencies, integrates checkpoints, and presents user decisions. | `commands/showrunner/produce.md` |
 | Unit director | Defines assignments, dispatches workers, checks results, and prepares checkpoints. | `commands/unit/direct.md` |
 | Worker | Changes or inspects its assigned files through a native Claude or Codex conversation. | [Worker lifecycle](long-lived-workers.md) |
@@ -19,7 +19,7 @@ The hierarchy connects the user's product choices to work in separate repository
 
 Morty, brain, and dwight have staff kind `producer` and no parent.
 They remain individual operators; their shared kind defines management.
-Dwight's role is strategist.
+Each producer's job is in `<PRODUCER_FOLDER_ROOT>/<name>/README.md`.
 `commands/producer/greenlight.md` and `commands/producer/to_production.md` define production preparation separately.
 The [staff contract](staff-accessors.md#producer-rows-and-commands) defines their commands and document folders.
 

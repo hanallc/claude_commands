@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Literal, TypedDict, NamedTuple, NotRequired, cast
 
 from scripts.accounts import accounts
+from scripts.build_hold import override_guard
 from scripts.herdr import herdr_types
 from scripts.agents import worker_lifecycle
 from scripts.copies import copies
@@ -45,7 +46,9 @@ from scripts.production import (
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.unit_move import RenameRefused, read_json, write_json
 from scripts.lib.atomic_file import sync_folder, write_text_atomic
+from scripts.worktree.worktrees import release_worktree_pair
 from scripts.agents import (
+    producer_lifecycle,
     producer_transfer,
     restart,
     restart_support,
@@ -94,6 +97,7 @@ class CommandLine(argparse.Namespace):
     excluded: list[str] = []
     finish_step: bool = False
     retired: bool = False
+    resend_opening_prompt: bool = False
     old: str = ""
     new: str = ""
     to_doc: str = ""
@@ -102,6 +106,7 @@ class CommandLine(argparse.Namespace):
     producer: str = ""
     model: str = ""
     effort: str = ""
+    job: str = ""
 
 
 class UnreachableMachine(TypedDict):
@@ -240,14 +245,16 @@ USAGE = """usage: agents COMMAND
   agents exit NAME [--finish-step] --why TEXT
   agents pause --production SHOWRUNNER [--except UNIT ...] [--finish-step] --why TEXT
   agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]
+  agents resume PRODUCER --resend-opening-prompt
   agents resume --production SHOWRUNNER
-  agents retire NAME
+  agents retire NAME [--to PRODUCER]
   agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]
   agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]
   agents restart [ACCOUNT] [--all] [--dry-run] [--only ID[,ID...]] [--here]
   agents stop SESSION [--dry-run] | --all [--dry-run] [--only ID[,ID...]] [--account ACCOUNT]
   agents remove-stray NAME SESSION
   agents transfer NAME [--model MODEL --effort EFFORT]
+  agents add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]
 """
 
 
@@ -383,7 +390,8 @@ def finish_producer_cleanup(path: Path, cleanup: PendingProducerCleanup, admissi
     transcripts = tuple(sorted(set(cleanup.transcripts) | set(sessions.transcript_locations(cleanup.session))))
     cleanup = replace(cleanup, step=ProducerCleanupStep.ADMISSION, transcripts=transcripts)
     save_producer_cleanup(path, cleanup)
-    if cleanup.admission_matches and admission.exists():
+    admission_identity = cleanup.admission.get("session_id", "")
+    if cleanup.admission_matches and admission_identity in ("", cleanup.session) and admission.exists():
         saved = herdr.json_object(cast(object, json.loads(admission.read_text())), "producer admission")
         if saved == cleanup.admission:
             admission.unlink()
@@ -396,7 +404,7 @@ def finish_producer_cleanup(path: Path, cleanup: PendingProducerCleanup, admissi
             continue
         if current.get("tab_id") != pane.tab:
             raise ValueError(f"{pane.pane}: stray tab identity changed")
-        _ = client.close_retained_pane(pane.pane, terminal=pane.terminal)
+        _ = client.close_retained_pane(pane.pane, terminal=pane.terminal, target=cleanup.session)
         if not isinstance(client.pane_row(pane.pane), herdr.NoPane):
             raise ValueError(f"{pane.pane}: stray pane closure is incomplete")
     cleanup = replace(cleanup, step=ProducerCleanupStep.TRANSCRIPTS)
@@ -434,26 +442,17 @@ def stray_producer_panes(client: herdr.Herdr, identity: str) -> list[StrayProduc
             continue
         info = herdr.json_object(client.result("pane", "process-info", "--pane", pane["pane_id"]).get("process_info"),
                                  "stray pane process info")
-        proved = False
-        for value in herdr.json_items(info.get("foreground_processes"), "stray pane foreground processes"):
-            process = herdr.json_object(value, "stray pane process")
-            pid = process.get("pid")
-            if not isinstance(observed, herdr.LiveConversation) or pid not in observed.pids:
-                continue
-            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-                raise ValueError("stray pane process has no valid pid")
-            arguments = process.get("argv")
-            if not isinstance(arguments, list):
-                raise ValueError("stray pane process has no arguments")
-            argv = [herdr.json_text(argument, "stray process argument") for argument in cast(list[object], arguments)]
-            matches = herdr.is_claude_process(argv) if observed.kind == "claude" else herdr.is_codex_process(argv)
-            if not matches:
-                raise ValueError(f"{pid}: selected process no longer runs {observed.kind}")
-            native = herdr.native_process(pid, observed.kind)
-            proved = proved or native.current_identity == identity
-        idle_retained = (retained_identity == identity
-                         and isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell))
-        if proved or idle_retained:
+        foreground = herdr.foreground_pane_owner(info)
+        if isinstance(foreground, herdr.UnprovedForegroundOwner):
+            continue
+        if isinstance(foreground, herdr.NoForegroundAgent):
+            matches = (retained_identity == identity
+                       and isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell))
+        else:
+            matches = (isinstance(observed, herdr.LiveConversation)
+                       and foreground.pid in observed.pids and foreground.kind == observed.kind
+                       and herdr.read_foreground_pane_owner(foreground, pane).current_identity == identity)
+        if matches:
             selected.append(StrayProducerPane(pane["pane_id"], herdr.json_text(pane.get("terminal_id"), "stray terminal")))
     return selected
 
@@ -478,15 +477,22 @@ def remove_stray_producer(name: str, session: str) -> int:
         if admission.exists():
             saved = herdr.json_object(cast(object, json.loads(admission.read_text())), "producer admission")
         retained = pane_record.read_strict(client.session)
-        admission_matches = saved.get("session_id") == identity
-        for pane in panes:
-            if saved.get("pane") == pane.pane and saved.get("terminal") == pane.terminal:
-                admission_matches = True
-            entry = retained.get(pane.pane)
-            if entry is not None and saved.get("pane") == pane.pane:
-                owner = record.by_member_reference(pane_launch.reference_id(entry))
-                retained_identity = owner.current_session if owner is not None else pane_launch.reference_id(entry)
-                admission_matches = admission_matches or retained_identity == identity
+        admission_identity = saved.get("session_id", "")
+        admission_matches = admission_identity == identity
+        if admission_identity == "":
+            for pane in panes:
+                if saved.get("pane") != pane.pane:
+                    continue
+                if saved.get("terminal") == pane.terminal:
+                    admission_matches = True
+                    break
+                entry = retained.get(pane.pane)
+                if entry is not None:
+                    owner = record.by_member_reference(pane_launch.reference_id(entry))
+                    retained_identity = owner.current_session if owner is not None else pane_launch.reference_id(entry)
+                    if retained_identity == identity:
+                        admission_matches = True
+                        break
         observed = herdr.read_conversation(identity)
         if isinstance(observed, herdr.UnknownConversation):
             raise ValueError(observed.reason)
@@ -668,6 +674,11 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("producer", metavar="NAME")
     _ = command.add_argument("--model", default="")
     _ = command.add_argument("--effort", default="")
+    command = commands.add_parser("add-producer")
+    _ = command.add_argument("producer", metavar="NAME")
+    _ = command.add_argument("--model", default="")
+    _ = command.add_argument("--effort", default="")
+    _ = command.add_argument("--job", default="")
     for verb in ("pause", "exit", "resume"):
         command = commands.add_parser(verb)
         selection = command.add_mutually_exclusive_group(required=True)
@@ -675,6 +686,7 @@ def main(argv: list[str] | None = None) -> int:
         _ = selection.add_argument("--production", default="")
         if verb == "resume":
             _ = command.add_argument("--retired", action="store_true")
+            _ = command.add_argument("--resend-opening-prompt", action="store_true")
             _ = command.add_argument("--to")
             _ = command.add_argument("--why", default="resumed by name")
         else:
@@ -683,6 +695,7 @@ def main(argv: list[str] | None = None) -> int:
             _ = command.add_argument("--except", dest="excluded", action="append", default=[])
     command = commands.add_parser("retire")
     _ = command.add_argument("session")
+    _ = command.add_argument("--to")
     command = commands.add_parser("rename")
     _ = command.add_argument("old")
     _ = command.add_argument("new")
@@ -718,10 +731,16 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("--session", dest="account", required=True)
     options = parser.parse_args(arguments, namespace=CommandLine())
     try:
+        if options.command == "resume" and options.resend_opening_prompt:
+            if options.production or options.retired:
+                raise ValueError("--resend-opening-prompt needs one producer name and an active pane")
+            return _result_code(stop_resume.resend_producer_opening(options.session, to=options.to or ""))
         if options.command == "remove-stray":
             return remove_stray_producer(options.producer, options.session)
         if options.command == "transfer":
             return producer_transfer.transfer(options.producer, model=options.model, effort=options.effort)
+        if options.command == "add-producer":
+            return producer_lifecycle.add(options.producer, model=options.model, effort=options.effort, job=options.job)
         if options.command == "stop" and options.all:
             return restart.stop_all(dry_run=options.dry_run,
                                     only=tuple(item for item in options.only.split(",") if item),
@@ -793,10 +812,23 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"{report['machine']}: unavailable (rc {report['rc']})")
             return 0
         if options.command == "rename":
+            if (producer_lifecycle.pending_rename(options.old)
+                    or producer_lifecycle.pending_admission(options.old)
+                    or producer_lifecycle.lookup(options.old, staff.initial_snapshot()) is not None):
+                if options.to_doc or options.to_branch:
+                    raise ValueError("producer rename keeps the document folder and has no branch option")
+                return producer_lifecycle.rename(options.old, options.new, rename_repair_displays)
             return rename_named_member(options.old, options.new, to_doc=options.to_doc, to_branch=options.to_branch)
         if options.command == "retire":
+            if (producer_lifecycle.pending_admission(options.session)
+                    or producer_lifecycle.lookup(options.session, staff.initial_snapshot()) is not None):
+                return producer_lifecycle.retire(options.session, to=options.to)
+            if options.to:
+                raise ValueError("--to is only for producer retirement")
             return retire_named_unit(options.session)
         if options.command == "resume" and options.retired:
+            if producer_lifecycle.lookup(options.session, staff.initial_snapshot()) is not None:
+                return _result_code(producer_lifecycle.restore(options.session, to=options.to, why=options.why))
             recovery_account = (accounts.NamedAccount(options.to, accounts.account_dir(options.to))
                                 if options.to else accounts.CURRENT_ACCOUNT_SETTINGS)
             return recover_named_unit(options.session, account=recovery_account)
@@ -830,8 +862,6 @@ def main(argv: list[str] | None = None) -> int:
 SCRIPTS = Path(__file__).resolve().parent.parent
 
 DETACHED_RUNS = "detached_runs"
-
-BUILD_HOLD = SCRIPTS / "build_hold" / "build_hold.py"
 
 MAC_CLAIMS = Path.home() / ".local/state/mac-test/claims"
 
@@ -1233,6 +1263,7 @@ def retirement_remove(unit: RetiringUnit, *, settings: conf.ConfigRead) -> list[
         result = retirement_git(unit, "worktree", "remove", "--force", str(unit.worktree), settings=settings)
         if result.returncode:
             return [retirement_failure(result)]
+        release_worktree_pair(unit.worktree)
         print(f"removed: worktree {unit.worktree}")
     if unit.branch:
         if retirement_git(unit, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}", settings=settings).returncode == 0:
@@ -1532,7 +1563,8 @@ def retirement_clear_worktree(unit: RetiringUnit, *, settings: conf.ConfigRead, 
     row = unit.staff_member
     owned = retirement_members(unit, record)
     for key in retirement_holds({member.id for member in owned}):
-        result = retirement_run([sys.executable, str(BUILD_HOLD), "release", "--holder", key], settings=settings)
+        hold_script = override_guard.helper_root(Path(__file__)) / "build_hold/build_hold.py"
+        result = retirement_run([sys.executable, str(hold_script), "release", "--holder", key], settings=settings)
         if result.returncode:
             print(f"anomaly: {retirement_failure(result)}")
     retirement_release_reservations(unit, settings=settings)
@@ -1788,6 +1820,7 @@ def recovery_resumed_session_proven(production_name: str, name: str, session_id:
             and entry.get("staff_id") == row.id and session_id == row.current_session)
 
 def recovery_resume(unit: RetiredUnitRecovery, record: staff.StaffSnapshot) -> int:
+    staff.validate_unit_name_for_write(unit.name)
     refused = recovery_refusals(unit)
     if refused:
         print("\n".join(f"refused: {reason}" for reason in refused))
@@ -1968,7 +2001,9 @@ def rename_plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") ->
     if row.kind == "unit":
         if to_doc:
             raise RenameRefused("--to-doc is only for showrunners; the staff row is a unit, not a showrunner")
-        name = unit_names.name(new)
+        name = row.name if new == row.name + "-unit" else unit_names.name(new)
+        if name != row.name:
+            staff.validate_unit_name_for_write(name)
         staff.validate_name(row.kind, name)
         if any(other.id != row.id and other.name == name and other.parent == row.parent
                for other in record.find(kind="unit")):
@@ -1977,7 +2012,8 @@ def rename_plan(old: str, new: str, *, to_doc: str = "", to_branch: str = "") ->
                 and row.worktree.machine != remote.local_machine()):
             raise ValueError(f"{old}: run rename on {row.worktree.machine}")
         pending = unit_move.pending_rename(row.id)
-        if pending is not None and (pending.name != name or to_branch and pending.branch != to_branch):
+        if (pending is not None and (pending.name != name or to_branch and pending.branch != to_branch)
+                and not unit_move.rename_unstarted(record, row, pending)):
             raise RenameRefused(f"{row.name}: finish the pending rename to {pending.name}")
         if to_branch:
             if isinstance(row.worktree, staff.WorktreeUnfilled):
@@ -2082,6 +2118,8 @@ def rename_move_branch(move: DocBranchMove) -> bool:
 def rename_qualified_workers(owner: staff.StaffRow) -> bool:
     """Migrate one owner's old worker names without removing retained work."""
     changed = False
+    unchanged = 0
+    # Staff rows retain no former names. Session formerNames are process-specific.
     client = herdr.Herdr(herdr.shared_session())
     for row in staff.snapshot().find(kind="worker", parent=owner.id):
         prefix, separator, bare = row.name.rpartition("-")
@@ -2091,10 +2129,9 @@ def rename_qualified_workers(owner: staff.StaffRow) -> bool:
                 bare = role + row.name[len(stem):]
                 prefix = row.name[:-len(bare)].removesuffix("-")
                 break
-        if not prefix or not separator:
-            continue
-        if prefix != owner.name and not prefix.endswith("-" + owner.name):
-            print(f"{row.name}: kept; prefix does not end with {owner.name}; run /agents rename {row.id} {bare}", file=sys.stderr)
+        if (not prefix or not separator
+                or prefix != owner.name and not prefix.endswith("-" + owner.name)):
+            unchanged += 1
             continue
         name = staff.WorkerName.parse(row.name)
         with worker_panes.worker_lock(owner.id, name, blocking=True) as hold:
@@ -2150,6 +2187,9 @@ def rename_qualified_workers(owner: staff.StaffRow) -> bool:
                         print(pair + "worker end is incomplete", file=sys.stderr)
                 except staff.StaffRefused as error:
                     print(pair + " ".join(str(error).splitlines()), file=sys.stderr)
+    if unchanged:
+        worker_names = "worker name" if unchanged == 1 else "worker names"
+        print(f"{unchanged} {worker_names} unchanged: no qualified prefix for {owner.name}", file=sys.stderr)
     return changed
 
 
@@ -2182,6 +2222,13 @@ def rename_repair_displays(row: staff.StaffRow) -> bool:
         write_text_atomic(path, json.dumps(raw, indent=2) + "\n")
         changed = True
     client = herdr.Herdr(herdr.shared_session())
+    if row.kind == "producer":
+        panes = restart.read_row_panes([row], client)
+        if isinstance(panes, restart.RowPanesUnreadable):
+            raise ValueError(f"{row.name}: cannot read producer panes: {panes.reason}")
+        for _, pane in panes:
+            changed = client.retitle(pane, row.name) or changed
+        return changed
     spaces: set[str] = set()
     for pane in client.panes():
         native_sessions: set[str] = set()
@@ -2239,17 +2286,30 @@ def rename_apply(old: str, new: str, *, to_doc: str = "", to_branch: str = "") -
         return request
 
 
+def _unit_rename_target(value: str, old_name: str, new_name: str) -> str | None:
+    """Replace a matching old suffix or keep a matching new suffix."""
+    return (unit_names.swap_stem(value, old_name, new_name)
+            or unit_names.swap_stem(value, new_name, new_name))
+
+
 def rename_apply_unit(request: RenamePlan) -> RenamePlan:
     with staff.row_operation(str(request.member.id)):
         record = staff.snapshot()
         if (row := record.by_id(request.member.id)) is None:
             raise ValueError(f"{request.member.id}: no unit staff row")
         changed = row.name != request.name
+        if changed:
+            staff.validate_unit_name_for_write(request.name)
+        replaced_pending = False
         pending = unit_move.pending_rename(row.id)
-        if pending is not None:
-            if (pending.name != request.name or isinstance(request.move, UnitBranchMove)
-                    and request.move.branch != pending.branch):
+        if pending is not None and (pending.name != request.name or isinstance(request.move, UnitBranchMove)
+                                    and request.move.branch != pending.branch):
+            if not unit_move.rename_unstarted(record, row, pending):
                 raise RenameRefused(f"{row.name}: finish the pending rename to {pending.name}")
+            unit_move.rename_move_path(row.id).unlink()
+            pending = None
+            replaced_pending = True
+        if pending is not None:
             _ = unit_move.rename_observation(record, row, pending)
         elif changed or (isinstance(request.move, UnitBranchMove) and request.move.old_branch != request.move.branch):
             if isinstance(row.worktree, staff.WorktreeUnfilled):
@@ -2258,13 +2318,13 @@ def rename_apply_unit(request: RenamePlan) -> RenamePlan:
                 if row.worktree.machine != remote.local_machine():
                     raise ValueError(f"{row.name}: run rename on {row.worktree.machine}")
                 folder = row.worktree.path.expanduser().resolve()
-                target = unit_names.swap_stem(folder.name, row.name, request.name) if changed else folder.name
+                target = _unit_rename_target(folder.name, row.name, request.name) if changed else folder.name
                 destination = folder.with_name(target) if target is not None else folder
                 unit_move.require_move_destination(record, row, destination)
                 checkout = unit_move.move_checkout(record, row)
                 branch = unit_move.checked_out_branch(checkout) if checkout.exists() else ""
                 renamed_branch = (request.move.branch if isinstance(request.move, UnitBranchMove) else
-                                  unit_names.swap_stem(branch, row.name, request.name))
+                                  _unit_rename_target(branch, row.name, request.name))
                 if changed and target is None:
                     print(f"anomaly: folder {folder} does not end with -{row.name}", file=sys.stderr)
                 if changed and renamed_branch is None:
@@ -2300,7 +2360,7 @@ def rename_apply_unit(request: RenamePlan) -> RenamePlan:
             fields = unit_move.json_object(read_json(notice))
             if not fields.get("pending"):
                 notice.unlink()
-        print("done" if changed or worker_names_changed else "unchanged")
+        print("done" if changed or worker_names_changed or replaced_pending else "unchanged")
         return request
 
 

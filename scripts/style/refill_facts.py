@@ -82,14 +82,21 @@ class RefillFacts:
         """Publish derived facts without committing a caller's source transaction."""
         before = self.connection.total_changes
         account = not isinstance(self.writes, RefillWriteBatch) or not self.writes.writing
-        _ = self.connection.execute("SAVEPOINT refill_publication")
         try:
-            yield
-            _ = self.connection.execute("RELEASE refill_publication")
-        except BaseException:
-            _ = self.connection.execute("ROLLBACK TO refill_publication")
-            _ = self.connection.execute("RELEASE refill_publication")
-            raise
+            if not self.connection.in_transaction:
+                with self.connection:
+                    # Take the write lock before a source version read starts a read transaction.
+                    _ = self.connection.execute("BEGIN IMMEDIATE")
+                    yield
+                return
+            _ = self.connection.execute("SAVEPOINT refill_publication")
+            try:
+                yield
+                _ = self.connection.execute("RELEASE refill_publication")
+            except BaseException:
+                _ = self.connection.execute("ROLLBACK TO refill_publication")
+                _ = self.connection.execute("RELEASE refill_publication")
+                raise
         finally:
             if account:
                 self.on_derived_write(self.connection.total_changes - before)

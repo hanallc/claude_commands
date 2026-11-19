@@ -21,6 +21,7 @@ from scripts.lib.test_models_registry import write_registry
 from scripts.message import sessions
 from scripts.agents import pane_record
 from scripts.herdr import herdr
+from scripts.herdr.test_herdr import codex_foreground_cases
 
 
 class LaunchEnvironmentTests(unittest.TestCase):
@@ -44,10 +45,66 @@ class LaunchEnvironmentTests(unittest.TestCase):
                       herdr_types.HerdrFailure("fixture pane is unreadable")):
             with (self.subTest(error=type(error).__name__),
                   patch.object(client, "result", return_value=info),
-                  patch.object(herdr, "pane_native_process", side_effect=error) as decoded):
+                  patch.object(herdr, "read_foreground_pane_owner", side_effect=error) as decoded):
                 self.assertEqual(pane_launch.reference_panes(pane_launch.StaffLaunchReference(owner.id),
                     record, client, {"w1:p1": entry}, evidence=evidence), [])
-                decoded.assert_called_once()
+                with self.assertRaisesRegex(pane_launch.PaneProcessUnreadable, "w1:p1:"):
+                    _ = pane_launch.reference_panes(pane_launch.StaffLaunchReference(owner.id),
+                        record, client, {"w1:p1": entry}, evidence=evidence, strict_retained_reads=True)
+                self.assertEqual(decoded.call_count, 2)
+        with (patch.object(client, "result", return_value={"process_info": {}}),
+              self.assertRaisesRegex(pane_launch.PaneProcessUnreadable, "expected positive pane process ids")):
+            _ = pane_launch.reference_panes(pane_launch.StaffLaunchReference(owner.id),
+                record, client, {"w1:p1": entry}, evidence=evidence, strict_retained_reads=True)
+
+    def test_retained_launch_requires_a_proved_owner(self) -> None:
+        owner = staff.StaffRow(staff.StaffId("owner"), "unit", "unit", staff.STAFF_ROOT,
+                               current_session=staff.StaffId("codex-native"))
+        child = replace(owner, id=staff.StaffId("child"), current_session=staff.StaffId("claude-native"))
+        record = staff.StaffSnapshot((owner, child))
+        pane: dict[str, object] = {"pane_id": "w1:p1", "session_id": owner.current_session}
+        entry = pane_launch.launch("w1:p1", owner.current_session, "/repo", {}, ["codex"], kind="codex")
+        evidence = pane_launch.NativePaneEvidence((pane,), herdr.RowPaneScan({}, []))
+        client = herdr.Herdr("fixture")
+        native = {456: herdr.NativeAgentProcess(herdr.PaneSessionReport(owner.current_session), "start", {}),
+                  457: herdr.NativeAgentProcess(herdr.EnvironmentThread(child.current_session), "start", {})}
+        def read_native(pid: int, *_args: object) -> herdr.NativeAgentProcess:
+            return native[pid]
+
+        with codex_foreground_cases(Path("/repo")) as cases, patch.object(
+                herdr, "native_process", side_effect=read_native):
+            for case in cases:
+                with self.subTest(case=case.name), patch.object(client, "result", return_value={"process_info": case.info}):
+                    if case.owner_proved:
+                        self.assertEqual(pane_launch.native_sessions(client, pane), {owner.current_session})
+                    else:
+                        with self.assertRaises(herdr_types.HerdrFailure):
+                            _ = pane_launch.native_sessions(client, pane)
+                    self.assertEqual(pane_launch.reference_panes(pane_launch.StaffLaunchReference(owner.id),
+                        record, client, {"w1:p1": entry}, evidence=evidence), [pane] if case.owner_proved else [])
+
+    def test_backend_detection_reads_only_the_proved_pane_owner(self) -> None:
+        owner = staff.StaffRow(staff.StaffId("owner"), "unit", "unit", staff.STAFF_ROOT,
+                               current_session=staff.StaffId("codex-native"))
+        child = replace(owner, id=staff.StaffId("child"), current_session=staff.StaffId("claude-native"))
+        pane: herdr.PaneIdentity = {"pane_id": "w1:p1", "workspace_id": "w1", "session_id": None}
+        native = {456: herdr.NativeAgentProcess(herdr.PaneSessionReport(owner.current_session), "start", {}),
+                  457: herdr.NativeAgentProcess(herdr.EnvironmentThread(child.current_session), "start", {})}
+        def read_native(pid: int, *_args: object) -> herdr.NativeAgentProcess:
+            return native[pid]
+
+        with (codex_foreground_cases(Path("/repo")) as cases,
+              patch.object(herdr, "shared_session", return_value="fixture"),
+              patch.object(herdr.Herdr, "panes", return_value=[pane]),
+              patch.object(herdr, "codex_resume_thread", side_effect=ValueError("no resume argument")),
+              patch.object(herdr, "native_process", side_effect=read_native),
+              patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive())):
+            for case in cases:
+                with self.subTest(case=case.name), patch.object(herdr.Herdr, "result", return_value={"process_info": case.info}):
+                    pane["session_id"] = owner.current_session
+                    self.assertEqual(pane_launch.native_kind(owner), "codex" if case.owner_proved else "")
+                    pane["session_id"] = child.current_session
+                    self.assertEqual(pane_launch.native_kind(child), "")
 
     def test_launch_does_not_retain_staff_environment(self) -> None:
         policy = ["--sandbox", "read-only", "-c", 'model_reasoning_effort="high"',

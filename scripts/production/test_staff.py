@@ -1,7 +1,7 @@
 """Exercise the staff contract with isolated state and an actual fake SSH process."""
 from __future__ import annotations
 
-from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_runtime_id
+from scripts.production.staff_test_support import fixture_member, fixture_unit_saved_name, fixture_worker, fixture_runtime_id
 
 import fcntl
 import io
@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-from scripts.production import staff
+from scripts.production import demote_showrunner, promote_showrunner, staff
 from scripts.agents import shutdown, stop_resume, restart_support
 from scripts.production.cli_fixture import invoke_cli
 from scripts.herdr import worker_panes
@@ -793,6 +793,20 @@ class DocumentLookupTests(StaffCommandTestCase):
 
 
 class StaffTests(StaffCommandTestCase):
+    def test_retired_producer_keeps_its_id_through_unrelated_writes_and_snapshot_round_trips(self) -> None:
+        producer = fixture_member("producer", name="planner")
+        mark = staff.RetiredProducer("claude:sonnet:high")
+        stopped = staff.set_producer_retirement(producer.id, mark)
+        _ = fixture_member("showrunner", name="another-production")
+        record = staff.StaffSnapshot.decode(staff.snapshot().encode())
+        self.assertEqual(record.by_id(producer.id), stopped)
+        self.assertIsNone(record.by_path(producer.name))
+        self.assertIsNone(record.by_current_session(producer.current_session))
+        self.assertNotIn(producer, staff.active(record, "producer"))
+        restored = staff.set_producer_retirement(producer.id, staff.Active())
+        self.assertEqual(restored, producer)
+        self.assertEqual(staff.snapshot().by_path(producer.name), restored)
+
     def test_owner_lookup_returns_the_unit_for_a_worker_reference(self) -> None:
         showrunner, unit, worker = self.tree()
         record = staff.local_snapshot()
@@ -1615,6 +1629,25 @@ class StaffTests(StaffCommandTestCase):
         self.assertEqual(moved, replace(morty, current_session=session, home=home, worktree=folder))
         self.assertEqual(staff.by_id(morty.id), moved)
 
+        with self.subTest(operation="producer creation"):
+            registry = self.root / "models.conf"
+            _ = registry.write_text("[producers]\n")
+            marker = f"mac:{'1' * 32}"
+            with (self.machine("mac"),
+                  mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0"})):
+                _ = staff.producer_creation_registry("claim", "dwight", marker, "claude:sonnet:high")
+                self.assertEqual(staff.producer_creation_registry("read", "Dwight"), marker)
+                with self.assertRaisesRegex(staff.StaffRefused, "the creation record is on mac"):
+                    _ = staff.producer_creation_registry("claim", "Dwight", f"natedev:{'1' * 32}", "claude:sonnet:high")
+                with self.assertRaisesRegex(staff.StaffRefused, "the creation record is on mac"):
+                    _ = staff.producer_creation_registry("finish", "dwight", f"natedev:{'1' * 32}")
+                self.assertEqual(staff.producer_creation_registry("read", "dwight"), marker)
+                _ = staff.producer_creation_registry("finish", "Dwight", marker)
+                self.assertEqual(staff.producer_creation_registry("read", "dwight"), "")
+            self.assertIn("dwight=claude:sonnet:high", registry.read_text())
+            self.assertEqual([command[:2] for command in self.ssh_commands()[1:]],
+                             [["producer-creation", action] for action in ("claim", "read", "claim", "finish", "read", "finish", "read")])
+
     def test_a_producer_launch_folder_owns_no_path_and_two_producers_share_it(self) -> None:
         _, unit, _ = self.tree()
         folder = staff.PresentWorktree("natedev", self.root)
@@ -1905,6 +1938,47 @@ class StaffTests(StaffCommandTestCase):
         for action in actions:
             with self.subTest(action=action):
                 self.assert_refused(action)
+
+    def test_unit_name_writers_refuse_the_reserved_suffix(self) -> None:
+        runner, unit, _ = self.tree()
+        child = fixture_member("showrunner", name="child", parent=runner.id)
+        location = ("--machine", "natedev", "--path", str(self.root / "child"))
+        cases = (
+            ("ensure-unit", ("ensure", "unit", "--parent", runner.id, "--runtime-id", fixture_runtime_id("new-x"))),
+            ("rename-unit", ("rename", unit.id)),
+            ("promote-unit", ("promote-unit", unit.id, "--parent", runner.id, *location)),
+            ("demote-unit", ("demote-showrunner", child.id, "--parent", runner.id, *location)),
+        )
+        before = self.staff_state()
+        for name, arguments in cases:
+            with self.subTest(command=arguments[0]):
+                result = self.cli(*arguments, "--name", name, code=2)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, f"StaffRefused: unit name {name!r} must not end in -unit\n")
+                self.assertEqual(self.staff_state(), before)
+
+    def test_a_legacy_unit_name_loads_and_survives_an_unrelated_write(self) -> None:
+        runner, unit, _ = self.tree()
+        legacy = fixture_unit_saved_name(unit, "x-unit")
+        self.assertEqual(staff.snapshot().by_path(f"{runner.name}/x-unit"), legacy)
+        _ = staff.rename(runner.id, "tools")
+        self.assertEqual(staff.snapshot().by_path("tools/x-unit"), legacy)
+
+    def test_role_change_commands_refuse_the_reserved_suffix_before_changing_staff(self) -> None:
+        runner, unit, _ = self.tree()
+        _ = fixture_member("showrunner", name="x-unit", parent=runner.id)
+        cases = (
+            (promote_showrunner, promote_showrunner.main,
+             [unit.name, "--production", "x-unit", "--model", "opus", "--effort", "high"]),
+            (demote_showrunner, demote_showrunner.main, ["x-unit"]),
+        )
+        before = self.staff_state()
+        for command, main, arguments in cases:
+            with self.subTest(command=command.__name__):
+                result = invoke_cli(command, lambda: main(arguments), arguments, dict(os.environ), CHECKOUT)
+                self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                 (2, "", "StaffRefused: unit name 'x-unit' must not end in -unit\n"))
+                self.assertEqual(self.staff_state(), before)
 
     def test_promoted_showrunner_and_original_unit_have_distinct_paths(self) -> None:
         showrunner, unit, worker = self.tree()

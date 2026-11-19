@@ -1,4 +1,6 @@
 from __future__ import annotations
+from scripts.agents.test_support import write_machine_config
+from scripts.lint.memory_test_support import write_config_fixture
 
 import io
 import json
@@ -252,7 +254,9 @@ class PaneRestoreTests(unittest.TestCase):
         configuration = self.root / "configuration"
         configuration.mkdir()
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            write_text_atomic(configuration / source.name, source.read_text())
+            _ = write_config_fixture(configuration / source.name)
+        write_machine_config(configuration)
+        _ = write_config_fixture(configuration / "staff.conf", "PRODUCER_WORKSPACE=producers\n")
         registry = write_registry(configuration / "models.conf", {"producers": {"alpha": "claude:opus:max"}})
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)})))
         for pid in (123, 4242):
@@ -617,7 +621,7 @@ class RestoreStaffNamesTests(StaffTestCase):
         unit = staff.set_worktree(unit.id, staff.PresentWorktree(machine, self.root), expected=unit.worktree)
         configuration = self.root / "configuration"
         for config_source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            write_text_atomic(configuration / config_source.name, config_source.read_text())
+            _ = write_config_fixture(configuration / config_source.name)
         (self.root / "run").mkdir()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(configuration), "UNIT_RUN_DIR": str(self.root / "run"),
@@ -887,7 +891,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         configuration = self.root / "configuration"
         configuration.mkdir()
         for source in (Path(__file__).resolve().parents[2] / "config").glob("*.conf"):
-            write_text_atomic(configuration / source.name, source.read_text())
+            _ = write_config_fixture(configuration / source.name)
         registry = write_registry(configuration / "models.conf")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(configuration), "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
@@ -1155,6 +1159,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
 
             with (mock.patch.object(accounts, "group_accounts", return_value=accounts.GroupAccounts(units="claude4")),
                   mock.patch.object(accounts, "claude_account_dir", return_value=backend.config),
+                  mock.patch.object(herdr, "live_sessions", return_value=[{"name": "agents"}]),
                   mock.patch.object(herdr, "Herdr", return_value=client),
                   mock.patch.object(client, "open_tab", side_effect=open_tab),
                   mock.patch.object(stop_resume, "_tab_of", return_value=stop_resume.SessionNotFound(self.owner.current_session)),

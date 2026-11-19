@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.build_queue import execution_identity
 from scripts.lib.checkout_test_support import copy_runtime, write_python_tool
 
 from collections.abc import Callable, Sequence
@@ -27,7 +28,6 @@ from scripts.copies.copies_test_support import copies_environment
 from scripts.lint.memory_test_support import write_config_fixture, config_environment
 
 from scripts.mac_test import eligibility, offload, mac_test
-from scripts.lib import conf
 from scripts.buildlog import treekey
 from scripts.buildlog import sync as buildlog_sync
 from scripts.mac_test.offload_test_commands import COMMAND_STUB, write_shell
@@ -121,6 +121,15 @@ def mirror_use_payload(case: unittest.TestCase, argv: Sequence[str]) -> list[str
     return [*argv[:-1], words[boundary + 3]]
 
 
+def split_mac_run_command(remote: str) -> tuple[list[str], str]:
+    """Get the invocation words and the cleanup commands."""
+    for status in (f" || echo {offload.MAC_NEXTTEST_SETUP_FAILURE}", "; echo mac_exit=$?"):
+        invocation, separator, cleanup = remote.rpartition(status)
+        if separator:
+            return shlex.split(invocation), cleanup
+    raise AssertionError(f"Missing Mac status command in {remote!r}")
+
+
 class SelectorEvent(TypedDict):
     command: str
     args: list[str]
@@ -148,7 +157,7 @@ class RemoteClaimRecord(TypedDict):
 
 HANA = eligibility.KnownRepository("hana")
 
-FIXTURE_MIRROR_ROOT = conf.read(Path(__file__).resolve().parents[2] / "config/mac_test.conf").text("mirror_root").removeprefix("~/")
+FIXTURE_MIRROR_ROOT = ".local/state/mac-test/test-mirror"
 
 HANA_COMMAND_PATTERN = offload.extended_regex_literal(FIXTURE_MIRROR_ROOT) + "/hana([/'\"[:space:]]|$)"
 
@@ -294,6 +303,7 @@ class OffloadCommandFixture(unittest.TestCase):
         for name in ("ssh", "rsync", "gh", "systemd-run"):
             (self.bin_directory / name).symlink_to(stub)
         self.config = {
+            "mirror_root": "~/" + FIXTURE_MIRROR_ROOT,
             "offload": "on",
             "host": "mac",
             "connect_timeout_s": "6",
@@ -341,6 +351,8 @@ class OffloadCommandFixture(unittest.TestCase):
             self.addCleanup(os.close, descriptor)
         self.sync_config()
         self.sync_fixture()
+        _ = write_config_fixture(self.root / "build_targets.conf", "platform.mac=macos\n")
+        _ = write_config_fixture(self.root / "config/copies.conf", "owner.verify=verify\n")
         self.environment = {
             **os.environ, **interpreter_cache_environment(self.root / "cache"),
             **config_environment(self.root),
@@ -398,8 +410,8 @@ class OffloadCommandFixture(unittest.TestCase):
         destination = placement.PlacementDestination(provider, target, host, scope, 1 if provider == "ssh" else 0)
         local = admission.request(owner=owner, episode=uuid.uuid4().hex, step=verb)
         source_key = treekey.tree_key(str(repository))
-        source = (placement.SourceKeyKnown(source_key) if source_key is not None
-                  else placement.SourceKeyUnavailable("the fixture has no tree key"))
+        source = (execution_identity.SourceKeyKnown(source_key) if source_key is not None
+                  else execution_identity.SourceKeyUnavailable("the fixture has no tree key"))
         constraints = placement.PlacementConstraints(source, ("cargo", verb), str(repository), "hana",
             session_owner.owning_session(self.environment if environment is None else environment),
             (placement.PlacementCandidate(destination),), placement.PinnedHost(target))
@@ -916,7 +928,8 @@ raise SystemExit(offload.main())
         self.assertEqual(len(self.events_for("rsync")), 1)
         remote = self.events_for("ssh")[-1]["args"][-1]
         self.assertIn("lint nextest", remote)
-        return shlex.split(remote.rpartition("; echo mac_exit=$?")[0])
+        words, _ = split_mac_run_command(remote)
+        return words
 
     def assert_stable_copy_sends_key(self) -> None:
         # A later stable copy must send its key after the earlier copy omitted it.

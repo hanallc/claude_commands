@@ -28,7 +28,9 @@ SAMPLE: dict[str, object] = {
     "workers": [WORKER,
                 {"staff_id": "handler-test", "name": "handler-test", "parent_staff_id": "handler-unit",
                  "machine": "natedev", "status": "idle", "activity": "", "activity_started_at": None,
-                 "pass": None, "pane": "closed", "runs": [], "unknown": None}],
+                 "pass": None, "pane": "closed", "runs": [], "unknown": None},
+                {**WORKER, "staff_id": "handler-review", "name": "handler-review", "runs": None,
+                 "unknown": {"reason": "cannot read detached run record"}}],
     "sessions": [{"session": "4dbdb78e", "machine": "natedev", "status": "busy", "activity": "impl · waiting",
                   "shells": [{"name": "Run the AWS gate", "started_at": 1794600100}, {"name": "Watch CI", "started_at": None}]},
                  {"session": "01a18dbb", "machine": "natedev", "status": None, "activity": None}],
@@ -37,6 +39,9 @@ SAMPLE: dict[str, object] = {
 
 class CensusTests(unittest.TestCase):
     def test_schema_two_parses_into_typed_records(self) -> None:
+        result = census.parse(json.dumps(SAMPLE))
+        self.assertIsInstance(result, census.Census)
+        assert isinstance(result, census.Census)
         expected = census.Census(
             (census.CensusMachine("natedev", True), census.CensusMachine("mac", False)),
             (census.CensusSession("4dbdb78e", "busy", (census.CensusShell("Run the AWS gate", 1794600100.0),
@@ -47,8 +52,12 @@ class CensusTests(unittest.TestCase):
                                  (census.CensusRun("verify test", 1794600060.0, "running"),
                                   census.CensusRun("lint", None, "missing"))),
              census.CensusWorker(staff.StaffId("handler-test"), "handler-test", staff.StaffId("handler-unit"), "idle", "",
-                                 census.NoPass(), ())))
-        self.assertEqual(census.parse(json.dumps(SAMPLE)), expected)
+                                 census.NoPass(), ()),
+             census.CensusWorker(staff.StaffId("handler-review"), "handler-review", staff.StaffId("handler-unit"), "busy",
+                                 "verify test", census.CensusPass("impl", "8"),
+                                 census.UnknownWorkerRuns("cannot read detached run record"))))
+        self.assertEqual(result, expected)
+        self.assertEqual(result.workers[-1].runs, ())
 
     def test_bad_output_is_one_failure_with_its_reason(self) -> None:
         worker = WORKER
@@ -74,6 +83,8 @@ class CensusTests(unittest.TestCase):
              "census: workers[0].status is not text or null"),
             (json.dumps({**SAMPLE, "workers": [{**worker, "activity": 3}]}),
              "census: workers[0].activity is not text or null"),
+            (json.dumps({**SAMPLE, "workers": [{**worker, "runs": None}]}),
+             "census: workers[0].unknown is not an object"),
             (json.dumps({**SAMPLE, "workers": [{**worker, "runs": [{"label": "x", "started_at": 1, "state": "done"}]}]}),
              "census: workers[0].runs[0].state is not one of running, finished_queued, missing"),
             (json.dumps({**SAMPLE, "workers": [{**worker, "runs": [{"label": "x", "started_at": True,

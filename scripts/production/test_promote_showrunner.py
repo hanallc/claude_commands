@@ -515,7 +515,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         place = herdr.HerdrPlace("agents", "w8:p1")
         with (mock.patch.object(showrunners, "current_name", return_value=""),
               mock.patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(5151)),
-              mock.patch.object(herdr, "herdr_place_of", return_value=place),
+              mock.patch.object(herdr, "process_placement", return_value=place),
               mock.patch.object(herdr.Herdr, "panes", return_value=[pane_identity(place.pane, "child")]),
               mock.patch.object(herdr.Herdr, "native_session", return_value=SESSION),
               mock.patch.object(herdr, "submitted_prompt", return_value=submitted),
@@ -568,6 +568,31 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertIn("sent child", out)
         self.assertIn("sent parent", out)
         self.assertFalse(pending.exists())
+
+    def test_pending_promotion_with_empty_composer_reports_manual_recovery(self) -> None:
+        parent = read_production("parent")
+        child = read_new_production(self.child_doc, "child")
+        marked = self.marked["demo"]
+        assert isinstance(marked.claude, unit_lookup.LiveClaude)
+        promotion = promote_showrunner.Promotion("demo", parent, child, marked, marked.claude, self.worktree)
+        promote_showrunner.save_promotion(promotion, self.unit_account.dir)
+        pending = promote_showrunner.promotion_record(parent, "demo")
+        errors = io.StringIO()
+
+        with (mock.patch.object(herdr, "process_placement", return_value=herdr.HerdrPlace("agents", "w8:p1")),
+              mock.patch.object(herdr.Herdr, "native_session", return_value=SESSION),
+              mock.patch.object(herdr.Herdr, "run", return_value="────────\n❯ \n────────"),
+              mock.patch.object(herdr.Herdr, "_wait_for_submit", return_value=None),
+              mock.patch.object(herdr.Herdr, "_prompt") as typed,
+              mock.patch.object(herdr.Herdr, "_send_keys") as keys,
+              redirect_stderr(errors)):
+            result = promote_showrunner.finish_child(promotion, self.unit_account.dir, pending, PID)
+        self.assertEqual(result, add_showrunner.SESSION_NOT_READY)
+        self.assertIn("sent once, not confirmed", errors.getvalue())
+        self.assertIn("Check the retained pane and send the prompt by hand if absent.", errors.getvalue())
+        self.assertTrue(pending.exists())
+        typed.assert_not_called()
+        keys.assert_not_called()
 
     def test_each_refusal_names_its_cause_and_stops_nothing(self) -> None:
         def no_production() -> None:
