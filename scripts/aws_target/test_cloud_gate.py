@@ -86,6 +86,7 @@ class FakeGateAws:
         self.refusals: list[str] = []
         self.result: dict[str, object] = {}
         self.has_result: bool = True
+        self.boot_error: str = ''
         self.has_log: bool = True
         self.state: str = 'running'
         self.state_reason: dict[str, str] = {}
@@ -138,6 +139,8 @@ class FakeGateAws:
             key, destination = args[key_at], Path(args[key_at + 1])
             if key.endswith('/gate.log') and self.has_log:
                 _ = destination.write_text(self.log)
+            elif key.endswith('/boot-error.json') and self.boot_error:
+                cloud_gate.save(destination, {'error': self.boot_error})
             elif key.endswith('/result.json') and self.has_result:
                 cloud_gate.save(destination, self.result)
             else:
@@ -1410,7 +1413,11 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
              'vcpus': 32, 'result': 'finished', 'gate_s': 1.0, 'mode': 'merge-gate', 'region': 'fixture-region'}])
         data = ledger.text(self.fake.launches[0], 'UserData')
         self.assertTrue(data.startswith('#!/bin/sh\n'))
-        links = ledger.mapping(cast(object, json.loads(data.split("<<'GATE_LINKS'\n", 1)[1].split('\nGATE_LINKS', 1)[0])))
+        link_rows = data.split("<<'GATE_LINKS'\n", 1)[1].split('\nGATE_LINKS', 1)[0]
+        links: dict[str, object] = {}
+        for line in link_rows.splitlines():
+            name, _, _, value = line.split('\t', 3)
+            links[cast(str, json.loads(name))] = cast(object, json.loads(value))
         for key in ('guest', 'request', 'source', 'log', 'result', 'boot_error'):
             parsed = urlsplit(ledger.text(links, key))
             query = parse_qs(parsed.query)
@@ -1881,7 +1888,8 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         sample = {'module': 'fixture/test_ok.py', 'variant': 'base', 'round': 1, 'cpu_s': 1.0,
                   'peak_mib': 1.0, 'wall_s': 1.0, 'status': 0, 'tests': 1, 'failures': 0, 'errors': 0,
                   'instance_type': 'm7a.8xlarge', 'box': ''}
-        self.fake.result = {**request, 'runs': [sample, {**sample, 'variant': 'changed'}], 'verdict': 'pass', 'gate_s': 2.0}
+        self.fake.result = {**request, 'runs': [sample, {**sample, 'variant': 'changed'}], 'verdict': 'pass',
+                            'gate_s': 2.0, 'log_error': 'The log PUT timed out'}
         cloud_gate.save(self.folder / 'request.json', request)
         reply = self.execute()
         self.assertEqual(reply['status'], 'complete')
@@ -2377,8 +2385,15 @@ class CloudRouteTests(CostFixture):
         _ = self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state))
         self.admission = caller_admission(self, self.root, {'BUILDLOG_DIR': str(self.root / 'buildlog')})
 
-    def run_spot_route(self, interruptions: int, *, status: int = 0, one_choice: bool = False,
-                       limit_after_first: bool = False, crash_after: int | None = None,
+    def retry_fixture(self) -> CloudRouteTests:
+        fixture = CloudRouteTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        return fixture
+
+    def run_spot_route(self, interruptions: int, *, box_failures: int = 0, log_error: str = '',
+                       status: int = 0, one_choice: bool = False, limit_after_first: bool = False,
+                       crash_after: int | None = None,
                        crash_on_retry_save: bool = False,
                        lower_limit_on_resume: bool = False) -> tuple[cloud_gate.LocalFallback | cloud_gate.CloudCompleted,
                                                                list[Path], list[FakeGateAws]]:
@@ -2422,14 +2437,20 @@ class CloudRouteTests(CostFixture):
             self.assertTrue(all(fake.terminated for fake in fakes))
             request = cloud_gate.read(folder / 'request.json')
             fake = FakeGateAws()
-            fake.has_result = len(folders) >= interruptions
-            fake.state = 'running' if fake.has_result else 'shutting-down'
+            failed_box = len(folders) < box_failures
+            fake.has_result = len(folders) >= box_failures + interruptions or (failed_box and bool(log_error))
+            if failed_box and not log_error:
+                fake.boot_error = 'The box failed at stage result upload (exit 1)'
+            fake.state = 'running' if fake.has_result or fake.boot_error else 'shutting-down'
             fake.state_reason = {'Code': 'Server.SpotInstanceTermination'}
             run = gate.GateRun(tuple(gate.GateJobResult('fixture', path.name, status, 1, '') for _, path in self.modules), 1, 1)
             row: dict[str, object] = {key: request[key] for key in ('attempt', 'commit', 'tree')}
             row.update(host='fixture-guest', verdict='pass' if run.passed else 'fail', gate=gate_box.encode_run(run), gate_s=1,
                 record=gate_box.completion_record(run, ledger.text(request, 'attempt'), ledger.text(request, 'commit'),
                     ledger.text(request, 'tree'), 'fixture-guest', now, now + 1, ledger.text(request, 'mode')))
+            if failed_box and log_error:
+                fake.has_log = False
+                row['log_error'] = log_error
             fake.result = row
             worker = cloud_gate.GateWorker(AwsCli('fixture-scaler', regions[0], 1, execute=fake), book,
                 self.settings, sidecar, clock=lambda: now)
@@ -2471,18 +2492,26 @@ class CloudRouteTests(CostFixture):
 
     def test_spot_interruption_retries_the_next_zone_then_succeeds(self) -> None:
         self.assertGreater(cloud_gate.settings().whole('spot_interruption_retries'), 0)
-        outcome, folders, fakes = self.run_spot_route(1)
-        self.assertIsInstance(outcome, cloud_gate.CloudCompleted)
-        self.assertEqual(len(folders), 2)
-        first = cloud_gate.read(folders[0] / 'launch.json')
-        second = cloud_gate.read(folders[1] / 'launch.json')
-        self.assertEqual(second['variants'], first['variants'])
-        self.assertEqual(second['variant'], ledger.instant(first, 'variant') + 1)
-        self.assertNotEqual(second['zone'], first['zone'])
-        self.assertEqual(second['region'], first['region'])
-        self.assertEqual(len({folder.name for folder in folders}), len(folders))
-        self.assertNotEqual(fakes[0].launches[0]['ClientToken'], fakes[1].launches[0]['ClientToken'])
-        self.assertEqual(self.fallback_rows(), [])
+        for interruptions, box_failures, log_error in ((1, 0, ''), (0, 1, ''), (0, 1, 'The log PUT timed out')):
+            with self.subTest(interruptions=interruptions, box_failures=box_failures, log_error=log_error):
+                fixture = self.retry_fixture() if box_failures else self
+                outcome, folders, fakes = fixture.run_spot_route(
+                    interruptions, box_failures=box_failures, log_error=log_error)
+                self.assertIsInstance(outcome, cloud_gate.CloudCompleted)
+                self.assertEqual(len(folders), 2)
+                first = cloud_gate.read(folders[0] / 'launch.json')
+                second = cloud_gate.read(folders[1] / 'launch.json')
+                self.assertEqual(second['variants'], first['variants'])
+                self.assertEqual(second['variant'], ledger.instant(first, 'variant') + 1)
+                self.assertNotEqual(second['zone'], first['zone'])
+                self.assertEqual(second['region'], first['region'])
+                self.assertEqual(len({folder.name for folder in folders}), len(folders))
+                self.assertNotEqual(fakes[0].launches[0]['ClientToken'], fakes[1].launches[0]['ClientToken'])
+                self.assertEqual(fixture.fallback_rows(), [])
+                if box_failures:
+                    reason = 'The final log upload failed' if log_error else fakes[0].boot_error
+                    self.assertEqual(cloud_gate.read(folders[0] / 'outcome.json'),
+                                     {'status': 'box-failed', 'reason': reason})
 
     def test_spot_interruption_limit_records_one_final_fallback(self) -> None:
         retries = cloud_gate.settings().whole('spot_interruption_retries')
@@ -2500,6 +2529,30 @@ class CloudRouteTests(CostFixture):
         if expected > 2:
             self.assertNotEqual(launches[1]['region'], launches[2]['region'])
 
+        signed_url = 'https://fixture.invalid/gate.log?X-Amz-Signature=fixture'
+        for log_error in ('', f'curl PUT timed out for {signed_url}'):
+            with self.subTest(box_failures=2, log_error=log_error):
+                fixture = self.retry_fixture()
+                outcome, folders, fakes = fixture.run_spot_route(0, box_failures=2, log_error=log_error, crash_after=2)
+                self.assertEqual(len(folders), 2)
+                reason = 'The final log upload failed' if log_error else fakes[-1].boot_error
+                fallback_reason = f'The box failure retry limit is reached: {reason}'
+                self.assertEqual(outcome, cloud_gate.LocalFallback(fallback_reason))
+                for folder in folders:
+                    self.assertEqual(cloud_gate.read(folder / 'outcome.json'), {'status': 'box-failed', 'reason': reason})
+                current = cloud_gate.read(folders[-1].parent / 'current.json')
+                self.assertEqual(current['box_failures'], 2)
+                self.assertEqual(current['spot_interruptions'], 0)
+                rows = fixture.fallback_rows()
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]['reason'], fallback_reason)
+                self.assertNotIn(signed_url, (fixture.state / 'cloud-gate-launches.jsonl').read_text())
+                service = mock.Mock(side_effect=AssertionError('The box failure retry limit is reached'))
+                resumed = cloud_gate.run(fixture.repo, mode=gate.SuiteMode.MERGE_GATE, full=True,
+                    module_time_limit_s=cloud_gate.settings().number('module_time_limit_s'), service=service)
+                self.assertEqual(resumed, outcome)
+                service.assert_not_called()
+
     def test_spot_interruption_without_another_choice_falls_back(self) -> None:
         outcome, folders, _ = self.run_spot_route(1, one_choice=True)
         self.assertEqual(len(folders), 1)
@@ -2514,6 +2567,19 @@ class CloudRouteTests(CostFixture):
         self.assertIsInstance(outcome, cloud_gate.LocalFallback)
         assert isinstance(outcome, cloud_gate.LocalFallback)
         self.assertIn(f'Spot interruption on {expected} attempts', outcome.reason)
+
+        with self.subTest(box_failures=1, interruptions=1):
+            fixture = self.retry_fixture()
+            path = fixture.root / 'cloud_gate.conf'
+            _ = path.write_text(re.sub(r'(?m)^spot_interruption_retries=.*$', 'spot_interruption_retries=0',
+                                       path.read_text()))
+            outcome, folders, _ = fixture.run_spot_route(1, box_failures=1)
+            self.assertEqual(len(folders), 2)
+            self.assertEqual(outcome, cloud_gate.LocalFallback(
+                'Spot interruption on 1 attempts; The Spot interruption retry limit is reached'))
+            current = cloud_gate.read(folders[-1].parent / 'current.json')
+            self.assertEqual(current['box_failures'], 1)
+            self.assertEqual(current['spot_interruptions'], 1)
 
     def test_spot_retry_checks_the_spend_limit_again(self) -> None:
         outcome, folders, fakes = self.run_spot_route(1, limit_after_first=True)
