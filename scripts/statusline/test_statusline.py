@@ -37,7 +37,6 @@ from scripts.review_links import for_you
 from scripts.statusline import adhoc_items, assignment, counts_row, rebuild_row, statusline_rows
 
 PROGRAM = Path(__file__).with_name("statusline.jq")
-SHIPPED_COLORS = PROGRAM.parents[2] / "config/statusline.conf"
 CONSOLE_HOST_SHELL = "uname() { echo Linux; }; "
 USER_ZONE = ZoneInfo("America/New_York")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -345,6 +344,16 @@ class ColorTests(unittest.TestCase):
                 field = status_lines({}, colors=f"account.claude1={value}\n")[1].split(" | ")[0]
                 self.assertRegex(field, r"^\x1b\[[0-9;]+mclaude1\x1b\[0m$")
 
+    def assert_worker_color_renders(self, colors: Path | str) -> None:
+        line = status_lines({"session_id": WORKER.current_session}, colors=colors,
+                            staff_text=staff_text(WORKER))[0]
+        self.assertRegex(line.split(" | ", 1)[0], r"^\x1b\[[0-9;]+mworker\x1b\[0m$")
+
+    def test_worker_color_must_render(self) -> None:
+        self.assert_worker_color_renders(self.colors)
+        with self.assertRaises(AssertionError):
+            self.assert_worker_color_renders("role.worker=invalid-color\n")
+
     def test_token_thresholds_use_the_unrounded_window_percentage(self) -> None:
         for tokens, code in ((79_000, 92), (79_999, 92), (80_000, 93),
                              (89_000, 93), (89_999, 93), (90_000, 91)):
@@ -435,8 +444,8 @@ class ColorTests(unittest.TestCase):
                                      + "\x1b[92m\x1b[1m130\x1b[22m efficiency\x1b[0m")
 
 
-    def test_shipped_colors_parse_without_pinning_their_values(self) -> None:
-        self.assertTrue(conf.read(SHIPPED_COLORS).values())
+    def test_fixture_color_config_parses(self) -> None:
+        self.assertTrue(conf.read(self.colors).values())
 
     def test_account_palette_has_distinct_hues(self) -> None:
         eligible = [color for color in new_account.STATUSLINE_PALETTE
@@ -457,10 +466,10 @@ class ForYouStatusTests(unittest.TestCase):
         for rows, failures, expected in (((row,), (), "1"), ((), (), "0"),
                                           ((row,), (for_you.UnavailableSource("fixture", "Failed."),), "unavailable")):
             with self.subTest(expected=expected), patch.object(for_you, "read", return_value=for_you.ForYouSnapshot(rows, failures)) as read:
-                self.assertEqual(statusline_rows.global_action_count(), expected)
+                self.assertEqual(for_you.global_action_count(), expected)
                 self.assertEqual(read.call_count, 1)
         with patch.object(for_you, "read", side_effect=OSError("Fixture read failed.")):
-            self.assertEqual(statusline_rows.global_action_count(), "unavailable")
+            self.assertEqual(for_you.global_action_count(), "unavailable")
 
     def test_mac_default_uses_the_console_peers_tailscale_address(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -471,8 +480,8 @@ class ForYouStatusTests(unittest.TestCase):
             connection = Mock(getresponse=Mock(return_value=response))
             with (patch.dict(os.environ, {"CONF_DIR": directory}, clear=True),
                   patch.object(subprocess, "check_output", return_value="100.64.0.42\n") as address,
-                  patch.object(statusline_rows, "HTTPConnection", return_value=connection) as connect):
-                self.assertEqual(statusline_rows.console_action_count(), "3")
+                  patch.object(for_you, "HTTPConnection", return_value=connection) as connect):
+                self.assertEqual(for_you.console_action_count(), "3")
                 connect.assert_called_once_with("100.64.0.42", 8765, timeout=2)
                 address.assert_called_once_with(
                     ["tailscale", "ip", "-4", "fixture-console"], text=True, stderr=subprocess.DEVNULL, timeout=2)
@@ -527,6 +536,34 @@ class ForYouStatusTests(unittest.TestCase):
             self.assertEqual(requests, ["/console/for-you.json?view=count"])
             self.assertEqual(unavailable.stdout.splitlines()[-1], "For you: Unavailable")
             self.assertFalse((home / ".local/state/for-you").exists())
+
+    def test_mac_refreshes_a_cache_that_expires_during_the_console_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "statusline.conf"
+            cache = root / "rebuild-cache"
+            _ = config.write_text(f"rebuild.cache={cache}\n", encoding="utf-8")
+            _ = cache.write_text("\n9999999999\n", encoding="utf-8")
+
+            def console_count() -> str:
+                _ = cache.write_text("\n0\n", encoding="utf-8")
+                return "3"
+
+            with (patch.dict(os.environ, {"HOME": directory, "STAFF_FILE": os.devnull,
+                                         "REBUILD_NEEDS_DIR": str(root / "needs")}),
+                  patch.object(sys, "argv", ["statusline_rows.py", "--for-you-console", "-r"]),
+                  patch.object(sys, "stdin", io.StringIO("{}")),
+                  patch.object(rebuild_row, "DEFAULT_CONFIG", config),
+                  patch.object(for_you, "console_action_count", side_effect=console_count) as request,
+                  patch.object(subprocess, "Popen") as refresh,
+                  patch.object(os, "execvp") as render):
+                statusline_rows.main()
+            request.assert_called_once_with()
+            refresh.assert_called_once()
+            self.assertEqual(refresh.call_args.args[0][-3:], ["refresh", "--config", str(config)])
+            render.assert_called_once()
+            arguments = cast(list[str], render.call_args.args[1])
+            self.assertEqual(arguments[arguments.index("for_you") + 1], "3")
 
     def test_review_and_action_rows_have_separate_counts(self) -> None:
         lines = status_lines({"session_id": "sid"}, counts="sid Review: 1 question, 2 changes, 1 investigation",
@@ -1447,7 +1484,7 @@ class CountsRowTests(ConfiguredShellTests):
                        "NOTIFIER_STATE_DIR": str(self.home / ".local/state/notifier"),
                        "SHOWRUNNER_STATE_DIR": str(self.home / ".local/state/showrunner")}
         with patch.dict(os.environ, environment), \
-                patch.object(assignment, "__file__", str(self.runtime / "scripts/statusline/assignment.py")), \
+                patch.object(rebuild_row, "DEFAULT_CONFIG", self.runtime / "config/statusline.conf"), \
                 patch.object(pane_record, "RECORD_DIR", self.home / "pane-records"), \
                 patch.object(counts_row, "write", wraps=counts_row.write) as refresh, \
                 patch.object(os, "execvp") as render, \
@@ -2205,11 +2242,13 @@ class RebuildRowTests(unittest.TestCase):
             config = Path(directory) / "statusline.conf"
             cache = Path(directory) / "cache"
             _ = config.write_text(f"rebuild.cache={cache}\n", encoding="utf-8")
-            self.assertEqual(rebuild_row.read(config), rebuild_row.RebuildAnswer((), True))
+            self.assertEqual(rebuild_row.read(config),
+                             rebuild_row.RebuildAnswer((), True, needs=rebuild_row.OpenRebuildNeeds(())))
             for text in ("invalid\n9999999999\n", "rebuild mac\ninvalid\n"):
                 with self.subTest(text=text):
                     _ = cache.write_text(text, encoding="utf-8")
-                    self.assertEqual(rebuild_row.read(config), rebuild_row.RebuildAnswer((), True))
+                    self.assertEqual(rebuild_row.read(config),
+                                     rebuild_row.RebuildAnswer((), True, needs=rebuild_row.OpenRebuildNeeds(())))
 
     def test_stale_cache_keeps_the_answer_for_the_reader_and_command(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

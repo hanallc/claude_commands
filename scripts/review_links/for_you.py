@@ -2,14 +2,19 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from http.client import HTTPConnection, HTTPException
+from ipaddress import IPv4Address
 from pathlib import Path
 from typing import Literal, cast
 
 from scripts.for_you.action import ActionStore
 from scripts.direct import recorder_state
+from scripts.lib import conf
 from scripts.production import staff
 from scripts.rebuild import need
 from scripts.statusline import rebuild_row
@@ -169,13 +174,16 @@ def read(config: Path = rebuild_row.DEFAULT_CONFIG, *,
 
     answer = rebuild if rebuild is not None else rebuild_row.read(config)
     pending: tuple[RebuildRequest, ...] = ()
-    needs_available = answer.needs_failure is None
-    if answer.needs_failure is not None:
-        unavailable.append(UnavailableSource("rebuild needs", answer.needs_failure))
+    needs = answer.needs
+    needs_available = isinstance(needs, rebuild_row.OpenRebuildNeeds)
+    if isinstance(needs, rebuild_row.RebuildNeedsNotRead):
+        unavailable.append(UnavailableSource("rebuild needs", "The open rebuild records have not been read."))
+    elif isinstance(needs, rebuild_row.RebuildNeedsUnavailable):
+        unavailable.append(UnavailableSource("rebuild needs", needs.reason))
     else:
         try:
             pending = tuple(_request(record, names, waiting_work, completed=False)
-                            for summary in answer.needs for record in summary.records)
+                            for summary in needs.machines for record in summary.records)
         except (OSError, ValueError, KeyError, TypeError) as error:
             needs_available = False
             unavailable.append(UnavailableSource("rebuild needs", str(error)))
@@ -231,3 +239,46 @@ def read(config: Path = rebuild_row.DEFAULT_CONFIG, *,
             requests[0].created_at if requests else "", status, "automatic",
             "\n".join(request.evidence for request in completed), requests))
     return ForYouSnapshot(tuple(rows), tuple(unavailable))
+
+
+def global_action_count(rebuild: rebuild_row.RebuildAnswer | None = None) -> str:
+    """Return a complete action count or an explicit unavailable result."""
+    try:
+        count = read(rebuild_row.DEFAULT_CONFIG, rebuild=rebuild).open_count
+    except (OSError, ValueError):
+        return "unavailable"
+    return str(count.value) if isinstance(count, KnownOpenCount) else "unavailable"
+
+
+def console_action_count() -> str:
+    """Read the global count from the console host."""
+    try:
+        host = os.environ.get("REVIEW_LINKS_HOST")
+        if not host:
+            peer = conf.read_or_repository("console").text("for_you.host")
+            address = subprocess.check_output(
+                ["tailscale", "ip", "-4", peer], text=True, stderr=subprocess.DEVNULL, timeout=2)
+            host = str(IPv4Address(address.strip()))
+        port = conf.read_or_repository("review_links").whole("server_port")
+        connection = HTTPConnection(host, port, timeout=2)
+        try:
+            connection.request("GET", "/console/for-you.json?view=count")
+            response = connection.getresponse()
+            if response.status != 200:
+                return "unavailable"
+            payload = cast(object, json.loads(response.read()))
+        finally:
+            connection.close()
+    except (HTTPException, OSError, ValueError, subprocess.SubprocessError):
+        return "unavailable"
+    if isinstance(payload, dict):
+        fields = cast(dict[str, object], payload)
+        count = fields.get("count")
+        if fields.get("available") is True and type(count) is int and count >= 0:
+            return str(count)
+    return "unavailable"
+
+
+def action_count(source: str, rebuild: rebuild_row.RebuildAnswer | None = None) -> str:
+    """Read the action count from its selected source."""
+    return console_action_count() if source == "--for-you-console" else global_action_count(rebuild)

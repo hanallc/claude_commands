@@ -187,6 +187,25 @@ def row(settings: RebuildSettings, expected: ExpectedSystems | NoExpectedSystems
 
 
 @dataclass(frozen=True)
+class RebuildNeedsNotRead:
+    """The open rebuild records have not been read."""
+
+
+@dataclass(frozen=True)
+class OpenRebuildNeeds:
+    """The open rebuild records that were read successfully."""
+
+    machines: tuple[need.MachineNeeds, ...]
+
+
+@dataclass(frozen=True)
+class RebuildNeedsUnavailable:
+    """The open rebuild records could not be read."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
 class RebuildAnswer:
     """The known rebuild machines and whether the cache needs a refresh.
 
@@ -200,9 +219,8 @@ class RebuildAnswer:
     expected: ExpectedSystems | NoExpectedSystems = NoExpectedSystems()
     failure: EvaluationFailure | NoEvaluationFailure = NoEvaluationFailure()
     compared: tuple[str, ...] = ()
-    needs: tuple[need.MachineNeeds, ...] = ()
+    needs: OpenRebuildNeeds | RebuildNeedsNotRead | RebuildNeedsUnavailable = RebuildNeedsNotRead()
     probes: RunningSystemProbes = RunningSystemProbes()
-    needs_failure: str | None = None
 
     def row(self) -> str:
         return ", ".join(f"rebuild {machine}" for machine in self.machines)
@@ -355,8 +373,9 @@ def read(config: Path = DEFAULT_CONFIG, *, clock: Callable[[], float] = time.tim
         needs = tuple(need.read_needs())
         machines = set(answer.machines) | {summary.newest["machine"] for summary in needs}
     except (OSError, ValueError, KeyError, TypeError) as error:
-        return replace(answer, needs_failure=str(error))
-    return replace(answer, machines=tuple(machine for machine in ("natedev", "mac") if machine in machines), needs=needs)
+        return replace(answer, needs=RebuildNeedsUnavailable(str(error)))
+    return replace(answer, machines=tuple(machine for machine in ("natedev", "mac") if machine in machines),
+                   needs=OpenRebuildNeeds(needs))
 
 
 def _read_cache(config: Path, clock: Callable[[], float]) -> RebuildAnswer:
@@ -401,10 +420,25 @@ def _read_cache(config: Path, clock: Callable[[], float]) -> RebuildAnswer:
         return RebuildAnswer((), True)
 
 
+def _watched_source(path: Path) -> Path:
+    """The path itself, or for one that does not exist yet its nearest folder that does."""
+    while not path.exists() and path.parent != path:
+        path = path.parent
+    return path
+
+
+def write_status_cache(cache: Path, line: str, due: str, sources: list[Path], began: int, details: str = "") -> None:
+    """Replace the cache with the answer, deadline, source paths, and optional result details."""
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    scratch = cache.with_name(f".{cache.name}.{os.getpid()}")
+    named = dict.fromkeys(str(_watched_source(path)) for path in sources)
+    _ = scratch.write_text("\n".join([line, due, *named, *([details] if details else [])]) + "\n", encoding="utf-8")
+    os.utime(scratch, ns=(began, began))
+    _ = scratch.replace(cache)
+
+
 def write(config: Path, run: CommandRunner = command_output, *, clock: Callable[[], float] = time.time) -> None:
     """Refresh the configured cache without concurrent evaluations."""
-    from scripts.statusline import counts_row
-
     try:
         cache = cache_path(config)
     except (OSError, ValueError, KeyError):
@@ -447,7 +481,7 @@ def write(config: Path, run: CommandRunner = command_output, *, clock: Callable[
             fields = cast(dict[str, object], json.loads(details))
             fields["running_system_probes"] = {"natedev": probes.natedev, "mac": probes.mac}
             details = json.dumps(fields)
-        counts_row.write_cache(cache, line, due, [config], began, details)
+        write_status_cache(cache, line, due, [config], began, details)
 
 
 def main(argv: list[str]) -> int:
