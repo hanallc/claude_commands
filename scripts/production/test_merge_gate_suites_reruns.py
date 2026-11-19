@@ -172,9 +172,13 @@ class MergeGateRerunsTests(GateSuitesFixture):
         self.environment["BUILDLOG_SCOPE"] = "1"
         output = io.StringIO()
         first_results: list[merge_gate.GateJobResult] = []
+        reservation_scopes: set[Path] = set()
         finish = merge_gate.finish_gate_job
 
         def record_finish(job: merge_gate.RunningGateJob, status: int) -> merge_gate.GateJobResult:
+            [reservation] = self.admission.server.reservations.values()
+            sidecar = Path(reservation.sidecar)
+            reservation_scopes.add(Path(sidecar.read_text().strip()))
             result = finish(job, status)
             first_results.append(result)
             return result
@@ -208,10 +212,14 @@ class MergeGateRerunsTests(GateSuitesFixture):
                 self.assertEqual(history[key], [first.seconds])
         scopes = [call for call in self.calls() if call["tool"] == "systemd-run"]
         self.assertEqual(len(scopes), self.module_count + 3)
-        flags = ["--user", "--scope", "--quiet", "--collect", "--expand-environment=no", "--slice=builds.slice", "--"]
-        self.assertEqual(scopes[0]["args"], [*flags, "true"])
+        flags = ["--user", "--scope", "--quiet", "--collect", "--expand-environment=no"]
+        self.assertEqual(scopes[0]["args"], [*flags, "--slice=builds.slice", "--", "true"])
+        [scope] = reservation_scopes
+        self.assertEqual(scope.parent, Path(self.environment["BUILDLOG_BUILDS_CGROUP"]))
+        self.assertRegex(scope.name, r"^builds-gate[0-9a-f]{16}\.slice$")
+        module_flags = [*flags, f"--slice={scope.name}", "--"]
         for call in scopes[1:]:
-            self.assertEqual(call["args"][:len(flags)], flags)
+            self.assertEqual(call["args"][:len(module_flags)], module_flags)
         for call in scopes[-2:]:
             self.assertEqual(sum(previous["args"] == call["args"] for previous in scopes), 2)
         self.assertFalse(any("basedpyright" in " ".join(call["args"]) for call in scopes))
