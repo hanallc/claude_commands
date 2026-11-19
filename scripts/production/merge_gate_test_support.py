@@ -40,6 +40,7 @@ from scripts.production.staff_test_support import fixture_member, isolated_staff
 from scripts.production.cli_fixture import invoke_cli
 from scripts.test_times.gate_record import GateRunRecord
 from scripts.buildlog import index
+from scripts.buildlog.store import host_name
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 
@@ -276,6 +277,11 @@ def suites_for_case(case: unittest.TestCase) -> tuple[str, ...]:
     return cast(tuple[str, ...], getattr(method, "gate_test_suites", ("hooks",)))
 
 
+def pin_gate_root(configuration: Path, root: Path) -> None:
+    """Keep the fixture gate on its private tmpfs path."""
+    _ = write_config_fixture(configuration, f"roots.gate={root}\nroots.gate.{host_name()}={root}\n")
+
+
 def wait_for_file(path: Path) -> None:
     wait_until(path.exists, path.parent, timeout=TEST_HANG_GUARD_SECS)
 
@@ -316,7 +322,9 @@ class MergeGateFixture(unittest.TestCase):
 
     @classmethod
     def fixture_configuration(cls, directory: Path) -> dict[str, str]:
-        return config_environment(directory)
+        environment = config_environment(directory)
+        pin_gate_root(directory / "build_folders.conf", Path("/dev/shm"))
+        return environment
 
     @classmethod
     @override
@@ -366,8 +374,8 @@ class MergeGateFixture(unittest.TestCase):
             # to the seed's original path, with its private origin and refs.
             _ = shutil.copytree(self.fixture_seeds[folders].snapshot, self.fixture_root)
         self.bind_fixture(self.fixture_root)
-        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_folders.conf",
-                                 f"roots.gate={self.fixture_root.parent}\n")
+        pin_gate_root(Path(self.environment["CONF_DIR"]) / "build_folders.conf", self.fixture_root.parent)
+        pin_gate_root(self.root / "build_folders.conf", self.fixture_root.parent)
         self.configure_gate("program_first_peak_gib.merge-gate=4\n")
         seed = self.fixture_seeds[folders]
         self.base, self.checkpoint = seed.base, seed.checkpoint
@@ -447,6 +455,8 @@ class MergeGateFixture(unittest.TestCase):
             "MERGE_GATE_UV": str(self.bin / "uv"),
             "MERGE_GATE_STATE_DIR": str(self.state / "runner"),
             "MERGE_GATE_PASSED_DIR": str(self.state / "passes"),
+            "BUILD_TARGETS_STATE_DIR": str(self.state / "build-targets"),
+            "MAC_TEST_STATE_DIR": str(self.state / "mac-test"),
             "MERGE_GATE_STYLE_SYNC": str(self.bin / "style_sync.py"),
             "BUILDLOG_SCOPE": "0",
             "BUILD_HOLD_DIR": str(self.root / "holders"),

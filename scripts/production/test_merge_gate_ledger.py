@@ -10,6 +10,7 @@ import io
 import os
 from pathlib import Path
 import select
+import shlex
 import sys
 import time
 from types import SimpleNamespace
@@ -66,6 +67,8 @@ INDEX_SPILL_PAGES=65536
 INDEX_TOUCH_MINUTES=60
 """,
     "codex_daemon": "# range: 0.001..\ntimeout_seconds=5\n",
+    "mac_gate": "admission_client_command=" + shlex.join((sys.executable, "-c", "raise SystemExit(125)"))
+                + "\n# range: 5e-324..\nterminate_grace_seconds=3\n",
     "merge_gate": """# range: 1..
 GATE_TIME_LIMIT_FACTOR=100
 # whole: 0..
@@ -262,13 +265,12 @@ class LedgerJobCompletion:
         if not self.jobs:
             return
         with ExitStack() as descriptors:
-            children: list[int] = []
+            waiter = select.poll()
             for job in self.jobs:
                 descriptor = os.pidfd_open(job.process.pid)
                 _ = descriptors.callback(os.close, descriptor)
-                children.append(descriptor)
-            ready, _, _ = select.select(children, [], [], TEST_HANG_GUARD_SECS)
-            if not ready:
+                waiter.register(descriptor, select.POLLIN)
+            if not waiter.poll(TEST_HANG_GUARD_SECS * 1000):
                 raise TimeoutError("a ledger fixture job did not exit")
 
 
@@ -293,12 +295,12 @@ class MergeGateLedgerTests(MergeGateFixture):
     def bind_fixture(self, root: Path) -> None:
         super().bind_fixture(root)
         self.environment["MERGE_GATE_PYTHON"] = sys.executable
-        pin_ledger_settings(root, root, root.parent)
 
     @override
     def restore_fixture(self, folders: tuple[str, ...]) -> None:
         super().restore_fixture(folders)
         # Keep the host override keys from the shared config templates out of the test.
+        pin_ledger_settings(self.root, self.root, self.root.parent)
         pin_ledger_settings(self.root / "config", self.root, self.root.parent)
 
     @override
@@ -325,6 +327,7 @@ class MergeGateLedgerTests(MergeGateFixture):
     def test_clean_pass_records_tree_commit_host_time_checkout_suites_and_source(self) -> None:
         result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.state / "build-targets/aws/cloud-gate-launches.jsonl").is_file())
         self.assert_all_modules_started()
         record, = self.pass_records()
         self.assertEqual(record["tree"], self.git(self.checkout, "rev-parse", "HEAD^{tree}"))
