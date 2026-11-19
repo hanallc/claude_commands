@@ -2031,7 +2031,13 @@ The snapshot decoder restores a missing caller name from the matching reservatio
 If the reservation has no usable name, the decoder looks up the fixed staff ID in the supplied staff snapshot.
 If the decoder finds no usable name, it supplies the label `unregistered session`.
 The feed uses separate rules for caller names, step labels, and CI labels.
-Wait lines prefer the unit and normalize the names in older replies.
+The client and service use the same formatter for wait names.
+The formatter selects the unit, caller, or folder name in that order.
+It adds the step when the step name is usable.
+The client also accepts the head name from older replies.
+The service and feed require a usable value for every field in a CI label template.
+An incomplete CI template uses the generic CI label.
+The feed omits unusable parts from step titles.
 The wait subject joins the usable repository and step names. It shows `build` when both names are unusable.
 The Builds page uses the names and hover titles from the feed.
 A continuation within the slot bypasses order, spacing, and pressure.

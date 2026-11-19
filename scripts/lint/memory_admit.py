@@ -1659,7 +1659,7 @@ def reservation_stem(directory: Path, pid: int, start_time: str, admitted_ns: in
 
 
 def waiter_unit_name(identity: WaiterIdentity) -> str:
-    return codec.select_queue_name(identity.get("unit"), identity["session_name"], Path(identity["folder"]).name)
+    return codec.wait_line_name(identity.get("unit", ""), identity["session_name"], identity["folder"], "")
 
 
 class QueueIdentityReader:

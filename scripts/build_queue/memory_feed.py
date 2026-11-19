@@ -47,7 +47,7 @@ from scripts.build_queue import cloud_progress, placement
 from scripts.build_targets import targets
 from scripts.build_queue.queue_evidence import ci_amount as ci_bytes_text, room_text, service_activity_text, step_labels
 from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, queue_view
-from scripts.build_queue.queue_lines import age, plain, step_owner_name, step_text
+from scripts.build_queue.queue_lines import age, blocking_step_name, plain, step_owner_name, step_text
 from scripts.build_queue.queue_view import reason_phrase
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib.build_steps import (GATE_PROGRAMS, OTHER_COMMAND, RECORDED_STEP_NAMES, CopiesRunCommand,
@@ -63,7 +63,6 @@ from scripts.build_queue.memory_files import DATA_NAME, PAGE_NAME, PAGE_SOURCE, 
 from scripts.build_targets import target_config
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
-from scripts.message.owner_role import OwnerRole
 from scripts.production import staff
 from scripts.lib import build_slots, conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -537,14 +536,9 @@ def page_owner_labels(identity: unit_labels.UnitLabels, *, ci_label: str = "",
 
 
 def ci_step_label(runner: str, job: str) -> str:
-    """Omit missing fields from the configured CI label."""
+    """Use the configured CI label when all of its fields are usable."""
     template = conf.read_or_repository("build_admission").text("ci_label")
-    try:
-        label = template.format(runner=runner, job=job)
-    except (ValueError, KeyError, AttributeError, IndexError):
-        label = f"{QueueKind.CI.value} · {runner} · {job}"
-    return codec.select_queue_name(
-        " · ".join(shown for part in label.split(" · ") if (shown := public_queue_text(part))), QueueKind.CI.value)
+    return codec.ci_label(template, runner, job)
 
 
 class SlotPlace(TypedDict):
@@ -693,9 +687,11 @@ def current_step_parts(step: admission_records.RunningStep | admission_records.W
                        labels: Mapping[str, unit_labels.UnitLabels]) -> list[staff_names.NamePart]:
     """Keep the recorded owner separate from the step text."""
     owner = step_owner_name(step, labels)
-    shown_owner, shown_step = " ".join(owner.split()), " ".join(names.shown(step.step).split())
-    return staff_names.text_parts(staff_names.StaffReference(shown_owner) if owner == identity.unit else shown_owner,
-                                 " " if shown_owner and shown_step else "", shown_step)
+    shown_step = public_queue_text(names.shown(step.step))
+    if not (owner or shown_step):
+        return staff_names.text_parts(codec.UNKNOWN_CALLER)
+    owner_part = staff_names.StaffReference(owner) if owner == identity.unit else owner
+    return staff_names.text_parts(owner_part, " " if owner and shown_step else "", shown_step)
 
 
 def step_name_parts(step: admission_records.RunningStep | admission_records.WaitingStep,
@@ -703,16 +699,7 @@ def step_name_parts(step: admission_records.RunningStep | admission_records.Wait
                     ci: bool = False) -> list[staff_names.NamePart]:
     """Mark the owner field before the feed creates its step label."""
     current = current_step_parts(step, names, identity, labels)
-    return queue_owner_parts(names, step.step, identity.unit, identity.role, ci=ci, current=current)
-
-
-def queue_owner_parts(names: StepNames, step: str, unit: str, role: OwnerRole, *,
-                      ci: bool = False, current: Sequence[staff_names.NamePart] = ()) -> list[staff_names.NamePart]:
-    """Use the recorded name parts if the owner template is invalid."""
-    try:
-        return staff_names.owned_step_parts(names, step, public_queue_text(unit), role, ci=ci, current=current)
-    except (ValueError, KeyError, AttributeError, IndexError):
-        return list(current)
+    return staff_names.owned_step_parts(names, step.step, identity.unit, identity.role, ci=ci, current=current)
 
 
 def step_key(row: RunRow | WaitRow | MacBuildRow | MacReadingUnavailableRow | CloudWorkRow) -> str:
@@ -1387,7 +1374,7 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
     name = (shown_step.for_owner(names, verb, identity.unit, identity.role, prefix=package or build.repository, ci=ci)
             if isinstance(shown_step, QueueRowName) else title_step)
     display_name = name.with_mac_status(shown_gate)
-    parts = queue_owner_parts(names, verb, identity.unit, identity.role,
+    parts = staff_names.owned_step_parts(names, verb, identity.unit, identity.role,
         ci=ci, current=staff_names.text_parts(name))
     parts.extend(staff_names.text_parts(" · " + shown_gate if shown_gate else ""))
     unit = staff_unit(identity, missing="—")
@@ -1759,9 +1746,10 @@ class SwapReadingPass:
             if isinstance(counter, int):
                 self.add(category, SWAP_NAMES[category], path, shown, counter, category=category)
         elif path.parent.name in ("app.slice", "background.slice") and not nested_owner:
-            app = program_name(path)
             if isinstance(counter, int):
-                self.add(str(path), SWAP_NAMES["apps"].format(app=app), path, shown, counter)
+                app = program_name(path)
+                name = codec.select_queue_name(codec.format_queue_name(SWAP_NAMES["apps"], app=app))
+                self.add(str(path), name, path, shown, counter)
         elif children:
             charged = sum(self.visit(child) for child in children)
             if isinstance(counter, int):
@@ -2522,8 +2510,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                        else admission_records.behind_place(cause, waiting))
             if blocker:
                 ahead = waiting[blocker - 1]
-                reason = admission_client.blocking_waiter_text(f"behind #{blocker}",
-                    ahead.session_name, ahead.step, ahead.unit, ahead.need / GIB, fallback_name=cause.head_name)
+                name = blocking_step_name(ahead, fallback_name=cause.head_name)
+                reason = admission_client.blocking_waiter_text(f"behind #{blocker}", name, ahead.need / GIB)
             else:
                 reason = f"behind {codec.select_queue_name(cause.head_name)}"
         else:
@@ -2603,12 +2591,12 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 title_step = display_name = QueueRowName.owner_only(unit, identity.owner_text)
                 parts = staff_names.text_parts(display_name)
                 if current is not None and not public_owner_name(recorded.name, recorded.session_id):
-                    parts = queue_owner_parts(names, step, unit, identity.role, current=parts)
+                    parts = staff_names.owned_step_parts(names, step, unit, identity.role, current=parts)
                     display_name = QueueRowName.owner_only(staff_names.parts_text(parts), title_step)
             else:
                 title_step = build_row_step(step, "", "", "", names, kind=QueueKind.AWS)
                 display_name = title_step.for_owner(names, step, unit, identity.role)
-                parts = queue_owner_parts(names, step, unit, identity.role)
+                parts = staff_names.owned_step_parts(names, step, unit, identity.role)
                 if title_step == QueueKind.AWS.value and isinstance(program := QueueRowName.recorded_program(step), QueueRowName):
                     title_step = program
                     display_name = QueueRowName.owner_only(staff_names.parts_text(parts), program)

@@ -32,6 +32,20 @@ class StepNameTests(unittest.TestCase):
                 labels = {"fixture": UnitLabels("caller", "production", staff_unit)}
                 self.assertEqual(step_text(step, names, labels=labels), expected)
 
+    def test_step_text_checks_the_configured_step_and_owner_parts(self) -> None:
+        from scripts.build_queue import admission_records as records
+        from scripts.lib.build_steps import StepNames
+
+        step = records.WaitingStep(123, "", "", "check", "", 0, 1, records.ReadyForAdmission())
+        for owner, shown, expected in (
+            ("panes", "type check", "panes type check"),
+            ("panes", "—", "panes"),
+            ("—", "type check", "type check"),
+            ("—", "—", "unregistered session"),
+        ):
+            with self.subTest(owner=owner, shown=shown):
+                self.assertEqual(step_text(replace(step, unit=owner), StepNames({"names.check": shown})), expected)
+
     def test_recorded_units_replace_repository_names_in_step_text_and_prose(self) -> None:
         from scripts.build_queue import admission_records as records
         from scripts.lib.build_steps import StepNames

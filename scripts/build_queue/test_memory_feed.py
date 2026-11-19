@@ -43,7 +43,7 @@ from scripts.lint import test_memory_admit as memory_tests
 from scripts.lib import atomic_file, conf, test_hang_guard
 from scripts.review_links import console_theme, page_frame, review_link, test_serve
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
-from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, command_job, read_step_names
+from scripts.lib.build_steps import OTHER_COMMAND, RECORDED_STEP_NAMES, RECORDED_VERBS, StepNames, command_job, read_step_names
 from scripts.message import unit_labels
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
@@ -791,8 +791,31 @@ process.stdout.write(JSON.stringify({
         for row, pid in ((run, 50), (wait, 200)):
             with self.subTest(pid=pid):
                 self.assertEqual((row["pid"], row["name"]), (pid, "CI nextest"))
-                self.assertEqual(row.get("ci_label"), "Fixture CI · hana-linux-2")
-                self.assertEqual(row["title"], {"unit": "", "step": "Fixture CI · hana-linux-2"})
+                self.assertEqual(row.get("ci_label"), "hana CI")
+                self.assertEqual(row["title"], {"unit": "", "step": "hana CI"})
+
+    def test_ci_feed_rejects_incomplete_label_templates(self) -> None:
+        for template, valid in (("CI {runner} {job}", "CI hana-linux-2 compile"),
+                                ("CI {runner} ({job})", "CI hana-linux-2 (compile)")):
+            _ = (self.root / "build_admission.conf").write_text(f"ci_label={template}\n")
+            for job, expected in (("compile", valid), ("—", "hana CI"), ("", "hana CI"), ("  ", "hana CI")):
+                with self.subTest(template=template, job=job):
+                    self.assertEqual(memory_feed.ci_step_label("hana-linux-2", job), expected)
+
+    def test_current_step_parts_check_the_configured_step_and_owner(self) -> None:
+        step = reservation_reading().view.running[0]
+        for unit, shown, expected in (("panes", "tests", "panes tests"),
+                                      ("panes", "—", "panes"),
+                                      ("—", "tests", "tests"),
+                                      ("—", "—", "unregistered session")):
+            with self.subTest(unit=unit, shown=shown):
+                identity = unit_labels.UnitLabels("caller", "", unit)
+                row = replace(step, unit=unit, project="")
+                names = StepNames({f"names.{row.step}": shown})
+                parts = memory_feed.current_step_parts(row, names, identity, {row.session_id: identity})
+                self.assertEqual(staff_names.parts_text(parts), expected)
+                self.assertEqual([part["text"] for part in parts if part["kind"] == "staff"],
+                                 ["panes"] if unit == "panes" else [])
 
     def test_mac_work_uses_the_caller_after_an_unknown_owner(self) -> None:
         build = queue_view.MacBuild(90082, "/private/hana", 0, "cargo nextest run", "hana")
@@ -1372,6 +1395,35 @@ process.stdout.write(JSON.stringify({
         self.assertTrue(all(count == 1 for count in reads.values()))
         self.assertNotIn(agent / "memory.swap.current", reads)
 
+    def test_swap_app_titles_check_the_program_name(self) -> None:
+        self.host_swap(2 * admission_records.GIB, admission_records.GIB)
+        _ = self.cgroup("app.slice", admission_records.GIB)
+        _ = self.cgroup("app.slice/app-test.scope", admission_records.GIB)
+        for program, expected in (("browser", "other apps: browser"), ("—", "unregistered session"),
+                                  (" ", "unregistered session")):
+            with self.subTest(program=program), mock.patch.object(memory_feed, "program_name", return_value=program):
+                reading = memory_feed.read_swap((), {}, 6, read_step_names())
+                assert isinstance(reading, memory_feed.SwapReading)
+                self.assertEqual([row["name"] for row in reading.rows if row["kind"] == "owner"], [expected])
+
+    def test_swap_step_titles_check_the_configured_step_and_owner(self) -> None:
+        self.host_swap(2 * admission_records.GIB, admission_records.GIB)
+        _ = self.cgroup("builds.slice", admission_records.GIB)
+        scope = self.cgroup("builds.slice/test.scope", admission_records.GIB)
+        step = reservation_reading().view.running[0]
+        memory = step.measured
+        assert isinstance(memory, admission_records.MeasuredMemory)
+        step = replace(step, measured=replace(memory, anonymous_source=admission_records.ScopeSource(scope, frozenset())))
+        for unit, shown, expected in (("widget", "tests", "widget tests"),
+                                      ("widget", "—", "widget"),
+                                      ("—", "tests", "tests"),
+                                      ("—", "—", "unregistered session")):
+            with self.subTest(unit=unit, shown=shown):
+                row = replace(step, unit="", project=unit)
+                reading = memory_feed.read_swap((row,), {}, 6, StepNames({f"names.{row.step}": shown}))
+                assert isinstance(reading, memory_feed.SwapReading)
+                self.assertEqual([item["name"] for item in reading.rows if item["kind"] == "owner"], [expected])
+
     def owner_swap_reading(self, owner: unit_labels.UnitLabels) -> memory_feed.SwapReading:
         """Read a real swap counter with its recorded staff owner."""
         self.host_swap(2 * admission_records.GIB, admission_records.GIB)
@@ -1753,7 +1805,7 @@ process.stdout.write(JSON.stringify({
             (admission_records.StartSpacingWait(200_010), "another step just started; the queue waits a few seconds between starts", False),
             (placement.CargoFolderWait(), placement.CARGO_FOLDER_WAIT_REASON, False),
             (admission_records.BehindHead("first", 1, "head-session"), "behind", False),
-            (admission_records.BehindHead("compiler", 2, "second-session"), "behind #2 · second · nextest · compiler", True),
+            (admission_records.BehindHead("compiler", 2, "second-session"), "behind #2 · compiler · nextest", True),
         )
         for reason, expected, has_blocker in reasons:
             with self.subTest(reason=reason):
@@ -2760,7 +2812,7 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(len({row.get("key") for row in (*running, *waiting)}), 8)
                 self.assertEqual(page["reserved"], 11.0)
                 self.assertEqual((running[1]["name"], running[1].get("ci_label")),
-                                 ("CI nextest", "hana CI · hana-linux-2"))
+                                 ("CI nextest", "hana CI"))
                 self.assertEqual((running[2].get("caller"), running[2].get("owner_text")), (held, held))
                 for row in (running[0], *waiting):
                     with self.subTest(pid=row["pid"]):
@@ -2841,8 +2893,8 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(mac["title"]["step"], "hana CI · hana-mac-1 · test-hana")
         self.assertEqual(mac.get("showrunner"), "")
         self.assertEqual(mac["unit"], "")
-        for runner, job, label in (("", "", "hana CI"), ("hana-mac-1", "", "hana CI · hana-mac-1"),
-                                   ("", "test-hana", "hana CI · test-hana")):
+        for runner, job, label in (("", "", "hana CI"), ("hana-mac-1", "", "hana CI"),
+                                   ("", "test-hana", "hana CI")):
             with self.subTest(runner=runner, job=job):
                 build = queue_view.MacBuild(90082, "/private/hana", 0, "cargo nextest run", "hana",
                     origin=queue_view.MacBuildOrigin.CI, ci_runner=runner, ci_job=job)
@@ -2971,6 +3023,24 @@ process.stdout.write(JSON.stringify({
             for table, pid in ((page["walk"], 700001), (page["waiters"], 700002)):
                 row, = [row for row in table if row.get("kind") == "cloud"]
                 self.assertEqual((row["pid"], row["name"], row.get("caller")), (pid, "targeted for panes", "panes"))
+
+    def test_cloud_owner_templates_check_the_configured_step_and_unit(self) -> None:
+        config = self.root / "build_steps.conf"
+        original = config.read_text()
+        for unit, showrunner, shown, expected in (("panes", "sdlc", "selected tests", "panes selected tests"),
+                                                  ("panes", "sdlc", "—", "panes"),
+                                                  ("—", "sdlc", "selected tests", "sdlc"),
+                                                  ("—", "—", "—", "unregistered session")):
+            with self.subTest(unit=unit, showrunner=showrunner, shown=shown):
+                _ = config.write_text(original.replace("owned.targeted-test={unit} targeted",
+                    "owned.targeted-test={unit} {step}").replace("names.targeted-test=targeted test",
+                    f"names.targeted-test={shown}"))
+                owner = unit_labels.UnitLabels("", showrunner, unit, unit_labels.OwnerRole.UNIT)
+                identity = wire.Identity("old-cloud", "", "targeted-test", "")
+                page = self.cloud_owner_page(identity.step, owner, identity=identity)
+                for table in (page["walk"], page["waiters"]):
+                    row, = [row for row in table if row.get("kind") == "cloud"]
+                    self.assertEqual((row["name"], row["title"]["step"]), (expected, expected))
 
     def test_unusable_cloud_templates_keep_the_owner_name(self) -> None:
         director = unit_labels.make_labels("panes", unit_labels.UnderShowrunner("sdlc", "sdlc", ""),

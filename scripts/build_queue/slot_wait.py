@@ -13,11 +13,11 @@ import re
 import subprocess
 
 from scripts.lib import conf
-from scripts.lib.build_steps import (INTERPRETER, LONG_VALUE_OPTIONS, RAW_ID, RECORDED_STEP_NAMES, RECORDED_VERBS,
+from scripts.lib.build_steps import (INTERPRETER, LONG_VALUE_OPTIONS, RECORDED_STEP_NAMES, RECORDED_VERBS,
                                      SHORT_OWNER_STEPS, VERIFY_VERBS, StepJob, StepNames, VerifyCommand, command_job,
                                      command_script, is_recorded_step, queue_identifier, script_file, verify_command)
 from scripts.build_queue import admission_wire as wire
-from scripts.build_queue.snapshot_codec import public_queue_text as public_queue_text, select_queue_name
+from scripts.build_queue.snapshot_codec import RAW_ID, public_queue_text as public_queue_text, select_queue_name
 from scripts.message.owner_role import OwnerRole
 
 

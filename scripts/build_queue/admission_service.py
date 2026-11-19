@@ -1322,10 +1322,8 @@ class ServiceEstimatedAdmission(wire.AdmitRequest):
 def wait_line_name(waiting: WaitingAdmission) -> str:
     """Name a queued build from its recorded owner and step."""
     row = waiting.row
-    identity = gate.RecordedQueueIdentities().identity(row["pid"], cast(dict[str, object], cast(object, row)))
-    name = gate.waiter_unit_name(identity)
-    step = codec.public_queue_text(identity["step"])
-    return f"{name} · {step}" if step else name
+    return codec.wait_line_name(row.get("unit", ""), row.get("session_name", ""),
+                                      row.get("folder", ""), row.get("step", ""))
 
 
 def peer_uid(connection: Connection | NoConnection) -> int:
@@ -4114,7 +4112,7 @@ done
             share_percent=configuration.peak_history_share_percent,
             build_history_generation=lambda: records.BuildHistoryGeneration(self.build_history_generation),
             location=step_estimator.RepositoryLocation(request.repository, request.worktree))
-        label = config.ci_label.format(runner=request.runner, job=request.job)
+        label = codec.ci_label(config.ci_label, request.runner, request.job)
         identity = wire.Identity("", label, estimate.profile.step, request.worktree)
         return ServiceEstimatedAdmission(request.episode, request.owner, request.argv, request.cwd, request.since,
             request.sidecar, identity, records.NoCallRecord(), request.test_width, estimate.profile,

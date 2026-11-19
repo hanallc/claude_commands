@@ -2313,6 +2313,21 @@ class RunnerAuthorizationTests(unittest.TestCase):
             self.assertEqual(fixture.server.caller_versions[records.run_owner(os.getpid(), str(start))], "allowed-version")
             self.assertEqual(service.read_state(fixture.state_dir).caller_versions, fixture.server.caller_versions)
 
+    def test_ci_estimates_reject_incomplete_label_templates(self) -> None:
+        with AdmissionFixture() as fixture:
+            config = fixture.root / "build_admission.conf"
+            for template, valid in (("CI {runner} {job}", "CI runner-a compile"),
+                                    ("CI {runner} ({job})", "CI runner-a (compile)")):
+                write_memory_config(config, ci_label=template)
+                for job, expected in (("compile", valid), ("—", "hana CI"), ("", "hana CI"), ("  ", "hana CI")):
+                    with self.subTest(template=template, job=job):
+                        fixture.allow_next_start()
+                        request = fixture.service_request(job=job)
+                        grant = only_admitted(fixture.connect(request).replies())
+                        record = fixture.server.reservations[request.episode]
+                        fixture.release(grant)
+                        self.assertEqual(record.queue_waiter.get("session_name"), expected)
+
     def test_invalid_ci_label_uses_committed_configuration_and_keeps_serving(self) -> None:
         with AdmissionFixture() as fixture:
             config = fixture.root / "build_admission.conf"

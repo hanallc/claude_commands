@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from types import MappingProxyType
 
-from scripts.build_queue.snapshot_codec import public_queue_text
+from scripts.build_queue.snapshot_codec import public_queue_text, select_queue_name, wait_line_name
 
 if TYPE_CHECKING:
     from scripts.build_queue.admission_records import RunningStep, WaitingStep
@@ -23,10 +23,6 @@ class Span:
 Line = tuple[Span, ...]
 
 
-def field(text: str) -> str:
-    return " ".join(text.split())
-
-
 def step_owner_name(step: WaitingStep | RunningStep, labels: Mapping[str, UnitLabels]) -> str:
     """Use a recorded unit, a staff unit, or the repository name."""
     identity = labels.get(step.session_id)
@@ -40,10 +36,17 @@ def step_owner_name(step: WaitingStep | RunningStep, labels: Mapping[str, UnitLa
     return public_queue_text(step.project)
 
 
+def blocking_step_name(step: WaitingStep, *, fallback_name: str = "") -> str:
+    """Name the step ahead of a waiting row."""
+    return wait_line_name(step.unit, step.session_name, step.folder, step.step, fallback_name=fallback_name)
+
+
 def step_text(step: WaitingStep | RunningStep, names: StepNames, *,
               labels: Mapping[str, UnitLabels] = NO_UNIT_LABELS) -> str:
     """Show the owner unit with the step's shown name."""
-    return field(f"{step_owner_name(step, labels)} {names.shown(step.step)}")
+    owner = step_owner_name(step, labels)
+    shown = public_queue_text(names.shown(step.step))
+    return select_queue_name(" ".join(part for part in (owner, shown) if part))
 
 
 def age(since: float, now: float) -> int:

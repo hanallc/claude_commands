@@ -201,6 +201,30 @@ class ClientTests(unittest.TestCase):
                     client.WaitOutput()(replace(WAIT, position=2, snapshot=snapshot))
                 self.assertIn(f"head {name} needs 2.0 GiB", output.getvalue().split("; "))
 
+    def test_wait_output_matches_the_service_name_after_reply_decoding(self) -> None:
+        with AdmissionFixture() as fixture:
+            head = fixture.request(need=2 * GIB)
+            waiter: records.Waiter = {"pid": head.owner.pid, "start_time": head.owner.start_time,
+                "since": head.since, "need": 2 * GIB, "session_name": "builder", "unit": "panes",
+                "folder": "/private/widget", "step": "nextest"}
+            service_name = service.wait_line_name(service.WaitingAdmission(head, waiter, service.NO_CONNECTION))
+            self.assertEqual(service_name, "panes · nextest")
+
+            older: records.Waiter = {"pid": head.owner.pid, "start_time": head.owner.start_time,
+                                     "since": head.since, "need": 2 * GIB}
+            for row, label in ((waiter, service_name), (older, "panes")):
+                with self.subTest(row=row):
+                    snapshot = replace(WAIT.snapshot,
+                        decision=replace(WAIT.snapshot.decision, order_hold=records.HeldBehindHead(row)),
+                        head_label=service_name, head_reason=records.BehindHead("panes", head.since, ""))
+                    waiting = replace(WAIT, position=2, text="behind #1", snapshot=snapshot)
+                    decoded = wire.parse_reply(wire.encode_reply(waiting))
+                    assert isinstance(decoded, wire.Wait)
+                    with redirect_stderr(io.StringIO()) as output:
+                        client.WaitOutput()(decoded)
+                    reason, = [part for part in output.getvalue().split("; ") if part.startswith("reason: ")]
+                    self.assertEqual(reason, f"reason: behind #1 · head {label} needs 2.0 GiB")
+
     def test_wait_lines_name_the_head_and_identify_the_current_build(self) -> None:
         for position, label, expected, reason in (
             (2, "hana CI · hana-linux-2 · test", "head hana CI · hana-linux-2 · test needs 12.3 GiB", ""),
@@ -209,7 +233,7 @@ class ClientTests(unittest.TestCase):
             (2, "42 · test", "head 42 · test needs 12.3 GiB", ""),
             (1, "hana CI · hana-linux-2 · test", "this build is the queue head", ""),
             (1, "hana · test", "this build is the queue head", "it edits the merged checkout"),
-            (3, "first · nextest", "behind #2 · second · nextest · compiler", ""),
+            (3, "first · nextest", "behind #2 · compiler · nextest", ""),
         ):
             with self.subTest(position=position, label=label), AdmissionFixture() as fixture:
                 waiting = replace(WAIT, position=position, head=label,

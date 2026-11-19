@@ -8,9 +8,11 @@ from dataclasses import MISSING, fields, is_dataclass
 from enum import Enum, auto
 from functools import lru_cache
 import math
+import re
 from pathlib import Path
+from string import Formatter
 from types import UnionType
-from typing import TYPE_CHECKING, Callable, Literal, NewType, NotRequired, cast, get_args, get_origin, get_type_hints, is_typeddict
+from typing import TYPE_CHECKING, Callable, Literal, NewType, NotRequired, cast, get_args, get_origin, get_type_hints, is_typeddict, override
 
 if TYPE_CHECKING:
     from scripts.production.staff import StaffId, StaffSnapshot
@@ -18,6 +20,8 @@ if TYPE_CHECKING:
 # Literal unions use typing.Union on Python 3.13.
 LITERAL_UNION_ORIGIN = get_origin(Literal[0] | Literal[1])
 UNKNOWN_CALLER = "unregistered session"
+RAW_ID = re.compile(r"(?<![0-9a-f])(?:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{32})(?![0-9a-f])",
+                    re.IGNORECASE)
 
 
 class SnapshotReadPolicy(Enum):
@@ -129,14 +133,47 @@ def public_queue_text(value: object) -> str:
     text = " ".join(value.split())
     if text in ("", "-", "–", "—", "owner not recorded", UNKNOWN_CALLER) or "$" in text:
         return ""
-    from scripts.lib.build_steps import RAW_ID
-
     return "" if RAW_ID.search(text) else text
+
+
+class QueueNameFormatter(Formatter):
+    """Read only usable named fields in a queue name template."""
+
+    @override
+    def get_field(self, field_name: str, args: Sequence[object],
+                  kwargs: Mapping[str, object]) -> tuple[str, str]:
+        name = public_queue_text(kwargs.get(field_name))
+        if not name:
+            raise ValueError(f"unusable queue name field {field_name}")
+        return name, field_name
+
+
+_QUEUE_NAME_FORMATTER = QueueNameFormatter()
+
+
+def format_queue_name(template: str, **fields: str) -> str:
+    """Return a usable label when every referenced field is usable."""
+    try:
+        return public_queue_text(_QUEUE_NAME_FORMATTER.vformat(template, (), fields))
+    except (ValueError, KeyError, IndexError):
+        return ""
 
 
 def select_queue_name(*candidates: object) -> str:
     """Use the first usable name or return the fallback label."""
     return next((name for value in candidates if (name := public_queue_text(value))), UNKNOWN_CALLER)
+
+
+def wait_line_name(unit: str, caller: str, folder: str, step: str, *, fallback_name: str = "") -> str:
+    """Name a waiting step in queue order."""
+    owner = select_queue_name(unit, caller, Path(folder).name, fallback_name)
+    shown_step = public_queue_text(step)
+    return f"{owner} · {shown_step}" if shown_step else owner
+
+
+def ci_label(template: str, runner: str, job: str) -> str:
+    """Use the complete CI label or the generic CI name."""
+    return select_queue_name(format_queue_name(template, runner=runner, job=job), "hana CI")
 
 
 def resolve_queue_caller(*, stored_caller: object, reservation_caller: object = "", staff_caller: object = "") -> str:
