@@ -17,7 +17,7 @@ import threading
 from collections.abc import Callable, Generator, Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta, timezone, tzinfo
+from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal, TypedDict, cast
@@ -473,8 +473,22 @@ _SOURCE_CLOCK = re.compile(r"(?:^|(?<=[\s,]))(?:\d{4}-\d{2}-\d{2}T)?"
 
 def source_without_clock(source: str) -> str:
     """Remove a hand-written clock time from the end of a log source."""
-    clock = _SOURCE_CLOCK.search(source.rstrip())
-    return source[:clock.start()].rstrip(" ,\t") if clock else source
+    text = source.rstrip()
+    clock = _SOURCE_CLOCK.search(text)
+    if clock:
+        return text[:clock.start()].rstrip(" ,\t")
+
+    start = max(text.rfind(" "), text.rfind(",")) + 1
+    token = text[start:]
+    try:
+        _ = datetime.fromisoformat(token)
+    except ValueError:
+        return source
+    try:
+        _ = date.fromisoformat(token)
+    except ValueError:
+        return text[:start].rstrip(" ,\t")
+    return source
 
 
 def _staff_id(value: str, name: str) -> None:

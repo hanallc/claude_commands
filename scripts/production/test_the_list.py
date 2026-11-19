@@ -462,14 +462,26 @@ class TheListTests(unittest.TestCase):
             self.assertIn("The report is ready. · 2026-11-16 13:20 EST", self.command("list", "--latest-status")[1])
 
     def test_update_refuses_a_clock_time_at_the_end_of_source(self) -> None:
-        item = self.add()
-        for clock in ("13:20", "13:20 EST", "13:20+01:00", "2026-11-18T23:55:00-05:00"):
+        clocks = (
+            "13:20", "13:20 EST", "13:20+01:00", "2026-11-18T23:55:00-05:00",
+            "2026-11-18t23:55:00-05:00", "20261118T235500-0500",
+        )
+        for clock in clocks:
             with self.subTest(clock=clock):
+                item = self.add()
                 result, output, error = self.command("update", "--id", item.id, "--state", "Working",
                                                      "--source", "morty: report, " + clock)
                 self.assertEqual((result, output), (1, ""))
                 self.assertIn("the tool adds the time", error)
                 self.assertEqual(the_list.load(MORTY.id, item.id), item)
+
+    def test_update_accepts_source_words_and_a_bare_date(self) -> None:
+        for source in ("morty: report", "morty: report, 2026-11-18", "morty: report,20261118"):
+            with self.subTest(source=source):
+                item = self.add()
+                self.assertEqual(self.command("update", "--id", item.id, "--state", "Working", "--source", source),
+                                 (0, "", ""))
+                self.assertEqual(the_list.load(MORTY.id, item.id).log[-1].source, source)
 
     def test_producer_cannot_run_other_commands(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
