@@ -172,8 +172,19 @@ class AgentBlocked(HerdrFailure):
     """An agent requires user input; nothing is sent in response."""
 
 
-class _CommandNotStarted(HerdrFailure):
+class HerdrCommandNotStarted(HerdrFailure):
     """The transport command did not start."""
+
+
+@dataclass
+class TrackedPromptSubmission:
+    """Check readiness and record whether the prompt may have sent input."""
+
+    check: Callable[[], None]
+    may_have_submitted: bool = field(default=False, init=False)
+
+    def __call__(self) -> None:
+        self.check()
 
 
 class _WrongNativeTarget(HerdrFailure):
@@ -1121,7 +1132,7 @@ def unmarked_environment() -> dict[str, str]:
     return child_environment(dict(os.environ))
 
 
-class HerdrLaunchRefused(_CommandNotStarted):
+class HerdrLaunchRefused(HerdrCommandNotStarted):
     """The deadline passed before Herdr started the command."""
 
 
@@ -1139,17 +1150,22 @@ def run_program(argv: list[str], timeout: float = PROGRAM_TIMEOUT_SECONDS, *,
     try:
         env = unmarked_environment() if environment is None else child_environment(environment)
         if not prompt_transport:
-            return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=remaining, env=env)
+            try:
+                return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=remaining, env=env)
+            except UnicodeDecodeError as error:
+                raise HerdrFailure("the Herdr reply cannot be decoded") from error
         process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     except Exception as error:
         if prompt_transport or isinstance(error, OSError):
-            raise _CommandNotStarted(f"{argv[0]}: {error}") from error
+            raise HerdrCommandNotStarted(f"{argv[0]}: {error}") from error
         raise
     with process:
         try:
             stdout, stderr = process.communicate(timeout=max(0.0, deadline - time.monotonic()))
-        except BaseException:
+        except BaseException as error:
             process.kill()
+            if isinstance(error, UnicodeDecodeError):
+                raise HerdrFailure("the Herdr prompt reply cannot be decoded") from error
             raise
         return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
@@ -3014,7 +3030,7 @@ class Herdr:
                 typed = draft_pending = True
                 try:
                     self._prompt(pane, text)
-                except _CommandNotStarted:
+                except HerdrCommandNotStarted:
                     typed = False
                     if record is not None:
                         record.path.unlink(missing_ok=True)
@@ -3110,7 +3126,16 @@ class Herdr:
                             pane_info=row, client=self):
             raise HerdrFailure(f"{pane}: would send keys to an unproved target instead of session {target}")
         _ = on_submission()
-        self._prompt(pane, _prepare_prompt(pane, text), proof=proof)
+        prepared = _prepare_prompt(pane, text)
+        transport_started = True
+        try:
+            self._prompt(pane, prepared, proof=proof)
+        except HerdrCommandNotStarted:
+            transport_started = False
+            raise
+        finally:
+            if isinstance(on_submission, TrackedPromptSubmission):
+                on_submission.may_have_submitted = transport_started
 
     def prompt_terminal(self, pane: str, terminal: str, text: str) -> None:
         """Send input to the selected pane terminal."""
