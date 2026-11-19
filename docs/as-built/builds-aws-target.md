@@ -53,22 +53,28 @@ Enter the administrator passphrase when the command asks for it.
 The command creates the `aws-build-plan` IAM user and one managed policy.
 It checks the user with STS, reads EC2 availability zones, and simulates seven denied actions.
 After these checks pass, it saves one access key in `~/.config/aws-build/plan.gpg` with mode `0600`.
-The rename that publishes `plan.gpg` commits setup.
-If setup fails before the rename, it revokes any new key it finds.
+If STS still rejects a new key after retries, setup revokes the unpublished key.
+Run `deploy.py plan-identity --approve-resources` again after one minute.
+If setup fails before it publishes `plan.gpg`, it revokes any new key it finds.
 During setup, `plan.gpg` must be absent before the command revokes a key.
-If directory sync or cleanup fails after the rename, the command warns and reports that the identity is ready.
-Setup keeps the verified file and IAM key after the rename.
+If directory sync or cleanup fails after setup publishes a verified key, the command warns and reports that the identity is ready.
 If IAM lists no key after a failed creation, a key can appear later.
 Run the same approved command again to revoke the late key and create a new key.
 If `plan.gpg` is absent, the command revokes all keys that IAM lists for the plan user before it creates one key.
-The command keeps the local key when it matches the sole key that IAM lists.
-Setup refuses if the local key differs from the sole key that IAM lists.
+Setup keeps the local key when it matches the sole key that IAM lists.
+Setup refuses if IAM lists no key, a different key, or more than one key.
+If STS rejects a saved key, setup preserves the local file and the IAM key.
 Setup also refuses if it cannot read or decrypt `plan.gpg`.
 This refusal preserves the local file and the IAM keys.
 Setup uses GPG without a passphrase prompt for these checks.
-If `plan.gpg` is damaged, delete the file and run the command again.
 The command compares the default policy with the current configuration and sets a new default version when they differ.
-Omit `--approve-resources` to print the plan without contacting AWS.
+Run `deploy.py plan-identity` without flags to print the plan without contacting AWS.
+Run `deploy.py plan-identity --check` to verify the saved plan key with STS without a prompt.
+Setup and the check use the region in the AWS target configuration.
+If AWS does not answer the check, run the check again.
+If AWS rejects the saved key, run the approved removal command below.
+Use the same command if `plan.gpg` is damaged or has invalid fields.
+Then run `deploy.py plan-identity --approve-resources` to create a new key.
 
 The policy allows setup reads, IAM simulation for users in the account, and S3 object listings in account buckets.
 The policy allows reads of applied service quotas and quota request history.
@@ -84,12 +90,42 @@ It denies EC2 instance attribute and Spot request reads because those calls can 
 
 Sessions use `plan_credentials()` to decrypt the key without a prompt.
 If the agent is cold, run `github-warmup` in a terminal on natedev.
-The approved removal command can revoke the key while `plan.gpg` exists.
-Run this command in the same terminal to remove the key, user, and policy.
+The approved removal command removes the IAM resources before it removes `plan.gpg`.
+It removes `plan.gpg` even if it cannot decode the file.
+It refuses if the decoded key belongs to a different AWS account.
 
 ```sh
 deploy.py down --workload plan-identity --approve-destroy
 ```
+
+## AWS test identity
+
+1. Sign in to the AWS console for the management account.
+2. Switch to `OrganizationAccountAccessRole` in the test account.
+3. Create the IAM user `aws-build-test` with the path `/aws-build/` and the `AdministratorAccess` policy in the test account.
+4. Create an access key for that user.
+5. Run `deploy.py test-identity` in a terminal on natedev.
+
+Enter the access key ID and the secret access key at the hidden prompts.
+The command checks the key format before it calls AWS.
+It uses STS with the saved plan key to identify the build account.
+It uses the region in the AWS target configuration for this STS call.
+It refuses a build account key or a test key whose account it cannot confirm.
+It stores the key in `~/.config/aws-build/test.gpg` with mode `0600`.
+The local AWS state folder holds the account ID in `test-identity.json`.
+The command saves the account record before it publishes the encrypted key.
+If setup stops after it saves the record, run the command again with a key from the same account.
+Run `github-warmup` in a terminal on natedev if the GPG agent is cold.
+If GPG cannot identify the encryption recipient, restore `~/.config/gh/token.gpg` with one GPG recipient.
+
+Run `deploy.py test-identity` again with a key from the same account to replace the key.
+The command refuses a key from a different account.
+Run `deploy.py test-identity --check` to verify the saved key and account without a prompt.
+If AWS does not answer, run the same command again.
+If you interrupt the check, run the check again.
+If the test key is locked, run `github-warmup`.
+If the private test key is unreadable, run `deploy.py test-identity` with a key from the recorded test account.
+`test_credentials()` checks the saved test key against the recorded account with one STS call.
 
 ## Run a setup plan
 
@@ -99,15 +135,16 @@ Run this command in a terminal on natedev.
 deploy.py hana-setup --plan
 ```
 
-The plan reports whether the deployed Hana image is current or stale.
-It refuses first-time Hana setup and setup with pending instance or volume work.
-It can preview one policy update for an idle, stopped, stack-owned Hana box.
+The plan checks root replacement for an existing Hana box with a registered image.
+It accepts stack-owned and direct-owned boxes.
+It refuses first-time setup and pending instance or data volume work.
+It reports whether the deployed guest digest matches the current guest files.
 
+For a pending replacement, the plan checks the instance, original data attachment, and registered image.
+For a new replacement, the plan also checks that the instance is stopped.
 The policy preview checks the local credential file and reads the scaler identity with STS.
-It uses the same stack, instance, disk, and parameter checks as approved setup.
-It previews one modification to `ScalerPolicy` without resource replacement.
-The plan deletes the change set and confirms its removal with CloudFormation.
-If removal stays unconfirmed, the plan prints the change set name and refuses.
+It reads the live stack and previews one modification to `ScalerPolicy` through IAM simulation.
+The plan makes read calls only.
 
 The IAM simulation excludes the live `ScalerPolicy` and includes the proposed document.
 The plan simulates the EC2 probes without reading user data or starting the box.
@@ -493,29 +530,7 @@ After it saves an effective guest setting, `tune.py` reports this message.
 
 > The Hana image is now stale. Build and register a current Hana image.
 
-### Replace a Hana image
-
-The NixOS configuration builds the guest files from its pinned `claude-commands` input.
-Use a reviewed pin that contains the current rendered guest files.
-Use the following sequence only when deletion of the Hana data disk is approved.
-
-1. Build the image with `nix build /etc/nixos#nixosConfigurations.aws-hana.config.system.build.images.amazon --out-link RESULT`.
-2. Register it with `scripts/aws_target/deploy.py hana-image --image RESULT --approve-resources`.
-3. Delete the saved deployment with `scripts/aws_target/deploy.py down --workload hana --approve-destroy`.
-4. Prepare the new deployment with `scripts/aws_target/deploy.py prepare --workload hana`.
-5. Provision the new box with `scripts/aws_target/deploy.py hana-setup --approve-resources`.
-
-The third command deletes the data disk and its data.
-Direct setup refuses changed image parameters on a saved box.
-The stack update also refuses replacement of an instance, volume, or attachment.
-
-A replacement that keeps the disk requires a separate setup procedure.
-It must hold the box idle, journal the replacement intent, and launch the replacement in the disk's zone.
-It must detach the same disk, attach it to the replacement, then verify the attachment and stopped state.
-It must persist the new lifecycle identity before it ends the old Spot request.
-Each rerun must confirm the saved intent and resume its last unfinished step.
-Stack-owned boxes also need a separate change that retains the disk and replaces the attachment.
-A combined build and registration command needs an explicit source pin and the local build evidence that registration checks.
+The root replacement procedure keeps the same instance and data volume. [Replace the Hana root image](#replace-the-hana-root-image)
 
 ## Ending persistent Spot boxes
 
@@ -829,6 +844,16 @@ Allow every region in `regions` and `spot_candidate_regions` in the `RegionFloor
 No other statement in that policy may deny EC2 in these regions.
 Keep the existing home and US region permissions.
 The runbook gives the preparation steps.
+
+`deploy.py up` always checks and updates the home stack.
+For each additional region, it hashes the rendered template, stack name, and parameters passed to CloudFormation.
+The deployment state folder stores each successful regional digest with the live stack ID and last update time in `regional-stack-digests.json`.
+Deployment skips a stack when all three fields match and the live status is `CREATE_COMPLETE` or `UPDATE_COMPLETE`.
+Deployment reads the outputs from that status reply and records the elapsed time for the region.
+Deployment warns once if it cannot read the digest file or finds an invalid record.
+It then deploys every region.
+Each deployment call uses a private template file that it removes after the call.
+Run one `deploy.py up` at a time. Two runs from different state folders can save a digest for the other run's stack revision, and a later run can then skip that region.
 
 `buildlog.timer` runs the hourly Spot snapshot through `buildlog hourly` on natedev.
 The existing timer uses `OnUnitInactiveSec=3600s` and calls the installed scripts.
@@ -1153,9 +1178,8 @@ It uses `spot_quota_request_vcpus` from `cloud_gate.conf`.
 The default request is 136 vCPUs for four 32-vCPU gates and one 8-vCPU Hana box.
 The same command requests G and VT Spot quota (`L-3819A6DF`) in each gate region from `regions`.
 A region in `spot_candidate_regions` only has no gate stack and gets no quota request.
-`deploy.py quota-status` reads the same gate regions.
-It uses `gpu_spot_quota_request_vcpus=32` for one GPU box up to 8xlarge.
-All three new keys are in `cloud_gate.conf`.
+The GPU quota request uses `gpu_spot_quota_request_vcpus=32` for one GPU box up to 8xlarge.
+These settings are in `cloud_gate.conf`.
 Both quota codes use one helper for regional requests.
 The command uses the encrypted administrator key through the admin executor.
 It skips regions with sufficient quota and prints existing open requests instead of creating duplicates.
@@ -1164,12 +1188,18 @@ A failed call prints only the AWS error code or Python error class and does not 
 Any regional failure makes the command exit with status 1.
 The external administrator IAM policy also needs `servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota` and `servicequotas:RequestServiceQuotaIncrease`.
 Both quota codes use these same three IAM actions.
-`python3 scripts/aws_target/deploy.py quota-status` reads both quotas and their request history through the same administrator executor.
+`deploy.py quota-status` reads both quotas and their request history with the read-only plan identity.
+If the key is missing, the command names the plan identity setup command.
+If the key is locked, the command tells you to run `github-warmup` in a terminal on natedev.
+If AWS rejects the plan key during any call, the command stops and names `deploy.py plan-identity --check`.
 It shares the quota codes and region lists with `quota-request`.
 Each region starts one terminal block with its name as the heading.
-Each quota shows its applied vCPUs once, above an aligned request table.
-The table shows asked vCPUs, status, case ID, and update time, with the newest requests first.
-Dates use the user's zone and the last update time, with the creation time as a fallback.
+Each quota shows its applied vCPUs and the vCPUs needed from `cloud_gate.conf`.
+The newest request shows its status, requested vCPUs, and age.
+The command uses creation time to select the newest request and calculate its age.
+If a request has no creation time, the command uses its last update time.
+A request that has neither date shows `age unknown`.
+The report keeps unknown status text and counts the request as open.
 A quota with no requests prints `No requests.`
 The final summary lists regions whose applied GPU quota fits the trial and requests that remain open.
 The summary uses the trial's shared vCPU calculation over `gpu_size_trial_spot_max_usd_per_hour`.
@@ -1177,12 +1207,12 @@ It does not use the requested quota as proof of an applied quota.
 When every applied quota is too small, the summary says `no region has enough applied quota`.
 An unread applied GPU quota adds `unknown for <regions>` after the regions that fit.
 An unread request history makes the summary say `open requests: unknown` and name the unavailable region and quota.
-The report omits account IDs, ARNs, and request IDs.
-Regional failures print the AWS error code or Python error class and allow the remaining regions to continue.
+The report omits account IDs, case IDs, request IDs, and ARNs.
+Other regional failures print the AWS error code or Python error class and permit the remaining quota reads.
 Any regional failure makes the command exit with status 1.
 The command uses only `GetServiceQuota` and `ListRequestedServiceQuotaChangeHistoryByQuota`, including every history page.
 It makes no quota request, paid API call, or local state write.
-The administrator IAM action list in the runbook already includes both read actions.
+The plan identity policy grants both read actions in `ReadSetupInputs`.
 `down` searches configured regions and regions in the saved manifest and stack records.
 It terminates boxes before it deletes their regional stacks.
 Then it deletes copied images and their snapshots.
@@ -1327,6 +1357,58 @@ Existing configuration values remain unchanged.
 | `control_url_seconds` | `3600` | Bound signed access for one boot. |
 | `control_poll_seconds` | `1` | Read current permission before the watchdog interval ends. |
 
+
+### Replace the Hana root image
+
+The NixOS configuration builds the guest files from its pinned `claude-commands` input.
+Use a reviewed pin that contains the current rendered guest files.
+
+1. Build the image with `nix build /etc/nixos#nixosConfigurations.aws-hana.config.system.build.images.amazon --out-link RESULT`.
+2. Register the image with `scripts/aws_target/deploy.py hana-image --image RESULT --approve-resources`.
+3. Check the registered image with `scripts/aws_target/deploy.py hana-setup --plan`.
+4. Apply the root replacement with `scripts/aws_target/deploy.py hana-setup --approve-resources`.
+
+The plan reports the deployed image freshness before it checks the registration or simulates the policy.
+The replacement plan reads AWS through the plan identity and does not write local state.
+Setup replaces the root volume on the same instance and keeps the data volume.
+
+Before the first attempt, setup checks that the box is stopped and has no claims.
+It checks the lifecycle identity and the retained data attachment.
+Setup requires an image registration for an existing box.
+The registered guest digest must match the current guest files and the EC2 image description.
+A pending attempt requires the same image and guest digest as its saved record.
+On each invocation, setup checks the registered image owner, architecture, virtualization, boot mode, billing platform, and product codes.
+If the image root exceeds `root_gib`, setup refuses before it makes any change.
+
+Approved setup installs the replacement grants in the existing Hana `ScalerPolicy`.
+Setup uses the scaler credentials for EC2 replacement calls.
+Start and stop use the existing Hana deployment and workload tag conditions.
+Task creation grants access to the exact Hana instance, registered AMI, and source snapshot.
+The task and new volume grants cover resources in the Hana account and region.
+EC2 requires wildcard resource scope for describe calls.
+The new describe grants apply only in the Hana region.
+[EC2 IAM actions and resources](https://docs.aws.amazon.com/service-authorization/latest/reference/list_ec2.html)
+
+The replacement record blocks claims, work starts, and permits.
+The controller keeps its stop duty when the compute reservation expires.
+Setup reserves compute through its time limit before it starts the box or continues on a running box.
+It gives the root replacement task a saved client token.
+EC2 deletes the previous root when the task completes.
+An EC2 stop and start can change an automatically assigned public IPv4 address.
+[EC2 root replacement](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/replace-root.html), [EC2 stop and start](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Stop_Start.html)
+
+If setup stops early, run the approved command again.
+Setup sends the saved token again and polls the task ID that EC2 returns.
+It waits for an active task and refuses to start an interrupted Spot instance.
+A failed task reports its state and the AWS message when one exists.
+The next invocation uses a new token after either task failure state.
+
+Setup completes when EC2 reports the registered image and the same data attachment.
+It requests a stop, closes the reservation, saves the image and guest digest, and removes the hold.
+If the box already uses the registered image, approved setup records its verified digest without replacing the root volume.
+The controller completes the stop if EC2 still reports a running box.
+If replacement execution exits early, setup requests a stop and leaves the reservation open.
+If preflight refuses a rerun, only the controller can request a stop.
 
 ## Hana source transport
 
