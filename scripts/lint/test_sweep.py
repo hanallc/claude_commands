@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Callable, Collection, Generator, Sequence
+from collections.abc import Callable, Collection, Generator, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
@@ -272,6 +272,8 @@ class SweepCase(unittest.TestCase):
         # A run inside a build slot carries that slot's Cargo cache; a test gate must lease its own.
         _ = os.environ.pop("CARGO_BUILD_BUILD_DIR", None)
         skip_host_ci_targets(state)
+        _ = write_config_fixture(conf.path("build_folders"),
+                                 f"roots.cargo_paths.{store.host_name()}={state / 'paths'}\n")
 
     def target(self) -> Target:
         return Target(Path(self.enterContext(tempfile.TemporaryDirectory())).resolve())
@@ -910,6 +912,7 @@ def fake_process(proc: Path, pid: int, *, exe: str = "/usr/bin/true", cwd: str =
     _ = (entry / "maps").write_text(maps)
     _ = (entry / "cmdline").write_bytes(b"".join(arg.encode() + b"\0" for arg in argv))
     _ = (entry / "environ").write_bytes(b"".join(item.encode() + b"\0" for item in environ))
+    (entry / "fd").mkdir()
 
 
 def run_from(binary: Path, cwd: Path | None = None) -> subprocess.Popen[bytes]:
@@ -1547,9 +1550,10 @@ class FloorTests(SweepCase):
             removal_order: sweep.RemovalOrder, planned_at: float, owners: sweep.TargetOwnerIndex, *,
             lint_settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
             policy: sweep.MacFloor | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+            orphan_sweep: sweep.OrphanSweep | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
         ) -> tuple[int, int, list[tuple[sweep.FloorTake, int]]]:
             result = shrink(scan, total, budget, dry_run, tree_targets, trees, busy, removal_order,
-                            planned_at, owners, lint_settings=lint_settings, policy=policy)
+                            planned_at, owners, lint_settings=lint_settings, policy=policy, orphan_sweep=orphan_sweep)
             shutil.rmtree(tree.parent)
             return result
 
@@ -1588,9 +1592,10 @@ class FloorTests(SweepCase):
             removal_order: sweep.RemovalOrder, planned_at: float, owners: sweep.TargetOwnerIndex, *,
             lint_settings: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
             policy: sweep.MacFloor | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
+            orphan_sweep: sweep.OrphanSweep | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
         ) -> tuple[int, int, list[tuple[sweep.FloorTake, int]]]:
             result = shrink(scan, total, budget, dry_run, tree_targets, trees, busy, removal_order,
-                            planned_at, owners, lint_settings=lint_settings, policy=policy)
+                            planned_at, owners, lint_settings=lint_settings, policy=policy, orphan_sweep=orphan_sweep)
             shutil.rmtree(other_tree.parent)
             return result
 
@@ -3463,6 +3468,8 @@ class FloorTests(SweepCase):
         _ = write_config_fixture(conf.path("lint"),
                                  FLOOR_TEST_SETTINGS + f"sweep_ci_targets={base / 'ci-1'} {base / 'ci-2'}\n"
                                  + f"sweep_floor_roots={base}\nsweep_phone_floor_gib=0\n")
+        _ = write_config_fixture(conf.path("build_folders"),
+                                 f"roots.cargo_paths.{store.host_name()}={base / 'paths'}\n")
         _ = self.enterContext(mock.patch.object(
             sweep, "send_floor_alert", side_effect=AssertionError("unexpected floor alert send")))
         _ = self.enterContext(mock.patch.object(
@@ -7770,6 +7777,500 @@ class RunnerTargetDirTests(SweepCase):
             status = sweep.main([sweep.TARGET_DIR_FLAG, str(target.root), sweep.FLOOR_ONLY_FLAG])
         self.assertEqual(status, 2)
         self.assertIn("does not go with", errors.getvalue())
+
+
+class OrphanFloorTests(SweepCase):
+    base: Path = Path()
+    cargo: Path = Path()
+    slots: Path = Path()
+    worktrees: Path = Path()
+    mirror: Path = Path()
+    proc: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.base = conf.path("build_folders").parent.parent.resolve()
+        self.cargo = self.base / "cargo"
+        self.slots = self.base / "slots"
+        self.worktrees = self.base / "worktrees"
+        self.mirror = self.base / "paths"
+        self.proc = self.base / "proc"
+        (self.cargo / "scratch").mkdir(parents=True)
+        self.proc.mkdir()
+        self.alias(self.base / "rust", self.cargo)
+        self.alias(self.worktrees, self.cargo)
+        self.alias(self.base / "scratch", self.cargo / "scratch")
+        machine = store.host_name()
+        _ = write_config_fixture(conf.path("build_folders"),
+            f"roots.cargo_paths.{machine}={self.mirror}\n"
+            + f"roots.slots.{machine}={self.slots}\n"
+            + f"roots.slot_cargo.{machine}={self.cargo}\n")
+        _ = write_config_fixture(conf.path("lint"), FLOOR_TEST_SETTINGS + "sweep_phone_floor_gib=0\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.base),
+            "BUILD_HOLD_DIR": str(self.base / "holders"),
+        })))
+        create_step_index(build_index.index_path())
+        process_uses = sweep.process_uses
+
+        def use_fixture_processes(targets: Sequence[str]) -> dict[str, sweep.TargetUse]:
+            return process_uses(targets, str(self.proc))
+
+        _ = self.enterContext(mock.patch.object(sweep, "process_uses", side_effect=use_fixture_processes))
+        orphan_process_idle = sweep.orphan_process_idle
+
+        def check_fixture_processes(root: str) -> bool:
+            return orphan_process_idle(root, str(self.proc))
+
+        _ = self.enterContext(mock.patch.object(sweep, "orphan_process_idle", side_effect=check_fixture_processes))
+        _ = self.enterContext(mock.patch.object(sweep, "notify_floor_problem", return_value=None))
+        _ = self.enterContext(mock.patch.object(sweep, "holder_sessions", return_value={}))
+        _ = self.enterContext(mock.patch.object(sweep, "send_floor_alert", return_value=DELIVERED_NATEDEV_ALERT))
+
+    def alias(self, source: Path, cache: Path) -> None:
+        link = self.mirror / source.relative_to(source.anchor)
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(cache, target_is_directory=True)
+
+    def build(self, name: str, used: float) -> tuple[Path, Path]:
+        root = self.cargo / name
+        output = unit(root / "debug", "deps", root.name, APP, used)
+        _ = (root / sweep.RUSTC_INFO).write_text("{}")
+        _ = write(root / "other-output")
+        _ = write(root / sweep.USE_STAMP, 0)
+        os.utime(root / sweep.USE_STAMP, (used, used))
+        return root, output
+
+    def hold(self, shortfall: int) -> int:
+        before = sweep.directory_blocks(str(self.cargo))
+        floor = 10 * GIB
+
+        def available(_path: str = "") -> int:
+            return floor - shortfall + before - sweep.directory_blocks(str(self.cargo))
+
+        with mock.patch.object(sweep, "free_bytes", side_effect=available), redirect_stdout(io.StringIO()):
+            return sweep.hold_floor(floor, False, [str(self.cargo)])
+
+    def test_all_orphan_folders_go_whole_before_an_older_live_target(self) -> None:
+        now = time.time()
+        live_root, live_output = self.build("live", now - 3 * DAY)
+        workspace = self.worktrees / live_root.name
+        workspace.mkdir(parents=True)
+        _ = (workspace / "Cargo.toml").write_text("[workspace]\n")
+        record_root_attempt(build_index.index_path(), str(workspace), str(live_root), str(live_root))
+        first, _ = self.build("gone", now - DAY)
+        second, _ = self.build("scratch/gone", now - DAY)
+
+        self.assertEqual(self.hold(1), 0)
+        self.assertTrue(live_output.exists())
+        self.assertFalse(first.exists())
+        self.assertFalse(second.exists())
+        self.assertCountEqual(
+            [(row["folder"], row["extent"], row["cause"]) for row in self.trim_rows()],
+            [(str(first), "whole", "orphan take"), (str(second), "whole", "orphan take")],
+        )
+
+    def test_orphan_output_with_a_cargo_lock_or_process_stays(self) -> None:
+        used = time.time() - DAY
+        locked, locked_output = self.build("locked", used)
+        running, running_output = self.build("running", used)
+        idle, _ = self.build("idle", used)
+        lock_path = write(locked / "debug" / sweep.LOCK_NAMES[0], 0)
+        fake_process(self.proc, 42, cwd=str(running))
+
+        with (lock_path.open("r+") as lock,
+              mock.patch.object(sweep, "held_cargo_lock_files", return_value=set())):
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(self.hold(1), 0)
+
+        self.assertTrue(locked_output.exists())
+        self.assertTrue(running_output.exists())
+        self.assertFalse(idle.exists())
+        row, = self.trim_rows()
+        self.assertEqual((row["folder"], row["cause"]), (str(idle), "orphan take"))
+
+    def test_slot_output_stays_when_no_worktree_exists(self) -> None:
+        used = time.time() - DAY
+        slot, slot_output = self.build("fixture-slot1", used)
+        (self.slots / slot.name).mkdir(parents=True)
+        orphan, _ = self.build("gone", used)
+
+        self.assertEqual(self.hold(1), 0)
+        self.assertTrue(slot_output.exists())
+        self.assertFalse(orphan.exists())
+        row, = self.trim_rows()
+        self.assertEqual((row["folder"], row["cause"]), (str(orphan), "orphan take"))
+
+    def test_above_floor_keeps_orphan_output(self) -> None:
+        orphan, output = self.build("gone", time.time() - DAY)
+
+        self.assertEqual(self.hold(-1), 0)
+        self.assertTrue(orphan.is_dir())
+        self.assertTrue(output.exists())
+        self.assertEqual(self.trim_rows(), [])
+
+    def test_output_in_the_mirror_maps_directly_to_its_workspace(self) -> None:
+        used = time.time() - DAY
+        absent = self.base / "direct" / "gone"
+        present = self.base / "direct" / "present"
+        present.mkdir(parents=True)
+        gone_root = self.mirror / absent.relative_to(absent.anchor)
+        live_root = self.mirror / present.relative_to(present.anchor)
+        for name, destination in (("gone", gone_root), ("present", live_root)):
+            root, _ = self.build(name, used)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _ = root.rename(destination)
+
+        self.assertEqual(self.hold(1), 0)
+        self.assertFalse(gone_root.exists())
+        self.assertTrue(live_root.is_dir())
+        row, = self.trim_rows()
+        self.assertEqual((row["folder"], row["extent"], row["cause"]), (str(gone_root), "whole", "orphan take"))
+
+    def test_recreated_workspace_keeps_output_after_the_scan(self) -> None:
+        root, payload = self.build("returns", time.time() - DAY)
+        scan_floor_roots = sweep.scan_floor_roots
+
+        def scan(roots: list[str], trees: dict[str, list[str]], *, lint_settings: conf.ConfigRead) -> sweep.Scan:
+            result = scan_floor_roots(roots, trees, lint_settings=lint_settings)
+            (self.worktrees / root.name).mkdir(parents=True)
+            return result
+
+        with mock.patch.object(sweep, "scan_floor_roots", side_effect=scan):
+            self.assertEqual(self.hold(1), 0)
+        self.assertTrue(payload.exists())
+        self.assertEqual(self.trim_rows(), [])
+
+    def test_partial_orphan_removal_retries_only_the_detached_folder(self) -> None:
+        root, _ = self.build("retry", time.time() - DAY)
+        lock = write(root / "debug" / sweep.LOCK_NAMES[0], 0)
+        unlink = os.unlink
+
+        def fail_payload(path: str | bytes | Path, *, dir_fd: int | None = None) -> None:
+            if path == "other-output":
+                raise PermissionError("fixture cannot remove the payload")
+            unlink(path, dir_fd=dir_fd)
+
+        with mock.patch.object(os, "unlink", side_effect=fail_payload):
+            self.assertEqual(self.hold(1), 1)
+        self.assertFalse(lock.exists())
+        self.assertFalse(root.exists())
+        detached, = self.cargo.glob(f"{sweep.DETACHED_ORPHAN_PREFIX}*")
+        self.assertTrue((detached / "other-output").is_file())
+        self.assertEqual(self.trim_rows(), [])
+        fresh = write(root / "new-build")
+        self.assertEqual(self.hold(-1), 0)
+        self.assertTrue(fresh.is_file())
+        self.assertFalse(detached.exists())
+        row, = self.trim_rows()
+        self.assertEqual((row["folder"], row["extent"], row["cause"]), (str(root), "whole", "orphan take"))
+
+    def test_build_created_after_rename_stays_at_the_live_path(self) -> None:
+        root, payload = self.build("returns-at-rename", time.time() - DAY)
+        rename = os.rename
+
+        def rename_then_build(source: str, destination: str, *, src_dir_fd: int, dst_dir_fd: int) -> None:
+            rename(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+            if source == root.name:
+                (self.worktrees / root.name).mkdir(parents=True)
+                _ = write(payload)
+
+        with mock.patch.object(os, "rename", side_effect=rename_then_build):
+            self.assertEqual(self.hold(1), 0)
+        self.assertTrue(payload.is_file())
+        self.assertFalse((root / "other-output").exists())
+        self.assertEqual(list(self.cargo.glob(f"{sweep.DETACHED_ORPHAN_PREFIX}*")), [])
+        row, = self.trim_rows()
+        self.assertEqual((row["folder"], row["extent"]), (str(root), "whole"))
+
+    def test_workspace_created_during_intent_save_prevents_rename(self) -> None:
+        root, payload = self.build("returns-at-save", time.time() - DAY)
+        save = sweep.TrimTake.save
+
+        def save_then_create_workspace(take: sweep.TrimTake) -> None:
+            save(take)
+            (self.worktrees / root.name).mkdir(parents=True, exist_ok=True)
+
+        with mock.patch.object(sweep.TrimTake, "save", autospec=True, side_effect=save_then_create_workspace):
+            self.assertEqual(self.hold(1), 0)
+        self.assertTrue(payload.is_file())
+        self.assertFalse(sweep.trim_intent_path(str(root)).exists())
+        self.assertEqual(self.trim_rows(), [])
+
+    def test_failed_rename_keeps_the_whole_build_folder(self) -> None:
+        root, payload = self.build("cannot-move", time.time() - DAY)
+        errors = io.StringIO()
+        with (mock.patch.object(os, "rename", side_effect=PermissionError("fixture cannot detach")),
+              redirect_stderr(errors)):
+            self.assertEqual(self.hold(1), 1)
+        self.assertIn("could not detach", errors.getvalue())
+        self.assertTrue(payload.is_file())
+        self.assertTrue((root / "other-output").is_file())
+        self.assertEqual(self.trim_rows(), [])
+        self.assertFalse(sweep.trim_intent_path(str(root)).exists())
+
+    def test_nested_target_under_a_skipped_directory_keeps_the_orphan(self) -> None:
+        used = time.time() - DAY
+        for marker in (sweep.CACHE_TAG, sweep.RUSTC_INFO):
+            with self.subTest(marker=marker):
+                root, payload = self.build(f"outer-{marker}", used)
+                nested = root / "node_modules" / "inner"
+                nested_payload = write(nested / "debug" / "deps" / "inner")
+                _ = write(nested / marker, 0)
+                self.assertNotIn(str(nested), sweep.target_dirs([str(root)]))
+                self.assertEqual(self.hold(1), 0)
+                self.assertTrue(payload.is_file())
+                self.assertTrue(nested_payload.is_file())
+        self.assertEqual(self.trim_rows(), [])
+
+    def test_same_device_bind_mount_keeps_the_orphan(self) -> None:
+        root, payload = self.build("with-mount", time.time() - DAY)
+        mount = root / "node_modules" / "bind here"
+        mounted_payload = write(mount / "keep")
+        mountinfo = self.proc / "self" / "mountinfo"
+        mountinfo.parent.mkdir()
+        escaped = str(mount).replace(" ", r"\040")
+        _ = mountinfo.write_text(f"42 1 0:42 /source {escaped} rw - tmpfs tmpfs rw\n")
+        with mock.patch.object(sweep, "PROC_DIR", str(self.proc)):
+            self.assertEqual(self.hold(1), 0)
+        self.assertTrue(payload.is_file())
+        self.assertTrue(mounted_payload.is_file())
+        self.assertEqual(self.trim_rows(), [])
+
+    def test_open_file_descriptor_keeps_the_orphan(self) -> None:
+        target, payload = self.build("open-file", time.time() - DAY)
+        other, _ = self.build("idle", time.time() - DAY)
+        fake_process(self.proc, 42)
+        (self.proc / "42" / "fd" / "3").symlink_to(payload)
+        self.assertEqual(self.hold(1), 0)
+        self.assertTrue((target / "other-output").is_file())
+        self.assertFalse(other.exists())
+        row, = self.trim_rows()
+        self.assertEqual(row["folder"], str(other))
+
+    def test_process_permission_error_does_not_keep_the_orphan(self) -> None:
+        root, _ = self.build("unreadable-fd", time.time() - DAY)
+        fake_process(self.proc, 42)
+        iterdir = Path.iterdir
+
+        def deny_fd(path: Path) -> Iterator[Path]:
+            if path == self.proc / "42" / "fd":
+                raise PermissionError("fixture cannot read descriptors")
+            yield from iterdir(path)
+
+        with mock.patch.object(Path, "iterdir", autospec=True, side_effect=deny_fd):
+            self.assertEqual(self.hold(1), 0)
+        self.assertFalse(root.exists())
+        row, = self.trim_rows()
+        self.assertEqual((row["folder"], row["cause"]), (str(root), "orphan take"))
+
+    def test_unreadable_process_list_keeps_the_orphan(self) -> None:
+        root, payload = self.build("unreadable-proc", time.time() - DAY)
+        listdir = os.listdir
+
+        def deny_proc(path: str) -> list[str]:
+            if path == str(self.proc):
+                raise PermissionError("fixture cannot list processes")
+            return listdir(path)
+
+        with mock.patch.object(os, "listdir", side_effect=deny_proc):
+            self.assertEqual(self.hold(1), 0)
+        self.assertTrue(payload.is_file())
+        self.assertTrue(root.is_dir())
+        self.assertEqual(self.trim_rows(), [])
+
+    def test_other_process_read_errors_keep_the_orphan(self) -> None:
+        root, payload = self.build("process-read-error", time.time() - DAY)
+        fake_process(self.proc, 42)
+        iterdir = Path.iterdir
+
+        def fail_fd(path: Path) -> Iterator[Path]:
+            if path == self.proc / "42" / "fd":
+                raise OSError(errno.EIO, "fixture cannot read descriptors")
+            yield from iterdir(path)
+
+        with mock.patch.object(Path, "iterdir", autospec=True, side_effect=fail_fd):
+            self.assertEqual(self.hold(1), 0)
+        self.assertTrue(payload.is_file())
+        # An exited group leader can still have a live thread with an open descriptor.
+        process = self.proc / "42"
+        (process / "cwd").unlink()
+        _ = (process / "status").write_text("State:\tZ (zombie)\nThreads:\t2\n")
+        self.assertEqual(self.hold(1), 0)
+        self.assertTrue(payload.is_file())
+        self.assertTrue(root.is_dir())
+        self.assertEqual(self.trim_rows(), [])
+
+    def test_secondary_floor_records_free_space_after_detaching_its_first_target(self) -> None:
+        root, _ = self.build("secondary/first", time.time() - DAY)
+        mount = root.parent
+        device = root.stat().st_dev
+        block = 4096
+        floor = GIB
+        _ = write_config_fixture(conf.path("lint"), "sweep_free_floor_percent=25\n")
+        probes: list[str] = []
+
+        def output_device(path: str) -> int:
+            return device if Path(path).is_relative_to(mount) else device + 1
+
+        def statvfs(path: str) -> os.statvfs_result:
+            _ = Path(path).stat()
+            probes.append(path)
+            available = floor - block * int(root.exists()) if output_device(path) == device else 2 * floor
+            return os.statvfs_result((block, block, 4 * floor // block, available // block, available // block,
+                                      0, 0, 0, 0, 255))
+
+        stdout = io.StringIO()
+        with (mock.patch.object(sweep, "output_device", side_effect=output_device),
+              mock.patch.object(os, "statvfs", side_effect=statvfs), redirect_stdout(stdout)):
+            self.assertEqual(sweep.hold_floor(floor, False, [str(self.cargo)]), 0)
+        self.assertFalse(root.exists())
+        self.assertNotIn(str(root), probes)
+        self.assertIn(str(mount), probes)
+        key = f"{os.major(device)}-{os.minor(device)}"
+        path = sweep.floor_record_path().with_name(f"floor-{key}.json")
+        saved = sweep.read_floor_record(path)
+        assert isinstance(saved, sweep.FloorRecord)
+        self.assertEqual((saved.filesystem, saved.free_bytes, saved.build_cache_bytes), (key, floor, 0))
+        self.assertIn(f"{sweep.gib(floor)} free", stdout.getvalue())
+        row, = self.trim_rows()
+        self.assertEqual((row["folder"], row["extent"]), (str(root), "whole"))
+
+    def test_target_with_detached_prefix_stays_in_discovery(self) -> None:
+        used = time.time() - DAY
+        root, _ = self.build(".sweep-orphan-project", used)
+        detached, _ = self.build(sweep.DETACHED_ORPHAN_PREFIX + "0" * 32, used)
+        workspace = self.worktrees / root.name
+        record_root_attempt(build_index.index_path(), str(workspace), str(root), str(root))
+        targets, index = sweep.discover_cargo_outputs([str(self.cargo)], lint_settings=conf.read("lint"))
+        self.assertIn(str(root), targets)
+        self.assertIn(str(root / "debug"), index.known_trees[str(root)])
+        self.assertNotIn(str(detached), targets)
+
+    def test_orphan_on_another_filesystem_above_its_floor_stays(self) -> None:
+        used = time.time() - DAY
+        here, _ = self.build("here", used)
+        other, payload = self.build("other-device", used)
+        workspace = self.worktrees / other.name
+        record_root_attempt(build_index.index_path(), str(workspace), str(here), str(other))
+        own_device = here.stat().st_dev
+        other_device = own_device + 1
+        floor = 10 * GIB
+        block = 4096
+        _ = write_config_fixture(conf.path("lint"), "sweep_free_floor_percent=25\n")
+
+        def device(path: str) -> int:
+            return other_device if Path(path).is_relative_to(other) else own_device
+
+        def statvfs(path: str) -> os.statvfs_result:
+            available = 50 * GIB if device(path) == other_device else floor - block * int(here.exists())
+            return os.statvfs_result((block, block, 100 * GIB // block, available // block, available // block,
+                                      0, 0, 0, 0, 255))
+
+        with (mock.patch.object(sweep, "output_device", side_effect=device),
+              mock.patch.object(os, "statvfs", side_effect=statvfs), redirect_stdout(io.StringIO())):
+            self.assertEqual(sweep.hold_floor(floor, False, [str(self.cargo)]), 0)
+        self.assertFalse(here.exists())
+        self.assertTrue(payload.is_file())
+        row, = self.trim_rows()
+        self.assertEqual(row["folder"], str(here))
+
+    def test_unreadable_live_settings_disable_all_orphan_takes_once(self) -> None:
+        used = time.time() - DAY
+        first, first_payload = self.build("first", used)
+        second, second_payload = self.build("second", used)
+        live = conf.path("build_folders")
+        fallback = conf.read("build_folders")
+        read_text = Path.read_text
+        errors = io.StringIO()
+
+        def deny_live(path: Path, *args: str, **kwargs: str) -> str:
+            if path == live:
+                raise PermissionError("fixture cannot read live settings")
+            return read_text(path, *args, **kwargs)
+
+        with (mock.patch.object(Path, "read_text", autospec=True, side_effect=deny_live),
+              mock.patch.object(conf, "read_or_repository", return_value=fallback),
+              mock.patch.object(sweep, "read_workspace_output_mirror",
+                                wraps=sweep.read_workspace_output_mirror) as read_mirror,
+              redirect_stderr(errors)):
+            self.assertEqual(self.hold(1), 0)
+        read_mirror.assert_not_called()
+        self.assertEqual(errors.getvalue().count("cannot read live build_folders settings"), 1)
+        self.assertTrue(first_payload.is_file())
+        self.assertTrue(second_payload.is_file())
+        self.assertTrue(first.is_dir())
+        self.assertTrue(second.is_dir())
+        self.assertEqual(self.trim_rows(), [])
+
+    def test_crash_after_rename_recovers_only_the_detached_path(self) -> None:
+        root, payload = self.build("crash-after-rename", time.time() - DAY)
+        rename = os.rename
+
+        def stop_after_rename(source: str, destination: str, *, src_dir_fd: int, dst_dir_fd: int) -> None:
+            rename(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+            raise KeyboardInterrupt("fixture stops after rename")
+
+        with (mock.patch.object(os, "rename", side_effect=stop_after_rename),
+              self.assertRaises(KeyboardInterrupt)):
+            _ = self.hold(1)
+        intent_path = sweep.trim_intent_path(str(root))
+        take = sweep.read_trim_intent(intent_path)
+        assert isinstance(take.orphan_output, sweep.DetachedOrphanOutput)
+        detached = Path(take.orphan_output.path)
+        self.assertEqual(take.orphan_output.state, sweep.OrphanRenameState.PREPARED)
+        self.assertTrue(detached.is_dir())
+        self.assertNotIn(str(detached), sweep.target_dirs([str(self.cargo), str(detached)]))
+        _ = write(payload)
+        self.assertEqual(self.hold(-1), 0)
+        self.assertEqual(self.hold(-1), 0)
+        self.assertTrue(payload.is_file())
+        self.assertFalse(detached.exists())
+        self.assertFalse(intent_path.exists())
+        row, = self.trim_rows()
+        self.assertEqual((row["folder"], row["extent"], row["cause"]), (str(root), "whole", "orphan take"))
+
+    def test_recovery_keeps_detached_orphan_with_open_descriptor(self) -> None:
+        root, payload = self.build("open-after-rename", time.time() - DAY)
+        with (mock.patch.object(sweep.TrimTake, "dispose_orphan",
+                                side_effect=KeyboardInterrupt("fixture stops before detached deletion")),
+              self.assertRaises(KeyboardInterrupt)):
+            _ = self.hold(1)
+
+        intent = sweep.trim_intent_path(str(root))
+        saved = intent.read_text()
+        take = sweep.read_trim_intent(intent)
+        assert isinstance(take.orphan_output, sweep.DetachedOrphanOutput)
+        detached = Path(take.orphan_output.path)
+        detached_payload = detached / payload.relative_to(root)
+        fake_process(self.proc, 42)
+        descriptor = self.proc / "42" / "fd" / "3"
+        descriptor.symlink_to(detached_payload)
+
+        self.assertEqual(self.hold(-1), 0)
+        self.assertTrue(detached_payload.is_file())
+        self.assertEqual(intent.read_text(), saved)
+        self.assertEqual(self.trim_rows(), [])
+
+        descriptor.unlink()
+        self.assertEqual(self.hold(-1), 0)
+        self.assertFalse(detached.exists())
+        self.assertFalse(intent.exists())
+        row, = self.trim_rows()
+        self.assertEqual((row["folder"], row["cause"]), (str(root), "orphan take"))
+
+    def test_crash_before_rename_recovers_without_deleting_the_live_folder(self) -> None:
+        root, payload = self.build("crash-before-rename", time.time() - DAY)
+        with (mock.patch.object(os, "rename", side_effect=KeyboardInterrupt("fixture stops before rename")),
+              self.assertRaises(KeyboardInterrupt)):
+            _ = self.hold(1)
+        intent_path = sweep.trim_intent_path(str(root))
+        self.assertTrue(intent_path.is_file())
+        self.assertEqual(self.hold(-1), 0)
+        self.assertTrue(payload.is_file())
+        self.assertFalse(intent_path.exists())
+        self.assertEqual(self.trim_rows(), [])
 
 
 if __name__ == "__main__":

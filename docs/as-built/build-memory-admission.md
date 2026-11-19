@@ -1663,6 +1663,34 @@ Each proven maker receives one message with its folders, outcomes, `scratch.py a
 A folder without a proven maker prints `maker unknown` and receives no message.
 
 
+### Whole build folders without workspaces
+
+The natedev floor reads `roots.cargo_paths.<host>` from the live `build_folders` file.
+If the file is unreadable, the sweep reports the error once and skips whole orphan takes.
+Each mirror path appends the absolute workspace path to the mirror root.
+The sweep uses mirror links and recorded mappings to check every workspace path for a folder.
+It keeps the folder if a workspace exists or its absence is uncertain.
+The sweep keeps slot output, folders with nested Cargo targets, and folders with mount points.
+
+The sweep takes an orphan only if its filesystem starts removal below its floor.
+The sweep measures free space on a secondary filesystem at its highest directory on that device.
+It takes eligible orphan folders before live output and continues through them after it meets the floor.
+The sweep holds Cargo locks and leases while it checks workspace paths, folder contents, and process use.
+Process checks include open file descriptors.
+The sweep skips a process if it exits or the operating system denies access to its entries.
+The sweep keeps the folder if it cannot list processes or encounters another error reading process use.
+
+The trim intent records a private sibling path and the directory identity before the rename.
+The sweep moves the whole folder to that path with one atomic rename.
+Discovery skips names that match the detached folder format.
+The sweep removes the detached folder with one recursive delete.
+A failed rename keeps the live folder intact.
+A workspace that appears between the final check and the rename can require a rebuild.
+Recovery checks process use again before it removes the detached folder.
+A build can create new output at the live path after the rename.
+The trim record uses the live folder path and the `orphan take` cause.
+The rebuild report includes these takes in its floor totals.
+
 ### Disk-floor alerts (`scripts/lint/sweep.py`, `scripts/buildlog/disk.py`)
 
 Each machine keeps its crossing state in `${LINT_SWEEP_STATE_DIR:-~/.local/state/lint-sweep}/floor.json`.

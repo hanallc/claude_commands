@@ -239,6 +239,8 @@ TARGET_DIR_FLAG = "--target-dir"
 TARGET_OVERRIDE_RECORDER_CUT = datetime(2026, 11, 5, 8, 31, 36, tzinfo=UTC)
 LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
 PROC_DIR = "/proc"
+DETACHED_ORPHAN_PREFIX = ".sweep-orphan-"
+DETACHED_ORPHAN_NAME = re.compile(re.escape(DETACHED_ORPHAN_PREFIX) + r"[0-9a-f]{32}")
 # The kernel adds this to an exe, cwd or maps path whose file was removed.
 DELETED_SUFFIX = " (deleted)"
 # cargo runs a subcommand as `cargo-nextest nextest …`; a wrapper may rename argv[0].
@@ -471,7 +473,7 @@ def discover_cargo_outputs(roots: Sequence[str], *,
         discovered = sorted(set(discovered) | set(target_dirs(added, lint_settings=lint_settings, known_trees=known_trees)))
     protected = tuple(NoRecordedEvidence(path) for path in discovered if path not in mapped)
     index = CargoOutputIndex(combined, no_recorded_evidence=protected, known_trees=known_trees)
-    return sorted(set(discovered) | mapped), index
+    return sorted(path for path in set(discovered) | mapped if not inside_detached_orphan(path)), index
 
 
 def scratch_checkout_roots(checkouts: Sequence[str],
@@ -521,13 +523,14 @@ class Group:
 
 @dataclass
 class WholeTargetTake:
-    """Observed contents of a target with no build units, leaving its locks and nested targets."""
+    """Observed output for a whole target take."""
 
     target: str
     entries: list[str] = field(default_factory=list)
     inodes: list[InodeKey] = field(default_factory=list)
     observed: dict[str, OutputVersion] = field(default_factory=dict)
     retained: set[str] = field(default_factory=set)
+    workspace_gone: bool = False
 
 
 FloorTake = Group | WholeTargetTake
@@ -540,9 +543,11 @@ RemovalOrder = Callable[[Group], tuple[float, ...]]
 class DiscoveredTargetRoots(list[str]):
     """Roots to scan, with all target roots from this pass's discovery."""
 
-    def __init__(self, roots: Sequence[str], discovered: Sequence[str]) -> None:
+    def __init__(self, roots: Sequence[str], discovered: Sequence[str], *,
+                 orphan_roots: Iterable[str] = ()) -> None:
         super().__init__(roots)
         self.discovered: tuple[str, ...] = tuple(discovered)
+        self.orphan_roots: frozenset[str] = frozenset(orphan_roots)
 
 
 @dataclass
@@ -1102,7 +1107,8 @@ def _build_trees(root: str, depth: int, *,
             try:
                 with os.scandir(directory) as entries:
                     next_frontier.extend(
-                        entry.path for entry in entries if entry.is_dir(follow_symlinks=False)
+                        entry.path for entry in entries
+                        if entry.is_dir(follow_symlinks=False) and not DETACHED_ORPHAN_NAME.fullmatch(entry.name)
                     )
             except OSError:
                 continue
@@ -1292,6 +1298,127 @@ def output_slot_leases(path: str) -> tuple[SlotBuildOutput, ...]:
 
 
 @dataclass(frozen=True)
+class NoWorkspaceOutputMirror:
+    """The sweep has no usable mirror for whole-folder removal."""
+
+
+NO_WORKSPACE_OUTPUT_MIRROR = NoWorkspaceOutputMirror()
+
+
+@dataclass(frozen=True)
+class WorkspaceOutputMirror:
+    root: Path
+    cargo: Path
+    slots: Path
+    destinations: dict[Path, Path]
+
+    def search_roots(self) -> tuple[str, ...]:
+        """Find direct output and physical directories reached through the mirror."""
+        return tuple(map(str, sorted({self.root, *self.destinations.values()})))
+
+    def workspace_gone(self, root: Path) -> bool:
+        """Require a mirror mapping and the absence of all possible workspace paths."""
+        from scripts.lib.build_slots import SLOT_NAME
+
+        if root in (self.root, self.cargo):
+            return False
+        if root.is_relative_to(self.slots):
+            return False
+        if root.is_relative_to(self.cargo) and SLOT_NAME.fullmatch(root.relative_to(self.cargo).parts[0]):
+            return False
+        workspaces = {workspace / root.relative_to(destination)
+                      for workspace, destination in self.destinations.items() if root.is_relative_to(destination)}
+        if root.is_relative_to(self.root):
+            direct = Path(root.anchor) / root.relative_to(self.root)
+            if direct.is_relative_to(self.slots):
+                return False
+            workspaces.add(direct)
+        if not workspaces:
+            return False
+        workspaces.update(mapping.workspace_root for mapping in OUTPUT_ROOTS.get().mappings_for(root))
+        for workspace in workspaces:
+            try:
+                _ = workspace.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False
+            return False
+        return True
+
+
+def inside_detached_orphan(path: str) -> bool:
+    return any(DETACHED_ORPHAN_NAME.fullmatch(part) for part in Path(path).parts)
+
+
+@dataclass
+class OrphanSweep:
+    """Keep one live-settings failure and the paths detached during a floor sweep."""
+
+    live_settings_unreadable: bool = False
+    detached_targets: set[str] = field(default_factory=set)
+
+    def read_mirror(self) -> WorkspaceOutputMirror | NoWorkspaceOutputMirror:
+        if self.live_settings_unreadable:
+            return NO_WORKSPACE_OUTPUT_MIRROR
+        path = conf.path("build_folders")
+        try:
+            values = {key: setting.value for key, setting in conf.settings(path.read_text(encoding="utf-8")).items()}
+        except (OSError, UnicodeError) as error:
+            self.live_settings_unreadable = True
+            print(f"lint sweep: cannot read live build_folders settings: {error}", file=sys.stderr)
+            return NO_WORKSPACE_OUTPUT_MIRROR
+        return read_workspace_output_mirror(values)
+
+
+def read_workspace_output_mirror(values: dict[str, str]) -> WorkspaceOutputMirror | NoWorkspaceOutputMirror:
+    """Read the mirror links without walking their destinations."""
+    from scripts.lib.slot_root import slot_root
+
+    machine = store.host_name()
+    mirror_value = values.get(f"roots.cargo_paths.{machine}", "")
+    cargo_value = values.get(f"roots.slot_cargo.{machine}", values.get("roots.slot_cargo", ""))
+    slot_value = slot_root(values, machine)
+    if not (mirror_value and cargo_value and slot_value):
+        return NoWorkspaceOutputMirror()
+
+    def configured_path(value: str) -> Path:
+        return Path(os.path.expandvars(value)).expanduser()
+
+    def unreadable(error: OSError) -> None:
+        raise error
+
+    try:
+        mirror = configured_path(mirror_value).resolve(strict=True)
+        cargo = configured_path(cargo_value).resolve()
+        slots = configured_path(slot_value).resolve()
+        if mirror == Path(mirror.anchor) or cargo == Path(cargo.anchor):
+            return NoWorkspaceOutputMirror()
+        destinations: dict[Path, Path] = {}
+        for directory, subdirs, names in mirror.walk(on_error=unreadable):
+            subdirs[:] = [name for name in subdirs if not DETACHED_ORPHAN_NAME.fullmatch(name)]
+            if RUSTC_INFO in names or (CACHE_TAG in names and (directory / CACHE_TAG).is_file()
+                                       and has_cargo_tag(str(directory))):
+                subdirs.clear()
+                continue
+            for name in names:
+                link = directory / name
+                if not link.is_symlink():
+                    continue
+                try:
+                    destination = link.resolve(strict=True)
+                except FileNotFoundError:
+                    continue
+                if (destination.is_relative_to(cargo) and destination.is_dir()
+                        and not inside_detached_orphan(str(destination))):
+                    workspace = Path(mirror.anchor) / link.relative_to(mirror)
+                    destinations[workspace] = destination
+        return WorkspaceOutputMirror(mirror, cargo, slots, destinations)
+    except (OSError, RuntimeError):
+        return NoWorkspaceOutputMirror()
+
+
+@dataclass(frozen=True)
 class FloorHolder:
     """A busy target the floor cannot take: its size, and the process and session that hold it when known."""
 
@@ -1373,7 +1500,7 @@ def mapped_files(maps: bytes) -> Iterator[str]:
     for line in maps.splitlines():
         fields = line.split(None, 5)
         if len(fields) == 6 and fields[5].startswith(b"/"):
-            yield fields[5].decode(errors="replace")
+            yield os.fsdecode(fields[5])
 
 
 def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, TargetUse]:
@@ -1432,15 +1559,23 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
             owner = owners.process_owner(path)
             if isinstance(owner, TargetOwner) and owner.target in checked:
                 _ = found.setdefault(owner.target, TargetUse(pid, f"maps {path}", start))
-        command = os.path.basename(argv[0]) if argv else ""
-        verify = command == "verify.sh" or (command in ("bash", "sh", "zsh", "dash") and os.path.basename(
-            next((argument for argument in argv[1:] if not argument.startswith("-")), "")) == "verify.sh")
-        if verify or NEXTEST_ARG in argv[1:2] or command == f"cargo-{NEXTEST_ARG}":
-            runner = "verify.sh" if verify else "cargo-nextest"
+        runner = cargo_workspace_runner(argv)
+        if runner:
             for target in workspace_targets(argv, cwd, os.path.join(base, "environ"), owners):
                 if target in checked:
                     _ = found.setdefault(target, TargetUse(pid, f"runs {runner} in {cwd}", start))
     return {target: found[target] for target in owners if target in found}
+
+
+def cargo_workspace_runner(argv: list[str]) -> str:
+    """Identify commands that reserve output between Cargo steps."""
+    command = os.path.basename(argv[0]) if argv else ""
+    if command == "verify.sh" or (command in ("bash", "sh", "zsh", "dash") and os.path.basename(
+            next((argument for argument in argv[1:] if not argument.startswith("-")), "")) == "verify.sh"):
+        return "verify.sh"
+    if NEXTEST_ARG in argv[1:2] or command == f"cargo-{NEXTEST_ARG}":
+        return "cargo-nextest"
+    return ""
 
 
 def process_use(target: str, owners: TargetOwnerIndex, proc: str = PROC_DIR) -> dict[str, TargetUse]:
@@ -1449,6 +1584,59 @@ def process_use(target: str, owners: TargetOwnerIndex, proc: str = PROC_DIR) -> 
     check.checked_targets = (target,)
     check.rechecking = True
     return process_uses(check) if proc == PROC_DIR else process_uses(check, proc)
+
+
+def orphan_process_idle(root: str, proc: str = PROC_DIR) -> bool:
+    """Require a process list and no use among the processes the sweep can read."""
+    prefix = root + os.sep
+
+    def inside(path: str) -> bool:
+        return path == root or path.startswith(prefix) or path == root + DELETED_SUFFIX
+
+    try:
+        for name in os.listdir(proc):
+            if not name.isdecimal() or int(name) == os.getpid():
+                continue
+            process = Path(proc) / name
+            try:
+                cwd = os.readlink(process / "cwd")
+                if inside(cwd) or inside(os.readlink(process / "exe")):
+                    return False
+                if any(inside(path) for path in mapped_files((process / "maps").read_bytes())):
+                    return False
+                argv = [os.fsdecode(arg) for arg in (process / "cmdline").read_bytes().split(b"\0") if arg]
+                if cargo_workspace_runner(argv) and workspace_targets(
+                        argv, cwd, str(process / "environ"), [root], require_environ=True):
+                    return False
+                for descriptor in (process / "fd").iterdir():
+                    try:
+                        if inside(os.readlink(descriptor)):
+                            return False
+                    except FileNotFoundError:
+                        continue
+            except (PermissionError, ProcessLookupError):
+                continue
+            except FileNotFoundError:
+                try:
+                    status = (process / "status").read_text()
+                except (PermissionError, ProcessLookupError):
+                    continue
+                except FileNotFoundError:
+                    try:
+                        _ = process.stat()
+                    except (FileNotFoundError, PermissionError, ProcessLookupError):
+                        continue
+                    return False
+                fields = status.splitlines()
+                if "Kthread:\t1" in fields:
+                    continue
+                if ("Threads:\t1" in fields
+                        and any(line.startswith(("State:\tZ", "State:\tX")) for line in fields)):
+                    continue
+                return False
+    except OSError:
+        return False
+    return True
 
 
 def lock_holder(lock: str, locks: str = PROC_LOCKS, *,
@@ -1661,12 +1849,15 @@ def floor_holders(busy: Mapping[str, TargetUse | LockHeld | BuildHoldTarget | No
     return sorted(holders, key=lambda holder: (-holder.bytes, holder.path))
 
 
-def workspace_targets(argv: list[str], cwd: str, environ: str, targets: Sequence[str]) -> list[str]:
+def workspace_targets(argv: list[str], cwd: str, environ: str, targets: Sequence[str], *,
+                      require_environ: bool = False) -> list[str]:
     """Resolve Cargo's artifact and intermediate folders through one busy check."""
     try:
         with open(environ, "rb") as handle:
             entries = handle.read().decode(errors="replace").split("\0")
     except OSError:
+        if require_environ:
+            raise
         entries = []
     environment = dict(entry.split("=", 1) for entry in entries if "=" in entry)
     settings = cargo_folder_settings(argv, cwd, environment)
@@ -1893,21 +2084,53 @@ def group_roots(trees: list[str], scan: Scan, *,
     return roots
 
 
+def orphan_mount_under(root: str) -> bool:
+    """Check the mount table for mounts that share a device with their parent."""
+    if os.path.ismount(root):
+        return True
+    if not sys.platform.startswith("linux"):
+        return False
+    prefix = os.fsencode(root.rstrip(os.sep) + os.sep)
+    exact = os.fsencode(root)
+    for line in Path(PROC_DIR, "self", "mountinfo").read_bytes().splitlines():
+        fields = line.split()
+        if len(fields) < 6:
+            raise OSError("invalid mount table entry")
+        mount = re.sub(rb"\\([0-7]{3})", lambda match: bytes([int(match[1], 8)]), fields[4])
+        if mount == exact or mount.startswith(prefix):
+            return True
+    return False
+
+
 def walk(directory: str, owner: FloorTake | None, roots: dict[str, Group], scan: Scan, *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> None:
     discovered = scan.discovered_targets or tuple(target_dirs([directory], lint_settings=lint_settings))
     nested_targets = set(discovered) - {os.path.realpath(directory)}
     target_links = scan.target_links.setdefault(directory, {})
+    whole_root = directory
+    whole_folder = isinstance(owner, WholeTargetTake) and owner.workspace_gone
+    device = owner.observed[directory].device if isinstance(owner, WholeTargetTake) and whole_folder else -1
+    doc_lock = os.path.join(directory, "doc", DOC_LOCK_NAME)
+    if whole_folder and orphan_mount_under(directory):
+        raise OSError(f"mount in {directory}")
 
     def visit(directory: str, owner: FloorTake | None) -> None:
-        listed = scan.observations.consume(directory)
+        if whole_folder:
+            with os.scandir(directory) as entries:
+                listed = list(entries)
+        else:
+            listed = scan.observations.consume(directory)
         for entry in listed:
-            if entry.path in nested_targets:
+            if (entry.path in nested_targets or DETACHED_ORPHAN_NAME.fullmatch(entry.name)
+                    or (whole_folder and directory != whole_root
+                        and entry.name in (RUSTC_INFO, CACHE_TAG))):
+                if whole_folder:
+                    raise OSError(f"nested target or detached folder at {entry.path}")
                 if isinstance(owner, WholeTargetTake):
                     owner.retained.add(entry.path)
                 continue
-            if isinstance(owner, WholeTargetTake) and (
+            if not whole_folder and isinstance(owner, WholeTargetTake) and (
                     entry.name == ".claude-busy" or entry.name in LOCK_NAMES
                     or entry.path == os.path.join(owner.target, "doc", ".lock")
                     or entry.name == scratch.STYLE_LOCK_NAME):
@@ -1915,17 +2138,25 @@ def walk(directory: str, owner: FloorTake | None, roots: dict[str, Group], scan:
                 continue
             group = roots.get(entry.path, owner)
             try:
-                stat = entry.stat(follow_symlinks=False)
+                status = entry.stat(follow_symlinks=False)
             except OSError:
+                if whole_folder:
+                    raise
                 continue
+            if whole_folder:
+                if status.st_dev != device or (stat.S_ISDIR(status.st_mode) and os.path.ismount(entry.path)):
+                    raise OSError(f"mount at {entry.path}")
+                lock_file = entry.name in (*LOCK_NAMES, scratch.STYLE_LOCK_NAME) or entry.path == doc_lock
+                if lock_file and not stat.S_ISREG(status.st_mode):
+                    raise OSError(f"invalid lock file at {entry.path}")
             if group is not None:
-                group.observed[entry.path] = output_version(stat)
-            if entry.is_dir(follow_symlinks=False):
+                group.observed[entry.path] = output_version(status)
+            if stat.S_ISDIR(status.st_mode):
                 visit(entry.path, group)
                 continue
-            key = (stat.st_dev, stat.st_ino)
-            scan.blocks[key] = stat.st_blocks * 512
-            scan.links[key] = stat.st_nlink
+            key = (status.st_dev, status.st_ino)
+            scan.blocks[key] = status.st_blocks * 512
+            scan.links[key] = status.st_nlink
             target_links[key] = target_links.get(key, 0) + 1
             if group is not None:
                 group.inodes.append(key)
@@ -1986,12 +2217,32 @@ def removed_entry_account(entry: PendingUnlink, confirmed: bool) -> ConfirmedDel
     return ConfirmedDeletion(freed, 0, 1, {entry.device: freed})
 
 
+@dataclass(frozen=True)
+class LiveTrimOutput:
+    """The trim intent has no detached directory."""
+
+
+class OrphanRenameState(str, Enum):
+    PREPARED = "prepared"
+    DETACHED = "detached"
+
+
+@dataclass(frozen=True)
+class DetachedOrphanOutput:
+    """Reserve a private sibling and identify the directory to remove there."""
+
+    path: str
+    device: int
+    inode: int
+    state: OrphanRenameState = OrphanRenameState.PREPARED
+
+
 @dataclass
 class TrimTake:
     """A target take whose deletion account must reach the build log before it is forgotten."""
 
     target: str
-    cause: Literal["budget take", "floor take"]
+    cause: record.SweepTrimCause
     remaining_groups: int
     at: float = 0.0
     bytes_freed: int = 0
@@ -2002,9 +2253,13 @@ class TrimTake:
     log_offset: int = 0
     unconfirmed_paths: list[str] = field(default_factory=list)
     output_roots: tuple[str, ...] = ()
+    orphan_output: LiveTrimOutput | DetachedOrphanOutput = field(default_factory=LiveTrimOutput)
 
     def save(self) -> None:
-        write_text_atomic(trim_intent_path(self.target), json.dumps(asdict(self)) + "\n")
+        saved = asdict(self)
+        if isinstance(self.orphan_output, LiveTrimOutput):
+            del saved["orphan_output"]
+        write_text_atomic(trim_intent_path(self.target), json.dumps(saved) + "\n")
 
     def prepare(self, group: FloorTake) -> None:
         self.pending = []
@@ -2038,8 +2293,45 @@ class TrimTake:
             self.group_paths = []
         self.save()
 
+    def dispose_orphan(self, output: DetachedOrphanOutput, *, recheck_process_use: bool = False) -> ConfirmedDeletion:
+        """Finish a recorded rename and remove only the directory at its private path."""
+        path = Path(output.path)
+        with ExitStack() as descriptors:
+            try:
+                parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                _ = descriptors.callback(os.close, parent)
+                current = os.lstat(path.name, dir_fd=parent)
+            except FileNotFoundError:
+                # Only a completed rename can have reached deletion.
+                self.remaining_groups = 0
+                self.save()
+                return ConfirmedDeletion(0, 0)
+            if (not stat.S_ISDIR(current.st_mode)
+                    or (current.st_dev, current.st_ino) != (output.device, output.inode)
+                    or orphan_mount_under(output.path)):
+                raise OSError(f"detached build folder changed: {path}")
+            if recheck_process_use and not orphan_process_idle(output.path):
+                return ConfirmedDeletion(0, 0)
+            if output.state is OrphanRenameState.PREPARED:
+                os.fsync(parent)
+                self.orphan_output = replace(output, state=OrphanRenameState.DETACHED)
+                self.removed = 1
+                self.save()
+            account = remove_entry_at(path.name, parent, output.path)
+            if not account.failures:
+                os.fsync(parent)
+                self.remaining_groups = 0
+            self.bytes_freed += account.bytes
+            self.removed += account.removed
+            self.save()
+            return account
+
     def recover(self) -> ConfirmedDeletion | UnconfirmedReclaim:
-        """A missing or replaced name proves removal, never reclaimed blocks."""
+        """Resume an orphan removal or account for a previous unlink."""
+        if isinstance(self.orphan_output, DetachedOrphanOutput):
+            if self.stage == "publishing" or not self.remaining_groups:
+                return ConfirmedDeletion(0, 0)
+            return self.dispose_orphan(self.orphan_output, recheck_process_use=True)
         paths: list[str] = []
         for entry in self.pending:
             try:
@@ -2075,7 +2367,8 @@ class TrimTake:
     def publish(self) -> bool:
         """An append seen after a stop is the same row, not another trim."""
         path = trim_intent_path(self.target)
-        if len(self.output_roots) > 1 and self.pending:
+        if ((len(self.output_roots) > 1 and self.pending)
+                or (isinstance(self.orphan_output, DetachedOrphanOutput) and self.remaining_groups)):
             return False
         if not self.removed:
             path.unlink(missing_ok=True)
@@ -2112,7 +2405,7 @@ def read_trim_intent(path: Path) -> TrimTake:
     unconfirmed = raw.get("unconfirmed_paths", [])
     output_roots = raw.get("output_roots", [])
     if (not isinstance(target, str) or not os.path.isabs(target) or trim_intent_path(target) != path
-            or cause not in ("budget take", "floor take") or stage not in ("deleting", "publishing")
+            or cause not in ("budget take", "floor take", "orphan take") or stage not in ("deleting", "publishing")
             or not all(isinstance(value, int) and value >= 0 for value in counts) or not _finite_number(at)
             or not isinstance(pending, list) or not isinstance(group_paths, list)
             or not isinstance(unconfirmed, list) or not isinstance(output_roots, list)
@@ -2137,10 +2430,24 @@ def read_trim_intent(path: Path) -> TrimTake:
         entries.append(PendingUnlink(name, cast(int, numbers[0]), cast(int, numbers[1]),
                                      cast(int, numbers[2]), cast(int, numbers[3]), directory,
                                      cast(int, fields.get("modified_ns", 0)), cast(int, fields.get("size", 0))))
+    orphan: LiveTrimOutput | DetachedOrphanOutput = LiveTrimOutput()
+    if "orphan_output" in raw:
+        output = raw["orphan_output"]
+        if cause != "orphan take" or not isinstance(output, dict):
+            raise ValueError(f"invalid detached build folder in {path}")
+        values = cast(dict[str, object], output)
+        detached, device, inode, state = (values[key] for key in ("path", "device", "inode", "state"))
+        if (not isinstance(detached, str) or os.path.normpath(detached) != detached
+                or os.path.dirname(detached) != os.path.dirname(target)
+                or not DETACHED_ORPHAN_NAME.fullmatch(os.path.basename(detached))
+                or not isinstance(device, int) or not isinstance(inode, int) or min(device, inode) < 0
+                or state not in ("prepared", "detached") or detached == target):
+            raise ValueError(f"invalid detached build folder in {path}")
+        orphan = DetachedOrphanOutput(detached, device, inode, OrphanRenameState(state))
     return TrimTake(target, cause, cast(int, counts[0]),
                     float(at), cast(int, counts[1]), cast(int, counts[2]), entries,
                     cast(list[str], group_paths), stage, cast(int, counts[3]), cast(list[str], unconfirmed),
-                    tuple(cast(list[str], output_roots)))
+                    tuple(cast(list[str], output_roots)), orphan)
 
 
 @dataclass(frozen=True)
@@ -2183,7 +2490,7 @@ def trim_row_recorded(take: TrimTake) -> bool:
 
 
 @contextmanager
-def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], scan: Scan,
+def recoverable_trim(target: str, cause: record.SweepTrimCause, scan: Scan,
                      dry_run: bool, owners: TargetOwnerIndex) -> Generator[None]:
     """One write-ahead deletion and publication path for budget and floor takes."""
     if dry_run:
@@ -2195,10 +2502,9 @@ def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], s
     with path.with_suffix(".lock").open("a") as guard:
         fcntl.flock(guard, fcntl.LOCK_EX)
         groups = [group for group in scan.groups if owners.owner(group.build_tree) == TargetOwner(target)]
-        whole_targets = [whole for whole in scan.whole_targets
-                         if cause == "floor take" and whole.target == target]
+        whole_targets = [whole for whole in scan.whole_targets if cause != "budget take" and whole.target == target]
         take = TrimTake(target, cause, len(groups) + len(whole_targets),
-                        output_roots=OUTPUT_ROOTS.get().roots_for(target))
+                        output_roots=(target,) if cause == "orphan take" else OUTPUT_ROOTS.get().roots_for(target))
         recovered = True
         if path.exists():
             unfinished = load_trim_for_recovery(path)
@@ -2230,8 +2536,10 @@ def stamp_newer(root: str, moment: float) -> bool:
 
 def trim_inside(take: TrimTake, roots: Sequence[str]) -> bool:
     """Whether every output root of take is inside one of roots."""
-    return all(any(Path(output).is_relative_to(root) for root in roots)
-               for output in take.output_roots or (take.target,))
+    outputs = take.output_roots or (take.target,)
+    if isinstance(take.orphan_output, DetachedOrphanOutput):
+        outputs = (*outputs, take.orphan_output.path)
+    return all(any(Path(output).is_relative_to(root) for root in roots) for output in outputs)
 
 
 def saved_trim_outside(roots: Sequence[str]) -> str | None:
@@ -2272,6 +2580,10 @@ def recover_pending_trims(locked_targets: Sequence[str] = (), *,
                 with ExitStack() as guards:
                     roots = take.output_roots or (take.target,)
                     if scope is TrimRecovery.INSIDE_SWEPT_ROOTS and not trim_inside(take, locked_targets):
+                        continue
+                    if isinstance(take.orphan_output, DetachedOrphanOutput):
+                        _ = take.recover()
+                        _ = take.publish()
                         continue
                     if len(roots) > 1:
                         owners = TargetOwnerIndex(roots)
@@ -2380,6 +2692,66 @@ def remove_entry_at(name: str, parent_fd: int, display_path: str) -> ConfirmedDe
     return ConfirmedDeletion(freed, failures, removed, device_bytes)
 
 
+def orphan_still_idle(group: WholeTargetTake, orphan_sweep: OrphanSweep) -> bool:
+    """Recheck eligibility under the removal locks."""
+    root = group.target
+    mirror = orphan_sweep.read_mirror()
+    try:
+        return (isinstance(mirror, WorkspaceOutputMirror) and on_floor_filesystem(root)
+                and not orphan_mount_under(root) and orphan_process_idle(root)
+                and group_unchanged(group) and mirror.workspace_gone(Path(root)))
+    except OSError:
+        return False
+
+
+def detach_orphan(group: WholeTargetTake, output: DetachedOrphanOutput, orphan_sweep: OrphanSweep) -> bool:
+    """Move the checked directory to the private name in its parent."""
+    root = Path(group.target)
+    parent = os.open(root.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if not orphan_still_idle(group, orphan_sweep):
+            return False
+        current = os.lstat(root.name, dir_fd=parent)
+        if (current.st_dev, current.st_ino) != (output.device, output.inode):
+            return False
+        if os.path.lexists(output.path):
+            raise FileExistsError(output.path)
+        os.rename(root.name, Path(output.path).name, src_dir_fd=parent, dst_dir_fd=parent)
+        return True
+    finally:
+        os.close(parent)
+
+
+def reclaim_orphan(group: WholeTargetTake, orphan_sweep: OrphanSweep, *,
+                   lint_settings: conf.ConfigRead) -> ConfirmedDeletion:
+    """Save the private name before moving the orphan out of its live path."""
+    root = Path(group.target)
+    take = TRIM_TAKES.get()[group.target]
+    if take.cause != "orphan take" or take.stage == "publishing" or isinstance(take.orphan_output, DetachedOrphanOutput):
+        return ConfirmedDeletion(0, 1)
+    if not record_before_delete([group.target], known_targets=[group.target], lint_settings=lint_settings):
+        return ConfirmedDeletion(0, 1)
+    observed = group.observed[group.target]
+    detached = root.with_name(DETACHED_ORPHAN_PREFIX + uuid.uuid4().hex)
+    output = DetachedOrphanOutput(str(detached), observed.device, observed.inode)
+    take.orphan_output = output
+    take.at = time.time()
+    take.save()
+    failures = 0
+    try:
+        moved = detach_orphan(group, output, orphan_sweep)
+    except OSError as error:
+        print(f"lint sweep: could not detach {root}: {error}", file=sys.stderr)
+        moved = False
+        failures = 1
+    if not moved:
+        take.remaining_groups = 0
+        take.save()
+        return ConfirmedDeletion(0, failures)
+    orphan_sweep.detached_targets.add(group.target)
+    return take.dispose_orphan(output)
+
+
 def remove(groups: Sequence[FloorTake], *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> ConfirmedDeletion:
@@ -2428,7 +2800,8 @@ def reclaim(group: FloorTake, scan: Scan, remaining: dict[InodeKey, int],
     identity = group.target if isinstance(group, WholeTargetTake) else group.build_tree
     take = TRIM_TAKES.get().get(identity) if isinstance(group, WholeTargetTake) or group.kind != "orphan" else None
     if take is not None:
-        if take.stage == "publishing" or len(take.output_roots) > 1 and take.pending:
+        if (take.stage == "publishing" or isinstance(take.orphan_output, DetachedOrphanOutput)
+                or (len(take.output_roots) > 1 and take.pending)):
             return ConfirmedDeletion(0, 1)
         take.prepare(group)
     account = remove([group], lint_settings=lint_settings)
@@ -2560,6 +2933,20 @@ def scan_roots(roots: list[str], trees: list[str], *,
         lint_settings = conf.read("lint")
     discovered = roots.discovered if isinstance(roots, DiscoveredTargetRoots) else tuple(target_dirs(roots, lint_settings=lint_settings))
     scan = Scan(discovered_targets=discovered)
+    if isinstance(roots, DiscoveredTargetRoots) and len(roots) == 1 and roots[0] in roots.orphan_roots:
+        root = roots[0]
+        whole = WholeTargetTake(root, entries=[root], workspace_gone=True)
+        try:
+            status = os.lstat(root)
+            if not stat.S_ISDIR(status.st_mode):
+                raise OSError(f"{root} is not a removable output directory")
+            whole.observed[root] = output_version(status)
+            walk(root, whole, {}, scan, lint_settings=lint_settings)
+        except OSError as error:
+            print(f"lint sweep: cannot inspect whole build folder {root}: {error}", file=sys.stderr)
+            return Scan(discovered_targets=discovered, target_links={root: {}})
+        scan.whole_targets.append(whole)
+        return scan
     owners = group_roots(trees, scan, lint_settings=lint_settings)
     for root in roots:
         if scan.groups:
@@ -2579,12 +2966,15 @@ def scan_floor_roots(roots: list[str], trees: dict[str, list[str]], *,
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     discovered = tuple(roots.discovered) if isinstance(roots, DiscoveredTargetRoots) else tuple(roots)
+    orphan_roots: frozenset[str] = roots.orphan_roots if isinstance(roots, DiscoveredTargetRoots) else frozenset()
     output_index = OUTPUT_ROOTS.get()
     def scan_target(cluster: tuple[str, ...]) -> Scan:
         _ = OUTPUT_ROOTS.set(output_index)
-        scan = scan_roots(DiscoveredTargetRoots(cluster, discovered),
+        scan = scan_roots(DiscoveredTargetRoots(cluster, discovered, orphan_roots=orphan_roots),
                           [tree for root in cluster for tree in trees[root]], lint_settings=lint_settings)
         for whole in scan.whole_targets:
+            if whole.workspace_gone:
+                continue
             orphan_paths = [path for orphan in scan.orphans for path in orphan.entries
                             if Path(path).is_relative_to(whole.target)]
             protected = {str(parent) for path in (*whole.retained, *orphan_paths)
@@ -2602,7 +2992,8 @@ def scan_floor_roots(roots: list[str], trees: dict[str, list[str]], *,
     assigned: set[str] = set()
     for root in roots:
         if root not in assigned:
-            cluster = tuple(path for path in paired_roots(root) if path in roots)
+            cluster = ((root,) if root in orphan_roots else
+                       tuple(path for path in paired_roots(root) if path in roots and path not in orphan_roots))
             clusters.append(cluster)
             assigned.update(cluster)
     if not clusters:
@@ -2739,7 +3130,7 @@ def target_dirs(roots: Sequence[str], *,
     marker_names = frozenset(("Cargo.toml", RUSTC_INFO, CACHE_TAG))
 
     def visit(search: TargetRootSearch, directory: str, depth: int) -> None:
-        if directory in search.owned_trees:
+        if directory in search.owned_trees or inside_detached_orphan(directory):
             return
         children: list[os.DirEntry[str]] = []
         markers: set[str] = set()
@@ -2750,7 +3141,7 @@ def target_dirs(roots: Sequence[str], *,
                     if entry.is_dir(follow_symlinks=False):
                         if name == GIT_DIR:
                             markers.add(GIT_DIR)
-                        if name not in skipped:
+                        if name not in skipped and not DETACHED_ORPHAN_NAME.fullmatch(name):
                             children.append(entry)
                     elif name in marker_names and entry.is_file():
                         markers.add(name)
@@ -2821,13 +3212,23 @@ def selected_inodes(group: FloorTake) -> list[InodeKey]:
 
 
 def group_unchanged(group: FloorTake) -> bool:
-    """Validate recorded paths, without another directory scan under the lock."""
+    """Compare the observed paths and the orphan folder's immediate entries."""
     for path, observed in group.observed.items():
         try:
             stat = os.lstat(path)
         except OSError:
             return False
-        if output_version(stat) != observed:
+        if isinstance(group, WholeTargetTake) and group.workspace_gone and path == group.target:
+            # Taking the busy lock can create a mark in this directory.
+            if (stat.st_dev, stat.st_ino) != (observed.device, observed.inode):
+                return False
+            try:
+                if any(os.path.join(path, name) not in group.observed and name != ".claude-busy"
+                       for name in os.listdir(path)):
+                    return False
+            except OSError:
+                return False
+        elif output_version(stat) != observed:
             return False
     return True
 
@@ -2840,12 +3241,14 @@ def shrink_floor(
 *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     policy: MacFloor | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    orphan_sweep: OrphanSweep | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> tuple[int, int, list[tuple[FloorTake, int]]]:
     """Plan unlocked; lock just one target for its deletions, then release it."""
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     orphan_batches: dict[str, list[FloorTake]] = {}
     target_batches: dict[str, list[FloorTake]] = {}
+    whole_orphans: list[tuple[str, list[FloorTake]]] = []
     for groups, target_groups in ((scan.orphans, orphan_batches), (scan.groups, target_batches)):
         for group in sorted(groups, key=removal_order):
             if not selected_inodes(group):
@@ -2853,9 +3256,12 @@ def shrink_floor(
             root = tree_targets[group.build_tree]
             target_groups.setdefault(root, []).append(group)
     for whole in scan.whole_targets:
-        if selected_inodes(whole):
+        if whole.workspace_gone:
+            if on_floor_filesystem(whole.target):
+                whole_orphans.append((whole.target, [whole]))
+        elif selected_inodes(whole):
             target_batches.setdefault(whole.target, []).append(whole)
-    batches = list(orphan_batches.items()) + sorted(
+    batches = sorted(whole_orphans) + list(orphan_batches.items()) + sorted(
         target_batches.items(),
         key=lambda batch: (max(target_last_use(root, [
             group for group in batch[1] if isinstance(group, Group)
@@ -2866,9 +3272,12 @@ def shrink_floor(
     attempted: list[FloorTake] = []
     failures = 0
     orphaned_bytes = 0
+    orphan_folder_bytes = 0
     left = total
     for root, candidates in batches:
-        if left <= budget:
+        first = candidates[0]
+        orphan_folder = isinstance(first, WholeTargetTake) and first.workspace_gone
+        if left <= budget and not orphan_folder:
             break
         paired_roots = OUTPUT_ROOTS.get().roots_for(root)
         if any(paired in busy for paired in paired_roots):
@@ -2907,6 +3316,9 @@ def shrink_floor(
             pair_trees = output_lock_trees(paired_roots,
                 [tree for paired in paired_roots for tree in trees.get(paired, [])],
                 [path for candidate in candidates for path in candidate.entries])
+            if orphan_folder:
+                pair_trees = sorted(set(pair_trees) | {os.path.dirname(path) for path in first.observed
+                                    if os.path.basename(path) in LOCK_NAMES})
             locks = lock_trees(pair_trees)
             if isinstance(locks, TargetLockBusy):
                 busy[root] = LockHeld(locks.path)
@@ -2923,7 +3335,7 @@ def shrink_floor(
                 doc_lock = os.path.join(root, "doc", ".lock")
                 whole_batch = any(isinstance(candidate, WholeTargetTake) for candidate in candidates)
                 if whole_batch and os.path.isdir(os.path.dirname(doc_lock)) and (
-                        not dry_run or os.path.exists(doc_lock)):
+                        (not dry_run and not orphan_folder) or os.path.exists(doc_lock)):
                     held = try_lock(doc_lock)
                     if held is None:
                         busy[root] = LockHeld(doc_lock)
@@ -2932,7 +3344,8 @@ def shrink_floor(
                 if whole_batch:
                     checked = set(target_lock_paths(pair_trees)) | {doc_lock}
                     extra = {path for candidate in candidates if isinstance(candidate, WholeTargetTake)
-                             for path in candidate.retained if os.path.basename(path) in (*LOCK_NAMES, scratch.STYLE_LOCK_NAME)
+                             for path in (candidate.observed if candidate.workspace_gone else candidate.retained)
+                             if os.path.basename(path) in (*LOCK_NAMES, scratch.STYLE_LOCK_NAME)
                              and path not in checked}
                     blocked = False
                     for path in sorted(extra):
@@ -2944,11 +3357,17 @@ def shrink_floor(
                         locks.held.append(held)
                     if blocked:
                         continue
-                with recoverable_trim(root, "floor take", scan, dry_run, owners):
+                if isinstance(first, WholeTargetTake) and first.workspace_gone:
+                    if isinstance(orphan_sweep, UseConfiguredValue):
+                        orphan_sweep = OrphanSweep()
+                    if not orphan_still_idle(first, orphan_sweep):
+                        continue
+                cause = "orphan take" if orphan_folder else "floor take"
+                with recoverable_trim(root, cause, scan, dry_run, owners):
                     for group in candidates:
-                        if left <= budget:
+                        if left <= budget and not orphan_folder:
                             break
-                        if not group_unchanged(group):
+                        if not orphan_folder and not group_unchanged(group):
                             continue
                         if isinstance(policy, MacFloor) and not dry_run:
                             current_claims = policy.claims_before_removal(paired_roots)
@@ -2956,7 +3375,11 @@ def shrink_floor(
                                 busy.update(current_claims)
                                 break
                         attempted.append(group)
-                        account = reclaim(group, scan, remaining, dry_run, lint_settings=lint_settings)
+                        if (not dry_run and isinstance(group, WholeTargetTake) and group.workspace_gone
+                                and isinstance(orphan_sweep, OrphanSweep)):
+                            account = reclaim_orphan(group, orphan_sweep, lint_settings=lint_settings)
+                        else:
+                            account = reclaim(group, scan, remaining, dry_run, lint_settings=lint_settings)
                         if isinstance(account, ConfirmedDeletion) and account.removed:
                             scan.changed_targets.add(root)
                             scan.changed_targets.update(OUTPUT_ROOTS.get().roots_for(root))
@@ -2967,10 +3390,13 @@ def shrink_floor(
                         left -= credited
                         failed = account.failures if isinstance(account, ConfirmedDeletion) else 0
                         failures += failed
-                        if not failed:
+                        detached = isinstance(orphan_sweep, OrphanSweep) and root in orphan_sweep.detached_targets
+                        if not failed and (not orphan_folder or dry_run or detached):
                             taken.append((group, credited))
                         if isinstance(group, Group) and group.kind == "orphan":
                             orphaned_bytes += account.bytes
+                        elif orphan_folder:
+                            orphan_folder_bytes += credited
             finally:
                 release(locks.held)
     verb, result = ("would remove", "would leave") if dry_run else ("removed", "left")
@@ -2982,7 +3408,7 @@ def shrink_floor(
     if groups:
         units = sum(group.kind == "unit" for group in groups)
         uses = [group.last_used for group in groups]
-        freed = total - left - orphaned_bytes
+        freed = total - left - orphaned_bytes - orphan_folder_bytes
         print(f"lint sweep: {verb} {units} build units and {len(groups) - units} incremental dirs"
               + f" ({gib(freed)}), last used {when(min(uses))} to {when(max(uses))}; {result} {gib(left)}")
     return left, failures, taken
@@ -4213,10 +4639,17 @@ def filesystem_floors(floor: int, targets: Sequence[str], *, lint_settings: conf
             continue
         try:
             device = output_device(path)
+            if device not in probes:
+                # Use the highest ancestor on this device so detaching a target keeps the probe.
+                probe = path
+                for parent in Path(path).parents:
+                    if output_device(str(parent)) != device:
+                        break
+                    probe = str(parent)
+                probes[device] = probe
         except FileNotFoundError:
             continue
         _ = devices.setdefault(device, [])
-        _ = probes.setdefault(device, path)
         if path in targets:
             devices[device].append(path)
     floors: list[FilesystemFloor] = []
@@ -4243,8 +4676,12 @@ def _hold_floor(floor: int, dry_run: bool, *,
     planned_at = time.time()
     token = OUTPUT_ROOTS.set(CargoOutputIndex())
     try:
-        targets, mappings = discover_cargo_outputs(roots or floor_roots(lint_settings=lint_settings),
-                                                   lint_settings=lint_settings)
+        orphan_sweep = OrphanSweep()
+        mirror = orphan_sweep.read_mirror()
+        search_roots = tuple(roots or floor_roots(lint_settings=lint_settings))
+        if isinstance(mirror, WorkspaceOutputMirror):
+            search_roots = tuple(dict.fromkeys((*search_roots, *mirror.search_roots())))
+        targets, mappings = discover_cargo_outputs(search_roots, lint_settings=lint_settings)
         _ = OUTPUT_ROOTS.set(mappings)
         ci_roots = [Path(path).expanduser().resolve() for path in lint_settings.words("sweep_ci_targets")]
         excluded_roots = set(ci_roots)
@@ -4265,7 +4702,8 @@ def _hold_floor(floor: int, dry_run: bool, *,
             scope = FLOOR_FILESYSTEM.set(filesystem)
             try:
                 outcome = _hold_floor_pass(filesystem.floor_bytes, dry_run, lint_settings=lint_settings,
-                                          policy=policy, planned_at=planned_at, roots=roots, lock=lock)
+                                          policy=policy, planned_at=planned_at, roots=roots, lock=lock, mirror=mirror,
+                                          orphan_sweep=orphan_sweep)
                 results.append(outcome)
             except OSError as error:
                 print(f"lint sweep: filesystem {filesystem.probe_path}: {error}", file=sys.stderr)
@@ -4514,6 +4952,8 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
     lint_settings: conf.ConfigRead, policy: MacFloor | NatedevFloor,
     roots: Sequence[str] = (), lock: str = "",
     planned_at: float | UseConfiguredValue = UseConfiguredValue.CURRENT,
+    mirror: WorkspaceOutputMirror | NoWorkspaceOutputMirror = NO_WORKSPACE_OUTPUT_MIRROR,
+    orphan_sweep: OrphanSweep | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> FloorOutcome:
     """Below the floor, take the shortfall from the least used idle targets."""
     from scripts.lint import tmp_sweep
@@ -4576,6 +5016,11 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                    target_dirs(roots, lint_settings=lint_settings, known_trees=known_trees))
         all_discovered = sorted(set(targets) | {str(Path(path).expanduser().resolve())
                                  for path in lint_settings.words("sweep_ci_targets") if os.path.isdir(os.path.expanduser(path))})
+        orphan_roots: frozenset[str] = frozenset()
+        if isinstance(mirror, WorkspaceOutputMirror):
+            orphan_roots = frozenset(root for root in targets if on_floor_filesystem(root)
+                                     and mirror.workspace_gone(Path(root))
+                                     and not any(other.startswith(root + os.sep) for other in all_discovered))
         excluded_targets = frozenset(all_discovered)
         if isinstance(filesystem, FilesystemFloor) and not filesystem.root_device:
             print(f"lint sweep: filesystem {filesystem.key} at {filesystem.probe_path}")
@@ -4586,6 +5031,9 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         hold_targets = (build_hold_targets(targets, known_trees, lint_settings=lint_settings)
                         if isinstance(policy, NatedevFloor) else {})
         uses: dict[str, TargetUse | LockHeld] = dict(policy.uses(targets) if isinstance(policy, MacFloor) else process_uses(owners))
+        if isinstance(orphan_sweep, OrphanSweep):
+            for root in orphan_sweep.detached_targets.intersection(targets):
+                uses[root] = LockHeld("a whole-folder take used this path during this sweep")
         if isinstance(policy, NatedevFloor):
             busy_mirrors = mirror_leases.enter_context(copies.target_mirror_leases(targets))
             for root in targets:
@@ -4612,9 +5060,9 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                 print(f"lint sweep: busy slot lease; {root} left alone")
                 continue
             with scratch.judgment_lock(Path(root)) as idle_copy:
-                if root in no_evidence and not idle_copy:
+                if root in no_evidence and root not in orphan_roots and not idle_copy:
                     held_targets.add(root)
-            if root in no_evidence:
+            if root in no_evidence and root not in orphan_roots:
                 if root in uses or root in hold_targets:
                     held_targets.add(root)
                 elif locked_files and root not in held_targets:
@@ -4660,7 +5108,8 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             if blocked_pair:
                 busy[root] = busy[blocked_pair]
                 idle.remove(root)
-        scan = scan_floor_roots(DiscoveredTargetRoots(idle, all_discovered), known_trees, lint_settings=lint_settings)
+        scan = scan_floor_roots(DiscoveredTargetRoots(idle, all_discovered, orphan_roots=orphan_roots),
+                                known_trees, lint_settings=lint_settings)
         target_groups: dict[str, list[Group]] = {root: [] for root in idle}
         grouped_roots = {root: paired_roots(root) for root in set(tree_targets.values())}
         for group in scan.groups:
@@ -4726,17 +5175,23 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                     *unit_age(group, planned_at),
                 ),
                 planned_at, owners,
-             lint_settings=lint_settings, policy=policy if isinstance(policy, MacFloor) else UseConfiguredValue.CURRENT)
+                lint_settings=lint_settings, policy=policy if isinstance(policy, MacFloor) else UseConfiguredValue.CURRENT,
+                orphan_sweep=orphan_sweep)
         else:
             print(f"lint sweep: {gib(scanned_free)} free after the scan, not under the {gib(floor)} floor;"
                   + " nothing taken")
         taken: dict[str, int] = {}
+        orphan_taken: set[str] = set()
         for group, freed in chosen:
             root = group.target if isinstance(group, WholeTargetTake) else tree_targets[group.build_tree]
             taken[root] = taken.get(root, 0) + freed
+            if isinstance(group, WholeTargetTake) and group.workspace_gone:
+                orphan_taken.add(root)
         for root, size in taken.items():
-            if size:
-                verb = "would take" if dry_run else "took"
+            verb = "would take" if dry_run else "took"
+            if root in orphan_taken:
+                print(f"lint sweep: the floor {verb} {gib(size)} from orphan build folder {root}")
+            elif size:
                 print(f"lint sweep: the floor {verb} {gib(size)} from {root},"
                       + f" last used {when(target_uses[root])}")
         after_free = free_bytes(home)
@@ -4886,7 +5341,7 @@ def doc_index_bytes(*, lint_settings: conf.ConfigRead | UseConfiguredValue = Use
     return size_bytes(raw, MIB)
 
 
-RebuildCause = Literal["floor take", "budget take", "tmp sweep", "none"]
+RebuildCause = Literal["floor take", "orphan take", "budget take", "tmp sweep", "none"]
 REBUILD_CAUSES: tuple[RebuildCause, ...] = ("floor take", "budget take", "tmp sweep", "none")
 CLONE_KINDS = ("gate and merge copies", "phase clones", "mktemp folders", "scratchpad clones",
                "scratch.py folders", "other /tmp", "~/rust worktrees", "other")
@@ -4930,12 +5385,12 @@ def parse_sweep_removals(rows: Iterable[dict[str, object]]) -> list[SweepRemoval
     for row in rows:
         at, path, cause = row.get("at"), row.get("path"), row.get("cause")
         if (_finite_number(at) and isinstance(path, str) and os.path.isabs(path)
-                and cause in ("budget take", "floor take")):
+                and cause in ("budget take", "floor take", "orphan take")):
             events.append(SweepRemoval(float(at), path, cast(RebuildCause, cause)))
     return events
 
 
-def record_sweep_removal(target: str, cause: Literal["budget take", "floor take"],
+def record_sweep_removal(target: str, cause: record.SweepTrimCause,
                          bytes_freed: int, extent: Literal["whole", "partial"], at: float) -> bool:
     """One build-log row per target take, including when stdout is discarded."""
     from scripts.buildlog import record
@@ -4981,9 +5436,12 @@ def parse_sweep_journal(lines: Iterable[str]) -> list[SweepRemoval]:
         at = float(stamp) / 1_000_000
         stream = str(row.get("_STREAM_ID") or (str(row.get("_BOOT_ID", "")) + ":" + str(row.get("_PID", ""))))
         floor = re.search(r"lint sweep: the floor took [\d.]+ GiB from (/.+), last used ", message)
+        orphan = re.search(r"lint sweep: the floor took [\d.]+ GiB from orphan build folder (/.+)", message)
         temporary = re.search(r"tmp sweep: deleted (/.+) \([\d.]+ GiB\), last changed ", message)
         budget = re.search(r"lint sweep: (/.+) is [\d.]+ GiB, (?:over|within) the .* budget", message)
-        if floor:
+        if orphan:
+            events.append(SweepRemoval(at, orphan[1], "orphan take"))
+        elif floor:
             events.append(SweepRemoval(at, floor[1], "floor take"))
         elif temporary:
             events.append(SweepRemoval(at, temporary[1], "tmp sweep"))
@@ -5030,7 +5488,7 @@ def read_rebuild_evidence(root: Path) -> RebuildEvidence:
         if kind == "sweep_trim":
             at, folder, cause = row.get("at"), row.get("folder"), row.get("cause")
             if (isinstance(at, str) and isinstance(folder, str) and os.path.isabs(folder)
-                    and cause in ("budget take", "floor take")):
+                    and cause in ("budget take", "floor take", "orphan take")):
                 trims.append(SweepRemoval(datetime.fromisoformat(at).timestamp(), os.path.normpath(folder),
                                           cast(RebuildCause, cause)))
             continue
@@ -5157,7 +5615,8 @@ def rebuilds_main(argv: list[str]) -> int:
     totals: dict[tuple[str, RebuildCause], float] = {}
     roots = scratch_roots()
     for rebuild in cold:
-        key = (clone_kind(rebuild.step.workspace, roots), rebuild.cause)
+        cause = "floor take" if rebuild.cause == "orphan take" else rebuild.cause
+        key = (clone_kind(rebuild.step.workspace, roots), cause)
         totals[key] = totals.get(key, 0.0) + rebuild.step.compile_seconds / 3600
     print(f"Cold rebuild compile-hours over {days} days ({len(cold)} steps with crates_compiled >= {cold_crates})")
     print("Clone kind | " + " | ".join(REBUILD_CAUSES) + " | total")
