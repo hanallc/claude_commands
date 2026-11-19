@@ -13,7 +13,7 @@ Use the `agents` program.
 - Use `agents pause --production SHOWRUNNER [--except UNIT ...] --why TEXT` to select a production.
 - Use `agents resume --production SHOWRUNNER` to resume its units.
 - `agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]`: resume a staff name, staff id, launch reference, or native session id.
-- `agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]`: rename a unit, showrunner, or worker.
+- Use `agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]` to rename a staff member.
 - `agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]`: move Claude sessions to a numbered account.
 - `agents retire NAME`: remove the unit worktree and branch. Keep its retired staff row and conversations.
 - `agents resume NAME --retired`: restore a retired unit and its retained workers.
@@ -23,6 +23,13 @@ Use the `agents` program.
 - `agents stop --all [--dry-run]`: save the live local staff rows, then stop them without a restart.
 - `agents remove-stray NAME SESSION`: remove a stray producer conversation on this machine.
 - `agents transfer NAME [--model MODEL --effort EFFORT]`: give the producer role NAME to the session that runs the command.
+
+## Create a producer
+
+Use `agents add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]` to create a producer.
+The command uses `producer_defaults.model` in `config/models.conf`.
+It creates the README if needed and prints the staff id, account and tab.
+Repeat the command with the same options after an interruption.
 
 First admission adopts one proved live Claude session or Codex thread with the producer name.
 It also checks live agents in matching tabs and panes in `PRODUCER_WORKSPACE`.
@@ -34,6 +41,14 @@ Recovery checks live sessions before it resumes a retained conversation.
 Recovery adopts a different proved live session and removes the pending admission record.
 Stop selects the producer row's `current_session` when several tabs have the same label.
 The Claude session registry proves a plain start without a session ID in its arguments.
+
+After you change a producer's family in `config/models.conf`, run `agents resume NAME`.
+The command stops the old conversation and closes its pane.
+It starts a fresh conversation in a new tab and binds it to the producer's row.
+Claude uses the producers account. Codex uses the workers account. `--to ACCOUNT` selects a different account.
+Repeat the command to continue from a saved admission record.
+If an interruption occurs before the admission write, a retry can leave an extra shell tab open.
+If transfer reports a pending admission, run `agents resume NAME` first.
 
 Remove a stray producer with these steps:
 
@@ -51,6 +66,23 @@ A repeated command uses that record to complete failed steps.
 It deletes the cleanup record after every step completes.
 A repeated command prints `unchanged` when no cleanup record or selected resource remains.
 
+## Rename or retire a producer
+
+Use `agents rename OLD NEW` to rename a producer.
+The command keeps the staff id and document folder.
+It reports the path of the document folder.
+
+Use `agents retire NAME [--to PRODUCER]` to retire a producer.
+The command requires the producer to close its open questions.
+If the producer has no `handoff.md`, the command requests the file.
+Repeat the command after the file exists.
+The command stops the conversation and closes its tab before it moves open List items.
+Open List items move to the selected producer, or to morty by default.
+Use `--to` only with a producer whose conversation is live.
+The command retains the conversation and document folder.
+Use `agents resume NAME --retired` to restore the profile and conversation.
+You cannot rename or retire morty.
+
 Pause and exit record the time, caller, and reason. The board shows `paused` or `exited`.
 Resume removes the record. A paused director receives one continuation message.
 Failed continuation delivery restores the pause and returns failure.
@@ -63,7 +95,7 @@ Other Claude sessions use the units account; `--to ACCOUNT` overrides the accoun
 The default reason is `resumed by name`.
 Retired units do not appear in active status or the board.
 Resume without `--retired` refuses a retired unit.
-A running session prints `unchanged` and returns status 0.
+When resume selects a running conversation, it prints `unchanged` and returns status 0.
 A closed tab uses the existing restore path.
 An empty current pane can resume its own saved session.
 Resume restores retained workers with their native conversations.
@@ -113,7 +145,7 @@ Transfer runs in a session that has no staff row, on the producer's machine.
 It stops the old conversation and closes its tab. It keeps the row id, the document, and the message queue.
 It sets the row's session, account home, and launch folder, then restarts the caller as the producer.
 `--model` and `--effort` replace `[producers].NAME`; the caller supplies the family.
-A Claude caller must use the producers account. The refusal gives the `agents move` command.
+A Claude caller must use the producers account, or the showrunners account while the producers group has no selection. The refusal gives the `agents move` command.
 After a failure, run the same command again.
 
 Before a power-off, run `agents stop --all`.

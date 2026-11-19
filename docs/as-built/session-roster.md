@@ -66,6 +66,9 @@ Its native address still accepts messages.
 The roster reads one staff snapshot and passes it to each entry reader.
 Codex thread titles and herdr labels do not become recipient names.
 The native registry helpers live in `scripts/message/session_records.py`.
+A missing registry folder or an unreadable record leaves unmatched liveness unknown.
+The roster reports each unreadable path and keeps entries that it can read.
+A process count needs a complete registry read.
 `sessions.py` exports those helpers and adds staff recipient lookup.
 Staff imports the native helpers directly, so neither module imports the other.
 
@@ -265,11 +268,29 @@ The `--to user` outcomes in full, including `SENT: … rewritten:` and `sent des
 
 Usage errors, the stderr-only refusals above, an unreadable `--file` and an empty message also exit 2.
 
-Delivery mechanics: `send.py` first tries the local postmaster for a Claude recipient in the live registry. It waits up to 3 seconds, withdraws the entry, and checks its claim. A claim allows another 15 seconds for the receipt, from `claim_grace_seconds` in `config/postmaster.conf`. A confirmed receipt reports `SENT: postmaster; …`. A claimed send without confirmation reports `FAILED` with exit 3. The message may already have arrived; the sender must not resend it by hand. The client starts no relay and queues no copy for that result. A key for that attempt stays pending across repeat windows and caller exits.
+`send.py` uses the checked relay for every Claude socket delivery on both hosts while postmaster is off.
+`_postmaster_recipient` returns `RecipientNotInRegistry` for all recipients.
+The direct relay receives the original timeout and logs `unresolved`.
+When Herdr reports one foreground Claude PID with unavailable argv, the relay can use the registry for the exact conversation.
+This route requires one registry record with the same live PID, process start, and a socket path.
+The conversation ID must be a canonical UUID.
+A pane report that names a different conversation or is unreadable prevents this route.
+The relay checks the pane report during planning and again before it writes.
+The relay checks the current registry, connected peer PID, and process start before it writes.
 
-A proved miss permits the relay: `absent`, `stale`, `self`, `unclaimed`, `outbox-error`, `failed`, `expired`, or `relay-only-sender` (`shutdown`). A recipient outside the live registry uses the relay directly and logs `unresolved`. A proved miss gives the relay `max(1.0, options.timeout - attempt.seconds)`. A recipient outside the registry gets the original timeout.
-
-The fallback is a headless `command claude -p` relay (sonnet, auto mode, tools `SendMessage` plus `ListAgents` for a name, hooks, MCP and slash commands off, `CLAUDE_*` variables removed, named by `relay_identity.relay_session_name(--from)` as `relay/<sender>`); delivery is read from the `SendMessage` tool result in the stream, which stays in `STATE/relay/<to>.jsonl`. `--timeout` defaults to 40 s for every transport. Where `~/.config/claude/oauth-token.gpg` exists (the Mac, whose keychain ssh cannot open) the relay decrypts it, and queues with `gpg-agent is cold on <machine>: run github-warmup there` when it cannot. Undelivered Claude messages go to `STATE/queue/`, latest per `--key`, under the recipient's session id; `pending` prints and clears them. `--key` with `--repeat-minutes` skips a repeat within the window; `ack` skips every later send with the key until `reopen`.
+The relay runs `command claude -p` with Sonnet, auto mode, and only the `SendMessage` tool.
+It disables MCP, slash commands, and settings sources and removes inherited `CLAUDE_*` variables.
+The proxy checks the request and writes it to the recipient's verified socket.
+The relay confirms delivery from the matching tool result and the completed proxy write.
+It saves the tool stream in `STATE/relay/<to>.jsonl`.
+`--timeout` defaults to 40 s for every transport.
+If `~/.config/claude/oauth-token.gpg` exists, the relay decrypts it for authentication.
+A cold GPG agent causes queueing with `gpg-agent is cold on <machine>: run github-warmup there`.
+Claude queue records live under the recipient's session ID in `STATE/queue/`.
+The queue keeps the latest message per `--key`.
+`pending` prints and clears the messages.
+`--key` with `--repeat-minutes` skips a repeat within the window.
+`ack` skips every later send with the key until `reopen`.
 
 The relay name has the form `relay/<sender>`. A name alone does not identify a relay: a real session can use the same form. The message body always carries `Shown sender: <display name>`, even when the display name equals `--from`. The conversation-pause hook reads the original sender with `relay_identity.message_sender_name` for scheduled messages and its return question. The native SendMessage miss hook resolves the exact target through staff. A non-staff name can use a live roster row. Verified relay recovery retains its saved sender lookup. This name is display text. `send.py` records the runtime sender ID separately.
 Caller lines that start with `Sender native id:` get a `> ` prefix in delivered text.
@@ -308,7 +329,17 @@ Live pane and daemon delivery use their existing paths. The hook needs no pane r
 
 Postmaster is a local Claude Code mod in `mods/postmaster/`, loaded directly with `--plugin-dir`; the trial start procedure loads `/home/natepiano/.claude/mods/postmaster` from main. It uses a Claude session named `postmaster` in `/home/natepiano/postmaster`. It reads and writes only under `STATE/postmaster/`, starts no process and makes no network call. `STATE` is `$XDG_STATE_HOME/message`, defaulting to `~/.local/state/message`.
 
-The mod folder holds `.claude-plugin/plugin.json` (name `postmaster`, version 0.1.0, no marketplace field), `hooks/hooks.json` (`{"modules": ["./register.ts"]}`), `hooks/{register,protocol,outbox,replies}.ts`, `tests/*.test.ts` and `tsconfig.json`. `register.ts` alone touches `$`: `callsFor($)` builds `PostmasterCalls` from direct `$.noun.method(...)` call sites (`env.get` with the literal names `HOME` and `XDG_STATE_HOME`; `fs.read`, `write`, `exists`, `list`; `session.id`, `send`), `now` as `Date.now` and `every` over `globalThis.setInterval`. `outbox.ts` (`startOutbox(calls, replies): Promise<Outbox>`) and `replies.ts` (`startReplies(calls): Promise<Replies>`) work only through that call set, so the tests hand them a fake one. `protocol.ts` holds the JSON types, their validators, `POLL_MS` (500), `BATCH` (20), `VERSION`, `REPLY_WINDOW_MS` (30 min) and `PATHS`.
+The mod folder holds `.claude-plugin/plugin.json`, `hooks/`, `tests/`, and `tsconfig.json`.
+The manifest names the mod `postmaster` and has no marketplace field.
+`hooks/hooks.json` loads `register.ts`.
+`register.ts` alone calls the engine through `$`.
+`callsFor($)` supplies `env.get`, `fs.read`, `fs.write`, `fs.exists`, `fs.list`, `session.id`, and `session.send`.
+It reads the literal environment names `HOME` and `XDG_STATE_HOME`.
+It also supplies `Date.now` and a timer that uses `globalThis.setInterval`.
+`startOutbox` and `startReplies` use those calls.
+The tests supply their own calls.
+`protocol.ts` defines the JSON types, validators, `VERSION`, and `PATHS`.
+It sets `POLL_MS` to 500, `BATCH` to 20, and `REPLY_WINDOW_MS` to 30 minutes.
 
 **Files and formats**
 
@@ -316,18 +347,51 @@ Each record is one JSON file. The engine refuses reads and writes over 4 MiB, so
 
 | Path under `STATE/postmaster/` | JSON fields and meaning |
 |---|---|
-| `outbox/<id>.json` | `{id, session_id, socket, text, sha256, deadline_ms, sender, reply_to_session_id}`; recipient id and `uds:` socket come from its live registry record; `sender` is non-empty |
+| `outbox/<id>.json` | `{id, session_id, recipient_pid, recipient_start, socket, text, sha256, deadline_ms, sender, reply_to_session_id}`. The recipient fields and socket come from the live registry. The sender is nonempty. |
 | `claimed/<id>.json` | `{id, claimed_ms, run}`; `run` identifies the hooks worker as `<at_ms>-<uuid>` |
-| `results/<id>.json` | `{id, outcome, detail, sha256, claimed_ms, finished_ms}`; outcome is `delivered`, `failed`, `expired`, `withdrawn` or `abandoned`; `sha256` is the mod's own hash of the text it passed to the send (of empty text for an unreadable entry) |
-| `heartbeat.json` | `{session_id, at_ms, version, run}`; written each poll and before each send; version is `0.1.0`; non-empty `run` is the worker's `<at_ms>-<uuid>`, also carried by its claims |
+| `results/<id>.json` | `{id, outcome, detail, sha256, claimed_ms, finished_ms}` plus the three recipient fields from a valid entry. The mod hashes the entry text or empty text when the entry is unreadable. |
+| `heartbeat.json` | `{session_id, at_ms, version, run}`. The mod writes it each poll and before each send. Each claim uses the same `<at_ms>-<uuid>` value for `run`. |
 | `delivered/<at_ms>-<n>.json` | `{route, socket, sender, reply_to_session_id, session_id, at_ms}`; `route` is `open` or `withdrawn`; names one delivery route |
 | `replies/<at_ms>-<n>.json` | `{at_ms, socket, name, session_id, senders, body, targets}`; replying identity, distinct original sender names in first-route order, body and intended destination ids. Written once, before the first forward |
 | `forwards/<at_ms>-<n>.json` | `{forwarded}`; confirmed forward destination ids for the reply of the same name. Written once, after the last forward; it exists only when forwarding is done |
 | `errors/<at_ms>-<n>.json` | `{at_ms, error}`; file/start/poll errors, including failed durable route withdrawal |
 
-The client resolves the original sender by its current name: exactly one live session gives `ReplyToSession(session_id)`, otherwise `ReplyUnroutable()`. Only the wire entry uses `reply_to_session_id: ""` for that state. The mod converts it into `ReplyDestination` (`session` or `unroutable`) when registering or restoring a route; it reads no session registry. The recipient gets `Message from <sender> via postmaster: <summary> [<first eight id characters>]`, a blank line and the original text. Distinct tags prevent the recipient's repeat-text filter from dropping equal messages. The mod adds neither entry routing field to the text itself.
+The client resolves the original sender by its current name.
+One live match gives `ReplyToSession(session_id)`. All other results give `ReplyUnroutable()`.
+The wire entry uses `reply_to_session_id: ""` for an unroutable reply.
+The mod uses that field to select the `session` or `unroutable` variant of `ReplyDestination` when it registers or restores a route.
+The routing fields stay in the wire entry.
+
+The current mod can omit recipient fields from `failed`, `withdrawn`, and `abandoned` receipts.
+Python accepts a fieldless receipt from any worker by entry ID and applies the same outcome rules as main.
+If a receipt has recipient fields, Python checks that the session ID, PID, and process start time all match the entry.
+A partial or mismatched recipient leaves delivery unconfirmed.
+
+| Receipt outcome | Python result |
+|---|---|
+| `delivered` | Confirm delivery and check whether the hash matches. |
+| `failed` or `expired` | Permit relay with that reason. |
+| `withdrawn` | Permit relay with reason `unclaimed`. |
+| `abandoned` | Retain the claim as unconfirmed. |
+
+A delivery starts with `<name>: <summary>`. The client removes a leading `send.py in ` from the sender name.
+The next line is `Sender native id: <id>`, followed by `Shown sender: <display name>` when needed.
+The metadata ends with `Tag: <tag8>`. The tag is the first eight characters of the entry ID.
+Line breaks in the name, summary and shown sender become spaces, so each metadata field is one line and the header has a fixed form.
+The recipient's UI still shows `Message from @postmaster:` before the delivery, because the engine send call has no sender field.
+A blank line separates the metadata from the original text.
+Distinct tags prevent the recipient's repeat-text filter from dropping equal messages.
 
 **Worker, claim and fallback**
+
+The outbox path below applies when the sender selects postmaster.
+It waits for a receipt for up to three seconds before withdrawal.
+The `claim_grace_seconds` setting in `config/postmaster.conf` allows another 15 seconds when a claim exists.
+Confirmed delivery reports `SENT: postmaster; …`.
+An unconfirmed claimed send reports `FAILED` with exit 3.
+Its key stays pending across repeat windows and caller exits.
+A proved outbox miss allows relay with `max(1.0, options.timeout - attempt.seconds)`.
+The miss reasons are `absent`, `stale`, `self`, `unclaimed`, `outbox-error`, `failed`, `expired`, and `relay-only-sender`.
 
 Either `session.start` or `session.receive` starts one shared worker promise, restoring replies before starting the outbox; concurrent hooks await the same start. A failed start writes an error and permits the next hook to retry. The 0.5 s poll never overlaps itself. Each poll writes the heartbeat, retries pending route withdrawals and unwritten results, marks a claim from an earlier worker without a result `abandoned` without sending again, then takes at most 20 new entries oldest-first by mtime, rewriting the heartbeat before each. The poll body, a failed start and each hook's `.catch` write one `errors/` file and never rethrow; a reply handler that throws writes none. Either way the hook hands the event on with `next(e)`.
 
@@ -340,24 +404,25 @@ Different addresses for that session use the same record.
 The record contains the entry ID, owner PID, process start time, and stage.
 The key file replacement syncs its content and directory before the next step starts.
 
-1. `reserved` is durable before publication work starts. Only this stage permits unpublished cancellation or recovery after the owner's death.
-2. `publishing` is durable before `os.replace()` exposes the entry. Exceptions retain the entry and claim evidence; owner death never releases this stage as unpublished.
-3. `relaying` is durable before any relay fallback starts, including a miss before publication. It keeps the entry ID and owner under the session ID.
-4. `resolved` records a definite postmaster or relay result before completion. Delivered or queued completes delivery; a definite failure permits another attempt.
+| Stage | Meaning and recovery |
+|---|---|
+| `direct-relay` | The sender reserves a relay without outbox publication. A live owner keeps a retry pending. A dead or replaced owner permits recovery. |
+| `reserved` | The sender saves this stage before publication work. A failure before publication or the owner's death permits recovery. |
+| `publishing` | The sender saves this stage before `os.replace()` exposes the entry. Exceptions and owner death retain the claim and receipt evidence. |
+| `relaying` | The sender saves this stage before relay fallback from a proved outbox miss. A live owner keeps a retry pending. |
+| `relay-unconfirmed` | The relay started or completed a recipient write without confirmed acceptance. This stage prevents another send with the same key. |
+| `resolved` | The sender saves a definite postmaster outcome before receipt cleanup. Confirmed delivery completes the claim. A proved miss permits fallback. |
 
 A failed stage write stops the send before its next step.
 A concurrent retry reads the saved stage and receipt.
 A publishing reservation without a receipt or file evidence reports unconfirmed delivery with exit 3.
 It never starts another send.
 A replacement reservation prevents the earlier sender from starting a relay or queued copy.
-A live `relaying` owner keeps a same-key retry pending through every address of that session.
 A dead `relaying` owner without a definite result leaves delivery unconfirmed with exit 3.
-The retry never sends again from that uncertain stage.
-A definite relay result is saved and synced before fallback ownership ends.
-Delivered or queued acceptance is then saved under the canonical session identity while the resolved session record still exists.
-Completion also saves the stable recipient alias, which preserves repeat windows across staff or named-session restarts.
-The same lock protects both saves and the later removal of the resolved session record.
-The accepted session timestamp remains after that removal, so a retry through another address reads the same acceptance.
+Recovery is possible if a legacy `relaying` record identifies a direct relay process and the owner is dead or replaced.
+A definite relay failure releases the claim.
+Relay delivery or queue acceptance saves the canonical session and stable recipient alias under one lock.
+The same write removes the pending record and preserves the repeat window across staff restarts.
 An unstaffed session uses its canonical identity for the claim, repeat guard and queue owner.
 Its socket address does not create another acceptance key.
 An explicit logical recipient also checks the canonical session's repeat window.
@@ -376,9 +441,25 @@ The client saves and syncs `resolved` before it removes a definite receipt. A fa
 
 **Replies**
 
-Only a `peer` event with a complete cross-session wrapper and a `from` socket having a route inside the 30-minute window is a reply. The handler reads the first line's `from` and `from-name` and the body between the opening and closing lines. It writes one reply file that names the socket, body and intended destinations, forwards to each distinct session destination registered for that socket, writes the confirmed forwards to a `forwards/` file of the same name, and returns `{consumed: "postmaster reply"}`, starting no turn in the postmaster session. Script senders with no destination still have their replies consumed and logged. Unknown sockets, other origins, ordinary prompts, relay messages and broadcasts pass to `next(e)` unchanged; a failed handler also passes the event on.
+A reply is a `peer` event with a complete cross-session wrapper and a route for the `from` socket within the 30-minute window.
+The handler reads `from` and `from-name` from the opening line and extracts the body from the wrapper.
+If the body starts with `postmaster:`, the handler passes it to the postmaster session before it reads the route.
+It ignores leading whitespace and letter case for this check.
+For a reply, the handler writes one reply file with the socket, body, and intended destinations.
+It forwards the body to each distinct session destination for that socket.
+It writes the confirmed destinations to a `forwards/` file of the same name.
+It returns `{ kind: "consumed", reason: "postmaster reply" }` and starts no turn in the postmaster session.
+The handler also records and consumes replies to script senders with no destination.
+Other events and handler failures pass to `next(e)`.
 
-A forward begins `Message from <name> (their answer to <sender>, passed on by postmaster) [<at_ms>-<n>]:`, then a blank line and the body. Several sender names produce `their answer to one of <a>, <b>` and each distinct session destination gets it. Each forward has a new tag. The Claude receiving rule answers the real sender named on the first line, never the wrapper's `postmaster` name. Routes are registered before the outbox send returns, so a quick reply is recognized; refusing a later delivery removes only that delivery's route. A throwing send keeps its route because delivery is unknown. A replaced worker restores valid `open` route files inside the window; malformed, invalid and withdrawn files are skipped.
+A forward has the form `<name> (answer to <answerTo>): <body>`, followed by a blank line and `Tag: <at_ms>-<n>`.
+`progress_history.py` reads the key from the final `Tag:` line and matches the forward against the text that `PostmasterReplyRecord.matches_forward()` rebuilds from the reply record. A sender name can contain `): `, so the reader never splits the forward at that text. The reader does not accept the earlier forward format.
+With several senders, `<answerTo>` has the form `one of <a>, <b>`.
+Each forward has a new tag. The recipient answers the sender named in the text.
+The mod registers the route before the outbox send returns so it can recognize an early reply.
+A refused delivery removes only its own route.
+If a send throws an error, the mod keeps its route because the delivery result is unknown.
+A replacement worker restores valid `open` routes within the 30-minute window.
 
 **Start, check and stop procedure**
 
@@ -655,7 +736,8 @@ Release recalculates the priority of a kept decision.
 - Strict checks from the repo root: `command claude plugin validate --strict mods/postmaster`, `command claude plugin test mods/postmaster`, and `nix shell nixpkgs#typescript --command tsc --noEmit -p mods/postmaster` (natedev has no `tsc`, `node` or `bun` on `PATH`). Repeat validation and the kit after a Claude Code update. The bare `claude` name is a shell alias, so commands and launches spell `command claude`.
 - The validator accepts only direct `$.noun.method(...)` call sites and literal `$.env.get` names, and refuses `import()` and a re-exported `register`; the mod imports only its own files with import declarations. A new engine call goes into `callsFor($)` in `register.ts`, never into `outbox.ts` or `replies.ts`.
 - Engine-generated `mods/postmaster/.claude-plugin/types/` stays ignored; it supplies `Register`, the hook and call types and the worker globals, so the mod uses ES2023 without `DOM`. The engine writes it only when a live session loads the folder; in a fresh checkout `tsc` reports `TS2307` for `claude-code` until then.
-- `--plugin-dir` reloads the folder when its files change. A pull on main replaces the worker 19–23 s after `register.ts` changes. The relay covers a stale heartbeat. The shutdown pane record retains each plugin directory as an absolute path. Account moves and pane restores pass those directories to Claude again. Old records without those directories need a manual launch with the plugin flag. A stopped postmaster needs a manual start.
+- `--plugin-dir` reloads the folder when its files change. A pull on main replaces the worker 19–23 s after `register.ts` changes. The shutdown pane record retains each plugin directory as an absolute path. Account moves and pane restores pass those directories to Claude again. Old records without those directories need a manual launch with the plugin flag. A stopped postmaster needs a manual start.
+- The cloud gate provides Node.js without the Claude mod runner. The Python gate runs the receipt fixture from `outbox.test.ts` with Node.js. The fixture calls the real mod and writes its receipt to a temporary file. Python checks the receipt with `is_outbox_result` and `receipt_matches_recipient`. The Python fakes use the same receipt as their template.
 - After about 32 quick sends to one session the engine answers `isDelivered: false` (then about one per 2 s); the mod does not pace, so these surface as `failed` and the client relays them.
 - A reply only counts when the recipient answers the postmaster session with SendMessage. A recipient that answers through `send.py --to postmaster` sends through the relay, whose socket holds no route, so the postmaster takes an ordinary turn.
 - `quota_alert.py` reads `quota_relay_timeout_seconds` from `config/accounts.conf` for session sends. The default is 40 seconds, with 10 seconds reserved before `send_budget.seconds()` adds the delivery allowances. Phone sends use `review.user_send_seconds()` and `send_budget.user_seconds()`.

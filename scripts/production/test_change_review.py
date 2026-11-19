@@ -28,7 +28,7 @@ from unittest import mock
 
 
 from scripts.production import change_review
-from scripts.lib import copy_record, file_lock
+from scripts.lib import conf, copy_record, file_lock
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.checkout_test_support import write_python_tool
 from scripts.production import (
@@ -43,7 +43,7 @@ from scripts.production.change_review import Invisible, Malformed, Visible
 from scripts.production.change_review_test_support import (
     fixture_image, fixture_row_image, pictured_changes, pictured_publication, pictured_review_lines,
 )
-from scripts.review_links import image_store
+from scripts.review_links import image_store, review_events
 
 # Importable once change_review has put scripts/lib on the path.
 from scripts.lib import scratch
@@ -92,8 +92,9 @@ def setUpModule() -> None:
     unittest.enterModuleContext(mock.patch.dict(os.environ, {
         "STAFF_FILE": str(Path(folder.name) / "staff.json"), "NEXT_STATE_DIR": folder.name,
         "REVIEW_LINKS_ROOT": str(Path(folder.name) / "links"), "CHANGE_REVIEW_DIR": folder.name,
+        "SHOWRUNNER_STATE_DIR": f"{folder.name}/showrunner-state",
         "UNIT_HISTORY_DIR": f"{folder.name}/history", copy_record.ROOT_ENV: f"{folder.name}/scratch",
-        scratch.VISIBLE_ROOT_ENV: f"{folder.name}/repro"}))
+        scratch.VISIBLE_ROOT_ENV: f"{folder.name}/repro", scratch.HOLDS_ENV: f"{folder.name}/holds.json"}))
     _ = fixture_member("showrunner", name="fixture")
     _ = fixture_member("showrunner", name="demo", runtime_id=DEMO_ID,
                        doc=staff.LiveDoc(remote.local_machine(), PRODUCTION))
@@ -218,7 +219,7 @@ class ProducerFixture(unittest.TestCase):
         _ = self.git("push", "origin", "main")
         return self.git("rev-parse", "HEAD")
 
-class ProducerWriterTests(ProducerFixture):
+class ProducerImageRequirementTests(ProducerFixture):
     def test_add_refuses_a_visible_row_without_an_image(self) -> None:
         code, output, error = run("add", "--production", "top", "--change", "No image", "--check", "Read", "--see", "Proof")
         self.assertEqual((code, output), (1, ""))
@@ -258,6 +259,56 @@ class ProducerWriterTests(ProducerFixture):
         self.assertEqual((self.listing.read_bytes(), self.listing.stat().st_mtime_ns), before)
         write.assert_not_called()
 
+class NativeVerdictTests(unittest.TestCase):
+    def test_withdraw_preserves_a_pending_verdict_until_recovery_delivers_it(self) -> None:
+        from scripts.review_links import change_page, review_page, test_review_page
+
+        case = test_review_page.ReviewPageTests('runTest')
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        delivery, _ = review_page.submit(case.root, case.body('page-owner/C1', 'works', 'Clear numbers'), case.status)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        listing = delivery.page.review_list
+        record = case.status.path(delivery.page, delivery.row)
+        before = listing.read_bytes(), record.read_bytes()
+        arguments = ('withdraw', '--production', 'page-owner', '--list', str(listing),
+                     '--row', delivery.row, '--reason', 'The change was reverted')
+        self.assertEqual(run(*arguments), (1, '', 'C1 has a pending verdict message. Withdraw it after delivery.\n'))
+        self.assertEqual((listing.read_bytes(), record.read_bytes()), before)
+        read_text = Path.read_text
+
+        def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            if path == record:
+                raise PermissionError('fixture record is unreadable')
+            return read_text(path, encoding=encoding, errors=errors)
+
+        with mock.patch.object(Path, 'read_text', new=read):
+            code, output, error = run(*arguments)
+        self.assertEqual((code, output), (1, ''))
+        self.assertIn('fixture record is unreadable', error)
+        self.assertEqual((listing.read_bytes(), record.read_bytes()), before)
+
+        for damaged in (b'{', b'{"verdict":{"state":"pending"}}',
+                        b'{"kind":"verdict","state":"pending","attempt":""}'):
+            with self.subTest(damaged=damaged):
+                _ = record.write_bytes(damaged)
+                code, output, error = run(*arguments)
+                self.assertEqual((code, output), (1, ''))
+                self.assertIn('cannot read its verdict delivery record', error)
+                self.assertEqual((listing.read_bytes(), record.read_bytes()), (before[0], damaged))
+            _ = listing.write_bytes(before[0])
+        _ = record.write_bytes(before[1])
+        self.assertEqual(case.fixture.messages, [])
+
+        change_page.recover_pending(change_page.DeliveryStatus(case.root))
+        self.assertCountEqual([recipient for recipient, _, _ in case.fixture.messages],
+                              ['builder-unit', 'page-owner'])
+        for _, _, message in case.fixture.messages:
+            self.assertIn('C1: works: Clear numbers', message)
+        self.assertEqual(run(*arguments)[0], 0)
+        row = next(row for row in change_review.review_rows(listing) if row['#'] == delivery.row)
+        self.assertEqual(row['Verdict'], 'withdrawn')
+
     def test_native_verdict_keeps_the_exchange_locked_until_the_list_save(self) -> None:
         from scripts.review_links import change_page, review_page, test_review_page
 
@@ -290,8 +341,41 @@ class ProducerWriterTests(ProducerFixture):
         self.assertEqual(next(row['Verdict'] for row in change_review.review_rows(delivery.page.review_list)
                               if row['#'] == delivery.row), 'works')
 
+    def test_validation_fault_reopens_a_change_without_a_review_log(self) -> None:
+        from scripts.review_links import review_items, test_review_page
+
+        case = test_review_page.ReviewPageTests('runTest')
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        listing = case.fixture.review_list
+        sent = {'attempt': 'check-id', 'state': 'sent', 'feedback': 'Check the spacing.'}
+        for row, fields, identity in (
+            ('C1', {'validation': sent}, 'check-id'),
+            ('C2', {'kind': 'validation', **sent}, 'check-id'),
+            ('C3', {'feedback': 'Check the spacing.'}, ''),
+        ):
+            with self.subTest(row=row):
+                pending = next(item for item in change_review.pending(listing) if item['#'] == row)
+                self.assertFalse(pending.get('Review log'))
+                record = change_routing.delivery_path(case.root, listing, row)
+                record.parent.mkdir(parents=True, exist_ok=True)
+                handed_at = '2026-11-16T12:49:08-05:00'
+                _ = record.write_text(json.dumps({**fields, 'waiting_why': 'The showrunner checks the spacing.',
+                                                  'handed_at': handed_at}))
+                result = change_review.save_verdict(listing, row, 'not works: the spacing differs',
+                                                   case.fixture.production, validation_id=identity)
+                self.assertIsInstance(result, change_review.VerdictSaved)
+                item = next(item for item in review_items.read(case.root) if item.key == f'page-owner/{row}')
+                self.assertEqual(item.state, review_items.ReviewState.OPEN)
+                self.assertIn(row, [pending['#'] for pending in change_review.pending(listing)])
+                self.assertEqual(item.log[-1].words, 'Check found a problem: not works: the spacing differs')
+                slots = change_routing.delivery_slots(record)
+                self.assertFalse(slots.validation_requested)
+                self.assertEqual(slots.waiting_why, 'The showrunner checks the spacing.')
+                self.assertEqual(cast(dict[str, object], json.loads(record.read_text())).get('handed_at'), handed_at)
+
     def test_native_verdict_uses_the_current_validation_id(self) -> None:
-        from scripts.review_links import change_page, review_items, review_page, test_review_page
+        from scripts.review_links import change_page, question_record, review_items, review_page, test_review_page
 
         for verdict in ('works', 'not works: the spacing differs'):
             for supplied in ('missing', 'old', 'current'):
@@ -300,16 +384,19 @@ class ProducerWriterTests(ProducerFixture):
                     case.setUp()
                     try:
                         key = 'page-owner/C1'
-                        old, _ = review_page.submit(case.root, case.body(key, 'validate', 'Check the old case.'), case.status)
-                        assert isinstance(old, change_page.MessageDelivery)
-                        change_page.deliver(old, case.status)
-                        current, _ = review_page.submit(case.root, case.body(key, 'validate', 'Check the new case.'), case.status)
+                        current, _ = review_page.submit(
+                            case.root, case.body(key, 'validate', 'Check the current case.'), case.status)
                         assert isinstance(current, change_page.MessageDelivery)
                         change_page.deliver(current, case.status)
                         listing = current.page.review_list
                         record = case.status.path(current.page, current.row)
                         before = listing.read_bytes(), record.read_bytes()
-                        identity = '' if supplied == 'missing' else old.attempt if supplied == 'old' else current.attempt
+                        messages = list(case.fixture.messages)
+                        with self.assertRaisesRegex(question_record.AnswerRefused, 'already with the showrunner'):
+                            _ = review_page.submit(case.root, case.body(key, 'validate', 'Check a second case.'), case.status)
+                        self.assertEqual((listing.read_bytes(), record.read_bytes(), case.fixture.messages),
+                                         (*before, messages))
+                        identity = {'missing': '', 'old': 'old-validation-id', 'current': current.attempt}[supplied]
                         arguments = ('verdict', '--production', 'page-owner', '--list', str(listing),
                                      '--row', 'C1', '--verdict', verdict)
                         if supplied != 'current':
@@ -345,21 +432,23 @@ class ProducerWriterTests(ProducerFixture):
                     finally:
                         case.doCleanups()
 
-    def test_native_verdict_refuses_a_superseded_validation(self) -> None:
-        from scripts.review_links import change_page, review_page, test_review_page
+    def test_native_verdict_keeps_validation_when_a_second_question_is_refused(self) -> None:
+        from scripts.review_links import change_page, question_record, review_page, test_review_page
 
         case = test_review_page.ReviewPageTests('runTest')
         case.setUp()
         self.addCleanup(case.doCleanups)
         key = 'page-owner/C1'
-        old, _ = review_page.submit(case.root, case.body(key, 'validate', 'Check the old case.'), case.status)
-        change_page.deliver(old, case.status)
-        current, _ = review_page.submit(case.root, case.body(key, 'question', 'Check the new case.'), case.status)
+        current, _ = review_page.submit(case.root, case.body(key, 'validate', 'Check the current case.'), case.status)
         assert isinstance(current, change_page.MessageDelivery)
         change_page.deliver(current, case.status)
         listing = current.page.review_list
         record = case.status.path(current.page, current.row)
-        before = listing.read_bytes(), record.read_bytes()
+        before = listing.read_bytes(), record.read_bytes(), list(case.fixture.messages)
+        with self.assertRaisesRegex(question_record.AnswerRefused, 'already with the showrunner'):
+            _ = review_page.submit(case.root, case.body(key, 'question', 'Check a second case.'), case.status)
+        self.assertEqual((listing.read_bytes(), record.read_bytes(), case.fixture.messages), before)
+
         reason = 'this question id does not match the current question'
         result = change_review.save_verdict(listing, 'C1', 'works', case.fixture.production)
         self.assertIsInstance(result, change_review.VerdictRefused)
@@ -369,11 +458,16 @@ class ProducerWriterTests(ProducerFixture):
         code, output, errors = run('verdict', '--production', 'page-owner', '--list', str(listing),
                                    '--row', 'C1', '--verdict', 'works')
         self.assertEqual((code, output, errors.strip()), (1, '', reason))
-        self.assertEqual((listing.read_bytes(), record.read_bytes()), before)
-        request = case.status.slots(current.page, current.row).question
-        assert isinstance(request, change_page.OpenQuestion)
-        self.assertTrue(change_page.answer_item(key, 'The new case passes.', request.question_id, case.status))
+        self.assertEqual((listing.read_bytes(), record.read_bytes(), case.fixture.messages), before)
 
+        result = change_review.save_verdict(listing, 'C1', 'works', case.fixture.production,
+                                            validation_id=current.attempt)
+        self.assertIsInstance(result, change_review.VerdictSaved)
+        self.assertEqual(next(row['Verdict'] for row in change_review.review_rows(listing) if row['#'] == 'C1'),
+                         'works')
+
+
+class ProducerWriterTests(ProducerFixture):
     def test_output_capture_adds_an_image_to_add_edit_and_batch_rows(self) -> None:
         output = self.root / "output.txt"
         _ = output.write_text("All checks passed\n", encoding="utf-8")
@@ -665,6 +759,21 @@ class ProducerWriterTests(ProducerFixture):
                 self.assertFalse(folder.exists())
                 reviewed = next(item for item in change_review.review_rows(self.listing) if item["#"] == row)
                 self.assertEqual(reviewed.get(change_review.IMAGE, ""), "")
+
+    def test_verdict_reports_failed_image_cleanup_after_the_write(self) -> None:
+        shot = self.root / "shot.png"
+        _ = shot.write_bytes(b"fixture image")
+        identity = image_store.register_change(shot)
+        day = date(2026, 11, 15)
+        _ = change_review.append_rows(self.listing, [Visible("Preview", "Read", "The image", image=identity)],
+            day, "", self.doc, producers=[self.unit.id], record=staff.snapshot())
+        warnings: list[str] = []
+        with mock.patch.object(image_store, "remove_change", side_effect=PermissionError("The image cannot be removed.")):
+            result = change_review.record_verdict(self.listing, "C1", "works", day, self.doc, report_warning=warnings.append)
+        self.assertIsInstance(result, change_review.VerdictRecorded)
+        self.assertEqual(change_review.review_snapshot(self.listing).reviewed[0]["Verdict"], "works")
+        warning, = warnings
+        self.assertIn("Image cleanup failed", warning)
 
     def test_open_cells_follow_staff_changes_without_rewriting_review_history(self) -> None:
         _ = change_review.append_rows(self.listing, pictured_changes([Visible("Unit", "Read", "Proof"),
@@ -2940,6 +3049,55 @@ class ActionTest(unittest.TestCase):
         self.assertIn("| # | Change | Verdict | Date | Merged |", text)
         self.assertIn("| --- | --- | --- | --- | --- |\n| C76 | Panels keep shields | Works, thanks | 2026-10-15 | 2026-10-14 |\n| C70 |", text)
 
+    def test_withdraw_an_open_row_and_keep_the_users_words_and_time(self) -> None:
+        words = "The panels are back | Keep the café sign.\u2028Keep the panels.\u2029Keep the shields.\u0085Keep the fonts."
+        arguments = ("withdraw", "--production", DOC, "--list", str(self.path), "--row", "C76", "--reason", words)
+        self.enterContext(mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.path.parent / "review-links")}))
+        folder = scratch.new(f"row:{self.path.stem}-C76", "withdraw")
+        _ = change_review.hold_for_row(self.path, "C76", [str(folder)])
+        held = os.path.realpath(folder)
+        self.assertIn(held, scratch.holds())
+        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+            with mock.patch.object(scratch, "end", side_effect=scratch.ScratchError("fixture cleanup failed")):
+                code, output, error = run(*arguments)
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn("scratch not removed: fixture cleanup failed", output)
+            self.assertIn(held, scratch.holds())
+            before = self.path.read_bytes()
+            with mock.patch.object(scratch, "end", side_effect=conf.Unusable("fixture scratch configuration is unavailable")):
+                code, output, error = run(*arguments)
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn("scratch not removed: fixture scratch configuration is unavailable", output)
+            self.assertIn(held, scratch.holds())
+            self.assertEqual(self.path.read_bytes(), before)
+            code, output, error = run(*arguments)
+            self.assertEqual((code, error), (0, ""))
+        self.assertIn(f"removed {folder}\n", output)
+        self.assertFalse(folder.exists())
+        self.assertNotIn(held, scratch.holds())
+        self.assertEqual(self.path.read_bytes(), before)
+        snapshot = change_review.review_snapshot(self.path)
+        self.assertEqual([row["#"] for row in snapshot.pending], ["C77"])
+        row = next(row for row in snapshot.reviewed if row["#"] == "C76")
+        self.assertEqual((row["Verdict"], row["Date"], row["Merged"]), ("withdrawn", "2026-11-13", "2026-10-14"))
+        self.assertIn("café", row["Review log"])
+        self.assertEqual(review_events.decode(row["Review log"]),
+                         (review_events.ReviewLog(ADD_TIME, "nate", f"Withdrawn: {words}"),))
+
+    def test_withdraw_a_reviewed_row_and_keep_its_previous_verdict(self) -> None:
+        words = "The change was reverted"
+        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+            code, _, error = run("withdraw", "--production", DOC, "--list", str(self.path),
+                                 "--row", "C70", "--reason", words)
+            self.assertEqual(code, 0, error)
+        snapshot = change_review.review_snapshot(self.path)
+        self.assertEqual([row["#"] for row in snapshot.pending], ["C76", "C77"])
+        row, = snapshot.reviewed
+        self.assertEqual((row["#"], row["Verdict"], row["Date"]), ("C70", "withdrawn", "2026-11-13"))
+        previous, withdrawal = review_events.decode(row["Review log"])
+        self.assertEqual((previous.words, previous.time.date()), ("works", date(2026, 10, 13)))
+        self.assertEqual(withdrawal, review_events.ReviewLog(ADD_TIME, "nate", f"Withdrawn: {words}"))
+
     def test_edit_and_verdict_replacement_failures_keep_the_list_and_rerun_once(self) -> None:
         for action in ("edit", "verdict"):
             with self.subTest(action=action):
@@ -3492,6 +3650,37 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
         self.assertEqual(self.git('rev-list', '--count', f'{head}..HEAD'), '1')
         self.assertEqual(next(row['Change'] for row in change_review.pending(paths[0]) if row['#'] == 'C1'), 'The accepted edit')
         self.assertEqual(next(row['Verdict'] for row in change_review.review_rows(paths[1]) if row['#'] == 'C1'), 'works')
+
+    def test_batch_validation_fault_reopens_a_change_without_a_review_log(self) -> None:
+        from scripts.review_links import review_later
+
+        root = self.repo.parent/'links'
+        key = 'natedev/C1'
+        state = self.repo.parent/'showrunner-state'
+        with mock.patch.dict(os.environ, {'REVIEW_LINKS_ROOT': str(root), 'SHOWRUNNER_STATE_DIR': str(state)}):
+            paths = self.batch_lists()
+            record = change_routing.delivery_path(root, paths[1], 'C1')
+            record.parent.mkdir(parents=True, exist_ok=True)
+            _ = record.write_text(json.dumps({'feedback': 'Check the spacing.'}))
+            until = datetime.fromisoformat('2099-01-01T00:00:00-05:00')
+            review_later.save(key, until)
+            review_later.save('natedev/C2', until)
+            head = self.git('rev-parse', 'HEAD')
+            code, output, errors = self.run_batch([
+                {'op': 'edit', 'production': DOC, 'list': str(paths[0]), 'row': 'C1',
+                 'change': 'The accepted edit', 'check': 'Read', 'see': 'Proof'},
+                {'op': 'verdict', 'production': DOC, 'list': str(paths[1]), 'row': 'C1',
+                 'verdict': 'not works: the spacing differs'},
+            ])
+            remaining = review_later.times()
+        self.assertEqual((code, errors), (0, ''))
+        self.assertIn('The accepted edit', output)
+        self.assertIn('the check found a problem. The change returned to Open.', output)
+        self.assertEqual(self.git('rev-list', '--count', f'{head}..HEAD'), '1')
+        row = next(row for row in change_review.pending(paths[1]) if row['#'] == 'C1')
+        self.assertIn('Check found a problem: not works: the spacing differs', row['Review log'])
+        self.assertTrue(change_routing.waits_for_user(paths[1], row, root))
+        self.assertEqual(remaining, {'natedev/C2': until})
 
     def test_a_batch_writes_two_lists_with_one_lock_and_commit(self) -> None:
         with mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.repo.parent / "links")}):

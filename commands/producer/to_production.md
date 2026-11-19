@@ -16,7 +16,7 @@ Read both first.
 
 **Usage:** `/producer:to_production <plan> [<plan>…] [--name <production>] [--merge-branch <branch>]`
 
-This command writes plan docs only. It writes no code and makes no commits,
+This command writes plan docs and showrunner notes only. It writes no code and makes no commits,
 branches or worktrees; `/showrunner:produce` creates those at launch.
 
 ---
@@ -156,7 +156,7 @@ Then stop.
 
 ## Rules
 
-- Plan docs only; no code, commits, branches or worktrees.
+- Plan docs and showrunner notes only; no code, commits, branches or worktrees.
 - Never rewrite a `done` phase and never renumber one.
 - A Work Order moves whole. Change only cross-unit references. Keep its Spec verbatim.
 - Splitting is packaging under `<DecisionEconomy/>`: decide it and state it.

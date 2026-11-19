@@ -16,6 +16,7 @@ from scripts.lib.test_names import fixture_names
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.unit_runs_test_support import bind_private_run_roots
 from scripts.message import sessions as runtime_sessions
+from scripts.message import process_identity, relay_identity, session_records
 from scripts.message.process_identity import process_start as REAL_PROCESS_START
 
 import argparse
@@ -29,6 +30,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from typing import ClassVar, cast, override
 from types import ModuleType
 from collections.abc import Callable, Iterator
@@ -43,6 +45,7 @@ from scripts.message import sessions
 from scripts.agents import inventory
 from scripts.agents import restart
 from scripts.herdr.herdr import HerdrPlace
+from scripts.herdr.herdr_types import HerdrFailure
 from scripts.production.production_doc import Refusal, read_production
 from scripts.accounts import accounts
 from scripts.whoami.note_file import NumberedAccountLabel, note_name, parse_account_label
@@ -58,6 +61,7 @@ SCRIPT = Path(__file__).with_name("add_unit.py")
 REAL_HERDR_RUN_PROGRAM = herdr.run_program
 REAL_KILL = os.kill
 FAKE_CLAUDE_PID = 991003
+ATTACH_SOURCE_PID = 991004
 MARKED_HERDR_PLACE = HerdrPlace("marked-herdr", "w7:p1")
 SHARED = herdr.SHARED_SESSION
 NO_LAUNCH_FIXTURE = add_unit.NoLabeledSession()
@@ -72,9 +76,11 @@ with private_process_registry(), patch.object(remote, 'local_machine', return_va
 """
 
 
-def fixture_process_start(pid: int) -> str | None:
+def fixture_process_start(pid: int, *, allow_host: bool = True) -> str | None:
     """Read the fake agent generation from its private process files."""
-    if pid != FAKE_CLAUDE_PID:
+    if pid not in (FAKE_CLAUDE_PID, ATTACH_SOURCE_PID):
+        if not allow_host:
+            raise AssertionError(f"unexpected process start probe for pid {pid}")
         return REAL_PROCESS_START(pid)
     try:
         fields = (Path(os.environ["HERDR_PROC"]) / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
@@ -83,9 +89,11 @@ def fixture_process_start(pid: int) -> str | None:
         return None
 
 
-def fixture_process_probe(pid: int, number: int) -> None:
+def fixture_process_probe(pid: int, number: int, *, allow_host: bool = True) -> None:
     """Read liveness for the private agent without signalling a host process."""
-    if pid != FAKE_CLAUDE_PID:
+    if pid not in (FAKE_CLAUDE_PID, ATTACH_SOURCE_PID):
+        if not allow_host:
+            raise AssertionError(f"unexpected liveness probe for pid {pid}")
         REAL_KILL(pid, number)
         return
     if number != 0:
@@ -227,6 +235,7 @@ class ObservedUnitLaunch:
         return self.observe(request, prompt)
 
 class AddUnitTestCase(ShutdownTestCase):
+    fixture_only_processes: ClassVar[bool] = False
     staff: StaffTestCase = StaffTestCase()
     production_name: str = "build-followups"
     seed: ClassVar[ImmutableGitSeed]
@@ -272,12 +281,20 @@ class AddUnitTestCase(ShutdownTestCase):
         super().setUp()
         self.staff = StaffTestCase()
         self.addCleanup(self.staff.doCleanups)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HERDR_PROC": str(self.root / "proc")})))
         self.staff.setUp()
         _ = self.enterContext(patch.object(names, "load_names", return_value=fixture_names()))
-        _ = self.enterContext(patch.object(sessions, "process_start", side_effect=fixture_process_start))
-        _ = self.enterContext(patch.object(runtime_sessions, "process_start", side_effect=fixture_process_start))
+        process_start = partial(fixture_process_start, allow_host=not self.fixture_only_processes)
+        _ = self.enterContext(patch.object(sessions, "process_start", side_effect=process_start))
+        _ = self.enterContext(patch.object(runtime_sessions, "process_start", side_effect=process_start))
+        if self.fixture_only_processes:
+            _ = self.enterContext(patch.object(session_records, "process_start", side_effect=process_start))
+            _ = self.enterContext(patch.object(process_identity, "process_start", side_effect=process_start))
+            _ = self.enterContext(patch.object(relay_identity, "process_start", side_effect=process_start))
         _ = self.enterContext(private_process_registry())
-        _ = self.enterContext(patch.object(os, "kill", side_effect=fixture_process_probe))
+        _ = self.enterContext(patch.object(os, "kill",
+            side_effect=partial(fixture_process_probe, allow_host=not self.fixture_only_processes)))
         # These CLI fixtures prove launcher plumbing; transcript proof is exercised
         # through the real submit method in PromptSubmissionTests.
         def submitted(client: herdr.Herdr, pane: str, opening: herdr.OpeningPrompt,
@@ -287,7 +304,7 @@ class AddUnitTestCase(ShutdownTestCase):
             return herdr.PromptSubmitted(datetime.now(timezone.utc))
 
         _ = self.enterContext(patch.object(herdr.Herdr, "submit_opening_prompt", submitted))
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state")})))
         bind_private_run_roots(self, self.root)
         home_context = cast(object, self.enterContext(
             patch.dict(os.environ, {"HOME": str(self.root / "home")})
@@ -337,6 +354,7 @@ class AddUnitTestCase(ShutdownTestCase):
         _ = sync_state.touch()
         self.env = {**os.environ, "HOME": str(self.root / "home"),
                     "HERDR_PLATFORM": "linux",
+                    "TOKIO_WORKER_THREADS": "1",
                     "NOTIFIER_SESSIONS_DIR": str(registry),
                     "FAKE_CLAUDE_SOCKET": str(self.root / "claude.sock"),
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
@@ -466,6 +484,8 @@ def submit_command(argv):
                 return REAL_HERDR_RUN_PROGRAM(argv, timeout, environment=environment)
 
         _ = self.enterContext(patch.object(herdr, "run_program", run_herdr))
+        if self.fixture_only_processes:
+            _ = self.enterContext(patch.object(herdr, "session_socket_request", side_effect=self.socket_reply))
         real_popen = cast(Callable[..., subprocess.Popen[str]], subprocess.Popen)
 
         def spawn(argv: list[str], **options: object) -> subprocess.Popen[str] | CompletedAgentCLI:
@@ -488,6 +508,21 @@ def submit_command(argv):
             _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "owner@example.com"}, "projects": self.trusted_projects()}))
         _ = self.select_unit_account("claude2")
         self.prepare_herdr_launch("alpha", "--plan", "docs/plans/given.md")
+
+    def socket_reply(self, session: str, method: str, **params: object) -> dict[str, object]:
+        if method != "pane.process_info":
+            raise AssertionError(f"unexpected fixture socket request: {method}")
+        command = f"--session {session} pane process-info --pane {params['pane_id']}"
+        if shell := self.env.get("FAKE_SHELL_PID"):
+            reply = fixture_foreground(int(shell))
+        else:
+            replies = cast(dict[str, CommandResponse | list[CommandResponse]],
+                           json.loads(Path(self.env["FAKE_HERDR_RESPONSES"]).read_text()))
+            reply = replies.get(command)
+        if reply is None:
+            raise HerdrFailure("no fixture pane process information")
+        assert not isinstance(reply, list)
+        return herdr.json_object(herdr.decode_object(reply["stdout"], "fixture response")["result"], "fixture result")
 
     def quota_reading(self, login: str, left: float, reset_days: float) -> None:
         with patch.dict(os.environ, self.env):
@@ -859,9 +894,12 @@ def submit_command(argv):
         return result, error.getvalue(), commands, len(launches), write_stub.call_count
 
     def write_resume_registry_record(self, proc_start: str) -> None:
+        self.write_source_registry_record(os.getpid(), proc_start)
+
+    def write_source_registry_record(self, pid: int, proc_start: str) -> None:
         registry = Path(self.env["NOTIFIER_SESSIONS_DIR"])
-        _ = (registry / f"{os.getpid()}.json").write_text(json.dumps({
-            "pid": os.getpid(), "sessionId": "62ccbd64-f22e-5647-b20e-7899aa39d766", "name": "postmaster",
+        _ = (registry / f"{pid}.json").write_text(json.dumps({
+            "pid": pid, "sessionId": "62ccbd64-f22e-5647-b20e-7899aa39d766", "name": "postmaster",
             "messagingSocketPath": self.env["FAKE_CLAUDE_SOCKET"], "updatedAt": 1, "procStart": proc_start,
             "bridgeSessionId": "session_bridge",
         }))
@@ -870,10 +908,12 @@ def submit_command(argv):
                        timeout: bool = False) -> tuple[Path, list[str]]:
         prior = self.root / "prior-session"
         prior.mkdir()
-        started = sessions.process_start(os.getpid())
+        write_process(self.env, ATTACH_SOURCE_PID, 0, ["claude"], {})
+        with patch.dict(os.environ, self.env):
+            started = fixture_process_start(ATTACH_SOURCE_PID)
         assert started is not None
-        self.write_resume_registry_record(started)
-        source = inventory.ListedSession("62ccbd64-f22e-5647-b20e-7899aa39d766", os.getpid(), started, "postmaster", "top-level",
+        self.write_source_registry_record(ATTACH_SOURCE_PID, started)
+        source = inventory.ListedSession("62ccbd64-f22e-5647-b20e-7899aa39d766", ATTACH_SOURCE_PID, started, "postmaster", "top-level",
                                          self.root / "home/.claude", "owner@example.com", "", "")
         _ = self.enterContext(patch.object(inventory, "listing", return_value=[source]))
         document, head = self.doc.read_text(), self.git("rev-parse", "HEAD")
@@ -900,12 +940,12 @@ def submit_command(argv):
             trace.append("stop")
             if timeout:
                 return stop_resume.StopFailed(identity, "fixture stop failed")
-            (Path(self.env["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json").unlink()
+            (Path(self.env["NOTIFIER_SESSIONS_DIR"]) / f"{ATTACH_SOURCE_PID}.json").unlink()
             stopped = True
-            return stop_resume.Stopped(identity, os.getpid())
+            return stop_resume.Stopped(identity, ATTACH_SOURCE_PID)
 
         def processes(_identity: str) -> sessions.SessionProcesses:
-            return sessions.SessionProcesses(after_launch if launched else after_stop if stopped else (os.getpid(),))
+            return sessions.SessionProcesses(after_launch if launched else after_stop if stopped else (ATTACH_SOURCE_PID,))
 
         _ = self.enterContext(patch.object(stop_resume, "stop", side_effect=stop))
         _ = self.enterContext(patch.object(add_unit, "launch_session", side_effect=launch))

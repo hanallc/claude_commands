@@ -6,8 +6,8 @@ import json
 import os
 import shlex
 import shutil
+import stat
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -16,24 +16,28 @@ import io
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
-from scripts.mac_test import eligibility, offload, mac_test
-from scripts.mac_test.offload_test_commands import ACTIVITY_SELECTOR_STUB, write_shell
+from scripts.mac_test import eligibility, offload, mac_test, nextest_log
+from scripts.mac_test.offload_test_commands import (
+    ACTIVITY_SELECTOR_STUB, configure_nextest_trim, install_nextest_log_writer, write_shell,
+)
 from scripts.mac_test.offload_test_support import HANA, HANA_COMMAND_PATTERN, SelectorEvent
-from scripts.lib import test_hang_guard
+from scripts.lib import conf, test_hang_guard
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 class MacCleanupProtocolTests(unittest.TestCase):
     def test_status_marker_followed_by_ordinary_output_is_printed_and_not_a_result(self) -> None:
-        output = io.StringIO()
         controller = offload.ProcessController()
-        text = "mac_exit=0\ntest still running\n"
-        with redirect_stdout(output):
-            answer = controller.stream_mac_run([
-                "/bin/sh", "-c", 'printf "%s" "$1"; exit 255', "protocol", text,
-            ])
-        self.assertIsInstance(answer, offload.MissingMacStatus)
-        self.assertEqual(output.getvalue(), text)
+        for marker in ("mac_exit=0", "mac_nextest_setup=failed"):
+            with self.subTest(marker=marker):
+                text = f"{marker}\ntest still running\n"
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    answer = controller.stream_mac_run([
+                        "/bin/sh", "-c", 'printf "%s" "$1"; exit 255', "protocol", text,
+                    ])
+                self.assertIsInstance(answer, offload.MissingMacStatus)
+                self.assertEqual(output.getvalue(), text)
 
     def test_stream_returns_cleanup_outcome_beside_the_reported_test_status(self) -> None:
         cases = (
@@ -87,6 +91,33 @@ class MacCleanupProtocolTests(unittest.TestCase):
                                  + text + " under the 100 GiB floor\n")
 
 
+    def test_nextest_summary_scan_bounds_long_lines(self) -> None:
+        summary = b"Summary [0.1s] 1 test run: 1 failed, "
+        noise = b"x" * (64 * 1024)
+        fake_summary = b"Summary [0.2s] 1 test run: 1 passed"
+        limits = nextest_log.NextestOutputLimits(tail_bytes=4, summary_bytes=64)
+        colored = b"\033[31m" + summary + noise + b"\033[0m"
+        cases = (
+            ("long Summary", colored + b"\n" + noise + fake_summary, (summary + noise)[:limits.summary_bytes]),
+            ("Summary after redraw", noise + b"\r" + colored, (summary + noise)[:limits.summary_bytes]),
+            ("Summary overwritten", colored + b"\rtest output", b""),
+            ("trailing returns", colored + b"\r\033[0m\r", (summary + noise)[:limits.summary_bytes]),
+        )
+        for label, contents, expected in cases:
+            with self.subTest(label=label):
+                output = io.BytesIO()
+                log = io.BytesIO(contents + b"\nend\n")
+                with mock.patch.object(log, "readline", wraps=log.readline) as readline:
+                    nextest_log.replay_log(log, Path("log"), 42, limits, output)
+                self.assertTrue(readline.called)
+                for call in readline.call_args_list:
+                    (size,) = cast(tuple[int], call.args)
+                    self.assertTrue(0 < size < len(noise))
+                self.assertEqual(output.getvalue(),
+                                 b"mac_test: full nextest log: log\nmac_test: tail fragment: end\n"
+                                 + (expected + b"\n" if expected else b""))
+
+
 class MacTargetCleanupShellTests(unittest.TestCase):
     root: Path = Path()
     home_directory: Path = Path()
@@ -111,11 +142,8 @@ class MacTargetCleanupShellTests(unittest.TestCase):
         self.bin_directory = self.root / "bin"
         self.bin_directory.mkdir()
         self.configuration_environment = config_environment(self.root / "configuration")
-        # The trim step runs the lint sweep, about 0.5 CPU s a start. Tests of the trim call real_sweep();
-        # the other tests check the shell text around it, so this stub reports a clean trim at once.
-        self.python = self.home_directory / ".claude/scripts/lib/py"
-        self.python.parent.mkdir(parents=True)
-        write_shell(self.python, 'exit 0\n')
+        # Use the real log writer and stub the trim unless the test needs it.
+        self.python = install_nextest_log_writer(self.home_directory)
         disk_space = self.bin_directory / "df"
         write_shell(disk_space, r'''
 json_args "$@" > "$CLEANUP_TEST_DIR/df-arguments.json"
@@ -141,10 +169,6 @@ printf 'nextest finished\n'
 exit "$CLEANUP_TEST_STATUS"
 ''')
 
-    def real_sweep(self) -> None:
-        """Run the real lint sweep in the trim step."""
-        write_shell(self.python, f'exec {shlex.quote(sys.executable)} "$@"\n')
-
     def run_remote(
         self, shell: list[str], status: int, words: tuple[str, ...] = (), *,
         disk_output: str = "Filesystem GiB Used Available Capacity Mounted\nfixture 500 401 99 80% /\n",
@@ -155,11 +179,15 @@ exit "$CLEANUP_TEST_STATUS"
         budget_values: tuple[tuple[str, str], ...] = (),
     ) -> subprocess.CompletedProcess[str]:
         request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words, owner="verify", holder_session="fixture-session")
+        settings = self.root / "command-mac.conf"
+        _ = write_config_fixture(settings, "".join(f"{key}={value}\n" for key, value in budget_values),
+                                 template="mac_test")
         config = eligibility.OffloadConfig(
             enabled=True, connection=eligibility.SshConnectionSettings("unused-host", 6, 10), probe_timeout_s=1,
             unreachable_backoff_s=300, free_floor_gib=free_floor_gib,
             default_target_budget_gib=budget_gib,
             values={"abandoned_session_minutes": str(abandoned_session_minutes), **dict(budget_values)},
+            settings=conf.read(settings),
         )
         text = (
             '[ "$(command -v df)" = ' + shlex.quote(str(self.bin_directory / "df")) + ' ] || exit 99\n'
@@ -177,11 +205,68 @@ exit "$CLEANUP_TEST_STATUS"
         )
 
     def cleanup_lines(self, answer: subprocess.CompletedProcess[str]) -> list[str]:
-        lines = answer.stdout.splitlines()
+        lines = [line for line in answer.stdout.splitlines()
+                 if not line.startswith("mac_test: full nextest log: ")]
         if lines[-1] == "mac_cleanup=skipped":
             return lines
         self.assertRegex(lines[2], r"^mac_trim=status=0 elapsed_seconds=[0-9]+ over_budget=(yes|no|unknown)$")
         return lines[:2] + lines[3:]
+
+    def test_unusable_log_directory_refuses_setup_before_lint(self) -> None:
+        path = self.home_directory / nextest_log.DIRECTORY
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text("a regular file blocks log setup")
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            with self.subTest(shell=shell):
+                answer = self.run_remote(shell, 42, ("--target-dir=other-target",))
+                self.assertEqual(answer.stdout.splitlines(), ["mac_nextest_setup=failed", "mac_cleanup=skipped"])
+                self.assertIn("cannot start nextest with a log", answer.stderr)
+                self.assertFalse((self.root / "lint-arguments.json").exists())
+
+    def test_python_shim_start_failure_declines_but_child_status_is_preserved(self) -> None:
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            for status in (75, 127):
+                with self.subTest(shell=shell, source="nextest", status=status):
+                    answer = self.run_remote(shell, status, ("--target-dir=other-target",))
+                    self.assertEqual(answer.stdout.splitlines()[-2:], [f"mac_exit={status}", "mac_cleanup=skipped"])
+        (self.root / "lint-arguments.json").unlink()
+        write_shell(self.python, "exit 127\n")
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            with self.subTest(shell=shell, source="shim"):
+                answer = self.run_remote(shell, 42, ("--target-dir=other-target",))
+                self.assertEqual(answer.stdout.splitlines(), ["mac_nextest_setup=failed", "mac_cleanup=skipped"])
+                self.assertFalse((self.root / "lint-arguments.json").exists())
+
+    def test_nextest_replays_success_and_retains_bounded_failure_output(self) -> None:
+        summary = "     Summary [  0.1s] 1 test run: 1 failed, " + "detail " * 30
+        fragment = "mac_exit=99\nlast output"
+        output = "     Summary [  0.0s] 1 test run: 1 passed\n" + "\033[31m" + summary + "\033[0m\n"
+        output += "earlier output\n" * 8 + "earlier " + fragment
+        _ = (self.root / "nextest-out").write_text(output)
+        lint = self.home_directory / ".claude/scripts/lint/lint"
+        write_shell(lint, 'cat "$CLEANUP_TEST_DIR/nextest-out" >&2\nexit "$CLEANUP_TEST_STATUS"\n')
+        limits = ((nextest_log.TAIL_BYTES, str(len(fragment))), (nextest_log.SUMMARY_BYTES, "52"))
+        logs = self.home_directory / nextest_log.DIRECTORY
+        for shell in (["/bin/sh"], ["zsh", "-f"]):
+            with self.subTest(shell=shell):
+                failed = self.run_remote(shell, 42, ("--target-dir=other-target",), budget_values=limits)
+                self.assertTrue(failed.stdout.startswith("mac_test: full nextest log: "), failed.stdout + failed.stderr)
+                self.assertEqual((failed.returncode, failed.stderr), (0, ""))
+                log, = logs.iterdir()
+                self.assertRegex(log.name, nextest_log.LOG_NAME)
+                self.assertEqual(stat.S_IMODE(log.stat().st_mode), 0o600)
+                self.assertEqual(log.read_text(), output)
+                self.assertEqual(failed.stdout, (
+                    f"mac_test: full nextest log: {log}\n"
+                    + f"mac_test: tail fragment: {fragment}\n{summary[:52]}\n"
+                    + "mac_exit=42\nmac_cleanup=skipped\n"
+                ))
+
+                passed = self.run_remote(shell, 0, ("--target-dir=other-target",), budget_values=limits)
+                self.assertEqual((passed.returncode, passed.stderr), (0, ""))
+                self.assertEqual(passed.stdout, output + "\nmac_exit=0\nmac_cleanup=skipped\n")
+                self.assertEqual(list(logs.iterdir()), [log])
+                log.unlink()
 
     def test_remote_text_removes_only_old_abandoned_sessions_before_building(self) -> None:
         minutes = 3
@@ -299,7 +384,7 @@ exit 1
                         self.assertEqual(existing.read_text(), "keep\n")
                         self.assertEqual((target / "nextest-output").read_text(), "built\n")
 
-        self.real_sweep()
+        configure_nextest_trim(self.python, "run")
         for shell in (["/bin/sh"], ["zsh", "-f"]):
             for status in (0, 42):
                 for default_kib, repository_kib, trim in ((96, 0, True), (256, 96, True), (96, 256, False)):
@@ -336,10 +421,7 @@ exit 1
                     target.mkdir()
                     retained = target / "unmatched-output"
                     _ = retained.write_bytes(os.urandom(128 * 1024))
-                    if trim_fails:
-                        write_shell(self.python, 'exit 9\n')
-                    else:
-                        self.real_sweep()
+                    configure_nextest_trim(self.python, 9 if trim_fails else "run")
                     answer = self.run_remote(
                         shell, 42, budget_gib=str(96 / 1024 ** 2),
                         disk_output=("Filesystem GiB Used Available Capacity Mounted\n"
@@ -385,7 +467,7 @@ exit 1
                     with self.subTest(shell=shell, status=status, words=words):
                         answer = self.run_remote(shell, status, words)
                         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
-                        self.assertEqual(answer.stdout.splitlines(), ["nextest finished", f"mac_exit={status}", "mac_cleanup=skipped"])
+                        self.assertEqual(self.cleanup_lines(answer), ["nextest finished", f"mac_exit={status}", "mac_cleanup=skipped"])
                         self.assertEqual(existing.read_text(), "keep\n")
                         self.assertEqual((other_target / "nextest-output").read_text(), "built\n")
                         self.assertEqual(cast(list[str], json.loads((self.root / "lint-arguments.json").read_text())), ["nextest", *words])

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field as dataclass_field, replace
+from dataclasses import dataclass, field as dataclass_field
 from functools import cached_property
 from enum import Enum
 import os
@@ -18,15 +18,16 @@ from typing import cast
 
 from scripts.build_queue.scope_activity import ScopeProcesses, LiveBuildRun, NotServiceSlice
 from scripts.build_queue import admission_protocol as wire, cloud_progress, progress_profile
+from scripts.build_queue.admission_wire import cloud_queue_order
 from scripts.build_queue.admission_records import (reason_phrase as reason_phrase, behind_place as behind_place,
     eligible_head_position as eligible_head_position)
 from scripts.build_queue.queue_evidence import step_labels as step_labels
 from scripts.build_queue.queue_lines import Line, Span
+from scripts.buildlog.parse import cargo_subcommand
 from scripts.lib import cargo_target_config, conf
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.build_steps import RECORDED_STEP_NAMES, StepNames, read_step_names
+from scripts.lib.build_steps import RECORDED_STEP_NAMES, StepNames, command_script, read_step_names
 from scripts.build_queue import admission_records
-from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
 from scripts.message import unit_labels
 
@@ -146,28 +147,25 @@ def mac_command_jobs(command: str) -> int | MacJobsUnavailable:
     return int(match[1]) if match and int(match[1]) > 0 else MacJobsUnavailable()
 
 
-def mac_step_name(build: MacBuild, *, names: StepNames = RECORDED_STEP_NAMES,
-                  identity: UnitLabels = UNRECORDED_OWNER) -> str:
+def mac_command_step(build: MacBuild) -> tuple[str, str]:
     try:
         words = shlex.split(build.command)
     except ValueError:
         words = []
-    step = "cargo"
+    step = ""
     for index, word in enumerate(words):
         name = Path(word).name
-        if name in ("cargo", "cargo-nextest"):
-            step = "nextest" if name == "cargo-nextest" else "cargo"
-            if name == "cargo-nextest":
-                break
-            for argument in words[index + 1:]:
-                if argument in ("build", "check", "clippy", "nextest", "test", "run", "bench"):
-                    step = argument
-                    break
+        if name == "cargo":
+            step = cargo_subcommand(words[index + 1:]) or "cargo"
+            break
+        if name == "cargo-nextest":
+            step = "nextest"
             break
         if name == "rustc":
             step = "rustc"
             break
-    if step == "cargo" and isinstance(build.stage, (MacTesting, MacTestingCounter)):
+    step = step or command_script(words)
+    if step in ("", "cargo") and isinstance(build.stage, (MacTesting, MacTestingCounter)):
         step = "test"
     package = ""
     for index, word in enumerate(words):
@@ -180,6 +178,13 @@ def mac_step_name(build: MacBuild, *, names: StepNames = RECORDED_STEP_NAMES,
         if word.startswith("-p") and len(word) > 2:
             package = word[2:]
             break
+    return step, package
+
+
+def mac_step_name(build: MacBuild, *, names: StepNames = RECORDED_STEP_NAMES,
+                  identity: UnitLabels = UNRECORDED_OWNER) -> str:
+    step, package = mac_command_step(build)
+    step = step or "cargo"
     current_name = " ".join(part for part in (package or build.repository, step) if part)
     return names.for_owner(step, identity.unit if identity.unit != "—" else "", identity.role,
                            ci=build.origin is MacBuildOrigin.CI, current_name=current_name)
@@ -810,9 +815,8 @@ def cloud_page_status(row: wire.CloudRow, work: CloudWork) -> Line:
 
 def cloud_step_labels(row: wire.CloudRow, model: QueueModel) -> UnitLabels:
     identity = row.identity
-    label = model.cloud_labels.get(identity.session_id, UnitLabels(identity.name, unit_labels.OWNER_NOT_RECORDED))
-    return replace(label, unit=gate.queue_unit(identity.unit, identity.session_id, model.cloud_labels)
-                   or unit_labels.OWNER_NOT_RECORDED)
+    return model.cloud_labels.get(identity.session_id,
+        UnitLabels(identity.name, unit_labels.OWNER_NOT_RECORDED, unit_labels.OWNER_NOT_RECORDED))
 
 
 def cloud_step_name(row: wire.CloudRow, model: QueueModel) -> str:
@@ -831,14 +835,19 @@ class WaitingBuild:
 
 
 def waiting_builds(model: QueueModel) -> list[WaitingBuild | wire.CloudRow | wire.RepositorySlotRow]:
-    """Insert cloud waits by arrival time without changing the local queue order."""
+    """Insert cloud waits in admission order. Keep the local queue order."""
     rows: list[WaitingBuild | wire.CloudRow | wire.RepositorySlotRow] = [WaitingBuild(index, step)
         for index, step in enumerate(model.reading.view.waiting, 1)]
     slot_rows = model.reading.repository_slots if isinstance(model.reading, wire.CloudQueueRead) else ()
+
+    def order(row: wire.CloudRow | wire.RepositorySlotRow) -> tuple[float, int, str]:
+        return cloud_queue_order(row.place, row.since) if isinstance(row, wire.CloudRow) else (row.since, 1, "")
+
     for cloud in sorted([*(row for row in cloud_rows(model) if isinstance(row.wait, wire.CloudSlotWait)), *slot_rows],
-                        key=lambda row: row.since):
+                        key=order):
+        order_time = order(cloud)[0]
         position = next((index for index, row in enumerate(rows)
-                         if (row.step.since if isinstance(row, WaitingBuild) else row.since) > cloud.since), len(rows))
+                         if (row.step.since if isinstance(row, WaitingBuild) else order(row)[0]) > order_time), len(rows))
         rows.insert(position, cloud)
     return rows
 

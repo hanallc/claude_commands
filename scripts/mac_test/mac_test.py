@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Literal, TypeGuard, cast
 from urllib.parse import quote
 
 
+from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state
@@ -82,6 +83,7 @@ from scripts.mac_test.claim_state import (
     coordination_depth as coordination_depth,
 )
 from scripts.lib import conf
+from scripts.buildlog import transfer_bytes
 from scripts.lib.user_zone import user_zone
 
 from scripts.message import session_send
@@ -93,7 +95,6 @@ from scripts.buildlog.mac_idle_alert import MacIdleConfigError, idle_config as i
 if TYPE_CHECKING:
     from scripts.build_queue.placement import SubmittingSession
     from scripts.build_queue import placement
-    from scripts.buildlog import sync as buildlog_sync
     from scripts.mac_test import eligibility
 
 MESSAGE_TIMEOUT_S = 30.0
@@ -692,13 +693,14 @@ def scopes_overlap(first: ClaimScope, second: ClaimScope) -> bool:
     return same_repository and (not first.slot or not second.slot or first.slot == second.slot)
 
 
-def slot_capacity(paths: StatePaths, scope: ClaimScope) -> int:
+def slot_capacity(paths: StatePaths, scope: ClaimScope, *,
+                  configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> int:
     if target_config.uses_legacy_mac_layout(paths.platform) or isinstance(scope, WholeMacScope):
         return 1
-    values = conf.read(config_path(paths.target)).values()
-    missing = (target_config.MissingSlotCapacity.REQUIRE_CONFIGURED if scope.key else
-               target_config.MissingSlotCapacity.SINGLE_SLOT)
-    return target_config.slot_capacity(values, scope.name, missing=missing)
+    settings = conf.read(config_path(paths.target)) if isinstance(configuration, conf.UseConfiguredValue) else configuration
+    missing = (target_config.MissingSlotCapacity.REQUIRE_CONFIGURED if scope.key
+               else target_config.MissingSlotCapacity.SINGLE_SLOT)
+    return target_config.slot_capacity(settings, scope.name, missing=missing)
 
 
 def affinity_path(paths: StatePaths, scope: RepositoryScope) -> Path:
@@ -1381,8 +1383,6 @@ printf 'active=%s\nwork=%s\nrc=0\n' "$active_count" "$work_count"
 
 
 def check_mac_activity(config: MacTestConfig, host: str) -> MacActivity:
-    from scripts.buildlog import sync as buildlog_sync
-
     arguments = ["ssh", "-o", "BatchMode=yes", "-o",
                  f"ConnectTimeout={config.connect_timeout_s:g}", host, mac_activity_script()]
     try:
@@ -1397,8 +1397,8 @@ def check_mac_activity(config: MacTestConfig, host: str) -> MacActivity:
         return ActivityCheckFailed(f"SSH activity check could not start: {error}")
     except UnicodeError:
         return ActivityCheckFailed("the activity check answer could not be read")
-    ledger = buildlog_sync.active_transfers.get()
-    if isinstance(ledger, buildlog_sync.TransferLedger):
+    ledger = transfer_bytes.active_transfers.get()
+    if isinstance(ledger, transfer_bytes.TransferLedger):
         ledger.observe("ssh_activity", arguments, result.stdout, result.stderr)
     if result.returncode != 0:
         reason = " ".join(result.stderr.split()) or f"SSH exited {result.returncode}"
@@ -1436,7 +1436,6 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
     user's Mac work, since a build process cannot be traced to a repository,
     so a claim is idle only while the Mac runs nothing at all.
     """
-    from scripts.buildlog import sync as buildlog_sync
 
     with locked(paths.lock):
         claims = tuple(claim for claim in read_claims(paths) if run_is_live(claim.record))
@@ -1446,18 +1445,18 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
         # The Linux controller must confirm remote cleanup before claim removal.
         return True
     activity: dict[str, MacActivity] = {}
-    traffic: dict[str, buildlog_sync.TransferLedger] = {}
+    traffic: dict[str, transfer_bytes.TransferLedger] = {}
     for claim in claims:
         host = claim_host(claim.record, config)
         if host not in activity:
-            traffic[host] = buildlog_sync.TransferLedger()
-            with buildlog_sync.measure_transfers(traffic[host]):
+            traffic[host] = transfer_bytes.TransferLedger()
+            with transfer_bytes.measure_transfers(traffic[host]):
                 activity[host] = check_mac_activity(config, host)
     now = utc_now()
     watched = False
     for claim in claims:
         host = claim_host(claim.record, config)
-        with buildlog_sync.measure_transfers(traffic[host]):
+        with transfer_bytes.measure_transfers(traffic[host]):
             if watch_claim(paths, config, claim, activity[host], now):
                 watched = True
     return watched
@@ -1467,7 +1466,6 @@ def watch_claim(
     paths: StatePaths, config: MacTestConfig, claim: HeldClaim, activity: MacActivity, now: datetime,
 ) -> bool:
     """Apply one activity answer to one claim; return whether it is still watched."""
-    from scripts.buildlog import sync as buildlog_sync
 
     run = claim.record
     with locked(paths.lock):
@@ -1479,8 +1477,8 @@ def watch_claim(
         if not run_is_live(current):
             return False
         changed = False
-        ledger = buildlog_sync.active_transfers.get()
-        if isinstance(ledger, buildlog_sync.TransferLedger) and ledger.transfers:
+        ledger = transfer_bytes.active_transfers.get()
+        if isinstance(ledger, transfer_bytes.TransferLedger) and ledger.transfers:
             # Charge a shared host query to only one live claim.
             current["transfers"] = [*current.get("transfers", []), *ledger.transfers]
             ledger.transfers.clear()
@@ -2014,15 +2012,15 @@ def command_claim_wait(args: CliArguments, paths: StatePaths, *, kind: str = "",
 def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = True,
                   session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
                   assignment: placement.PlacementAssignment | UnassignedClaim = UNASSIGNED_CLAIM) -> int:
-    from scripts.build_queue import admission_protocol as wire, placement
-
     if (args.assignment_file or args.assignment) and isinstance(assignment, UnassignedClaim):
+        from scripts.build_queue import admission_wire as wire
+
         saved = wire.parse_reply(args.assignment or Path(args.assignment_file).read_text())
         if not isinstance(saved, wire.Assignment):
             raise ValueError("claim requires a remote assignment")
         assignment = saved.assignment
     session = claim_state.submitting_session(session)
-    if isinstance(assignment, placement.PlacementAssignment):
+    if not isinstance(assignment, UnassignedClaim):
         destination = assignment.destination
         if destination.target != (args.target or "mac") or destination.provider not in ("mac", "ssh"):
             return 12
@@ -2032,7 +2030,7 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
         if not args.from_pid:
             args.episode, args.attempt = assignment.episode, assignment.attempt
             if not args.claim_id:
-                args.claim_id = placement.assigned_claim_id(assignment.episode, assignment.attempt)
+                args.claim_id = execution_identity.assigned_claim_id(assignment.episode, assignment.attempt)
         session = assignment.session
     else:
         scope = target_claim_scope(paths, args.worktree)
@@ -2097,7 +2095,7 @@ class ClaimsReleased:
     """Every claim the holder owned is gone; the transfers are what those claims recorded."""
 
     count: int
-    transfers: tuple[buildlog_sync.TransferBytes, ...]
+    transfers: tuple[transfer_bytes.TransferBytes, ...]
 
 
 @dataclass(frozen=True)
@@ -2124,7 +2122,7 @@ def release_exact_claims(
                 continue
             if isinstance(record, dict) and record["pid"] == pid and claim_state.claim_identity(record) == identity:
                 owned.append((path, record))
-    transfers: list[buildlog_sync.TransferBytes] = []
+    transfers: list[transfer_bytes.TransferBytes] = []
     for path, record in owned:
         pending = offload.pending_start_path(paths.target, identity)
         if "remote_host" in record and pending.exists():
@@ -2168,6 +2166,7 @@ def command_release(args: CliArguments, paths: StatePaths, *, provider_lock_held
 def free_now(
     paths: StatePaths, settings: Path | eligibility.DefaultMacSettings, repo_root: Path, copy: bool = False,
     *, session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
+    configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
 ) -> FreeNowAnswer:
     """Whether a claim for repo_root's repository made now could start a Mac run.
 
@@ -2182,7 +2181,12 @@ def free_now(
     from scripts.mac_test import eligibility
     from scripts.buildlog import repository
 
-    if not eligibility.read_config(settings).enabled:
+    if isinstance(configuration, conf.ConfigRead):
+        capacity_settings = configuration
+    else:
+        path = eligibility.config_path() if isinstance(settings, eligibility.DefaultMacSettings) else settings
+        capacity_settings = conf.read(path)
+    if not capacity_settings.value("offload", conf.on_off):
         return "off"
     backoff = (eligibility.read_backoff(time.time()) if paths.target == "mac"
                else eligibility.read_backoff(time.time(), paths.target))
@@ -2205,8 +2209,10 @@ def free_now(
     if not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope):
         try:
             scopes = tuple(RepositoryScope(scope.name, scope.key, slot)
-                           for slot in range(1, slot_capacity(paths, scope) + 1))
-        except (OSError, ConfigError):
+                           for slot in range(1, slot_capacity(paths, scope, configuration=capacity_settings) + 1))
+        except (OSError, ConfigError) as error:
+            if isinstance(error, conf.Unusable) and isinstance(configuration, conf.ConfigRead):
+                raise
             return "state"
     held = all(any(
         scopes_overlap(claim.scope, candidate) and run_is_live(claim.record) and not run_is_kept(claim.record)

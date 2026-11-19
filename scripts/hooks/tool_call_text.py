@@ -1,26 +1,13 @@
-"""The text of a tool call that the banned-word PostToolUse hook scans.
+"""Extract text from tool inputs for the build-hold guard.
 
-The hook scans only text a call writes, never the tool's output. Text a call
-removes or searches for is not scanned: Edit and MultiEdit contribute
-`new_string`, never `old_string`; a NotebookEdit that deletes a cell
-contributes nothing; and in a Bash command, `mask_removed_text` blanks the
-pattern side of each sed `s<d>old<d>new<d>` expression in a sed invocation,
-the first argument of `.replace(...)` or `re.sub(...)` when it is a string
-literal, and the pattern of a grep, rg or git grep call: each argument after
-`-e`/`--regexp`, else the first argument not starting with `-`.
-Removal- and search-shaped text is blanked by pattern, not by parsing, so
-a lookalike (an echo or commit message quoting a sed expression, a `.replace`
-call or a grep) is blanked too and a word in it goes unreported, in the
-command. Text the patterns do not match is scanned whole, except simple
-read-only commands whose arguments are inspection paths.
-Blanking keeps newlines, so the reported line numbers still index the
-original text.
+Mask search patterns and the text that replacements remove.
+Keep newlines so that line positions still match the original input.
 """
 
 import re
+import shlex
+from pathlib import Path
 from typing import TypedDict
-
-from scripts.hooks.banned_words_lib import is_read_only_command
 
 
 class EditEntry(TypedDict, total=False):
@@ -57,6 +44,22 @@ _WORD = re.compile(_SHELL_WORD)
 _SED_S = re.compile(r"(?<!\w)(?:\d+|\$)?s([/|#,@:])((?:\\.|(?!\1)[^\\\n])*)\1(?:\\.|(?!\1)[^\\\n])*\1")
 _PY_STRING = r"""[rRbBuUfF]{0,2}(?:\"\"\"(?:\\.|[^\\])*?\"\"\"|'''(?:\\.|[^\\])*?'''|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*')"""
 _PY_REMOVAL = re.compile(rf"(?:\.replace|\bre\.subn?)\(\s*({_PY_STRING})\s*,", re.S)
+
+
+READ_ONLY_PROGRAMS = (
+    "cat", "head", "tail", "ls", "wc",
+)
+
+
+def is_read_only_command(command: str) -> bool:
+    """Check for a single inspection command with path arguments."""
+    if not command or any(char in command for char in ";&|()<>\n$`"):
+        return False
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    return bool(words and Path(words[0]).name in READ_ONLY_PROGRAMS)
 
 
 def scan_text(tool_name: str, tool_input: ToolInput) -> str:

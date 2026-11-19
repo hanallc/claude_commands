@@ -299,6 +299,7 @@ def _try_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: st
         numbers = range(1, maximum + 1)
     repository = _slot_repository(pool)
     checkout = build_folders.SlotCheckout(repository, _git(pool.source, "rev-parse", f"{commit}^{{commit}}"))
+    source_busy: build_folders.SlotSourceBusy | None = None
     with _slot_commit(repository, pool.source, checkout.commit):
         for number in numbers:
             spec = build_folders.BuildFolderSpec(kind="slot", parent=pool.root, suffix_length=0,
@@ -308,6 +309,9 @@ def _try_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: st
             with ExitStack() as held:
                 try:
                     path = held.enter_context(build_folders.slot_build_folder(spec))
+                except build_folders.SlotSourceBusy as error:
+                    source_busy = error
+                    continue
                 except BlockingIOError:
                     continue
                 descriptor = build_folders.build_folder_lock_fd(path)
@@ -339,6 +343,8 @@ def _try_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                 yield Slot(path, cargo, pool.repository, number,
                            MappingProxyType({"CARGO_BUILD_BUILD_DIR": str(cargo)}))
             return
+        if source_busy is not None:
+            raise source_busy
         raise SlotsFull(pool.repository, pool.machine, maximum)
 
 
@@ -387,12 +393,9 @@ def take_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: st
               selection: SlotSelection = LOWEST_FREE_SLOT,
               queue_position: SlotQueuePosition | NewSlotQueuePosition = NEW_SLOT_QUEUE_POSITION) -> Generator[Slot]:
     """Take the lowest free slot and wait through the queue at capacity."""
-    from scripts.build_queue import slot_wait
-
     episode = queue_position.episode if isinstance(queue_position, SlotQueuePosition) else str(uuid4())
     since = queue_position.since if isinstance(queue_position, SlotQueuePosition) else time.time()
     seconds = conf.read_or_repository("build_folders").number("slots.wait_seconds")
-    deadline = time.monotonic() + seconds
     expires_at = time.time() + seconds
     while True:
         with ExitStack() as held:
@@ -402,16 +405,33 @@ def take_slot(source: Path, commit: str, *, showrunner: str, unit: str, work: st
             except SlotsFull as error:
                 if wait_policy is SlotWaitPolicy.REFUSE or isinstance(selection, ExactSlotRequest):
                     raise
-                if sys.platform == "darwin":
-                    _ = sys.stderr.write(str(error) + "; waiting for a free slot\n")
-                    _wait_mac_slot(configured_slot_root(), error.repository, error.maximum, deadline)
-                else:
-                    slot_wait.wait_for_slot(error.repository, error.machine, configured_slot_root(), error.maximum,
-                        episode=episode, since=since, showrunner=showrunner, unit=unit, work=work, purpose=purpose,
-                        expires_at=expires_at)
+                _wait_for_capacity(error, SlotQueuePosition(episode, since), expires_at,
+                                   showrunner=showrunner, unit=unit, work=work, purpose=purpose)
                 continue
             yield slot
             return
+
+
+def wait_for_capacity(source: Path, position: SlotQueuePosition, expires_at: float, *,
+                      showrunner: str, unit: str, work: str, purpose: str, owner_pid: int) -> None:
+    """Wait for capacity without taking a repository slot."""
+    pool = _pool(source)
+    _wait_for_capacity(SlotsFull(pool.repository, pool.machine, _maximum(pool)), position, expires_at,
+                       showrunner=showrunner, unit=unit, work=work, purpose=purpose, owner_pid=owner_pid)
+
+
+def _wait_for_capacity(full: SlotsFull, position: SlotQueuePosition, expires_at: float, *,
+                       showrunner: str, unit: str, work: str, purpose: str, owner_pid: int = 0) -> None:
+    from scripts.build_queue import slot_wait
+
+    if sys.platform == "darwin":
+        _ = sys.stderr.write(str(full) + "; waiting for a free slot\n")
+        deadline = time.monotonic() + max(0.0, expires_at - time.time())
+        _wait_mac_slot(configured_slot_root(), full.repository, full.maximum, deadline)
+    else:
+        slot_wait.wait_for_slot(full.repository, full.machine, configured_slot_root(), full.maximum,
+            episode=position.episode, since=position.since, showrunner=showrunner, unit=unit, work=work,
+            purpose=purpose, expires_at=expires_at, owner_pid=owner_pid)
 
 
 def _size(path: Path) -> int:
@@ -506,7 +526,7 @@ def main(argv: Sequence[str]) -> int:
     except SlotsNotConfigured as error:
         _ = sys.stderr.write(f"{error}\n")
         return 2
-    except (SlotGitFailure, subprocess.SubprocessError) as error:
+    except (SlotGitFailure, build_folders.SlotSourceBusy, subprocess.SubprocessError) as error:
         _ = sys.stderr.write(f"{error}\n")
         return 2
 

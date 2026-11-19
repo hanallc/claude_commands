@@ -79,14 +79,17 @@ def _take(name: str, caller: str, pane: str, client: herdr.Herdr, model: str, ef
 
 def transfer(name: str, *, model: str = "", effort: str = "") -> int:
     """Move the producer row to the caller, then restart the caller as the producer."""
+    staff.validate_unit_name_for_write(name)
     if bool(model) != bool(effort):
         raise ValueError("give --model and --effort together")
     caller, pane = staff.runtime_id(), os.environ.get("HERDR_PANE_ID", "")
     if not caller or not pane:
         raise ValueError("run the transfer in the conversation that takes the role, in its herdr pane")
-    client = herdr.Herdr(herdr.shared_session())
     with staff.slot_operation("producer-first-" + name, name):
         row = _producer(staff.initial_snapshot(), name)
+        if stop_resume.producer_admission_record(row.name).exists():
+            raise ValueError(f"{name}: producer admission is pending. Run agents resume {name} first.")
+        client = herdr.Herdr(herdr.shared_session())
         with staff.row_operation(str(row.id)):
             row = _take(name, caller, pane, client, model, effort)
     # The restart takes the row lock in a process outside this conversation.

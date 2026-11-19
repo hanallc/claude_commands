@@ -360,6 +360,13 @@ class NoRun:
 
 
 @dataclass(frozen=True)
+class RetiredProducer:
+    """Retain the model profile of a retired producer."""
+
+    profile: str
+
+
+@dataclass(frozen=True)
 class StaffRow:
     id: StaffId
     kind: Kind
@@ -376,6 +383,7 @@ class StaffRow:
     home: SessionHome | HomeUnknown = field(default_factory=HomeUnknown, kw_only=True)
     run: OpenRun | NoRun = field(default_factory=NoRun, kw_only=True)
     unit_type: UnitDetails | NotUnit = field(default_factory=NotUnit, kw_only=True)
+    retirement: RetiredProducer | Active = field(default_factory=Active, kw_only=True)
     unknown_fields: dict[str, object] = field(default_factory=dict, kw_only=True, compare=False)
 
     def reports_to(self, identity: StaffId) -> bool:
@@ -407,6 +415,8 @@ class StaffRow:
             value["paused"] = self.paused.to_json()
         if isinstance(self.exited, Exited):
             value["exited"] = self.exited.to_json()
+        if isinstance(self.retirement, RetiredProducer):
+            value["retired_producer"] = self.retirement.profile
         return value
 
     @classmethod
@@ -442,6 +452,13 @@ class StaffRow:
                        if isinstance(role, str) and role in WORKER_ROLES else WorkerRoleUnknown())
         parsed_home = SessionHome(Path(home)) if isinstance(home, str) and Path(home).is_absolute() else HomeUnknown()
         known_fields = {"id", "kind", "name", "parent", "current_session", "worktree", "doc", "paused", "exited", "run", "unit_type"}
+        known_fields.add("retired_producer")
+        retirement: RetiredProducer | Active = Active()
+        if "retired_producer" in fields:
+            profile = fields["retired_producer"]
+            if kind != "producer" or not isinstance(profile, str) or not profile:
+                raise StaffUnreadable("invalid retired producer profile")
+            retirement = RetiredProducer(profile)
         invalid: list[str] = []
         for key, fact in (("role", parsed_role), ("home", parsed_home)):
             if isinstance(fact, (KnownWorkerRole, SessionHome)):
@@ -455,7 +472,7 @@ class StaffRow:
         return cls(StaffId(staff_id), kind, name,
                    ReportsTo(StaffId(parent)) if isinstance(parent, str) else StaffRoot(), worktree, doc, current_session=StaffId(current),
                    role=parsed_role, home=parsed_home, unit_type=unit_type,
-                   run=OpenRun(Path(run)) if isinstance(run, str) else NoRun(),
+                   run=OpenRun(Path(run)) if isinstance(run, str) else NoRun(), retirement=retirement,
                    paused=Paused.from_json(fields["paused"]) if "paused" in fields else Active(),
                    exited=Exited.from_json(fields["exited"]) if "exited" in fields else Active(),
                    unknown_fields=_unknown_fields(fields, known_fields))
@@ -560,8 +577,22 @@ class StaffSnapshot:
     # The session ids a caller already read. None reads the session registry at use.
     running_sessions: frozenset[str] | None = field(default=None, compare=False)
 
+    retired_producers: tuple[StaffRow, ...] = field(default=(), kw_only=True)
+
+    def __post_init__(self) -> None:
+        retired = tuple(row for row in self.rows if isinstance(row.retirement, RetiredProducer))
+        if retired:
+            object.__setattr__(self, "rows", tuple(row for row in self.rows if not isinstance(row.retirement, RetiredProducer)))
+            object.__setattr__(self, "retired_producers", (*self.retired_producers, *retired))
+
+    @property
+    def all_rows(self) -> tuple[StaffRow, ...]:
+        if self.retired_producers:
+            return tuple(sorted((*self.rows, *self.retired_producers), key=lambda row: row.id))
+        return self.rows
+
     def encode(self) -> str:
-        return json.dumps({"rows": [row.to_json() for row in self.rows], "schema": self.schema,
+        return json.dumps({"rows": [row.to_json() for row in self.all_rows], "schema": self.schema,
                            "pending_retire": list(self.pending_retire), "inputs": list(self.inputs)}, sort_keys=True)
 
     @classmethod
@@ -580,7 +611,8 @@ class StaffSnapshot:
         return {row.id: row for row in self.rows}
 
     def by_id(self, staff_id: StaffId) -> StaffRow | None:
-        return self.rows_by_id.get(staff_id)
+        return self.rows_by_id.get(staff_id) or next(
+            (row for row in self.retired_producers if row.id == staff_id), None)
 
     def parent_of(self, row: StaffRow) -> StaffRow | None:
         return self.by_id(row.parent.id) if isinstance(row.parent, ReportsTo) else None
@@ -603,7 +635,7 @@ class StaffSnapshot:
 
     def by_member_reference(self, reference: str) -> StaffRow | None:
         """Resolve a persisted fixed member id or its current conversation."""
-        return self.by_id(StaffId(reference)) or self.by_current_session(reference)
+        return self.rows_by_id.get(StaffId(reference)) or self.by_current_session(reference)
 
     def by_path(self, names: str) -> StaffRow | None:
         return _row_by_path(self.rows, names)
@@ -963,6 +995,12 @@ def validate_name(kind: Kind, name: str) -> None:
         _ = WorkerName.parse(name)
 
 
+def validate_unit_name_for_write(name: str) -> None:
+    """Reserve the -unit suffix for references to existing units."""
+    if name.endswith("-unit"):
+        raise StaffRefused(f"unit name {name!r} must not end in -unit")
+
+
 def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = ()) -> None:
     """Check the complete proposed graph before any bytes are replaced."""
     indexed: dict[StaffId, StaffRow] = {}
@@ -1082,8 +1120,8 @@ _PARSED: dict[str, tuple[str, StaffSnapshot]] = {}
 def _clean_parse(fields: dict[str, object], loaded: StaffSnapshot) -> bool:
     """True when the parse printed no anomaly, so a later read of the same text prints none either."""
     rows = fields.get("rows")
-    return (isinstance(rows, list) and len(cast(list[object], rows)) == len(loaded.rows)
-            and not any("role" in row.unknown_fields or "home" in row.unknown_fields for row in loaded.rows))
+    return (isinstance(rows, list) and len(cast(list[object], rows)) == len(loaded.all_rows)
+            and not any("role" in row.unknown_fields or "home" in row.unknown_fields for row in loaded.all_rows))
 
 
 def _load(*, initial: bool = False) -> StaffSnapshot:
@@ -1115,13 +1153,15 @@ def local_by_current_session(session_id: str) -> StaffRow | None:
         if isinstance(value, dict):
             fields = cast(dict[str, object], value)
             if fields.get("current_session", fields.get("id")) == session_id:
-                return StaffRow.from_json(fields)
+                row = StaffRow.from_json(fields)
+                return None if isinstance(row.retirement, RetiredProducer) else row
     return None
 
 
 def backend(row: StaffRow) -> ClaudeBackend | CodexBackend | BackendUnavailable:
     """Find the backend for this row's current session."""
-    return _found_backends((row,)).get(row.id, BACKEND_UNAVAILABLE)
+    return (BACKEND_UNAVAILABLE if isinstance(row.retirement, RetiredProducer)
+            else _found_backends((row,)).get(row.id, BACKEND_UNAVAILABLE))
 
 
 def _found_backends(rows: Sequence[StaffRow],
@@ -1226,6 +1266,24 @@ def _remote_row(arguments: list[str]) -> StaffRow:
     return StaffRow.from_json(_remote(arguments))
 
 
+def producer_creation_registry(action: str, name: str, marker: str = "", profile: str = "") -> str:
+    """Use the staff owner for shared producer creation marker operations."""
+    if not is_owner():
+        result = _remote(["producer-creation", action, f"--name={name}",
+                          f"--marker={marker}", f"--profile={profile}"])
+        if not isinstance(result, str):
+            raise StaffUnreadable("invalid producer creation response")
+        return result
+    edit = cast(Callable[[str, str, str, str], str],
+                import_module("scripts.agents.producer_creation").owner_registry_action)
+    try:
+        return edit(action, name, marker, profile)
+    except ValueError as error:
+        raise StaffRefused(str(error)) from error
+    except OSError as error:
+        raise StaffUnreadable(str(error)) from error
+
+
 def _all_rows() -> list[StaffRow]:
     return list(_load().rows) if is_owner() else _rows(_remote(["show"]))
 
@@ -1253,6 +1311,11 @@ def snapshot() -> StaffSnapshot:
     supplied = _command_snapshot.get()
     if isinstance(supplied, StaffSnapshot):
         return supplied
+    return authority_snapshot()
+
+
+def authority_snapshot() -> StaffSnapshot:
+    """Read the current staff record from its authority."""
     if is_owner():
         return replace(_load(), production=not _file_override())
     value = _remote(["show", "--snapshot"])
@@ -1330,7 +1393,7 @@ def current_session_target(target: str) -> str:
     """Resolve a retained member address when delivering to its live conversation."""
     if not target.startswith("session:"):
         return target
-    row = initial_snapshot().by_id(StaffId(target[8:]))
+    row = initial_snapshot().rows_by_id.get(StaffId(target[8:]))
     return "session:" + row.current_session if row is not None else target
 
 
@@ -1443,11 +1506,11 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
             for temporary in path.parent.glob(f".{path.name}.*"):
                 temporary.unlink()
             original = _load(initial=True)
-            proposed = list(original.rows)
+            proposed = list(original.all_rows)
             pending = set(original.pending_retire)
             result = edit(proposed, pending)
             if path.resolve() == _default_file().resolve():
-                previous = {row.id: row for row in original.rows}
+                previous = {row.id: row for row in original.all_rows}
                 for row in proposed:
                     if previous.get(row.id) != row:
                         for location in _location_paths(row):
@@ -1457,7 +1520,7 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
                         if any(identity[14:15] == "5" for identity in (row.id, row.current_session)):
                             raise StaffRefused("fixture runtime id cannot enter the real staff record")
             proposed.sort(key=lambda row: row.id)
-            if original.schema == 2 and original.current_sessions_recorded and proposed == list(original.rows) and pending == set(original.pending_retire):
+            if original.schema == 2 and original.current_sessions_recorded and proposed == list(original.all_rows) and pending == set(original.pending_retire):
                 # A prior replace may have succeeded before its folder sync failed.
                 atomic_file.sync_folder(path.parent)
                 print("unchanged", file=sys.stderr)
@@ -1496,6 +1559,8 @@ def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: ReportsTo |
     existing = next((row for row in rows
                      if (row.kind, row.name, row.parent) == (kind, name, parent)), None)
     if existing is not None:
+        if isinstance(existing.retirement, RetiredProducer):
+            raise StaffRefused(f"{name}: retired; use agents resume {name} --retired")
         if unit_type is not None and existing.unit_type != UnitDetails(unit_type):
             raise StaffRefused(f"{existing.id}: existing unit_type conflicts with admission")
         if not isinstance(worktree, WorktreeUnfilled) and not isinstance(existing.worktree, WorktreeUnfilled) and existing.worktree != worktree:
@@ -1507,6 +1572,8 @@ def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: ReportsTo |
                            doc=existing.doc if isinstance(doc, DocUnfilled) else doc)
         rows[rows.index(existing)] = admitted
         return admitted
+    if kind == "unit":
+        validate_unit_name_for_write(name)
     if not runtime_id:
         raise StaffRefused(f"{kind} {name}: native runtime identity is not proved")
     staff_id = native_id(runtime_id)
@@ -1638,8 +1705,8 @@ def transfer_producer(identity: StaffId, session: StaffId, home: SessionHome, fo
                             "--machine", folder.machine, "--path", str(folder.path)])
     def edit(rows: list[StaffRow]) -> StaffRow:
         row = _required(rows, identity)
-        if row.kind != "producer":
-            raise StaffRefused("transfer-producer requires a producer")
+        if row.kind != "producer" or isinstance(row.retirement, RetiredProducer):
+            raise StaffRefused("transfer-producer requires an active producer")
         if any(session in (other.id, other.current_session) for other in rows if other.id != row.id):
             raise StaffRefused(f"{session}: runtime identity already belongs to another member")
         changed = replace(row, current_session=session, home=home,
@@ -1667,6 +1734,7 @@ class UnitRole:
 
 def change_director(identity: StaffId, destination: ShowrunnerRole | UnitRole) -> StaffRow:
     """Change a director's role and preserve its identity and workers."""
+    validate_unit_name_for_write(destination.name)
     promoting = isinstance(destination, ShowrunnerRole)
     location = destination.doc if isinstance(destination, ShowrunnerRole) else destination.worktree
     if not is_owner():
@@ -1709,7 +1777,7 @@ def publish_native_ids(expected: StaffSnapshot, identities: Mapping[StaffId, Sta
                        additions: tuple[StaffRow, ...] = ()) -> StaffSnapshot:
     """Finish a migration in the single staff writer after its references are ready."""
     def edit(rows: list[StaffRow], pending: set[StaffId]) -> StaffSnapshot:
-        if tuple(rows) != expected.rows:
+        if tuple(rows) != expected.all_rows:
             raise StaffRefused("staff changed during migration; read a fresh snapshot")
         for old, identity in identities.items():
             _ = native_id(identity)
@@ -1763,6 +1831,14 @@ def rename(staff_id: StaffId, new_name: str) -> StaffRow:
     else:
         def edit(rows: list[StaffRow]) -> StaffRow:
             row = _required(rows, staff_id)
+            if row.kind == "unit":
+                validate_unit_name_for_write(new_name)
+            if row.kind == "producer":
+                validate_name(row.kind, new_name)
+                if row.name.casefold() == "morty" or isinstance(row.retirement, RetiredProducer):
+                    raise StaffRefused(f"{row.name}: this producer cannot be renamed")
+                if any(other.id != row.id and other.name.casefold() == new_name.casefold() for other in rows):
+                    raise StaffRefused(f"{new_name}: another staff row has this name")
             renamed = replace(row, name=new_name)
             rows[rows.index(row)] = renamed
             return renamed
@@ -1908,6 +1984,23 @@ def require_stopped(identity: StaffId) -> None:
     check(record, identity)
 
 
+def set_producer_retirement(identity: StaffId, state: RetiredProducer | Active) -> StaffRow:
+    """Change a producer's retirement mark and preserve its identity and locations."""
+    if not is_owner():
+        profile = state.profile if isinstance(state, RetiredProducer) else ""
+        return _remote_row(["set-producer-retirement", identity, f"--profile={profile}"])
+
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        row = _required(rows, identity)
+        if row.kind != "producer" or row.name.casefold() == "morty":
+            raise StaffRefused(f"{row.name}: retirement requires a producer other than morty")
+        changed = replace(row, retirement=state)
+        rows[rows.index(row)] = changed
+        return changed
+
+    return _transaction(edit)
+
+
 def retire(staff_id: StaffId) -> StaffRow | None:
     if not is_owner():
         value = _remote(["retire", staff_id])
@@ -1984,6 +2077,8 @@ def _retire_row(rows: list[StaffRow], staff_id: StaffId) -> StaffRow | None:
     row = _row_by_id(rows, staff_id)
     if row is None:
         return None
+    if isinstance(row.retirement, RetiredProducer):
+        raise StaffRefused(f"{row.name}: keep the retired producer's identity")
     if row.kind not in ("worker", "producer"):
         raise StaffRefused("retire requires a worker or producer; retain units and showrunners with their location state")
     rows.remove(row)
@@ -2149,6 +2244,9 @@ class _MoveCommand(Protocol):
 
 
 class _Arguments:
+    creation_action: str = ""
+    marker: str = ""
+    profile: str = ""
     hold_record: str = ""
     home: str = ""
     runtime_id: str = ""
@@ -2237,6 +2335,16 @@ def _parser() -> argparse.ArgumentParser:
     _ = transfer_parser.add_argument("--machine", required=True)
     _ = transfer_parser.add_argument("--path", required=True)
     _ = transfer_parser.add_argument("--json", action="store_true")
+    producer_retirement = verbs.add_parser("set-producer-retirement", help=argparse.SUPPRESS)
+    _ = producer_retirement.add_argument("target")
+    _ = producer_retirement.add_argument("--profile", required=True)
+    _ = producer_retirement.add_argument("--json", action="store_true")
+    creation = verbs.add_parser("producer-creation", help=argparse.SUPPRESS)
+    _ = creation.add_argument("creation_action", choices=("read", "claim", "finish"))
+    _ = creation.add_argument("--name", required=True)
+    _ = creation.add_argument("--marker", default="")
+    _ = creation.add_argument("--profile", default="")
+    _ = creation.add_argument("--json", action="store_true")
     for command in ("promote-unit", "demote-showrunner"):
         director = verbs.add_parser(command, help=argparse.SUPPRESS)
         _ = director.add_argument("target")
@@ -2314,6 +2422,9 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
         return ensure_worker(native_id(arguments.target), arguments.name, StaffId(arguments.parent))
     if arguments.verb == "update-current-session":
         return update_current_session(StaffId(arguments.target), native_id(arguments.new_id))
+    if arguments.verb == "set-producer-retirement":
+        state = RetiredProducer(arguments.profile) if arguments.profile else Active()
+        return set_producer_retirement(StaffId(arguments.target), state)
     if arguments.verb == "transfer-producer":
         return transfer_producer(StaffId(arguments.target), native_id(arguments.new_id),
                                  SessionHome(Path(arguments.home).absolute()),
@@ -2370,6 +2481,10 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
 
 
 def _main(arguments: _Arguments) -> int:
+    if arguments.verb == "producer-creation":
+        print(json.dumps(producer_creation_registry(arguments.creation_action, arguments.name,
+                                                    arguments.marker, arguments.profile)))
+        return 0
     if arguments.verb == "move":
         if arguments.destination is not None:
             if arguments.parent is not None:

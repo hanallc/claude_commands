@@ -30,11 +30,6 @@ docs/plans/*-log.md
 !scripts/**
 !shared/
 !shared/**
-!Cargo.toml
-!Cargo.lock
-!taplo.toml
-!rust/
-!rust/**
 !templates/
 !templates/**
 !mods/
