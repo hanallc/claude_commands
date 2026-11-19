@@ -4540,6 +4540,34 @@ class CiSliceAdmissionTests(unittest.TestCase):
 
 class ServiceTests(unittest.TestCase):
 
+    def test_merge_gate_keeps_the_explicit_unit_from_another_director(self) -> None:
+        runner = staff.StaffRow(staff.StaffId("runner"), "showrunner", "fixture", staff.StaffRoot(),
+                                current_session=staff.StaffId("runner-session"))
+        units = tuple(staff.StaffRow(staff.StaffId(f"director-{name}"), "unit", name, staff.ReportsTo(runner.id),
+                                    current_session=staff.StaffId(f"session-{name}"),
+                                    unit_type=staff.UnitDetails("direct")) for name in ("a", "b"))
+        members = staff.StaffSnapshot((runner, *units))
+        with AdmissionFixture() as fixture, mock.patch.object(staff, "local_snapshot", return_value=members), \
+                mock.patch.object(staff, "snapshot", return_value=members):
+            fixture.free(0)
+            fixture.hold_starts()
+            older = fixture.request(since=fixture.clock.now() - 1)
+            _ = fixture.server.handle_request(older)
+            request = fixture.request(step="merge-gate")
+            with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "session-b",
+                                              "BUILDLOG_UNIT": "a"}):
+                request = replace(request, identity=client.step_identity("merge-gate", request.cwd))
+            _ = fixture.server.handle_request(request)
+            younger = fixture.request(since=fixture.clock.now() + 1)
+            younger = replace(younger, identity=replace(younger.identity, unit="a"))
+            _ = fixture.server.handle_request(younger)
+            self.assertEqual(fixture.completed_queue_change(
+                wire.PrioritySetRequest("gate-priority", "a", "user work", "director")), [wire.Ok()])
+            reply, = fixture.server.handle_request(wire.ViewRequest())
+            assert isinstance(reply, wire.ViewReply)
+            self.assertEqual([(step.pid, step.unit) for step in reply.reading.view.waiting],
+                             [(request.owner.pid, "a"), (younger.owner.pid, "a"), (older.owner.pid, "")])
+
     def test_unit_priority_leaves_a_same_name_showrunner_in_normal_order(self) -> None:
         production = staff.StaffRow(staff.StaffId("production-id"), "showrunner", "research", staff.StaffRoot(),
                                     current_session=staff.StaffId("production-session"))
@@ -4592,6 +4620,26 @@ class ServiceTests(unittest.TestCase):
             saved = service.read_state(fixture.state_dir).reservations[request.episode]
             self.assertEqual(saved.queue_waiter.get("session_name"), row.session_name)
 
+    def test_restore_uses_one_staff_snapshot_for_all_saved_callers(self) -> None:
+        director = staff.StaffRow(staff.StaffId("director"), "unit", "fixture unit", staff.StaffRoot(),
+                                  current_session=staff.StaffId("fixture-session"))
+        members = staff.StaffSnapshot((director,))
+        with AdmissionFixture() as fixture:
+            for _ in range(2):
+                request = fixture.request(need=GIB)
+                _ = only_admitted(fixture.connect(request).replies())
+                fixture.clock.advance(5)
+            state = service.read_state(fixture.state_dir)
+            for episode, record in state.reservations.items():
+                state.reservations[episode] = replace(record, queue_waiter={
+                    **record.queue_waiter, "session_name": "", "session_id": director.current_session})
+            _ = (fixture.state_dir / "state.json").write_text(wire.encode_record(state))
+            with mock.patch.object(staff, "local_snapshot", return_value=members) as read_staff:
+                fixture.restart()
+            read_staff.assert_called_once_with()
+            self.assertEqual([record.queue_waiter.get("session_name") for record in fixture.server.reservations.values()],
+                             ["fixture unit", "fixture unit"])
+
     def test_service_names_placement_without_an_identity(self) -> None:
         from scripts.build_queue.test_placement import placement_request
 
@@ -4631,6 +4679,40 @@ class ServiceTests(unittest.TestCase):
             self.assertRegex(before, r"^memory admission: reload ready, source hash [a-f0-9]{64}$")
             self.assertRegex(after, r"^memory admission: reload ready, source hash [a-f0-9]{64}$")
             self.assertNotEqual(before, after)
+
+    def test_reload_hash_includes_a_source_that_loads_after_ready(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.server.close()
+            sources = fixture.root / "scripts"
+            startup = sources / "build_queue" / "admission_service.py"
+            late = sources / "mac_test" / "eligibility.py"
+            for path in (startup, late):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _ = path.write_text("old\n")
+            ready: list[str] = []
+            for text in ("old\n", "new\n"):
+                _ = late.write_text(text)
+                server = fixture.new_server(start=False)
+                server.source_root = sources
+                info = startup.stat()
+                server.sources = {startup: (info.st_ino, info.st_mtime_ns)}
+                try:
+                    with mock.patch.dict(os.environ, {service.ADMISSION_SOURCE_RELOAD: "1"}), \
+                            redirect_stderr(io.StringIO()) as journal:
+                        server.start()
+                    line = journal.getvalue()
+                    self.assertRegex(line, r"^memory admission: reload ready, source hash [a-f0-9]{64}$")
+                    ready.append(line)
+                    if text == "old\n":
+                        module = types.ModuleType("reload_hash_late_source")
+                        module.__file__ = str(late)
+                        with mock.patch.dict(sys.modules, {module.__name__: module}):
+                            fixture.clock.advance(1)
+                            server.run_once(0)
+                            self.assertIn(late, server.sources)
+                finally:
+                    server.close()
+            self.assertNotEqual(ready[0], ready[1])
 
     def test_showrunner_ci_nextest_records_its_caller_on_the_running_row(self) -> None:
         session = staff.StaffId("b6374931-fe3a-4f6d-96b7-ad20415a8346")
@@ -5294,7 +5376,7 @@ class ServiceTests(unittest.TestCase):
                         with mock.patch.object(service, "_notify", side_effect=notify_before_journal):
                             replacement.start()
                         self.assertEqual(notices.recv(4096).decode(), "READY=1")
-                        version = admission_code.admission_code_version(replacement.source_root, watched=replacement.sources)
+                        version = admission_code.reload_source_version(replacement.source_root)
                         self.assertRegex(version, r"^[0-9a-f]{64}$")
                         self.assertEqual(journal.getvalue().splitlines(),
                             [f"memory admission: reload ready, source hash {version}"])

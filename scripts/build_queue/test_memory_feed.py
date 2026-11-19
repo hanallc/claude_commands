@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.review_links.test_page_frame import assert_status_states
-from scripts.build_queue import admission_records, placement
+from scripts.build_queue import admission_records, placement, queue_evidence
 from scripts.build_queue import snapshot_codec as codec
 from scripts.build_queue.test_queue_view import with_converted_executions
 
@@ -2729,6 +2729,28 @@ process.stdout.write(JSON.stringify({
                 waiting = [row for row in page["waiters"] if row.get("kind") == "cloud"]
                 self.assertEqual([row["name"] for row in running], [expected])
                 self.assertEqual([row["name"] for row in waiting], [expected])
+
+    def test_queue_views_keep_recorded_names_when_registry_labels_are_empty(self) -> None:
+        base = cloud_reading(with_wait_reason(captured_reading(), admission_records.NeedsMemory()))
+        waiter = replace(base.view.waiting[0], step="merge-gate", session_name="local caller name")
+        slot = wire.RepositorySlotRow(wire.Owner(701001, "start"),
+            wire.Identity("slot-session", "slot caller name", "merge-gate", str(self.root)),
+            base.explanation.now - 60, "natedev",
+            wire.RepositorySlotWaiting("widget", (1,), 1, "slots.natedev.widget.max"))
+        reading = replace(base, view=replace(base.view, waiting=(waiter,)), repository_slots=(slot,))
+        labels = {session: unit_labels.UnitLabels("") for session in (
+            waiter.session_id, slot.identity.session_id, *(row.identity.session_id for row in base.cloud))}
+        with (mock.patch.object(admission_client, "view", return_value=reading),
+              mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
+              mock.patch.object(unit_labels, "unit_labels_for", return_value=labels)):
+            page = memory_feed.reading()
+        rows = {row["pid"]: row for row in (*page["walk"], *page["waiters"])}
+        for pid, name in ((waiter.pid, waiter.session_name), (slot.owner.pid, slot.identity.name),
+                          *((row.owner.pid, row.identity.name) for row in base.cloud)):
+            with self.subTest(pid=pid):
+                self.assertEqual(rows[pid]["name"], name)
+                self.assertEqual(rows[pid].get("caller") or rows[pid].get("showrunner"), name)
+        self.assertEqual(queue_evidence.step_labels(waiter, labels).owner_text, waiter.session_name)
 
     def test_cloud_without_staff_does_not_publish_the_stored_unit(self) -> None:
         base = cloud_reading(captured_reading())

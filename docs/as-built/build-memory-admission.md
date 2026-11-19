@@ -1005,7 +1005,8 @@ Source changes stop the service after the settle interval. A missing source also
 Under systemd, the service then runs the new code in the same process with `execv`, and keeps the inherited socket.
 It sends `RELOADING=1` before `execv` and `READY=1` when the new listener is ready, so the systemd restart delay does not apply.
 The service logs the changed source paths before `execv`.
-The replacement sends `READY=1`, then logs a hash of the files it watches.
+The replacement sends `READY=1`, then hashes the Python sources under `scripts` and logs the hash.
+The hash includes sources that load only after startup.
 A failed start of the new code exits, and `Restart=always` starts the service again.
 A service started without `LISTEN_FDS` stops on a source change and does not run `execv`.
 `down-alert` waits `silence_seconds` and claims `build-admission`.

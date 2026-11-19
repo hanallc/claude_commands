@@ -764,6 +764,11 @@ def public_owner_name(name: str, session: str = "") -> str:
     return "" if name in (session, f"session:{session}") else name
 
 
+def recorded_caller_name(session: str, name: str, folder: str) -> str:
+    return admission_records.queue_caller(session, "", public_owner_name(name, session),
+                                          "", public_owner_name(Path(folder).name)).name
+
+
 class FeedStaff:
     """Resolve current unit and owner labels from one staff snapshot."""
 
@@ -830,7 +835,7 @@ def repository_slot_row(slot: wire.RepositorySlotRow, names: StepNames, members:
                else members.labels_for(identity.session_id, slot.machine, source))
     label = current or unit_labels.UnitLabels("")
     unit = staff_unit(label)
-    showrunner = public_owner_name(label.showrunner) or public_owner_name(identity.name, identity.session_id)
+    showrunner = public_owner_name(label.showrunner) or recorded_caller_name(identity.session_id, identity.name, str(source))
     if isinstance(step, NoNamedStep):
         step = QueueRowName.owner_only(unit or showrunner) if legacy_gate else QueueRowName.repository(slot.wait.repository, str(source))
     if isinstance(step, NoNamedStep):
@@ -1255,11 +1260,10 @@ def step_page_owner(step: admission_records.RunningStep | admission_records.Wait
     folder = Path(step.folder)
     if not step_runner(step, runners):
         current = members.labels_for(step.session_id, machine, folder) or labels.get(step.session_id)
-        if current is not None:
+        if current is not None and public_owner_name(current.owner_text, step.session_id):
             return StepPageOwner(current, unit=staff_unit(current, missing="—"))
-    caller = admission_records.queue_caller(step.session_id, "", public_owner_name(step.session_name, step.session_id),
-                                          "", public_owner_name(folder.name), members=members.members)
-    return StepPageOwner(replace(identity, showrunner="", unit=""), caller.name)
+    caller = recorded_caller_name(step.session_id, step.session_name, step.folder)
+    return StepPageOwner(replace(identity, showrunner="", unit=""), caller)
 
 
 def mac_build_units(builds: Sequence[queue_view.MacBuild],
@@ -2282,9 +2286,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     leftovers: list[LeftoverScope] = []
     for step, memory, activity in queue_view.leftover_processes(parsed.view.running):
         identity = labels.get(activity.session_id)
-        owner = admission_records.queue_caller(activity.session_id, "",
-            public_owner_name(identity.session if identity is not None else activity.session_name, activity.session_id),
-            "", public_owner_name(Path(activity.folder).name), members=members.members).name
+        label = public_owner_name(identity.session, activity.session_id) if identity is not None else ""
+        owner = label or recorded_caller_name(activity.session_id, activity.session_name, activity.folder)
         scope_members: list[LeftoverProcess] = [
             {"pid": member.pid, "program": leftover_program(member.pid, member.program)} for member in activity.members]
         if not scope_members:
@@ -2545,15 +2548,18 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         cloud_waiters: dict[wire.Owner, CloudWaitRow] = {}
         for cloud in rows:
             information = queue_view.cloud_work(cloud, explanation.now, parsed.cloud_gate_stale_pushes, interval)
-            current = members.labels_for(cloud.identity.session_id, machine, Path(cloud.identity.folder))
-            identity = current or queue_view.cloud_step_labels(cloud, model)
+            recorded = cloud.identity
+            current = members.labels_for(recorded.session_id, machine, Path(recorded.folder)) or cloud_labels.get(recorded.session_id)
+            unit = staff_unit(current, missing="—") if current is not None else ""
+            owner = public_owner_name(current.owner_text, recorded.session_id) if current is not None else ""
+            identity = current if current is not None and owner else unit_labels.UnitLabels(
+                recorded_caller_name(recorded.session_id, recorded.name, recorded.folder))
             job = cloud.identity.job if isinstance(cloud.identity.job, StepJob) else step_job(
                 cloud.identity.step, cloud.owner.pid, PROC, start_time=cloud.owner.start_time)
             step = job_step(job, cloud.identity.step)
-            unit = staff_unit(identity, missing="—") if current is not None or cloud.identity.session_id in cloud_labels else ""
             if step in GATE_STEPS:
                 title_step = display_name = QueueRowName.owner_only(public_queue_text(unit)
-                    or public_queue_text(identity.owner_text) or public_owner_name(cloud.identity.name, cloud.identity.session_id))
+                    or identity.owner_text)
                 parts = staff_names.text_parts(display_name)
             else:
                 title_step = build_row_step(step, "", "", "", names, kind=QueueKind.AWS)

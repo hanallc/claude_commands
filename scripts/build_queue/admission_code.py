@@ -23,10 +23,22 @@ ADMISSION_CODE_PATHS = (
 )
 
 
-def admission_code_version(scripts: Path | None = None, *, watched: Iterable[Path] | None = None) -> str:
+RELOAD_SOURCE_SUFFIX = ".py"
+
+
+def admission_code_version(scripts: Path | None = None) -> str:
     root = scripts if scripts is not None else Path(__file__).resolve().parents[1]
+    return _source_hash(root, ADMISSION_CODE_PATHS)
+
+
+def reload_source_version(root: Path) -> str:
+    """Hash the Python source files that the watch can see."""
+    paths = sorted(str(path.relative_to(root)) for path in root.rglob(f"*{RELOAD_SOURCE_SUFFIX}") if path.is_file())
+    return _source_hash(root, paths)
+
+
+def _source_hash(root: Path, paths: Iterable[str]) -> str:
     digest = hashlib.sha256()
-    paths = ADMISSION_CODE_PATHS if watched is None else tuple(sorted(str(path.relative_to(root)) for path in watched))
     for relative in paths:
         try:
             content = (root / relative).read_bytes()

@@ -694,7 +694,7 @@ def read_system(plan: SystemReadingPlan, readings: Readings, proc: Proc, clock: 
     unowned = gate.unowned_slice_memory([], processes, proc.path,
         activity_reader=activity, ci_memory_slice=plan.config.ci_memory_slice)
     has_caller = plan.runs or any(isinstance(row.activity, ScopeProcesses) and row.activity.session_id for row in unowned)
-    staff_members = records.queue_staff() if has_caller else None
+    staff_members = records.queue_staff() if has_caller else records.NO_STAFF_LOOKUP
 
     def scope_caller(evidence: ScopeProcesses, unit: str = "") -> records.QueueCaller:
         return records.queue_caller(evidence.session_id, "", evidence.session_name, "", evidence.folder,
@@ -1490,17 +1490,19 @@ class AdmissionServer:
         if path.exists():
             self._persisted = path.read_text()
             state = parse_service_state(self._persisted, warn_missing_folders=True)
+            members = (records.queue_staff() if state.reservations or state.places or state.placement_requests
+                       else records.NO_STAFF_LOOKUP)
             for episode, record in state.reservations.items():
                 row = record.queue_waiter
                 caller = self._stored_caller(row.get("session_id", ""), row.get("session_name", ""),
-                    row.get("folder") or record.worktree, row.get("unit", ""))
+                    row.get("folder") or record.worktree, row.get("unit", ""), members=members)
                 record = replace(record, queue_waiter={**row, "session_name": caller.name, "unit": caller.unit})
                 state.reservations[episode] = record
                 self.writes.register(record)
             for key, place in state.places.items():
                 identity = place.queue_identity
                 caller = self._stored_caller(identity["session_id"], identity["session_name"],
-                                             identity["folder"], identity.get("unit", ""))
+                                             identity["folder"], identity.get("unit", ""), members=members)
                 state.places[key] = replace(place, queue_identity={
                     **identity, "session_name": caller.name, "unit": caller.unit})
             self.reservations, self.places = state.reservations, state.places
@@ -1510,7 +1512,7 @@ class AdmissionServer:
             self.run_places = state.run_places
             self.lifecycle_outbox = state.lifecycle_outbox
             self.caller_versions = state.caller_versions
-            self.placement_requests = {key: self._named_placement(request)
+            self.placement_requests = {key: self._named_placement(request, members=members)
                                        for key, request in state.placement_requests.items()}
             self.assignments = state.assignments
             self.current_assignments = state.current_assignments
@@ -4117,22 +4119,27 @@ done
             runner=request.runner)
 
     @staticmethod
-    def _stored_caller(session: str, name: str, folder: str, unit: str) -> records.QueueCaller:
-        caller = records.queue_caller(session, "", name, "", folder,
-                                      members=records.queue_staff() if session else None, unit=unit)
+    def _stored_caller(session: str, name: str, folder: str, unit: str, *,
+                       members: records.QueueStaff) -> records.QueueCaller:
+        caller = records.queue_caller(session, "", name, "", folder, members=members, unit=unit)
         return replace(caller, name=name.strip() or caller.name)
 
-    def _named_identity(self, identity: wire.Identity, *, folder: str = "") -> wire.Identity:
-        caller = self._stored_caller(identity.session_id, identity.name, identity.folder or folder, identity.unit)
+    def _named_identity(self, identity: wire.Identity, *, folder: str = "",
+                        members: records.QueueStaff | None = None) -> wire.Identity:
+        if members is None:
+            members = records.queue_staff() if identity.session_id else records.NO_STAFF_LOOKUP
+        caller = self._stored_caller(identity.session_id, identity.name, identity.folder or folder, identity.unit,
+                                     members=members)
         return replace(identity, name=caller.name, unit=caller.unit)
 
-    def _named_placement(self, request: wire.PlacementRequest) -> wire.PlacementRequest:
+    def _named_placement(self, request: wire.PlacementRequest, *,
+                         members: records.QueueStaff | None = None) -> wire.PlacementRequest:
         identity = request.identity
         session = request.constraints.session
         identity = replace(identity, session_id=identity.session_id or (
             session.session_id if isinstance(session, OwningSession) else ""),
             step=identity.step or request.profile.step, folder=identity.folder or request.profile.worktree)
-        return replace(request, identity=self._named_identity(identity))
+        return replace(request, identity=self._named_identity(identity, members=members))
 
     def handle_request(self, request: wire.Request, connection: Connection | NoConnection = NO_CONNECTION
                        ) -> list[wire.Reply]:
@@ -4453,7 +4460,7 @@ done
         self.listener_started_at = self.clock.monotonic()
         _notify("READY=1")
         if os.environ.pop(ADMISSION_SOURCE_RELOAD, ""):
-            version = admission_code.admission_code_version(self.source_root, watched=self.sources)
+            version = admission_code.reload_source_version(self.source_root)
             print(f"memory admission: reload ready, source hash {version or 'unavailable'}",
                   file=sys.stderr, flush=True)
 
@@ -4591,7 +4598,7 @@ done
             filename = cast(object, getattr(module, "__file__", None))
             if isinstance(filename, str):
                 path = Path(filename).resolve()
-                if path.is_relative_to(self.source_root):
+                if path.suffix == admission_code.RELOAD_SOURCE_SUFFIX and path.is_relative_to(self.source_root):
                     paths.add(path)
         return paths
 

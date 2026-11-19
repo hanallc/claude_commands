@@ -1571,23 +1571,32 @@ class QueueCaller:
     unit: str
 
 
-def queue_staff() -> staff.StaffSnapshot | None:
+@dataclass(frozen=True)
+class StaffLookupSkipped:
+    """The caller has no staff reference to resolve."""
+
+
+NO_STAFF_LOOKUP = StaffLookupSkipped()
+type QueueStaff = staff.StaffSnapshot | staff.StaffUnreadable | StaffLookupSkipped
+
+
+def queue_staff() -> QueueStaff:
     try:
         return staff.local_snapshot()
-    except staff.StaffUnreadable:
-        return None
+    except staff.StaffUnreadable as error:
+        return error
 
 
 def queue_caller(session_id: str, staff_id: str, exported_name: str, session_folder: str,
-                 worktree: str, *, members: staff.StaffSnapshot | None = None, unit: str = "") -> QueueCaller:
+                 worktree: str, *, members: QueueStaff = NO_STAFF_LOOKUP, unit: str = "") -> QueueCaller:
     """Resolve the caller name and its unit for queue priority."""
     reference = session_id or staff_id
-    member = members.by_member_reference(reference) if members is not None and reference else None
-    if member is not None and members is not None:
-        owner = members.parent_of(member) if member.kind == "worker" else member
-        unit = owner.name if owner is not None and owner.kind == "unit" else ""
+    if isinstance(members, staff.StaffSnapshot) and reference and (member := members.by_member_reference(reference)):
+        if not unit:
+            owner = members.parent_of(member) if member.kind == "worker" else member
+            unit = owner.name if owner is not None and owner.kind == "unit" else ""
         session_id = session_id or member.current_session
-        exported_name = member.name
+        exported_name = member.name.strip() or exported_name
     name = exported_name.strip() or Path(session_folder).name.strip()
     if not name and not reference and (folder := Path(worktree).name.strip()):
         name = f"terminal · {folder}"
@@ -1599,7 +1608,7 @@ def waiter_identity(step: str, worktree: str) -> WaiterIdentity:
     reference = os.environ.get("BUILDLOG_OWNER_STAFF_ID", "")
     caller = queue_caller(session, reference, os.environ.get("CLAUDE_SESSION_NAME", ""),
         os.environ.get("CLAUDE_SESSION_FOLDER", ""), worktree or os.getcwd(),
-        members=queue_staff() if session or reference else None, unit=os.environ.get(BUILDLOG_UNIT, ""))
+        members=queue_staff() if session or reference else NO_STAFF_LOOKUP, unit=os.environ.get(BUILDLOG_UNIT, ""))
     identity: WaiterIdentity = {"session_id": caller.session_id, "session_name": caller.name,
         "step": step, "folder": os.getcwd() if worktree else ""}
     if caller.unit:
