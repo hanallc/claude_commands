@@ -5023,3 +5023,148 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
 - impl: test_scratch.py and scratch.py.
 
 **Acceptance gate:** the test passes 20 times under host load in a 2 GB scope; the full suite is green.
+### Phase 360 — the scratch retry never deletes a live ref  · status: todo
+**Depends on:** Phase 359
+
+#### Work Order
+
+**Goal:** the scratch retry deletes no Git ref that was added or changed after the intent.
+
+**Spec:** fix three deletion paths found by the phase 359 review (phases/359/review_reply_1.txt):
+1. scratch.py:1535: a new alias to a published commit passes fsck and the work check, so recovery_state returns RECHECK and the retry deletes it.
+2. scratch.py:1471: on a coarse-clock file system, a ref made after the intent can get a time before the cutoff.
+3. scratch.py:1745: with no Cargo metadata, the retry deletes after its first scan; a ref made during Cargo preparation escapes.
+- Fix each in scratch.py at its cause. Add one row per path to the existing scratch tests. Every assertion remains. Tests read no /tune-changeable value.
+
+**Files:** scripts/lib/scratch.py; scripts/lib/test_scratch.py.
+
+**Workers:** 1 writer. One module and its test.
+- impl: scratch.py and test_scratch.py.
+
+**Acceptance gate:** each new row fails before its fix; test_scratch.py passes 20 times under load; the full suite is green.
+### Phase 361 — the Mac signal boundary test passes under gate load  · status: todo
+**Depends on:** Phase 360
+
+#### Work Order
+
+**Goal:** scripts/direct/test_verify_mac_signal_boundaries.py passes in every full suite.
+
+**Spec:**
+- The module failed in the phase 358 full suite and in its isolated rerun, on the phase base and on the fix (phases/358/fix2_reply.txt).
+- Cause seen in the trace: SIGINT arrives before the runner has a PID. The test releases the runner on the tree watcher's signal (test line 67).
+- Find whether verify.sh or the test owns the race. Fix it where it lives.
+- Every assertion remains. Tests read no /tune-changeable value.
+
+**Files:** scripts/direct/test_verify_mac_signal_boundaries.py; scripts/direct/verify.sh when the cause is there.
+
+**Workers:** 1 writer. One module and its subject.
+- impl: the test module and verify.sh.
+
+**Acceptance gate:** the module passes 20 times under host load in a 2 GB scope; the full suite is green.
+### Phase 362 — scratch removal moves the checkout before it checks refs  · status: todo
+**Depends on:** Phase 361
+
+#### Work Order
+
+**Goal:** the scratch removal retry never deletes a Git ref made after the removal intent, with less retry code than before.
+
+**Spec:**
+- Builds approved this design on 2026-11-18. It replaces the timestamp cutoffs and the extra scans.
+1. At the retry, move the checkout and its linked worktree admin folder to a tombstone path, with one rename each. A Git process that writes after the rename fails at the old path.
+2. Compare one stat snapshot (inode, size, mtime_ns) of every file in the Git folder, the admin folder and packed-refs with the snapshot from the intent.
+3. Any difference moves both folders back and keeps them.
+4. A move back that fails leaves both folders in place and reports. It never deletes.
+- Delete the timestamp cutoffs and the extra scans. The retry code gets smaller.
+- Add one row per known race to the existing scratch tests, 7 in all: phases/359/review_reply_1.txt items 1-3 and phases/360/review_reply_1.txt items 1-4.
+- Also close the phase 360 closure review items (phases/360/review_reply_1.txt): 2. a fresh removal reads HEAD again through `git_directory` and passes over the scan more than once; 3. a retry scans twice when Cargo preparation runs no Cargo command; 4. the retry test copies the shipped scratch.conf, so it reads the /tune `ls-remote` timeout. Item 1 (an in-place ref overwrite that keeps inode, size and mtime) is not a Git write: Git writes refs through a lock file and a rename.
+- Every assertion remains. Tests read no /tune-changeable value.
+
+**Files:** scripts/lib/scratch.py; scripts/lib/test_scratch.py.
+
+**Workers:** 1 writer. One module and its test.
+- impl: scratch.py and test_scratch.py.
+
+**Acceptance gate:** each new row fails on the phase 360 code; scratch.py retry code has fewer lines; test_scratch.py passes 20 times under load; the full suite is green.
+### Phase 363 — the AWS trial test cleans up its Git repository under gate load  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** scripts/aws_target/test_aws_trial.py passes in every full suite.
+
+**Spec:**
+- sdlc saw 3 tests fail in a full gate on a31f4cbff (2026-11-18, about 18:40 EST). The tempfile cleanup raised "Directory not empty: .../repo/.git" in /dev/shm.
+- The module passes alone on that tip and on main 51d3608ad. The likely cause is a Git child that still writes at cleanup.
+1. Reproduce the failure under load first, in a 2 GB scope.
+2. Find the cause. Fix it where it lives: in the code under test when it leaves a Git child running, in the test when only the test does.
+- Every assertion remains. Tests read no /tune-changeable value.
+
+**Files:** scripts/aws_target/test_aws_trial.py; scripts/aws_target/aws_trial.py or its helpers when the cause is there.
+
+**Workers:** 1 writer. One module and its subject.
+- impl: the test module and its subject.
+
+**Acceptance gate:** the failure reproduces under load before the fix; the module passes 20 times under load after it; the full suite is green.
+### Phase 364 — four modules lose the AWS CPU they gained since 11-17  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** four modules whose AWS gate CPU about doubled since 11-17 cost less gate CPU, with every assertion kept.
+
+**Spec:**
+- Builds assigned this on 2026-11-18. Base: origin/main 83f0a961e.
+- AWS gate median CPU now (before 11-17): production/test_mac_run.py 41.6 (21); direct/test_verify_lint_local_writes.py 30.2 (7); mac_test/test_offload_lifecycle.py 25.0 (14); direct/test_assign_claude_claim_follow.py 17 (5).
+1. For each module, find the commit that added the cost (`show.py module`, git log of the module, its support and its subject).
+2. Remove that cost where it lives: in the test, its support, or the production code it runs.
+3. Measure each module with paired runs before and after, on AWS (`aws_trial.py --rounds 3`).
+- Every assertion remains. Tests read no /tune-changeable value. No signal handlers, no lazy imports, no copies.
+- If this phase touches files that phase 355 renames, the branch that merges second resolves the conflict.
+
+**Files:** the four modules, their test support, and the production code that added the cost.
+
+**Workers:** 1 writer. The four modules share support files.
+- impl: the four modules and their support.
+
+**Acceptance gate:** an AWS pair shows the CPU saved per module; the changed modules pass; basedpyright clean on changed files; the full suite is green.
+### Phase 365 — the status line and list page tests lose the gate CPU added on 11-18  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** statusline/test_statusline.py and review_links/test_list_page.py lose the gate CPU they gained on 11-18, with every assertion kept.
+
+**Spec:**
+- Builds assigned this on 2026-11-18. Gate CPU rose from about 4,330 to 5,292 CPU s. test_statusline went 44 -> 152 CPU s and test_list_page 1 -> 93 (builds' read of the build log).
+- natedev records: test_statusline 31 CPU s (101 tests) at 11-17 20:02, then 163 CPU s (112 tests) at 11-18 03:44. test_list_page 8 CPU s (17 tests) at 11-17 17:18, 56 (63 tests) at 20:02, 107 (93 tests) on 11-18, 131 (125 tests) at 13:39.
+- Phase 350 (on the merge line, branch natest-listpage350) makes the list page tests share one browser for each class. Measure on top of it; do not repeat it.
+1. For each module, find the commits that added the cost (git log of the module, its support and its subject, between those records).
+2. Remove the cost at its cause: in the test, its support, or the production code it runs.
+3. Measure each module with an AWS pair, 3 rounds, before and after.
+- Every assertion remains. Tests read no /tune-changeable value. No signal handlers, no lazy imports, no copies.
+
+**Files:** the two modules, their test support, and the production code that added the cost.
+
+**Workers:** 1 writer. Two modules; the cause search comes first.
+- impl: both modules and their support.
+
+**Acceptance gate:** an AWS pair shows the CPU saved per module; the changed modules pass; basedpyright clean on changed files; the full suite is green.
+### Phase 366 — the phase 349 Mac-only branch merges with main  · status: todo
+**Depends on:** Phase 349
+
+#### Work Order
+
+**Goal:** branch natest-maconly349 merges clean with origin/main and passes the full suite.
+
+**Spec:**
+- Builds took 349 (123e1f784) off the merge line on 2026-11-18: it conflicts with main cd9f5002b in scripts/direct/verify_mac_offload_test_support.py.
+1. Merge origin/main into natest-maconly349.
+2. Resolve the conflict so both sides keep their intent: main's change and 349's shared runner fixture wait.
+- Every assertion remains. Tests read no /tune-changeable value.
+
+**Files:** scripts/direct/verify_mac_offload_test_support.py and any other conflicted file.
+
+**Workers:** 1 writer.
+- impl: the merge.
+
+**Acceptance gate:** test_verify_mac_only.py and the modules that import the support file pass; the full suite is green.
