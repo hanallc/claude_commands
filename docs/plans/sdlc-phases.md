@@ -1311,6 +1311,27 @@ The test server joins its request handlers before fixture cleanup and gives each
 **Acceptance gate:**
 1. A test fails on main for a missing `--checkpoint` and for a start-time match. basedpyright: 0 errors, 0 warnings. Full gate green.
 
+### Phase 81 — A new registry row goes after its section's last key  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** the sdlc showrunner (2026-11-18), from producer bob's create. `registry_rows.replay` adds a new row when it reaches the next section header. So `bob=claude:fable:high` landed in `config/models.conf` after the comment block of the production section, just before `[production.claude]`. The parser still reads it in `[producers]`.
+
+**Spec:**
+1. A new row goes directly after the last key line of its section (for `[producers]`, after `dwight=`). Comments and blank lines that follow the last key stay below the new row. A section with no keys gets the row directly after its header.
+2. Move bob's line in `config/models.conf` to after `dwight=` in the same change. The value stays the same, so this is not a value change.
+3. Add rows to the existing registry tests (`scripts/lib/test_models_registry.py` or `scripts/agents/test_models_conf_publish.py`); add no new module.
+
+**Files:** `scripts/lib/registry_rows.py`, its existing test, `config/models.conf`.
+
+**Workers:** 1 writer.
+
+**Order:** on main 83f0a961e. No other open phase touches these files.
+
+**Acceptance gate:**
+1. The new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
