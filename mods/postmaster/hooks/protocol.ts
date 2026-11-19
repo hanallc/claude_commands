@@ -2,13 +2,17 @@ import type { EngineInterface, SessionReceiveInput } from "claude-code";
 
 export const POLL_MS = 500;
 export const BATCH = 20;
-export const VERSION = "0.1.0";
+export const VERSION = "0.2.0";
 export const REPLY_WINDOW_MS = 30 * 60 * 1000;
 export const PATHS = { outbox: "outbox", claimed: "claimed", results: "results", heartbeat: "heartbeat.json", errors: "errors", delivered: "delivered", replies: "replies", forwards: "forwards" } as const;
 
-export type OutboxEntry = {
-  id: string;
+export type OutboxRecipient = {
   session_id: string;
+  recipient_pid: number;
+  recipient_start: string;
+};
+export type OutboxEntry = OutboxRecipient & {
+  id: string;
   socket: string;
   text: string;
   sha256: string;
@@ -17,14 +21,25 @@ export type OutboxEntry = {
   reply_to_session_id: string;
 };
 export type OutboxClaim = { id: string; claimed_ms: number; run: string };
-export type OutboxResult = {
+const FIELDLESS_OUTCOMES = ["failed", "withdrawn", "abandoned"] as const;
+const OUTBOX_OUTCOMES = ["delivered", "expired", ...FIELDLESS_OUTCOMES] as const;
+
+type OutboxResultFields = {
   id: string;
-  outcome: "delivered" | "failed" | "expired" | "withdrawn" | "abandoned";
   detail: string;
   sha256: string;
   claimed_ms: number;
   finished_ms: number;
 };
+type ResultWithoutRecipient = {
+  outcome: (typeof FIELDLESS_OUTCOMES)[number];
+  session_id?: never;
+  recipient_pid?: never;
+  recipient_start?: never;
+};
+export type OutboxResult = OutboxResultFields & (
+  (OutboxRecipient & { outcome: (typeof OUTBOX_OUTCOMES)[number] }) | ResultWithoutRecipient
+);
 export type Heartbeat = { session_id: string; at_ms: number; version: string; run: string };
 export type PostmasterCalls = {
   env: Pick<EngineInterface["env"], "get">;
@@ -83,18 +98,29 @@ export function isEntryId(value: unknown): value is string {
 function hash(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 }
+function hasOutboxRecipient(value: Record<string, unknown>): boolean {
+  return typeof value.session_id === "string" && value.session_id !== ""
+    && timestamp(value.recipient_pid) && value.recipient_pid > 0
+    && typeof value.recipient_start === "string" && value.recipient_start !== "";
+}
 export function isOutboxEntry(value: unknown): value is OutboxEntry {
-  return record(value) && isEntryId(value.id) && typeof value.session_id === "string" && value.session_id !== ""
+  return record(value) && isEntryId(value.id) && hasOutboxRecipient(value)
     && typeof value.socket === "string" && typeof value.text === "string" && hash(value.sha256) && timestamp(value.deadline_ms)
     && typeof value.sender === "string" && value.sender !== "" && typeof value.reply_to_session_id === "string";
 }
 export function isOutboxClaim(value: unknown): value is OutboxClaim {
   return record(value) && isEntryId(value.id) && timestamp(value.claimed_ms) && typeof value.run === "string" && value.run !== "";
 }
+export function isFieldlessOutcome(value: unknown): value is (typeof FIELDLESS_OUTCOMES)[number] {
+  return FIELDLESS_OUTCOMES.some(outcome => outcome === value);
+}
 export function isOutboxResult(value: unknown): value is OutboxResult {
-  return record(value) && isEntryId(value.id) && typeof value.outcome === "string"
-    && ["delivered", "failed", "expired", "withdrawn", "abandoned"].includes(value.outcome)
-    && typeof value.detail === "string" && hash(value.sha256) && timestamp(value.claimed_ms) && timestamp(value.finished_ms);
+  return record(value) && isEntryId(value.id) && OUTBOX_OUTCOMES.some(outcome => outcome === value.outcome)
+    && typeof value.detail === "string" && hash(value.sha256) && timestamp(value.claimed_ms) && timestamp(value.finished_ms)
+    && (hasOutboxRecipient(value) || (
+      isFieldlessOutcome(value.outcome)
+      && !("session_id" in value) && !("recipient_pid" in value) && !("recipient_start" in value)
+    ));
 }
 export function isHeartbeat(value: unknown): value is Heartbeat {
   return record(value) && typeof value.session_id === "string" && value.session_id !== ""

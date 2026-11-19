@@ -1377,6 +1377,7 @@ def restore(parent: StaffId, *, record: staff.StaffSnapshot | None = None,
                         continue
                     if recovery in (CompletionRecovery.PENDING_CLOSE, CompletionRecovery.WAITING_ON_RUNS,
                                     CompletionRecovery.WAITING_ON_REPLY):
+                        print(f"{state.row.name}: {recovery.value}", file=sys.stderr)
                         outcome = ExitCode.UNCERTAIN
                         continue
                     if isinstance(state, worker_panes.OpenWorker) and not state.status.idle:

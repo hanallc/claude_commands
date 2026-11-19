@@ -1629,6 +1629,25 @@ class StaffTests(StaffCommandTestCase):
         self.assertEqual(moved, replace(morty, current_session=session, home=home, worktree=folder))
         self.assertEqual(staff.by_id(morty.id), moved)
 
+        with self.subTest(operation="producer creation"):
+            registry = self.root / "models.conf"
+            _ = registry.write_text("[producers]\n")
+            marker = f"mac:{'1' * 32}"
+            with (self.machine("mac"),
+                  mock.patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0"})):
+                _ = staff.producer_creation_registry("claim", "dwight", marker, "claude:sonnet:high")
+                self.assertEqual(staff.producer_creation_registry("read", "Dwight"), marker)
+                with self.assertRaisesRegex(staff.StaffRefused, "the creation record is on mac"):
+                    _ = staff.producer_creation_registry("claim", "Dwight", f"natedev:{'1' * 32}", "claude:sonnet:high")
+                with self.assertRaisesRegex(staff.StaffRefused, "the creation record is on mac"):
+                    _ = staff.producer_creation_registry("finish", "dwight", f"natedev:{'1' * 32}")
+                self.assertEqual(staff.producer_creation_registry("read", "dwight"), marker)
+                _ = staff.producer_creation_registry("finish", "Dwight", marker)
+                self.assertEqual(staff.producer_creation_registry("read", "dwight"), "")
+            self.assertIn("dwight=claude:sonnet:high", registry.read_text())
+            self.assertEqual([command[:2] for command in self.ssh_commands()[1:]],
+                             [["producer-creation", action] for action in ("claim", "read", "claim", "finish", "read", "finish", "read")])
+
     def test_a_producer_launch_folder_owns_no_path_and_two_producers_share_it(self) -> None:
         _, unit, _ = self.tree()
         folder = staff.PresentWorktree("natedev", self.root)

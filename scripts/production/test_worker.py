@@ -1049,6 +1049,54 @@ class WorkerCommandTests(unittest.TestCase):
             self.assertEqual(self.command("restore"), (0, f"{self.fixture.parent.name}: workers unchanged\n", ""))
         self.assertEqual(len(self.fixture.world.launches), before)
 
+    def test_restore_reports_each_worker_with_pending_completion(self) -> None:
+        impl = self.opened("impl")
+        cm = self.opened("cm")
+        dispatches: dict[str, str] = {}
+        for opened in (impl, cm):
+            name = opened.row.name
+            dispatch = progress_history.begin_dispatch(self.run_dir, slot=name, phase="8", role="impl",
+                worker_name=name, worker_id=opened.row.id, launcher_command=["assign.sh", name],
+                prompt=self.prompt, kind="impl", lens="")
+            dispatches[name] = dispatch
+            line = f"Complete the work. End your reply with DONE {dispatch}."
+            reply = self.run_dir / f"{name}_reply.md"
+            progress_history.save_dispatch_delivery(self.run_dir, dispatch,
+                pass_recorder.DispatchDelivery(line, dispatch, str(reply)))
+            self.agent.append(opened.pane, "user", line)
+
+        backend = staff.backend(impl.row)
+        assert isinstance(backend, (staff.ClaudeBackend, staff.CodexBackend))
+        transcript = worker_admission.transcript_source(impl.row, backend)
+        with transcript.open("a", encoding="utf-8") as stream:
+            _ = stream.write('{"torn":')
+        result_path, result = self.detached_record(cm.row, "private-check")
+        result.update(delivery=f"sent: worker cm at {cm.pane}", pane_dispatch_id=dispatches["cm"])
+        atomic_file.write_text_atomic(result_path, json.dumps(result))
+        self.agent.append(cm.pane, "user", "Detached run: private-check\nRun finished: private verification")
+        self.agent.append(cm.pane, "assistant", "The check is on hold.")
+        self.fixture.world.locations[cm.pane]["agent_status"] = "done"
+
+        observe = worker_panes.observe
+
+        def observe_impl_first(parent: staff.StaffId, record: staff.StaffSnapshot) -> list[worker_panes.WorkerPane]:
+            return sorted(observe(parent, record), key=lambda state: state.row.name != "impl")
+
+        _ = self.enterContext(patch.object(worker_panes, "observe", side_effect=observe_impl_first))
+        code, _, errors = self.command("restore")
+        self.assertEqual(code, worker.ExitCode.UNCERTAIN)
+        self.assertEqual(errors.splitlines(), ["anomaly: impl: worker transcript has incomplete records",
+                                               "cm: a detached run result awaits a matching DONE"])
+        self.assertIn(impl.pane, self.fixture.world.locations)
+        self.assertIn(cm.pane, self.fixture.world.locations)
+
+        self.agent.append(cm.pane, "assistant", f"The check is complete.\nDONE {dispatches['cm']}")
+        code, _, errors = self.command("restore")
+        self.assertEqual(code, worker.ExitCode.UNCERTAIN)
+        self.assertEqual(errors.splitlines(), ["anomaly: impl: worker transcript has incomplete records"])
+        self.assertIn(impl.pane, self.fixture.world.locations)
+        self.assertNotIn(cm.pane, self.fixture.world.locations)
+
     def test_herdr_dispatch_records_the_worker_staff_id(self) -> None:
         for foreign_tab in (False, True):
             with self.subTest(foreign_tab=foreign_tab):

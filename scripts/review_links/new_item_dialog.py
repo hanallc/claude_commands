@@ -391,7 +391,7 @@ def render() -> str:
     """Mount once and open with window.reviewNewItem.open({trigger, kind, evidence})."""
     chips = "".join(
         f'<label class="new-item-chip" data-kind="{kind}"><input type="radio" name="kind" value="{kind}">'
-        + f'<span>{page_frame.icon_svg(icon)}{label}</span></label>'
+        + f'<span data-button-face>{page_frame.icon_svg(icon)}{label}</span></label>'
         for kind, label, icon in KINDS)
     limits = json.dumps({"types": list(IMAGE_FORMATS), "images": MAX_IMAGES,
                          "imageBytes": MAX_IMAGE_BYTES,
@@ -450,7 +450,6 @@ STYLE = '''
  border: 0; border-radius: 6px; background: transparent; width: 30px; height: 30px;
  color: var(--ink-2, #c3c2b7); font-size: 22px; line-height: 1;
 }
-#review-new-item [data-close]:hover { background: var(--hover, #242422); }
 #review-new-item .new-item-body {
  display: grid; align-content: start; gap: 18px; min-width: 0; padding: 4px 24px 20px;
  overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin;
@@ -471,7 +470,6 @@ STYLE = '''
  border: 1px solid var(--line, #34332f); color: var(--ink-2, #c3c2b7);
  font-size: 14px; overflow-wrap: anywhere; cursor: pointer;
 }
-#review-new-item .new-item-chip:hover span { background: var(--hover, #242422); }
 #review-new-item .new-item-chip input:checked + span,
 #review-new-item button[type="submit"] { background: #2670c5; color: white; border-color: transparent; }
 #review-new-item .new-item-chip svg { width: 16px; height: 16px; flex: none; }
@@ -651,7 +649,9 @@ SCRIPT = r'''(() => {
    input.name = 'recipient_id';
    input.value = recipient.id;
    input.checked = recipient.id === selected;
-   chip.append(input, node('span', recipient.name));
+   const face = node('span', recipient.name);
+   face.setAttribute('data-button-face', '');
+   chip.append(input, face);
    recipientChips.append(chip);
   }
   recipientStatus.textContent = available.length ? '' : 'No recipients are available.';
