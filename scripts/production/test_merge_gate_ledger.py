@@ -10,7 +10,6 @@ import io
 import os
 from pathlib import Path
 import select
-import shlex
 import sys
 import time
 from types import SimpleNamespace
@@ -26,7 +25,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE
 from scripts.production.affected_modules import CertifiedBase, FullSuite
 from scripts.buildlog.store import host_name
-from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, gate_suites
+from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MERGE_GATE_TEST_SETTINGS, MergeGateFixture, gate_suites
 
 
 # Run the same fixture test in one child. The suite tests cover the full runner.
@@ -67,13 +66,7 @@ INDEX_SPILL_PAGES=65536
 INDEX_TOUCH_MINUTES=60
 """,
     "codex_daemon": "# range: 0.001..\ntimeout_seconds=5\n",
-    "mac_gate": "admission_client_command=" + shlex.join((sys.executable, "-c", "raise SystemExit(125)"))
-                + "\n# range: 5e-324..\nterminate_grace_seconds=3\n",
-    "merge_gate": """# range: 1..
-GATE_TIME_LIMIT_FACTOR=100
-# whole: 0..
-memory_stop_reruns=1
-# one of: on, off
+    "merge_gate": MERGE_GATE_TEST_SETTINGS + """# one of: on, off
 nightly_result_push=on
 # whole: 1..
 nightly_result_modules=8
@@ -314,7 +307,6 @@ class MergeGateLedgerTests(MergeGateFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.write(Path(self.environment["CONF_DIR"]) / "merge_gate.conf", LEDGER_SETTINGS["merge_gate"])
         _ = cast(object, self.enterContext(mock.patch.object(merge_gate, "push_nightly_result")))
         # The memory tests measure real processes. The ledger tests need only available capacity.
         _ = self.enterContext(mock.patch.object(merge_gate, "process_memory_mib", new=fixture_job_memory))

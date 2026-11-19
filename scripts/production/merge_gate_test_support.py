@@ -19,6 +19,7 @@ import contextlib
 import os
 from pathlib import Path
 import shutil
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -50,6 +51,17 @@ SCRIPT = Path(__file__).with_name("merge_gate.py")
 # Fixture data, independent of the checkout's test folders.
 FIXTURE_FOLDERS = ("lib", "hooks", "message", "notify", "direct", "fixture_a", "fixture_b", "fixture_c")
 # Each folder holds test_first.py, and lib also holds test_second.py.
+
+MERGE_GATE_TEST_SETTINGS = """# range: 1..
+GATE_TIME_LIMIT_FACTOR=100
+# whole: 0..
+memory_stop_reruns=1
+"""
+# The fixture has no Mac placement. The client refuses it without contacting the queue.
+MAC_GATE_TEST_SETTINGS = (
+    "admission_client_command=" + shlex.join((sys.executable, "-c", "raise SystemExit(125)"))
+    + "\n# range: 5e-324..\nterminate_grace_seconds=3\n"
+)
 
 
 def install_test_runner(checkout: Path) -> Path:
@@ -352,7 +364,6 @@ class MergeGateFixture(unittest.TestCase):
         self.restore_fixture(suites_for_case(self))
         _ = self.enterContext(mock.patch.object(session_send, "SEND_SCRIPT", self.bin / "send.py"))
         self.admission = caller_admission(self, self.root, self.environment)
-        _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=100")
         self.admission_started = True
 
     def restore_fixture(self, folders: tuple[str, ...]) -> None:
@@ -381,7 +392,6 @@ class MergeGateFixture(unittest.TestCase):
         self.base, self.checkpoint = seed.base, seed.checkpoint
         if restart_admission:
             self.admission = caller_admission(self, self.root, self.environment)
-            _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=100")
 
     @property
     def module_count(self) -> int:
@@ -572,7 +582,9 @@ class MergeGateFixture(unittest.TestCase):
         self.bin.mkdir()
         self.state.mkdir()
         _ = write_config_fixture(self.root / "config/buildlog.conf")
-        _ = write_config_fixture(self.root / "config/merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=100")
+        for configuration in (self.root, Path(self.environment["CONF_DIR"])):
+            _ = write_config_fixture(configuration / "merge_gate.conf", MERGE_GATE_TEST_SETTINGS)
+            self.write(configuration / "mac_gate.conf", MAC_GATE_TEST_SETTINGS)
         # These tests prove gate behavior without a near deadline from their short jobs.
         history = Path(self.environment["BUILDLOG_DIR"])
         history.mkdir(parents=True, exist_ok=True)
