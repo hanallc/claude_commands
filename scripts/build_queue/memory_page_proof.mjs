@@ -570,20 +570,58 @@ try {
               fields:['$6.00','$2.00','$3.00','$6.20/month','$24.80/month','$31.00/month'], fits:true
             });
             if (theme === 'dark' && width === 1400) {
-              const awsTip = await evaluate(`(() => {
+              const awsTips = await evaluate(`(async () => {
                 const section = document.querySelector('#aws-costs');
                 section.scrollIntoView({block:'center'});
-                const heading = section.querySelector('[data-tip="aws-cost:gates"]');
-                const bounds = heading.getBoundingClientRect();
-                showTip(heading.dataset.tip, bounds.left + 30, bounds.bottom);
-                const grid = document.querySelector('#tip dl.tip');
-                const pairs = [...grid.querySelectorAll('dt')].map(label => [label.textContent, label.nextElementSibling.textContent]);
-                return {pairs, columns:getComputedStyle(grid).gridTemplateColumns.split(' ').length};
+                const tip = document.querySelector('#tip');
+                const showCost = trigger => {
+                  const bounds = trigger.getBoundingClientRect();
+                  showTip(trigger.dataset.tip, bounds.left + bounds.width / 2, bounds.bottom);
+                };
+                const views = Object.fromEntries([...section.querySelectorAll('[data-tip^="aws-cost:"]')].map(trigger => {
+                  showCost(trigger);
+                  const grid = tip.querySelector(':scope > dl.tip');
+                  const labels = [...grid.querySelectorAll(':scope > dt')];
+                  const pairs = labels.map(label => [label.textContent, label.nextElementSibling.textContent]);
+                  const aligned = labels.every(label => label.nextElementSibling.tagName === 'DD' &&
+                    getComputedStyle(label).textAlign === 'left' &&
+                    getComputedStyle(label.nextElementSibling).textAlign === 'right');
+                  const unwrapped = [...grid.children].every(cell => {
+                    const range = document.createRange();
+                    range.selectNodeContents(cell);
+                    return range.getClientRects().length <= 1;
+                  });
+                  return [trigger.dataset.tip, {pairs, aligned, unwrapped, columns:getComputedStyle(grid).gridTemplateColumns.split(' ').length}];
+                }));
+                let clip;
+                if (${awsCostsComparison}) {
+                  showCost(section.querySelector('[data-tip="aws-cost:today"]'));
+                  const r = tip.getBoundingClientRect();
+                  await Promise.all(tip.getAnimations().map(animation => animation.finished));
+                  const pane = section.getBoundingClientRect();
+                  const left = Math.min(pane.left, r.left), top = Math.min(pane.top, r.top);
+                  clip = {x:left+scrollX, y:top+scrollY, width:Math.max(pane.right, r.right)-left,
+                    height:Math.max(pane.bottom, r.bottom)-top, scale:1};
+                }
+                return {views, clip};
               })()`);
-              assert.equal(awsTip.columns, 2);
-              assert.deepEqual(awsTip.pairs, [['Billed gate spend',''],['Period','Month to date'],
+              assert.equal(Object.keys(awsTips.views).length, 5);
+              for (const [key, view] of Object.entries(awsTips.views)) {
+                assert.equal(view.columns, 2, key);
+                assert.ok(view.aligned, key);
+                for (const [label] of view.pairs)
+                  assert.ok([...label].length <= 18, `${key} label exceeds 18 characters: ${label}`);
+                assert.ok(view.pairs.every(([label,value]) => !label.endsWith(':') && !/[.!?]$/.test(value)), key);
+              }
+              assert.deepEqual(awsTips.views['aws-cost:gates'].pairs, [['Billed gate spend',''],['Period','Month to date'],
                 ['Basis','Recorded box time'],['Full merge gates','$6.00'],['Targeted tests','$2.00'],
-                ['Average per merge gate','$3.00']]);
+                ['Merge gate average','$3.00']]);
+              assert.deepEqual(awsTips.views['aws-cost:today'].pairs, [
+                ['Today (estimated)','$4.00 of $20.00'],['Source','Saved ledger and bills'],
+                ['Day boundary','UTC'],['Non-compute costs','full day if billed']]);
+              assert.ok(awsTips.views['aws-cost:today'].unwrapped, 'A Today tooltip row wraps on desktop.');
+              if (awsCostsComparison)
+                await saveScreenshot('aws-cost-tip-dark',{captureBeyondViewport:true,clip:awsTips.clip});
               await evaluate('hideTip()');
               if (awsCostsComparison) {
                 const clip = await evaluate(`(() => {
