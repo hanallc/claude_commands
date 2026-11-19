@@ -768,6 +768,14 @@ The render value's hover text shows the median of at most 10 successful renders.
 `/console/list.html` reads the producer's numbered List records on each request.
 The navigation label is List, and the page title is The List.
 The page uses the shared status line in `page_frame.py`.
+The **+ New item** button beside the title opens the shared Review dialog.
+The **To** field selects the List page owner from `page.list.owner` in `config/console.conf`.
+**Send** saves the native Review item and a linked List row for the recipient shown in **To**.
+The dialog keeps the draft key when it reopens after a failed send.
+A retry reuses the newest saved item whose original or current owner appears in **To**.
+For a different owner, the server uses the draft key and that owner to save a separate item once.
+The List refreshes and opens the new row after the server confirms the save.
+If a row save is in progress, the List refreshes when that save ends.
 The columns are #, Owner, Producer, Item, State, Next step, ETA, and Update.
 The Producer cell shows the name of the record's producer.
 On desktop, the ETA cell stays on one line and shows an ellipsis if the text is too long.
@@ -1689,10 +1697,12 @@ The setting starts at 8765.
 `--port` overrides the setting for one server run.
 
 Use `--list-fixture FOLDER` to serve a private List from an existing folder.
+The practice List opens the New item dialog with Send disabled.
 The server reads List records from `FOLDER/records` and staff records from `FOLDER/staff.json`.
 Open `/console/list.html` on the fixture port.
 Remove uses the normal List save path in the fixture store.
-The fixture serves only the List page and accepts only Remove.
+The fixture serves the List page and reads its New item recipients.
+Remove is the only action that the fixture accepts.
 The fixture omits counts from other pages.
 It skips message delivery, recovery, snapshot sweeps, and code restarts.
 The server checks the fixture folder before it checks the Tailscale address.

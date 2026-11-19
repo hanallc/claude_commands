@@ -425,7 +425,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         server = cast(ReviewLinksServer, self.server)
         root = server.root
         route = urlsplit(self.path)
-        if server.mode is ServerMode.LIST_FIXTURE and route.path != list_page.PAGE_PATH:
+        fixture_options = route.path == review_page.NEW_ITEM_PATH and route.query == "page=list"
+        if server.mode is ServerMode.LIST_FIXTURE and route.path != list_page.PAGE_PATH and not fixture_options:
             self.send_error(404)
             return None
         if route.path == f"/{change_page.CONSOLE_FOLDER}":
@@ -536,11 +537,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                                                review_records=(list_page.LinkedReviewRead.AFTER_RENDER
                                                                if live and reviews is list_page.LinkedReviewRead.FROM_DISK
                                                                else reviews))
+                    content = owned_document(content, "list")
             except (OSError, ValueError) as error:
                 print(f"review-links list: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The List page is not available.</p>"))
                 return None
-            self.html_response(200, owned_document(content, "list"))
+            self.html_response(200, content)
             return None
         if route.path == images.PAGE_PATH:
             try:
@@ -923,10 +925,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         try:
             fields: dict[str, object] = {"token": server.new_item_token}
             if selected:
-                settings = conf.read_or_repository("console")
-                members = staff.local_snapshot()
-                owner = review_submissions.page_owner(selected[0], settings, members)
-                producer = review_submissions.list_producer(settings, members)
+                with server.list_store_access():
+                    settings = conf.read_or_repository("console")
+                    members = staff.local_snapshot()
+                    owner = review_submissions.page_owner(selected[0], settings, members)
+                    producer = review_submissions.list_producer(settings, members)
                 recipients: list[review_submissions.RecipientOption] = []
                 fields["page_owner"] = ""
                 if isinstance(owner, staff.StaffRow):
@@ -940,6 +943,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             print(f"review-links New item recipients: {error}", file=sys.stderr)
             self.json_response(503, {"error": "The recipients are unavailable."})
             return
+        if server.mode is ServerMode.LIST_FIXTURE:
+            fields.update(token="", send_disabled="Sending is off on a practice List.")
         self.json_response(200, {**fields, "recipients": recipients})
 
     def new_item_post(self) -> None:
@@ -990,6 +995,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         try:
             created = server.review_cache.create_submission(request)
+            response = {"id": created.saved.id, "key": created.key, "version": created.version}
+            if request.page == "list":
+                response["list_key"] = list_page.add_submission(created).key
             details = created.saved.details
             evidence_url = ""
             if key or details.images or request.page_state is not None or isinstance(
@@ -1011,11 +1019,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.json_response(503, {"error": "Could not publish the item. Try Send again."})
             return
         try:
-            self.json_response(200, {"id": created.saved.id, "key": created.key, "version": created.version})
+            self.json_response(200, response)
         finally:
             self.deliver_review(server, delivery)
             if key:
-                if created.saved.reused:
+                if review_submissions.PAGE_SCREENSHOT in details.images:
                     server.page_captures.discard(key)
                 elif (image := server.page_captures.file(key, created.saved)) is not None:
                     server.attach_page_screenshot(created.saved, image)
