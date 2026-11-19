@@ -2944,16 +2944,12 @@ Held by builds 2026-11-18 01:2x EST: about 1% of the wait. Tonight 16 Hana nexte
 
 ### Phase 160 — The Phase 156 gate-time price card merges with main  · status: done
 
-**Source:** builds 11-18 20:1x EST. The Phase 156 row `039bb9706` conflicts with main `cd9f5002b` in `scripts/aws_target/aws_prices.html` and `scripts/aws_target/test_aws_page.py`. Main `366128688` puts prices and quotas in one table and moves the quota help into it.
+#### As-built
+- The Phase 156 row `039bb9706` conflicted with main `cd9f5002b` in `aws_prices.html` and `test_aws_page.py`. Main `366128688` puts prices and quotas in one table, with the quota help inside it.
+- The new row keeps main's table and the gate-time price card below Spot placement scores. The old Quotas section is gone. `readAwsPage` reads both data scripts; a refresh rebuilds the region chips when the region list changes.
+- `test_aws_page.py` keeps the imports of both sides; the refresh fixture returns both data scripts.
+- Tests on the row in both layouts, 0 failures: 13 suites, 474 tests; types 0. A dark desktop shot shows the three cards; a region chip removes that region from all three.
+- Open note: the Gate column of Prices and quotas leaves out the transfer charge that the break-even card adds (us-west-2 m7a.4xlarge: 0.0396 against 0.0397).
+- Checkpoint `e1b9cfee8`; row `46539f832` on main `cd9f5002b`, branch `builds-resources-p160`. It replaces `039bb9706`.
 
-**Spec:**
-1. Keep main's page: the one Prices and quotas table, its filters and the quota help inside it.
-2. Keep the Phase 156 gate-time price card (`gate-time-price`), its data script (`aws-gate-time-data`) and its fill call. Remove the row's old Quotas section; main replaced it.
-3. Check the parts that merged without a conflict: the region chips, `readAwsPage`, the live refresh and `aws_page.py`.
-4. The new row has one parent, main, and goes on a new branch `builds-resources-p160`.
-
-**Files:** `scripts/aws_target/aws_prices.html`, `scripts/aws_target/test_aws_page.py`, `scripts/aws_target/aws_page.py` (if the clean merge is wrong).
-
-**Workers:** `1 writer`.
-
-**Acceptance gate:** test_aws_page and the AWS page suites pass on the row in both layouts; basedpyright 0; the rendered page shows the Prices and quotas table and the gate-time price card (one dark desktop shot, checked by me).
+**Files:** `scripts/aws_target/aws_prices.html`, `scripts/aws_target/test_aws_page.py`.
