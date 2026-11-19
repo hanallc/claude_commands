@@ -176,7 +176,8 @@ class StandingTests(unittest.TestCase):
     @contextmanager
     def queue_service(self) -> Generator[AdmissionFixture]:
         original = dict(os.environ)
-        _ = write_config_fixture(Path(original["CONF_DIR"]) / "build_admission.conf", "wait_reply_seconds=60\n")
+        _ = write_config_fixture(Path(original["CONF_DIR"]) / "build_admission.conf",
+            "running_pass_seconds=5\nwaiting_pass_seconds=1\nwait_reply_seconds=60\n")
         with AdmissionFixture() as fixture:
             fixture.clock.epoch = time.time()
             with mock.patch.dict(os.environ, {**original, "ADMISSION_SOCKET": str(fixture.socket_path)}), fixture.serving():
@@ -329,6 +330,16 @@ class StandingTests(unittest.TestCase):
             self.assertEqual(copies.run_slot_step(self.source, args), 0)
         self.assertEqual(self.git(self.source, "rev-parse", "HEAD"), incoming)
         self.assertEqual(output.read_text().strip(), requested_tree)
+
+    def test_slot_accepts_a_source_that_configures_utf16_log_output(self) -> None:
+        _ = self.git(self.source, "config", "i18n.logOutputEncoding", "UTF-16")
+        tree = self.git(self.source, "rev-parse", "HEAD^{tree}")
+        output = self.base / "slot-head"
+        result = self.cli("hold", "--repo", str(self.source), "--tree", tree,
+                          "--capacity-file", str(self.base / "capacity"), "--", "sh", "-eu", "-c",
+                          'git rev-parse HEAD > "$1"', "slot-command", str(output))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output.read_text().strip(), self.head)
 
     def test_expired_slot_wait_stops_the_cli_before_it_starts_the_command(self) -> None:
         _ = write_config_fixture(self.base / "config/build_folders.conf",

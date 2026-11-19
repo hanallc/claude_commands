@@ -2419,7 +2419,7 @@ def run_slot_step(source: Path, args: CopyArguments) -> int:
         raise CopyError("a slot step needs a tree, capacity file and command")
     # Print the tree from the same commit object that supplies the commit ID.
     revisions = git(source, "log", "-1", "--format=%H%n%T", "--no-show-signature", "--no-notes",
-                    "--no-decorate", "--no-color", "HEAD", "--").decode().splitlines()
+                    "--no-decorate", "--no-color", "--encoding=UTF-8", "HEAD", "--").decode().splitlines()
     if len(revisions) != 2:
         raise CopyError(f"{source}: cannot read the HEAD commit and tree")
     head, head_tree = revisions
