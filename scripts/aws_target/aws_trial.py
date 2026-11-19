@@ -33,12 +33,11 @@ from scripts.aws_target.gate_box import (
 )
 from scripts.aws_target import ledger, cloud_gate
 from scripts.aws_target.s3_presign import SigningKey as SigningKey, presign as presign
-from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
+from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock
 from scripts.aws_target.config import read_settings, account_settings_path, gate_deployment, gate_regions
 from scripts.lib import conf
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib.process_group import send_process_group
-from scripts.lib import cancellation
 from scripts.build_queue.admission_records import process_start_time
 from scripts.build_queue.admission_wire import CloudGroup, Owner
 from scripts.build_targets import target_config
@@ -94,8 +93,10 @@ def network_git(repo: Path, *arguments: str) -> str:
     """Bound network Git calls and stop their process groups on cancellation."""
     command = ['git', '-C', str(repo), *arguments]
     timeout = cloud_gate.settings().number('git_network_timeout_s')
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, start_new_session=True) as process:
+    stop_timeout = conf.read('build_admission').number('program_stop_seconds')
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, start_new_session=True)
+    try:
         try:
             output, errors = process.communicate(timeout=timeout)
         except BaseException:
@@ -103,11 +104,19 @@ def network_git(repo: Path, *arguments: str) -> str:
                 send_process_group(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            _ = process.communicate()
+            try:
+                _ = process.communicate(timeout=stop_timeout)
+            except subprocess.TimeoutExpired:
+                print('paired trial: Git process group stop unresolved', file=sys.stderr)
             raise
         if process.returncode:
             raise subprocess.CalledProcessError(process.returncode, command, output=output, stderr=errors)
         return output.strip()
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
 
 
 def trial_request(repo: Path, base: str, changed: str, modules: Sequence[str], rounds: int) -> PairedTrialRequest:
@@ -176,7 +185,7 @@ def module_request(trial: PairedTrialRequest, module: str, attempt: str, expires
             'origin': trial.clone_url, 'clone_url': trial.clone_url, 'mode': 'targeted-test',
             'module': module, 'modules': ['scripts/' + module], 'rounds': trial.rounds, 'source_key': '',
             'expires': expires, 'module_time_limit_s': cloud_gate.settings().number('module_time_limit_s'),
-            'delivery_s': cloud_gate.settings().number('termination_timeout_s') + 2 * cloud_gate.settings().number('api_timeout_s')}
+            'delivery_s': cloud_gate.cleanup_timeout_s()}
 
 
 def module_summary(module: str, rounds: int, runs: Sequence[dict[str, object]]) -> dict[str, object]:
@@ -289,8 +298,7 @@ def paired_cleanup_main(argv: Sequence[str], settings_path: Path, directory: Pat
     worker = cloud_gate.GateWorker(AwsCli(policy.text('credentials_profile'), policy.text('region'),
         cloud_gate.settings().number('api_timeout_s')), ledger.CostLedger(directory), settings_path,
         args.paired_cleanup / 'reservation.cgroup', clock=time.time)
-    with cancellation.defer_cleanup_signals():
-        return int(not cleanup_trial(args.paired_cleanup, worker))
+    return int(not cleanup_trial(args.paired_cleanup, worker))
 
 
 class LaunchBarrier(Protocol):
@@ -321,19 +329,26 @@ def paired_module(folder: Path, directory: Path, settings_path: Path, connection
                 cloud_gate.save(folder / 'outcome.json', outcome)
                 slot.status = int(outcome.get('status') != 'complete')
             finally:
-                with cancellation.defer_cleanup_signals():
-                    if not cleanup_trial(folder, worker):
-                        slot.status = 1
+                slot.keep = True
+                if cleanup_trial(folder, worker):
+                    slot.keep = False
+                else:
+                    slot.status = 1
     except BaseException as error:
         cloud_gate.save(folder / 'outcome.json', {'status': 'fallback', 'reason': str(error)})
     finally:
         connection.close()
 
 
+class UnresolvedTrialWorkers(GateRefused):
+    """The service still owns workers that did not exit."""
+
+
 def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
     """Launch all modules after every slot and cost reservation succeeds."""
-    from scripts.aws_target.aws_target import control_lock
     started_at = time.time()
+    stop_timeout = conf.read('build_admission').number('program_stop_seconds')
+    cleanup_timeout = cloud_gate.cleanup_timeout_s()
     policy = conf.read(settings_path)
     book = ledger.CostLedger(directory)
     worker = cloud_gate.GateWorker(AwsCli(policy.text('credentials_profile'), policy.text('region'),
@@ -372,8 +387,7 @@ def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
                 except (OSError, ValueError, EOFError):
                     pass
         if not waiting:
-            deadline = (time.monotonic() + cloud_gate.settings().number('termination_timeout_s')
-                        + 2 * cloud_gate.settings().number('api_timeout_s'))
+            deadline = time.monotonic() + cleanup_timeout
             for process, _connection in pending:
                 process.join(timeout=max(0, deadline - time.monotonic()))
         for process, _connection in pending:
@@ -432,24 +446,34 @@ def coordinate_trial(folder: Path, directory: Path, settings_path: Path) -> int:
         except (OSError, ValueError, EOFError) as error:
             print('paired trial: ' + str(error), file=sys.stderr)
             failed = True
-            with cancellation.defer_cleanup_signals():
-                abort_unlaunched()
+            abort_unlaunched()
+        deadline = time.monotonic() + max(0, expires - worker.clock()) + cleanup_timeout
         for process, _connection in children[:launched_count]:
-            process.join()
+            process.join(timeout=max(0, deadline - time.monotonic()))
+            if process.is_alive():
+                raise GateRefused('A paired trial worker exceeded the box and cleanup deadlines')
     except (OSError, ValueError, EOFError, GateRefused, AwsUnavailable, subprocess.SubprocessError,
             KeyboardInterrupt) as error:
         print('paired trial: ' + str(error), file=sys.stderr)
         failed = True
     finally:
-        with cancellation.defer_cleanup_signals():
-            abort_unlaunched()
-            for process, connection in children:
-                if process.is_alive():
-                    process.terminate()
-                connection.close()
-            for process, _connection in children:
-                process.join()
-            failed = not cleanup_trial(folder, worker) or failed
+        abort_unlaunched()
+        for process, connection in children:
+            connection.close()
+            if process.is_alive():
+                process.terminate()
+        deadline = time.monotonic() + stop_timeout
+        for process, _connection in children:
+            process.join(timeout=max(0, deadline - time.monotonic()))
+        remaining = [process for process, _connection in children if process.is_alive()]
+        for process in remaining:
+            process.kill()
+        deadline = time.monotonic() + stop_timeout
+        for process in remaining:
+            process.join(timeout=max(0, deadline - time.monotonic()))
+        if any(process.is_alive() for process in remaining):
+            raise UnresolvedTrialWorkers('Paired trial cleanup unresolved. Keep the trial records for service cleanup.')
+        failed = not cleanup_trial(folder, worker) or failed
     summaries: list[dict[str, object]] = []
     cursor = folder / 'emitted.json'
     emitted = cloud_gate.read(cursor) if cursor.exists() else {}
@@ -499,7 +523,12 @@ def paired_worker_main(argv: Sequence[str], settings_path: Path, directory: Path
     class WorkerArguments(argparse.Namespace):
         paired_worker: Path = Path()
     args = parser.parse_args(list(argv), namespace=WorkerArguments())
-    return coordinate_trial(args.paired_worker, directory, settings_path)
+    try:
+        return coordinate_trial(args.paired_worker, directory, settings_path)
+    except UnresolvedTrialWorkers as error:
+        print(error, file=sys.stderr, flush=True)
+        # Python would join these workers again during interpreter shutdown.
+        os._exit(1)
 
 
 def paired_service(command: Sequence[str], unit: str) -> int:
@@ -513,8 +542,13 @@ def paired_service(command: Sequence[str], unit: str) -> int:
         return 1
     finally:
         if not completed:
-            with cancellation.defer_cleanup_signals():
-                _ = subprocess.run(['systemctl', '--user', 'stop', unit], check=False)
+            try:
+                stopped = subprocess.run(['systemctl', '--user', 'stop', unit], check=False,
+                                         timeout=cloud_gate.cleanup_timeout_s())
+                if stopped.returncode:
+                    print(f'paired trial: service stop unresolved for {unit}', file=sys.stderr)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                print(f'paired trial: service stop unresolved for {unit}: {error}', file=sys.stderr)
 
 
 def paired_main(argv: Sequence[str], directory: Path) -> int:
@@ -568,9 +602,8 @@ def paired_main(argv: Sequence[str], directory: Path) -> int:
         print(json.dumps({'total_cost_usd': 0, 'cost_basis': 'estimate', 'cleanup_complete': True}))
         return 1
     finally:
-        with cancellation.defer_cleanup_signals():
-            if trial_id:
-                delete_trial_branches(args.repo, clone_url, prefix, expires, trial_id)
+        if trial_id:
+            delete_trial_branches(args.repo, clone_url, prefix, expires, trial_id)
 
 
 if __name__ == '__main__':

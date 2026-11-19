@@ -21,11 +21,12 @@ import sys
 import threading
 import time
 from types import SimpleNamespace
-from typing import cast, override
+from typing import Never, cast, override
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.aws_target import aws_trial, cloud_gate, gate_box, ledger, s3_presign
+from scripts.aws_target.test_aws_trial import assert_term_during_cleanup
 from scripts.aws_target.aws_target import USAGE_ONLY, AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings
 from scripts.aws_target.ledger_test_support import CostFixture, account_reply, instant, numeric_settings, text_setting
@@ -1261,6 +1262,59 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                 self.assertEqual(other.state, ledger.GateRunning('i-other-live'))
                 self.assertNotIn('i-other-live', fake.terminated_instances)
 
+    def test_term_during_box_cleanup_preserves_the_launch_for_retry(self) -> None:
+        _ = write_config_fixture(self.root / 'build_admission.conf', 'program_stop_seconds=2\n')
+        _ = write_config_fixture(self.root / 'cloud_gate.conf', 'api_timeout_s=1\ntermination_timeout_s=2\n')
+        identity = process_start(os.getpid())
+        assert isinstance(identity, Started)
+        attempt = self.folder.name
+        _ = self.book.reserve_gate(self.settings, ledger.GateReservation(
+            attempt, int(self.now), int(self.now) + 1200, Decimal('.8'), Decimal('.02')))
+        self.book.gate_owner(attempt, ledger.GateWorkerOwner(os.getpid(), identity.start, str(self.folder)))
+        self.book.resolve_gate(attempt, ledger.GateRunning('i-fixture'))
+        launch = self.folder / 'launch.json'
+        cloud_gate.save(launch, {'instance': 'i-fixture', 'region': 'fixture-region'})
+        command = ['cloud-gate', '--cleanup', str(self.folder), '--directory', str(self.state),
+                   '--sidecar', str(self.folder / 'reservation.cgroup'), '--settings', str(self.settings)]
+
+        def stop_command(hang: Callable[[], Never]) -> int:
+            with (mock.patch.object(sys, 'argv', command),
+                  mock.patch.object(cloud_gate, 'cleanup_folder', side_effect=hang)):
+                return cloud_gate.main()
+
+        assert_term_during_cleanup(self, stop_command, cloud_gate.cleanup_timeout_s())
+        self.assertEqual(cloud_gate.read(launch)['instance'], 'i-fixture')
+        api = AwsCli('fixture', 'fixture-region', 1, execute=self.fake)
+        with mock.patch.object(sys, 'argv', command), mock.patch.object(cloud_gate, 'AwsCli', return_value=api):
+            self.assertEqual(cloud_gate.main(), 0)
+            command_count = len(self.fake.commands)
+            self.assertEqual(cloud_gate.main(), 0)
+        self.assertEqual(len(self.fake.commands), command_count)
+        reservation = next(row for row in self.book.read_snapshot().gate_reservations if row.attempt == attempt)
+        self.assertIsInstance(reservation.state, ledger.GateTerminated)
+
+    def test_term_during_worker_termination_keeps_the_recorded_box(self) -> None:
+        _ = write_config_fixture(self.root / 'build_admission.conf', 'program_stop_seconds=2\n')
+        _ = write_config_fixture(self.root / 'cloud_gate.conf', 'api_timeout_s=1\ntermination_timeout_s=2\n')
+
+        def terminate(hang: Callable[[], Never]) -> int:
+            transport = self.fake
+
+            def execute(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+                if 'terminate-instances' in arguments:
+                    hang()
+                return transport(arguments, **options)
+
+            worker = cloud_gate.GateWorker(AwsCli('fixture', 'fixture-region', 1, execute=execute),
+                self.book, self.settings, self.folder / 'reservation.cgroup', clock=lambda: self.now, pause=self.advance)
+            _ = worker.execute(self.folder, self.request, self.deployment)
+            return 0
+
+        assert_term_during_cleanup(self, terminate, cloud_gate.cleanup_timeout_s())
+        self.assertEqual(cloud_gate.read(self.folder / 'launch.json')['instance'], 'i-fixture')
+        reservation = next(row for row in self.book.read_snapshot().gate_reservations if row.attempt == self.folder.name)
+        self.assertIsInstance(reservation.state, ledger.GateRunning)
+
     def test_reconcile_preserves_live_and_unreadable_worker_owners(self) -> None:
         worker = self.worker_with_pending_gate()
         owner = ledger.GateWorkerOwner(os.getpid(), 'fixture-start', str(self.folder))
@@ -2106,7 +2160,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                 def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
                     if 'terminate-instances' in arguments:
                         blocked = signal.pthread_sigmask(signal.SIG_BLOCK, set())
-                        self.assertTrue(set(aws_trial.TRIAL_SIGNALS) <= blocked)
+                        self.assertFalse(set(aws_trial.TRIAL_SIGNALS) & blocked)
                     return self.fake(arguments, **options)
                 api = AwsCli('fixture', 'us-east-1', 1, execute=transport)
                 worker = cloud_gate.GateWorker(api, self.book, self.settings, folder / 'reservation',
@@ -2123,10 +2177,12 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                          group: CloudGroup) -> Generator[cloud_gate.CloudReservation]:
                     self.assertEqual(job, aws_trial.PAIRED_TRIAL_JOB)
                     self.assertEqual(group, trial_group)
+                    reservation = cloud_gate.CloudReservation(sidecar)
                     try:
-                        yield cloud_gate.CloudReservation(sidecar)
+                        yield reservation
                     finally:
                         self.assertTrue(self.fake.terminated)
+                        self.assertEqual(reservation.keep, not confirmed)
                         _, cleanup = aws_trial.trial_cost(self.book, {attempt}, self.settings, int(self.now))
                         self.assertEqual(cleanup, confirmed)
                 parent, child = multiprocessing.get_context('fork').Pipe()

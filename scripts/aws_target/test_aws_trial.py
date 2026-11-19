@@ -4,16 +4,18 @@ from __future__ import annotations
 from scripts.lib.checkout_test_support import copy_startup, copy_test_runner
 
 from collections.abc import Callable, Generator, Sequence
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from decimal import Decimal
 from io import StringIO
 import json
 import multiprocessing
 from multiprocessing.connection import Connection
+from multiprocessing.process import BaseProcess
 import os
 import pathlib
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -25,7 +27,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import cast, final, override
+from typing import Never, cast, final, override
 import unittest
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
@@ -39,8 +41,29 @@ from scripts.build_queue.admission_wire import CloudGroup, Owner
 from scripts.production import merge_gate
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.lib.process_group import send_process_group
+from scripts.lib.fork_test_support import ForkChildren
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+def assert_term_during_cleanup(test: unittest.TestCase, action: Callable[[Callable[[], Never]], int],
+                               timeout: float) -> None:
+    with ForkChildren() as children:
+        reader, writer = children.pipe()
+
+        def hang(*_args: object, **_options: object) -> Never:
+            _ = os.write(writer, b'1')
+            _ = threading.Event().wait()
+            raise AssertionError('The fixture wait ended')
+
+        child = children.start(lambda: action(hang), pass_fds=(writer,))
+        test.assertTrue(select.select([reader], [], [], TEST_HANG_GUARD_SECS)[0])
+        ready = os.read(reader, 1)
+        if not ready:
+            test.fail('The child exited before cleanup.\n' + child.result().stderr)
+        os.kill(child.pid, signal.SIGTERM)
+        reply = child.result(timeout=timeout + 3)
+        test.assertEqual(reply.returncode, -signal.SIGTERM, reply.stderr)
 
 
 @final
@@ -156,8 +179,7 @@ class GuestTests(unittest.TestCase):
                     if present:
                         _ = meminfo.write_text(f'MemTotal: 1000000 kB\nMemAvailable: {available} kB\n')
                 write(900000)
-                result: dict[str, object] = {'memory_peak_bytes': None}
-                namespace: dict[str, object] = {'pathlib': pathlib, 'result': result}
+                namespace: dict[str, object] = {'pathlib': pathlib}
                 code = gate_box.CANDIDATE_GUEST[gate_box.CANDIDATE_GUEST.index('def sample_memory():'):gate_box.CANDIDATE_GUEST.index('memory_stop =')]
                 code = code.replace("'/proc/meminfo'", repr(str(meminfo)))
                 exec(compile(code, '<memory sampler>', 'exec'), namespace)
@@ -170,7 +192,7 @@ class GuestTests(unittest.TestCase):
                 with mock.patch.object(stop, 'wait', new=pause):
                     cast(Callable[[threading.Event], None], namespace['monitor_memory'])(stop)
                 self.assertEqual(waits, [2, 2, 2])
-                self.assertEqual(result['memory_peak_bytes'], 800000 * 1024 if present else None)
+                self.assertEqual(namespace['memory_peak'], 800000 * 1024 if present else None)
 
 
     def test_guest_uses_whole_machine_without_types_with_timeout_and_counts(self) -> None:
@@ -639,7 +661,8 @@ class Sample(unittest.TestCase):
                     with (mock.patch.object(subprocess, 'call', side_effect=stop_terminal),
                           mock.patch.object(subprocess, 'run') as stop):
                         result = service(command, unit)
-                        stop.assert_called_once_with(['systemctl', '--user', 'stop', unit], check=False)
+                        stop.assert_called_once_with(['systemctl', '--user', 'stop', unit], check=False,
+                                                     timeout=cloud_gate.cleanup_timeout_s())
                         return result
 
                 with mock.patch.object(trial, 'paired_service', side_effect=interrupted):
@@ -755,7 +778,8 @@ assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
 repo, base, changed, state, settings, pids, interrupted = sys.argv[1:]
 class FixtureGitProcess(subprocess.Popen):
     def communicate(self, input=None, timeout=None):
-        if 'push' in self.args and '--delete' not in self.args and timeout is not None:
+        if 'push' in self.args and '--delete' not in self.args and not getattr(self, 'stalled', False):
+            self.stalled = True
             assert select.select([self.stdout], [], [], TEST_HANG_GUARD_SECS)[0], 'Git did not report readiness'
             assert os.read(self.stdout.fileno(), 1) == b'R'
             timeout = TEST_HANG_GUARD_SECS if interrupted == '1' else 0
@@ -767,7 +791,7 @@ with (mock.patch.object(aws_trial, 'account_settings_path', return_value=Path(se
                                    '--modules', 'fixture/test_sample.py'], Path(state))
 assert status == 1
 processes = json.loads(Path(pids).read_text())
-assert signal.SIGINT not in processes['blocked']
+assert not set(aws_trial.TRIAL_SIGNALS).intersection(processes['blocked'])
 assert os.waitpid(processes['child'], 0)[0] == processes['child']
 try:
     send_process_group(processes['group'], 0)
@@ -1108,21 +1132,90 @@ print('200', end='')
               mock.patch.object(signal, 'signal', side_effect=AssertionError('handler'))):
             with self.assertRaises(OSError):
                 _ = trial.paired_service(['fixture'], 'fixture-unit')
-        stop.assert_called_once_with(['systemctl', '--user', 'stop', 'fixture-unit'], check=False)
+        stop.assert_called_once_with(['systemctl', '--user', 'stop', 'fixture-unit'], check=False,
+                                     timeout=cloud_gate.cleanup_timeout_s())
 
     def test_terminal_interrupt_stops_the_owning_service(self) -> None:
         from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
         for number in (signal.SIGINT,):
             script = '''import signal, sys
 from unittest import mock
-from scripts.aws_target import aws_trial
+from scripts.aws_target import aws_trial, cloud_gate
 with mock.patch.object(aws_trial.subprocess, 'call', side_effect=lambda command: signal.raise_signal(int(sys.argv[1]))), mock.patch.object(aws_trial.subprocess, 'run') as stop:
     assert aws_trial.paired_service(['fixture'], 'fixture-unit') == 1
-    stop.assert_called_once_with(['systemctl', '--user', 'stop', 'fixture-unit'], check=False)
+    stop.assert_called_once_with(['systemctl', '--user', 'stop', 'fixture-unit'], check=False, timeout=cloud_gate.cleanup_timeout_s())
 '''
             reply = subprocess.run([sys.executable, '-c', script, str(number)], capture_output=True, text=True,
                                    timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(reply.returncode, 0, reply.stderr)
+
+    def test_term_during_each_trial_cleanup(self) -> None:
+        _ = write_config_fixture(self.root / 'build_admission.conf', 'program_stop_seconds=2\n')
+        _ = write_config_fixture(self.root / 'cloud_gate.conf', 'api_timeout_s=1\ntermination_timeout_s=2\n')
+        cohort = self.root / 'term-trial'
+        cohort.mkdir()
+        folder = cohort / 'module'
+        folder.mkdir()
+        cloud_gate.save(folder / 'request.json', {'attempt': folder.name})
+        group = CloudGroup(cohort.name, 1, time.time(), Owner(os.getpid(), 'fixture'))
+
+        def cleanup_command(hang: Callable[[], Never]) -> int:
+            with mock.patch.object(trial, 'cleanup_trial', side_effect=hang):
+                return trial.paired_cleanup_main(['--paired-cleanup', str(cohort)], self.settings, self.state)
+
+        def cleanup_worker(hang: Callable[[], Never]) -> int:
+            parent, connection = multiprocessing.get_context('fork').Pipe()
+            slot = cloud_gate.CloudReservation(folder / 'reservation.cgroup')
+            with (parent, connection,
+                  mock.patch.object(cloud_gate, 'cloud_reservation', return_value=nullcontext(slot)),
+                  mock.patch.object(trial, 'cleanup_trial', side_effect=hang)):
+                parent.send('abort')
+                trial.paired_module(folder, self.state, self.settings, connection, group=group)
+            return 0
+
+        def waiting_worker(_folder: Path, _directory: Path, _settings: Path, connection: trial.LaunchBarrier,
+                           *, group: CloudGroup) -> None:
+            del group
+            connection.send('ready')
+            _ = connection.recv()
+            connection.close()
+
+        def cleanup_coordinator(hang: Callable[[], Never], *, abort: bool) -> int:
+            send = Connection.send
+
+            def send_command(connection: Connection, message: object) -> None:
+                if message == 'launch' and abort:
+                    raise BrokenPipeError('launch failed')
+                send(connection, message)
+
+            with (mock.patch.object(trial, 'sweep_trial_resources'), mock.patch.object(trial, 'reserve_trial'),
+                  mock.patch.object(trial, 'paired_module', new=waiting_worker),
+                  mock.patch.object(Connection, 'send', new=send_command),
+                  mock.patch.object(trial, 'cleanup_trial', side_effect=hang)):
+                if abort:
+                    with mock.patch.object(BaseProcess, 'join', side_effect=hang):
+                        return trial.coordinate_trial(cohort, self.state, self.settings)
+                return trial.coordinate_trial(cohort, self.state, self.settings)
+
+        def stop_service(hang: Callable[[], Never]) -> int:
+            with (mock.patch.object(subprocess, 'call', side_effect=KeyboardInterrupt),
+                  mock.patch.object(subprocess, 'run', side_effect=hang)):
+                return trial.paired_service(['fixture'], 'fixture-unit')
+
+        def delete_branches(hang: Callable[[], Never]) -> int:
+            with (mock.patch.object(trial, 'paired_service', return_value=0),
+                  mock.patch.object(trial, 'delete_trial_branches', side_effect=hang)):
+                return self.invoke_trial()
+
+        cases: tuple[tuple[str, Callable[[Callable[[], Never]], int]], ...] = (
+            ('cleanup command', cleanup_command), ('worker cleanup', cleanup_worker),
+            ('abort during launch', lambda hang: cleanup_coordinator(hang, abort=True)),
+            ('coordinator cleanup', lambda hang: cleanup_coordinator(hang, abort=False)),
+            ('service stop', stop_service), ('branch deletion', delete_branches),
+        )
+        for name, action in cases:
+            with self.subTest(name=name):
+                assert_term_during_cleanup(self, action, cloud_gate.cleanup_timeout_s())
 
     def test_guest_failed_sample_keeps_measurements_and_counts(self) -> None:
         module = self.repo / 'scripts/fixture/test_sample.py'

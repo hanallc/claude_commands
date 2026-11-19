@@ -33,7 +33,7 @@ from scripts.aws_target.aws_target import AwsCli, AwsUnavailable, control_lock, 
 from scripts.aws_target.config import account_settings_path, gate_deployment, gate_regions, money, read_settings
 from scripts.build_queue import admission_client, admission_protocol as wire, cloud_progress, progress_profile, queue_place
 from scripts.build_queue.admission_wire import CloudGroup, NoCloudGroup, NO_CLOUD_GROUP
-from scripts.lib import cancellation
+from scripts.lib.file_lock import LockResult, exclusive
 from scripts.build_targets import target_config
 from scripts.buildlog import store
 from scripts.lib import conf, git_index
@@ -332,6 +332,7 @@ def cleanup_attempts(attempts: Sequence[GateCleanupAttempt], worker: GateWorker)
 class CloudReservation:
     sidecar: Path
     status: int = 1
+    keep: bool = False
 
 
 @contextmanager
@@ -361,6 +362,7 @@ def cloud_reservation(repo: Path, sidecar: Path, work: gate.SuiteMode | StepJob,
             yield reservation
         finally:
             held.status = reservation.status
+            held.keep = reservation.keep
 
 
 @dataclass(frozen=True)
@@ -434,9 +436,13 @@ class GateWorker:
         while self.clock() < deadline:
             try:
                 if not requested:
-                    _ = api.call('terminate-instances', '--instance-ids', instance)
+                    _ = self.termination_call(self.box_region, 'terminate-instances', (instance,), deadline)
                     requested = True
-                if api.observe(instance, int(self.clock())).state == 'terminated':
+                remaining = deadline - self.clock()
+                if remaining <= 0:
+                    continue
+                observer = AwsCli(api.profile, api.region, min(api.timeout_s, remaining), api.execute)
+                if observer.observe(instance, int(self.clock())).state == 'terminated':
                     break
             except AwsUnavailable as error:
                 if instance_not_found(error):
@@ -445,7 +451,7 @@ class GateWorker:
                 if not aws_down(str(error)):
                     raise
                 print(f'Cloud gate termination waits on {self.box_region}: {error}', flush=True)
-            self.pause(settings().number('result_poll_s'))
+            self.pause(max(0, min(settings().number('result_poll_s'), deadline - self.clock())))
         else:
             raise AwsUnavailable('Termination is unconfirmed; the expiry function still owns cleanup')
         ended_at = int(self.clock()) if isinstance(result_seen_at, _ResultNotReceived) else result_seen_at
@@ -752,6 +758,7 @@ class GateWorker:
                               request['mode'] == 'targeted-test' and not request.get('full', False)))
                 seconds = budget.seconds if isinstance(budget, gate_record.GateTimeLimit) else 0.0
                 links['gate_time_limit_s'] = str(seconds)
+                links['program_stop_seconds'] = str(conf.read('build_admission').number('program_stop_seconds'))
                 credentials = self.api.call('export-credentials', '--format', 'process', service='configure')
                 signing = s3_presign.SigningKey(ledger.text(credentials, 'AccessKeyId'), ledger.text(credentials, 'SecretAccessKey'),
                     ledger.text(credentials, 'SessionToken') if 'SessionToken' in credentials else '')
@@ -1011,9 +1018,8 @@ class GateWorker:
                 if not row:
                     raise ValueError('The instance expired without a final result')
             finally:
-                with cancellation.defer_cleanup_signals():
-                    self.terminate(attempt, instance, result_seen_at=result_seen_at)
-                    interruption_confirmed = bool(interruption_code)
+                self.terminate(attempt, instance, result_seen_at=result_seen_at)
+                interruption_confirmed = bool(interruption_code)
             return {'status': 'complete', 'instance': instance, 'result_file': RESULT_FILE}
         except (OSError, ValueError, KeyError, TypeError, AwsUnavailable, subprocess.SubprocessError) as error:
             launch = read(folder / 'launch.json') if (folder / 'launch.json').exists() else {}
@@ -1370,6 +1376,11 @@ def run_cloud(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit
                 folder.mkdir()
 
 
+def cleanup_timeout_s() -> float:
+    values = settings()
+    return values.number('termination_timeout_s') + 2 * values.number('api_timeout_s')
+
+
 def service_command(module: str, arguments: Sequence[str], unit: str, *, paired: bool = False) -> list[str]:
     """Use the installed scaler environment for each gate controller."""
     credential = str(admin_secrets.credentials_file())
@@ -1378,7 +1389,7 @@ def service_command(module: str, arguments: Sequence[str], unit: str, *, paired:
              ('CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_NAME', admission_records.BUILDLOG_UNIT)
              if name in os.environ]
     cleanup: list[str] = []
-    stop_timeout = settings().number('termination_timeout_s') + 2 * settings().number('api_timeout_s')
+    stop_timeout = cleanup_timeout_s()
     if paired:
         folder = arguments[arguments.index('--paired-worker') + 1]
         command = shlex.join([sys.executable, '-m', module, '--paired-cleanup', folder])
@@ -1437,14 +1448,17 @@ def main() -> int:
     cleanup = cast(Path | None, args.cleanup)
     folder = cleanup if cleanup is not None else cast(Path, args.worker)
     directory = cast(Path, args.directory)
-    with control_lock(folder):
+    folder.mkdir(parents=True, exist_ok=True)
+    with exclusive(folder / 'controller.lock', wait=cleanup is None) as lock:
+        if lock is LockResult.BUSY:
+            print(f'Cloud gate cleanup unresolved: {folder} is in use', file=sys.stderr)
+            return 1
         settings_path = cast(Path, args.settings)
         configuration = conf.read(settings_path)
         api = AwsCli(configuration.text('credentials_profile'), configuration.text('region'), settings().number('api_timeout_s'))
         worker = GateWorker(api, ledger.CostLedger(directory), settings_path, cast(Path, args.sidecar))
         if cleanup is not None:
-            with cancellation.defer_cleanup_signals():
-                return int(not cleanup_folder(folder, worker))
+            return int(not cleanup_folder(folder, worker))
         if (folder / 'outcome.json').exists() and read(folder / 'outcome.json').get('status') != 'pending':
             return 0
         outcome = worker.execute(folder, read(folder / 'request.json'), read(folder / 'deployment.json'))
