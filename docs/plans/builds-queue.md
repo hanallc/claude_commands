@@ -3139,6 +3139,18 @@ Work:
 6. Update the as-built docs for the session root.
 7. After the merge, measure the same p50 in a new session folder.
 
+### Phase 44df — A landing merge test gets more CPU than sibling gates  · status: todo
+**From builds (item 140, decision (b)), 2026-11-19:** natedev's CPU was full (3,156% of 3,200%) while 15 of 31 tokens were free, so a landing merge test lost CPU, not tokens. The read is phases/44de/review2_reply_1.txt in the run folder.
+
+Work:
+1. A landing merge gate (the 44cy landing mark: a live land record and a natemerge session) runs its modules in one scope with a CPUWeight above sibling gates.
+2. The weight is one new key in config/merge_gate.conf (new key; no go needed).
+3. Other gates and builds keep their weight. The token pool and the memory queue do not change.
+4. Measure the load case before and after: landing module wall time and CPU pressure while sibling gates run.
+5. Update the as-built text for gate scopes.
+
+Out of scope: the Hana CI CPU cap (nixos; builds sends it to natedev) and a token priority (dropped).
+
 ### Phase placecpu2 — placecpu and probebackoff return to main without the verify route hang  · status: todo
 **From builds, 2026-11-17:** placecpu aeca7cefe with probebackoff 687230599 hangs `direct/test_verify_step_routes` `test_natedev_only_waits_for_release_before_running`. Neither commit is on main. Put both on main after the gate folder move, fix the cause, and run every `direct/test_verify_*` module. Hash due 2026-11-17 15:30 EST. Clone `/session/queue/placecpu2`, branch `builds-queue-placecpu2`.
 **Ruling (queue, 2026-11-17):** the review found that the separate status reader during a pass and the parked socket replies of placecpu lose replies, and each repair added new defects. The rebuild keeps one host-evidence read for each pass and probebackoff, and drops the status reader. Branch `builds-queue-placecpu3` from e84795673. Hash due 15:45 EST.
