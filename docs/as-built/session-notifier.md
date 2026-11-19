@@ -314,7 +314,8 @@ Run the command without `--dry-run` to move the files.
 The final line gives the folder count, size in GiB, live entries kept, and other refusals.
 The dry run uses `would move` in that line.
 Both modes keep folders with a running session or an active process when they check candidates.
-The real run checks again before it writes the journal for a new copy.
+The real run checks again after it writes the session index and just before it saves the journal.
+If that check finds a live source, the next run can reuse its index entry.
 Both modes continue with other candidates and return status 0 if they only skip live entries before copying.
 A destination conflict or a failed copy stops a real run and returns status 1.
 The dry run reads the session index and folder records without creating a preview directory.

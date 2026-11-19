@@ -46,6 +46,10 @@ class LiveSource(MoveRefused):
     """A running session or another process uses the source."""
 
 
+class JournaledLiveSource(LiveSource):
+    """A live source has a saved copy journal."""
+
+
 @dataclass
 class MoveSummary:
     moved_folders: int = 0
@@ -1068,8 +1072,12 @@ def start_copy(move: PlannedCopy, roots: MoveRoots, root_fd: int, session_pids: 
         with child_directory(source, move.source.name, mount=mount_identity(source)) as original:
             identity = FolderIdentity.of(os.fstat(original))
         job = MoveJournal(move, identity, CopyInProgress())
+        check_copy_idle(move.source, session_pids)
         job.save(journal)
-        return resume_copy(job, journal, roots, root_fd, session_pids)
+        try:
+            return resume_copy(job, journal, roots, root_fd, session_pids)
+        except LiveSource as error:
+            raise JournaledLiveSource(str(error)) from error
 
 
 def move_candidates(roots: MoveRoots, root_fd: int, names: DestinationNames, holds: tuple[OpenScratchHold, ...],
@@ -1124,7 +1132,6 @@ def move_candidates(roots: MoveRoots, root_fd: int, names: DestinationNames, hol
     uses = process_uses(tuple(leaf.source for leaf in leaves), session_pids)
     destinations: set[Path] = set()
     for leaf in leaves:
-        journaled = False
         try:
             if leaf.source.is_relative_to(roots.sessions):
                 raise MoveRefused("source is inside the destination root")
@@ -1135,13 +1142,12 @@ def move_candidates(roots: MoveRoots, root_fd: int, names: DestinationNames, hol
             show_copy(move, size)
             check_destination(root_fd, roots.sessions, move.target, destinations)
             if not dry_run:
-                check_copy_idle(leaf.source, session_pids)
                 names.remember(name, root_fd)
-                journaled = True
                 size = start_copy(move, roots, root_fd, session_pids)
             destinations.add(move.target)
             summary.record_move(size)
         except LiveSource as error:
+            journaled = isinstance(error, JournaledLiveSource)
             summary.keep_live(leaf.source, error, journaled=journaled)
             if journaled:
                 return

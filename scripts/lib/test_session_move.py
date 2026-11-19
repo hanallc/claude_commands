@@ -448,26 +448,46 @@ with (mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapsho
         self.assertEqual(status, 0, errors)
         self.assertTrue(target.is_dir())
 
-    def test_session_that_becomes_live_before_copy_keeps_the_next_move(self) -> None:
+    def test_session_that_becomes_live_during_index_write_keeps_the_next_move(self) -> None:
         source = self.leaf("becomes-live")
-        target = self.index(source.name, "live")
+        transcript = self.base / "claude-home" / "projects" / self.project / f"{source.name}.jsonl"
+        transcript.parent.mkdir(parents=True)
+        _ = transcript.write_text(json.dumps({"cwd": str(self.base / "live")}) + "\n", encoding="utf-8")
+        folder = self.root / "live"
+        target = folder / self.claude / self.project / source.name
         movable = self.leaf("movable")
         moved = self.index(movable.name, "demo") / self.claude / self.project / movable.name
-        stopped = session_records.RegistryRead((), ())
+        registry = session_records.RegistryRead((), ())
         resumed = self.live_registry(source.name)
-        before_first_copy = iter((stopped,))
+        write_record = session_move.write_record_at
 
-        with mock.patch.object(session_records, "read_registry", side_effect=lambda: next(before_first_copy, resumed)):
+        def resume_during_index_write(parent: int, name: str, value: object) -> None:
+            nonlocal registry
+            write_record(parent, name, value)
+            if name == session_folder.RECORD:
+                registry = resumed
+
+        with (mock.patch.object(session_records, "read_registry", side_effect=lambda: registry),
+              mock.patch.object(session_move, "write_record_at", side_effect=resume_during_index_write)):
             status, output, errors = self.invoke()
 
         self.assertEqual(status, 0, errors)
         self.assertIn(f"session {source.name} is live", errors)
         self.assertEqual((source / "draft.md").read_bytes(), b"scratch content\n")
-        self.assertEqual(list(target.iterdir()), [])
+        self.assertEqual(session_folder.folder_for(self.root, source.name), folder)
+        self.assertFalse(target.exists())
+        self.assertFalse((self.root / session_move.JOURNAL / session_move.MOVE_RECORD).exists())
         self.assertFalse(movable.exists())
         self.assertEqual((moved / "draft.md").read_bytes(), b"scratch content\n")
         self.assertEqual(output.splitlines()[-1],
                          "session_move: moved 1 folders (0.00 GiB), kept 1 live, refused 0 other")
+
+        status, output, errors = self.invoke()
+
+        self.assertEqual(status, 0, errors)
+        self.assertIn(f"{source} -> {target} (.id index)", output)
+        self.assertFalse(source.exists())
+        self.assertEqual((target / "draft.md").read_bytes(), b"scratch content\n")
 
     def test_session_that_resumes_during_verification_keeps_its_source(self) -> None:
         source = self.leaf("resuming")
