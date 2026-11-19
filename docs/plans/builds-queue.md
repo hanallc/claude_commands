@@ -2934,6 +2934,15 @@ Work:
 1. F014: before an outage, the leave hook runs with no timeout and can pass the launch deadline. The base (47027a14c, admission_client.py:424 and :492) has the same gap. The hook gets only the time left to the active deadline.
 2. A replacement refusal can arrive while the original socket holds only part of a grant frame. The service saves the grant before delivery and does not release it on disconnect (admission_service.py:2645, :4323). Design the service coordination for this case and for cancellation, so a saved grant is never left unresolved.
 
+### Phase 44ck — Every queue row carries one stored name from admission to the page  · status: todo
+**From 44cf closure pass 3 and Astra (/tmp/claude/astra/20261119T010103Z-2553136/review.md), 2026-11-18:** the user's rule is that no row in the queue can be without a name. Earlier rounds fixed one path per round. This phase makes an empty name impossible by construction. Starts after 44cf merges.
+1. One immutable, validated `NamedWork` identity: the stored caller name and the stored display name. Validation rejects empty text, white space and missing-name marks.
+2. Create it before queue entry, for every caller kind: placement requests, repository slot waits, Mac dispatch, and observed scopes (an explicit observed identity).
+3. Every state change and row constructor keeps it: running, waiting, retained and continuation holds, remote placements, Mac rows, CI and cloud rows. Views read its fields and derive no name.
+4. No row leaves the page because a name lookup failed (memory_feed.py `NoNamedStep` branches).
+5. Old wire and snapshot records upgrade to the identity before the strict reader runs; pinned clients keep working.
+6. Tests replace the ones that let unnamed rows drop off the page. They cover release, continuation, restart, snapshot round trip, missing staff, Mac ownership and an empty process scope, and check the page's caller text.
+
 ### Phase 44cg — A memory wait fixture gives the same result under load  · status: todo
 **From builds, 2026-11-18 18:3x:** queue's next item after 44cf.
 
