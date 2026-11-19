@@ -1290,7 +1290,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Result:** A review-trial row records its full checkpoint hash, and `merge_checkpoint.py` passes `--checkpoint`. Two rows name one phase only when unit, plan, phase and checkpoint match; a row with no checkpoint matches by start time. `--checkpoint` stays optional for the landing merge; a follow-up makes it required. The lost postmaster 45bef9a09 and admin-console reviewask 6aff8187c rows are in the natedev ledger. On main b8e30ad51 (hash 767ac1df9).
 
-### Phase 80 — Review-trial rows require a checkpoint  · status: todo
+### Phase 80 — Review-trial rows require a checkpoint  · status: done
 **Depends on:** phase 79
 
 #### Work Order
@@ -1312,6 +1312,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Acceptance gate:**
 1. A test fails on main for a missing `--checkpoint` and for a start-time match. basedpyright: 0 errors, 0 warnings. Full gate green.
+
+**Result:** `review_regime.py add` requires `--checkpoint`, and two rows match only when unit, plan, phase and checkpoint match; the start-time match is gone. Older ledger rows with no checkpoint stay as history rows that report and watch still read, and no new row matches them. On main 49b3cd5da (hash a31f4cbff).
 
 ### Phase 81 — A new registry row goes after its section's last key  · status: todo
 **Depends on:** none
