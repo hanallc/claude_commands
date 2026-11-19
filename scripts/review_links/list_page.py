@@ -560,7 +560,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
                   "open-question": str(open_question).lower(), "unread-delivery": str(the_list.unread_delivery(item)).lower(),
                   "title": item.title.lower(),
                   "owner-name": owner.lower(),
-                  "order": str(index), "sort-values": json.dumps(values, ensure_ascii=False)}
+                  "order": str(index), "list-order": str(index), "sort-values": json.dumps(values, ensure_ascii=False)}
     attrs = ''.join(f' data-{key}="{html.escape(value, quote=True)}"' for key, value in attributes.items())
     panel = f'list-detail-{index}'
     row_id = html.escape(entry.key.replace("/", "-"), quote=True)
@@ -920,6 +920,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     owners: Counter[the_list.ItemOwner] = Counter()
     producers: Counter[the_list.ItemOwner] = Counter()
     rows: list[str] = []
+    parked_rows: list[str] = []
     deferred_links = False
     chip_counts: Counter[ListChip] = Counter()
     for index, entry in enumerate(items):
@@ -938,9 +939,10 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
         ):
             row_reviews = LinkedReviewRead.AFTER_RENDER
             deferred_links = True
-        rows.append(item_rows(entry, names, today, index, secret, row_reviews, parked=parked,
-                              open_question=open_question, visibility=visibility))
-    shows = [record_table.Chip("all", "All", chip_counts.total() - chip_counts[ListChip.PARKED]),
+        (parked_rows if parked else rows).append(
+            item_rows(entry, names, today, index, secret, row_reviews, parked=parked,
+                      open_question=open_question, visibility=visibility))
+    shows = [record_table.Chip("all", "All", len(items)),
              *(record_table.Chip(chip.value, chip.value.replace("-", " ").capitalize(), chip_counts[chip])
                for chip in ListChip if chip != ListChip.ALL)]
     headers = ''.join(f'<th scope="col" aria-sort="none"><button type="button" id="list-sort-{index}" data-sort="{index}">{label}'
@@ -987,7 +989,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + '<div class="list-table-tools"><div class="list-expansion">' + expansion + '</div>'
                + '<span data-list-count role="status" aria-live="polite"></span></div>'
                + '<div class="list-table"><table aria-label="The List">' + columns + '<thead><tr>' + headers + '</tr></thead>'
-               + ''.join(rows) + '</table>'
+               + ''.join(rows + parked_rows) + '</table>'
                + '<p data-empty hidden>No items in this view.</p></div>'
                + '<section data-linked-item hidden><h2 id="list-linked-heading">Linked item outside filters</h2>'
                + '<div class="list-table"><table aria-labelledby="list-linked-heading">' + columns
@@ -1099,9 +1101,10 @@ const chipsByQuestion=''' + json.dumps({
 const shows=''' + json.dumps(list(ListChip)) + r''';
 const chipsByState=chipsByQuestion.false.false;
 const deliveryParking=''' + json.dumps(the_list.ParkUntilDelivered.DELIVERED) + r''';
+const isParked=data=>data.parked==='true' || data.parked===deliveryParking;
 const chipFor=data=>{
  if(data.state==='Closed') return;
- const parked=data.parked==='true' || data.parked===deliveryParking;
+ const parked=isParked(data);
  if(!parked && data.unreadDelivery==='true') return 'needs-me';
  return chipsByQuestion[data.openQuestion][String(parked)][data.state];
 };
@@ -1271,7 +1274,14 @@ const tableView=createRecordTable({content:()=>content,
  },
  filters:['producer','unread'],
  staffChipFilters:['owner','producer'],
- beforeApply:rememberLogPositions,
+ beforeApply:()=>{
+  rememberLogPositions();
+  const rows=content.querySelectorAll('[data-list-item]');
+  for(const {dataset:data} of rows){
+   const order=String(Number(data.listOrder)+(isParked(data) ? rows.length : 0));
+   if(data.order!==order) data.order=order;
+  }
+ },
  applied:(_items,{show,filters})=>{
   const nextUnreadShow=filters.unread ? show : '';
   if(nextUnreadShow!==unreadShow){
@@ -1284,7 +1294,6 @@ const tableView=createRecordTable({content:()=>content,
  itemOpened:watchOpenedAnswer,
  expandedSelection:(data,selection)=>selection.filters.unread && selection.show===unreadShow &&
   keepOpenAfterRead.has(data.key) ? {...selection,filters:{...selection.filters,unread:''}} : undefined,
- requiredShow:data=>data && chipFor(data)==='parked' ? 'parked' : undefined,
  hasKey:key=>!closedKeys.has(key) && !!content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]'),
  revealLinked:(data,{filters})=>data.openQuestion==='true' || (filters.unread && data.unread!=='true'),
  missingItem:key=>{

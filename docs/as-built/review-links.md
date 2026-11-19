@@ -774,9 +774,11 @@ On desktop, the ETA cell stays on one line and shows an ellipsis if the text is 
 Hover or focus on the ETA to see the full text.
 On a phone, the ETA wraps to show the full text in the row.
 Past times and past range end times use the same warning color as Check overdue.
-The default order uses `the_list.order`, which the CLI also uses.
+The default order puts parked items after other items.
+Within each group, the List uses `the_list.order`.
 User decisions come first, then unread updates, then the earliest next check.
-A column button sorts its values; a second click reverses that order.
+A column button sorts all matching items by its values.
+A second click reverses that order.
 
 The List starts with All selected in the Owner, Producer, and Show rows.
 Owner and Producer list staff in name order after All and omit every trailing `-unit` from names.
@@ -791,9 +793,11 @@ Morty answering includes other unparked items with an open question, including i
 Needs me also includes unparked items in Waiting for nate or Delivered with no open question.
 Working includes other unparked items in New or Working.
 Blocked includes other unparked items in Blocked or Paused.
-All excludes parked items and includes unparked Done items.
+All includes every open item, including parked items and Done items.
+The State cell shows the parking end time or delivery condition under the saved state.
 The Unread only switch limits the visible items and chip counts to unread items.
 Each chip count reflects the words box and the filters in the other rows.
+In All, each Owner and Producer chip counts matching parked items.
 The “need you” total uses the Needs me chip count.
 A zero-count chip stays visible and dimmed.
 The chip rows wrap when the available width decreases.
@@ -806,7 +810,7 @@ Hidden items keep their open or closed state.
 
 A link under Links opens the target item in the console.
 The table can change Show to All to reveal the target.
-A link to an item in Parked selects Parked.
+A direct link with no filters opens a parked item in All.
 The table clears each filter that excludes the target and keeps each filter that matches it.
 The table scrolls to the target and highlights it briefly.
 The table leaves a gap below the sticky status banner when it shows.
@@ -1082,7 +1086,6 @@ Focus moves from **Unpark** to the Parked filter and brings the filter and confi
 If All is active when Unpark saves, the row stays expanded and its item number can receive focus.
 After Unpark, the item's saved state sets its status chip.
 
-A direct link to a parked item selects Parked.
 Morty can set this parking condition with `the_list.py park --id L<N> --until delivered --source morty`.
 When morty records Delivered, the List writer clears this parking condition in the same write.
 The Review snapshot worker checks each snapshot after it publishes it.
@@ -1106,7 +1109,8 @@ The existing sender delivers the notice with its retry and alert rules.
 A delivery failure does not reverse the completed item action.
 Tell morty sends the user's words without changing the item's state or parking time.
 Remove hides the item at once and closes it when the save succeeds.
-Park moves an item to Parked at once.
+Park moves an item to the parked group at once.
+The item stays visible in All if it matches the other filters.
 With Unread only on, the row leaves the view when the user presses Mark read, Ask question, or Tell morty.
 The row returns when the server reports an unread update and the row matches the current filters.
 The shared table fades and collapses the row and its open details when an action hides them.
