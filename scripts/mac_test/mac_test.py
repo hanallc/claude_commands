@@ -9,7 +9,7 @@ except FileNotFoundError:
 
 import argparse
 from collections.abc import Generator
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import fcntl
@@ -2212,6 +2212,11 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
     yield_deadline = 0.0
     stopped: set[tuple[int, str]] = set()
     while True:
+        if paths.platform == "macos" and isinstance(assignment, UnassignedClaim) and not args.from_pid:
+            settings = Path(args.settings) if args.settings else config_path(paths.target if paths.registry_selected else "")
+            # claim_once reports unreadable state after it reads the claims under the lock.
+            with suppress(ClaimStateUnreadable):
+                settle_retained_mac_claims(paths, settings)
         with locked(paths.lock):
             attempt = (adopt_wait_claim(args, paths, scope, session=session) if args.from_pid
                        else claim_once(args, paths, scope, session=session, reserve_wait=not watch_claim, assignment=assignment))

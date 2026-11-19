@@ -24,6 +24,11 @@ class ProcessEnvironmentUnreadable:
     reason: str
 
 
+@dataclass(frozen=True)
+class ProcessExited:
+    """The process no longer has a PID in the kernel."""
+
+
 def read_process_environment(pid: int) -> ProcessEnvironment | ProcessEnvironmentUnreadable:
     """Read Cargo paths, CI labels and the placement value."""
     if sys.platform != "darwin":
@@ -44,6 +49,19 @@ def read_process_environment(pid: int) -> ProcessEnvironment | ProcessEnvironmen
         return cargo_environment(data.raw[:size.value])
     except (OSError, ValueError, AttributeError):
         return ProcessEnvironmentUnreadable("the process argument read failed")
+
+
+def observe_process_environment(pid: int) -> ProcessEnvironment | ProcessExited | ProcessEnvironmentUnreadable:
+    """Check for exit after an unsuccessful environment read."""
+    observed = read_process_environment(pid)
+    if isinstance(observed, ProcessEnvironmentUnreadable):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return ProcessExited()
+        except OSError:
+            return ProcessEnvironmentUnreadable("the process environment and exit are unconfirmed")
+    return observed
 
 
 def cargo_environment(data: bytes) -> ProcessEnvironment | ProcessEnvironmentUnreadable:
@@ -79,19 +97,21 @@ def print_placement_pids(placement: str) -> int:
     uid = os.getuid()
     rows = subprocess.check_output(["ps", "-axo", "pid=,uid=,stat="], text=True)
     matches: list[int] = []
-    checked = False
+    listed = False
     for row in rows.splitlines():
         pid, owner, state = row.split()
         if int(owner) != uid or state.startswith("Z"):
             continue
-        observed = read_process_environment(int(pid))
+        listed = True
+        observed = observe_process_environment(int(pid))
+        if isinstance(observed, ProcessExited):
+            continue
         if isinstance(observed, ProcessEnvironmentUnreadable):
             print(f"cannot check Mac process {pid}: {observed.reason}", file=sys.stderr)
             return 1
-        checked = True
         if observed.fields.get("MAC_PLACEMENT") == placement:
             matches.append(int(pid))
-    if not checked:
+    if not listed:
         print("the Mac process list contains no live processes for the SSH user", file=sys.stderr)
         return 1
     for match in matches:

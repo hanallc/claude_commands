@@ -77,7 +77,7 @@ state=$MAC_RUN_STUB_STATE
 command=${0:t}
 remote=${@[-1]}
 placed_run=0
-if [[ $command == ssh && $remote == *mac_group=* ]]; then
+if [[ $command == ssh && $remote == *grace_polls=* ]]; then
     outer=("${(@Q)${(z)remote}}")
     wrapper=("${(@Q)${(z)outer[3]}}")
     work=${wrapper[1]#work=}
@@ -88,7 +88,6 @@ if [[ $command == ssh && $remote == *mac_group=* ]]; then
     remote=${words[4]}
     set -- "${@[1,-2]}" "$remote"
     placed_run=1
-    print -r -- mac_group=4567
 fi
 claimed=false
 [[ ! -e $MAC_TEST_STATE_DIR/run.json ]] || claimed=true
@@ -137,10 +136,6 @@ if [[ ${@[-1]} == true ]] && (( ${@[(Ie)-o]} )); then
 fi
 
 remote=${@[-1]}
-if [[ $remote == *mac_stopped=* ]]; then
-    print -r -- mac_stopped=4567
-    exit 0
-fi
 clone_head=$state/clone-head
 if [[ $MAC_RUN_REAL_COPIES == 1 && $remote == *'copies.py '* ]]; then
     run_real_copies

@@ -111,15 +111,21 @@ The grant holds its reservation until a runner adopts it or the grant closes.
 A remote dispatch records its pending start fence before it launches SSH.
 A retained claim still holds capacity after its local owner ends.
 The admission service retries fenced claims when it reads Mac capacity.
+The standalone claim command retries them before each unassigned Mac claim attempt.
 The block watcher uses the same settlement check before it activates a pending block.
 Verify's claim watcher can also retry a retained Verify claim.
 
 The release check closes the exact attempt's start fence outside `state.lock`.
 For Verify, it checks for processes that refer to the claimed mirror or use that mirror as their working directory.
-For a queue run, it checks the exact `MAC_PLACEMENT` value of each live process for the SSH user.
+For a queue run, it checks the exact `MAC_PLACEMENT` value of each live process in the SSH user's process snapshot.
+After a failed environment read, the check asks the kernel if the PID still exists.
+The check skips a PID when the kernel confirms its absence.
 It releases the claim when the fence has settled and the process check finds no matching processes.
-A failed environment read leaves the process check unconfirmed.
+A failed read leaves the process check unconfirmed if the kernel cannot confirm the exit.
 A timeout, an unconfirmed check, or a matching process keeps the claim for a later check.
+
+When the SSH input closes, the remote watcher checks its own group membership before each pass that sends signals.
+If SSH returns no exit status, the queue runner keeps the claim and any pending cleanup record.
 
 The watcher uses the retained repository's mirror activity for older claims without a fence.
 It uses host activity for claims with a live holder and for old whole-Mac claims without a fence.

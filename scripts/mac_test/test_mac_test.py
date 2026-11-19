@@ -3535,6 +3535,42 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         self.assertEqual(check.call_count, len(observations))
         send.assert_called_once()
 
+    def test_standalone_claim_retry_recovers_capacity_from_a_dead_queue_owner(self) -> None:
+        from scripts.mac_test import claim_state, offload
+
+        _ = write_config_fixture(self.root / "mac_test.conf", "max_active_builds=1\n")
+        ended_pid = os.getpid() + 1
+        record = self.write_claim(pid=ended_pid, queue_dispatch=True)
+        identity = claim_state.ClaimIdentity(cast(str, record["claim_id"]), cast(str, record["episode"]),
+                                             cast(str, record["attempt"]))
+        offload.record_pending_start(self.paths.target, identity)
+        pending = offload.pending_start_path(self.paths.target, identity)
+        marker = "dispatch_start_settled=" + offload.pending_start_key(identity)
+        observations = iter((offload.LeftoverObservation(offload.LeftoversRemain(1), marker),
+                             offload.LeftoverObservation(offload.LeftoversEnded(), marker)))
+
+        def process_start(pid: int) -> process_identity.Started | process_identity.Gone:
+            return process_identity.Gone() if pid == ended_pid else process_identity.Started("owner-start")
+
+        def check(*_arguments: object) -> offload.LeftoverObservation:
+            with self.paths.lock.open("a+") as state_lock:
+                fcntl.flock(state_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return next(observations)
+
+        args = mac_test.CliArguments()
+        args.pid, args.what, args.worktree, args.wait = os.getpid(), "standalone tests", str(self.root), 1
+        with (mock.patch.object(process_identity, "process_start", side_effect=process_start),
+              mock.patch.object(offload, "read_leftovers", side_effect=check) as remote,
+              mock.patch.object(time, "monotonic", side_effect=(0, 0, 1)),
+              mock.patch.object(time, "sleep") as delay,
+              mock.patch.object(mac_test, "start_claim_watcher")):
+            self.assertEqual(mac_test.command_claim(args, self.paths), 0)
+
+        delay.assert_called_once()
+        self.assertEqual(remote.call_count, 2)
+        self.assertEqual(self.read_claim()["pid"], args.pid)
+        self.assertFalse(pending.exists())
+
     def test_queue_claim_type_matches_the_decoder(self) -> None:
         from scripts.mac_test import claim_state
 

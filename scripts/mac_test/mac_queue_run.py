@@ -77,26 +77,37 @@ def placement_arguments(episode: str, since: float, pid: int, worktree: Path, pa
 
 
 def remote_wrapper(work: str, on_close: str, grace_polls: int) -> str:
-    """Run the work in the SSH session's process group, and stop the work when the SSH input closes.
+    """Run the work in the SSH session's process group.
 
-    zsh refuses job control without a terminal, so the work shares the session's group. When the
-    input closes, the watcher ends every other process of the group, then runs `on_close` (work
-    such as a GUI app that started outside the group).
+    The watcher stays in the group and stops its other members when the SSH input closes.
+    The watcher then runs `on_close` for work outside the group.
     """
     return ("work=" + shlex.quote(work) + "\non_close=" + shlex.quote(on_close)
             + f"\ngrace_polls={grace_polls}" + r"""
 exec 3<&0
-group=$(ps -o pgid= -p $$)
-group=${group//[[:space:]]/}
-printf 'mac_group=%s\n' "$group"
 {
     read -r _ <&3
-    zmodload zsh/system zsh/zselect
+    zmodload zsh/system zsh/zselect || exit 1
     self=$sysparams[pid]
-    members() { reply=(${(f)"$(pgrep -g $group)"}); reply=(${reply:#$self}) }
-    members; (( ! $#reply )) || kill -TERM $reply
-    for _ in {1..$grace_polls}; do members; (( $#reply )) || break; zselect -t 10; done
-    members; (( ! $#reply )) || kill -KILL $reply
+    group=$(ps -o pgid= -p "$self") || exit 1
+    group=${group//[[:space:]]/}
+    [[ $group == <1-> ]] || exit 1
+    members() {
+        local snapshot
+        snapshot=$(pgrep -g "$group") || return 1
+        reply=(${(f)snapshot})
+        (( ${reply[(Ie)$self]} )) || return 1
+        reply=(${reply:#$self})
+    }
+    members || exit 1
+    (( ! $#reply )) || kill -TERM $reply
+    for _ in {1..$grace_polls}; do
+        members || exit 1
+        (( $#reply )) || break
+        zselect -t 10
+    done
+    members || exit 1
+    (( ! $#reply )) || kill -KILL $reply
     [[ -z $on_close ]] || /bin/zsh -c "$on_close"
 } </dev/null >/dev/null 2>&1 &
 watcher=$!
@@ -122,35 +133,13 @@ def remote_command(dispatch: ArmedMacDispatch, cwd: str, argv: list[str], on_clo
 
 class RemoteState(Enum):
     NOT_STARTED = "not started"
-    LIVE = "live"
+    EXIT_UNCONFIRMED = "exit unconfirmed"
     EXITED = "exited"
 
 
 @dataclass
 class RemoteRun:
     state: RemoteState = RemoteState.NOT_STARTED
-    group: int = 0
-
-
-def stop_remote(dispatch: ArmedMacDispatch, remote: RemoteRun) -> bool:
-    if remote.group == 0:
-        return False
-    grace = conf.read("mac_gate").number("terminate_grace_seconds")
-    # The installed helper checks the group id before it sends; the ps check below proves the stop.
-    script = f"""group={remote.group}
-signal_group() {{ "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/process_group.py" "$group" "$1" 2>/dev/null }}
-signal_group TERM
-sleep {grace}
-signal_group KILL
-groups=$(ps -axo pgid=) || exit 1
-if printf '%s\\n' "$groups" | grep -Eq "^[[:space:]]*$group[[:space:]]*$"; then exit 1; fi
-printf 'mac_stopped=%s\\n' "$group"
-"""
-    connection = eligibility.read_connection_settings(mac_test.config_path(dispatch.paths.target))
-    result = subprocess.run(["ssh", *offload.ssh_options(connection), dispatch.assignment.destination.host,
-        "/bin/zsh -c " + shlex.quote(script)], stdin=subprocess.DEVNULL, capture_output=True, text=True,
-        timeout=connection.leftover_timeout_s, check=False)
-    return result.returncode == 0 and result.stdout.strip() == f"mac_stopped={remote.group}"
 
 
 def stop_command(process: subprocess.Popen[str]) -> None:
@@ -178,15 +167,12 @@ def stream_remote(command: list[str], remote: RemoteRun, identity: claim_state.C
     with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8",
                           errors="replace") as process:
         try:
-            remote.state = RemoteState.LIVE
+            remote.state = RemoteState.EXIT_UNCONFIRMED
             assert process.stdout is not None
             last = ""
             fence_key = offload.pending_start_key(identity)
             for line in cast(TextIO, process.stdout):
                 if line.rstrip() in (f"dispatch_start_settled={fence_key}", f"dispatch_start_pending={fence_key}"):
-                    continue
-                if line.startswith("mac_group=") and line.removeprefix("mac_group=").strip().isdigit():
-                    remote.group = int(line.removeprefix("mac_group="))
                     continue
                 print(line, end="", flush=True)
                 last = line.rstrip("\n")
@@ -220,7 +206,7 @@ class SavedRun(TypedDict):
 
 @contextlib.contextmanager
 def run_directory(episode: str) -> Generator[Path]:
-    """Hold this run's state folder. Its lock ends with the process, so a later run finds a run that a signal ended."""
+    """Hold the run directory lock and keep any pending cleanup record."""
     runs = Path.home() / RUNS
     runs.mkdir(parents=True, exist_ok=True, mode=0o700)
     starting = runs / (episode + ".new")
@@ -233,7 +219,8 @@ def run_directory(episode: str) -> Generator[Path]:
         try:
             yield directory
         finally:
-            shutil.rmtree(directory, ignore_errors=True)
+            if not (directory / "run.json").exists():
+                shutil.rmtree(directory, ignore_errors=True)
     finally:
         os.close(descriptor)
 
@@ -345,12 +332,7 @@ def run(args: Arguments) -> int:
             print(f"mac queue: {error}", file=sys.stderr)
             status = 2
         finally:
-            safe = remote.state != RemoteState.LIVE
-            if not safe and isinstance(dispatch, ArmedMacDispatch):
-                try:
-                    safe = stop_remote(dispatch, remote)
-                except (OSError, ValueError, subprocess.TimeoutExpired):
-                    safe = False
+            safe = remote.state != RemoteState.EXIT_UNCONFIRMED
             if prepared and safe:
                 try:
                     cleanup_status = run_callback(args.lifecycle_script, "cleanup", argv_file, original_command, callback_environment)
@@ -360,6 +342,8 @@ def run(args: Arguments) -> int:
                 if cleanup_status:
                     print(f"mac queue: lifecycle cleanup failed ({cleanup_status})", file=sys.stderr)
                     status = status or cleanup_status
+                else:
+                    (directory / "run.json").unlink(missing_ok=True)
             if lease_descriptor >= 0:
                 os.close(lease_descriptor)
             if safe and isinstance(dispatch, ArmedMacDispatch):

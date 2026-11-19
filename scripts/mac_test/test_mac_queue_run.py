@@ -71,24 +71,32 @@ import json, os, shlex, sys
 from pathlib import Path
 root = Path(os.environ["FAKE_QUEUE_STATE"])
 args = shlex.split(sys.argv[-1])
+lost_group = os.environ.get("FAKE_LOST_GROUP")
 if "dispatch_start_prepared=" in sys.argv[-1]:
     print(args[-1])
     raise SystemExit(0)
 if "leftovers=0" in sys.argv[-1] or "settlement=$(" in sys.argv[-1]:
     key, = (root / "mac-state" / "pending-starts").iterdir()
-    count = int(os.environ.get("FAKE_GROUP_REMAINS", "0")) if "select_group_processes" in sys.argv[-1] else 0
-    if "MAC_PLACEMENT" in sys.argv[-1]:
-        count += int(os.environ.get("FAKE_PLACEMENT_REMAINS", "0"))
+    count = int(os.environ.get("FAKE_PLACEMENT_REMAINS", "0"))
+    if lost_group == "children" and not (root / "children-ended").exists():
+        count += 1
     print(f"dispatch_start_settled={key.name}\nleftovers={count}\nrc=0")
     raise SystemExit(0)
 if "mac_stopped=" in args[-1]:
-    (root / "stop").write_text(args[-1])
-    if os.environ.get("FAKE_STOP_FAIL") == "1":
-        raise SystemExit(255)
+    owner = "original"
+    with (root / "signals").open("w") as signals:
+        for line in args[-1].splitlines():
+            if line.startswith("signal_group "):
+                signals.write(f"{line.split()[1]} {owner}\n")
+            if lost_group == "reused" and line.startswith("sleep "):
+                owner = "replacement"
+    if lost_group == "children":
+        (root / "children-ended").touch()
     print("mac_stopped=4567", flush=True)
     raise SystemExit(0)
 (root / "remote").write_text(json.dumps(args))
-print("mac_group=4567", flush=True)
+if "mac_group=" in args[-1]:
+    print("mac_group=4567", flush=True)
 if os.environ.get("FAKE_SSH_LOST") == "1":
     raise SystemExit(255)
 if os.environ.get("FAKE_SSH_HOLD") == "1":
@@ -208,10 +216,10 @@ class QueueRunTests(unittest.TestCase):
             self.assertEqual(list((root / "mac-state/claims").iterdir()), [])
             self.assertEqual(list((root / "mac-state/pending-starts").iterdir()), [])
 
-    def test_unconfirmed_stop_retains_the_exact_remote_claim(self) -> None:
+    def test_dead_group_leader_with_live_children_retains_the_exact_remote_claim(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            environment = {**self.fixture(root), "FAKE_SSH_LOST": "1", "FAKE_STOP_FAIL": "1"}
+            environment = {**self.fixture(root), "FAKE_SSH_LOST": "1", "FAKE_LOST_GROUP": "children"}
             result = subprocess.run(self.command(root), capture_output=True, text=True, env=environment,
                                     timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 255, result.stdout + result.stderr)
@@ -223,6 +231,13 @@ class QueueRunTests(unittest.TestCase):
             self.assertTrue(mac_test.run_is_kept(record))
             self.assertEqual(len(list((root / "mac-state/pending-starts").iterdir())), 1)
             self.assertFalse((root / "watcher-start").exists())
+            with mock.patch.dict(os.environ, environment):
+                paths = mac_test.state_paths()
+                mac_test.settle_retained_mac_claims(paths, mac_test.config_path())
+                self.assertEqual(len(mac_test.read_claims(paths)), 1)
+                (root / "children-ended").touch()
+                mac_test.settle_retained_mac_claims(paths, mac_test.config_path())
+                self.assertEqual(mac_test.read_claims(paths), ())
 
     def test_queue_retains_capacity_while_the_remote_attempt_runs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -234,37 +249,39 @@ class QueueRunTests(unittest.TestCase):
             self.assertEqual([event[0] for event in self.events(root)], ["place-step"])
             self.assertTrue((root / "mac-state/claims/hana.json").exists())
 
-    def test_queue_returns_capacity_when_only_a_reused_process_group_runs(self) -> None:
+    def test_lost_ssh_sends_no_signal_to_a_group_reused_during_grace(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            environment = {**self.fixture(root), "FAKE_GROUP_REMAINS": "1"}
+            environment = {**self.fixture(root), "FAKE_SSH_LOST": "1", "FAKE_LOST_GROUP": "reused"}
             result = subprocess.run(self.command(root), capture_output=True, text=True, env=environment,
                                     timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
-            self.assertEqual(list((root / "mac-state/claims").iterdir()), [])
+            self.assertEqual(result.returncode, 255, result.stdout + result.stderr)
+            signals = root / "signals"
+            self.assertFalse(signals.exists(), signals.read_text() if signals.exists() else "")
+            self.assertEqual([event[0] for event in self.events(root)], ["place-step"])
+            self.assertTrue((root / "mac-state/claims/hana.json").exists())
 
-    def test_process_scan_distinguishes_a_failed_read_from_an_unmarked_process(self) -> None:
+    def test_process_scan_distinguishes_a_confirmed_exit_from_an_unreadable_environment(self) -> None:
         arguments = shlex.split(mac_process_environment.placement_pids_command("episode", "attempt"))
 
         def process_list(command: list[str], *, text: bool) -> str:
             self.assertTrue(text)
-            state = " S" if command[-1].endswith("stat=") else ""
-            return f"4567 {os.getuid()}{state}\n"
+            self.assertEqual(command[-1], "pid=,uid=,stat=")
+            return f"4567 {os.getuid()} S\n4568 {os.getuid()} S\n"
 
-        for outcome in ("size failed", "read failed", "malformed", "unmarked", "matching"):
+        for outcome in ("exited", "size failed", "read failed", "malformed", "unmarked", "matching"):
             with self.subTest(outcome=outcome):
                 field = b"MAC_PLACEMENT=episode/attempt" if outcome == "matching" else b"HOME=/fixture"
                 data = struct.pack("i", 1) + b"/bin/build\0\0build\0" + field + b"\0\0"
                 if outcome == "malformed":
                     data = data[:-2]
 
-                def sysctl(_mib: object, _count: int, buffer: object, size: object,
+                def sysctl(mib: ctypes.Array[ctypes.c_int], _count: int, buffer: object, size: object,
                            _new: object, _new_count: int) -> int:
                     if buffer is None:
                         length = ctypes.cast(cast(ctypes.c_void_p, size), ctypes.POINTER(ctypes.c_size_t))
                         length.contents.value = len(data)
-                        return int(outcome == "size failed")
+                        return int(outcome == "size failed" or (outcome == "exited" and mib[2] == 4567))
                     if outcome == "read failed":
                         return 1
                     _ = ctypes.memmove(cast(ctypes.c_void_p, buffer), data, len(data))
@@ -274,17 +291,20 @@ class QueueRunTests(unittest.TestCase):
                 output, errors = io.StringIO(), io.StringIO()
                 with (mock.patch.object(sys, "platform", "darwin"), mock.patch.object(sys, "argv", arguments[2:]),
                       mock.patch.object(ctypes, "CDLL", return_value=kernel),
+                      mock.patch.object(os, "kill", side_effect=ProcessLookupError if outcome == "exited" else None) as check,
                       mock.patch.object(subprocess, "check_output", side_effect=process_list),
                       redirect_stdout(output), redirect_stderr(errors), self.assertRaises(SystemExit) as status):
                     exec(compile(arguments[2], "<placement process probe>", "exec"), {"__name__": "__main__"})
-                if outcome in ("unmarked", "matching"):
+                if outcome in ("exited", "unmarked", "matching"):
                     self.assertEqual(status.exception.code, 0)
-                    self.assertEqual(output.getvalue(), "4567\n" if outcome == "matching" else "")
+                    self.assertEqual(output.getvalue(), "4567\n4568\n" if outcome == "matching" else "")
                     self.assertEqual(errors.getvalue(), "")
                 else:
                     self.assertEqual(status.exception.code, 1)
                     self.assertEqual(output.getvalue(), "")
                     self.assertIn("cannot check Mac process 4567", errors.getvalue())
+                if outcome == "exited":
+                    check.assert_called_once_with(4567, 0)
 
     def test_a_signal_ends_the_run_with_its_default_action(self) -> None:
         for waiting, signum in ((False, signal.SIGTERM), (False, signal.SIGHUP), (True, signal.SIGTERM),
@@ -308,22 +328,17 @@ class QueueRunTests(unittest.TestCase):
                             _ = process.communicate()
                 self.assertEqual(process.returncode, -signum, output + errors)
                 events = [event[0] for event in self.events(root)]
-                if signum == signal.SIGINT:
-                    # Python's own KeyboardInterrupt runs the finally path, which returns the placement.
-                    self.assertEqual(events, ["place-step", "cancel-placement"])
-                    self.assertEqual(self.events(root)[-1][-1], "the Mac run ended with status 1")
-                    self.assertIn("signal_group TERM", (root / "stop").read_text())
-                else:
-                    # The queue ends the placement when this process ends.
-                    self.assertEqual(events, ["place-step"])
-                    if not waiting:
-                        wait_until((root / "input_closed").exists, root)
-                        with mock.patch.dict(os.environ, environment):
-                            paths = mac_test.state_paths()
-                            self.assertEqual(len(mac_test.read_claims(paths)), 1)
-                            mac_test.settle_retained_mac_claims(paths, mac_test.config_path())
-                            self.assertEqual(mac_test.read_claims(paths), ())
-                    # The run's state folder stays until the next run cleans it.
+                self.assertEqual(events, ["place-step"])
+                if not waiting and signum != signal.SIGINT:
+                    wait_until((root / "input_closed").exists, root)
+                if not waiting:
+                    with mock.patch.dict(os.environ, environment):
+                        paths = mac_test.state_paths()
+                        self.assertEqual(len(mac_test.read_claims(paths)), 1)
+                        mac_test.settle_retained_mac_claims(paths, mac_test.config_path())
+                        self.assertEqual(mac_test.read_claims(paths), ())
+                if signum != signal.SIGINT:
+                    # The next run cleans the state of a run that ended without local cleanup.
                     runs = root / mac_queue_run.RUNS
                     self.assertEqual(len(list(runs.iterdir())), 1)
                     self.assertEqual(len(list((root / mac_queue_run.RECEIPTS).iterdir())), 1)
@@ -353,7 +368,6 @@ class QueueRunTests(unittest.TestCase):
                                       text=True, start_new_session=True) as process:
                     try:
                         assert process.stdout is not None and process.stdin is not None
-                        self.assertEqual(process.stdout.readline(), f"mac_group={process.pid}\n")
                         started = cast(str, process.stdout.readline())
                         self.assertRegex(started, r"\Astarted \d+\n\Z")
                         _ = (root / "work").write_text(started.split()[1])
