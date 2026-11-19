@@ -443,10 +443,15 @@ It then notifies the production owner through the existing messaging path.
 `nightly_owner` selects the owner for both the standing checkout and the notice.
 The gate sends each author unit its own type diagnostics.
 Git blame identifies the commit for each diagnostic on the tested tree.
-The gate reads the earliest matching checkpoint receipt and the producer ID saved for its merge.
-A `fast-track(<unit>)` subject can also identify the author.
+The gate checks for a `fast-track(<unit>)` subject first.
+For other commits, it uses the earliest checkpoint receipt whose merge added the commit.
+The gate skips main integration receipts and commits already present in the merge's first parent.
+The gate reads the receipt file without a lock and skips incomplete rows.
+The gate matches the receipt's plan to a unit under the production owner.
+If the plan has no unique match, the gate uses the producer ID saved for the merge.
 When every diagnostic reaches its author and the tests pass, the gate assigns the result to the unit with the most diagnostics.
-The notice to the production owner lists the diagnostics sent to each unit.
+Each unit notice shows up to 20 diagnostic lines and counts any omitted lines.
+The notice to the production owner also shows up to 20 lines from the list of author units and their diagnostics.
 `${MERGE_GATE_STATE_DIR:-~/.local/state/merge-gate}/nightly-red/<id>.json` stores each red result.
 The record holds the branch, tree, finish time, failure lines, receipt time, assignment, push acceptance, and last owner alert.
 The receipt time records successful delivery to the production owner.
@@ -460,7 +465,9 @@ It saves the assignment before it sends `nightly.assigned`.
 The push places the receipt and assignment status before the failure list.
 The phone retains that status when it truncates a long failure list.
 A rerun prints `unchanged` after the sender accepts the push.
-Both automatic and manual assignment send the same user push. The push names the assignee.
+Both automatic and manual assignment send a user push.
+The push names the assignee when the receipt is confirmed.
+If automatic assignment has no confirmed receipt, the push shows the nightly result without a receipt time.
 An unassigned red result never sends a user push.
 `merge_gate.py nightly-check` alerts the production owner when an unassigned result reaches its deadline.
 The alert repeats once in each later deadline window until the fix is assigned.
@@ -470,7 +477,8 @@ A failed alert stays due, and the next check sends it again.
 The existing `scripts/maintenance/herdr_upkeep.py` job runs this check every 120 seconds.
 It checks results before it restores terminal sessions.
 Assignment and the check use the same file lock.
-A failed push keeps the result pending; run `nightly-assigned` again to send it.
+A failed push keeps the result pending.
+The next `nightly-check` retries the push for each assigned result with pending delivery.
 Each red result uses the key `nightly-result:<id>`.
 The sender suppresses a second accepted push for the complete `datetime` range.
 This also prevents another push when the gate cannot save its acceptance state.

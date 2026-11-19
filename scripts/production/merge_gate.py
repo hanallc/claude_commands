@@ -71,7 +71,7 @@ from scripts.copies import copies
 from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, unit_runs, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import read_step_names
-from scripts.production import affected_modules, change_review, land_runs, staff, unit_names  # noqa: E402
+from scripts.production import affected_modules, change_review, land_runs, session_staff, staff, unit_config, unit_names  # noqa: E402
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
@@ -2429,11 +2429,14 @@ def send_nightly_red(directory: Path, result: NightlyRedResult, assignment: Nigh
 
     if isinstance(result.delivery, NightlyPushAccepted) or conf.read("merge_gate").text("nightly_result_push") == "off":
         return False
-    row = staff.snapshot().by_id(staff.StaffId(assignment.unit))
-    rendered = push_texts.render("nightly.assigned", branch=result.branch, time=nightly_time(result.finished),
-        types=result.types, tests=result.tests, outcome="failed",
-        unit=row.name if row is not None else assignment.unit, assigned=nightly_time(assignment.at),
-        received=nightly_time(result.received.at if isinstance(result.received, NightlyNoticeReceived) else assignment.at))
+    values = dict(branch=result.branch, time=nightly_time(result.finished),
+                  types=result.types, tests=result.tests, outcome="failed")
+    if isinstance(result.received, NightlyNoticeReceived):
+        row = staff.snapshot().by_id(staff.StaffId(assignment.unit))
+        rendered = push_texts.render("nightly.assigned", **values, unit=row.name if row is not None else assignment.unit,
+                                    assigned=nightly_time(assignment.at), received=nightly_time(result.received.at))
+    else:
+        rendered = push_texts.render("nightly.result", **values)
     command = push_texts.user_send_argv(rendered, key=f"nightly-result:{result.id}")
     # This window exceeds the complete datetime range. Accepted results never expire.
     command.extend(["--repeat-minutes", str(timedelta.max.days * 1440)])
@@ -2512,6 +2515,8 @@ def check_nightly_assignments() -> int:
                 result = read_nightly_red(path)
                 if isinstance(result.assignment, NightlyFixUnassigned):
                     changed = alert_nightly_unassigned(directory, result) or changed
+                elif isinstance(result.delivery, NightlyPushPending):
+                    changed = send_nightly_red(directory, result, result.assignment) or changed
             except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
                 print(f"Nightly result check: {error}", file=sys.stderr)
                 failed = True
@@ -2524,6 +2529,7 @@ class NightlyMergeReceipt:
     checkpoint: str
     merge: str
     at: float
+    issue: str
 
 
 @dataclass(frozen=True)
@@ -2541,8 +2547,7 @@ def _nightly_merge_receipts() -> list[NightlyMergeReceipt]:
     path = unit_runs.history_root() / "merge_receipts.jsonl"
     receipts: list[NightlyMergeReceipt] = []
     try:
-        with path.open(encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+        with path.open(encoding="utf-8", errors="replace") as handle:
             for line in handle:
                 try:
                     raw = cast(object, json.loads(line))
@@ -2554,8 +2559,9 @@ def _nightly_merge_receipts() -> list[NightlyMergeReceipt]:
                 if record.get("event_type") != "merge_receipt":
                     continue
                 source, merge, at = (record.get(key) for key in ("source_checkpoint", "merge_commit", "timestamp_epoch"))
+                issue = record.get("issue")
                 if isinstance(source, str) and isinstance(merge, str) and isinstance(at, (int, float)):
-                    receipts.append(NightlyMergeReceipt(source, merge, at))
+                    receipts.append(NightlyMergeReceipt(source, merge, at, issue if isinstance(issue, str) else ""))
     except FileNotFoundError:
         pass
     except (OSError, ValueError) as error:
@@ -2563,30 +2569,71 @@ def _nightly_merge_receipts() -> list[NightlyMergeReceipt]:
     return sorted(receipts, key=lambda receipt: receipt.at)
 
 
+def _nightly_plan_author(issue: str, production: staff.StaffId,
+                         members: staff.StaffSnapshot) -> staff.StaffRow | NoNightlyAuthor:
+    from scripts.agents import remote
+
+    if not issue:
+        return NoNightlyAuthor()
+    plan = Path(issue)
+    resolver = session_staff.RowResolver(members)
+    machine = remote.local_machine()
+    matches: list[staff.StaffRow] = []
+    for row in members.find(kind="unit", parent=production):
+        if not isinstance(row.worktree, (staff.PresentWorktree, staff.RemovedWorktree)) or row.worktree.machine != machine:
+            continue
+        try:
+            config = resolver.unit_config(row)
+        except (OSError, ValueError):
+            continue
+        if isinstance(config, unit_config.UnitConfig) and isinstance(config.plan, unit_config.PlanFile) and config.plan.path == plan:
+            matches.append(row)
+    return matches[0] if len(matches) == 1 else NoNightlyAuthor()
+
+
 def _nightly_author(repo: Path, tip: str, blamed: str, receipts: Sequence[NightlyMergeReceipt],
-                    members: staff.StaffSnapshot) -> staff.StaffRow | NoNightlyAuthor:
-    if receipts:
-        descendants = set(checked_git(repo, "rev-list", "--ancestry-path", f"{blamed}..{tip}").splitlines())
-        descendants.add(blamed)
-        for receipt in receipts:
-            if receipt.checkpoint in descendants and receipt.merge in descendants:
-                producer = change_review.merge_producer(receipt.merge)
-                if isinstance(producer, str):
-                    row = members.by_id(producer)
-                    if row is not None and row.kind == "unit":
-                        return row
-                break
+                    members: staff.StaffSnapshot, production: staff.StaffId) -> staff.StaffRow | NoNightlyAuthor:
     subject = checked_git(repo, "show", "-s", "--format=%s", blamed)
     match = re.fullmatch(rf"fast-track\(({unit_names.NAME.pattern})\):\s+.+", subject)
     if match:
         rows = [row for row in members.find(kind="unit") if row.name == match[1]]
-        if len(rows) == 1:
-            return rows[0]
+        return rows[0] if len(rows) == 1 else NoNightlyAuthor()
+    if not receipts:
+        return NoNightlyAuthor()
+
+    descendants = set(checked_git(repo, "rev-list", "--ancestry-path", f"{blamed}..{tip}").splitlines())
+    descendants.add(blamed)
+    for receipt in receipts:
+        if receipt.checkpoint not in descendants or receipt.merge not in descendants:
+            continue
+        parents, _, merge_subject = checked_git(repo, "show", "-s", "--format=%P%n%s", receipt.merge).partition("\n")
+        if len(parents.split()) < 2 or merge_subject.startswith("Merge origin/main into "):
+            continue
+        ancestry = git(repo, "merge-base", "--is-ancestor", blamed, f"{receipt.merge}^1")
+        if ancestry.returncode == 0:
+            continue
+        if ancestry.returncode != 1:
+            raise GateRefused(f"Could not check the first parent of {receipt.merge}. {failure_detail(ancestry)}")
+        row = _nightly_plan_author(receipt.issue, production, members)
+        if isinstance(row, staff.StaffRow):
+            return row
+        producer = change_review.merge_producer(receipt.merge)
+        if isinstance(producer, str):
+            row = members.by_id(producer)
+            if row is not None and row.kind == "unit":
+                return row
+        break
     return NoNightlyAuthor()
 
 
+def _nightly_diagnostic_excerpt(lines: Sequence[str]) -> str:
+    shown = "\n".join(lines[:NIGHTLY_TYPE_DIAGNOSTIC_LINES])
+    omitted = len(lines) - NIGHTLY_TYPE_DIAGNOSTIC_LINES
+    return f"{shown}\n{omitted} other diagnostic lines omitted." if omitted > 0 else shown
+
+
 def _notify_nightly_type_authors(repo: Path, tip: str, result_id: str, type_failures: Sequence[GateJobResult],
-                                 tests_passed: bool) -> NightlyTypeNotices:
+                                 tests_passed: bool, production: staff.StaffId) -> NightlyTypeNotices:
     from scripts.production import showrunners
 
     pattern = re.compile(r"\s*(.+):([1-9]\d*):\d+ - (?:error|warning|information|note):.*")
@@ -2611,7 +2658,7 @@ def _notify_nightly_type_authors(repo: Path, tip: str, result_id: str, type_fail
                 blame = checked_git(repo, "blame", "--porcelain", "-L", f"{number},{number}", tip, "--", str(path))
                 blamed = blame.split(" ", 1)[0]
                 if blamed not in authors:
-                    authors[blamed] = _nightly_author(repo, tip, blamed, receipts, members)
+                    authors[blamed] = _nightly_author(repo, tip, blamed, receipts, members, production)
                 author = authors[blamed]
             except (GateRefused, OSError, ValueError, KeyError, subprocess.SubprocessError):
                 complete = False
@@ -2622,7 +2669,7 @@ def _notify_nightly_type_authors(repo: Path, tip: str, result_id: str, type_fail
             by_unit.setdefault(author.id, (author, []))[1].append(line)
     details: list[str] = []
     for author, lines in by_unit.values():
-        diagnostics_text = "\n".join(lines)
+        diagnostics_text = _nightly_diagnostic_excerpt(lines)
         try:
             notice = showrunners.send_to_address(f"session:{author.current_session}",
                 f"merge-gate-nightly:{result_id}:{author.id}",
@@ -2633,7 +2680,7 @@ def _notify_nightly_type_authors(repo: Path, tip: str, result_id: str, type_fail
             delivered = False
         complete = complete and delivered
         heading = f"Sent to {author.name}" if delivered else f"Could not send to {author.name}"
-        details.append(f"{heading}:\n{diagnostics_text}")
+        details.extend([f"{heading}:", *lines])
     if tests_passed and complete and by_unit:
         first = max(by_unit.values(), key=lambda entry: len(entry[1]))[0]
         return NightlyTypeNotices(tuple(details), NightlyFixAssigned(first.id, datetime.now(UTC).isoformat()))
@@ -2659,7 +2706,7 @@ def tell_nightly_red(args: GateArguments, tree: str, failed: Sequence[str], *,
             if summaries:
                 detail += "\n" + summaries[-1]
         if author_notices:
-            detail += "\n" + "\n".join(author_notices)
+            detail += "\n" + _nightly_diagnostic_excerpt(author_notices)
         if result_id:
             detail += f"\nAssign the fix, then run merge_gate.py nightly-assigned --result {result_id} --unit UNIT."
         owner = nightly_owner_name(args)
@@ -2693,7 +2740,8 @@ def nightly(args: GateArguments) -> int:
         _ = nightly_git(repo, "fetch", "origin",
                         f"+refs/heads/{args.merge_branch}:refs/remotes/origin/{args.merge_branch}")
         commit = checked_git(repo, "rev-parse", f"refs/remotes/origin/{args.merge_branch}")
-        with copies.standing(nightly_owner(args), repo, copies.CommittedSource(commit), step="test-nightly") as clone:
+        owner = nightly_owner(args)
+        with copies.standing(owner, repo, copies.CommittedSource(commit), step="test-nightly") as clone:
             tree = checked_git(clone, "rev-parse", "HEAD^{tree}")
             try:
                 run = run_suites(clone, NIGHTLY_TYPE_DIRS,
@@ -2734,7 +2782,7 @@ def nightly(args: GateArguments) -> int:
             with nightly_red_lock(wait=True) as directory:
                 save_nightly_red(directory, result)
                 notices = _notify_nightly_type_authors(clone, commit, identity, type_failures,
-                                                       not failed and not run.time_limit_report)
+                                                       not failed and not run.time_limit_report, staff.StaffId(owner))
                 assignment = notices.assignment
                 received = tell_nightly_red(args, tree, [*failed, run.time_limit_report] if run.time_limit_report else failed,
                                             type_failures=type_failures, author_notices=notices.details,

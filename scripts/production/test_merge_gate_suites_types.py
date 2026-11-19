@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import ClassVar, TextIO, cast, final, override
 from unittest import mock
 from datetime import UTC, datetime, timedelta, tzinfo
+from scripts.agents import remote
 from scripts.copies import copies
 from scripts.direct import progress_history
 from scripts.lib import build_folders
@@ -38,9 +39,12 @@ class MergeGateTypesTests(GateSuitesFixture):
         super().setUp()
         _ = cast(object, self.enterContext(mock.patch.object(merge_gate, "push_nightly_result")))
 
-    def run_nightly(self) -> subprocess.CompletedProcess[str]:
+    def run_nightly(self, *, production: str = "") -> subprocess.CompletedProcess[str]:
         arguments = ["--nightly", "--repo", str(self.checkout), "--merge-branch", "integration"]
-        with mock.patch.object(merge_gate, "nightly_owner", return_value="fixture-showrunner"):
+        if production:
+            arguments.extend(["--production", production])
+        owner = nullcontext() if production else mock.patch.object(merge_gate, "nightly_owner", return_value="fixture-showrunner")
+        with owner:
             return invoke_cli(merge_gate, lambda: merge_gate.main(arguments), arguments,
                               self.environment, self.root)
 
@@ -90,61 +94,89 @@ class MergeGateTypesTests(GateSuitesFixture):
     def test_nightly_sends_each_type_diagnostic_to_its_author_unit(self) -> None:
         history = self.root / "history"
         source = "scripts/receipt.py"
+        plan = "docs/plans/receipt.md"
+        self.write(self.main / "scripts/unknown.py", "VALUE = 3\n")
+        main_change = self.commit(self.main, "Change without an author unit")
+        _ = self.git(self.checkout, "merge", "--no-ff", "-m", "Merge origin/main into integration", main_change)
+        main_merge = self.git(self.checkout, "rev-parse", "HEAD")
+        self.write(self.main / "scripts/fast.py", "VALUE = 2\n")
+        fast_change = self.commit(self.main, "fast-track(fast): change the value")
+        _ = self.git(self.main, "push", "origin", "main")
+        _ = self.git(self.unit, "merge", "--no-ff", "-m", "Merge origin/main into unit-phase", fast_change)
+        self.write(self.unit / plan, "# Receipt plan\n")
         self.write(self.unit / source, "VALUE = 1\nOTHER = 2\n")
         checkpoint = self.commit(self.unit, "Checkpoint change")
-        _ = self.git(self.checkout, "fetch", str(self.unit), checkpoint)
         _ = self.git(self.checkout, "merge", "--no-ff", "-m", "Merge receipt fixture", checkpoint)
         receipt_merge = self.git(self.checkout, "rev-parse", "HEAD")
-        self.write(self.checkout / "scripts/fast.py", "VALUE = 2\n")
-        _ = self.commit(self.checkout, "fast-track(fast): change the value")
-        self.write(self.checkout / "scripts/unknown.py", "VALUE = 3\n")
-        _ = self.commit(self.checkout, "Change without an author unit")
         _ = self.git(self.checkout, "push", "origin", "HEAD:integration")
+        self.write(self.unit / ".unit.toml", f'plan = "{plan}"\nresponsibilities = []\n')
 
         self.environment["UNIT_HISTORY_DIR"] = str(history)
         with (mock.patch.dict(os.environ, self.environment),
               isolated_staff_file(self.root / "nightly-staff.json", self.environment)):
-            owner = fixture_member("showrunner", name="fixture-showrunner")
-            receipt_author = fixture_member("unit", name="receipt", parent=owner.id)
+            owner = fixture_member("showrunner", name="fixture-showrunner",
+                                   doc=staff.LiveDoc(remote.local_machine(), self.quiet_production))
+            receipt_author = fixture_member("unit", name="receipt", parent=owner.id,
+                                            worktree=staff.PresentWorktree(remote.local_machine(), self.unit))
             fast_author = fixture_member("unit", name="fast", parent=owner.id)
+            _ = progress_history.write_merge_receipt(project="origin", phase_id="2", merge_commit=main_merge,
+                                                     source_checkpoint=main_change, target_branch="integration",
+                                                     merged_at=1, issue=plan)
             _ = progress_history.write_merge_receipt(project="origin", phase_id="2", merge_commit=receipt_merge,
-                                                     source_checkpoint=checkpoint, target_branch="integration", merged_at=1)
-            change_review.record_merge_producer(change_review.KnownMergeProducer(receipt_merge, receipt_author.id))
+                                                     source_checkpoint=checkpoint, target_branch="integration",
+                                                     merged_at=2, issue=plan)
+            self.assertIsInstance(change_review.merge_producer(receipt_merge), change_review.UnknownProducer)
+            with (history / "merge_receipts.jsonl").open("a", encoding="utf-8") as receipts:
+                _ = receipts.write("{incomplete\n")
 
             receipt_lines = (f"{source}:1:1 - error: first", f"{source}:2:1 - error: second")
             fast_line = "scripts/fast.py:1:1 - error: third"
             unknown_line = "scripts/unknown.py:1:1 - error: fourth"
-            for case, extra_line, tests_red in (("assigned", "", False), ("unknown", unknown_line, False),
-                                                ("test red", "", True)):
+            limit = merge_gate.NIGHTLY_TYPE_DIAGNOSTIC_LINES
+            for case in ("assigned", "unknown", "test red", "long report", "notice failure"):
                 with self.subTest(case=case):
                     self.environment["MERGE_GATE_STATE_DIR"] = str(self.root / case)
-                    lines = [*receipt_lines, fast_line, *([extra_line] if extra_line else [])]
+                    routed_lines: list[str] = list(receipt_lines)
+                    if case == "long report":
+                        routed_lines.extend(f"{source}:1:1 - error: finding {i}." for i in range(limit))
+                    lines = [*routed_lines, fast_line]
+                    if case == "unknown":
+                        lines.append(unknown_line)
                     output = "\n".join([*lines, f"{len(lines)} errors, 0 warnings, 0 notes"])
                     type_check = merge_gate.GateJobResult("types", "basedpyright", 1, 0, output,
                                                          kind=merge_gate.GateJobKind.TYPE_CHECK)
-                    test = merge_gate.GateJobResult("hooks", "test_first.py", int(tests_red), 0, "")
+                    test = merge_gate.GateJobResult("hooks", "test_first.py", int(case == "test red"), 0, "")
                     run = merge_gate.GateRun((type_check, test), 0, 0)
+                    notice_result = "could not tell fixture-showrunner" if case == "notice failure" else "told fixture-showrunner"
                     with (mock.patch.object(merge_gate, "run_suites", return_value=run),
                           mock.patch.object(showrunners, "send_to_address", return_value=showrunners.NoticeDelivery()) as deliver,
-                          mock.patch.object(showrunners, "tell", return_value="told fixture-showrunner") as notice,
+                          mock.patch.object(showrunners, "tell", return_value=notice_result) as notice,
                           mock.patch.object(merge_gate, "send_nightly_red", return_value=True) as push):
-                        result = self.run_nightly()
+                        result = self.run_nightly(production=owner.name)
                     self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                     first, second = deliver.call_args_list
                     self.assertEqual(first.args[0], f"session:{receipt_author.current_session}")
                     self.assertEqual(second.args[0], f"session:{fast_author.current_session}")
                     first_text = cast(str, first.args[2])
                     second_text = cast(str, second.args[2])
-                    self.assertEqual(first_text.splitlines()[1:], list(receipt_lines))
+                    expected = routed_lines[:limit]
+                    if case == "long report":
+                        expected.append("2 other diagnostic lines omitted.")
+                    self.assertEqual(first_text.splitlines()[1:], expected)
                     self.assertEqual(second_text.splitlines()[1:], [fast_line])
                     self.assertIn("Fix it in your next phase.", first_text)
                     notice.assert_called_once()
                     notice_text = cast(str, notice.call_args.args[2])
                     self.assertIn("Sent to receipt:\n" + "\n".join(receipt_lines), notice_text)
-                    self.assertIn("Sent to fast:\n" + fast_line, notice_text)
+                    if case == "long report":
+                        author_lines = notice_text[notice_text.index("Sent to receipt:"):].splitlines()
+                        self.assertEqual(author_lines, ["Sent to receipt:", *routed_lines[:limit - 1],
+                                                       "5 other diagnostic lines omitted."])
+                    else:
+                        self.assertIn("Sent to fast:\n" + fast_line, notice_text)
                     path, = (Path(self.environment["MERGE_GATE_STATE_DIR"]) / "nightly-red").glob("*.json")
                     saved = merge_gate.read_nightly_red(path)
-                    if case == "assigned":
+                    if case in ("assigned", "long report", "notice failure"):
                         self.assertIsInstance(saved.assignment, merge_gate.NightlyFixAssigned)
                         assert isinstance(saved.assignment, merge_gate.NightlyFixAssigned)
                         self.assertEqual(saved.assignment.unit, receipt_author.id)
@@ -154,8 +186,10 @@ class MergeGateTypesTests(GateSuitesFixture):
                         self.assertIsInstance(saved.assignment, merge_gate.NightlyFixUnassigned)
                         push.assert_not_called()
                         self.assertIn(f"nightly-assigned --result {saved.id} --unit UNIT", notice_text)
-                    if extra_line:
-                        self.assertIn(extra_line, notice_text)
+                    if case == "unknown":
+                        self.assertIn(unknown_line, notice_text)
+                    if case == "notice failure":
+                        self.assertIsInstance(saved.received, merge_gate.NightlyNoticeUnreceived)
 
     def test_nightly_notice_limits_a_large_type_report_and_keeps_its_summary(self) -> None:
         from scripts.production import showrunners
@@ -518,6 +552,35 @@ class NightlyPushTests(unittest.TestCase):
                     sent.assert_called_once()
                     saved = cast(dict[str, object], json.loads(record_path.read_text()))
                     self.assertEqual(cast(dict[str, str], saved["assignment"])["unit"], str(self.fixer.id))
+
+    def test_nightly_check_retries_an_assigned_push_without_claiming_receipt(self) -> None:
+        directory = self.root / "state/nightly-red"
+        directory.mkdir(parents=True)
+        finished = "2026-11-11T08:00:00+00:00"
+        assignment = merge_gate.NightlyFixAssigned(self.fixer.id, "2026-11-11T08:05:00+00:00")
+        saved = merge_gate.NightlyRedResult("automatic", "main", "fixture-tree", finished, (),
+                                           "failed with 1 error, 0 warnings, 0 notes", "passed", assignment=assignment)
+        merge_gate.save_nightly_red(directory, saved)
+        path = directory / "automatic.json"
+        unavailable = subprocess.CompletedProcess([], 3, "", "sender unavailable")
+        accepted = subprocess.CompletedProcess([], 0, "SENT: fixture\n", "")
+        with (mock.patch.object(subprocess, "run", side_effect=[unavailable, accepted]) as sent,
+              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+            self.assertEqual(merge_gate.main(["nightly-check"]), 1)
+            self.assertEqual(merge_gate.read_nightly_red(path), saved)
+            self.assertEqual(merge_gate.main(["nightly-check"]), 0)
+            self.assertEqual(merge_gate.main(["nightly-check"]), 0)
+
+        first, retry = sent.call_args_list
+        command = cast(list[str], retry.args[0])
+        self.assertEqual(first.args[0], command)
+        self.assertEqual(command[command.index("--key") + 1], "nightly-result:automatic")
+        self.assertEqual(command[command.index("--text-id") + 1], "nightly.result")
+        self.assertFalse(any(word.startswith("received=") for word in command))
+        updated = merge_gate.read_nightly_red(path)
+        self.assertEqual(updated.received, saved.received)
+        self.assertEqual(updated.assignment, assignment)
+        self.assertIsInstance(updated.delivery, merge_gate.NightlyPushAccepted)
 
     def red_nightly(self, finished: datetime) -> Path:
         NightlyClock.current = finished
