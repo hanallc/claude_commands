@@ -203,13 +203,17 @@ Provisional: S2 designs the API from the uses and can change these phases. The S
 
 S3 and S4 run one after the other: a unit holds one Rust build-queue item at a time (nate, 2026-11-18). Each speed phase reports its result against its target: **milestone 7**.
 
-S3 runs as five phases in series, from the S3 inventory (2026-11-18). Each phase is one cargo-liner checkpoint:
+S3 runs as nine phases in series (the first two are done), re-cut from the declaration scope read (style-unit, 2026-11-19: the declaration outcome calls the rename proofs). Each phase is one cargo-liner checkpoint and adds one answer to the `finding` reply:
 
 1. `s3-cache`: typed facts apart from their wire format; the blob fact cache in `selection.sqlite` by blob id and reader version; misses parse on all cores.
 2. `s3-ledger`: read-only ledger access and the `finding` subcommand with its first answer, the source anchor, and the `observed` ledger revision.
-3. `s3-declarations`: `finding` adds declaration outcomes and site evidence.
-4. `s3-rename`: `finding` adds rename permission and the applied check.
-5. `s3-footprint`: `finding` adds footprints; the S3 measure (needed blobs, cold time, the stop point).
+3. `s3-site`: `original_site`, whether the original judgment still covers a site at the synced tip (`_site_proof`).
+4. `s3-relocation`: `same_declaration`, the declaration in place, a gained same-name destination, or the exact blocker.
+5. `s3-outside`: `outside_rename`, the source-based outside rename proof or its candidates and reasons.
+6. `s3-declarations`: `declaration` and `site_evidence`, the complete declaration reading. The request carries an approval snapshot (decision paths and answers); Python keeps the decision-file parse.
+7. `s3-rename`: `rename_admission`, the anchored rename permission or its refusal.
+8. `s3-rename-applied`: `rename_applied`, the ticket-aware applied check.
+9. `s3-footprint`: `footprint`; then the S3 measure (needed blobs, cold time, the stop point).
 
 Code with no consumer cannot land, so each S3 phase extends `finding`, its consumer. The `next` request and reply types (`NextOutcome`, `SelectedTicket`) move to S5, which builds `next` (style-unit, 2026-11-18).
 
