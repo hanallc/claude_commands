@@ -884,9 +884,11 @@ frame.addEventListener('load',async()=>{
             body = list_page.render(self.root / "reviews", include_counts=False).decode()
             self.assertIn(f'<h3>Latest status · <time datetime="{updated.isoformat()}">2026-11-16 13:20 EST</time></h3>', body)
 
-    def test_log_source_shows_the_recorded_clock_time(self) -> None:
+    def test_log_shows_the_recorded_clock_time_once(self) -> None:
         log = self.legacy_log('- 2026-11-16 18:20:00+00:00 Updated state: "Working" — morty, 09:00 CST')
-        self.assertIn("morty, 13:20 EST</small>", without_role_colors(log))
+        self.assertIn('<time datetime="2026-11-16T18:20:00+00:00">13:20 EST</time>', log)
+        self.assertIn("morty</small>", without_role_colors(log))
+        self.assertEqual(log.count("13:20 EST"), 1)
         self.assertNotIn("09:00 CST", log)
 
     def test_legacy_log_text_renders_with_a_new_field_change(self) -> None:
@@ -2828,9 +2830,11 @@ observer.observe(original.parentNode,{childList:true});
         self.assertNotIn('class="question-unread"', panel)
         log = re.sub(r'<span class="staff-name"[^>]*>(.*?)</span>', r'\1', log)
         question_row = '<li data-log-index="Q1-asked">' + asked_time + '<div>Question Q1 <small>— nate</small>'
-        answer_row = '<li data-log-index="Q1-answered">' + answer_time + '<div>Answer <small>— morty, 12:36 EST</small>'
+        answer_row = '<li data-log-index="Q1-answered">' + answer_time + '<div>Answer <small>— morty</small>'
         self.assertIn(question_row + '<p>What changed in &lt;List&gt;?</p></div></li>', log)
         self.assertIn(answer_row + '<p>The &lt;filter&gt; changed.</p></div></li>', log)
+        self.assertEqual(log.count('12:35 EST'), 1)
+        self.assertNotIn('12:36 EST', log)
         self.assertLess(log.index(answer_row), log.index(question_row))
 
     def test_stale_mark_read_keeps_the_newer_answer_in_the_panel(self) -> None:
