@@ -1338,7 +1338,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Result:** `registry_rows.replay` inserts a new row directly after the last key of its section, and a new section at the end of the file. Comments and blank lines after the last key stay below the new row. `bob=` in `config/models.conf` now follows `dwight=`. On main bec23322d (hash 96accc3fa).
 
-### Phase 82 — A producer sets the state and check time of its own List items  · status: todo
+### Phase 82 — A producer sets the state and check time of its own List items  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -1360,6 +1360,8 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Acceptance gate:**
 1. Each new test row fails on main. basedpyright: 0 errors, 0 warnings. Full gate green.
+
+**Result:** a producer sets `--state` (not Closed) and `--next-check` on its own List items, and the List records the source. A producer cannot change another producer's item. Landed inside the phase 83 merge, on main 69b0e7ae6 (hash 02977b702).
 
 ### Phase 83 — Tools add the present time; agents write only future times  · status: done
 **Depends on:** phase 82
