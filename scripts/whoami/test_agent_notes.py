@@ -100,7 +100,7 @@ class AgentNotesTests(unittest.TestCase):
         self.root = Path(directory.name)
         _ = self.enterContext(scratch_accounts_config())
         self.job_config = self.root / "agent_notes.toml"
-        _ = self.job_config.write_text("[mac_usage]\ninterval_seconds = 60\n")
+        _ = self.job_config.write_text("[mac_usage]\ninterval_seconds = 60\ncodex_interval_seconds = 1800\n")
         home_context = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root),
             "XDG_STATE_HOME": str(self.root / "state"), "AGENT_NOTES_JOB_CONFIG": str(self.job_config),
@@ -378,7 +378,7 @@ class AgentNotesTests(unittest.TestCase):
             clock.set_time(self.now + timedelta(seconds=150))
             agent_notes.usage_only()
             self.assertEqual(http.call_count, 1)
-            _ = self.job_config.write_text("[mac_usage]\ninterval_seconds = 30\n")
+            _ = self.job_config.write_text("[mac_usage]\ninterval_seconds = 30\ncodex_interval_seconds = 1800\n")
             agent_notes.usage_only()
         self.assertEqual(http.call_count, 2)
 
@@ -406,6 +406,25 @@ class AgentNotesTests(unittest.TestCase):
             clock.set_time(self.now + timedelta(seconds=209.9))
             agent_notes.usage_only()
             self.assertEqual(http.call_count, 2)
+
+    def test_usage_only_reads_a_codex_home_on_its_own_interval_less_the_poll_allowance(self) -> None:
+        _ = self.job_config.write_text("[mac_usage]\ninterval_seconds = 120\ncodex_interval_seconds = 600\n")
+        home = self.root / ".codex2"
+        with (self.live_usage_reader() as (clock, http),
+              patch.object(agent_accounts, "codex_homes", return_value=[home]),
+              patch.object(agent_accounts, "codex_live", return_value=Report("Codex", source=CodexHomeSource(home))) as codex):
+            for seconds, claude_reads, codex_reads in (
+                (0, 1, 1),
+                (104.9, 1, 1),
+                (105, 2, 1),
+                (584.9, 3, 1),
+                (585, 3, 2),
+            ):
+                with self.subTest(seconds=seconds):
+                    clock.set_time(self.now + timedelta(seconds=seconds))
+                    agent_notes.usage_only(poll_seconds=30)
+                    self.assertEqual(http.call_count, claude_reads)
+                    self.assertEqual(codex.await_args_list, [call(home)] * codex_reads)
 
     def test_usage_only_selection_failure_does_not_delay_the_next_read(self) -> None:
         directory = self.root / "state/agent-notes/usage-only"
@@ -580,11 +599,14 @@ class AgentNotesTests(unittest.TestCase):
             self.assertEqual(times[str(self.root / ".claude2")], (self.now + timedelta(seconds=179.9)).timestamp())
 
     def test_usage_only_refuses_missing_or_invalid_interval_with_file_and_key(self) -> None:
-        for text in ("", "[mac_usage]\n", "mac_usage = 60", "[mac_usage]\ninterval_seconds = 0",
-                     "[mac_usage]\ninterval_seconds = -1", "[mac_usage]\ninterval_seconds = true",
-                     '[mac_usage]\ninterval_seconds = "60"', "[mac_usage]\ninterval_seconds = nan",
-                     "[mac_usage]\ninterval_seconds = inf", "[mac_usage",
-                     "[mac_usage]\ninterval_seconds = " + "9" * 400):
+        cases = [(text, "interval_seconds") for text in ("", "[mac_usage]\n", "mac_usage = 60", "[mac_usage")]
+        for key, valid in (("interval_seconds", "codex_interval_seconds = 1800"),
+                           ("codex_interval_seconds", "interval_seconds = 120")):
+            base = f"[mac_usage]\n{valid}\n"
+            cases.append((base, key))
+            cases.extend((f"{base}{key} = {value}", key)
+                         for value in ("0", "-1", "true", '"60"', "nan", "inf", "9" * 400))
+        for text, key in cases:
             with self.subTest(config=text):
                 _ = self.job_config.write_text(text)
                 with (patch.object(sys, "argv", ["agent_notes.py", "usage-only"]),
@@ -592,7 +614,7 @@ class AgentNotesTests(unittest.TestCase):
                       self.assertRaises(SystemExit) as refusal):
                     agent_notes.main()
                 self.assertEqual(str(refusal.exception),
-                    f"{self.job_config}: mac_usage.interval_seconds must be a finite positive number")
+                    f"{self.job_config}: mac_usage.{key} must be a finite positive number")
                 read.assert_not_called()
                 self.assertFalse((self.root / "state/agent-notes/usage-only").exists())
         self.job_config.unlink()

@@ -9,6 +9,7 @@ from scripts.agents import remote
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 
 import contextlib
+import fcntl
 from dataclasses import replace
 import io
 import json
@@ -446,6 +447,7 @@ class LifecycleTests(LifecycleFixture):
         self.env["UNIT_HISTORY_DIR"] = str(history.parent.parent)
 
     def test_load_reports_code_checkpoints_after_a_parked_branch_is_deleted(self) -> None:
+        Path(self.env["NOTIFIER_SESSIONS_DIR"]).mkdir(parents=True, exist_ok=True)
         self.running()
         alpha_tip, _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "2")
         beta_tip, _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
@@ -486,11 +488,15 @@ class LifecycleTests(LifecycleFixture):
         address = Path(self.enterContext(short_socket_directory())) / "beta.sock"
         listener = socket.socket(socket.AF_UNIX)
         listener.bind(str(address))
+        listener.listen(128)
         self.addCleanup(listener.close)
+        from scripts.message import sessions
+
         records = Path(self.env["NOTIFIER_SESSIONS_DIR"])
         records.mkdir(parents=True, exist_ok=True)
         _ = (records / f"{pid}.json").write_text(json.dumps({
-            "pid": pid, "sessionId": beta.current_session, "name": "renamed-since-launch",
+            "pid": pid, "procStart": sessions.process_start(pid),
+            "sessionId": beta.current_session, "name": "renamed-since-launch",
             "messagingSocketPath": str(address), "updatedAt": 1, "tmux": "", "formerNames": [],
         }))
         fake_unit_host.place_process(self.env, pid, "w2:p1", exec_shell=True)
@@ -498,6 +504,22 @@ class LifecycleTests(LifecycleFixture):
         self.assert_step(result, "ok")
         self.assertIn("alpha: gone", result.stdout)
         self.assertIn("beta: renamed-since-launch live", result.stdout)
+
+    def test_load_reports_unknown_for_unproved_and_unlisted_units(self) -> None:
+        from scripts.production import session_staff, unit_lookup
+
+        self.running()
+        production = read_production("example")
+        pane = unit_lookup.LabeledSession("alpha", unit_lookup.ClaudeUnknown("owner unreadable"),
+            unit_lookup.Place("agents", "w1:p1"), identity=session_staff.UnprovedPaneIdentity())
+        every = unit_lookup.LabeledProductions({"example": {"alpha": pane}}, unreadable_pane_lists=(
+            session_staff.UnreadablePaneList("agents", "pane list denied"),))
+        output = io.StringIO()
+        with (mock.patch.object(unit_lookup, "every_labeled_session", return_value=every),
+              contextlib.redirect_stdout(output)):
+            production_lifecycle.load(production, [], True, None)
+        self.assertIn("alpha: unknown", output.getvalue())
+        self.assertIn("beta: unknown", output.getvalue())
 
     def test_open_holds_when_production_is_wrapped(self) -> None:
         self.running()
@@ -1078,6 +1100,33 @@ class LifecycleTests(LifecycleFixture):
                     self.assertIn("tree: ok — no parent and no child showrunners", result.stdout)
                     self.assertEqual(self.sent(), [])
 
+    def test_wrap_releases_only_the_free_worktree_pair(self) -> None:
+        self.running()
+        pairs: list[tuple[Path, Path]] = []
+        for tree in (self.alpha, self.beta):
+            _ = self.side_commit(tree, f"{tree.name}-branch", tree.name, "1")
+            lease = tree.with_name(tree.name + ".lease.json")
+            lock = tree.with_name(tree.name + ".lock")
+            _ = lease.write_text("{}\n")
+            lock.touch()
+            pairs.append((lease, lock))
+        _ = self.git("push", "origin", "production")
+        (held_lease, held_lock), (free_lease, free_lock) = pairs
+
+        with held_lock.open("r+") as descriptor:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            result = self.run_lifecycle("wrap", "--no-ci")
+
+        self.assert_step(result, "ok")
+        self.assertFalse(self.alpha.exists())
+        self.assertFalse(self.beta.exists())
+        self.assertEqual(held_lease.read_text(), "{}\n")
+        self.assertTrue(held_lock.is_file())
+        self.assertFalse(free_lease.exists())
+        self.assertFalse(free_lock.exists())
+        self.assertEqual(result.stderr.count("Worktree pair kept"), 1)
+        self.assertEqual(self.git("ls-remote", "--heads", "origin", "alpha-branch", "beta-branch"), "")
+
     def test_wrap_moves_a_doc_out_of_productions_into_the_archive(self) -> None:
         self.running()
         _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
@@ -1254,8 +1303,8 @@ class LifecycleTests(LifecycleFixture):
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assert_step(result, "ok")
         self.assertRegex(result.stdout, rf"(?m)^tidy: ok — removed footers-off/{owner_id}, "
-                         + rf"outstanding/{owner_id}\.json, {owner_id}/$")
-        self.assertFalse(any(path.exists() for path in own))
+                         + rf"outstanding/{owner_id}\.lock, outstanding/{owner_id}\.json, {owner_id}/$")
+        self.assertFalse(any(path.exists() for path in (*own, state / "outstanding" / f"{owner_id}.lock")))
         self.assertFalse((state / owner_id).exists())
         self.assertTrue(all(path.exists() for path in other))
 

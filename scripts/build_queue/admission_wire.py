@@ -1,7 +1,9 @@
 """Admission socket shapes and encoding without queue records at startup."""
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,11 +12,14 @@ from typing import TYPE_CHECKING, TypeVar, cast
 
 from scripts.build_queue import snapshot_codec as codec
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_targets import target_config
+from scripts.build_targets.execution_transport import HanaControlTransport
 
 if TYPE_CHECKING:
     from scripts.build_queue import admission_records as records
     from scripts.build_queue import placement
+    from scripts.build_targets.execution_transport import ExecutionTransport
 else:
     class _DeferredAdmissionRecords:
         """Load domain types when an annotation or a default needs them."""
@@ -101,6 +106,7 @@ class Identity:
     step: str
     folder: str
     unit: str = ""
+    job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -444,6 +450,42 @@ class CancelPlacement(CallerCode):
     reason: str
 
 
+def placement_configuration_digest(target_name: str, settings: placement.ProviderSettings, *,
+                                   targets: Iterable[target_config.Target],
+                                   transport_for: Callable[[target_config.SshTarget], ExecutionTransport],
+                                   read_bytes: Callable[[Path], bytes]) -> str:
+    """Hash the configuration for placement or an adapter refusal."""
+    from scripts.lib import conf
+
+    paths = {conf.path("build_targets"), conf.path("build_admission"), conf.path("mac_test")}
+    if isinstance(settings, placement.ExplicitProviderSettings):
+        paths.add(settings.path)
+    for target in targets:
+        if isinstance(target, target_config.SshTarget) and target.name == target_name:
+            paths.add(target.settings)
+            if target.platform != "linux":
+                continue
+            try:
+                transport = transport_for(records.ssh_target_settings(target, settings))
+            except conf.Unusable:
+                continue
+            if isinstance(transport, HanaControlTransport):
+                paths.add(conf.path("aws_target"))
+    digest = hashlib.sha256()
+    for path in sorted(paths):
+        digest.update(str(path).encode())
+        try:
+            contents = read_bytes(path)
+        except FileNotFoundError:
+            contents = b"missing"
+        except OSError as error:
+            # The provider reads and reports its own settings error.
+            digest.update(b"\0unreadable\0")
+            contents = type(error).__name__.encode()
+        digest.update(contents)
+    return digest.hexdigest()
+
+
 @dataclass(frozen=True)
 class ClaimFailure(CallerCode):
     """The report holds an assignment, failed provider claim, and reason."""
@@ -452,6 +494,8 @@ class ClaimFailure(CallerCode):
     reason: str
     claim: placement.ProviderClaimReference | placement.NoProviderClaim = field(
         default_factory=lambda: placement.NoProviderClaim())
+    refusal_settings: records.RefusalSettings | records.NoRefusalSettings = field(
+        default_factory=lambda: records.NoRefusalSettings())
 
 
 @dataclass(frozen=True)
@@ -507,6 +551,7 @@ class Assignment:
     assignment: placement.PlacementAssignment
     provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
     mac_disk_exclusions: tuple[str, ...] = ()
+    hana_image_stale: bool = False
 
 
 @dataclass(frozen=True)
@@ -516,6 +561,7 @@ class LocalPlacementGranted:
     grant: Admitted
     provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
     mac_disk_exclusions: tuple[str, ...] = ()
+    hana_image_stale: bool = False
 
 
 @dataclass(frozen=True)

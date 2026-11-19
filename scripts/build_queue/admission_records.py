@@ -17,12 +17,16 @@ from pathlib import Path
 
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import placement
+from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
+from scripts.build_targets import target_config
 from scripts.build_targets.target_config import LocalRequired, StepRoute
 from scripts.buildlog import parse
 from scripts.lib import conf
+from scripts.lib.proc_text import read_proc_text
+from scripts.production.staff import StaffId
 from scripts.lib.test_phase import (CallRecord as CallRecord, NoCallRecord as NoCallRecord,
                                    TestPhaseChargeUse as TestPhaseChargeUse)
 
@@ -31,8 +35,58 @@ DIRECT_CARGO = LocalRequired("a direct cargo command runs where it starts")
 
 
 @dataclass(frozen=True)
+class UnregisteredTarget:
+    """The target name has no registration."""
+
+
+def effective_target(name: str, settings: placement.ProviderSettings, *,
+                     configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT
+                     ) -> target_config.Target | UnregisteredTarget:
+    """Select the registered target with the settings supplied by the request."""
+    for target in target_config.read_targets(selected=name, purpose=target_config.RegistryRead.PLACEMENT,
+                                              configuration=configuration):
+        return ssh_target_settings(target, settings) if isinstance(target, target_config.SshTarget) else target
+    return UnregisteredTarget()
+
+
+def ssh_target_settings(target: target_config.SshTarget, settings: placement.ProviderSettings) -> target_config.SshTarget:
+    """Apply the settings supplied by the request to an SSH target."""
+    if isinstance(settings, placement.ExplicitProviderSettings):
+        return replace(target, settings=settings.path)
+    return target
+
+
+@dataclass(frozen=True)
+class RefusalSettings:
+    """The digest identifies the settings read immediately before a prelaunch refusal."""
+    digest: str
+
+
+@dataclass(frozen=True)
+class NoRefusalSettings:
+    """The report supplies no settings digest."""
+
+
+@dataclass(frozen=True)
+class RemoteStartHoldUnrecorded:
+    """The assignment has no recorded hold for a remote start."""
+
+
+@dataclass(frozen=True)
+class RemoteStartHold:
+    """Keep the local place until this deadline while a remote start is pending."""
+
+    deadline: float
+
+
+@dataclass(frozen=True)
+class RemoteStartHoldEnded:
+    """The remote assignment no longer keeps a place on natedev."""
+
+
+@dataclass(frozen=True)
 class SavedPlacementAssignment:
-    """The saved assignment holds its permission, claim, retry decision, and final report."""
+    """The saved assignment holds its settings generation and dispatch state."""
     assignment: placement.PlacementAssignment
     state: placement.AssignmentState = placement.CurrentAssignment()
     permission: placement.LaunchPermission = placement.PermissionAvailable()
@@ -40,6 +94,10 @@ class SavedPlacementAssignment:
     holder: placement.ClaimHolderIdentity | placement.ClaimHolderUnconfirmed = placement.ClaimHolderUnconfirmed("not consumed")
     retry: placement.RetryDecision = placement.DoNotRetry("attempt is not settled")
     terminal_report: placement.TerminalAttemptReport | placement.NoTerminalReport = placement.NoTerminalReport()
+    assigned_settings_generation: placement.AssignedSettingsGeneration | placement.UnknownAssignedSettingsGeneration = (
+        placement.UnknownAssignedSettingsGeneration())
+    refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
+    remote_start_hold: RemoteStartHold | RemoteStartHoldUnrecorded | RemoteStartHoldEnded = RemoteStartHoldUnrecorded()
 
 # Historical multiplier for saved dev bases from the Phase 24 replay.
 DEV_HEADROOM = 4.2034275337646125
@@ -320,6 +378,8 @@ class Reservation(TypedDict):
     test_phase_charge_use: NotRequired[TestPhaseChargeUse]
     build_run: NotRequired[LiveBuildRun | NoLiveBuildRun]
     run_origin: NotRequired[CallerRun | FoundRun]
+    slot_staff: NotRequired[StaffId | NoEndedStepStaff]
+    job: NotRequired[StepJob]
 
 
 @dataclass(frozen=True)
@@ -599,6 +659,7 @@ class Waiter(TypedDict):
     test_threads: NotRequired[int | None]
     # Requests can record a route. Direct commands without a reason use DIRECT_CARGO.
     route: NotRequired[StepRoute]
+    job: NotRequired[StepJob]
 
 
 @dataclass(frozen=True)
@@ -699,12 +760,40 @@ class RunUseUnavailable:
 
 
 @dataclass(frozen=True)
+class NoEndedStepStaff:
+    """The ended step has no recorded staff owner."""
+
+
+@dataclass(frozen=True)
+class EndedStepFactNotRecorded:
+    """The reservation did not record this fact about the ended step."""
+
+
+@dataclass(frozen=True)
+class EndedStepFacts:
+    """The reservation's work and staff facts survive until the hold ends."""
+
+    step: str | EndedStepFactNotRecorded
+    package: str | PackageNotRecorded
+    project: str | EndedStepFactNotRecorded
+    folder: str | EndedStepFactNotRecorded
+    staff_id: StaffId | NoEndedStepStaff
+    job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
+
+
+@dataclass(frozen=True)
+class HoldPredatesStepFacts:
+    """The saved hold records its memory but has no facts about the ended step."""
+
+
+@dataclass(frozen=True)
 class BetweenStepsSlot:
     """The run retains memory between steps until the slot expires."""
     run: LiveBuildRun
     reservation: str
     bytes: int
     expires_at: float
+    identity: EndedStepFacts | HoldPredatesStepFacts
 
 
 @dataclass(frozen=True)
@@ -887,7 +976,7 @@ class NatedevHeld:
     purpose: str
 
 HeadCause = (MemoryPressure | PressureUnavailable | ReadingUnavailable | StartSpacingWait | NeedsMemory | EstimateExpired
-             | BehindHead | GpuSlotWait | ReadyForAdmission)
+             | BehindHead | GpuSlotWait | ReadyForAdmission | placement.CargoFolderWait)
 
 
 @dataclass(frozen=True)
@@ -900,7 +989,7 @@ class HeadAdmissionStatus:
 
 WaitReason = (StartSpacingWait | PressureUnavailable | EstimateExpired | NeedsMemory | BehindHead | GpuSlotWait
               | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure | TokenWaitingWaiter
-              | NatedevHeld)
+              | NatedevHeld | placement.CargoFolderWait)
 
 
 def held_text(wait: NatedevHeld) -> str:
@@ -927,6 +1016,8 @@ def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
         return "head: " + gpu_slot_text(cause)
     if isinstance(cause, ReadyForAdmission):
         return "head: ready for admission"
+    if isinstance(cause, placement.CargoFolderWait):
+        return "head: " + placement.CARGO_FOLDER_WAIT_REASON
     return f"head: needs {reason.need / GIB:.1f} GiB; room {max(0, reason.decision.room.room) / GIB:.1f} GiB"
 
 
@@ -951,6 +1042,7 @@ class WaitingStep:
     run: LiveBuildRun | NoLiveBuildRun = field(default=NoLiveBuildRun(), kw_only=True)
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
+    job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -971,6 +1063,7 @@ class RunningStep:
     assignment_host: str = ""
     package: str | PackageNotRecorded = field(default=PackageNotRecorded(), kw_only=True)
     route: StepRoute = field(default=DIRECT_CARGO, kw_only=True)
+    job: StepJob | GateJobNotRecorded = field(default=GATE_JOB_NOT_RECORDED, kw_only=True)
 
 
 def execution_host(step: RunningStep, local_host: str) -> str:
@@ -1159,6 +1252,10 @@ class QueueInputs:
     blockers_for: frozenset[str] = frozenset()
     waiter_orders: dict[str, PriorityUnit | NormalOrder] = field(default_factory=dict, kw_only=True)
     slots: tuple[RunSlot, ...] = field(default=(), kw_only=True)
+    cargo_folders: dict[str, placement.CargoFolder] = field(default_factory=dict, kw_only=True)
+    occupied_cargo_folders: frozenset[placement.CargoFolder] = field(default=frozenset(), kw_only=True)
+    pending_remote_starts: frozenset[str] = field(default=frozenset(), kw_only=True)
+    local_waits: dict[str, placement.EvidenceNeeded] = field(default_factory=dict, kw_only=True)
 
     def __post_init__(self) -> None:
         orders = {waiter_owner(row): (waiter_priority(row) if isinstance(row.get("order"), (PriorityUnit, NormalOrder))
@@ -1418,7 +1515,7 @@ test_threads = parse.test_threads
 
 def process_start_time(pid: int) -> str | None:
     try:
-        stat = (Path("/proc") / str(pid) / "stat").read_text()
+        stat = read_proc_text(Path("/proc") / str(pid) / "stat")
         fields = stat.rsplit(") ", 1)[1].split()
         return fields[19] if fields[0] not in ("Z", "X") else None
     except (OSError, IndexError):
@@ -1559,6 +1656,8 @@ def reason_phrase(reason: WaitReason, waiting: Sequence[WaitingStep]) -> str:
             return "another step just started; the queue waits a few seconds between starts"
         case NeedsMemory():
             return "free memory"
+        case placement.CargoFolderWait():
+            return placement.CARGO_FOLDER_WAIT_REASON
         case GpuSlotWait():
             return "GPU test slot"
         case BehindHead():

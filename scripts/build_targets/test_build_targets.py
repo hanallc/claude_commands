@@ -291,6 +291,21 @@ class StatusTests(IsolatedBuildTargetTest):
             code = build_targets.command_status(probe)
         return code, output.getvalue(), errors.getvalue()
 
+    def test_status_names_the_stale_hana_image_once(self) -> None:
+        from scripts.aws_target import hana_box, hana_placement
+
+        workload = self.root / 'hana_aws.conf'
+        _ = workload.write_text('execution_transport=hana-control\nhost=aws-hana\n')
+        target = target_config.SshTarget('hana-aws', 'linux', workload)
+        controller = hana_box.HanaController(self.root / 'state', self.root / 'account.conf', workload,
+            hana_box.ProviderNotInstalled())
+        controller.register(hana_box.DeploymentIdentity('fixture', 'fixture', 'fixture', 'fixture'))
+        with (mock.patch.object(build_targets, 'read_targets', return_value=[target]),
+                mock.patch.object(hana_placement, 'controller_for', return_value=controller)):
+            status, output, errors = self.capture_status()
+        self.assertEqual((status, errors), (0, ''))
+        self.assertEqual(output, f'hana-aws: unreachable — {hana_box.HANA_IMAGE_STALE}\n')
+
     def test_mac_idle_alert_prints_first_with_red_only_on_a_terminal(self) -> None:
         _ = write_idle_alert(self.root / "mac-idle", NOW.timestamp())
         config = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
@@ -848,6 +863,25 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
                     self.root, "claude", "run", ("python3", "-m", "unittest"), NoOwningSession(), "fixed-source",
                     selection=Pinned("mac"))
                 mac, = (candidate for candidate in constraints.candidates if candidate.destination.target == "mac")
+                self.assertEqual(mac.eligibility, expected)
+
+    def test_claude_doc_exclusion_applies_only_to_the_default_route(self) -> None:
+        cases: tuple[tuple[str, build_targets.StepKind, TargetSelection, placement.HostEligibility], ...] = (
+            (".claude", "doc", ROUTED, placement.FixedExclusion("offload_exclude")),
+            (".claude", "doc", Pinned("mac"), placement.AllowedHost()),
+            (".claude", "lint", ROUTED, placement.AllowedHost()),
+            ("hana", "doc", ROUTED, placement.AllowedHost()),
+            ("hana", "lint", ROUTED, placement.AllowedHost()),
+        )
+        for repo, kind, selection, expected in cases:
+            with self.subTest(repo=repo, kind=kind, selection=selection), mock.patch.object(
+                eligibility, "repository_identity", return_value=eligibility.KnownRepository(repo),
+            ):
+                constraints = build_targets.fixed_placement_constraints(
+                    self.root, "portable", kind, ("cargo", kind), NoOwningSession(), "fixed-source",
+                    selection=selection)
+                mac, = (candidate for candidate in constraints.candidates
+                        if candidate.destination.target == "mac")
                 self.assertEqual(mac.eligibility, expected)
 
     def test_temporary_refusals_keep_mac_retries_and_off_refuses_mac_steps(self) -> None:

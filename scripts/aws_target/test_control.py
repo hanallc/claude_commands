@@ -11,7 +11,6 @@ import fcntl
 import json
 import shutil
 import os
-from pathlib import Path
 import subprocess
 import sys
 from typing import cast, override
@@ -22,8 +21,9 @@ from scripts.review_links.test_page_frame import assert_status_states
 from scripts.aws_target import admin_secrets, aws_page, aws_target, deploy, ledger, run_cost, spend, spot_table
 from scripts.aws_target import config as aws_config
 from scripts.aws_target.control_test_support import TestClock
-from scripts.aws_target.ledger_test_support import CostFixture, text_setting
+from scripts.aws_target.ledger_test_support import CostFixture
 from scripts.lib import atomic_file, conf
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.notify import push_texts
 from scripts.review_links import console_theme, review_link
 
@@ -63,20 +63,19 @@ class ControlTests(CostFixture):
         self.notice_accepted = True
         self.failure_reason = 'AccessDenied: account 123456789012'
         self.omitted = ''
-        source = Path(__file__).resolve().parents[2] / 'config/cloud_gate.conf'
         values_path = self.root / 'cloud_gate.conf'
-        _ = values_path.write_bytes(source.read_bytes())
-        # Use different regions and types to detect dependencies on shipped values.
-        text_setting(values_path, 'spot_candidate_regions', 'us-east-1 us-west-1 us-east-1')
-        text_setting(values_path, 'instance_types', 'c7a.4xlarge m7a.2xlarge')
-        text_setting(values_path, 'price_compare_instance_types', 'm7a.8xlarge c7a.4xlarge')
-        text_setting(values_path, 'gpu_instance_types', 'g6.2xlarge g4dn.xlarge')
-        text_setting(values_path, 'gate_wait_usd_per_minute', '0')
+        _ = write_config_fixture(values_path, """spot_candidate_regions=us-east-1 us-west-1 us-east-1
+instance_types=c7a.4xlarge m7a.2xlarge
+price_compare_instance_types=m7a.8xlarge c7a.4xlarge
+gpu_instance_types=g6.2xlarge g4dn.xlarge
+hana_gpu_instance_types=g6.2xlarge g4dn.2xlarge
+gate_wait_usd_per_minute=0
+""")
         values = conf.read(values_path)
         self.regions = tuple(dict.fromkeys(values.words('spot_candidate_regions')))
         self.standard = values.words('instance_types')
         self.compare = tuple(size for size in values.words('price_compare_instance_types') if size not in self.standard)
-        self.gpu = values.words('gpu_instance_types')
+        self.gpu = ('g6.2xlarge', 'g4dn.xlarge', 'g4dn.2xlarge')
         self.sizes = (*self.standard, *self.compare, *self.gpu)
         self.quota = deploy.largest_gate_vcpus(self.sizes) * 3 + 1
         self.enterContext(mock.patch.dict(os.environ, {
@@ -612,7 +611,7 @@ class ControlTests(CostFixture):
             self.assertEqual(aws_target.main(), 1)
         read.assert_called_once_with(self.settings, self.state)
 
-    def test_scaler_policy_allows_snapshot_reads_in_all_regions(self) -> None:
+    def test_scaler_policy_allows_spot_reads_in_all_regions(self) -> None:
         document = ledger.mapping(cast(object, json.loads(deploy.TEMPLATE.read_text())))
         resources = ledger.mapping(document['Resources'])
         policy = ledger.mapping(ledger.mapping(resources['GateGpuTrialScalerPolicy'])['Properties'])
@@ -621,9 +620,10 @@ class ControlTests(CostFixture):
         # Derive IAM actions from every API request in the snapshot path.
         actions = {arguments[5].replace('-', '') + ':' + ''.join(
             word.capitalize() for word in arguments[6].split('-')) for arguments in self.calls}
-        for action in actions:
-            self.assertTrue(any(action in cast(list[str], row['Action']) and row['Resource'] == '*'
-                                and row['Effect'] == 'Allow' and 'Condition' not in row for row in statements))
+        for action in sorted(actions | {'ec2:GetSpotPlacementScores'}):
+            with self.subTest(action=action):
+                self.assertTrue(any(action in cast(list[str], row['Action']) and row['Resource'] == '*'
+                                    and row['Effect'] == 'Allow' and 'Condition' not in row for row in statements))
 
     def test_initial_failure_saves_each_error_and_the_table_names_its_time(self) -> None:
         self.failure = 'describe-spot-price-history'

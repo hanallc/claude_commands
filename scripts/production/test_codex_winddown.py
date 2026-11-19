@@ -35,7 +35,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.herdr import herdr, worker_panes
 from scripts.message import process_table, roster
 from scripts.message.process_table import Process
-from scripts.message.sessions import SessionRecord
+from scripts.message.sessions import SessionRecord, process_start
 from scripts.production.showrunners import Showrunner
 
 SCRIPT = Path(__file__).with_name("codex_winddown.py")
@@ -196,7 +196,7 @@ class NoticeRetryTests(unittest.TestCase):
         with mock.patch.object(broadcast, "send", side_effect=Killed):
             with self.assertRaises(Killed):
                 _ = codex_winddown.refresh(self.runner.id, [self.unit.id], {self.unit.id: 0}, 1000)
-        _ = staff.rename(self.unit.id, "renamed-unit")
+        _ = staff.rename(self.unit.id, "renamed")
         current = staff.native_id(fixture_runtime_id("winddown-after-clear"))
         _ = staff.update_current_session(self.unit.current_session, current)
         from scripts.message import sessions
@@ -589,7 +589,8 @@ class MessageTests(unittest.TestCase):
             self.addCleanup(listener.close)
             listener.bind(str(socket_dir / f"{name}.sock"))
             _ = (self.root / f"sessions/{pid}.json").write_text(json.dumps({
-                "pid": pid, "sessionId": fixture_runtime_id("showrunner::show") if name == "hana" else
+                "pid": pid, "procStart": process_start(pid),
+                "sessionId": fixture_runtime_id("showrunner::show") if name == "hana" else
                     fixture_runtime_id("unit:" + fixture_runtime_id("showrunner::show") + ":trunk"), "name": name, "updatedAt": 1,
                 "tmux": "",
                 "messagingSocketPath": str(socket_dir / f"{name}.sock"),

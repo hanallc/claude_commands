@@ -116,11 +116,12 @@ submitted_review = design_roles.submitted_review
 
 
 def read_review(reply: Path, run: Path) -> int:
-    """Read a completed pass after the caller receives its hook message."""
-    if not progress_history.reply_completed(run, reply):
+    """Read a saved review reply with a matching DONE."""
+    result = progress_history.read_completed_reply(run, reply)
+    if isinstance(result, progress_history.NoValidatedDispatchReply):
         print("astra_review: the review pass is not completed", file=sys.stderr)
         return 1
-    print(reply.read_text(encoding="utf-8").strip())
+    print(result.text.strip())
     print(f"\nSaved: {reply}")
     return 0
 

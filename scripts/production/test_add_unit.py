@@ -358,6 +358,9 @@ class AddUnitLaunchTests(AddUnitTestCase):
         (self.state / f"herdr-live-{SHARED}").unlink()
         for pid in (101, 102):
             shutil.rmtree(self.root / "proc" / str(pid))
+        director = self.env["FAKE_CLAUDE_PID"]
+        shutil.rmtree(self.root / "proc" / director)
+        (Path(self.env["NOTIFIER_SESSIONS_DIR"]) / f"{director}.json").unlink()
         before_calls = len(self.herdr_calls())
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(unit_config.read(worktree), unit_config.UnitConfig(
@@ -1322,6 +1325,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.herdr_overrides["--session default session list --json"] = CommandResponse(code=0, stdout=json.dumps(
             herdr.SessionListResult(sessions=[herdr.SessionEntry(name="alpha2", running=True, default=False,
                 session_dir="/fixture", socket_path="/fixture/socket")])))
+        self.herdr_overrides["--session alpha2 pane list"] = CommandResponse(
+            code=0, stdout=json.dumps({"result": {"panes": []}}))
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(len(self.servers_started()), 1)
 

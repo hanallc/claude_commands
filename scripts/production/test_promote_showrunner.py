@@ -515,7 +515,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         place = herdr.HerdrPlace("agents", "w8:p1")
         with (mock.patch.object(showrunners, "current_name", return_value=""),
               mock.patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(5151)),
-              mock.patch.object(herdr, "herdr_place_of", return_value=place),
+              mock.patch.object(herdr, "process_placement", return_value=place),
               mock.patch.object(herdr.Herdr, "panes", return_value=[pane_identity(place.pane, "child")]),
               mock.patch.object(herdr.Herdr, "native_session", return_value=SESSION),
               mock.patch.object(herdr, "submitted_prompt", return_value=submitted),
@@ -579,7 +579,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         pending = promote_showrunner.promotion_record(parent, "demo")
         errors = io.StringIO()
 
-        with (mock.patch.object(herdr, "herdr_place_of", return_value=herdr.HerdrPlace("agents", "w8:p1")),
+        with (mock.patch.object(herdr, "process_placement", return_value=herdr.HerdrPlace("agents", "w8:p1")),
               mock.patch.object(herdr.Herdr, "native_session", return_value=SESSION),
               mock.patch.object(herdr.Herdr, "run", return_value="────────\n❯ \n────────"),
               mock.patch.object(herdr.Herdr, "_wait_for_submit", return_value=None),

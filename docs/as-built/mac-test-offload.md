@@ -26,7 +26,11 @@ The same episode can receive a Mac assignment after disk evidence recovers.
 The live step record keeps diagnostic disk evidence.
 Standalone fixed local callers retain their existing local admission path.
 
-Doc prepares one staged snapshot before routing. Both routes judge that snapshot and write the same doc pass record after success, only if the staged tree still matches. The Mac runner gets the original repository identity and `--source-root` for the snapshot; it copies no unstaged or untracked sources.
+Doc uses a snapshot of the staged tree.
+After success, verify writes a doc pass record if the staged tree still matches the snapshot.
+The Mac runner uses the original repository identity and copies the snapshot from `--source-root`.
+Default routing excludes the Mac for `doc` from the `.claude` repository through `offload_exclude..claude=doc`.
+An explicit Mac pin permits doc for that repository.
 
 Lint judgments, check, and doc use the same availability checks and target reservations as tests.
 A free eligible target permits immediate routing, including during a natedev Cargo token wait.
@@ -313,7 +317,17 @@ Declined, lost, and invalid results return the step to its waiting state.
   A Linux step checks tool versions before this removal.
   A missing target or a failed removal does not stop the build.
 - **Cleanup.** After `echo mac_exit=$?` the remote command runs a cleanup step whatever the tests returned. When the verb arguments name `--target-dir` (or `--target-dir=`), it prints `mac_cleanup=skipped`. Otherwise it reads free GiB with `df -g "$HOME"`: below `free_floor_gib` it runs `rm -rf -- "$HOME"/.local/state/mac-test/mirror/<repo>/target` and prints `mac_cleanup=0` or the `rm` status; at or above the floor, or when `df` gives no number, it prints `mac_cleanup=kept` and the output stays for the next run. That path is the only thing it removes.
-- **Markers.** Output streams as it arrives. `stream_mac_run` holds a `mac_exit=<n>` line (n at most 255) as the result only while every later line is a `mac_cleanup=` marker; any other later line prints the held line and makes the result `MISSING_MAC_STATUS`. The held line proves a finished run whatever ssh returned. `parse_cleanup` reads the marker into `CleanupOutcome = CleanupDone | CleanupFailed(rc) | CleanupSkipped | CleanupKept | CleanupUnconfirmed`; a missing, malformed or out-of-range marker is `CleanupUnconfirmed`. `ReportedMacStatus(status, cleanup)` carries both, and the test result always comes from `status`.
+- **Nextest output.** The Mac saves both output streams in a private file under `~/.local/state/mac-test/logs`.
+  After success, the runner sends the full output and deletes the file.
+  After failure, it reports the saved path and sends a tail of `nextest_failure_tail_bytes` bytes (65,536 by default).
+  It also sends the last nextest Summary line, up to `nextest_failure_summary_bytes` bytes (1,024 by default).
+  The hourly Mac `tmp_sweep.py` job removes closed, owned logs after `nextest_failure_log_days` days (seven by default).
+  It measures age from the failure time or, for an interrupted run, the last write time.
+  On the Mac, read a saved log with `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/nextest_log.py read PATH`.
+  The reader holds a shared lock until the copy ends.
+  The sweep holds an exclusive lock during removal and also checks for open files with `lsof`.
+  If the log writer cannot start nextest, the runner reports a setup failure.
+- **Markers.** `stream_mac_run` holds a `mac_exit=<n>` line (n at most 255) as the result only while every later line is a `mac_cleanup=` marker; any other later line prints the held line and makes the result `MISSING_MAC_STATUS`. The held line proves a finished run whatever ssh returned. `parse_cleanup` reads the marker into `CleanupOutcome = CleanupDone | CleanupFailed(rc) | CleanupSkipped | CleanupKept | CleanupUnconfirmed`; a missing, malformed or out-of-range marker is `CleanupUnconfirmed`. `ReportedMacStatus(status, cleanup)` carries both, and the test result always comes from `status`.
 - `report_cleanup` prints `Mac build output not removed: <rc>`, `Mac build output kept: the run used another target dir` or `Mac build output cleanup unconfirmed`, and nothing for `CleanupDone` or `CleanupKept`. On `CleanupUnconfirmed`, `claimed_run` runs `check_leftovers` and releases the claim only on `LeftoversEnded`; every other outcome releases it.
 - SIGINT, SIGTERM, and SIGHUP stop the SSH child.
   The runner checks remote leftovers and releases its claim only after it confirms their end.

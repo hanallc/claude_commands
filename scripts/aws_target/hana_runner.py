@@ -22,6 +22,12 @@ if TYPE_CHECKING:
 
 
 IMAGE_COMPILER_VERSION = Path('/etc/hana-aws/compiler-version')
+SHELL_TIMEOUT_KEY = 'loopback.shell_timeout_s'
+COMMAND_TIMEOUT_KEY = 'loopback.command_timeout_s'
+EXECUTION_TIMEOUT_KEYS = (SHELL_TIMEOUT_KEY, COMMAND_TIMEOUT_KEY)
+EXECUTION_SHELL_KEY = 'execution_shell'
+FREE_FLOOR_KEY = 'free_floor_gib'
+EXECUTION_CONFIG_KEYS = (EXECUTION_SHELL_KEY, FREE_FLOOR_KEY)
 
 
 class HanaCompilerVersionUnavailable(ValueError):
@@ -85,18 +91,18 @@ class GuestExecutionTimeouts:
 
 
 def read_timeouts() -> GuestExecutionTimeouts:
-    values = conf.read_or_repository('build_targets').values()
-    return GuestExecutionTimeouts(linux_runner.positive_setting(values, 'loopback.shell_timeout_s'),
-        linux_runner.positive_setting(values, 'loopback.command_timeout_s'))
+    values = conf.read_or_repository('build_targets').values(*EXECUTION_TIMEOUT_KEYS)
+    return GuestExecutionTimeouts(linux_runner.positive_setting(values, SHELL_TIMEOUT_KEY),
+        linux_runner.positive_setting(values, COMMAND_TIMEOUT_KEY))
 
 
 def read_settings(configuration: conf.ConfigRead) -> GuestExecutionSettings:
-    values = configuration.values()
+    values = configuration.values(*EXECUTION_CONFIG_KEYS)
     timeouts = read_timeouts()
-    settings = GuestExecutionSettings(configuration.text('execution_shell'),
+    settings = GuestExecutionSettings(configuration.text(EXECUTION_SHELL_KEY),
         timeouts.shell_timeout_s,
         read_image_compiler_version(),
-        linux_runner.positive_setting(values, 'free_floor_gib'),
+        linux_runner.positive_setting(values, FREE_FLOOR_KEY),
         timeouts.command_timeout_s)
     if not settings.shell or not settings.compiler_version:
         raise ValueError('The guest requires a shell and a compiler version')

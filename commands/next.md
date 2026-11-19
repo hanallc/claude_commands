@@ -149,16 +149,24 @@ Apply an approved change; commit and push only when the user says so.
 
 ## question
 
-In a producer session, `/next question` reads that producer's own question folder without a production document.
+If `/next` shows a sent Question, keep its full key and fixed owner.
+Show the Question and the recipient's reply.
+To mark it important, run `update_registration.py mark-important --key "<key>" --production <fixed owner>`.
+When the user accepts the reply, run the displayed `answer --key` command to mark the Question read.
+
+For a Question filed outside Review, use `--item` when the title identifies one Question.
+If the command lists matching keys, select the intended Question and use its full `--key`.
+
+In a producer session, `/next question` reads the producer's question folder.
 The Review page sends an answer to the producer's current session.
-For a chat answer, run `update_registration.py answer --production <producer name> --item "<its text>"`.
+To answer in chat, run `update_registration.py answer --production <producer name> --item "<its text>"`.
 Use its relay line to send the answer to the producer.
 
-The current open question. A question with a follow-up that waits for the asker's reply is not shown.
-Mark: `update_registration.py mark-important
---production <showrunner name> --item "<its text>"`. Ask it in full: what is asked,
-why, and the answer choices. Act on the user's answer as `/showrunner:produce` →
-Throughout says, and remove the item through its Open-questions list.
+A Question with a pending follow-up stays out of `/next`.
+Mark a Question important with `update_registration.py mark-important --production <showrunner name> --item "<its text>"`.
+Ask the full Question and show its reason and choices.
+Follow the instructions in the Throughout section of `/showrunner:produce`.
+Remove the Question through the Open-questions list.
 
 An item shown with `asked by <unit>` was filed with `/unit:question` or
 `/showrunner:question`. When the user answers it, run `update_registration.py
@@ -187,9 +195,10 @@ Approve and Decline make the item Done at once.
 Approve sends the user's words and the record command to the owner showrunner.
 Run that command when the message arrives.
 Decline records the answer at once: a proposal's declined answer, or an efficiency's `declined` outcome.
-Send feedback sends the words to the owner and closes the item.
-Ask question moves it to Waiting.
+Send feedback closes questions, investigations, proposals and efficiencies.
+Ask question moves those items to Waiting.
+On a change, Send feedback and Ask question send the words to the showrunner and move the change to Validating.
 Answer it with `change_page.py answer-question --item <Review key> --question <id> --text "<answer>"`.
 Use the question ID from the request message for all five Review types.
-The item returns to For you with the answer in its log.
+The item returns to Open with the answer in its log.
 Later takes a date and time and hides the item from Review, the count and `/next` until then.

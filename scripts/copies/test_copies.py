@@ -25,11 +25,11 @@ from unittest import mock
 from scripts.buildlog.store import host_name
 from scripts.copies import copies
 from scripts.build_queue.admission_test_support import AdmissionFixture
-from scripts.build_queue import admission_protocol as wire
+from scripts.build_queue import admission_protocol as wire, slot_wait
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
-from scripts.lib import build_folders, copy_record, scratch
+from scripts.lib import build_folders, copy_record, scratch, session_folder
 from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.lint import folder_audit, sweep, tmp_sweep
 from scripts.lint.memory_test_support import write_config_fixture
@@ -160,7 +160,7 @@ class StandingTests(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, environment, clear=True))
         self.enterContext(isolated_staff_file(self.base / "staff.json", {}))
         parent = fixture_member("showrunner", name="builds")
-        owner = fixture_member("unit", name="verify-unit", parent=parent.id)
+        owner = fixture_member("unit", name="copy-owner", parent=parent.id)
         self.owner_id = str(owner.id)
         os.environ["CODEX_THREAD_ID"] = ""
         os.environ["CLAUDE_CODE_SESSION_ID"] = owner.current_session
@@ -252,7 +252,7 @@ class StandingTests(unittest.TestCase):
 
     def test_same_named_units_have_separate_folders_and_removal(self) -> None:
         parent = fixture_member("showrunner", name="another-production")
-        other = fixture_member("unit", name="verify-unit", parent=parent.id)
+        other = fixture_member("unit", name="copy-owner", parent=parent.id)
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as first:
             with copies.standing(str(other.id), self.source, copies.CommittedSource(self.head)) as second:
                 self.assertNotEqual(first, second)
@@ -285,6 +285,13 @@ class StandingTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertEqual(result.stderr, "copies: calling session has no staff row or unit owner\n")
                     self.assertFalse(self.gates.exists())
+
+    def test_free_slot_does_not_resolve_the_queue_name(self) -> None:
+        command = ("bash", "-c", "bash /fixture/verify.sh check hana")
+        with mock.patch.object(slot_wait, "command_slot_name", wraps=slot_wait.command_slot_name) as resolve:
+            with copies.command_tree(self.owner_id, self.source, copies.CommittedSource(self.head), command) as tree:
+                self.assertTrue(tree.is_dir())
+        resolve.assert_not_called()
 
     def test_expired_slot_wait_stops_the_cli_before_it_starts_the_command(self) -> None:
         _ = write_config_fixture(self.base / "config/build_folders.conf",
@@ -585,6 +592,118 @@ class StandingTests(unittest.TestCase):
         self.assertEqual(scratch.end("gate:camera"), [checkout])
         self.assertFalse(checkout.exists())
         self.assertEqual((self.source / "tracked.txt").read_text(), "source HEAD\n")
+
+    def test_clone_git_child_keeps_both_destination_locks_after_parent_death(self) -> None:
+        task = "gate:orphan-clone"
+        child = """import os, sys
+ready, release, *locks = map(int, sys.argv[2:])
+os.write(ready, os.fsencode(sys.argv[1]) + b'\\n')
+os.read(release, 1)
+for lock in locks:
+    os.close(lock)
+"""
+        maker = """import subprocess, sys
+from pathlib import Path
+from unittest.mock import patch
+from scripts.copies import copies
+
+source, task, child, ready, release = sys.argv[1:]
+run = subprocess.run
+ready, release = int(ready), int(release)
+
+def pause_clone(arguments, **options):
+    if arguments[0] != 'git' or arguments[5:8] != ['-C', source, 'clone']:
+        return run(arguments, **options)
+    locks = options['pass_fds']
+    options['pass_fds'] = (*locks, ready, release)
+    destination = Path(arguments[-1]).parent
+    return run([sys.executable, '-c', child, str(destination), str(ready), str(release), *map(str, locks)], **options)
+
+with patch.object(subprocess, 'run', pause_clone):
+    copies.clone(Path(source), task, 'orphan')
+"""
+        with ExitStack() as pipes:
+            ready_read, ready_write = os.pipe()
+            ready = pipes.enter_context(os.fdopen(ready_read, "r", encoding="utf-8"))
+            ready_writer = pipes.enter_context(os.fdopen(ready_write, "wb"))
+            release_read, release_write = os.pipe()
+            release_reader = pipes.enter_context(os.fdopen(release_read, "rb"))
+            release = pipes.enter_context(os.fdopen(release_write, "wb"))
+            process = pipes.enter_context(subprocess.Popen(
+                [sys.executable, "-c", maker, str(self.source), task, child, str(ready_write), str(release_read)],
+                env={**os.environ, session_folder.ROOT_ENV: str(self.base / "session")},
+                pass_fds=(ready_write, release_read), stderr=subprocess.PIPE))
+            ready_writer.close()
+            release_reader.close()
+            try:
+                self.assertTrue(select.select([ready], [], [], TEST_HANG_GUARD_SECS)[0], "Git did not start")
+                line = ready.readline().strip()
+                if not line:
+                    _, error = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    self.fail(f"The clone maker exited before Git started: {error.decode(errors='replace')}")
+                checkout = Path(line)
+                self.assertTrue(checkout.is_relative_to(self.base / "scratch"))
+                process.kill()
+                _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(build_folders.build_folder_state(checkout), "held")
+                with scratch.busy_path(checkout).open("rb") as other, self.assertRaises(BlockingIOError):
+                    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                result = scratch.end(task)
+                self.assertEqual(result, [])
+                self.assertEqual(result.kept, [scratch.KeptFolder(checkout, scratch.BUSY_REASON)])
+                self.assertTrue(checkout.is_dir())
+                release.close()
+                self.assertTrue(select.select([ready], [], [], TEST_HANG_GUARD_SECS)[0], "Git did not exit")
+                self.assertEqual(ready.read(), "")
+                self.assertEqual(scratch.end(task), [checkout])
+                self.assertFalse(checkout.exists())
+            finally:
+                release.close()
+                if process.poll() is None:
+                    process.kill()
+                    _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+
+    def test_removal_retry_claims_a_missing_busy_mark_and_refuses_a_linked_checkout(self) -> None:
+        task = "gate:retry-source"
+        clone = copies.clone(self.source, task, "source")
+        with mock.patch.object(scratch, "remove", side_effect=OSError("stop after removal intent")):
+            self.assertTrue(scratch.end(task).kept)
+        self.assertTrue(scratch.removal_mark(clone).is_file())
+        busy = scratch.busy_path(clone)
+        busy.unlink()
+        destination = self.base / "late-worktree"
+        request = build_folders.LinkedEditableRepository(destination, clone,
+                                                         build_folders.NewWorktreeBranch("late", self.head))
+        with self.assertRaisesRegex(BlockingIOError, "source removal has already started"):
+            _ = build_folders.create_build_folder(request)
+        self.assertFalse(destination.exists())
+        self.assertEqual(self.git(clone, "branch", "--list", "late"), "")
+
+        work = clone / "new-work" / scratch.BUSY
+        work.parent.mkdir()
+        _ = work.write_text("Keep this file")
+        kept = scratch.end(task)
+        self.assertEqual(kept, [])
+        self.assertTrue(kept.kept)
+        self.assertEqual(work.read_text(), "Keep this file")
+        work.unlink()
+        work.parent.rmdir()
+        busy.unlink(missing_ok=True)
+
+        remove = scratch.remove
+
+        def check_retry(path: Path) -> None:
+            self.assertEqual(path, clone)
+            with busy.open("rb") as other, self.assertRaises(BlockingIOError):
+                fcntl.flock(other, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            with self.assertRaises(BlockingIOError):
+                _ = build_folders.create_build_folder(request)
+            remove(path)
+
+        with mock.patch.object(scratch, "remove", side_effect=check_retry):
+            self.assertEqual(scratch.end(task), [clone])
+        self.assertFalse(scratch.removal_mark(clone).exists())
+        self.assertFalse(destination.exists())
 
     def clone_trust_files(self, trusted_homes: tuple[int, ...] = (0, 1, 2)) -> tuple[Path, ...]:
         home = Path.home()
@@ -1920,7 +2039,7 @@ class StandingTests(unittest.TestCase):
                     result = self.cli('list')
                     self.assertEqual(result.returncode, 0, result.stderr)
                     line = next(line for line in result.stdout.splitlines() if str(tree) in line)
-                    for value in ('verify-unit', 'origin', self.head[:7], 'busy', str(os.getpid())):
+                    for value in ('copy-owner', 'origin', self.head[:7], 'busy', str(os.getpid())):
                         self.assertIn(value, line)
                     self.assertIn(f'\t{host_name()}\t', line)
                 result = self.cli('list')
@@ -1937,7 +2056,7 @@ class StandingTests(unittest.TestCase):
                 if layout == 'mixed':
                     remote = next(row for row in rows if row['path'] == mirror.path)
                     self.assertEqual((remote['owner'], remote['repository'], remote['host']),
-                                     ('verify-unit', self.source.name, 'remote-host'))
+                                     ('copy-owner', self.source.name, 'remote-host'))
                     self.assertEqual((remote['state'], remote['session'], remote['holder_pid']),
                                      expected_remote_lease_columns('idle', '-', '-'))
 

@@ -17,14 +17,17 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
+from importlib import import_module
 from pathlib import Path
-from collections.abc import Callable, Generator
-from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import NamedTuple, NotRequired, TypedDict, cast
+from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
+from typing import Literal, NamedTuple, NotRequired, TypedDict, cast, overload
 from zoneinfo import ZoneInfo
 
 from scripts.production.production_doc import Production, Refusal, read_production
@@ -33,13 +36,15 @@ from scripts.production.checkpoint_gate import report
 from scripts.production import change_routing, delivery_state, showrunners, session_staff, showrunner_tree, staff, unit_lookup
 from scripts.production.proposals_folder import issues_folder
 from scripts.production.store_owner import showrunner_id
-from scripts.production.record_store import state_root
+from scripts.production import record_store
+from scripts.production.record_store import has_line_break, state_root
 from scripts.production.issues import Issue, frontmatter
 from scripts.lib import urgency
 from scripts.lib.urgency import Urgency, UrgencyError
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.user_zone import user_zone
 
+from scripts.review_links import new_item_dialog, review_events
 from scripts.usage import agents_log
 
 from scripts.lib import conf, names
@@ -106,6 +111,20 @@ class OutstandingQuestion:
     # The fixed staff id identifies the asker for the answer relay.
     asked_by: str = ""
     followups: tuple[Followup, ...] = ()
+
+
+@dataclass(frozen=True, kw_only=True)
+class SentOutstandingQuestion(OutstandingQuestion):
+    key: str
+    recipient: staff.StaffId
+
+    @property
+    def reference_text(self) -> str:
+        return f"{self.text} ({self.key})"
+
+    def read_command(self) -> str:
+        return ("~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py answer "
+                f"--production {shlex.quote(self.recipient)} --key {shlex.quote(self.key)}")
 
 
 @dataclass(frozen=True)
@@ -183,7 +202,7 @@ class RefusedQuestionTitle:
 def check_question_title(text: str) -> ValidQuestionTitle | RefusedQuestionTitle:
     """Check the title before a new or changed question reaches storage."""
     limit = conf.read_or_repository("production").whole("question_title_max_chars")
-    if not text.strip() or text.splitlines() != [text]:
+    if not text.strip() or has_line_break(text):
         return RefusedQuestionTitle("must be one nonempty line; put the rest in --context and --item")
     if len(text) > limit:
         return RefusedQuestionTitle(f"has {len(text)} characters; the limit is {limit}; put the rest in --context and --item")
@@ -252,7 +271,14 @@ def parse_outstanding_entries(entries: object, path: Path) -> list[Outstanding]:
             raise InputError(f"{where}: expected an object")
         fields = cast(dict[str, object], entry)
         check_keys(fields, {"since", "text", "after", "question", "parts", "reviewed", "review_unavailable", "urgency",
-                            "due", "marked", "follows", "asked_by", "followup", "followups", "review_id", "review_log", "waiting_why"}, where)
+                            "due", "marked", "follows", "asked_by", "followup", "followups", "review_id", "review_log", "waiting_why",
+                            "review_submission"}, where)
+        details: new_item_dialog.SubmissionOrigin = new_item_dialog.NoReviewSubmission()
+        if "review_submission" in fields:
+            try:
+                details = new_item_dialog.read_submission(fields["review_submission"])
+            except ValueError as error:
+                raise InputError(f"{where}.review_submission: {error}") from error
         if "parts" in fields:
             _ = read_parts(fields["parts"], where)
         rank = read_ranking(fields, where)
@@ -291,6 +317,15 @@ def parse_outstanding_entries(entries: object, path: Path) -> list[Outstanding]:
                 raise InputError(f"{where}.review_unavailable: expected reason text")
             items.append(ReviewUnavailableOutstandingQuestion(since_at, text, question, unavailable, timing, rank, asked_by,
                                                               followups))
+        elif isinstance(details, new_item_dialog.ReviewSubmission):
+            identity = fields.get("review_id")
+            if not isinstance(identity, str) or not re.fullmatch(r"Q[1-9][0-9]*", identity) or not asked_by:
+                raise InputError(f"{where}: a sent Question requires a native ID and recipient.")
+            recipient = staff.StaffId(asked_by)
+            key = new_item_dialog.submission_key(new_item_dialog.SubmissionKind.QUESTION, recipient, identity,
+                                                 details.request_id)
+            items.append(SentOutstandingQuestion(since_at, text, question, timing, rank, asked_by, followups,
+                                                 key=key, recipient=recipient))
         else:
             items.append(OutstandingQuestion(since_at, text, question, timing, rank, asked_by, followups))
     return sorted(items, key=lambda item: item.since)
@@ -339,6 +374,7 @@ class OutstandingItem(TypedDict):
     waiting_why: NotRequired[str]
     review_id: NotRequired[str]
     review_log: NotRequired[str]
+    review_submission: NotRequired[dict[str, object]]
     since: str
     text: str
     after: NotRequired[str]
@@ -588,7 +624,7 @@ def answered_items(outstanding: Path, now: datetime) -> list[AnsweredItem]:
     if not history.exists():
         return []
     retained: list[AnsweredItem] = []
-    for line in history.read_text(encoding="utf-8").splitlines():
+    for line in history.read_text(encoding="utf-8", newline="\n").split("\n"):
         try:
             value = cast(object, json.loads(line))
             if not isinstance(value, dict):
@@ -946,9 +982,11 @@ def outstanding_file(reference: str, *, identities: QuestionStaff | None = None)
 
 
 def outstanding_path(production: QuestionScope) -> Path:
-    root = state_root()
-    owner = production.owner
-    return root / "outstanding" / f"{owner.id}.json"
+    return outstanding_path_for_owner(production.owner.id)
+
+
+def outstanding_path_for_owner(owner: staff.StaffId) -> Path:
+    return state_root() / "outstanding" / f"{owner}.json"
 
 
 @dataclass(frozen=True)
@@ -972,14 +1010,13 @@ def question_folder(document: Path | staff.StaffRow, identities: QuestionStaff, 
     if isinstance(document, staff.StaffRow):
         if document.kind != "producer":
             raise RegistrationFailure("questions", f"{document.id}: expected a producer")
-        return QuestionFolder(state_root() / document.id / "questions", document.id)
+        return QuestionFolder(record_store.default_question_folder(document.id), document.id)
     owner = identities.record.by_doc(local_machine(), document)
     if owner is None or owner.kind != "showrunner":
         return QuestionOwnerUnavailable(document)
     assert isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
     folder = issues_folder(owner.doc.path, lines=lines)
-    root = state_root()
-    return QuestionFolder(folder if folder is not None else root / owner.id / "questions", owner.id)
+    return QuestionFolder(folder if folder is not None else record_store.default_question_folder(owner.id), owner.id)
 
 
 @dataclass(frozen=True)
@@ -993,63 +1030,130 @@ class QuestionRecord:
     status: str
 
 
-def question_records(production: QuestionScope, identities: QuestionStaff) -> list[QuestionRecord]:
-    return question_records_for_document(question_source(production), identities)
+def question_records(production: QuestionScope, identities: QuestionStaff, *, strict: bool = False) -> list[QuestionRecord]:
+    return question_records_for_document(question_source(production), identities, strict=strict)
 
 
 def question_records_for_document(doc: Path | staff.StaffRow, identities: QuestionStaff, *, include_unrouted: bool = False,
                                   lines: list[str] | None = None,
                                   sources: list[Path] | None = None, statuses: tuple[str, ...] = (),
-                                  owner_ids: set[staff.StaffId] | None = None) -> list[QuestionRecord]:
+                                  owner_ids: set[staff.StaffId] | None = None, strict: bool = False) -> list[QuestionRecord]:
     """Read canonical question records without requiring unrelated checkpoint fields."""
-    folder = question_folder(doc, identities, lines=lines)
+    try:
+        folder = question_folder(doc, identities, lines=lines)
+    except (OSError, UnicodeError):
+        if strict or sources is not None:
+            raise
+        assert isinstance(doc, Path)
+        row = identities.record.by_doc(local_machine(), doc)
+        folder = (QuestionFolder(record_store.default_question_folder(row.id), row.id)
+                  if row is not None and row.kind == "showrunner" else QuestionOwnerUnavailable(doc))
     if isinstance(folder, QuestionOwnerUnavailable):
-        source = issues_folder(folder.document, lines=lines) if include_unrouted else None
+        try:
+            source = issues_folder(folder.document, lines=lines) if include_unrouted else None
+        except OSError:
+            source = None
         if source is None:
             return []
     else:
         source = folder.path
-    from scripts.production.issues import source_paths
+    owner = folder.owner if isinstance(folder, QuestionFolder) else staff.StaffId("")
+    require_complete = strict or sources is not None
+    roots = record_store.known_folders(record_store.RecordKind.QUESTION, owner, (source,),
+                                       document=doc if isinstance(doc, Path) else None, strict=require_complete)
+    paths = record_store.stored_paths(roots, sources=sources, strict=require_complete)
+    if sources is not None:
+        # Use the Question filename in the shared current folder. The proposal reader reads its other headers.
+        shared = source.resolve() if isinstance(doc, Path) and owner and source != record_store.default_question_folder(owner) else None
+        paths = (path for path in paths if path.parent != shared or path.name.startswith("question-"))
+    return selected_question_records(sorted(paths), statuses, owner_ids, sources, owner, strict=strict)
 
-    paths = sorted(source_paths(source, "question-*.md", sources=sources))
-    return selected_question_records(paths, statuses, owner_ids, sources,
-                                    folder.owner if isinstance(folder, QuestionFolder) else "")
+
+def review_question_path(folder: QuestionFolder, request_id: str) -> Path:
+    digest = hashlib.sha256(request_id.encode()).hexdigest()
+    return folder.path / f"question-{folder.owner}-review-{digest}.md"
+
+
+def find_review_question_in_folder(folder: QuestionFolder,
+                                   lookup: new_item_dialog.ReviewSubmissionLookup,
+                                   *, other_folders: Iterable[Path] = (),
+                                   document: Path | None = None) -> QuestionRecord | None:
+    paths = _known_question_paths(folder.owner, folder.path, *other_folders, document=document,
+                                  strict=True, require_document=False)
+    for path in paths:
+        fields = _question_fields(path, folder.owner)
+        if fields is None:
+            continue
+        registration = fields.value("registration")
+        if isinstance(lookup, new_item_dialog.ByRequestId) and lookup.value not in registration:
+            continue
+        if isinstance(lookup, new_item_dialog.ByItemId) and _stored_question_id(fields) != lookup.value:
+            continue
+        for record in _question_records([fields], legacy_owner=folder.owner):
+            if "review_submission" in record.item and (isinstance(lookup, new_item_dialog.ByItemId)
+                    or new_item_dialog.read_submission(record.item["review_submission"]).request_id == lookup.value):
+                return record
+    return None
+
+
+def read_review_question(path: Path, owner: str = "") -> QuestionRecord:
+    """Read one sent question at its native path."""
+    records = _question_records([Issue(path, record_store.read_header(path, strict=True))], legacy_owner=owner)
+    if len(records) != 1 or "review_submission" not in records[0].item:
+        raise OSError(f"Cannot read a saved question at {path}.")
+    return records[0]
 
 
 def selected_question_records(paths: list[Path], statuses: tuple[str, ...], owner_ids: set[staff.StaffId] | None,
-                              sources: list[Path] | None = None, owner: str = "") -> list[QuestionRecord]:
+                              sources: list[Path] | None = None, owner: str = "", *, strict: bool = True,
+                              allowed_owners: tuple[staff.StaffId, ...] = ()) -> list[QuestionRecord]:
     """Select by status and owner before decoding the question registration."""
     def wanted(issue: Issue) -> bool:
-        if issue.value("record_type") != "question" or owner and issue.value("production_id") != owner:
+        production = record_store.record_owner(record_store.RecordKind.QUESTION, issue, owner)
+        if issue.value("record_type") != "question":
+            return False
+        if allowed_owners and production not in allowed_owners or owner and production != owner:
             return False
         if owner_ids is not None:
-            owner_ids.add(staff.StaffId(issue.value("production_id")))
+            owner_ids.add(production)
         return not statuses or issue.value("status") in statuses or issue.value("status") not in ("open", "closed")
 
     issues: list[Issue] = []
     for path in paths:
-        fields = frontmatter(path, sources=sources, keys=frozenset(("record_type", "status", "production_id")), select=wanted)
+        keys = frozenset(("record_type", "status", "production_id"))
+        if strict:
+            fields = record_store.read_header(path, sources=sources, strict=True)
+            if not wanted(Issue(path, fields)):
+                continue
+        else:
+            fields = record_store.read_header(path, sources=sources, keys=keys, select=wanted)
         if fields:
             issues.append(Issue(path, fields))
-    return _question_records(issues)
+    return _question_records(issues, legacy_owner=owner)
+
+
+def question_records_for_owner(owner: staff.StaffId, *, statuses: tuple[str, ...] = (),
+                               owner_ids: set[staff.StaffId] | None = None, strict: bool = False) -> list[QuestionRecord]:
+    paths = sorted(_known_question_paths(owner, strict=strict))
+    return selected_question_records(paths, statuses, owner_ids, owner=owner, strict=strict)
 
 
 def unowned_question_records(identities: QuestionStaff, *, statuses: tuple[str, ...] = (),
                              owner_ids: set[staff.StaffId] | None = None) -> list[QuestionRecord]:
-    """Read state questions, including producers without production documents."""
-    owners = {row.id for row in identities.record.rows if row.kind == "showrunner"}
-    paths = sorted(path for path in state_root().glob("*/questions/question-*.md")
-                   if path.parent.parent.name not in owners)
-    return selected_question_records(paths, statuses, owner_ids)
-
-
-def _question_records(issues: list[Issue]) -> list[QuestionRecord]:
-    """Read canonical question fields from their issue records."""
-    questions = [issue for issue in issues if issue.value("record_type") == "question"]
-    if not questions:
-        return []
+    """Read state questions outside the stores of showrunners."""
     records: list[QuestionRecord] = []
-    for issue in questions:
+    for owner, row in record_store.store_owners(record_store.RecordKind.QUESTION, identities.record).items():
+        if row is None or row.kind != "showrunner":
+            records.extend(question_records_for_owner(owner, statuses=statuses, owner_ids=owner_ids))
+    return records
+
+
+def _question_records(issues: list[Issue], *, legacy_owner: str = "") -> list[QuestionRecord]:
+    """Read canonical question fields from their issue records."""
+    records: list[QuestionRecord] = []
+    for issue in issues:
+        if issue.value("record_type") != "question":
+            continue
         path = issue.path
         try:
             raw = cast(object, json.loads(issue.value("registration")))
@@ -1066,50 +1170,188 @@ def _question_records(issues: list[Issue]) -> list[QuestionRecord]:
         status = issue.value("status")
         if status not in {"open", "closed"}:
             raise RegistrationFailure("questions", f"{path}: question status must be open or closed")
-        records.append(QuestionRecord(path, staff.StaffId(issue.value("production_id")), staff.StaffId(asker), item, status))
+        owner = record_store.record_owner(record_store.RecordKind.QUESTION, issue, legacy_owner)
+        records.append(QuestionRecord(path, owner, staff.StaffId(asker), item, status))
     return records
+
+
+def pending_review_reply(record: QuestionRecord) -> bool:
+    """Return whether a sent Question still accepts a scoped reply."""
+    return record.status == "open" and "review_submission" in record.item and "followup" in record.item
+
+
+@contextmanager
+def wrap_question_locks(*owners: staff.StaffId) -> Generator[None]:
+    """Lock Question stores in staff ID order."""
+    with ExitStack() as locks:
+        for owner in sorted(set(owners)):
+            _ = locks.enter_context(outstanding_lock(outstanding_path_for_owner(owner)))
+            _ = locks.enter_context(_question_number_lock(owner))
+        yield
 
 
 def close_questions(document: Path, identities: QuestionStaff) -> None:
     """Close the production's questions and retain their records for history."""
-    _ = identities.owner(document)
-    with outstanding_lock(outstanding_file(identities.owner(document).id, identities=identities)):
-        for record in question_records_for_document(document, identities):
-            if record.status == "open":
-                write_question_record(QuestionRecord(record.path, record.owner, record.asker, record.item, "closed"))
+    owner = identities.owner(document).id
+    with outstanding_lock(outstanding_file(owner, identities=identities)), _question_number_lock(owner), ExitStack() as rollback:
+        closing = [replace(record, status="closed") for record in question_records_for_document(document, identities, strict=True)
+                   if record.status == "open" and not pending_review_reply(record)]
+        texts = [_question_text(record) for record in closing]
+        with question_numbers() as numbers:
+            for record, text in zip(closing, texts, strict=True):
+                _ = rollback.enter_context(record_store.keep_file_on_error(record.path))
+                _write_question_text(record, text, numbers)
+
+
+def _question_fields(path: Path, owner: staff.StaffId) -> Issue | None:
+    issue = Issue(path, record_store.read_header(path, strict=True))
+    if issue.value("record_type") == "question" and record_store.record_owner(record_store.RecordKind.QUESTION, issue, owner) == owner:
+        return issue
+    return None
+
+
+def _stored_question_id(issue: Issue) -> str:
+    registration = issue.value("registration")
+    try:
+        item = cast(object, json.loads(registration))
+    except ValueError:
+        # Reserve a legible ID even if a different field is damaged.
+        match = re.search(r'(?:^|[,{])\s*"review_id"\s*:\s*"(Q[1-9][0-9]*)"', registration)
+        return match[1] if match else ""
+    if isinstance(item, dict):
+        identity = cast(dict[object, object], item).get("review_id")
+        if isinstance(identity, str) and re.fullmatch(r"Q[1-9][0-9]*", identity):
+            return identity
+    return ""
+
+
+def _question_ids(owner: staff.StaffId, paths: Iterable[Path]) -> Iterator[tuple[Issue, str]]:
+    for path in paths:
+        if (fields := _question_fields(path, owner)) is not None and (identity := _stored_question_id(fields)):
+            yield fields, identity
+
+
+def _known_question_paths(owner: staff.StaffId, *folders: Path, document: Path | None = None,
+                          strict: bool = False, require_document: bool = True) -> Iterator[Path]:
+    roots = record_store.known_folders(record_store.RecordKind.QUESTION, owner, folders, document=document,
+                                       strict=strict, require_document=require_document)
+    return record_store.stored_paths(roots, strict=strict)
+
+
+def _question_number_lock(owner: staff.StaffId) -> AbstractContextManager[None]:
+    return outstanding_lock(state_root() / "review-folders" / owner / "question-numbers")
+
+
+def _seed_question_id(path: Path) -> str:
+    fields = record_store.number_fields(path, frozenset(("record_type", "registration")))
+    return _stored_question_id(fields) if fields.value("record_type") == "question" else ""
+
+
+def question_numbers() -> AbstractContextManager[record_store.LockedRecordNumbers]:
+    return record_store.record_numbers(record_store.RecordKind.QUESTION, _seed_question_id)
+
+
+def _publish_question(record: QuestionRecord, *, record_history: Callable[[], None] | None = None) -> str:
+    """Save the record and assign an ID if this is its first numbered write."""
+    with question_numbers() as numbers:
+        identity = _numbered_question_id(record) or numbers.next_id(record.path.parent)
+        numbered = replace(record, item={**record.item, "review_id": identity})
+        text = _question_text(numbered)
+        if record_history is not None:
+            record_history()
+        _write_question_text(numbered, text, numbers)
+        record.item["review_id"] = identity
+        return identity
 
 
 def question_review_id(record: QuestionRecord) -> str:
-    """Allocate the question's stable owner-local number in its existing record."""
-    if identity := record.item.get("review_id", ""):
+    """Give a legacy Question its stored ID under the owner's lock."""
+    if identity := _numbered_question_id(record):
         return identity
-    with outstanding_lock(record.path.parent / ".review-ids"):
-        fields = frontmatter(record.path) if record.path.exists() else {}
-        if fields:
-            current = _question_records([Issue(record.path, fields)])[0]
-            record = current
-        identity = record.item.get("review_id", "")
-        if identity:
-            return identity
-        highest = 0
-        for path in record.path.parent.glob("question-*.md"):
-            fields = frontmatter(path, keys=frozenset(("record_type", "registration")))
-            if fields.get("record_type") != ["question"]:
+    with _question_number_lock(record.owner):
+        return _publish_question(_current_legacy_question(record))
+
+
+def _numbered_question_id(record: QuestionRecord) -> str:
+    identity = record.item.get("review_id", "")
+    return identity if re.fullmatch(r"Q[1-9][0-9]*", identity) else ""
+
+
+def _current_legacy_question(record: QuestionRecord) -> QuestionRecord:
+    """Check that an unnumbered selection still refers to the same Question."""
+    fields = _question_fields(record.path, record.owner)
+    if fields is None:
+        raise RegistrationFailure("questions", f"{record.path}: the selected Question changed")
+    current, = _question_records([fields], legacy_owner=record.owner)
+    previous = current.item.copy()
+    _ = previous.pop("review_id", None)
+    expected = record.item.copy()
+    _ = expected.pop("review_id", None)
+    if replace(current, item=previous) != replace(record, item=expected):
+        raise RegistrationFailure("questions", f"{record.path}: the selected Question changed")
+    return current
+
+
+def _file_question(record: QuestionRecord,
+                   before_write: Callable[[str, Path], None] = lambda _id, _path: None
+                   ) -> QuestionRecord:
+    with _question_number_lock(record.owner), question_numbers() as numbers:
+        folder = record.path.parent
+        names = {path.name for path in _known_question_paths(record.owner, folder, strict=True)}
+        identity = numbers.next_id(folder)
+        while True:
+            path = record_store.free_record_path(record.path, names)
+            filed = replace(record, path=path, item={**record.item, "review_id": identity})
+            text = _question_text(filed, new_record=True)
+            assert text is not None
+            before_write(identity, path)
+            try:
+                with numbers.write(path, identity, record.owner, new_record=True):
+                    try:
+                        record_store.create_record_text(path, text)
+                    except record_store.ReusedReviewRecord:
+                        filed = read_review_question(path, record.owner)
+                        if filed.owner != record.owner or not (saved_id := _numbered_question_id(filed)):
+                            raise OSError(f"Cannot read a saved question at {path}.") from None
+                        before_write(saved_id, path)
+            except record_store.OccupiedRecordPath:
+                names.add(path.name)
+                identity = numbers.next_id_after_collision(identity, path)
                 continue
-            registration = next(iter(fields.get("registration", [])), "")
-            number = re.search(r'(?:^|[,{])\s*"review_id"\s*:\s*"Q([1-9][0-9]*)"', registration)
-            if number is not None:
-                highest = max(highest, int(number[1]))
-        identity = f"Q{highest+1}"
-        record.item["review_id"] = identity
-        write_question_record(record)
-        return identity
+            return filed
 
 
-def write_question_record(record: QuestionRecord) -> None:
+def write_question_record(record: QuestionRecord, *, assign_id: bool = False) -> None:
+    if assign_id and not _numbered_question_id(record):
+        with _question_number_lock(record.owner):
+            _ = _publish_question(record)
+        return
+    text = _question_text(record)
+    _write_question_text(record, text)
+
+
+def _write_question_text(record: QuestionRecord, text: str | None,
+                         numbers: record_store.LockedRecordNumbers | None = None) -> None:
+    if text is None:
+        return
+    identity = _numbered_question_id(record)
+    if not identity:
+        write_text_atomic(record.path, text)
+        return
+    sequence = nullcontext(numbers) if numbers is not None else question_numbers()
+    with sequence as locked, locked.write(record.path, identity, record.owner):
+        write_text_atomic(record.path, text)
+
+
+def _question_text(record: QuestionRecord, *, new_record: bool = False) -> str | None:
     item = record.item
-    stored = _question_records([Issue(record.path, frontmatter(record.path))]) if record.path.exists() else []
+    stored = _question_records([Issue(record.path, record_store.read_header(record.path, strict=True))],
+                               legacy_owner=record.owner) if not new_record and record.path.exists() else []
     old = stored[0].item if stored else None
+    old_id = old.get("review_id", "") if old is not None else ""
+    identity = item.get("review_id", "")
+    if stored and (stored[0].owner != record.owner or old_id and identity and old_id != identity):
+        raise RegistrationFailure("questions", f"{record.path}: the selected Question changed")
     old_text = old["text"] if old is not None else None
     old_ask = old["parts"]["ask"] if old is not None and "parts" in old else None
     titles = {"text": item["text"]}
@@ -1133,54 +1375,104 @@ def write_question_record(record: QuestionRecord) -> None:
     if "question" not in item:
         raise RegistrationFailure("questions", f"{record.path}: the question text is missing")
     if stored and record == stored[0]:
-        return
-    text = "\n".join([
+        return None
+    return "\n".join([
         "---", "record_type: question", "tags: [question]", f"status: {record.status}",
         f"production_id: {record.owner}", f"asked_by: {record.asker}",
         "registration: " + json.dumps(item, ensure_ascii=False), "---", "",
         f"# {item['text']}", "", item["question"], "",
     ])
-    if not record.path.exists() or record.path.read_text(encoding="utf-8") != text:
-        write_text_atomic(record.path, text)
 
 
-def record_review_log(path: Path, words: str, who: str = "nate") -> None:
+def record_review_log(source: Path | QuestionRecord, words: str, who: str = "nate", *,
+                      owner: staff.StaffId | None = None, check: Callable[[], object] | None = None) -> None:
     """Keep the user's action on the canonical question record."""
-    from scripts.review_links import review_events
-    with outstanding_lock(path.parent / ".review-ids"):
-        record = _question_records([Issue(path, frontmatter(path))])[0]
+    if isinstance(source, Path):
+        fields = record_store.read_header(source, strict=True)
+        record, = _question_records([Issue(source, fields)], legacy_owner=owner or "")
+    else:
+        record = source
+    if owner is not None and record.owner != owner:
+        raise RegistrationFailure("questions", f"{record.path}: the question owner changed")
+    with (outstanding_lock(state_root() / "outstanding" / f"{record.owner}.json"), _question_number_lock(record.owner)):
+        if check is not None:
+            _ = check()
+        record = _current_question(record, "questions")
         events = review_events.decode(record.item.get("review_log", ""))
         event = review_events.ReviewLog(datetime.now().astimezone(user_zone()), who, words)
         record.item["review_log"] = review_events.encode(review_events.append(events, event))
-        write_question_record(record)
+        _ = _publish_question(record)
 
 
-def store_questions(production: QuestionScope, entries: list[OutstandingItem], identities: QuestionStaff) -> None:
-    """Store questions in their records and close questions absent from the new list."""
-    questions = [entry for entry in entries if "question" in entry]
-    existing = question_records(production, identities)
+def store_questions(production: QuestionScope, entries: list[OutstandingItem], identities: QuestionStaff, *,
+                    write_list: Callable[[], None] = lambda: None, last: tuple[OutstandingItem, ...] = ()) -> None:
+    """Check all record changes. Save the new Ask after its list and legacy records."""
+    final_items = {id(entry) for entry in last}
+    questions = [entry for entry in entries if "question" in entry and id(entry) not in final_items]
+    questions.extend(last)
+    existing = native_question_records(production, identities, strict=True)
     if not questions and not existing:
+        write_list()
         return
-    folder = question_folder(question_source(production), identities)
+    document = question_source(production)
+    folder = question_folder(document, identities)
     if isinstance(folder, QuestionOwnerUnavailable):
         raise RegistrationFailure("questions", f"{folder.document}: no showrunner staff row")
     owner = folder.owner
-    folder.path.mkdir(parents=True, exist_ok=True)
-    open_paths: set[Path] = set()
-    for item in questions:
-        row = question_member(production, item, identities)
-        item["asked_by"] = row.id
-        digest = hashlib.sha256(f"{owner}:{row.id}:{item['text']}".encode()).hexdigest()
-        path = next((record.path for record in existing
-                     if record.asker == row.id and record.item["text"] == item["text"]),
-                    folder.path / f"question-{row.id}-{digest[:16]}.md")
-        open_paths.add(path)
-        record = QuestionRecord(path, owner, row.id, item, "open")
-        write_question_record(record)
-        _ = question_review_id(record)
-    for record in existing:
-        if record.status == "open" and record.path not in open_paths:
-            write_question_record(QuestionRecord(record.path, record.owner, record.asker, record.item, "closed"))
+    current = {record.item['review_id']: record for record in existing if record.status == 'open' and 'review_id' in record.item}
+    legacy = {(record.asker, record.item['text']): record for record in existing
+              if record.status == 'open' and 'review_id' not in record.item}
+    with (_question_number_lock(owner),
+          question_numbers() as numbers,
+          ExitStack() as rollback):
+        retained: set[Path] = set()
+        plans: list[tuple[QuestionRecord, str | None]] = []
+        names = {path.name for path in _known_question_paths(owner, folder.path, strict=True)}
+        ceiling = numbers.high_water
+
+        def plan(record: QuestionRecord) -> None:
+            nonlocal ceiling
+            identity = _numbered_question_id(record)
+            if not identity:
+                ceiling = max(ceiling, numbers.floor(record.path.parent)) + 1
+                record = replace(record, item={**record.item, "review_id": f"Q{ceiling}"})
+            ceiling = max(ceiling, numbers.number(_numbered_question_id(record)))
+            plans.append((record, _question_text(record)))
+
+        for entry in questions:
+            item = entry.copy()
+            row = question_member(production, item, identities)
+            item["asked_by"] = row.id
+            selected = current.get(item.get("review_id", "")) or legacy.get((row.id, item["text"]))
+            if selected is None:
+                digest = hashlib.sha256(f"{owner}:{row.id}:{item['text']}".encode()).hexdigest()
+                path = record_store.free_record_path(folder.path / f"question-{row.id}-{digest[:16]}.md", names)
+                names.add(path.name)
+                record = QuestionRecord(path, owner, row.id, item, "open")
+            else:
+                selected = _current_question(selected, "questions")
+                if identity := _numbered_question_id(selected):
+                    item["review_id"] = identity
+                record = replace(selected, item=item)
+            retained.add(record.path)
+            plan(record)
+        final = plans[len(plans) - len(last):]
+        if last:
+            del plans[-len(last):]
+        for record in existing:
+            if record.status == "open" and record.path not in retained:
+                plan(replace(_current_question(record, "questions"), status="closed"))
+
+        def write(record: QuestionRecord, text: str | None) -> None:
+            if text is not None:
+                _ = rollback.enter_context(record_store.keep_file_on_error(record.path))
+                _write_question_text(record, text, numbers)
+
+        for record, text in plans:
+            write(record, text)
+        write_list()
+        for record, text in final:
+            write(record, text)
 
 
 def question_member(production: QuestionScope, item: OutstandingItem, identities: QuestionStaff) -> staff.StaffRow:
@@ -1198,7 +1490,7 @@ def migrate_questions(production: Production, *, identities: QuestionStaff | Non
     with outstanding_lock(path):
         legacy = legacy_entries(path)
         existing = open_entries(production, identities)
-        recorded = {(record.asker, record.item["text"]) for record in question_records(production, identities)}
+        recorded = {(record.asker, record.item["text"]) for record in native_question_records(production, identities, strict=True)}
         questions = {(question_member(production, entry, identities).id, entry["text"]): entry
                      for entry in existing if "question" in entry}
         for entry in legacy:
@@ -1207,9 +1499,12 @@ def migrate_questions(production: Production, *, identities: QuestionStaff | Non
                 if key not in questions and key not in recorded:
                     questions[key] = entry
         reminders = [entry for entry in legacy if "question" not in entry]
-        store_questions(production, [*reminders, *questions.values()], identities)
-        if any("question" in entry for entry in legacy):
-            write_text_atomic(path, json.dumps(reminders) + "\n")
+        def write_list() -> None:
+            if any("question" in entry for entry in legacy):
+                write_text_atomic(path, json.dumps(reminders) + "\n")
+
+        with record_store.keep_file_on_error(path):
+            store_questions(production, [*reminders, *questions.values()], identities, write_list=write_list)
     report("migrate-questions", "ok", "recorded")
 
 
@@ -1233,17 +1528,31 @@ def questions_table(production: QuestionScope, *, identities: QuestionStaff | No
             state = f"deferred until {after}"
         if "review_unavailable" in item:
             state += "; review unavailable"
-        cells = (label, item["text"], item["since"], state)
+        parsed = parse_outstanding_entries([item], record.path)[0]
+        title = parsed.reference_text if isinstance(parsed, SentOutstandingQuestion) else item["text"]
+        cells = (label, title, item["since"], state)
         print("| " + " | ".join(" ".join(cell.split()).replace("|", "\\|") for cell in cells) + " |")
+
+
+_held_outstanding_locks: ContextVar[frozenset[Path]] = ContextVar("held_outstanding_locks", default=frozenset())
 
 
 @contextmanager
 def outstanding_lock(outstanding: Path) -> Generator[None]:
-    """Lock the list during reads and writes. Never take this lock twice in one process."""
-    outstanding.parent.mkdir(parents=True, exist_ok=True)
-    with outstanding.with_suffix(".lock").open("a", encoding="utf-8") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    """Lock the owner's records. Reuse the lock in the same call context."""
+    path = outstanding.with_suffix(".lock").resolve()
+    held = _held_outstanding_locks.get()
+    if path in held:
         yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        token = _held_outstanding_locks.set(held | {path})
+        try:
+            yield
+        finally:
+            _held_outstanding_locks.reset(token)
 
 
 def legacy_entries(outstanding: Path) -> list[OutstandingItem]:
@@ -1271,7 +1580,12 @@ def stored_entries(outstanding: Path) -> list[OutstandingItem]:
 def open_entries(production: QuestionScope, identities: QuestionStaff) -> list[OutstandingItem]:
     """Read reminders and open question records from their owning stores."""
     return [*stored_entries(outstanding_path(production)),
-            *(record.item.copy() for record in question_records(production, identities) if record.status == "open")]
+            *(record.item.copy() for record in native_question_records(production, identities) if record.status == "open")]
+
+
+def native_question_records(production: QuestionScope, identities: QuestionStaff, *, strict: bool = False) -> list[QuestionRecord]:
+    """Read staff questions for registration and list replacement."""
+    return [record for record in question_records(production, identities, strict=strict) if "review_submission" not in record.item]
 
 
 class QuestionStoreUnreadable(InputError, ValueError):
@@ -1336,12 +1650,13 @@ def read_all_open_fields() -> list[OutstandingItem]:
     return fields
 
 
-def write_open_entries(production: QuestionScope, entries: list[OutstandingItem], identities: QuestionStaff) -> None:
+def write_open_entries(production: QuestionScope, entries: list[OutstandingItem], identities: QuestionStaff, *,
+                       last: tuple[OutstandingItem, ...] = (), before_list: Callable[[], None] = lambda: None) -> None:
     """Keep unrecorded legacy questions before replacing their JSON list."""
     path = outstanding_path(production)
     legacy = [entry for entry in legacy_entries(path) if "question" in entry]
     if legacy:
-        recorded = {(record.asker, record.item["text"]) for record in question_records(production, identities)}
+        recorded = {(record.asker, record.item["text"]) for record in native_question_records(production, identities)}
         supplied = {(question_member(production, entry, identities).id, entry["text"])
                     for entry in entries if "question" in entry}
         entries = list(entries)
@@ -1350,12 +1665,19 @@ def write_open_entries(production: QuestionScope, entries: list[OutstandingItem]
             if key not in recorded and key not in supplied:
                 entries.append(entry)
                 supplied.add(key)
-    store_questions(production, entries, identities)
     reminders = [entry for entry in entries if "question" not in entry]
     text = json.dumps(reminders) + "\n"
-    if reminders or path.exists():
-        if not path.exists() or path.read_text(encoding="utf-8") != text:
+
+    exists = path.exists()
+    change_list = bool(reminders or exists) and (not exists or path.read_text(encoding="utf-8") != text)
+
+    def write_list() -> None:
+        before_list()
+        if change_list:
             write_text_atomic(path, text)
+
+    with record_store.keep_file_on_error(path) if change_list else nullcontext():
+        store_questions(production, entries, identities, write_list=write_list, last=last)
 
 
 # An item can wait longer than a week, so the day is named in full.
@@ -1372,6 +1694,8 @@ class OpenItem(NamedTuple):
         text = self.item.text if isinstance(self.item, OutstandingReminder) else self.item.question
         if not isinstance(self.item, OutstandingReminder):
             text += "".join(f"\nFollow-up: {each.followup}\nReply: {each.reply}" for each in self.item.followups)
+        if isinstance(self.item, SentOutstandingQuestion):
+            text += "\n" + (self.item.key if isinstance(self.item.timing, AwaitingReply) else self.item.read_command())
         level = urgency.cell(self.item.rank.urgency)
         asker = f", asked by {self.asker_label}" if self.asker_label else ""
         return f"{self.name}{f' [{level}]' if level else ''}, since {self.item.since:{WHEN}}{asker}: {text}"
@@ -1398,7 +1722,8 @@ def question_queue_name(owner: str, below: bool = False) -> str:
 def question_entry(owner: str, item: OutstandingItem, path: Path) -> urgency.Entry[OutstandingItem]:
     """The queue entry of one stored question, keyed as `open_lists` keys it."""
     parsed = parse_outstanding_entries([item], path)[0]
-    return urgency.Entry(item_key(owner, item["text"]), item, parsed.rank.urgency, parsed.since,
+    key = parsed.key if isinstance(parsed, SentOutstandingQuestion) else item_key(owner, item["text"])
+    return urgency.Entry(key, item, parsed.rank.urgency, parsed.since,
                          after=item_key(owner, parsed.rank.follows) if parsed.rank.follows else "")
 
 
@@ -1439,7 +1764,8 @@ def open_lists(production: QuestionScope, below: bool = False, *, identities: Qu
                 awaiting.append(opened)
             else:
                 owner = documents[name].id
-                due.append(urgency.Entry(item_key(owner, item.text), opened, item.rank.urgency,
+                key = item.key if isinstance(item, SentOutstandingQuestion) else item_key(owner, item.text)
+                due.append(urgency.Entry(key, opened, item.rank.urgency,
                                          item.since, after=item_key(owner, item.rank.follows) if item.rank.follows else ""))
     deferred.sort(key=lambda found: (cast(DeferredUntil, found.item.timing).at, found.name))
     return OpenLists(urgency.queue_order(due, question_queue(production, below)), deferred, unreadable, awaiting)
@@ -1455,11 +1781,13 @@ def open_items(production: Production) -> None:
     for number, entry in enumerate(lists.due, 1):
         print(f"{number}. {entry.item.line()}")
     for found in lists.deferred:
+        key = f" ({found.item.key})" if isinstance(found.item, SentOutstandingQuestion) else ""
         print(f"deferred until {cast(DeferredUntil, found.item.timing).at:{WHEN}}: {found.name}: "
-              + (found.item.text if isinstance(found.item, OutstandingReminder) else found.item.question))
+              + (found.item.text if isinstance(found.item, OutstandingReminder) else found.item.question) + key)
     for found in lists.awaiting:
+        key = f" ({found.item.key})" if isinstance(found.item, SentOutstandingQuestion) else ""
         print(f"waiting for the asker's reply since {cast(AwaitingReply, found.item.timing).sent:{WHEN}}: {found.name}: "
-              + found.item.text)
+              + found.item.text + key)
     for name in lists.unreadable:
         print(f"{name}: {UNREADABLE_LIST}")
     report("open", "ok", f"{len(lists.due)} due, {len(lists.deferred)} deferred"
@@ -1475,44 +1803,68 @@ def next_item(production: Production) -> None:
     report("next", "ok", f"{max(len(lists.due) - 1, 0)} more due")
 
 
-def mark_important(production: Production, words: str) -> None:
-    """Mark the one item whose text is `words`, or holds them, as the user's: it goes first after the shown one."""
-    identities = QuestionStaff.read()
-    wanted = words.strip()
-    exact: list[tuple[Path, str]] = []
-    partial: list[tuple[Path, str]] = []
-    # The item the user names may come from an all-below /next, so the lists below are searched too.
-    for name in identities.names(production.name, below=True):
-        for item in read_open_items(outstanding_file(name, identities=identities),
-                                    production=production if name == production.name else None, identities=identities):
-            full = item.text if isinstance(item, OutstandingReminder) else item.question
-            if item.text == wanted:
-                exact.append((outstanding_file(name, identities=identities), item.text))
-            elif wanted and (wanted in item.text or wanted in full):
-                partial.append((outstanding_file(name, identities=identities), item.text))
-    found = exact or partial
-    if len(found) != 1:
-        raise RegistrationFailure("mark-important", f"{len(found)} open items match {wanted!r}; name one by its text")
-    path, text = found[0]
-    with outstanding_lock(path):
-        owner = production if path == outstanding_path(production) else read_production(path.stem, identities.record)
-        entries = open_entries(owner, identities)
-        entry = next(entry for entry in entries if entry.get("text") == text)
-        for key in ("urgency", "due", "marked"):
-            _ = entry.pop(key, None)
-        store_ranking(entry, Ranking(urgency.mark(datetime.now(production.zone).replace(tzinfo=None))))
-        write_open_entries(owner, entries, identities)
-    report("mark-important", "ok", text)
+def mark_important(production: QuestionScope, words: str | ByQuestionKey) -> None:
+    """Mark the selected item important."""
+    _ = act_on_question(production, words, "mark-important", QuestionStaff.read())
 
 
 # What `ask` records as the asker when the showrunner files its own question.
 SHOWRUNNER_ASKER = "showrunner"
 
 
+@dataclass(frozen=True)
+class QuestionFromReview:
+    words: str
+    waiting_why: str
+    details: new_item_dialog.ReviewSubmission
+    before_write: Callable[[str, Path], None]
+
+
+@dataclass(frozen=True)
+class QuestionFromStaff:
+    pass
+
+
+_QUESTION_FROM_STAFF = QuestionFromStaff()
+
+def _ask_recipient(production: QuestionScope, text: str, parts: QuestionParts,
+                   identities: QuestionStaff, outgoing: QuestionFromReview) -> QuestionRecord:
+    document = question_source(production)
+    folder = question_folder(document, identities)
+    if isinstance(folder, QuestionOwnerUnavailable):
+        raise RegistrationFailure("ask", f"{folder.document}: no showrunner staff row")
+    sent = datetime.now(production.zone).strftime("%Y-%m-%dT%H:%M")
+    item = OutstandingItem(since=sent, text=text, question=outgoing.words, asked_by=folder.owner,
+                           parts={**parts, "context": outgoing.words},
+                           followup=PendingFollowup(text=outgoing.words, sent=sent),
+                           waiting_why=outgoing.waiting_why,
+                           review_submission=new_item_dialog.stored_submission(outgoing.details))
+    path = review_question_path(folder, outgoing.details.request_id)
+    record = QuestionRecord(path, folder.owner, folder.owner, item, "open")
+    with outstanding_lock(outstanding_path(production)):
+        return _file_question(record, outgoing.before_write)
+
+
+@overload
 def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, rank: Ranking, *,
-        identities: QuestionStaff | None = None) -> None:
+        identities: QuestionStaff | None = None,
+        outgoing: QuestionFromStaff = _QUESTION_FROM_STAFF) -> None: ...
+
+
+@overload
+def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, rank: Ranking, *,
+        identities: QuestionStaff | None = None, outgoing: QuestionFromReview) -> QuestionRecord: ...
+
+
+def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, rank: Ranking, *,
+        identities: QuestionStaff | None = None,
+        outgoing: QuestionFromReview | QuestionFromStaff = _QUESTION_FROM_STAFF) -> QuestionRecord | None:
     """Review and file a question with its asker's fixed staff id; its parts keep their layout on the Questions page."""
     identities = identities if identities is not None else QuestionStaff.read()
+    if isinstance(outgoing, QuestionFromReview):
+        limit = conf.read_or_repository("production").whole("question_title_max_chars")
+        title = text[:limit].rstrip()
+        return _ask_recipient(production, title, {**parts, "ask": title}, identities, outgoing)
     asker = identities.asker(production, unit)
     for option, title in (("--text", text), ("--ask", parts["ask"])):
         checked = check_question_title(title)
@@ -1544,126 +1896,342 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
         entries = open_entries(production, identities)
         if any(stored["text"] == text for stored in entries):
             raise RegistrationFailure("ask", f"{text}: an item with this text is already open")
+        if any("question" in stored and stored["text"] == text
+               and question_member(production, stored, identities).id == asker.id
+               for stored in legacy_entries(outstanding)):
+            raise RegistrationFailure("ask", f"{text}: a legacy question from this asker is already open")
         entries.append(entry)
-        record_question_history(outstanding, [entry], now)
-        write_open_entries(production, entries, identities)
+        with record_store.keep_file_on_error(outstanding.with_suffix(".history.jsonl")):
+            write_open_entries(production, entries, identities, last=(entry,),
+                               before_list=lambda: record_question_history(outstanding, [entry], now))
     filed = accepted.reviewed if isinstance(accepted, ReviewedQuestion) else question
     print("filed question: " + filed)
     report("ask", "ok", f"{text}: on the open-questions list of {production.name}, not shown to the user")
+    return None
 
 
-def answer(production: QuestionScope, words: str, *, identities: QuestionStaff | None = None,
+@dataclass(frozen=True)
+class ByQuestionKey:
+    key: str
+
+
+@dataclass(frozen=True)
+class StoredReminder:
+    """A reminder and the fixed owner of its list."""
+
+    owner: staff.StaffId
+    item: OutstandingItem
+
+
+@dataclass(frozen=True)
+class NoTitleMatch:
+    """The requested title does not identify an existing item."""
+
+
+type OpenItemRecord = QuestionRecord | StoredReminder
+type QuestionMutation = Literal["answer", "withdraw", "mark-important", "reply", "followup"]
+type QuestionAction = QuestionMutation | Literal["questions"]
+
+
+def open_item_key(record: OpenItemRecord) -> str:
+    if isinstance(record, StoredReminder):
+        identity = hashlib.sha256(json.dumps([record.item["since"], record.item["text"]]).encode()).hexdigest()
+        return f"reminder/{record.owner}/{identity}"
+    if "review_submission" in record.item:
+        details = new_item_dialog.read_submission(record.item["review_submission"])
+        return new_item_dialog.submission_key(new_item_dialog.SubmissionKind.QUESTION, record.owner,
+                                             record.item.get("review_id", ""), details.request_id)
+    identity = _numbered_question_id(record)
+    return f"question/{record.owner}/{identity}" if identity else ""
+
+
+def open_question_items(path: Path, document: Path | staff.StaffRow | None,
+                        identities: QuestionStaff) -> list[OpenItemRecord]:
+    """Read open items and sent Questions in earlier native folders."""
+    owner = staff.StaffId(path.stem)
+    try:
+        items: list[OpenItemRecord] = [StoredReminder(owner, item) for item in stored_entries(path)]
+        if document is not None:
+            items.extend(question_records_for_document(document, identities, statuses=("open",)))
+        else:
+            paths = sorted(_known_question_paths(owner))
+            items.extend(selected_question_records(paths, ("open",), None, owner=owner))
+        return items
+    except (RegistrationFailure, InputError) as error:
+        raise QuestionStoreUnreadable(str(error)) from error
+
+
+def resolve_question_title(words: str, records: list[OpenItemRecord], action: QuestionAction, *,
+                           partial: bool = False, history: Sequence[AnsweredItem] = ()
+                           ) -> OpenItemRecord | AnsweredItem | NoTitleMatch:
+    """Resolve one title before checking what the selected item permits."""
+    wanted = words.strip()
+
+    def contains(item: OutstandingItem | AnsweredItem) -> bool:
+        return bool(wanted) and (wanted in item["text"] or wanted in item.get("question", ""))
+
+    matches: Sequence[OpenItemRecord | AnsweredItem] = (
+        [record for record in records if record.item["text"] == wanted]
+        or [item for item in history if item["text"] == wanted]
+        or [record for record in records if partial and contains(record.item)]
+        or [item for item in history if contains(item)]
+    )
+    if not matches:
+        return NoTitleMatch()
+    if len(matches) == 1:
+        return matches[0]
+    message = f"{len(matches)} open items match {wanted!r}"
+    keys = [key for record in matches if not isinstance(record, dict) and (key := open_item_key(record))]
+    legacy = [f"Legacy Question {record.item['text']!r} at {record.path}"
+              for record in matches if isinstance(record, QuestionRecord) and not _numbered_question_id(record)]
+    if keys:
+        message += ". Matching keys: " + ", ".join(keys)
+    if legacy:
+        message += ". " + ". ".join(legacy)
+    if not keys and not legacy:
+        message += "; name one by its text"
+    raise RegistrationFailure(action, message)
+
+
+@contextmanager
+def select_question(production: QuestionScope, selector: str | ByQuestionKey, action: QuestionMutation,
+                    identities: QuestionStaff, *, only_open: bool = False
+                    ) -> Generator[OpenItemRecord | AnsweredItem]:
+    """Resolve one item in the command's scope and retain its native identity."""
+    own = outstanding_path(production)
+    local_only = only_open or action == "followup"
+    names = [production.name] if local_only else identities.names(production.name, below=True)
+    paths = {name: own if name == production.name else outstanding_file(name, identities=identities) for name in names}
+    if isinstance(selector, ByQuestionKey) and selector.key.startswith(new_item_dialog.KEY_PREFIX):
+        scoped = new_item_dialog.read_submission_key(selector.key)
+        if scoped.kind != new_item_dialog.SubmissionKind.QUESTION:
+            raise RegistrationFailure(action, "This sent Question is outside the selected production.")
+        lookup = cast(Callable[[new_item_dialog.ScopedSubmissionKey, staff.StaffSnapshot], AbstractContextManager[Path]],
+                      import_module("scripts.review_links.review_submissions").sent_question_path)
+        with lookup(scoped, identities.record) as path:
+            current = read_review_question(path)
+            if current.owner not in {item_path.stem for item_path in paths.values()}:
+                raise RegistrationFailure(action, "This sent Question is outside the selected production.")
+            yield current
+        return
+
+    records: list[OpenItemRecord] = []
+    history: list[AnsweredItem] = []
+    for name, path in paths.items():
+        row = identities.record.by_id(staff.StaffId(path.stem))
+        if path == own:
+            document = question_source(production)
+        elif row is not None and isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)):
+            document = row.doc.path
+        else:
+            document = None
+        if isinstance(selector, ByQuestionKey) and selector.key.startswith("question/"):
+            owner, _, identity = selector.key.removeprefix("question/").partition("/")
+            if owner == path.stem and re.fullmatch(r"Q[1-9][0-9]*", identity):
+                location = question_folder(document, identities) if document is not None else None
+                folders = (location.path,) if isinstance(location, QuestionFolder) else ()
+                found = _find_question(staff.StaffId(owner), identity, action, *folders,
+                                       document=document if isinstance(document, Path) else None)
+                if found is not None and found.status == "open" and "review_submission" not in found.item:
+                    yield found
+                    return
+            continue
+        records.extend(open_question_items(path, document, identities))
+        if action == "answer" and not only_open and isinstance(selector, str):
+            for item in answered_items(path, datetime.now(production.zone)):
+                item["name"] = name
+                history.append(item)
+
+    if isinstance(selector, ByQuestionKey):
+        candidates = [record for record in records if open_item_key(record) == selector.key]
+        if len(candidates) != 1:
+            raise RegistrationFailure(action, f"The key {selector.key!r} does not select one open item in this production.")
+        yield candidates[0]
+        return
+    selected = resolve_question_title(selector, records, action, history=history,
+                                      partial=action == "mark-important" or action == "answer" and not only_open)
+    if isinstance(selected, NoTitleMatch):
+        if action == "reply":
+            raise RegistrationFailure(action, f"0 questions with a follow-up match {selector.strip()!r}; name one by its exact text")
+        if action == "followup":
+            raise RegistrationFailure(action, f"{selector}: no open question with this text in {production.name}")
+        match_text = "exact text" if action == "withdraw" else "text"
+        raise RegistrationFailure(action, f"0 open items match {selector.strip()!r}; name one by its {match_text}")
+    yield selected
+
+
+def _question_request_id(record: QuestionRecord) -> str:
+    if "review_submission" in record.item:
+        return new_item_dialog.read_submission(record.item["review_submission"]).request_id
+    return ""
+
+
+def _find_question(owner: staff.StaffId, identity: str, action: QuestionAction, *folders: Path,
+                   request_id: str = "", document: Path | None = None) -> QuestionRecord | None:
+    paths = _known_question_paths(owner, *folders, document=document, strict=True)
+    issues = [fields for fields, number in _question_ids(owner, paths) if number == identity]
+    found = [record for record in _question_records(issues, legacy_owner=owner) if _question_request_id(record) == request_id]
+    if len(found) > 1:
+        raise RegistrationFailure(action, f"{owner}/{identity}: more than one Question has this ID")
+    return found[0] if found else None
+
+
+def _current_question(record: QuestionRecord, action: QuestionAction) -> QuestionRecord:
+    identity = _numbered_question_id(record)
+    if not identity:
+        return _current_legacy_question(record)
+    current = _find_question(record.owner, identity, action, record.path.parent, request_id=_question_request_id(record))
+    if current is None:
+        raise RegistrationFailure(action, f"{record.owner}/{identity}: no longer open")
+    return current
+
+
+def current_open_question(record: QuestionRecord, action: QuestionAction) -> QuestionRecord:
+    """Find the selected ID again under the owner's lock."""
+    current = _current_question(record, action)
+    if current.status != "open":
+        raise RegistrationFailure(action, f"{record.owner}/{_numbered_question_id(current) or current.path.name}: no longer open")
+    return current
+
+
+def write_selected_item(selected: OpenItemRecord, production: QuestionScope, action: QuestionAction,
+                        change: Callable[[OutstandingItem, datetime], None], *, close: bool = False,
+                        history: Callable[[Path, OutstandingItem, datetime], None] | None = None) -> OutstandingItem:
+    """Write one selected Question or reminder under its owner's lock."""
+    path = state_root() / "outstanding" / f"{selected.owner}.json"
+    suffix = ".answered.jsonl" if action == "answer" else ".history.jsonl"
+    retained_history = (nullcontext() if history is None
+                        else record_store.keep_file_on_error(path.with_suffix(suffix)))
+    with outstanding_lock(path), retained_history:
+        now = datetime.now(production.zone)
+        if isinstance(selected, QuestionRecord):
+            with _question_number_lock(selected.owner):
+                current = current_open_question(selected, action)
+                change(current.item, now)
+                save_history = None if history is None else lambda: history(path, current.item, now)
+                _ = _publish_question(replace(current, status="closed") if close else current, record_history=save_history)
+            return current.item
+
+        entries = legacy_entries(path)
+        key = open_item_key(selected)
+        indices = [index for index, item in enumerate(entries)
+                   if "question" not in item and open_item_key(StoredReminder(selected.owner, item)) == key]
+        if len(indices) != 1:
+            raise RegistrationFailure(action, f"{selected.item['text']}: no longer open")
+        index = indices[0]
+        item = entries[index]
+        change(item, now)
+        if close:
+            del entries[index]
+        text = json.dumps(entries) + "\n"
+        with record_store.keep_file_on_error(path):
+            if history is not None:
+                history(path, item, now)
+            if path.read_text(encoding="utf-8") != text:
+                write_text_atomic(path, text)
+        return item
+
+
+_NO_QUESTION_RELAY = AnswerRelay("", NoAnswerRelay())
+
+
+def act_on_question(production: QuestionScope, selector: str | ByQuestionKey, action: QuestionMutation,
+                    identities: QuestionStaff, *, words: str = "", only_open: bool = False,
+                    adopt: bool = False) -> AnswerRelay:
+    """Apply an action only after resolving and checking its selected item."""
+    with select_question(production, selector, action, identities, only_open=only_open) as selected:
+        if isinstance(selected, QuestionRecord) and "review_submission" in selected.item:
+            if action == "reply":
+                raise RegistrationFailure(action, "Use the scoped reply for the sent Question from Review.")
+            if action not in ("answer", "mark-important"):
+                raise RegistrationFailure(action, "This command cannot change a sent Question. Use Review.")
+            scope = production if selected.owner == production.owner.id else question_scope(selected.owner, identities.record)
+            review_sent_question(selected, scope, "read" if action == "answer" else "mark-important", "", "")
+            report(action, "ok", f"Marked {open_item_key(selected)} {'read' if action == 'answer' else 'important'}.")
+            return _NO_QUESTION_RELAY
+
+        def adopt_state() -> None:
+            if adopt and isinstance(production, Production):
+                for line in adopt_moved_state(production, record=identities.record):
+                    report("state-dir", "ok", line)
+
+        if isinstance(selected, dict):
+            adopt_state()
+            replay_answer(production, selected, identities)
+            return answer_relay(production, selected["name"], question_asker(
+                selected, AskerNotRecorded("asked_by not recorded in answered record"), identities), identities)
+
+        row = identities.record.by_id(selected.owner)
+        name = row.name if row is not None else str(selected.owner)
+        title = selected.item["text"]
+        if action in ("reply", "followup") and not isinstance(selected, QuestionRecord):
+            raise RegistrationFailure(action, f"{title}: the selected item is a reminder")
+        if action == "reply":
+            assert isinstance(selected, QuestionRecord)
+            reply_record(selected, words, name, identities=identities)
+            adopt_state()
+            return _NO_QUESTION_RELAY
+
+        def change(item: OutstandingItem, now: datetime) -> None:
+            match action:
+                case "answer" | "withdraw":
+                    if isinstance(selected, QuestionRecord):
+                        scope = production if selected.owner == production.owner.id else question_scope(selected.owner, identities.record)
+                        item["asked_by"] = question_member(scope, item, identities).id
+                case "mark-important":
+                    mark_item_important(item, now)
+                case "followup":
+                    if "followup" in item:
+                        raise RegistrationFailure(action, f"{title}: a follow-up already waits for the asker's reply")
+                    item["followup"] = PendingFollowup(text=words.strip(), sent=now.strftime("%Y-%m-%dT%H:%M"))
+                    item["waiting_why"] = review_events.require_waiting_why(words)
+
+        def record_result(path: Path, item: OutstandingItem, now: datetime) -> None:
+            if action == "answer":
+                record_answer(path, name, item, now)
+            else:
+                record_question_history(path, [item], now, withdrawn=True)
+
+        close = action in ("answer", "withdraw")
+        updated = write_selected_item(selected, production, action, change, close=close,
+                                      history=record_result if close else None)
+        adopt_state()
+        if action in ("answer", "followup"):
+            relay = answer_relay(production, name, question_asker(updated, OpenItemWithoutAsker(), identities), identities)
+            if action == "answer":
+                print(relay.line)
+                report(action, "ok", f"{name}: {title}")
+            return relay
+        report(action, "ok", title if action == "mark-important" else f"{name}: {title}")
+        return _NO_QUESTION_RELAY
+
+
+def mark_item_important(item: OutstandingItem, now: datetime) -> None:
+    for field in ("urgency", "due", "marked"):
+        _ = item.pop(field, None)
+    store_ranking(item, Ranking(urgency.mark(now.replace(tzinfo=None))))
+
+
+def answer(production: QuestionScope, words: str | ByQuestionKey, *, identities: QuestionStaff | None = None,
            only_open: bool = False) -> AnswerRelay:
-    """Answer one item and resolve its asker's current staff row for relay."""
+    """Answer the selected item and resolve its asker's current staff row."""
     identities = identities if identities is not None else QuestionStaff.read()
-    wanted = words.strip()
-    exact: list[tuple[str, str]] = []
-    partial: list[tuple[str, str]] = []
-    answered_exact: list[AnsweredItem] = []
-    answered_partial: list[AnsweredItem] = []
-    now = datetime.now(production.zone)
-    names = [production.name] if only_open else identities.names(production.name, below=True)
-    for name in names:
-        for item in read_open_items(outstanding_file(name, identities=identities),
-                                    production=production if name == production.name else None, identities=identities):
-            full = item.text if isinstance(item, OutstandingReminder) else item.question
-            if item.text == wanted:
-                exact.append((name, item.text))
-            elif wanted and (wanted in item.text or wanted in full):
-                partial.append((name, item.text))
-        for saved in answered_items(outstanding_file(name, identities=identities), now):
-            # The fixed file owner supplies the current display name.
-            saved["name"] = name
-            if saved["text"] == wanted:
-                answered_exact.append(saved)
-            elif wanted and (wanted in saved["text"] or wanted in saved.get("question", "")):
-                answered_partial.append(saved)
-    found = exact if only_open else exact or answered_exact or partial or answered_partial
-    if len(found) != 1:
-        raise RegistrationFailure("answer", f"{len(found)} open items match {wanted!r}; name one by its text")
-    selected = found[0]
-    if not isinstance(selected, tuple):
-        replay_answer(production, selected, identities)
-        return answer_relay(production, selected["name"], question_asker(
-            selected, AskerNotRecorded("asked_by not recorded in answered record"), identities), identities)
-    name, text = selected
-    removed = remove_open_item(production, name, text, identities, "answer",
-                               lambda path, item, now: record_answer(path, name, item, now))
-    relay = answer_relay(production, name, question_asker(removed, OpenItemWithoutAsker(), identities), identities)
-    print(relay.line)
-    report("answer", "ok", f"{name}: {text}")
-    return relay
+    return act_on_question(production, words, "answer", identities, only_open=only_open)
 
 
-def remove_open_item(production: QuestionScope, name: str, text: str, identities: QuestionStaff, verb: str,
-                     record: Callable[[Path, OutstandingItem, datetime], None]) -> OutstandingItem:
-    """Record and remove one open item under its owner's lock."""
-    path = outstanding_file(name, identities=identities)
-    with outstanding_lock(path):
-        owner = production if name == production.name else read_production(name, identities.record)
-        entries = open_entries(owner, identities)
-        removed = next((entry for entry in entries if entry["text"] == text), None)
-        if removed is None:
-            raise RegistrationFailure(verb, f"{text}: no longer open in {name}")
-        remaining = [entry for entry in entries if entry["text"] != text]
-        if "question" in removed:
-            removed["asked_by"] = question_member(owner, removed, identities).id
-        record(path, removed, datetime.now(production.zone))
-        write_open_entries(owner, remaining, identities)
-    return removed
-
-
-def withdraw(production: QuestionScope, words: str, *, identities: QuestionStaff | None = None) -> None:
-    """Remove one exact open item without an answer or a relay."""
+def withdraw(production: QuestionScope, words: str | ByQuestionKey, *, identities: QuestionStaff | None = None) -> None:
+    """Remove one selected item without an answer or relay."""
     identities = identities if identities is not None else QuestionStaff.read()
-    wanted = words.strip()
-    found = [(name, item.text) for name in identities.names(production.name, below=True)
-             for item in read_open_items(outstanding_file(name, identities=identities),
-                                        production=production if name == production.name else None, identities=identities)
-             if item.text == wanted]
-    if len(found) != 1:
-        raise RegistrationFailure("withdraw", f"{len(found)} open items match {wanted!r}; name one by its exact text")
-    name, text = found[0]
-    _ = remove_open_item(production, name, text, identities, "withdraw",
-                         lambda path, item, now: record_question_history(path, [item], now, withdrawn=True))
-    report("withdraw", "ok", f"{name}: {text}")
+    _ = act_on_question(production, words, "withdraw", identities)
 
 
-def change_open_question(production: QuestionScope, name: str, text: str, identities: QuestionStaff, verb: str,
-                         change: Callable[[OutstandingItem], None]) -> OutstandingItem:
-    """Change one open question under its owner's lock and write it back."""
-    path = outstanding_file(name, identities=identities)
-    with outstanding_lock(path):
-        owner = production if name == production.name else read_production(name, identities.record)
-        entries = open_entries(owner, identities)
-        found = next((entry for entry in entries if entry["text"] == text and "question" in entry), None)
-        if found is None:
-            raise RegistrationFailure(verb, f"{text}: no open question with this text in {name}")
-        change(found)
-        write_open_entries(owner, entries, identities)
-    return found
-
-
-def followup(production: QuestionScope, text: str, words: str, *, identities: QuestionStaff | None = None) -> AnswerRelay:
-    """Send the asker a follow-up: the question leaves the due list until the asker replies.
-
-    The follow-up words are the item's why this is waiting text.
-    """
-    from scripts.review_links.review_events import require_waiting_why
-    identities = identities if identities is not None else QuestionStaff.read()
+def followup(production: QuestionScope, text: str | ByQuestionKey, words: str, *,
+             identities: QuestionStaff | None = None) -> AnswerRelay:
+    """Send the asker a follow-up and record that the Question waits for a reply."""
     if not words.strip():
         raise RegistrationFailure("followup", "the follow-up is empty")
-    reason = require_waiting_why(words)
-    sent = datetime.now(production.zone).strftime("%Y-%m-%dT%H:%M")
-
-    def add(entry: OutstandingItem) -> None:
-        if "followup" in entry:
-            raise RegistrationFailure("followup", f"{text}: a follow-up already waits for the asker's reply")
-        entry["followup"] = PendingFollowup(text=words.strip(), sent=sent)
-        entry["waiting_why"] = reason
-
-    changed = change_open_question(production, production.name, text, identities, "followup", add)
-    return answer_relay(production, production.name, question_asker(changed, OpenItemWithoutAsker(), identities), identities)
+    identities = identities if identities is not None else QuestionStaff.read()
+    return act_on_question(production, text, "followup", identities, words=words)
 
 
 def set_waiting_why(record: QuestionRecord, text: str) -> None:
@@ -1685,46 +2253,90 @@ def answer_followup(entry: OutstandingItem, text: str) -> None:
     entry["followups"] = [*entry.get("followups", []), FollowupExchange(followup=pending["text"], reply=text.strip())]
 
 
+def review_sent_question(record: QuestionRecord, scope: QuestionScope,
+                         action: Literal["answer", "feedback", "question", "read", "mark-important"], words: str, token: str) -> None:
+    """Apply the user's action to the exact sent question under its locks."""
+    with outstanding_lock(outstanding_path(scope)), _question_number_lock(record.owner):
+        current = current_open_question(record, "mark-important" if action == "mark-important" else "answer")
+        details = new_item_dialog.read_submission(current.item.get("review_submission"))
+        if action == "read" and "followup" in current.item:
+            raise RegistrationFailure(action, "The recipient still needs to reply.")
+        now = datetime.now(scope.zone)
+        if action == "mark-important":
+            mark_item_important(current.item, now)
+            write_question_record(current)
+            return
+        pending = current.item.pop("followup", None)
+        events = review_events.decode(current.item.get("review_log", ""))
+        if pending is not None:
+            events = review_events.append(events, review_events.ReviewLog(now, "nate", "Superseded followup: " + pending["text"]))
+        if action == "question":
+            current.item["followup"] = PendingFollowup(text=words.strip(), sent=now.strftime("%Y-%m-%dT%H:%M"))
+            current.item["waiting_why"] = review_events.require_waiting_why(words)
+            current.item["review_submission"] = new_item_dialog.stored_submission(replace(details, reply_token=token))
+        else:
+            current = replace(current, status="closed")
+        label = "feedback sent" if action == "feedback" else action
+        event = review_events.ReviewLog(now, "nate", "Marked read" if action == "read" else label + ": " + words)
+        current.item["review_log"] = review_events.encode(review_events.append(events, event))
+        write_question_record(current)
+
+
+def reply_to_submission(path: Path, key: new_item_dialog.ScopedSubmissionKey, words: str, token: str, *,
+                        owner: staff.StaffId) -> bool:
+    """Apply a reply to the current wait on a question sent by the user."""
+    with (outstanding_lock(state_root() / "outstanding" / (owner + ".json")),
+          _question_number_lock(owner)):
+        current = read_review_question(path, owner)
+        details = new_item_dialog.read_submission(current.item.get("review_submission"))
+        if current.owner != owner or current.item.get("review_id") != key.item_id or details.request_id != key.request_id:
+            raise new_item_dialog.SubmissionError("The selected Question changed.")
+        new_item_dialog.require_reply_token(details, token)
+        exchanges = current.item.get("followups", [])
+        repeated = current.status == "open" and "followup" not in current.item and bool(
+            exchanges and exchanges[-1]["reply"] == words)
+        if not repeated and (current.status != "open" or "followup" not in current.item):
+            raise new_item_dialog.SubmissionError("This item no longer accepts this reply.")
+        if repeated:
+            return False
+        answer_followup(current.item, words)
+        events = review_events.decode(current.item.get("review_log", ""))
+        event = review_events.ReviewLog(datetime.now().astimezone(user_zone()), current.owner, "Answer: " + words)
+        current.item["review_log"] = review_events.encode(review_events.append(events, event))
+        write_question_record(current)
+        return True
+
+
 def reply_record(record: QuestionRecord, text: str, who: str, *, identities: QuestionStaff, question_id: str = '') -> None:
     """Answer the exact record under its owner's lock and keep the answer in its log."""
-    from scripts.review_links import review_events
     if not text.strip():
         raise RegistrationFailure("reply", "the reply is empty")
     scope = question_scope(record.owner, identities.record)
-    with outstanding_lock(outstanding_path(scope)):
-        current = _question_records([Issue(record.path, frontmatter(record.path))])[0]
+    with outstanding_lock(outstanding_path(scope)), _question_number_lock(record.owner):
+        current = current_open_question(record, "reply")
         delivery = change_routing.delivery_path(change_routing.review_root(), current.path, current.path.stem)
+        if "review_submission" in current.item:
+            raise RegistrationFailure("reply", "Use the scoped reply from the Review item.")
         exchange = change_routing.delivery_slots(delivery).question
         if question_id or isinstance(exchange, delivery_state.OpenQuestion):
             _ = delivery_state.question_exchange_for_reply(exchange, question_id, text.strip())
-        if current.status != "open" or "followup" not in current.item:
+        if "followup" not in current.item:
             raise RegistrationFailure("reply", f"{current.item['text']}: no open follow-up waits for a reply")
         answer_followup(current.item, text)
         events = review_events.decode(current.item.get("review_log", ""))
         event = review_events.ReviewLog(datetime.now().astimezone(user_zone()), who, 'Answer: '+text)
         current.item["review_log"] = review_events.encode(review_events.append(events, event))
-        write_question_record(current)
+        _ = _publish_question(current)
     report("reply", "ok", f"{scope.name}: {current.item['text']}: back on the open-questions list with the reply")
 
 
-def reply(production: QuestionScope, words: str, text: str, *, identities: QuestionStaff | None = None) -> None:
-    """Record the asker's reply to the follow-up; the question returns to the user with both."""
-    identities = identities if identities is not None else QuestionStaff.read()
+def reply(production: QuestionScope, words: str | ByQuestionKey, text: str, *,
+          identities: QuestionStaff | None = None) -> None:
+    """Record the asker's reply to the selected follow-up."""
     if not text.strip():
         raise RegistrationFailure("reply", "the reply is empty")
-    wanted = words.strip()
-    found = [name for name in identities.names(production.name, below=True)
-             for item in read_open_items(outstanding_file(name, identities=identities),
-                                        production=production if name == production.name else None, identities=identities)
-             if item.text == wanted and isinstance(item.timing, AwaitingReply)]
-    if len(found) != 1:
-        raise RegistrationFailure("reply", f"{len(found)} questions with a follow-up match {wanted!r}; name one by its exact text")
-
-    scope = production if found[0] == production.name else question_scope(found[0], identities.record)
-    record = next(record for record in question_records(scope, identities)
-                  if record.status == 'open' and 'followup' in record.item and record.item['text'] == wanted)
-    owner = identities.record.by_id(record.owner)
-    reply_record(record, text, owner.name if owner is not None else str(record.owner), identities=identities)
+    identities = identities if identities is not None else QuestionStaff.read()
+    _ = act_on_question(production, words, "reply", identities, words=text)
 
 
 def state_block(production: Production, state: ShowrunnerState, timestamp: str) -> str:
@@ -1743,7 +2355,8 @@ def state_block(production: Production, state: ShowrunnerState, timestamp: str) 
         wait = judgment.wait if judgment is not None else "not stated"
         unit_lines.append(f"{name}: {phase}; last merged {last}; waits on {wait}")
     held_lines = ", ".join(state.merges_held)
-    open_lines = ", ".join(item.text for item in read_open_items(outstanding_path(production), production=production))
+    open_lines = ", ".join(item.reference_text if isinstance(item, SentOutstandingQuestion) else item.text
+                           for item in read_open_items(outstanding_path(production), production=production))
     return "\n".join([f"### STATE {timestamp}", *unit_lines, f"Merges accepted but held: {held_lines or 'none'}",
                       f"Open for the user: {open_lines or 'none'}", f"Next: {'; '.join(state.owed) or 'none'}", ""])
 
@@ -1754,7 +2367,7 @@ def append_log(production: Production, event: str, path: Path | None, before_com
     state = judgment_state(path, "log")
     timestamp = production_time(production, datetime.now(production.zone).isoformat())
     previous = production.log.read_text(encoding="utf-8") if production.log.exists() else ""
-    count = sum(bool(re.match(r"^- \d\d:\d\d \S+: ", line)) for line in previous.splitlines()) + 1
+    count = sum(bool(re.match(r"^- \d\d:\d\d \S+: ", line)) for line in previous.split("\n")) + 1
     block = state_block(production, state, timestamp) if count % 10 == 0 or before_compaction else ""
     production.log.parent.mkdir(parents=True, exist_ok=True)
     with production.log.open("a", encoding="utf-8") as output:
@@ -1770,7 +2383,7 @@ def record_question_history(outstanding: Path, items: list[OutstandingItem], now
     retained: list[QuestionRegistration] = []
     cutoff = now - timedelta(hours=48)
     if history.exists():
-        for line in history.read_text(encoding="utf-8").splitlines():
+        for line in history.read_text(encoding="utf-8", newline="\n").split("\n"):
             try:
                 value = cast(object, json.loads(line))
                 if not isinstance(value, dict):
@@ -1843,6 +2456,8 @@ def keep_layout_fields(entry: OutstandingItem, stored: OutstandingItem) -> None:
         entry["followups"] = stored["followups"]
     if "waiting_why" in stored:
         entry["waiting_why"] = stored["waiting_why"]
+    if "review_id" in stored:
+        entry["review_id"] = stored["review_id"]
 
 
 class HeldRegistrationQuestion(NamedTuple):
@@ -1892,7 +2507,13 @@ def replace_outstanding(production: Production, outstanding: Path, replacement: 
                         identities: QuestionStaff | None = None) -> None:
     """Write the showrunner's new list; a question someone filed with `ask` leaves only through `answer`."""
     identities = identities if identities is not None else QuestionStaff.read()
-    previous = {item.text: item for item in read_open_items(outstanding, production=production, identities=identities)}
+    records = open_question_items(outstanding, production.doc, identities)
+    for item in replacement.items:
+        selected = resolve_question_title(item.text, records, "questions")
+        if isinstance(selected, QuestionRecord) and "review_submission" in selected.item:
+            raise RegistrationFailure("questions", "This command cannot change a sent Question. Use Review.")
+    previous = {record.item["text"]: parse_outstanding_entries([record.item], outstanding)[0] for record in records
+                if "review_submission" not in record.item}
     stored = {entry["text"]: entry for entry in open_entries(production, identities)}
     now = datetime.now(production.zone)
     since = now.strftime("%Y-%m-%dT%H:%M")
@@ -1948,8 +2569,10 @@ def replace_outstanding(production: Production, outstanding: Path, replacement: 
         if asker and stored["text"] not in items_by_text:
             entries.append(stored)
             report("questions", "kept", f"{stored['text']}: asked by {asker}; it leaves only through `answer` or `withdraw`")
-    record_question_history(outstanding, [entry for entry in entries if entry["text"] not in previous], now)
-    write_open_entries(production, entries, identities)
+    added = [entry for entry in entries if entry["text"] not in previous]
+    with record_store.keep_file_on_error(outstanding.with_suffix(".history.jsonl")):
+        write_open_entries(production, entries, identities, last=tuple(entry for entry in added if "question" in entry),
+                           before_list=lambda: record_question_history(outstanding, added, now))
     for item in pending:
         accepted_text = item.reviewed if isinstance(item, ReviewedQuestion) else item.question
         print("reviewed question: " + accepted_text)
@@ -1967,7 +2590,8 @@ def main() -> int:
     for action in ("register", "time", "log", "questions", "open", "next", "mark-important", "ask", "answer", "withdraw",
                    "reply", "questions-table", "migrate-questions"):
         subcommand = commands.add_parser(action, description=ASK_DESCRIPTION if action == "ask" else None)
-        _ = subcommand.add_argument("--production", type=str, required=action not in ("ask", "questions-table"))
+        _ = subcommand.add_argument("--production", type=str,
+                                    required=action not in ("ask", "answer", "withdraw", "questions-table"))
         if action == "register":
             # Accepted and unused: a showrunner started before its name was looked up still passes it.
             _ = subcommand.add_argument("--session")
@@ -1979,11 +2603,12 @@ def main() -> int:
             _ = subcommand.add_argument("--before-compaction", action="store_true")
         elif action == "questions":
             _ = subcommand.add_argument("--state", type=Path)
-        elif action in ("mark-important", "answer", "withdraw"):
-            _ = subcommand.add_argument("--item", required=True)
-        elif action == "reply":
-            _ = subcommand.add_argument("--item", required=True, help="the question's exact one-line text")
-            _ = subcommand.add_argument("--text", required=True, help="your reply to the user's follow-up")
+        elif action in ("answer", "mark-important", "withdraw", "reply"):
+            target = subcommand.add_mutually_exclusive_group(required=True)
+            _ = target.add_argument("--item", help="the title of the selected item")
+            _ = target.add_argument("--key", help="the full key of the selected item")
+            if action == "reply":
+                _ = subcommand.add_argument("--text", required=True, help="your reply to the user's follow-up")
         elif action == "ask":
             _ = subcommand.add_argument("--text", default="",
                                         help="the one-line item the count and lists name, at most question_title_max_chars characters (config/production.conf); the default is --ask")
@@ -2009,19 +2634,21 @@ def main() -> int:
             prompt = scheduled_prompt(minutes, production)
             print(f"showrunner-timer-{production.owner.name}\n{prompt}" if action == "delivery" else prompt)
             return 0
-        identities = QuestionStaff.read() if action in ("ask", "reply", "answer", "withdraw", "questions-table") else None
+        identities = QuestionStaff.read() if action in ("ask", "reply", "answer", "withdraw", "questions-table", "mark-important") else None
         name = cast(str | None, args.production)
         if name is None:
             assert identities is not None
-            if action == "ask":
-                unit = cast(str, args.unit)
+            if action in ("ask", "answer", "withdraw"):
+                unit = cast(str, args.unit) if action == "ask" else ""
                 caller = identities.record.by_current_session(staff.caller_identity())
                 if not unit and caller is not None and caller.kind == "producer":
                     name = str(caller.id)
                 elif unit:
                     name = unit_lookup.unit_parent(unit, session_staff.StoredReference(unit), record=identities.record).name
-                else:
+                elif action == "ask":
                     raise RegistrationFailure(action, "pass --unit <staff id> or --production <name>")
+                else:
+                    commands.choices[action].error("the following arguments are required: --production")
             else:
                 name = identities.production_of(staff.caller_identity())
                 if name is None:
@@ -2029,9 +2656,6 @@ def main() -> int:
         if action == "ask":
             assert identities is not None
             scope = question_scope(name, identities.record)
-            if isinstance(scope, Production):
-                for line in adopt_moved_state(scope, record=identities.record):
-                    report("state-dir", "ok", line)
             try:
                 level = urgency.read(cast(str, args.urgency), cast(str, args.due))
             except urgency.UrgencyError:
@@ -2041,23 +2665,34 @@ def main() -> int:
                                   recommend=cast(str, args.recommend), choices=cast(list[str], args.choices))
             ask(scope, cast(str, args.text) or asked, parts, cast(str, args.unit), Ranking(level),
                 identities=identities)
+            if isinstance(scope, Production):
+                for line in adopt_moved_state(scope, record=identities.record):
+                    report("state-dir", "ok", line)
             return 0
-        if action in ("reply", "answer", "withdraw", "questions-table"):
+        if action in ("reply", "answer", "withdraw", "mark-important"):
+            assert identities is not None
+            scope = question_scope(name, identities.record)
+            key = cast(str | None, args.key)
+            selector = cast(str, args.item) if key is None else ByQuestionKey(key)
+            words = cast(str, args.text) if action == "reply" else ""
+            if action == "reply" and not words.strip():
+                raise RegistrationFailure(action, "the reply is empty")
+            _ = act_on_question(scope, selector, action, identities, words=words, adopt=key is None)
+            return 0
+        if action == "questions-table":
             assert identities is not None
             scope = question_scope(name, identities.record)
             if isinstance(scope, Production):
                 for line in adopt_moved_state(scope, record=identities.record):
                     report("state-dir", "ok", line)
-            if action == "reply":
-                reply(scope, cast(str, args.item), cast(str, args.text), identities=identities)
-            elif action == "answer":
-                _ = answer(scope, cast(str, args.item), identities=identities)
-            elif action == "withdraw":
-                withdraw(scope, cast(str, args.item), identities=identities)
-            else:
-                questions_table(scope, identities=identities)
+            questions_table(scope, identities=identities)
             return 0
         production = read_production(name, identities.record if identities else None)
+        if action == "questions":
+            questions(production, cast(Path | None, args.state), identities=identities)
+            for line in adopt_moved_state(production):
+                report("state-dir", "ok", line)
+            return 0
         for line in adopt_moved_state(production, record=identities.record if identities is not None else None):
             report("state-dir", "ok", line)
         if action == "register":
@@ -2070,12 +2705,8 @@ def main() -> int:
             open_items(production)
         elif action == "next":
             next_item(production)
-        elif action == "mark-important":
-            mark_important(production, cast(str, args.item))
         elif action == "migrate-questions":
             migrate_questions(production)
-        else:
-            questions(production, cast(Path | None, args.state))
         return 0
     except delivery_state.StaleQuestionExchange as error:
         report(action, "failed", str(error))

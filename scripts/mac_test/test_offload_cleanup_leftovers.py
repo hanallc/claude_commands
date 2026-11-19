@@ -9,6 +9,7 @@ import subprocess
 from typing import cast
 import unittest
 from unittest import mock
+from scripts.build_queue.admission_test_support import caller_admission
 from scripts.mac_test import eligibility, offload
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test.offload_test_commands import SELECTOR_STUB, write_shell
@@ -22,6 +23,9 @@ class OffloadCommandTests(SeededCleanupFixture):
         self.sync_config()
         _ = write_config_fixture(self.root / "transport-mac.conf", self.config_path.read_text(), template="mac_test")
         _ = write_config_fixture(self.root / "build_targets.conf", "settings.mac=transport-mac.conf\n")
+        settings = self.root / "cleanup-settings.conf"
+        configuration = self.config_path.read_text()
+        _ = settings.write_text(configuration)
         self.fixture["run_cleanup_line"] = ""
         self.sync_fixture()
         stream = offload.ProcessController.stream_mac_run
@@ -29,12 +33,13 @@ class OffloadCommandTests(SeededCleanupFixture):
         def change_settings(controller: offload.ProcessController,
                             arguments: Sequence[str]) -> offload.RemoteRunStatus:
             answer = stream(controller, arguments)
-            self.config["leftover_timeout_s"] = value
-            self.sync_config()
+            # Keep the admission fixture configuration valid during later passes.
+            _ = settings.write_text(configuration.replace(
+                "leftover_timeout_s=10\n", f"leftover_timeout_s={value}\n"))
             return answer
 
         with mock.patch.object(offload.ProcessController, "stream_mac_run", change_settings):
-            return self.command(separate_stderr=True)
+            return self.command(settings=settings, separate_stderr=True)
 
     def test_completed_run_reads_the_cleanup_timeout_after_execution(self) -> None:
         with mock.patch.object(offload, "check_leftovers", wraps=offload.check_leftovers) as cleanup:
@@ -49,15 +54,27 @@ class OffloadCommandTests(SeededCleanupFixture):
         self.assertNotIn("Traceback", result.stdout + result.stderr)
 
     def test_completed_run_keeps_the_claim_when_the_cleanup_timeout_becomes_unusable(self) -> None:
-        result = self.command_with_changed_cleanup_timeout("broken")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assert_wire("passed", "")
-        self.assertTrue(self.claim_file.exists())
-        self.assertEqual(self.remote_claim()["remote_host"], "mac")
-        self.assertEqual(self.leftover_events(), [])
-        self.assertIn("leftover_timeout_s", result.stderr)
-        self.assertIn("stays busy", result.stderr)
-        self.assertNotIn("Traceback", result.stdout + result.stderr)
+        for value in ("broken", "0", "nan"):
+            with self.subTest(leftover_timeout_s=value):
+                self.reset_leftover_case()
+                result = self.command_with_changed_cleanup_timeout(value)
+                admission = caller_admission(self, self.root, self.environment)
+                # Force the settings read that raced the command's completion.
+                with admission.loop_turn():
+                    self.assertTrue(admission.server.placement_requests)
+                    for request in admission.server.placement_requests.values():
+                        for candidate in request.constraints.candidates:
+                            _ = admission.server.host_evidence_key(request, candidate.destination)
+                    _ = admission.run_pass()
+                self.assertEqual(eligibility.read_connection_settings(self.config_path).leftover_timeout_s, 10)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assert_wire("passed", "")
+                self.assertTrue(self.claim_file.exists())
+                self.assertEqual(self.remote_claim()["remote_host"], "mac")
+                self.assertEqual(self.leftover_events(), [])
+                self.assertIn("leftover_timeout_s", result.stderr)
+                self.assertIn("stays busy", result.stderr)
+                self.assertNotIn("Traceback", result.stdout + result.stderr)
 
     def test_leftover_check_uses_connection_settings_and_the_recorded_host(self) -> None:
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))

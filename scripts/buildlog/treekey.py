@@ -71,6 +71,11 @@ def content(path: bytes) -> bytes:
     return b"absent"
 
 
+def committed_tree_key(tree_id: bytes) -> str:
+    """Name a clean checkout of the given tree."""
+    return hashlib.sha256(tree_id + b"\n").hexdigest()
+
+
 def tree_key(directory: str) -> str | None:
     try:
         processes = [
@@ -89,6 +94,8 @@ def tree_key(directory: str) -> str | None:
     if len(lines) != 2:
         return None
     top, tree = lines
+    if not status:
+        return committed_tree_key(tree)
     key = hashlib.sha256(tree + b"\n")
     # Each entry is "XY PATH"; a path both staged and untracked (git rm --cached) comes twice.
     try:
