@@ -21,12 +21,13 @@ from scripts.hooks.tool_call_text import scan_text
 
 from scripts.lib.suite_runners import SUITE_RUNNERS, starts_suite_runner
 
-GUARD = Path("scripts/lib/test_guard.py")
+GUARD = Path("scripts/lib/walled_tests.py")
 SHIM = Path("scripts/lib/py")
 RUNNER = Path("scripts/test_times/module_run.py")
 GUARDED_RUNNERS = SUITE_RUNNERS | {"gate.py", RUNNER.name, "coverage_overlap.py"}
+# Keep these markers in sync with the shell hook.
 GUARD_CANDIDATE = re.compile(
-    r"unittest|pytest|py[.]test|test_|proof|module_run|coverage_overlap|merge_gate|gate[.]py|targeted_test"
+    r"unittest|pytest|py[.]test|test_|proof|module_run|coverage_overlap|merge_gate|gate[.]py|targeted_test|walled_tests"
 )
 PYTHON = re.compile(r"python(?:\d+(?:\.\d+)*)?")
 SHELLS = frozenset({"bash", "sh", "dash", "zsh"})
@@ -192,7 +193,7 @@ def test_refusal(words: list[str], directory: Path) -> str:
     basename = Path(entry).name
     if module and entry.startswith("scripts."):
         basename = entry.rsplit(".", 1)[-1] + ".py"
-    launcher = Path(entry).parts[-3:] == GUARD.parts or entry == "scripts.lib.test_guard"
+    launcher = Path(entry).parts[-3:] == GUARD.parts or entry == "scripts.lib.walled_tests"
     runner = basename in GUARDED_RUNNERS
     direct_test = (basename in {"pytest", "py.test"} or module and entry == "unittest"
                    or Path(basename).match("test_*.py") or Path(basename).match("test_*.sh")

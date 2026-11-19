@@ -280,6 +280,22 @@ class BuildHoldGuardTest(TemporaryGuardTest):
                                       env={**os.environ, "CLAUDE_PYTHON": sys.executable})
                 self.assertEqual(done.stdout, invoke_hook(payload))
 
+    def test_shell_front_denies_raw_tests_without_a_hold(self) -> None:
+        self.holders.mkdir()
+        for command in ("python3 -m unittest x", ["bash", "test_x.sh"],
+                        "python3 -m unit\\\ntest x", "node memory_page_proof.mjs"):
+            with self.subTest(command=command):
+                payload = json.dumps({"tool_name": "Bash", "cwd": str(self.root),
+                                      "tool_input": {"command": command}})
+                done = subprocess.run(["bash", str(FRONT)], input=payload, capture_output=True,
+                                      text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
+                                      env={**os.environ, "CLAUDE_PYTHON": sys.executable})
+                response = cast(dict[str, dict[str, str]], json.loads(done.stdout))
+                self.assertEqual(response["hookSpecificOutput"], {
+                    "hookEventName": "PreToolUse", "permissionDecision": "deny",
+                    "permissionDecisionReason": "Start tests through scripts/lib/py or scripts/lib/walled_tests.py.",
+                })
+
     def test_fast_paths_do_not_import_hold_code(self) -> None:
         for has_hold, command in ((False, "cargo build"), (True, "cargo metadata"), (True, "pwd"),
                                   (True, "verify.sh check")):
@@ -341,7 +357,7 @@ exit "$GUARD_STATUS"
         for has_directory in (False, True):
             if has_directory:
                 self.holders.mkdir()
-            for command in ("cargo build", "python3 merge_gate.py --tests-only"):
+            for command in ("cargo build", "pwd"):
                 raw = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
                 self.assert_no_python(raw)
 

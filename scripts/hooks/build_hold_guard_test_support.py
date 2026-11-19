@@ -48,7 +48,7 @@ class TemporaryGuardTest(TemporaryHoldTest):
     @override
     def setUpClass(cls) -> None:
         super().setUpClass()
-        folder = tempfile.TemporaryDirectory(dir=HOOK.resolve().parents[2], prefix="guard-test-")
+        folder = tempfile.TemporaryDirectory(prefix="guard-test-")
         cls.addClassCleanup(folder.cleanup)
         cls.seed, cls.case = Path(folder.name) / "seed", Path(folder.name) / "case"
         # Capture the existing fixture's environment contract rather than duplicating it.

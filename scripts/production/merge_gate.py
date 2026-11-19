@@ -81,7 +81,7 @@ from scripts.buildlog import store  # noqa: E402
 from scripts.buildlog.store import host_name  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
-from scripts.lib import scratch, test_guard  # noqa: E402
+from scripts.lib import scratch, walled_tests  # noqa: E402
 from scripts.test_times import gate_record
 from scripts.build_queue import admission_records  # noqa: E402
 from scripts.build_queue import progress_profile
@@ -1091,7 +1091,7 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     started_at = time.time()
     try:
         with cancellation.defer_cleanup_signals():
-            host_environment = environment if test_guard.guarded() else test_guard.host_environment(environment)
+            host_environment = environment if walled_tests.guarded() else walled_tests.host_environment(environment)
             process = subprocess.Popen([sys.executable, "-I", "-c", SUITE_BOOTSTRAP, *argv],
                                        cwd=repo, env={**host_environment, "MERGE_GATE_PARENT_PID": str(os.getpid())},
                                        stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, text=True,
@@ -1737,9 +1737,9 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                     else:
                         candidate = [python, str(runner), str(path.parent), path.name]
                     try:
-                        with test_guard.gate_inputs(repo, job_environment, read_only=read_only):
-                            argv = test_guard.command(candidate, root)
-                    except test_guard.TestGuardUnavailable as error:
+                        with walled_tests.gate_inputs(repo, job_environment, read_only=read_only):
+                            argv = walled_tests.command(candidate, root)
+                    except walled_tests.WallsUnavailable as error:
                         raise GateRefused(str(error)) from error
                     if request.kind is GateJobKind.TEST_MODULE:
                         argv = [*scope_prefix, *argv]

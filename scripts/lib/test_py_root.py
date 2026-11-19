@@ -87,7 +87,7 @@ assert status == 0 and record['exit_code'] == 0, record
 class PythonRootTests(unittest.TestCase):
     def test_startup_refuses_a_test_even_with_an_inherited_gate_pid(self) -> None:
         root = str(Path(__file__).resolve().parents[2])
-        guard = str(Path(root) / "scripts/lib/test_guard.py")
+        guard = str(Path(root) / "scripts/lib/walled_tests.py")
         for original, arguments in (
             ([sys.executable, "-m", "unittest"], ["-m"]),
             ([sys.executable, "scripts/lib/test_py_root.py"], ["scripts/lib/test_py_root.py"]),

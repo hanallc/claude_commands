@@ -1,4 +1,4 @@
-"""Prove the test guard from inside a guarded gate job."""
+"""Check the test walls from inside a guarded gate job."""
 
 from __future__ import annotations
 
@@ -19,12 +19,12 @@ import unittest
 from unittest import mock
 from uuid import uuid4
 
-from scripts.lib import conf, test_guard
+from scripts.lib import conf, walled_tests
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import merge_gate
 
 CHECKOUT = Path(__file__).resolve().parents[2]
-CONFIG = CHECKOUT / "config/test_guard.conf"
+CONFIG = CHECKOUT / "config/walled_tests.conf"
 MODULE_RUNNER = CHECKOUT / "scripts/test_times/module_run.py"
 HOOK = CHECKOUT / "scripts/hooks/pre-tool-use-build-hold-guard.py"
 SHIM = CHECKOUT / "scripts/lib/py"
@@ -65,12 +65,12 @@ def parent_pid(pid: int) -> int:
     return int(data[data.rindex(")") + 2:].split()[1])
 
 
-class TestGuardProof(unittest.TestCase):
+class TestWallsProof(unittest.TestCase):
     job: Path = Path()
 
     @override
     def setUp(self) -> None:
-        self.assertTrue(test_guard.guarded(), "The required test walls are absent.")
+        self.assertTrue(walled_tests.guarded(), "The required test walls are absent.")
         self.job = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="guard-proof-")))
 
     def denied_create(self, path: Path, allowed_errors: tuple[int, ...] = (errno.EROFS, errno.ENOENT)) -> None:
@@ -110,8 +110,8 @@ class TestGuardProof(unittest.TestCase):
 
     def test_job_folder_accepts_writes(self) -> None:
         marker = self.job / "write"
-        _ = marker.write_text("test guard\n")
-        self.assertEqual(marker.read_text(), "test guard\n")
+        _ = marker.write_text("test walls\n")
+        self.assertEqual(marker.read_text(), "test walls\n")
 
     def test_caller_environment_is_absent(self) -> None:
         for name in (*CALLER_VARIABLES, *AGENT_SOCKET_VARIABLES):
@@ -128,9 +128,9 @@ class TestGuardProof(unittest.TestCase):
 
     def guarded_command(self, argv: list[str], environment: dict[str, str]) -> list[str]:
         # Build a second launch to test the boundary from this guarded module.
-        with mock.patch.object(test_guard, "guarded", return_value=False), \
+        with mock.patch.object(walled_tests, "guarded", return_value=False), \
                 mock.patch.dict(os.environ, environment, clear=True):
-            return test_guard.command(argv, self.job)
+            return walled_tests.command(argv, self.job)
 
     def test_shell_git_and_type_jobs_discard_caller_traps(self) -> None:
         repo = self.job / "repo"
@@ -242,29 +242,29 @@ class TestGuardProof(unittest.TestCase):
         self.assertNotEqual(sender.returncode, 0, sender.stdout + sender.stderr)
 
     def test_missing_bubblewrap_refuses_the_runner_before_the_module(self) -> None:
-        config = self.job / "test_guard.conf"
+        config = self.job / "walled_tests.conf"
         _ = config.write_text(f"bubblewrap={self.job / 'missing-bwrap'}\n")
         marker = self.job / "started"
-        module = self.job / "test_guard_refusal_fixture.py"
+        module = self.job / "test_walls_refusal_fixture.py"
         _ = module.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
         argv = [str(MODULE_RUNNER), str(self.job), module.name]
-        with mock.patch.object(test_guard, "CONFIG", config), \
+        with mock.patch.object(walled_tests, "CONFIG", config), \
                 mock.patch.object(sys, "path", sys.path.copy()), \
-                mock.patch.object(test_guard, "guarded", return_value=False), \
+                mock.patch.object(walled_tests, "guarded", return_value=False), \
                 mock.patch.dict(os.environ, {"MERGE_GATE_PARENT_PID": "1"}, clear=True), \
                 mock.patch.object(sys, "argv", argv), \
                 mock.patch.object(sys, "orig_argv", [sys.executable, *argv]):
-            with self.assertRaisesRegex(test_guard.TestGuardUnavailable, "Bubblewrap is unavailable"):
-                test_guard.enter([sys.executable, *argv])
+            with self.assertRaisesRegex(walled_tests.WallsUnavailable, "Bubblewrap is unavailable"):
+                walled_tests.enter([sys.executable, *argv])
             with self.assertRaisesRegex(SystemExit, "Bubblewrap is unavailable"):
                 _ = runpy.run_path(str(MODULE_RUNNER), run_name="__main__")
         self.assertFalse(marker.exists())
 
     def test_launcher_refuses_when_the_walls_are_absent_after_launch(self) -> None:
-        with mock.patch.object(test_guard, "guarded", return_value=False), \
+        with mock.patch.object(walled_tests, "guarded", return_value=False), \
                 mock.patch.object(os, "execvpe", side_effect=AssertionError("The command must not start.")):
             with self.assertRaisesRegex(SystemExit, "the required test walls are absent after launch"):
-                test_guard.main(["--inside", sys.executable, "-I", "-c", "raise SystemExit(0)"])
+                walled_tests.main(["--inside", sys.executable, "-I", "-c", "raise SystemExit(0)"])
 
     def test_gate_stop_removes_a_descendant_in_its_own_session(self) -> None:
         marker = self.job / "untrusted-startup"
@@ -311,7 +311,7 @@ class TestGuardProof(unittest.TestCase):
             self.fail("The descendant stayed alive.")
 
 
-class TestGuardHookProof(unittest.TestCase):
+class TestWallsHookProof(unittest.TestCase):
     def invoke(self, command: str | list[str], root: Path) -> str:
         with mock.patch.object(sys, "path", sys.path.copy()):
             decide = cast(Callable[[str], str], runpy.run_path(str(HOOK))["decide"])
@@ -320,13 +320,13 @@ class TestGuardHookProof(unittest.TestCase):
     def test_raw_tests_are_denied_and_guarded_forms_are_allowed(self) -> None:
         for command in ("python3 -m unittest x", "pytest", "bash test_x.sh", "node memory_page_proof.mjs",
                         ["bash", "-lc", "env FLAG=1 python3 -munittest x"],
-                        "python3 scripts/lib/test_test_guard.py", "bash -O extglob -c 'bash test_x.sh'",
+                        "python3 scripts/lib/test_walled_tests.py", "bash -O extglob -c 'bash test_x.sh'",
                         "echo ok; python3 -m unittest x"):
             with self.subTest(command=command):
                 self.assertIn("Start tests through", self.invoke(command, CHECKOUT))
         for command in ("scripts/lib/py -m unittest x", "bash scripts/lib/py -m unittest x",
-                        "scripts/lib/py scripts/lib/test_test_guard.py",
-                        "scripts/lib/py scripts/lib/test_guard.py -- bash test_x.sh",
+                        "scripts/lib/py scripts/lib/test_walled_tests.py",
+                        "scripts/lib/py scripts/lib/walled_tests.py -- bash test_x.sh",
                         "printf '%s' 'python3 -m unittest x'", "rg 'pytest' scripts"):
             with self.subTest(command=command):
                 self.assertEqual(self.invoke(command, CHECKOUT), "")
@@ -345,7 +345,7 @@ class TestGuardHookProof(unittest.TestCase):
                 (["python3", "scripts/production/merge_gate.py", "--repo", str(old)], CHECKOUT),
             ):
                 with self.subTest(command=command):
-                    self.assertIn(f"Test starts require scripts/lib/test_guard.py in {old}",
+                    self.assertIn(f"Test starts require scripts/lib/walled_tests.py in {old}",
                                   self.invoke(command, root))
 
 

@@ -25,7 +25,7 @@ TEST_RUNNER_FILES = (*STARTUP_FILES, "scripts/test_times/module_run.py", "script
                      "scripts/lib/conf_reads.py", "scripts/lib/build_folders.py", "scripts/lib/build_folder_lock.py",
                      "scripts/lib/boot_identity.py",
                      "scripts/lib/conf.py", "scripts/lib/git_files.py", "config/build_folders.conf",
-                     "scripts/lib/test_guard.py", "config/test_guard.conf")
+                     "scripts/lib/walled_tests.py", "config/walled_tests.conf")
 DATACLASS_CODE_FILENAME = "<string>"
 # dataclasses.py has no __future__ import, so its exec compiles with no flags.
 DATACLASS_CODE_FLAGS = 0
@@ -262,18 +262,18 @@ def _start_test_run(selected: str, arguments: list[str]) -> None:
     test_module = (module.partition(".")[0] in ("unittest", "pytest")
                    or module.startswith("scripts.") and module.rsplit(".", 1)[-1].startswith("test_"))
     filename = os.path.basename(target)
-    guard = os.path.join(selected, "scripts/lib/test_guard.py")
-    test_file = filename.startswith("test_") and filename.endswith(".py") and os.path.abspath(target) != guard
+    guard = os.path.join(selected, "scripts/lib/walled_tests.py")
+    test_file = filename.startswith("test_") and filename.endswith(".py")
     if not (test_module or filename == "module_run.py" or test_file):
         return
     if not kernel_guarded():
         if not os.path.isfile(guard):
-            raise SystemExit(f"test guard: launcher not found: {guard}")
+            raise SystemExit(f"walled tests: launcher not found: {guard}")
         # The launcher calls enter() before it restarts Python.
         try:
             os.execv(sys.executable, [sys.executable, "-I", guard, "--", sys.executable, *original[1:]])
         except OSError as error:
-            raise SystemExit(f"test guard: cannot start the launcher: {error}") from error
+            raise SystemExit(f"walled tests: cannot start the launcher: {error}") from error
     if os.environ.get("MERGE_GATE_PARENT_PID"):
         return
     # Partial fixture checkouts can contain only the startup files.
