@@ -463,15 +463,16 @@ class TheListTests(unittest.TestCase):
             self.assertIn("The report is ready. · 2026-11-16 13:20 EST", self.command("list", "--latest-status")[1])
 
     def test_update_refuses_a_clock_time_at_the_end_of_source(self) -> None:
-        clocks = (
-            "13:20", "13:20 EST", "13:20+01:00", "2026-11-18T23:55:00-05:00",
-            "2026-11-18t23:55:00-05:00", "20261118T235500-0500",
+        suffixes = (
+            " 13:20", " 13:20 EST", " 13:20+01:00", " 2026-11-18T23:55:00-05:00",
+            " 2026-11-18t23:55:00-05:00", " 20261118T235500-0500",
+            " 20261118T235500,25-0500", "\t20261118T235500-0500",
         )
-        for clock in clocks:
-            with self.subTest(clock=clock):
+        for suffix in suffixes:
+            with self.subTest(suffix=suffix):
                 item = self.add()
                 result, output, error = self.command("update", "--id", item.id, "--state", "Working",
-                                                     "--source", "morty: report, " + clock)
+                                                     "--source", "morty: report," + suffix)
                 self.assertEqual((result, output), (1, ""))
                 self.assertIn("the tool adds the time", error)
                 self.assertEqual(the_list.load(MORTY.id, item.id), item)

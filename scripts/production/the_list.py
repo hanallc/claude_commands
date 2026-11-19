@@ -522,29 +522,27 @@ def _log_line(value: str, name: str) -> None:
         raise ListError(f"{name} must have one nonempty line")
 
 
-_SOURCE_CLOCK = re.compile(r"(?:^|(?<=[\s,]))(?:\d{4}-\d{2}-\d{2}T)?"
-                           + r"(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:[.,]\d+)?)?"
+_SOURCE_CLOCK = re.compile(r"(?:^|(?<=[\s,]))(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:[.,]\d+)?)?"
                            + r"(?: [A-Z]{2,6}|Z| ?[+-]\d{2}(?::?\d{2})?)?$")
 
 
 def source_without_clock(source: str) -> str:
     """Remove a hand-written clock time from the end of a log source."""
     text = source.rstrip()
-    clock = _SOURCE_CLOCK.search(text)
-    if clock:
-        return text[:clock.start()].rstrip(" ,\t")
+    for boundary in re.finditer(r"^|[ \t,]", text):
+        start = boundary.end()
+        suffix = text[start:]
+        try:
+            _ = datetime.fromisoformat(suffix)
+        except ValueError:
+            continue
+        try:
+            _ = date.fromisoformat(suffix)
+        except ValueError:
+            return text[:start].rstrip(" ,\t")
 
-    start = max(text.rfind(" "), text.rfind(",")) + 1
-    token = text[start:]
-    try:
-        _ = datetime.fromisoformat(token)
-    except ValueError:
-        return source
-    try:
-        _ = date.fromisoformat(token)
-    except ValueError:
-        return text[:start].rstrip(" ,\t")
-    return source
+    clock = _SOURCE_CLOCK.search(text)
+    return text[:clock.start()].rstrip(" ,\t") if clock else source
 
 
 def _staff_id(value: str, name: str) -> None:
