@@ -195,7 +195,7 @@
   4. Full natedev gate passes (reds that also occur on base do not count).
 
 ### Phase 391 — the gate wakes on child exit and reads job memory from its cgroup  · status: todo
-**Depends on:** Phase 388 (merge_gate.py job environment); builds orders the start (merge_gate.py is busy)
+**Depends on:** Phase 392 (merge_gate.py job start and stop); 383 (bb1) lands first. Queue 44df is dropped (bob, List item 140): job memory comes from each module's own scope, with no gate scope.
 
 #### Work Order
 - **Goal:** merge_gate.py stops timed polls of its jobs: it wakes on child exit (pidfd) and reads each job's memory from the job cgroup, so the gate supervisor uses less CPU on every gate run (proposal from 385: child runners were 45.3% of the base trace CPU; builds accepted 11-19).
