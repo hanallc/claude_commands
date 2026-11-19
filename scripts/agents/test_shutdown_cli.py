@@ -409,18 +409,34 @@ def write_pinned_fixture_setting(path: Path, overrides: str = "") -> int:
     return path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def fixture_git_environment() -> dict[str, str]:
+    """Use private Git settings and ignore the caller's Git repository."""
+    return {
+        **{key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TEMPLATE_DIR": "",
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.invalid",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.invalid",
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "maintenance.auto",
+        "GIT_CONFIG_VALUE_0": "false",
+        "GIT_CONFIG_KEY_1": "commit.gpgsign",
+        "GIT_CONFIG_VALUE_1": "false",
+    }
+
+
 def setUpModule() -> None:
     unittest.enterModuleContext(foreign_hostname())
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
     isolate_state_home()
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory(prefix="shutdown-config-")))
-    environment = shutdown_fixture_configuration(root)
-    templates = root / "git-templates"
-    templates.mkdir()
-    environment["GIT_TEMPLATE_DIR"] = str(templates)
+    environment = {**fixture_git_environment(), **shutdown_fixture_configuration(root)}
     ShutdownStaffFixture.owner_server = SharedStaffOwner(root)
     unittest.addModuleCleanup(ShutdownStaffFixture.owner_server.close)
-    unittest.enterModuleContext(mock.patch.dict(os.environ, environment))
+    unittest.enterModuleContext(mock.patch.dict(os.environ, environment, clear=True))
     _ = unittest.enterModuleContext(mock.patch.object(staff_test_support, "write_config_fixture", write_pinned_fixture_setting))
     _ = unittest.enterModuleContext(mock.patch.object(build_slots_test_support, "config_environment", shutdown_fixture_configuration))
     _ = unittest.enterModuleContext(mock.patch.object(rename_unit_test_support, "config_environment", shutdown_fixture_configuration))
@@ -430,7 +446,7 @@ def setUpModule() -> None:
 
 def git(where: Path, *arguments: str) -> str:
     return subprocess.run(["git", "-C", str(where), *arguments], check=True, capture_output=True,
-                          text=True).stdout.strip()
+                          text=True, env=fixture_git_environment()).stdout.strip()
 
 def session(session_id: str, name: str, pid: int) -> SessionRecord:
     return SessionRecord(pid=pid, sessionId=session_id, name=name, messagingSocketPath="/nonexistent.sock",
@@ -608,7 +624,8 @@ class RetireUnitTests(ShutdownRepositoryFixture):
             return self.stop_session(identity, deadline=deadline)
 
         with (mock.patch.object(stop_resume, "stop", side_effect=stop) as stops,
-              mock.patch.object(shutdown, "retirement_refusals", return_value=[]),
+              mock.patch.object(shutdown, "retirement_check",
+                                return_value=shutdown.RetirementReady(shutdown.RetirementBranchTips({}, {}))),
               mock.patch.object(shutdown, "retirement_remove", return_value=[]) as remove):
             code, output = self.retire()
         self.assertEqual(code, 0, output)
@@ -894,10 +911,9 @@ class RetireUnitTests(ShutdownRepositoryFixture):
     @override
     def build_repository(self) -> None:
         origin = self.root / "origin.git"
-        _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+        _ = git(self.root, "init", "-q", "--bare", "-b", "main", str(origin))
         self.checkout = self.root / "checkout"
-        _ = subprocess.run(["git", "clone", "-q", str(origin), str(self.checkout)], check=True,
-                           capture_output=True)
+        _ = git(self.root, "clone", "-q", str(origin), str(self.checkout))
         for setting in (("user.email", "test@example.invalid"), ("user.name", "test"), ("commit.gpgsign", "false")):
             _ = git(self.checkout, "config", *setting)
         _ = (self.checkout / "Cargo.toml").write_text("[workspace]\n")
@@ -1116,7 +1132,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                                  settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> subprocess.CompletedProcess[str]:
                         result = run(argv, cwd=cwd, settings=settings)
                         if result.returncode == 0 and ((step == "worktree" and argv[3:5] == ["worktree", "remove"])
-                                or (step == "local branch" and argv[3:5] == ["branch", "-D"])
+                                or (step == "local branch" and argv[3:5] == ["update-ref", "-d"])
                                 or (step == "origin branch" and argv[3:6] == ["push", "-q", "origin"])):
                             raise SystemExit(91)
                         return result
@@ -1263,8 +1279,9 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                         case.assertIsInstance(case.unit_worktree(), staff.RemovedWorktree)
                         return close(identity, terminal=terminal)
                     remove = shutdown.retirement_remove
-                    def remove_worktree(unit: shutdown.RetiringUnit, *, settings: conf.ConfigRead) -> list[str]:
-                        return ["TEST-removal failed"] if removal_fails else remove(unit, settings=settings)
+                    def remove_worktree(unit: shutdown.RetiringUnit, ready: shutdown.RetirementReady, *,
+                                        settings: conf.ConfigRead) -> list[str]:
+                        return ["TEST-removal failed"] if removal_fails else remove(unit, ready, settings=settings)
                     with (mock.patch.object(unit_move, "processes_inside", side_effect=inside),
                           mock.patch.object(shutdown, "retirement_process_session", return_value=""),
                           mock.patch.object(shutdown, "retirement_proc_start", return_value="TEST-start"),
@@ -1320,8 +1337,9 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                                                  {"CLAUDE_CONFIG_DIR": str(case.config)}, ["claude", "-n", other.name])
                     replacement = pane_launch.retained_launch(observed, staff.snapshot())
                     remove = shutdown.retirement_remove
-                    def replace_after_cleanup(unit: shutdown.RetiringUnit, *, settings: conf.ConfigRead) -> list[str]:
-                        result = remove(unit, settings=settings)
+                    def replace_after_cleanup(unit: shutdown.RetiringUnit, ready: shutdown.RetirementReady, *,
+                                              settings: conf.ConfigRead) -> list[str]:
+                        result = remove(unit, ready, settings=settings)
                         case.assertEqual(result, [])
                         case.pane_world.locations["w1:p1"]["terminal_id"] = "TEST-new-terminal"
                         case.pane_world.locations["w1:p1"]["label"] = other.name
@@ -1411,8 +1429,11 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                         _ = git(case.checkout, "push", "-q", "origin", f"{commit}:refs/tags/TEST-origin-tag")
                         case.assertEqual(git(case.checkout, "for-each-ref", "refs/tags/TEST-origin-tag"), "")
                     unit = shutdown.retirement_find_unit("alpha", "alpha")
-                    refusals = shutdown.retirement_refusals(unit, settings=conf.read("production"))
-                    case.assertEqual(refusals, [f"unmerged commits on alpha-branch: {commit}"] if unmerged else [])
+                    checked = shutdown.retirement_check(unit, settings=conf.read("production"))
+                    if unmerged:
+                        case.assertEqual(checked, shutdown.RetirementBlocked([f"unmerged commits on alpha-branch: {commit}"]))
+                    else:
+                        case.assertIsInstance(checked, shutdown.RetirementReady)
                     case.assertEqual(git(case.checkout, "branch", "--list", "main"), "")
                     case.assertEqual(git(case.checkout, "for-each-ref", "refs/remotes/origin/main"), "")
                     if fetch_tags:
@@ -1437,17 +1458,87 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                 tracking = git(case.checkout, "for-each-ref", "refs/remotes/origin")
                 unit = shutdown.retirement_find_unit("alpha", "alpha")
                 with mock.patch.object(shutdown, "retirement_run", wraps=shutdown.retirement_run) as commands:
-                    self.assertEqual(shutdown.retirement_refusals(unit, settings=conf.read("production")),
-                                     [f"unmerged commits on alpha-branch: {new_work}"])
+                    self.assertEqual(shutdown.retirement_check(unit, settings=conf.read("production")),
+                                     shutdown.RetirementBlocked([f"unmerged commits on alpha-branch: {new_work}"]))
                 fetches = [tuple(cast(list[str], call.args[0])) for call in commands.call_args_list
                            if call.args[0][3:4] == ["fetch"]]
                 self.assertEqual(len(fetches), 1)
-                self.assertEqual(set(fetches[0][-2:]), {new_main, new_work})
+                self.assertEqual(set(fetches[0][-2:]), {"refs/heads/main", branch})
                 self.assertEqual(git(case.checkout, "for-each-ref", "refs/remotes/origin"), tracking)
                 self.assertFalse((case.checkout / ".git/FETCH_HEAD").exists())
                 self.assertTrue(case.worktree.is_dir())
             finally:
                 case.doCleanups()
+
+        with self.subTest(branch_with_line_separator=True):
+            case = RetireUnitTests()
+            case.setUp()
+            try:
+                branch = "work\u2028in-progress"
+                _ = git(case.worktree, "branch", "-m", branch)
+                _ = git(case.worktree, "commit", "--allow-empty", "-qm", "Unmerged checkpoint")
+                tip = git(case.worktree, "rev-parse", "HEAD")
+                status, output = case.retire()
+                self.assertEqual(status, 1, output)
+                self.assertIn(f"unmerged commits on {branch}: {tip}", output)
+                self.assertEqual(git(case.checkout, "rev-parse", f"refs/heads/{branch}"), tip)
+                self.assertTrue(case.worktree.is_dir())
+            finally:
+                case.doCleanups()
+
+        with self.subTest(branch_advances_after_validation=True):
+            case = RetireUnitTests()
+            case.setUp()
+            try:
+                ref = "refs/heads/alpha-branch"
+                tip = git(case.checkout, "rev-parse", ref)
+                advanced = git(case.checkout, "commit-tree", f"{tip}^{{tree}}", "-p", tip, "-m", "Late checkpoint")
+
+                def advance(_owner: str) -> None:
+                    _ = git(case.checkout, "update-ref", ref, advanced, tip)
+
+                with mock.patch.object(copies, "remove_trees", side_effect=advance):
+                    status, output = case.retire()
+                self.assertEqual(status, 1, output)
+                self.assertIn(f"expected {tip}", output)
+                self.assertEqual(git(case.checkout, "rev-parse", ref), advanced)
+                self.assertIn(tip, git(case.checkout, "ls-remote", "origin", ref))
+                status, output = case.retire()
+                self.assertEqual(status, 1, output)
+                self.assertIn(f"unmerged commits on alpha-branch: {advanced}", output)
+            finally:
+                case.doCleanups()
+
+        with self.subTest(remote_branch_vanishes_during_validation=True):
+            case = RetireUnitTests()
+            case.setUp()
+            try:
+                origin = case.root / "origin.git"
+                branch = "refs/heads/alpha-branch"
+                tip = git(case.checkout, "rev-parse", "refs/heads/main")
+                _ = git(case.checkout, "push", "-q", "origin",
+                        "main", f"{tip}:{branch}", f"{tip}:refs/heads/retained")
+
+                def remove_during_fetch(argv: list[str], cwd: Path | None = None, *,
+                        settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT
+                ) -> subprocess.CompletedProcess[str]:
+                    if argv[3:4] == ["fetch"]:
+                        _ = git(origin, "update-ref", "-d", branch, tip)
+                    return case.fake_run(argv, cwd=cwd, settings=settings)
+
+                with mock.patch.object(shutdown, "retirement_run", side_effect=remove_during_fetch):
+                    status, output = case.retire()
+                self.assertEqual(status, 1, output)
+                self.assertIn(f"couldn't find remote ref {branch}", output)
+                self.assertEqual(git(origin, "rev-parse", "refs/heads/retained"), tip)
+                self.assertTrue(case.worktree.is_dir())
+            finally:
+                case.doCleanups()
+
+        with self.subTest(fixture_ignores_inherited_git_directory=True):
+            directory = git(self.worktree, "rev-parse", "--absolute-git-dir")
+            with mock.patch.dict(os.environ, {"GIT_DIR": str(self.root / "origin.git")}):
+                self.assertEqual(git(self.worktree, "rev-parse", "--absolute-git-dir"), directory)
 
     def test_the_recorders_project_started_line_is_not_uncommitted_work(self) -> None:
         plan = self.worktree / "work.txt"
@@ -1455,7 +1546,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         _ = plan.write_text(recorded, encoding="utf-8")
 
         unit = shutdown.retirement_find_unit("alpha", "alpha")
-        self.assertEqual(shutdown.retirement_refusals(unit, settings=conf.read("production")), [])
+        self.assertIsInstance(shutdown.retirement_check(unit, settings=conf.read("production")), shutdown.RetirementReady)
         # A line a person wrote beside it is still uncommitted work.
         _ = plan.write_text(recorded + "a note\n", encoding="utf-8")
         code, output = self.retire()
@@ -1498,7 +1589,8 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                 try:
                     row = case.move_to_other_machine()
                     remove = shutdown.retirement_remove
-                    def blocked_remove(unit: shutdown.RetiringUnit, *, settings: conf.ConfigRead) -> list[str]:
+                    def blocked_remove(unit: shutdown.RetiringUnit, ready: shutdown.RetirementReady, *,
+                                       settings: conf.ConfigRead) -> list[str]:
                         case.assertEqual(remote.local_machine(), "mac")
                         if failure == "remove":
                             return ["fixture removal failed"]
@@ -1506,7 +1598,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                             _ = git(case.checkout, "worktree", "remove", "--force", str(case.worktree))
                             _ = git(case.checkout, "branch", "-D", "alpha-branch")
                             return ["fixture branch deletion failed"]
-                        result = remove(unit, settings=settings)
+                        result = remove(unit, ready, settings=settings)
                         return ["fixture completion failed"] if failure == "branch" else result
                     def stop(identity: str, *, deadline: float = math.inf) -> StopResult:
                         case.assertEqual(remote.local_machine(), "mac")
@@ -1827,10 +1919,9 @@ class ResumeUnitTests(ShutdownRepositoryFixture):
     @override
     def build_repository(self) -> None:
         origin = self.root / "origin.git"
-        _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+        _ = git(self.root, "init", "-q", "--bare", "-b", "main", str(origin))
         self.checkout = self.root / "checkout"
-        _ = subprocess.run(["git", "clone", "-q", str(origin), str(self.checkout)], check=True,
-                           capture_output=True)
+        _ = git(self.root, "clone", "-q", str(origin), str(self.checkout))
         for setting in (("user.email", "test@example.invalid"), ("user.name", "test"), ("commit.gpgsign", "false")):
             _ = git(self.checkout, "config", *setting)
         self.worktree = self.root / "alpha-wt"
