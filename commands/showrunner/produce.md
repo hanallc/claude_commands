@@ -172,9 +172,12 @@ The question form for every question to the user is defined by this import:
   have a natural home under an L1".
   - **A child showrunner's branch** is merged only by hand-off. A
     same-repository child with `**Kind:** style` sends
-    `hand-off <checkpoint>`. Correctness-review
-    its diff against the branch point as for a unit checkpoint, then run
-    `merge_checkpoint.py --from-child <style showrunner name> --checkpoint <hash> --production <showrunner name> --started <time>`.
+    `hand-off <checkpoint>`. Check its diff against the branch point as for a unit checkpoint.
+    Start the handoff as a detached run:
+    `~/.claude/scripts/lib/py ~/.claude/scripts/agents/detached_runs.py start --session-dir "<STATE_DIR>"
+    --label "merge handoff <style showrunner name>" -- ~/.claude/scripts/lib/py
+    ~/.claude/scripts/production/merge_checkpoint.py --from-child <style showrunner name>
+    --checkpoint <hash> --production <showrunner name> --started <time>`.
     A locally merged hand-off is pushed before acknowledgment; a duplicate
     already on origin is acknowledged without another merge or push. A root
     uses `--root-self`, receives no acknowledgment and runs ledger `reconcile`
@@ -582,7 +585,7 @@ notice to the unit director before any merge command runs:
    Use one batch file per destination. Keep its notices in arrival order.
    Write each item's arguments after `--production` as shell words on a separate line in `<file>`.
    Use the same detached start for `merge_checkpoint.py --production <destination production> --batch <file>`.
-   Stop a detached merge with `detached_runs.py stop <record>`.
+   Stop a detached merge with `detached_runs.py stop --reason "<why>" <record>`.
    Keep each item's flags on its line.
    Use single commands for `--bump` and child handoffs.
    Add one `--trailer <line>` per attribution line this session requires, `--regime trial` if the broad

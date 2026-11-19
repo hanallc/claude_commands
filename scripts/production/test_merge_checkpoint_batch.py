@@ -183,6 +183,7 @@ raise SystemExit(1)
         failed = self.land_batch(lines)
         self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
         self.assertIn("promote: failed", failed.stdout)
+        self.assertFalse(self.batch_record().exists())
         pushed = self.git("rev-parse", "production", cwd=self.origin)
         self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), start)
         marker.unlink()
@@ -405,6 +406,54 @@ raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
         self.assertEqual(result.stdout.count("batch: retry"), 0)
         self.assertEqual(self.git("rev-parse", "HEAD"), start)
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
+        self.assertFalse(self.batch_record().exists())
+
+    def batch_record(self) -> Path:
+        return Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "checkpoint-batches/production"))
+
+    def interrupt_batch(self, line: str) -> str:
+        self.executable(self.bin / "checkpoint-test", STUB + "raise KeyboardInterrupt\n")
+        with self.assertRaises(KeyboardInterrupt):
+            _ = self.land_batch([line])
+        self.executable(self.bin / "checkpoint-test", STUB)
+        return self.git("rev-parse", "HEAD")
+
+    def assert_batch_requires_reset(self, result: subprocess.CompletedProcess[str], published: str, unpublished: str) -> None:
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("reset the merge branch to its pushed tip, then start a fresh batch", result.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD"), unpublished)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), published)
+
+    def test_a_stopped_batch_refuses_a_change_to_shrink(self) -> None:
+        published = self.git("rev-parse", "HEAD")
+        commit = self.checkpoint(content="alpha batch change\n")
+        unpublished = self.interrupt_batch(self.batch_line("alpha", "2", commit))
+        result = self.land_batch([self.batch_line("alpha", "2", commit, "--shrink")])
+        self.assert_batch_requires_reset(result, published, unpublished)
+
+    def test_a_published_batch_retires_its_record_and_a_new_batch_runs(self) -> None:
+        commit = self.checkpoint(content="alpha batch change\n")
+        result = self.land_batch([self.batch_line("alpha", "2", commit)])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.batch_record().exists())
+        beta = self.beta_checkpoint("src/beta.txt", "beta batch change\n")
+        fresh = self.land_batch([self.batch_line("beta", "2", beta)])
+        self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
+        self.assertEqual(self.git("rev-parse", "production^2", cwd=self.origin), beta)
+
+    def test_unpushed_merges_without_a_batch_record_require_a_reset(self) -> None:
+        published = self.git("rev-parse", "HEAD")
+        commit = self.checkpoint(content="alpha batch change\n")
+        line = self.batch_line("alpha", "2", commit)
+        unpublished = self.interrupt_batch(line)
+        self.batch_record().unlink()
+        result = self.land_batch([line])
+        self.assert_batch_requires_reset(result, published, unpublished)
+        self.assertFalse(self.batch_record().exists())
+        _ = self.git("reset", "--keep", published)
+        fresh = self.land_batch([line])
+        self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
+        self.assertEqual(self.git("rev-parse", "production^2", cwd=self.origin), commit)
 
     def test_a_changed_batch_cannot_resume_unpushed_merges_but_the_same_batch_can(self) -> None:
         start = self.git("rev-parse", "HEAD")
@@ -425,10 +474,12 @@ raise SystemExit(1 if Path("src/broken.txt").is_file() else 0)
         self.assertEqual(self.git("rev-parse", "HEAD"), unpublished)
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
 
-        same = self.land_batch([original])
+        equivalent = "  " + original.replace("alpha 2", "'alpha' 2", 1)
+        same = self.land_batch([equivalent])
         self.assertEqual(same.returncode, 0, same.stdout + same.stderr)
         self.assertIn("batch: resume — alpha phase 2 is already merged", same.stdout)
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), unpublished)
+        self.assertFalse(self.batch_record().exists())
 
     def test_red_package_drops_only_the_item_that_selects_its_command(self) -> None:
         for interrupted, shrink, shared_red, probe_case in ((False, False, False, ""), (True, False, False, ""),

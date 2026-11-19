@@ -1186,8 +1186,7 @@ def deliver(record: RunRecord, result: CommandResult, *,
     marker = f"Detached run: {record['run_id']}"
     timeout = send_budget.seconds()
     if member.kind in ("unit", "showrunner"):
-        recipient = member.name if member.kind == "showrunner" else str(member.id)
-        sent = send.send(send.parse(["--to", recipient, "--from", "detached-runs",
+        sent = send.send(send.parse(["--to", str(member.id), "--from", "detached-runs",
                                      "--timeout", str(timeout), "--text", marker + "\n" + text]))
         if sent.outcome in ("failed", "refused"):
             raise RunDeliveryFailed(f"{sent.outcome}: {sent.detail}")

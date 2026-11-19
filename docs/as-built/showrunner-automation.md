@@ -226,7 +226,8 @@ The queue survives a unit rename because its key is the fixed staff id.
 
 `produce.md` `<MergeCheckpoint/>` sends the command to a merge unit when one serves the production.
 Otherwise, the showrunner starts single and batch merges with `detached_runs.py start --session-dir "<STATE_DIR>"`.
-The run continues across an account move. Stop the run with `detached_runs.py stop <record>`.
+The showrunner also uses this start command for child handoffs.
+The run continues across an account move. Stop the run with `detached_runs.py stop --reason "<why>" <record>`.
 `--as-built` merges a unit's closing documentation commit without tests or a review-ledger row.
 It requires an earlier code checkpoint merge for that phase.
 It accepts only `.md` paths and requires a change to or deletion of the unit's plan.

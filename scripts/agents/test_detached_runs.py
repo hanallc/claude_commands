@@ -49,7 +49,7 @@ from scripts.lib.fork_test_support import ForkChild, ForkChildren
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
 from scripts.production import staff, session_staff, test_worker, worker, worker_admission
-from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, fixture_session
+from scripts.production.staff_test_support import StaffTestCase, fixture_member, fixture_runtime_id, fixture_session
 
 WORKER = "unit-impl"
 THREAD_ONE = fixture_runtime_id("detached-run-thread-one")
@@ -2217,8 +2217,11 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIn(f"Detached run: {record['run_id']}", text)
         self.assertIn("Private land completed.", text)
 
-    def test_a_showrunner_starts_a_new_session_and_hears_its_result(self) -> None:
+    def test_a_showrunner_starts_a_new_session_and_hears_its_result_with_a_shared_name(self) -> None:
         showrunner, = staff.snapshot().find(kind="showrunner")
+        unit = fixture_member("unit", name=showrunner.name, parent=showrunner.id)
+        self.assertEqual(unit.name, showrunner.name)
+        self.assertNotEqual(unit.id, showrunner.id)
         run_dir = self.fixture.root / "showrunner-state"
         with (patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": showrunner.current_session}),
               patch.object(treekey, "tree_key", return_value="private-tree"),
@@ -2236,7 +2239,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIn("sent", detached_runs.deliver(record, detached_runs.CompletedCommand(0)))
         self.assertEqual(self.inputs, [])
         (target, message), = self.notices
-        self.assertEqual(target, showrunner.name)
+        self.assertEqual(target, showrunner.id)
         self.assertIn(f"Detached run: {record['run_id']}", message)
         self.assertIn("Private land completed.", message)
 
