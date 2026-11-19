@@ -1,75 +1,106 @@
-"""Share the Mac process environment reader across SSH probes."""
+"""Read the Mac process environment for Builds and claim settlement."""
 
-import shlex
-
-
-MAC_PROCESS_ENVIRONMENT = r'''
 import ctypes
+from dataclasses import dataclass
+import inspect
 import os
+import shlex
 import struct
+import subprocess
 import sys
 
 
-def process_environment(pid):
-    """Read only Cargo paths, CI labels and the queue placement from the Mac environment."""
+@dataclass(frozen=True)
+class ProcessEnvironment:
+    """The fields from a complete environment read."""
+
+    fields: dict[str, str]
+
+
+@dataclass(frozen=True)
+class ProcessEnvironmentUnreadable:
+    """The reader cannot read or parse the process environment."""
+
+    reason: str
+
+
+def read_process_environment(pid: int) -> ProcessEnvironment | ProcessEnvironmentUnreadable:
+    """Read Cargo paths, CI labels and the placement value."""
     if sys.platform != "darwin":
-        return {}
+        return ProcessEnvironmentUnreadable("the platform has no Mac process environment reader")
     try:
         kernel = ctypes.CDLL(None, use_errno=True)
         kernel.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
                                   ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
         kernel.sysctl.restype = ctypes.c_int
-        # sysinfo uses CTL_KERN and KERN_PROCARGS2 for the same process observation.
+        # CTL_KERN and KERN_PROCARGS2 read the process argument buffer.
         mib = (ctypes.c_int * 3)(1, 49, pid)
         size = ctypes.c_size_t()
         if kernel.sysctl(mib, 3, None, ctypes.byref(size), None, 0) or not 4 <= size.value <= 2097152:
-            return {}
+            return ProcessEnvironmentUnreadable("the process argument size is unavailable")
         data = ctypes.create_string_buffer(size.value)
         if kernel.sysctl(mib, 3, data, ctypes.byref(size), None, 0):
-            return {}
+            return ProcessEnvironmentUnreadable("the process arguments are unavailable")
         return cargo_environment(data.raw[:size.value])
     except (OSError, ValueError, AttributeError):
-        return {}
+        return ProcessEnvironmentUnreadable("the process argument read failed")
 
 
-def cargo_environment(data):
-    """Keep only Cargo paths, CI labels and the queue placement from the environment."""
+def cargo_environment(data: bytes) -> ProcessEnvironment | ProcessEnvironmentUnreadable:
+    """Parse the environment from the Mac process argument buffer."""
+    invalid = ProcessEnvironmentUnreadable("the process argument buffer is invalid")
     if len(data) < 4:
-        return {}
-    argc = struct.unpack_from("i", data)[0]
-    if argc < 1:
-        return {}
-    start = data.find(b"\0", 4)
-    if start < 0:
-        return {}
-    start += 1
+        return invalid
+    argc = int(struct.unpack_from("i", data)[0])
+    path_end = data.find(b"\0", 4)
+    if argc < 1 or path_end <= 4:
+        return invalid
+    start = path_end + 1
     while start < len(data) and data[start] == 0:
         start += 1
     fields = data[start:].split(b"\0")
-    selected = {}
+    if len(fields) <= argc or fields[-1]:
+        return invalid
+    selected: dict[str, str] = {}
     for field in fields[argc:]:
         if not field:
             break
         key, separator, value = field.partition(b"=")
-        if separator and key in (b"CARGO_TARGET_DIR", b"CARGO_BUILD_TARGET_DIR", b"CARGO_HOME", b"HOME",
-                                 b"RUNNER_NAME", b"GITHUB_JOB", b"MAC_PLACEMENT"):
+        if not key or not separator:
+            return invalid
+        if key in (b"CARGO_TARGET_DIR", b"CARGO_BUILD_TARGET_DIR", b"CARGO_HOME", b"HOME",
+                   b"RUNNER_NAME", b"GITHUB_JOB", b"MAC_PLACEMENT"):
             selected[os.fsdecode(key)] = os.fsdecode(value)
-    return selected
-'''
+    return ProcessEnvironment(selected)
+
+
+def print_placement_pids(placement: str) -> int:
+    """Print matching process IDs after all live processes of this user were checked."""
+    uid = os.getuid()
+    rows = subprocess.check_output(["ps", "-axo", "pid=,uid=,stat="], text=True)
+    matches: list[int] = []
+    checked = False
+    for row in rows.splitlines():
+        pid, owner, state = row.split()
+        if int(owner) != uid or state.startswith("Z"):
+            continue
+        observed = read_process_environment(int(pid))
+        if isinstance(observed, ProcessEnvironmentUnreadable):
+            print(f"cannot check Mac process {pid}: {observed.reason}", file=sys.stderr)
+            return 1
+        checked = True
+        if observed.fields.get("MAC_PLACEMENT") == placement:
+            matches.append(int(pid))
+    if not checked:
+        print("the Mac process list contains no live processes for the SSH user", file=sys.stderr)
+        return 1
+    for match in matches:
+        print(match)
+    return 0
 
 
 def placement_pids_command(episode: str, attempt: str) -> str:
-    """Print the user's processes that carry the exact placement identity."""
-    program = MAC_PROCESS_ENVIRONMENT + r'''
-import subprocess
-
-
-placement = sys.argv[1]
-uid = os.getuid()
-rows = subprocess.check_output(["ps", "-axo", "pid=,uid="], text=True)
-for row in rows.splitlines():
-    pid, owner = map(int, row.split())
-    if owner == uid and process_environment(pid).get("MAC_PLACEMENT") == placement:
-        print(pid)
-'''
+    """Build the remote process check for one exact placement."""
+    source = inspect.getsource(sys.modules[__name__])
+    program = source + "\nraise SystemExit(print_placement_pids(sys.argv[1]))\n"
     return shlex.join(["python3", "-c", program, f"{episode}/{attempt}"])

@@ -25,7 +25,7 @@ from scripts.build_queue.queue_evidence import step_labels as step_labels
 from scripts.build_queue.queue_lines import Line, Span
 from scripts.buildlog.parse import cargo_subcommand
 from scripts.lib import cargo_target_config, conf
-from scripts.mac_test.mac_process_environment import MAC_PROCESS_ENVIRONMENT
+from scripts.mac_test import mac_process_environment
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.build_steps import RECORDED_STEP_NAMES, StepNames, command_script, read_step_names
 from scripts.build_queue import admission_records
@@ -397,7 +397,13 @@ def repository_name(folder):
     return ""
 
 
-''' + MAC_PROCESS_ENVIRONMENT + r'''
+''' + inspect.getsource(mac_process_environment) + r'''
+
+
+def process_environment(pid):
+    """Supply display fields when the process environment is readable."""
+    observed = read_process_environment(pid)
+    return observed.fields if isinstance(observed, ProcessEnvironment) else {}
 
 
 def test_output_directories(pid, folder, command, members, processes):

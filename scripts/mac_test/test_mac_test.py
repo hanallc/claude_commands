@@ -22,7 +22,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, NotRequired, TypedDict, cast, final, override
+from typing import TYPE_CHECKING, Never, NotRequired, TypedDict, cast, final, get_type_hints, override
 
 from scripts.build_queue import execution_identity
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
@@ -3497,6 +3497,58 @@ class ClaimWatchTests(NotificationGuardedTestCase):
         self.assertFalse((self.paths.claims / "hana.json").exists())
         self.assertFalse(pending.exists())
         self.assertTrue((self.paths.claims / "cargo-liner.json").exists())
+
+    def test_pending_block_settles_the_queue_claim_without_placement_requests(self) -> None:
+        from scripts.mac_test import claim_state, offload
+
+        _ = write_config_fixture(self.root / "mac_test.conf", "ci_repo=\nmax_active_builds=1\n")
+        record = self.write_claim(queue_dispatch=True)
+        identity = claim_state.ClaimIdentity(cast(str, record["claim_id"]), cast(str, record["episode"]),
+                                             cast(str, record["attempt"]))
+        offload.record_pending_start(self.paths.target, identity)
+        pending = offload.pending_start_path(self.paths.target, identity)
+        block = claim_state.PendingMacBlock("blocker", "rendering", self.now, self.now + timedelta(hours=1),
+            claim_state.HolderQueue("blocker"), claim_state.NoShowrunner(), "not_configured",
+            claim_state.WaitingOnLocalRun("alpha tests"))
+        mac_test.write_block(self.paths.block, block)
+
+        marker = "dispatch_start_settled=" + offload.pending_start_key(identity)
+        observations = (offload.LeftoverObservation(offload.LeftoversRemain(1), marker),
+                        offload.LeftoverObservation(offload.LeftoversEnded(), marker))
+        with (mock.patch.object(mac_test, "utc_now", return_value=self.now),
+              mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()),
+              mock.patch.object(offload, "read_leftovers", side_effect=observations) as check,
+              mock.patch.object(mac_test, "start_watcher"),
+              mock.patch.object(mac_test, "send_target_free", return_value=True) as send):
+            config = mac_test.read_config()
+            first = mac_test.full_settle(self.paths, config, watcher_holds_lock=True)
+            self.assertIsInstance(first.block, claim_state.PendingMacBlock)
+            self.assertTrue(self.paths.run.exists())
+            self.assertTrue(pending.exists())
+            send.assert_not_called()
+            second = mac_test.full_settle(self.paths, config, watcher_holds_lock=True)
+
+        self.assertIsInstance(second.block, claim_state.ActiveMacBlock)
+        self.assertIsInstance(mac_test.read_block(self.paths.block), claim_state.ActiveMacBlock)
+        self.assertFalse(self.paths.run.exists())
+        self.assertFalse(pending.exists())
+        self.assertEqual(check.call_count, len(observations))
+        send.assert_called_once()
+
+    def test_queue_claim_type_matches_the_decoder(self) -> None:
+        from scripts.mac_test import claim_state
+
+        verify_fields = get_type_hints(claim_state.RemoteJobClaim)
+        self.assertNotIn("queue_dispatch", verify_fields)
+        queue_fields = get_type_hints(claim_state.QueueDispatchClaim)
+        self.assertIn("queue_dispatch", claim_state.QueueDispatchClaim.__required_keys__)
+        self.assertEqual(self.write_claim(queue_dispatch=True), mac_test.read_run(self.paths.run))
+        for field, value in (("cleanup_pending", True), ("instance_generation", "other-host")):
+            with self.subTest(field=field):
+                self.assertIs(cast(object, queue_fields[field]), Never)
+                _ = self.write_claim(queue_dispatch=True, **{field: value})
+                with self.assertRaisesRegex(claim_state.StateReadError, "invalid queue_dispatch"):
+                    _ = mac_test.read_run(self.paths.run)
 
     def test_one_activity_check_per_host_serves_every_repository_claim(self) -> None:
         records = self.write_repository_claims()

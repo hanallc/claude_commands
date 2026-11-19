@@ -921,7 +921,7 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
     with mac_test.locked(paths.lock):
         claims = tuple(claim for claim in mac_test.read_claims(paths)
                        if mac_test.scopes_overlap(claim.scope, scope) and "remote_host" in claim.record
-                       and not claim.record.get("queue_dispatch")
+                       and "queue_dispatch" not in claim.record
                        and (mac_test.run_is_kept(claim.record)
                             or (claim.record.get("cleanup_pending") and claim.record["pid"] == args.pid
                                 and claim.record["proc_start"] == start.start)))
@@ -935,17 +935,19 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
     owner = mac_test.CliArguments()
     owner.pid = args.pid
     for claim in claims:
+        record = claim.record
         with mac_test.locked(paths.lock):
-            if mac_test.read_run(claim.path) != claim.record or "remote_host" not in claim.record:
+            if ("remote_host" not in record or "queue_dispatch" in record
+                    or mac_test.read_run(claim.path) != record):
                 continue
             with redirect_stdout(io.StringIO()):
-                attempt = mac_test.take_over_kept_claim(owner, claim, claim.record, session=session)
+                attempt = mac_test.take_over_kept_claim(owner, claim, record, session=session)
             if not isinstance(attempt, mac_test.ClaimFinished) or attempt.status != 13:
                 continue
         try:
-            checked = offload.check_leftovers(config, claim.record["remote_host"],
+            checked = offload.check_leftovers(config, record["remote_host"],
                                               eligibility.KnownRepository(scope.name, scope.key), target.name,
-                                              claim.record.get("slot", 1))
+                                              record.get("slot", 1))
         except conf.Unusable as error:
             print(f"build targets: {target.name}: cleanup settings unavailable: {error}", file=sys.stderr)
             continue

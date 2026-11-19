@@ -1,6 +1,9 @@
 """Exercise placement return and SSH routing with executable stand-ins."""
 from __future__ import annotations
 
+from contextlib import redirect_stderr, redirect_stdout
+import ctypes
+import io
 import json
 import os
 from pathlib import Path
@@ -9,6 +12,7 @@ import select
 import shlex
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -19,7 +23,7 @@ from unittest import mock
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.mac_test import mac_queue_run, mac_test
+from scripts.mac_test import mac_process_environment, mac_queue_run, mac_test
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
@@ -221,16 +225,66 @@ class QueueRunTests(unittest.TestCase):
             self.assertFalse((root / "watcher-start").exists())
 
     def test_queue_retains_capacity_while_the_remote_attempt_runs(self) -> None:
-        for running in ("FAKE_GROUP_REMAINS", "FAKE_PLACEMENT_REMAINS"):
-            with self.subTest(running=running), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                environment = {**self.fixture(root), running: "1"}
-                result = subprocess.run(self.command(root), capture_output=True, text=True, env=environment,
-                                        timeout=TEST_HANG_GUARD_SECS)
-                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                self.assertEqual([event[0] for event in self.events(root)], ["place-step"])
-                self.assertTrue((root / "mac-state/claims/hana.json").exists())
-                self.assertIn(".group", (root / "remote").read_text())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = {**self.fixture(root), "FAKE_PLACEMENT_REMAINS": "1"}
+            result = subprocess.run(self.command(root), capture_output=True, text=True, env=environment,
+                                    timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual([event[0] for event in self.events(root)], ["place-step"])
+            self.assertTrue((root / "mac-state/claims/hana.json").exists())
+
+    def test_queue_returns_capacity_when_only_a_reused_process_group_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = {**self.fixture(root), "FAKE_GROUP_REMAINS": "1"}
+            result = subprocess.run(self.command(root), capture_output=True, text=True, env=environment,
+                                    timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual([event[0] for event in self.events(root)], ["place-step", "cancel-placement"])
+            self.assertEqual(list((root / "mac-state/claims").iterdir()), [])
+
+    def test_process_scan_distinguishes_a_failed_read_from_an_unmarked_process(self) -> None:
+        arguments = shlex.split(mac_process_environment.placement_pids_command("episode", "attempt"))
+
+        def process_list(command: list[str], *, text: bool) -> str:
+            self.assertTrue(text)
+            state = " S" if command[-1].endswith("stat=") else ""
+            return f"4567 {os.getuid()}{state}\n"
+
+        for outcome in ("size failed", "read failed", "malformed", "unmarked", "matching"):
+            with self.subTest(outcome=outcome):
+                field = b"MAC_PLACEMENT=episode/attempt" if outcome == "matching" else b"HOME=/fixture"
+                data = struct.pack("i", 1) + b"/bin/build\0\0build\0" + field + b"\0\0"
+                if outcome == "malformed":
+                    data = data[:-2]
+
+                def sysctl(_mib: object, _count: int, buffer: object, size: object,
+                           _new: object, _new_count: int) -> int:
+                    if buffer is None:
+                        length = ctypes.cast(cast(ctypes.c_void_p, size), ctypes.POINTER(ctypes.c_size_t))
+                        length.contents.value = len(data)
+                        return int(outcome == "size failed")
+                    if outcome == "read failed":
+                        return 1
+                    _ = ctypes.memmove(cast(ctypes.c_void_p, buffer), data, len(data))
+                    return 0
+
+                kernel = mock.Mock(sysctl=mock.Mock(side_effect=sysctl))
+                output, errors = io.StringIO(), io.StringIO()
+                with (mock.patch.object(sys, "platform", "darwin"), mock.patch.object(sys, "argv", arguments[2:]),
+                      mock.patch.object(ctypes, "CDLL", return_value=kernel),
+                      mock.patch.object(subprocess, "check_output", side_effect=process_list),
+                      redirect_stdout(output), redirect_stderr(errors), self.assertRaises(SystemExit) as status):
+                    exec(compile(arguments[2], "<placement process probe>", "exec"), {"__name__": "__main__"})
+                if outcome in ("unmarked", "matching"):
+                    self.assertEqual(status.exception.code, 0)
+                    self.assertEqual(output.getvalue(), "4567\n" if outcome == "matching" else "")
+                    self.assertEqual(errors.getvalue(), "")
+                else:
+                    self.assertEqual(status.exception.code, 1)
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertIn("cannot check Mac process 4567", errors.getvalue())
 
     def test_a_signal_ends_the_run_with_its_default_action(self) -> None:
         for waiting, signum in ((False, signal.SIGTERM), (False, signal.SIGHUP), (True, signal.SIGTERM),

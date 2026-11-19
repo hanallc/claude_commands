@@ -516,8 +516,9 @@ class MacQueueViewTests(unittest.TestCase):
                     script = queue_view.mac_build_script().replace('CAPTURE_ROOT = Path("/tmp/cargo-tile")',
                         f"CAPTURE_ROOT = Path({str(fixture.root / 'captures')!r})")
                     script = script.replace("print(json.dumps(read_reading()))",
-                        f"assert cargo_environment({data!r}) == {environment!r}\n"
-                        + f"process_environment = lambda pid: cargo_environment({data!r})\nprint(json.dumps(read_builds()))")
+                        f"observed = cargo_environment({data!r})\n"
+                        + f"assert observed == ProcessEnvironment({environment!r})\n"
+                        + "read_process_environment = lambda pid: observed\nprint(json.dumps(read_builds()))")
                     result = subprocess.run(["sh", "-c", script], text=True, capture_output=True,
                         env={**os.environ, "PATH": str(binary) + os.pathsep + os.environ["PATH"]}, timeout=5)
                     self.assertEqual(result.returncode, 0, result.stderr)
