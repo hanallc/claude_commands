@@ -218,8 +218,7 @@ def _check_name(name: str) -> None:
         raise ValueError("a build folder name must be one path component")
 
 
-BuildFolderKind = Literal["temporary", "gate", "standing", "editable", "mirror", "target", "shell-cache",
-                          "scratch", "legacy-unique", "legacy-stable", "tool", "slot"]
+BuildFolderKind = Literal["temporary", "editable", "mirror", "scratch", "legacy-unique", "legacy-stable", "tool", "slot"]
 
 
 @dataclass(frozen=True)
@@ -309,7 +308,7 @@ def build_folder_path(spec: BuildFolderSpec) -> Path:
     if named and not (spec.showrunner and spec.unit and spec.purpose):
         raise ValueError("a named build folder needs showrunner, unit, and purpose")
     if not suffix and ((named and not spec.work) or
-                       (not named and spec.kind in ("temporary", "gate", "scratch", "legacy-unique"))):
+                       (not named and spec.kind in ("temporary", "scratch", "legacy-unique"))):
         suffix = _new_suffix(spec.suffix_length, settings)
     pattern = settings.text("patterns.named" if named else f"patterns.{spec.kind}")
     for field, value in (("repository", spec.repository), ("owner", spec.owner), ("purpose", spec.purpose)):
@@ -437,7 +436,7 @@ def _request_spec(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFold
 
 
 def _stable_folder(spec: BuildFolderSpec) -> bool:
-    return spec.kind in ("standing", "editable", "mirror", "target", "shell-cache", "legacy-stable", "slot")
+    return spec.kind in ("editable", "mirror", "legacy-stable", "slot")
 
 
 def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFolderRequest) -> Path:

@@ -46,9 +46,8 @@ class BuildFolderTests(unittest.TestCase):
             "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": "",
         })))
         _ = write_config_fixture(config / "build_folders.conf",
-            "patterns.temporary={repository}/{owner}-{purpose}-{suffix}\npatterns.gate={purpose}-{suffix}\n"
-            + "patterns.standing={repository}/{owner}-gate{suffix}\npatterns.editable={repository}-{owner}/{purpose}\n"
-            + "patterns.mirror={repository}/{owner}-s{slot}\npatterns.target={purpose}\npatterns.shell-cache={repository}\n"
+            "patterns.temporary={repository}/{owner}-{purpose}-{suffix}\n"
+            + "patterns.editable={repository}-{owner}/{purpose}\npatterns.mirror={repository}/{owner}-s{slot}\n"
             + "patterns.scratch={purpose}-{suffix}\npatterns.legacy-unique={purpose}{suffix}\n"
             + "patterns.legacy-stable={purpose}\nnames.repository_key_length=8\n"
             + "patterns.tool={purpose}{suffix}\npatterns.named={showrunner}-{unit}/{work}-{purpose}\n"
@@ -633,8 +632,8 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
 from scripts.lib import build_folders as f
 root = pathlib.Path(os.environ['TMPDIR'])
 read, write = os.pipe()
-outer_spec = f.BuildFolderSpec(kind='target', parent=root, suffix_length=0, purpose='outer')
-inner_spec = f.BuildFolderSpec(kind='target', parent=root, suffix_length=0, purpose='inner')
+outer_spec = f.BuildFolderSpec(kind='legacy-stable', parent=root, suffix_length=0, purpose='outer')
+inner_spec = f.BuildFolderSpec(kind='legacy-stable', parent=root, suffix_length=0, purpose='inner')
 with f.temporary_build_folder(outer_spec) as outer:
     with f.temporary_build_folder(inner_spec) as inner:
         with f.temporary_build_folder(outer_spec) as shared:
@@ -982,7 +981,7 @@ print('signals')
                     if held:
                         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     inode = lock.stat().st_ino
-                    spec = folders.BuildFolderSpec(kind="gate", parent=parent, suffix_length=2, purpose="proof")
+                    spec = folders.BuildFolderSpec(kind="scratch", parent=parent, suffix_length=2, purpose="proof")
                     with mock.patch("secrets.choice", side_effect=list("aabb")):
                         with folders.temporary_build_folder(spec) as made:
                             self.assertEqual(made, parent / "proof-bb")
@@ -1564,7 +1563,7 @@ assert not loaded, loaded
     def test_allocation_refuses_a_repository_parent_symlink(self) -> None:
         outside = self.root / "outside"
         outside.mkdir()
-        kinds: tuple[folders.BuildFolderKind, ...] = ("temporary", "standing")
+        kinds: tuple[folders.BuildFolderKind, ...] = ("temporary", "mirror")
         for kind in kinds:
             with self.subTest(kind=kind):
                 parent = self.root / kind
@@ -1674,15 +1673,15 @@ assert not loaded, loaded
 
     def test_approved_patterns_share_one_naming_function(self) -> None:
         cases: list[tuple[folders.BuildFolderKind, str]] = [
-            ("temporary", "hana-key/unit-proof-abcdef"), ("gate", "proof-abcdef"),
-            ("standing", "hana-key/unit-gate"), ("editable", "hana-key-unit/proof"),
-            ("mirror", "hana-key/unit-s3"), ("target", "proof"), ("shell-cache", "hana-key"),
+            ("temporary", "hana-key/unit-proof-abcdef"),
+            ("editable", "hana-key-unit/proof"),
+            ("mirror", "hana-key/unit-s3"),
         ]
         for kind, expected in cases:
             with self.subTest(kind=kind):
                 spec = folders.BuildFolderSpec(kind=kind, parent=self.root, suffix_length=6,
                                                 repository="hana-key", owner="unit", purpose="proof", slot=3,
-                                                suffix="abcdef" if kind in ("temporary", "gate") else "")
+                                                suffix="abcdef" if kind == "temporary" else "")
                 self.assertEqual(folders.build_folder_path(spec), self.root / expected)
         with mock.patch.object(folders, "build_folder_path", wraps=folders.build_folder_path) as naming:
             with folders.temporary_build_folder(folders.UniqueBuildFolder("proof-")):

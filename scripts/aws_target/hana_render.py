@@ -205,7 +205,7 @@ def runtime_files(checkout: Path, configuration: Path | conf.ConfigRead) -> tupl
         if key != 'root' and key.rpartition('.')[0] != 'root'}, alias))
     folders = conf.settings((checkout / 'config/build_folders.conf').read_text(encoding='utf-8'))
     # The image supplies the slot pool and lock timing.
-    image_roots = ('roots.slots', 'roots.slot_cargo', 'roots.mirror', 'roots.shell', 'roots.temporary')
+    image_roots = ('roots.slots', 'roots.slot_cargo', 'roots.temporary')
     folder_defaults = _runtime_defaults(folders, alias)
     folder_config = config_text({key: setting for key, setting in folder_defaults.items()
         if not any(key == base or key.startswith(base + '.') for base in (*image_roots, *SLOT_PROBE_KEYS))
