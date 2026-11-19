@@ -209,15 +209,21 @@ class GuestTests(unittest.TestCase):
             modules = [('fixture', suite / 'test_stuck.py'), ('fixture', suite / 'test_broken.py')]
             uploads: dict[str, bytes] = {}
             timings = {'fixture/test_stuck.py': 20.0, 'fixture/test_broken.py': 1.0}
-            def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            real_run = subprocess.run
+            def transport(arguments: Sequence[str], **options: object
+                          ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
+                if arguments[0] == 'awk':
+                    return real_run(arguments, input=cast(bytes, options['input']), stdout=subprocess.PIPE, check=True)
                 if arguments[0] == 'curl':
                     self.assertIn(arguments[arguments.index('--max-time') + 1], ('30', '60'))
-                    url = next(word for word in arguments if word.startswith('https://'))
-                    if '-o' in arguments:
+                    configuration = Path(arguments[arguments.index('--config') + 1])
+                    url = cast(str, json.loads(configuration.read_text().partition('= ')[2]))
+                    if '-X' not in arguments:
                         content = json.dumps(timings).encode() if url == links['module_seconds'] else b'fixture bundle'
                         _ = Path(arguments[arguments.index('-o') + 1]).write_bytes(content)
                     else:
                         uploads[url] = cast(bytes, options['input'])
+                    return subprocess.CompletedProcess(arguments, 0, b'200')
                 return subprocess.CompletedProcess(arguments, 0, 'version', '')
             code = trial.GUEST.replace("'/proc/meminfo'", repr(str(root / 'meminfo'))).replace("'/var/lib/gate-trial'", repr(str(root)))
             candidate = gate_box.CANDIDATE_GUEST.replace("'/proc/meminfo'", repr(str(root / 'meminfo'))).replace("'/proc/stat'", repr(str(root / 'stat')))
@@ -888,8 +894,11 @@ else:
         tools.mkdir()
         curl = tools / 'curl'
         _ = curl.write_text(f'''#!{sys.executable}
-import os, pathlib, sys
-pathlib.Path({str(box)!r}, 'uploaded-' + sys.argv[-1]).write_bytes(sys.stdin.buffer.read())
+import json, pathlib, sys
+config = pathlib.Path(sys.argv[sys.argv.index('--config') + 1])
+name = json.loads(config.read_text().partition('= ')[2])
+pathlib.Path({str(box)!r}, 'uploaded-' + name).write_bytes(sys.stdin.buffer.read())
+print('200', end='')
 ''')
         curl.chmod(0o755)
         _ = (box / 'guest.py').write_text(gate_box.GUEST)

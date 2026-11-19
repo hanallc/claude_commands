@@ -59,7 +59,6 @@ class Showrunner(TypedDict):
 
 class ShowrunnerSettings(TypedDict):
     threshold_percent: float
-    repeat_minutes: float
     stall_minutes: float
     faults_to: str
     always: list[str]
@@ -192,9 +191,8 @@ def load_settings_from(path: Path) -> ShowrunnerSettings:
     settings = tunables.read(path)
     return ShowrunnerSettings(
         threshold_percent=settings.number("threshold_percent"),
-        repeat_minutes=settings.number("repeat_minutes"),
         stall_minutes=settings.number("stall_minutes"),
-        faults_to=settings.text("faults_to"), always=settings.values()["always"].split())
+        faults_to=settings.text("faults_to"), always=settings.values("always")["always"].split())
 
 
 def socket_for(target: str, *, deadline: float = math.inf) -> str | None:
