@@ -282,7 +282,8 @@ class BuildHoldGuardTest(TemporaryGuardTest):
 
     def test_shell_front_denies_raw_tests_without_a_hold(self) -> None:
         self.holders.mkdir()
-        for command in ("python3 -m unittest x", ["bash", "test_x.sh"],
+        for command in ("python3 -m unittest x", "python3 -m unittest.__main__ x", "pytest",
+                        ["bash", "test_x.sh"], "node --require setup.cjs memory_page_proof.mjs",
                         "python3 -m unit\\\ntest x", "node memory_page_proof.mjs"):
             with self.subTest(command=command):
                 payload = json.dumps({"tool_name": "Bash", "cwd": str(self.root),
@@ -365,6 +366,15 @@ exit "$GUARD_STATUS"
         self.hold()
         for command in ("pwd", "verify.sh check", "bash verify.sh --session-dir run lint"):
             self.assert_no_python(json.dumps({"tool_name": "Bash", "tool_input": {"command": command}}))
+
+    def test_test_text_without_an_interpreter_starts_no_python(self) -> None:
+        edit = {"tool_name": "Edit", "tool_input": {
+            "file_path": "scripts/lib/test_walled_fixture.py", "new_string": "def test_example(): pass",
+        }}
+        self.assert_no_python(json.dumps(edit))
+        for command in ("grep test_ notes.md", "grep proof notes.md", "python3 aggregate.py"):
+            with self.subTest(command=command):
+                self.assert_no_python(json.dumps({"tool_name": "Bash", "tool_input": {"command": command}}))
 
     def test_same_stdin_output_and_status_are_relayed(self) -> None:
         self.hold()

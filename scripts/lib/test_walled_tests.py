@@ -242,13 +242,18 @@ class TestWallsProof(unittest.TestCase):
         self.assertNotEqual(sender.returncode, 0, sender.stdout + sender.stderr)
 
     def test_missing_bubblewrap_refuses_the_runner_before_the_module(self) -> None:
-        config = self.job / "walled_tests.conf"
-        _ = config.write_text(f"bubblewrap={self.job / 'missing-bwrap'}\n")
+        executable = Path(conf.read(CONFIG).text("bubblewrap", recover_invalid=False))
+        self.assertEqual(executable, walled_tests.SYSTEM / "bin/bwrap")
+        is_file = Path.is_file
+
+        def installed(path: Path) -> bool:
+            return path != executable and is_file(path)
+
         marker = self.job / "started"
         module = self.job / "test_walls_refusal_fixture.py"
         _ = module.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
         argv = [str(MODULE_RUNNER), str(self.job), module.name]
-        with mock.patch.object(walled_tests, "CONFIG", config), \
+        with mock.patch.object(Path, "is_file", autospec=True, side_effect=installed) as existence, \
                 mock.patch.object(sys, "path", sys.path.copy()), \
                 mock.patch.object(walled_tests, "guarded", return_value=False), \
                 mock.patch.dict(os.environ, {"MERGE_GATE_PARENT_PID": "1"}, clear=True), \
@@ -256,8 +261,11 @@ class TestWallsProof(unittest.TestCase):
                 mock.patch.object(sys, "orig_argv", [sys.executable, *argv]):
             with self.assertRaisesRegex(walled_tests.WallsUnavailable, "Bubblewrap is unavailable"):
                 walled_tests.enter([sys.executable, *argv])
+            existence.assert_any_call(executable)
+            existence.reset_mock()
             with self.assertRaisesRegex(SystemExit, "Bubblewrap is unavailable"):
                 _ = runpy.run_path(str(MODULE_RUNNER), run_name="__main__")
+            existence.assert_any_call(executable)
         self.assertFalse(marker.exists())
 
     def test_launcher_refuses_when_the_walls_are_absent_after_launch(self) -> None:

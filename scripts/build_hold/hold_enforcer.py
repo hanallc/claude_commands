@@ -34,6 +34,7 @@ from scripts.mac_test import claim_state
 from scripts.build_hold import override_guard
 from scripts.build_hold.shared_state_defaults import DEFAULT_ENFORCER_DIRECTORY as DEFAULT_STATE_DIRECTORY
 from scripts.buildlog.parse import CARGO_BUILD_VERBS, cargo_subcommand
+from scripts.lib.raw_starts import python_target
 from scripts.lib.suite_runners import SUITE_RUNNERS, starts_suite_runner
 
 from scripts.direct import step_record
@@ -693,23 +694,6 @@ def read_processes(
             process = replace(process, argv=argv, cwd=cwd)
         processes[pid] = process
     return processes
-
-
-def python_target(arguments: tuple[str, ...]) -> tuple[str, ...]:
-    """Read the Python entry point, not arguments passed to another script."""
-    skip_value = False
-    for index, argument in enumerate(arguments):
-        if skip_value:
-            skip_value = False
-        elif argument in {"-W", "-X", "--check-hash-based-pycs"}:
-            skip_value = True
-        elif argument == "--":
-            return arguments[index + 1:]
-        elif argument in {"-m", "-c"} or not argument.startswith("-"):
-            return arguments[index:]
-        elif argument.startswith("-m"):
-            return ("-m", argument[2:], *arguments[index + 1:])
-    return ()
 
 
 def is_waiting_gate(process: build_hold.AuditProcess) -> bool:
