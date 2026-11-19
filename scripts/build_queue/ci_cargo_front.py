@@ -7,7 +7,8 @@ except FileNotFoundError:
     pass
 
 from collections.abc import Sequence
-from contextlib import ExitStack
+from collections.abc import Generator
+from contextlib import ExitStack, contextmanager
 import ctypes
 from dataclasses import dataclass
 from functools import partial
@@ -122,6 +123,26 @@ def remove_abandoned_folders(shared_folder: Path) -> None:
                 pass
 
 
+@contextmanager
+def cargo_folder(prefix: str, parent: Path | None) -> Generator[str]:
+    folder = tempfile.mkdtemp(prefix=prefix, dir=parent)
+    keep = False
+    try:
+        yield folder
+    except queue_place.CleanupUnresolved:
+        keep = True
+        raise
+    finally:
+        if not keep:
+            queue_place.remove_program_folder(Path(folder))
+
+
+def stop_progress_reader(reader: threading.Thread, timeout: float) -> None:
+    reader.join(timeout=timeout)
+    if reader.is_alive():
+        raise queue_place.CleanupUnresolved("the Cargo progress reader did not stop")
+
+
 def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_folder: Path | JobTemporaryFolder) -> int:
     pid = os.getpid()
     start = records.process_start_time(pid)
@@ -133,10 +154,8 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
     test_width: records.TestWidth = records.RequestedTestWidth(width) if width else records.UnspecifiedTestWidth()
     prefix = f"build-admission-ci-{os.getuid()}-"
     if isinstance(shared_folder, Path):
-        remove_abandoned_folders(shared_folder)
         prefix += f"{pid}-{start}-"
-    with tempfile.TemporaryDirectory(prefix=prefix,
-                                     dir=shared_folder if isinstance(shared_folder, Path) else None) as folder:
+    with cargo_folder(prefix, shared_folder if isinstance(shared_folder, Path) else None) as folder:
         directory = Path(folder)
         directory.chmod(0o755)
         sidecar = directory / "cargo.cgroup"
@@ -156,6 +175,9 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
             if not isinstance(grant, wire.RunnerAdmitted):
                 print("the service estimate grant has no runner timing", file=sys.stderr)
                 return 1
+            if isinstance(shared_folder, Path):
+                queue_place.cleanup_program_starts(grant.execution)
+                remove_abandoned_folders(shared_folder)
             place = queue_place.QueuePlace(sidecar, sidecar, configuration=grant.execution,
                 purpose=queue_place.ProgramPurpose.RUNNER, arguments=tuple(argv))
             environment = dict(os.environ, PATH=child_path, CARGO_TERM_PROGRESS_WHEN="always", CARGO_TERM_PROGRESS_WIDTH="80")
@@ -172,7 +194,7 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
                 reader = threading.Thread(target=capture_progress, args=(stream.fileno(), sidecar), daemon=True)
                 reader.start()
                 _ = cleanup.callback(stream.close)
-                _ = cleanup.callback(reader.join)
+                _ = cleanup.callback(stop_progress_reader, reader, grant.execution.program_stop_seconds)
                 status = process.wait()
             except SystemExit as error:
                 status = error.code if isinstance(error.code, int) else 1
@@ -181,7 +203,6 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
                 held.keep = True
                 try:
                     place.finish(failed=status != 0)
-                    held.keep = False
                 finally:
                     try:
                         cleanup.close()
@@ -193,6 +214,7 @@ def run_cargo(command: str, arguments: Sequence[str], child_path: str, shared_fo
                             pass
                         finally:
                             held.status = status
+                held.keep = False
         return status if status >= 0 else 128 - status
 
 

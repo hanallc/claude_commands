@@ -74,6 +74,13 @@ class QueuePlaceRefused(Exception):
     """The program cannot acquire or keep its queue place."""
 
 
+class CleanupUnresolved(QueuePlaceRefused):
+    """Recovery still owns the program or reservation."""
+
+    def __init__(self, reason: str):
+        super().__init__(f"UNRESOLVED: {reason}")
+
+
 def no_hold_wait() -> None:
     pass
 
@@ -146,9 +153,12 @@ class ProgramTree:
     observed: dict[int, str] = field(default_factory=dict[int, str])
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
-    def live_members(self, scope_members: set[int]) -> dict[int, str]:
+    def live_members(self, scope_members: set[int], *, deadline: float | None = None) -> dict[int, str]:
         """Retain observed descendants after a session change or reparenting."""
-        with self.lock:
+        wait = -1 if deadline is None else max(0, deadline - time.monotonic())
+        if not self.lock.acquire(timeout=wait):
+            raise CleanupUnresolved("the program sampler did not release its process list")
+        try:
             processes = memory_admit.process_table(Path("/proc"))
             roots = dict(self.observed)
             if isinstance(self.adopter, wire.Owner):
@@ -166,6 +176,8 @@ class ProgramTree:
             live = {pid: processes[pid].start for pid in members if pid in processes}
             self.observed = live
             return live
+        finally:
+            self.lock.release()
 
 
 @dataclass
@@ -180,6 +192,7 @@ class StartedProgram:
     sampler: threading.Thread | UnmeasuredProbe
     tracking: ScopedProgram | ProgramTree
     record: Path
+    finished: bool = False
 
 
 @dataclass(frozen=True)
@@ -208,10 +221,33 @@ def program_start(record: Path, holder: wire.Owner, argv: Sequence[str], *, scop
 
 
 @contextmanager
-def queue_place_folder() -> Generator[Path]:
-    """Allocate and remove the folder without installing a signal handler."""
-    with build_folders.tool_folder("queue-place") as path:
-        yield path
+def recoverable_tool_folder(tool: str, parent: Path | None = None, *,
+                            keep: Callable[[], bool] | None = None) -> Generator[Path]:
+    """Keep the folder and its record when cleanup cannot finish."""
+    with ExitStack() as lease:
+        path = build_folders._claim_tool_folder(tool, parent,  # pyright: ignore[reportPrivateUsage]
+            lambda spec: lease.enter_context(build_folders.leased_build_folder(spec)))
+        unresolved = False
+        try:
+            yield path
+        except CleanupUnresolved:
+            unresolved = True
+            raise
+        finally:
+            lease.close()
+            if not unresolved and (keep is None or not keep()):
+                remove_program_folder(path)
+
+
+def remove_program_folder(path: Path) -> None:
+    def remove() -> None:
+        try:
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            pass
+
+    if not build_folders.remove_build_folder(path, remove, wait=False):
+        raise CleanupUnresolved(f"could not remove {path}")
 
 
 def cleanup_queue_place_folders() -> None:
@@ -225,7 +261,7 @@ def cleanup_queue_place_folders() -> None:
             continue
         try:
             if not path.is_symlink() and path.is_dir() and path.stat().st_uid == os.getuid():
-                _ = build_folders.remove_build_folder(path, lambda: shutil.rmtree(path))
+                remove_program_folder(path)
         except FileNotFoundError:
             pass
 
@@ -254,15 +290,7 @@ def cleanup_program_starts(configuration: admission_records.MemoryConfig | wire.
             if start is None or start == record.program.start_time:
                 tree = ProgramTree(record.program.pid)
                 tree.observed[record.program.pid] = record.program.start_time
-                while members := tree.live_members(set()):
-                    number = signal.SIGKILL if time.monotonic() >= deadline else signal.SIGTERM
-                    for pid, identity in members.items():
-                        try:
-                            if admission_records.process_start_time(pid) == identity:
-                                os.kill(pid, number)
-                        except ProcessLookupError:
-                            pass
-                    time.sleep(configuration.program_sample_seconds)
+                stop_members(lambda: tree.live_members(set()), deadline, configuration.program_sample_seconds)
         path.unlink(missing_ok=True)
 
 
@@ -282,8 +310,12 @@ def scope_start(sidecar: Path, holder_pid: int, holder_start: str, argv: Sequenc
 
 def stop_scope(scope: Path, deadline: float, sample_seconds: float) -> None:
     """Stop scope members until the scope is empty."""
+    kill_at = (time.monotonic() + deadline) / 2
     while members := memory_admit.scope_members(scope):
-        number = signal.SIGKILL if time.monotonic() >= deadline else signal.SIGTERM
+        now = time.monotonic()
+        if now >= deadline:
+            raise CleanupUnresolved(f"scope {scope} still has live processes")
+        number = signal.SIGKILL if now >= kill_at else signal.SIGTERM
         killed_scope = False
         if number == signal.SIGKILL:
             try:
@@ -297,11 +329,27 @@ def stop_scope(scope: Path, deadline: float, sample_seconds: float) -> None:
                     os.kill(pid, number)
                 except ProcessLookupError:
                     pass
-        time.sleep(min(sample_seconds, max(0, deadline - time.monotonic()))
-                   if number == signal.SIGTERM else sample_seconds)
+        time.sleep(max(0, min(sample_seconds, (kill_at if now < kill_at else deadline) - time.monotonic())))
 
 
-def program_members(tree: ProgramTree, sidecar: Path) -> dict[int, str]:
+def stop_members(read_members: Callable[[], dict[int, str]], deadline: float, sample_seconds: float) -> None:
+    """Stop the processes that still match their recorded identities."""
+    kill_at = (time.monotonic() + deadline) / 2
+    while members := read_members():
+        now = time.monotonic()
+        if now >= deadline:
+            raise CleanupUnresolved(f"processes still live: {', '.join(map(str, members))}")
+        number = signal.SIGKILL if now >= kill_at else signal.SIGTERM
+        for pid, identity in members.items():
+            try:
+                if admission_records.process_start_time(pid) == identity:
+                    os.kill(pid, number)
+            except ProcessLookupError:
+                pass
+        time.sleep(max(0, min(sample_seconds, (kill_at if now < kill_at else deadline) - time.monotonic())))
+
+
+def program_members(tree: ProgramTree, sidecar: Path, *, deadline: float | None = None) -> dict[int, str]:
     """Find observed tree members and scope members, including nested scopes."""
     members: set[int] = set()
     try:
@@ -310,7 +358,7 @@ def program_members(tree: ProgramTree, sidecar: Path) -> dict[int, str]:
             members = memory_admit.scope_members(Path(scope))
     except FileNotFoundError:
         pass
-    return tree.live_members(members)
+    return tree.live_members(members, deadline=deadline)
 
 
 @dataclass
@@ -326,6 +374,7 @@ class QueuePlace:
     purpose: ProgramPurpose = field(default=ProgramPurpose.BATCH, kw_only=True)
     arguments: tuple[str, ...] = field(default=(), kw_only=True)
     _samples: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    keep_reservation: bool = field(default=False, init=False)
 
     def publish_sample(self, suffix: str, value: str) -> None:
         path = self.path.with_suffix(suffix)
@@ -387,10 +436,14 @@ class QueuePlace:
         self.program = StartedProgram(process, stopped, sampler, tracking, record)
         if isinstance(sampler, threading.Thread):
             sampler.start()
+        deadline = time.monotonic() + self.configuration.program_stop_seconds
         while not record.exists():
             if process.poll() is not None and not record.exists():
                 raise QueuePlaceRefused("the program exited before it published its ownership")
-            time.sleep(self.configuration.program_sample_seconds)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CleanupUnresolved("the program did not publish its ownership")
+            time.sleep(min(self.configuration.program_sample_seconds, remaining))
         self.on_started()
         return process
 
@@ -425,37 +478,41 @@ class QueuePlace:
         if not isinstance(self.program, StartedProgram):
             return
         program = self.program
+        if program.finished:
+            program.record.unlink(missing_ok=True)
+            return
         process = program.process
+        config = self.configuration
+        deadline = time.monotonic() + config.program_stop_seconds
         try:
             completed = process.poll()
-            config = self.configuration
-            deadline = time.monotonic() + config.program_stop_seconds
             if isinstance(program.tracking, ScopedProgram):
-                stop_scope(Path(self.sidecar.read_text().strip()), deadline, config.program_sample_seconds)
+                scope = self.sidecar.read_text().strip()
+                if scope:
+                    stop_scope(Path(scope), deadline, config.program_sample_seconds)
+                else:
+                    process.kill()
             else:
-                members = program_members(program.tracking, self.sidecar)
-                while members:
-                    number = signal.SIGKILL if time.monotonic() >= deadline else signal.SIGTERM
-                    for pid, start in members.items():
-                        try:
-                            if admission_records.process_start_time(pid) == start:
-                                os.kill(pid, number)
-                        except ProcessLookupError:
-                            pass
+                def live_members() -> dict[int, str]:
                     _ = process.poll()
-                    time.sleep(min(config.program_sample_seconds,
-                                   max(0, deadline - time.monotonic())) if number == signal.SIGTERM
-                               else config.program_sample_seconds)
-                    members = program_members(program.tracking, self.sidecar)
-            _ = process.wait()
+                    assert isinstance(program.tracking, ProgramTree)
+                    return program_members(program.tracking, self.sidecar, deadline=deadline)
+
+                stop_members(live_members, deadline, config.program_sample_seconds)
+            try:
+                _ = process.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired as error:
+                raise CleanupUnresolved(f"program {process.pid} did not exit") from error
             if completed is not None and not failed:
                 self.status = completed
-            program.record.unlink(missing_ok=True)
         finally:
             program.stopped.set()
             if isinstance(program.sampler, threading.Thread) and program.sampler.ident is not None:
-                program.sampler.join()
-        self.program = ProgramNotStarted()
+                program.sampler.join(timeout=max(0, deadline - time.monotonic()))
+                if program.sampler.is_alive():
+                    raise CleanupUnresolved(f"the sampler for program {process.pid} did not stop")
+        program.finished = True
+        program.record.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -554,7 +611,8 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
     if start is None:
         raise QueuePlaceRefused("owner no longer exists")
     # The reservation ends before its folder: the service can read the sidecar until release.
-    with queue_place_folder() as temporary, ExitStack() as reservation:
+    keep_folder = False
+    with recoverable_tool_folder("queue-place", keep=lambda: keep_folder) as temporary, ExitStack() as reservation:
         sidecar = temporary / "program.cgroup"
         atomic_file.atomic_sample(sidecar, "")
         grant: HeldReservation | UnreservedProgram = UnreservedProgram()
@@ -581,12 +639,14 @@ def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False
                             error.code if isinstance(error, SystemExit) and isinstance(error.code, int) else 1)
             raise
         finally:
+            keep_folder = True
             if isinstance(grant, HeldReservation):
                 grant.keep = True
             place.finish(failed=failed)
+            keep_folder = place.keep_reservation
             if isinstance(grant, HeldReservation):
                 grant.status = place.status
-                grant.keep = False
+                grant.keep = place.keep_reservation
 
 
 class ShellArguments(argparse.Namespace):
