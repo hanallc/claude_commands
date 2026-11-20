@@ -358,10 +358,8 @@ class AssignClaudeLauncherFixture(LauncherFixture):
             "check = assign.call([assign.PYTHON, str(assign.SCRIPTS / 'progress_history.py'), 'check-launch', '--session-dir', str(run), '--pass-kind', role, '--phase-id', phase, '--prompt-file', str(prompt), '--fix-cause', args.fix_cause], env, check=False)",
             "if check.returncode: raise SystemExit(3 if check.returncode == 3 else 2)",
             "slot = args.to or args.new_worker or role",
-            "before = assign.pass_start_count(run, slot)",
             "worker = assign_claude.ClaudeFollowUp(args.to) if args.to else assign_claude.NewClaudeWorker()",
             "code = assign_claude.run(assign_claude.ClaudeLaunch(run, phase, cwd, prompt, role, slot, args.fix_cause, args.pass_number, model[1], model[2], worker, ('bash', str(assign.SCRIPTS / 'assign.sh'), *sys.argv[1:]), env))",
-            "if code and assign.pass_start_count(run, slot) > before: assign.end_failed_launch(run, slot, env)",
             "raise SystemExit(code)",
         )) + "\n"
         if self.direct_cli_calls:

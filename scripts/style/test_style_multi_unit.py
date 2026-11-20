@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import io
-import sqlite3
 import unittest
-from contextlib import closing, redirect_stdout
+from contextlib import redirect_stdout
 from pathlib import Path
 
 from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner
 from scripts.style import rules, style_ledger, style_plan
-from scripts.style.ledger_test_support import DEFAULT_STYLE_ASSIGNMENTS, ticket_owner_id, write_style_units
+from scripts.style.ledger_test_support import DEFAULT_STYLE_ASSIGNMENTS, add_saved_reservation_path, ticket_owner_id, write_style_units
 from scripts.style.style_config import StyleUnitAssignment
 from scripts.style.style_plan_test_support import StylePlanFixture
 
@@ -140,9 +139,7 @@ class StyleMultiUnitTests(StylePlanFixture):
                 for path in ticket["files"]:
                     self.record(rule, path, self.tip, ticket_id)
         ledger.ticket_checkpoint("1", self.tip)
-        with closing(sqlite3.connect(ledger.database)) as connection, connection:
-            _ = connection.execute("INSERT INTO ticket_widened_paths VALUES (?,?,?,?,?)",
-                                   ("2", self.sources[2], "Stored overlap", "fixture", "now"))
+        add_saved_reservation_path(ledger, "2", self.sources[2], style_ledger.ReservationRole.WIDENED)
         output = io.StringIO()
         with redirect_stdout(output):
             self.assertEqual(style_plan.gate(self.repo, "2"), 1)

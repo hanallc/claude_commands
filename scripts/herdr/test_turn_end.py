@@ -1341,9 +1341,11 @@ class TurnEndTests(unittest.TestCase):
         config = self.case.fixture.root / "conf"
         for name in ("detached_runs.conf", "postmaster.conf", "codex_daemon.conf"):
             _ = shutil.copyfile(source / name, config / name)
-        for finishes_during_turn in (True, False):
-            with self.subTest(finishes_during_turn=finishes_during_turn):
-                name = f"impl-result-{int(finishes_during_turn)}"
+        cases = ((True, False, False), (False, False, False), (True, True, False), (True, True, True))
+        for finishes_during_turn, self_stop, transcript_unavailable in cases:
+            with self.subTest(finishes_during_turn=finishes_during_turn, self_stop=self_stop,
+                              transcript_unavailable=transcript_unavailable):
+                name = f"impl-result-{int(finishes_during_turn)}-{int(self_stop)}-{int(transcript_unavailable)}"
                 self.case.reply = self.case.run_dir / f"{name}.md"
                 self.case.agent.finish_after = 1
                 self.assertIs(worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse(name), "impl",
@@ -1353,8 +1355,12 @@ class TurnEndTests(unittest.TestCase):
                 row = self.case.agent.row(pane)
                 path, record = self.case.detached_record(row, name)
                 record["status"] = "running"
+                if self_stop:
+                    record.update(stop_reason="The newer check replaces this run.",
+                                  stop_pass_requested=True, self_stop=True)
+                log = "The private check began." if self_stop else "The private check passed."
                 atomic_file.write_text_atomic(path, json.dumps(record))
-                atomic_file.write_text_atomic(Path(record["log"]), "The private check passed.\n")
+                atomic_file.write_text_atomic(Path(record["log"]), log + "\n")
                 submitted: list[str] = []
                 notices = len(self.case.agent.notices)
                 run = self.case.fixture.world.run
@@ -1388,12 +1394,29 @@ class TurnEndTests(unittest.TestCase):
 
                 with (patch.object(self.case.fixture.world, "run", side_effect=submit),
                       patch.object(self.case.fixture.world, "wait_turn_end", side_effect=wait_for_idle),
-                      patch.object(detached_runs, "_run", return_value=0),
+                      patch.object(detached_runs, "_stopped_group_has_ended", return_value=True),
+                      patch.object(detached_runs, "_run", return_value=143 if self_stop else 0),
                       patch.object(detached_runs, "deliver_in_fresh_process", side_effect=deliver)):
                     if not finishes_during_turn:
                         with patch.object(detached_runs, "live_runs", return_value=[record]):
                             self.assertEqual(finish_turn(), turn_end.TurnOutcome.WAITING_ON_RUNS)
-                    self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+                    if transcript_unavailable:
+                        with patch.object(detached_runs, "_result_received", side_effect=OSError("fixture read failure")):
+                            self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+                        saved = worker_lifecycle.read_json_object(path)
+                        self.assertEqual(saved.get("delivery"),
+                                         "deferred: worker transcript is unavailable: fixture read failure")
+                        self.assertNotIn("delivered_at", saved)
+                        self.assertEqual(len(self.case.agent.notices), notices)
+                        with patch.object(worker_panes, "observe", return_value=(worker_panes.ClosedWorker(row),)):
+                            self.assertEqual(self.case.finish(name, turn_end.EventKind.RUN_FINISHED),
+                                             turn_end.TurnOutcome.RETRY_EVIDENCE)
+                        saved = worker_lifecycle.read_json_object(path)
+                        self.assertEqual(saved.get("delivery"), "deferred: worker pane is closed")
+                        self.assertNotIn("delivered_at", saved)
+                        self.assertEqual(len(self.case.agent.notices), notices)
+                    else:
+                        self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
                     if finishes_during_turn:
                         saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
                         self.assertTrue(saved.get("completion_pending"))
@@ -1401,7 +1424,13 @@ class TurnEndTests(unittest.TestCase):
                         self.assertEqual(finish_turn(), turn_end.TurnOutcome.SUBMITTED)
                     result, = submitted
                     self.assertIn(f"Detached run: {name}", result)
-                    self.assertIn("The private check passed.", result)
+                    self.assertIn(log, result)
+                    if self_stop:
+                        self.assertIn("Result: STOPPED (exit 143)", result)
+                        self.assertIsInstance(progress_history.active_dispatch(row.id, self.case.run_dir),
+                                              progress_history.ActiveDispatch)
+                        self.assertIn(pane, self.case.fixture.world.locations)
+                        self.assertEqual(len(self.case.agent.notices), notices)
                     saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
                     self.assertEqual(saved.get("delivery"), f"sent: worker {name} at {pane}")
                     self.assertTrue(saved.get("completion_pending"))

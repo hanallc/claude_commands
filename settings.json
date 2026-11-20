@@ -232,10 +232,6 @@
     "style_rename": "user-invocable-only",
     "watcher": "user-invocable-only",
     "zed": "user-invocable-only",
-    "banned_word_analysis": "user-invocable-only",
-    "banned_word_hook": "user-invocable-only",
-    "revert_banned_count": "user-invocable-only",
-    "add_banned_word": "user-invocable-only",
     "nightly_review": "user-invocable-only"
   },
   "hooks": {
