@@ -20,9 +20,9 @@ def normalized_name(name: str) -> str:
     return " ".join(name.casefold().split())
 
 
-def matching_sessions(name: str) -> dict[str, str]:
-    """Return the registered names by session ID."""
-    matches: dict[str, str] = {}
+def matching_session_ids(name: str) -> set[str]:
+    """Return the session IDs that match the normalized name."""
+    matches: set[str] = set()
     for config in config_dirs():
         try:
             paths = list((config / "sessions").iterdir())
@@ -35,7 +35,7 @@ def matching_sessions(name: str) -> dict[str, str]:
                 record = parse_session(cast(object, json.loads(path.read_text(encoding="utf-8"))))
                 if (not isinstance(record, UnreadableSessionRecord) and record["sessionId"]
                         and normalized_name(record["name"]) == name and running_session(record)):
-                    matches[record["sessionId"]] = record["name"]
+                    matches.add(record["sessionId"])
             except (OSError, ValueError, RecursionError):
                 continue
     return matches
@@ -69,12 +69,14 @@ def main() -> None:
             target = target.strip()
             name = re.sub(r"\s+\[[^\[\]\r\n]+\]\Z", "", target)
             normalized = normalized_name(name)
-            matches = matching_sessions(normalized) if normalized else {}
+            if not normalized:
+                return
+            matches = matching_session_ids(normalized)
             if not matches:
                 return
             if len(matches) == 1:
-                session, registered_name = next(iter(matches.items()))
-                reason = send_reason(f"session:{session}" if name != target else registered_name)
+                session, = matches
+                reason = send_reason(f"session:{session}")
             else:
                 choices = ", ".join(f"`session:{session}`" for session in sorted(matches))
                 reason = (f"Choose one session address from {choices}. "

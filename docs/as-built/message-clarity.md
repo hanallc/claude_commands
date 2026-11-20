@@ -51,7 +51,7 @@ Use `/tune` to set `review_hold=on` when message holding can resume.
 The sender hook refuses native `SendMessage` calls to other sessions, including urgent calls.
 It matches bare socket paths, `uds:` addresses, `session:` addresses, and live local registry names.
 It ignores case and differences in spacing when it compares names.
-For a name with ` [ref]`, it gives the matching session ID.
+For a unique name match, it gives a `session:` address.
 For multiple matches, it lists the session IDs so the sender can choose one.
 The hook allows names with no live local match, including remote session names and local helpers.
 Use `send.py` for messages to other sessions. Add `--urgent` for an URGENT message.

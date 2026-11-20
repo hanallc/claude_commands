@@ -82,9 +82,13 @@ class ReviewHoldSendTests(unittest.TestCase):
         path = str(self.home / "socket folder" / "session.sock")
         self.assert_denied(self.send(path), f"uds:{path}")
 
-    def test_matches_case_and_spaces_and_gives_the_registered_name(self) -> None:
+    def test_matches_case_and_spaces_and_gives_the_session_id(self) -> None:
         self.write_live_session(self.config)
-        self.assert_denied(self.send("  ReViEw   OwNeR  "), NAME)
+        self.assert_denied(self.send("  ReViEw   OwNeR  "), f"session:{SESSION}")
+
+    def test_denies_a_unique_name_without_a_ref_and_gives_the_session_id(self) -> None:
+        self.write_live_session(self.config)
+        self.assert_denied(self.send(NAME), f"session:{SESSION}")
 
     def test_denies_a_unique_name_with_a_ref_and_gives_the_session_id(self) -> None:
         self.write_live_session(self.home / ".claude2")
@@ -104,7 +108,7 @@ class ReviewHoldSendTests(unittest.TestCase):
     def test_denies_an_urgent_message_to_a_session(self) -> None:
         self.write_live_session(self.config)
         message = "URGENT: The build needs attention."
-        self.assert_denied(self.send(NAME, message), NAME, message)
+        self.assert_denied(self.send(NAME, message), f"session:{SESSION}", message)
 
     def test_denies_a_live_session_beside_an_invalid_session_file(self) -> None:
         sessions = self.home / ".claude2" / "sessions"
@@ -114,7 +118,7 @@ class ReviewHoldSendTests(unittest.TestCase):
         for invalid in ("{incomplete", "[]", json.dumps({"name": NAME})):
             with self.subTest(invalid=invalid):
                 _ = record.write_text(invalid, encoding="utf-8")
-                self.assert_denied(self.send(NAME), NAME)
+                self.assert_denied(self.send(NAME), f"session:{SESSION}")
 
     def test_allows_helper_names_without_a_live_registry_match(self) -> None:
         self.write_session(self.config, started="stale process start")
