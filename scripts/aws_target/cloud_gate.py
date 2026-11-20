@@ -74,6 +74,22 @@ class RegionalLiveSpotRead:
     prices: tuple[ledger.RegionalSpotPrice, ...] = ()
 
 
+@dataclass(frozen=True)
+class DefaultOrder:
+    """Use the usual cost order within the capacity group."""
+
+
+@dataclass(frozen=True)
+class FasterWithinRatio:
+    reference: GateLaunchVariant
+    saved_seconds: Decimal
+    cost_ratio: Decimal
+
+
+def gate_rate_candidates(variants: Sequence[GateLaunchVariant]) -> tuple[ledger.GateRateCandidate, ...]:
+    return tuple(dict.fromkeys(ledger.GateRateCandidate(row.instance_type, row.region) for row in variants))
+
+
 SPOT_INTERRUPTION_CODES = frozenset(('Server.SpotInstanceTermination', 'Server.SpotInstanceShutdown'))
 # The downloaded box result; outcome.json names this file and holds no second copy.
 RESULT_FILE = 'remote-result.json'
@@ -629,11 +645,10 @@ class GateWorker:
             pool.shutdown(wait=False, cancel_futures=True)
 
     def rank_variants(self, variants: Sequence[GateLaunchVariant], mode: str,
-                      live_prices: Sequence[ledger.RegionalSpotPrice] = ()) -> list[GateLaunchVariant]:
-        """Prefer available capacity, then the lowest expected USD per run, then the configured type order.
-
-        A type and region whose median box time is above max_gate_minutes is not tried."""
-        values = settings()
+                      live_prices: Sequence[ledger.RegionalSpotPrice] = (), *,
+                      configuration: conf.ConfigRead | None = None) -> list[GateLaunchVariant]:
+        """Rank by capacity, then by speed within the ratio and expected cost."""
+        values = configuration if configuration is not None else settings()
         types = values.words('instance_types')
         def type_rank(variant: GateLaunchVariant) -> int:
             return types.index(variant.instance_type) if variant.instance_type in types else len(types)
@@ -678,16 +693,58 @@ class GateWorker:
             price = eligibility.prices.get(variant)
             cost = pricing.expected_usd(price, variant.instance_type, variant.region) if price is not None else Decimal(0)
             return capacity_order(variant), price is None, cost, type_rank(variant), position
-        return [variant for _, variant in sorted(enumerate(eligibility.variants), key=order)]
+        ratio = values.value('faster_box_max_cost_ratio', conf.decimal)
+        if ratio == 1:
+            return [variant for _, variant in sorted(enumerate(eligibility.variants), key=order)]
 
-    def launch(self, folder: Path, request: dict[str, object], deployment: dict[str, object]) -> str | LocalFallback:
+        estimates = {variant: pricing.placement_estimate(price, variant.instance_type, variant.region)
+                     for variant, price in eligibility.prices.items()}
+        reference = min(estimates, key=lambda variant: (estimates[variant].aws_spend_usd, type_rank(variant)))
+        baseline = estimates[reference]
+
+        def decision(variant: GateLaunchVariant) -> DefaultOrder | FasterWithinRatio:
+            estimate = estimates.get(variant)
+            if (estimate is None or isinstance(estimate.same_type_seconds, run_cost.NoBoxTimeMeasurement)
+                    or isinstance(baseline.same_type_seconds, run_cost.NoBoxTimeMeasurement)):
+                return DefaultOrder()
+            saving = baseline.same_type_seconds - estimate.same_type_seconds
+            if saving <= 0 or estimate.aws_spend_usd > ratio * baseline.aws_spend_usd:
+                return DefaultOrder()
+            # Two choices at zero spend have the same cost.
+            multiple = estimate.aws_spend_usd / baseline.aws_spend_usd if baseline.aws_spend_usd else Decimal(1)
+            return FasterWithinRatio(reference, saving, multiple)
+
+        decisions = {variant: decision(variant) for variant in estimates}
+
+        def faster_order(item: tuple[int, GateLaunchVariant]
+                         ) -> tuple[tuple[bool, bool, bool], bool, Decimal, bool, Decimal, int, int]:
+            position, variant = item
+            estimate = estimates.get(variant)
+            choice = decisions.get(variant)
+            saving = choice.saved_seconds if isinstance(choice, FasterWithinRatio) else Decimal(0)
+            cost = estimate.order_cost_usd if estimate is not None else Decimal(0)
+            return capacity_order(variant), not saving, -saving, estimate is None, cost, type_rank(variant), position
+
+        ranked = [variant for _, variant in sorted(enumerate(eligibility.variants), key=faster_order)]
+        first = ranked[0]
+        preference = decisions.get(first)
+        if isinstance(preference, FasterWithinRatio):
+            saved = run_cost.median_run_time([preference.saved_seconds])
+            print(f'Cloud gate prefers {first.instance_type} in {first.region}: {saved} faster than '
+                  + f'{preference.reference.instance_type} in {preference.reference.region} for '
+                  + f'{preference.cost_ratio:.2f} x the cost (limit {ratio}).', flush=True)
+        return ranked
+
+    def launch(self, folder: Path, request: dict[str, object], deployment: dict[str, object], *,
+               configuration: conf.ConfigRead | None = None, reserved_types: tuple[str, ...] = ()) -> str | LocalFallback:
         path = folder / 'launch.json'
         launch: dict[str, object] = read(path) if path.exists() else {}
         if launch.get('instance'):
             self.box_region = str(launch.get('region', self.api.region))
             self.box_zone = str(launch.get('zone', ''))
             return ledger.text(launch, 'instance')
-        sizes = settings().words('instance_types')
+        values = configuration if configuration is not None else settings()
+        sizes = reserved_types or values.words('instance_types')
         deployed = run_cost.deployed_gate_variants(deployment, sizes)
         if 'instance_types' in deployment:
             if deployed.unsupported_types:
@@ -703,7 +760,7 @@ class GateWorker:
             else:
                 readings = self.live_spot_prices(variants)
                 live_prices = [price for reading in readings if reading.used for price in reading.prices]
-                variants = self.rank_variants(variants, ledger.text(request, 'mode'), live_prices)
+                variants = self.rank_variants(variants, ledger.text(request, 'mode'), live_prices, configuration=values)
                 if not variants:
                     self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
                     return LocalFallback('Every gate type and region has a median gate time above max_gate_minutes')
@@ -792,6 +849,7 @@ class GateWorker:
                     save(path, {**launch, 'instance': instance})
                     self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateRunning(instance), instance_type=size)
                     self.box_zone = zone
+                    print(f'Cloud gate accepted {size} in {self.box_region} ({zone}).', flush=True)
                     return instance
                 raise AwsUnavailable('The expired launch remains unconfirmed')
             launch_json = json.dumps(arguments)
@@ -846,6 +904,7 @@ class GateWorker:
             save(path, {**launch, 'instance': instance})
             self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateRunning(instance), instance_type=size)
             self.box_zone = zone
+            print(f'Cloud gate accepted {size} in {self.box_region} ({zone}).', flush=True)
             return instance
         self.book.resolve_gate(ledger.text(request, 'attempt'), ledger.GateAbsent(int(self.clock())))
         return LocalFallback('Spot capacity is unavailable in every configured region')
@@ -867,16 +926,32 @@ class GateWorker:
             previous = next((row for row in self.book.read_snapshot().gate_reservations if row.attempt == attempt), None)
             if previous is not None and isinstance(previous.state, (ledger.GateAbsent, ledger.GateTerminated)):
                 return {'status': 'fallback', 'reason': 'The saved attempt has ended'}
+            values = settings()
+            reserved_types: tuple[str, ...] = ()
             if not (folder / 'launch.json').exists():
                 if request.get('task') != 'paired':
                     self.charges()
+                sizes = values.words('instance_types')
+                candidates: tuple[ledger.GateRateCandidate, ...] = ()
+                if values.value('faster_box_max_cost_ratio', conf.decimal) > 1:
+                    deployed = run_cost.deployed_gate_variants(deployment, sizes)
+                    retry = ledger.mapping(request.get('retry_launch', {}))
+                    if 'variants' in retry:
+                        candidates = tuple(dict.fromkeys(ledger.GateRateCandidate(
+                            ledger.text(row, 'instance_type'), ledger.text(row, 'region'))
+                            for row in ledger.rows(retry, 'variants')[ledger.instant(retry, 'variant'):]))
+                    else:
+                        candidates = gate_rate_candidates(deployed.variants)
                 reservation = self.book.reserve_gate(self.settings_path, ledger.GateReservation(
                     attempt, int(self.clock()), ledger.instant(request, 'expires'),
-                    money(str(settings().number('spot_max_usd_per_hour'))),
-                    money(str(settings().number('attempt_allowance_usd'))),
-                    instance_type=settings().words('instance_types')[0]))
+                    money(str(values.number('spot_max_usd_per_hour'))),
+                    money(str(values.number('attempt_allowance_usd'))),
+                    state=ledger.GateLaunchPending(candidates), instance_type=sizes[0]))
                 if isinstance(reservation, (ledger.GateCapReached, ledger.GateAttemptEnded)):
                     return {'status': 'fallback', 'reason': reservation.reason}
+                pending = reservation.reservation.state
+                if isinstance(pending, ledger.GateLaunchPending):
+                    reserved_types = tuple(dict.fromkeys(row.instance_type for row in pending.rate_candidates))
                 identity = process_start(os.getpid())
                 if not isinstance(identity, Started):
                     raise ValueError('The worker has no readable process identity')
@@ -892,7 +967,7 @@ class GateWorker:
             if not isinstance(identity, Started):
                 raise ValueError('The worker has no readable process identity')
             self.book.gate_owner(attempt, ledger.GateWorkerOwner(os.getpid(), identity.start, str(folder.resolve())))
-            launched = self.launch(folder, request, deployment)
+            launched = self.launch(folder, request, deployment, configuration=values, reserved_types=reserved_types)
             if isinstance(launched, LocalFallback):
                 return {'status': 'fallback', 'reason': launched.reason}
             instance = launched

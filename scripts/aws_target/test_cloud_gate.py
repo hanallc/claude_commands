@@ -639,6 +639,125 @@ class CloudGateTests(CostFixture):
         self.assertEqual(len(reads), 4)
         self.assertTrue(all(row.used for row in reads))
 
+    def test_ratio_one_keeps_main_order(self) -> None:
+        worker, variants = self.steering_fixture()
+        text_setting(self.root / 'cloud_gate.conf', 'instance_types', 'm7a.4xlarge m7a.8xlarge')
+        slow, fast = variants[4], variants[0]
+        tied_slow, tied_fast = variants[5], variants[1]
+        choices = [tied_slow, tied_fast, slow, fast]
+        self.gate_history([(slow.instance_type, slow.region, 600), (fast.instance_type, fast.region, 300)])
+
+        for small_price, fast_price, order in (
+            ('.3', '.65', [tied_slow, slow, tied_fast, fast]),
+            ('.3', '.60', [tied_slow, slow, tied_fast, fast]),
+            ('.3', '.50', [tied_fast, fast, tied_slow, slow]),
+            ('.3', '', [tied_slow, slow, tied_fast, fast]),
+            ('', '', choices),
+        ):
+            with self.subTest(small_price=small_price, fast_price=fast_price):
+                prices = [ledger.RegionalSpotPrice(row.region, row.zone, row.instance_type, Decimal(rate), int(self.now))
+                          for row, rate in zip(choices, (small_price, fast_price, small_price, fast_price))
+                          if rate]
+                self.assertEqual(worker.rank_variants(choices, 'merge-gate', prices), order)
+
+    def test_faster_order_uses_one_spend_reference_and_fresh_prices(self) -> None:
+        worker, variants = self.steering_fixture()
+        small, medium, large = variants[4], variants[2], variants[0]
+        choices = [small, medium, large]
+        override_fixture_settings(self.root / 'cloud_gate.conf', 'faster_box_max_cost_ratio=1.5')
+        self.gate_history([(row.instance_type, row.region, seconds)
+                           for row, seconds in zip(choices, (600, 450, 300))])
+        for rates, order in (
+            (('.3', '.56', '1.176'), [medium, small, large]),
+            (('.3', '.56', '.90'), [large, medium, small]),
+            (('.3', '.64', '1.176'), [small, medium, large]),
+        ):
+            with self.subTest(rates=rates):
+                prices = [ledger.RegionalSpotPrice(row.region, row.zone, row.instance_type, Decimal(rate), int(self.now))
+                          for row, rate in zip(choices, rates)]
+                self.assertEqual(worker.rank_variants(choices, 'merge-gate', prices), order)
+
+    def test_speed_keeps_capacity_first_and_uses_the_cheapest_full_box_as_reference(self) -> None:
+        worker, variants = self.steering_fixture()
+        small, medium, large = variants[10], variants[2], variants[0]
+        choices = [small, medium, large]
+        override_fixture_settings(self.root / 'cloud_gate.conf', 'faster_box_max_cost_ratio=1.5')
+        self.gate_history([(row.instance_type, row.region, seconds)
+                           for row, seconds in zip(choices, (600, 450, 300))])
+        self.variant_prices(choices, {(row.region, row.instance_type, row.zone): rate
+                                      for row, rate in zip(choices, ('.3', '.64', '1.08'))})
+        self.west_quota(0)
+        # The full box costs 0.05. Neither available box qualifies for promotion.
+        self.assertEqual(worker.rank_variants(choices, 'merge-gate'), [medium, large, small])
+        self.west_quota(16)
+        self.assertEqual(worker.rank_variants(choices, 'merge-gate'), [small, medium, large])
+        self.variant_prices(choices, {(row.region, row.instance_type, row.zone): rate
+                                      for row, rate in zip(choices, ('.3', '.55', '1.08'))})
+        self.west_quota(0)
+        # A recent refusal places the promoted choice after an available choice.
+        cloud_gate.append_launch(self.state, {'time': self.now, 'result': 'refused',
+            'region': medium.region, 'instance_type': medium.instance_type,
+            'availability_zone': medium.zone, 'error_code': 'InsufficientInstanceCapacity'},
+            gate_job=GateJobNotRecorded())
+        self.assertEqual(worker.rank_variants(choices, 'merge-gate'), [large, medium, small])
+
+    def test_speed_requires_times_from_both_instance_types(self) -> None:
+        worker, variants = self.steering_fixture()
+        small, fast, other_large = variants[4], variants[0], variants[2]
+        override_fixture_settings(self.root / 'cloud_gate.conf', 'faster_box_max_cost_ratio=1.5')
+        self.variant_prices([small, fast], {(small.region, small.instance_type, small.zone): '.3',
+                                            (fast.region, fast.instance_type, fast.zone): '.7'})
+        self.gate_history([(small.instance_type, small.region, 600),
+                           (other_large.instance_type, fast.region, 300)])
+        self.assertEqual(worker.rank_variants([small, fast], 'merge-gate'), [small, fast])
+        for runs in ([(fast.instance_type, fast.region, 300)], []):
+            with self.subTest(runs=runs):
+                self.gate_history(runs)
+                self.assertEqual(worker.rank_variants([small, fast], 'merge-gate'), [small, fast])
+
+    def test_promotion_counts_regional_seconds_and_transfer_but_not_wait_cost(self) -> None:
+        worker, variants = self.steering_fixture()
+        small, fast = variants[4], variants[6]
+        choices = [small, fast]
+        config = self.root / 'cloud_gate.conf'
+        override_fixture_settings(config, 'faster_box_max_cost_ratio=1.5')
+        self.gate_history([(small.instance_type, small.region, 600),
+                           (fast.instance_type, small.region, 300)], [(small.instance_type, small.region, 100)])
+        self.variant_prices(choices, {(small.region, small.instance_type, small.zone): '.3',
+                                      (fast.region, fast.instance_type, fast.zone): '.7'})
+        text_setting(config, 'unmeasured_region_extra_seconds', '{"us-west-2": 60}')
+        text_setting(config, 'region_extra_gate_seconds', '{"us-west-2": 180}')
+        with redirect_stdout(StringIO()) as output:
+            self.assertEqual(worker.rank_variants(choices, 'merge-gate'), [fast, small])
+        self.assertIn('1m 0s faster than m7a.4xlarge in us-east-2 for 1.40 x the cost', output.getvalue())
+        text_setting(config, 'region_extra_gate_seconds', '{"us-west-2": 240}')
+        self.assertEqual(worker.rank_variants(choices, 'merge-gate'), [small, fast])
+        text_setting(config, 'region_extra_gate_seconds', '{}')
+        text_setting(config, 'region_transfer_usd', '{"us-west-2": 0.01}')
+        numeric_settings(config, {'gate_wait_usd_per_minute': '.005'})
+        with redirect_stdout(StringIO()) as output:
+            self.assertEqual(worker.rank_variants(choices, 'merge-gate'), [fast, small])
+        # Transfer makes the fast box cost 0.08 versus 0.05. The refusal wait cannot raise the baseline.
+        self.assertNotIn('prefers', output.getvalue())
+
+    def test_launch_reports_the_preferred_box_and_the_accepted_fallback(self) -> None:
+        worker, variants = self.steering_fixture()
+        config = self.root / 'cloud_gate.conf'
+        override_fixture_settings(config, 'faster_box_max_cost_ratio=1.5\ninstance_types=m7a.4xlarge m7a.8xlarge')
+        east = ledger.rows(self.deployment, 'regions')[0]
+        self.deployment['regions'] = [{**east, 'subnets': [ledger.rows(east, 'subnets')[0]]}]
+        small, fast = variants[4], variants[0]
+        self.gate_history([(small.instance_type, small.region, 600), (fast.instance_type, fast.region, 300)])
+        self.variant_prices([small, fast], {(small.region, small.instance_type, small.zone): '.3',
+                                            (fast.region, fast.instance_type, fast.zone): '.7'})
+        self.fake.refusals = ['InsufficientInstanceCapacity']
+        with redirect_stdout(StringIO()) as output:
+            self.assertEqual(worker.launch(self.folder, self.request, self.deployment), 'i-fixture')
+        self.assertIn('Cloud gate prefers m7a.8xlarge in us-east-2', output.getvalue())
+        self.assertIn('Cloud gate accepted m7a.4xlarge in us-east-2', output.getvalue())
+        self.assertEqual([row['InstanceType'] for row in self.fake.launches], [fast.instance_type, small.instance_type])
+        self.assertEqual(self.book.read_snapshot().gate_reservations[0].instance_type, small.instance_type)
+
     def test_variant_prices_prefer_the_cheapest_zone_and_preserve_equal_price_order(self) -> None:
         worker, variants = self.steering_fixture()
         self.variant_prices(variants, {})
@@ -1933,6 +2052,44 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
             worker.reconcile()
         self.assertIsInstance(self.book.read_snapshot().gate_reservations[0].state, ledger.GateLaunchPending)
         self.assertEqual(self.fake.commands, [])
+
+    def test_faster_box_reserves_the_highest_rate_before_ranking(self) -> None:
+        config = self.root / 'cloud_gate.conf'
+        override_fixture_settings(config, 'faster_box_max_cost_ratio=1.5\ninstance_types=m7a.4xlarge m7a.8xlarge\nregions=us-east-2')
+        self.deployment['regions'] = [{**ledger.rows(self.deployment, 'regions')[0], 'region': 'us-east-2'}]
+        numeric_settings(self.settings, {'daily_limit_usd': '3.1'})
+        reading = ledger.ChargeRead('2026-01-14', int(self.now), int(self.now) - 90000, int(self.now) - 3600,
+            Decimal('.92'), Decimal(0), Decimal(0), (
+                ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal('.12'), Decimal(1), 'Hrs'),
+                ledger.UsageTypeCost('USE2-SpotUsage:m7a.8xlarge', Decimal('.80'), Decimal(1), 'Hrs')))
+        with (mock.patch.object(self.book, 'read_bills', return_value=(reading,)),
+              mock.patch.object(cloud_gate.GateWorker, 'charges'),
+              mock.patch.object(cloud_gate.GateWorker, 'rank_variants', side_effect=AssertionError('Rank after the cap check'))):
+            small = self.book.reserve_gate(self.settings, ledger.GateReservation(
+                'small', int(self.now), int(self.now) + 1200, Decimal('.8'), Decimal('.02'), instance_type='m7a.4xlarge'))
+            self.assertIsInstance(small, ledger.GateReserved)
+            self.book.resolve_gate('small', ledger.GateAbsent(int(self.now)))
+            self.assertEqual(self.execute(), {'status': 'fallback', 'reason': 'daily_limit'})
+        self.assertEqual(self.fake.commands, [])
+
+    def test_pending_faster_box_keeps_the_highest_rate_after_a_region_is_set(self) -> None:
+        numeric_settings(self.settings, {'daily_limit_usd': '4'})
+        reading = ledger.ChargeRead('2026-01-14', int(self.now), int(self.now) - 90000, int(self.now) - 3600,
+            Decimal('.92'), Decimal(0), Decimal(0), (
+                ledger.UsageTypeCost('USE2-SpotUsage:m7a.4xlarge', Decimal('.12'), Decimal(1), 'Hrs'),
+                ledger.UsageTypeCost('USW2-SpotUsage:m7a.8xlarge', Decimal('.80'), Decimal(1), 'Hrs')))
+        pending = ledger.GateLaunchPending((ledger.GateRateCandidate('m7a.4xlarge', 'us-east-2'),
+                                           ledger.GateRateCandidate('m7a.8xlarge', 'us-west-2')))
+        with mock.patch.object(self.book, 'read_bills', return_value=(reading,)):
+            self.assertIsInstance(self.book.reserve_gate(self.settings, ledger.GateReservation(
+                'attempt', int(self.now), int(self.now) + 1200, Decimal('.8'), Decimal('.02'),
+                state=pending, instance_type='m7a.4xlarge')), ledger.GateReserved)
+            self.book.gate_region('attempt', 'us-east-2')
+            saved = self.book.priced_snapshot(int(self.now)).gate_reservations[0]
+            self.assertEqual(saved.state, pending)
+            self.assertEqual(saved.rate.usd_per_hour, Decimal('.8'))
+            self.book.resolve_gate('attempt', ledger.GateRunning('i-fixture'), instance_type='m7a.4xlarge')
+            self.assertEqual(self.book.read_snapshot().gate_reservations[0].rate.usd_per_hour, Decimal('.12'))
 
     def test_combined_rust_cost_refuses_gate_before_launch(self) -> None:
         self.book.observe(ledger.InstanceObservation(int(self.now), 'running', 'fixture'))

@@ -68,8 +68,15 @@ class ComputeRequest:
 
 
 @dataclass(frozen=True)
+class GateRateCandidate:
+    instance_type: str
+    region: str
+
+
+@dataclass(frozen=True)
 class GateLaunchPending:
     """The launch has no confirmed instance identity."""
+    rate_candidates: tuple[GateRateCandidate, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -833,7 +840,9 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
         status = mapping(item['state'])
         kind = text(status, 'kind')
         if kind == 'pending':
-            gate_state = GateLaunchPending()
+            gate_state = GateLaunchPending(tuple(
+                GateRateCandidate(text(candidate, 'instance_type'), text(candidate, 'region'))
+                for candidate in rows(status, 'rate_candidates')) if 'rate_candidates' in status else ())
         elif kind == 'running':
             gate_state = GateRunning(text(status, 'instance_id'))
         elif kind == 'absent':
@@ -950,7 +959,8 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
              'day_rates': [{'day': day, 'usd_per_hour': str(rate.usd_per_hour), 'source': rate.source}
                            for day, rate in r.day_rates],
              'applied_usd_per_hour': str(r.rate.usd_per_hour), 'rate_source': r.rate.source, 'state':
-             {'kind': 'pending'} if isinstance(r.state, GateLaunchPending) else
+             {'kind': 'pending', **({'rate_candidates': [asdict(candidate) for candidate in r.state.rate_candidates]}
+                                    if r.state.rate_candidates else {})} if isinstance(r.state, GateLaunchPending) else
              {'kind': 'running', 'instance_id': r.state.instance_id} if isinstance(r.state, GateRunning) else
              {'kind': 'absent', 'at': r.state.at} if isinstance(r.state, GateAbsent) else
              {'kind': 'terminated', 'at': r.state.at, 'instance_id': r.state.instance_id}}
@@ -2133,7 +2143,8 @@ class CostLedger:
                       and any(row.usage_type.endswith('EBS:VolumeUsage.gp3') and row.quantity > 0
                               for reading in readings for row in reading.usage_types))
         configuration = conf.read_or_repository('cloud_gate') if needs_root or any(
-            not row.region for row in state.gate_reservations) else None
+            not row.region or (isinstance(row.state, GateLaunchPending) and row.state.rate_candidates)
+            for row in state.gate_reservations) else None
         configured_regions = configuration.words('regions') if configuration is not None else ()
         root_gib = configuration.whole('root_gib') if configuration is not None and needs_root else 0
         priced: list[GateReservation] = []
@@ -2145,16 +2156,22 @@ class CostLedger:
             days = tuple(datetime.fromtimestamp(left, ZoneInfo('UTC')).date().isoformat()
                          for left, _right in _days(at, max(at + 1, end), ZoneInfo('UTC')))
             regions = (reservation.region,) if reservation.region else configured_regions
-            for region in regions:
-                key = (size, region, reservation.root_gib or root_gib)
+            candidates = tuple(GateRateCandidate(size, region) for region in regions)
+            if launch is None and isinstance(reservation.state, GateLaunchPending) and reservation.state.rate_candidates:
+                # Keep the original reservation as a floor until AWS confirms a launch.
+                floor = (GateRateCandidate(size, region) for region in configured_regions)
+                candidates = tuple(dict.fromkeys((*reservation.state.rate_candidates, *floor)))
+            rates_by_candidate: list[_BillRates] = []
+            for candidate in candidates:
+                key = (candidate.instance_type, candidate.region, reservation.root_gib or root_gib)
                 if key not in indexes:
-                    indexes[key] = _bill_rates(readings, size, now, region, root_gib=key[2], gate_counts=gate_counts)
-            rates = tuple((day, max((indexes[(size, region, reservation.root_gib or root_gib)].for_day(day, reservation.usd_per_hour) for region in regions),
+                    indexes[key] = _bill_rates(readings, key[0], now, key[1], root_gib=key[2], gate_counts=gate_counts)
+                rates_by_candidate.append(indexes[key])
+            rates = tuple((day, max((index.for_day(day, reservation.usd_per_hour) for index in rates_by_candidate),
                                    key=lambda rate: rate.usd_per_hour,
                                    default=BoxRate(reservation.usd_per_hour, 'spot_max_usd_per_hour'))) for day in days)
             reservation = replace(reservation, at=at, instance_type=size, rate=rates[0][1], day_rates=rates)
-            priced.append(replace(reservation, booked_allowance=_book_allowance(
-                reservation, tuple(indexes[(size, region, reservation.root_gib or root_gib)] for region in regions))))
+            priced.append(replace(reservation, booked_allowance=_book_allowance(reservation, rates_by_candidate)))
         state.gate_reservations = priced
         _correct_allowance_estimates(state, readings, now)
 
