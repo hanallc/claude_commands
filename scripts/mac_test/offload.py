@@ -11,6 +11,7 @@ import argparse
 from collections.abc import Generator, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from functools import partial
 from importlib import import_module
 import fcntl
@@ -250,6 +251,13 @@ class KnownMacJob:
 
 
 @dataclass(frozen=True)
+class RecordedMirrorSession:
+    """The last session recorded in the mirror."""
+
+    session: str
+
+
+@dataclass(frozen=True)
 class LostRunLeftovers:
     """Work from a lost run still holds the Mac."""
 
@@ -259,14 +267,24 @@ class UnreadableMacHolder:
     """The Mac holder cannot be read."""
 
 
-MacHolder = KnownMacJob | LostRunLeftovers | UnreadableMacHolder
+MacHolder = KnownMacJob | RecordedMirrorSession | LostRunLeftovers | UnreadableMacHolder
+
+
+class MirrorBusyCheck(Enum):
+    """The mirror check that reported a busy refusal."""
+
+    UNREPORTED = ""
+    LEASE = "mirror lease"
+    PROCESS = "mirror process check"
 
 
 @dataclass(frozen=True)
 class BusyMacDecline:
-    """The decline holds the Mac holder and elapsed time."""
+    """The result records the Mac holder and any reported mirror check."""
+
     holder: MacHolder
     seconds: float
+    mirror_check: MirrorBusyCheck = MirrorBusyCheck.UNREPORTED
 
     @property
     def reason(self) -> Literal["busy"]:
@@ -281,6 +299,8 @@ def claim_holder(stdout: str) -> MacHolder:
 def holder_value(holder: MacHolder) -> str:
     if isinstance(holder, KnownMacJob):
         return holder.what
+    if isinstance(holder, RecordedMirrorSession):
+        return f"last recorded mirror session {holder.session}"
     return "leftovers" if isinstance(holder, LostRunLeftovers) else "unreadable"
 
 
@@ -814,8 +834,16 @@ class MissingMacStatus:
 
 
 @dataclass(frozen=True)
-class MirrorUseBusy:
-    """The mirror lease refused the command before the runner started."""
+class MirrorBusyRefusal:
+    """A receiver or runner could not acquire the mirror."""
+
+    holder: RecordedMirrorSession | UnreadableMacHolder
+    mirror_check: MirrorBusyCheck
+
+
+@dataclass(frozen=True)
+class NoMirrorBusyRefusal:
+    """The diagnostic does not report a busy mirror."""
 
 
 @dataclass(frozen=True)
@@ -824,7 +852,7 @@ class UnresolvedSlotStartup:
 
 
 RemoteRunStatus = (ReportedMacStatus | MacNextestSetupFailed | MissingMacStatus
-                   | UnresolvedSlotStartup | ToolVersionMismatch | MirrorUseBusy)
+                   | UnresolvedSlotStartup | ToolVersionMismatch | MirrorBusyRefusal)
 MISSING_MAC_STATUS = MissingMacStatus()
 
 
@@ -1091,7 +1119,7 @@ class ProcessController:
         cleanup: CleanupOutcome = CleanupUnconfirmed()
         held_status_line = ""
         mismatch = ""
-        mirror_refused = False
+        mirror_refusal: MirrorBusyRefusal | NoMirrorBusyRefusal = NoMirrorBusyRefusal()
         build_target_directory = ""
         received_bytes = 0
         finished_output = False
@@ -1117,8 +1145,9 @@ class ProcessController:
                         and marker == "dispatch_start_pending=" + pending_start_key(identity)):
                     self.pending = PendingStartOperation()
                     continue
-                if mirror_busy_refusal(marker):
-                    mirror_refused = True
+                refusal = mirror_busy_refusal(marker)
+                if isinstance(refusal, MirrorBusyRefusal):
+                    mirror_refusal = refusal
                 if marker.startswith("build_target_directory="):
                     build_target_directory = marker.removeprefix("build_target_directory=")
                     continue
@@ -1168,6 +1197,7 @@ class ProcessController:
                 self.stop()
             self.active = IDLE_PROCESS
             startup_refused = isinstance(status, UnresolvedSlotStartup)
+            mirror_refused = isinstance(mirror_refusal, MirrorBusyRefusal)
             if isinstance(self.pending, AcknowledgedStartOperation) or mirror_refused or mismatch or startup_refused:
                 self.pending = SettledDispatchOperations()
             if (mirror_refused or mismatch or startup_refused) and not isinstance(status, ReportedMacStatus):
@@ -1183,8 +1213,8 @@ class ProcessController:
             return ReportedMacStatus(status.status, cleanup, build_target_directory)
         if isinstance(status, MacNextestSetupFailed):
             return MacNextestSetupFailed(cleanup)
-        if mirror_refused:
-            return MirrorUseBusy()
+        if isinstance(mirror_refusal, MirrorBusyRefusal):
+            return mirror_refusal
         if isinstance(status, UnresolvedSlotStartup):
             return status
         return MissingMacStatus(f"runner exited with status {exit_status} without a final status")
@@ -1310,7 +1340,11 @@ def write_result(
             print(f"mac_test: not running on the {label} ({description})")
     fixed = result.fix if isinstance(result, PassedOnMac) else FIX_NOT_RUN
     if isinstance(destination, ResultFile):
-        holder_line = f"holder={holder_value(result.holder)}\n" if isinstance(result, BusyMacDecline) else ""
+        holder_line = ""
+        if isinstance(result, BusyMacDecline):
+            check = result.mirror_check.value
+            suffix = f" ({check})" if check else ""
+            holder_line = f"holder={holder_value(result.holder)}{suffix}\n"
         linux = bool(target) and not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target).platform)
         prefix = f"outcome={mac}\ntarget={target}" if linux else f"mac={mac}"
         details = ""
@@ -1336,8 +1370,18 @@ def write_mirror_busy(config: OffloadConfig, repository: str, target: str) -> No
     write_text_atomic(path, f"{time.time() + config.mirror_busy_backoff_s:.6f}\n")
 
 
-def mirror_busy_refusal(detail: str) -> bool:
-    return re.search(r"\bcopies: [^\n]+: busy; held by session ", detail) is not None
+def mirror_busy_refusal(detail: str) -> MirrorBusyRefusal | NoMirrorBusyRefusal:
+    """Read the receiver or runner diagnostic, including older receivers."""
+    match = re.search(
+        r"(?:^copy: rsync: |^|; )copies: [^\r\n]+?: busy; held by session"
+        + r"(?: (?P<session>[^;\r\n]*?))?(?: \((?P<check>mirror (?:lease|process check))\))?(?=; |$)",
+        detail.rstrip(),
+    )
+    if match is None:
+        return NoMirrorBusyRefusal()
+    session = (match["session"] or "").strip()
+    holder = RecordedMirrorSession(session) if session and session != "unreadable" else UnreadableMacHolder()
+    return MirrorBusyRefusal(holder, MirrorBusyCheck(match["check"] or ""))
 
 
 def write_backoff(until: float, target: str = "mac") -> None:
@@ -2645,10 +2689,10 @@ def claimed_run(
                 command,
             ]
         )
-        if isinstance(remote_status, MirrorUseBusy):
+        if isinstance(remote_status, MirrorBusyRefusal):
             release_allowed = True
             write_mirror_busy(config, repository.name, request.target)
-            return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+            return BusyMacDecline(remote_status.holder, elapsed_seconds(started), remote_status.mirror_check)
         if not isinstance(remote_status, (ReportedMacStatus, MacNextestSetupFailed)):
             if isinstance(controller.pending, PendingStartOperation):
                 settlement = settle_pending_start(controller, config, config.host, repository, request.target, request.slot)
@@ -3189,8 +3233,11 @@ def run_offload(
                     continue
                 leases[slot] = admission_leases.enter_context(lease)
             result = leased_offload(controller, config, request, repository, started, linux, leases)
-            if isinstance(result, DeclinedMacRun) and result.reason == "copy" and mirror_busy_refusal(result.detail):
-                write_mirror_busy(config, repository.name, request.target)
+            if isinstance(result, DeclinedMacRun) and result.reason == "copy":
+                refusal = mirror_busy_refusal(result.detail)
+                if isinstance(refusal, MirrorBusyRefusal):
+                    write_mirror_busy(config, repository.name, request.target)
+                    return BusyMacDecline(refusal.holder, result.seconds, refusal.mirror_check)
             return result
     except copies.CopyError as error:
         return DeclinedMacRun("copy", elapsed_seconds(started), str(error))

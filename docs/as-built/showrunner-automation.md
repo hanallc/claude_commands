@@ -557,7 +557,7 @@ Quoted log values preserve line endings as JSON escapes.
 States are `New`, `Working`, `Blocked`, `Waiting for nate`, `Delivered`, `Done`, `Paused`, and `Closed`.
 Parking sets a time without changing the state.
 The List hides an item with unanswered questions while each send is pending or successful.
-If any unanswered question needs a resend, the item appears with its resend control.
+If a question send fails, the item shows Question not delivered.
 The `the_list.py list` command still shows the item.
 The producer uses `the_list.py answer` to save an answer and mark the item unread.
 Add and update accept `Mon D`, `Mon D HH:MM ZONE`, `No time yet`, `Waiting for nate`, `Paused`, and `Delivered` as an ETA.

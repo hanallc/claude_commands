@@ -1996,7 +1996,21 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             self.session("bogus", "bogus")
         return send.send(local_options(["--to", "bogus", "--from", "test", *args]))
 
+    def test_disabled_review_sends_without_reading_damaged_hold_state(self) -> None:
+        _ = write_config_fixture(self.root / "config/send.conf", "review_hold=off")
+        self.session("recipient", "Recipient")
+        review_hold.set_count("recipient", 2, send.now().timestamp(), self.fail,
+            record_keys=send.record_released_acceptances)
+        state = self.root / ".local/state/adhoc_review/.holds/recipient.json"
+        damaged = "{invalid JSON"
+        _ = state.write_text(damaged, encoding="utf-8")
+        result = send.send(local_options(["--to", "session:recipient", "--from", "test", "--text", "New update."]))
+        self.assertEqual(result.outcome, "sent", result.detail)
+        self.assertEqual([message.text for message in self.relayed], ["New update."])
+        self.assertEqual(state.read_text(encoding="utf-8"), damaged)
+
     def test_review_hold_keeps_the_send_and_its_repeat_window(self) -> None:
+        _ = write_config_fixture(self.root / "config/send.conf", "review_hold=on")
         self.session("recipient", "Recipient")
         review_hold.set_count("recipient", 5, send.now().timestamp(), self.fail,
             record_keys=send.record_released_acceptances)
@@ -2014,6 +2028,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(send.pending("session:recipient"), "")
 
     def test_review_hold_skips_a_saved_key_without_a_repeat_window(self) -> None:
+        _ = write_config_fixture(self.root / "config/send.conf", "review_hold=on")
         self.session("recipient", "Recipient")
         at = send.now().timestamp()
         review_hold.set_count("recipient", 5, at, self.fail,
@@ -2034,6 +2049,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(self.relayed, [])
 
     def test_urgent_send_goes_through_an_open_review(self) -> None:
+        _ = write_config_fixture(self.root / "config/send.conf", "review_hold=on")
         self.session("recipient", "Recipient")
         review_hold.set_count("recipient", 5, send.now().timestamp(), self.fail,
             record_keys=send.record_released_acceptances)
@@ -2050,6 +2066,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertNotIn("Now.", held[0])
 
     def test_urgent_postmaster_delivery_prefixes_an_explicit_summary(self) -> None:
+        _ = write_config_fixture(self.root / "config/send.conf", "review_hold=on")
         clock = self.postmaster_clock()
         self.session("recipient", "Recipient")
         self.session("worker", "Postmaster")
@@ -2074,6 +2091,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertIn("Read when you return.", queued)
 
     def test_confirmed_urgent_send_removes_only_the_matching_held_key(self) -> None:
+        _ = write_config_fixture(self.root / "config/send.conf", "review_hold=on")
         self.session("recipient", "Recipient")
         at = send.now().timestamp()
         review_hold.set_count("recipient", 2, at, self.fail,
@@ -2092,6 +2110,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertNotIn("Old update.", batches[0])
 
     def test_urgent_send_releases_the_remaining_messages_when_the_review_ends_in_transport(self) -> None:
+        _ = write_config_fixture(self.root / "config/send.conf", "review_hold=on")
         self.session("recipient", "Recipient")
         at = send.now()
         review_hold.set_count("recipient", 3, at.timestamp(), self.fail,
@@ -2127,7 +2146,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
     def test_each_local_release_restarts_the_repeat_window_for_a_held_key(self) -> None:
         released = send.now()
         at = released - timedelta(minutes=20)
-        _ = write_send_config(self.root / "config/send.conf", "review_hold_idle_minutes=1")
+        _ = write_send_config(self.root / "config/send.conf", "review_hold=on\nreview_hold_idle_minutes=1")
         for trigger in ("count-zero", "user-prompt", "session-start"):
             with self.subTest(trigger=trigger):
                 self.session(trigger, trigger)
@@ -2156,7 +2175,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_skipped_send_releases_the_expired_list_without_the_skipped_body(self) -> None:
         self.session("recipient", "Recipient")
-        _ = write_send_config(self.root / "config/send.conf", "review_hold_idle_minutes=1")
+        _ = write_send_config(self.root / "config/send.conf", "review_hold=on\nreview_hold_idle_minutes=1")
         at = send.now()
         args = ["--to", "session:recipient", "--from", "test"]
         with mock.patch.object(send, "now", return_value=at):
@@ -2187,7 +2206,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_expired_review_releases_the_list_and_stays_ended_until_a_new_review(self) -> None:
         self.session("recipient", "Recipient")
-        _ = write_send_config(self.root / "config/send.conf", "review_hold_idle_minutes=4")
+        _ = write_send_config(self.root / "config/send.conf", "review_hold=on\nreview_hold_idle_minutes=4")
         at = send.now()
         review_hold.set_count("recipient", 5, at.timestamp(), self.fail,
             record_keys=send.record_released_acceptances)
@@ -2223,7 +2242,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_the_first_send_after_idle_releases_the_list_without_a_prompt(self) -> None:
         self.session("recipient", "Recipient")
-        _ = write_send_config(self.root / "config/send.conf", "review_hold_idle_minutes=1")
+        _ = write_send_config(self.root / "config/send.conf", "review_hold=on\nreview_hold_idle_minutes=1")
         at = send.now()
         review_hold.set_count("recipient", 3, at.timestamp(), self.fail,
             record_keys=send.record_released_acceptances)
@@ -2250,7 +2269,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
 
     def test_released_review_keys_start_a_new_repeat_window_for_each_original_recipient(self) -> None:
         self.session("recipient", "Recipient")
-        _ = write_send_config(self.root / "config/send.conf", "review_hold_idle_minutes=1")
+        _ = write_send_config(self.root / "config/send.conf", "review_hold=on\nreview_hold_idle_minutes=1")
         at = send.now()
         review_hold.set_count("recipient", 3, at.timestamp(), self.fail,
             record_keys=send.record_released_acceptances)
@@ -2275,6 +2294,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(len(self.relayed), 1)
 
     def test_review_holds_stall_watch_and_send_later_timer_prompts(self) -> None:
+        _ = write_config_fixture(self.root / "config/send.conf", "review_hold=on")
         self.session("recipient", "Recipient")
         at = send.now()
         review_hold.set_count("recipient", 5, at.timestamp(), self.fail,
@@ -3602,6 +3622,21 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(len(self.relayed), 1)
         self.assertEqual([path.name for path in (self.root / "queue").iterdir()], ["session-recipient.jsonl"])
         self.assertEqual((self.log()[-1]["via"], self.log()[-1]["postmaster"]), ("relay", "failed"))
+
+    def test_unwritten_relay_mismatch_refuses_and_releases_the_send_key(self) -> None:
+        self.session("recipient", "Recipient")
+        options = local_options(["--to", "session:recipient", "--from", "Sender", "--key", "notice",
+                                 "--repeat-minutes", "30", "--text", "body"])
+        events = stream(INIT, call("changed body"), answer(OK))
+        result = send.read_relay(
+            send.RelayTransportResponse(0, events, "", RELAY_FIXTURE_TARGET, send.RelayRequestNotForwarded()), "body")
+        with mock.patch.object(send, "relay", side_effect=(result, self.outcome)) as relay:
+            first = send.send(options)
+            self.assertIsInstance(first, send.RefusedRelayRequest)
+            self.assertEqual(first, send.RefusedRelayRequest("refused", "SendMessage used a different target or payload"))
+            self.assertEqual(self.claims("notice"), {})
+            self.assertEqual(send.send(options).outcome, "sent")
+            self.assertEqual(relay.call_count, 2)
 
     def test_queued_relay_reports_recipient_that_exits_during_delivery(self) -> None:
         self.session("recipient", "Recipient")
@@ -8120,7 +8155,7 @@ class PaneWorkerMessageTests(unittest.TestCase):
         session = str(worker.current_session)
         _ = self.fixture.session_record(session, worker.name)
         registry = session_records.read_registry()
-        _ = write_send_config(self.fixture.root / "conf/send.conf", "review_hold_idle_minutes=1")
+        _ = write_send_config(self.fixture.root / "conf/send.conf", "review_hold=on\nreview_hold_idle_minutes=1")
         at = send.now()
         args = ["--here", "--to", f"worker:{self.fixture.parent.name}/{worker.name}", "--from", "fixture",
                 "--forwarded-shown-sender", "fixture"]

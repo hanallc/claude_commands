@@ -1983,7 +1983,7 @@ def complete_postmaster_fallback(message: Message, recipient: StableRecipient, e
             marker["postmaster"] = RelayAcceptanceUnconfirmed(stage="relay-unconfirmed", entry_id=entry_id,
                 owner_pid=reservation["owner_pid"], owner_start=reservation["owner_start"])
             return True
-        if result.outcome == "failed":
+        if result.outcome == "failed" or isinstance(result, RefusedRelayRequest):
             release_postmaster_claim(state, message.to, marker)
             return True
         if result.outcome not in ("sent", "queued"):
@@ -3422,7 +3422,10 @@ def read_relay(observed: RelayTransportResponse, text: str, *,
         call = forwarded_calls[0]
     inputs = as_dict(call.get("input"))
     if inputs.get("to") != observed.target or inputs.get("message") != text:
-        return _unaccepted_relay(forward, "SendMessage used a different target or payload")
+        reason = "SendMessage used a different target or payload"
+        if isinstance(forward, RelayRequestNotForwarded):
+            return RefusedRelayRequest("refused", reason)
+        return _unaccepted_relay(forward, reason)
     tool_id = as_str(call.get("id"))
     results = [part for event in events if event.get("type") == "user"
                for value in as_list(as_dict(event.get("message")).get("content"))
