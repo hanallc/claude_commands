@@ -1691,6 +1691,28 @@ The test server joins its request handlers before fixture cleanup and gives each
 
 **Order:** writes and reviews now; tests run in the next test slot after the phase 91 and 93 gates.
 
+### Phase 97 — The test rules limit new tests and reach every worker prompt  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** nate, 13:06 EST Nov 20 (via natest and builds), on natest's test count analysis: "i approve all". Correction, 13:39 EST: his 2026-11-11 words on test removal were for one situation; P2 applies in full. Name: testrules.
+**Spec:** natest proposals P1, P2, P3, P4, P5 and P7 with the exact text in natest's Lane E tracker (`/session/natest/testcount/plan_draft.md`) and process report sections 6 and 7 (`/session/natest/testcount/report_process.md`):
+1. P1: a Work Order `**Tests:**` field; the `test` slot writes only the tests it names.
+2. P2: a worker may delete a test that its change makes a duplicate; reviewers ask which added test is not needed.
+3. P3: a finding gets a test only for damage that no later run repairs; a closure Minor or nit opens no round.
+4. P4: `assign.sh` adds the test rules to each implement, fix and test prompt. The text has one source in `write_prompt_contract.md`.
+5. P5: a 10-line "When you write no test" section in `write_prompt_contract.md`.
+6. P7: a Python marker-class rule in `config/review/code.md`.
+7. `docs/plans/sdlc-phases-design.md:85`: the refill tag is in `docs/direct/style_unit.md`.
+**Files:** `docs/direct_plan_format.md`, `docs/direct/write_prompt_contract.md`, `docs/direct/dual_review.md`, `docs/direct/repair_rounds.md`, `scripts/direct/assign.sh` (or the helper that builds its prompt) and its test module, `config/review/code.md`, `docs/plans/sdlc-phases-design.md`.
+**Tests:** one table row in the existing assign launcher test: implement, fix and test prompts carry the test rules once; a review prompt does not. A break sends workers prompts without the rules.
+**Acceptance gate:** each Lane E live-check grep passes on the branch; the assign launcher targeted test passes; basedpyright 0/0 on changed Python; shellcheck clean on changed shell.
+
+**Workers:** 1 writer.
+
+**Order:** writes and reviews now; tests run in the next test slot after the phase 91 and 93 gates.
+
 ### Phase 6 — Each phase records its waits and their cause, and each merge leaves a receipt  · status: done
 **Depends on:** Phase 3
 
