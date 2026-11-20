@@ -70,6 +70,7 @@ class LandQueueTests(unittest.TestCase):
     def test_dequeue_keeps_protection_until_the_registered_land_ends(self) -> None:
         commit = "a" * 40
         self.assertEqual(self.run_line("add", "builds first", "--commit", commit)[0], 0)
+        land_runs.record_runner(os.getpid())
         self.assertIsInstance(landing_test_gate.read(), landing_test_gate.QueuedLandingTests)
         with patch.object(land_runs, "process_start", return_value=Started("10")):
             self.assertEqual(self.run_line("next", "--claimant", "123"), (0, "builds first\n", ""))
@@ -89,6 +90,22 @@ class LandQueueTests(unittest.TestCase):
         for owner in (Gone(), Started("11")):
             with self.subTest(owner=type(owner).__name__), patch.object(land_runs, "process_start", return_value=owner):
                 self.assertIsInstance(landing_test_gate.read(), landing_test_gate.NoProtectedLandingTests)
+
+    def test_a_stopped_runner_does_not_protect_the_remaining_line(self) -> None:
+        self.assertEqual(self.run_line("add", "builds first", "--commit", "a" * 40)[0], 0)
+        self.assertEqual(self.run_line("add", "builds second", "--commit", "b" * 40)[0], 0)
+        with patch.object(land_runs, "process_start", return_value=Started("10")):
+            self.assertEqual(land_queue.take_next(123), "builds first")
+        with patch.object(land_runs, "process_start", return_value=Gone()):
+            self.assertIsInstance(landing_test_gate.read(), landing_test_gate.NoProtectedLandingTests)
+        self.assertIn("builds second", land_queue.listing())
+
+    def test_the_next_dequeue_closes_the_claim_for_a_skipped_item(self) -> None:
+        self.assertEqual(self.run_line("add", "builds skipped", "--commit", "a" * 40)[0], 0)
+        self.assertEqual(land_queue.take_next(os.getpid()), "builds skipped")
+        self.assertIsInstance(landing_test_gate.read(), landing_test_gate.RunningLandingTests)
+        self.assertEqual(land_queue.take_next(os.getpid()), "")
+        self.assertIsInstance(landing_test_gate.read(), landing_test_gate.NoProtectedLandingTests)
 
     def test_add_refuses_a_batch_path_with_white_space(self) -> None:
         batch = self.batch("setup wait", "aws hana-setup-wait " + "a" * 40)

@@ -159,9 +159,10 @@ def _compiler_scan(running: tuple[records.RunningStep, ...]) -> CompilerScan:
 def find_stall(snapshot: QueueSnapshot, admitted: float, now: float, limit: float) -> HeadStall | NoStall:
     inputs = snapshot.inputs
     running = tuple(step for step in inputs.running if step.promise > 0)
-    if not inputs.ordered or not running:
+    head = next((row for _, row in inputs.ordered
+                 if records.waiter_owner(row) not in inputs.landing_test_waits), None)
+    if head is None or not running:
         return NoStall()
-    _, head = inputs.ordered[0]
     waited = now - head["since"]
     last_start = max(admitted, *(step.started_at for step in running))
     quiet = now - last_start

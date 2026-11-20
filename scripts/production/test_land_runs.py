@@ -15,8 +15,9 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.lib.process_start import Started, process_start
+from scripts.build_queue import landing_test_gate
 from scripts.production.production_doc import ProductionDocument
-from scripts.production import checkpoint_gate, land_runs, merge_checkpoint, merge_gate
+from scripts.production import checkpoint_gate, land_queue, land_runs, merge_checkpoint, merge_gate
 
 
 class LandRunTests(unittest.TestCase):
@@ -65,6 +66,28 @@ class LandRunTests(unittest.TestCase):
         _ = (folder / "live.json").write_text(json.dumps({"pid": os.getpid(), "start": start.start, "commits": ["f" * 40]}))
         self.assertEqual(land_runs.running_lands(), {"f" * 40: ""})
         self.assertEqual(sorted(path.name for path in folder.iterdir()), ["broken.json", "live.json", "partial.json"])
+
+    def test_a_live_record_without_a_reference_does_not_protect_tests(self) -> None:
+        start = process_start(os.getpid())
+        assert isinstance(start, Started)
+        folder = land_runs.lands_dir()
+        folder.mkdir()
+        _ = (folder / "legacy.json").write_text(json.dumps({"pid": os.getpid(), "start": start.start, "commits": ["a" * 40]}))
+        self.assertEqual(land_runs.running_lands(), {"a" * 40: ""})
+        self.assertIsInstance(landing_test_gate.read(), landing_test_gate.NoProtectedLandingTests)
+
+    def test_a_refused_batch_closes_its_claim_while_the_runner_is_live(self) -> None:
+        batch = self.root / "missing.txt"
+        _ = batch.write_text("unit phase " + "a" * 40 + " --started __STARTED__\n")
+        land_queue.add("builds failed", batch=str(batch), commits=["a" * 40], first=False, before=None)
+        self.assertEqual(land_queue.take_next(os.getpid()), f"builds failed {batch}")
+        batch.unlink()
+        self.assertIsInstance(landing_test_gate.read(), landing_test_gate.RunningLandingTests)
+        result = subprocess.run([sys.executable, str(Path(merge_checkpoint.__file__)), "--production",
+                                 "builds", "--batch", str(batch)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(str(batch), result.stdout)
+        self.assertIsInstance(landing_test_gate.read(), landing_test_gate.NoProtectedLandingTests)
 
     def test_a_short_hash_holds_its_full_commit(self) -> None:
         full = "0123456789" * 4

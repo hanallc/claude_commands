@@ -14,7 +14,7 @@ from scripts.build_queue import execution_identity
 from scripts.build_targets import target_config
 from scripts.build_queue import admission_records as records
 from scripts.build_queue import snapshot_codec as codec
-from scripts.build_queue import admission_protocol as wire, placement
+from scripts.build_queue import admission_protocol as wire, cloud_progress, placement, progress_profile
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, snapshot_with_head_cause, wait_reply
 from scripts.build_queue.queue_fixture import head_reading
 from scripts.build_hold.owning_session import NoOwningSession
@@ -335,6 +335,22 @@ class SnapshotCodecTests(unittest.TestCase):
             self.assertEqual(type(reason).__name__, "BehindHead")
             self.assertEqual(cast(str, getattr(reason, "head_name")), "the natedev hold by fps for Phase 3 timing")
         self.assertEqual(cast(str, getattr(older, "text")), "natedev is held by fps for Phase 3 timing; waiting for release")
+
+    def test_the_previous_v3_client_reads_a_cloud_row_waiting_for_the_land(self) -> None:
+        reading = head_reading()
+        row = wire.CloudRow(wire.Owner(42, "123"), wire.Identity("", "", "merge-gate", "/fixture"),
+            wire.CloudPlace("aws"), 1000.0, 0.0, cloud_progress.NoCloudProgress(), progress_profile.NoCounter(),
+            records.WaitsForLandingTest())
+        reply = wire.ViewReply(wire.CloudQueueRead(reading.view, reading.explanation, reading.ordered,
+            reading.diagnostics, (row,), 2, cloud_gate_stale_pushes=0))
+        line = wire.encode_reply(reply)
+        self.assertEqual(wire.parse_reply(line), reply)
+        with pinned_snapshot_reader("e332b0e70b") as (_parse, _schema, pinned):
+            older = cast(Callable[[str], object], getattr(pinned, "parse_reply"))(line)
+            older_reading = cast(object, getattr(older, "reading"))
+            cloud, = cast(tuple[object, ...], getattr(older_reading, "cloud"))
+            wait = cast(object, getattr(cloud, "wait"))
+            self.assertEqual((type(wait).__name__, getattr(wait, "slots")), ("CloudSlotWait", 2))
 
     def test_gpu_slot_wait_keeps_its_shape_in_a_field_with_no_wait_behind_the_head(self) -> None:
         waiting = wait_reply(records.NeedsMemory()).snapshot

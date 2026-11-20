@@ -75,6 +75,8 @@ def wire_record(schema: type, record: dict[str, object], *, writing: bool) -> di
         del record["verify"]
     if writing and record.get("landing_test") == {"kind": "NoLandingTestReference"}:
         del record["landing_test"]
+    if writing and record.get("test_command") == []:
+        del record["test_command"]
     if schema.__module__ == "scripts.build_queue.admission_records":
         if writing and schema.__name__ == "QueueInputs":
             # Pinned clients require this inactive field in the wire record.
@@ -151,6 +153,15 @@ def legacy_wait_shape(schema: type, record: dict[str, object]) -> dict[str, obje
     and it refuses its step on a wait that it cannot read.
     """
     shaped = dict(record)
+    if record["kind"] == "CloudQueueRead":
+        rows = cast(list[dict[str, object]], record["cloud"])
+        used = sum(row["started_at"] != 0 for row in rows)
+        # The v3 CloudRow schema accepts CloudSlotWait and ReadyForAdmission.
+        fallback = {"kind": "CloudSlotWait", "used": used, "slots": record["cloud_slots"],
+                    "state": {"kind": "WaitingForCloudSlot"}}
+        shaped["cloud"] = [{**row, "wait": fallback, "wait" + LANDING_TEST_SUFFIX: row["wait"]}
+                           if cast(dict[str, object], row["wait"]).get("kind") == "WaitsForLandingTest"
+                           else row for row in rows]
     for key in wait_reason_fields(schema):
         item = record.get(key)
         if not isinstance(item, dict):

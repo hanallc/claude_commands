@@ -720,10 +720,12 @@ Git, executable stand-ins, and selected unit and child-handoff cases retain real
 `land_queue.py` keeps the order in which the land runner takes items: `add`, `move`, `remove`, `list`, `next`.
 The runner takes each item with `next` under the line lock.
 `next` records the runner's PID and start time before it removes the item.
+The merge command binds the claim before it validates its arguments and closes it on exit.
 The running land replaces the claim when it registers the commits.
-Admission checks claims and registrations against the process start time.
-An ended process cannot keep the line protected.
-Admission reads the land line and ignores the runner's paused entries in `held.txt`.
+Admission checks the runner and the merge command against their process start times.
+The runner can call `close-claim` before it puts a skipped item in `held.txt`.
+The next dequeue also closes the previous claim.
+Admission ignores the paused entries in `held.txt`.
 The units board reads the line to show `<Nth> in line` for a checkpoint that waits to land.
 
 ### Queued checkpoint batches

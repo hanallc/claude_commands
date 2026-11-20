@@ -35,6 +35,9 @@ class LandRecord(TypedDict):
     commits: list[str]
     owners: NotRequired[list[str]]
     test_reference: NotRequired[str]
+    command_pid: NotRequired[int]
+    command_start: NotRequired[str]
+    claim_id: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -49,21 +52,21 @@ class NoLandingTestReference:
 
 _TEST_REFERENCE: ContextVar[LandingTestReference | NoLandingTestReference] = ContextVar(
     "landing_test_reference", default=NoLandingTestReference())
-_TEST_REFERENCE_ENV = "BUILDLOG_LANDING_TEST_REFERENCE"
+TEST_REFERENCE_ENV = "BUILDLOG_LANDING_TEST_REFERENCE"
 
 
 def test_reference() -> LandingTestReference | NoLandingTestReference:
     reference = _TEST_REFERENCE.get()
     if isinstance(reference, LandingTestReference):
         return reference
-    token = os.environ.get(_TEST_REFERENCE_ENV, "")
+    token = os.environ.get(TEST_REFERENCE_ENV, "")
     return LandingTestReference(token) if token else NoLandingTestReference()
 
 
 def test_environment() -> dict[str, str]:
     reference = test_reference()
     if isinstance(reference, LandingTestReference):
-        return {**os.environ, _TEST_REFERENCE_ENV: reference.token}
+        return {**os.environ, TEST_REFERENCE_ENV: reference.token}
     return dict(os.environ)
 
 
@@ -92,9 +95,37 @@ def _claims_dir() -> Path:
     return state_dir() / "land_claims"
 
 
+def runners_dir() -> Path:
+    return state_dir() / "land_runners"
+
+
+def protection_paths() -> tuple[Path, ...]:
+    return runners_dir(), _claims_dir(), lands_dir()
+
+
 def _write_land(path: Path, record: LandRecord) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     write_text_atomic(path, json.dumps(record) + "\n")
+
+
+def record_runner(pid: int) -> None:
+    owner = process_start(pid)
+    if not isinstance(owner, Started):
+        raise ValueError("the land runner has no live process identity")
+    path = runners_dir() / f"{pid}.json"
+    _write_land(path, {"pid": pid, "start": owner.start, "commits": []})
+    (_claims_dir() / path.name).unlink(missing_ok=True)
+
+
+def close_claim(pid: int) -> None:
+    """Remove the claim when the runner skips a command."""
+    for path, record in _active_records(_claims_dir()):
+        if record["pid"] == pid:
+            path.unlink(missing_ok=True)
+
+
+def runner_is_live() -> bool:
+    return any(True for _ in _active_records(runners_dir()))
 
 
 def claim(pid: int, commits: Sequence[str]) -> None:
@@ -102,7 +133,8 @@ def claim(pid: int, commits: Sequence[str]) -> None:
     owner = process_start(pid)
     if not isinstance(owner, Started):
         raise ValueError("the land runner has no live process identity")
-    _write_land(_claims_dir() / f"{pid}.json", {"pid": pid, "start": owner.start, "commits": list(commits)})
+    _write_land(_claims_dir() / f"{pid}.json", {"pid": pid, "start": owner.start, "commits": list(commits),
+                                              "claim_id": uuid4().hex})
 
 
 def _active_records(directory: Path, *, prune: bool = False) -> Generator[tuple[Path, LandRecord]]:
@@ -117,7 +149,9 @@ def _active_records(directory: Path, *, prune: bool = False) -> Generator[tuple[
                 continue
             owner = process_start(record["pid"])
             if owner == Started(record["start"]):
-                yield path, record
+                command_pid = record.get("command_pid")
+                if command_pid is None or process_start(command_pid) == Started(record.get("command_start", "")):
+                    yield path, record
             elif prune and not isinstance(owner, Unreadable):
                 path.unlink(missing_ok=True)
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
@@ -130,13 +164,48 @@ def _accept_claim(commits: Sequence[str]) -> None:
             path.unlink(missing_ok=True)
 
 
+def _parents() -> set[int]:
+    parents: set[int] = set()
+    pid = os.getppid()
+    proc = Path(os.environ.get("VERIFY_PROC_ROOT", "/proc"))
+    while pid > 1 and pid not in parents:
+        parents.add(pid)
+        try:
+            pid = int((proc / str(pid) / "stat").read_bytes().rpartition(b")")[2].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return parents
+
+
+@contextmanager
+def claim_command() -> Generator[None]:
+    """Bind the runner's claim before the merge command validates its input."""
+    pid = os.getpid()
+    identity = process_start(pid)
+    parents = _parents()
+    for path, record in _active_records(_claims_dir()):
+        if record["pid"] not in parents or "command_pid" in record or not isinstance(identity, Started):
+            continue
+        claim_id = record.get("claim_id", uuid4().hex)
+        _write_land(path, {**record, "command_pid": pid, "command_start": identity.start, "claim_id": claim_id})
+        try:
+            yield
+        finally:
+            for current, saved in _active_records(_claims_dir()):
+                if current == path and saved.get("claim_id") == claim_id:
+                    path.unlink(missing_ok=True)
+        return
+    yield
+
+
 def running_test_references() -> frozenset[LandingTestReference | NoLandingTestReference]:
     """Read live claims before registrations so the handoff keeps protection."""
     references: set[LandingTestReference | NoLandingTestReference] = {
         NoLandingTestReference() for _ in _active_records(_claims_dir())}
     for _, record in _active_records(lands_dir()):
         token = record.get("test_reference", "")
-        references.add(LandingTestReference(token) if token else NoLandingTestReference())
+        if token:
+            references.add(LandingTestReference(token))
     return frozenset(references)
 
 

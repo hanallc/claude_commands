@@ -145,6 +145,7 @@ class Identity:
     verify: VerifyStep = field(default=NotVerifyCall(), kw_only=True)
     job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
     landing_test: LandingTestReference | NoLandingTestReference = field(default=NoLandingTestReference(), kw_only=True)
+    test_command: tuple[str, ...] = field(default=(), kw_only=True)
 
 
 @dataclass(frozen=True, kw_only=True)

@@ -18,7 +18,9 @@ from scripts.direct.local_release_wait import local_release_waiter
 from scripts.lib import build_folders
 from scripts.lib.build_slots import SlotQueuePosition
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, StepJob
-from scripts.lib.build_steps import VerifyCommand, command_job, command_program, verify_command
+from scripts.lib.build_steps import VerifyCommand, build_call_arguments, command_job, command_program, verify_command
+from scripts.production import land_runs
+from scripts.production.merge_gate_arguments import GateArguments, gate_parser, missing_landing_fields
 
 
 class FirstStepRefused(RuntimeError):
@@ -162,7 +164,7 @@ def _program_grant(command: Sequence[str], source: Path, owner: wire.Owner,
             break
     def refresh() -> wire.AdmitRequest:
         request = client.step_request(arguments, str(source), owner, position.since, '', position.episode, profile, run=run)
-        return replace(request, identity=replace(request.identity, job=job))
+        return replace(request, identity=replace(request.identity, job=job, test_command=tuple(command)))
     output = client.WaitOutput()
     answer = queue_place.request_place(queue_place.RefreshedRequest(refresh), output)
     if isinstance(answer, wire.Refused):
@@ -171,6 +173,30 @@ def _program_grant(command: Sequence[str], source: Path, owner: wire.Owner,
         raise FirstStepRefused('the caller left before first-step admission', 75)
     output.finished()
     return answer
+
+
+@contextmanager
+def _copy_landing(command: Sequence[str]) -> Generator[None]:
+    """Register the merge before the copy requests its first step."""
+    program = build_call_arguments(command)
+    if program[:1] == ("merge_gate.py",) and program[1:2] not in (("nightly-assigned",), ("nightly-check",)):
+        options, unknown = gate_parser().parse_known_args(program[1:], namespace=GateArguments())
+        if (not unknown and not options.modules and not (options.tests_only or options.promote_only or options.nightly)
+                and not missing_landing_fields(options)):
+            with land_runs.landing([options.checkpoint], [f"{options.unit} {options.phase}"]):
+                previous = os.environ.get(land_runs.TEST_REFERENCE_ENV)
+                reference = land_runs.test_reference()
+                if isinstance(reference, land_runs.LandingTestReference):
+                    os.environ[land_runs.TEST_REFERENCE_ENV] = reference.token
+                try:
+                    yield
+                finally:
+                    if previous is None:
+                        _ = os.environ.pop(land_runs.TEST_REFERENCE_ENV, None)
+                    else:
+                        os.environ[land_runs.TEST_REFERENCE_ENV] = previous
+            return
+    yield
 
 
 @contextmanager
@@ -191,7 +217,7 @@ def admitted_run(command: Sequence[str], source: Path) -> Generator[FirstStepAdm
                 'BUILDLOG_FIRST_STEP_SINCE', 'BUILDLOG_PREPARED_COPY'):
         _ = os.environ.pop(key, None)
     try:
-        with build_folders.tool_folder('copies-admission') as folder:
+        with _copy_landing(command), build_folders.tool_folder('copies-admission') as folder:
             assignment_file = folder / 'assignment.json'
             verify = verify_command(command)
             grant: wire.Admitted | wire.LocalPlacementGranted | wire.Assignment

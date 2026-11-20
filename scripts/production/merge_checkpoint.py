@@ -2266,6 +2266,11 @@ def batch_requests(path: Path, production: str) -> tuple[MergeRequest, ...]:
 
 
 def main() -> int:
+    with land_runs.claim_command():
+        return _main()
+
+
+def _main() -> int:
     parser = checkpoint_parser()
     args = parser.parse_args()
     batch = cast(Path | None, args.batch)

@@ -62,6 +62,12 @@ STALLED = snapshot([waiter(NOW - 3 * 3600)], (holder(NOW - 3 * 3600),
 
 
 class FindStallTests(unittest.TestCase):
+    def test_a_test_waiting_for_the_land_cannot_cause_a_stall_alert(self) -> None:
+        protected = waiter(NOW - 3600)
+        queue = snapshot([protected], (holder(NOW - 3600),))
+        inputs = replace(queue.inputs, landing_test_waits=frozenset({records.waiter_owner(protected)}))
+        self.assertEqual(head_stall.find_stall(replace(queue, inputs=inputs), 0.0, NOW, LIMIT), head_stall.NoStall())
+
     def test_holder_time_starts_at_admission(self) -> None:
         queue = snapshot([waiter(NOW - 3600)], (holder(NOW - 62 * 60),))
         stall = head_stall.find_stall(queue, NOW - 3600, NOW, LIMIT)

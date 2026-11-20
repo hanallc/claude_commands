@@ -9,6 +9,7 @@ Usage:
   land_queue.py move LABEL (--first | --before LABEL)
   land_queue.py remove LABEL
   land_queue.py next
+  land_queue.py close-claim
   land_queue.py list
 """
 from __future__ import annotations
@@ -263,6 +264,7 @@ def remove(label: str) -> None:
 def take_next(claimant: int) -> str:
     """Record the runner's claim before removing the first item."""
     with edited() as items:
+        land_runs.record_runner(claimant)
         if not items:
             return ""
         item = items[0]
@@ -303,6 +305,7 @@ def parser() -> argparse.ArgumentParser:
     _ = removed.add_argument("label")
     next_item = commands.add_parser("next", help="claim the first item and print its label and batch path")
     _ = next_item.add_argument("--claimant", type=int, default=os.getppid(), help="PID of the land runner")
+    _ = commands.add_parser("close-claim", help="close the runner's claim without a merge command")
     _ = commands.add_parser("list", help="print the line")
     return root
 
@@ -331,6 +334,8 @@ def main(argv: list[str] | None = None) -> int:
                 output = take_next(args.claimant)
                 if output:
                     print(output)
+            case "close-claim":
+                land_runs.close_claim(os.getppid())
             case _:
                 print(listing())
     except (Refusal, OSError, ValueError, KeyError, TypeError) as error:
