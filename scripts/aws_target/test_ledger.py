@@ -168,6 +168,93 @@ class LedgerTests(CostFixture):
         self.assertEqual({key[2]: value.hana_reserved_hours for key, value in hours.items()},
                          {'2026-01-16': Decimal(1)})
 
+    def test_zero_bill_keeps_the_established_reconciliation_floor(self) -> None:
+        self.costs({'cost_explorer_read_usd': '0', 'limit_reserve_usd': '0'})
+        day = self.start + 86400
+        now = day + 2 * 86400
+        self.book.record_inventory(ledger.ResourceInventory(self.start, (), 'fixture', builder_removed=True))
+        self.observe(self.start, 'terminated')
+        self.write_complete_bill_fixture(ledger.ChargeRead('2026-01-15', now, self.start, day,
+            Decimal(2), Decimal(0), Decimal(0), (ledger.UsageTypeCost('EBS:VolumeUsage.gp3', Decimal(2)),)))
+        self.write_complete_bill_fixture(ledger.ChargeRead('2026-01-16', now, day, day + 86400,
+            Decimal(0), Decimal(0), Decimal(0)))
+        self.book.reconcile(ledger.CostReconciliation(now, day, day + 86400, Decimal(0), 'Cost Explorer',
+            established_days=(ledger.EstablishedDayCost('2026-01-16', Decimal(40)),)))
+        accrued = self.book.accrued_cost(self.settings, now, window='month')
+        self.assertEqual({row.day.isoformat(): row.cost for row in accrued.days}['2026-01-16'], Decimal(40))
+        self.assertEqual(accrued.cost, Decimal(46))
+
+    def test_actionless_permit_cancellation_keeps_the_renewed_hana_exposure(self) -> None:
+        self.book.record_inventory(ledger.ResourceInventory(self.start, (), 'fixture', builder_removed=True))
+        self.observe(self.start, 'terminated')
+        now = self.start + 7200
+        with self.book.transaction() as evidence:
+            evidence.hana_compute.extend((
+                ledger.HanaComputeExposure(self.start, now, 2, Decimal(1), ledger.HanaExposureClosed(now),
+                    region='us-east-2'),
+                ledger.HanaComputeExposure(now, now + 3600, 3, Decimal(1),
+                    ledger.HanaExposureClosed(now + 3600), region='us-east-2'),
+            ))
+        journal = self.state / 'hana' / 'provider'
+        journal.mkdir(parents=True)
+        _ = (journal / 'publish.json').write_text(json.dumps({'generation': 2, 'cancelled': True}))
+        _ = (journal / 'later-cancel.json').write_text(json.dumps({'generation': 3, 'cancelled': True}))
+        start = {'generation': 1, 'action': 'start', 'dispatched': True, 'dispatched_at': self.start}
+        for evidence, expected in ((start, Decimal(2)),
+                ({**start, 'accepted': True, 'accepted_at': self.start + 3600}, Decimal(1))):
+            with self.subTest(evidence=evidence):
+                _ = (journal / 'start.json').write_text(json.dumps(evidence))
+                accrued = self.book.accrued_cost(self.settings, now + 3600, window='day')
+                self.assertEqual(accrued.cost, expected)
+                shown = spend.read_spend(self.settings, self.state, now + 3600, '2026-01-15')
+                assert isinstance(shown, spend.Spend)
+                self.assertEqual(shown.days[0].usd, expected)
+
+    def test_pending_gate_cost_stays_in_page_and_guard_spend(self) -> None:
+        self.costs({'cost_explorer_read_usd': '0', 'limit_reserve_usd': '0'})
+        day = self.start + 86400
+        now = day + 3600
+        self.book.record_inventory(ledger.ResourceInventory(self.start, (), 'fixture', builder_removed=True))
+        self.observe(self.start, 'terminated')
+        with self.book.transaction() as evidence:
+            evidence.gate_reservations.append(ledger.GateReservation(
+                'pending', day, now + 3600, Decimal(1), Decimal('.25'), region='us-east-2'))
+        for with_bill in (False, True):
+            with self.subTest(with_bill=with_bill):
+                if with_bill:
+                    self.write_complete_bill_fixture(ledger.ChargeRead('2026-01-15', now, self.start, day,
+                        Decimal(5), Decimal(0), Decimal(0), (
+                            ledger.UsageTypeCost('USE2-SpotUsage:c7a.4xlarge', Decimal(5)),)))
+                shown = spend.read_spend(self.settings, self.state, now, '2026-01-16')
+                assert isinstance(shown, spend.Spend)
+                self.assertEqual(shown.days[0].usd, Decimal('1.25'))
+                accrued = self.book.accrued_cost(self.settings, now, window='day')
+                self.assertEqual(accrued.cost, Decimal('1.25'))
+                self.assertEqual(accrued.reserves, Decimal(1))
+                self.assertEqual(accrued.limit_count, Decimal('2.25'))
+
+    def test_gate_allowance_counts_once_at_the_launch_second(self) -> None:
+        self.costs({'cost_explorer_read_usd': '0', 'limit_reserve_usd': '0'})
+        now = self.start + 86400
+        self.book.record_inventory(ledger.ResourceInventory(self.start, (), 'fixture', builder_removed=True))
+        self.observe(self.start, 'terminated')
+        with self.book.transaction() as evidence:
+            evidence.gate_reservations.append(ledger.GateReservation('launch', now, now + 3600,
+                Decimal(0), Decimal('.25'), state=ledger.GateRunning('fixture'), region='us-east-2'))
+        for with_bill in (False, True):
+            with self.subTest(with_bill=with_bill):
+                if with_bill:
+                    self.write_complete_bill_fixture(ledger.ChargeRead('2026-01-15', now, self.start, now,
+                        Decimal(5), Decimal(0), Decimal(0), (
+                            ledger.UsageTypeCost('USE2-SpotUsage:c7a.4xlarge', Decimal(5)),)))
+                shown = spend.read_spend(self.settings, self.state, now, '2026-01-16')
+                assert isinstance(shown, spend.Spend)
+                self.assertEqual(shown.days[0].usd, Decimal('.25'))
+                accrued = self.book.accrued_cost(self.settings, now, window='day')
+                self.assertEqual(accrued.limit_count, Decimal('.25'))
+                self.assertEqual(accrued.cost, Decimal('.25'))
+                self.assertEqual(accrued.reserves, Decimal(0))
+
     def test_unbilled_day_ignores_unclassified_usage_and_activity_without_billed_hours(self) -> None:
         self.inventory(self.start)
         self.observe(self.start, 'terminated')
@@ -1000,7 +1087,7 @@ class LedgerTests(CostFixture):
         self.assertEqual(costs.daily.usd, Decimal(0))
 
     def test_accrued_cost_uses_each_day_source_and_the_guard_limit_count(self) -> None:
-        self.costs({'monthly_limit_usd': '9.513',
+        self.costs({'monthly_limit_usd': '10.03',
                     'cost_explorer_read_usd': '.01'})
         first = instant('2026-01-01T00:00:00+00:00')
         second = first + 86400
@@ -1030,9 +1117,9 @@ class LedgerTests(CostFixture):
         self.assertEqual(accrued.days, (
             ledger.AccruedDay(date(2026, 1, 1), Decimal('2.01'), 'billed_not_final', None, fee),
             ledger.AccruedDay(date(2026, 1, 2), Decimal('3.01'), 'estimate', Decimal(5), fee),
-            ledger.AccruedDay(date(2026, 1, 3), Decimal('.493'), 'estimate', None, fee),
+            ledger.AccruedDay(date(2026, 1, 3), Decimal('1.01'), 'estimate', None, fee),
         ))
-        self.assertEqual(accrued.cost, Decimal('5.513'))
+        self.assertEqual(accrued.cost, Decimal('6.03'))
         self.assertEqual(sum((day.cost for day in accrued.days), Decimal(0)), accrued.cost)
         self.assertEqual(accrued.reserves, Decimal(1))
         self.assertEqual(accrued.limit_count, accrued.cost + accrued.reserves + accrued.headroom)
@@ -1052,14 +1139,14 @@ class LedgerTests(CostFixture):
         self.assertEqual(self.book.accrued_cost(self.settings, now, window='month'), accrued)
         daily = self.book.accrued_cost(self.settings, now, window='day')
         self.assertEqual(daily, ledger.AccruedCost(
-            Decimal('.493'), Decimal('4.493'), Decimal(1), Decimal(3), accrued.days[-1:]))
+            Decimal('1.01'), Decimal('5.01'), Decimal(1), Decimal(3), accrued.days[-1:]))
         decision = self.guard(now)
         self.assertIsInstance(decision, ledger.SpendingRefused)
         assert isinstance(decision, ledger.SpendingRefused)
         self.assertEqual(decision.reason, 'monthly_limit')
         notice, = self.notices
         self.assertEqual(notice.estimate_usd + config.read_settings(self.settings).limit_reserve_usd, accrued.limit_count)
-        self.assertEqual(accrued.limit_count, Decimal('9.513'))
+        self.assertEqual(accrued.limit_count, Decimal('10.03'))
 
     def test_accrued_cost_estimates_a_day_with_a_damaged_charge_file(self) -> None:
         start = self.start

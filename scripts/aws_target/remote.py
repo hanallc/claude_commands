@@ -33,9 +33,18 @@ def start_was_dispatched(record: dict[str, object]) -> bool:
     return record.get('action') == 'start' and record.get('dispatched') is True
 
 
-def read_hana_start_acceptance(directory: Path) -> dict[int, HanaStartAcceptance | HanaStartAccepted]:
-    """Read the acceptance of each Hana start in the provider journal."""
+@dataclass(frozen=True)
+class HanaStartJournal:
+    starts: dict[int, HanaStartAcceptance | HanaStartAccepted]
+    dispatched_starts: set[int]
+    actionless_cancellations: set[int]
+
+
+def read_hana_start_journal(directory: Path) -> HanaStartJournal:
+    """Read start evidence and legacy cancellations from the provider journal."""
     starts: dict[int, HanaStartAcceptance | HanaStartAccepted] = {}
+    dispatched_starts: set[int] = set()
+    actionless_cancellations: set[int] = set()
     for path in (directory / 'hana' / 'provider').glob('*.json'):
         try:
             record = read_record(path)
@@ -44,12 +53,16 @@ def read_hana_start_acceptance(directory: Path) -> dict[int, HanaStartAcceptance
         action, generation = record.get('action'), record.get('generation')
         if type(generation) is not int or generation < 0:
             continue
-        if action == 'bootstrap' or action == 'start' or (action is None and record.get('cancelled') is True):
+        if action == 'bootstrap' or action == 'start':
             _ = starts.setdefault(generation, HanaStartAcceptance.AWAITING)
+        elif action is None and record.get('cancelled') is True:
+            actionless_cancellations.add(generation)
+        if not start_was_dispatched(record):
+            continue
+        dispatched_starts.add(generation)
         at = record.get('accepted_at')
-        if (start_was_dispatched(record) and mutation_accepted(record)
-                and type(at) is int and at >= 0):
+        if mutation_accepted(record) and type(at) is int and at >= 0:
             previous = starts[generation]
             if not isinstance(previous, HanaStartAccepted) or at < previous.at:
                 starts[generation] = HanaStartAccepted(at)
-    return starts
+    return HanaStartJournal(starts, dispatched_starts, actionless_cancellations)

@@ -911,16 +911,17 @@ These rates use the same bill day rule as compute rates.
 The ledger stores the selected cost and its bill source.
 Paired trials use this booked cost for completed gates.
 A gate keeps `attempt_allowance_usd` until AWS supplies a bill for its launch day.
-Admission also reserves this allowance for an open gate.
+Admission reserves the allowance before the launch time.
 A bill for the launch day corrects saved estimates that include configured allowances.
 The Spend tiles show the AWS amount for a day with a bill.
 For an unbilled day, the estimate carries storage from the most recent earlier bill.
-It adds accepted gate compute and the configured gate allowance.
+It adds pending and accepted gate compute and the configured gate allowance.
 Hana has no configured activity allowance.
 Unknown usage, public IPv4, requests, and transfer have no carry-forward amount.
-The guard uses this estimate for unbilled days after the first bill.
+The guard uses this estimate for unbilled days after the first bill when it covers established and possible costs.
 The guard accounts for query fees, reserves, and headroom separately.
 A Hana demand start accrues compute from the provider's acceptance time.
+Approved Hana setup and image replacement accrue compute from reservation time.
 An unaccepted open start still reserves the projected cost.
 Reports keep the existing reconciliation floors.
 The account checks adjust the existing total for each qualifying UTC day inside the limit window.

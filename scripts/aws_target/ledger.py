@@ -153,6 +153,10 @@ def gate_is_open(reservation: GateReservation) -> bool:
     return isinstance(reservation.state, (GateLaunchPending, GateRunning))
 
 
+def _gate_allowance_accrued(reservation: GateReservation, now: int) -> bool:
+    return reservation.at <= now
+
+
 @dataclass(frozen=True)
 class HanaExposureOpen:
     """No observation confirms the end of this exposure."""
@@ -1102,7 +1106,7 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
     for reservation in state.gate_reservations:
         if isinstance(reservation.state, GateAbsent):
             continue
-        if window_start <= reservation.at < pricing_end:
+        if window_start <= reservation.at and _gate_allowance_accrued(reservation, pricing_end):
             allowance = gate_allowance(reservation)
             intervals.append(ChargedInterval(reservation.at, reservation.at, allowance.usd,
                                              'gate storage and transfer:' + reservation.attempt + ' (' + allowance.source + ')', 'fixed'))
@@ -1713,6 +1717,26 @@ def gate_compute_intervals(state: LedgerEvidence, now: int, minimum_seconds: int
     return tuple(intervals)
 
 
+def _hana_exposure_starts(exposures: Sequence[HanaComputeExposure], journal: remote.HanaStartJournal
+                          ) -> dict[int, HanaStartAcceptance | HanaStartAccepted]:
+    starts = journal.starts.copy()
+    dispatched = sorted(journal.dispatched_starts)
+    first = 0
+    # Renewal keeps the exposure and increases its generation. A closed exposure ends its generation range.
+    for generation in sorted({row.generation for row in exposures}):
+        end = bisect_right(dispatched, generation, lo=first)
+        exposure_dispatches = dispatched[first:end]
+        first = end
+        accepted = min((start for index in exposure_dispatches
+                        if isinstance(start := journal.starts[index], HanaStartAccepted)),
+                       key=lambda start: start.at, default=None)
+        if accepted is not None:
+            starts[generation] = accepted
+        elif generation in journal.actionless_cancellations:
+            starts[generation] = HanaStartAcceptance.LEGACY if exposure_dispatches else HanaStartAcceptance.AWAITING
+    return starts
+
+
 def hana_compute_start(state: LedgerEvidence, exposure: HanaComputeExposure
                        ) -> HanaStartAccepted | HanaStartAcceptance:
     """Use the provider start record or a start time saved for this exposure."""
@@ -1868,8 +1892,7 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
             for charge in older:
                 include(charge)
             for reservation in state.gate_reservations:
-                if (isinstance(reservation.state, GateAbsent) or reservation.at > stop
-                        or (not reserve and isinstance(reservation.state, GateLaunchPending))):
+                if isinstance(reservation.state, GateAbsent) or reservation.at > stop:
                     continue
                 for charge in gate_compute.get('gate:' + reservation.attempt, ()):
                     groups[spend_group('SpotUsage:' + reservation.instance_type)] += _overlap(charge, start, end)
@@ -1881,7 +1904,7 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
         for reservation in state.gate_reservations:
             if isinstance(reservation.state, GateAbsent) or not start <= reservation.at < end:
                 continue
-            if ((bill is None and (reserve or not isinstance(reservation.state, GateLaunchPending)))
+            if ((bill is None and (reserve or _gate_allowance_accrued(reservation, now)))
                     or (reserve and gate_is_open(reservation))):
                 allowance = GateAllowance(reservation.allowance_usd, 'attempt_allowance_usd')
                 groups['other'] += allowance.usd
@@ -1924,7 +1947,7 @@ def gate_future_periods(state: LedgerEvidence, settings: SpendingSettings, now: 
             cost = max(Decimal(0), reserved - accrued_days.get(day, Decimal(0)))
             daily[day] = daily.get(day, Decimal(0)) + cost
             monthly[day[:7]] = monthly.get(day[:7], Decimal(0)) + cost
-        if reservation.at >= now:
+        if not _gate_allowance_accrued(reservation, now):
             day = datetime.fromtimestamp(reservation.at, settings.accounting_zone).strftime('%Y-%m-%d')
             daily[day] = daily.get(day, Decimal(0)) + reservation.allowance_usd
             monthly[day[:7]] = monthly.get(day[:7], Decimal(0)) + reservation.allowance_usd
@@ -2084,7 +2107,8 @@ class CostLedger:
         try:
             state = _decode(mapping(cast(object, json.loads(self.path.read_text()))))
             if any(not isinstance(row.start_acceptance, HanaStartAccepted) for row in state.hana_compute):
-                state.hana_start_acceptance = remote.read_hana_start_acceptance(self.directory)
+                journal = remote.read_hana_start_journal(self.directory)
+                state.hana_start_acceptance = _hana_exposure_starts(state.hana_compute, journal)
             return state
         except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
             raise LedgerUnavailable(f"ledger evidence is unavailable: {error}") from error
@@ -2649,17 +2673,23 @@ class CostLedger:
         costs = _charges(state, settings, now, current_window=True)
         if not any(is_billed_day(row) and row.period_end <= now for row in readings):
             return costs
-        estimates = {day.day: day for day in gate_spend_days(state, settings, readings, now)
-                     if day.source == 'estimated from the newest bill'}
+        utc = ZoneInfo('UTC')
+        baseline = tuple(charge for charge in costs.intervals if charge.kind != 'explorer')
+        estimates: dict[str, tuple[ChargedInterval, ...]] = {}
+        for day in gate_spend_days(state, settings, readings, now):
+            if day.source != 'estimated from the newest bill':
+                continue
+            candidate = tuple(charge for charge in day.intervals if charge.kind != 'explorer')
+            start, end = period_bounds(date.fromisoformat(day.day), utc)
+            # Keep established reconciliation and other possible costs in each accounting period.
+            if all(period_cost(candidate, left, right) >= period_cost(baseline, left, right)
+                   for left, right in _days(start, end, settings.accounting_zone)):
+                estimates[day.day] = candidate
         if not estimates:
             return costs
-        utc = ZoneInfo('UTC')
-        pending = {row.attempt for row in state.gate_reservations if isinstance(row.state, GateLaunchPending)}
-        pending_sources = {'gate:' + attempt for attempt in pending}
-        pending_sources.update('gate storage and transfer:' + attempt + ' (attempt_allowance_usd)' for attempt in pending)
         intervals: list[ChargedInterval] = []
         for charge in costs.intervals:
-            if charge.kind == 'explorer' or charge.source in pending_sources:
+            if charge.kind == 'explorer':
                 intervals.append(charge)
                 continue
             spans = ((charge.start, charge.end),) if charge.start == charge.end else _days(charge.start, charge.end, utc)
@@ -2667,7 +2697,7 @@ class CostLedger:
                 if datetime.fromtimestamp(left, utc).date().isoformat() not in estimates:
                     intervals.append(replace(charge, start=left, end=right, usd=_overlap(charge, left, right)
                                              if left < right else charge.usd))
-        intervals.extend(charge for day in estimates.values() for charge in day.intervals if charge.kind != 'explorer')
+        intervals.extend(charge for candidate in estimates.values() for charge in candidate)
         daily, monthly = spending_periods(intervals, settings.accounting_zone)
         return replace(costs, daily=replace(costs.daily, usd=daily.get(costs.daily.day, Decimal(0))),
                        monthly=replace(costs.monthly, usd=monthly.get(costs.monthly.month, Decimal(0))),
