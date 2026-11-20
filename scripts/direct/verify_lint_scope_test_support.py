@@ -316,8 +316,9 @@ if __name__ == "__main__":
         }
         self.environment = {
             name: value for name, value in os.environ.items()
-            if not name.startswith(("BUILD", "UNIT_", "LINT_", "MAC_TEST_",
-                                    "CARGO_", "RUST", "NEXTEST_", "CLAUDE_CODE_", "CODEX_"))
+            if name != "COPIES_RUN_PID"
+            and not name.startswith(("BUILD", "UNIT_", "LINT_", "MAC_TEST_",
+                                     "CARGO_", "RUST", "NEXTEST_", "CLAUDE_CODE_", "CODEX_"))
         }
         self.environment.update({
             # The fixture supplies its complete toolchain; Nix discovery is unrelated
