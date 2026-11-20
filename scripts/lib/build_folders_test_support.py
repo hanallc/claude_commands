@@ -5,6 +5,18 @@ import json
 from pathlib import Path
 from typing import cast
 
+from scripts.lib import build_folders
+
+
+def make_idle_folder_lease(folder: Path) -> Path:
+    """Create a folder and return its lease record after release."""
+    spec = build_folders.BuildFolderSpec(
+        kind="legacy-stable", parent=folder.parent, purpose=folder.name, suffix_length=0,
+    )
+    with build_folders.leased_build_folder(spec) as path:
+        assert path == folder
+    return path.with_name(path.name + ".lease.json")
+
 
 def _tool_name(name: str, tool: str) -> bool:
     """True for <tool> and for <tool>-2, <tool>-3 and up."""

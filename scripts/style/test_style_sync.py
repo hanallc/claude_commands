@@ -36,6 +36,7 @@ from scripts.lib import scratch
 from scripts.style import style_ledger
 from scripts.style import style_rules
 from scripts.lib import build_folders
+from scripts.lib.build_folders_test_support import make_idle_folder_lease
 from scripts.lib.process_group import send_process_group
 from scripts.production import showrunners, staff
 from scripts.production.cli_fixture import invoke_cli
@@ -895,7 +896,8 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         result = fixture.invoke_verify("lint", "--check", "--no-cache", cwd=fixture.root)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(source.read_bytes(), before)
-        self.assertEqual(fixture.calls("mend"), [["--all-targets", "--workspace", "--fail-on-warn"]])
+        self.assertEqual(fixture.calls("mend"), [["--all-targets", "--workspace", "--fail-on-warn"]],
+                         result.stdout + result.stderr)
         self.assertEqual(fixture.calls("+nightly"), [["fmt", "--version"], ["fmt", "--all", "--check"]])
         self.assertEqual(fixture.calls("clippy"), [[
             "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings",
@@ -1236,10 +1238,8 @@ with tree.with_name(tree.name + '.lock').open('r+') as lock:
 
     def test_sweep_retries_a_query_that_still_holds_its_lock(self) -> None:
         directory = self.stale_dir("query", ended_pid(), registered=True)
+        lease = make_idle_folder_lease(directory)
         lock = directory.with_name(directory.name + ".lock")
-        lock.touch()
-        lease = directory.with_name(directory.name + ".lease.json")
-        _ = lease.write_text("record")
         reached, release = threading.Event(), threading.Event()
         flock = fcntl.flock
 

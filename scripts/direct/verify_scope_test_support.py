@@ -29,6 +29,8 @@ mkdir "$scope"
 printf 'populated 0\n' > "$scope/cgroup.events"
 printf '%s\n' "$scope" > "$peak.cgroup"
 : > "$peak"
+# The owner check receives the step leader PID as its fifth argument.
+export TEST_SCOPE_STEP_LEADER=${9:-}
 exec "$@" 2>&1
 ''')
     manager.chmod(0o755)

@@ -383,7 +383,7 @@ source_check_seconds=1
         args.capacity_file = str(self.base / "capacity")
         args.command = ["sh", "-eu", "-c", 'git rev-parse HEAD^{tree} > "$1"', "slot-command", str(output)]
         with mock.patch.object(copies, "git", side_effect=git):
-            self.assertEqual(copies.run_slot_step(self.source, args), 0)
+            self.assertEqual(copies.run_slot_step(self.source, args, copies.SlotLaunch.DIRECT), 0)
         self.assertEqual(self.git(self.source, "rev-parse", "HEAD"), incoming)
         self.assertEqual(output.read_text().strip(), requested_tree)
 

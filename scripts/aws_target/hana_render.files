@@ -39,6 +39,7 @@ scripts/buildlog/step_context.py
 scripts/buildlog/store.py
 scripts/buildlog/treekey.py
 scripts/copies/copies.py
+scripts/copies/scope_bindings.py
 scripts/direct/local_release_wait.py
 scripts/direct/recorder_state.py
 scripts/direct/step_selection.py

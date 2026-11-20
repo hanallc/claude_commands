@@ -368,6 +368,31 @@ if Path(sys.argv[0]).name == "tree_watch.py" and not sys.argv[1].startswith("--"
         startup = Path(__file__).resolve().parents[1] / "lib/python_startup"
         self.environment["PYTHONPATH"] = os.pathsep.join((str(startup), str(control)))
 
+    def hold_edited_cargo_until_step_stops(self) -> None:
+        """Keep fake Cargo alive until Verify cancels the step."""
+        control = self.prepare_edit_event("cargo-finish", before=False)
+        helper = control / "wait-for-step-exit.py"
+        _ = helper.write_text(f'''
+import os
+import select
+import sys
+
+leader = os.environ.get("TEST_SCOPE_STEP_LEADER")
+if not leader:
+    os.execv(sys.executable, [sys.executable, {self.environment["TEST_EDIT_WAIT"]!r}, sys.argv[1]])
+try:
+    descriptor = os.pidfd_open(int(leader))
+except ProcessLookupError:
+    raise SystemExit(0)
+try:
+    ready, _, _ = select.select([descriptor], [], [], {TEST_HANG_GUARD_SECS})
+    if not ready:
+        raise TimeoutError("Verify did not stop the fixture step")
+finally:
+    os.close(descriptor)
+''')
+        self.environment["TEST_EDIT_WAIT"] = str(helper)
+
     def side_by_side_phases(self, edited: str) -> subprocess.CompletedProcess[str]:
         """Test alpha, which depends on gamma, while another phase edits `edited`."""
         _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers = ["alpha", "beta", "gamma"]\nresolver = "2"\n')

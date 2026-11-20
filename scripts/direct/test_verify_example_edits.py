@@ -37,10 +37,10 @@ class ExampleEditTests(SeededExampleWorkspaceFixture):
 
     def test_a_watched_edit_cancels_the_test_run_and_records_no_pass(self) -> None:
         _ = self.package()
-        _ = self.prepare_edit_event("cargo-finish", before=False)
+        self.hold_edited_cargo_until_step_stops()
         self.environment["VERIFY_TREE_WATCH_S"] = "0.01"
         self.environment.update({"TREE_DIRTY": "1", "EDIT_DURING_TEST": "1"})
-        result = self.verify("test", "sample")
+        result = self.verify("test", "sample", "--local", "the fixture uses local Cargo")
         self.assertEqual(result.returncode, 77, result.stdout + result.stderr)
         self.assertIn("cancelled — the tree changed while test ran (src/lib.rs)", result.stderr)
         self.assertEqual(list((self.root / "session" / "verify_cache").glob("*.pass")), [])

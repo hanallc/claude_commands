@@ -33,6 +33,7 @@ from scripts.lib import build_folders, cargo_output, copy_record, git_files, pro
 from scripts.lint import sweep
 
 from scripts.lib import conf
+from scripts.lib.build_folders_test_support import make_idle_folder_lease
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.message import sessions
 from scripts.production import staff
@@ -2492,8 +2493,10 @@ print(scratch.target('gate:proof', 'tree', False))
             for record, lock in itertools.product(records, (scratch.removal_lock, scratch.judgment_lock)):
                 with self.subTest(record=record.name, lock=lock.__name__), lock(record) as idle:
                     self.assertFalse(idle)
-        residue = self.base / "ended-run.lease.json"
-        residue.touch()
+        ended = self.base / "ended-run"
+        residue = make_idle_folder_lease(ended)
+        ended.rmdir()
+        ended.with_suffix(".lock").unlink()
         with scratch.removal_lock(residue) as idle:
             self.assertTrue(idle)
 

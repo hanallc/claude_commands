@@ -320,7 +320,8 @@ if __name__ == "__main__":
         }
         self.environment = {
             name: value for name, value in os.environ.items()
-            if name != "COPIES_RUN_PID"
+            # Use the fixture tools and metadata instead of caller startup hooks.
+            if name not in ("COPIES_RUN_PID", "PYTHONPATH")
             and not name.startswith(("BUILD", "UNIT_", "LINT_", "MAC_TEST_",
                                      "CARGO_", "RUST", "NEXTEST_", "CLAUDE_CODE_", "CODEX_"))
         }
