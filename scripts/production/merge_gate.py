@@ -593,38 +593,48 @@ def command(arguments: Sequence[str], repo: Path) -> subprocess.CompletedProcess
         child = start_recorded_gate_child(arguments, repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                           register=register)
         output, errors = child.communicate(timeout=None if deadline is None else max(0, deadline - time.monotonic()))
-    except BaseException as error:
-        if not launched:
-            raise
-        process = launched[0]
-        try:
-            process_group.send_process_group(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        remaining = (admission_records.read_memory_config().program_stop_seconds if deadline is None
-                     else max(0, deadline - time.monotonic()))
-        try:
-            _ = process.wait(timeout=remaining)
-        except subprocess.TimeoutExpired as timeout:
-            if isinstance(recovery, GateRecovery):
-                recovery.unresolved = True
-            raise GateRefused(f"UNRESOLVED: command group {process.pid} did not stop") from timeout
-        if live_group(process.pid):
-            if isinstance(recovery, GateRecovery):
-                recovery.unresolved = True
-            raise GateRefused(f"UNRESOLVED: command group {process.pid} still has members") from error
-        if isinstance(error, subprocess.TimeoutExpired):
-            raise GateRefused(f"UNRESOLVED: the rollback command exceeded its deadline: {shlex.join(arguments)}") from error
-        raise
+    except subprocess.TimeoutExpired as error:
+        raise GateRecoveryUnresolved(f"the rollback command exceeded its deadline: {shlex.join(arguments)}") from error
     finally:
         if launched:
             process = launched[0]
-            for stream in (process.stdout, process.stderr):
-                if stream is not None:
-                    stream.close()
-            if isinstance(recovery, GateRecovery) and process.returncode is not None and not recovery.unresolved:
+            try:
+                finish_command_group(process, deadline)
+            except BaseException as error:
+                if isinstance(recovery, GateRecovery):
+                    recovery.unresolved = True
+                if isinstance(error, OSError):
+                    raise GateRecoveryUnresolved(f"cannot verify command group {process.pid}: {error}") from error
+                raise
+            finally:
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None:
+                        stream.close()
+            if isinstance(recovery, GateRecovery) and not recovery.unresolved:
                 recovery.remove_group(process.pid)
     return subprocess.CompletedProcess(arguments, cast(int, child.returncode), output, errors)
+
+
+def finish_command_group(process: subprocess.Popen[str], deadline: float | None) -> None:
+    # The gate cannot track a descendant after it calls setsid.
+    if process.returncode is not None and not live_group(process.pid):
+        return
+    config = admission_records.read_memory_config()
+    if deadline is None:
+        deadline = time.monotonic() + bounded_program_stop_seconds(config)
+    try:
+        process_group.send_process_group(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        _ = process.wait(timeout=max(0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired as error:
+        raise GateRecoveryUnresolved(f"command group {process.pid} did not stop") from error
+    while live_group(process.pid):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise GateRecoveryUnresolved(f"command group {process.pid} still has members")
+        time.sleep(min(config.program_sample_seconds, remaining))
 
 
 def start_recorded_gate_child[Child](arguments: Sequence[str], repo: Path, *,
@@ -639,7 +649,7 @@ def start_recorded_gate_child[Child](arguments: Sequence[str], repo: Path, *,
         if suite and environment is not None:
             environment = {**environment, "MERGE_GATE_START_FD": "-1"}
         if isinstance(recovery, GateRecovery):
-            reader, writer = os.pipe2(os.O_CLOEXEC)
+            reader, writer = os.pipe()
             _ = closer.callback(os.close, reader)
             _ = closer.callback(os.close, writer)
             descriptors = (*descriptors, reader)
@@ -923,16 +933,23 @@ class GateRecovery:
                 self.rollback_deadline = rollback_deadline
                 try:
                     head = checked_git(repo, "rev-parse", "HEAD")
-                    if head not in (self.rollback, self.rollback_head):
+                    matches = head in (self.rollback, self.rollback_head)
+                    if not matches and self.rollback_head in ("", self.rollback) and self.rollback_source:
+                        # The gate can stop after Git creates the merge and before the gate saves its hash.
                         parents = checked_git(repo, "rev-list", "--parents", "-n", "1", head).split()[1:]
-                        if parents != [self.rollback, self.rollback_source]:
-                            raise GateRollbackConflict(f"HEAD {head} differs from the recorded merge")
-                    rollback_merge(repo, self.rollback)
+                        matches = parents == [self.rollback, self.rollback_source]
+                    if matches:
+                        rollback_merge(repo, self.rollback)
+                        message = "merge undone, not pushed"
+                    else:
+                        message = f"cleared stale rollback for recorded merge {self.rollback_head or '(unknown)'} at HEAD {head}"
                     self.rollback = ""
+                    self.rollback_head = ""
+                    self.rollback_source = ""
                     self.save()
                 finally:
                     self.rollback_deadline = None
-            print(f"Recovered gate {self.pid}: merge undone, not pushed", flush=True)
+            print(f"Recovered gate {self.pid}: {message}", flush=True)
         if not self.tokens:
             self.path.unlink(missing_ok=True)
 
@@ -942,10 +959,6 @@ class GateRecoveryUnresolved(GateRefused):
 
     def __init__(self, reason: str):
         super().__init__(f"UNRESOLVED: {reason}")
-
-
-class GateRollbackConflict(GateRecoveryUnresolved):
-    """The requested checkout has a commit newer than its rollback record."""
 
 
 def prove_scope_empty(scope: Path, deadline: float, sample_seconds: float) -> None:
@@ -1023,9 +1036,9 @@ def recover_gate_runs(repo: Path, *, shared: bool = True) -> None:
     gate_root = build_folders.tmpfs_gate_root()
     temporary = build_folders.tmpfs_temporary_parent()
     for parent in dict.fromkeys((gate_root, temporary)):
-        recover_private_gate_runs(parent, str(repo.resolve()))
+        recover_private_gate_runs(parent)
     if shared:
-        recover_shared_gate_runs(str(repo.resolve()))
+        recover_shared_gate_runs()
 
 
 def shared_gate_directories() -> list[Path]:
@@ -1036,28 +1049,26 @@ def shared_gate_directories() -> list[Path]:
         return []
 
 
-def recover_shared_gate_runs(repo: str) -> None:
+def recover_shared_gate_runs() -> None:
     for directory in shared_gate_directories():
         try:
-            recover_gate_directory(directory, repo)
-        except GateRollbackConflict:
-            raise
+            recover_gate_directory(directory)
         except (GateRecoveryUnresolved, OSError) as error:
             report_gate_recovery(directory, error)
 
 
-def recover_gate_directory(directory: Path, repo: str) -> None:
+def recover_gate_directory(directory: Path) -> None:
     """Recover dead owners while holding the directory lock."""
     descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
         lock_gate_state(descriptor, fcntl.LOCK_EX)
         for path in sorted(directory.glob("*.json")):
-            recover_gate_record(path, repo)
+            recover_gate_record(path)
     finally:
         os.close(descriptor)
 
 
-def recover_private_gate_runs(root: Path, repo: str) -> None:
+def recover_private_gate_runs(root: Path) -> None:
     """Read whole-machine records under the tool folder lease."""
     for folder in sorted(root.glob(f"{build_folders.GATE_RECOVERY_TOOL}*")):
         if not build_folders.gate_recovery_folder(folder.name):
@@ -1077,7 +1088,7 @@ def recover_private_gate_runs(root: Path, repo: str) -> None:
             if not os.path.samestat(current, status):
                 return False
             path = folder / "run.json"
-            recover_gate_record(path, repo)
+            recover_gate_record(path)
             if path.exists():
                 return False
             shutil.rmtree(folder)
@@ -1105,9 +1116,11 @@ def record_list(value: object, field_name: str) -> list[object]:
     return cast(list[object], value)
 
 
-def record_text(value: object, field_name: str) -> str:
+def record_text(value: object, field_name: str, *, allow_empty: bool = True) -> str:
     if not isinstance(value, str) or "\0" in value:
         raise GateRecordError(f"invalid {field_name}: expected text")
+    if not allow_empty and not value:
+        raise GateRecordError(f"invalid {field_name}: expected nonempty text")
     return value
 
 
@@ -1152,10 +1165,11 @@ def parse_gate_recovery(path: Path, payload: object) -> GateRecovery:
     for group, identity in record_object(data.get("groups"), "groups").items():
         if not group.isascii() or not group.isdecimal() or len(group) > 10:
             raise GateRecordError("invalid process group id")
-        groups[record_int(int(group), "process group id", MAX_PID, 1)] = record_text(identity, "process group start")
+        groups[record_int(int(group), "process group id", MAX_PID, 1)] = record_text(
+            identity, "process group start", allow_empty=False)
     folders = [record_path(folder, "folder path") for folder in record_list(data.get("folders"), "folders")]
     return GateRecovery(path, record_path(data.get("repo"), "repo path"), record_int(data.get("pid"), "pid", MAX_PID, 1),
-                        record_text(data.get("start"), "start"), groups, folders, tokens,
+                        record_text(data.get("start"), "start", allow_empty=False), groups, folders, tokens,
                         record_text(data.get("rollback"), "rollback"), record_text(data.get("rollback_head"), "rollback head"),
                         record_text(data.get("rollback_source"), "rollback source"),
                         scope=record_path(data.get("scope", ""), "scope path", allow_empty=True))
@@ -1180,7 +1194,7 @@ def report_gate_recovery(path: Path, error: Exception | str) -> None:
     print(f"UNRESOLVED: {reason}. Record: {path}", flush=True)
 
 
-def recover_gate_record(path: Path, repo: str) -> None:
+def recover_gate_record(path: Path) -> None:
     try:
         recovery = read_gate_recovery(path)
     except GateRecordError as error:
@@ -1198,8 +1212,6 @@ def recover_gate_record(path: Path, repo: str) -> None:
     try:
         recovery.recover()
     except (GateRefused, OSError) as error:
-        if isinstance(error, GateRollbackConflict) and recovery.repo == repo:
-            raise
         report_gate_recovery(recovery.path, error)
     finally:
         ACTIVE_GATE_RECOVERY.reset(active)
@@ -1461,12 +1473,14 @@ def live_group(group: int) -> bool:
         process_group.send_process_group(group, 0)
     except ProcessLookupError:
         return False
+    if sys.platform != "linux":
+        return True
     for entry in Path("/proc").iterdir():
         if not entry.name.isdecimal():
             continue
         try:
             fields = (entry / "stat").read_bytes().rsplit(b")", 1)[1].split()
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             continue
         if fields[0] != b"Z" and int(fields[2]) == group:
             return True

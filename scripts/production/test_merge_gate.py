@@ -108,7 +108,7 @@ def announce_wait(seconds):
     sleep(seconds)
 
 with mock.patch.object(scratch.time, "sleep", side_effect=announce_wait):
-    merge_gate.recover_gate_directory(merge_gate.gate_run_directory(repo), str(repo))
+    merge_gate.recover_gate_directory(merge_gate.gate_run_directory(repo))
 """
         checkout = Path(__file__).resolve().parents[2]
         copies = self.root / "copies"

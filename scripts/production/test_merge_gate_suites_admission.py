@@ -14,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 from dataclasses import replace
@@ -540,13 +541,14 @@ class MergeGateAdmissionTests(unittest.TestCase):
                                  higher_pressure)),
                              ("memory pressure",))
 
-    def test_scope_probe_timeout_or_missing_command_runs_without_prefix(self) -> None:
+    def test_scope_probe_timeout_or_missing_command_refuses_a_required_scope(self) -> None:
         for error in (subprocess.TimeoutExpired("systemd-run", 10), FileNotFoundError("systemd-run")):
             with self.subTest(error=type(error).__name__), mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "1"}), \
-                    mock.patch.object(queue, "in_builds_slice", return_value=False), \
-                    mock.patch("scripts.production.merge_gate.subprocess.run", side_effect=error) as probe, \
+                    mock.patch.object(sys, "platform", "linux"), \
+                    mock.patch.object(subprocess, "run", side_effect=error) as probe, \
                     redirect_stdout(io.StringIO()) as output:
-                self.assertEqual(queue.suite_scope_prefix(), [])
+                with self.assertRaisesRegex(GateRefused, "the systemd scope probe failed"):
+                    _ = merge_gate.suite_scope_prefix()
                 self.assertEqual(probe.call_args.kwargs["timeout"], 10)
                 self.assertIn("Module scope skipped: probe failed", output.getvalue())
 

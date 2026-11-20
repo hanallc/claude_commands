@@ -20,10 +20,12 @@ from typing import cast, final
 from unittest import mock
 from scripts.build_queue import admission_records
 from scripts.build_queue.queue_place import QueuePlace
-from scripts.lib import build_folders
+from scripts.lib import build_folders, process_group
 from scripts.lib.process_group import send_process_group
+from scripts.lib.process_start import Started, process_start
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.production import merge_gate, merge_gate_suites_test_support
+from scripts.production.gate_modules import GateRefused
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.production.merge_gate_test_support import gate_suites
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
@@ -62,6 +64,46 @@ class MergeGateSignalsTests(GateSuitesFixture):
         self.addCleanup(os.close, descriptor)
         self.environment["BUILDLOG_JOBSERVER_FIFO"] = str(path)
         self.supply_jobserver(tokens)
+
+    def test_command_keeps_the_group_record_until_the_members_stop(self) -> None:
+        self.configure_gate("program_stop_seconds=5\nprogram_sample_seconds=1")
+        for remains_live in (False, True):
+            with self.subTest(remains_live=remains_live):
+                clock = 100.0
+                recovery = merge_gate.GateRecovery(self.state / "command.json", str(self.checkout),
+                                                   os.getpid(), "fixture", rollback_deadline=clock + 0.5)
+                child = mock.Mock(spec=subprocess.Popen, pid=1234, returncode=0, stdout=None, stderr=None,
+                                  communicate=mock.Mock(return_value=("output", "")))
+
+                def advance(seconds: float) -> None:
+                    nonlocal clock
+                    self.assertEqual(json.loads(recovery.path.read_text())["groups"], {"1234": "fixture-child"})
+                    clock += seconds
+
+                active = merge_gate.ACTIVE_GATE_RECOVERY.set(recovery)
+                try:
+                    with mock.patch.dict(os.environ, self.environment, clear=True), \
+                            mock.patch.object(subprocess, "Popen", return_value=child), \
+                            mock.patch.object(merge_gate, "process_start", return_value=Started("fixture-child")), \
+                            mock.patch.object(merge_gate, "live_group", side_effect=None if remains_live else [True, True, False],
+                                              return_value=True), \
+                            mock.patch.object(process_group, "send_process_group") as send, \
+                            mock.patch.object(time, "monotonic", side_effect=lambda: clock), \
+                            mock.patch.object(time, "sleep", side_effect=advance) as pause:
+                        arguments = ["git", "status"]
+                        if remains_live:
+                            with self.assertRaisesRegex(GateRefused, "UNRESOLVED: command group 1234 still has members"):
+                                _ = merge_gate.command(arguments, self.checkout)
+                        else:
+                            result = merge_gate.command(arguments, self.checkout)
+                            self.assertEqual((result.returncode, result.stdout), (0, "output"))
+                        send.assert_called_once_with(1234, signal.SIGKILL)
+                        pause.assert_called_once_with(0.5)
+                        self.assertEqual(recovery.unresolved, remains_live)
+                        expected = {"1234": "fixture-child"} if remains_live else {}
+                        self.assertEqual(json.loads(recovery.path.read_text())["groups"], expected)
+                finally:
+                    merge_gate.ACTIVE_GATE_RECOVERY.reset(active)
 
     def test_recovery_kills_a_term_ignoring_member_after_its_leader_ends(self) -> None:
         self.supply_jobserver(b"Q")
@@ -203,7 +245,7 @@ sys.stdin.read(1)
             output = io.StringIO()
             with redirect_stdout(output):
                 for _ in range(2):
-                    merge_gate.recover_gate_directory(directory, str(self.checkout))
+                    merge_gate.recover_gate_directory(directory)
                     self.assertEqual(self.jobserver_tokens(), b"RQ")
                     saved = merge_gate.read_gate_recovery(recovery.path)
                     assert saved is not None
@@ -211,7 +253,7 @@ sys.stdin.read(1)
             self.assertIn(f"UNRESOLVED: the FIFO has an interrupted slot operation. Record: {recovery.path}",
                           output.getvalue())
 
-    def test_bad_slot_values_leave_their_records_and_allow_other_recovery(self) -> None:
+    def test_invalid_records_stay_and_allow_other_recovery(self) -> None:
         self.supply_jobserver(b"Q")
         with mock.patch.dict(os.environ, self.environment, clear=True), merge_gate.shared_cpu_pool() as pool:
             assert isinstance(pool, merge_gate.SharedCPUPool)
@@ -231,6 +273,8 @@ sys.stdin.read(1)
             for name, update in (
                 ("null-folder", {"folders": [None]}),
                 ("large-pid", {"pid": 10**399}),
+                ("empty-start", {"start": "", "groups": {str(os.getpid()): "fixture-group"}}),
+                ("empty-group-start", {"groups": {str(os.getpid()): ""}}),
                 ("absolute-unencodable-token", {"tokens": [asdict(invalid_token)]}),
                 ("relative-folder", {"folders": ["relative"]}),
                 ("relative-repo", {"repo": "relative"}),
@@ -242,8 +286,12 @@ sys.stdin.read(1)
                 invalid[path] = json.dumps(data)
                 self.write(path, invalid[path])
             output = io.StringIO()
-            with redirect_stdout(output):
-                merge_gate.recover_gate_directory(directory, str(self.checkout))
+            with redirect_stdout(output), \
+                    mock.patch.object(merge_gate, "process_start", wraps=process_start) as read_start, \
+                    mock.patch.object(process_group, "send_process_group") as send:
+                merge_gate.recover_gate_directory(directory)
+            read_start.assert_called_once_with(os.getpid())
+            send.assert_not_called()
             self.assertFalse(valid.path.exists())
             self.assertEqual(self.jobserver_tokens(), b"Q")
             for path, original in invalid.items():
@@ -252,6 +300,8 @@ sys.stdin.read(1)
             self.assertEqual(output.getvalue().count("UNRESOLVED: invalid CPU slot value"), 3)
             self.assertIn("UNRESOLVED: invalid folder path", output.getvalue())
             self.assertIn("UNRESOLVED: invalid pid", output.getvalue())
+            self.assertIn("UNRESOLVED: invalid start: expected nonempty text", output.getvalue())
+            self.assertIn("UNRESOLVED: invalid process group start: expected nonempty text", output.getvalue())
             self.assertIn("UNRESOLVED: invalid token path: path cannot be encoded", output.getvalue())
             self.assertIn("UNRESOLVED: invalid repo path", output.getvalue())
             self.assertIn("UNRESOLVED: invalid scope path", output.getvalue())
@@ -745,20 +795,19 @@ merge_gate.run_gate_suites = whole_gate
                     self.assertTrue(all(folder.is_dir() for folder in folders))
                     (self.state / "hold-module").unlink()
                     (self.state / "leak-child").unlink()
+                    expected_head = self.base
+                    recovery_message = "merge undone"
                     if sig == signal.SIGTERM:
                         merged = self.git(self.checkout, "rev-parse", "HEAD")
                         self.write(self.checkout / "later.txt", "an unrelated later commit")
-                        later = self.commit(self.checkout, "Add an unrelated later commit")
-                        refused = self.run_gate("--tests-only", "--full", own_process=True)
-                        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
-                        self.assertIn("differs from the recorded merge", refused.stderr)
-                        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), later)
-                        self.assertTrue(records[0].is_file())
-                        _ = self.git(self.checkout, "reset", "--hard", merged)
+                        _ = self.git(self.checkout, "add", "later.txt")
+                        _ = self.git(self.checkout, "commit", "--amend", "-m", "Add an unrelated file to the merge")
+                        expected_head = self.git(self.checkout, "rev-parse", "HEAD")
+                        recovery_message = f"cleared stale rollback for recorded merge {merged} at HEAD {expected_head}"
                     recovered = self.run_gate("--tests-only", "--full", own_process=True)
                     self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
-                    self.assertIn("merge undone", recovered.stdout)
-                    self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+                    self.assertIn(recovery_message, recovered.stdout)
+                    self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), expected_head)
                     self.assert_process_stopped(child)
                     self.assert_process_stopped(leftover)
                     self.assertTrue(all(not folder.exists() for folder in folders))
