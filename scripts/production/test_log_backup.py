@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import subprocess
+
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from tempfile import TemporaryDirectory
 import tarfile
 import unittest
@@ -14,8 +18,26 @@ from scripts.production.staff_test_support import fixture_member, isolated_staff
 
 
 class LogBackupTests(unittest.TestCase):
-    def test_backup_restores_both_repositories_and_retries_after_wrap(self) -> None:
+    def test_production_check_reports_status_without_starting_backup(self) -> None:
         with TemporaryDirectory() as folder:
+            root = Path(folder)
+            document = root / "production.md"
+            check = Path(__file__).with_name("production_check.sh")
+            with isolated_staff_file(root / "staff.json", {}):
+                owner = fixture_member("showrunner", name="backup-owner",
+                                       doc=staff.LiveDoc(remote.local_machine(), document))
+                for status, code in (("running", 0), ("wrapped", 2), ("paused", 1)):
+                    with self.subTest(status=status):
+                        _ = document.write_text(f"> **Status: PRODUCTION — {status}.**\n")
+                        result = subprocess.run(["zsh", str(check), owner.id], capture_output=True, text=True,
+                                                env={**os.environ, "HOME": str(root), "XDG_STATE_HOME": str(root)},
+                                                check=False, timeout=TEST_HANG_GUARD_SECS)
+                        self.assertEqual((result.returncode, result.stdout, result.stderr), (code, "", ""))
+                        self.assertFalse((root / log_backup.BACKUP_ROOT).exists())
+
+    def test_backup_restores_both_repositories_and_retries_after_wrap(self) -> None:
+        with (TemporaryDirectory() as folder,
+              patch.dict(os.environ, {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull})):
             root = Path(folder)
             state = root / "staff-state"
             backup_root = root / "backups"
@@ -79,13 +101,15 @@ class LogBackupTests(unittest.TestCase):
                             with self.subTest(label=label, commit=commit):
                                 archive = root / f"{label}-{commit}.tar"
                                 _ = log_backup.git(restored, "archive", f"--output={archive}", commit)
+                                destination_folder = root / f"{label}-restore-{commit}"
+                                destination_folder.mkdir()
                                 with tarfile.open(archive) as files:
-                                    expected = {"document/demo-production.md": b"Production\r\n",
-                                                "log/LOG.md": content, "notes/review.txt": note.read_bytes(),
-                                                "notes/.gitattributes": b"* text eol=lf\n"}
-                                    self.assertEqual({entry.name for entry in files if entry.isfile()}, set(expected))
-                                    for name, data in expected.items():
-                                        member = files.extractfile(name)
-                                        assert member is not None
-                                        with member:
-                                            self.assertEqual(member.read(), data)
+                                    files.extractall(destination_folder, filter="data")
+                                expected = {"document/demo-production.md": b"Production\r\n",
+                                            "log/LOG.md": content, "notes/review.txt": note.read_bytes(),
+                                            "notes/.gitattributes": b"* text eol=lf\n"}
+                                self.assertEqual({str(path.relative_to(destination_folder))
+                                                  for path in destination_folder.rglob("*") if path.is_file()},
+                                                 set(expected))
+                                for name, data in expected.items():
+                                    self.assertEqual((destination_folder / name).read_bytes(), data)

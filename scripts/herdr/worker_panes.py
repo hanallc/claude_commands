@@ -1647,6 +1647,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
         if isinstance(process.start_ticks, herdr.ProcessGenerationUnavailable):
             raise herdr_types.HerdrFailure(process.start_ticks.reason)
         launch_processes[launched.pane] = process
+        if isinstance(paths, EnrolledPaths):
+            require_review_process(client, launched.pane, paths)
         if not identity and policy.settings.kind == "codex":
             if isinstance(launched.outcome, herdr.PromptNotSubmitted):
                 raise herdr_types.HerdrFailure(launched.outcome.reason)
