@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import MappingProxyType
 from typing import TYPE_CHECKING, NoReturn, TextIO, cast, override
 from urllib.parse import unquote, urlsplit
 from uuid import UUID
@@ -868,7 +869,8 @@ def workspace_path(owner: str, repo: str | Path, name: str) -> Path:
 
 @contextmanager
 def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: str,
-              task: str = "", path: Path | None = None, run_manifest: Path | None = None) -> Generator[Path]:
+              task: str = "", path: Path | None = None, run_manifest: Path | None = None,
+              on_create: build_folders.FolderCreationNotice = "untracked") -> Generator[Path]:
     """Hold a registered editable copy without resetting edits during recovery."""
     source = Path(repo).expanduser().resolve()
     for active in ACTIVE_GATES.get():
@@ -892,7 +894,7 @@ def workspace(owner: str, repo: str | Path, commit: str, *, name: str, branch: s
         if path is None:
             spec = build_folders.BuildFolderSpec(kind="editable", parent=copy_record.copies_root(),
                 suffix_length=0, repository=identity, owner=owner, purpose=name)
-            tree = lifetime.enter_context(build_folders.leased_build_folder(spec))
+            tree = lifetime.enter_context(build_folders.leased_build_folder(spec, on_create=on_create))
             descriptors.append(build_folders.build_folder_lock_fd(tree))
         with claim_tree(tree, create=True, inherited_fds=descriptors) as state:
             if state is not ClaimState.ACQUIRED:
@@ -999,6 +1001,7 @@ class AcquireCrateRunLock:
 
 CrateRunRemovalLock = HeldCrateRunLock | AcquireCrateRunLock
 ACQUIRE_CRATE_RUN_LOCK = AcquireCrateRunLock()
+NO_CREATED_WORKSPACES: Mapping[Path, os.stat_result] = MappingProxyType({})
 
 
 def rescue_workspace(tree: Path, record: copy_record.Registered) -> None:
@@ -1028,57 +1031,46 @@ def rescue_workspace(tree: Path, record: copy_record.Registered) -> None:
 
 
 def end_workspaces(task: str, paths: list[Path], *,
-                   run_lock: CrateRunRemovalLock = ACQUIRE_CRATE_RUN_LOCK) -> None:
-    """End workspace records and remove copies linked to terminal crates."""
-    holds = scratch.holds()
-    changed = False
+                   run_lock: CrateRunRemovalLock = ACQUIRE_CRATE_RUN_LOCK,
+                   created: Mapping[Path, os.stat_result] = NO_CREATED_WORKSPACES) -> None:
+    """End workspace records and remove terminal folders made by this run."""
+    moment = time.time()
     selected = {str(path.resolve()) for path in paths}
-    for path, hold in holds.items():
-        if path in selected and hold["task"] == task:
-            hold["ended"] = time.time()
-            changed = True
-    if changed:
-        scratch.write_holds(holds)
-    for tree in paths:
-        record = scratch.task_of(tree)
-        if (copy_record.copy_folder(tree) != tree.resolve()
-                and not (isinstance(record, copy_record.Registered) and "crate_run" in record.fields)):
-            if (not tree.exists() and isinstance(scratch.pending_removal(tree), copy_record.NotRegistered)
-                    or scratch.end_copy(tree, task, time.time())):
-                hold = scratch.holds().get(str(tree.resolve()))
-                if hold is not None and hold["task"] == task:
-                    _ = scratch.release(tree)
+    with scratch.locked_holds() as holds:
+        changed = False
+        for path, hold in holds.items():
+            if path in selected and hold["task"] == task and not hold["ended"]:
+                hold["ended"] = moment
+                changed = True
+        if changed:
+            scratch.write_holds(holds)
+
+    for tree in dict.fromkeys(paths):
+        if not os.path.lexists(tree):
             continue
-        if not tree.exists():
-            if isinstance(record, copy_record.Registered) and record.task == task:
-                with workspace_removal_guard(tree, record, run_lock=run_lock) as validate, scratch.removal_lock(tree) as idle:
-                    if not idle:
-                        raise CopyError(f"{tree}: workspace is busy during task completion")
-                    validate()
-                    scratch.remove_marked(tree)
-            hold = scratch.holds().get(str(tree.resolve()))
-            if hold is not None and hold["task"] == task:
-                _ = scratch.release(tree)
+        record = scratch.task_of(tree)
+        if isinstance(record, copy_record.NotRegistered):
+            scratch.report_retained_task_folder(tree, "the workspace has no task record")
             continue
         if not isinstance(record, copy_record.Registered) or record.task != task:
             raise CopyError(f"{tree}: workspace task differs")
+        removed = False
         with (workspace_removal_guard(tree, record, run_lock=run_lock) as validate,
               scratch.removal_lock(tree) as idle,
               scratch.copy_record_lock(tree)):
             if not idle:
                 raise CopyError(f"{tree}: workspace is busy during task completion")
-            def ended(current: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
-                if not isinstance(current, copy_record.Registered) or current.task != task:
-                    raise CopyError(f"{tree}: workspace task differs")
-                return {**current.fields, "ended": time.time(), "ended_task": task}
             validate()
-            # A deletion intent preserves ownership but does not certify saved work.
             if isinstance(scratch.pending_removal(tree), copy_record.NotRegistered):
-                _ = scratch.update_record(tree, ended)
-            if "crate_run" not in record.fields:
-                continue
-            scratch.remove_marked(tree)
-        _ = scratch.release(tree)
+                scratch.record_task_end(tree, task, moment)
+            if ("crate_run" in record.fields and tree in created
+                    and os.path.samestat(tree.lstat(), created[tree])):
+                scratch.remove_marked(tree, source_deletion=scratch.SourceDeletion.CRATE_WORKSPACE_ONLY)
+                removed = True
+        if removed:
+            _ = scratch.release(tree)
+        else:
+            scratch.report_retained_task_folder(tree, f"task {task} ended")
 
 
 def slot_source(source: Path) -> Path:
@@ -1535,8 +1527,16 @@ def workspace_repository(record: copy_record.Registered) -> str:
     return identity
 
 
-def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> list[tuple[Path, copy_record.Registered]]:
-    """Select registered copies and adopted copies without depending on a live source."""
+class WorkspaceScanPurpose(Enum):
+    """Choose the checks for removal or session reporting."""
+
+    REMOVE = auto()
+    REPORT = auto()
+
+
+def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES, *,
+                     purpose: WorkspaceScanPurpose = WorkspaceScanPurpose.REMOVE) -> list[tuple[Path, copy_record.Registered]]:
+    """Select registered workspaces for the owner."""
     root = copy_record.copies_root()
     paths = set(scratch.registered_copy_paths())
     paths.update(scratch.pending_copy_paths(root))
@@ -1545,19 +1545,24 @@ def owned_workspaces(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> l
     found: list[tuple[Path, copy_record.Registered]] = []
     for tree in sorted(paths):
         record = scratch.task_of(tree)
-        if isinstance(record, copy_record.UnreadableRecord):
-            raise CopyError(record.reason)
         if isinstance(record, copy_record.NotRegistered):
             hold = held.get(str(tree))
             if (copy_record.copy_folder(tree) != tree.resolve()
                     and (hold is None or hold["reason"] != LEGACY_WORKER_HOLD_REASON)):
                 continue
-            raise CopyError(f"repair record {tree / copy_record.RECORD}: copy is not registered")
+            record = copy_record.UnreadableRecord(f"repair record {tree / copy_record.RECORD}: copy is not registered")
+        if isinstance(record, copy_record.UnreadableRecord):
+            if purpose is WorkspaceScanPurpose.REMOVE:
+                raise CopyError(record.reason)
+            print(f"copies: {' '.join(record.reason.splitlines())}", file=sys.stderr)
+            continue
         if copy_owner(str(record.fields.get("owner_unit", ""))) != copy_owner(owner):
             continue
         if isinstance(scope, SelectedRepository) and workspace_repository(record) != scope.name:
             continue
         found.append((tree, record))
+    if purpose is WorkspaceScanPurpose.REPORT:
+        return found
     selected = dict(found)
     ordered: list[tuple[Path, copy_record.Registered]] = []
     visited: set[Path] = set()
@@ -2388,8 +2393,7 @@ def publish_files(tree: Path, paths: Sequence[str], before: Sequence[Publication
         repository = repository_name(tree)
         with ExitStack() as cleanup:
             publication = scratch.new(word="gate-binary", throwaway=True)
-            record = cast(copy_record.Registered, scratch.task_of(publication))
-            _ = cleanup.callback(scratch.end, record.task)
+            _ = cleanup.callback(shutil.rmtree, publication)
             for source in sources:
                 destination = publication / source.name
                 temporary = publication / f".{source.name}.tmp"
