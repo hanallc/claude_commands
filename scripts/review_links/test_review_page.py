@@ -2434,6 +2434,11 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
                     self.assertIn('<div class="record-filter-row">'
                                   + f'<span aria-hidden="true">{label}</span>'
                                   + f'<div {container} role="group" aria-label="{label}">', source)
+                status = source.index('<p class="page-status"')
+                words = source.index('id="list-search"')
+                self.assertIn('</p><div class="record-filter-words">', source[status:words])
+                self.assertLess(words, source.index('role="group" aria-label="Type"'))
+                self.assertIn('<label class="list-search-label" for="list-search">Search</label>', source)
                 group = source.partition('<div class="review-types review-shows"')[2].partition('</div>')[0]
                 self.assertTrue(group, 'Show has a second chip row')
                 self.assertNotIn('<select id="list-show"', source)
@@ -2546,7 +2551,11 @@ window.fetch=async(url,options)=>{
   check(chip('Validating') && getComputedStyle(chip('Validating')).opacity==='1',
     'A nonzero Validating chip has full opacity.');
   const search=document.querySelector('#list-search');
+  search.focus();
   search.value='no matching title';search.dispatchEvent(new Event('input'));
+  check(document.activeElement===search && search.type==='search' && search.tabIndex===0 &&
+   new URLSearchParams(location.hash.slice(1)).get('q')==='no matching title',
+   'The search input keeps focus and saves the query in the link.');
   check(count('Validating')?.textContent==='0' && chip('Validating') &&
     Number(getComputedStyle(chip('Validating')).opacity)<1,'A zero Validating chip is dim.');
   search.value='';search.dispatchEvent(new Event('input'));
@@ -2652,6 +2661,16 @@ window.fetch=async(url,options)=>{
     'All supplies the count for every Show chip');
   const groups=[...document.querySelectorAll('.review-types')],buttons=[...document.querySelectorAll('[data-show-chip]')];
   const labels=groups.map(group=>group.previousElementSibling);
+  const words=search.getBoundingClientRect(),typeRow=groups[0].parentElement.getBoundingClientRect();
+  const line=document.querySelector('[data-page-status]').getBoundingClientRect();
+  const newButton=document.querySelector('[data-review-new]').getBoundingClientRect();
+  const stacked=matchMedia('(max-width:800px)').matches;
+  check(words.bottom<=typeRow.top && Math.abs(words.right-typeRow.right)<1,
+   'The search input is above Type and ends at the right edge.');
+  check(stacked ? words.top>=line.bottom && Math.abs(words.left-typeRow.left)<1 :
+   words.left>=line.right && Math.abs(words.right-newButton.right)<1 &&
+   Math.abs((words.top+words.bottom)-(line.top+line.bottom))<2,
+   'The search input shares the status row on desktop and spans the row below the status on a phone.');
   check(labels.map(label=>label.textContent).join('|')==='Type|State|Owner' &&
     groups.every((group,index)=>group.getAttribute('aria-label')===labels[index].textContent),
     'The three filter rows have visible and accessible labels');
