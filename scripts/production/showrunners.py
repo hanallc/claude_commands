@@ -12,7 +12,7 @@ from time import monotonic
 import os
 import subprocess
 import sys
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from importlib import import_module
@@ -519,48 +519,28 @@ class NoticeDelivery:
     failed: tuple[str, ...] = ()
 
 
-def notice_deadline(seconds: float) -> float:
-    if not math.isfinite(seconds) or seconds <= 0:
-        raise ValueError("The notice budget must be finite and positive.")
-    return monotonic() + seconds
-
-
-def run_notice(command: Sequence[str], *, deadline: float | None) -> subprocess.CompletedProcess[str]:
-    remaining = None if deadline is None else deadline - monotonic()
-    if remaining is not None and remaining <= 0:
-        raise subprocess.TimeoutExpired(command, 0)
-    return subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                          check=False, timeout=remaining)
-
-
 def send_to_address(address: str, key: str, text: str, *, recipient: str,
-                    sender: str = "showrunners", deadline: float | None = None) -> NoticeDelivery:
+                    sender: str = "showrunners") -> NoticeDelivery:
     """Send to a known session address with the same report as production notices."""
-    command = session_send.send_argv("--to", address, "--from", sender, "--key", key, "--text", text, send_script=SEND)
-    try:
-        sent = run_notice(command, deadline=deadline)
-    except subprocess.TimeoutExpired:
-        return NoticeDelivery((f"could not tell {recipient}: the notice deadline expired",), failed=(recipient,))
+    sent = subprocess.run(session_send.send_argv("--to", address, "--from", sender, "--key", key,
+                           "--text", text, send_script=SEND), capture_output=True, text=True, check=False)
     if sent.returncode != 0:
-        reason = sent.stdout.strip() or sent.stderr.strip() or f"send.py exited {sent.returncode}"
-        return NoticeDelivery((f"could not tell {recipient}: {reason}",), failed=(recipient,))
+        return NoticeDelivery((f"could not tell {recipient}: {sent.stderr.strip() or f'send.py exited {sent.returncode}'}",),
+                              failed=(recipient,))
     return NoticeDelivery((f"told {recipient}",))
 
 
-def deliver(production_name: str, key: str, text: str, *,
-            sender: str = "showrunners", deadline: float | None = None) -> NoticeDelivery:
+def deliver(production_name: str, key: str, text: str, *, sender: str = "showrunners") -> NoticeDelivery:
     """Resolve a production's current address and report whether its notice failed."""
-    options = {} if deadline is None else {"deadline": deadline}
-    address = current_address(production_name, **options)
+    address = current_address(production_name)
     if not address:
         return NoticeDelivery((f"{production_name} is not running: tell it when it starts",))
-    return send_to_address(address, key, text, recipient=production_name, sender=sender, **options)
+    return send_to_address(address, key, text, recipient=production_name, sender=sender)
 
 
-def tell(production_name: str, key: str, text: str, *, sender: str = "showrunners",
-         deadline: float | None = None) -> str:
+def tell(production_name: str, key: str, text: str, *, sender: str = "showrunners") -> str:
     """Send one line and preserve the existing human-readable delivery report."""
-    return deliver(production_name, key, text, sender=sender, deadline=deadline).lines[0]
+    return deliver(production_name, key, text, sender=sender).lines[0]
 
 
 def tell_others(texts: dict[str, str], key: str) -> NoticeDelivery:

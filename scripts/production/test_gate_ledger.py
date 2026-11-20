@@ -18,7 +18,7 @@ from collections.abc import Sequence
 from contextlib import ExitStack, redirect_stdout
 from unittest import mock
 from zoneinfo import ZoneInfo
-from scripts.production import gate, land_runs, showrunners
+from scripts.production import gate, land_runs
 from scripts.lib import build_folders
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -529,11 +529,13 @@ class MergeGateLedgerTests(MergeGateFixture):
             self.assertEqual(selected.commit, head)
 
     def test_nightly_without_a_build_cache_sends_the_result_and_removes_its_copy(self) -> None:
+        from scripts.production import showrunners
+
         _ = self.git(self.checkout, "rm", "Cargo.toml")
         tip = self.commit(self.checkout, "repository without a build cache")
         _ = self.git(self.checkout, "push", "origin", "HEAD:integration")
         self.write(self.state / "red-hooks", "red")
-        with mock.patch.object(showrunners, "tell", return_value="told quiet") as notice:
+        with mock.patch.object(showrunners, "tell", return_value="sent to quiet") as notice:
             result = self.run_gate("--nightly")
 
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -639,7 +641,7 @@ class MergeGateLedgerTests(MergeGateFixture):
         self.assertTrue((retained[0] / "target").is_dir())
 
     def test_nightly_notice_resolves_the_production_from_its_branch_without_a_calling_session(self) -> None:
-        from scripts.production import staff
+        from scripts.production import showrunners, staff
         from scripts.agents import remote
 
         production = self.checkout / "quiet-production.md"
