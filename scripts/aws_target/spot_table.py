@@ -181,7 +181,11 @@ def spot_tables_from(directory: Path, now: int, values: conf.ConfigRead, configu
     home = configuration.text('region')
     inputs = gate_pricing if gate_pricing is not None else run_cost.read_gate_pricing_inputs(
         directory, now, values, configuration)
-    hours = billed_hours(directory, now, regions, hours_check_scope(values), days, home,
+    page = evidence.page_inputs if evidence is not None else None
+    if isinstance(page, ledger.SpendPageInputsNotCaptured):
+        raise ledger.LedgerUnavailable('page capture requires the Hana hours settings')
+    hana = page.hana_hours if isinstance(page, ledger.SpendPageInputs) else None
+    hours = billed_hours(directory, now, regions, hours_check_scope(values, hana=hana), days, home,
                          configuration.text('instance_type'), conf.decimal(configuration.text('billed_hours_gap_max_ratio')),
                          evidence=evidence)
     return SpotTables(

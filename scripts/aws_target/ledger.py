@@ -20,7 +20,6 @@ import subprocess
 import sys
 import time
 from uuid import uuid4
-from types import MappingProxyType
 from typing import BinaryIO, Literal, cast
 from zoneinfo import ZoneInfo
 
@@ -2996,9 +2995,16 @@ class SpendSourceVersion:
 
 
 @dataclass(frozen=True)
+class SpendConfigurationVersion:
+    source: Path
+    committed: conf.CommittedConfigurationRevision | conf.NoCommittedConfiguration
+
+
+@dataclass(frozen=True)
 class PageEvidenceRevision:
     at: int
     sources: tuple[SpendSourceVersion, ...]
+    configurations: tuple[SpendConfigurationVersion, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -3017,6 +3023,23 @@ class UnreadableSpendBill:
     reason: str
 
 
+class SpendCapturePurpose(Enum):
+    REPORT = 'spend report'
+    PAGE_PUBLICATION = 'page publication'
+
+
+@dataclass(frozen=True)
+class SpendPageInputsNotCaptured:
+    """The spend report does not use the page inputs."""
+
+
+@dataclass(frozen=True)
+class SpendPageInputs:
+    hana_hours: conf.ConfigRead
+    frame_template: str
+    step_tip_template: str
+
+
 @dataclass(frozen=True)
 class SpendEvidenceAt:
     revision: PageEvidenceRevision
@@ -3028,6 +3051,7 @@ class SpendEvidenceAt:
     settings: SpendingSettings
     account_configuration: conf.ConfigRead
     gate_configuration: conf.ConfigRead
+    page_inputs: SpendPageInputs | SpendPageInputsNotCaptured
     builder_region: str
     gate_root_gib: int
     spot_prices: tuple[RegionalSpotPrice, ...]
@@ -3158,6 +3182,9 @@ class UtcAccountSpend:
 
 _SPEND_UTC = ZoneInfo('UTC')
 _REPOSITORY_GATE_SPEND_SETTINGS = Path(__file__).resolve().parents[2] / 'config' / 'cloud_gate.conf'
+_REPOSITORY_HANA_HOURS_SETTINGS = _REPOSITORY_GATE_SPEND_SETTINGS.with_name('hana_aws.conf')
+_REPOSITORY_CONSOLE_SETTINGS = _REPOSITORY_GATE_SPEND_SETTINGS.with_name('console.conf')
+SPEND_PAGE_SOURCE = Path(__file__).with_name('aws_prices.html')
 
 
 def _spend_file_stamp(info: os.stat_result) -> SpendFileStamp:
@@ -3185,7 +3212,8 @@ class _SpendSourcePaths:
     revision: PageEvidenceRevision
 
 
-def _spend_source_paths(book: CostLedger, at: int, settings_path: Path) -> _SpendSourcePaths:
+def _spend_source_paths(book: CostLedger, at: int, settings_path: Path,
+                        purpose: SpendCapturePurpose) -> _SpendSourcePaths:
     charges = book.directory / 'charges'
     provider = book.directory / 'hana' / 'provider'
     bills, journal = _spend_json_paths(charges), _spend_json_paths(provider)
@@ -3193,6 +3221,13 @@ def _spend_source_paths(book: CostLedger, at: int, settings_path: Path) -> _Spen
              book.directory / SPOT_PRICE_FILE, book.directory / GATE_DEPLOYMENT_FILE,
              book.directory / SPOT_PLACEMENT_FILE, settings_path, conf.path('cloud_gate'),
              _REPOSITORY_GATE_SPEND_SETTINGS, *bills, *journal}
+    if purpose is SpendCapturePurpose.PAGE_PUBLICATION:
+        from scripts.build_queue import memory_files
+        from scripts.review_links import page_frame
+
+        paths.update((conf.path('hana_aws'), _REPOSITORY_HANA_HOURS_SETTINGS, conf.path('console'),
+                      _REPOSITORY_CONSOLE_SETTINGS, SPEND_PAGE_SOURCE, memory_files.PAGE_SOURCE,
+                      *page_frame.title_source_paths()))
     versions = tuple(SpendSourceVersion(str(path.absolute()), _spend_path_stamp(path)) for path in sorted(paths))
     return _SpendSourcePaths(bills, journal, PageEvidenceRevision(at, versions))
 
@@ -3290,13 +3325,21 @@ def _captured_ledger(contents: str | SpendFileAbsent, journal: remote.HanaStartJ
     return state
 
 
-def _frozen_spend_configuration(configuration: conf.ConfigRead) -> conf.ConfigRead:
-    if isinstance(configuration.settings, dict):
-        return replace(configuration, settings=MappingProxyType(configuration.settings))
-    return configuration
+def _capture_spend_page(hana: conf.ConfigRead, console: conf.ConfigRead) -> SpendPageInputs:
+    from scripts.build_queue import memory_files
+    from scripts.review_links import console_theme, page_frame
+
+    source = console_theme.with_theme(SPEND_PAGE_SOURCE.read_text(encoding='utf-8'))
+    frame = page_frame.template(source, 'AWS', 'aws', settings=console)
+    return SpendPageInputs(hana, frame, memory_files.PAGE_SOURCE.read_text(encoding='utf-8'))
 
 
-def capture_spend_evidence(directory: Path, now: int, *, settings_path: Path | None = None
+def _spend_configurations_match(versions: Sequence[SpendConfigurationVersion]) -> bool:
+    return all(conf.committed_configuration_revision(version.source) == version.committed for version in versions)
+
+
+def capture_spend_evidence(directory: Path, now: int, *, settings_path: Path | None = None,
+                           purpose: SpendCapturePurpose = SpendCapturePurpose.REPORT
                            ) -> SpendEvidenceAt | SpendEvidenceUnavailable:
     """Read one report revision under shared, nonblocking locks."""
     book = CostLedger(directory)
@@ -3306,7 +3349,7 @@ def capture_spend_evidence(directory: Path, now: int, *, settings_path: Path | N
             raise LedgerUnavailable('spend time must use nonnegative integer seconds')
         with (_spend_file_lock(directory / 'cost-ledger.lock', fcntl.LOCK_SH) as ledger_lock,
               _spend_file_lock(book.launch_history_path, fcntl.LOCK_SH) as launch_lock):
-            sources = _spend_source_paths(book, now, account_path)
+            sources = _spend_source_paths(book, now, account_path, purpose)
             if isinstance(ledger_lock, SpendFileAbsent) and (
                     book.path.exists() or sources.bills or sources.journal or any(
                         (directory / name).exists() for name in (SPOT_PRICE_FILE, GATE_DEPLOYMENT_FILE, SPOT_PLACEMENT_FILE))
@@ -3322,11 +3365,21 @@ def capture_spend_evidence(directory: Path, now: int, *, settings_path: Path | N
             bills, refusals = _spend_bills(sources.bills, now)
             _require_complete_bill_publication(state, bills)
             account = conf.read(account_path, load=conf.read_bytes)
+            live_gate_path = conf.path('cloud_gate')
+            gate_path = 'cloud_gate' if live_gate_path.exists() else _REPOSITORY_GATE_SPEND_SETTINGS
+            gate = conf.read(gate_path, load=conf.read_bytes)
+            if purpose is SpendCapturePurpose.PAGE_PUBLICATION:
+                account, gate = account.freeze(), gate.freeze()
+                hana = conf.read_or_repository('hana_aws').freeze()
+                console = conf.read_or_repository('console').freeze()
+                page_inputs = _capture_spend_page(hana, console)
+                configurations = (account, gate, hana, console)
+            else:
+                account, gate = account.freeze_settings(), gate.freeze_settings()
+                page_inputs = SpendPageInputsNotCaptured()
+                configurations = ()
             settings = read_settings(account)
             builder_region = account.text('region')
-            live_gate_path = conf.path('cloud_gate')
-            gate = (conf.read('cloud_gate', load=conf.read_bytes) if live_gate_path.exists()
-                    else conf.read(_REPOSITORY_GATE_SPEND_SETTINGS, load=conf.read_bytes))
             gate_root = gate.origin('root_gib', conf.positive_whole)
             if not isinstance(gate_root, conf.UsableLiveValue):
                 recovery = conf.read(_REPOSITORY_GATE_SPEND_SETTINGS, load=conf.read_bytes)
@@ -3345,15 +3398,20 @@ def capture_spend_evidence(directory: Path, now: int, *, settings_path: Path | N
             except (OSError, ValueError, KeyError) as error:
                 print(f'aws_page: Spot placement scores unavailable: {type(error).__name__}', file=sys.stderr)
                 placement = ()
-            if sources != _spend_source_paths(book, now, account_path):
+            versions = tuple(SpendConfigurationVersion(config.source, config.recovery.revision)
+                             for config in configurations
+                             if isinstance(config.recovery, conf.SavedConfigurationRecovery))
+            if (sources != _spend_source_paths(book, now, account_path, purpose)
+                    or not _spend_configurations_match(versions)):
                 raise LedgerUnavailable('spend sources changed during capture')
             for path, stream in ((directory / 'cost-ledger.lock', ledger_lock), (book.launch_history_path, launch_lock)):
                 stamp = SpendFileAbsent() if isinstance(stream, SpendFileAbsent) else _spend_file_stamp(os.fstat(stream.fileno()))
                 if stamp != _spend_path_stamp(path):
                     raise LedgerUnavailable(f'{path.name} changed during capture')
-            return SpendEvidenceAt(sources.revision, contents, bills, refusals, launches, journal,
-                                   settings, _frozen_spend_configuration(account), _frozen_spend_configuration(gate),
-                                   builder_region, gate_root.value, spot_prices, spot_document, deployment, placement)
+            revision = replace(sources.revision, configurations=versions)
+            return SpendEvidenceAt(revision, contents, bills, refusals, launches, journal,
+                                   settings, account, gate, page_inputs, builder_region, gate_root.value,
+                                   spot_prices, spot_document, deployment, placement)
     except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
         return SpendEvidenceUnavailable(str(error))
 
@@ -3369,9 +3427,12 @@ def verify_spend_revision(directory: Path, evidence: SpendEvidenceAt
             if isinstance(ledger_lock, SpendFileAbsent):
                 raise LedgerUnavailable('page publication requires the existing cost ledger lock')
             launch_lock = locks.enter_context(_spend_file_lock(book.launch_history_path, fcntl.LOCK_SH))
-            current = _spend_source_paths(book, evidence.at, evidence.account_configuration.source)
-            if current.revision != evidence.revision or (
-                    isinstance(launch_lock, SpendFileAbsent) and book.launch_history_path.exists()):
+            purpose = (SpendCapturePurpose.PAGE_PUBLICATION if isinstance(evidence.page_inputs, SpendPageInputs)
+                       else SpendCapturePurpose.REPORT)
+            current = _spend_source_paths(book, evidence.at, evidence.account_configuration.source, purpose)
+            if (current.revision.sources != evidence.revision.sources
+                    or not _spend_configurations_match(evidence.revision.configurations)
+                    or (isinstance(launch_lock, SpendFileAbsent) and book.launch_history_path.exists())):
                 raise LedgerUnavailable('spend sources changed before publication')
             result = SpendRevisionVerified()
         except (OSError, ValueError) as error:
@@ -3606,14 +3667,15 @@ def _add_utc_reconciliations(state: LedgerEvidence, at: int, local: dict[date, l
     for reading in state.reconciliations:
         if reading.source != 'Cost Explorer' or reading.at > at or reading.period_end > at:
             continue
-        day = _utc_date(reading.period_start)
-        if day in billed_days or (reading.period_start, reading.period_end) != period_bounds(day, _SPEND_UTC):
-            continue
-        charges = local.get(day, [])
-        basis = tuple(charge.interval for charge in charges if charge.reconciliation_basis)
+        basis = tuple(charge.interval for start, _ in _days(reading.period_start, reading.period_end, _SPEND_UTC)
+                      for charge in local.get(_utc_date(start), ()) if charge.reconciliation_basis)
         _, adjustment = _reconciliation_charges(reading, basis, _SPEND_UTC)
-        for charge in _spend_day_storage_costs(adjustment, day, refused_days):
-            local.setdefault(day, []).append(_UtcSpendCharge(charge, 'other', reconciliation_basis=True))
+        for charge in adjustment:
+            day = _utc_date(charge.start)
+            if day in billed_days:
+                continue
+            for allowed in _spend_day_storage_costs((charge,), day, refused_days):
+                local.setdefault(day, []).append(_UtcSpendCharge(allowed, 'other', reconciliation_basis=True))
 
 
 def _utc_spend(evidence: SpendEvidenceAt) -> UtcAccountSpend:

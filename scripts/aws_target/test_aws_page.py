@@ -531,6 +531,34 @@ class AwsPageSpendReferenceTests(ledger_test_support.SpendReferenceFixture):
                 self.assertEqual(render.call_count, 3)
                 self.assertEqual(path.read_bytes(), earlier)
 
+    def test_render_uses_captured_configuration_recovery(self) -> None:
+        def git(*args: str) -> None:
+            _ = subprocess.run(['git', '-C', str(self.root), '-c', 'user.name=Fixture',
+                                '-c', 'user.email=fixture@example.invalid', *args],
+                               capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
+
+        git('init', '-q')
+        self.replace('run_cost_days', '7')
+        git('add', self.settings.name)
+        git('commit', '-qm', 'Save fixture settings')
+        settings = self.settings.read_text().replace('run_cost_days=7\n', '')
+        _ = self.settings.write_text(settings)
+        report = spend.read_utc_spend(self.state, self.midnight, settings_path=self.settings,
+                                      purpose=ledger.SpendCapturePurpose.PAGE_PUBLICATION)
+        assert isinstance(report, spend.UtcSpendReport)
+
+        with (mock.patch.object(conf, '_git', side_effect=AssertionError('configuration Git read during render')),
+              mock.patch.object(conf, 'read_or_repository', side_effect=AssertionError('settings read during render')),
+              mock.patch.object(Path, 'read_text', side_effect=AssertionError('file read during render'))):
+            page = aws_page.render_report_page(self.state, report, 0)
+        self.assertIn('last 7 days', page)
+        with ledger.verify_spend_revision(self.state, report.evidence) as verified:
+            self.assertIsInstance(verified, ledger.SpendRevisionVerified)
+
+        git('commit', '--allow-empty', '-qm', 'Change fixture configuration revision')
+        with ledger.verify_spend_revision(self.state, report.evidence) as verified:
+            self.assertEqual(verified, ledger.SpendEvidenceUnavailable('spend sources changed before publication'))
+
     def test_row_n04_page_retries_when_a_launch_changes_the_revision(self) -> None:
         self.refresh(self.midnight, '2')
         now = self.midnight + 3600

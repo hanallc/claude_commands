@@ -98,10 +98,11 @@ class UtcSpendReport:
     account: ledger.UtcAccountSpend | ledger.SpendEvidenceUnavailable
 
 
-def read_utc_spend(directory: Path, instant: int, *, settings_path: Path | None = None
+def read_utc_spend(directory: Path, instant: int, *, settings_path: Path | None = None,
+                   purpose: ledger.SpendCapturePurpose = ledger.SpendCapturePurpose.REPORT
                    ) -> UtcSpendReport | ledger.SpendEvidenceUnavailable:
     """Read and evaluate one revision for both reports."""
-    evidence = ledger.capture_spend_evidence(directory, instant, settings_path=settings_path)
+    evidence = ledger.capture_spend_evidence(directory, instant, settings_path=settings_path, purpose=purpose)
     if isinstance(evidence, ledger.SpendEvidenceUnavailable):
         return evidence
     return UtcSpendReport(evidence, ledger.utc_account_spend(evidence))

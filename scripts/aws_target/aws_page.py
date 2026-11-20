@@ -24,13 +24,12 @@ from statistics import median
 from typing import Literal, NotRequired, TypedDict
 
 from scripts.aws_target import cloud_gate, config as aws_config, console_help, ledger, quota_requests, run_cost, spend as aws_spend, spot_table
-from scripts.build_queue import memory_files
 from scripts.disks.disks_page import shared_step_tip
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.review_links import console_theme, page_frame, review_link
+from scripts.review_links import review_link
 
-PAGE_NAME = 'aws_prices.html'
+PAGE_NAME = ledger.SPEND_PAGE_SOURCE.name
 # The user's order for the region filter, 2026-11-15: the groups in this order, then each group A to Z.
 REGION_GROUPS = ('us', 'eu', 'ap', 'ca', 'sa')
 
@@ -657,6 +656,9 @@ def published_revision(path: Path) -> PageAbsent | LegacyPageRevision | Publishe
 
 def render_report_page(directory: Path, report: aws_spend.UtcSpendReport, started: float) -> str:
     evidence = report.evidence
+    inputs = evidence.page_inputs
+    if isinstance(inputs, ledger.SpendPageInputsNotCaptured):
+        raise ledger.LedgerUnavailable('page capture requires the page inputs')
     now, values, configuration = evidence.at, evidence.gate_configuration, evidence.account_configuration
     spend = utc_spend_data(report)
     watched = report.account.settlement_notes if isinstance(report.account, ledger.UtcAccountSpend) else ()
@@ -670,11 +672,10 @@ def render_report_page(directory: Path, report: aws_spend.UtcSpendReport, starte
     gate_time_price = table_data(gate_time_price_table(comparisons))
     regions = sorted(set(data['regions']).union(row[0] for row in gate_time_price['rows']), key=region_filter_key)
     gate_time_data = {'table': gate_time_price, 'regions': regions}
-    source = console_theme.with_theme(Path(__file__).with_name(PAGE_NAME).read_text(encoding='utf-8'))
-    tip = shared_step_tip(memory_files.PAGE_SOURCE.read_text(encoding='utf-8'))
+    tip = shared_step_tip(inputs.step_tip_template)
     data['render_seconds'] = time.perf_counter() - started
     # Escape closing tags inside JSON values.
-    return (page_frame.template(source, 'AWS', 'aws')
+    return (inputs.frame_template
             .replace('__STEP_TIP_STYLE__', tip.style, 1)
             .replace('__AWS_QUOTA_HELP__', quota_help(), 1)
             .replace('__AWS_PRICES_DATA__', json.dumps(data).replace('</', '<\\/'))
@@ -689,12 +690,13 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     reason = 'The AWS page revision changed during publication.'
     for attempt in range(aws_spend.REPORT_ATTEMPTS):
         before = published_revision(page_path)
-        report = aws_spend.read_utc_spend(directory, now, settings_path=account_path)
+        report = aws_spend.read_utc_spend(directory, now, settings_path=account_path,
+                                          purpose=ledger.SpendCapturePurpose.PAGE_PUBLICATION)
         if isinstance(report, ledger.SpendEvidenceUnavailable):
             reason = report.reason
             continue
         evidence = report.evidence
-        digest = hashlib.sha256(repr(evidence.revision.sources).encode()).hexdigest()
+        digest = hashlib.sha256(repr((evidence.revision.sources, evidence.revision.configurations)).encode()).hexdigest()
         page = render_report_page(directory, report, started)
         with ledger.verify_spend_revision(directory, evidence) as verified:
             if isinstance(verified, ledger.SpendEvidenceUnavailable):

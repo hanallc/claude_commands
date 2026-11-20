@@ -9,7 +9,7 @@ except FileNotFoundError:
 from collections.abc import Callable, Generator, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import math
 import os
@@ -19,6 +19,7 @@ import socket
 import subprocess
 import sys
 from threading import Lock
+from types import MappingProxyType
 from typing import TYPE_CHECKING, TypeVar
 
 from scripts.lib import conf_reads
@@ -156,6 +157,37 @@ class UseConfiguredValue(Enum):
 
 
 @dataclass(frozen=True)
+class NoCommittedConfiguration:
+    """The source has no Git revision that can supply configuration."""
+
+
+@dataclass(frozen=True)
+class CommittedConfigurationRevision:
+    checkout: Path
+    path: str
+    commit: str
+
+
+@dataclass(frozen=True)
+class CurrentConfigurationRecovery:
+    """Read recovery sources when the caller requests a value."""
+
+
+@dataclass(frozen=True)
+class NoRepositoryConfiguration:
+    """The repository has no default configuration for this source."""
+
+
+@dataclass(frozen=True)
+class SavedConfigurationRecovery:
+    """Keep the recovery sources available for the same configuration read."""
+
+    repository: Mapping[str, Setting] | NoRepositoryConfiguration
+    committed: tuple[Mapping[str, Setting], ...]
+    revision: CommittedConfigurationRevision | NoCommittedConfiguration
+
+
+@dataclass(frozen=True)
 class ConfigRead:
     """Keep one live file read for the settings used in one pass."""
 
@@ -164,6 +196,46 @@ class ConfigRead:
     settings: Mapping[str, Setting] | _UnreadableFile
     repository_allowed: bool
     stamp: ConfigurationStamp | UnstampedConfiguration = UnstampedConfiguration.UNSTAMPED
+    recovery: CurrentConfigurationRecovery | SavedConfigurationRecovery = CurrentConfigurationRecovery()
+
+    def freeze_settings(self) -> ConfigRead:
+        """Keep a read-only copy of the live settings."""
+        if isinstance(self.settings, _UnreadableFile):
+            return self
+        return replace(self, settings=MappingProxyType(dict(self.settings)))
+
+    def freeze(self) -> ConfigRead:
+        """Copy the live settings and pin their recovery sources."""
+        if isinstance(self.recovery, SavedConfigurationRecovery):
+            return self
+        revision = committed_configuration_revision(self.source)
+        repository = self._repository_settings()
+        if not isinstance(repository, NoRepositoryConfiguration):
+            repository = MappingProxyType(dict(repository))
+        recovery = SavedConfigurationRecovery(
+            repository,
+            tuple(MappingProxyType(_parse(contents)) for contents in _files_at_revision(revision)),
+            revision)
+        return replace(self.freeze_settings(), recovery=recovery)
+
+    def _repository_settings(self) -> Mapping[str, Setting] | NoRepositoryConfiguration:
+        if isinstance(self.recovery, SavedConfigurationRecovery):
+            return self.recovery.repository
+        if self.repository_allowed and isinstance(self.file, str):
+            repository = _repository_path(self.file)
+            if repository != self.source:
+                try:
+                    return _parse(repository.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError):
+                    pass
+        return NoRepositoryConfiguration()
+
+    def _committed_settings(self) -> Iterator[Mapping[str, Setting]]:
+        if isinstance(self.recovery, SavedConfigurationRecovery):
+            yield from self.recovery.committed
+        else:
+            for contents in _committed_files(self.source):
+                yield _parse(contents)
 
     def _resolve(self, key: str, convert: Callable[[str], Result], *, warn: bool,
                  default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT, allow_blank: bool = False,
@@ -196,14 +268,12 @@ class ConfigRead:
             reason = f"{self.source}: {key}={bad!r}: {error}"
         if not recover_invalid and not repository_allowed:
             return UnavailableValue(reason)
-        if repository_allowed and self.repository_allowed and isinstance(self.file, str):
-            repository = _repository_path(self.file)
-            if repository != self.source:
-                try:
-                    value, _ = read_key(_parse(repository.read_text(encoding="utf-8")))
-                    return RecoveredValue(value, reason)
-                except (OSError, UnicodeError, ValueError, ArithmeticError):
-                    pass
+        if repository_allowed and not isinstance(repository := self._repository_settings(), NoRepositoryConfiguration):
+            try:
+                value, _ = read_key(repository)
+                return RecoveredValue(value, reason)
+            except (ValueError, ArithmeticError):
+                pass
         if warn:
             _key_warning(self.source, key, reason, bad, self.stamp)
         current_limit = ""
@@ -212,9 +282,9 @@ class ConfigRead:
             if current is not None and current.limit.startswith(("# whole:", "# range:", "# one of:")):
                 current_limit = current.limit
         fallback: RecoveredValue[Result] | None = None
-        for committed in _committed_files(self.source):
+        for committed in self._committed_settings():
             try:
-                value, raw_value = read_key(_parse(committed))
+                value, raw_value = read_key(committed)
             except (ValueError, ArithmeticError):
                 continue
             if not current_limit:
@@ -291,15 +361,12 @@ class ConfigRead:
                 result[key] = self.text(key)
         return result
 
-    def _recover_file(self, fault: _UnreadableFile) -> dict[str, Setting]:
-        if fault.missing and self.repository_allowed and isinstance(self.file, str):
-            try:
-                return _parse(_repository_path(self.file).read_text(encoding="utf-8"))
-            except (OSError, UnicodeError):
-                pass
-        for contents in _committed_files(self.source):
+    def _recover_file(self, fault: _UnreadableFile) -> Mapping[str, Setting]:
+        if fault.missing and not isinstance(repository := self._repository_settings(), NoRepositoryConfiguration):
+            return repository
+        for settings in self._committed_settings():
             _warning(f"warning: {self.source}: keys: {fault.reason}")
-            return _parse(contents)
+            return settings
         _warning(f"warning: {self.source}: keys: {fault.reason}")
         raise Unusable(f"{self.source}: keys: {fault.reason}; no usable committed file")
 
@@ -475,20 +542,32 @@ def _git(folder: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(["git", *arguments], 1, "", str(error))
 
 
-def _committed_files(source: Path) -> Iterator[str]:
-    root = _git(source.parent, "rev-parse", "--show-toplevel")
+def committed_configuration_revision(source: Path) -> CommittedConfigurationRevision | NoCommittedConfiguration:
+    """Identify the commit and file that can supply saved settings."""
+    root = _git(source.parent, "rev-parse", "--show-toplevel", "HEAD")
     if root.returncode:
-        return
-    checkout = Path(root.stdout.strip())
+        return NoCommittedConfiguration()
+    checkout_text, commit = root.stdout.splitlines()
+    checkout = Path(checkout_text).resolve()
     try:
-        relative = source.resolve().relative_to(checkout.resolve()).as_posix()
+        relative = source.resolve().relative_to(checkout).as_posix()
     except ValueError:
+        return NoCommittedConfiguration()
+    return CommittedConfigurationRevision(checkout, relative, commit)
+
+
+def _files_at_revision(revision: CommittedConfigurationRevision | NoCommittedConfiguration) -> Iterator[str]:
+    if isinstance(revision, NoCommittedConfiguration):
         return
-    history = _git(checkout, "log", "--format=%H", "--", relative)
-    for revision in history.stdout.splitlines() if history.returncode == 0 else ():
-        committed = _git(checkout, "show", f"{revision}:{relative}")
-        if committed.returncode == 0:
-            yield committed.stdout
+    history = _git(revision.checkout, "log", "--format=%H", revision.commit, "--", revision.path)
+    for commit in history.stdout.splitlines() if history.returncode == 0 else ():
+        saved = _git(revision.checkout, "show", f"{commit}:{revision.path}")
+        if saved.returncode == 0:
+            yield saved.stdout
+
+
+def _committed_files(source: Path) -> Iterator[str]:
+    yield from _files_at_revision(committed_configuration_revision(source))
 
 
 def _converted(setting: Setting, convert: Callable[[str], Result]) -> Result:

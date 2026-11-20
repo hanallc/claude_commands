@@ -1060,9 +1060,8 @@ print(floor.day, floor.usd, decision.reason)
         with self.book.transaction() as state:
             state.hana_storage.append(ledger.HanaStorageExposure(
                 JAN1, Decimal(90), ledger.HanaExposureClosed(JAN3)))
-            for start in (JAN1, JAN2):
-                state.reconciliations.append(ledger.CostReconciliation(
-                    self.now, start, start + DAY, Decimal(5), 'Cost Explorer'))
+            state.reconciliations.append(ledger.CostReconciliation(
+                self.now, JAN1, JAN3, Decimal(10), 'Cost Explorer'))
 
         def completed_days() -> tuple[Decimal, ...]:
             return tuple(row.usd for row in self.captured_utc_spend().days[:-1]
