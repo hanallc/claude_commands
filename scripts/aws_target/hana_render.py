@@ -201,8 +201,7 @@ def runtime_files(checkout: Path, configuration: Path | conf.ConfigRead) -> tupl
     shell_config = resolved_config_text(conf.settings(targets.read_text(encoding='utf-8')),
                                         (SHELL_TIMEOUT_KEY,), alias)
     copies = conf.settings((checkout / 'config/copies.conf').read_text(encoding='utf-8'))
-    copies_config = config_text(_runtime_defaults({key: setting for key, setting in copies.items()
-        if key != 'root' and key.rpartition('.')[0] != 'root'}, alias))
+    copies_config = config_text(_runtime_defaults(copies, alias))
     folders = conf.settings((checkout / 'config/build_folders.conf').read_text(encoding='utf-8'))
     # The image supplies the slot pool and lock timing.
     image_roots = ('roots.slots', 'roots.slot_cargo', 'roots.mirror', 'roots.shell', 'roots.temporary')
