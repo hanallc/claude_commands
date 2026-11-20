@@ -202,8 +202,9 @@ sys.stdin.read(1)
                     recovery.tokens.append(recovery.token(pool.descriptor, b"Q", "returning", pool_size=size))
                     recovery.save()
                     original = recovery.path.read_text()
-                    problem = merge_gate.recover_fifo_slots(pool.descriptor)
-                    assert problem is not None
+                    problems = merge_gate.recover_fifo_slots(pool.descriptor)
+                    assert problems is not None
+                    [problem] = problems
                     self.assertEqual(problem.path, recovery.path)
                     self.assertIn(reason, problem.reason)
                     self.assertEqual(recovery.path.read_text(), original)
@@ -369,7 +370,7 @@ sys.stdin.read(1)
         self.assertEqual(self.jobserver_tokens(), b"")
 
     def test_cpu_wait_names_a_record_that_becomes_unreadable(self) -> None:
-        self.configure_gate("program_stop_seconds=0.25")
+        self.configure_gate("program_stop_seconds=3\nprogram_sample_seconds=1")
         self.create_jobserver(self.root / "unreadable-jobserver", b"Q")
         with mock.patch.dict(os.environ, self.environment, clear=True), \
                 merge_gate.gate_recovery(self.checkout) as live, merge_gate.shared_cpu_pool() as pool:
@@ -381,26 +382,73 @@ sys.stdin.read(1)
             ready = select.select
             corrupt = b"{"
             waits = 0
+            now = 100.0
 
             def damage_record(readers: list[int], writers: list[int], errors: list[int],
                               timeout: float | None = None) -> tuple[list[int], list[int], list[int]]:
-                nonlocal waits
+                nonlocal now, waits
                 if pool.blocking in readers:
                     waits += 1
-                    self.assertEqual(waits, 1)
-                    self.assertEqual(merge_gate.read_gate_recovery(holder.path), holder)
-                    _ = holder.path.write_bytes(corrupt)
+                    self.assertLessEqual(waits, 2)
+                    assert timeout is not None
+                    if waits == 1:
+                        self.assertEqual(merge_gate.read_gate_recovery(holder.path), holder)
+                        _ = holder.path.write_bytes(corrupt)
+                    now += timeout
+                    return [], [], []
                 return ready(readers, writers, errors, timeout)
 
-            stop_seconds = admission_records.read_memory_config().program_stop_seconds
-            pool.deadline = time.monotonic() + stop_seconds
-            with mock.patch.object(select, "select", side_effect=damage_record), \
+            sample_seconds = admission_records.read_memory_config().program_sample_seconds
+            pool.deadline = now + 2 * sample_seconds
+            with mock.patch.object(time, "monotonic", side_effect=lambda: now), \
+                    mock.patch.object(select, "select", side_effect=damage_record), \
                     self.assertRaises(merge_gate.GateRecoveryUnresolved) as failure:
                 _ = pool.acquire()
-            self.assertEqual(waits, 1)
+            self.assertEqual(waits, 2)
             self.assertIn(f"Record: {holder.path}", str(failure.exception))
             self.assertIn("cannot parse gate record", str(failure.exception))
             self.assertEqual(holder.path.read_bytes(), corrupt)
+            self.assertEqual(self.jobserver_tokens(), b"")
+
+    def test_cpu_wait_keeps_its_stop_clock_when_one_of_two_records_clears(self) -> None:
+        self.configure_gate("program_stop_seconds=3\nprogram_sample_seconds=1")
+        self.create_jobserver(self.root / "two-holders", b"QR")
+        with mock.patch.dict(os.environ, self.environment, clear=True), \
+                merge_gate.gate_recovery(self.checkout) as live, merge_gate.shared_cpu_pool() as pool:
+            assert isinstance(pool, merge_gate.SharedCPUPool)
+            first, second = [merge_gate.GateRecovery(live.path.with_name(name), str(self.checkout),
+                                                      live.pid, live.start)
+                             for name in ("first.json", "second.json")]
+            for holder in (first, second):
+                token = holder.token(pool.descriptor, os.read(pool.descriptor, 1), "held")
+                holder.tokens.append(replace(token, path="relative"))
+                holder.save()
+            ready = select.select
+            began = now = 100.0
+            config = admission_records.read_memory_config()
+            waits = 0
+
+            def clear_first(readers: list[int], writers: list[int], errors: list[int],
+                            timeout: float | None = None) -> tuple[list[int], list[int], list[int]]:
+                nonlocal now, waits
+                if pool.blocking in readers:
+                    waits += 1
+                    self.assertLessEqual(now + config.program_sample_seconds, began + config.program_stop_seconds)
+                    assert timeout is not None
+                    if waits == 1:
+                        first.tokens[:] = [replace(first.tokens[0], path=self.environment["BUILDLOG_JOBSERVER_FIFO"])]
+                        first.save()
+                    now += timeout
+                    return [], [], []
+                return ready(readers, writers, errors, timeout)
+
+            with mock.patch.object(time, "monotonic", side_effect=lambda: now), \
+                    mock.patch.object(select, "select", side_effect=clear_first), \
+                    self.assertRaises(merge_gate.GateRecoveryUnresolved) as failure:
+                _ = pool.acquire()
+            self.assertEqual(now, began + config.program_stop_seconds)
+            self.assertIn(f"Record: {second.path}", str(failure.exception))
+            self.assertNotIn(f"Record: {first.path}", str(failure.exception))
             self.assertEqual(self.jobserver_tokens(), b"")
 
     def test_fifo_recount_preserves_live_slots_and_available_bytes(self) -> None:
@@ -428,6 +476,25 @@ sys.stdin.read(1)
             _ = merge_gate.recover_fifo_slots(pool.descriptor)
             self.assertEqual(self.jobserver_tokens(), b"C+")
         self.assertEqual(self.jobserver_tokens(), b"C+A")
+
+    def test_fifo_scan_caps_record_reads_and_rejects_an_oversize_record(self) -> None:
+        self.create_jobserver(self.root / "one-slot", b"Q")
+        oversized = self.root / "oversized.json"
+        with oversized.open("wb") as stream:
+            _ = stream.truncate(merge_gate.MAX_GATE_RECORD_BYTES + 1)
+        with self.assertRaisesRegex(merge_gate.GateRecordError, "format size limit"):
+            _ = merge_gate.read_gate_recovery(oversized)
+
+        with mock.patch.dict(os.environ, self.environment, clear=True), merge_gate.shared_cpu_pool() as pool:
+            assert isinstance(pool, merge_gate.SharedCPUPool)
+            directory = merge_gate.gate_run_directory(self.checkout)
+            self.write(directory / "first.json", "{")
+            self.write(directory / "second.json", "{")
+            with mock.patch.object(merge_gate, "read_gate_recovery", wraps=merge_gate.read_gate_recovery) as read:
+                scan = merge_gate.fifo_records(pool.descriptor, deadline=float("inf"))
+            self.assertEqual(read.call_count, 1)
+            self.assertFalse(scan.complete)
+            self.assertEqual(len(scan.unresolved), 1)
 
     def test_fifo_recount_checks_fifo_identity_before_the_token_value(self) -> None:
         other = self.root / "other-fifo"
