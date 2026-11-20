@@ -5176,6 +5176,49 @@ class ProgressKeepAsideTests(unittest.TestCase):
                 self.assertEqual(memory_feed.need_notes((step,)),
                     {"need_part": False, "need_reason": f"full need: {reason}"})
 
+    def test_replay_of_november_20_nextest_holds_requires_decay_evidence(self) -> None:
+        # The history retains the peak sizes and test start times.
+        # It has no .wave times or complete compiler scans.
+        hold_seconds = 1500
+        policy = replace(admission_policy_fixture(), peak_hold=admission_records.PeakHold(hold_seconds))
+        for pid, grant, peak, test_start, test_peak, baseline, width, reduced in (
+            (350420, 14_755_037_184, 9_194_807_296, 1795173233, 1_080_451_072, 1_127_587_840, 1, 1_296_541_287),
+            (2365962, 15_023_239_168, 14_040_457_216, 1795174562, 6_336_188_416, 7_036_043_264, 24, 7_603_426_100),
+        ):
+            with self.subTest(pid=pid):
+                row = fixture_reservation(pid, grant, step="nextest")
+                row["test_phase_need"] = gate.test_phase_need_record(
+                    admission_records.TestPhaseNeed(baseline, 1, width, width, "same_width", margin=1.2))
+                scope = Path("/fixture/builds.slice/test.scope")
+                memory = admission_records.MeasuredMemory(test_peak,
+                    anonymous=admission_records.AnonymousRunUse(test_peak),
+                    anonymous_source=admission_records.ScopeSource(scope, frozenset({pid})))
+                missing_time = gate.UnreadableSample()
+                samples = gate.PeakSamples(gate.PeakFileSample(str(peak), missing_time),
+                    gate.PeakFileSample(missing_time, missing_time))
+                phase = test_phase.ObservedTestPhase(test_peak, test_start)
+                evidence = service.ReservationEvidence(memory, samples, phase, str(scope), memory.compiler_evidence)
+                boundary = test_start + hold_seconds
+                reading = service.reservation_charge(evidence, row, boundary, policy)
+                self.assertEqual(gate.test_need_override(row, reading, ()),
+                    admission_records.TestNeedOverride(grant, "peak evidence unavailable"))
+
+                # Use the test start as an upper bound for the wave time.
+                # Set the modeled reading to the saved test peak.
+                paired_wave = gate.PeakFileSample(f"{peak} {test_start}", missing_time)
+                modeled = replace(evidence, peak_samples=replace(samples, wave=paired_wave))
+                reading = service.reservation_charge(modeled, row, boundary - 1, policy)
+                self.assertEqual(gate.reservation_need(row, reading), grant)
+                reading = service.reservation_charge(modeled, row, boundary, policy)
+                assert isinstance(reading, admission_records.MeasuredMemory)
+                history = reading.peak_history
+                assert isinstance(history, admission_records.PeakDecayed)
+                self.assertEqual(gate.reservation_need(row, reading), grant)
+                sampled = replace(reading, peak_history=replace(history, bytes=test_peak, margin=1.2, sampled=True),
+                    compiler_evidence=admission_records.NoCompilerSeen())
+                self.assertEqual(gate.reservation_need(row, sampled), reduced)
+                self.assertEqual(gate.reservation_need(row, sampled, compiling_scopes=(scope,)), grant)
+
     def test_matched_test_progress_replaces_baseline_but_the_growing_peak_keeps_its_frozen_margin(self) -> None:
         row = self.reservation("nextest", need=20 * GIB)
         baseline = admission_records.TestPhaseNeed(8 * GIB, 5, 8, 8, "same_width", margin=1.25)
