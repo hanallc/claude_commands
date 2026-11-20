@@ -25,7 +25,7 @@ class MergeGateRerunsTests(GateSuitesFixture):
     def set_module_time_history(self, rows: dict[str, tuple[float, ...]]) -> None:
         config = Path(self.environment["CONF_DIR"])
         _ = write_config_fixture(config / "merge_gate.conf",
-                                 "rerun_module_time_factor=4\nrerun_module_time_floor_s=3")
+                                 "rerun.module_time_factor=4\nrerun.module_time_floor_seconds=3")
         _ = write_config_fixture(config / "test_times.conf", "TOP_RUNS=3")
         database = index.index_path_in(Path(self.environment["BUILDLOG_DIR"]))
         with closing(sqlite3.connect(database)) as connection, connection:
@@ -60,14 +60,19 @@ class MergeGateRerunsTests(GateSuitesFixture):
             "lib/test_second.py": merge_gate.DEFAULT_MODULE_TIME_LIMIT,
         }
         named_options = [word for name in expected_named for word in ("--module", name)]
+        expected_default = dict.fromkeys(expected_named, merge_gate.DEFAULT_MODULE_TIME_LIMIT)
         cases = (
             ("named", named_options, expected_named),
-            ("full", ["--full"], dict.fromkeys(expected_named, merge_gate.DEFAULT_MODULE_TIME_LIMIT)),
+            ("full", ["--full"], expected_default),
             ("explicit default value", [*named_options, "--module-time-limit-s", "1800"],
              dict.fromkeys(expected_named, merge_gate.ExplicitModuleTimeLimit(1800))),
+            ("unreadable index", named_options, expected_default),
         )
         for label, options, expected in cases:
             with self.subTest(label=label), mock.patch.object(merge_gate, "start_gate_job", side_effect=capture_started):
+                if label == "unreadable index":
+                    database = index.index_path_in(Path(self.environment["BUILDLOG_DIR"]))
+                    _ = database.write_bytes(b"invalid SQLite database\n" * 100)
                 jobs.clear()
                 result = self.run_gate("--tests-only", *options)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -75,16 +80,23 @@ class MergeGateRerunsTests(GateSuitesFixture):
                 self.assertEqual(actual, expected)
                 if label == "named":
                     self.assertEqual(actual["hooks/test_first.py"].seconds, 20.0)
+                if label == "unreadable index":
+                    warnings = [line for line in result.stdout.splitlines() if "cannot read the gate index" in line]
+                    self.assertEqual(len(warnings), 1, result.stdout)
+                    self.assertIn("file is not a database", warnings[0])
 
     def test_named_module_stops_at_the_fixture_floor(self) -> None:
         self.set_module_time_history({"hooks/test_first.py": (0.5,)})
-        self.write(self.checkout / "scripts/hooks/test_first.py", """import time
+        self.write(self.checkout / "scripts/hooks/test_first.py", """import os
+from pathlib import Path
+import time
 import unittest
 
 
 class HangingModule(unittest.TestCase):
     def test_hangs(self) -> None:
         time.sleep(8)
+        (Path(os.environ["MERGE_GATE_TEST_STATE"]) / "module-completed").touch()
 """)
         result = self.run_gate("--tests-only", "--module", "hooks/test_first.py")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -92,6 +104,7 @@ class HangingModule(unittest.TestCase):
                       + "the module time limit (configured rerun floor)", result.stdout)
         self.assertIn("--- hooks/test_first.py exit=", result.stdout)
         self.assertEqual(result.stdout.count("Starting module: hooks/test_first.py"), 1)
+        self.assertFalse((self.state / "module-completed").exists(), result.stdout)
 
     def test_memory_stop_with_a_tripwire_reports_failure_without_a_rerun(self) -> None:
         module = self.checkout / "scripts/hooks/test_first.py"

@@ -255,12 +255,9 @@ def run_test_steps(production: ProductionDocument, steps: Sequence[CheckpointTes
         name, command, folder = step
         # Run only the known flaky tests when they cause the failure.
         alone = bool(tests) and tests <= flaky_tests
-        if runs_merge_gate(command):
-            rerun_command = narrowed(RedStep(step, first_names)).command
-        else:
-            rerun_command = only_tests(command, tests) if alone else command
         with log.open("a", encoding="utf-8") as output:
-            result = run_test_command(rerun_command, folder, raise_start_errors=raise_start_errors)
+            result = run_test_command(only_tests(command, tests) if alone else command, folder,
+                                      raise_start_errors=raise_start_errors)
             _ = output.write(result.stdout + result.stderr)
             _ = output.write(f"{name.replace(' ', '_')}_RERUN_EXIT={result.returncode}\n")
         stop_cancelled_test(name, result, log)

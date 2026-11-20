@@ -31,14 +31,17 @@ from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 @final
 class MergeGateSuitesTests(GateSuitesFixture):
     @gate_suites("hooks")
-    def test_finished_local_job_wins_when_polling_crosses_the_deadline(self) -> None:
+    def test_gate_deadline_preserves_a_pass_and_reports_a_stopped_job_as_red(self) -> None:
         # The queue admission wait comes before the time limit starts.
-        cases = (("whole machine", merge_gate.WholeMachine(), 0.0),
-                 ("shared after a 300 s admission wait", merge_gate.SHARED_MACHINE, 300.0))
-        for name, machine, admission_wait in cases:
+        cases = (("pass before deadline", merge_gate.WholeMachine(), 0.0, False),
+                 ("pass after a 300 s admission wait", merge_gate.SHARED_MACHINE, 300.0, False),
+                 ("exit zero when stopped", merge_gate.WholeMachine(), 0.0, True))
+        for name, machine, admission_wait, stop_at_deadline in cases:
             with self.subTest(name):
                 now = 0.0
                 began = 0.0
+                sent_term = False
+                output = io.StringIO()
                 process = cast(subprocess.Popen[str], cast(object, SimpleNamespace(pid=987654321, returncode=None)))
 
                 @contextlib.contextmanager
@@ -56,7 +59,13 @@ class MergeGateSuitesTests(GateSuitesFixture):
                     return merge_gate.RunningGateJob(suite, path, process, began, 0, log.open("r+"), log, path.name)
 
                 def reap(*arguments: int) -> tuple[int, int, resource.struct_rusage]:
-                    return (arguments[0] if now >= began + 9.99 else 0), 0, resource.getrusage(resource.RUSAGE_SELF)
+                    finished = sent_term if stop_at_deadline else now >= began + 9.99
+                    return (arguments[0] if finished else 0), 0, resource.getrusage(resource.RUSAGE_SELF)
+
+                def send(_pid: int, signum: int) -> None:
+                    nonlocal sent_term
+                    if signum == signal.SIGTERM:
+                        sent_term = True
 
                 def advance(seconds: float) -> None:
                     nonlocal now
@@ -68,14 +77,17 @@ class MergeGateSuitesTests(GateSuitesFixture):
                       mock.patch.object(merge_gate, "gate_reservation", side_effect=admitted_after_wait),
                       mock.patch.object(merge_gate, "start_gate_job", side_effect=start),
                       mock.patch.object(os, "wait4", side_effect=reap),
-                      mock.patch.object(process_group, "send_process_group"),
-                      contextlib.redirect_stdout(io.StringIO())):
+                      mock.patch.object(process_group, "send_process_group", side_effect=send),
+                      contextlib.redirect_stdout(output)):
                     run = merge_gate.run_suites(self.checkout, machine=machine,
                                                time_limit=gate_record.GateTimeLimit(10))
-                self.assertTrue(run.passed, run.time_limit_report)
-                self.assertEqual(run.jobs[0].returncode, 0)
-                self.assertEqual(run.jobs[0].killed_for, "")
-                self.assertEqual(run.time_limit_report, "")
+                self.assertEqual(sent_term, stop_at_deadline)
+                self.assertEqual(run.passed, not stop_at_deadline, run.time_limit_report)
+                self.assertEqual(run.jobs[0].returncode, int(stop_at_deadline))
+                self.assertEqual(bool(run.jobs[0].killed_for), stop_at_deadline)
+                self.assertEqual(bool(run.time_limit_report), stop_at_deadline)
+                names = checkpoint_gate.red_names(["merge_gate.py"], output.getvalue())
+                self.assertEqual(names, {"hooks/test_first.py"} if stop_at_deadline else set())
                 self.assertLess(run.seconds, 20)
 
     def test_time_limit_notice_resolves_staff_ids_and_unit_names(self) -> None:
