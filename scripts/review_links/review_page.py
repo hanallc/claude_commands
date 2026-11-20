@@ -1149,8 +1149,10 @@ STYLE = '''<style>
 .review-types button{max-width:100%;overflow-wrap:anywhere}
 :is(.review-types button,[data-clear-linked-reviews]){display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:14px;min-height:36px;
 background:var(--card);border:1px solid var(--line);border-radius:999px;color:var(--ink-2);padding:5px 14px;margin:0}
-:is(.review-types button,[data-clear-linked-reviews])[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
-#review-show-validating[data-empty-count]{opacity:.55}
+.review-types button[aria-pressed=true]{background:var(--filter-selected-bg);border-color:var(--filter-selected-bg);
+color:var(--filter-selected-ink)}
+[data-clear-linked-reviews][aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:#fff}
+#review-show-validating[data-empty-count][aria-pressed=false]{opacity:.55}
 .review-icon{display:inline-flex;vertical-align:middle;margin-right:5px}.review-icon svg{width:18px;height:18px}
 .question{--type-color:#b99aff}.change{--type-color:#62b7ef}.investigation{--type-color:#30c1ad}
 .proposal{--type-color:#f27ab8}.efficiency{--type-color:#a3d63a}.bug{--type-color:#ed876b}.response{--type-color:#edc46d}
