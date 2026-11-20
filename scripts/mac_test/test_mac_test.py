@@ -36,8 +36,9 @@ from scripts.lint.memory_test_support import write_config_fixture, commit_config
 from scripts.copies import copies
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
-from scripts.mac_test import mac_test
+from scripts.mac_test import eligibility, mac_test
 from scripts.lib import conf
+from scripts.lib import file_lock
 from scripts.lib import test_hang_guard
 
 if TYPE_CHECKING:
@@ -1347,6 +1348,11 @@ finally:
                     self.assertEqual(self.claim_names(), [])
                     self.assert_command(self.command("free-now", "--repo-root", str(hana)), 1, "busy\n")
                     self.assert_command(self.command("free-now", "--repo-root", str(liner)), 0, "free\n")
+                with self.subTest(mirror="holder omitted on first read"), copies.remote_lease(mirror):
+                    device = file_lock.device_key(copies.remote_lease_path(mirror))
+                    with mock.patch.object(file_lock, "held_flock_keys", side_effect=({}, {device: os.getpid()})):
+                        holder = eligibility.mac_mirror_holder(mirror.host, eligibility.KnownRepository(hana.name))
+                    self.assertEqual(holder, os.getpid())
                 with self.subTest(mirror="released"):
                     self.assertTrue(copies.remote_lease_path(mirror).is_file())
                     self.assert_command(self.command("free-now", "--repo-root", str(hana)), 0, "free\n")

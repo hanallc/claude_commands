@@ -269,7 +269,7 @@ def mac_mirror_holder(host: str, repository: KnownRepository) -> int | None:
     from scripts.mac_test.floor_claims import MirrorIdentity
 
     mirror = MirrorIdentity(host, mac_mirror_path(repository.legacy_mirror_name))
-    return file_lock.lock_holder(str(copies.remote_mirror_lock_path(mirror)), reads=1)
+    return file_lock.lock_holder(str(copies.remote_mirror_lock_path(mirror)))
 
 
 def comma_values(value: str) -> set[str]:

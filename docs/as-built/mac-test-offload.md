@@ -721,7 +721,7 @@ A successful copy removes the repository's refusal time.
 `free-now` reads this local record without SSH or a lock.
 A live time answers `busy` only for its target and repository.
 The coordinator holds its mirror lease through remote cleanup and claim release.
-Dispatch checks this lease with one read of the coordinator's kernel lock table per lookup.
+Dispatch reads the coordinator's kernel lock table up to three times because the kernel can omit a holder.
 A live speculative copy can still give way to a new step.
 A released lease file supplies no evidence of a holder.
 The claim and mirror lease still make the final decision under their locks.
