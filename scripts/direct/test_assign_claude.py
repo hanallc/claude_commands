@@ -7,7 +7,6 @@ from collections.abc import Callable, Generator
 import json
 import os
 import select
-import shutil
 import shlex
 import signal
 import socket
@@ -228,43 +227,21 @@ exec python3 -c ''' + shlex.quote(GROUP_STOP_READY) + "\n")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.root / "worker-models-path").read_text(), str(custom.resolve()))
 
-    def test_a_failed_claude_launch_ends_its_run_and_keeps_its_worker_row(self) -> None:
+    def test_a_failed_claude_launch_keeps_its_run_and_worker_row(self) -> None:
         session = self.start_phase("failed-worker")
         environment = self.launch_environment(session)
-        environment.update({
-            "SCRATCH_ROOT": str(self.root / "scratch"),
-            "SCRATCH_VISIBLE_ROOT": str(self.root / "visible-scratch"),
-            "SCRATCH_HOLDS": str(self.root / "scratch-holds.json"),
-            "DESIGN_ROLES_STATE": str(self.root / "designs"),
-        })
-        # This backend has no native worker panes to remove.
-        _ = (self.assign_script.parent / "remove_workers.py").write_text("")
-        copies = self.root / "scripts/copies"
-        copies.mkdir(exist_ok=True)
-        _ = shutil.copy2(support.DIRECT_DIR.parent / "copies/copies.py", copies / "copies.py")
-        environment["COPIES_CONFIG"] = str(support.DIRECT_DIR.parents[1] / "config/copies.conf")
         with patch.dict(os.environ, environment):
             row = staff.local_snapshot().by_current_session(environment["CODEX_THREAD_ID"])
             assert row is not None
             _ = staff.set_run(row.id, staff.OpenRun(session))
-        registry = Path(environment["NOTIFIER_SESSIONS_DIR"])
-        registry.mkdir(parents=True)
-        from scripts.message import sessions
-        _ = (registry / "director.json").write_text(json.dumps({
-            "sessionId": environment["CODEX_THREAD_ID"], "pid": os.getpid(),
-            "name": "fixture director", "procStart": sessions.process_start(os.getpid()),
-            "updatedAt": 1, "messagingSocketPath": "",
-        }))
         sender = self.root / "opening-send.py"
         _ = sender.write_text(sender.read_text().replace("print('SENT: fixture')", "raise SystemExit(2)"))
         result = self.run_assignment(self.assign_command(session), environment)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         with patch.dict(os.environ, environment):
-            self.assertIsNone(unit_runs.open_run(environment["CODEX_THREAD_ID"]), result.stdout + result.stderr)
-        state = cast(dict[str, object], json.loads((session / "progress_history_state.json").read_text()))
-        self.assertEqual(state["status"], "error")
-        self.assertEqual([event["status"] for event in self.launch_records(session, "run_finished")], ["error"])
-        self.assertIn("run ended", result.stderr)
+            self.assertEqual(unit_runs.open_run(environment["CODEX_THREAD_ID"]), session, result.stdout + result.stderr)
+        self.assertEqual(self.launch_records(session, "run_finished"), [])
+        self.assertEqual([event["status"] for event in self.launch_records(session, "pass_finished")], ["error"])
         worker = self.recorded_worker(session)
         self.assertEqual(worker.parent, staff.ReportsTo(staff.native_id(self.staff_parent)))
         self.assertTrue(worker.current_session)

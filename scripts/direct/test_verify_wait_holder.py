@@ -434,22 +434,29 @@ BOARD_DIR=$TEST_IDENTITY_ROOT/token-board
         self.assertEqual((self.root / "identity-python-calls").read_text().splitlines(),
                          ["PHASE_WAIT_HOLDER", "recorder", "recorder"])
         arguments = (self.root / "identity-recorder-args").read_text().splitlines()
-        self.assertIn("--director", arguments)
+        self.assertEqual(arguments[arguments.index("--verify-phase-id") + 1], "6")
+        self.assertNotIn("--director", arguments)
         self.assertNotIn("--worker-thread-id", arguments)
         self.assertEqual(arguments[arguments.index("--owner-session") + 1],
                          fixture_runtime_id("fixture-director"))
+        self.assertEqual(rows[0]["phase_id"], "6")
+        self.assertNotIn("pass_instance_id", rows[0])
 
     def test_saved_worker_record_names_the_session_without_a_roster(self) -> None:
         reference = self.worker_reference("fixture-first")
         self.write_token_record("impl_worker_saved.json", {"slot": "writer", "staff_id": reference,
                                                           "model": "fixture"})
         self.acquire_identity_token("writer")
-        self.assertEqual(recorded_holders(self.record_token_passes()),
-                         [named_holder("slot", "cargo", FIRST_SESSION)])
+        rows = self.record_token_passes()
+        self.assertEqual(recorded_holders(rows), [named_holder("slot", "cargo", FIRST_SESSION)])
         arguments = (self.root / "identity-recorder-args").read_text().splitlines()
-        self.assertEqual(arguments[arguments.index("--worker-thread-id") + 1],
+        self.assertEqual(arguments[arguments.index("--verify-phase-id") + 1], "6")
+        self.assertEqual(arguments[arguments.index("--owner-session") + 1],
                          fixture_runtime_id("thread-impl"))
+        self.assertNotIn("--worker-thread-id", arguments)
         self.assertNotIn("--director", arguments)
+        self.assertEqual(rows[0]["team_slot"], "impl")
+        self.assertEqual(rows[0]["wait_attribution"], {"state": "WorkerPass"})
 
     def test_dispatch_pass_names_the_worker_session_without_worker_files(self) -> None:
         state = cast(dict[str, object], json.loads(

@@ -4,12 +4,16 @@ from __future__ import annotations
 
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.process_supervisor import ManagedProcess, launch
 
 import unittest
 from scripts.direct import review_launcher_test_support as support
+from scripts.direct.wait_for_test_state import wait_until
 from typing import cast
 import json
 import subprocess
+from contextlib import ExitStack
+from pathlib import Path
 from unittest.mock import patch
 
 
@@ -52,11 +56,59 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         start, = [call for call in self.call_records("pass-calls.jsonl") if call["verb"] == "start-pass"]
         self.assertEqual(cast("list[str]", start["argv"])[-2:], ["--phase-id", "3"])
 
+    def test_matching_lenses_keep_their_phase_and_pass_on_completion(self) -> None:
+        session = self.start_implementation("parallel-review-completion")
+        self.finish_implementation(session)
+        self.recorder("start-phase", "--session-dir", str(session), "--phase-id", "4", "--phase-title", "Next phase")
+
+        def reviews(verb: str) -> list[dict[str, object]]:
+            return [event for event in self.pass_events(session.name)
+                    if event["event_type"] == verb and event["pass_kind"] == "review"]
+
+        with ExitStack() as processes:
+            def start_review(phase: str, name: str) -> tuple[ManagedProcess[str], Path]:
+                entered = self.root / f"{name}-entered"
+                release = self.root / f"{name}-release"
+                environment = {**self.environment(), "TEST_WORKER_STARTED": str(entered),
+                               "STUB_REVIEW_FINISH_FILE": str(release)}
+                command = self.review_command(session)
+                command[2:2] = ["--phase", phase]
+                process = processes.enter_context(launch(
+                    command, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+                _ = processes.callback(release.touch)
+                wait_until(entered.exists, self.root, processes=[process])
+                return process, release
+
+            first, release_first = start_review("3", "first")
+            second, release_second = start_review("4", "second")
+            original, other = reviews("pass_started")
+            self.assertNotEqual(original["team_slot"], other["team_slot"])
+            self.assertEqual(reviews("pass_finished"), [])
+
+            retry, release_retry = start_review("3", "retry")
+            _, _, replacement = reviews("pass_started")
+            release_first.touch()
+            _, error = first.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(first.returncode, 0, error)
+            self.assertEqual([(event["pass_instance_id"], event["status"]) for event in reviews("pass_finished")],
+                             [(original["pass_instance_id"], "interrupted")])
+
+            for process, release in ((second, release_second), (retry, release_retry)):
+                release.touch()
+                _, error = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(process.returncode, 0, error)
+
+        self.assertEqual([(event["phase_id"], event["pass_instance_id"], event["status"])
+                          for event in reviews("pass_finished")],
+                         [("3", original["pass_instance_id"], "interrupted"),
+                          ("4", other["pass_instance_id"], "completed"),
+                          ("3", replacement["pass_instance_id"], "completed")])
+
     def test_plain_review_of_an_older_phase_keeps_findings_without_a_turn_record(self) -> None:
         session = self.start_implementation("named-phase-turn")
         self.finish_implementation(session)
-        older = cast("dict[str, object]", json.loads(
-            (session / "progress_history_state.json").read_text(encoding="utf-8"))["phase"])
+        older = cast(dict[str, object], json.loads(
+            (session / "progress_history_state.json").read_text(encoding="utf-8"))["open_phases"][0])
         self.recorder("start-phase", "--session-dir", str(session), "--phase-id", "4", "--phase-title", "Next phase")
         environment = self.environment()
         environment["STUB_FINDINGS"] = "1. First finding\n2. Second finding\n"
@@ -65,8 +117,8 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         result = subprocess.run(command, env=environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.turn_records(session), [])
-        current = cast("dict[str, object]", json.loads(
-            (session / "progress_history_state.json").read_text(encoding="utf-8"))["phase"])
+        current = cast(dict[str, object], json.loads(
+            (session / "progress_history_state.json").read_text(encoding="utf-8"))["open_phases"][1])
         self.assertNotEqual(older["instance_id"], current["instance_id"])
         self.assertEqual((session / "phases/3/review_findings_1_contract.txt").read_text(),
                          environment["STUB_FINDINGS"])
@@ -148,7 +200,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         session = self.start_implementation("two-turn-records")
         self.finish_implementation(session)
         from scripts.direct import progress_history
-        metadata = cast(dict[str, object], json.loads((session / "progress_history_state.json").read_text())["phase"])
+        metadata = cast(dict[str, object], json.loads((session / "progress_history_state.json").read_text())["open_phases"][0])
         progress = {"phase": metadata["id"], "phase_instance_id": metadata["instance_id"]}
         with patch.dict("os.environ", self.environment()):
             for raised in (3, 7):

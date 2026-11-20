@@ -17,8 +17,8 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Callable, Iterable, Mapping, MutableMapping
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from collections.abc import Callable, Generator, Iterable, Mapping, MutableMapping
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from functools import cached_property
 from enum import Enum
@@ -30,25 +30,30 @@ from unittest import mock
 from scripts.accounts import accounts
 from scripts.lib.state_home_test_support import isolate_state_home
 from scripts.herdr import herdr_types
-from scripts.agents import worker_lifecycle
+from scripts.agents import test_stop_resume, worker_lifecycle
 from scripts.direct import progress_history
 from scripts.copies import copies
-from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
+from scripts.copies import remote_test_support
+from scripts.copies.copies_test_support import fake_remote_removal, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport
 from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.herdr.herdr import HerdrPlace
 from scripts.herdr.test_worker_panes import PaneWorld
-from scripts.lib import build_folders, process_group, process_start, atomic_file, conf, unit_runs
+from scripts.lib import (
+    atomic_file, build_folder_lock, build_folders, build_slots_test_support, conf, process_group, process_start,
+    socket_test_support, unit_runs,
+)
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.unit_runs_test_support import bind_private_run_roots
-from scripts.lint.memory_test_support import write_config_fixture
-from scripts.agents.test_support import write_machine_config
 from scripts.message import session_records, sessions, session_send
 from scripts.message.sessions import SessionRecord
-from scripts.production import unit_lookup, unit_move, staff, unit_config, add_unit, completion_receipt, worker
+from scripts.production import (
+    unit_lookup, unit_move, staff, staff_test_support, unit_config, add_unit, completion_receipt, worker,
+    rename_unit_test_support,
+)
 from scripts.production.production_doc import Production, read_production
 from scripts.production.staff import StaffId
 from scripts.production.staff_test_support import (
@@ -56,7 +61,7 @@ from scripts.production.staff_test_support import (
     fixture_member,
     fixture_unit_saved_name,
     fixture_worker,
-    StaffTestCase,
+    SharedStaffOwner, StaffTestCase,
     fixture_runtime_id,
     CHECKOUT,
     unit_membership,
@@ -74,9 +79,9 @@ from scripts.production.rename_unit_test_support import FolderRenameFixture, Fol
 
 class AgentsUsageTests(unittest.TestCase):
     def test_resume_dwight_admits_the_first_conversation_and_retains_the_live_conversation(self) -> None:
-        from scripts.agents.test_stop_resume import producer_first_fixture
-
-        with producer_first_fixture("claude") as world:
+        with (mock.patch.object(test_stop_resume, "write_config_fixture", write_pinned_fixture_setting),
+              mock.patch.object(test_stop_resume, "write_machine_config", shutdown_fixture_configuration),
+              test_stop_resume.producer_first_fixture("claude") as world):
             for attempt in range(2):
                 with self.subTest(attempt=attempt):
                     code, output, errors = self.invoke(["resume", "dwight"])
@@ -180,14 +185,270 @@ SEAT = "22222222-2222-2222-2222-222222222222"
 
 STOP_SESSION = stop_resume.stop
 
+SHUTDOWN_FIXTURE_SETTINGS = {
+    "staff": """\
+# range: 0.001..
+OPERATION_LOCK_SECONDS=30
+# range: 0.001..
+REMOTE_SECONDS=20
+PRODUCER_WORKSPACE=producers
+PRODUCER_FOLDER_ROOT=~/rust/hanadocs
+""",
+    "shutdown": """\
+# whole: 1..300
+STOP_GRACE_SECONDS=2
+# whole: 1..300
+KILL_GRACE_SECONDS=5
+# whole: 1..300
+MOVE_STOP_MARGIN_SECONDS=3
+# range: 5e-324..
+START_SECONDS=20
+# range: 5e-324..
+OPENING_PROMPT_SECONDS=90
+# range: 5e-324..
+STAY_SECONDS=10
+# range: 0..300
+OWN_PANE_SHELL_SECONDS=30
+# range: 0..3600
+RESUME_CHECK_SECONDS=180
+# range: 5e-324..300
+RESUME_CHECK_INTERVAL_SECONDS=5
+""",
+    "production": """\
+# range: 5e-324..
+RETIRE_POLL_SECONDS=0.2
+# range: 5e-324..
+RETIRE_TERM_WAIT_SECONDS=10
+# range: 5e-324..
+RETIRE_COMMAND_TIMEOUT_SECONDS=900
+# range: 5e-324..
+RENAME_LIVE_WAIT_SECONDS=180
+# range: 5e-324..
+RENAME_RUN_STOP_WAIT_SECONDS=120
+# range: 5e-324..
+RENAME_POLL_SECONDS=1
+# range: 5e-324..
+RENAME_COMMAND_TIMEOUT_SECONDS=900
+# whole: 1..
+unit_port_first=15720
+# whole: 1..
+unit_port_last=15789
+# whole: 1..
+smoke_port=15790
+# whole: 1..
+mac_run_port=15710
+""",
+    "direct": """\
+# range: 0.1..0.9
+WORKER_SPLIT_RATIO=0.667
+WORKER_FIRST_TURN_TEXT=Reply with ready. Do not use tools.
+# range: 1..600
+WORKER_FIRST_TURN_SECONDS=120
+# range: 1..1800
+WORKER_COMPACT_SECONDS=300
+# range: 0.01..600
+WORKER_PUBLISH_LOCK_SECONDS=15
+# range: 1..600
+PANE_AGENT_START_SECONDS=90
+# whole: 1..
+UNIT_COMPACT_ABOVE_TOKENS=200000
+""",
+    "build_folders": """\
+# whole: 1..
+names.suffix_length=8
+# whole: 1..64
+names.repository_key_length=8
+names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_
+roots.system=/tmp
+roots.temporary=${TMPDIR}/builds
+roots.gate=/tmp
+roots.session=~/session
+roots.workspace=~/worktrees
+patterns.temporary={repository}/{owner}-{purpose}-{suffix}
+patterns.tool={purpose}{suffix}
+patterns.legacy-unique={purpose}{suffix}
+patterns.legacy-stable={purpose}
+patterns.editable={repository}-{owner}/{purpose}
+patterns.named={showrunner}-{unit}/{work}-{purpose}
+patterns.gate={purpose}-{suffix}
+patterns.scratch={purpose}-{suffix}
+patterns.target={purpose}
+# range: 0.001..1
+locks.probe_retry_seconds=0.005
+# range: 0.001..60
+locks.probe_wait_seconds=0.001
+# whole: 0..1
+seed.enabled=0
+# whole: 1..
+seed.max_gib=24
+# whole: 0..
+seed.min_free_gib=350
+prefixes.copies-index=copies-index-
+""",
+    "copies": """\
+remote_registry=~/remote-mirrors
+wait_seconds=0.01
+git_timeout_seconds=10
+guard_timeout_seconds=10
+guard_choice_limit=32
+owner.verify=verify
+""",
+    "machines": """\
+aliases=natedev mac
+# one of: linux, darwin
+natedev.platform=linux
+natedev.hosts=natedev
+# one of: linux, darwin
+mac.platform=darwin
+mac.hosts=Nates-MacBook-Pro-2023
+""",
+    "scratch": """\
+visible_root=~/rust/repro
+holds_file=~/.local/state/scratch/holds.json
+# whole: 1..
+default_life_seconds=86400
+# whole: 1..
+repo_depth=3
+# whole: 1..
+suffix_length=6
+repo_skip=target node_modules .git
+# whole: 1..
+record_lock_attempts=3
+# whole: 1..
+removal_remote_timeout_seconds=30
+""",
+    "codex_daemon": """\
+# range: 0.001..
+timeout_seconds=5.0
+# range: 0.001..
+queue_timeout_seconds=30
+agents_slice=app-agents.slice
+""",
+    "postmaster": """\
+# range: 0.001..
+wait_seconds=3.0
+# range: 0.001..
+claim_grace_seconds=15.0
+# range: 0.001..
+heartbeat_max_age_seconds=2.0
+# range: 0.001..
+poll_seconds=0.05
+""",
+    "send": """\
+# range: 0.001..
+waits_review_seconds=30
+# range: 0.001..
+delivery_timeout=40
+# range: 0.001..
+kill_grace=10
+# range: 0.001..
+user_cancel_timeout=30
+# range: 0.001..
+check_timeout=20
+# range: 0.001..
+caller_margin_seconds=15
+# range: 0.001..
+remote_transport_seconds=30
+""",
+    "build_steps": """\
+names.targeted-test=targeted test
+names.merge-gate=gate
+names.integrate=integrate
+names.test-all=test all
+names.test-modules=test named
+prose.merge-gate=the gate
+prose.build=release build
+owned.default={unit} {step}
+owned.showrunner-default=showrunner {step}
+owned.ci-default=CI {step}
+""",
+    "showrunners": """\
+# range: 0..100
+threshold_percent=2
+# range: 0..
+repeat_minutes=30
+# range: 0..
+stall_minutes=5
+""",
+    "script_prompts": """\
+# whole: 1..
+max_records=4096
+""",
+}
+
+
+def shutdown_fixture_configuration(root: Path) -> dict[str, str]:
+    """Supply fixed settings to the shared repository fixtures."""
+    root.mkdir(parents=True, exist_ok=True)
+    for stem, content in SHUTDOWN_FIXTURE_SETTINGS.items():
+        destination = root / f"{stem}.conf"
+        if not destination.exists():
+            if stem == "copies":
+                content = content.replace("~/remote-mirrors", str(root / "remote-mirrors"))
+            _ = destination.write_text(content, encoding="utf-8")
+    return {"CONF_DIR": str(root), "COPIES_CONFIG": str(root / "copies.conf"),
+            "BUILD_TARGETS_CONFIG": str(root / "build_targets.conf")}
+
+
+def retirement_copies_environment(root: Path) -> dict[str, str]:
+    private = build_slots_test_support.private_slot_config(root, repository="fixture", default_maximum=2)
+    return {**private.environment, "HOME": str(root), "SCRATCH_COPIES_ROOT": str(root / "copies")}
+
+
+def write_pinned_fixture_setting(path: Path, overrides: str = "") -> int:
+    """Write only settings that the shutdown fixtures use."""
+    content = SHUTDOWN_FIXTURE_SETTINGS.get(path.stem, "")
+    if not content:
+        if overrides:
+            raise AssertionError(f"Unexpected fixture settings for {path}")
+        return 0
+    lines = content.splitlines()
+    for assignment in overrides.splitlines():
+        key, _, _ = assignment.partition("=")
+        index = next(index for index, line in enumerate(lines) if line.startswith(key + "="))
+        lines[index] = assignment
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def fixture_git_environment() -> dict[str, str]:
+    """Use private Git settings and ignore the caller's Git repository."""
+    return {
+        **{key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TEMPLATE_DIR": "",
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.invalid",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.invalid",
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "maintenance.auto",
+        "GIT_CONFIG_VALUE_0": "false",
+        "GIT_CONFIG_KEY_1": "commit.gpgsign",
+        "GIT_CONFIG_VALUE_1": "false",
+    }
+
+
 def setUpModule() -> None:
     unittest.enterModuleContext(foreign_hostname())
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
     isolate_state_home()
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory(prefix="shutdown-config-")))
+    environment = {**fixture_git_environment(), **shutdown_fixture_configuration(root)}
+    ShutdownStaffFixture.owner_server = SharedStaffOwner(root)
+    unittest.addModuleCleanup(ShutdownStaffFixture.owner_server.close)
+    unittest.enterModuleContext(mock.patch.dict(os.environ, environment, clear=True))
+    _ = unittest.enterModuleContext(mock.patch.object(staff_test_support, "write_config_fixture", write_pinned_fixture_setting))
+    _ = unittest.enterModuleContext(mock.patch.object(build_slots_test_support, "config_environment", shutdown_fixture_configuration))
+    _ = unittest.enterModuleContext(mock.patch.object(rename_unit_test_support, "config_environment", shutdown_fixture_configuration))
+    _ = unittest.enterModuleContext(mock.patch.object(remote_test_support, "copies_environment", retirement_copies_environment))
+    _ = unittest.enterModuleContext(mock.patch.object(socket_test_support, "config_environment", shutdown_fixture_configuration))
+    _ = unittest.enterModuleContext(mock.patch.object(PaneWorld, "setup", setup_pinned_panes))
 
 def git(where: Path, *arguments: str) -> str:
     return subprocess.run(["git", "-C", str(where), *arguments], check=True, capture_output=True,
-                          text=True).stdout.strip()
+                          text=True, env=fixture_git_environment()).stdout.strip()
 
 def session(session_id: str, name: str, pid: int) -> SessionRecord:
     return SessionRecord(pid=pid, sessionId=session_id, name=name, messagingSocketPath="/nonexistent.sock",
@@ -234,6 +495,39 @@ class MoveTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), "TEST move report\n")
         self.assertEqual(errors.getvalue(), "TEST move anomaly\n")
         self.assertEqual(delegated.call_count, 1)
+
+
+SETUP_PANES = PaneWorld.setup
+
+
+@contextmanager
+def pinned_fixture_settings(*stems: str) -> Generator[None]:
+    """Give a shared fixture pinned text before it opens any config source."""
+    sources = {CHECKOUT / "config" / f"{stem}.conf": SHUTDOWN_FIXTURE_SETTINGS[stem] for stem in stems}
+    read_text = Path.read_text
+
+    def read(path: Path, encoding: str | None = None, errors: str | None = None,
+             newline: str | None = None) -> str:
+        if path in sources:
+            return sources[path]
+        return read_text(path, encoding=encoding, errors=errors, newline=newline)
+
+    with mock.patch.object(Path, "read_text", read):
+        yield
+
+
+def setup_pinned_panes(world: PaneWorld, test: StaffTestCase) -> None:
+    with pinned_fixture_settings("codex_daemon", "script_prompts"):
+        SETUP_PANES(world, test)
+
+
+class ShutdownStaffFixture(StaffTestCase):
+    owner_server: ClassVar[SharedStaffOwner]
+
+    @cached_property
+    @override
+    def shared_owner(self) -> SharedStaffOwner:
+        return self.owner_server
 
 
 class ShutdownRepositoryFixture(unittest.TestCase):
@@ -428,7 +722,6 @@ class RetireUnitTests(ShutdownRepositoryFixture):
 
 
     def test_retire_removes_only_the_units_idle_trees_and_workspaces(self) -> None:
-        _ = write_config_fixture(self.root / "scratch.conf")
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
             cache = (tree / "target").resolve().parent
             with copies.standing("other-unit", self.checkout, copies.CommittedSource("HEAD")) as other:
@@ -473,14 +766,13 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertEqual(their_commit, git(self.checkout, "rev-parse", "HEAD"))
 
     def test_retire_without_a_build_cache_has_no_standing_tree_to_remove(self) -> None:
-        _ = write_config_fixture(self.root / "scratch.conf")
         _ = git(self.worktree, "rm", "Cargo.toml")
         _ = git(self.worktree, "commit", "-qm", "remove the root build manifest")
         _ = git(self.worktree, "push", "-q", "origin", "alpha-branch")
         _ = git(self.checkout, "merge", "-q", "--no-ff", "-m", "Merge manifest removal", "alpha-branch")
         with copies.standing(str(self.unit_staff_id), self.worktree, copies.CommittedSource("HEAD")) as tree:
             self.assertTrue(tree.is_relative_to(Path(tempfile.gettempdir())))
-            self.assertEqual(build_folders.build_folder_state(tree), "held")
+            self.assert_slot_held(tree)
             self.assertEqual(git(tree, "rev-parse", "HEAD"), git(self.worktree, "rev-parse", "HEAD"))
         self.assertTrue(tree.exists())
         self.assertEqual(build_folders.build_folder_state(tree), "free")
@@ -489,12 +781,18 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         self.assertFalse(self.worktree.exists())
         self.assertEqual(build_folders.build_folder_state(tree), "free")
 
+    def assert_slot_held(self, path: Path) -> None:
+        """Read the lock after the fixture acquires its lease."""
+        with mock.patch.object(build_folders, "_probe_timing",
+                               return_value=build_folder_lock.ProbeTiming(0, 0.001)):
+            self.assertEqual(build_folders.build_folder_state(path), "held")
+
     def test_retire_keeps_a_busy_tree_and_still_retires_the_unit(self) -> None:
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
             code, output = self.retire()
             self.assertEqual(code, 0, output)
             self.assertNotIn("busy", output)
-            self.assertEqual(build_folders.build_folder_state(tree), "held")
+            self.assert_slot_held(tree)
             self.assertTrue(tree.exists())
         self.assertFalse(self.worktree.exists())
 
@@ -503,7 +801,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
             code, output = self.retire()
             self.assertEqual(code, 0, output)
             self.assertNotIn("busy", output)
-            self.assertEqual(build_folders.build_folder_state(tree), "held")
+            self.assert_slot_held(tree)
         code, output = self.retire()
         self.assertEqual(code, 0, output)
         self.assertIn("unchanged", output)
@@ -629,10 +927,9 @@ class RetireUnitTests(ShutdownRepositoryFixture):
     @override
     def build_repository(self) -> None:
         origin = self.root / "origin.git"
-        _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+        _ = git(self.root, "init", "-q", "--bare", "-b", "main", str(origin))
         self.checkout = self.root / "checkout"
-        _ = subprocess.run(["git", "clone", "-q", str(origin), str(self.checkout)], check=True,
-                           capture_output=True)
+        _ = git(self.root, "clone", "-q", str(origin), str(self.checkout))
         for setting in (("user.email", "test@example.invalid"), ("user.name", "test"), ("commit.gpgsign", "false")):
             _ = git(self.checkout, "config", *setting)
         _ = (self.checkout / "Cargo.toml").write_text("[workspace]\n")
@@ -644,29 +941,31 @@ class RetireUnitTests(ShutdownRepositoryFixture):
             encoding="utf-8")
         _ = git(self.checkout, "add", "-A")
         _ = git(self.checkout, "commit", "-q", "-m", "production")
-        _ = git(self.checkout, "push", "-q", "origin", "main")
         _ = git(self.checkout, "worktree", "add", "-q", "-b", "alpha-branch", str(self.worktree))
         (self.worktree / "docs/plans").mkdir(parents=True, exist_ok=True)
         _ = (self.worktree / "work.txt").write_text("done\n", encoding="utf-8")
         _ = git(self.worktree, "add", "work.txt")
         _ = git(self.worktree, "commit", "-q", "-m", "checkpoint(alpha): the work")
-        _ = git(self.worktree, "push", "-q", "origin", "alpha-branch")
+        _ = git(self.checkout, "push", "-q", "origin", "main", "alpha-branch")
         _ = git(self.checkout, "merge", "-q", "--no-ff", "-m", "Merge alpha", "alpha-branch")
+        exclude = self.checkout / ".git/info/exclude"
+        exclude.parent.mkdir(exist_ok=True)
+        _ = exclude.write_text("/.unit.toml\n", encoding="utf-8")
+        _ = (self.worktree / ".unit.toml").write_text(
+            'plan = "docs/plans/alpha.md"\nport = 1\nresponsibilities = ["scripts"]\n', encoding="utf-8")
 
     @override
     def setUp(self) -> None:
         _ = self.enterContext(fake_cargo_output_roots(children=True))
-        self.staff = StaffTestCase()
+        self.staff = ShutdownStaffFixture()
         self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
         self.restore_repository()
+        config = shutdown_fixture_configuration(self.root)
         _ = self.limits()
-        atomic_file.write_text_atomic(self.root / "shutdown.conf", (Path(__file__).resolve().parents[2] / "config/shutdown.conf").read_text())
-        environment = copies_environment(self.root)
-        _ = shutil.copy2(Path(environment["CONF_DIR"]) / "build_folders.conf", self.root / "build_folders.conf")
-        self.enterContext(mock.patch.dict(os.environ, environment))
-        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
-        write_machine_config(self.root)
+        environment = retirement_copies_environment(self.root)
+        _ = (Path(environment["CONF_DIR"]) / "build_folders.conf").replace(self.root / "build_folders.conf")
+        self.enterContext(mock.patch.dict(os.environ, {**config, **environment, "CONF_DIR": str(self.root)}))
         runs = self.root / "runs"
         self.run_folder = runs / "run-1"
         self.run_folder.mkdir(parents=True)
@@ -681,8 +980,6 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         parent = fixture_member("showrunner", name="alpha")
         self.unit_staff_id = fixture_member("unit", name="alpha", parent=parent.id, runtime_id=DIRECTOR,
                          worktree=staff.PresentWorktree(remote.local_machine(), self.worktree)).id
-        _ = unit_config.write(self.worktree, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
-                                                               unit_config.AppPort(1), ("scripts",)))
         member = fixture_member("worker", name="seat", parent=self.unit_staff_id, runtime_id=SEAT)
         atomic_file.write_text_atomic(self.run_folder / "progress_history_state.json",
                                      json.dumps({"owner_staff_id": str(self.unit_staff_id)}))
@@ -1157,6 +1454,138 @@ class RetireUnitTests(ShutdownRepositoryFixture):
                 finally:
                     case.doCleanups()
 
+        with self.subTest(branch_with_line_separator=True):
+            case = RetireUnitTests()
+            case.setUp()
+            try:
+                branch = "work\u2028in-progress"
+                _ = git(case.worktree, "branch", "-m", branch)
+                _ = git(case.worktree, "commit", "--allow-empty", "-qm", "Unmerged checkpoint")
+                tip = git(case.worktree, "rev-parse", "HEAD")
+                status, output = case.retire()
+                self.assertEqual(status, 1, output)
+                self.assertIn(f"unmerged commits on {branch}: {tip}", output)
+                self.assertEqual(git(case.checkout, "rev-parse", f"refs/heads/{branch}"), tip)
+                self.assertTrue(case.worktree.is_dir())
+            finally:
+                case.doCleanups()
+
+        for moving_branch in ("alpha-branch", "main"):
+            with self.subTest(moving_branch=moving_branch):
+                case = RetireUnitTests()
+                case.setUp()
+                try:
+                    ref = f"refs/heads/{moving_branch}"
+                    unit_ref = "refs/heads/alpha-branch"
+                    unit_tip = git(case.checkout, "rev-parse", unit_ref)
+                    tip = git(case.checkout, "rev-parse", ref)
+                    if moving_branch == "main":
+                        moved = git(case.checkout, "rev-parse", "refs/remotes/origin/main")
+                        unmerged = unit_tip
+                    else:
+                        moved = git(case.checkout, "commit-tree", f"{tip}^{{tree}}", "-p", tip, "-m", "Late checkpoint")
+                        unmerged = moved
+                    unit_queries = 0
+
+                    def move_during_read(argv: list[str], cwd: Path | None = None, *,
+                                         settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT
+                    ) -> subprocess.CompletedProcess[str]:
+                        nonlocal unit_queries
+                        if argv[3:4] == ["ls-remote"] and unit_ref in argv[4:]:
+                            unit_queries += 1
+                            if unit_queries == 2:
+                                _ = git(case.checkout, "update-ref", ref, moved, tip)
+                        return case.fake_run(argv, cwd=cwd, settings=settings)
+
+                    with mock.patch.object(shutdown, "retirement_run", side_effect=move_during_read):
+                        status, output = case.retire()
+                    self.assertEqual(status, 1, output)
+                    self.assertIn(f"unmerged commits on alpha-branch: {unmerged}", output)
+                    self.assertEqual(git(case.checkout, "rev-parse", ref), moved)
+                    self.assertIn(unit_tip, git(case.checkout, "ls-remote", "origin", unit_ref))
+                    self.assertTrue(case.worktree.is_dir())
+                    status, output = case.retire()
+                    self.assertEqual(status, 1, output)
+                    self.assertIn(f"unmerged commits on alpha-branch: {unmerged}", output)
+                finally:
+                    case.doCleanups()
+
+        for disappearing in ("alpha-branch", "main"):
+            with self.subTest(disappearing=disappearing):
+                case = RetireUnitTests()
+                case.setUp()
+                try:
+                    origin = case.root / "origin.git"
+                    branch = f"refs/heads/{disappearing}"
+                    tip = git(case.checkout, "rev-parse", "refs/heads/main")
+                    _ = git(case.checkout, "push", "-q", "origin",
+                            "main", f"{tip}:{branch}" if disappearing != "main" else "alpha-branch",
+                            f"{tip}:refs/heads/retained")
+                    removed = False
+
+                    def remove_after_advertisement(argv: list[str], cwd: Path | None = None, *,
+                                                   settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT
+                    ) -> subprocess.CompletedProcess[str]:
+                        nonlocal removed
+                        result = case.fake_run(argv, cwd=cwd, settings=settings)
+                        if argv[3:4] == ["ls-remote"] and branch in argv[4:] and not removed:
+                            _ = git(origin, "update-ref", "-d", branch, tip)
+                            removed = True
+                        return result
+
+                    with mock.patch.object(shutdown, "retirement_run", side_effect=remove_after_advertisement):
+                        status, output = case.retire()
+                    self.assertEqual(status, 1, output)
+                    self.assertIn(f"couldn't find remote ref {branch}", output)
+                    self.assertEqual(git(origin, "rev-parse", "refs/heads/retained"), tip)
+                    self.assertTrue(case.worktree.is_dir())
+                finally:
+                    case.doCleanups()
+
+        with self.subTest(other_worktree_rebases_branch=True):
+            case = RetireUnitTests()
+            case.setUp()
+            try:
+                branch = "refs/heads/alpha-branch"
+                tip = git(case.checkout, "rev-parse", branch)
+                other = case.root / "rebasing-worktree"
+                _ = git(case.checkout, "worktree", "add", "--detach", str(other), tip)
+                state = Path(git(other, "rev-parse", "--absolute-git-dir")) / "rebase-merge"
+                state.mkdir()
+                write_text_atomic(state / "head-name", branch + "\n")
+                write_text_atomic(state / "orig-head", tip + "\n")
+                write_text_atomic(state / "onto", git(case.checkout, "rev-parse", "main") + "\n")
+                status, output = case.retire()
+                self.assertEqual(status, 1, output)
+                self.assertIn(str(other), output)
+                self.assertEqual(git(case.checkout, "rev-parse", branch), tip)
+                self.assertTrue(state.is_dir())
+            finally:
+                case.doCleanups()
+
+        with self.subTest(suffix_only_advertisement=True):
+            case = RetireUnitTests()
+            case.setUp()
+            try:
+                origin = case.root / "origin.git"
+                branch = "refs/heads/alpha-branch"
+                suffix = f"refs/heads/archive/{branch}"
+                tip = git(origin, "rev-parse", branch)
+                _ = git(origin, "update-ref", suffix, tip)
+                _ = git(origin, "update-ref", "-d", branch, tip)
+                status, output = case.retire()
+                self.assertEqual(status, 1, output)
+                self.assertIn(f"couldn't find remote ref {branch}", output)
+                self.assertEqual(git(origin, "rev-parse", suffix), tip)
+                self.assertTrue(case.worktree.is_dir())
+            finally:
+                case.doCleanups()
+
+        with self.subTest(fixture_ignores_inherited_git_directory=True):
+            directory = git(self.worktree, "rev-parse", "--absolute-git-dir")
+            with mock.patch.dict(os.environ, {"GIT_DIR": str(self.root / "origin.git")}):
+                self.assertEqual(git(self.worktree, "rev-parse", "--absolute-git-dir"), directory)
+
     def test_the_recorders_project_started_line_is_not_uncommitted_work(self) -> None:
         plan = self.worktree / "work.txt"
         recorded = plan.read_text(encoding="utf-8") + "- **Project started:** 2026-10-18T22:00:00-04:00\n"
@@ -1514,7 +1943,6 @@ class ResumeUnitTests(ShutdownRepositoryFixture):
                 _ = cast(Callable[..., object], shutdown.RetiredUnitRecovery)(**fields)
 
     def test_neither_config_refuses_with_the_backfill_instruction_before_any_change(self) -> None:
-        _ = self.staff.record_production("alpha", self.doc)
         row = unit_membership("alpha", "alpha")
         row = staff.update_current_session(row.current_session, staff.StaffId(DIRECTOR))
         _ = staff.set_worktree(row.id, staff.RemovedWorktree(remote.local_machine(), self.worktree), expected=row.worktree)
@@ -1536,10 +1964,9 @@ class ResumeUnitTests(ShutdownRepositoryFixture):
     @override
     def build_repository(self) -> None:
         origin = self.root / "origin.git"
-        _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+        _ = git(self.root, "init", "-q", "--bare", "-b", "main", str(origin))
         self.checkout = self.root / "checkout"
-        _ = subprocess.run(["git", "clone", "-q", str(origin), str(self.checkout)], check=True,
-                           capture_output=True)
+        _ = git(self.root, "clone", "-q", str(origin), str(self.checkout))
         for setting in (("user.email", "test@example.invalid"), ("user.name", "test"), ("commit.gpgsign", "false")):
             _ = git(self.checkout, "config", *setting)
         self.worktree = self.root / "alpha-wt"
@@ -1552,13 +1979,11 @@ class ResumeUnitTests(ShutdownRepositoryFixture):
 
     @override
     def setUp(self) -> None:
-        self.staff = StaffTestCase()
+        self.staff = ShutdownStaffFixture()
         self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
         self.restore_repository()
-        for name in ("shutdown", "production", "direct"):
-            write_text_atomic(self.root / f"{name}.conf", (CHECKOUT / f"config/{name}.conf").read_text())
-        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
+        self.enterContext(mock.patch.dict(os.environ, shutdown_fixture_configuration(self.root)))
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.root / "pane-launches"))
         self.configs = [self.root / "claude1", self.root / "claude2"]
         self.transcript(self.configs[0])
@@ -1875,6 +2300,7 @@ class ResumeUnitTests(ShutdownRepositoryFixture):
 
     def test_recovery_retries_after_a_checkout_hook_fails(self) -> None:
         hook = self.checkout / ".git/hooks/post-checkout"
+        hook.parent.mkdir(exist_ok=True)
         _ = hook.write_text("#!/bin/sh\nprintf 'checkout failed' >&2\nexit 1\n")
         hook.chmod(0o755)
         code, output = self.resume()
@@ -3664,8 +4090,15 @@ class UnitRenameTests(UnitRenameFixture):
         self.assertEqual([resumed.id for resumed in session.starts], [])
 
 
+class ShutdownFolderRenameFixture(FolderRenameFixture):
+    @override
+    def setUp(self) -> None:
+        with pinned_fixture_settings("production"):
+            super().setUp()
+
+
 @final
-class FolderRenameTests(FolderRenameFixture):
+class FolderRenameTests(ShutdownFolderRenameFixture):
     old_name: str = "port"
     new_name: str = "x"
 
@@ -3870,7 +4303,7 @@ class FolderRenameTests(FolderRenameFixture):
 
 
 @final
-class StartupRenameTests(FolderRenameFixture):
+class StartupRenameTests(ShutdownFolderRenameFixture):
     old_name: str = "startup"
 
     @override

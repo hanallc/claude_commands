@@ -17,7 +17,7 @@ import unittest
 from collections.abc import Callable
 from unittest import mock
 from pathlib import Path
-from typing import TypedDict, cast, final, override
+from typing import ClassVar, TypedDict, cast, final, override
 from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 
 from scripts.copies import copies
@@ -288,6 +288,17 @@ if os.environ.get("MAC_TEST_ADVANCE_WAIT") == "1":
 
 @final
 class MacRunTests(unittest.TestCase):
+    helper_home: ClassVar[Path]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="mac-run-helpers-")
+        cls.addClassCleanup(temporary.cleanup)
+        cls.helper_home = Path(temporary.name)
+        _ = copy_helpers(cls.helper_home, *COPY_HELPERS, "scripts/hana_instances", "scripts/accounts",
+                         "scripts/whoami", "scripts/notify", "scripts/maintenance", "config")
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
@@ -304,9 +315,11 @@ class MacRunTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.home = self.root / "home"
-        self.home.mkdir()
-        _ = copy_helpers(self.home, *COPY_HELPERS, "scripts/hana_instances", "scripts/accounts",
-                         "scripts/whoami", "scripts/notify", "scripts/maintenance", "config")
+        installed = self.home / ".claude"
+        installed.mkdir(parents=True)
+        helpers = self.helper_home / ".claude"
+        (installed / "scripts").symlink_to(helpers / "scripts", target_is_directory=True)
+        _ = shutil.copytree(helpers / "config", installed / "config", symlinks=True)
         self.state_directory = self.root / "mac-test-state"
         self.stub_state = self.root / "stub-state"
         self.stub_state.mkdir()
@@ -344,6 +357,7 @@ class MacRunTests(unittest.TestCase):
             **{name: value for name, value in os.environ.items() if name not in SESSION_SELECTORS},
             "HOME": str(self.home),
             "XDG_CACHE_HOME": str(self.root / "cache"),
+            "PYTHONPYCACHEPREFIX": str(self.helper_home / "bytecode"),
             "__ETC_ZSHENV_SOURCED": "1",
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "PYTHONPATH": str(startup),
@@ -359,6 +373,7 @@ class MacRunTests(unittest.TestCase):
         }
 
         _ = self.environment.pop("CLAUDE_PYTHON", None)
+        _ = self.environment.pop("PYTHONDONTWRITEBYTECODE", None)
 
     def write_production_config(self, **overrides: str) -> None:
         settings = MAC_RUN_CONFIG | overrides

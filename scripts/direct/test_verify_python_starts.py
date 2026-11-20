@@ -17,7 +17,7 @@ from scripts.lib.shell_test_support import shell_function
 from scripts.direct.tree_watch_test_support import TreeWatchFixture
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
-from scripts.direct.verify_lint_scope_test_support import VERIFY, CARGO_STUB, TAPLO_STUB
+from scripts.direct.verify_lint_scope_test_support import VERIFY, CARGO_STUB, TAPLO_STUB, write_fixture_cargo_mend
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -188,6 +188,7 @@ class PairedTreeKeyTests(TreeWatchFixture):
             tool = self.root / "tools" / name
             _ = tool.write_text(f"#!{sys.executable}\n" + content)
             tool.chmod(0o755)
+        write_fixture_cargo_mend(self.root / "tools/cargo-mend")
         self.environment.update({
             "TEST_CARGO_EVENTS": str(self.root / "session/cargo-events"),
             "TEST_TAPLO_EVENTS": str(self.root / "session/taplo-events"),

@@ -20,7 +20,7 @@ from unittest import mock
 
 from scripts.lib import build_folders, build_slots, copy_record, git_rescue, scratch
 from scripts.copies import copies
-from scripts.build_queue import admission_protocol as wire, slot_wait
+from scripts.build_queue import admission_client, admission_protocol as wire, slot_wait
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.lib.build_slots_test_support import UseDefaultMaximum, private_slot_config
 from scripts.lib.descendants import adopt_descendants
@@ -744,6 +744,36 @@ sys.exit(7)
         self.assertEqual(len((result.stdout + result.stderr).splitlines()), 2)
         self.assertIn("widget", result.stdout + result.stderr)
         self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "repository slot advice uses the Linux queue")
+    def test_false_ready_retries_the_same_wait_before_starting_work(self) -> None:
+        _ = private_slot_config(self.root, repository="widget", maximum=1)
+        position = build_slots.SlotQueuePosition("slot-wait", time.time())
+        requests: list[wire.RepositorySlotRequest] = []
+        work: list[Path] = []
+
+        with ExitStack() as holder:
+            held = holder.enter_context(self.take())
+
+            def advise(request: wire.RepositorySlotRequest) -> wire.RepositorySlotReady:
+                self.assertEqual(work, [])
+                requests.append(request)
+                self.assertLessEqual(len(requests), 2)
+                if len(requests) == 2:
+                    holder.close()
+                return wire.RepositorySlotReady()
+
+            with mock.patch.object(admission_client, "repository_slot", side_effect=advise):
+                with build_slots.take_slot(self.source, self.base, showrunner="builds", unit="queue",
+                                           work="proof", purpose="test", queue_position=position) as slot:
+                    work.append(slot.path)
+
+        first, retry = requests
+        self.assertEqual(first.episode, position.episode)
+        self.assertEqual(first.since, position.since)
+        self.assertGreater(first.deadline, position.since)
+        self.assertEqual(retry, first)
+        self.assertEqual(work, [held.path])
 
     def test_mac_capacity_wait_expires_without_an_admission_service(self) -> None:
         _ = write_config_fixture(self.settings,

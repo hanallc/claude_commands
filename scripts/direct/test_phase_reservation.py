@@ -38,7 +38,7 @@ def record_unit(test: unittest.TestCase, run: Path, home: Path, phase: str) -> N
     owner = fixture_member("showrunner", name="reservation")
     row = fixture_unit_location(owner, "reservation", home)
     _ = (run / plan_history.STATE_FILENAME).write_text(json.dumps({
-        "owner_staff_id": row.id, "phase": {"id": phase, "status": "active"}, "open_phases": []}))
+        "owner_staff_id": row.id, "open_phases": [{"id": phase, "status": "active"}]}))
 
 
 @final
@@ -68,9 +68,7 @@ class WorktreeAttributionTests(unittest.TestCase):
     def phases(self, worktrees: dict[str, Path]) -> list[phase_reservation.OpenPhase]:
         records = [{"id": name, "instance_id": name, "status": "active"} for name in ("1", "2")]
         state = cast(dict[str, object], json.loads((self.session / plan_history.STATE_FILENAME).read_text()))
-        state.update({
-            "phase": records[-1], "open_phases": records[:-1],
-        })
+        state["open_phases"] = records
         _ = (self.session / plan_history.STATE_FILENAME).write_text(json.dumps(state))
         for name in ("1", "2"):
             directory = phase_reservation.phase_directory(self.session, name)
@@ -610,10 +608,11 @@ class PhaseStateTests(unittest.TestCase):
         self.assertEqual(self.run_verb("clear"), (0, ""))
         path = self.session / plan_history.STATE_FILENAME
         state = cast(dict[str, object], json.loads(path.read_text()))
+        state["open_phases"] = []
         state["phase"] = {"id": "34h", "status": "completed"}
         _ = path.write_text(json.dumps(state))
         self.assertEqual(phase_reservation.open_phases(self.session), [])
-        state["phase"] = {"id": "34h", "status": "active"}
+        state["open_phases"] = [{"id": "34h", "status": "active"}]
         _ = path.write_text(json.dumps(state))
         self.assertEqual(phase_reservation.restore(self.phase_dir(), "34h"), "enrolled_awaiting_first_touch")
         self.assertEqual([phase.phase for phase in phase_reservation.open_phases(self.session)], ["34h"])
@@ -682,9 +681,7 @@ class PhaseRepairTests(unittest.TestCase):
     def recorder_phases(self, *phases: str) -> None:
         records = [{"id": phase, "status": "active"} for phase in phases]
         state = cast(dict[str, object], json.loads((self.session / plan_history.STATE_FILENAME).read_text()))
-        state.update({
-            "phase": records[-1] if records else {"id": "34h", "status": "completed"},
-            "open_phases": records[:-1]})
+        state["open_phases"] = records
         _ = (self.session / plan_history.STATE_FILENAME).write_text(json.dumps(state))
 
     def test_a_checkpoint_released_phase_cannot_restore_a_live_mapping(self) -> None:
