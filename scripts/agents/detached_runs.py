@@ -42,7 +42,7 @@ from importlib.machinery import ModuleSpec, SourceFileLoader
 from importlib.util import spec_from_file_location
 from pathlib import Path
 from types import CodeType, ModuleType
-from typing import IO, Literal, NotRequired, TypedDict, TypeGuard, cast, override
+from typing import IO, TYPE_CHECKING, Literal, NotRequired, TypedDict, TypeGuard, cast, override
 
 from scripts.agents import detached_run_process, worker_lifecycle
 from scripts.buildlog import treekey
@@ -51,6 +51,9 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cancellation import CANCELLATION_SIGNALS
 from scripts.message import send_budget
 from scripts.production import staff, worker_admission
+
+if TYPE_CHECKING:
+    from scripts.accounts.session_state import RunEvidence
 
 # Exit status of `start` when no worker or director owns the run: run the command attached.
 NOT_A_DETACHED_WORKER = 3
@@ -1014,6 +1017,10 @@ def live_run_evidence_in_folders(folders: Mapping[Path, frozenset[staff.StaffId]
         found.extend(evidence.runs)
         errors.extend(evidence.read_errors)
     return LiveRunEvidence(tuple(found), tuple(errors))
+
+
+if TYPE_CHECKING:
+    _accounts_run_evidence: Callable[..., RunEvidence] = live_run_evidence_in_folders
 
 
 def _recover_indexed_stop(path: Path, raw: dict[str, object]) -> None:
