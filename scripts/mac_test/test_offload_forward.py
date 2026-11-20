@@ -9,7 +9,6 @@ import shlex
 import signal
 import time
 from typing import cast
-from unittest import mock
 
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import OwningSession
@@ -135,7 +134,8 @@ class OffloadForwardTests(OffloadCommandFixture):
         assignment = placement.PlacementAssignment("episode-a", "attempt-b", destination, execution_identity.SourceKeyKnown("source-a"),
             placement.SubmittingOwner("natedev", 42, "start"), OwningSession("submitting-session"), 1.0)
         config = eligibility.read_config(self.config_path)
-        with self.subTest(placement="assigned"), mock.patch.dict(os.environ, {"MAC_PLACEMENT": "environment/value"}):
+        with self.subTest(placement="assigned"), self.admission.replace_environment(
+                {**os.environ, "MAC_PLACEMENT": "environment/value"}):
             placed = shlex.split(offload.remote_test_command(
                 config, replace(request, placement=offload.AssignedOffloadRequest(assignment)), HANA))
             gate = placed.index("PATH=$HOME/.claude/scripts/mac_test/cargo_gate/bin:$HOME/.cargo/bin:$PATH")

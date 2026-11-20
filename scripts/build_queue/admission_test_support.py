@@ -7,8 +7,8 @@ from scripts.lib import cancellation, test_phase
 from scripts.build_queue.queue_fixture import write_memory_config
 
 from collections import Counter
-from collections.abc import Callable, Generator
-from contextlib import ExitStack, contextmanager
+from collections.abc import Callable, Generator, Mapping
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from datetime import UTC, datetime
 from dataclasses import dataclass, replace
 import os
@@ -41,6 +41,7 @@ from scripts.build_targets import build_targets
 from scripts.build_queue.queue_fixture import blocking_slot, fixture_reservation, write_process, write_scope
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.production.cli_fixture import locked_environment
 
 NOW = datetime(2026, 10, 31, 12, tzinfo=UTC).timestamp()
 GIB = records.GIB
@@ -390,6 +391,9 @@ class AdmissionFixture(ExitStack):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC",
             "HOME": str(self.root), "TMPDIR": str(self.temporary),
             **interpreter_cache_environment(self.root / "cache")}
+        self._memory_environment: dict[str, str] = {key: environment[key] for key in (
+            "BUILDLOG_PROC", "BUILDLOG_MEMINFO", "BUILDLOG_MEMORY_PRESSURE",
+            "BUILDLOG_BUILDS_CGROUP", "BUILDLOG_CI_CGROUP", "BUILDLOG_LIVE_MEMORY_TRIPWIRE")}
         self.enter_context(mock.patch.dict(os.environ, environment))
         if not (self.root / "build_admission.conf").exists():
             write_memory_config(self.root / "build_admission.conf")
@@ -404,6 +408,14 @@ class AdmissionFixture(ExitStack):
             self.close()
             raise
         _ = self.callback(lambda: self.server.close())
+
+    def with_private_memory(self, environment: Mapping[str, str]) -> dict[str, str]:
+        """Keep the memory readers on the fixture paths during an environment change."""
+        return {**environment, **self._memory_environment}
+
+    def replace_environment(self, environment: Mapping[str, str]) -> AbstractContextManager[None]:
+        """Replace and restore the caller environment between admission loop turns."""
+        return locked_environment(self.with_private_memory(environment), self.loop_access)
 
     def new_server(self, *, start: bool = True) -> ObservedAdmissionServer:
         server = ObservedAdmissionServer(self.state_dir, self.clock, self.readings, self.proc,
@@ -1105,8 +1117,8 @@ def caller_admission(test: unittest.TestCase, root: Path, environment: dict[str,
 
     fixture.server.host_probe = provider
     _ = environment.setdefault("LINT_CONFIG_READER", os.environ["LINT_CONFIG_READER"])
-    for key in ("XDG_CACHE_HOME", "USER_ZONE", "ADMISSION_SOCKET", "LINT_CONFIG_FILE", "BUILDLOG_PROC", "BUILDLOG_MEMINFO",
-                "BUILDLOG_MEMORY_PRESSURE", "BUILDLOG_BUILDS_CGROUP", "BUILDLOG_CI_CGROUP", "BUILDLOG_LIVE_MEMORY_TRIPWIRE"):
+    for key in ("XDG_CACHE_HOME", "USER_ZONE", "ADMISSION_SOCKET", "LINT_CONFIG_FILE"):
         environment[key] = os.environ[key]
+    environment.update(fixture.with_private_memory(environment))
     _ = fixture.enter_context(fixture.serving())
     return fixture

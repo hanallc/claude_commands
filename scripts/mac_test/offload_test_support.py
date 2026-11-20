@@ -34,7 +34,7 @@ from scripts.mac_test.offload_test_commands import COMMAND_STUB, write_shell
 from scripts.lib import test_hang_guard
 from scripts.lib.process_group import send_process_group
 from scripts.production.cli_fixture import invoke_cli
-from scripts.build_queue.admission_test_support import caller_admission, private_provider_evidence
+from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission, private_provider_evidence
 from scripts.build_queue import admission_protocol as wire, placement
 from scripts.build_hold import owning_session as session_owner
 from scripts.mac_test import claim_state
@@ -398,8 +398,12 @@ class OffloadCommandFixture(unittest.TestCase):
         _ = self.environment.pop("PYTHONDONTWRITEBYTECODE", None)
         self.start_admission()
 
+    @property
+    def admission(self) -> AdmissionFixture:
+        return caller_admission(self, self.root, self.environment)
+
     def start_admission(self) -> None:
-        admission = caller_admission(self, self.root, self.environment)
+        admission = self.admission
         admission.configure(waiting_pass_seconds=0.25)
 
         def provider(key: placement.HostEvidenceKey) -> placement.HostEvidence:
@@ -530,9 +534,10 @@ class OffloadCommandFixture(unittest.TestCase):
         arguments.extend(nextest_arguments)
         if assigned_adapter:
             if not subprocess_cli:
-                return invoke_cli(offload, assigned_adapter_main, arguments[2:], self.environment, self.root,
+                return invoke_cli(offload, assigned_adapter_main, arguments[2:],
+                                  self.admission.with_private_memory(self.environment), self.root,
                                   combined_output=not separate_stderr,
-                                  environment_lock=caller_admission(self, self.root, self.environment).loop_access)
+                                  environment_lock=self.admission.loop_access)
             entry = self.root / "assigned-adapter.py"
             _ = entry.write_text(
                 f"import sys\nsys.path.insert(0, {str(SCRIPT.resolve().parents[2])!r})\n"
@@ -543,9 +548,10 @@ class OffloadCommandFixture(unittest.TestCase):
             return subprocess.run(arguments, cwd=self.root, env=self.environment, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
                                   text=True, check=False, timeout=timeout)
-        return invoke_cli(offload, offload.main, arguments[2:], self.environment, self.root,
+        return invoke_cli(offload, offload.main, arguments[2:],
+                          self.admission.with_private_memory(self.environment), self.root,
                           combined_output=not separate_stderr,
-                          environment_lock=caller_admission(self, self.root, self.environment).loop_access)
+                          environment_lock=self.admission.loop_access)
 
     def process_command(self, *arguments: str, separate_stderr: bool = False,
                         last_decline: str = "", assigned_adapter: bool = False,
