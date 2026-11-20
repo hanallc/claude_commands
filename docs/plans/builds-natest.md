@@ -341,3 +341,21 @@
   1. 20 repeated runs pass under a load like the gate's, TMPDIR=/tmp, 2 GB scope.
   2. basedpyright zero errors and warnings on changed files.
   3. Full natedev gate passes (reds that also occur on base do not count).
+
+### Phase 398 — the fixed cost of each gate module and the gate work outside the modules are measured  · status: todo
+**Depends on:** none
+
+#### Work Order
+- **Goal:** one architecture proposal with numbers: the CPU that each gate module pays before and after its tests (fixed cost), and the CPU that a full gate uses outside the module rows (about 750 CPU s of the 6,452 CPU s mean on 11-20). bob and builds accepted it under List item 80 (11-20 08:52); the module-by-module steps stop after 387, 394 and 395.
+- **Spec:**
+  1. Records first, no run: for each full natedev gate on 11-20, read the gate record. Give the total gate CPU, the sum of the module CPU, and the difference. Name each part of the difference that a record shows (supervisor, scopes, bytecode, setup, cleanup).
+  2. Fixed cost: one module with one empty test, run the way the gate runs a module (module_run.py, the gate interpreter, sitecustomize, the scope). Then module_cost.py `--commands 20` on it and on 10 of the smallest real modules. Split the CPU by program: interpreter start, sitecustomize, imports, fixture setup, cleanup, supervisor.
+  3. Outside the modules: one task_cpu.py trace of one full gate, or the 385 base trace if it is still on disk. Give the CPU of the gate supervisor, its polls (the 391 target) and each other program outside the module rows.
+  4. Proposal: each change that removes a part of the fixed cost or of the outside work, with its CPU saved per gate run (measured or estimated, say which) and its cost in worker hours. Say whether 391 stays.
+  5. Runs need natemerge's go and use the natest build-queue item. Fresh TMPDIR, bytecode on. No test or profile makes load on purpose. Change no repository file.
+- **Files:** none (a report in the session folder).
+- **Workers:** 1 writer (impl7): records step now; run steps after natemerge's go.
+- **Constraints from prior phases:** 387, 394 and 395 are the last module-by-module steps. 391 waits for this result.
+- **Acceptance gate:**
+  1. Each number names its source run or record.
+  2. The fixed cost times 840 modules plus the outside work, compared with the 6,452 CPU s gate mean.
