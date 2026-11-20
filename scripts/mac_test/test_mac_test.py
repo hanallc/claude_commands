@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from contextlib import redirect_stdout, redirect_stderr
-from collections.abc import Callable
+from contextlib import ExitStack, contextmanager, redirect_stdout, redirect_stderr
+from collections.abc import Callable, Generator
+from concurrent.futures import Future, ThreadPoolExecutor
 import io
 import json
 import fcntl
@@ -35,7 +37,7 @@ from scripts.lint.memory_test_support import write_config_fixture, commit_config
 
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
-from scripts.mac_test import mac_ci, mac_test
+from scripts.mac_test import claim_state, mac_ci, mac_test
 from scripts.mac_test.mac_ci_test_support import BUSY_PROCESS_LIST, idle_ci_reply, write_idle_ci_ssh
 from scripts.lib import conf
 from scripts.lib import test_hang_guard
@@ -1606,6 +1608,7 @@ finally:
         self.write_config(ci_repo="")
         source = """
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
@@ -3032,6 +3035,87 @@ subprocess.run = expire_gh
         )
         stdout, stderr = status.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertEqual(status.returncode, 0, stdout + stderr)
+
+
+@dataclass(frozen=True)
+class MacCiReadInProgress:
+    """Keep the first CI read blocked until the test releases it."""
+
+    host: mac_ci.MacCiHostReading
+    owner: Future[claim_state.MacCiReading]
+    submit_read: Callable[[], Future[claim_state.MacCiReading]]
+    release: threading.Event
+    commands: list[list[str]]
+    observed_at: float
+    probe_timeout: float
+
+
+class MacCiReadingsTests(unittest.TestCase):
+    @contextmanager
+    def blocked_read(self) -> Generator[MacCiReadInProgress]:
+        with ExitStack() as fixture:
+            root = Path(fixture.enter_context(tempfile.TemporaryDirectory()))
+            settings = root / "mac_test.conf"
+            _ = write_config_fixture(settings, "host=fixture-mac\nprobe_timeout_s=1\n")
+            configuration = conf.read(settings)
+            probe_timeout = configuration.number("probe_timeout_s")
+            observed_at = time.time()
+            readings = mac_ci.MacCiReadings(lambda: observed_at)
+            host = mac_ci.MacCiHostReading()
+            _ = fixture.enter_context(mock.patch.object(mac_ci, "MacCiHostReading", return_value=host))
+            entered, release = threading.Event(), threading.Event()
+            commands: list[list[str]] = []
+
+            def held_ssh(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+                commands.append(arguments)
+                entered.set()
+                if not release.wait(test_hang_guard.TEST_HANG_GUARD_SECS):
+                    raise AssertionError("The fixture did not release the CI probe")
+                return idle_ci_reply(arguments, **options)
+
+            _ = fixture.enter_context(mock.patch.object(mac_ci, "run", side_effect=held_ssh))
+            workers = fixture.enter_context(ThreadPoolExecutor(max_workers=2))
+            _ = fixture.callback(release.set)
+
+            def submit_read() -> Future[claim_state.MacCiReading]:
+                return workers.submit(readings.read, configuration, probe_timeout)
+
+            owner = submit_read()
+            self.assertTrue(entered.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+            yield MacCiReadInProgress(host, owner, submit_read, release, commands, observed_at, probe_timeout)
+
+    def test_a_contended_mac_ci_read_times_out_while_the_lock_is_held(self) -> None:
+        with self.blocked_read() as probe:
+            waiter = probe.submit_read()
+            reading = waiter.result(timeout=2 * probe.probe_timeout)
+            self.assertEqual(reading, claim_state.MacCiReading(claim_state.MacCiActivity.UNKNOWN, probe.observed_at))
+            self.assertFalse(probe.owner.done())
+            self.assertIs(probe.host.reading, claim_state.NO_MAC_CI_READING)
+            self.assertEqual(len(probe.commands), 1)
+
+    def test_a_mac_ci_waiter_reuses_the_reading_after_the_lock_is_released(self) -> None:
+        with self.blocked_read() as probe:
+            waiting = threading.Event()
+            lock = probe.host.lock
+            observed = mock.Mock(wraps=lock)
+
+            def acquire(*, timeout: float) -> bool:
+                if lock.acquire(blocking=False):
+                    return True
+                waiting.set()
+                return lock.acquire(timeout=timeout)
+
+            with (mock.patch.object(observed, "acquire", new=acquire),
+                  mock.patch.object(probe.host, "lock", observed)):
+                waiter = probe.submit_read()
+                try:
+                    self.assertTrue(waiting.wait(probe.probe_timeout))
+                finally:
+                    probe.release.set()
+                reading = waiter.result(timeout=2 * probe.probe_timeout)
+            self.assertIs(reading, probe.owner.result(timeout=probe.probe_timeout))
+            self.assertEqual(reading, claim_state.MacCiReading(claim_state.MacCiActivity.IDLE, probe.observed_at))
+            self.assertEqual(len(probe.commands), 1)
 
 
 class MacActivityScriptTests(NotificationGuardedTestCase):

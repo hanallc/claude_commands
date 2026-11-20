@@ -602,7 +602,8 @@ class MacBuildLimitTests(unittest.TestCase):
                 fixture.server.host_requests[key] = request
                 reply = subprocess.CompletedProcess(["ssh"], status, process_list, "")
                 with mock.patch.object(mac_ci, "run", return_value=reply) as read:
-                    evidence = fixture.read_host_evidence(key)
+                    with mock.patch.object(mac_ci, "monotonic", side_effect=fixture.clock.monotonic):
+                        evidence = fixture.read_host_evidence(key)
                     read.assert_called_once()
                     self.assertEqual(read.call_args.args[0][-2:], ["fixture-mac", mac_ci.PROCESS_LIST_COMMAND])
                     self.assertEqual(read.call_args.kwargs["timeout"], 7)

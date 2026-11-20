@@ -5,8 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from subprocess import DEVNULL, PIPE, TimeoutExpired, run
-from threading import Lock
-from time import time
+from threading import Lock, TIMEOUT_MAX
+from time import monotonic, time
 from typing import TYPE_CHECKING
 
 from scripts.lib import conf
@@ -36,24 +36,41 @@ class MacCiReadings:
         self._lock: Lock = Lock()
 
     def read(self, configuration: conf.ConfigRead, max_age: float) -> MacCiReading:
+        started_at = monotonic()
         from scripts.mac_test import eligibility
 
         settings = eligibility.SshProbeSettings(configuration)
         try:
             host = settings.host
+            deadline = started_at + settings.probe_timeout_s
         except conf.Unusable:
             return MacCiReading(MacCiActivity.UNKNOWN, self._now())
-        with self._lock:
+        if not _acquire_before(self._lock, deadline):
+            return MacCiReading(MacCiActivity.UNKNOWN, self._now())
+        try:
             entry = self._hosts.get(host)
             if entry is None:
                 entry = MacCiHostReading()
                 self._hosts[host] = entry
-        with entry.lock:
+        finally:
+            self._lock.release()
+        if not _acquire_before(entry.lock, deadline):
+            return MacCiReading(MacCiActivity.UNKNOWN, self._now())
+        try:
             reading = entry.reading
             if isinstance(reading, MacCiReading) and reading.is_fresh(self._now(), max_age):
                 return reading
-            entry.reading = _read_mac_ci_activity(settings, self._now)
+            if monotonic() >= deadline:
+                return MacCiReading(MacCiActivity.UNKNOWN, self._now())
+            entry.reading = _read_mac_ci_activity(settings, self._now, lambda: deadline - monotonic())
             return entry.reading
+        finally:
+            entry.lock.release()
+
+
+def _acquire_before(lock: Lock, deadline: float) -> bool:
+    remaining = deadline - monotonic()
+    return remaining > 0 and lock.acquire(timeout=min(remaining, TIMEOUT_MAX))
 
 
 def is_runner_worker(name: str) -> bool:
@@ -65,21 +82,26 @@ def read_mac_ci_activity(configuration: conf.ConfigRead) -> MacCiReading:
     """Read CI activity for a standalone capacity check."""
     from scripts.mac_test import eligibility
 
-    return _read_mac_ci_activity(eligibility.SshProbeSettings(configuration), time)
+    settings = eligibility.SshProbeSettings(configuration)
+    return _read_mac_ci_activity(settings, time, lambda: settings.probe_timeout_s)
 
 
-def _read_mac_ci_activity(settings: eligibility.SshProbeSettings, now: Callable[[], float]) -> MacCiReading:
+def _read_mac_ci_activity(
+    settings: eligibility.SshProbeSettings, now: Callable[[], float], ssh_timeout: Callable[[], float],
+) -> MacCiReading:
     observed_at = now()
-    return MacCiReading(_read_mac_ci_processes(settings), observed_at)
+    return MacCiReading(_read_mac_ci_processes(settings, ssh_timeout), observed_at)
 
 
-def _read_mac_ci_processes(settings: eligibility.SshProbeSettings) -> MacCiActivity:
+def _read_mac_ci_processes(settings: eligibility.SshProbeSettings, ssh_timeout: Callable[[], float]) -> MacCiActivity:
     from scripts.mac_test import offload
 
     try:
-        result = run([*offload.ssh_prefix(settings), PROCESS_LIST_COMMAND],
-                     stdin=DEVNULL, stdout=PIPE, stderr=PIPE, text=True, check=False,
-                     timeout=settings.probe_timeout_s)
+        command = [*offload.ssh_prefix(settings), PROCESS_LIST_COMMAND]
+        timeout = ssh_timeout()
+        if timeout <= 0:
+            return MacCiActivity.UNKNOWN
+        result = run(command, stdin=DEVNULL, stdout=PIPE, stderr=PIPE, text=True, check=False, timeout=timeout)
     except (OSError, TimeoutExpired, ValueError):
         return MacCiActivity.UNKNOWN
     if result.returncode or not result.stdout.strip():
