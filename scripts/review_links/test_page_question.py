@@ -310,17 +310,20 @@ class PageQuestionTests(unittest.TestCase):
         state = delivery_state.QuestionSendState
         cases: tuple[tuple[send_result.Outcome, delivery_state.QuestionSendState], ...] = (
             ("sent", state.SENT), ("kept", state.SENT), ("queued", state.QUEUED),
-            ("failed", state.FAILED), ("refused", state.FAILED), ("skipped", state.FAILED),
+            ("failed", state.FAILED), ("refused", state.FAILED), ("skipped", state.SENT),
             ("replaced", state.FAILED), ("held", state.UNKNOWN), ("pending", state.UNKNOWN),
-            ("retry", state.UNKNOWN),
+            ("retry", state.FAILED),
         )
         for outcome, expected in cases:
             with (self.subTest(outcome=outcome), patch.object(change_page, "alert_delivery_failures"),
                   patch.object(change_page, "send_question", return_value=question_outcome(outcome)) as send):
                 delivery = self.ask(outcome)
                 change_page.deliver(delivery, self.status)
-                self.assertEqual(self.attempt(delivery).state, expected)
+                result = self.attempt(delivery)
+                self.assertEqual(result.state, expected)
                 self.assertEqual(send.call_count, 2 if expected is state.FAILED else 1)
+                if outcome == "skipped":
+                    self.assertEqual(result.receipt, delivery_state.QuestionSendReceipt("kept", "fixture receipt"))
 
     def test_an_empty_question_does_not_write_or_claim(self) -> None:
         with self.assertRaisesRegex(question_record.AnswerRefused, 'Enter a question first'):

@@ -572,6 +572,7 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
     settings = conf.read("review_links")
     feedback_rows = settings.whole("feedback_rows")
     refresh_seconds = settings.number("page_refresh_seconds")
+    card_motion = page_frame.CardMotion.read(settings)
     prepared = prepare(browser, status, settings=settings)
     names_read = staff_names.read()
     kind = browser.kind
@@ -585,7 +586,9 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
                      + f'data-count="{count}"{names_read.style(name)} value="{html.escape(name)}">{html.escape(label)} ({count})</option>')
     cards = (''.join(section(item, feedback_rows) for item in prepared.changes) if kind == "changes"
              else ''.join(question_section(item, browser, feedback_rows, names_read) for item in prepared.questions))
-    content = (PAGE_STYLE + page_frame.title(change_page.TITLES[kind], "review") + f'<div data-review-content data-kind="{kind}" data-refresh-seconds="{refresh_seconds}" data-script="{SCRIPT_VERSION}">'
+    content = (PAGE_STYLE + page_frame.title(change_page.TITLES[kind], "review")
+               + f'<div data-review-content data-kind="{kind}" data-refresh-seconds="{refresh_seconds}"'
+               + f' data-script="{SCRIPT_VERSION}" {card_motion.attributes()}>'
                + '<div data-showrunner-filter><label for="review-showrunner">Showrunner:</label>'
                + '<select id="review-showrunner" aria-label="Showrunner"><option value="">All</option></select></div>'
                + '<template data-runner-options>' + ''.join(menus) + '</template>'
@@ -846,8 +849,8 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
 
 
 SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.MOTION_SCRIPT + r'''
-const motion=createCardMotion();
 let content=document.querySelector('[data-review-content]');
+const motion=createCardMotion(()=>content);
 let rows,viewOrders,runnerOptions,showrunners,runnerMenu,next,empty,saveNotice;
 let shownPage=content.outerHTML, heldPage=null, newestRequest=0, activeLoads=false, activeSaves=0;
 const remembered=new Map(), kind=content.dataset.kind; let current=null, tab='', navigation=0, shownHash='';

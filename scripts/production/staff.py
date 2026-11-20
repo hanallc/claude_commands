@@ -18,6 +18,7 @@ from contextlib import AbstractContextManager, ExitStack, contextmanager, nullco
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from enum import Enum
 from functools import cached_property
 from importlib import import_module
 from pathlib import Path
@@ -1344,15 +1345,55 @@ def _remote_row(arguments: list[str]) -> StaffRow:
     return StaffRow.from_json(_remote(arguments))
 
 
-def producer_creation_registry(action: str, name: str, marker: str = "", profile: str = "") -> str:
+@dataclass(frozen=True)
+class RecordedProducerCreation:
+    name: str
+    marker: str
+
+    def to_json(self) -> dict[str, str]:
+        return {"name": self.name, "marker": self.marker}
+
+
+class ProducerCreationRegistryStatus(Enum):
+    ABSENT = "no creation marker"
+    UPDATED = "registry update complete"
+
+
+def _read_remote_producer_creation(name: str) -> RecordedProducerCreation | ProducerCreationRegistryStatus:
+    try:
+        result = _remote(["producer-creation", "read-named", f"--name={name}"])
+    except StaffUnreadable as error:
+        last_line = str(error).rpartition("\n")[2]
+        if ": error: argument creation_action: invalid choice: 'read-named' (choose from " not in last_line:
+            raise
+        result = _remote(["producer-creation", "read", f"--name={name}"])
+        if isinstance(result, str):
+            return RecordedProducerCreation(name, result) if result else ProducerCreationRegistryStatus.ABSENT
+        raise StaffUnreadable("invalid producer creation response") from error
+    if result == "":
+        return ProducerCreationRegistryStatus.ABSENT
+    if isinstance(result, dict):
+        fields = cast(dict[str, object], result)
+        saved_name = fields.get("name")
+        saved_marker = fields.get("marker")
+        if (isinstance(saved_name, str) and saved_name.casefold() == name.casefold()
+                and isinstance(saved_marker, str) and saved_marker):
+            return RecordedProducerCreation(saved_name, saved_marker)
+    raise StaffUnreadable("invalid producer creation response")
+
+
+def producer_creation_registry(action: str, name: str, marker: str = "",
+                               profile: str = "") -> RecordedProducerCreation | ProducerCreationRegistryStatus:
     """Use the staff owner for shared producer creation marker operations."""
     if not is_owner():
+        if action == "read":
+            return _read_remote_producer_creation(name)
         result = _remote(["producer-creation", action, f"--name={name}",
                           f"--marker={marker}", f"--profile={profile}"])
-        if not isinstance(result, str):
+        if result != "":
             raise StaffUnreadable("invalid producer creation response")
-        return result
-    edit = cast(Callable[[str, str, str, str], str],
+        return ProducerCreationRegistryStatus.UPDATED
+    edit = cast(Callable[[str, str, str, str], RecordedProducerCreation | ProducerCreationRegistryStatus],
                 import_module("scripts.agents.producer_creation").owner_registry_action)
     try:
         return edit(action, name, marker, profile)
@@ -2418,7 +2459,7 @@ def _parser() -> argparse.ArgumentParser:
     _ = producer_retirement.add_argument("--profile", required=True)
     _ = producer_retirement.add_argument("--json", action="store_true")
     creation = verbs.add_parser("producer-creation", help=argparse.SUPPRESS)
-    _ = creation.add_argument("creation_action", choices=("read", "claim", "finish"))
+    _ = creation.add_argument("creation_action", choices=("read", "claim", "finish", "read-named"))
     _ = creation.add_argument("--name", required=True)
     _ = creation.add_argument("--marker", default="")
     _ = creation.add_argument("--profile", default="")
@@ -2560,8 +2601,13 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
 
 def _main(arguments: _Arguments) -> int:
     if arguments.verb == "producer-creation":
-        print(json.dumps(producer_creation_registry(arguments.creation_action, arguments.name,
-                                                    arguments.marker, arguments.profile)))
+        action = arguments.creation_action
+        creation = producer_creation_registry("read" if action == "read-named" else action,
+                                              arguments.name, arguments.marker, arguments.profile)
+        payload: str | dict[str, str] = ""
+        if not isinstance(creation, Enum):
+            payload = creation.marker if action == "read" else creation.to_json()
+        print(json.dumps(payload))
         return 0
     if arguments.verb == "move":
         if arguments.destination is not None:
