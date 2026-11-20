@@ -3232,6 +3232,7 @@ Tests: one row in the existing bare copy removal test, failing first.
 Tests: one row each in the existing Mac offload busy-mirror test and the existing dispatch test, each failing first.
 
 ### Phase 44dn — The sweep and scratch end keep going past a bad backlink or journal  · status: todo
+**Hold (builds, 2026-11-19 21:29):** these are removal sites under item 152 (user rule 20:42: no automatic deletion until the bubblewrap proof exists). resources owns them now: phase 181 (scratch task end) and phase 178 (the sweep). After 181 and 178 merge, merge main in, check with resources that nothing removes more than 178 and 181 allow, then send the hash. No more work until then.
 **From the 44de reviews (pass 1 and closure pass 2), 2026-11-19:** the builds landing rule moves these gaps out of 44de. After 44de merges.
 
 1. The 44de backlink check reads `gitdir` with `read_text()` (tmp_sweep.py:1107, scratch.py:1617). A FIFO with no writer blocks the read, and the sweep does not reach later folders. Fix: read the backlink only when it is a regular file; any other kind keeps the folder.
@@ -3259,6 +3260,7 @@ Tests, in `test_only_a_busy_mac_candidate_appears_in_the_mac_waits` (test_placem
 Keep the registry error and recovered omission rows. Item 2 keeps the 44cu rows green.
 
 ### Phase 44dq — Task cleanup ends every hold when another cleanup changes a journal  · status: todo
+**Hold (builds, 2026-11-19 21:29):** these are removal sites under item 152 (user rule 20:42: no automatic deletion until the bubblewrap proof exists). resources owns them now: phase 181 (scratch task end) and phase 178 (the sweep). After 181 and 178 merge, merge main in, check with resources that nothing removes more than 178 and 181 allow, then send the hash. No more work until then.
 **From the 44dn closure (pass 2), 2026-11-19:** the builds landing rule moves these gaps out of 44dn. After 44dn merges.
 
 1. `checked_operation` refuses a journal that changed after the first scan with `FolderRecoveryRequired` (scratch.py:2118). Empty-pair removal catches only `UnreadableFolderOperation` (scratch.py:4045), so the refusal escapes. A second `scratch end` that marks an unrelated adoption journal after the first scan aborts the first cleanup before it saves the later hold changes (scratch.py:3970). Fix: a changed journal keeps only the folders its paths overlap; cleanup ends the other holds and reports the journal.
