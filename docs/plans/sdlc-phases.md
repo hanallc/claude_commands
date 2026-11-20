@@ -1706,7 +1706,7 @@ The test server joins its request handlers before fixture cleanup and gives each
 6. P7: a Python marker-class rule in `config/review/code.md`.
 7. `docs/plans/sdlc-phases-design.md:85`: the refill tag is in `docs/direct/style_unit.md`.
 **Files:** `docs/direct_plan_format.md`, `docs/direct/write_prompt_contract.md`, `docs/direct/dual_review.md`, `docs/direct/repair_rounds.md`, `scripts/direct/assign.sh` (or the helper that builds its prompt) and its test module, `config/review/code.md`, `docs/plans/sdlc-phases-design.md`.
-**Tests:** one table row in the existing assign launcher test: implement, fix and test prompts carry the test rules once; a review prompt does not. A break sends workers prompts without the rules.
+**Tests:** one table row in the existing assign launcher test: implement, fix and test prompts on the staff-worker path carry the test rules once. A break sends workers prompts without the rules. (The review case is a prompt test under P5 rule 2; it is not written.)
 **Acceptance gate:** each Lane E live-check grep passes on the branch; the assign launcher targeted test passes; basedpyright 0/0 on changed Python; shellcheck clean on changed shell.
 
 **Workers:** 1 writer.
