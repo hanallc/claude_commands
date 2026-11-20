@@ -22,18 +22,39 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 GATE = Path(__file__).with_name("cargo_gate") / "bin"
 FIXTURE_WORKER_BUDGET = "3"
-PROGRAM = '''import json, os, subprocess, sys
+PROGRAM = '''import json, os, stat, subprocess, sys
 from pathlib import Path
 root = Path(os.environ["GATE_TEST_ROOT"])
 records = root / ".local/state/mac-gate/records"
+flags = os.environ.get("CARGO_MAKEFLAGS")
+pool = ()
+tokens = b""
+inode = None
+if "MAC_GATE_JOBSERVER" in os.environ:
+    pool = tuple(map(int, flags.rsplit("--jobserver-auth=", 1)[1].split(",")))
+    reader, writer = pool
+    read_info, write_info = os.fstat(reader), os.fstat(writer)
+    assert stat.S_ISFIFO(read_info.st_mode) and stat.S_ISFIFO(write_info.st_mode)
+    assert read_info.st_ino == write_info.st_ino
+    inode = read_info.st_ino
+    os.set_blocking(reader, False)
+    try:
+        tokens = os.read(reader, 4096)
+    except BlockingIOError:
+        pass
+    finally:
+        os.set_blocking(reader, True)
+    assert os.write(writer, tokens) == len(tokens)
 with (root / "runs").open("a") as stream:
     stream.write(json.dumps({"argv":sys.argv[1:], "path":os.environ["PATH"],
         "cargo_jobs":os.environ.get("CARGO_BUILD_JOBS"),
+        "cargo_makeflags":flags, "makeflags":os.environ.get("MAKEFLAGS"), "mflags":os.environ.get("MFLAGS"),
+        "jobserver_inode":inode, "jobserver_tokens":len(tokens),
         "nextest_threads":os.environ.get("NEXTEST_TEST_THREADS"),
         "record":os.environ.get("MAC_GATE_RECORD"),
         "records":[path.read_text() for path in records.iterdir()]}) + "\\n")
 if sys.argv[1:] == ["child"]:
-    raise SystemExit(subprocess.call([os.environ["GATE_TEST_BIN"] + "/rustc", "quoted value"]))
+    raise SystemExit(subprocess.call([os.environ["GATE_TEST_BIN"] + "/rustc", "quoted value"], pass_fds=pool))
 raise SystemExit(int(os.environ.get("REAL_STATUS", "0")))
 '''
 CHECK = '''import os, sys, time
@@ -72,7 +93,7 @@ class CargoGateTests(unittest.TestCase):
         fake = root / "fake"
         real.mkdir()
         fake.mkdir()
-        for name in ("mkdir", "mv", "rm"):
+        for name in ("getconf", "mkdir", "mkfifo", "mv", "rm"):
             executable = shutil.which(name)
             assert executable is not None
             (fake / name).symlink_to(executable)
@@ -105,15 +126,17 @@ class CargoGateTests(unittest.TestCase):
         ssh.chmod(0o755)
         environment = {key: value for key, value in os.environ.items()
                        if key not in ("CLAUDECODE", "CODEX_HOME", "SSH_CONNECTION", "SSH_CLIENT", "MAC_PLACEMENT",
-                                      "MAC_GATE_RECORD", "CARGO_BUILD_JOBS", "NEXTEST_TEST_THREADS")}
+                                      "MAC_GATE_RECORD", "MAC_GATE_JOBSERVER", "CARGO_BUILD_JOBS",
+                                      "CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS", "NEXTEST_TEST_THREADS")}
         environment.update(config_environment(root / "config"))
         environment.update(HOME=str(root), GATE_TEST_ROOT=str(root), GATE_TEST_BIN=str(GATE),
             PATH=os.pathsep.join((str(GATE), str(fake), str(real), "/usr/bin", "/bin")))
         return environment
 
-    def run_gate(self, environment: dict[str, str], *arguments: str, name: str = "cargo") -> subprocess.CompletedProcess[str]:
+    def run_gate(self, environment: dict[str, str], *arguments: str, name: str = "cargo",
+                 pass_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess[str]:
         return subprocess.run([str(GATE / name), *arguments], env=environment, capture_output=True, text=True,
-                              timeout=TEST_HANG_GUARD_SECS)
+                              pass_fds=pass_fds, timeout=TEST_HANG_GUARD_SECS)
 
     def runs(self, root: Path) -> list[dict[str, object]]:
         return [cast(dict[str, object], json.loads(line)) for line in (root / "runs").read_text().splitlines()]
@@ -181,7 +204,7 @@ class CargoGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             environment = self.fixture(root, process_list=BUSY_PROCESS_LIST)
-            environment.update(CARGO_BUILD_JOBS="12", NEXTEST_TEST_THREADS="13")
+            environment.update(CARGO_BUILD_JOBS="12", NEXTEST_TEST_THREADS="13", CARGO_MAKEFLAGS="terminal")
             _ = write_config_fixture(root / "config/mac_test.conf", "max_active_builds=1\n")
             result = self.run_gate(environment, "build", "--jobs=15")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -189,6 +212,7 @@ class CargoGateTests(unittest.TestCase):
             self.assertEqual(row["argv"], ["build", "--jobs=15"])
             self.assertEqual(row["cargo_jobs"], "12")
             self.assertEqual(row["nextest_threads"], "13")
+            self.assertEqual(row["cargo_makeflags"], "terminal")
             self.assertIn("\tuser\n", cast(list[str], row["records"])[0])
             calls = (root / "ps-calls").read_text().splitlines()
             self.assertEqual(len(calls), 1)
@@ -196,32 +220,74 @@ class CargoGateTests(unittest.TestCase):
             self.assertFalse((root / "checks").exists())
             self.assertFalse((root / "ssh-arguments").exists())
 
-    def test_placed_cargo_caps_jobs_and_preserves_smaller_values(self) -> None:
-        budget = FIXTURE_WORKER_BUDGET
-        for caller_jobs, arguments, jobs, expected in (
-            ("", ("build",), budget, ("build",)),
-            ("2", ("build", "-j1"), "2", ("build", "-j1")),
-            ("12", ("doc", "--jobs", "8"), budget, ("doc", "--jobs", budget)),
+    def test_placed_compile_uses_the_jobserver_without_rewriting_arguments(self) -> None:
+        for name, arguments in (
+            ("cargo", ("build",)),
+            ("cargo", ("build", "--config", "build.jobs=12")),
+            ("cargo", ("build", "-vj12")),
+            ("cargo", ("build", "-j00000000000000012")),
+            ("cargo", ("build", "-j1")),
+            ("rustc", ("--version",)),
         ):
-            with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as temporary:
+            with self.subTest(name=name, arguments=arguments), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 environment = self.fixture(root)
-                environment.update(CLAUDECODE="1", MAC_PLACEMENT="episode/attempt")
-                if caller_jobs:
-                    environment["CARGO_BUILD_JOBS"] = caller_jobs
-                result = self.run_gate(environment, *arguments)
+                environment.update(CLAUDECODE="1", MAC_PLACEMENT="episode/attempt", CARGO_BUILD_JOBS="2")
+                result = self.run_gate(environment, *arguments, name=name)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 row, = self.runs(root)
-                self.assertEqual(row["cargo_jobs"], jobs)
-                self.assertEqual(row["argv"], list(expected))
+                self.assertEqual(row["jobserver_tokens"], int(FIXTURE_WORKER_BUDGET) - 1)
+                self.assertEqual(row["cargo_jobs"], "2")
+                self.assertIsNone(row["nextest_threads"])
+                self.assertEqual(row["argv"], list(arguments))
+                self.assertEqual(list((root / ".local/state/mac-gate").glob("jobserver-*")), [])
 
-    def test_placed_nextest_caps_build_and_test_width_before_the_separator(self) -> None:
+    def test_a_single_jobserver_slot_needs_no_pipe_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = self.fixture(root)
+            _ = write_config_fixture(root / "config/mac_gate.conf", "worker_budget=1\n")
+            environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt")
+            result = self.run_gate(environment, "build")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            row, = self.runs(root)
+            self.assertIsInstance(row["jobserver_inode"], int)
+            self.assertEqual(row["jobserver_tokens"], 0)
+
+    def test_placed_cargo_replaces_an_inherited_jobserver(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = self.fixture(root)
+            reader, writer = os.pipe()
+            try:
+                inherited = f"-j --jobserver-auth={reader},{writer}"
+                environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt",
+                                   CARGO_MAKEFLAGS=inherited, MAKEFLAGS=inherited, MFLAGS=inherited)
+                inherited_tokens = b"inherited tokens"
+                self.assertEqual(os.write(writer, inherited_tokens), len(inherited_tokens))
+                result = self.run_gate(environment, "build", pass_fds=(reader, writer))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                row, = self.runs(root)
+                self.assertNotEqual(row["jobserver_inode"], os.fstat(reader).st_ino)
+                self.assertNotEqual(row["cargo_makeflags"], inherited)
+                self.assertIsNone(row["makeflags"])
+                self.assertIsNone(row["mflags"])
+                self.assertEqual(row["jobserver_tokens"], int(FIXTURE_WORKER_BUDGET) - 1)
+                os.set_blocking(reader, False)
+                self.assertEqual(os.read(reader, len(inherited_tokens)), inherited_tokens)
+            finally:
+                os.close(reader)
+                os.close(writer)
+
+    def test_placed_nextest_caps_test_width_and_uses_the_compile_jobserver(self) -> None:
         budget = FIXTURE_WORKER_BUDGET
         for name, requested, threads, arguments, expected in (
             ("cargo", "", budget, (), ()),
             ("cargo", "10", budget, ("--test-threads", "12"), ("--test-threads", budget)),
-            ("cargo-nextest", "2", "2", ("--build-jobs=8", "--jobs=1"), (f"--build-jobs={budget}", "--jobs=1")),
+            ("cargo-nextest", "2", "2", ("--build-jobs=8", "--jobs=1"), ("--build-jobs=8", "--jobs=1")),
             ("cargo-nextest", "2", "2", ("-j12",), (f"-j{budget}",)),
+            ("cargo-nextest", "", budget, ("-vj12",), (f"-vj{budget}",)),
+            ("cargo-nextest", "", budget, ("-vj00000000000000012",), (f"-vj{budget}",)),
         ):
             with self.subTest(name=name, arguments=arguments), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -233,16 +299,28 @@ class CargoGateTests(unittest.TestCase):
                 result = self.run_gate(environment, "nextest", "run", *arguments, *tail, name=name)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 row, = self.runs(root)
-                self.assertEqual(row["cargo_jobs"], budget)
+                self.assertEqual(row["jobserver_tokens"], int(budget) - 1)
                 self.assertEqual(row["nextest_threads"], threads)
                 self.assertEqual(row["argv"], ["nextest", "run", *expected, *tail])
+
+    def test_placed_nextest_refuses_unreadable_test_thread_options(self) -> None:
+        for arguments in (("-vj",), ("-vjbad",), ("--test-threads=",), ("-xj12",)):
+            with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = self.fixture(root)
+                environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt")
+                result = self.run_gate(environment, "nextest", "run", *arguments)
+                self.assertEqual(result.returncode, 125, result.stdout + result.stderr)
+                self.assertIn("nextest test thread", result.stderr)
+                self.assertFalse((root / "runs").exists())
 
     def test_placed_nextest_resolves_cpu_relative_widths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             environment = self.fixture(root)
             getconf = root / "fake/getconf"
-            _ = getconf.write_text('#!/bin/sh\n[ "$1" = _NPROCESSORS_ONLN ] && printf "12\\n"\n')
+            getconf.unlink()
+            _ = getconf.write_text('#!/bin/sh\ncase "$1" in _NPROCESSORS_ONLN) echo 12 ;; PIPE_BUF) echo 512 ;; esac\n')
             getconf.chmod(0o755)
             environment.update(SSH_CONNECTION="fake", MAC_PLACEMENT="episode/attempt",
                                CARGO_BUILD_JOBS="-10", NEXTEST_TEST_THREADS="num-cpus")
@@ -271,8 +349,8 @@ class CargoGateTests(unittest.TestCase):
             mend, clippy = self.runs(root)
             self.assertEqual(mend["argv"], ["mend", "--all-targets", "--fix", "--fail-on-warn", "--workspace"])
             self.assertEqual(clippy["argv"], ["clippy", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"])
-            self.assertEqual(mend["cargo_jobs"], FIXTURE_WORKER_BUDGET)
-            self.assertEqual(clippy["cargo_jobs"], FIXTURE_WORKER_BUDGET)
+            for row in (mend, clippy):
+                self.assertEqual(row["jobserver_tokens"], int(FIXTURE_WORKER_BUDGET) - 1)
 
     def test_agent_markers_and_failed_checks_refuse_without_starting_a_program(self) -> None:
         route = "; run it through mac_queue_run.py"
@@ -329,7 +407,8 @@ class CargoGateTests(unittest.TestCase):
             self.assertEqual(len(rows), 2)
             self.assertEqual(rows[0]["record"], rows[1]["record"])
             self.assertEqual(len(cast(list[str], rows[1]["records"])), 1)
-            self.assertEqual(rows[1]["cargo_jobs"], FIXTURE_WORKER_BUDGET)
+            self.assertEqual(rows[0]["jobserver_inode"], rows[1]["jobserver_inode"])
+            self.assertEqual(rows[1]["jobserver_tokens"], int(FIXTURE_WORKER_BUDGET) - 1)
             self.assertEqual(rows[1]["argv"], ["quoted value"])
 
     def test_missing_program_reports_the_name_without_recursion(self) -> None:

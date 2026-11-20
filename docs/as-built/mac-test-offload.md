@@ -41,10 +41,16 @@ A cached idle result can stay in use until its age limit after CI starts.
 
 The Mac Cargo gate at `scripts/mac_test/cargo_gate/gate.zsh` checks placement for agent and SSH calls.
 The `cargo`, `cargo-nextest`, and `rustc` links use this gate.
-For a placed call, `worker_budget` in `config/mac_gate.conf` sets the maximum Cargo jobs and nextest test threads.
-The initial budget is four workers per command.
-The gate exports `CARGO_BUILD_JOBS` and `NEXTEST_TEST_THREADS` for the tool and its children.
-It also caps explicit job and thread arguments before `--` and keeps smaller caller values.
+For a placed call, `worker_budget` in `config/mac_gate.conf` sets the jobserver slots and caps nextest test threads.
+The initial budget is four slots per command.
+The gate replaces inherited jobserver settings with its own pipe in `CARGO_MAKEFLAGS`.
+Cargo and rustc have one implicit slot. The gate puts one fewer token than the budget in the pipe.
+A nested gate call for the same placement uses the same pipe.
+The gate leaves compile arguments intact. Cargo uses the gate budget even when an explicit compile width is smaller.
+For `cargo nextest` and `cargo-nextest`, the gate exports `NEXTEST_TEST_THREADS` and caps explicit test thread options before `--`.
+It preserves smaller caller values from the environment and test thread options.
+The exported value takes priority over the profile default. The audited repository profiles had no `test-threads` setting.
+The gate refuses test thread values that it cannot bound.
 Mac `mend-fix` uses the same budget for mend and the follow-up Clippy command.
 The gate leaves interactive calls under the `user` label at their existing width.
 

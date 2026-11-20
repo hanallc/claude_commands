@@ -90,67 +90,84 @@ if (( agent_call )); then
     fi
     label="placement $placement"
 
+    zmodload zsh/stat || exit 2
     worker_budget=$(conf_value mac_gate worker_budget) || exit 2
     [[ ${worker_budget#+} == <-> && ${#worker_budget} -le 15 ]] && (( worker_budget > 0 )) \
         || refuse 'invalid worker_budget' ''
     worker_budget=$(( worker_budget ))
-    logical_cpus=''
-    limit_worker_width() {
-        local requested=$1 width
-        REPLY=$requested
+    nextest_width() {
+        local requested=$1 digits width relative=0
         case $requested in
-            default|num-cpus|-<->)
-                if [[ -z $logical_cpus ]]; then
-                    logical_cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null)
-                    [[ $logical_cpus == <-> && $logical_cpus != 0 ]] \
-                        || refuse 'cannot read the logical CPU count' ''
-                fi
-                width=$logical_cpus
-                if [[ $requested == -* && ${#requested} -le 16 ]]; then
-                    (( width += requested ))
-                elif [[ $requested == -* ]]; then
-                    return 0
-                fi
-                ;;
-            <->|+<->)
-                [[ ${#requested} -le 16 ]] || return 0
-                width=$requested
-                ;;
-            *) return 0 ;;
+            num-cpus) digits=0; relative=1 ;;
+            -<->) digits=${requested#-}; relative=1 ;;
+            <->|+<->) digits=${requested#+} ;;
+            *) refuse "invalid nextest test thread count: $requested" '' ;;
         esac
-        if (( width > worker_budget )); then REPLY=$worker_budget; fi
+        digits=${digits#${digits%%[1-9]*}}
+        (( ${#digits} <= 15 )) || refuse 'nextest test thread count is too large' ''
+        width=${digits:-0}
+        if (( relative )); then
+            if [[ -z $logical_cpus ]]; then
+                logical_cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null)
+                [[ $logical_cpus == <-> && $logical_cpus != 0 ]] \
+                    || refuse 'cannot read the logical CPU count' ''
+            fi
+            width=$(( logical_cpus - width ))
+            if (( width < 1 )); then width=1; fi
+        fi
+        (( width > 0 )) || refuse 'nextest test thread count must be positive' ''
+        REPLY=$(( width > worker_budget ? worker_budget : width ))
     }
 
-    limit_worker_width "${CARGO_BUILD_JOBS-$worker_budget}"
-    export CARGO_BUILD_JOBS=$REPLY
-    limit_worker_width "${NEXTEST_TEST_THREADS-$worker_budget}"
-    export NEXTEST_TEST_THREADS=$REPLY
-
-    # Cargo and nextest give command-line options priority over the environment.
-    if [[ $program != rustc ]]; then
-        gate_arguments=()
+    cap_nextest_threads() {
+        setopt localoptions extended_glob
+        local argument prefix logical_cpus=''
+        nextest_width "${NEXTEST_TEST_THREADS-$worker_budget}"
+        export NEXTEST_TEST_THREADS=$REPLY
+        nextest_arguments=()
         while (( $# )); do
             argument=$1
             shift
             case $argument in
-                --) gate_arguments+=("$argument" "$@"); break ;;
-                --jobs|-j|--build-jobs|--test-threads)
-                    gate_arguments+=("$argument")
-                    (( $# )) || break
-                    limit_worker_width "$1"
-                    gate_arguments+=("$REPLY")
+                --) nextest_arguments+=("$argument" "$@"); break ;;
+                --jobs|--test-threads|-[rvqhV]#j)
+                    (( $# )) || refuse "missing nextest test thread count after $argument" ''
+                    nextest_width "$1"
+                    nextest_arguments+=("$argument" "$REPLY")
                     shift
                     ;;
-                --jobs=*|--build-jobs=*|--test-threads=*|-j?*)
-                    prefix=-j
+                --jobs=*|--test-threads=*|-[rvqhV]#j?*)
+                    prefix=${argument%%j*}j
                     if [[ $argument == *=* ]]; then prefix=${argument%%=*}=; fi
-                    limit_worker_width "${argument#"$prefix"}"
-                    gate_arguments+=("$prefix$REPLY")
+                    nextest_width "${argument#"$prefix"}"
+                    nextest_arguments+=("$prefix$REPLY")
                     ;;
-                *) gate_arguments+=("$argument") ;;
+                -[rvqhV]#[pEFZC]*) nextest_arguments+=("$argument") ;;
+                -[^-]*j*) refuse "cannot read nextest test thread option: $argument" '' ;;
+                *) nextest_arguments+=("$argument") ;;
             esac
         done
-        set -- "${gate_arguments[@]}"
+    }
+    nextest_call=0
+    if [[ $program == cargo-nextest ]]; then
+        nextest_call=1
+    elif [[ $program == cargo ]]; then
+        skip_value=0
+        for argument in "$@"; do
+            if (( skip_value )); then skip_value=0; continue; fi
+            case $argument in
+                --config|--color|-Z|-C) skip_value=1 ;;
+                --) break ;;
+                -*|+*) ;;
+                nextest) nextest_call=1; break ;;
+                *) break ;;
+            esac
+        done
+    fi
+    if (( nextest_call )); then
+        nextest_arguments=()
+        cap_nextest_threads "$@"
+        set -- "${nextest_arguments[@]}"
     fi
 fi
 # Verify both the ancestor relation and the recorded process start time.
@@ -160,7 +177,7 @@ if [[ $ancestor == <-> && -r $state/records/$ancestor ]]; then
     IFS=$'\t' read -r recorded_pid recorded_start recorded_label < "$state/records/$ancestor"
     cursor=$PPID
     while [[ $cursor == <-> && $cursor != 0 ]]; do
-        if [[ $cursor == $recorded_pid && $(process_start "$cursor") == $recorded_start ]]; then
+        if [[ $cursor == $recorded_pid && $recorded_label == "$label" && $(process_start "$cursor") == $recorded_start ]]; then
             recorded=1
             break
         fi
@@ -177,9 +194,8 @@ if (( ! recorded )); then
                 rm -f -- "$file"
             fi
         done
-        zmodload zsh/stat
         limit=$(conf_value mac_gate placement_check_timeout_seconds) || exit 2
-        for file in "$state/"answer-*(N); do
+        for file in "$state/"answer-*(N) "$state/"jobserver-*(N); do
             zstat -A modified +mtime "$file" 2>/dev/null || continue
             (( EPOCHREALTIME - modified[1] <= limit + 1 )) || rm -f -- "$file"
         done
@@ -193,5 +209,44 @@ if (( ! recorded )); then
     print -r -- "$$"$'\t'"$started"$'\t'"$label" > "$state/records/$$.new"
     mv -f -- "$state/records/$$.new" "$state/records/$$"
     export MAC_GATE_RECORD=$$
+fi
+if (( agent_call )); then
+    jobserver_identity() {
+        local -A read_info write_info
+        zstat -s -H read_info -f "$pool_read" 2>/dev/null &&
+            zstat -s -H write_info -f "$pool_write" 2>/dev/null &&
+            [[ $read_info[mode] == p* && $write_info[mode] == p* &&
+               $read_info[device] == $write_info[device] && $read_info[inode] == $write_info[inode] ]] \
+            || return 1
+        REPLY="$read_info[device]:$read_info[inode]"
+    }
+    if (( recorded )); then
+        # Reuse the pool only for a verified ancestor with the same placement.
+        inherited_pool=${MAC_GATE_JOBSERVER:-}
+        [[ $inherited_pool == <->,<->:<->:<-> ]] || refuse 'ancestor jobserver is missing' ''
+        pool_read=${inherited_pool%%,*}
+        pool_write=${${inherited_pool#*,}%%:*}
+        jobserver_identity && [[ $REPLY == ${inherited_pool#*:} ]] \
+            || refuse 'ancestor jobserver descriptors are unavailable' ''
+    else
+        fifo=$state/jobserver-$$-$EPOCHREALTIME-$RANDOM
+        mkfifo "$fifo" || refuse 'cannot create the jobserver' ''
+        pipe_buf=$(getconf PIPE_BUF "$fifo" 2>/dev/null)
+        if [[ $pipe_buf != <-> ]] || (( worker_budget - 1 > pipe_buf )); then
+            rm -f -- "$fifo"
+            refuse 'worker_budget exceeds the jobserver pipe limit' ''
+        fi
+        # Open both ends before separate opens so neither end blocks at startup.
+        exec {pool_hold}<>"$fifo" && exec {pool_read}<"$fifo" && exec {pool_write}>"$fifo" \
+            || refuse 'cannot open the jobserver' ''
+        rm -f -- "$fifo" || refuse 'cannot unlink the jobserver' ''
+        exec {pool_hold}>&- || refuse 'cannot close the jobserver setup descriptor' ''
+        jobserver_identity || refuse 'cannot identify the jobserver' ''
+        # Cargo and rustc already own one implicit slot.
+        printf '%*s' "$(( worker_budget - 1 ))" '' >&$pool_write || refuse 'cannot seed the jobserver' ''
+        export MAC_GATE_JOBSERVER="$pool_read,$pool_write:$REPLY"
+    fi
+    unset MAKEFLAGS MFLAGS
+    export CARGO_MAKEFLAGS="-j --jobserver-fds=$pool_read,$pool_write --jobserver-auth=$pool_read,$pool_write"
 fi
 exec "$real_program" "$@"
