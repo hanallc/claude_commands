@@ -4578,7 +4578,9 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
   Each child that can change the deployment inherits the deployment lock.
   A separate process holds the lock while each privileged service command runs.
   The state file records the identity or absence of both gate folders before the first step.
-  Recovery checks both paths before it restarts services and releases the owned hold.
+  Recovery checks the original state before it starts services.
+  It repeats the check after startup, before it releases the owned hold.
+  If that check fails, recovery stops the services again and keeps the hold.
   The command removes the type-check environment only after both conversion passes succeed.
   The converter saves the original content digest before it writes.
   For a profile move, it saves the source identity and the destination state.
@@ -4597,3 +4599,49 @@ Checkpoint 2cfdd87f1. Changed `scripts/message/test_notifier.py` (launcher stubs
   It includes values that new code wrote before the forward deployment.
   Both directions refuse if both profile keys exist.
 - Checkpoint 403ec6239.
+
+#### Recovery regression
+
+A service start creates the destination folder. Run this example with `python3 -m doctest docs/plans/builds-natest.md` from the checkout.
+
+```pycon
+>>> from contextlib import redirect_stdout
+>>> from io import StringIO
+>>> from pathlib import Path
+>>> from tempfile import TemporaryDirectory
+>>> from unittest.mock import patch
+>>> from zoneinfo import ZoneInfo
+>>> from scripts.production.gate_rename_deploy import deploy_gate_rename as deploy
+>>> output = StringIO()
+>>> calls = []
+>>> with TemporaryDirectory() as folder:
+...     home = Path(folder)
+...     settings = deploy.DeploymentSettings(0, 0, 0, ZoneInfo("UTC"), 0)
+...     roots = deploy.rename.RecordRoots(home, home, home, ())
+...     paths = deploy.DeploymentPaths(home, home, home / "journal.json", roots, settings, -1)
+...     old, new = deploy.move_paths(paths)
+...     old.mkdir(parents=True)
+...     failure = deploy.RecoveryRequired(deploy.STOP_STEP + 1, 2, "Buildlog still runs.")
+...     state = deploy.DeploymentState(next_step=failure.step, owns_hold=True, stopped_at=1,
+...                                   gate_folders=deploy.GateFolders.read(old, new), recovery=failure)
+...     deploy.save(paths, state)
+...     def service(_paths, action, unit, *, user):
+...         calls.append((action, unit))
+...         if action == "start" and unit == "buildlog.timer":
+...             new.mkdir()
+...     with (patch.object(deploy, "service", side_effect=service),
+...           patch.object(deploy, "release_owned") as release, redirect_stdout(output)):
+...         status = deploy.recover(paths, state, failure)
+...     saved = deploy.load(paths.journal, reverse=False)
+...     destination_exists = new.is_dir()
+>>> status
+2
+>>> calls[-4:]
+[('stop', 'buildlog.timer'), ('stop', 'build-memory-feed.service'), ('stop', 'build-admission.socket'), ('stop', 'build-admission.service')]
+>>> release.assert_not_called()
+>>> destination_exists and saved.owns_hold and saved.recovery == failure
+True
+>>> "After correcting the cause, continue with:" in output.getvalue()
+True
+
+```

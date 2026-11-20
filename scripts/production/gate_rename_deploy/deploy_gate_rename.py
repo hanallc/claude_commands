@@ -17,7 +17,7 @@ import shlex
 import subprocess
 import tempfile
 import time
-from typing import cast
+from typing import Literal, cast
 from zoneinfo import ZoneInfo
 
 from scripts.build_hold import build_hold, hold_enforcer, override_guard
@@ -379,14 +379,14 @@ def original_folders(state: DeploymentState) -> GateFolders:
     return state.gate_folders
 
 
-def restore_original_state(paths: DeploymentPaths, state: DeploymentState, step: int) -> None:
-    """Prove the original records and both gate paths before recovery can restart services."""
+def prove_original_state(paths: DeploymentPaths, state: DeploymentState, *, restore_folder: bool = False) -> None:
+    """Check the original records and both gate paths."""
     if paths.writes.requires_completion():
         raise DeploymentFailed("Cannot prove the records match their state before deployment.")
     original = original_folders(state)
     old, new = move_paths(paths)
-    current = GateFolders.read(old, new)
-    if step >= MOVE_STEP and original.source is not None:
+    if restore_folder and original.source is not None:
+        current = GateFolders.read(old, new)
         if current == original.moved:
             move_gate_state.rename_folder(new, old)
             say(f"Moved the gate folder back: {new} -> {old}")
@@ -396,16 +396,22 @@ def restore_original_state(paths: DeploymentPaths, state: DeploymentState, step:
         raise DeploymentFailed(f"Cannot verify the original gate folders at {old} and {new}.")
 
 
-def restart(paths: DeploymentPaths, state: DeploymentState) -> None:
+def change_services(paths: DeploymentPaths, action: Literal["start", "stop"]) -> None:
+    timer = (True, "buildlog.timer")
+    feed = (False, "build-memory-feed.service")
+    admission = ((False, "build-admission.socket"), (False, "build-admission.service"))
+    order = (*admission, feed, timer) if action == "start" else (timer, feed, *admission)
     errors: list[str] = []
-    for user, unit in ((False, "build-admission.socket"), (False, "build-admission.service"),
-                       (False, "build-memory-feed.service"), (True, "buildlog.timer")):
+    for user, unit in order:
         try:
-            service(paths, "start", unit, user=user)
+            service(paths, action, unit, user=user)
         except (DeploymentFailed, OSError) as error:
             errors.append(str(error))
     if errors:
-        raise DeploymentFailed("Services did not start. Restore them before releasing the hold: " + "; ".join(errors))
+        raise DeploymentFailed(f"Cannot {action} all services.\n" + "\n".join(errors))
+
+
+def record_service_start(paths: DeploymentPaths, state: DeploymentState) -> None:
     if state.stopped_at:
         state.stop_seconds += max(0.0, time.time() - state.stopped_at)
         state.stopped_at = 0.0
@@ -468,9 +474,7 @@ def execute_step(number: int, paths: DeploymentPaths, state: DeploymentState) ->
         if not state.stopped_at:
             state.stopped_at = time.time()
             save(paths, state)
-        for user, unit in ((True, "buildlog.timer"), (False, "build-memory-feed.service"),
-                           (False, "build-admission.socket"), (False, "build-admission.service")):
-            service(paths, "stop", unit, user=user)
+        change_services(paths, "stop")
     elif number == 7:
         state_name = run(paths.settings,
             ["systemctl", "--user", "show", "--property=ActiveState", "--value", "buildlog.service"],
@@ -516,7 +520,8 @@ def execute_step(number: int, paths: DeploymentPaths, state: DeploymentState) ->
             raise DeploymentFailed(f"Cannot verify the gate folders after the move: {old} and {target}.")
         if original.source is not None:
             move_gate_state.remove_typecheck_environment(target)
-        restart(paths, state)
+        change_services(paths, "start")
+        record_service_start(paths, state)
         paths.writes.clear()
     elif number == LAST:
         release_owned(paths, state)
@@ -533,16 +538,27 @@ def recover(paths: DeploymentPaths, state: DeploymentState, failure: RecoveryReq
     say("Cancel the complete foreground caller with Ctrl-C.")
     say("For a detached caller: detached_runs.py stop --reason 'gate rename deployment' <record.json>.")
     say("For a scoped caller: systemctl --user stop <unit.scope>.")
+    needs_restart = bool(state.stopped_at) or failure.step >= STOP_STEP
     try:
-        restore_original_state(paths, state, failure.step)
+        prove_original_state(paths, state, restore_folder=failure.step >= MOVE_STEP)
+        if needs_restart:
+            change_services(paths, "start")
+            prove_original_state(paths, state)
+            record_service_start(paths, state)
     except (DeploymentFailed, OSError, ValueError) as error:
         say(f"Recovery blocked: {error}")
+        try:
+            if needs_restart:
+                change_services(paths, "stop")
+        except (DeploymentFailed, OSError) as stop_error:
+            say(f"Recovery failed to stop the services: {stop_error}")
+            say("Keep the drain hold in force.")
+            print_resume_command(paths)
+            return 1
         say("Keep the services stopped and the drain hold in force.")
         print_resume_command(paths)
         return failure.status
     try:
-        if state.stopped_at or failure.step >= STOP_STEP:
-            restart(paths, state)
         release_owned(paths, state)
         state.gate_folders = None
         state.next_step = 2
