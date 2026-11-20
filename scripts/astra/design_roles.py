@@ -1512,6 +1512,9 @@ def main(argv: list[str]) -> int:
             for problem in cast(list[dict[str, str]], report['problems']) if not args.get('json') else ():
                 print(f"problem: {problem['path']}: {problem['reason']}", file=sys.stderr)
             print(json.dumps(report) if args.get('json') else render_roles(report))
+    except recorder_state.OldRecorderState as error:
+        print(error, file=sys.stderr)
+        return 1
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, configparser.Error) as error:
         damaged = (error.__cause__ if isinstance(error, worker_lifecycle.WorkerStateUnreadable)
                    else error)
