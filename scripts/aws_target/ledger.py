@@ -2002,11 +2002,13 @@ def gate_spend_days(state: LedgerEvidence, settings: SpendingSettings, readings:
                     groups[group.group] += group.usd
                 include(ChargedInterval(start, end, sum(groups.values(), Decimal(0)), 'newest bill non-compute', 'fixed'))
             else:
-                groups['storage'] += period_cost(tuple(row for row in base.intervals if row.kind != 'explorer'
-                                                       and row.kind != 'instance'), start, end)
-                for charge in base.intervals:
-                    if charge.kind not in ('explorer', 'instance'):
-                        include(charge)
+                if use_local_charges:
+                    groups['other'] += query_usd
+                storage_costs = tuple(row for row in base.intervals
+                                      if row.kind == 'fixed' or (row.kind == 'reconciliation' and not use_local_charges))
+                groups['storage'] += period_cost(storage_costs, start, end)
+                for charge in storage_costs:
+                    include(charge)
             groups[spend_group('SpotUsage:' + settings.instance_type)] += period_cost(older, start, end)
             for charge in older:
                 include(charge)

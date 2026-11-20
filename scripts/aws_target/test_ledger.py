@@ -12,6 +12,7 @@ import io
 import json
 from pathlib import Path
 import subprocess
+from tempfile import TemporaryDirectory
 from threading import Event
 from typing import cast, override
 from unittest import mock
@@ -19,9 +20,39 @@ import unittest
 from zoneinfo import ZoneInfo
 
 from scripts.aws_target import aws_trial, config, ledger, measurement, run_cost, spend
-from scripts.aws_target.ledger_test_support import CostFixture, charge_readings, git_only, instant
+from scripts.aws_target.ledger_test_support import FIXTURES, CostFixture, charge_readings, git_only, instant
 from scripts.lib import conf
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atomic
+
+
+class RefusedBillEstimateTests(unittest.TestCase):
+    def test_refused_day_keeps_query_fees_with_local_storage_in_spend_and_usage(self) -> None:
+        state_folder = Path(self.enterContext(TemporaryDirectory()))
+        settings = FIXTURES / 'aws_target.conf'
+        book = ledger.CostLedger(state_folder)
+        day = '2026-01-15'
+        start = instant(day + 'T00:00:00Z')
+        end = start + 86400
+        now = end + 3600
+        query_usd = Decimal('.07')
+        bill = ledger.ChargeRead(day, end, start, end, Decimal(5), Decimal(0), query_usd)
+        with book.transaction() as state:
+            state.inventories.append(ledger.ResourceInventory(start, (), 'fixture', builder_removed=True))
+            state.observations.append(ledger.InstanceObservation(start, 'terminated', 'fixture'))
+            state.hana_storage.append(ledger.HanaStorageExposure(start, Decimal(90), ledger.HanaExposureClosed(end)))
+            state.reconciliations.append(ledger.CostReconciliation(end, start, end, Decimal(5), 'Cost Explorer', query_usd))
+            state.charge_refresh_at = end
+        charges = state_folder / 'charges'
+        charges.mkdir()
+        _ = (charges / 'alias.json').write_text(json.dumps(ledger.charge_record(bill)))
+
+        expected = Decimal(3) + query_usd
+        page = spend.read_spend(settings, state_folder, now, '2026-01-16')
+        assert isinstance(page, spend.Spend)
+        estimate = next(row for row in page.days if row.day == day)
+        self.assertEqual((estimate.usd, estimate.query_usd), (expected, query_usd))
+        self.assertEqual(measurement.daily_usage(settings, state_folder, day, now),
+                         measurement.DailyUsage(0, expected))
 
 
 class LedgerTests(CostFixture):

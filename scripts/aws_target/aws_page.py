@@ -22,6 +22,8 @@ from statistics import median
 from typing import Literal, NotRequired, TypedDict
 
 from scripts.aws_target import config as aws_config, console_help, ledger, measurement, quota_requests, run_cost, spend as aws_spend, spot_table
+from scripts.build_queue import memory_files
+from scripts.disks.disks_page import shared_step_tip
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.review_links import console_theme, page_frame, review_link
@@ -590,9 +592,11 @@ def publish(directory: Path, now: int, folder: Path, *, settings_path: Path | No
     regions = sorted(set(data['regions']).union(row[0] for row in gate_time_price['rows']), key=region_filter_key)
     gate_time_data = {'table': gate_time_price, 'regions': regions}
     source = console_theme.with_theme(Path(__file__).with_name(PAGE_NAME).read_text(encoding='utf-8'))
-    # A '</' in a cell must not end the script element.
+    tip = shared_step_tip(memory_files.PAGE_SOURCE.read_text(encoding='utf-8'))
     data['render_seconds'] = time.perf_counter() - started
+    # Escape closing tags inside JSON values.
     page = (page_frame.template(source, 'AWS', 'aws')
+            .replace('__STEP_TIP_STYLE__', tip.style, 1)
             .replace('__AWS_QUOTA_HELP__', quota_help(), 1)
             .replace('__AWS_PRICES_DATA__', json.dumps(data).replace('</', '<\\/'))
             .replace('__AWS_GATE_TIME_DATA__', json.dumps(gate_time_data).replace('</', '<\\/')))
