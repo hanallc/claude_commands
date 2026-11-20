@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from scripts.style.ledger_test_support import DEFAULT_STYLE_ASSIGNMENTS, ticket_owner_id
+from scripts.style.ledger_test_support import DEFAULT_STYLE_ASSIGNMENTS, add_saved_reservation_path, ticket_owner_id
 
 import json
 import sqlite3
 import unittest
 from contextlib import closing
 from dataclasses import replace
-from typing import final
+from typing import cast, final
 from unittest import mock
 
 
@@ -129,16 +129,29 @@ class StylePlanTests(StylePlanFixture):
         with closing(sqlite3.connect(ledger.database)) as connection:
             self.assertEqual(connection.execute("SELECT * FROM ticket_predecessors WHERE ticket='3'").fetchall(), [])
 
+    def test_parallel_structure_root_blocks_an_explicit_path_in_its_crate(self) -> None:
+        ledger, rule = self.parallel_tickets(2, 0)
+        owner = ticket_owner_id("names")
+        path = self.sources[0]
+        ledger.ticket_add("1", owner, "structure", "names", "crates/alpha", [], [rule])
+        ledger.ticket_add("2", owner, "read", "names", "crates/alpha", [path], [rule])
+        ledger.ticket_assign("1", "demo-style-names")
+        with self.assertRaisesRegex(style_ledger.LedgerError, "overlap: " + path):
+            ledger.ticket_assign("2", "demo-style-names")
+        self.assertEqual(ledger.ticket_get("2")["state"], "queued")
+
     def test_parallel_first_and_third_overlap_rechecks_every_peer_boundary(self) -> None:
         ledger, rule = self.parallel_tickets(3, 3)
         for ticket in ("1", "2", "3"):
             ledger.ticket_assign(ticket, "demo-style-names")
         self.record(rule, self.sources[1], self.tip, "2")
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            original, = cast(tuple[str], connection.execute(
+                "SELECT plan FROM ticket_reservations WHERE ticket='1'",
+            ).fetchone())
 
         def widen_first() -> None:
-            with closing(sqlite3.connect(ledger.database)) as connection, connection:
-                _ = connection.execute("INSERT INTO ticket_widened_paths VALUES (?,?,?,?,?)",
-                                       ("1", self.sources[2], "legacy widen", "director", "now"))
+            add_saved_reservation_path(ledger, "1", self.sources[2], style_ledger.ReservationRole.WIDENED)
 
         widen_first()
         for boundary in (lambda: ledger.check_ticket_pipeline("2"), lambda: ledger.set_tip(self.tip),
@@ -147,7 +160,7 @@ class StylePlanTests(StylePlanFixture):
                 boundary()
         self.assertEqual(ledger.ticket_get("2")["state"], "assigned")
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
-            _ = connection.execute("DELETE FROM ticket_widened_paths WHERE ticket='1'")
+            _ = connection.execute("UPDATE ticket_reservations SET plan=? WHERE ticket='1'", (original,))
         ledger.ticket_checkpoint("2", self.tip)
         widen_first()
         with self.assertRaisesRegex(style_ledger.LedgerError, "overlap: " + self.sources[2]):
@@ -224,7 +237,7 @@ class StylePlanTests(StylePlanFixture):
         assign = style_ledger.Ledger.ticket_assign
 
         def widen_then_assign(current: style_ledger.Ledger, ticket: str, branch: str) -> None:
-            self.widen_for_pipeline("1", self.sources[1])
+            add_saved_reservation_path(ledger, "1", self.sources[1], style_ledger.ReservationRole.WIDENED)
             assign(current, ticket, branch)
 
         before = self.plan.read_bytes()
@@ -250,14 +263,12 @@ class StylePlanTests(StylePlanFixture):
         ledger, _, _ = self.waiting_proposal_pair()
         ledger.ticket_assign("2", "demo-style-names")
         before = self.plan.read_bytes()
-        with closing(sqlite3.connect(ledger.database)) as connection, connection:
-            _ = connection.execute("INSERT INTO ticket_widened_paths VALUES (?,?,?,?,?)",
-                                   ("1", self.sources[1], "legacy widen", "showrunner", "now"))
+        add_saved_reservation_path(ledger, "1", self.sources[1], style_ledger.ReservationRole.WIDENED)
         code, output, error = self.run_next()
         self.assertEqual((code, error), (5, ""))
         self.assertIn("overlap: " + self.sources[1], output)
         self.assertEqual(self.plan.read_bytes(), before)
-        with mock.patch.object(style_ledger.Ledger, "pipeline_footprint", side_effect=style_ledger.LedgerError("unreadable")):
+        with mock.patch.object(style_ledger.Ledger, "open_ticket_reservation", side_effect=style_ledger.LedgerError("unreadable")):
             code, output, error = self.run_next()
         self.assertEqual((code, error), (5, ""))
         self.assertIn("unreadable", output)

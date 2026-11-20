@@ -1150,44 +1150,50 @@ class NoStepScope:
     """The process names no step scope."""
 
 
-def named_step_scope(pid: int, proc: Path) -> Path | NoStepScope:
-    """Read the step scope that invoke.sh exports; sccache gives each compiler its client's environment."""
+def named_step_scope(pid: int, proc: Path) -> Path | NoStepScope | ReadingUnavailable:
+    """Read the step scope from the compiler environment."""
+    path = proc / str(pid) / "environ"
     try:
-        environment = (proc / str(pid) / "environ").read_bytes()
-    except OSError:
-        return NoStepScope()
+        environment = path.read_bytes()
+    except OSError as error:
+        return ReadingUnavailable(f"{path}: {error}")
     for entry in environment.split(b"\0"):
         if entry.startswith(STEP_SCOPE_ENTRY):
             return Path(os.fsdecode(entry.removeprefix(STEP_SCOPE_ENTRY)))
     return NoStepScope()
 
 
-def compiler_jobs(members: Iterable[int], proc: Path) -> tuple[CompilerJob, ...]:
-    """Group the compiler service processes by the step scope that each one names."""
+def compiler_jobs(source: ScopeSource, proc: Path) -> tuple[tuple[CompilerJob, ...], ScopeSource | records.NoSource]:
+    """Group the compilers by step scope. Keep the source if all environments are readable."""
     scopes: dict[Path, set[int]] = {}
-    for pid in members:
+    complete = True
+    for pid in source.members:
         scope = named_step_scope(pid, proc)
         if isinstance(scope, Path):
             scopes.setdefault(scope, set()).add(pid)
-    return tuple(CompilerJob(scope, process_memory(pids, proc).anonymous) for scope, pids in sorted(scopes.items()))
+        elif isinstance(scope, ReadingUnavailable):
+            complete = False
+    jobs = tuple(CompilerJob(scope, process_memory(pids, proc).anonymous) for scope, pids in sorted(scopes.items()))
+    return jobs, source if complete else records.NoSource()
 
 
 def sccache_memory(proc: Path = PROC) -> list[StepMemory]:
-    """Charge the compiler service once, outside all step process trees; each step's compilers count in that step."""
-    directory = builds_slice_cgroup()
+    """Charge the compiler service outside the step scopes. Each step counts its compiler jobs."""
+    directory = builds_slice_cgroup() / "sccache.service"
     try:
-        reading = slice_working_set(directory / "sccache.service")
+        reading = slice_working_set(directory)
         try:
-            members = (directory / "sccache.service" / "cgroup.procs").read_text().split()
+            members = (directory / "cgroup.procs").read_text().split()
         except OSError:
-            members = []
-        pids = [int(member) for member in members if member.isdecimal()]
+            return [CompilerServiceMemory(reading.bytes, swap_bytes=reading.swap_bytes, pid=PidNotRecorded())]
+        pids = frozenset(int(member) for member in members if member.isdecimal())
         programs = member_programs(pids, proc, skip_unreadable=True)
         servers = [pid for pid, program in programs.items() if program == "sccache"]
-        jobs = compiler_jobs(pids, proc)
+        jobs, source = compiler_jobs(ScopeSource(directory, pids), proc)
         charged = sum(job.use.bytes for job in jobs if isinstance(job.use, AnonymousRunUse))
         return [CompilerServiceMemory(max(0, reading.bytes - charged), swap_bytes=reading.swap_bytes,
-                                      pid=min(servers) if servers else PidNotRecorded(), jobs=jobs)]
+                                      pid=min(servers) if servers else PidNotRecorded(), jobs=jobs,
+                                      anonymous_source=source)]
     except (OSError, ValueError):
         return []
 
@@ -2394,7 +2400,11 @@ def queue_read_from_pass(inputs: QueueInputs, policy: AdmissionPolicy,
             line.append(LineWaiter(step, own.state == "admit", own, *decision_checks(own, step.need, available)))
     if waiting and isinstance(first, NoWaiter):
         first = TokenWaitersOnly()
-    view = QueueView(tuple(waiting), inputs.running, available, totals.promised, totals.reserve, inputs.now)
+    # The compiler source records scan evidence for the alert. The queue view uses sources for swap ownership.
+    running = tuple(replace(step, measured=replace(step.measured, anonymous_source=records.NoSource()))
+                    if isinstance(step.measured, CompilerServiceMemory) and isinstance(step.measured.anonymous_source, ScopeSource)
+                    else step for step in inputs.running)
+    view = QueueView(tuple(waiting), running, available, totals.promised, totals.reserve, inputs.now)
     host = (HostAvailable(inputs.host.available, inputs.host.total, policy.safety_bytes, inputs.pressure)
             if isinstance(inputs.host, HostMemory) else inputs.host)
     explanation = QueueExplanation(inputs.now, host, tuple(explained),

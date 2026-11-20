@@ -835,7 +835,7 @@ def collector_lease(path: Path, *, children: bool = False, wait: bool = True) ->
 
 
 @contextmanager
-def leased_build_folder(spec: BuildFolderSpec) -> Generator[Path]:
+def leased_build_folder(spec: BuildFolderSpec | UniqueBuildFolder) -> Generator[Path]:
     """Hold the maker lease while a persistent folder is in use."""
     path = create_build_folder(spec)
     try:
