@@ -1015,18 +1015,20 @@ class PlacementTests(unittest.TestCase):
         cases = ((False, "busy", "none"), (True, "off", "none"),
                  (False, "busy", "landing pass"), (False, "busy", "disable Mac"),
                  (False, "busy", "expire Mac evidence"), (False, "busy", "expire local evidence"),
-                 (False, "off", "busy at local preview"), (False, "busy", "off at local preview"))
+                 (False, "off", "busy at local preview"), (False, "busy", "off at local preview"),
+                 (False, "busy", "remove Mac target"), (False, "busy", "registry read error"))
         for pinned, reason, change in cases:
             with self.subTest(reason=reason, change=change), PlacementFixture() as fixture:
                 landing_pass = change in ("landing pass", "busy at local preview", "off at local preview")
                 local_first = change in ("expire local evidence", "busy at local preview", "off at local preview")
+                registry_change = change in ("remove Mac target", "registry read error")
                 request = placement_request(fixture, since=fixture.clock.now() - 1 if landing_pass else None)
                 destination = request.constraints.candidates[0].destination
                 if pinned:
                     request = replace(request, constraints=replace(request.constraints,
                         selection=placement.PinnedHost(destination.target)))
                 mac_request = request
-                if landing_pass or local_first or change == "disable Mac":
+                if landing_pass or local_first or change == "disable Mac" or registry_change:
                     fixture.hold_starts()
                     local = local_candidate(fixture)
                     candidates = ((local, *request.constraints.candidates) if local_first
@@ -1099,6 +1101,32 @@ class PlacementTests(unittest.TestCase):
                             _ = publish_candidate(fixture, mac_request, placement.TemporaryExclusion("busy"))
                             _ = fixture.run_pass()
                             self.assertEqual(published_mac_waits(fixture), waits)
+                    continue
+                if registry_change:
+                    self.assertIsInstance(reply, wire.PlacementWait)
+                    self.assertEqual([wait.episode for wait in waits], [request.episode])
+                    registry = fixture.root / "build_targets.conf"
+                    local_registry = "targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n"
+                    unreadable = change == "registry read error"
+                    if unreadable:
+                        _ = registry.write_bytes(b"\xff")
+                    else:
+                        _ = registry.write_text(local_registry)
+                    _ = fixture.run_pass()
+                    self.assertEqual(published_mac_waits(fixture), waits if unreadable else ())
+                    mac, local = fixture.server.placement_eligibility[request.episode]
+                    if unreadable:
+                        self.assertIsInstance(mac.eligibility, placement.EvidenceNeeded)
+                    else:
+                        self.assertIsInstance(mac.eligibility, placement.FixedExclusion)
+                    self.assertEqual(local.eligibility, ALLOWED_HOST)
+                    self.assertIn(request.owner.pid, fixture.queue_pids())
+                    if not unreadable:
+                        _ = registry.write_text(local_registry +
+                            "pinned_targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+                        _ = publish_candidate(fixture, mac_request, placement.TemporaryExclusion("busy"))
+                        _ = fixture.run_pass()
+                        self.assertEqual(published_mac_waits(fixture), waits)
                     continue
                 if reason == "busy":
                     self.assertIsInstance(reply, wire.PlacementWait)

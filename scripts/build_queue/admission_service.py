@@ -3956,6 +3956,15 @@ done
                 permitted = placement.FixedExclusion(retry.reason)
             elif retry.deadline > self.clock.now():
                 permitted = placement.TemporaryExclusion("retry deadline has not passed")
+            if destination.provider == "mac" and not isinstance(permitted, placement.FixedExclusion):
+                with conf.report_key_changes():
+                    try:
+                        target = _provider_configuration().registered_target(destination.target)
+                    except conf.Unusable as error:
+                        permitted = placement.EvidenceNeeded(str(error))
+                    else:
+                        if isinstance(target, records.UnregisteredTarget):
+                            permitted = placement.FixedExclusion("target is no longer configured")
             if isinstance(permitted, placement.AllowedHost):
                 evidence = self._request_host_evidence(request, destination, keys)
                 if destination.provider == "local" and isinstance(evidence, placement.FreshHostEvidence):
