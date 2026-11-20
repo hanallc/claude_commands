@@ -38,12 +38,12 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit, urlunsplit
 STARTED_NS = time.time_ns()
 
 from scripts.disks import disks_page, sessions, slots
-from scripts.aws_target import aws_page
+from scripts.aws_target import aws_page, machines_page
 from scripts.build_queue import memory_files
 from scripts.lib import conf, scratch
 from scripts.production import change_routing, change_review, staff, the_list
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
-from scripts.review_links import new_item_dialog, page_frame, question_record, review_actions, review_submissions, staff_names
+from scripts.review_links import console_tune, new_item_dialog, page_frame, question_record, review_actions, review_submissions, staff_names
 from scripts.review_links.review_link import private_name
 
 BRANCHES_DELETING = "Deleting these branches now. The result comes by message."
@@ -62,6 +62,8 @@ def published_console_page(root: Path, path: str) -> str:
         match leaf:
             case aws_page.PAGE_NAME:
                 page, folder = "aws", aws_page.output_folder()
+            case machines_page.PAGE_NAME:
+                page, folder = "aws_machines", machines_page.output_folder()
             case disks_page.PAGE_NAME:
                 page, folder = "disks", disks_page.output_folder()
             case memory_files.PAGE_NAME:
@@ -487,6 +489,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path in (investigations_page.PAGE_PATH, "/console/questions.html", "/console/changes.html"):
             self.redirect(review_page.legacy_url(route.path, route.query))
             return None
+        if route.path == console_tune.PAGE_PATH:
+            self.tune_token(route.query)
+            return None
         if route.path == review_page.NEW_ITEM_PATH:
             self.new_item_options()
             return None
@@ -763,7 +768,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         refusal = self.tailscale_refusal()
         if refusal:
-            if route.path == review_page.NEW_ITEM_PATH:
+            if route.path == console_tune.PAGE_PATH:
+                self.json_response(403, {"reason": refusal})
+            elif route.path == review_page.NEW_ITEM_PATH:
                 self.json_response(403, {"error": refusal})
             else:
                 self.html_response(403, change_page.document(f"<p>{html.escape(refusal)}</p>"))
@@ -773,6 +780,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return
         if route.path == review_page.ATTACHMENT_PATH:
             self.send_error(405)
+            return
+        if route.path == console_tune.PAGE_PATH:
+            self.tune_post(route.query)
             return
         if route.query or self.headers.get_content_type() != "application/x-www-form-urlencoded":
             self.html_response(400, change_page.document("<p>Use the answer form on the review page.</p>"))
@@ -957,10 +967,14 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return "The Tailscale address is not available."
         return ""
 
-    def same_origin(self) -> bool:
+    def same_origin(self, *, required: bool = False) -> bool:
         origins = self.headers.get_all("Origin", [])
         host = self.headers.get("Host", "")
-        return not origins or bool(host and origins == [f"http://{host}"])
+        return (not required and not origins) or bool(host and origins == [f"http://{host}"])
+
+    def valid_request_token(self, token: object) -> bool:
+        server = cast(ReviewLinksServer, self.server)
+        return isinstance(token, str) and token.isascii() and secrets.compare_digest(token, server.new_item_token)
 
     def new_item_options(self) -> None:
         """Return a New item token and current recipients."""
@@ -1026,8 +1040,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise new_item_dialog.SubmissionError("Invalid New item request.")
             fields = cast(dict[str, object], payload)
-            token = fields.get("token")
-            if not isinstance(token, str) or not token.isascii() or not secrets.compare_digest(token, server.new_item_token):
+            if not self.valid_request_token(fields.get("token")):
                 self.json_response(403, {"code": "stale_token", "error": "The New item token expired. Try Send again."})
                 return
             if "page_capture" in fields:
@@ -1206,6 +1219,52 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 except Exception as error:
                     print(f"review-links review delivery release: {error}", file=sys.stderr)
                 server.review_cache.invalidate()
+
+    def tune_token(self, query: str) -> None:
+        """Return the console request token for a Go confirmation."""
+        if self.command != "GET" or query:
+            self.json_response(400, {"reason": "Use the Go button on the console page."})
+            return
+        refusal = self.tailscale_refusal()
+        if refusal or not self.same_origin():
+            self.json_response(403, {"reason": refusal or "Open the Go button on this console."})
+            return
+        server = cast(ReviewLinksServer, self.server)
+        self.json_response(200, {"token": server.new_item_token})
+
+    def tune_post(self, query: str) -> None:
+        """Apply one setting from the shared Go button."""
+        if not self.same_origin(required=True):
+            self.json_response(403, {"reason": "Open the Go button on this console."})
+            return
+        try:
+            if query or self.headers.get_content_type() != "application/x-www-form-urlencoded":
+                raise ValueError("Use the Go button on the console page.")
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 4096:
+                raise ValueError("Invalid tune request size.")
+            fields = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
+        except ValueError as error:
+            self.json_response(400, {"reason": str(error)})
+            return
+        tokens = fields.pop("token", [])
+        if len(tokens) != 1 or not self.valid_request_token(tokens[0]):
+            self.json_response(403, {"reason": "The Go token expired. Confirm again."})
+            return
+        if set(fields) != {"page", "key", "value"} or any(len(values) != 1 for values in fields.values()):
+            self.json_response(400, {"reason": "Send one page, key and value."})
+            return
+        outcome = console_tune.save(fields["page"][0], fields["key"][0], fields["value"][0])
+        result = outcome.result
+        response: dict[str, object] = {
+            "live_value": outcome.live.value if isinstance(outcome.live, conf.UsableLiveValue) else None,
+        }
+        if isinstance(result, accounts_page.Refused):
+            self.json_response(400, {**response, "reason": result.reason})
+        elif isinstance(result, accounts_page.SaveFailed):
+            self.json_response(503, {**response, "reason": result.reason})
+        else:
+            self.json_response(200, {**response, "state": "saved"})
 
     def accounts_post(self) -> None:
         """Apply one Accounts page action."""
