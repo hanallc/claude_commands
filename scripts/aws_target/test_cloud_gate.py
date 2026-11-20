@@ -11,6 +11,7 @@ from io import StringIO
 import base64
 import fcntl
 import gzip
+import inspect
 import json
 from math import inf
 import os
@@ -40,7 +41,7 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, Exchang
 from scripts.buildlog import index, store
 from scripts.build_targets import target_config
 from scripts.production import affected_modules
-from scripts.production import merge_gate as gate
+from scripts.production import gate
 from scripts.production.gate_modules import GateRefused
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib import conf
@@ -197,7 +198,7 @@ class CloudGateTests(CostFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root / "buildlog")})))
-        _ = write_config_fixture(self.root / "merge_gate.conf", "GATE_TIME_LIMIT_FACTOR=2")
+        _ = write_config_fixture(self.root / "gate.conf", "GATE_TIME_LIMIT_FACTOR=2")
         _ = write_config_fixture(self.root / "test_times.conf", "TOP_RUNS=3\nGATE_FAILURE_LOG_KIB=4")
         # The fixture keeps two sizes, so the shipped type list can change without these cases.
         _ = write_config_fixture(self.root / 'cloud_gate.conf',
@@ -212,7 +213,7 @@ class CloudGateTests(CostFixture):
         self.folder = self.root / 'attempt'
         self.folder.mkdir()
         _ = (self.folder / 'source.bundle').write_bytes(b'private bundle')
-        self.request = {'attempt': 'attempt', 'commit': 'commit', 'tree': 'tree', 'mode': 'merge-gate',
+        self.request = {'attempt': 'attempt', 'commit': 'commit', 'tree': 'tree', 'mode': 'gate',
             'origin': '/private/origin', 'modules': ['scripts/fixture/test_ok.py'],
             'expires': int(self.now) + 1200, 'module_time_limit_s': 1800, 'source_key': 'source/private.bundle'}
         cloud_gate.save(self.folder / 'request.json', self.request)
@@ -228,7 +229,7 @@ class CloudGateTests(CostFixture):
         with closing(sqlite3.connect(index.index_path())) as connection, connection:
             connection.execute("""INSERT INTO gate_runs
                 (id, started_at, step, vcpus, max_jobs, status, aborted, selection, wall_s, modules_run)
-                VALUES ('normal', '2026-01-01', 'merge-gate', 32, 32, 0, 0, 'full', 7, 1)""").close()
+                VALUES ('normal', '2026-01-01', 'gate', 32, 32, 0, 0, 'full', 7, 1)""").close()
         modules = ['scripts/fixture/test_ok.py', 'scripts/fixture/nested/test_busy.py']
         log = ('Runner: 2 modules, whole machine, 32 CPUs\n'
                'Starting module: fixture/test_ok.py\n'
@@ -327,7 +328,7 @@ class CloudGateTests(CostFixture):
         with closing(sqlite3.connect(index.index_path())) as connection, connection:
             connection.execute("""INSERT INTO gate_runs
                 (id, started_at, step, vcpus, max_jobs, status, aborted, selection, wall_s, modules_run)
-                VALUES ('normal', '2026-01-01', 'merge-gate', 32, 32, 0, 0, 'full', 1, 1)""").close()
+                VALUES ('normal', '2026-01-01', 'gate', 32, 32, 0, 0, 'full', 1, 1)""").close()
         for arrival in ('before-poll', 'at-stop', 'at-stop-log-timeout', 'ec2-timeout', 'at-deadline',
                         'ec2-outage-limit', 'boot-and-result'):
             with self.subTest(arrival=arrival):
@@ -405,7 +406,7 @@ class CloudGateTests(CostFixture):
     def result(self, status: int = 0) -> dict[str, object]:
         run = gate.GateRun((gate.GateJobResult('fixture', 'test_ok.py', status, 1, 'OK'),), 1, 2)
         record = gate_box.completion_record(run, 'attempt', 'commit', 'tree', 'fixture-guest', self.now,
-                                            self.now + 1, 'merge-gate')
+                                            self.now + 1, 'gate')
         return {'attempt': 'attempt', 'commit': 'commit', 'tree': 'tree', 'host': 'fixture-guest',
                 'verdict': 'pass' if run.passed else 'fail', 'gate': gate_box.encode_run(run), 'record': record, 'gate_s': 1.0}
 
@@ -532,7 +533,7 @@ class CloudGateTests(CostFixture):
             self.assertFalse(east.used)
             self.assertEqual(east.prices, ())
             prices = [price for reading in reads for price in reading.prices]
-            ranked = worker.rank_variants(variants, 'merge-gate', prices)
+            ranked = worker.rank_variants(variants, 'gate', prices)
             # Every type in eu-south-2 has the live price, so all of them come before us-east-2.
             self.assertEqual([row.region for row in ranked[:8]], ['eu-south-2'] * 6 + ['us-east-2'] * 2)
             self.assertEqual((self.state / 'spot-prices.json').read_bytes(), hourly)
@@ -545,7 +546,7 @@ class CloudGateTests(CostFixture):
 
     def test_all_live_price_failures_keep_the_hourly_order(self) -> None:
         worker, variants = self.live_price_fixture()
-        expected = worker.rank_variants(variants, 'merge-gate')
+        expected = worker.rank_variants(variants, 'gate')
         calls: list[str] = []
         def transport(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
             if 'describe-spot-price-history' in arguments:
@@ -583,28 +584,28 @@ class CloudGateTests(CostFixture):
             '.49' if row.region == 'eu-south-2' else '.5' for row in variants})
         text_setting(self.root / 'cloud_gate.conf', 'region_extra_gate_seconds', '{"eu-south-2": 60}')
         numeric_settings(self.root / 'cloud_gate.conf', {'gate_wait_usd_per_minute': '.01'})
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0].region, 'us-east-2')
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0].region, 'us-east-2')
         numeric_settings(self.root / 'cloud_gate.conf', {'gate_wait_usd_per_minute': '0'})
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0].region, 'eu-south-2')
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0].region, 'eu-south-2')
 
     def test_a_far_region_pays_its_own_transfer(self) -> None:
         worker, variants = self.steering_fixture()
         self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.48'})
         text_setting(self.root / 'cloud_gate.conf', 'region_transfer_usd', '{}')
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], variants[7])
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0], variants[7])
         # The 0.02 USD/h saving over the 20 minute lifetime is 0.0067 USD, below the 0.01 USD transfer.
         text_setting(self.root / 'cloud_gate.conf', 'region_transfer_usd', '{"us-west-2": 0.01}')
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0].region, 'us-east-2')
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0].region, 'us-east-2')
 
     def test_a_region_without_runs_adds_its_unmeasured_seconds(self) -> None:
         worker, variants = self.steering_fixture()
         self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.48'})
         self.gate_history([('m7a.8xlarge', 'us-east-2', 300)])
         text_setting(self.root / 'cloud_gate.conf', 'unmeasured_region_extra_seconds', '{}')
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], variants[7])
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0], variants[7])
         # us-west-2 borrows the 300 s run: 0.48 USD/h for 360 s costs more than 0.5 USD/h for 300 s.
         text_setting(self.root / 'cloud_gate.conf', 'unmeasured_region_extra_seconds', '{"us-west-2": 60, "us-east-2": 600}')
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0].region, 'us-east-2')
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0].region, 'us-east-2')
 
     def test_region_maps_refuse_a_negative_number(self) -> None:
         worker, variants = self.steering_fixture()
@@ -613,7 +614,7 @@ class CloudGateTests(CostFixture):
             with self.subTest(key=key):
                 text_setting(self.root / 'cloud_gate.conf', key, '{"us-west-2": -1}')
                 with self.assertRaisesRegex(ValueError, key):
-                    _ = worker.rank_variants(variants, 'merge-gate')
+                    _ = worker.rank_variants(variants, 'gate')
                 text_setting(self.root / 'cloud_gate.conf', key, '{}')
 
     def test_live_price_reads_run_concurrently(self) -> None:
@@ -639,9 +640,9 @@ class CloudGateTests(CostFixture):
     def test_variant_prices_prefer_the_cheapest_zone_and_preserve_equal_price_order(self) -> None:
         worker, variants = self.steering_fixture()
         self.variant_prices(variants, {})
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[:4], [variants[0], variants[1], variants[6], variants[7]])
+        self.assertEqual(worker.rank_variants(variants, 'gate')[:4], [variants[0], variants[1], variants[6], variants[7]])
         self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.1'})
-        ranked = worker.rank_variants(variants, 'merge-gate')
+        ranked = worker.rank_variants(variants, 'gate')
         self.assertEqual(ranked[:2], [variants[7], variants[0]])
         self.assertFalse(any('describe-spot-price-history' in command for command in self.fake.commands))
 
@@ -649,14 +650,14 @@ class CloudGateTests(CostFixture):
         """Write finished runs (type, region, box seconds) and refused requests before each launch."""
         rows: list[dict[str, object]] = []
         for index, (size, region, box_s) in enumerate(runs):
-            row: dict[str, object] = {'attempt': f'run-{index}', 'instance_type': size, 'region': region, 'mode': 'merge-gate'}
+            row: dict[str, object] = {'attempt': f'run-{index}', 'instance_type': size, 'region': region, 'mode': 'gate'}
             rows.extend(({**row, 'time': self.now - 7200 - box_s, 'result': 'launched'},
                          {**row, 'time': self.now - 7200, 'result': 'finished', 'gate_s': box_s - 60}))
         for index, (size, region, count) in enumerate(refusals):
             for step in range(count):
-                rows.append({'attempt': f'refused-{index}', 'instance_type': size, 'region': region, 'mode': 'merge-gate',
+                rows.append({'attempt': f'refused-{index}', 'instance_type': size, 'region': region, 'mode': 'gate',
                              'time': self.now - 9000 + step * 6, 'result': 'refused', 'error_code': 'InsufficientInstanceCapacity'})
-            rows.append({'attempt': f'refused-{index}', 'instance_type': size, 'region': region, 'mode': 'merge-gate',
+            rows.append({'attempt': f'refused-{index}', 'instance_type': size, 'region': region, 'mode': 'gate',
                          'time': self.now - 9000 + count * 6, 'result': 'launched'})
         _ = (self.state / 'cloud-gate-launches.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
 
@@ -669,7 +670,7 @@ class CloudGateTests(CostFixture):
                                        for row in variants})
         self.gate_history([(first, 'us-east-2', cap - 60), (third, 'us-east-2', cap + 60)])
         with redirect_stdout(StringIO()) as output:
-            ranked = worker.rank_variants(variants, 'merge-gate')
+            ranked = worker.rank_variants(variants, 'gate')
         # us-west-2 has no runs of the third type, so it uses the type's time in us-east-2 and is skipped too.
         self.assertEqual({row.instance_type for row in ranked}, {first, second})
         self.assertEqual(ranked[0].instance_type, first)
@@ -677,20 +678,20 @@ class CloudGateTests(CostFixture):
         # A median at the cap is still tried; a type without runs is never skipped.
         self.gate_history([(first, 'us-east-2', cap), (third, 'us-east-2', cap)])
         with redirect_stdout(StringIO()):
-            self.assertEqual(len(worker.rank_variants(variants, 'merge-gate')), len(variants))
+            self.assertEqual(len(worker.rank_variants(variants, 'gate')), len(variants))
 
     def test_a_region_whose_spot_quota_is_below_one_box_stays_in_the_order(self) -> None:
         worker, variants = self.steering_fixture()
         self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.1'})
         self.west_quota(31)
-        ranked = worker.rank_variants(variants, 'merge-gate')
+        ranked = worker.rank_variants(variants, 'gate')
         self.assertCountEqual(ranked, variants)
         self.assertCountEqual(ranked[-4:], variants[6:10])
         # One box fits at equality. An expired snapshot does not set the order.
         for west, age in ((32, 0), (0, conf.read(self.settings).whole('price_max_age_seconds') + 1)):
             with self.subTest(west=west, age=age):
                 self.west_quota(west, age=age)
-                self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], variants[7])
+                self.assertEqual(worker.rank_variants(variants, 'gate')[0], variants[7])
 
     def test_every_type_above_max_gate_minutes_falls_back_before_launch(self) -> None:
         cap = conf.read(self.root / 'cloud_gate.conf').whole('max_gate_minutes') * 60
@@ -710,12 +711,12 @@ class CloudGateTests(CostFixture):
         self.variant_prices(variants, {(row.region, row.instance_type, row.zone): '.3' if row.instance_type == third else '.5'
                                        for row in variants})
         self.gate_history([(first, 'us-east-2', 300), (third, 'us-east-2', 600)])
-        ranked = worker.rank_variants(variants, 'merge-gate')
+        ranked = worker.rank_variants(variants, 'gate')
         self.assertEqual([row.instance_type for row in ranked[:2]], [first, first])
         # The region uses its own box time; us-west-2 has none, so it uses us-east-2's time.
         self.assertEqual({row.region for row in ranked[:4]}, {'us-east-2', 'us-west-2'})
         self.gate_history([(first, 'us-east-2', 900), (third, 'us-east-2', 600)])
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0].instance_type, third)
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0].instance_type, third)
 
     def test_expected_refusals_count_only_when_wait_time_has_a_cost(self) -> None:
         worker, variants = self.steering_fixture()
@@ -724,34 +725,34 @@ class CloudGateTests(CostFixture):
                                        for row in variants})
         self.gate_history([(first, 'us-east-2', 600), (second, 'us-east-2', 600)], [(first, 'us-east-2', 100)])
         def home_types() -> list[str]:
-            return [row.instance_type for row in worker.rank_variants(variants, 'merge-gate') if row.region == 'us-east-2']
+            return [row.instance_type for row in worker.rank_variants(variants, 'gate') if row.region == 'us-east-2']
         self.assertEqual(home_types()[:2], [first, first])
         # 50 refusals per launch, 6 s apart, at .01 USD a minute is 0.05 USD: more than the price gap.
         numeric_settings(self.root / 'cloud_gate.conf', {'gate_wait_usd_per_minute': '.01'})
         self.assertEqual(home_types()[:2], [second, second])
         # A region without refusals keeps the type first.
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], cloud_gate.GateLaunchVariant(
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0], cloud_gate.GateLaunchVariant(
             'us-west-2', first, 'us-west-2a', 'us-west-2a'))
 
     def test_equal_cost_per_run_keeps_the_configured_type_order(self) -> None:
         worker, variants = self.steering_fixture()
         self.variant_prices(variants, {})
-        ranked = worker.rank_variants(variants, 'merge-gate')
+        ranked = worker.rank_variants(variants, 'gate')
         types = conf.read(self.root / 'cloud_gate.conf').words('instance_types')
         self.assertEqual([row.instance_type for row in ranked if row.region == 'us-east-2'], [size for size in types for _ in range(2)])
 
     def test_absent_stale_or_invalid_prices_preserve_configured_order(self) -> None:
         worker, variants = self.steering_fixture()
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate'), variants)
+        self.assertEqual(worker.rank_variants(variants, 'gate'), variants)
         self.variant_prices(variants, {}, age=7201)
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate'), variants)
+        self.assertEqual(worker.rank_variants(variants, 'gate'), variants)
         _ = (self.state / 'spot-prices.json').write_text('{')
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate'), variants)
+        self.assertEqual(worker.rank_variants(variants, 'gate'), variants)
 
     def test_missing_prices_follow_priced_variants_of_the_same_size(self) -> None:
         worker, variants = self.steering_fixture()
         self.variant_prices([variants[6]], {})
-        ranked = worker.rank_variants(variants, 'merge-gate')
+        ranked = worker.rank_variants(variants, 'gate')
         self.assertEqual(ranked[0], variants[6])
         self.assertEqual(ranked[1:4], [variants[0], variants[1], variants[7]])
         self.assertEqual(ranked[-4:], [variants[4], variants[5], variants[10], variants[11]])
@@ -765,11 +766,11 @@ class CloudGateTests(CostFixture):
                 _ = (self.state / 'cloud-gate-launches.jsonl').write_text(json.dumps(dict(
                     time=self.now - 600, result='refused', region='us-west-2', instance_type='m7a.8xlarge',
                     availability_zone='us-west-2b', error_code=code)) + '\n')
-                ranked = worker.rank_variants(variants, 'merge-gate')
+                ranked = worker.rank_variants(variants, 'gate')
                 self.assertEqual(ranked[0], variants[6])
                 self.assertEqual(ranked[-1], variants[7])
         self.advance(1260)
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], variants[7])
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0], variants[7])
 
     def test_quota_refusal_does_not_cool_a_region_after_a_box_ends(self) -> None:
         worker, variants = self.steering_fixture()
@@ -783,11 +784,11 @@ class CloudGateTests(CostFixture):
                 _ = (self.state / 'cloud-gate-launches.jsonl').write_text(json.dumps(dict(
                     time=self.now - 300, result='refused', region='us-west-2', instance_type='m7a.8xlarge',
                     availability_zone='us-west-2b', error_code=code)) + '\n')
-                ranked = worker.rank_variants(variants, 'merge-gate')
+                ranked = worker.rank_variants(variants, 'gate')
                 self.assertEqual(ranked[0], variants[7])
                 self.assertCountEqual(ranked, variants)
         self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.1'})
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], variants[7])
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0], variants[7])
 
     def test_live_gate_vcpus_rank_a_full_region_after_regions_with_room(self) -> None:
         worker, variants = self.steering_fixture()
@@ -804,13 +805,13 @@ class CloudGateTests(CostFixture):
                     (fits.region, fits.instance_type, fits.zone): '.2',
                     (gpu.region, gpu.instance_type, gpu.zone): '.3'})
                 self.west_quota(32, gpu_vcpus=12)
-                ranked = worker.rank_variants(variants, 'merge-gate')
+                ranked = worker.rank_variants(variants, 'gate')
                 self.assertEqual(ranked[-1], full)
                 self.assertCountEqual(ranked[:-1], [east, fits, gpu])
         self.advance(1200)
         self.variant_prices(variants, {(full.region, full.instance_type, full.zone): '.1'})
         self.west_quota(32, gpu_vcpus=12)
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], full)
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0], full)
 
     def test_full_gpu_quota_preserves_the_standard_variant_with_room(self) -> None:
         worker, variants = self.steering_fixture()
@@ -823,7 +824,7 @@ class CloudGateTests(CostFixture):
             (standard.region, standard.instance_type, standard.zone): '.2',
             (gpu.region, gpu.instance_type, gpu.zone): '.1'})
         self.west_quota(32, gpu_vcpus=32)
-        self.assertEqual(worker.rank_variants([east, standard, gpu], 'merge-gate'), [standard, east, gpu])
+        self.assertEqual(worker.rank_variants([east, standard, gpu], 'gate'), [standard, east, gpu])
 
     def test_launch_quota_refusal_marks_the_class_until_live_use_drops(self) -> None:
         worker, variants = self.steering_fixture()
@@ -832,7 +833,7 @@ class CloudGateTests(CostFixture):
         self.record_running_gate('other', west.instance_type, west.region)
         self.variant_prices(variants, {(west.region, west.instance_type, west.zone): '.1'})
         self.west_quota(256)
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], west)
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0], west)
         self.fake.refusals = ['MaxSpotInstanceCountExceeded']
         with mock.patch.object(time, 'time', return_value=self.now):
             self.assertEqual(worker.launch(self.folder, self.request, self.deployment), 'i-fixture')
@@ -840,15 +841,15 @@ class CloudGateTests(CostFixture):
         self.assertEqual([command[command.index('--region') + 1] for command in launches], ['us-west-2', 'us-east-2'])
         pool = ledger.SpotQuotaPool(west.region, ledger.SpotQuotaClass.STANDARD)
         self.assertEqual(self.book.read_snapshot().gate_quota_refusals, [ledger.GateQuotaRefusal(pool, 32, int(self.now))])
-        ranked = worker.rank_variants(variants, 'merge-gate')
+        ranked = worker.rank_variants(variants, 'gate')
         self.assertEqual(ranked[:6], variants[:6])
         self.assertCountEqual(ranked[6:], variants[6:])
         self.book.resolve_gate('other', ledger.GateTerminated(int(self.now) + 1, 'i-other'))
         self.advance(1)
         self.assertEqual(self.book.read_snapshot().gate_quota_refusals, [])
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], west)
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0], west)
         self.record_running_gate('replacement', west.instance_type, west.region)
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], west)
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0], west)
 
     def test_quota_refusal_at_zero_live_vcpus_expires_at_the_cooldown(self) -> None:
         worker, variants = self.steering_fixture()
@@ -856,14 +857,14 @@ class CloudGateTests(CostFixture):
         east, west = variants[0], variants[7]
         variants = [east, west]
         self.variant_prices(variants, {(west.region, west.instance_type, west.zone): '.1'})
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate'), [west, east])
+        self.assertEqual(worker.rank_variants(variants, 'gate'), [west, east])
         pool = ledger.SpotQuotaPool(west.region, ledger.SpotQuotaClass.STANDARD)
         self.book.record_gate_quota_refusal(pool, self.now)
         self.assertEqual(self.book.read_snapshot().gate_quota_refusals, [ledger.GateQuotaRefusal(pool, 0, int(self.now))])
         self.advance(29)
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate'), [east, west])
+        self.assertEqual(worker.rank_variants(variants, 'gate'), [east, west])
         self.advance(1)
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate'), [west, east])
+        self.assertEqual(worker.rank_variants(variants, 'gate'), [west, east])
         self.book.resolve_gate('attempt', ledger.GateAbsent(int(self.now)))
         self.assertEqual(self.book.read_snapshot().gate_quota_refusals, [])
 
@@ -906,10 +907,10 @@ class CloudGateTests(CostFixture):
         worker, variants = self.steering_fixture()
         numeric_settings(self.root / 'cloud_gate.conf', {'remote_region_transfer_usd': '.005'})
         self.variant_prices(variants, {('us-west-2', 'm7a.8xlarge', 'us-west-2b'): '.48'})
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], variants[7])
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0], variants[7])
         # Box times of another type give the mode's median when the ranked types have no runs.
         self.gate_history([('other.8xlarge', 'us-east-2', duration) for duration in (300, 600, 900)])
-        self.assertEqual(worker.rank_variants(variants, 'merge-gate')[0], variants[0])
+        self.assertEqual(worker.rank_variants(variants, 'gate')[0], variants[0])
 
     def test_regions_try_home_types_and_zones_before_west_and_keep_home_transfers(self) -> None:
         self.deployment['regions'] = [{**ledger.rows(self.deployment, 'regions')[0], 'region': region, 'image': 'ami-' + suffix,
@@ -1708,19 +1709,19 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         self.assertEqual(choices, [('m7a.8xlarge', 'fixture-a'), ('m7a.8xlarge', 'fixture-b'),
                                    ('m7a.4xlarge', 'fixture-a'), ('m7a.4xlarge', 'fixture-b')])
         self.assertEqual(self.book.launches()[-1], {'time': self.now, 'attempt': 'attempt',
-            'instance_type': 'm7a.4xlarge', 'vcpus': 16, 'result': 'finished', 'gate_s': 1.0, 'mode': 'merge-gate', 'region': 'fixture-region'})
+            'instance_type': 'm7a.4xlarge', 'vcpus': 16, 'result': 'finished', 'gate_s': 1.0, 'mode': 'gate', 'region': 'fixture-region'})
         spends = self.book.spend_days(read_settings(self.settings), int(self.now))
         self.assertEqual(sum(day.runs for day in spends), 1)
         self.assertEqual(self.book.read_snapshot().gate_reservations[0].instance_type, 'm7a.4xlarge')
 
     def test_targeted_run_records_mode_in_every_event(self) -> None:
-        self.request['mode'] = 'targeted-test'
+        self.request['mode'] = gate.SuiteMode.TARGETED.wire
         cloud_gate.save(self.folder / 'request.json', self.request)
         self.fake.refusals = ['An error occurred (InsufficientInstanceCapacity) when calling the RunInstances operation: fixture']
         self.assertEqual(self.execute()['status'], 'complete')
         rows = self.book.launches()
         self.assertEqual([row['result'] for row in rows], ['refused', 'launched', 'finished'])
-        self.assertTrue(all(row['mode'] == 'targeted-test' for row in rows))
+        self.assertTrue(all(row['mode'] == 'test-affected' for row in rows))
 
     def test_all_capacity_refusals_allow_local_fallback(self) -> None:
         self.fake.refusals = ['An error occurred (InsufficientInstanceCapacity) when calling the RunInstances operation: fixture'] * 4
@@ -1730,7 +1731,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
         rows = [ledger.mapping(cast(object, json.loads(line)))
                 for line in (self.state / 'cloud-gate-launches.jsonl').read_text().splitlines()]
         self.assertEqual(len(rows), 4)
-        self.assertTrue(all(row['mode'] == 'merge-gate' for row in rows))
+        self.assertTrue(all(row['mode'] == 'gate' for row in rows))
         self.assertTrue(all(row['result'] == 'refused' for row in rows))
         self.assertEqual(output.getvalue().count('Cloud gate refused:'), 4)
 
@@ -1747,7 +1748,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                 for line in (self.state / 'cloud-gate-launches.jsonl').read_text().splitlines()]
         evidence = cloud_gate.read(self.folder / 'launch.json')['spot_price_reads']
         self.assertEqual(rows, [{'time': self.now, 'attempt': 'attempt', 'instance_type': 'm7a.8xlarge',
-            'vcpus': 32, 'availability_zone': 'a', 'result': 'refused', 'mode': 'merge-gate', 'error_code': 'InvalidParameterValue',
+            'vcpus': 32, 'availability_zone': 'a', 'result': 'refused', 'mode': 'gate', 'error_code': 'InvalidParameterValue',
             'reason': reason, 'region': 'fixture-region', 'spot_price_reads': evidence}])
         self.assertEqual(output.getvalue(), 'Cloud gate refused: m7a.8xlarge in a: InvalidParameterValue\n')
         for private in ('123456789012', 'subnet-fixture', 'i-private', 'RED'):
@@ -1759,10 +1760,10 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                 for line in (self.state / 'cloud-gate-launches.jsonl').read_text().splitlines()]
         evidence = cloud_gate.read(self.folder / 'launch.json')['spot_price_reads']
         self.assertEqual(rows, [{'time': self.now, 'attempt': 'attempt', 'instance_type': 'm7a.8xlarge',
-            'vcpus': 32, 'availability_zone': 'a', 'result': 'launched', 'error_code': '', 'reason': '', 'mode': 'merge-gate',
+            'vcpus': 32, 'availability_zone': 'a', 'result': 'launched', 'error_code': '', 'reason': '', 'mode': 'gate',
             'region': 'fixture-region', 'spot_price_reads': evidence},
             {'time': self.now, 'attempt': 'attempt', 'instance_type': 'm7a.8xlarge',
-             'vcpus': 32, 'result': 'finished', 'gate_s': 1.0, 'mode': 'merge-gate', 'region': 'fixture-region'}])
+             'vcpus': 32, 'result': 'finished', 'gate_s': 1.0, 'mode': 'gate', 'region': 'fixture-region'}])
         data = ledger.text(self.fake.launches[0], 'UserData')
         self.assertTrue(data.startswith('#!/bin/sh\n'))
         link_rows = data.split("<<'GATE_LINKS'\n", 1)[1].split('\nGATE_LINKS', 1)[0]
@@ -2119,6 +2120,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                 run = gate.GateRun((passed,), 3, 2, executions=(failed, passed) if retried else (passed,))
                 result = self.result()
                 result['gate'] = gate_box.encode_run(run)
+                # An older box names the step merge-gate; the store keeps the new name.
                 result['record'] = gate_box.completion_record(run, 'attempt', 'commit', 'tree', 'fixture-guest',
                                                              self.now, self.now + 3, 'merge-gate')
                 _ = destination.write_text('{"interrupted":')
@@ -2137,7 +2139,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
                     self.assertEqual(json.loads(gzip.decompress((buildlog / kept_result).read_bytes())), result)
                 records = [ledger.mapping(cast(object, json.loads(line))) for line in destination.read_text().splitlines()]
                 self.assertEqual([row['id'] for row in records], ['gate-attempt'])
-                self.assertEqual(records[0]['host'], 'fixture-guest')
+                self.assertEqual((records[0]['host'], records[0]['step']), ('fixture-guest', 'gate'))
                 modules = ledger.rows(records[0], 'modules')
                 if retried:
                     first, second = modules
@@ -2232,7 +2234,7 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
 
     def test_remote_red_never_calls_the_local_runner(self) -> None:
         remote = gate.GateRun((gate.GateJobResult('fixture', 'test_ok.py', 1, 1, ''),), 1, 1)
-        for mode, full in ((gate.SuiteMode.MERGE_GATE, False), (gate.SuiteMode.TARGETED_TEST, True)):
+        for mode, full in ((gate.SuiteMode.GATE, False), (gate.SuiteMode.TARGETED, True)):
             with (self.subTest(mode=mode, full=full),
                   mock.patch.object(cloud_gate, 'run', return_value=cloud_gate.CloudCompleted(remote)) as run,
                   mock.patch.object(gate, 'select_affected', side_effect=AssertionError('The full suite needs no selection')),
@@ -2244,9 +2246,9 @@ with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
     def test_allowed_fallback_calls_the_original_local_runner(self) -> None:
         with (mock.patch.object(cloud_gate, 'run', return_value=cloud_gate.LocalFallback('AWS is down')),
               mock.patch.object(gate, 'run_suites') as local, redirect_stdout(StringIO())):
-            _ = gate.run_gate_suites(self.root, full=True, mode=gate.SuiteMode.TARGETED_TEST)
+            _ = gate.run_gate_suites(self.root, full=True, mode=gate.SuiteMode.TARGETED)
         self.assertTrue(local.call_args.kwargs['full'])
-        self.assertEqual(local.call_args.kwargs['mode'], gate.SuiteMode.TARGETED_TEST)
+        self.assertEqual(local.call_args.kwargs['mode'], gate.SuiteMode.TARGETED)
 
 
     def test_paired_result_uses_shared_worker_and_confirms_cleanup(self) -> None:
@@ -2739,7 +2741,7 @@ class CloudRouteTests(CostFixture):
         super().setUp()
         _ = self.settings.write_text(self.settings.read_text().replace('region=us-east-1', 'region=us-east-2'))
         _ = self.enterContext(mock.patch.object(cloud_gate, 'account_settings_path', side_effect=lambda: Path(os.environ.get('AWS_TARGET_CONFIG', str(self.settings)))))
-        _ = write_config_fixture(self.root / 'merge_gate.conf')
+        _ = write_config_fixture(self.root / 'gate.conf')
         _ = write_config_fixture(self.root / 'cloud_gate.conf',
             'credential_file=~/.config/aws-build/credentials\n')
         self.repo = self.root / 'repo'
@@ -2747,6 +2749,9 @@ class CloudRouteTests(CostFixture):
         folder.mkdir(parents=True)
         for name in ('test_one.py', 'test_two.py'):
             _ = (folder / name).write_text('import unittest\n')
+        runner = self.repo / 'scripts/production/gate.py'
+        runner.parent.mkdir()
+        _ = runner.write_text('from enum import Enum\n' + inspect.getsource(gate.SuiteMode))
         for args in (('init', '-q', '-b', 'fixture'), ('config', 'user.name', 'Fixture'),
                      ('config', 'user.email', 'fixture@example.invalid'), ('add', '.'), ('commit', '-qm', 'Fixture'),
                      ('remote', 'add', 'origin', '/private/origin'), ('update-ref', 'refs/remotes/origin/main', 'HEAD')):
@@ -2755,6 +2760,59 @@ class CloudRouteTests(CostFixture):
         _ = self.enterContext(mock.patch.object(cloud_gate, 'discover_test_modules', return_value=self.modules))
         _ = self.enterContext(mock.patch.object(target_config, 'ssh_target_state_directory', return_value=self.state))
         self.admission = caller_admission(self, self.root, {'BUILDLOG_DIR': str(self.root / 'buildlog')})
+
+    def test_old_checkout_modes_reach_the_box(self) -> None:
+        runner = self.repo / 'scripts/production/gate.py'
+        source = runner.read_text()
+        _ = runner.write_text(source.replace('"gate"', '"merge-gate"').replace('"test-affected"', '"targeted-test"'))
+        _ = gate.checked_git(self.repo, 'add', '.')
+        _ = gate.checked_git(self.repo, 'commit', '-qm', 'Use the previous suite mode values')
+        head = gate.checked_git(self.repo, 'rev-parse', 'HEAD')
+        _ = runner.write_text(source.replace('"merge-gate"', '"other-merge"').replace('"targeted-test"', '"other-targeted"'))
+        _ = gate.checked_git(self.repo, 'commit', '-qam', 'Read only the new suite mode values')
+        new_only = gate.checked_git(self.repo, 'rev-parse', 'HEAD')
+        mapping = '{"merge-gate": cls.GATE, "targeted-test": cls.TARGETED}'
+        self.assertIn(mapping, source)
+        _ = runner.write_text(source.replace(mapping, '{}'))
+        _ = gate.checked_git(self.repo, 'commit', '-qam', 'Write the old values without reading them')
+        writes_only = gate.checked_git(self.repo, 'rev-parse', 'HEAD')
+        for mode in gate.SuiteMode:
+            with self.subTest(mode=mode):
+                self.assertTrue(cloud_gate.accepts_suite_mode(self.repo, head, mode))
+                self.assertFalse(cloud_gate.accepts_suite_mode(self.repo, new_only, mode))
+                self.assertFalse(cloud_gate.accepts_suite_mode(self.repo, writes_only, mode))
+                self.assertIs(gate.SuiteMode(mode.wire), mode)
+                self.assertEqual(gate.SuiteMode.step(mode.wire), mode.value)
+                self.assertEqual(gate.SuiteMode.step(mode.value), mode.value)
+        self.assertEqual(gate.SuiteMode.step('gpu-size-trial'), 'gpu-size-trial')
+
+    def test_unknown_checkout_modes_use_local_gate_without_starting_the_cloud_service(self) -> None:
+        cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
+        runner = self.repo / 'scripts/production/gate.py'
+        source = runner.read_text()
+        _ = runner.write_text(source.replace('"gate"', '"other-gate"').replace('"test-affected"', '"other-affected"')
+                              .replace('"merge-gate"', '"other-merge"').replace('"targeted-test"', '"other-targeted"'))
+        _ = gate.checked_git(self.repo, 'add', '.')
+        _ = gate.checked_git(self.repo, 'commit', '-qm', 'Use suite mode values this code does not read')
+        passed = gate.GateRun((gate.GateJobResult('fixture', 'test_one.py', 0, 1, 'OK'),), 1, 0)
+        for mode in gate.SuiteMode:
+            with (self.subTest(mode=mode),
+                  mock.patch.object(cloud_gate, 'run_service', side_effect=AssertionError('No cloud service may start')) as service,
+                  mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('No AWS call may start')),
+                  mock.patch.object(gate, 'run_suites', return_value=passed) as local,
+                  redirect_stdout(StringIO()) as output):
+                before = len(self.fallback_rows())
+                outcome = gate.run_gate_suites(self.repo, full=True, mode=mode)
+                self.assertTrue(outcome.passed)
+                local.assert_called_once_with(self.repo, (), gate.DEFAULT_MODULE_TIME_LIMIT_S,
+                                              source='tests-only', full=True, mode=mode)
+                service.assert_not_called()
+                reason = f'The tested commit does not read SuiteMode value {mode.wire!r}'
+                self.assertEqual(output.getvalue(), 'Cloud gate uses natedev: ' + reason + '\n')
+                rows = self.fallback_rows()
+                self.assertEqual(len(rows), before + 1)
+                self.assertEqual((rows[-1]['mode'], rows[-1]['reason']), (mode.value, reason))
+                self.assertTrue(self.admission.callers_released())
 
     def retry_fixture(self) -> CloudRouteTests:
         fixture = CloudRouteTests()
@@ -2843,7 +2901,7 @@ class CloudRouteTests(CostFixture):
               redirect_stdout(StringIO())):
             if crash_after is not None or crash_on_retry_save or lower_limit_on_resume:
                 with self.assertRaisesRegex(SystemExit, 'fixture controller crash'):
-                    _ = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=True,
+                    _ = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
                         module_time_limit_s=values.number('module_time_limit_s'), service=service)
                 self.assertTrue(self.admission.callers_released())
                 if lower_limit_on_resume:
@@ -2852,7 +2910,7 @@ class CloudRouteTests(CostFixture):
                     _ = path.write_text(re.sub(r'(?m)^spot_interruption_retries=.*$',
                         'spot_interruption_retries=' + str(limit), path.read_text()))
                 controller += 1
-            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=True,
+            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
                 module_time_limit_s=values.number('module_time_limit_s'), service=service)
         self.assertTrue(all(len(set(rows)) == 1 for rows in admissions.values()))
         self.assertTrue(self.admission.callers_released())
@@ -2925,7 +2983,7 @@ class CloudRouteTests(CostFixture):
                 self.assertEqual(rows[0]['reason'], fallback_reason)
                 self.assertNotIn(signed_url, (fixture.state / 'cloud-gate-launches.jsonl').read_text())
                 service = mock.Mock(side_effect=AssertionError('The box failure retry limit is reached'))
-                resumed = cloud_gate.run(fixture.repo, mode=gate.SuiteMode.MERGE_GATE, full=True,
+                resumed = cloud_gate.run(fixture.repo, mode=gate.SuiteMode.GATE, full=True,
                     module_time_limit_s=cloud_gate.settings().number('module_time_limit_s'), service=service)
                 self.assertEqual(resumed, outcome)
                 service.assert_not_called()
@@ -2985,7 +3043,7 @@ class CloudRouteTests(CostFixture):
         self.assertIn(f'Spot interruption on {expected} attempts', outcome.reason)
         self.assertEqual(self.fallback_rows()[-1]['reason'], outcome.reason)
         service = mock.Mock(side_effect=AssertionError('The retry budget is spent'))
-        resumed = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=True,
+        resumed = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
             module_time_limit_s=cloud_gate.settings().number('module_time_limit_s'), service=service)
         self.assertEqual(resumed, outcome)
         service.assert_not_called()
@@ -3032,7 +3090,7 @@ class CloudRouteTests(CostFixture):
         _ = write_config_fixture(self.root / 'cloud_gate.conf',
             'clone_url=https://example.invalid/fixture-source.git\n')
         folder = self.root / 'attempt'
-        request = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.MERGE_GATE, 1800)
+        request = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.GATE, 1800)
         self.assertEqual(request['tree'], gate.checked_git(self.repo, 'rev-parse', 'HEAD^{tree}'))
         self.assertEqual(request['commit'], gate.checked_git(self.repo, 'rev-parse', 'HEAD'))
         self.assertEqual(request['head'], request['commit'])
@@ -3048,7 +3106,7 @@ class CloudRouteTests(CostFixture):
         _ = gate.checked_git(self.repo, 'add', 'new-file')
         _ = gate.checked_git(self.repo, 'commit', '-qm', 'New commit')
         folder = self.root / 'attempt'
-        request = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.MERGE_GATE, 1800)
+        request = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.GATE, 1800)
         bundle = folder / 'source.bundle'
         header = bundle.read_bytes().split(b'\n\n', 1)[0].decode()
         self.assertIn('-' + base + ' ', header)
@@ -3080,7 +3138,7 @@ class CloudRouteTests(CostFixture):
         head = gate.checked_git(self.repo, 'rev-parse', 'HEAD')
         refs = gate.checked_git(self.repo, 'for-each-ref')
         folder = self.root / 'attempt'
-        request = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.MERGE_GATE, 1800)
+        request = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.GATE, 1800)
         commit = ledger.text(request, 'commit')
         self.assertNotEqual(commit, head)
         self.assertEqual(request['head'], head)
@@ -3155,19 +3213,19 @@ class CloudRouteTests(CostFixture):
                         with (mock.patch.object(cloud_gate, 'save') as save,
                               mock.patch.object(gate, 'checked_git', wraps=gate.checked_git) as git):
                             with self.assertRaisesRegex(GateRefused, 'The checkout changed after the test selection'):
-                                _ = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.TARGETED_TEST, 1800,
+                                _ = cloud_gate.prepare(self.repo, folder, gate.SuiteMode.TARGETED, 1800,
                                                        selected=selected)
                         save.assert_not_called()
                         self.assertFalse((folder / 'request.json').exists())
                         self.assertFalse(any('bundle' in call.args for call in git.call_args_list))
                         cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
                         with mock.patch.object(cloud_gate, 'run_service', side_effect=AssertionError('No service may start')) as service:
-                            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED_TEST, full=False,
+                            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED, full=False,
                                                      module_time_limit_s=1800, selected=selected)
                         self.assertEqual(outcome, cloud_gate.LocalFallback('The checkout changed after the test selection'))
                         service.assert_not_called()
                         continue
-                    request = cloud_gate.prepare(self.repo, self.root / 'attempt', gate.SuiteMode.TARGETED_TEST, 1800,
+                    request = cloud_gate.prepare(self.repo, self.root / 'attempt', gate.SuiteMode.TARGETED, 1800,
                                                 selected=selected)
                     self.assertEqual(select.call_count, 1)
                 self.assertEqual(select.call_args.args[0], self.repo)
@@ -3191,15 +3249,15 @@ class CloudRouteTests(CostFixture):
             book.resolve_gate(folder.name, ledger.GateAbsent(now))
             return 0
         for _ in range(2):
-            _ = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
+            _ = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False,
                                module_time_limit_s=1800, service=service)
         self.assertNotEqual(folders[0], folders[1])
         self.assertFalse(any((folder / 'outcome.json').exists() for folder in folders))
 
     def _run_gate_for_resume(self, service: Callable[[Sequence[str]], int]) -> cloud_gate.LocalFallback | cloud_gate.CloudCompleted:
         with mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('The controller must not call AWS')):
-            return cloud_gate.run_cloud(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
-                module_time_limit_s=1800, service=service, attempt=cloud_gate.CloudAttempt(self.state, gate.SuiteMode.MERGE_GATE))
+            return cloud_gate.run_cloud(self.repo, mode=gate.SuiteMode.GATE, full=False,
+                module_time_limit_s=1800, service=service, attempt=cloud_gate.CloudAttempt(self.state, gate.SuiteMode.GATE))
 
     def _finish_gate_for_resume(self, command: Sequence[str], *, status: int = 0) -> int:
         folder = Path(command[command.index('--worker') + 1])
@@ -3208,7 +3266,7 @@ class CloudRouteTests(CostFixture):
         result = {key: request[key] for key in ('attempt', 'commit', 'tree')}
         result.update(host='fixture-guest', verdict='pass' if run.passed else 'fail', gate=gate_box.encode_run(run),
             record=gate_box.completion_record(run, folder.name, ledger.text(request, 'commit'),
-                ledger.text(request, 'tree'), 'fixture-guest', 0, 1, 'merge-gate'))
+                ledger.text(request, 'tree'), 'fixture-guest', 0, 1, 'gate'))
         book = ledger.CostLedger(self.state)
         now = int(time.time())
         booked = book.reserve_gate(self.settings, ledger.GateReservation(
@@ -3373,7 +3431,7 @@ class CloudRouteTests(CostFixture):
             return 0
         for content in ('first edit\n', 'first edit\n', 'second edit\n'):
             _ = self.modules[0][1].write_text(content)
-            _ = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
+            _ = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False,
                                module_time_limit_s=1800, service=service)
         self.assertEqual(folders[0], folders[1])
         self.assertNotEqual(folders[1], folders[2])
@@ -3381,12 +3439,12 @@ class CloudRouteTests(CostFixture):
         tree, dirty = cloud_gate.working_tree(self.repo)
         self.assertTrue(dirty)
         selected = gate.TreeSelection(paths, tree)
-        _ = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED_TEST, full=False,
+        _ = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED, full=False,
                            module_time_limit_s=1800, service=service, selected=selected)
         stale = gate.TreeSelection(paths, gate.checked_git(self.repo, 'rev-parse', 'HEAD^{tree}'))
         with self.subTest(selection='different tree with a saved request'):
             count = len(folders)
-            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED_TEST, full=False,
+            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED, full=False,
                                      module_time_limit_s=1800, service=service, selected=stale)
             self.assertEqual(outcome, cloud_gate.LocalFallback('The checkout changed after the test selection'))
             self.assertEqual(len(folders), count)
@@ -3401,7 +3459,7 @@ class CloudRouteTests(CostFixture):
         with (self.subTest(selection='tree changed during reservation'),
               mock.patch.object(cloud_gate, 'cloud_reservation', side_effect=changed_reservation),
               mock.patch.object(cloud_gate, 'run_service', side_effect=AssertionError('No service may start')) as start):
-            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED_TEST, full=False,
+            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED, full=False,
                                      module_time_limit_s=1800, service=service,
                                      selected=gate.TreeSelection(('scripts/fixture/test_two.py',), tree))
         self.assertEqual(outcome, cloud_gate.LocalFallback('The checkout changed after the test selection'))
@@ -3447,7 +3505,7 @@ class CloudRouteTests(CostFixture):
                     self.assertIn('--property=UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONFIG_FILE AWS_PROFILE', command)
 
     def test_forwarded_worker_records_keep_the_callers_labels_and_unit(self) -> None:
-        _ = write_config_fixture(self.root / 'build_steps.conf', 'owned.merge-gate={unit} merge\n')
+        _ = write_config_fixture(self.root / 'build_steps.conf', 'owned.gate={unit} merge\n')
         owner = UnitLabels('fixture caller', 'fixture-production', 'fixture-unit', OwnerRole.UNIT)
         for paired in (False, True):
             for session_key in ('CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID'):
@@ -3462,7 +3520,7 @@ class CloudRouteTests(CostFixture):
                     for key in (session_key, 'CLAUDE_SESSION_NAME', 'BUILDLOG_UNIT'):
                         del os.environ[key]
                     os.environ.update(forwarded)
-                    with cloud_gate.cloud_reservation(self.repo, self.root / 'worker.sidecar', gate.SuiteMode.MERGE_GATE):
+                    with cloud_gate.cloud_reservation(self.repo, self.root / 'worker.sidecar', gate.SuiteMode.GATE):
                         record, = self.admission.caller_reservations().values()
                         identity = record.queue_waiter
                         self.assertEqual((identity.get('session_id'), identity.get('session_name'), identity.get('unit')),
@@ -3531,7 +3589,7 @@ class CloudRouteTests(CostFixture):
                     row: dict[str, object] = {key: request[key] for key in ('attempt', 'commit', 'tree')}
                     row.update(host='remote-host', verdict='pass', gate=gate_box.encode_run(run), record=gate_box.completion_record(
                         run, ledger.text(request, 'attempt'), ledger.text(request, 'commit'), ledger.text(request, 'tree'),
-                        'remote-host', 0, 1, 'merge-gate'))
+                        'remote-host', 0, 1, 'gate'))
                     record = ledger.mapping(row['record'])
                     record.update(head=request['head'], dirty=bool(request['dirty_paths']), dirty_paths=request['dirty_paths'])
                     if later_edit:
@@ -3547,9 +3605,9 @@ class CloudRouteTests(CostFixture):
                 before = len(self.fallback_rows())
                 with (mock.patch.object(cloud_gate, 'AwsCli', side_effect=AssertionError('The session must not call AWS')),
                       mock.patch.object(store, 'host_file', return_value=destination),
-                      mock.patch.dict(os.environ, {'MERGE_GATE_PASSED_DIR': str(self.root / 'passed')}),
+                      mock.patch.dict(os.environ, {'GATE_PASSED_DIR': str(self.root / 'passed')}),
                       redirect_stdout(StringIO()) as output):
-                    outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
+                    outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False,
                                              module_time_limit_s=1800, service=service)
                 if changed_head:
                     self.assertEqual(outcome, cloud_gate.LocalFallback('The checkout changed during the cloud attempt'))
@@ -3579,7 +3637,7 @@ class CloudRouteTests(CostFixture):
 
     def test_absent_stack_needs_no_service_or_aws_call(self) -> None:
         service = mock.Mock(side_effect=AssertionError('An absent stack needs no service'))
-        outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
+        outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False,
                                  module_time_limit_s=1800, service=service)
         self.assertIsInstance(outcome, cloud_gate.LocalFallback)
         service.assert_not_called()
@@ -3589,7 +3647,7 @@ class CloudRouteTests(CostFixture):
         with (mock.patch.object(cloud_gate, 'append_launch',
                                 side_effect=PermissionError('fixture row write denied')) as append,
               redirect_stderr(StringIO()) as errors):
-            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
+            outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=False,
                 module_time_limit_s=cloud_gate.settings().number('module_time_limit_s'), service=service)
         self.assertEqual(outcome, cloud_gate.LocalFallback('image or stack is absent'))
         self.assertEqual(errors.getvalue(), 'Cloud gate fallback row was not written: fixture row write denied\n')
@@ -3610,13 +3668,13 @@ class CloudRouteTests(CostFixture):
                     cloud_gate.save(self.state / 'gate-deployment.json', dict(deployment))
                 before = len(self.fallback_rows())
                 service = mock.Mock(side_effect=AssertionError('No service may start'))
-                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED_TEST, full=False,
+                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED, full=False,
                     module_time_limit_s=cloud_gate.settings().number('module_time_limit_s'), service=service)
                 self.assertEqual(outcome, cloud_gate.LocalFallback('image or stack is absent'))
                 rows = self.fallback_rows()
                 self.assertEqual(len(rows), before + 1)
                 self.assertEqual((rows[-1]['attempt'], rows[-1]['reason'], rows[-1]['mode']),
-                                 ('', 'image or stack is absent', gate.SuiteMode.TARGETED_TEST.value))
+                                 ('', 'image or stack is absent', gate.SuiteMode.TARGETED.value))
                 self.assertIsInstance(rows[-1]['time'], (int, float))
                 service.assert_not_called()
 
@@ -3630,7 +3688,7 @@ class CloudRouteTests(CostFixture):
                   mock.patch.object(cloud_gate, phase, side_effect=error)):
                 before = len(self.fallback_rows())
                 service = mock.Mock(side_effect=AssertionError('No service may start'))
-                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED_TEST, full=False,
+                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.TARGETED, full=False,
                     module_time_limit_s=cloud_gate.settings().number('module_time_limit_s'), service=service)
                 self.assertEqual(outcome, cloud_gate.LocalFallback(str(error)))
                 rows = self.fallback_rows()
@@ -3664,7 +3722,7 @@ class CloudRouteTests(CostFixture):
                         cloud_gate.save(folder / 'outcome.json', reply)
                     return 1
                 before = len(self.fallback_rows())
-                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=True,
+                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
                     module_time_limit_s=cloud_gate.settings().number('module_time_limit_s'), service=service)
                 self.assertEqual(outcome, cloud_gate.LocalFallback(reason))
                 rows = self.fallback_rows()
@@ -3696,7 +3754,7 @@ class CloudRouteTests(CostFixture):
             cloud_gate.save(folder / 'outcome.json', {'status': 'fallback', 'reason': 'capacity'})
             return 0
         with mock.patch.object(admission_client, 'admit', side_effect=record):
-            for mode in (gate.SuiteMode.MERGE_GATE, gate.SuiteMode.TARGETED_TEST):
+            for mode in (gate.SuiteMode.GATE, gate.SuiteMode.TARGETED):
                 outcome = cloud_gate.run(self.repo, mode=mode, full=True, module_time_limit_s=1800, service=service)
                 self.assertIsInstance(outcome, cloud_gate.LocalFallback)
                 self.assertTrue(self.admission.callers_released())
@@ -3716,17 +3774,17 @@ class CloudRouteTests(CostFixture):
             return 0
         run = cloud_gate.run
         def route(repo: Path, **_kwargs: object) -> cloud_gate.LocalFallback | cloud_gate.CloudCompleted:
-            return run(repo, mode=gate.SuiteMode.TARGETED_TEST, full=True, module_time_limit_s=1800, service=service)
+            return run(repo, mode=gate.SuiteMode.TARGETED, full=True, module_time_limit_s=1800, service=service)
         def local(repo: Path, *_args: object, **_kwargs: object) -> gate.GateRun:
             self.assertTrue(self.admission.callers_released())
-            with gate.gate_reservation(repo, self.root, gate.BuildHoldWait(), mode=gate.SuiteMode.TARGETED_TEST) as place:
+            with gate.gate_reservation(repo, self.root, gate.BuildHoldWait(), mode=gate.SuiteMode.TARGETED) as place:
                 record, = self.admission.caller_reservations().values()
                 self.assertGreater(record.need, 0)
                 place.status = 0
             return gate.GateRun((), 0, 0)
         with (mock.patch.object(cloud_gate, 'run', side_effect=route),
               mock.patch.object(gate, 'run_suites', side_effect=local), redirect_stdout(StringIO())):
-            _ = gate.run_gate_suites(self.repo, full=True, mode=gate.SuiteMode.TARGETED_TEST)
+            _ = gate.run_gate_suites(self.repo, full=True, mode=gate.SuiteMode.TARGETED)
         self.assertTrue(self.admission.callers_released())
 
     def test_cloud_service_error_releases_its_slot(self) -> None:
@@ -3736,7 +3794,7 @@ class CloudRouteTests(CostFixture):
                   mock.patch.object(affected_modules, 'dirty_paths', return_value=set(),
                                     side_effect=affected_modules.GraphError('fixture status error') if status_error else None)):
                 service = mock.Mock(side_effect=OSError('fixture service error'))
-                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=True,
+                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
                                          module_time_limit_s=1800, service=service)
                 self.assertIsInstance(outcome, cloud_gate.LocalFallback)
                 self.assertTrue(self.admission.callers_released())
@@ -3749,7 +3807,7 @@ class CloudRouteTests(CostFixture):
         sidecar = self.root / 'reservation.cgroup'
         sidecar.touch()
         with ExitStack() as slot:
-            _ = slot.enter_context(cloud_gate.cloud_reservation(self.repo, sidecar, gate.SuiteMode.MERGE_GATE))
+            _ = slot.enter_context(cloud_gate.cloud_reservation(self.repo, sidecar, gate.SuiteMode.GATE))
             record, = self.admission.caller_reservations().values()
             clock = FakeClock()
             clock.advance(10)
@@ -3776,7 +3834,7 @@ class CloudRouteTests(CostFixture):
                 service = mock.Mock(side_effect=AssertionError('The result already exists'))
                 with (mock.patch.object(queue_place, 'release_place', side_effect=queue_place.CleanupUnresolved(reason)),
                       redirect_stderr(StringIO()) as errors, redirect_stdout(StringIO())):
-                    outcome = cloud_gate.run(fixture.repo, mode=gate.SuiteMode.MERGE_GATE, full=False,
+                    outcome = cloud_gate.run(fixture.repo, mode=gate.SuiteMode.GATE, full=False,
                         module_time_limit_s=1800, service=service)
                 assert isinstance(outcome, cloud_gate.CloudCompleted)
                 self.assertEqual(outcome.run.passed, status == 0)
@@ -3809,7 +3867,7 @@ class CloudRouteTests(CostFixture):
             with (mock.patch.object(queue_place, 'release_place', side_effect=release),
                   mock.patch.object(cloud_gate, 'time', SimpleNamespace(time=time.time, monotonic=clock.monotonic)),
                   mock.patch.object(store, 'locked_append', wraps=store.locked_append) as append):
-                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=True,
+                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
                     module_time_limit_s=1800, service=lambda _command: 1)
             append.assert_called_once_with(path, deadline=release_start + 0.2)
         self.assertEqual(outcome, cloud_gate.LocalFallback(reason))
@@ -3840,7 +3898,7 @@ class CloudRouteTests(CostFixture):
         with path.open('rb') as locked:
             fcntl.flock(locked, fcntl.LOCK_EX)
             with mock.patch.object(store, 'locked_append', side_effect=append_with_deadline) as append:
-                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=True,
+                outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
                     module_time_limit_s=1800, service=service)
             append.assert_called_once_with(path, deadline=worker_deadline)
         self.assertEqual(outcome, cloud_gate.LocalFallback(reason))
@@ -3849,7 +3907,7 @@ class CloudRouteTests(CostFixture):
 
     def test_route_uses_installed_limit_and_handles_missing_results(self) -> None:
         cloud_gate.save(self.state / 'gate-deployment.json', {'image': 'fixture-image', 'template': 'fixture-template'})
-        outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=True, module_time_limit_s=1800,
+        outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True, module_time_limit_s=1800,
                                  service=lambda _command: 0)
         self.assertIsInstance(outcome, cloud_gate.LocalFallback)
         self.assertTrue(self.admission.callers_released())
@@ -3882,7 +3940,7 @@ class CloudRouteTests(CostFixture):
                     fake.result = {key: request[key] for key in ('attempt', 'commit', 'tree')}
                     fake.result.update(host='fixture-guest', verdict='pass', gate=gate_box.encode_run(run),
                         record=gate_box.completion_record(run, ledger.text(request, 'attempt'),
-                            ledger.text(request, 'commit'), ledger.text(request, 'tree'), 'fixture-guest', now, now + 1, 'merge-gate'))
+                            ledger.text(request, 'commit'), ledger.text(request, 'tree'), 'fixture-guest', now, now + 1, 'gate'))
                     api = AwsCli('build-scaler', 'fixture-region', 1, execute=fake)
                     arguments = list(command[command.index('--worker'):])
                     with (mock.patch.object(cloud_gate, 'AwsCli', return_value=api),
@@ -3894,7 +3952,7 @@ class CloudRouteTests(CostFixture):
                     'subnets': [{'id': 'fixture-a', 'zone': 'a'}]}
                 cloud_gate.save(self.state / 'gate-deployment.json', deployment)
                 with mock.patch.dict(os.environ, {'CONF_DIR': str(checkout), 'AWS_TARGET_CONFIG': str(installed)}):
-                    outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.MERGE_GATE, full=True,
+                    outcome = cloud_gate.run(self.repo, mode=gate.SuiteMode.GATE, full=True,
                                              module_time_limit_s=1800, service=service)
                 self.assertEqual(outcome, cloud_gate.LocalFallback('daily_limit'))
                 self.assertEqual(fake.launches, [])

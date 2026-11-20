@@ -17,6 +17,8 @@ from scripts.production.change_review import ChangeReviewError
 from scripts.production.production_doc import Refusal
 from scripts.review_links import accounts_page, change_page, console_theme, for_you, page_frame, review_link, review_legacy
 
+PHONE_QUERY = "(max-width:680px)"
+
 PAGE_NAME = "console.html"
 # The console posts the open page here and reads which other pages hold new items.
 NEWS_NAME = "news"
@@ -291,7 +293,7 @@ def render(pages: tuple[ConsolePage, ...], rebuilds: AvailablePage | Unavailable
     content = content.replace("<!-- OPEN -->", icon_svg("panel-left-open"))
     content = content.replace("<!-- MENU -->", icon_svg("menu") + '<span class="new-mark" id="menu-new" hidden>' + new_mark + '</span>')
     content = content.replace('<script>', '<script>'+REVIEW_PLACE_SCRIPT, 1)
-    return content.encode("utf-8")
+    return content.replace("/* Phone query */", PHONE_QUERY).encode("utf-8")
 
 
 FOR_YOU_STYLE = r'''
@@ -327,7 +329,7 @@ font:14px/1.4 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere
 #action-popover a{color:var(--accent);font-size:13px;text-decoration:none}
 #action-popover footer{padding:14px 20px;border-top:1px solid var(--border);background:var(--hover)}
 .mobile-header .for-you-button{display:none}
-@media(max-width:680px){.for-you-slot{display:none}.mobile-header .for-you-button{display:flex;width:auto;gap:6px;min-height:36px;padding:5px 8px;font-size:12px}
+@media /* Phone query */{.for-you-slot{display:none}.mobile-header .for-you-button{display:flex;width:auto;gap:6px;min-height:36px;padding:5px 8px;font-size:12px}
 .mobile-header .for-you-button svg{width:16px;height:16px}.mobile-header .for-you-label{display:inline}
 .mobile-header .for-you-state{display:none}.mobile-header .for-you-button b{position:static;min-width:20px;line-height:20px}
 .mobile-header .for-you-button[data-state=stale] b{outline:2px dotted var(--notice-text);outline-offset:2px}
@@ -520,7 +522,7 @@ background:var(--notice);color:var(--notice-text);font-weight:600;text-align:lef
 border-radius:9px;background:var(--notice-text);color:var(--notice);font-size:11px;font-weight:700}
 .collapsed .rebuild-link:hover .tooltip,.collapsed .rebuild-link:focus .tooltip{display:block}
 [hidden]{display:none!important}.dismiss,.mobile-header{display:none}
-@media(max-width:680px){.shell,.shell.collapsed{display:flex;flex-direction:column}
+@media /* Phone query */{.shell,.shell.collapsed{display:flex;flex-direction:column}
 .mobile-header{height:56px;flex:none;display:flex;align-items:center;gap:12px;padding:0 12px;
 background:var(--nav);border-bottom:1px solid var(--border);z-index:4}
 .sidebar{position:fixed;inset:56px auto 0 0;width:244px;box-shadow:10px 0 32px #0002;overflow-y:auto}
@@ -565,7 +567,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
   const shell = document.getElementById('console-shell');
   const toggle = document.getElementById('nav-toggle');
   const mobileToggle = document.getElementById('mobile-nav-toggle');
-  const phone = matchMedia('(max-width:680px)');
+  const phone = matchMedia('/* Phone query */');
   const entries = [...document.querySelectorAll('.nav-entry')];
   const rebuildLink = document.getElementById('rebuild-link');
   // The rebuild link opens its page as a navigation entry does, so it is one of the pages.

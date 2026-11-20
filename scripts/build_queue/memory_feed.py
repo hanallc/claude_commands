@@ -52,7 +52,7 @@ from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.queue_lines import age, plain, step_owner_name, step_text
 from scripts.build_queue.queue_view import reason_phrase
 from scripts.build_queue.admission_jobs import StepJob
-from scripts.lib.build_steps import (GATE_PROGRAMS, OTHER_COMMAND, RECORDED_STEP_NAMES, CopiesRunCommand,
+from scripts.lib.build_steps import (GATE_PROGRAMS, GATE_SCRIPTS, OTHER_COMMAND, RECORDED_STEP_NAMES, CopiesRunCommand,
                                      OtherCommand, StepNames, command_script, copies_run_command,
                                      gate_job_from_process, live_process_arguments, process_arguments, read_step_names)
 from scripts.lib.build_steps import CommandUnreadable as CommandUnreadable
@@ -841,7 +841,7 @@ def copies_slot_command(owner: wire.Owner) -> CopiesRunCommand | OtherCommand:
 def repository_slot_row(slot: wire.RepositorySlotRow, names: StepNames, members: FeedStaff) -> WaitRow | NoNamedStep:
     identity = slot.identity
     folder = Path(identity.folder)
-    legacy_gate = identity.step in GATE_STEPS or Path(identity.step).name in GATE_PROGRAMS.values()
+    legacy_gate = identity.step in GATE_STEPS or Path(identity.step).name in GATE_SCRIPTS
     legacy = copies_slot_command(slot.owner) if legacy_gate or not folder.is_absolute() else OTHER_COMMAND
     source = Path(legacy.source) if isinstance(legacy, CopiesRunCommand) else folder
     step = NoNamedStep.FOUND if legacy_gate else recorded_step(identity.step, names)
@@ -1249,9 +1249,9 @@ class LocalStepName:
 
 
 def local_step_name(step: admission_records.RunningStep | admission_records.WaitingStep, owner: StepPageOwner,
-                    names: StepNames, labels: Mapping[str, unit_labels.UnitLabels], ci_label: str
+                    names: StepNames, labels: Mapping[str, unit_labels.UnitLabels], ci_label: str, job: StepJobReading
                     ) -> LocalStepName | NoNamedStep:
-    if step.step in GATE_STEPS:
+    if step.step in GATE_STEPS and not isinstance(job, StepJob):
         neutral = QueueRowName.owner_only(ci_label) if ci_label else owner.neutral_name()
         return LocalStepName(neutral, neutral, staff_names.text_parts(neutral))
     title = (build_row_step(step.step, step.package, step.project, step.folder, names, kind=QueueKind.CI)
@@ -2362,7 +2362,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         else:
             owner = page_owner(step)
             shown = replace(step, step=job_step(job, step.step), unit=owner.labels.unit)
-            named = local_step_name(shown, owner, names, labels, ci_label)
+            named = local_step_name(shown, owner, names, labels, ci_label, job)
             if isinstance(named, NoNamedStep):
                 continue
             title_step, display_name, parts = named.title, named.name, named.parts
@@ -2523,7 +2523,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         ci_label = waiter.session_name if waiter.unit in ci_runners else ""
         job = NotGateStep() if ci_label else local_job(waiter)
         shown_waiter = replace(waiter, step=job_step(job, waiter.step), unit=identity.unit)
-        named = local_step_name(shown_waiter, owner, names, labels, ci_label)
+        named = local_step_name(shown_waiter, owner, names, labels, ci_label, job)
         if isinstance(named, NoNamedStep):
             continue
         waiters[place] = {**queue_row_labels(named.title, named.name, unit=owner.unit, ci_label=ci_label),
@@ -2590,7 +2590,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
                 cloud.identity.step, cloud.owner.pid, PROC, start_time=cloud.owner.start_time)
             step = job_step(job, cloud.identity.step)
             unit = staff_unit(identity, missing="—") if current is not None or cloud.identity.session_id in cloud_labels else ""
-            if step in GATE_STEPS:
+            if step in GATE_STEPS and not isinstance(job, StepJob):
                 title_step = display_name = QueueRowName.owner_only(public_queue_text(unit)
                     or public_queue_text(identity.owner_text) or public_owner_name(cloud.identity.name, cloud.identity.session_id))
                 parts = staff_names.text_parts(display_name)

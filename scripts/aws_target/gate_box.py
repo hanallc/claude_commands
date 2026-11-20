@@ -14,7 +14,7 @@ import math
 from scripts.lib.python_startup import sitecustomize as python_startup
 
 if TYPE_CHECKING:
-    from scripts.production.merge_gate import GateRun
+    from scripts.production.gate import GateRun
     from scripts.test_times import gate_record
 
 
@@ -225,9 +225,8 @@ GUEST_TRANSFERS = f'''import json, os, subprocess, tempfile, time
 from collections.abc import Mapping
 {inspect.getsource(signed_urls)}
 gate_record_filter = {GATE_RECORD_FILTER!r}
-transfer_retries = {BOX_CURL_RETRY!r} if (
-    gate_request.get('task') != 'paired' and gate_request.get('mode') in ('merge-gate', 'targeted-test')
-) else ()
+# The controller validates the suite mode before it sends the request.
+transfer_retries = {BOX_CURL_RETRY!r} if gate_request.get('task') != 'paired' and 'mode' in gate_request else ()
 ''' + r'''secret_file = root / 'transfer-secrets'
 try:
     descriptor = os.open(secret_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -323,7 +322,7 @@ try:
                                         module_time_limit_s=links['module_time_limit_s'])
         if links.get('production'):
             result['record'] = completion_record(gate, links['attempt'], links['commit'], links['tree'], os.uname().nodename,
-                                                 result['gate_started_at'], time.time(), links['mode'])
+                                                 result['gate_started_at'], time.time(), merge_gate.SuiteMode.step(links['mode']))
             dirty = gate_request['dirty_paths']
             result['record'].update(head=gate_request['head'], dirty=bool(dirty), dirty_paths=dirty,
                                     dirty_path_count=len(dirty))
@@ -375,7 +374,10 @@ def run_guest(root: Path, links: dict[str, object], result: dict[str, object]) -
     }
     exec(GUEST_TRANSFERS, namespace)
     if request.get('task') == 'paired':
-        from scripts.production import merge_gate
+        if TYPE_CHECKING:
+            from scripts.production import gate as merge_gate
+        else:
+            from scripts.production import merge_gate
         from scripts.lib.descendants import adopt_descendants
         from scripts.lib.process_group import send_process_group
         namespace.update(
@@ -694,7 +696,7 @@ nix --extra-experimental-features 'nix-command flakes' shell {tools} --command b
 def encode_run(run: object) -> dict[str, object]:
     """Return the complete gate result for object transfer."""
     from scripts.test_times import gate_record
-    from scripts.production.merge_gate import GateRun, GateJobResult
+    from scripts.production.gate import GateRun, GateJobResult
     from dataclasses import asdict
     from typing import cast
     if not isinstance(run, GateRun):
@@ -727,7 +729,7 @@ def decode_run(value: object) -> GateRun:
     """Validate the transferred result before computing its verdict."""
     from scripts.test_times import gate_record
     from scripts.aws_target.ledger import mapping, rows, text
-    from scripts.production.merge_gate import GateRun, GateJobResult, GateJobKind
+    from scripts.production.gate import GateRun, GateJobResult, GateJobKind
     import math
     from typing import cast
 
@@ -786,7 +788,7 @@ def completion_record(value: object, attempt: str, commit: str, tree: str, host:
     from scripts.test_times import gate_record
     from datetime import UTC
     from scripts.buildlog import record, store
-    from scripts.production.merge_gate import GateRun
+    from scripts.production.gate import GateRun
     import os
     if not isinstance(value, GateRun):
         raise TypeError('expected a completed gate')
@@ -797,7 +799,7 @@ def completion_record(value: object, attempt: str, commit: str, tree: str, host:
     return {'kind': 'gate_run', 'v': record.RECORD_VERSION, 'id': 'gate-' + attempt, 'host': host,
             'started_at': datetime.fromtimestamp(started, UTC).isoformat(),
             'ended_at': datetime.fromtimestamp(ended, UTC).isoformat(), 'wall_s': value.seconds,
-            'hold_wait_s': 0, 'selection': 'affected' if mode == 'targeted-test' else 'full',
+            'hold_wait_s': 0, 'selection': 'affected' if mode == 'test-affected' else 'full',
             'reason': 'time limit' if value.time_limit_report else 'cloud gate',
             'vcpus': os.cpu_count() or 1, 'status': int(not value.passed), 'max_jobs': os.cpu_count() or 1,
             'peak_mib': value.peak_memory_mib, 'cap_mib': 0, 'checkout': '/var/lib/gate-trial/repo',

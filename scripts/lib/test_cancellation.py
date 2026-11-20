@@ -94,10 +94,10 @@ class CancellationTests(unittest.TestCase):
     def test_term_stops_gate_reaping(self) -> None:
         self.assert_term_stops_hung_cleanup("""
 from types import SimpleNamespace
-from scripts.production import merge_gate
+from scripts.production import gate
 job = SimpleNamespace(process=SimpleNamespace(returncode=None, pid=1))
 with mock.patch.object(os, "wait4", side_effect=hang):
-    merge_gate.reap_gate_job(job)
+    gate.reap_gate_job(job)
 """)
 
     def test_term_stops_queue_place_cleanup(self) -> None:

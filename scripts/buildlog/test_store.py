@@ -12,7 +12,7 @@ import time
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast, override
+from typing import IO, cast, override
 from unittest import mock
 
 from scripts.buildlog import store
@@ -27,6 +27,18 @@ class StoreTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())) / "buildlog"
+
+    def test_error_log_escapes_a_filename_that_its_encoding_cannot_write(self) -> None:
+        open_file = Path.open
+
+        def open_ascii(path: Path, mode: str, *, errors: str | None = None) -> IO[str]:
+            self.assertEqual(mode, "a")
+            return open_file(path, "a", encoding="ascii", errors=errors)
+
+        with mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root)}), \
+                mock.patch.object(Path, "open", autospec=True, side_effect=open_ascii):
+            store.note_error("Could not write café.log")
+        self.assertIn(r"Could not write caf\xe9.log", (self.root / store.ERRORS_NAME).read_text(encoding="ascii"))
 
     def test_locked_rows_read_whole_objects_from_the_offset_and_ignore_an_absent_file(self) -> None:
         path = self.root / "history.jsonl"

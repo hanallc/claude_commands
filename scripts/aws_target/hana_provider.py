@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
+from enum import Enum
 import base64
 import fcntl
 import json
@@ -51,6 +52,14 @@ class ProviderPending(RuntimeError):
 
 class ProviderTimedOut(ProviderPending):
     """The AWS request exceeded its time limit."""
+
+
+class MutationMilestone(Enum):
+    DISPATCHED = 'dispatched'
+    DIRECT_ACCEPTANCE = 'direct'
+    OBSERVED_ACCEPTANCE = 'observed'
+    CANCELLED = 'cancelled'
+    START_ABANDONED = 'start-abandoned'
 
 
 class AwsHanaProvider:
@@ -274,6 +283,21 @@ class AwsHanaProvider:
     def _save_mutation(self, path: Path, saved: dict[str, object]) -> None:
         write_text_atomic(path, json.dumps(saved, sort_keys=True) + '\n', new_file_mode=0o600)
 
+    def _record_milestone(self, path: Path, saved: dict[str, object], operation: box.PendingOperation,
+                          milestone: MutationMilestone) -> None:
+        saved['generation'] = operation.generation
+        now = self.clock()
+        if milestone == MutationMilestone.DISPATCHED:
+            saved['dispatched_at'] = int(now)
+        elif milestone in (MutationMilestone.CANCELLED, MutationMilestone.START_ABANDONED):
+            saved['cancellation_at'] = int(now)
+            if milestone == MutationMilestone.START_ABANDONED:
+                saved['cancelled_at'] = float(now)
+        elif 'accepted_at' not in saved:
+            saved['accepted_at'] = int(now)
+            saved['acceptance_source'] = milestone.value
+        self._save_mutation(path, saved)
+
     def step(self, identity: box.DeploymentIdentity, start: box.DemandStart | box.NoDemandStart,
              operation: box.PendingOperation) -> box.ProviderReply:
         path, lock_path = self._paths(operation)
@@ -287,6 +311,7 @@ class AwsHanaProvider:
                     raise ProviderPending('The Hana ' + operation.action.value + ' operation is cancelled')
                 if saved.get('accepted') is True:
                     return self._accepted(identity, start, operation)
+                acceptance = MutationMilestone.DIRECT_ACCEPTANCE
                 if saved:
                     recovered = self._recover(identity, start, operation, path, saved)
                     if isinstance(recovered, box.MutationUnresolved):
@@ -299,6 +324,8 @@ class AwsHanaProvider:
                             raise ProviderPending('The Hana ' + operation.action.value + ' operation remains unresolved')
                     elif operation.action != box.Action.BOOTSTRAP:
                         return self._accepted(identity, start, operation)
+                    else:
+                        acceptance = MutationMilestone.OBSERVED_ACCEPTANCE
                 else:
                     saved = {'version': 1, 'token': operation.token, 'action': operation.action.value,
                         'deployment': identity.deployment, 'dispatched': True}
@@ -307,10 +334,10 @@ class AwsHanaProvider:
                             raise ValueError('Hana bootstrap needs a demand start')
                         saved['descriptor'] = self._bootstrap(identity, start)
                         saved['bootstrap_puts'] = 0
-                    self._save_mutation(path, saved)
+                    self._record_milestone(path, saved, operation, MutationMilestone.DISPATCHED)
                     self._dispatch(identity, start, operation, path, saved)
                 saved['accepted'] = True
-                self._save_mutation(path, saved)
+                self._record_milestone(path, saved, operation, acceptance)
                 return self._accepted(identity, start, operation)
             except (OSError, AwsUnavailable, subprocess.SubprocessError):
                 raise ProviderPending('The Hana ' + operation.action.value + ' response is unavailable') from None
@@ -364,9 +391,8 @@ class AwsHanaProvider:
                     read_started_at = self.clock()
                     observed = self._observation(identity, start)
                     if saved.get('cancelled') is not True:
-                        saved = {**saved, 'version': 1, 'token': operation.token,
-                            'cancelled': True, 'cancelled_at': float(self.clock())}
-                        self._save_mutation(path, saved)
+                        saved = {**saved, 'version': 1, 'token': operation.token, 'cancelled': True}
+                        self._record_milestone(path, saved, operation, MutationMilestone.START_ABANDONED)
                     if operation.action == box.Action.START and observed.state == 'stopped':
                         if saved.get('accepted') is True:
                             return box.StartMayBeRunning(operation.token, observed)
@@ -390,7 +416,8 @@ class AwsHanaProvider:
     def _recover(self, identity: box.DeploymentIdentity, start: box.DemandStart | box.NoDemandStart,
                  operation: box.PendingOperation, path: Path, saved: dict[str, object]) -> box.MutationRecovery:
         if not saved:
-            self._save_mutation(path, {'version': 1, 'token': operation.token, 'cancelled': True})
+            self._record_milestone(path, {'version': 1, 'token': operation.token, 'cancelled': True},
+                operation, MutationMilestone.CANCELLED)
         read_started_at = self.clock()
         observed = self._observation(identity, box.NoDemandStart() if operation.action == box.Action.BOOTSTRAP else start)
         if (operation.action == box.Action.START and observed.state == 'stopped'

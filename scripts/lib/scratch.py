@@ -96,6 +96,7 @@ from typing import Literal, Protocol, TypedDict, cast
 from urllib.parse import unquote_to_bytes
 
 from scripts.lib import cargo_output, conf, copy_record, git_files, session_folder, time_limit  # noqa: E402
+from scripts.direct import recorder_state  # noqa: E402
 from scripts.lib.conf import UseConfiguredValue
 
 from scripts.lib.build_folders import (  # noqa: E402
@@ -1137,32 +1138,29 @@ def record_lifetime(path: Path, now: float, ending_task: str = "", *,
         run, phase = record.fields.get("run_dir"), record.fields.get("phase_id")
         if not isinstance(run, str) or not run or not isinstance(phase, str) or not phase:
             return Unknown(f"repair record {path / copy_record.RECORD}: phase needs run_dir and phase_id")
-        progress = Path(run) / "progress_history_state.json"
+        progress = Path(run) / recorder_state.STATE_FILENAME
         try:
-            raw = cast(object, json.loads(progress.read_text(encoding="utf-8")))
-            if not isinstance(raw, dict):
-                raise ValueError("expected progress object")
-            state = cast(dict[str, object], raw)
+            state = recorder_state.read_state(progress)
             current = state.get("phase")
-            parked = state.get("open_phases", [])
-            if not isinstance(current, dict) or not isinstance(parked, list):
+            opened = state.get("open_phases", [])
+            if (current is not None and not isinstance(current, dict)) or not isinstance(opened, list):
                 raise ValueError("invalid phase state")
-            phases: list[object] = [cast(object, current), *cast(list[object], parked)]
-            for item in phases:
+            for item in cast(list[object], opened):
                 if not isinstance(item, dict):
                     raise ValueError("invalid phase record")
-                fields = cast(dict[str, object], item)
-                if str(fields.get("id")) == phase:
-                    status = fields.get("status")
-                    if status == "active" or item in parked:
-                        return Live(f"open phase: {phase} in {run}")
-                    # finish-phase's --status choices in progress_history.py; no shared constant exists.
-                    if status not in ("completed", "stopped", "error", "finished", "complete", "ended"):
+                if cast(dict[str, object], item).get("id") == phase:
+                    return Live(f"open phase: {phase} in {run}")
+            if isinstance(current, dict):
+                fields = cast(dict[str, object], current)
+                if fields.get("id") == phase:
+                    if fields.get("status") not in ("completed", "stopped", "error", "finished", "complete", "ended"):
                         raise ValueError("unreadable phase status")
                     return Ended(f"phase {phase} ended in {progress}") if isinstance(protection, Ended) else protection
             if record.task == ending_task or task_has_end_evidence(record):
                 return Ended(f"task {record.task} ended; phase is no longer open in {progress}") if isinstance(protection, Ended) else protection
             raise ValueError(f"phase {phase} has no end record")
+        except recorder_state.OldRecorderState as error:
+            return Unknown(str(error))
         except (OSError, ValueError, UnicodeError) as error:
             return Unknown(f"repair progress file {progress}: {error}")
     if record.task.startswith("landed:"):

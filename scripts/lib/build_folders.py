@@ -39,7 +39,7 @@ LEGACY_MKTEMP_SUFFIX_PATTERN = r"[A-Za-z0-9]{6}"
 BUSY = ".claude-busy"
 RECOVERY_MARKER = ".build-folder-recovery"
 QUEUE_PROGRAM_SIDECAR = "program.cgroup"
-GATE_RECOVERY_TOOL = "merge-gate-recovery"
+GATE_RECOVERY_TOOL = "gate-recovery"
 _GATE_RECOVERY_FOLDER = re.compile(re.escape(GATE_RECOVERY_TOOL) + r"(?:-[0-9]+)?")
 REMOVAL_RECORD_PREFIX = ".scratch-removing-"
 REMOVAL_RECORD_SUFFIX = ".json"
@@ -926,7 +926,7 @@ def collector_lease(path: Path, *, children: bool = False, wait: bool = True) ->
 
 
 @contextmanager
-def leased_build_folder(spec: BuildFolderSpec) -> Generator[Path]:
+def leased_build_folder(spec: BuildFolderSpec | UniqueBuildFolder) -> Generator[Path]:
     """Hold the maker lease while a persistent folder is in use."""
     path = create_build_folder(spec)
     try:

@@ -24,10 +24,10 @@ from scripts.lib import build_folders, process_group
 from scripts.lib.process_group import send_process_group
 from scripts.lib.process_start import Gone, Zombie, process_start
 from scripts.message.process_test_support import OwnedTestProcesses
-from scripts.production import merge_gate, merge_gate_suites_test_support
+from scripts.production import gate, gate_suites_test_support
 from scripts.direct.wait_for_test_state import wait_until
-from scripts.production.merge_gate_test_support import gate_suites
-from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
+from scripts.production.gate_test_support import gate_suites
+from scripts.production.gate_suites_test_support import GateSuitesFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -43,9 +43,9 @@ class GateProcessStateTests(unittest.TestCase):
             kernel = mock.Mock(pidfd_open=opened, close=closed)
             readiness = mock.Mock(select=mock.Mock(return_value=([47], [], [])))
             with self.subTest(initial_state=initial_state), \
-                    mock.patch.object(merge_gate_suites_test_support, "Path", return_value=status), \
-                    mock.patch.object(merge_gate_suites_test_support, "os", kernel), \
-                    mock.patch.object(merge_gate_suites_test_support, "select", readiness):
+                    mock.patch.object(gate_suites_test_support, "Path", return_value=status), \
+                    mock.patch.object(gate_suites_test_support, "os", kernel), \
+                    mock.patch.object(gate_suites_test_support, "select", readiness):
                 fixture.assert_process_stopped(1234)
                 status_read.assert_called_once_with()
                 self.assertEqual(opened.call_count, int(isinstance(initial_state, str)))
@@ -75,10 +75,10 @@ print(member.pid)
 print("command stderr", file=sys.stderr)
 """
         with mock.patch.dict(os.environ, processes.environment(self.environment), clear=True), \
-                merge_gate.gate_recovery(self.checkout) as recovery:
+                gate.gate_recovery(self.checkout) as recovery:
             config = admission_records.read_memory_config()
             recovery.rollback_deadline = time.monotonic() + config.program_stop_seconds
-            result = merge_gate.command([sys.executable, "-c", source], self.checkout)
+            result = gate.command([sys.executable, "-c", source], self.checkout)
             self.assertEqual(result.returncode, 0)
             self.assertEqual(result.stderr, "command stderr\n")
             self.assertIsInstance(process_start(int(result.stdout)), (Gone, Zombie))
@@ -101,7 +101,7 @@ sys.stdin.read(1)
             output = leader.stdout
             assert output is not None
             member = int(cast(str, output.readline()))
-            recovery = merge_gate.GateRecovery(self.state / "dead-gate.json", str(self.checkout),
+            recovery = gate.GateRecovery(self.state / "dead-gate.json", str(self.checkout),
                                                leader.pid, "ended-owner")
             recovery.add_group(leader.pid)
             stdout, stderr = leader.communicate(input="x", timeout=TEST_HANG_GUARD_SECS)
@@ -117,7 +117,7 @@ sys.stdin.read(1)
             descriptor = os.open(self.environment["BUILDLOG_JOBSERVER_FIFO"], os.O_RDWR | os.O_NONBLOCK)
             try:
                 with mock.patch.dict(os.environ, self.environment, clear=True):
-                    recovery.path = merge_gate.gate_run_directory(self.checkout) / "dead-gate.json"
+                    recovery.path = gate.gate_run_directory(self.checkout) / "dead-gate.json"
                     recovery.tokens.append(recovery.token(descriptor, os.read(descriptor, 1)))
                     recovery.save()
                     recovery.recover()
@@ -143,10 +143,10 @@ sys.stdin.read(1)
             with self.subTest(live_holder=live_holder), mock.patch.dict(os.environ, self.environment, clear=True):
                 with ExitStack() as holder:
                     if live_holder:
-                        _ = holder.enter_context(merge_gate.gate_recovery(self.checkout))
-                    directory = merge_gate.gate_run_directory(self.checkout)
+                        _ = holder.enter_context(gate.gate_recovery(self.checkout))
+                    directory = gate.gate_run_directory(self.checkout)
                     directory.mkdir(parents=True, exist_ok=True)
-                    recovery = merge_gate.GateRecovery(directory / "dead-owner.json", str(self.checkout),
+                    recovery = gate.GateRecovery(directory / "dead-owner.json", str(self.checkout),
                                                        leader.pid, "ended-owner")
                     folder = self.root / "abandoned-gate"
                     folder.mkdir()
@@ -176,11 +176,11 @@ sys.stdin.read(1)
                         self.assertEqual(len(output.getvalue().splitlines()), 1)
                         self.assertIn("rollback waits for the live gate", output.getvalue())
                     else:
-                        with merge_gate.gate_recovery(self.unit):
+                        with gate.gate_recovery(self.unit):
                             self.assertEqual(self.jobserver_tokens(), b"Q")
                     self.assertEqual(self.jobserver_tokens(), b"Q")
                     self.assertFalse(folder.exists())
-                with merge_gate.gate_recovery(self.checkout):
+                with gate.gate_recovery(self.checkout):
                     self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
                     self.assertFalse(recovery.path.exists())
                 self.assertEqual(list(directory.glob("*.json")), [])
@@ -188,8 +188,8 @@ sys.stdin.read(1)
     def test_recovery_drops_a_non_fifo_token_without_writing(self) -> None:
         pool = self.root / "token-pool"
         self.write(pool, "original pool")
-        recovery = merge_gate.GateRecovery(self.state / "dead-gate.json", str(self.checkout),
-                                           0, "ended-owner")
+        recovery = gate.GateRecovery(self.state / "dead-gate.json", str(self.checkout),
+                                     0, "ended-owner")
         environment = {**self.environment, "BUILDLOG_JOBSERVER_FIFO": str(pool)}
         with mock.patch.dict(os.environ, environment, clear=True), \
                 tempfile.TemporaryDirectory(prefix="merge-gate-", dir="/dev/shm") as folder:
@@ -207,10 +207,10 @@ sys.stdin.read(1)
 
     def test_recovery_replays_only_held_tokens_for_the_recorded_fifo(self) -> None:
         self.supply_jobserver(b"QR")
-        with mock.patch.dict(os.environ, self.environment, clear=True), merge_gate.shared_cpu_pool() as pool:
-            assert isinstance(pool, merge_gate.SharedCPUPool)
-            directory = merge_gate.gate_run_directory(self.checkout)
-            recovery = merge_gate.GateRecovery(directory / "dead-gate.json", str(self.checkout),
+        with mock.patch.dict(os.environ, self.environment, clear=True), gate.shared_cpu_pool() as pool:
+            assert isinstance(pool, gate.SharedCPUPool)
+            directory = gate.gate_run_directory(self.checkout)
+            recovery = gate.GateRecovery(directory / "dead-gate.json", str(self.checkout),
                                                os.getpid(), "ended-owner")
             held = recovery.token(pool.descriptor, os.read(pool.descriptor, 1))
             pending = recovery.token(pool.descriptor, b"R", "returning")
@@ -224,9 +224,9 @@ sys.stdin.read(1)
             output = io.StringIO()
             with redirect_stdout(output):
                 for _ in range(2):
-                    merge_gate.recover_gate_directory(directory)
+                    gate.recover_gate_directory(directory)
                     self.assertEqual(self.jobserver_tokens(), b"RQ")
-                    saved = merge_gate.read_gate_recovery(recovery.path)
+                    saved = gate.read_gate_recovery(recovery.path)
                     assert saved is not None
                     self.assertEqual(saved.tokens, [pending])
             self.assertIn(f"UNRESOLVED: the FIFO has an interrupted slot operation. Record: {recovery.path}",
@@ -234,10 +234,10 @@ sys.stdin.read(1)
 
     def test_invalid_records_stay_and_allow_other_recovery(self) -> None:
         self.supply_jobserver(b"Q")
-        with mock.patch.dict(os.environ, self.environment, clear=True), merge_gate.shared_cpu_pool() as pool:
-            assert isinstance(pool, merge_gate.SharedCPUPool)
-            directory = merge_gate.gate_run_directory(self.checkout)
-            valid = merge_gate.GateRecovery(directory / "valid.json", str(self.checkout),
+        with mock.patch.dict(os.environ, self.environment, clear=True), gate.shared_cpu_pool() as pool:
+            assert isinstance(pool, gate.SharedCPUPool)
+            directory = gate.gate_run_directory(self.checkout)
+            valid = gate.GateRecovery(directory / "valid.json", str(self.checkout),
                                             os.getpid(), "ended-owner")
             valid.save()
             invalid: dict[Path, str] = {}
@@ -266,9 +266,9 @@ sys.stdin.read(1)
                 self.write(path, invalid[path])
             output = io.StringIO()
             with redirect_stdout(output), \
-                    mock.patch.object(merge_gate, "process_start", wraps=process_start) as read_start, \
+                    mock.patch.object(gate, "process_start", wraps=process_start) as read_start, \
                     mock.patch.object(process_group, "send_process_group") as send:
-                merge_gate.recover_gate_directory(directory)
+                gate.recover_gate_directory(directory)
             read_start.assert_called_once_with(os.getpid())
             send.assert_not_called()
             self.assertFalse(valid.path.exists())
@@ -289,11 +289,11 @@ sys.stdin.read(1)
         sidecar = self.state / "gate.cgroup"
         sidecar.touch()
         record = self.state / "run.json"
-        recovery = merge_gate.GateRecovery(record, str(self.checkout), os.getpid(), "fixture")
+        recovery = gate.GateRecovery(record, str(self.checkout), os.getpid(), "fixture")
         with mock.patch.dict(os.environ, self.environment, clear=True):
             configuration = admission_records.read_memory_config()
             reservation = QueuePlace(self.state / "gate", sidecar, configuration=configuration)
-            prefix = merge_gate.publish_gate_scope(recovery, reservation, ["--slice=builds.slice", "--"])
+            prefix = gate.publish_gate_scope(recovery, reservation, ["--slice=builds.slice", "--"])
         scope = Path(sidecar.read_text().strip())
         self.assertEqual(str(scope), recovery.scope)
         self.assertEqual(scope.parent, Path(self.environment["BUILDLOG_BUILDS_CGROUP"]))
@@ -306,8 +306,8 @@ sys.stdin.read(1)
         for has_deadline in (False, True):
             self.supply_jobserver(b"")
             with self.subTest(has_deadline=has_deadline), mock.patch.dict(os.environ, self.environment, clear=True), \
-                    merge_gate.shared_cpu_pool() as pool:
-                assert isinstance(pool, merge_gate.SharedCPUPool)
+                    gate.shared_cpu_pool() as pool:
+                assert isinstance(pool, gate.SharedCPUPool)
                 blocking = pool.blocking
                 clock = 100.0
                 if has_deadline:
@@ -349,10 +349,10 @@ sys.stdin.read(1)
         reader, writer = os.pipe()
         try:
             began = time.monotonic()
-            result = subprocess.run([sys.executable, "-I", "-S", "-c", merge_gate.GATE_START_PERMISSION
+            result = subprocess.run([sys.executable, "-I", "-S", "-c", gate.GATE_START_PERMISSION
                                      + f"open({str(marker)!r}, 'w').close()\n"],
-                                    env={**self.environment, "MERGE_GATE_START_FD": str(reader),
-                                         "MERGE_GATE_START_SECONDS": str(stop_seconds)},
+                                    env={**self.environment, "GATE_START_FD": str(reader),
+                                         "GATE_START_SECONDS": str(stop_seconds)},
                                     pass_fds=(reader,), timeout=stop_seconds + 1, check=False)
             self.assertLessEqual(time.monotonic() - began, stop_seconds + 1)
             self.assertEqual(result.returncode, 1)
@@ -364,10 +364,10 @@ sys.stdin.read(1)
     def test_held_nested_lease_keeps_folders_and_slot_and_allows_other_recovery(self) -> None:
         self.supply_jobserver(b"Q")
         with mock.patch.dict(os.environ, self.environment, clear=True):
-            directory = merge_gate.gate_run_directory(self.checkout)
-            first = merge_gate.GateRecovery(directory / "first.json", str(self.checkout),
+            directory = gate.gate_run_directory(self.checkout)
+            first = gate.GateRecovery(directory / "first.json", str(self.checkout),
                                             os.getpid(), "ended-owner")
-            second = merge_gate.GateRecovery(directory / "second.json", str(self.checkout),
+            second = gate.GateRecovery(directory / "second.json", str(self.checkout),
                                              os.getpid(), "ended-owner")
             descriptor = os.open(self.environment["BUILDLOG_JOBSERVER_FIFO"], os.O_RDWR | os.O_NONBLOCK)
             self.addCleanup(os.close, descriptor)
@@ -381,13 +381,13 @@ sys.stdin.read(1)
             nested = build_folders.BuildFolderSpec(kind="tool", parent=parent, purpose="nested", suffix_length=0)
             with build_folders.leased_build_folder(nested) as holder:
                 output = io.StringIO()
-                with redirect_stdout(output), merge_gate.gate_recovery(self.checkout):
+                with redirect_stdout(output), gate.gate_recovery(self.checkout):
                     self.assertIn("UNRESOLVED", output.getvalue())
                     self.assertTrue(holder.is_dir())
                     self.assertTrue(first.path.is_file())
                     self.assertFalse(second.path.exists())
                     self.assertEqual(self.jobserver_tokens(), b"")
-            with merge_gate.gate_recovery(self.checkout):
+            with gate.gate_recovery(self.checkout):
                 self.assertFalse(parent.exists())
                 self.assertFalse(first.path.exists())
                 self.assertEqual(self.jobserver_tokens(), b"Q")
@@ -396,7 +396,7 @@ sys.stdin.read(1)
     def test_both_gate_modes_recover_the_private_run_record(self) -> None:
         with mock.patch.dict(os.environ, self.environment, clear=True):
             root = build_folders.tmpfs_gate_root()
-            for machine in (merge_gate.SHARED_MACHINE, merge_gate.WholeMachine()):
+            for machine in (gate.SHARED_MACHINE, gate.WholeMachine()):
                 with self.subTest(machine=type(machine).__name__):
                     tool = build_folders.GATE_RECOVERY_TOOL
                     spec = build_folders.BuildFolderSpec(kind="tool", parent=root, purpose=tool, suffix_length=0)
@@ -404,12 +404,12 @@ sys.stdin.read(1)
                         work = self.root / "abandoned-work"
                         work.mkdir()
                         self.write(work / "output", "unfinished")
-                        recovery = merge_gate.GateRecovery(folder / "run.json", str(self.checkout), os.getpid(),
+                        recovery = gate.GateRecovery(folder / "run.json", str(self.checkout), os.getpid(),
                                                            "ended-owner", folders=[str(work)])
                         recovery.save()
                     output = io.StringIO()
                     with redirect_stdout(output):
-                        run = merge_gate.run_suites(self.checkout, machine=machine, full=True)
+                        run = gate.run_suites(self.checkout, machine=machine, full=True)
                     self.assertTrue(run.passed, output.getvalue())
                     self.assertFalse(folder.exists())
                     self.assertFalse(folder.with_name(folder.name + ".lease.json").exists())
@@ -428,11 +428,11 @@ import signal
 import sys
 from contextlib import contextmanager
 
-with open(Path({str(Path(merge_gate.__file__).parents[2])!r}) / "scripts/lib/package_root.py") as package_root:
+with open(Path({str(Path(gate.__file__).parents[2])!r}) / "scripts/lib/package_root.py") as package_root:
     exec(package_root.read(), {{"__file__": package_root.name}})
 from scripts.lib import build_folders
-from scripts.production import merge_gate
-from scripts.production.merge_gate_test_support import MergeGateFixture
+from scripts.production import gate
+from scripts.production.gate_test_support import MergeGateFixture
 
 MergeGateFixture.setUpClass()
 allocate = build_folders.temporary_build_folder
@@ -446,7 +446,7 @@ def hold_nested_gate(request):
         yield folder
 
 build_folders.temporary_build_folder = hold_nested_gate
-merge_gate.run_suites(Path.cwd(), full=True)
+gate.run_suites(Path.cwd(), full=True)
 '''
         helper = self.bin / "nested-gate.py"
         self.write(helper, program)
@@ -465,30 +465,30 @@ merge_gate.run_suites(Path.cwd(), full=True)
         self.assertEqual(list(parent.iterdir()), [])
 
     def test_cancellation_sends_term_to_all_jobs_before_reaping(self) -> None:
-        jobs: list[merge_gate.RunningGateJob] = []
+        jobs: list[gate.RunningGateJob] = []
         for name in ("first", "second"):
-            job = merge_gate.start_gate_job(
+            job = gate.start_gate_job(
                 "hooks", Path(f"test_{name}.py"),
                 [sys.executable, "-c", "import signal; signal.pause()"],
                 self.checkout, self.environment, self.state / f"{name}.log")
             self.addCleanup(job.output.close)
-            self.addCleanup(merge_gate.kill_job_group, job)
+            self.addCleanup(gate.kill_job_group, job)
             jobs.append(job)
         sent: list[int] = []
-        reap = merge_gate.reap_gate_job
+        reap = gate.reap_gate_job
 
         def send_record(pid: int, number: int) -> None:
             if number == signal.SIGTERM:
                 sent.append(pid)
             send_process_group(pid, number)
 
-        def reap_after_all_terms(job: merge_gate.RunningGateJob) -> None:
+        def reap_after_all_terms(job: gate.RunningGateJob) -> None:
             self.assertEqual(sent, [item.process.pid for item in jobs])
             reap(job)
 
-        with mock.patch("scripts.production.merge_gate.process_group.send_process_group", side_effect=send_record), \
-                mock.patch.object(merge_gate, "reap_gate_job", side_effect=reap_after_all_terms):
-            merge_gate.stop_gate_jobs(jobs)
+        with mock.patch("scripts.production.gate.process_group.send_process_group", side_effect=send_record), \
+                mock.patch.object(gate, "reap_gate_job", side_effect=reap_after_all_terms):
+            gate.stop_gate_jobs(jobs)
         for job in jobs:
             self.assertIsNotNone(job.process.returncode)
 
@@ -505,7 +505,7 @@ import sys
 def cleanup_event(event, arguments):
     if event != "shutil.rmtree":
         return
-    if Path(arguments[0]).name != "merge-gate":
+    if Path(arguments[0]).name != {gate.SuiteMode.GATE.wire!r}:
         return
     if {number}:
         os.kill(os.getpid(), {number})
@@ -551,17 +551,17 @@ sys.addaudithook(cleanup_event)
         self.supply_jobserver(b"Q")
         self.write(self.state / "hold-module", "hold")
         launched = self.state / "launched-job"
-        preamble = f"""start = merge_gate.start_gate_job
+        preamble = f"""start = gate.start_gate_job
 def stop_after_start(*arguments, **options):
     job = start(*arguments, **options)
     if arguments[0] == "hooks":
         from scripts.direct.wait_for_test_state import wait_until
-        wait_until((Path(os.environ["MERGE_GATE_TEST_STATE"]) / "module-held").exists,
-                   Path(os.environ["MERGE_GATE_TEST_STATE"]), timeout={TEST_HANG_GUARD_SECS})
+        wait_until((Path(os.environ["GATE_TEST_STATE"]) / "module-held").exists,
+                   Path(os.environ["GATE_TEST_STATE"]), timeout={TEST_HANG_GUARD_SECS})
         Path({str(launched)!r}).write_text(str(job.process.pid))
         os.kill(os.getpid(), signal.SIGTERM)
     return job
-merge_gate.start_gate_job = stop_after_start
+gate.start_gate_job = stop_after_start
 """
         result = self.run_gate("--tests-only", own_process=True, preamble=preamble)
         self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
@@ -581,26 +581,26 @@ merge_gate.start_gate_job = stop_after_start
         preamble = f"""import json
 from scripts.direct.wait_for_test_state import wait_until
 
-start = merge_gate.start_gate_job
-release = merge_gate.SharedCPUSlot.release
+start = gate.start_gate_job
+release = gate.SharedCPUSlot.release
 launched = Path({str(launched)!r})
 
 def release_after_stop(slot):
     if not slot.returned and launched.exists():
-        assert not merge_gate.live_group(int(launched.read_text()))
+        assert not gate.live_group(int(launched.read_text()))
     release(slot)
 
 def interrupt_after_start(*arguments, **options):
     job = start(*arguments, **options)
-    state = Path(os.environ["MERGE_GATE_TEST_STATE"])
+    state = Path(os.environ["GATE_TEST_STATE"])
     wait_until((state / "module-held").exists, state, timeout={TEST_HANG_GUARD_SECS})
-    recovery = merge_gate.ACTIVE_GATE_RECOVERY.get()
+    recovery = gate.ACTIVE_GATE_RECOVERY.get()
     assert str(job.process.pid) in json.loads(recovery.path.read_text())["groups"]
     launched.write_text(str(job.process.pid))
     raise KeyboardInterrupt
 
-merge_gate.SharedCPUSlot.release = release_after_stop
-merge_gate.start_gate_job = interrupt_after_start
+gate.SharedCPUSlot.release = release_after_stop
+gate.start_gate_job = interrupt_after_start
 """
         result = self.run_gate("--tests-only", own_process=True, preamble=preamble, type_dirs=())
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -627,18 +627,18 @@ child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"]
                          stderr=subprocess.DEVNULL, start_new_session=True)
 Path({str(descendant)!r}).write_text(str(child.pid))
 """)
-        finish = merge_gate.finish_gate_job
+        finish = gate.finish_gate_job
         send = os.kill
         escaped = 0
         began = 0.0
         signals: list[int] = []
         leaders: list[int] = []
 
-        def record_scope(job: merge_gate.RunningGateJob, status: int) -> merge_gate.GateJobResult:
+        def record_scope(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
             nonlocal escaped, began
             escaped = int(descendant.read_text())
             self.assertEqual(os.getsid(escaped), escaped)
-            self.assertFalse(merge_gate.live_group(job.process.pid))
+            self.assertFalse(gate.live_group(job.process.pid))
             assert job.scope is not None
             job.scope.mkdir(parents=True)
             self.write(job.scope.parent / "cgroup.procs", "")
@@ -654,12 +654,12 @@ Path({str(descendant)!r}).write_text(str(child.pid))
                 send(pid, number)
 
         with mock.patch.dict(os.environ, environment, clear=True), \
-                mock.patch.object(merge_gate, "module_runner", return_value=runner), \
-                mock.patch.object(merge_gate, "finish_gate_job", side_effect=record_scope), \
+                mock.patch.object(gate, "module_runner", return_value=runner), \
+                mock.patch.object(gate, "finish_gate_job", side_effect=record_scope), \
                 mock.patch.object(os, "kill", side_effect=retain_fixture_member):
             stop_seconds = admission_records.read_memory_config().program_stop_seconds
-            with self.assertRaisesRegex(merge_gate.GateRecoveryUnresolved, "scope .* still has live processes"):
-                _ = merge_gate.run_suites(self.checkout)
+            with self.assertRaisesRegex(gate.GateRecoveryUnresolved, "scope .* still has live processes"):
+                _ = gate.run_suites(self.checkout)
             self.assertLessEqual(time.monotonic() - began, stop_seconds + 1)
         self.assertTrue(signals)
         self.assertEqual(os.getsid(escaped), escaped)
@@ -739,10 +739,10 @@ Path({str(descendant)!r}).write_text(str(child.pid))
                 # The supported whole-machine path has no queue-owned handlers.
                 preamble = """signal.signal(signal.SIGINT, signal.SIG_DFL)
 def whole_gate(repo, type_dirs, module_time_limit_s, **options):
-    with merge_gate.shared_cpu_pool() as pool:
+    with gate.shared_cpu_pool() as pool:
         pool.try_acquire()
-        return merge_gate.run_suites(repo, type_dirs, module_time_limit_s, machine=merge_gate.WholeMachine())
-merge_gate.run_gate_suites = whole_gate
+        return gate.run_suites(repo, type_dirs, module_time_limit_s, machine=gate.WholeMachine())
+gate.run_gate_suites = whole_gate
 """
                 process = subprocess.Popen(
                     [*self.gate_command(preamble=preamble), "--repo", str(self.checkout), "--merge-branch", "integration",

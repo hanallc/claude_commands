@@ -2445,6 +2445,9 @@ class RunnerAuthorizationTests(unittest.TestCase):
         held = records.NatedevHeld("fps", "Phase 3 timing")
         with AdmissionFixture() as fixture, fixture.loop_turn():
             request = fixture.service_request()
+            priority = records.QueuePriority(({"unit": request.runner, "why": "fixture",
+                "set_at": fixture.clock.now(), "set_by": "fixture"},))
+            fixture.server.priority = priority
             with mock.patch.object(build_targets, "hold_waited_on", return_value=holder):
                 waiting, = fixture.server.handle_request(request)
                 assert isinstance(waiting, wire.Wait)
@@ -2454,6 +2457,11 @@ class RunnerAuthorizationTests(unittest.TestCase):
                 assert isinstance(view, wire.ViewReply)
                 step, = view.reading.view.waiting
                 self.assertEqual(step.reason, held)
+                snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+                assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+                self.assertEqual([row["pid"] for _, row in snapshot.inputs.ordered], [request.owner.pid])
+                self.assertEqual(snapshot.inputs.priority, priority)
+                self.assertEqual(list(snapshot.inputs.waiter_orders.values()), [records.PriorityUnit(request.runner)])
             fixture.allow_next_start()
             fixture.release(only_admitted(fixture.server.handle_request(request)))
 
@@ -2679,13 +2687,13 @@ class WaitHolderServiceTests(unittest.TestCase):
     def test_gate_hold_keeps_the_admitted_job_after_restart_and_command_loss(self) -> None:
         job = StepJob("test-all")
         for source, expected in (("request", "test-all"), ("process", "test-all"),
-                                 ("process with invalid stat", "test-all"), ("old record", "merge-gate")):
+                                 ("process with invalid stat", "test-all"), ("old record", "gate")):
             with self.subTest(source=source), AdmissionFixture() as fixture:
                 run = fixture.run_owner()
-                request = fixture.request(step="merge-gate", run=run)
+                request = fixture.request(step="gate", run=run)
                 cmdline = fixture.proc.path / str(request.owner.pid) / "cmdline"
                 argv = ("python3", "copies.py", "run", "--repo", str(fixture.root), "--",
-                        "python3", "merge_gate.py", "--tests-only", "--full")
+                        "python3", "gate.py", "--tests-only", "--full")
                 if source == "request":
                     request = replace(request, identity=replace(request.identity, job=job))
                 else:
@@ -3118,7 +3126,7 @@ class ProgressProfileServiceTests(unittest.TestCase):
             _ = (helper_proc / "comm").write_text("rustc-outlier\n")
             sidecar = fixture.scope(owner, members=(owner.pid, helper.pid), current=4 * GIB, anonymous=3 * GIB)
             scope = Path(sidecar.read_text().strip())
-            request = replace(fixture.request(owner=owner, step="merge-gate", need=4 * GIB), sidecar=str(sidecar))
+            request = replace(fixture.request(owner=owner, step="gate", need=4 * GIB), sidecar=str(sidecar))
             grant = only_admitted(fixture.server.handle_request(request))
             progress.publish_counter(sidecar, progress.ProgressCounter("suites:1", 20, 100))
             _ = fixture.run_pass()
@@ -3584,7 +3592,7 @@ class CloudAdmissionTests(unittest.TestCase):
         assert isinstance(reply, wire.ViewReply)
         return reply.reading
 
-    def cloud_request(self, fixture: AdmissionFixture, *, step: str = "merge-gate",
+    def cloud_request(self, fixture: AdmissionFixture, *, step: str = "gate",
                       run: wire.RunIdentity | wire.NoRun = wire.NO_RUN,
                       group: status_wire.CloudGroup | status_wire.NoCloudGroup = status_wire.NO_CLOUD_GROUP
                       ) -> wire.AdmitRequest:
@@ -3751,7 +3759,7 @@ class CloudAdmissionTests(unittest.TestCase):
                 _ = status_wire.parse_envelope(encoded_group, {"admit": wire.AdmitRequest})
 
     def test_cloud_starts_with_full_local_memory_and_charges_zero(self) -> None:
-        for step in ("merge-gate", "targeted-test"):
+        for step in ("gate", "test-affected"):
             with self.subTest(step=step), AdmissionFixture() as fixture:
                 fixture.free(0)
                 fixture.hold_starts()
@@ -3882,7 +3890,7 @@ class CloudAdmissionTests(unittest.TestCase):
             cloud = self.cloud_request(fixture)
             grant = only_admitted(fixture.server.handle_request(cloud))
             fixture.release(grant)
-            local = fixture.request(need=4 * GIB, step="merge-gate")
+            local = fixture.request(need=4 * GIB, step="gate")
             reply, = fixture.server.handle_request(local)
             self.assertIsInstance(reply, wire.Wait)
             self.assertFalse(fixture.server.reservations)
@@ -4408,7 +4416,7 @@ class RoomAndSlotTests(unittest.TestCase):
             mend = fixture.request(need=int(7.3 * GIB), step="mend")
             self.assertIsInstance(fixture.server.handle_request(mend)[0], wire.Wait)
             fixture.clock.advance(1)
-            gates = [fixture.request(need=6 * GIB, step="merge-gate") for _ in range(3)]
+            gates = [fixture.request(need=6 * GIB, step="gate") for _ in range(3)]
             for request in gates:
                 self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
             fixture.free(11 * GIB)
@@ -4440,7 +4448,7 @@ class QueueLifecycleTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             fixture.free(0)
             fixture.hold_starts()
-            request = fixture.request(step="merge-gate", since=fixture.clock.now() - 30)
+            request = fixture.request(step="gate", since=fixture.clock.now() - 30)
             self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
             fixture.clock.advance(10)
             fixture.free(60 * GIB)
@@ -4462,7 +4470,7 @@ class QueueLifecycleTests(unittest.TestCase):
     def test_admission_recovery_keeps_one_event_for_the_durable_grant(self) -> None:
         for boundary in ("after_state_write", "after_admitted_append"):
             with self.subTest(boundary=boundary), AdmissionFixture() as fixture:
-                request = fixture.request(step="merge-gate", since=fixture.clock.now() - 7)
+                request = fixture.request(step="gate", since=fixture.clock.now() - 7)
                 fixture.fault.stage = boundary
                 with self.assertRaises(InjectedCrash):
                     _ = fixture.server.handle_request(request)
@@ -4482,7 +4490,7 @@ class QueueLifecycleTests(unittest.TestCase):
 
     def test_gate_exit_before_a_positive_sample_still_records_its_end(self) -> None:
         with AdmissionFixture() as fixture:
-            request = fixture.request(step="merge-gate")
+            request = fixture.request(step="gate")
             grant = only_admitted(fixture.server.handle_request(request))
             fixture.clock.advance(3)
             _ = fixture.server.handle_request(wire.ReleaseRequest("gate-end", grant.reservation, 0))
@@ -4532,7 +4540,7 @@ class QueueLifecycleTests(unittest.TestCase):
     def test_an_end_append_retry_preserves_the_saved_time_and_publishes_once(self) -> None:
         for sampled in (False, True):
             with self.subTest(sampled=sampled), AdmissionFixture() as fixture:
-                request = fixture.request(step="merge-gate")
+                request = fixture.request(step="gate")
                 if sampled:
                     request = replace(request, sidecar=str(fixture.scope(request.owner)))
                 grant = only_admitted(fixture.server.handle_request(request))
@@ -4559,7 +4567,7 @@ class QueueLifecycleTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             fixture.free(0)
             fixture.hold_starts()
-            request = fixture.request(step="merge-gate")
+            request = fixture.request(step="gate")
             peer = fixture.connect(request)
             self.assertIsInstance(peer.replies()[0], wire.Wait)
             fixture.clock.advance(10)
@@ -4583,7 +4591,7 @@ class QueueLifecycleTests(unittest.TestCase):
                 fixture.free(0)
                 fixture.hold_starts()
                 age = records.read_memory_config().policy.timing.estimate_refresh_seconds + 1
-                request = (fixture.request(step="merge-gate", age=age) if estimator == "client"
+                request = (fixture.request(step="gate", age=age) if estimator == "client"
                            else fixture.service_request())
                 peer = fixture.connect(request)
                 initial = peer.replies()[-1]
@@ -4615,7 +4623,7 @@ class QueueLifecycleTests(unittest.TestCase):
 
     def test_restart_after_reservation_removal_keeps_the_completed_end(self) -> None:
         with AdmissionFixture() as fixture:
-            request = fixture.request(step="merge-gate")
+            request = fixture.request(step="gate")
             grant = only_admitted(fixture.server.handle_request(request))
             fixture.clock.advance(5)
             ended_at = fixture.clock.now()
@@ -4644,7 +4652,7 @@ class QueueLifecycleTests(unittest.TestCase):
             with self.subTest(appended=appended), AdmissionFixture() as fixture:
                 fixture.free(0)
                 fixture.hold_starts()
-                request = fixture.request(step="merge-gate")
+                request = fixture.request(step="gate")
                 peer = fixture.connect(request)
                 self.assertIsInstance(peer.replies()[0], wire.Wait)
                 fixture.clock.advance(10)
@@ -4672,7 +4680,7 @@ class QueueLifecycleTests(unittest.TestCase):
             with self.subTest(reason=reason), AdmissionFixture() as fixture:
                 fixture.free(0)
                 fixture.hold_starts()
-                request = fixture.request(step="merge-gate")
+                request = fixture.request(step="gate")
                 peer = fixture.connect(request)
                 self.assertIsInstance(peer.replies()[0], wire.Wait)
                 place, = fixture.server.places.values()
@@ -4866,6 +4874,40 @@ class ServiceTests(unittest.TestCase):
             assert isinstance(fixture.server.last_policy, records.AdmissionPolicy)
             reading = gate.queue_read_from(snapshot.inputs, snapshot.policy)
             self.assertEqual([row["pid"] for _, row in reading.ordered], [second.owner.pid, first.owner.pid])
+
+    def test_snapshot_keeps_the_pass_order_when_staff_labels_change_after_admission(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            fixture.hold_starts()
+            starter, older, chosen, removed = (fixture.request(since=fixture.clock.now() - age)
+                                                for age in (90, 60, 30, 10))
+            labels = {starter.identity.session_id: UnitLabels("starter", unit="urgent"),
+                      older.identity.session_id: UnitLabels("older", unit="other"),
+                      chosen.identity.session_id: UnitLabels("chosen", unit="urgent")}
+            admit = cast(Callable[..., None], getattr(fixture.server, "_admit"))
+
+            def admit_and_change_labels(waiters: list[service.WaitingAdmission], config: records.MemoryConfig,
+                                        share_percent: int, *,
+                                        cargo_folder: placement.CargoFolder | placement.NoCargoFolder) -> None:
+                admit(waiters, config, share_percent, cargo_folder=cargo_folder)
+                labels[older.identity.session_id] = UnitLabels("older", unit="urgent")
+                labels[chosen.identity.session_id] = UnitLabels("chosen", unit="other")
+                del fixture.server.waiters[removed.episode]
+
+            with mock.patch.object(gate, "priority_labels", return_value=labels):
+                for request in (starter, older, chosen, removed):
+                    _ = fixture.server.handle_request(request)
+                _ = fixture.completed_queue_change(wire.PrioritySetRequest("ranked-snapshot", "urgent", "urgent", "director"))
+                fixture.free(60 * GIB)
+                write_pressure_reading(fixture.root / "pressure")
+                with mock.patch.object(fixture.server, "_admit", side_effect=admit_and_change_labels):
+                    _ = fixture.run_pass()
+            self.assertEqual(set(fixture.server.reservations), {starter.episode})
+            snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+            assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+            self.assertEqual([row["pid"] for _, row in snapshot.inputs.ordered], [chosen.owner.pid, older.owner.pid])
+            self.assertEqual([records.waiter_priority(row) for _, row in gate.ranked_queue_waiters(snapshot.inputs)],
+                             [records.PriorityUnit("urgent"), records.NormalOrder()])
 
     def test_snapshot_replacement_failure_keeps_the_last_complete_snapshot(self) -> None:
         with AdmissionFixture() as fixture:
@@ -6164,7 +6206,7 @@ class CutoverServiceTests(unittest.TestCase):
 
     def test_policy_edits_reclassify_pressure_in_both_directions(self) -> None:
         with AdmissionFixture() as fixture:
-            request = fixture.request(step="merge-gate", need=8 * GIB)
+            request = fixture.request(step="gate", need=8 * GIB)
             request = replace(request, sidecar=str(fixture.scope(request.owner)))
             grant = only_admitted(fixture.server.handle_request(request))
             fixture.scoped_peak(grant, 8 * GIB)
@@ -7762,7 +7804,10 @@ class AdmissionConfigurationTests(unittest.TestCase):
 
     def test_drain_ignores_current_socket_waiters_and_counts_older_caller_code(self) -> None:
         scripts = Path(__file__).resolve().parents[1]
-        for relative in ("direct/verify.sh", "lint/invoke.sh", "production/merge_gate.py", "build_queue/admission_client.py",
+        for name, expected in (("gate.py", True), ("cloud_gate.py", False), ("gate_box.py", False)):
+            with self.subTest(name=name):
+                self.assertEqual(name in service.ADMISSION_CALLERS, expected)
+        for relative in ("direct/verify.sh", "lint/invoke.sh", "production/merge_gate.py", "production/gate.py", "build_queue/admission_client.py",
                          "build_queue/queue_place.py", "mac_test/offload.py", "mac_test/copy_watch.py"):
             with self.subTest(script=relative), AdmissionFixture() as fixture:
                 caller = fixture.proc.spawn()

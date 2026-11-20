@@ -48,6 +48,7 @@ CONFIG
 
 F() { "$tools_dir/../lib/py" "$tools_dir/findings.py" "$@" --session-dir "$scratch/run"; }
 P() { "$tools_dir/../lib/py" "$tools_dir/progress_history.py" "$@" --session-dir "$scratch/run"; }
+R() { "$tools_dir/../lib/py" "$tools_dir/pass_record.py" "$@" --session-dir "$scratch/run"; }
 setup() {
     step="$1"; shift
     local output
@@ -70,17 +71,17 @@ refuse() {
 passes() {
     # F and P add the scratch session; print the usable call after each refusal.
     printf 'Pass: '
-    if [[ "$1" == F ]]; then printf 'findings.py '; else printf 'progress_history.py '; fi
+    if [[ "$1" == F ]]; then printf 'findings.py '; elif [[ "$1" == R ]]; then printf 'pass_record.py '; else printf 'progress_history.py '; fi
     printf '%q ' "${@:2}"
     printf '\n'
     setup "$step: passing call" "$@"
     printf 'exit=0\n'
 }
 record_fix() {
-    UNIT_PASS_OWNER=launcher setup "start repair $1" P start-pass \
+    UNIT_PASS_OWNER=launcher setup "start repair $1" R start-pass \
         --pass-kind fix --phase-id 1 --fix-pass "$1" --activity "Repair the demo finding" \
         --called-task direct.fix --called-family claude --called-model opus --called-effort high
-    UNIT_PASS_OWNER=launcher setup "finish repair $1" P finish-pass --status completed
+    UNIT_PASS_OWNER=launcher setup "finish repair $1" R finish-pass --status completed
 }
 
 printf 'Phase 1 — Demo phase\n' > "$scratch/phase.md"
@@ -118,10 +119,10 @@ passes F dispatch --covers F001 --accepted-checks "none: demo" --keep "F001=brok
 
 refuse "4. A recorded launch requires its phase" \
     'Missing phase: --phase-id is required for a recorded run' \
-    P check-launch --pass-kind impl
-passes P check-launch --pass-kind impl --phase-id 1
+    R check-launch --pass-kind impl
+passes R check-launch --pass-kind impl --phase-id 1
 refuse "5. The prompt identity must match the open phase" \
     'Stale prompt phase: Phase 9 — Some other phase; open phase is Phase 1 — Demo phase' \
-    P check-launch --pass-kind impl --phase-id 1 --prompt-file "$scratch/stale.md"
-passes P check-launch --pass-kind impl --phase-id 1 --prompt-file "$scratch/phase.md"
+    R check-launch --pass-kind impl --phase-id 1 --prompt-file "$scratch/stale.md"
+passes R check-launch --pass-kind impl --phase-id 1 --prompt-file "$scratch/phase.md"
 printf '\nall five refusals shown\n'

@@ -21,7 +21,7 @@ from unittest import mock
 from contextlib import contextmanager, nullcontext
 
 from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, scratch, unit_runs, process_group
-from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository
 
@@ -1003,6 +1003,28 @@ print('signals')
         self.assertFalse(path.exists())
         self.assertFalse(path.with_name(path.name + ".lock").exists())
         self.assertFalse(path.with_name(path.name + ".lease.json").exists())
+        with self.subTest(request="persistent unique"):
+            config = self.root / "persistent-config"
+            config.mkdir()
+            _ = (config / "build_folders.conf").write_text("""\
+# whole: 1..
+names.suffix_length=12
+names.suffix_characters=abcdefghijklmnopqrstuvwxyz0123456789_
+patterns.legacy-unique={purpose}{suffix}
+# range: 0.001..60
+locks.probe_wait_seconds=0.25
+# range: 0.001..1
+locks.probe_retry_seconds=0.005
+""")
+            request = folders.UniqueBuildFolder("persistent-", folders.ExplicitBuildParent(self.root))
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
+                with folders.leased_build_folder(request) as persistent:
+                    self.assertTrue(persistent.name.startswith("persistent-"))
+                    self.assertEqual(len(persistent.name.removeprefix("persistent-")), 12)
+                    self.assertEqual(folders.build_folder_state(persistent), "held")
+                    _ = (persistent / "proof").write_text("saved")
+                self.assertEqual(folders.build_folder_state(persistent), "free")
+                self.assertEqual((persistent / "proof").read_text(), "saved")
 
     def test_collector_scans_the_folder_path_after_the_parent_changes(self) -> None:
         old_parent = self.root / "old-parent"
@@ -1716,13 +1738,11 @@ assert not loaded, loaded
         self.assertEqual(environment, {"CONF_DIR": str(config.parent),
                                        "BUILD_TARGETS_CONFIG": str(config.parent / "build_targets.conf")})
         sources = Path(__file__).resolve().parents[2] / "config"
+        admission = config.parent / ADMISSION_CONFIG_FIXTURE.name
+        self.assertEqual(conf.read(admission).values(), conf.read(ADMISSION_CONFIG_FIXTURE).values())
         for source in sources.glob("*.conf"):
-            private = config.parent / source.name
-            if source.name == "build_admission.conf":
-                shipped = conf.read(source).values()
-                self.assertEqual(conf.read(private).values(), shipped | {"min_pass_gap_seconds": "0"})
-            else:
-                self.assertEqual(private.read_bytes(), source.read_bytes())
+            if source.name != ADMISSION_CONFIG_FIXTURE.name:
+                self.assertEqual((config.parent / source.name).read_bytes(), source.read_bytes())
         _ = write_config_fixture(config, "prefixes.admit-test=admit-test-\nroots.system=/tmp\n")
         original = config.read_text()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
@@ -2026,7 +2046,7 @@ os._exit(0)
         self.assertEqual((held / "kept").read_text(), "x")
 
     def test_an_error_in_the_tool_run_is_not_taken_as_a_name_clash(self) -> None:
-        with self.assertRaises(FileExistsError), folders.tool_folder("merge-gate"):
+        with self.assertRaises(FileExistsError), folders.tool_folder("gate"):
             raise FileExistsError("from the tool")
         self.assertEqual(list(self.root.iterdir()), [])
 

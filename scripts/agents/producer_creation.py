@@ -80,12 +80,12 @@ def marker_for(record: Mapping[str, object]) -> Marker:
 
 
 def require_record(name: str, record: Mapping[str, object]) -> Marker | None:
-    value = staff.producer_creation_registry("read", name)
-    if not value:
+    creation = staff.producer_creation_registry("read", name)
+    if isinstance(creation, staff.ProducerCreationRegistryStatus):
         return None
-    marker = Marker.parse(value)
+    marker = Marker.parse(creation.marker)
     if marker.machine != remote.this_machine() or record.get("creation_id") != marker.creation_id:
-        raise ValueError(f"the creation record is on {marker.machine}. Run {retry(name)} there.")
+        raise ValueError(f"the creation record is on {marker.machine}. Run {retry(creation.name)} there.")
     return marker
 
 
@@ -105,7 +105,8 @@ def finish(name: str, marker: Marker) -> None:
     _ = staff.producer_creation_registry("finish", name, marker.value())
 
 
-def owner_registry_action(action: str, name: str, value: str, profile: str) -> str:
+def owner_registry_action(action: str, name: str, value: str,
+                          profile: str) -> staff.RecordedProducerCreation | staff.ProducerCreationRegistryStatus:
     """Compare and edit the marker on the staff owner under one lock."""
     staff.validate_name("producer", name)
     if any(mark in name for mark in "#[]="):
@@ -119,7 +120,8 @@ def owner_registry_action(action: str, name: str, value: str, profile: str) -> s
         marker_name = next((stored for stored in markers if stored.casefold() == key), name)
         current = markers.get(marker_name)
         if action == "read":
-            return current or ""
+            return (staff.RecordedProducerCreation(marker_name, current) if current
+                    else staff.ProducerCreationRegistryStatus.ABSENT)
         marker = Marker.parse(value)
         if current and current != value:
             owner = Marker.parse(current)
@@ -142,4 +144,4 @@ def owner_registry_action(action: str, name: str, value: str, profile: str) -> s
             raise ValueError("unknown producer creation action")
         after = registry_rows.replay(before, edits, False)
         _ = models_registry.store_registry(path, before, after, f"{action} producer creation for {name}")
-        return ""
+        return staff.ProducerCreationRegistryStatus.UPDATED

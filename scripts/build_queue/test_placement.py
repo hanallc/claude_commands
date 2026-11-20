@@ -818,6 +818,11 @@ class PlacementTests(unittest.TestCase):
                 self.assertIsInstance(reply, wire.PlacementWait)
                 self.assertEqual(fixture.caller_reservations(), {})
                 self.assertEqual(fixture.queue_pids(), [head.owner.pid, later.owner.pid])
+                snapshot = queue_snapshot.read_queue_snapshot(fixture.state_dir)
+                assert isinstance(snapshot, queue_snapshot.QueueSnapshot)
+                self.assertEqual([row["pid"] for _, row in snapshot.inputs.ordered], [head.owner.pid, later.owner.pid])
+                self.assertEqual(snapshot.inputs.pending_remote_starts, frozenset({
+                    records.run_owner(head.owner.pid, head.owner.start_time)}))
 
                 claim = adopt_assignment(fixture, head, remote)
                 if ending in ("busy after authorization", "busy after estimate expiry", "confirmed",

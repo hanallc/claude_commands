@@ -42,7 +42,7 @@ from scripts.aws_target.config import read_settings, account_settings_path, gate
 from scripts.lib import conf
 from scripts.lib.boot_identity import boot_identity
 from scripts.lib.file_lock import LockResult, exclusive
-from scripts.build_queue import queue_place
+from scripts.build_queue import program_start, queue_place
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib.process_start import Started, Unreadable, process_start
 from scripts.lib.time_limit import TIMED_OUT
@@ -316,10 +316,10 @@ def start_scoped_git(lifeline: int, path: Path, record: GitRecovery, stop_second
             reader, writer = os.pipe()
             _ = barrier.callback(os.close, reader)
             _ = barrier.callback(os.close, writer)
-            wrapper = Path(queue_place.__file__).resolve()
+            wrapper = Path(program_start.__file__).resolve()
             argv = ['systemd-run', '--user', '--scope', '--quiet', '--collect',
                     '--expand-environment=no', '--slice=builds.slice', '--unit=' + record.unit, '--',
-                    sys.executable, str(wrapper), '--scope-start', str(path.with_suffix('.cgroup')),
+                    sys.executable, str(wrapper), '--scope-start', '--authorized', str(path.with_suffix('.cgroup')),
                     str(record.owner), record.owner_start, str(path.with_suffix('.scope.json')), str(reader),
                     str(max(0, run_deadline - time.monotonic())), *command]
             child = subprocess.Popen(argv, cwd=cwd, pass_fds=(reader,), stdin=subprocess.DEVNULL)

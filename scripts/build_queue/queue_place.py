@@ -16,7 +16,6 @@ import errno
 import os
 from pathlib import Path
 import re
-import select
 import signal
 import shutil
 import subprocess
@@ -28,6 +27,7 @@ from typing import BinaryIO, TypedDict, Unpack
 from scripts.lib import build_folders, atomic_file, conf
 from scripts.lib.build_folders import program_starts as program_starts
 from scripts.build_queue import admission_records, snapshot_codec
+from scripts.build_queue import program_start as startup
 from scripts.build_queue import step_estimator
 from scripts.lint import memory_admit
 from scripts.build_queue import admission_client, admission_protocol as wire
@@ -198,30 +198,9 @@ class StartedProgram:
     finished: bool = False
 
 
-@dataclass(frozen=True)
-class ProgramStart:
-    holder: wire.Owner
-    program: wire.Owner
-    scope: str
-    ready: bool = True
-    sidecar: str = ""
-
-    def __post_init__(self) -> None:
-        for owner in (self.holder, self.program):
-            if not 0 < owner.pid < 2 ** 31 or not owner.start_time:
-                raise snapshot_codec.SnapshotParseError("invalid program process identity")
-        for path in (self.scope, self.sidecar):
-            if "\0" in path:
-                raise snapshot_codec.SnapshotParseError("invalid program path")
-            try:
-                _ = os.fsencode(path)
-            except UnicodeError as error:
-                raise snapshot_codec.SnapshotParseError("invalid program path") from error
-
-
-def read_program_start(record: Path) -> ProgramStart | None:
+def read_program_start(record: Path) -> startup.ProgramStart | None:
     try:
-        return wire.parse_record(build_folders.read_program_record(record), ProgramStart)
+        return wire.parse_record(build_folders.read_program_record(record), startup.ProgramStart)
     except FileNotFoundError:
         return None
     except snapshot_codec.SnapshotParseError:
@@ -244,32 +223,6 @@ def _mark_program_recovery(path: Path, sidecar: Path) -> None:
     marker = sidecar.with_name(build_folders.RECOVERY_MARKER)
     with suppress(FileExistsError, FileNotFoundError):
         marker.symlink_to(path.absolute())
-
-
-def wait_for_start(descriptor: int, stop_seconds: float) -> None:
-    with os.fdopen(descriptor, "rb") as permission:
-        if not select.select([permission], [], [], stop_seconds)[0] or permission.read(1) != b"1":
-            raise QueuePlaceRefused("the queue place holder did not authorize startup")
-
-
-def program_start(record: Path, holder: wire.Owner, argv: Sequence[str], *,
-                  sidecar: Path, scope: str = "") -> None:
-    """Publish ownership before execution and reject a dead holder."""
-    if admission_records.process_start_time(holder.pid) != holder.start_time:
-        raise QueuePlaceRefused("the queue place holder exited before program startup")
-    start = admission_records.process_start_time(os.getpid())
-    if start is None:
-        raise QueuePlaceRefused("the program has no live process identity")
-    owner = wire.Owner(os.getpid(), start)
-    if scope:
-        atomic_file.write_text_atomic(record, wire.encode_record(
-            ProgramStart(holder, owner, scope, ready=False, sidecar=str(sidecar))))
-        atomic_file.atomic_sample(sidecar, scope + "\n")
-    atomic_file.write_text_atomic(record, wire.encode_record(ProgramStart(holder, owner, scope, sidecar=str(sidecar))))
-    if admission_records.process_start_time(holder.pid) != holder.start_time:
-        raise QueuePlaceRefused("the queue place holder exited during program publication")
-    _ = signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGINT, signal.SIGHUP})
-    os.execvp(argv[0], list(argv))
 
 
 @contextmanager
@@ -331,7 +284,7 @@ def cleanup_program_starts(configuration: admission_records.MemoryConfig | wire.
         if target is not None:
             atomic_file.remove_dead_temporary_files(directory / target)
     for path in directory.glob("*.json"):
-        record: ProgramStart | None = None
+        record: startup.ProgramStart | None = None
         try:
             record = read_program_start(path)
             if record is None or admission_records.process_start_time(record.holder.pid) == record.holder.start_time:
@@ -366,25 +319,6 @@ def cleanup_program_starts(configuration: admission_records.MemoryConfig | wire.
                             _mark_program_recovery(path, sidecar)
             print(f"UNRESOLVED: recovery kept {path}: {error}", file=sys.stderr)
     return kept
-
-
-def program_scope() -> Path | None:
-    for line in Path("/proc/self/cgroup").read_text().splitlines():
-        if line.startswith("0::") and "/builds.slice/" in line:
-            return Path("/sys/fs/cgroup") / line[3:].lstrip("/")
-    return None
-
-
-def scope_start(sidecar: Path, holder_pid: int, holder_start: str, argv: Sequence[str], *,
-                record: Path, permission: int, stop_seconds: float) -> None:
-    """Publish the scope and confirm its holder before the program starts."""
-    wait_for_start(permission, stop_seconds)
-    if admission_records.process_start_time(holder_pid) != holder_start:
-        raise QueuePlaceRefused("the queue place holder exited before scope startup")
-    scope = program_scope()
-    if scope is None:
-        raise QueuePlaceRefused("the program did not enter its memory scope")
-    program_start(record, wire.Owner(holder_pid, holder_start), argv, sidecar=sidecar, scope=str(scope))
 
 
 def _scope_is_empty(scope: Path) -> bool:
@@ -520,12 +454,12 @@ class QueuePlace:
         record = directory / (uuid.uuid4().hex + ".json")
         self.sidecar.with_name(build_folders.RECOVERY_MARKER).symlink_to(record.absolute())
         atomic_file.sync_folder(self.sidecar.parent)
-        wrapper = [sys.executable, str(Path(__file__).resolve())]
+        wrapper = [sys.executable, str(Path(startup.__file__).resolve())]
         holder = wire.Owner(holder_pid, holder_start)
         read_fd, write_fd = os.pipe()
         with os.fdopen(read_fd, "rb") as reader, os.fdopen(write_fd, "wb", buffering=0) as permission:
             action = "--scope-start" if prefix else "--program-start"
-            command = [*prefix, *wrapper, action, str(self.sidecar), str(holder_pid), holder_start,
+            command = [*prefix, *wrapper, action, "--authorized", str(self.sidecar), str(holder_pid), holder_start,
                        str(record), str(read_fd), str(self.configuration.program_stop_seconds), *argv]
             popen_arguments["pass_fds"] = (*popen_arguments.get("pass_fds", ()), reader.fileno())
             process = subprocess.Popen(command, **popen_arguments)
@@ -542,7 +476,7 @@ class QueuePlace:
                     tracking.adopter = holder
                 tracking.observed[process.pid] = start
             atomic_file.write_text_atomic(record, wire.encode_record(
-                ProgramStart(holder, wire.Owner(process.pid, start), "", ready=False, sidecar=str(self.sidecar))))
+                startup.ProgramStart(holder, wire.Owner(process.pid, start), "", ready=False, sidecar=str(self.sidecar))))
             if isinstance(sampler, threading.Thread):
                 sampler.start()
             _ = permission.write(b"1")
@@ -895,16 +829,9 @@ def shell_wait(args: ShellArguments) -> int:
 def main(argv: list[str] | None = None) -> int:
     """Run a program in its queue place, or serve a shell step's admit, launch or release."""
     argv = sys.argv[1:] if argv is None else argv
-    if len(argv) >= 8 and argv[0] in ("--scope-start", "--program-start"):
-        sidecar, holder, record = Path(argv[1]), wire.Owner(int(argv[2]), argv[3]), Path(argv[4])
-        permission, stop_seconds = int(argv[5]), float(argv[6])
-        if argv[0] == "--scope-start":
-            scope_start(sidecar, holder.pid, holder.start_time, argv[7:], record=record,
-                        permission=permission, stop_seconds=stop_seconds)
-        else:
-            wait_for_start(permission, stop_seconds)
-            program_start(record, holder, argv[7:], sidecar=sidecar)
-        return 0
+    # A run that loaded queue_place.py before this change still calls these actions.
+    if argv[:1] in (["--program-start"], ["--scope-start"]):
+        return startup.main(argv)
     if argv[:1] and argv[0] in SHELL_ACTIONS:
         args = shell_arguments(argv)
         if args.command == "release":

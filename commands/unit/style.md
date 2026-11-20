@@ -106,6 +106,11 @@ Keep footprint proofs at assignment, gate, and merge.
 Record every owned cell through the ledger at its judged commit.
 Hold changes outside the mechanical criteria for a decision under `docs/style_production.md`.
 Preserve approved finding paths and recorded widened paths.
+For blocked proposal work, record the needed paths and yield each blocked finding with `ticket yield --finding`.
+Follow the yielding procedure in `docs/style_production.md`.
+Use `style_plan.py widen` to add a required path to the active dispatch.
+Repeat the same widen if the ledger saved the path before the dispatch update.
+Read the updated `ticket-paths.txt` before you edit that path.
 Apply <HeldAstraRoles/> when a ticket holds an Astra role.
 </StyleTicketExecution>
 

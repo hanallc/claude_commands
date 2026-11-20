@@ -1,6 +1,8 @@
 """Exercise native hook payloads against private staff and transcripts."""
 from __future__ import annotations
 
+from scripts.direct import pass_record as pass_recorder
+
 from scripts.lib.checkout_test_support import python_tool_source
 
 import json
@@ -382,7 +384,7 @@ class TurnEndTests(unittest.TestCase):
                         worker_name=name, worker_id=opened.row.id, launcher_command=["assign.sh"], prompt=self.case.prompt, kind="impl", lens="")
                     if cause == "missing prompt":
                         progress_history.save_dispatch_delivery(self.case.run_dir, instance,
-                            progress_history.DispatchDelivery(f"Read the task. DONE {instance}", instance,
+                            pass_recorder.DispatchDelivery(f"Read the task. DONE {instance}", instance,
                                                               str(self.case.reply)))
                     elif cause == "ended pass":
                         progress_history.complete_dispatch(self.case.run_dir, name, instance, status="error")
@@ -422,7 +424,7 @@ class TurnEndTests(unittest.TestCase):
                                 worker_name=name, worker_id=opened.row.id, launcher_command=["assign.sh"],
                                 prompt=self.case.prompt, kind="impl", lens="")
                             progress_history.save_dispatch_delivery(self.case.run_dir, instance,
-                                progress_history.DispatchDelivery("The pending assignment.", instance, str(self.case.reply)))
+                                pass_recorder.DispatchDelivery("The pending assignment.", instance, str(self.case.reply)))
                             before = (self.case.run_dir / "progress_history_state.json").read_bytes()
                         self.assertEqual(pending.result(timeout=LauncherHangGuard("queued bootstrap hook").remaining()),
                                          turn_end.TurnOutcome.IGNORED)
@@ -714,7 +716,7 @@ class TurnEndTests(unittest.TestCase):
                 assert isinstance(active, progress_history.ActiveDispatch)
                 if instruction == "old":
                     passed = worker_panes.worker_pass(row, self.case.run_dir)
-                    delivery = progress_history.dispatch_delivery(passed)
+                    delivery = pass_recorder.dispatch_delivery(passed)
                     old_line = (f'Read the unchanged prompt file "{self.case.prompt}". '
                                 f"End your final reply with DONE {active.instance_id}. "
                                 "A reply that waits on a detached run is not final.")
@@ -814,7 +816,7 @@ class TurnEndTests(unittest.TestCase):
         name = staff.WorkerName.parse("impl")
         self.assertIs(worker.dispatch(self.case.fixture.parent.id, name, "impl", self.case.prompt,
             session_dir=self.case.run_dir, slot=name.value, phase="8", kind="impl", launcher_command=["assign.sh"],
-            reply=self.case.reply, completion_actions=progress_history.CompletionActions(
+            reply=self.case.reply, completion_actions=pass_recorder.CompletionActions(
                 status_file=str(status), report_file=str(report), end_worker=True)), worker.DispatchSubmission.SUBMITTED)
         pane = self.case.agent.submitted[-1][0]
         row = self.case.agent.row(pane)
@@ -870,7 +872,7 @@ class TurnEndTests(unittest.TestCase):
         self.case.agent.without_done = True
         self.assertIs(worker.dispatch(self.case.fixture.parent.id, name, "impl", self.case.prompt,
             session_dir=run, slot=name.value, phase="8", kind="impl", launcher_command=["assign.sh"],
-            reply=self.case.reply, completion_actions=progress_history.CompletionActions(end_worker=True)),
+            reply=self.case.reply, completion_actions=pass_recorder.CompletionActions(end_worker=True)),
             worker.DispatchSubmission.SUBMITTED)
         pane = self.case.agent.submitted[-1][0]
         row = self.case.agent.row(pane)
@@ -1273,7 +1275,7 @@ class TurnEndTests(unittest.TestCase):
         self.assertIs(worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse("fix"), "fix",
             self.case.prompt, session_dir=self.case.run_dir, slot="fix", phase="8", kind="fix",
             launcher_command=["fix"], reply=self.case.reply, fix_cause="Repair the failed gate",
-            completion_actions=progress_history.CompletionActions(status_file=str(status), resolve_fix=True)),
+            completion_actions=pass_recorder.CompletionActions(status_file=str(status), resolve_fix=True)),
             worker.DispatchSubmission.SUBMITTED)
         pane = self.case.agent.submitted[-1][0]
         row = self.case.agent.row(pane)
@@ -1341,9 +1343,11 @@ class TurnEndTests(unittest.TestCase):
         config = self.case.fixture.root / "conf"
         for name in ("detached_runs.conf", "postmaster.conf", "codex_daemon.conf"):
             _ = shutil.copyfile(source / name, config / name)
-        for finishes_during_turn in (True, False):
-            with self.subTest(finishes_during_turn=finishes_during_turn):
-                name = f"impl-result-{int(finishes_during_turn)}"
+        cases = ((True, False, False), (False, False, False), (True, True, False), (True, True, True))
+        for finishes_during_turn, self_stop, transcript_unavailable in cases:
+            with self.subTest(finishes_during_turn=finishes_during_turn, self_stop=self_stop,
+                              transcript_unavailable=transcript_unavailable):
+                name = f"impl-result-{int(finishes_during_turn)}-{int(self_stop)}-{int(transcript_unavailable)}"
                 self.case.reply = self.case.run_dir / f"{name}.md"
                 self.case.agent.finish_after = 1
                 self.assertIs(worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse(name), "impl",
@@ -1353,8 +1357,12 @@ class TurnEndTests(unittest.TestCase):
                 row = self.case.agent.row(pane)
                 path, record = self.case.detached_record(row, name)
                 record["status"] = "running"
+                if self_stop:
+                    record.update(stop_reason="The newer check replaces this run.",
+                                  stop_pass_requested=True, self_stop=True)
+                log = "The private check began." if self_stop else "The private check passed."
                 atomic_file.write_text_atomic(path, json.dumps(record))
-                atomic_file.write_text_atomic(Path(record["log"]), "The private check passed.\n")
+                atomic_file.write_text_atomic(Path(record["log"]), log + "\n")
                 submitted: list[str] = []
                 notices = len(self.case.agent.notices)
                 run = self.case.fixture.world.run
@@ -1388,12 +1396,29 @@ class TurnEndTests(unittest.TestCase):
 
                 with (patch.object(self.case.fixture.world, "run", side_effect=submit),
                       patch.object(self.case.fixture.world, "wait_turn_end", side_effect=wait_for_idle),
-                      patch.object(detached_runs, "_run", return_value=0),
+                      patch.object(detached_runs, "_stopped_group_has_ended", return_value=True),
+                      patch.object(detached_runs, "_run", return_value=143 if self_stop else 0),
                       patch.object(detached_runs, "deliver_in_fresh_process", side_effect=deliver)):
                     if not finishes_during_turn:
                         with patch.object(detached_runs, "live_runs", return_value=[record]):
                             self.assertEqual(finish_turn(), turn_end.TurnOutcome.WAITING_ON_RUNS)
-                    self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+                    if transcript_unavailable:
+                        with patch.object(detached_runs, "_result_received", side_effect=OSError("fixture read failure")):
+                            self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+                        saved = worker_lifecycle.read_json_object(path)
+                        self.assertEqual(saved.get("delivery"),
+                                         "deferred: worker transcript is unavailable: fixture read failure")
+                        self.assertNotIn("delivered_at", saved)
+                        self.assertEqual(len(self.case.agent.notices), notices)
+                        with patch.object(worker_panes, "observe", return_value=(worker_panes.ClosedWorker(row),)):
+                            self.assertEqual(self.case.finish(name, turn_end.EventKind.RUN_FINISHED),
+                                             turn_end.TurnOutcome.RETRY_EVIDENCE)
+                        saved = worker_lifecycle.read_json_object(path)
+                        self.assertEqual(saved.get("delivery"), "deferred: worker pane is closed")
+                        self.assertNotIn("delivered_at", saved)
+                        self.assertEqual(len(self.case.agent.notices), notices)
+                    else:
+                        self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
                     if finishes_during_turn:
                         saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
                         self.assertTrue(saved.get("completion_pending"))
@@ -1401,7 +1426,13 @@ class TurnEndTests(unittest.TestCase):
                         self.assertEqual(finish_turn(), turn_end.TurnOutcome.SUBMITTED)
                     result, = submitted
                     self.assertIn(f"Detached run: {name}", result)
-                    self.assertIn("The private check passed.", result)
+                    self.assertIn(log, result)
+                    if self_stop:
+                        self.assertIn("Result: STOPPED (exit 143)", result)
+                        self.assertIsInstance(progress_history.active_dispatch(row.id, self.case.run_dir),
+                                              progress_history.ActiveDispatch)
+                        self.assertIn(pane, self.case.fixture.world.locations)
+                        self.assertEqual(len(self.case.agent.notices), notices)
                     saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
                     self.assertEqual(saved.get("delivery"), f"sent: worker {name} at {pane}")
                     self.assertTrue(saved.get("completion_pending"))
@@ -1446,7 +1477,7 @@ class TurnEndTests(unittest.TestCase):
         self.assertIs(worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse("impl"), "impl",
             self.case.prompt, session_dir=self.case.run_dir, slot="impl", phase="8", kind="impl",
             launcher_command=["assign.sh"], reply=self.case.reply,
-            completion_actions=progress_history.CompletionActions(status_file=str(status))),
+            completion_actions=pass_recorder.CompletionActions(status_file=str(status))),
             worker.DispatchSubmission.SUBMITTED)
         pane = self.case.agent.submitted[-1][0]
         row = self.case.agent.row(pane)
@@ -1625,7 +1656,7 @@ class TurnEndTests(unittest.TestCase):
                 reply = self.case.run_dir / f"{name.value}_reply.md"
                 self.assertIs(worker.dispatch(self.case.fixture.parent.id, name, "impl", self.case.prompt,
                     session_dir=self.case.run_dir, slot=name.value, phase="8", kind="impl", launcher_command=["assign.sh", "--to", name.value],
-                    reply=reply, completion_actions=progress_history.CompletionActions(end_worker=managed)),
+                    reply=reply, completion_actions=pass_recorder.CompletionActions(end_worker=managed)),
                     worker.DispatchSubmission.SUBMITTED)
                 pane = self.case.agent.submitted[-1][0]
                 row = self.case.agent.row(pane)
@@ -1743,7 +1774,7 @@ class TurnEndTests(unittest.TestCase):
     def test_a_failed_notice_recovers_the_completed_pass_without_another_close(self) -> None:
         result = worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse("impl"), "impl", self.case.prompt,
             session_dir=self.case.run_dir, slot="impl", phase="8", kind="impl", launcher_command=["assign.sh"],
-            reply=self.case.reply, completion_actions=progress_history.CompletionActions(end_worker=True))
+            reply=self.case.reply, completion_actions=pass_recorder.CompletionActions(end_worker=True))
         self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
         pane = self.case.agent.submitted[-1][0]
         row = self.case.agent.row(pane)
@@ -1779,7 +1810,7 @@ class TurnEndTests(unittest.TestCase):
                 self.case.agent.finish_after = 0
                 opened = self.case.opened(name, role)
                 row = opened.row
-                actions = (progress_history.CompletionActions(end_worker=True, held_role=str(row.id))
+                actions = (pass_recorder.CompletionActions(end_worker=True, held_role=str(row.id))
                            if recovery == "same hold" else progress_history.NO_COMPLETION_ACTIONS)
                 if recovery == "same hold":
                     pid = self.case.fixture.world.foreground[opened.pane][0]
@@ -1862,7 +1893,7 @@ class TurnEndTests(unittest.TestCase):
                 else:
                     save = progress_history.save_dispatch_delivery
 
-                    def interrupt(run: Path, instance: str, delivery: progress_history.DispatchDelivery) -> None:
+                    def interrupt(run: Path, instance: str, delivery: pass_recorder.DispatchDelivery) -> None:
                         save(run, instance, delivery)
                         raise OSError("interrupted after Stage 2 save")
 
@@ -1895,7 +1926,7 @@ class TurnEndTests(unittest.TestCase):
             result = worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse(name), "astra-reviewer", following,
                 session_dir=self.case.run_dir, slot="impl", phase="8", kind="astra", launcher_command=["review-b"],
                 reply=self.case.reply, started=current,
-                completion_actions=progress_history.CompletionActions(end_worker=True, held_role=str(current.row.id)))
+                completion_actions=pass_recorder.CompletionActions(end_worker=True, held_role=str(current.row.id)))
             self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
             active = progress_history.active_dispatch(current.row.id, self.case.run_dir)
             event = turn_end.hook_event({"hook_event_name": "Stop", "session_id": str(current.row.current_session),
@@ -1938,7 +1969,7 @@ class TurnEndTests(unittest.TestCase):
         result = worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse("fix"), "fix", self.case.prompt,
             session_dir=self.case.run_dir, slot="fix", phase="8", kind="fix", launcher_command=["fix"], reply=self.case.reply,
             fix_cause="Repair the failed gate",
-            completion_actions=progress_history.CompletionActions(status_file=str(status), resolve_fix=True))
+            completion_actions=pass_recorder.CompletionActions(status_file=str(status), resolve_fix=True))
         self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
         row = self.case.agent.row(self.case.agent.submitted[-1][0])
         self.assertEqual(self.case.finish("fix"), turn_end.TurnOutcome.ERROR)
@@ -1954,7 +1985,7 @@ class TurnEndTests(unittest.TestCase):
                 prompt=self.case.prompt, kind="impl", lens="")
             missing = self.case.run_dir / "missing-error-reply.md"
             progress_history.save_dispatch_delivery(self.case.run_dir, instance,
-                progress_history.DispatchDelivery("saved prompt", instance, str(missing)))
+                pass_recorder.DispatchDelivery("saved prompt", instance, str(missing)))
             progress_history.complete_dispatch(self.case.run_dir, current.row.name, instance, status="error")
             progress_history.save_hook_completion(self.case.run_dir, instance,
                 progress_history.HookCompletion("error", str(missing), ("error reply write failed",)))
@@ -1974,7 +2005,7 @@ class TurnEndTests(unittest.TestCase):
             self.assertNotIsInstance(held, astra_roles.HoldWorkerUnavailable)
             result = worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse(row.name), "astra-reviewer", self.case.prompt,
                 session_dir=self.case.run_dir, slot=row.name, phase="8", kind="astra", launcher_command=["assign.sh"],
-                reply=self.case.reply, completion_actions=progress_history.CompletionActions(end_worker=True, held_role=str(row.id)))
+                reply=self.case.reply, completion_actions=pass_recorder.CompletionActions(end_worker=True, held_role=str(row.id)))
             self.assertIs(result, worker.DispatchSubmission.SUBMITTED)
             hold = self.case.fixture.root / "holds" / f"{row.id}.json"
             before = hold.read_bytes()

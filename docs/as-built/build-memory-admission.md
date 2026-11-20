@@ -123,12 +123,14 @@ Both paths compute the evidence key from the submitted request and current confi
 Settlement schedules the probe before it reads the shared evidence result.
 Local placements release their reader subscriptions when their reservations end.
 
+`RepositorySlotReady()` advises a retry because `/proc/locks` can omit a held slot, and only the caller's successful `flock` proves it acquired the slot.
+
 ### Cloud gates
 
 `AdmitRequest.place` defaults to `LocalPlace()`.
 This tree supplies the queue API and the cloud progress file.
 The aws route integration belongs to a separate tree.
-That route calls this API with `CloudPlace("aws")` for a `merge-gate` or `targeted-test` step.
+That route calls this API with `CloudPlace("aws")` for a `gate` or `test-affected` step.
 The route process owns the reservation.
 The service releases the cloud slot when that process ends.
 An explicit release also ends the reservation.
@@ -542,7 +544,7 @@ Queue views continue to use the service.
 ### Queue lifecycle and calibration
 
 The service records queue events in `admission/queue_times.jsonl` through `append_queue_time`.
-The same record holds Cargo, `targeted-test`, and `merge-gate` steps.
+The same record holds Cargo, `test-affected`, and `gate` steps.
 The append function locks the file and removes incomplete rows before an append.
 At 8 MiB, it retains the newest events from the last 14 days in less than 6 MiB.
 
@@ -616,7 +618,7 @@ The existing unreachable limit still applies until a valid reply arrives.
 
 A fresh nextest estimate expires after one running-pass interval. Other history estimates expire after `estimate_refresh_seconds`.
 A program uses its history estimate and refreshes it under the normal estimate policy.
-The merge gate reads `program_first_peak_gib.merge-gate` at use; its first need is 4 GiB.
+The merge gate reads `program_first_peak_gib.gate` at use; its first need is 4 GiB.
 Legacy gate peak records do not size that need. A matching anonymous progress profile supplies the first pass's look-ahead window.
 The gate removes its progress counter before reruns, which keep the full need.
 The merge-gate progress profile key includes `shape` (`tests` or `types`).
@@ -628,7 +630,7 @@ The gate reports its first need as a fallback and explains any matching anonymou
 The queue model reads the step names once from `config/build_steps.conf`.
 Renderers use its `StepNames` value without file reads.
 Other sentences read the step names when they need the text.
-The Builds page uses the configured step name, including `targeted test` for `targeted-test`.
+The Builds page uses the configured step name, including `test affected` for `test-affected`.
 `step_promise` gives every admitted step a `LifetimePromise` until it ends.
 The run calculation uses the accepted need before tests start.
 For nextest, an observed test phase can select the frozen test-phase need instead.
@@ -1012,14 +1014,25 @@ The sender prints each send outcome header to the journal.
 
 `build_queue/head_stall.py` watches for a stalled queue head. `buildlog sample` runs it each minute on natedev.
 It reads `queue.json` and the tail of `queue_times.jsonl`. It does not ask the service.
-A stall needs three facts: the head waited `head_stall_alert_minutes` (`build_admission.conf`), a step with a promise above zero runs, and no step with need above zero started in that time.
-Merge gates and targeted tests start with zero need, so they do not hide a stall.
-A snapshot older than `silence_seconds` is not a stall; `down-alert` covers a silent service.
-The watch sends one message to `builds` with the head and each holder's promise and use.
-It also sends one `alert.blocked` phone push with the key `head-stall-<pid>:<start time>:<last start>`.
-The push clears when `head_stall.py cleared --head <key>` exits 0: the head started, left, or no longer stalls.
-`~/.local/state/buildlog/head_stall.json` records the alerted key, so each stall alerts once. A step start ends a stall; a later stall alerts again. A failed send retries the next minute.
-The 2026-11-17 stall held the head from 00:36 to 03:46 EST; no alert reached anyone.
+The watch uses `head_stall_alert_minutes` from `build_admission.conf` as the stall limit.
+The head must wait at least that long. At least one step must hold memory.
+The last admission or step start with a memory need above zero must also be at least that old.
+Merge gates and targeted tests start with a memory need of zero.
+The watch skips snapshots older than `silence_seconds`. `down-alert` covers a silent service.
+
+The watch sends one alert per stall to each of the `builds` and `bob` sessions.
+The alert names the head and lists each holder's time since admission, memory promise, and memory use.
+It adds a note when an incomplete sccache scan can make the use values too low.
+The stall key is the most recent admission or step start with a memory need above zero.
+A head change keeps the same key. A new admission or step start ends the stall.
+The sender uses the stall key to keep one queued copy per recipient.
+The watch accepts `SENT`, `SKIPPED`, `QUEUED`, and `KEPT` as delivery outcomes.
+After each accepted send, the watch records the recipient and stall key in `~/.local/state/buildlog/head_stall.json`.
+An old shared key counts for `builds` only.
+If a state write fails, the watch continues to the next recipient and reports one write error after the sends.
+If the stall continues, the watch retries each unaccepted send the next minute.
+
+The 2026-11-17 stall held the head from 00:36 to 03:46 EST. No alert reached anyone.
 
 The builds showrunner owns cut-over. Workers do not change live units or admission state.
 
@@ -2106,7 +2119,7 @@ No adaptive controller, fixed admission limit, order window, CI growth promise, 
 ### Progress memory profiles
 
 Merge gates start with a ranked peak from their host's recorded peaks from the last 14 days, as other programs do.
-Without history, they use `program_first_peak_gib.merge-gate` from `config/build_admission.conf`.
+Without history, they use `program_first_peak_gib.gate` from `config/build_admission.conf`.
 Matching progress profiles still determine the running need.
 
 Cargo build, check, clippy, mend, nextest, and merge gates record attributed swap-backed use in five-percent phase bins.

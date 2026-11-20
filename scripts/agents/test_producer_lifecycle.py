@@ -91,6 +91,18 @@ def retain_producer_pane(row: staff.StaffRow) -> None:
 
 
 class CreateProducerTests(unittest.TestCase):
+    def test_remote_creation_retry_uses_the_saved_name(self) -> None:
+        with producer_first_fixture("claude") as world:
+            registry = world.case.root / "configuration/models.conf"
+            marker = producer_creation.Marker("fixture-creation-machine", "1" * 32)
+            _ = write_registry(registry, {"producer_creations": {"dwight": marker.value()}}, update=True)
+            with patch.object(remote, "this_machine", return_value="fixture-other-machine"):
+                code, output, errors = command("add-producer", "Dwight")
+            self.assertEqual((code, output), (2, ""))
+            self.assertEqual(errors.splitlines(), [
+                "shutdown: the creation record is on fixture-creation-machine. Run agents add-producer dwight there.",
+            ])
+
     def test_create_uses_default_or_override_and_passes_only_its_opening_prompt(self) -> None:
         codex_arguments = ("--model", "codex:gpt-test")
         cases: tuple[tuple[Literal["claude", "codex"], tuple[str, ...], str, str, Rollout], ...] = (
