@@ -949,8 +949,12 @@ class HanaSetupTests(CostFixture):
         calls: list[str] = []
         alternative = deploy.DeploymentNetwork('us-east-2', 'discovered-vpc', [
             {'zone': 'us-east-2b', 'id': 'discovered-subnet'}])
+
+        def pause(seconds: float) -> None:
+            self.clock.advance(int(seconds))
+
         with self.prepared_stop_setup(fake, calls, stack_subnet='fixture-subnet') as (subject, _):
-            subject.pause = lambda seconds: self.clock.advance(int(seconds))
+            subject.pause = pause
             with self.assertRaisesRegex(deploy.DeploymentRefused, 'The Hana box is not yet stopped'):
                 _ = subject.hana_setup(approve_resources=True)
             saved_path = self.state / 'hana/setup.json'
