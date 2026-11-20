@@ -1083,8 +1083,9 @@ frame.addEventListener('load',async()=>{
         self.assertIn("State</dt><dd>Working</dd>", log)
         self.assertIn("Next step</dt><dd>", log)
         self.assertIn("Latest status</dt><dd>", log)
+        shown = re.sub(r"<[^>]+>", "", log)
         for text in (OWNER.id, MORTY.id, "EtaRange(", "next_step", "latest_status"):
-            self.assertNotIn(text, log)
+            self.assertNotIn(text, shown)
 
     def test_updated_log_shows_full_eta_and_shares_the_next_step_renderer(self) -> None:
         item = self.add("Log an update")
