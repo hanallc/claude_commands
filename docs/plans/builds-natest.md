@@ -841,3 +841,37 @@ Ordered after the red main repair and the guard repair (builds). It does not mov
 
 **Acceptance gate:** `module_cost.py` before and after shows CPU at half or less, labeled with its host, or the report gives a floor result; 20 repeated runs of the changed module pass, TMPDIR=/tmp, under `systemd-run --user --scope -p MemoryMax=2G`, after natemerge's go; basedpyright gives zero errors and zero warnings on the changed file; one blind review.
 
+
+### Phase 409 — a rerun or bisect step stops a hanging module after a short limit  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a rerun step or a bisect step of the merge gate stops a module that hangs after a limit made from that module's measured time, not after 1800 s. On 2026-11-20 one hanging test cost 30 minutes in each bisect step of batch bb13 (natemerge's finding, assigned by builds). The slowest measured module takes 387 s.
+
+**Spec:**
+1. Find each path where a rerun step or a bisect step runs named gate modules: `run_named_modules` in `scripts/production/merge_gate.py`, the memory-stop rerun in `run_suites`, and the red-step rerun and `bisect_red_batch` calls in `scripts/production/merge_checkpoint.py` through `checkpoint_gate.narrowed` and `checkpoint_gate.run_test_steps`. State each path in the summary.
+2. For these paths, each module gets its own limit: `max(rerun_module_time_floor_s, rerun_module_time_factor × median wall time of the passing runs of that module on the same vCPU count)`. Read the medians with the query that `gate_record.history_time_limit` already uses; share that code, do not copy it.
+3. A module with no passing record keeps `DEFAULT_MODULE_TIME_LIMIT_S`. A full gate run and a nightly run keep `DEFAULT_MODULE_TIME_LIMIT_S`. An explicit `--module-time-limit-s` argument still sets the limit for every module.
+4. Add two keys to `config/merge_gate.conf` with their range comments: `rerun_module_time_factor=3.0` (number, range 1..) and `rerun_module_time_floor_s=120` (whole, 1..). Read them through `conf.read("merge_gate")`. No number of the two is in code.
+5. The kill text names the limit and its source: the factor and the median, or the floor.
+6. Model the limit as a type: a per-module limit that is one of measured, floor or default. Do not pass a bare optional float.
+7. Tests: table rows in the existing merge gate suite tests. Rows: a module with history gets factor × median; a short module gets the floor; a module with no history gets the default; a full run keeps the default; a hanging module in a named-module run is stopped at its limit (use a fixture config with a small floor and a fixture module that sleeps; the test reads no live config value). Each test fails without the change.
+
+**Files:**
+- `scripts/production/merge_gate.py` — the per-module limit for named-module runs
+- `scripts/production/merge_checkpoint.py` — the rerun and bisect calls, only if they need a change
+- `scripts/production/checkpoint_gate.py` — the narrowed step, only if it needs a change
+- `scripts/test_times/gate_record.py` — the shared module median read
+- `config/merge_gate.conf` — the two keys
+- `scripts/production/test_merge_gate_suites_reruns.py` — the table rows
+- `scripts/test_times/test_gate_record.py` — rows for the shared read, if it moves
+
+**Workers:** 1 writer. The files depend on one another; nothing splits.
+- `impl` — all files.
+
+**State:** none. The change reads the gate index and writes no record.
+
+**Constraints from prior phases:** the base is main. Phase 355 renames `merge_gate.py` to `gate.py`; it follows this change by rename at its next merge of main. The report unit's branch `builds-report-jobnames` changes one line in the merge gate test files; keep edits away from the first lines of those files. Tests read no tunable config value. Tests run on the Mac too. Focused modules inside the writer pass are allowed; any other test run needs natemerge's go.
+
+**Acceptance gate:** basedpyright gives zero errors and zero warnings on changed files; the changed test modules pass; 20 repeated runs of each changed test module pass after natemerge's go; one blind review; the gate route that builds names for the merge passes.
