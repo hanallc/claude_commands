@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import cast, final
 from unittest import mock
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.build_hold import build_hold
 from scripts.direct.verify_mac_offload_test_support import TARGETS_WRAPPER
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY, stub_build_tool_path as stub_build_tool_path, processes_carrying
@@ -25,6 +26,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, FixtureHang
 class VerifyMacFixtureTests(VerifyMacOffloadFixture):
     def test_condition_can_become_true_between_its_check_and_process_exit(self) -> None:
         with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read(1)"],
+                              env=verify_test_environment(),
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               text=True) as process:
             first = True

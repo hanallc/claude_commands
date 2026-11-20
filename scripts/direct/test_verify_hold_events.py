@@ -16,6 +16,7 @@ import unittest
 from typing import cast
 from unittest import mock
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.direct.verify_hold_wait_test_support import (
     VerifyHoldWaitFixture,
     grant_call,
@@ -31,11 +32,18 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 class VerifyHoldWaitTests(VerifyHoldWaitFixture):
     def test_hold_release_records_before_the_fixture_restores_its_environment(self) -> None:
-        environments: tuple[tuple[str, dict[str, str]], ...] = (("ambient", {}), ("marked", self.fixture.environment))
-        for count, (name, environment) in enumerate(environments, 1):
+        startup = self.fixture.root / "caller-startup.sh"
+        _ = startup.write_text(': > "${BASH_SOURCE[0]}.ran"\nexit 97\n')
+        caller_environment = {"BASH_ENV": str(startup)}
+        environments: tuple[tuple[str, dict[str, str], dict[str, str]], ...] = (
+            ("ambient", {}, {}),
+            ("marked", self.fixture.environment, {}),
+            ("caller-startup", {}, caller_environment),
+        )
+        for count, (name, environment, caller) in enumerate(environments, 1):
             with self.subTest(environment=name):
                 self.hold()
-                with local_hold_environment(environment):
+                with mock.patch.dict(os.environ, caller), local_hold_environment(environment):
                     grant_call(self.cycle_file)
                 recorded: list[tuple[object, object]] = []
                 for path in (self.fixture.root / "buildlog").rglob("*.jsonl"):
@@ -44,6 +52,7 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
                         if row.get("kind") == "hold_event":
                             recorded.append((row.get("event"), row.get("holder")))
                 self.assertEqual(recorded, [("ended", "hana")] * count)
+                self.assertFalse(startup.with_suffix(".sh.ran").exists())
 
     def test_local_admission_waits_for_release_notifications_instead_of_sleeping(self) -> None:
         from scripts.build_targets import build_targets
@@ -156,7 +165,7 @@ class PlacementWaitModeTests(unittest.TestCase):
                 "PLACEMENT_EPISODE=two; wait_for_placement",
                 "PLACEMENT_WAIT_MEMORY=1; PLACEMENT_EPISODE=three; wait_for_placement",
             ))
-            result = subprocess.run(["bash", "-c", script], env={**os.environ, "CALLS": str(calls)},
+            result = subprocess.run(["bash", "-c", script], env={**verify_test_environment(), "CALLS": str(calls)},
                                     capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(calls.read_text().splitlines(), [

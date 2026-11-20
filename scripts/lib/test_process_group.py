@@ -24,6 +24,8 @@ from unittest.mock import MagicMock, patch
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_group
+from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.lib.shell_test_support import refusing_bash_startup
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment
 
@@ -149,7 +151,7 @@ def unguarded_group_signals(scripts: Path) -> list[str]:
                     lines.add(number)
         if relative == Path("lib/process_group.py"):
             allowed = next((node for node in ast.walk(ast.parse(source))
-                            if isinstance(node, ast.FunctionDef) and node.name == "send_process_group"), None)
+                            if isinstance(node, ast.FunctionDef) and node.name == "_send_checked_group"), None)
             if allowed is not None:
                 send_line = next((node.lineno for node in ast.walk(allowed)
                                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
@@ -188,6 +190,16 @@ class ProcessGroupTests(PrivateGroupFixture):
             process_group.send_process_group(child.pid, signal.SIGTERM)
             send.assert_called_once_with(child.pid, signal.SIGTERM)
 
+    def test_only_the_group_leader_can_terminate_its_own_group(self) -> None:
+        pid = os.getpid()
+        with patch.object(os, "killpg") as send, patch.object(os, "getpgrp", return_value=pid + 1):
+            with self.assertRaises(ValueError):
+                process_group.terminate_owned_process_group()
+            send.assert_not_called()
+        with patch.object(os, "killpg") as send, patch.object(os, "getpgrp", return_value=pid):
+            process_group.terminate_owned_process_group()
+            send.assert_called_once_with(pid, signal.SIGTERM)
+
     def test_cli_refuses_invalid_ids_without_sending_a_signal(self) -> None:
         invalid: tuple[object, ...] = (MagicMock(), True, False, 0, 1, -2, os.getpgrp())
         with patch.object(os, "killpg") as send, redirect_stderr(io.StringIO()):
@@ -208,7 +220,7 @@ class ProcessGroupTests(PrivateGroupFixture):
 
 class ShellProcessGroupTests(PrivateGroupFixture):
     root: Path = Path()
-    environment: dict[str, str] = {}
+    fixture_environment: dict[str, str] = {}
 
     @override
     def setUp(self) -> None:
@@ -223,9 +235,13 @@ class ShellProcessGroupTests(PrivateGroupFixture):
         copy_startup(self.root)
         home = self.root / "home"
         home.mkdir()
-        self.environment = {**os.environ, **config_environment(self.root / "config"),
-                            "HOME": str(home), **interpreter_cache_environment(self.root / "cache"),
-                            "VERIFY_PROCESS_GROUP_LIB": str(self.root / "scripts/lib")}
+        self.fixture_environment = {**config_environment(self.root / "config"),
+                                    "HOME": str(home), **interpreter_cache_environment(self.root / "cache"),
+                                    "VERIFY_PROCESS_GROUP_LIB": str(self.root / "scripts/lib")}
+
+    @property
+    def environment(self) -> dict[str, str]:
+        return {**verify_test_environment(), **self.fixture_environment}
 
     def release_child_group(self, child: subprocess.Popen[str]) -> subprocess.CompletedProcess[str]:
         board = self.root / "scripts/direct/board.sh"
@@ -294,16 +310,23 @@ kill() {
     def test_copied_verify_cancellation_uses_the_local_helper(self) -> None:
         child = self.private_child()
         individual_signals = self.root / "watch" / "individual-signals"
-        for function, status, signum in (("cancel_tree_run", 77, "KILL"), ("verify_interrupted", 143, "15")):
-            for helper_status in (0, 3):
-                with self.subTest(function=function, helper_status=helper_status):
-                    self.fake_helper(helper_status)
-                    result = self.cancel_step(function, child)
-                    self.assertEqual(result.returncode, status, result.stdout + result.stderr)
-                    self.assertEqual((self.root / "helper-arguments").read_text(), f"{child.pid} {signum}")
-                    self.assertNotIn("process group helper failed", result.stderr)
-                    self.assertFalse(individual_signals.exists(), "Cancellation must use the group helper.")
-                    self.assertIsNone(child.poll(), "Cancellation must leave the individual child alive.")
+        startup = refusing_bash_startup(self.root)
+        for function, status, signum, helper_status, bash_env in (
+            ("cancel_tree_run", 77, "KILL", 0, ""),
+            ("cancel_tree_run", 77, "KILL", 3, ""),
+            ("verify_interrupted", 143, "15", 0, ""),
+            ("verify_interrupted", 143, "15", 3, ""),
+            ("cancel_tree_run", 77, "KILL", 0, str(startup)),
+        ):
+            with (self.subTest(function=function, helper_status=helper_status, caller_startup=bool(bash_env)),
+                  patch.dict(os.environ, {"BASH_ENV": bash_env})):
+                self.fake_helper(helper_status)
+                result = self.cancel_step(function, child)
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                self.assertEqual((self.root / "helper-arguments").read_text(), f"{child.pid} {signum}")
+                self.assertNotIn("process group helper failed", result.stderr)
+                self.assertFalse(individual_signals.exists(), "Cancellation must use the group helper.")
+                self.assertIsNone(child.poll(), "Cancellation must leave the individual child alive.")
 
     def test_verify_cancellation_reports_missing_or_refused_local_helpers(self) -> None:
         child = self.private_child()
@@ -315,6 +338,7 @@ kill() {
                         (self.root / "scripts/lib/process_group.py").unlink()
                     result = self.cancel_step(function, child)
                     self.assertIn("process group helper failed", result.stderr)
+                    self.assertFalse((self.root / "watch" / "individual-signals").exists())
                     self.assertIsNone(child.poll(), "a refused helper must not fall back to an unchecked signal")
 
     def test_copied_board_releases_its_private_group_without_a_home_helper(self) -> None:
@@ -338,7 +362,6 @@ kill() {
                 self.assertTrue((self.root / "session/locks/cargo.d").exists())
                 self.assertIsNone(child.poll(), "helper refusal must not signal the individual child")
                 shutil.rmtree(self.root / "session")
-
 
 class ProcessGroupSourceTests(unittest.TestCase):
     def test_guard_finds_planted_python_shell_and_heredoc_sends(self) -> None:

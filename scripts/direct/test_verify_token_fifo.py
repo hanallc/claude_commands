@@ -4,7 +4,7 @@ from __future__ import annotations
 import subprocess
 import unittest
 from scripts.lib.process_supervisor import launch
-from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers
+from scripts.lib.helper_tree_test_support import VERIFY_HELPERS, copy_helpers, verify_test_environment
 
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY, BOARD
 from scripts.lib.test_hang_guard import FixtureHang, TEST_HANG_GUARD_SECS
@@ -19,7 +19,7 @@ class VerifyTokenFifoTests(VerifyTokenWaitFixture):
         waiters = board / "token_waiters"
         waiters.mkdir(parents=True)
         older = self.enterContext(launch(["bash", "-c", 'read -r -t "$1" _; :', "verify.sh",
-                                  str(TEST_HANG_GUARD_SECS)], stdin=subprocess.PIPE))
+                                  str(TEST_HANG_GUARD_SECS)], env=verify_test_environment(), stdin=subprocess.PIPE))
         older_entry = waiters / f"peer.0123456789abcdef.1000000.{older.pid}.again"
         older_entry.touch()
         output = self.root / "queued.out"

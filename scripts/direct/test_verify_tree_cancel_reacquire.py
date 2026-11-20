@@ -10,6 +10,7 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.build_queue import placement
 
 from scripts.direct.verify_tree_cancel_test_support import cancellation_lines, VerifyTreeCancelFixture
@@ -48,12 +49,13 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         wait_until(lambda: blocked_episode() and not lock.exists(), self.root, processes=(process,))
         self.assertEqual(self.admission.server.placement_requests[episode].episode, episode)
         holder = self.enterContext(launch_process([sys.executable, "-c", "import sys; sys.stdin.read()", "verify.sh"],
-                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  env=verify_test_environment(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True))
         self.started_groups.add(holder.pid)
         self.addCleanup(self.finish_process, holder)
         taken = subprocess.run(["bash", str(BOARD), "acquire", str(self.board), "peer", "cargo",
                                 "--pid", str(holder.pid), "--hold", "3600", "--wait", "0"],
+                               env=verify_test_environment(),
                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(taken.returncode, 0, taken.stdout + taken.stderr)
         hold.unlink()
@@ -79,19 +81,21 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         records = self.records()
         self.assertEqual([(row.get("outcome"), row.get("status")) for row in records], [("cancelled", 77)])
         released = subprocess.run(["bash", str(BOARD), "release", str(self.board), "peer", "cargo",
-                                   "--pid", str(holder.pid)], capture_output=True, text=True,
+                                   "--pid", str(holder.pid)],
+                                   env=verify_test_environment(), capture_output=True, text=True,
                                   check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
 
     def test_tree_cancel_during_token_wait_removes_own_entry_and_keeps_peer(self) -> None:
         # Keep the peer alive before the caller publishes its token entry.
         holder = self.enterContext(launch_process([sys.executable, "-c", "import sys; sys.stdin.read()", "verify.sh"],
-                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  env=verify_test_environment(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True))
         self.started_groups.add(holder.pid)
         self.addCleanup(self.finish_process, holder)
         taken = subprocess.run(["bash", str(BOARD), "acquire", str(self.board), "peer", "cargo",
                                 "--pid", str(holder.pid), "--hold", "3600", "--wait", "0"],
+                               env=verify_test_environment(),
                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(taken.returncode, 0, taken.stdout + taken.stderr)
         process = self.start_verify("test")
@@ -123,7 +127,8 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         records = self.records()
         self.assertEqual([(row.get("outcome"), row.get("status")) for row in records], [("cancelled", 77)])
         released = subprocess.run(["bash", str(BOARD), "release", str(self.board), "peer", "cargo",
-                                   "--pid", str(holder.pid)], capture_output=True, text=True,
+                                   "--pid", str(holder.pid)],
+                                   env=verify_test_environment(), capture_output=True, text=True,
                                   check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
 

@@ -11,6 +11,7 @@ import tempfile
 from typing import TypedDict, cast, override
 import unittest
 
+from scripts.lib.helper_tree_test_support import verify_test_environment
 from scripts.direct.test_verify_mac_offload import stub_build_tool_path
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.process_supervisor import ManagedProcess, launch
@@ -50,6 +51,7 @@ class TokenWaitNoteTests(unittest.TestCase):
                 "token_wait_note still 5",
             ))
             result = subprocess.run(["bash", "-c", script, "wait-note-test", str(board)],
+                                    env=verify_test_environment(),
                                     text=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "")
